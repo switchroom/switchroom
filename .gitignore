@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+
+# Agent runtime data (generated, not committed)
+/agents/
+
+# Vault
+*.enc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+*.tsbuildinfo
