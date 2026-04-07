@@ -4,9 +4,6 @@ import { resolve } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
 import {
   loginAgent,
-  loginAllAgents,
-  startLogin,
-  completeLogin,
   getAuthStatus,
   getAllAuthStatuses,
   refreshAgent,
@@ -38,7 +35,7 @@ export function registerAuthCommand(program: Command): void {
   auth
     .command("login <name>")
     .description(
-      "Login an agent via OAuth (or 'all' to login all agents sequentially)"
+      "Show instructions for completing Claude Code onboarding for an agent"
     )
     .action(
       withConfigError(async (name: string) => {
@@ -46,17 +43,16 @@ export function registerAuthCommand(program: Command): void {
         const agentsDir = resolveAgentsDir(config);
 
         if (name === "all") {
-          console.log(chalk.bold("\nLogging in all agents...\n"));
-          const results = await loginAllAgents(config);
-
-          for (const [agentName, result] of Object.entries(results)) {
-            if (result.success) {
-              console.log(chalk.green(`  ${agentName}: authenticated`));
-            } else {
-              console.error(chalk.red(`  ${agentName}: failed`));
+          console.log(chalk.bold("\nAuth instructions for all agents:\n"));
+          for (const agentName of Object.keys(config.agents)) {
+            const agentDir = resolve(agentsDir, agentName);
+            const result = loginAgent(agentName, agentDir);
+            console.log(chalk.cyan(`--- ${agentName} ---`));
+            for (const line of result.instructions) {
+              console.log(`  ${line}`);
             }
+            console.log();
           }
-          console.log();
           return;
         }
 
@@ -73,15 +69,13 @@ export function registerAuthCommand(program: Command): void {
         }
 
         const agentDir = resolve(agentsDir, name);
-        console.log(chalk.bold(`\nLogging in agent: ${name}\n`));
-        const result = await loginAgent(name, agentDir);
+        const result = loginAgent(name, agentDir);
 
-        if (result.success) {
-          console.log(chalk.green(`\nAgent "${name}" authenticated successfully.\n`));
-        } else {
-          console.error(chalk.red(`\nFailed to authenticate agent "${name}": ${result.error}\n`));
-          process.exit(1);
+        console.log();
+        for (const line of result.instructions) {
+          console.log(line);
         }
+        console.log();
       })
     );
 
@@ -144,7 +138,7 @@ export function registerAuthCommand(program: Command): void {
   // clerk auth refresh <name>
   auth
     .command("refresh <name>")
-    .description("Force re-login to refresh OAuth tokens for an agent")
+    .description("Show instructions for refreshing OAuth tokens for an agent")
     .action(
       withConfigError(async (name: string) => {
         const config = getConfig(program);
@@ -163,82 +157,13 @@ export function registerAuthCommand(program: Command): void {
         }
 
         const agentDir = resolve(agentsDir, name);
-        console.log(chalk.bold(`\nRefreshing auth for agent: ${name}\n`));
-        const result = await refreshAgent(name, agentDir);
+        const result = refreshAgent(name, agentDir);
 
-        if (result.success) {
-          console.log(chalk.green(`\nAgent "${name}" refreshed successfully.\n`));
-        } else {
-          console.error(chalk.red(`\nFailed to refresh agent "${name}": ${result.error}\n`));
-          process.exit(1);
+        console.log();
+        for (const line of result.instructions) {
+          console.log(line);
         }
-      })
-    );
-
-  // clerk auth start <name> — generate URL without waiting for input (for headless/remote use)
-  auth
-    .command("start <name>")
-    .description(
-      "Generate an auth URL for an agent (use 'clerk auth complete' to finish)"
-    )
-    .action(
-      withConfigError(async (name: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        if (!config.agents[name]) {
-          console.error(
-            chalk.red(`Agent "${name}" is not defined in clerk.yaml`)
-          );
-          process.exit(1);
-        }
-
-        const agentDir = resolve(agentsDir, name);
-        const { authUrl } = startLogin(name, agentDir);
-
-        console.log(
-          chalk.bold(`\nAuth URL for ${name}:\n`)
-        );
-        console.log(`  ${authUrl}\n`);
-        console.log(
-          chalk.gray(
-            `  After signing in, run: clerk auth complete ${name} <code>\n`
-          )
-        );
-      })
-    );
-
-  // clerk auth complete <name> <code> — finish auth with a code
-  auth
-    .command("complete <name> <code>")
-    .description("Complete auth for an agent using the code from the browser")
-    .action(
-      withConfigError(async (name: string, code: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        if (!config.agents[name]) {
-          console.error(
-            chalk.red(`Agent "${name}" is not defined in clerk.yaml`)
-          );
-          process.exit(1);
-        }
-
-        const agentDir = resolve(agentsDir, name);
-        const result = await completeLogin(name, agentDir, code);
-
-        if (result.success) {
-          console.log(
-            chalk.green(`\nAgent "${name}" authenticated successfully.\n`)
-          );
-        } else {
-          console.error(
-            chalk.red(
-              `\nFailed to authenticate agent "${name}": ${result.error}\n`
-            )
-          );
-          process.exit(1);
-        }
+        console.log();
       })
     );
 }

@@ -10,5 +10,10 @@
     {{/if}}
   }{{#if mcpServers}},
   "mcpServers": {{{json mcpServers}}}
-  {{/if}}
+  {{/if}}{{#if skipPermissionPrompt}},
+  "skipDangerousModePermissionPrompt": true
+  {{/if}},
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
+  }
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { getAuthStatus, formatTimeUntilExpiry } from "../src/auth/manager.js";
+import { getAuthStatus, formatTimeUntilExpiry, loginAgent, refreshAgent } from "../src/auth/manager.js";
 
 describe("formatTimeUntilExpiry", () => {
   it("returns hours and minutes for future timestamps", () => {
@@ -134,5 +134,52 @@ describe("getAuthStatus", () => {
 
     const status = getAuthStatus("test-agent", tempDir);
     expect(status.authenticated).toBe(false);
+  });
+});
+
+describe("loginAgent", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `clerk-login-test-${Date.now()}`);
+    mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns onboarding instructions for unauthenticated agent", () => {
+    const result = loginAgent("test-agent", tempDir);
+    expect(result.instructions).toBeDefined();
+    expect(result.instructions.length).toBeGreaterThan(0);
+    expect(result.instructions.some(l => l.includes("clerk agent start"))).toBe(true);
+    expect(result.instructions.some(l => l.includes("clerk agent attach"))).toBe(true);
+  });
+
+  it("returns already-authenticated message for authenticated agent", () => {
+    const creds = {
+      claudeAiOauth: {
+        accessToken: "sk-ant-oat01-test-token",
+        refreshToken: "sk-ant-ort01-test-refresh",
+        expiresAt: Date.now() + 8 * 60 * 60_000,
+        subscriptionType: "max",
+      },
+    };
+    writeFileSync(
+      resolve(tempDir, ".claude", ".credentials.json"),
+      JSON.stringify(creds)
+    );
+
+    const result = loginAgent("test-agent", tempDir);
+    expect(result.instructions.some(l => l.includes("already authenticated"))).toBe(true);
+  });
+});
+
+describe("refreshAgent", () => {
+  it("returns refresh instructions", () => {
+    const result = refreshAgent("test-agent", "/tmp/fake");
+    expect(result.instructions).toBeDefined();
+    expect(result.instructions.some(l => l.includes("attach"))).toBe(true);
   });
 });

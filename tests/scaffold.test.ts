@@ -74,6 +74,7 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
     expect(startSh).toContain('TELEGRAM_TOPIC_ID="42"');
     expect(startSh).toContain("exec claude --channels plugin:telegram@claude-plugins-official");
+    expect(startSh).not.toContain("--dangerously-skip-permissions");
   });
 
   it("omits TELEGRAM_TOPIC_ID when topic_id is not set", () => {
@@ -138,6 +139,83 @@ describe("scaffoldAgent", () => {
     // Verify file was not overwritten
     const content = readFileSync(claudePath, "utf-8");
     expect(content).toBe("# Custom content\n");
+  });
+
+  it("includes --dangerously-skip-permissions when dangerous_mode is true", () => {
+    const config = makeAgentConfig({ dangerous_mode: true });
+    const result = scaffoldAgent("dangerous-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain("--dangerously-skip-permissions");
+  });
+
+  it("does not include --dangerously-skip-permissions when dangerous_mode is false", () => {
+    const config = makeAgentConfig({ dangerous_mode: false });
+    const result = scaffoldAgent("safe-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("includes skipDangerousModePermissionPrompt when skip_permission_prompt is true", () => {
+    const config = makeAgentConfig({ skip_permission_prompt: true });
+    const result = scaffoldAgent("skip-prompt-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    expect(settings.skipDangerousModePermissionPrompt).toBe(true);
+  });
+
+  it("does not include skipDangerousModePermissionPrompt by default", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("default-prompt-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    expect(settings.skipDangerousModePermissionPrompt).toBeUndefined();
+  });
+
+  it("includes enabledPlugins for telegram in settings.json", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("plugin-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    expect(settings.enabledPlugins).toBeDefined();
+    expect(settings.enabledPlugins["telegram@claude-plugins-official"]).toBe(true);
+  });
+
+  it("writes comment in .env when bot token is unresolvable vault reference", () => {
+    const vaultTelegramConfig: TelegramConfig = {
+      bot_token: "vault:telegram-bot-token",
+      forum_chat_id: "-1001234567890",
+    };
+    // With no CLERK_VAULT_PASSPHRASE or TELEGRAM_BOT_TOKEN set, should write comment
+    const origPassphrase = process.env.CLERK_VAULT_PASSPHRASE;
+    const origToken = process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.CLERK_VAULT_PASSPHRASE;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+
+    try {
+      const config = makeAgentConfig();
+      const result = scaffoldAgent("vault-agent", config, tmpDir, vaultTelegramConfig);
+      const envContent = readFileSync(join(result.agentDir, "telegram", ".env"), "utf-8");
+
+      expect(envContent).toContain("# Set your bot token");
+    } finally {
+      if (origPassphrase !== undefined) process.env.CLERK_VAULT_PASSPHRASE = origPassphrase;
+      if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
+    }
+  });
+
+  it("creates plugin directories during scaffolding", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("plugin-dir-agent", config, tmpDir, telegramConfig);
+
+    expect(existsSync(join(result.agentDir, ".claude", "plugins", "marketplaces"))).toBe(true);
   });
 
   it("returns correct agentDir path", () => {

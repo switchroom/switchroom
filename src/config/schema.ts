@@ -71,6 +71,14 @@ export const AgentSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe("Additional MCP server configurations"),
+  dangerous_mode: z
+    .boolean()
+    .optional()
+    .describe("If true, include --dangerously-skip-permissions in start.sh"),
+  skip_permission_prompt: z
+    .boolean()
+    .optional()
+    .describe("If true, add skipDangerousModePermissionPrompt to settings.json"),
 });
 
 export const TelegramConfigSchema = z.object({
