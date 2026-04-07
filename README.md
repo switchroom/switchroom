@@ -31,13 +31,26 @@ Clerk is **not a harness or wrapper**. It never intercepts Claude's authenticati
 - A Telegram bot token ([create one with @BotFather](https://t.me/BotFather))
 - A Telegram group with forum/topics enabled
 
-### 1. Install Clerk
+### Install and Setup
 
 ```bash
 npm install -g clerk-ai
+clerk setup
 ```
 
-### 2. Create your config
+That's it. The interactive wizard walks you through everything: config file, bot token, DM pairing, group detection, topic creation, agent scaffolding, and onboarding.
+
+For non-interactive / CI usage:
+
+```bash
+TELEGRAM_BOT_TOKEN=your-token USER_ID=12345 clerk setup --non-interactive --config clerk.yaml
+```
+
+### Manual Setup (Advanced)
+
+If you prefer to set up each step manually:
+
+#### 1. Create your config
 
 ```bash
 clerk init --example clerk
@@ -51,7 +64,7 @@ $EDITOR clerk.yaml
 
 At minimum, set your Telegram `forum_chat_id` (the group where topics will be created).
 
-### 3. Set up secrets
+#### 2. Set up secrets
 
 ```bash
 # Create an encrypted vault for sensitive values
@@ -63,7 +76,7 @@ clerk vault set telegram-bot-token
 
 The vault uses AES-256-GCM encryption. You'll be prompted for a passphrase.
 
-### 4. Create Telegram forum topics
+#### 3. Create Telegram forum topics
 
 ```bash
 # Make sure your bot is an admin in the forum group, then:
@@ -73,7 +86,7 @@ clerk topics sync
 
 This creates a forum topic for each agent and saves the mapping.
 
-### 5. Initialize and start
+#### 4. Initialize and start
 
 ```bash
 # Scaffold all agent directories and install systemd units
@@ -83,7 +96,7 @@ clerk init
 clerk agent start health-coach
 ```
 
-### 6. Complete Claude Code onboarding (once per agent)
+#### 5. Complete Claude Code onboarding (once per agent)
 
 ```bash
 # Attach to the agent's tmux session

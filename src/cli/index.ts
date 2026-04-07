@@ -9,6 +9,7 @@ import { registerAuthCommand } from "./auth.js";
 import { registerVaultCommand } from "./vault.js";
 import { registerMemoryCommand } from "./memory.js";
 import { registerWebCommand } from "./web.js";
+import { registerSetupCommand } from "./setup.js";
 
 const pkg = JSON.parse(
   readFileSync(resolve(import.meta.dirname, "../../package.json"), "utf-8")
@@ -22,6 +23,7 @@ export const program = new Command()
   .version(pkg.version)
   .option("-c, --config <path>", "Path to clerk.yaml config file");
 
+registerSetupCommand(program);
 registerInitCommand(program);
 registerAgentCommand(program);
 registerSystemdCommand(program);
