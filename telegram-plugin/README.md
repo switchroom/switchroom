@@ -63,6 +63,73 @@ bun server.ts
 4. Otherwise, the `message_thread_id` is included in the MCP notification metadata and auto-captured for replies
 5. When the agent calls the `reply` tool, `message_thread_id` is passed to `bot.api.sendMessage()` so the response lands in the correct topic thread
 
+## Enhanced features
+
+### Read receipt indicator
+
+When an inbound message is received, the plugin immediately reacts with an emoji to indicate it was seen. Configure via `ackReaction` in `access.json`:
+
+```json
+{
+  "ackReaction": "👀"
+}
+```
+
+Set to an empty string `""` to disable. Only Telegram's fixed emoji whitelist is accepted (👍 👎 ❤ 🔥 👀 🎉 etc). A typing indicator is also sent automatically.
+
+### Streaming progress via message editing
+
+For long-running tasks, agents can show progress:
+
+1. Send an initial "thinking..." message with `reply` — note the returned `message_id`
+2. Call `edit_message` with updated text as work progresses (edits are silent — no push notification)
+3. Call `send_typing` between steps to keep the typing indicator alive (it expires after ~5s)
+4. When done, send a **new** `reply` so the user's device pings with a push notification
+
+### `send_typing` tool
+
+Sends a typing indicator ("Bot is typing...") to a chat. Auto-expires after ~5 seconds. Call repeatedly during long operations.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `chat_id` | yes | Target chat ID |
+
+### `pin_message` tool
+
+Pins a message in a chat. Requires admin rights in groups.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `chat_id` | yes | Chat ID |
+| `message_id` | yes | Message to pin |
+
+### `forward_message` tool
+
+Forwards an existing message to a chat, preserving original sender attribution. In forum topics, the forwarded message lands in the correct thread (auto-detected or explicit).
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `chat_id` | yes | Destination chat ID |
+| `from_chat_id` | yes | Source chat ID |
+| `message_id` | yes | Message ID to forward |
+| `message_thread_id` | no | Forum topic thread ID (auto-applied if not specified) |
+
+### Improved MarkdownV2 formatting
+
+When using `format: "markdownv2"` in the `reply` or `edit_message` tools, special characters are now **auto-escaped** outside of code blocks and inline code spans. Agents can write natural markdown without manually escaping Telegram's special characters (`_ * [ ] ( ) ~ > # + - = | { } . !`).
+
+Code blocks (`` ``` ... ``` ``) and inline code (`` ` ... ` ``) are preserved as-is.
+
+### Voice message metadata
+
+When a voice message or audio file is received, the inbound metadata includes:
+
+- `attachment_kind: "voice"` or `"audio"`
+- `attachment_file_id` — use with `download_attachment` to fetch the file
+- `attachment_mime` — MIME type (e.g. `audio/ogg` for voice messages)
+
+**Whisper transcription**: To auto-transcribe voice messages, set up a Whisper MCP server (e.g. [whisper-mcp](https://github.com/modelcontextprotocol/servers)) and instruct your agent to download voice attachments and pass them to the Whisper tool for transcription.
+
 ## Use case: multi-agent orchestration
 
 In a Clerk multi-agent setup, each agent instance can run this plugin with a different `TELEGRAM_TOPIC_ID`, routing each forum topic to a dedicated agent while sharing a single bot token and group chat.

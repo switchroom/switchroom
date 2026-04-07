@@ -365,6 +365,33 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// MarkdownV2 requires escaping these characters outside of code spans/blocks:
+// _ * [ ] ( ) ~ ` > # + - = | { } . !
+// But characters inside ``` ... ``` or ` ... ` must NOT be escaped.
+function escapeMarkdownV2(text: string): string {
+  const specialChars = /[_*\[\]()~`>#+\-=|{}.!\\]/g
+  const parts: string[] = []
+  let last = 0
+
+  // Match code blocks (``` ... ```) and inline code (` ... `) to skip them.
+  const codeRe = /(```[\s\S]*?```|`[^`\n]+`)/g
+  let m: RegExpExecArray | null
+  while ((m = codeRe.exec(text)) !== null) {
+    // Escape the segment before this code span
+    if (m.index > last) {
+      parts.push(text.slice(last, m.index).replace(specialChars, '\\$&'))
+    }
+    // Keep the code span as-is
+    parts.push(m[0])
+    last = m.index + m[0].length
+  }
+  // Escape the trailing segment
+  if (last < text.length) {
+    parts.push(text.slice(last).replace(specialChars, '\\$&'))
+  }
+  return parts.join('')
+}
+
 const mcp = new Server(
   { name: 'telegram', version: '1.0.0' },
   {
@@ -385,9 +412,11 @@ const mcp = new Server(
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. Use send_typing to show a typing indicator during long operations. Use pin_message to pin important outputs. Use forward_message to quote/resurface earlier messages.',
       '',
       'If a message includes message_thread_id, it came from a forum topic. The reply tool will automatically route replies back to the same topic — no need to pass message_thread_id manually unless you want to override.',
+      '',
+      'When using format: "markdownv2", special characters are auto-escaped outside code blocks/spans — just write natural markdown and it will render correctly in Telegram.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -505,6 +534,46 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    {
+      name: 'send_typing',
+      description: 'Send a typing indicator to a chat. The indicator auto-expires after ~5 seconds. Call repeatedly during long operations to show the bot is still working. Useful between processing steps.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'pin_message',
+      description: 'Pin a message in a Telegram chat. Useful for important outputs the user wants to find later. Requires admin rights in groups.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'forward_message',
+      description: 'Forward an existing message to a chat. Useful for quoting or resurfacing earlier messages. Preserves the original sender attribution. In forum topics, the forwarded message lands in the correct thread.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Destination chat ID' },
+          from_chat_id: { type: 'string', description: 'Source chat ID where the original message lives' },
+          message_id: { type: 'string', description: 'ID of the message to forward' },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic thread ID in the destination chat. Auto-applied from the last inbound message if not specified.',
+          },
+        },
+        required: ['chat_id', 'from_chat_id', 'message_id'],
+      },
+    },
   ],
 }))
 
@@ -531,6 +600,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         assertAllowedChat(chat_id)
 
+        // Auto-escape MarkdownV2 special chars (preserving code blocks/spans)
+        const effectiveText = parseMode ? escapeMarkdownV2(text) : text
+
         // Resolve thread ID: explicit arg > auto-captured from inbound
         const threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
 
@@ -546,7 +618,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const chunks = chunk(effectiveText, limit, mode)
         const sentIds: number[] = []
 
         try {
@@ -624,14 +696,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const editText = editParseMode ? escapeMarkdownV2(args.text as string) : args.text as string
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
-          args.text as string,
+          editText,
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+      }
+      case 'send_typing': {
+        assertAllowedChat(args.chat_id as string)
+        await bot.api.sendChatAction(args.chat_id as string, 'typing')
+        return { content: [{ type: 'text', text: 'typing indicator sent' }] }
+      }
+      case 'pin_message': {
+        assertAllowedChat(args.chat_id as string)
+        await bot.api.pinChatMessage(args.chat_id as string, Number(args.message_id))
+        return { content: [{ type: 'text', text: `pinned message ${args.message_id}` }] }
+      }
+      case 'forward_message': {
+        const fwdChatId = args.chat_id as string
+        const fwdFromChatId = args.from_chat_id as string
+        const fwdMsgId = Number(args.message_id)
+        assertAllowedChat(fwdChatId)
+        const threadId = resolveThreadId(fwdChatId, args.message_thread_id as string | undefined)
+        const fwd = await bot.api.forwardMessage(fwdChatId, fwdFromChatId, fwdMsgId, {
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        })
+        return { content: [{ type: 'text', text: `forwarded (id: ${fwd.message_id})` }] }
       }
       default:
         return {
