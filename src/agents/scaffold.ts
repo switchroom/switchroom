@@ -7,7 +7,7 @@ import {
   renderTemplate,
   copySkills,
 } from "./templates.js";
-import { getHindsightSettingsEntry } from "../memory/scaffold-integration.js";
+import { getHindsightSettingsEntry, getClerkMcpSettingsEntry } from "../memory/scaffold-integration.js";
 
 export interface ScaffoldResult {
   agentDir: string;
@@ -84,19 +84,28 @@ export function scaffoldAgent(
     0o600,
   );
 
-  // --- Merge Hindsight MCP config into settings.json ---
+  // --- Merge MCP configs into settings.json ---
   if (clerkConfig) {
     const settingsPath = join(agentDir, ".claude", "settings.json");
-    const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
-    if (hindsightEntry && existsSync(settingsPath)) {
+    if (existsSync(settingsPath)) {
       const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
       if (!settings.mcpServers) {
         settings.mcpServers = {};
       }
-      if (!settings.mcpServers[hindsightEntry.key]) {
+
+      // Hindsight memory MCP
+      const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
+      if (hindsightEntry && !settings.mcpServers[hindsightEntry.key]) {
         settings.mcpServers[hindsightEntry.key] = hindsightEntry.value;
-        writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
       }
+
+      // Clerk management MCP
+      const clerkMcpEntry = getClerkMcpSettingsEntry();
+      if (!settings.mcpServers[clerkMcpEntry.key]) {
+        settings.mcpServers[clerkMcpEntry.key] = clerkMcpEntry.value;
+      }
+
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
     }
   }
 
