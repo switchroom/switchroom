@@ -103,6 +103,13 @@ That's it. Your agents are running headless, each responding in their own Telegr
 ### Interacting with agents
 
 - **Send a message** in a Telegram forum topic — the assigned agent responds
+- **Use bot commands** in Telegram for instant management (no Claude tokens):
+  - `/agents` — check all agent statuses
+  - `/clerkstart health-coach` — start an agent
+  - `/stop health-coach` — stop an agent
+  - `/restart all` — restart all agents
+  - `/logs health-coach` — view recent logs
+  - `/clerkhelp` — list all bot commands
 - **Attach to a session**: `clerk agent attach health-coach` (tmux, Ctrl+B D to detach)
 - **View logs**: `clerk agent logs health-coach -f`
 - **Web dashboard**: `clerk web` then open http://localhost:8080
@@ -284,15 +291,55 @@ Set `isolation: strict` on any agent to prevent its memories from being included
 - **Web dashboard**: Binds to localhost only, optional bearer token auth via `CLERK_WEB_TOKEN`
 - **No credential interception**: Each agent authenticates directly with Claude Code OAuth
 
-## In-Session Management
+## Telegram Bot Commands
 
-Install the `/clerk` skill into any agent to manage other agents from within a conversation:
+The Telegram bot handles management commands directly — zero Claude tokens, instant response:
+
+| Command | Description |
+|---------|-------------|
+| `/agents` | Show all agent statuses |
+| `/clerkstart <name>` | Start an agent |
+| `/stop <name>` | Stop an agent |
+| `/restart <name\|all>` | Restart agent(s) |
+| `/auth` | Check OAuth token health |
+| `/topics` | Show topic-to-agent mapping |
+| `/logs <name> [lines]` | View recent log lines |
+| `/memory <query>` | Search Hindsight memories |
+| `/clerkhelp` | List all commands |
+
+These run on the server via the clerk CLI — no inference needed. Regular messages (not starting with /) go to Claude as normal.
+
+Configure with `CLERK_CLI_PATH` and `CLERK_CONFIG` env vars if clerk is not on the default PATH.
+
+## Clerk MCP Server
+
+Each agent automatically gets a clerk management MCP server configured during scaffolding. This provides 8 tools that agents can call without needing Bash access:
+
+- `clerk_agent_list`, `clerk_agent_start`, `clerk_agent_stop`, `clerk_agent_restart`
+- `clerk_auth_status`, `clerk_topics_list`
+- `clerk_memory_search`, `clerk_memory_stats`
+
+This means agents with restricted tools (`deny: [bash]`) can still manage other agents.
+
+## In-Session Skill
+
+The `/clerk` skill provides an alternative management interface within conversations:
 
 ```
 /clerk agents          # List all agents
 /clerk start coding    # Start the coding agent
 /clerk memory "topic"  # Search memories
 ```
+
+## Session Optimization
+
+Long-running agents benefit from careful context management. See [docs/session-optimization.md](docs/session-optimization.md) for guidance on:
+
+- Keeping SOUL.md and CLAUDE.md concise (under 500 and 800 words)
+- Using Hindsight auto-recall to restore context after compaction
+- Scheduling daily session resets for fresh context
+- Minimizing tool count per agent to save token budget
+- Proactive memory saves before compaction occurs
 
 ## Docker Support
 
