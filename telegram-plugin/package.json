@@ -1,0 +1,15 @@
+{
+  "name": "clerk-telegram-plugin",
+  "version": "0.1.0",
+  "description": "Forked Telegram plugin for Clerk with forum topic routing support",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun install --no-summary && bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "grammy": "^1.21.0"
+  }
+}
