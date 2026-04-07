@@ -5,6 +5,8 @@ import { registerInitCommand } from "./init.js";
 import { registerAgentCommand } from "./agent.js";
 import { registerSystemdCommand } from "./systemd.js";
 import { registerTopicsCommand } from "./topics.js";
+import { registerAuthCommand } from "./auth.js";
+import { registerVaultCommand } from "./vault.js";
 
 const pkg = JSON.parse(
   readFileSync(resolve(import.meta.dirname, "../../package.json"), "utf-8")
@@ -22,3 +24,5 @@ registerInitCommand(program);
 registerAgentCommand(program);
 registerSystemdCommand(program);
 registerTopicsCommand(program);
+registerAuthCommand(program);
+registerVaultCommand(program);
