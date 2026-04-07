@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    {{#if tools.allow}}
+    "allow": [{{#each tools.allow}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}]
+    {{else}}
+    "allow": []
+    {{/if}}
+    {{#if tools.deny}},
+    "deny": [{{#each tools.deny}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}]
+    {{/if}}
+  }{{#if mcpServers}},
+  "mcpServers": {{{json mcpServers}}}
+  {{/if}}
+}

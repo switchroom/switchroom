@@ -1,0 +1,7 @@
+#!/bin/bash
+export PATH="$HOME/.bun/bin:$HOME/.nvm/versions/node/$(node -v)/bin:$PATH"
+export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
+export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
+{{#if topicId}}export TELEGRAM_TOPIC_ID="{{topicId}}"
+{{/if}}cd "{{agentDir}}"
+exec claude --channels plugin:telegram@claude-plugins-official
