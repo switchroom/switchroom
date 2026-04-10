@@ -138,7 +138,8 @@ export function registerAgentCommand(program: Command): void {
 
         // Also generate and install the systemd unit
         const agentDir = resolve(agentsDir, name);
-        const unitContent = generateUnit(name, agentDir);
+        const useAutoaccept = agentConfig.use_clerk_plugin === true;
+        const unitContent = generateUnit(name, agentDir, useAutoaccept);
         installUnit(name, unitContent);
 
         console.log(chalk.green(`  Agent "${name}" scaffolded at ${agentDir}`));
