@@ -11,6 +11,7 @@
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@xterm/headless": "^6.0.0",
     "grammy": "^1.21.0"
   }
 }

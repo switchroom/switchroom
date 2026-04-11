@@ -38,6 +38,7 @@ import { join, extname, sep } from 'path'
 import { StatusReactionController } from './status-reactions.js'
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
+import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1457,6 +1458,105 @@ if (sessionTailEnabled) {
   }
 }
 
+// ─── PTY tail (live token-level streaming from script -qfc service.log) ─
+//
+// The session JSONL only writes WHOLE assistant messages, so it can't
+// give us per-token text streaming. But Claude Code's TUI renders the
+// reply tool's `text:` parameter character-by-character as the model
+// generates. We capture that via the existing `script -qfc ...
+// service.log` wrapper, feed the bytes into a headless xterm, and
+// extract the in-progress reply text from the rendered buffer.
+//
+// The extracted text is pushed via createDraftStream → bot.api.editMessageText
+// using the same throttle/coalesce loop the stream_reply MCP tool uses.
+// When the model eventually calls the real reply tool via MCP, the
+// reply handler finds the open draft stream for the same chat and
+// finalizes it (replacing the preview with the canonical text), so the
+// user sees one message that grows as the model writes — no duplicates.
+//
+// Disabled if CLERK_PTY_TAIL=off, or if the service.log path can't be
+// determined (no clerk daemon, running plugin standalone for tests).
+const ptyTailEnabled = process.env.CLERK_PTY_TAIL !== 'off'
+let ptyTailHandle: PtyTailHandle | null = null
+if (ptyTailEnabled) {
+  try {
+    // service.log lives next to the agent dir per src/agents/systemd.ts
+    const serviceLogPath = process.env.CLERK_SERVICE_LOG_PATH
+      ?? join(process.cwd(), 'service.log')
+    ptyTailHandle = startPtyTail({
+      logFile: serviceLogPath,
+      log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
+      onPartial: handlePtyPartial,
+    })
+    process.stderr.write(
+      `telegram channel: pty tail watching ${serviceLogPath}\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram channel: pty tail failed to start: ${(err as Error).message}\n`)
+  }
+}
+
+/**
+ * Called by the PTY tail when the extracted reply text changes. Pushes
+ * the new full text into a draft stream for the chat the model is
+ * currently working on, creating the stream on the first delta.
+ *
+ * If we don't know which chat is in flight (no enqueue seen yet from
+ * the JSONL tail), drop the partial — it might belong to a previous
+ * turn's leftover bytes in the buffer.
+ */
+function handlePtyPartial(text: string): void {
+  if (currentSessionChatId == null) return
+  const chatId = currentSessionChatId
+  const threadId = currentSessionThreadId
+  const sKey = streamKey(chatId, threadId)
+
+  // Ignore previews that match what we already showed (avoids redundant
+  // edits when the extractor re-fires on a still-frame buffer).
+  if (lastPtyPreviewByChat.get(sKey) === text) return
+  lastPtyPreviewByChat.set(sKey, text)
+
+  let stream = activeDraftStreams.get(sKey)
+  if (!stream) {
+    const sendOpts = {
+      parse_mode: 'HTML' as const,
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      link_preview_options: { is_disabled: true },
+    }
+    stream = createDraftStream(
+      async (sendText) => {
+        const sent = await robustApiCall(
+          () => bot.api.sendMessage(chatId, sendText, sendOpts),
+          { threadId, chat_id: chatId },
+        )
+        return sent.message_id
+      },
+      async (id, editText) => {
+        await robustApiCall(
+          () => bot.api.editMessageText(chatId, id, editText, sendOpts),
+          { threadId, chat_id: chatId },
+        )
+      },
+      { throttleMs: 1000 },
+    )
+    activeDraftStreams.set(sKey, stream)
+  }
+
+  // Convert markdown → HTML so the streaming preview already has the
+  // right formatting. The reply tool will eventually do the same when
+  // it lands the canonical text, so the preview and final message
+  // will match exactly (and the editMessageText "not modified" path
+  // will handle any duplicates harmlessly).
+  const rendered = markdownToHtml(text)
+  void stream.update(rendered).catch(() => {})
+}
+
+/**
+ * Per-chat last preview text — used to suppress redundant emits from
+ * the PTY tail when the buffer hasn't changed materially.
+ */
+const lastPtyPreviewByChat = new Map<string, string>()
+
 /**
  * Resolve a session event into a status reaction transition on whichever
  * controller is currently active for the in-flight chat. Bookkeeping is
@@ -1583,6 +1683,11 @@ function handleSessionEvent(ev: SessionEvent): void {
       // controller's terminal state is idempotent.
       if (ctrl) ctrl.setDone()
       activeStatusReactions.delete(statusKey(chatId, threadId))
+      // Clear PTY preview state for this chat so the next turn starts
+      // fresh. If we left the previous preview in place, the extractor
+      // would see the OLD reply block in the xterm buffer and we'd
+      // suppress emits until enough new text differed.
+      lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
       currentSessionChatId = null
       currentSessionThreadId = undefined
       currentTurnReplyCalled = false
@@ -1602,6 +1707,9 @@ function shutdown(): void {
   process.stderr.write('telegram channel: shutting down\n')
   if (sessionTailHandle != null) {
     try { sessionTailHandle.stop() } catch { /* ignore */ }
+  }
+  if (ptyTailHandle != null) {
+    try { ptyTailHandle.stop() } catch { /* ignore */ }
   }
   // The runner has its own .stop() that signals graceful shutdown of the
   // background fetch loop. Force-exit after 2s if it hangs.
