@@ -23,3 +23,7 @@ Thumbs.db
 
 # Build
 *.tsbuildinfo
+
+# Python bytecode (from vendored Hindsight plugin)
+__pycache__/
+*.pyc
