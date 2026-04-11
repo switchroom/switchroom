@@ -51,6 +51,18 @@
 import { existsSync, readFileSync, statSync, watch, openSync, readSync, closeSync, type FSWatcher } from 'fs'
 import { Terminal } from '@xterm/headless'
 
+/**
+ * How many trailing bytes of the log to replay into xterm.js at attach
+ * time. Must be large enough to contain at least one full-screen Ink
+ * redraw — Ink's renderer is differential and emits cursor-forward
+ * escapes for unchanged cells, so without a baseline the terminal
+ * ends up with blank cells where the "● clerk-telegram - stream_reply"
+ * marker characters should be, and the v1 extractor's substring match
+ * silently misses every partial. 1 MB is empirically ~15–30 s of
+ * steady output, comfortably covering a full-frame redraw.
+ */
+const PRELOAD_BYTES = 1_000_000
+
 // ─── MessageRegionExtractor interface ─────────────────────────────────────
 //
 // Versioned. When Claude Code's TUI changes break the v1 extractor, ship
@@ -309,13 +321,59 @@ export function startPtyTail(config: PtyTailConfig): PtyTailHandle {
   function attachWatcher(): void {
     if (!existsSync(config.logFile)) return
     if (watcher) return
+    let size = 0
     try {
-      // Seek to current EOF before attaching, so historical content is ignored
-      cursor = statSync(config.logFile).size
+      size = statSync(config.logFile).size
     } catch {
-      cursor = 0
+      // File vanished between existsSync and statSync — bail out, pollTimer
+      // will retry on the next tick.
+      return
     }
-    log?.(`pty-tail: attached to ${config.logFile} (cursor=${cursor})`)
+
+    // Preload the tail end of the log into the terminal emulator BEFORE we
+    // start tailing fresh bytes. Critical for Ink: its renderer uses
+    // *differential* updates (cursor-forward escapes for unchanged cells),
+    // so a fresh terminal starting at EOF sees `\e[1C` skipping over cells
+    // that Ink assumes already contain characters from a prior full frame.
+    // Without a baseline, marker strings like "clerk-telegram" render
+    // with gaps (e.g. "clerk te egram") and the extractor's substring
+    // check fails → no partials ever emit.
+    //
+    // 1 MB is deliberately generous: even a few seconds of steady Ink
+    // output is enough to capture a full-frame redraw that initializes
+    // every cell. We suppress the first onPartial by seeding
+    // `lastEmittedText` from the post-preload extract result, so the
+    // very next real extract (from a new tool call) is what actually
+    // fires onPartial.
+    const preloadBytes = Math.min(size, PRELOAD_BYTES)
+    const preloadFrom = size - preloadBytes
+    if (preloadBytes > 0) {
+      try {
+        const fd = openSync(config.logFile, 'r')
+        try {
+          const buf = Buffer.alloc(preloadBytes)
+          readSync(fd, buf, 0, preloadBytes, preloadFrom)
+          term.write(buf, () => {
+            // Seed lastEmittedText with whatever the extractor sees after
+            // the baseline is loaded. Any NEW render (newer than this
+            // baseline) will produce a different extract result and fire
+            // onPartial naturally.
+            const seeded = extractor.extract(term)
+            if (seeded != null) {
+              lastEmittedText = seeded
+              log?.(`pty-tail: preload seeded lastEmittedText (${seeded.length} chars)`)
+            }
+          })
+        } finally {
+          closeSync(fd)
+        }
+      } catch (err) {
+        log?.(`pty-tail: preload failed: ${(err as Error).message}`)
+      }
+    }
+
+    cursor = size
+    log?.(`pty-tail: attached to ${config.logFile} (cursor=${cursor}, preloaded=${preloadBytes})`)
     try {
       watcher = watch(config.logFile, () => readNew())
     } catch (err) {
