@@ -1827,7 +1827,22 @@ function spawnClerkDetached(args: string[]): void {
  * used in clerk.yaml. Used to detect "self-restart" vs "restart some
  * other agent".
  */
+/**
+ * The clerk agent name this plugin is running inside. Reads
+ * CLERK_AGENT_NAME (set by start.sh from the Handlebars `{{name}}`
+ * variable) and falls back to basename(cwd) only as a last resort.
+ *
+ * We can't rely on basename(cwd) alone because Claude Code spawns MCP
+ * plugins with cwd = $HOME regardless of the parent claude process's
+ * cwd. That made the previous self-restart detection silently misfire,
+ * which is exactly the bug the user hit when /restart kept showing
+ * "Command failed" — basename($HOME) is the username, never an agent
+ * name, so isSelfTargetingCommand always returned false and the bot
+ * fell into the blocking execFileSync path that gets killed mid-call.
+ */
 export function getMyAgentName(): string {
+  const fromEnv = process.env.CLERK_AGENT_NAME
+  if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
   return basename(process.cwd())
 }
 

@@ -77,7 +77,9 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
     expect(startSh).toContain("exec claude --channels plugin:telegram@claude-plugins-official");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
-    expect(startSh).not.toContain("AGENT_NAME");
+    // CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
+    // telegram-plugin reads to detect self-restart commands. Must be set.
+    expect(startSh).toContain('CLERK_AGENT_NAME="my-agent"');
     expect(startSh).not.toContain("CLERK_SOCKET_PATH");
     expect(startSh).not.toContain("--dangerously-skip-permissions");
     // Must NOT use $(node -v) since node isn't on PATH under systemd user units
