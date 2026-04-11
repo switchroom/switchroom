@@ -632,12 +632,16 @@ export interface ReconcileResult {
 
 /**
  * Re-apply clerk.yaml-derived state to an existing agent without touching
- * user-edited files (CLAUDE.md, SOUL.md, start.sh, telegram/.env, etc.).
+ * user-edited files (CLAUDE.md, SOUL.md, telegram/.env, etc.).
  *
  * Specifically rewrites:
+ *   - start.sh (purely template-driven, safe to overwrite)
  *   - .mcp.json (when use_clerk_plugin is true)
  *   - .claude/settings.json mcpServers
  *   - .claude/settings.json permissions.allow / .deny / defaultMode
+ *   - .claude/plugins/hindsight-memory/ (vendored plugin tree)
+ *
+ * Does NOT touch CLAUDE.md, SOUL.md, telegram/.env, or any user content.
  *
  * This is the operation a non-developer needs after editing clerk.yaml —
  * e.g., adding a new MCP server, enabling memory, changing the tool
@@ -654,7 +658,6 @@ export function reconcileAgent(
   clerkConfig: ClerkConfig,
   clerkConfigPath?: string,
 ): ReconcileResult {
-  void telegramConfig; // reserved for future use (telegram/.env reconciliation)
   const agentDir = resolve(agentsDir, name);
   const changes: string[] = [];
 
@@ -680,6 +683,40 @@ export function reconcileAgent(
     ...CLERK_MCP_TOOLS,
   ]);
   const desiredDeny = tools.deny ?? [];
+
+  // Resolve telegram + hindsight context for the start.sh template
+  const rawBotToken = agentConfig.bot_token ?? telegramConfig.bot_token;
+  const resolvedBotToken = resolveBotToken(rawBotToken);
+  const hindsightAutoRecallEnabled = hindsightEnabled
+    && agentConfig.memory?.auto_recall !== false;
+  const hindsightBankId = agentConfig.memory?.collection ?? name;
+  const hindsightApiBaseUrl = (clerkConfig.memory?.config?.url as string | undefined)
+    ? (clerkConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
+    : "http://127.0.0.1:8888";
+
+  // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
+  const startShPath = join(agentDir, "start.sh");
+  if (existsSync(startShPath)) {
+    const basePath = getBaseTemplatePath();
+    const startShContext: Record<string, unknown> = {
+      name,
+      agentDir,
+      botToken: resolvedBotToken ?? rawBotToken,
+      forumChatId: telegramConfig.forum_chat_id,
+      dangerousMode: agentConfig.dangerous_mode === true,
+      useClerkPlugin: agentConfig.use_clerk_plugin === true,
+      hindsightEnabled: hindsightAutoRecallEnabled,
+      hindsightBankId,
+      hindsightApiBaseUrl,
+    };
+    const beforeStartSh = readFileSync(startShPath, "utf-8");
+    const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
+    if (afterStartSh !== beforeStartSh) {
+      writeFileSync(startShPath, afterStartSh, "utf-8");
+      chmodSync(startShPath, 0o755);
+      changes.push(startShPath);
+    }
+  }
 
   // --- Reconcile settings.json ---
   const settingsPath = join(agentDir, ".claude", "settings.json");

@@ -509,7 +509,11 @@ describe("reconcileAgent", () => {
     expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
   });
 
-  it("does not touch CLAUDE.md, SOUL.md, start.sh, or telegram files", () => {
+  it("does not touch CLAUDE.md, SOUL.md, or telegram user-content files", () => {
+    // start.sh is intentionally NOT in this list — it's purely
+    // template-driven (no user content) and reconcile re-renders it
+    // so config changes (like enabling Hindsight or switching ports)
+    // propagate without forcing a full re-scaffold.
     const agentConfig = makeAgentConfig();
     const initialConfig = buildClerkConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
@@ -517,7 +521,6 @@ describe("reconcileAgent", () => {
     const userEditedFiles = [
       join(tmpDir, "test-agent", "CLAUDE.md"),
       join(tmpDir, "test-agent", "SOUL.md"),
-      join(tmpDir, "test-agent", "start.sh"),
       join(tmpDir, "test-agent", "telegram", ".env"),
       join(tmpDir, "test-agent", "telegram", "access.json"),
     ];
@@ -540,6 +543,29 @@ describe("reconcileAgent", () => {
         expect(readFileSync(f, "utf-8")).toContain("# USER EDIT");
       }
     }
+  });
+
+  it("re-renders start.sh when config drives template changes (Hindsight enable)", () => {
+    const agentConfig = makeAgentConfig();
+    const initialConfig = buildClerkConfig(agentConfig);
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
+
+    const startShPath = join(tmpDir, "test-agent", "start.sh");
+    const before = readFileSync(startShPath, "utf-8");
+    expect(before).not.toContain("HINDSIGHT_API_URL");
+
+    // Enable Hindsight via clerk.yaml and reconcile
+    const withMemory = buildClerkConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const after = readFileSync(startShPath, "utf-8");
+    expect(after).toContain("HINDSIGHT_API_URL=\"http://127.0.0.1:18888\"");
+    expect(after).toContain("--plugin-dir");
+    expect(after).toContain(".claude/plugins/hindsight-memory");
   });
 
   it("returns no changes when settings already match", () => {
