@@ -1384,7 +1384,19 @@ const sessionTailEnabled = process.env.CLERK_SESSION_TAIL !== 'off'
 let sessionTailHandle: SessionTailHandle | null = null
 if (sessionTailEnabled) {
   try {
+    // Claude Code writes its session JSONL under
+    // $CLAUDE_CONFIG_DIR/projects/<sanitized-cwd>/<id>.jsonl where <cwd>
+    // is the claude daemon's own cwd, NOT the MCP subprocess's cwd.
+    // The plugin subprocess gets cwd=<telegram-plugin source dir>, so if
+    // we default to process.cwd() we'd end up watching a sibling dir
+    // that never contains the real session file. Derive the daemon's
+    // cwd from CLAUDE_CONFIG_DIR (which is <agent>/.claude), matching
+    // the same trick we use for pty-tail's service.log path below.
+    const sessionCwd = process.env.CLAUDE_CONFIG_DIR
+      ? dirname(process.env.CLAUDE_CONFIG_DIR)
+      : process.cwd()
     sessionTailHandle = startSessionTail({
+      cwd: sessionCwd,
       log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
       onEvent: handleSessionEvent,
     })
