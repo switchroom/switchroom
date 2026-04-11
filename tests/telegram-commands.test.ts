@@ -225,9 +225,8 @@ describe('telegram bot commands', () => {
     // Locks the contract behind the /restart, /reconcile, /update self-kill
     // fix in server.ts. The bot needs to detect when a clerk subcommand
     // would SIGTERM its own systemd unit (mid-execFileSync) and switch to
-    // a detached spawn instead. The detection is "agent name == basename(cwd)
-    // OR target == 'all'". See spawnClerkDetached + isSelfTargetingCommand
-    // in telegram-plugin/server.ts.
+    // a detached spawn instead. See spawnClerkDetached +
+    // isSelfTargetingCommand in telegram-plugin/server.ts.
     function isSelfTargetingCommand(name: string, myAgentName: string): boolean {
       if (name === 'all') return true
       return name === myAgentName
@@ -252,6 +251,49 @@ describe('telegram bot commands', () => {
 
     it('is case-sensitive (matches systemd unit naming)', () => {
       expect(isSelfTargetingCommand('Assistant', 'assistant')).toBe(false)
+    })
+  })
+
+  describe('getMyAgentName resolution', () => {
+    // Locks the env-var-first contract behind getMyAgentName in server.ts.
+    // Claude Code spawns MCP plugins with cwd = $HOME regardless of the
+    // parent claude process cwd, so basename(cwd) returns the OS username
+    // (e.g., "kenthompson") instead of the agent name. The plugin must
+    // read CLERK_AGENT_NAME from the env (set in start.sh) and only fall
+    // back to cwd parsing when the env var is missing.
+    function getMyAgentName(env: NodeJS.ProcessEnv, cwd: string): string {
+      const fromEnv = env.CLERK_AGENT_NAME
+      if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
+      // Replicates `basename(cwd)` from path.basename
+      return cwd.split('/').filter(Boolean).pop() ?? ''
+    }
+
+    it('reads CLERK_AGENT_NAME from env when set', () => {
+      const env = { CLERK_AGENT_NAME: 'assistant' }
+      // cwd is irrelevant when env is set — Claude Code's MCP plugin spawn
+      // sets cwd to $HOME but the env var carries the truth.
+      expect(getMyAgentName(env, '/home/kenthompson')).toBe('assistant')
+    })
+
+    it('trims whitespace from CLERK_AGENT_NAME', () => {
+      const env = { CLERK_AGENT_NAME: '  coach  ' }
+      expect(getMyAgentName(env, '/home/kenthompson')).toBe('coach')
+    })
+
+    it('falls back to basename(cwd) when env var is unset', () => {
+      const env = {}
+      expect(getMyAgentName(env, '/home/kenthompson/.clerk/agents/assistant')).toBe('assistant')
+    })
+
+    it('falls back to basename(cwd) when env var is empty', () => {
+      const env = { CLERK_AGENT_NAME: '' }
+      expect(getMyAgentName(env, '/home/kenthompson/.clerk/agents/assistant')).toBe('assistant')
+    })
+
+    it('returns empty string when both env and cwd are unhelpful (defensive)', () => {
+      // Not a real-world case, just locks the no-crash behavior
+      const env = {}
+      expect(getMyAgentName(env, '/')).toBe('')
     })
   })
 })

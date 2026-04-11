@@ -4,6 +4,11 @@ export NVM_DIR="$HOME/.nvm"
 export PATH="$HOME/.bun/bin:$PATH"
 export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
 export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
+# CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
+# telegram-plugin reads to detect self-restart commands. We can't rely on
+# basename(process.cwd()) inside the plugin because Claude Code spawns
+# MCP servers with cwd = $HOME regardless of the parent's cwd.
+export CLERK_AGENT_NAME="{{name}}"
 {{#if hindsightEnabled}}
 # Hindsight memory plugin (vendored at .claude/plugins/hindsight-memory/).
 # Reads env vars at hook startup; settings.json autoMemoryEnabled: false
