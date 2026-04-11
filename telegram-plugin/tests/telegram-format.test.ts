@@ -6,7 +6,7 @@ import { describe, test, expect } from 'vitest'
 
 // Import the exported functions from server.ts
 // We use a direct import — Bun handles TS natively.
-import { markdownToHtml, splitHtmlChunks } from '../server'
+import { markdownToHtml, splitHtmlChunks, isLikelyTelegramHtml } from '../server'
 
 // ---------------------------------------------------------------------------
 // markdownToHtml
@@ -133,6 +133,70 @@ describe('markdownToHtml', () => {
     const result = markdownToHtml(input)
     expect(result).toContain('# this is a comment')
     expect(result).not.toContain('<b># this is a comment</b>')
+  })
+
+  // ─── HTML pass-through (the bug that made <b> tags render as text) ─────
+
+  test('passes through already-rendered Telegram HTML untouched', () => {
+    const input = '<b>Bold heading</b>\n<i>italic body</i>'
+    expect(markdownToHtml(input)).toBe(input)
+  })
+
+  test('passes through Telegram HTML with <code> blocks', () => {
+    const input = '<b>commit</b> <code>abc123</code>'
+    expect(markdownToHtml(input)).toBe(input)
+  })
+
+  test('passes through Telegram HTML with mixed tags and text', () => {
+    const input = '<b>What you should see</b>\n👀 immediately, then 🤔 after 2s'
+    expect(markdownToHtml(input)).toBe(input)
+  })
+
+  test('escapes when input has unsupported HTML tags (e.g. <div>)', () => {
+    const input = '<div>not telegram html</div>'
+    const out = markdownToHtml(input)
+    // Falls into the markdown path → escapes the angle brackets
+    expect(out).toContain('&lt;div&gt;')
+  })
+
+  test('escapes when input is plain markdown without HTML', () => {
+    const input = '**bold** text'
+    const out = markdownToHtml(input)
+    expect(out).toContain('<b>bold</b>')
+  })
+})
+
+describe('isLikelyTelegramHtml', () => {
+  test('returns true for simple <b>', () => {
+    expect(isLikelyTelegramHtml('<b>hello</b>')).toBe(true)
+  })
+
+  test('returns true for <code>', () => {
+    expect(isLikelyTelegramHtml('use <code>git status</code>')).toBe(true)
+  })
+
+  test('returns true for nested supported tags', () => {
+    expect(isLikelyTelegramHtml('<b><i>bold italic</i></b>')).toBe(true)
+  })
+
+  test('returns true for <a href>', () => {
+    expect(isLikelyTelegramHtml('see <a href="https://x.com">x</a>')).toBe(true)
+  })
+
+  test('returns false when ANY tag is unsupported', () => {
+    expect(isLikelyTelegramHtml('<b>fine</b> but <div>not</div>')).toBe(false)
+  })
+
+  test('returns false for plain text with no tags', () => {
+    expect(isLikelyTelegramHtml('just words here')).toBe(false)
+  })
+
+  test('returns false for plain markdown', () => {
+    expect(isLikelyTelegramHtml('**bold** and *italic*')).toBe(false)
+  })
+
+  test('returns false for code with angle brackets', () => {
+    expect(isLikelyTelegramHtml('the operator <-> means something')).toBe(false)
   })
 })
 

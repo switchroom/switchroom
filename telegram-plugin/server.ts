@@ -28,6 +28,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execFileSync, execSync } from 'child_process'
@@ -36,6 +37,7 @@ import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { StatusReactionController } from './status-reactions.js'
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
+import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -94,6 +96,18 @@ function endStatusReaction(
   else ctrl.setError()
   activeStatusReactions.delete(key)
 }
+
+/**
+ * The chat_id currently being processed by Claude Code, as inferred from
+ * the most recent `queue-operation enqueue` event in the session JSONL.
+ *
+ * Session events (thinking, tool_use, text, tool_result, turn_end) all
+ * apply to whichever chat the model is currently working on. Since
+ * Claude Code processes turns serially, this is a single global value —
+ * not a per-chat map. When a new enqueue arrives, the focus shifts.
+ */
+let currentSessionChatId: string | null = null
+let currentSessionThreadId: string | undefined = undefined
 
 /**
  * Active draft streams, keyed by `${chat_id}:${thread_id ?? "_"}`.
@@ -471,7 +485,69 @@ function escapeMarkdownV2(text: string): string {
  * Handles bold, italic, code, code blocks, strikethrough, links.
  * Escapes HTML entities in plain text. Wraps file references in <code>.
  */
+/**
+ * Telegram-supported HTML tags. Anything outside this set is either
+ * unrecognized (Telegram strips it) or actively dangerous (the API
+ * rejects the message). Source: https://core.telegram.org/bots/api#html-style
+ *
+ * Used by isLikelyTelegramHtml() to detect when an LLM caller has already
+ * produced Telegram HTML and we should pass it through verbatim instead
+ * of escaping every `<` to `&lt;` (which is the bug that made our recent
+ * replies show raw `<b>` tags as text).
+ */
+const TELEGRAM_HTML_TAGS = new Set([
+  'b', 'strong',
+  'i', 'em',
+  'u', 'ins',
+  's', 'strike', 'del',
+  'span', // requires class="tg-spoiler"
+  'tg-spoiler',
+  'a',
+  'tg-emoji',
+  'code',
+  'pre',
+  'blockquote',
+])
+
+/**
+ * Heuristic: does this look like already-rendered Telegram HTML rather
+ * than markdown waiting to be converted?
+ *
+ * Returns true when ALL the tags we find are recognized Telegram HTML
+ * tags AND there's at least one of them. This is conservative: if the
+ * model wrote `<div>foo</div>` (not Telegram HTML), we treat it as
+ * markdown and escape it. If the model wrote `<b>foo</b>`, we trust it.
+ *
+ * Why we need this: the model is told the reply tool's default format is
+ * "html" and reasonably writes things like `<b>Header</b>`. But our
+ * markdownToHtml escapes all `<` and `>` as a defensive measure, turning
+ * the model's HTML into literal text in the message.
+ */
+export function isLikelyTelegramHtml(text: string): boolean {
+  // Find all opening tag names
+  const tagMatches = text.matchAll(/<\/?([a-z][a-z0-9-]*)\b[^>]*>/gi)
+  let count = 0
+  for (const m of tagMatches) {
+    const tag = m[1].toLowerCase()
+    if (!TELEGRAM_HTML_TAGS.has(tag)) {
+      // Found an unsupported tag — caller didn't intend Telegram HTML
+      return false
+    }
+    count++
+  }
+  return count > 0
+}
+
 export function markdownToHtml(text: string): string {
+  // Smart pass-through: if the input is already valid Telegram HTML
+  // (every tag is in the supported list), trust the caller and return
+  // it unchanged. This is the fix for the bug where the model wrote
+  // `<b>title</b>` and we'd escape the `<` characters, showing them
+  // as literal text in the rendered message.
+  if (isLikelyTelegramHtml(text)) {
+    return text
+  }
+
   // First, extract code blocks and inline code to protect them from other transforms.
   const codeBlocks: string[] = []
   const BLOCK_PH = '\x00CODEBLOCK'
@@ -1322,6 +1398,116 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
+// ─── Session JSONL tail ─────────────────────────────────────────────────
+//
+// Tails Claude Code's per-session transcript file in real time and drives
+// the status reaction controllers with richer events than we can get from
+// the MCP tool-call traffic alone. We see:
+//   - queue-operation enqueue → 👀 (already done by handleInbound, but
+//     this gives us a backup for messages that bypass our coalesce path)
+//   - assistant content[type=thinking] → 🤔 immediately, not after 2s
+//   - assistant tool_use(non-telegram) → 🔥/👨‍💻/⚡ (resolved by tool name)
+//   - assistant tool_use(reply / stream_reply) → 💬 (about to send)
+//   - tool_result for the reply tool → 👍 done (terminal)
+//
+// The tail seeks to current end on attach so historical events are
+// ignored. See ./session-tail.ts for the implementation. Disabled if
+// CLAUDE_CONFIG_DIR is not set AND ~/.claude/projects doesn't exist
+// (e.g., this plugin is being run outside a Claude Code session for tests).
+const sessionTailEnabled = process.env.CLERK_SESSION_TAIL !== 'off'
+let sessionTailHandle: SessionTailHandle | null = null
+if (sessionTailEnabled) {
+  try {
+    sessionTailHandle = startSessionTail({
+      log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
+      onEvent: handleSessionEvent,
+    })
+    process.stderr.write(
+      `telegram channel: session tail watching ${sessionTailHandle.getActiveFile() ?? '(no active file yet)'}\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram channel: session tail failed to start: ${(err as Error).message}\n`)
+  }
+}
+
+/**
+ * Resolve a session event into a status reaction transition on whichever
+ * controller is currently active for the in-flight chat. Bookkeeping is
+ * minimal: we trust the JSONL ordering (Claude processes turns serially),
+ * so the most recent `enqueue` is the chat we're currently working on.
+ */
+function handleSessionEvent(ev: SessionEvent): void {
+  switch (ev.kind) {
+    case 'enqueue': {
+      // The model is about to process this chat. Capture the focus so
+      // subsequent events (thinking/tool_use/etc.) get routed correctly.
+      if (ev.chatId) {
+        currentSessionChatId = ev.chatId
+        currentSessionThreadId = ev.threadId != null ? Number(ev.threadId) as unknown as undefined : undefined
+        // Note: handleInbound has already created the controller and set
+        // 👀; we don't need to do anything here. This case mostly exists
+        // for debugging and to track focus.
+      }
+      return
+    }
+    case 'dequeue': {
+      // The model has accepted the message into its working set. The
+      // next assistant event will be its real first action.
+      return
+    }
+    case 'thinking': {
+      // Promote the controller to 🤔 immediately rather than waiting for
+      // the 2-second hardcoded timer in handleInbound.
+      if (currentSessionChatId == null) return
+      const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
+      if (ctrl) ctrl.setThinking()
+      return
+    }
+    case 'tool_use': {
+      if (currentSessionChatId == null) return
+      const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
+      if (!ctrl) return
+      // The clerk-telegram tools (reply, stream_reply, react, etc.) have
+      // their own meaning — they're the "I'm sending you something" stage.
+      const name = ev.toolName
+      if (name === 'mcp__clerk-telegram__reply'
+        || name === 'mcp__clerk-telegram__stream_reply'
+        || name === 'mcp__clerk-telegram__edit_message'
+        || name === 'mcp__clerk-telegram__react') {
+        // The reply tool's CallToolRequest handler will mark setDone()
+        // when the actual API send completes. Don't preempt it here.
+        return
+      }
+      // Everything else is the model doing real work — drive a tool reaction.
+      ctrl.setTool(name)
+      return
+    }
+    case 'text': {
+      // Plain text in an assistant message means the model is composing
+      // a final answer (often happens before the reply tool fires). Treat
+      // as "still working" — don't promote past tool state.
+      return
+    }
+    case 'tool_result': {
+      // Used to be a "done" signal but the tool_use_id mapping is fragile;
+      // we rely on the reply tool handler's own setDone() instead.
+      return
+    }
+    case 'turn_end': {
+      // Backstop: if the reply tool handler missed the setDone for some
+      // reason (e.g., the model used `text` content instead of calling
+      // reply), make sure the controller terminates.
+      if (currentSessionChatId == null) return
+      const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
+      if (ctrl) ctrl.setDone()
+      activeStatusReactions.delete(statusKey(currentSessionChatId, currentSessionThreadId))
+      currentSessionChatId = null
+      currentSessionThreadId = undefined
+      return
+    }
+  }
+}
+
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
@@ -1330,10 +1516,17 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
+  if (sessionTailHandle != null) {
+    try { sessionTailHandle.stop() } catch { /* ignore */ }
+  }
+  // The runner has its own .stop() that signals graceful shutdown of the
+  // background fetch loop. Force-exit after 2s if it hangs.
   setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  if (runnerHandle != null) {
+    void Promise.resolve(runnerHandle.stop()).finally(() => process.exit(0))
+  } else {
+    void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  }
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -2268,10 +2461,11 @@ async function handleInbound(
         // 👀 immediately
         ctrl.setQueued()
 
-        // 🤔 after 2s — the model has had time to start generating. If it
-        // finishes before then (very fast reply), the controller's
-        // emoji-already-current dedupe ensures the transition is cheap.
-        setTimeout(() => ctrl.setThinking(), 2000)
+        // 🤔 → 🔥/👨‍💻/⚡ → 👍 transitions are driven by the session tail
+        // watcher (./session-tail.ts), which reads Claude Code's transcript
+        // file in real time and sees the actual `thinking` and `tool_use`
+        // events. The 2-second hardcoded timer we used before is gone —
+        // we promote on real model events now, not a guess.
       }
     } else if (access.ackReaction) {
       // Legacy single-emoji ack path — only used if statusReactions is
@@ -2321,23 +2515,36 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// 409 Conflict = another getUpdates consumer is still active (zombie from a
-// previous session, or a second Claude Code instance). Retry with backoff
-// until the slot frees up instead of crashing on the first rejection.
+// Use grammy's concurrent runner instead of bot.start(). Default polling
+// blocks the next getUpdates call until the current handler chain settles
+// — which means user messages stay at one ✓ tick until our handler returns.
+// The runner decouples fetching from handling: it pulls updates as fast as
+// possible (advancing offsets immediately) while handlers run concurrently
+// in the background. The user sees ✓✓ instantly because Telegram considers
+// the message "read by bot" the moment our offset advances past it.
+//
+// 409 Conflict handling: the runner has its own error handler. When another
+// getUpdates consumer is active, we wait + restart manually (the runner
+// itself doesn't retry on 409 by default).
+let runnerHandle: RunnerHandle | null = null
+
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
-      await bot.start({
-        onStart: info => {
-          botUsername = info.username
-          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          if (TOPIC_ID != null) {
-            process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
-          }
-          void registerClerkBotCommands().catch(() => {})
-        },
-      })
-      return // bot.stop() was called — clean exit from the loop
+      // Pre-fetch bot info (the runner doesn't expose an onStart callback
+      // like bot.start does, so we have to call getMe ourselves).
+      const me = await bot.api.getMe()
+      botUsername = me.username
+      process.stderr.write(`telegram channel: polling as @${me.username}\n`)
+      if (TOPIC_ID != null) {
+        process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
+      }
+      void registerClerkBotCommands().catch(() => {})
+
+      // run() returns a RunnerHandle. Call .task() to await background completion.
+      runnerHandle = run(bot)
+      await runnerHandle.task()
+      return // graceful stop
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 409) {
         const delay = Math.min(1000 * attempt, 15000)
@@ -2350,7 +2557,6 @@ void (async () => {
         await new Promise(r => setTimeout(r, delay))
         continue
       }
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
       process.stderr.write(`telegram channel: polling failed: ${err}\n`)
       return

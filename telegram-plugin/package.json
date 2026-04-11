@@ -9,6 +9,7 @@
     "start": "bun server.ts"
   },
   "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "grammy": "^1.21.0"
   }
