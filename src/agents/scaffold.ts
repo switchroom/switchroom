@@ -469,6 +469,66 @@ function syncGlobalSkills(
 }
 
 /**
+ * Symlink every clerk-* skill from the clerk project's built-in skills/
+ * directory into <agentDir>/.claude/skills/<name>.
+ *
+ * This runs unconditionally on every scaffold/reconcile so all agents
+ * automatically get the management skills (clerk-config, clerk-health,
+ * etc.) without needing to list them in clerk.yaml.
+ *
+ * Rules:
+ *   - Only directories that start with "clerk-" and contain a SKILL.md
+ *     file are linked.
+ *   - The destination .claude/skills/ directory is created if absent.
+ *   - Existing entries at the destination are left untouched (idempotent).
+ */
+export function installClerkSkills(agentDir: string): void {
+  const builtinSkillsDir = resolve(import.meta.dirname, "../../skills");
+  if (!existsSync(builtinSkillsDir)) return;
+
+  const targetDir = join(agentDir, ".claude", "skills");
+  mkdirSync(targetDir, { recursive: true });
+
+  let entries: string[];
+  try {
+    entries = readdirSync(builtinSkillsDir);
+  } catch {
+    return;
+  }
+
+  for (const name of entries) {
+    if (!name.startsWith("clerk-")) continue;
+    const src = join(builtinSkillsDir, name);
+    // Only link directories that contain SKILL.md
+    let srcStat;
+    try {
+      srcStat = lstatSync(src);
+    } catch {
+      continue;
+    }
+    if (!srcStat.isDirectory()) continue;
+    if (!existsSync(join(src, "SKILL.md"))) continue;
+
+    const dest = join(targetDir, name);
+    // Skip if destination already exists (idempotent — don't replace
+    // real dirs or correctly-pointing symlinks)
+    try {
+      lstatSync(dest);
+      continue; // exists — leave it alone
+    } catch {
+      // does not exist — fall through to symlink
+    }
+    try {
+      symlinkSync(src, dest);
+    } catch (err) {
+      console.warn(
+        `  WARNING: failed to symlink clerk skill "${name}": ${(err as Error).message}`,
+      );
+    }
+  }
+}
+
+/**
  * Translate per-channel YAML fields into env vars the telegram-plugin
  * will read at startup. Today: CLERK_TG_FORMAT and CLERK_TG_RATE_LIMIT_MS.
  *
@@ -1130,6 +1190,9 @@ export function scaffoldAgent(
     );
   }
 
+  // --- Install built-in clerk-* skills into .claude/skills/ ---
+  installClerkSkills(agentDir);
+
   // --- Set up plugin symlinks ---
   setupPlugins(agentDir);
 
@@ -1534,6 +1597,9 @@ export function reconcileAgent(
   if (agentConfig.skills) {
     syncGlobalSkills(agentDir, agentConfig.skills, clerkConfig.clerk.skills_dir);
   }
+
+  // --- Install built-in clerk-* skills into .claude/skills/ ---
+  installClerkSkills(agentDir);
 
   // --- Reconcile .mcp.json (clerk-telegram plugin agents only) ---
   if (usesClerkTelegramPlugin(agentConfig)) {
