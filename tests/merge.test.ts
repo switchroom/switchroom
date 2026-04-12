@@ -244,6 +244,28 @@ describe("mergeAgentConfig skills pool", () => {
   });
 });
 
+describe("mergeAgentConfig session policy", () => {
+  it("shallow-merges session fields with agent winning", () => {
+    const defaults: AgentDefaults = {
+      session: { max_idle: "2h", max_turns: 50 },
+    };
+    const agent = baseAgent({
+      session: { max_turns: 20 },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.session?.max_idle).toBe("2h"); // from defaults
+    expect(result.session?.max_turns).toBe(20); // agent wins
+  });
+
+  it("flows defaults.session when agent has none", () => {
+    const result = mergeAgentConfig(
+      { session: { max_idle: "1h" } },
+      baseAgent(),
+    );
+    expect(result.session?.max_idle).toBe("1h");
+  });
+});
+
 describe("mergeAgentConfig channels block", () => {
   it("flows defaults.channels.telegram.* to agents that leave them unset", () => {
     const defaults: AgentDefaults = {

@@ -299,6 +299,17 @@ export function mergeAgentConfig(
     };
   }
 
+  // --- session: shallow field merge, agent wins ---
+  if (defaults.session || merged.session) {
+    const base = defaults.session ?? {};
+    const override = merged.session ?? {};
+    const combined: Record<string, unknown> = { ...base };
+    for (const [k, v] of Object.entries(override)) {
+      if (v !== undefined) combined[k] = v;
+    }
+    merged.session = combined as AgentConfig["session"];
+  }
+
   // --- channels: per-channel shallow merge, agent wins ---
   //
   // Today only telegram exists; the structure generalizes for future

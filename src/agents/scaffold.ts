@@ -191,6 +191,23 @@ function shellSingleQuote(s: string): string {
 }
 
 /**
+ * Parse a duration string like "2h", "30m", "7200s" into seconds.
+ * Returns undefined for undefined input.
+ */
+function parseDurationToSeconds(d: string | undefined): number | undefined {
+  if (!d) return undefined;
+  const match = d.match(/^(\d+)([smh])$/);
+  if (!match) return undefined;
+  const n = parseInt(match[1], 10);
+  switch (match[2]) {
+    case "s": return n;
+    case "m": return n * 60;
+    case "h": return n * 3600;
+    default: return undefined;
+  }
+}
+
+/**
  * Resolve the global clerk skills pool directory. Honors the optional
  * `clerk.skills_dir` override in clerk.yaml and falls back to
  * `~/.clerk/skills`. Expands a leading `~/` against $HOME.
@@ -607,6 +624,9 @@ export function scaffoldAgent(
     extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
       ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
       : undefined,
+    // Session freshness check thresholds (shell variables in start.sh)
+    sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
+    sessionMaxTurns: agentConfig.session?.max_turns,
   };
 
   // --- Create directory structure ---
@@ -999,6 +1019,8 @@ export function reconcileAgent(
       extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
         ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
         : undefined,
+      sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
+      sessionMaxTurns: agentConfig.session?.max_turns,
     };
     const beforeStartSh = readFileSync(startShPath, "utf-8");
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);

@@ -93,6 +93,45 @@ export const AgentHooksSchema = z
   .optional();
 
 /**
+ * Session lifecycle policy. Controls whether the agent resumes its
+ * previous Claude Code session on restart or starts fresh.
+ *
+ * At agent startup, start.sh inspects the most recent session JSONL:
+ *   - If the session has been idle longer than `max_idle`, start fresh
+ *   - If the session has more user turns than `max_turns`, start fresh
+ *   - Otherwise, pass `--continue` to resume
+ *
+ * A fresh session gets a clean context window with Hindsight recall
+ * bringing back relevant memories. The previous session's data stays
+ * on disk (Claude Code doesn't delete old sessions).
+ */
+export const SessionSchema = z
+  .object({
+    max_idle: z
+      .string()
+      .regex(
+        /^\d+[smh]$/,
+        "Duration must be a number followed by s, m, or h (e.g. '2h', '30m')",
+      )
+      .optional()
+      .describe(
+        "Start a fresh session if the previous one has been idle " +
+        "longer than this duration. Examples: '2h', '30m', '7200s'.",
+      ),
+    max_turns: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Start a fresh session if the previous one has more user " +
+        "turns than this. Useful for preventing context bloat on " +
+        "long-running agents.",
+      ),
+  })
+  .optional();
+
+/**
  * Per-channel configuration. Today the only channel is Telegram but
  * the shape is designed to expand (Slack, Discord, Matrix, Email) —
  * each channel lives under its own key with channel-specific options.
@@ -196,6 +235,7 @@ const profileFields = {
   env: z.record(z.string(), z.string()).optional(),
   system_prompt_append: z.string().optional(),
   skills: z.array(z.string()).optional(),
+  session: SessionSchema,
   channels: ChannelsSchema,
   dangerous_mode: z.boolean().optional(),
   skip_permission_prompt: z.boolean().optional(),
@@ -287,6 +327,10 @@ export const AgentSchema = z.object({
       "Names of skills from clerk.skills_dir to symlink into this " +
       "agent's skills/ directory. Unioned with defaults.skills.",
     ),
+  session: SessionSchema.describe(
+    "Session lifecycle policy. Controls --continue vs fresh start on " +
+    "agent restart based on idle time and turn count thresholds.",
+  ),
   channels: ChannelsSchema.describe(
     "Per-channel configuration. Today only `telegram` is defined; the " +
     "shape is designed to expand to other channels (Slack, Discord, " +

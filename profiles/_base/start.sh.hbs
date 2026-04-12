@@ -30,6 +30,41 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{/each}}
 {{/if}}
 cd "{{agentDir}}"
-{{#if useClerkPlugin}}exec claude --continue --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
-{{else}}exec claude --continue --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+
+# --- Session freshness check ---
+# Decide whether to resume the previous session (--continue) or start
+# fresh based on idle time and turn count. A fresh session gets a clean
+# context window; Hindsight auto-recall brings back relevant memories.
+CONTINUE_FLAG="--continue"
+{{#if sessionMaxIdleSecs}}
+_SESSION_DIR="$CLAUDE_CONFIG_DIR/sessions"
+if [ -d "$_SESSION_DIR" ]; then
+  _LATEST=$(ls -t "$_SESSION_DIR/"*.jsonl 2>/dev/null | head -1)
+  if [ -n "$_LATEST" ]; then
+    _LAST_MOD=$(stat -c %Y "$_LATEST" 2>/dev/null || echo 0)
+    _NOW=$(date +%s)
+    _IDLE=$((_NOW - _LAST_MOD))
+    if [ "$_IDLE" -gt {{sessionMaxIdleSecs}} ]; then
+      CONTINUE_FLAG=""
+    fi
+  fi
+fi
+{{/if}}
+{{#if sessionMaxTurns}}
+if [ -n "$CONTINUE_FLAG" ]; then
+  _SESSION_DIR="$CLAUDE_CONFIG_DIR/sessions"
+  if [ -d "$_SESSION_DIR" ]; then
+    _LATEST=$(ls -t "$_SESSION_DIR/"*.jsonl 2>/dev/null | head -1)
+    if [ -n "$_LATEST" ]; then
+      _TURNS=$(grep -c '"type":"user"' "$_LATEST" 2>/dev/null || echo 0)
+      if [ "$_TURNS" -gt {{sessionMaxTurns}} ]; then
+        CONTINUE_FLAG=""
+      fi
+    fi
+  fi
+fi
+{{/if}}
+
+{{#if useClerkPlugin}}exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+{{else}}exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 {{/if}}

@@ -75,8 +75,9 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("$NVM_DIR/nvm.sh");
     expect(startSh).toContain(`CLAUDE_CONFIG_DIR="${result.agentDir}/.claude"`);
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
-    // Default is the clerk fork with --continue for session resumption
-    expect(startSh).toContain("exec claude --continue --dangerously-load-development-channels server:clerk-telegram");
+    // Default is the clerk fork with $CONTINUE_FLAG for session resumption
+    // (defaults to --continue; session policy checks may clear it)
+    expect(startSh).toContain("exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
     // CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
     // telegram-plugin reads to detect self-restart commands. Must be set.
@@ -1599,6 +1600,137 @@ describe("phase-6b bug fixes", () => {
     expect(() =>
       scaffoldAgent("sched-agent", agentConfig, tmpDir, telegramConfig, clerkConfig),
     ).not.toThrow();
+  });
+});
+
+describe("session freshness check in start.sh", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "clerk-session-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes the idle check when session.max_idle is set", () => {
+    const agentConfig = makeAgentConfig({
+      session: { max_idle: "2h" },
+    });
+    const result = scaffoldAgent(
+      "idle-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // Check block appears with the correct threshold (2h = 7200s)
+    expect(startSh).toContain("CONTINUE_FLAG=");
+    expect(startSh).toContain("-gt 7200");
+    // exec line uses $CONTINUE_FLAG instead of hardcoded --continue
+    expect(startSh).toContain("exec claude $CONTINUE_FLAG");
+  });
+
+  it("includes the turn check when session.max_turns is set", () => {
+    const agentConfig = makeAgentConfig({
+      session: { max_turns: 50 },
+    });
+    const result = scaffoldAgent(
+      "turns-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain("-gt 50");
+    expect(startSh).toContain('"type":"user"');
+  });
+
+  it("includes both checks when both thresholds are set", () => {
+    const agentConfig = makeAgentConfig({
+      session: { max_idle: "30m", max_turns: 20 },
+    });
+    const result = scaffoldAgent(
+      "both-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // 30m = 1800s
+    expect(startSh).toContain("-gt 1800");
+    expect(startSh).toContain("-gt 20");
+  });
+
+  it("omits both checks when no session policy is set (always --continue)", () => {
+    const agentConfig = makeAgentConfig();
+    const result = scaffoldAgent(
+      "default-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // No idle or turn check blocks
+    expect(startSh).not.toContain("_IDLE");
+    expect(startSh).not.toContain("_TURNS");
+    // Still uses $CONTINUE_FLAG (which stays as --continue since no check clears it)
+    expect(startSh).toContain("CONTINUE_FLAG");
+  });
+
+  it("session policy flows through defaults cascade", () => {
+    const agentConfig = makeAgentConfig();
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        session: { max_idle: "1h", max_turns: 100 },
+      },
+      agents: { "cascade-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "cascade-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // 1h = 3600s
+    expect(startSh).toContain("-gt 3600");
+    expect(startSh).toContain("-gt 100");
+  });
+
+  it("reconcile propagates session policy changes to start.sh", () => {
+    const initial = makeAgentConfig();
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "rec-session": initial },
+    } as ClerkConfig;
+    scaffoldAgent("rec-session", initial, tmpDir, telegramConfig, clerkConfig);
+
+    const before = readFileSync(join(tmpDir, "rec-session", "start.sh"), "utf-8");
+    expect(before).not.toContain("_IDLE");
+
+    // Add session policy via reconcile
+    const updated = makeAgentConfig({ session: { max_idle: "4h" } });
+    const updatedConfig: ClerkConfig = {
+      ...clerkConfig,
+      agents: { "rec-session": updated },
+    } as ClerkConfig;
+    reconcileAgent("rec-session", updated, tmpDir, telegramConfig, updatedConfig);
+
+    const after = readFileSync(join(tmpDir, "rec-session", "start.sh"), "utf-8");
+    // 4h = 14400s
+    expect(after).toContain("-gt 14400");
   });
 });
 
