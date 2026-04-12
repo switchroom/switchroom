@@ -1,6 +1,6 @@
 ---
 name: clerk-status
-description: Shows status of all clerk agents including uptime, auth, memory collection, and model. Use when the user asks about agents, what's running, status, uptime, or 'are my agents OK'.
+description: Shows which clerk agents are running, their uptime, and current state. Use when the user asks about status, 'what's running', uptime, 'are my agents OK', or wants an overview of all agents.
 ---
 
 # Agent Status

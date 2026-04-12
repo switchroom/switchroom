@@ -1,6 +1,6 @@
 ---
 name: clerk-reconcile
-description: Re-applies clerk.yaml configuration to existing agents. Updates settings.json, start.sh, .mcp.json, sub-agent files, and cron scripts without touching CLAUDE.md. Use when the user changed clerk.yaml, asks to 'apply config', 'update settings', 'reconcile', or 'sync my config'.
+description: Re-applies clerk.yaml changes to running agents. Use when the user edited clerk.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited clerk.yaml', or 'how do I apply changes'.
 allowed-tools: Bash(clerk *)
 ---
 

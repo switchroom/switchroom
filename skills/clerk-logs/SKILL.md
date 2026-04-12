@@ -1,6 +1,6 @@
 ---
 name: clerk-logs
-description: Shows recent logs for a clerk agent from the systemd journal. Use when the user asks for logs, 'what happened', error output, wants to debug agent behavior, or asks why something failed.
+description: Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.
 ---
 
 # Agent Logs

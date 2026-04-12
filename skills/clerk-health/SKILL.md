@@ -1,6 +1,6 @@
 ---
 name: clerk-health
-description: Runs diagnostic health checks on clerk agents — dependencies, config validity, MCP wireup, auth tokens, memory backends, systemd units. Use when something seems broken, the user mentions errors, asks to diagnose or troubleshoot, or asks 'what's wrong'.
+description: Runs a health check and diagnostics on the clerk setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.
 ---
 
 # Agent Health Diagnostics

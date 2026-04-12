@@ -1,6 +1,6 @@
 ---
 name: clerk-restart
-description: Restarts a clerk agent with preflight safety checks. Verifies expect wrapper, bot token, settings.json, and systemd unit before restarting. Use when the user asks to restart, reboot, or refresh an agent.
+description: Restarts or reboots a clerk agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.
 allowed-tools: Bash(clerk *) Bash(systemctl --user *)
 ---
 
