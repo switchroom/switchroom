@@ -22,7 +22,13 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{#if hindsightApiToken}}export HINDSIGHT_API_TOKEN="{{hindsightApiToken}}"
 {{/if}}
 {{/if}}
+{{#if userEnv}}
+# User-declared env vars from clerk.yaml (agent + defaults merged).
+# These take precedence over the vars above because they appear later.
+{{#each userEnv}}export {{@key}}="{{this}}"
+{{/each}}
+{{/if}}
 cd "{{agentDir}}"
-{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
-{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
+{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
+{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
 {{/if}}

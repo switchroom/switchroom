@@ -885,6 +885,187 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(after.permissions.allow).toContain("Edit");
   });
 
+  it("writes user hooks from clerk.yaml into settings.json under hooks", () => {
+    const agentConfig = makeAgentConfig({
+      hooks: {
+        UserPromptSubmit: [
+          { command: "/opt/audit.sh", timeout: 5 },
+        ],
+        Stop: [
+          { command: "/opt/retain.sh", async: true },
+        ],
+      },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "hooks-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "hooks-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    // Native Claude Code nested shape
+    expect(settings.hooks.UserPromptSubmit).toEqual([
+      {
+        hooks: [
+          { type: "command", command: "/opt/audit.sh", timeout: 5 },
+        ],
+      },
+    ]);
+    expect(settings.hooks.Stop).toEqual([
+      {
+        hooks: [
+          { type: "command", command: "/opt/retain.sh", async: true },
+        ],
+      },
+    ]);
+  });
+
+  it("unions defaults.hooks with per-agent hooks", () => {
+    const agentConfig = makeAgentConfig({
+      hooks: {
+        UserPromptSubmit: [{ command: "/agent/recall.sh" }],
+      },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        hooks: {
+          UserPromptSubmit: [{ command: "/global/audit.sh", timeout: 5 }],
+          PreToolUse: [{ command: "/global/policy.sh" }],
+        },
+      },
+      agents: { "hook-union-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "hook-union-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    const ups = settings.hooks.UserPromptSubmit[0].hooks as Array<{ command: string }>;
+    expect(ups.map((h) => h.command)).toEqual([
+      "/global/audit.sh",
+      "/agent/recall.sh",
+    ]);
+    // PreToolUse from defaults-only flows through
+    expect(settings.hooks.PreToolUse).toBeDefined();
+  });
+
+  it("writes model override into settings.json when set", () => {
+    const agentConfig = makeAgentConfig({ model: "claude-opus-4-6" });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "model-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "model-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    expect(settings.model).toBe("claude-opus-4-6");
+    // And --model is appended to exec claude in start.sh
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--model claude-opus-4-6");
+  });
+
+  it("exports user env vars in start.sh in declaration order", () => {
+    const agentConfig = makeAgentConfig({
+      env: {
+        CLERK_AUDIT_URL: "https://audit.example",
+        LOG_LEVEL: "debug",
+      },
+    });
+    const result = scaffoldAgent(
+      "env-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain('export CLERK_AUDIT_URL="https://audit.example"');
+    expect(startSh).toContain('export LOG_LEVEL="debug"');
+  });
+
+  it("escapes system_prompt_append via POSIX single-quote wrapping", () => {
+    const agentConfig = makeAgentConfig({
+      system_prompt_append:
+        "Always respond with 'care'. Never use double-\"quotes\". Or $VAR.",
+    });
+    const result = scaffoldAgent(
+      "prompt-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // --append-system-prompt argument is single-quote-wrapped
+    expect(startSh).toContain("--append-system-prompt '");
+    // Embedded single quote becomes '"'"'
+    expect(startSh).toContain(`'"'"'care'"'"'`);
+    // Dollar signs and double quotes survive untouched inside single quotes
+    expect(startSh).toContain("$VAR");
+    expect(startSh).toContain('double-"quotes"');
+  });
+
+  it("reconcile propagates hooks/env/model updates without touching user files", () => {
+    const agentConfig = makeAgentConfig();
+    const initial: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "rec-phase2": agentConfig },
+    } as ClerkConfig;
+    scaffoldAgent("rec-phase2", agentConfig, tmpDir, telegramConfig, initial);
+
+    // Update agent config in-place (a real user would edit clerk.yaml)
+    const updatedAgent = makeAgentConfig({
+      model: "claude-sonnet-4-6",
+      hooks: { Stop: [{ command: "/new/hook.sh", async: true }] },
+      env: { NEW_VAR: "hello" },
+    });
+    const updated: ClerkConfig = {
+      ...initial,
+      agents: { "rec-phase2": updatedAgent },
+    } as ClerkConfig;
+    reconcileAgent("rec-phase2", updatedAgent, tmpDir, telegramConfig, updated);
+
+    const settings = JSON.parse(
+      readFileSync(join(tmpDir, "rec-phase2", ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.model).toBe("claude-sonnet-4-6");
+    expect(settings.hooks.Stop).toBeDefined();
+
+    const startSh = readFileSync(join(tmpDir, "rec-phase2", "start.sh"), "utf-8");
+    expect(startSh).toContain('export NEW_VAR="hello"');
+    expect(startSh).toContain("--model claude-sonnet-4-6");
+  });
+
   it("is a no-op when clerk.yaml has no defaults block (backcompat)", () => {
     // The refactor moved scaffold through mergeAgentConfig. This test
     // asserts that omitting `defaults` produces the same settings.json
