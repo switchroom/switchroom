@@ -119,6 +119,40 @@ let currentSessionChatId: string | null = null
 let currentSessionThreadId: number | undefined = undefined
 let currentTurnReplyCalled = false
 let currentTurnCapturedText: string[] = []
+/**
+ * Timeout fallback for orphaned-reply detection. Some error paths in
+ * Claude Code (like "Prompt is too long") produce an assistant text
+ * block but NO turn_duration system event, leaving the orphaned-reply
+ * backstop waiting forever. This timer fires 30s after the last JSONL
+ * event and synthetically triggers turn_end processing.
+ */
+let orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null = null
+const ORPHANED_REPLY_TIMEOUT_MS = 30_000
+
+function resetOrphanedReplyTimeout(): void {
+  if (orphanedReplyTimeoutId != null) {
+    clearTimeout(orphanedReplyTimeoutId)
+    orphanedReplyTimeoutId = null
+  }
+  // Only arm the timer if we have a chat and some captured text but
+  // the reply tool hasn't been called yet.
+  if (
+    currentSessionChatId != null &&
+    currentTurnCapturedText.length > 0 &&
+    !currentTurnReplyCalled
+  ) {
+    orphanedReplyTimeoutId = setTimeout(() => {
+      orphanedReplyTimeoutId = null
+      if (currentSessionChatId != null && currentTurnCapturedText.length > 0 && !currentTurnReplyCalled) {
+        process.stderr.write(
+          `telegram channel: orphaned-reply timeout (${ORPHANED_REPLY_TIMEOUT_MS}ms with no turn_end) — forcing backstop\n`,
+        )
+        // Synthesize a turn_end event to trigger the backstop
+        handleSessionEvent({ kind: 'turn_end', durationMs: -1 })
+      }
+    }, ORPHANED_REPLY_TIMEOUT_MS)
+  }
+}
 
 /**
  * Active draft streams, keyed by `${chat_id}:${thread_id ?? "_"}`.
@@ -1760,6 +1794,12 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (name === 'mcp__clerk-telegram__reply'
         || name === 'mcp__clerk-telegram__stream_reply') {
         currentTurnReplyCalled = true
+        // Reply tool called → cancel the orphaned-reply timeout (the
+        // reply handler itself will finalize the turn).
+        if (orphanedReplyTimeoutId != null) {
+          clearTimeout(orphanedReplyTimeoutId)
+          orphanedReplyTimeoutId = null
+        }
       }
       if (!ctrl) return
       if (name === 'mcp__clerk-telegram__reply'
@@ -1782,12 +1822,65 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (currentSessionChatId != null) {
         currentTurnCapturedText.push(ev.text)
       }
+
+      // Arm the orphaned-reply timeout — if no turn_end arrives within
+      // 30s, we synthesize one so the backstop fires. This covers the
+      // "Prompt is too long" error path and any other case where Claude
+      // Code silently ends a turn without emitting turn_duration.
+      resetOrphanedReplyTimeout()
+
+      // Context exhaustion detection. When the session's context window
+      // fills up (from heavy autonomous work like evals, long research
+      // chains, etc.), Claude Code returns "Prompt is too long" as a
+      // text content block and the turn ends WITHOUT a turn_duration
+      // event — so the orphaned-reply backstop never triggers and the
+      // user gets permanent silence on every subsequent message.
+      //
+      // Detect this and auto-restart the agent with a fresh session.
+      // Hindsight auto-recall brings back relevant memories so context
+      // isn't truly lost. Tell the user what happened before restarting.
+      if (ev.text.includes('Prompt is too long') && currentSessionChatId != null) {
+        const chatId = currentSessionChatId
+        const threadId = currentSessionThreadId
+        process.stderr.write(
+          `telegram channel: context exhaustion detected ("Prompt is too long") — auto-restarting agent with fresh session\n`,
+        )
+        // Notify the user before we die
+        const restartOpts = {
+          parse_mode: 'HTML' as const,
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }
+        void bot.api.sendMessage(
+          chatId,
+          '⚠️ <b>Context window full</b> — the session has too much history for the model to process. Restarting with a fresh session now. Hindsight will recall relevant past context automatically.',
+          restartOpts,
+        ).catch(() => {}).finally(() => {
+          // Fire the restart in a detached child so we don't block on our own death
+          setTimeout(() => {
+            spawnClerkDetached(['agent', 'restart', getMyAgentName()])
+          }, 1000)
+        })
+
+        // Clean up state
+        const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
+        if (ctrl) ctrl.setError()
+        activeStatusReactions.delete(statusKey(chatId, threadId))
+        currentSessionChatId = null
+        currentSessionThreadId = undefined
+        currentTurnReplyCalled = false
+        currentTurnCapturedText = []
+      }
       return
     }
     case 'tool_result': {
       return
     }
     case 'turn_end': {
+      // Cancel orphaned-reply timeout — turn_end arrived normally
+      if (orphanedReplyTimeoutId != null) {
+        clearTimeout(orphanedReplyTimeoutId)
+        orphanedReplyTimeoutId = null
+      }
       if (currentSessionChatId == null) return
       const chatId = currentSessionChatId
       const threadId = currentSessionThreadId
