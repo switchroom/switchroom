@@ -180,7 +180,13 @@ const profileFields = {
     })
     .optional(),
   schedule: z.array(ScheduleEntrySchema).optional(),
-  model: z.string().optional(),
+  model: z
+    .string()
+    .regex(
+      /^[a-zA-Z0-9][a-zA-Z0-9._\-/\[\]:]*$/,
+      "Model name must be alphanumeric with ._-/[]: only",
+    )
+    .optional(),
   mcp_servers: z.record(z.string(), z.unknown()).optional(),
   hooks: AgentHooksSchema,
   env: z.record(z.string(), z.string()).optional(),
@@ -245,6 +251,10 @@ export const AgentSchema = z.object({
   schedule: z.array(ScheduleEntrySchema).default([]),
   model: z
     .string()
+    .regex(
+      /^[a-zA-Z0-9][a-zA-Z0-9._\-/\[\]:]*$/,
+      "Model name must be alphanumeric with ._-/[]: only (no spaces or shell specials)",
+    )
     .optional()
     .describe("Claude model override (e.g., 'claude-sonnet-4-6')"),
   mcp_servers: z
@@ -355,6 +365,7 @@ export const MemoryBackendConfigSchema = z.object({
         .describe("Whether to include Hindsight in docker-compose"),
       url: z
         .string()
+        .url("Hindsight URL must be a valid URL (no shell-special characters)")
         .optional()
         .describe("Hindsight MCP endpoint URL (e.g., http://localhost:18888/mcp/). Defaults to http://localhost:8888/mcp/."),
     })
@@ -373,10 +384,18 @@ export const ClerkConfigSchema = z.object({
     version: z.literal(1).describe("Config schema version"),
     agents_dir: z
       .string()
+      .regex(
+        /^[a-zA-Z0-9~._\-/]+$/,
+        "agents_dir must not contain shell-special characters ($, `, \", ', \\, etc.)",
+      )
       .default("~/.clerk/agents")
       .describe("Base directory for agent installations"),
     skills_dir: z
       .string()
+      .regex(
+        /^[a-zA-Z0-9~._\-/]+$/,
+        "skills_dir must not contain shell-special characters ($, `, \", ', \\, etc.)",
+      )
       .default("~/.clerk/skills")
       .describe(
         "Shared skills pool. Each subdirectory is a named skill " +

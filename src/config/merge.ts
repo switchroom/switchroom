@@ -131,6 +131,9 @@ export function deepMergeJson(base: unknown, override: unknown): unknown {
   }
   const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
   for (const [k, v] of Object.entries(override as Record<string, unknown>)) {
+    // Skip prototype-pollution keys — a `__proto__` or `constructor`
+    // entry in settings_raw would otherwise mutate Object.prototype.
+    if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
     out[k] = deepMergeJson(out[k], v);
   }
   return out;
