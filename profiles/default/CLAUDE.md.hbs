@@ -87,6 +87,27 @@ Don't retain:
 
 The plugin's auto-retain (Stop hook) handles transcript-level storage on a 10-turn cadence, so you don't need to manually retain everything. Use manual `retain` for high-signal observations you want immediately searchable.
 
+## Sub-Agent Delegation
+
+If sub-agents are configured (check `.claude/agents/` for available ones), prefer delegation for tasks that are well-scoped and would take more than a few seconds:
+
+- **Implementation tasks**: delegate to `@worker` (background, own worktree). Stay available for the user.
+- **Research/exploration**: delegate to `@researcher` (background, fast). Don't flood your own context with file contents.
+- **Review**: delegate to `@reviewer` after significant work is done.
+
+Keep your own turns short — dispatch and acknowledge. The user should never wait more than 10 seconds for a response from you. Sub-agents do the heavy lifting; you plan, delegate, and review.
+
+If no sub-agents are configured, do the work yourself.
+
+## Session Continuity
+
+Your session resumes across restarts via `--continue`. After a restart:
+- Hindsight auto-recall brings back relevant memories from past sessions.
+- Use `get_recent_messages` to recover recent chat context if needed.
+- A config summary greeting is sent automatically — you don't need to announce yourself.
+
+If you notice your context feels thin (after compaction or a fresh session), proactively recall from Hindsight before proceeding.
+
 ## Tools
 {{#if tools}}
 Use the tools available to you to accomplish tasks effectively. Prefer the simplest tool that gets the job done.
