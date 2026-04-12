@@ -17,6 +17,94 @@ import {
 } from "../agents/lifecycle.js";
 import { generateUnit, installUnit, uninstallUnit } from "../agents/systemd.js";
 
+/**
+ * Pre-restart preflight check. Verifies the agent's runtime
+ * dependencies are in place before allowing a restart — catches
+ * problems that would leave the agent unable to start (e.g. missing
+ * `expect` binary when dev channels need the autoaccept wrapper).
+ *
+ * Returns an array of error strings. Empty = all checks passed.
+ */
+function preflightCheck(
+  name: string,
+  agentDir: string,
+  usesDevChannels: boolean,
+): string[] {
+  const errors: string[] = [];
+
+  // 1. start.sh exists and is executable
+  const startSh = resolve(agentDir, "start.sh");
+  if (!existsSync(startSh)) {
+    errors.push(`start.sh not found at ${startSh}`);
+  }
+
+  // 2. systemd unit exists
+  const unitPath = resolve(
+    process.env.HOME ?? "/root",
+    ".config/systemd/user",
+    `clerk-${name}.service`,
+  );
+  if (!existsSync(unitPath)) {
+    errors.push(
+      `systemd unit not found at ${unitPath}. Run: clerk agent create ${name}`,
+    );
+  } else if (usesDevChannels) {
+    // 3. If using dev channels, the unit MUST use the expect wrapper
+    const unitContent = readFileSync(unitPath, "utf-8");
+    if (!unitContent.includes("expect")) {
+      errors.push(
+        `systemd unit is missing the expect autoaccept wrapper — ` +
+        `dev channels will hang on the confirmation dialog. ` +
+        `Fix: clerk systemd install (regenerates the unit)`,
+      );
+    }
+  }
+
+  // 4. expect binary exists (if needed)
+  if (usesDevChannels) {
+    try {
+      const { execSync: exec } = require("node:child_process");
+      exec("which expect", { stdio: "pipe" });
+    } catch {
+      errors.push(
+        `'expect' binary not found on PATH — required for dev channels. ` +
+        `Install: sudo apt install expect`,
+      );
+    }
+  }
+
+  // 5. Bot token file exists and has content
+  const envPath = resolve(agentDir, "telegram", ".env");
+  if (existsSync(envPath)) {
+    const envContent = readFileSync(envPath, "utf-8");
+    if (!envContent.includes("TELEGRAM_BOT_TOKEN=") || envContent.includes("# Set your bot token")) {
+      errors.push(
+        `telegram/.env is missing TELEGRAM_BOT_TOKEN. ` +
+        `Set it or run: clerk setup`,
+      );
+    }
+  } else {
+    errors.push(`telegram/.env not found at ${envPath}`);
+  }
+
+  // 6. .claude/settings.json exists
+  if (!existsSync(resolve(agentDir, ".claude", "settings.json"))) {
+    errors.push(
+      `.claude/settings.json not found. Run: clerk agent reconcile ${name}`,
+    );
+  }
+
+  // 7. Claude binary on PATH
+  try {
+    const { execSync: exec } = require("node:child_process");
+    exec("which claude", { stdio: "pipe" });
+  } catch {
+    errors.push(`'claude' binary not found on PATH`);
+  }
+
+  return errors;
+}
+
 function formatUptime(timestamp: string | null): string {
   if (!timestamp) return "\u2014";
   const start = new Date(timestamp).getTime();
@@ -188,9 +276,11 @@ export function registerAgentCommand(program: Command): void {
   agent
     .command("start <name>")
     .description("Start an agent (or 'all' to start all agents)")
+    .option("--force", "Skip preflight checks and start anyway")
     .action(
-      withConfigError(async (name: string) => {
+      withConfigError(async (name: string, opts: { force?: boolean }) => {
         const config = getConfig(program);
+        const agentsDir = resolveAgentsDir(config);
         const names =
           name === "all" ? Object.keys(config.agents) : [name];
 
@@ -199,6 +289,24 @@ export function registerAgentCommand(program: Command): void {
             console.error(chalk.red(`Agent "${n}" is not defined in clerk.yaml`));
             continue;
           }
+
+          if (!opts.force) {
+            const agentDir = resolve(agentsDir, n);
+            const usesDevChannels =
+              config.agents[n].channels?.telegram?.plugin !== "official";
+            const errors = preflightCheck(n, agentDir, usesDevChannels);
+            if (errors.length > 0) {
+              console.error(chalk.red(`\n  Preflight failed for ${n}:\n`));
+              for (const e of errors) {
+                console.error(chalk.red(`    ✗ ${e}`));
+              }
+              console.error(
+                chalk.gray(`\n  Fix the issues above, or use --force to skip preflight.\n`)
+              );
+              continue;
+            }
+          }
+
           try {
             startAgent(n);
             console.log(chalk.green(`Started ${n}`));
@@ -242,9 +350,11 @@ export function registerAgentCommand(program: Command): void {
   agent
     .command("restart <name>")
     .description("Restart an agent (or 'all' to restart all agents)")
+    .option("--force", "Skip preflight checks and restart anyway")
     .action(
-      withConfigError(async (name: string) => {
+      withConfigError(async (name: string, opts: { force?: boolean }) => {
         const config = getConfig(program);
+        const agentsDir = resolveAgentsDir(config);
         const names =
           name === "all" ? Object.keys(config.agents) : [name];
 
@@ -253,6 +363,27 @@ export function registerAgentCommand(program: Command): void {
             console.error(chalk.red(`Agent "${n}" is not defined in clerk.yaml`));
             continue;
           }
+
+          // Preflight: verify runtime dependencies before restart.
+          // Catches problems (missing expect, broken unit, missing
+          // token) that would leave the agent unable to start.
+          if (!opts.force) {
+            const agentDir = resolve(agentsDir, n);
+            const usesDevChannels =
+              config.agents[n].channels?.telegram?.plugin !== "official";
+            const errors = preflightCheck(n, agentDir, usesDevChannels);
+            if (errors.length > 0) {
+              console.error(chalk.red(`\n  Preflight failed for ${n}:\n`));
+              for (const e of errors) {
+                console.error(chalk.red(`    ✗ ${e}`));
+              }
+              console.error(
+                chalk.gray(`\n  Fix the issues above, or use --force to skip preflight.\n`)
+              );
+              continue;
+            }
+          }
+
           try {
             restartAgent(n);
             console.log(chalk.green(`Restarted ${n}`));
