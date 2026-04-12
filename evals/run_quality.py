@@ -4,14 +4,12 @@
 import argparse
 import asyncio
 import json
-import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
 import yaml
 
 EVALS_DIR = Path(__file__).parent
@@ -37,6 +35,34 @@ def load_skill_content(skill_name: str) -> str:
     if skill_md.exists():
         return skill_md.read_text()
     return ""
+
+
+async def call_claude(
+    prompt: str,
+    model: str,
+    system_prompt: str | None = None,
+    append_system: bool = False,
+    timeout: int = 60,
+) -> str:
+    args = ["claude", "-p", prompt, "--model", model, "--print", "--no-session-persistence", "--bare"]
+    if system_prompt:
+        if append_system:
+            args.extend(["--append-system-prompt", system_prompt])
+        else:
+            args.extend(["--system-prompt", system_prompt])
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"claude -p timed out after {timeout}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude -p failed (exit {proc.returncode}): {stderr.decode().strip()}")
+    return stdout.decode("utf-8").strip()
 
 
 def check_assertions(
@@ -68,7 +94,6 @@ def check_assertions(
 
 
 async def run_eval(
-    client: anthropic.AsyncAnthropic,
     eval_item: dict,
     model: str,
     with_skill: bool,
@@ -76,19 +101,12 @@ async def run_eval(
     skill_name = eval_item.get("primary_skill", "")
     skill_content = load_skill_content(skill_name) if with_skill else ""
 
-    system_prompt = (
-        f"You are a helpful assistant for the clerk-ai platform.\n\n{skill_content}"
-        if skill_content
-        else "You are a helpful assistant for the clerk-ai platform."
+    response_text = await call_claude(
+        eval_item["question"],
+        model,
+        system_prompt=skill_content if skill_content else None,
+        append_system=True,
     )
-
-    response = await client.messages.create(
-        model=model,
-        max_tokens=512,
-        system=system_prompt,
-        messages=[{"role": "user", "content": eval_item["question"]}],
-    )
-    response_text = response.content[0].text
 
     passed, matched, missed = check_assertions(
         response_text,
@@ -115,12 +133,11 @@ async def run_all(
     parallel: int,
     ablation: bool,
 ) -> list[dict]:
-    client = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(parallel)
 
     async def bounded(eval_item, with_skill):
         async with semaphore:
-            return await run_eval(client, eval_item, model, with_skill)
+            return await run_eval(eval_item, model, with_skill)
 
     tasks = []
     for e in evals:
@@ -139,10 +156,6 @@ def main():
     parser.add_argument("--filter", help="Filter evals by skill name or tag")
     parser.add_argument("--dataset", default=str(EVALS_DIR / "dataset.yaml"))
     args = parser.parse_args()
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
 
     dataset = yaml.safe_load(Path(args.dataset).read_text())
     evals = dataset["evals"]

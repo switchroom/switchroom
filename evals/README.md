@@ -5,8 +5,7 @@ Evaluates Claude Code custom skills for quality and routing correctness.
 ## Setup
 
 ```bash
-pip install anthropic pyyaml
-export ANTHROPIC_API_KEY=sk-ant-...
+pip install pyyaml
 ```
 
 ## Quality evals
