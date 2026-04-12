@@ -105,6 +105,43 @@ function dedupe<T>(items: T[]): T[] {
   return out;
 }
 
+/**
+ * Recursive deep-merge for plain JSON-ish values. Used by the
+ * `settings_raw` cascade so users can layer partial overrides:
+ *
+ *   defaults.settings_raw: { permissions: { defaultMode: "auto" } }
+ *   agent.settings_raw:    { permissions: { deny: ["Bash(rm -rf *)"] } }
+ *
+ * produces:
+ *
+ *   { permissions: { defaultMode: "auto", deny: [...] } }
+ *
+ * Semantics:
+ *   - Objects are merged per-key recursively.
+ *   - Arrays are REPLACED (not concatenated). Users who want array
+ *     union should use the typed fields (tools.allow, hooks, skills).
+ *     settings_raw is for power-user overrides, not array building.
+ *   - Primitives and null override.
+ *
+ * Exported so scaffold.ts can reuse the same semantics when applying
+ * `settings_raw` onto the computed settings.json object.
+ */
+export function deepMergeJson(base: unknown, override: unknown): unknown {
+  if (override === undefined) return base;
+  if (base === undefined) return override;
+  if (
+    typeof base !== "object" || base === null || Array.isArray(base)
+    || typeof override !== "object" || override === null || Array.isArray(override)
+  ) {
+    return override;
+  }
+  const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  for (const [k, v] of Object.entries(override as Record<string, unknown>)) {
+    out[k] = deepMergeJson(out[k], v);
+  }
+  return out;
+}
+
 export function mergeAgentConfig(
   defaults: AgentDefaults | undefined,
   agent: AgentConfig,
@@ -274,6 +311,33 @@ export function mergeAgentConfig(
     const d = defaults.skills ?? [];
     const a = merged.skills ?? [];
     merged.skills = dedupe([...d, ...a]);
+  }
+
+  // --- settings_raw: deep merge, agent wins ---
+  if (defaults.settings_raw || merged.settings_raw) {
+    merged.settings_raw = deepMergeJson(
+      defaults.settings_raw ?? {},
+      merged.settings_raw ?? {},
+    ) as AgentConfig["settings_raw"];
+  }
+
+  // --- claude_md_raw: concatenate with blank-line separator ---
+  if (defaults.claude_md_raw || merged.claude_md_raw) {
+    const parts = [defaults.claude_md_raw, merged.claude_md_raw]
+      .filter((p): p is string => typeof p === "string" && p.length > 0);
+    merged.claude_md_raw = parts.join("\n\n");
+  }
+
+  // --- cli_args: concat (defaults first), no dedup ---
+  //
+  // We don't dedup because a user may pass the same flag with
+  // different values (e.g. --add-dir A --add-dir B), and some flags
+  // are repeatable by design.
+  if (defaults.cli_args || merged.cli_args) {
+    merged.cli_args = [
+      ...(defaults.cli_args ?? []),
+      ...(merged.cli_args ?? []),
+    ];
   }
 
   return merged;

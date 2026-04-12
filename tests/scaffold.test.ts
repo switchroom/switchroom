@@ -1034,6 +1034,68 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain('double-"quotes"');
   });
 
+  it("settings_raw deep-merges into the generated settings.json", () => {
+    const agentConfig = makeAgentConfig({
+      settings_raw: {
+        effort: "high",
+        permissions: { defaultMode: "bypassPermissions" },
+      },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "raw-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "raw-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    // Escape hatch wins — overrides clerk's default permissions.defaultMode
+    expect(settings.effort).toBe("high");
+    expect(settings.permissions.defaultMode).toBe("bypassPermissions");
+    // And the pre-existing clerk-managed keys still present
+    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+  });
+
+  it("claude_md_raw is appended to CLAUDE.md on scaffold", () => {
+    const agentConfig = makeAgentConfig({
+      claude_md_raw: "## Custom addendum\n\nExtra user notes.",
+    });
+    const result = scaffoldAgent(
+      "rawmd-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const md = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
+
+    expect(md).toContain("## Custom addendum");
+    expect(md).toContain("Extra user notes.");
+  });
+
+  it("cli_args are appended to exec claude in start.sh, single-quoted", () => {
+    const agentConfig = makeAgentConfig({
+      cli_args: ["--effort", "high", "--add-dir", "/tmp/has space"],
+    });
+    const result = scaffoldAgent(
+      "cliargs-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toMatch(/exec claude.*'--effort' 'high' '--add-dir' '\/tmp\/has space'/);
+  });
+
   it("channels.telegram.plugin: 'clerk' writes .mcp.json like legacy use_clerk_plugin", () => {
     const agentConfig = makeAgentConfig({
       channels: { telegram: { plugin: "clerk" } },

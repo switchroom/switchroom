@@ -18,6 +18,7 @@ import {
   mergeAgentConfig,
   translateHooksToClaudeShape,
   usesClerkTelegramPlugin,
+  deepMergeJson,
 } from "../config/merge.js";
 import {
   getTemplatePath,
@@ -542,6 +543,13 @@ export function scaffoldAgent(
     systemPromptAppendShellQuoted: agentConfig.system_prompt_append
       ? shellSingleQuote(agentConfig.system_prompt_append)
       : undefined,
+    // Phase 5 — cli_args escape hatch. Pre-joined here so the template
+    // can dump it verbatim. Each arg is POSIX-single-quoted so arbitrary
+    // user input (including flag values with spaces) reaches claude
+    // intact. Leading space lets the template concat without a gap.
+    extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
+      ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
+      : undefined,
   };
 
   // --- Create directory structure ---
@@ -647,7 +655,18 @@ export function scaffoldAgent(
         settings.model = agentConfig.model;
       }
 
-      writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+      // --- Phase 5: settings_raw escape hatch ---
+      //
+      // Final step before writing: deep-merge any user-declared raw
+      // settings onto the computed object. This lets power users reach
+      // Claude Code settings keys clerk doesn't wrap directly (e.g.
+      // `effort`, `apiKeyHelper`, future keys). Happens last so clerk's
+      // typed fields can be overridden — that's the point of the hatch.
+      const mergedSettings = agentConfig.settings_raw
+        ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
+        : settings;
+
+      writeFileSync(settingsPath, JSON.stringify(mergedSettings, null, 2) + "\n", "utf-8");
     }
   }
 
@@ -709,7 +728,17 @@ export function scaffoldAgent(
     if (existsSync(srcPath)) {
       writeIfMissing(
         join(agentDir, dest),
-        () => renderTemplate(srcPath, context),
+        () => {
+          let rendered = renderTemplate(srcPath, context);
+          // Phase 5: append claude_md_raw escape hatch on initial
+          // scaffold. CLAUDE.md is user-protected afterwards so the
+          // hatch is one-shot — users who edit CLAUDE.md after scaffold
+          // keep their edits through subsequent reconciles.
+          if (dest === "CLAUDE.md" && agentConfig.claude_md_raw) {
+            rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
+          }
+          return rendered;
+        },
         created,
         skipped,
       );
@@ -910,6 +939,9 @@ export function reconcileAgent(
       systemPromptAppendShellQuoted: agentConfig.system_prompt_append
         ? shellSingleQuote(agentConfig.system_prompt_append)
         : undefined,
+      extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
+        ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
+        : undefined,
     };
     const beforeStartSh = readFileSync(startShPath, "utf-8");
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
@@ -1045,7 +1077,12 @@ export function reconcileAgent(
       delete settings.model;
     }
 
-    const after = JSON.stringify(settings, null, 2) + "\n";
+    // --- Phase 5: settings_raw escape hatch ---
+    const mergedSettings = agentConfig.settings_raw
+      ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
+      : settings;
+
+    const after = JSON.stringify(mergedSettings, null, 2) + "\n";
     if (after !== before) {
       writeFileSync(settingsPath, after, { encoding: "utf-8", mode: 0o600 });
       changes.push(settingsPath);

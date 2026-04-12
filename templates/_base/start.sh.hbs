@@ -29,6 +29,6 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{/each}}
 {{/if}}
 cd "{{agentDir}}"
-{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
-{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}
+{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 {{/if}}

@@ -183,6 +183,9 @@ export const AgentDefaultsSchema = z
     dangerous_mode: z.boolean().optional(),
     skip_permission_prompt: z.boolean().optional(),
     use_clerk_plugin: z.boolean().optional(),
+    settings_raw: z.record(z.string(), z.unknown()).optional(),
+    claude_md_raw: z.string().optional(),
+    cli_args: z.array(z.string()).optional(),
   })
   .optional();
 
@@ -274,6 +277,33 @@ export const AgentSchema = z.object({
       "DEPRECATED: prefer channels.telegram.plugin: 'clerk'. " +
       "Kept for backward compatibility — both forms are accepted " +
       "and produce the same scaffold output.",
+    ),
+  settings_raw: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      "Escape hatch: raw object deep-merged into the generated " +
+      "settings.json as the final step. Use for Claude Code settings " +
+      "keys clerk doesn't wrap directly (e.g. effort, apiKeyHelper). " +
+      "Power-user-only — prefer the typed fields when they exist."
+    ),
+  claude_md_raw: z
+    .string()
+    .optional()
+    .describe(
+      "Escape hatch: markdown text appended verbatim to CLAUDE.md on " +
+      "initial scaffold. Not re-applied on reconcile (CLAUDE.md is " +
+      "user-protected). Use for one-off persona tuning that isn't " +
+      "worth a template."
+    ),
+  cli_args: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Escape hatch: extra arguments appended to the `exec claude` " +
+      "invocation in start.sh. Use for Claude Code CLI flags clerk " +
+      "doesn't expose directly (e.g. --effort high, " +
+      "--exclude-dynamic-system-prompt-sections)."
     ),
 });
 

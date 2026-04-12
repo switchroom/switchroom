@@ -329,6 +329,90 @@ describe("usesClerkTelegramPlugin backcompat", () => {
   });
 });
 
+describe("mergeAgentConfig escape hatches", () => {
+  it("deep-merges settings_raw objects across defaults and agent", () => {
+    const defaults: AgentDefaults = {
+      settings_raw: {
+        permissions: { defaultMode: "auto" },
+        effort: "high",
+      },
+    };
+    const agent = baseAgent({
+      settings_raw: {
+        permissions: { deny: ["Bash(rm -rf *)"] },
+      },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.settings_raw).toEqual({
+      permissions: {
+        defaultMode: "auto", // from defaults
+        deny: ["Bash(rm -rf *)"], // from agent
+      },
+      effort: "high", // from defaults
+    });
+  });
+
+  it("agent settings_raw primitives override defaults", () => {
+    const result = mergeAgentConfig(
+      { settings_raw: { effort: "high" } },
+      baseAgent({ settings_raw: { effort: "max" } }),
+    );
+    expect((result.settings_raw as { effort: string }).effort).toBe("max");
+  });
+
+  it("concatenates claude_md_raw with a blank line separator", () => {
+    const result = mergeAgentConfig(
+      { claude_md_raw: "Global note." },
+      baseAgent({ claude_md_raw: "Agent note." }),
+    );
+    expect(result.claude_md_raw).toBe("Global note.\n\nAgent note.");
+  });
+
+  it("concatenates cli_args (defaults first, no dedup)", () => {
+    const result = mergeAgentConfig(
+      { cli_args: ["--effort", "high"] },
+      baseAgent({ cli_args: ["--add-dir", "/extra"] }),
+    );
+    expect(result.cli_args).toEqual(["--effort", "high", "--add-dir", "/extra"]);
+  });
+
+  it("leaves escape hatches undefined when neither side sets them", () => {
+    const result = mergeAgentConfig({ model: "opus" }, baseAgent());
+    expect(result.settings_raw).toBeUndefined();
+    expect(result.claude_md_raw).toBeUndefined();
+    expect(result.cli_args).toBeUndefined();
+  });
+});
+
+describe("deepMergeJson", () => {
+  const { deepMergeJson } = require("../src/config/merge.js");
+
+  it("per-key merges nested objects recursively", () => {
+    const out = deepMergeJson(
+      { a: { b: 1, c: 2 }, d: 3 },
+      { a: { c: 99, e: 5 }, f: 6 },
+    );
+    expect(out).toEqual({ a: { b: 1, c: 99, e: 5 }, d: 3, f: 6 });
+  });
+
+  it("replaces arrays rather than concatenating", () => {
+    const out = deepMergeJson(
+      { list: [1, 2, 3] },
+      { list: [9] },
+    );
+    expect(out).toEqual({ list: [9] });
+  });
+
+  it("override primitives win", () => {
+    expect(deepMergeJson(1, 2)).toBe(2);
+    expect(deepMergeJson("a", "b")).toBe("b");
+  });
+
+  it("undefined override leaves base untouched", () => {
+    expect(deepMergeJson({ a: 1 }, undefined)).toEqual({ a: 1 });
+  });
+});
+
 describe("translateHooksToClaudeShape", () => {
   // Local import to keep the describe block self-contained; see merge.ts
   // for the source implementation.
