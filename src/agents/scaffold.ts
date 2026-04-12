@@ -205,41 +205,51 @@ function buildSessionGreetingScript(
   topicId: number | undefined,
 ): string {
   const chatId = telegramConfig.forum_chat_id;
-  const model = agentConfig.model ?? "default";
-  const profile = agentConfig.extends ?? "default";
+
+  // Helper: show the actual resolved value, with "(default)" label when
+  // the user didn't explicitly set it — so the greeting is informative
+  // even for a zero-config agent.
+  const DEFAULT_MODEL = "claude-sonnet-4-6";
+  const model = agentConfig.model
+    ? agentConfig.model
+    : `${DEFAULT_MODEL} (default)`;
+  const profile = agentConfig.extends
+    ? agentConfig.extends
+    : "default";
   const tools = agentConfig.tools?.allow?.includes("all")
     ? "all"
-    : (agentConfig.tools?.allow?.slice(0, 5).join(", ") ?? "none")
+    : (agentConfig.tools?.allow?.slice(0, 5).join(", ") ?? "none (default)")
       + ((agentConfig.tools?.allow?.length ?? 0) > 5
         ? ` +${(agentConfig.tools?.allow?.length ?? 0) - 5} more`
         : "");
   const deny = agentConfig.tools?.deny?.length
     ? agentConfig.tools.deny.join(", ")
-    : "none";
-  const memory = agentConfig.memory?.collection ?? name;
+    : null;
+  const memory = agentConfig.memory?.collection ?? `${name} (default)`;
   const hooks = agentConfig.hooks
     ? Object.keys(agentConfig.hooks).join(", ")
-    : "none";
+    : null;
   const skills = agentConfig.skills?.length
     ? agentConfig.skills.join(", ")
-    : "none";
+    : null;
   const session = [];
   if (agentConfig.session?.max_idle) session.push(`idle ${agentConfig.session.max_idle}`);
   if (agentConfig.session?.max_turns) session.push(`${agentConfig.session.max_turns} turns`);
-  const sessionStr = session.length ? session.join(", ") : "unlimited";
-  const plugin = agentConfig.channels?.telegram?.plugin ?? "clerk";
+  const sessionStr = session.length ? session.join(", ") : "unlimited (default)";
+  const plugin = agentConfig.channels?.telegram?.plugin ?? "clerk (default)";
 
-  // Telegram HTML — keep it compact for mobile
+  // Telegram HTML — keep it compact for mobile. Omit rows that are
+  // null (unset with no interesting default to show).
   const text = [
     `<b>🤖 ${name} online</b>`,
     ``,
     `<b>Model</b>  ${escapeHtml(model)}`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
-    deny !== "none" ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
+    deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
     `<b>Memory</b>  ${escapeHtml(memory)}`,
-    `<b>Hooks</b>  ${escapeHtml(hooks)}`,
-    skills !== "none" ? `<b>Skills</b>  ${escapeHtml(skills)}` : null,
+    hooks ? `<b>Hooks</b>  ${escapeHtml(hooks)}` : null,
+    skills ? `<b>Skills</b>  ${escapeHtml(skills)}` : null,
     `<b>Session</b>  ${escapeHtml(sessionStr)}`,
     `<b>Channel</b>  ${escapeHtml(plugin)}`,
   ].filter(Boolean).join("\n");
