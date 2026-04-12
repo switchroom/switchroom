@@ -242,6 +242,25 @@ describe("mergeAgentConfig", () => {
   });
 });
 
+describe("mergeAgentConfig skills pool", () => {
+  it("unions defaults.skills with agent.skills preserving order", () => {
+    const defaults: AgentDefaults = { skills: ["checkin", "retain"] };
+    const agent = baseAgent({ skills: ["checkin", "weekly-review"] });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.skills).toEqual(["checkin", "retain", "weekly-review"]);
+  });
+
+  it("flows defaults.skills when agent has none", () => {
+    const result = mergeAgentConfig({ skills: ["a", "b"] }, baseAgent());
+    expect(result.skills).toEqual(["a", "b"]);
+  });
+
+  it("leaves skills undefined when neither side sets it", () => {
+    const result = mergeAgentConfig({ model: "opus" }, baseAgent());
+    expect(result.skills).toBeUndefined();
+  });
+});
+
 describe("mergeAgentConfig channels block", () => {
   it("flows defaults.channels.telegram.* to agents that leave them unset", () => {
     const defaults: AgentDefaults = {

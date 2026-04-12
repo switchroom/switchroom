@@ -188,6 +188,98 @@ function shellSingleQuote(s: string): string {
 }
 
 /**
+ * Resolve the global clerk skills pool directory. Honors the optional
+ * `clerk.skills_dir` override in clerk.yaml and falls back to
+ * `~/.clerk/skills`. Expands a leading `~/` against $HOME.
+ */
+function resolveSkillsPoolDir(override: string | undefined): string {
+  const raw = override ?? "~/.clerk/skills";
+  if (raw.startsWith("~/")) {
+    return resolve(process.env.HOME ?? "/root", raw.slice(2));
+  }
+  return resolve(raw);
+}
+
+/**
+ * Sync the set of global-skill symlinks in an agent's skills/ directory
+ * against the user's declared `skills:` list (already merged with
+ * defaults). Idempotent and safe to call on reconcile:
+ *
+ *   - Missing links for declared skills are created.
+ *   - Stale links whose target no longer appears in the list are
+ *     removed. Only symlinks are ever removed — real files/directories
+ *     from the template's copySkills pass are untouched.
+ *   - Missing pool entries (user listed a skill that doesn't exist at
+ *     <skills_dir>/<name>) produce a warning but don't throw — this is
+ *     a non-fatal configuration lint.
+ */
+function syncGlobalSkills(
+  agentDir: string,
+  declared: string[],
+  skillsDirOverride: string | undefined,
+): void {
+  const skillsPool = resolveSkillsPoolDir(skillsDirOverride);
+  const agentSkillsDir = join(agentDir, "skills");
+  mkdirSync(agentSkillsDir, { recursive: true });
+
+  // Create symlinks for each declared skill. Skip entries that are
+  // already correct; replace ones pointing at the wrong target.
+  for (const name of declared) {
+    if (!name || name.includes("/") || name === "." || name === "..") {
+      console.warn(`  WARNING: invalid skill name "${name}" — skipping`);
+      continue;
+    }
+    const src = join(skillsPool, name);
+    const dest = join(agentSkillsDir, name);
+    if (!existsSync(src)) {
+      console.warn(
+        `  WARNING: skill "${name}" not found in pool (${skillsPool}) — skipping`,
+      );
+      continue;
+    }
+    // If dest exists and is a symlink to the right target, leave it.
+    // If dest exists and is something else (real file/dir from template),
+    // leave it too — the template takes priority over the global pool to
+    // avoid silent surprises.
+    let stat;
+    try {
+      stat = statSync(dest);
+    } catch {
+      stat = null;
+    }
+    if (stat) {
+      // Something already exists at dest. Don't touch it.
+      continue;
+    }
+    try {
+      symlinkSync(src, dest);
+    } catch (err) {
+      console.warn(
+        `  WARNING: failed to symlink skill "${name}": ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // Clean up stale symlinks — ones that point into the skills pool but
+  // aren't in the current declared set. Real files and symlinks that
+  // point elsewhere are left untouched.
+  const declaredSet = new Set(declared);
+  for (const entry of readdirSync(agentSkillsDir)) {
+    if (declaredSet.has(entry)) continue;
+    const path = join(agentSkillsDir, entry);
+    let linkTarget: string | null = null;
+    try {
+      linkTarget = require("node:fs").readlinkSync(path);
+    } catch {
+      continue; // not a symlink
+    }
+    if (linkTarget && linkTarget.startsWith(skillsPool)) {
+      rmSync(path, { force: true });
+    }
+  }
+}
+
+/**
  * Translate per-channel YAML fields into env vars the telegram-plugin
  * will read at startup. Today: CLERK_TG_FORMAT and CLERK_TG_RATE_LIMIT_MS.
  *
@@ -687,6 +779,20 @@ export function scaffoldAgent(
   // --- Copy skill files from template ---
   copySkills(templatePath, join(agentDir, "skills"));
 
+  // --- Symlink global skills from clerk.skills_dir ---
+  //
+  // Skills named in `agents.x.skills: [name1, name2]` (merged with
+  // defaults.skills) are resolved to <skills_dir>/<name> and symlinked
+  // into <agentDir>/skills/<name>. This decouples skill authoring from
+  // template authoring — add a skill to the pool once, opt-in per agent.
+  if (agentConfig.skills && agentConfig.skills.length > 0) {
+    syncGlobalSkills(
+      agentDir,
+      agentConfig.skills,
+      clerkConfig?.clerk?.skills_dir,
+    );
+  }
+
   // --- Set up plugin symlinks ---
   setupPlugins(agentDir);
 
@@ -944,6 +1050,14 @@ export function reconcileAgent(
       writeFileSync(settingsPath, after, { encoding: "utf-8", mode: 0o600 });
       changes.push(settingsPath);
     }
+  }
+
+  // --- Reconcile global skills pool symlinks ---
+  //
+  // Mirrors the scaffold syncGlobalSkills call so reconcile picks up
+  // added/removed entries in clerk.yaml.
+  if (agentConfig.skills) {
+    syncGlobalSkills(agentDir, agentConfig.skills, clerkConfig.clerk.skills_dir);
   }
 
   // --- Reconcile .mcp.json (use_clerk_plugin agents only) ---

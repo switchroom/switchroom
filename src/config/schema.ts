@@ -178,6 +178,7 @@ export const AgentDefaultsSchema = z
     hooks: AgentHooksSchema,
     env: z.record(z.string(), z.string()).optional(),
     system_prompt_append: z.string().optional(),
+    skills: z.array(z.string()).optional(),
     channels: ChannelsSchema,
     dangerous_mode: z.boolean().optional(),
     skip_permission_prompt: z.boolean().optional(),
@@ -245,6 +246,13 @@ export const AgentSchema = z.object({
     .describe(
       "Text passed via claude's --append-system-prompt flag. " +
       "Appended to the default or CLAUDE.md-derived system prompt.",
+    ),
+  skills: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Names of skills from clerk.skills_dir to symlink into this " +
+      "agent's skills/ directory. Unioned with defaults.skills.",
     ),
   channels: ChannelsSchema.describe(
     "Per-channel configuration (today: telegram). " +
@@ -329,6 +337,14 @@ export const ClerkConfigSchema = z.object({
       .string()
       .default("~/.clerk/agents")
       .describe("Base directory for agent installations"),
+    skills_dir: z
+      .string()
+      .default("~/.clerk/skills")
+      .describe(
+        "Shared skills pool. Each subdirectory is a named skill " +
+        "(matching a clerk.yaml `skills:` entry). Scaffold symlinks " +
+        "selected skills into each agent's skills/ directory."
+      ),
   }),
   telegram: TelegramConfigSchema,
   memory: MemoryBackendConfigSchema.optional(),

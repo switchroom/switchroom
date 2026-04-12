@@ -265,5 +265,16 @@ export function mergeAgentConfig(
     merged.schedule = [...defaults.schedule, ...merged.schedule];
   }
 
+  // --- skills: union, dedup-preserving-order (defaults first) ---
+  //
+  // A user with `defaults.skills: [checkin, retain]` and an agent with
+  // `skills: [checkin, weekly-review]` ends up with three distinct
+  // names; `checkin` is not symlinked twice.
+  if (defaults.skills || merged.skills) {
+    const d = defaults.skills ?? [];
+    const a = merged.skills ?? [];
+    merged.skills = dedupe([...d, ...a]);
+  }
+
   return merged;
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1182,6 +1182,165 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.permissions.allow).toContain("Edit");
     expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
     expect(settings.permissions.allow).toContain("mcp__clerk__*");
+  });
+});
+
+describe("scaffoldAgent global skills pool", () => {
+  let tmpDir: string;
+  let skillsPool: string;
+  let origHome: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "clerk-skills-"));
+    skillsPool = join(tmpDir, "skills-pool");
+
+    // Populate a fake skills pool with three fake skills
+    for (const name of ["checkin", "retain", "weekly-review"]) {
+      const dir = join(skillsPool, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "SKILL.md"), `# ${name}\n`, "utf-8");
+    }
+    // Ensure HOME expansion can't accidentally reach into the real user
+    // pool — pin HOME to the tmpDir. Restore in afterEach.
+    origHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+  });
+
+  afterEach(() => {
+    if (origHome !== undefined) process.env.HOME = origHome;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function buildConfig(
+    agentConfig: AgentConfig,
+    skillsDir?: string,
+  ): ClerkConfig {
+    return {
+      clerk: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsDir ?? skillsPool },
+      telegram: telegramConfig,
+      agents: { "skills-agent": agentConfig },
+    } as ClerkConfig;
+  }
+
+  it("symlinks declared skills from the pool into the agent skills dir", () => {
+    const agentConfig = makeAgentConfig({ skills: ["checkin", "retain"] });
+    const clerkConfig = buildConfig(agentConfig);
+
+    const result = scaffoldAgent(
+      "skills-agent",
+      agentConfig,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      clerkConfig,
+    );
+
+    const checkinPath = join(result.agentDir, "skills", "checkin");
+    const retainPath = join(result.agentDir, "skills", "retain");
+    expect(existsSync(checkinPath)).toBe(true);
+    expect(existsSync(retainPath)).toBe(true);
+    // Verify they're symlinks pointing into the pool
+    const { readlinkSync } = require("node:fs");
+    expect(readlinkSync(checkinPath)).toBe(join(skillsPool, "checkin"));
+  });
+
+  it("unions defaults.skills with agent.skills in the symlink pass", () => {
+    const agentConfig = makeAgentConfig({ skills: ["weekly-review"] });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsPool },
+      telegram: telegramConfig,
+      defaults: { skills: ["checkin", "retain"] },
+      agents: { "skills-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "skills-agent",
+      agentConfig,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      clerkConfig,
+    );
+
+    for (const name of ["checkin", "retain", "weekly-review"]) {
+      expect(existsSync(join(result.agentDir, "skills", name))).toBe(true);
+    }
+  });
+
+  it("warns and skips missing skills without throwing", () => {
+    const agentConfig = makeAgentConfig({ skills: ["checkin", "does-not-exist"] });
+    const clerkConfig = buildConfig(agentConfig);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = scaffoldAgent(
+      "skills-agent",
+      agentConfig,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      clerkConfig,
+    );
+    warnSpy.mockRestore();
+
+    expect(existsSync(join(result.agentDir, "skills", "checkin"))).toBe(true);
+    expect(existsSync(join(result.agentDir, "skills", "does-not-exist"))).toBe(false);
+  });
+
+  it("reconcile removes stale symlinks when a skill is dropped from clerk.yaml", () => {
+    const before = makeAgentConfig({ skills: ["checkin", "retain"] });
+    const initial = buildConfig(before);
+    const result = scaffoldAgent(
+      "skills-agent",
+      before,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      initial,
+    );
+    expect(existsSync(join(result.agentDir, "skills", "retain"))).toBe(true);
+
+    const after = makeAgentConfig({ skills: ["checkin"] });
+    const updated = buildConfig(after);
+    reconcileAgent(
+      "skills-agent",
+      after,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      updated,
+    );
+
+    expect(existsSync(join(result.agentDir, "skills", "checkin"))).toBe(true);
+    // retain's symlink was removed
+    expect(existsSync(join(result.agentDir, "skills", "retain"))).toBe(false);
+  });
+
+  it("does not touch template-copied skill files during stale cleanup", () => {
+    // Create an agent, then manually drop a non-symlink skill file into
+    // the agent's skills dir to simulate a template-contributed skill.
+    // A reconcile that removes nothing from the pool must leave that
+    // file in place.
+    const agentConfig = makeAgentConfig({ skills: ["checkin"] });
+    const clerkConfig = buildConfig(agentConfig);
+    const result = scaffoldAgent(
+      "skills-agent",
+      agentConfig,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      clerkConfig,
+    );
+
+    const templateSkill = join(result.agentDir, "skills", "template-skill");
+    mkdirSync(templateSkill, { recursive: true });
+    writeFileSync(join(templateSkill, "SKILL.md"), "# template\n", "utf-8");
+
+    // Reconcile with the same config
+    reconcileAgent(
+      "skills-agent",
+      agentConfig,
+      join(tmpDir, "agents"),
+      telegramConfig,
+      clerkConfig,
+    );
+
+    // template-skill survives because it's a real directory, not a
+    // symlink pointing into the pool
+    expect(existsSync(templateSkill)).toBe(true);
   });
 });
 
