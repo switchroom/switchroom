@@ -1008,8 +1008,10 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    expect(startSh).toContain('export CLERK_AUDIT_URL="https://audit.example"');
-    expect(startSh).toContain('export LOG_LEVEL="debug"');
+    // Env values are POSIX-single-quoted by scaffold so shell-sensitive
+    // bytes survive. See scaffold.ts userEnvQuoted.
+    expect(startSh).toContain("export CLERK_AUDIT_URL='https://audit.example'");
+    expect(startSh).toContain("export LOG_LEVEL='debug'");
   });
 
   it("escapes system_prompt_append via POSIX single-quote wrapping", () => {
@@ -1157,8 +1159,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    expect(startSh).toContain('export CLERK_TG_FORMAT="markdownv2"');
-    expect(startSh).toContain('export CLERK_TG_RATE_LIMIT_MS="500"');
+    expect(startSh).toContain("export CLERK_TG_FORMAT='markdownv2'");
+    expect(startSh).toContain("export CLERK_TG_RATE_LIMIT_MS='500'");
   });
 
   it("user env entry wins over channel-derived env default on key conflict", () => {
@@ -1175,8 +1177,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
     // Only the user value remains
-    expect(startSh).toContain('export CLERK_TG_FORMAT="text"');
-    expect(startSh).not.toContain('export CLERK_TG_FORMAT="markdownv2"');
+    expect(startSh).toContain("export CLERK_TG_FORMAT='text'");
+    expect(startSh).not.toContain("export CLERK_TG_FORMAT='markdownv2'");
   });
 
   it("reconcile propagates hooks/env/model updates without touching user files", () => {
@@ -1207,7 +1209,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.hooks.Stop).toBeDefined();
 
     const startSh = readFileSync(join(tmpDir, "rec-phase2", "start.sh"), "utf-8");
-    expect(startSh).toContain('export NEW_VAR="hello"');
+    expect(startSh).toContain("export NEW_VAR='hello'");
     expect(startSh).toContain("--model claude-sonnet-4-6");
   });
 
@@ -1402,6 +1404,198 @@ describe("scaffoldAgent global skills pool", () => {
     // template-skill survives because it's a real directory, not a
     // symlink pointing into the pool
     expect(existsSync(templateSkill)).toBe(true);
+  });
+});
+
+describe("phase-6b bug fixes", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "clerk-phase6b-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("env values with shell-sensitive bytes are POSIX-quoted in start.sh", () => {
+    // Dollar sign, backtick, double quote, embedded single quote,
+    // ampersand, and newline all need to survive shell parsing.
+    const agentConfig = makeAgentConfig({
+      env: {
+        TRICKY: "a & b $HOME `pwd` \"q\" 'x' \n two",
+      },
+    });
+    const result = scaffoldAgent(
+      "env-adversarial",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // The whole value is inside POSIX single quotes; embedded single
+    // quote becomes '"'"' (close-dq"'"dq-reopen).
+    expect(startSh).toContain(
+      `export TRICKY='a & b $HOME \`pwd\` "q" '"'"'x'"'"' \n two'`,
+    );
+  });
+
+  it("cli_args with embedded single quote and dollar sign stay intact", () => {
+    const agentConfig = makeAgentConfig({
+      cli_args: ["--note", "can't stop $PATH"],
+    });
+    const result = scaffoldAgent(
+      "cli-adversarial",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain(`'--note' 'can'"'"'t stop $PATH'`);
+  });
+
+  it("reconcile drops settings.hooks events that were removed from clerk.yaml", () => {
+    const withHooks = makeAgentConfig({
+      hooks: {
+        UserPromptSubmit: [{ command: "/opt/a.sh" }],
+        Stop: [{ command: "/opt/b.sh", async: true }],
+      },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "drift-agent": withHooks },
+    } as ClerkConfig;
+
+    scaffoldAgent("drift-agent", withHooks, tmpDir, telegramConfig, clerkConfig);
+    const settingsPath = join(tmpDir, "drift-agent", ".claude", "settings.json");
+    const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(before.hooks.UserPromptSubmit).toBeDefined();
+    expect(before.hooks.Stop).toBeDefined();
+
+    // User removes Stop from clerk.yaml
+    const lessHooks = makeAgentConfig({
+      hooks: { UserPromptSubmit: [{ command: "/opt/a.sh" }] },
+    });
+    const updated: ClerkConfig = {
+      ...clerkConfig,
+      agents: { "drift-agent": lessHooks },
+    } as ClerkConfig;
+    reconcileAgent("drift-agent", lessHooks, tmpDir, telegramConfig, updated);
+
+    const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(after.hooks.UserPromptSubmit).toBeDefined();
+    // Stop was dropped — the whole event is gone
+    expect(after.hooks.Stop).toBeUndefined();
+  });
+
+  it("reconcile retracts settings_raw keys that were removed from clerk.yaml", () => {
+    const withRaw = makeAgentConfig({
+      settings_raw: { effort: "high", customKey: "original" },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "raw-drift": withRaw },
+    } as ClerkConfig;
+
+    scaffoldAgent("raw-drift", withRaw, tmpDir, telegramConfig, clerkConfig);
+    const settingsPath = join(tmpDir, "raw-drift", ".claude", "settings.json");
+    const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(before.effort).toBe("high");
+    expect(before.customKey).toBe("original");
+    // Side-car tracks what was injected
+    expect(before._clerkManagedRawKeys).toEqual(["effort", "customKey"]);
+
+    // User removes customKey from clerk.yaml
+    const lessRaw = makeAgentConfig({ settings_raw: { effort: "high" } });
+    const updated: ClerkConfig = {
+      ...clerkConfig,
+      agents: { "raw-drift": lessRaw },
+    } as ClerkConfig;
+    reconcileAgent("raw-drift", lessRaw, tmpDir, telegramConfig, updated);
+
+    const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(after.effort).toBe("high"); // still present
+    expect(after.customKey).toBeUndefined(); // retracted
+    expect(after._clerkManagedRawKeys).toEqual(["effort"]);
+  });
+
+  it("reconcile retracts all settings_raw keys when the field is cleared entirely", () => {
+    const withRaw = makeAgentConfig({
+      settings_raw: { effort: "high", apiKeyHelper: "/bin/true" },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "clear-drift": withRaw },
+    } as ClerkConfig;
+    scaffoldAgent("clear-drift", withRaw, tmpDir, telegramConfig, clerkConfig);
+
+    const emptyRaw = makeAgentConfig();
+    const updated: ClerkConfig = {
+      ...clerkConfig,
+      agents: { "clear-drift": emptyRaw },
+    } as ClerkConfig;
+    reconcileAgent("clear-drift", emptyRaw, tmpDir, telegramConfig, updated);
+
+    const after = JSON.parse(
+      readFileSync(join(tmpDir, "clear-drift", ".claude", "settings.json"), "utf-8"),
+    );
+    expect(after.effort).toBeUndefined();
+    expect(after.apiKeyHelper).toBeUndefined();
+    expect(after._clerkManagedRawKeys).toBeUndefined();
+  });
+
+  it("reconcile is idempotent across two back-to-back runs with the same config", () => {
+    const agentConfig = makeAgentConfig({
+      hooks: { PreToolUse: [{ command: "/opt/audit.sh", timeout: 5 }] },
+      env: { FOO: "bar" },
+      model: "claude-sonnet-4-6",
+      settings_raw: { effort: "high" },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "idem-agent": agentConfig },
+    } as ClerkConfig;
+
+    scaffoldAgent("idem-agent", agentConfig, tmpDir, telegramConfig, clerkConfig);
+    reconcileAgent("idem-agent", agentConfig, tmpDir, telegramConfig, clerkConfig);
+    const result = reconcileAgent(
+      "idem-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    // Second reconcile is a no-op — no files touched
+    expect(result.changes).toEqual([]);
+  });
+
+  it("merge does not crash when defaults has schedule but agent does not (layered cast safety)", () => {
+    // Regression for the `[...merged.schedule]` crash in mergeAgentConfig
+    // when resolveAgentConfig's first layer (defaults → profile) runs
+    // and the profile has no schedule field at all. Covered indirectly
+    // by scaffolding an agent whose cascade exercises the path.
+    const agentConfig = makeAgentConfig({ extends: "coder" });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        schedule: [{ cron: "0 9 * * *", prompt: "standup" }],
+      },
+      profiles: {
+        coder: { tools: { allow: ["Bash"] } }, // no schedule
+      },
+      agents: { "sched-agent": agentConfig },
+    } as ClerkConfig;
+
+    // This call would previously TypeError via [...undefined]
+    expect(() =>
+      scaffoldAgent("sched-agent", agentConfig, tmpDir, telegramConfig, clerkConfig),
+    ).not.toThrow();
   });
 });
 

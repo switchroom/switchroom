@@ -329,9 +329,12 @@ export function mergeAgentConfig(
   // --- schedule: concat (defaults first) ---
   //
   // Only prepend defaults when they have entries; otherwise leave the
-  // agent's schedule untouched (even if it's the zod default []).
+  // agent's schedule untouched. The `?? []` guard protects the
+  // cross-layer case in resolveAgentConfig where a profile (cast to
+  // AgentConfig for the merge primitive) legitimately has no schedule
+  // field at all — without the guard `[...undefined]` would throw.
   if (defaults.schedule && defaults.schedule.length > 0) {
-    merged.schedule = [...defaults.schedule, ...merged.schedule];
+    merged.schedule = [...defaults.schedule, ...(merged.schedule ?? [])];
   }
 
   // --- skills: union, dedup-preserving-order (defaults first) ---

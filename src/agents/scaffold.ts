@@ -9,6 +9,8 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  lstatSync,
+  readlinkSync,
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -118,7 +120,7 @@ export function setupPlugins(agentDir: string): void {
 
 /**
  * Pre-approved MCP tool names for the clerk enhanced Telegram plugin.
- * When use_clerk_plugin is enabled we pre-approve these so the agent
+ * When channels.telegram.plugin is "clerk" we pre-approve these so the agent
  * never has to prompt for MCP tool permissions.
  */
 const CLERK_TELEGRAM_MCP_TOOLS = [
@@ -239,18 +241,35 @@ function syncGlobalSkills(
       continue;
     }
     // If dest exists and is a symlink to the right target, leave it.
-    // If dest exists and is something else (real file/dir from template),
-    // leave it too — the template takes priority over the global pool to
-    // avoid silent surprises.
-    let stat;
+    // If dest exists as a real file/dir (e.g. from profile copySkills),
+    // also leave it — profile-bundled skills take priority over the
+    // pool to avoid silent surprises. Use lstatSync so broken symlinks
+    // are detected (statSync would follow them and throw, falsely
+    // indicating the path is free).
+    let linkStat;
     try {
-      stat = statSync(dest);
+      linkStat = lstatSync(dest);
     } catch {
-      stat = null;
+      linkStat = null;
     }
-    if (stat) {
-      // Something already exists at dest. Don't touch it.
-      continue;
+    if (linkStat) {
+      // Broken symlink into the pool: replace it (the old target is
+      // gone, so we can safely recreate). Anything else: leave alone.
+      if (linkStat.isSymbolicLink()) {
+        let target: string | null = null;
+        try {
+          target = readlinkSync(dest);
+        } catch { /* unreadable; leave alone */ }
+        if (target && target.startsWith(skillsPool)) {
+          try {
+            rmSync(dest, { force: true });
+          } catch { /* best effort */ }
+        } else {
+          continue;
+        }
+      } else {
+        continue;
+      }
     }
     try {
       symlinkSync(src, dest);
@@ -267,15 +286,15 @@ function syncGlobalSkills(
   const declaredSet = new Set(declared);
   for (const entry of readdirSync(agentSkillsDir)) {
     if (declaredSet.has(entry)) continue;
-    const path = join(agentSkillsDir, entry);
+    const entryPath = join(agentSkillsDir, entry);
     let linkTarget: string | null = null;
     try {
-      linkTarget = require("node:fs").readlinkSync(path);
+      linkTarget = readlinkSync(entryPath);
     } catch {
       continue; // not a symlink
     }
     if (linkTarget && linkTarget.startsWith(skillsPool)) {
-      rmSync(path, { force: true });
+      rmSync(entryPath, { force: true });
     }
   }
 }
@@ -299,6 +318,25 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   }
   return out;
 }
+
+/**
+ * Top-level settings.json keys that clerk's scaffold/reconcile
+ * pipeline owns and rebuilds on every run. When the settings_raw
+ * escape hatch injects additional top-level keys (e.g. `effort`,
+ * `apiKeyHelper`), they're tracked via the `_clerkManagedRawKeys`
+ * side-car so reconcile can retract them if the user removes them
+ * from clerk.yaml. Keys in this set are never retracted because the
+ * scaffold path rebuilds them deterministically from clerk.yaml.
+ */
+const CLERK_OWNED_SETTINGS_KEYS = new Set<string>([
+  "permissions",
+  "mcpServers",
+  "enabledPlugins",
+  "autoMemoryEnabled",
+  "skipDangerousModePermissionPrompt",
+  "hooks",
+  "model",
+]);
 
 const ALL_BUILTIN_TOOLS = [
   "Bash",
@@ -487,7 +525,7 @@ export function scaffoldAgent(
   //     literal string "all" in the permissions.allow list. The correct
   //     equivalent is to use defaultMode: "acceptEdits" with an empty
   //     allow list.
-  //   - If use_clerk_plugin is enabled, pre-approve the clerk-telegram
+  //   - If channels.telegram.plugin is "clerk", pre-approve the clerk-telegram
   //     MCP tool names so the agent never has to confirm MCP tool
   //     permissions at runtime.
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
@@ -540,10 +578,19 @@ export function scaffoldAgent(
     hindsightBankId,
     hindsightApiBaseUrl,
     // Phase 2 + 3 — user env merged with channel-derived env. User
-    // entries win on conflict (explicit beats channel default).
-    userEnv: (() => {
+    // entries win on conflict (explicit beats channel default). Each
+    // value is POSIX-single-quoted at build time so `&`, `$`, backtick,
+    // newline, and embedded quotes all survive shell parsing. The
+    // template emits `export KEY={{{value}}}` with triple braces to
+    // avoid Handlebars HTML-escaping the already-quoted string.
+    userEnvQuoted: (() => {
       const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
-      return Object.keys(combined).length > 0 ? combined : undefined;
+      if (Object.keys(combined).length === 0) return undefined;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(combined)) {
+        out[k] = shellSingleQuote(v);
+      }
+      return out;
     })(),
     systemPromptAppendShellQuoted: agentConfig.system_prompt_append
       ? shellSingleQuote(agentConfig.system_prompt_append)
@@ -626,33 +673,19 @@ export function scaffoldAgent(
         settings.autoMemoryEnabled = false;
       }
 
-      // Clean up the legacy hooks.UserPromptSubmit shell hook entry from
-      // any prior scaffolds. The plugin owns this hook now.
-      if (settings.hooks?.UserPromptSubmit) {
-        const filtered = (settings.hooks.UserPromptSubmit as Array<{
-          hooks?: Array<{ command?: string }>
-        }>).filter((group) =>
-          !(group.hooks ?? []).some((h) => (h.command ?? "").includes("auto-recall.sh"))
-        );
-        if (filtered.length === 0) {
-          delete settings.hooks.UserPromptSubmit;
-          if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-        } else {
-          settings.hooks.UserPromptSubmit = filtered;
-        }
-      }
-
       // --- Phase 2: user-declared hooks and model ---
       //
       // Hooks from clerk.yaml (merged with defaults) are translated from
-      // clerk's flat shape to Claude Code's nested shape and merged into
-      // settings.hooks. Plugin-installed hooks (hindsight) live in the
-      // plugin's own hooks.json and are loaded via --plugin-dir, so they
-      // don't collide with settings.hooks — Claude Code merges them at
-      // runtime.
+      // clerk's flat shape to Claude Code's nested shape and assigned
+      // wholesale to settings.hooks. Clerk owns the entire settings.hooks
+      // object — plugin-installed hooks (hindsight) live in the plugin's
+      // own hooks.json and are loaded via --plugin-dir, so they're not
+      // affected by this and Claude Code merges them at runtime.
       const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
       if (userHooks) {
-        settings.hooks = { ...(settings.hooks ?? {}), ...userHooks };
+        settings.hooks = userHooks;
+      } else {
+        delete settings.hooks;
       }
       // Explicit model override: written to settings.model so the user
       // doesn't have to pass --model on every invocation.
@@ -667,9 +700,14 @@ export function scaffoldAgent(
       // Claude Code settings keys clerk doesn't wrap directly (e.g.
       // `effort`, `apiKeyHelper`, future keys). Happens last so clerk's
       // typed fields can be overridden — that's the point of the hatch.
+      // Also stamp the `_clerkManagedRawKeys` side-car so reconcile can
+      // retract non-clerk-owned keys if the user removes them later.
       const mergedSettings = agentConfig.settings_raw
         ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
         : settings;
+      if (agentConfig.settings_raw && Object.keys(agentConfig.settings_raw).length > 0) {
+        mergedSettings._clerkManagedRawKeys = Object.keys(agentConfig.settings_raw);
+      }
 
       writeFileSync(settingsPath, JSON.stringify(mergedSettings, null, 2) + "\n", "utf-8");
     }
@@ -677,7 +715,7 @@ export function scaffoldAgent(
 
   // --- Write project-level .mcp.json for clerk-telegram development channel ---
   //
-  // When use_clerk_plugin is enabled, Claude Code's
+  // When channels.telegram.plugin is "clerk", Claude Code's
   // `--dangerously-load-development-channels server:NAME` flag resolves
   // the MCP server definition from the project-level .mcp.json in the
   // working directory — NOT from settings.json mcpServers. Write it here
@@ -847,7 +885,7 @@ export interface ReconcileResult {
  *
  * Specifically rewrites:
  *   - start.sh (purely template-driven, safe to overwrite)
- *   - .mcp.json (when use_clerk_plugin is true)
+ *   - .mcp.json (when channels.telegram.plugin is "clerk")
  *   - .claude/settings.json mcpServers
  *   - .claude/settings.json permissions.allow / .deny / defaultMode
  *   - .claude/plugins/hindsight-memory/ (vendored plugin tree)
@@ -939,10 +977,16 @@ export function reconcileAgent(
       hindsightEnabled: hindsightAutoRecallEnabled,
       hindsightBankId,
       hindsightApiBaseUrl,
-      // Phase 2 + 3 — user env merged with channel-derived env.
-      userEnv: (() => {
+      // Phase 2 + 3 — user env merged with channel-derived env,
+      // pre-quoted so shell-sensitive bytes survive.
+      userEnvQuoted: (() => {
         const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
-        return Object.keys(combined).length > 0 ? combined : undefined;
+        if (Object.keys(combined).length === 0) return undefined;
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(combined)) {
+          out[k] = shellSingleQuote(v);
+        }
+        return out;
       })(),
       model: agentConfig.model,
       systemPromptAppendShellQuoted: agentConfig.system_prompt_append
@@ -1050,34 +1094,35 @@ export function reconcileAgent(
       delete settings.autoMemoryEnabled;
     }
 
-    // Clean up any leftover legacy shell hook entries from prior
-    // scaffolds. The vendored plugin owns UserPromptSubmit now.
-    if (settings.hooks?.UserPromptSubmit) {
-      const filtered = (settings.hooks.UserPromptSubmit as Array<{
-        hooks?: Array<{ command?: string }>
-      }>).filter((group) =>
-        !(group.hooks ?? []).some((h) => (h.command ?? "").includes("auto-recall.sh"))
-      );
-      if (filtered.length === 0) {
-        delete settings.hooks.UserPromptSubmit;
-        if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-      } else {
-        settings.hooks.UserPromptSubmit = filtered;
+    // --- Phase 5: drop non-clerk-owned top-level keys from a prior
+    // settings_raw run before rewriting. Reconcile tracks which keys
+    // were injected last time via a `_clerkManagedRawKeys` side-car
+    // and removes them here so removed clerk.yaml entries don't leave
+    // stale drift behind. Keys that are also clerk-owned (permissions,
+    // mcpServers, hooks, model, etc) are left alone because the
+    // scaffold rebuild below re-derives them from clerk.yaml anyway.
+    const META_KEY = "_clerkManagedRawKeys";
+    const priorRawKeys = Array.isArray(settings[META_KEY])
+      ? (settings[META_KEY] as string[])
+      : [];
+    for (const k of priorRawKeys) {
+      if (!CLERK_OWNED_SETTINGS_KEYS.has(k) && k in settings) {
+        delete settings[k];
       }
     }
+    delete settings[META_KEY];
 
-    // --- Phase 2: reconcile user hooks and model ---
+    // --- Phase 2: reconcile user hooks (replace, don't merge) ---
     //
-    // Reconcile treats clerk.yaml as source of truth for user hooks:
-    // the merged `agentConfig.hooks` value fully replaces any previously
-    // written user hooks under the events it mentions. Events not in
-    // the merged config are left untouched (e.g. the legacy cleanup
-    // above). Clerk-owned keys (UserPromptSubmit auto-recall) are
-    // already filtered before this runs.
+    // Fully replace settings.hooks from clerk.yaml each reconcile, so
+    // removing a hook event from clerk.yaml also removes it from
+    // settings.json. Plugin-installed hooks (hindsight) live in the
+    // plugin's own hooks.json and are loaded via --plugin-dir, so
+    // they're not affected by this. Clerk-owned.
     const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
     if (userHooks) {
-      settings.hooks = { ...(settings.hooks ?? {}), ...userHooks };
-    } else if (settings.hooks && Object.keys(settings.hooks).length === 0) {
+      settings.hooks = userHooks;
+    } else {
       delete settings.hooks;
     }
     if (agentConfig.model !== undefined) {
@@ -1087,9 +1132,16 @@ export function reconcileAgent(
     }
 
     // --- Phase 5: settings_raw escape hatch ---
+    //
+    // Apply fresh after the scaffold-rebuild of clerk-owned fields.
+    // Stamp the new META_KEY so the next reconcile knows which keys
+    // to retract if the user removes them from clerk.yaml.
     const mergedSettings = agentConfig.settings_raw
       ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
       : settings;
+    if (agentConfig.settings_raw && Object.keys(agentConfig.settings_raw).length > 0) {
+      mergedSettings[META_KEY] = Object.keys(agentConfig.settings_raw);
+    }
 
     const after = JSON.stringify(mergedSettings, null, 2) + "\n";
     if (after !== before) {
@@ -1106,7 +1158,7 @@ export function reconcileAgent(
     syncGlobalSkills(agentDir, agentConfig.skills, clerkConfig.clerk.skills_dir);
   }
 
-  // --- Reconcile .mcp.json (use_clerk_plugin agents only) ---
+  // --- Reconcile .mcp.json (clerk-telegram plugin agents only) ---
   if (usesClerkTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");

@@ -134,12 +134,15 @@ export function registerAgentCommand(program: Command): void {
     );
 
   // clerk agent create <name>
+  //
+  // The profile an agent extends is declared in clerk.yaml via
+  // `extends: <profile>`, not on the CLI — there's only one source of
+  // truth. This command just materializes the directory/files.
   agent
     .command("create <name>")
     .description("Scaffold a new agent directory")
-    .option("-t, --template <template>", "Template to use", "default")
     .action(
-      withConfigError(async (name: string, opts: { template: string }) => {
+      withConfigError(async (name: string) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
         const agentConfig = config.agents[name];
