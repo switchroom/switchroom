@@ -31,6 +31,23 @@
 import type { AgentConfig, AgentDefaults, AgentHooks } from "./schema.js";
 
 /**
+ * Resolve whether an agent should load the forked clerk-telegram MCP.
+ *
+ * Two config paths both express this:
+ *   - Legacy: `agents.x.use_clerk_plugin: true`
+ *   - New:    `agents.x.channels.telegram.plugin: "clerk"`
+ *
+ * Either is accepted. The new form is preferred and documented as such
+ * in the schema; the legacy boolean stays for backcompat so existing
+ * clerk.yaml files keep working untouched.
+ */
+export function usesClerkTelegramPlugin(agent: AgentConfig): boolean {
+  if (agent.channels?.telegram?.plugin === "clerk") return true;
+  if (agent.channels?.telegram?.plugin === "official") return false;
+  return agent.use_clerk_plugin === true;
+}
+
+/**
  * Translate clerk's ergonomic hook shape into Claude Code's native
  * settings.json shape. The flat form:
  *
@@ -203,6 +220,29 @@ export function mergeAgentConfig(
       ...(defaults.env ?? {}),
       ...(merged.env ?? {}),
     };
+  }
+
+  // --- channels: per-channel shallow merge, agent wins ---
+  //
+  // Today only telegram exists; the structure generalizes for future
+  // channels. We merge telegram field-by-field: defaults.channels.telegram
+  // lays down the base, agent fields override.
+  if (defaults.channels || merged.channels) {
+    const dChan = defaults.channels ?? {};
+    const aChan = merged.channels ?? {};
+    const combined: Record<string, unknown> = { ...dChan };
+    for (const [key, value] of Object.entries(aChan)) {
+      if (value === undefined) continue;
+      // Per-channel deep merge (one level)
+      const base = (combined[key] as Record<string, unknown> | undefined) ?? {};
+      const override = value as Record<string, unknown>;
+      const field: Record<string, unknown> = { ...base };
+      for (const [k, v] of Object.entries(override)) {
+        if (v !== undefined) field[k] = v;
+      }
+      combined[key] = field;
+    }
+    merged.channels = combined as AgentConfig["channels"];
   }
 
   // --- system_prompt_append: concatenate, defaults first ---
