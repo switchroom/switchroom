@@ -46,6 +46,53 @@ export const AgentMemorySchema = z
   .optional();
 
 /**
+ * A single hook entry in clerk.yaml. We accept the ergonomic flat form
+ * (`{ command, timeout?, async?, env?, matcher? }`) and translate to
+ * Claude Code's nested `{ hooks: [{ type: "command", ... }] }` shape in
+ * scaffold.ts. Keeping the flat form in YAML makes the common case
+ * (just run this script on this event) a two-line declaration.
+ */
+export const HookEntrySchema = z.object({
+  command: z.string().describe("Shell command to run. Supports ${CLAUDE_CONFIG_DIR} and ${CLAUDE_PLUGIN_ROOT} substitution."),
+  timeout: z
+    .number()
+    .optional()
+    .describe("Timeout in seconds before Claude Code aborts the hook"),
+  async: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true (valid on Stop only), the hook does not block the agent response"
+    ),
+  env: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe("Extra env vars passed to the hook process"),
+  matcher: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("Condition gates (e.g., { channel: 'telegram' })"),
+});
+
+/**
+ * Per-event arrays of hook entries. Clerk accepts any Claude Code hook
+ * lifecycle event; the list below is the current set as of 2026-04.
+ * Unknown event names pass through as-is so future Claude Code events
+ * don't break the schema.
+ */
+export const AgentHooksSchema = z
+  .object({
+    SessionStart: z.array(HookEntrySchema).optional(),
+    UserPromptSubmit: z.array(HookEntrySchema).optional(),
+    PreToolUse: z.array(HookEntrySchema).optional(),
+    PostToolUse: z.array(HookEntrySchema).optional(),
+    Stop: z.array(HookEntrySchema).optional(),
+    SessionEnd: z.array(HookEntrySchema).optional(),
+  })
+  .catchall(z.array(HookEntrySchema))
+  .optional();
+
+/**
  * Subset of AgentSchema fields that can be set at the global `defaults:`
  * level in clerk.yaml. Every field is optional and no zod defaults are
  * applied — `mergeAgentConfig` (src/config/merge.ts) layers the parsed
@@ -83,6 +130,9 @@ export const AgentDefaultsSchema = z
     schedule: z.array(ScheduleEntrySchema).optional(),
     model: z.string().optional(),
     mcp_servers: z.record(z.string(), z.unknown()).optional(),
+    hooks: AgentHooksSchema,
+    env: z.record(z.string(), z.string()).optional(),
+    system_prompt_append: z.string().optional(),
     dangerous_mode: z.boolean().optional(),
     skip_permission_prompt: z.boolean().optional(),
     use_clerk_plugin: z.boolean().optional(),
@@ -135,6 +185,21 @@ export const AgentSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe("Additional MCP server configurations"),
+  hooks: AgentHooksSchema.describe(
+    "Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, Stop, etc). " +
+    "Written to settings.json.hooks in Claude Code's native shape.",
+  ),
+  env: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe("Environment variables exported in start.sh before claude runs"),
+  system_prompt_append: z
+    .string()
+    .optional()
+    .describe(
+      "Text passed via claude's --append-system-prompt flag. " +
+      "Appended to the default or CLAUDE.md-derived system prompt.",
+    ),
   dangerous_mode: z
     .boolean()
     .optional()
@@ -231,6 +296,8 @@ export const ClerkConfigSchema = z.object({
 export type ClerkConfig = z.infer<typeof ClerkConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentSchema>;
 export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;
+export type AgentHooks = z.infer<typeof AgentHooksSchema>;
+export type HookEntry = z.infer<typeof HookEntrySchema>;
 export type AgentSoul = z.infer<typeof AgentSoulSchema>;
 export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;

@@ -28,7 +28,54 @@
  * The function always returns a new AgentConfig; inputs are not mutated.
  */
 
-import type { AgentConfig, AgentDefaults } from "./schema.js";
+import type { AgentConfig, AgentDefaults, AgentHooks } from "./schema.js";
+
+/**
+ * Translate clerk's ergonomic hook shape into Claude Code's native
+ * settings.json shape. The flat form:
+ *
+ *   hooks:
+ *     UserPromptSubmit:
+ *       - command: /path/to/recall.sh
+ *         timeout: 12
+ *
+ * becomes:
+ *
+ *   {
+ *     UserPromptSubmit: [
+ *       { hooks: [{ type: "command", command: "/path/to/recall.sh", timeout: 12 }] }
+ *     ]
+ *   }
+ *
+ * The nested `{ hooks: [...] }` wrapper is Claude Code's matcher-group
+ * structure; we always emit a single group per event since our schema
+ * already supports per-entry matchers.
+ */
+export function translateHooksToClaudeShape(
+  hooks: AgentHooks,
+): Record<string, unknown> | undefined {
+  if (!hooks) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [event, entries] of Object.entries(hooks)) {
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    out[event] = [
+      {
+        hooks: entries.map((e) => {
+          const entry: Record<string, unknown> = {
+            type: "command",
+            command: e.command,
+          };
+          if (e.timeout !== undefined) entry.timeout = e.timeout;
+          if (e.async !== undefined) entry.async = e.async;
+          if (e.env !== undefined) entry.env = e.env;
+          if (e.matcher !== undefined) entry.matcher = e.matcher;
+          return entry;
+        }),
+      },
+    ];
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 function dedupe<T>(items: T[]): T[] {
   const seen = new Set<T>();
@@ -125,6 +172,49 @@ export function mergeAgentConfig(
       ...(defaults.mcp_servers ?? {}),
       ...(merged.mcp_servers ?? {}),
     };
+  }
+
+  // --- hooks: per-event concat (defaults first, agent extends) ---
+  //
+  // Unlike tools.allow we do NOT dedup hook entries — two identical
+  // command strings may still be intentionally both present (e.g. an
+  // auditor hook declared globally and re-declared with a different
+  // matcher on an individual agent). Users who want dedup can reach for
+  // the matcher field.
+  if (defaults.hooks || merged.hooks) {
+    const result: Record<string, unknown[]> = {};
+    const dHooks = defaults.hooks ?? {};
+    const aHooks = merged.hooks ?? {};
+    const events = new Set<string>([
+      ...Object.keys(dHooks),
+      ...Object.keys(aHooks),
+    ]);
+    for (const event of events) {
+      const d = (dHooks as Record<string, unknown[]>)[event] ?? [];
+      const a = (aHooks as Record<string, unknown[]>)[event] ?? [];
+      result[event] = [...d, ...a];
+    }
+    merged.hooks = result as AgentConfig["hooks"];
+  }
+
+  // --- env: per-key merge, agent wins ---
+  if (defaults.env || merged.env) {
+    merged.env = {
+      ...(defaults.env ?? {}),
+      ...(merged.env ?? {}),
+    };
+  }
+
+  // --- system_prompt_append: concatenate, defaults first ---
+  //
+  // Joined with a blank line so each layer reads as a separate
+  // paragraph in the final system prompt.
+  if (defaults.system_prompt_append || merged.system_prompt_append) {
+    const parts = [
+      defaults.system_prompt_append,
+      merged.system_prompt_append,
+    ].filter((p): p is string => typeof p === "string" && p.length > 0);
+    merged.system_prompt_append = parts.join("\n\n");
   }
 
   // --- schedule: concat (defaults first) ---

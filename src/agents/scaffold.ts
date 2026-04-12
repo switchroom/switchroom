@@ -14,7 +14,7 @@ import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import type { AgentConfig, ClerkConfig, TelegramConfig } from "../config/schema.js";
 import { DEFAULT_TEMPLATE } from "../config/schema.js";
-import { mergeAgentConfig } from "../config/merge.js";
+import { mergeAgentConfig, translateHooksToClaudeShape } from "../config/merge.js";
 import {
   getTemplatePath,
   getBaseTemplatePath,
@@ -168,6 +168,19 @@ function dedupe<T>(items: T[]): T[] {
     out.push(item);
   }
   return out;
+}
+
+/**
+ * POSIX-safe single-quote wrapping for embedding a user-supplied string
+ * in a generated shell script. Every embedded single-quote is replaced
+ * with the `'"'"'` sequence, which closes the current single-quoted
+ * literal, emits a double-quoted single quote, and reopens a new
+ * single-quoted literal. Works with arbitrary bytes including
+ * newlines, backticks, and dollar signs — the shell never interprets
+ * the content.
+ */
+function shellSingleQuote(s: string): string {
+  return "'" + s.replace(/'/g, "'\"'\"'") + "'";
 }
 
 const ALL_BUILTIN_TOOLS = [
@@ -404,6 +417,11 @@ export function scaffoldAgent(
     hindsightEnabled: hindsightAutoRecallEnabled,
     hindsightBankId,
     hindsightApiBaseUrl,
+    // Phase 2 — user-declared env vars + system prompt
+    userEnv: agentConfig.env,
+    systemPromptAppendShellQuoted: agentConfig.system_prompt_append
+      ? shellSingleQuote(agentConfig.system_prompt_append)
+      : undefined,
   };
 
   // --- Create directory structure ---
@@ -489,6 +507,24 @@ export function scaffoldAgent(
         } else {
           settings.hooks.UserPromptSubmit = filtered;
         }
+      }
+
+      // --- Phase 2: user-declared hooks and model ---
+      //
+      // Hooks from clerk.yaml (merged with defaults) are translated from
+      // clerk's flat shape to Claude Code's nested shape and merged into
+      // settings.hooks. Plugin-installed hooks (hindsight) live in the
+      // plugin's own hooks.json and are loaded via --plugin-dir, so they
+      // don't collide with settings.hooks — Claude Code merges them at
+      // runtime.
+      const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
+      if (userHooks) {
+        settings.hooks = { ...(settings.hooks ?? {}), ...userHooks };
+      }
+      // Explicit model override: written to settings.model so the user
+      // doesn't have to pass --model on every invocation.
+      if (agentConfig.model !== undefined) {
+        settings.model = agentConfig.model;
       }
 
       writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
@@ -731,6 +767,12 @@ export function reconcileAgent(
       hindsightEnabled: hindsightAutoRecallEnabled,
       hindsightBankId,
       hindsightApiBaseUrl,
+      // Phase 2 — user-declared env vars + system prompt + model
+      userEnv: agentConfig.env,
+      model: agentConfig.model,
+      systemPromptAppendShellQuoted: agentConfig.system_prompt_append
+        ? shellSingleQuote(agentConfig.system_prompt_append)
+        : undefined,
     };
     const beforeStartSh = readFileSync(startShPath, "utf-8");
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
@@ -844,6 +886,26 @@ export function reconcileAgent(
       } else {
         settings.hooks.UserPromptSubmit = filtered;
       }
+    }
+
+    // --- Phase 2: reconcile user hooks and model ---
+    //
+    // Reconcile treats clerk.yaml as source of truth for user hooks:
+    // the merged `agentConfig.hooks` value fully replaces any previously
+    // written user hooks under the events it mentions. Events not in
+    // the merged config are left untouched (e.g. the legacy cleanup
+    // above). Clerk-owned keys (UserPromptSubmit auto-recall) are
+    // already filtered before this runs.
+    const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
+    if (userHooks) {
+      settings.hooks = { ...(settings.hooks ?? {}), ...userHooks };
+    } else if (settings.hooks && Object.keys(settings.hooks).length === 0) {
+      delete settings.hooks;
+    }
+    if (agentConfig.model !== undefined) {
+      settings.model = agentConfig.model;
+    } else if ("model" in settings) {
+      delete settings.model;
     }
 
     const after = JSON.stringify(settings, null, 2) + "\n";
