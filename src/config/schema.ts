@@ -93,6 +93,51 @@ export const AgentHooksSchema = z
   .optional();
 
 /**
+ * Per-channel configuration. Today the only channel is Telegram but
+ * the shape is designed to expand (Slack, Discord, Matrix, Email) —
+ * each channel lives under its own key with channel-specific options.
+ *
+ * Telegram options:
+ *  - plugin: "clerk" enables the forked clerk-telegram MCP (loaded via
+ *    --dangerously-load-development-channels). "official" uses the
+ *    upstream plugin:telegram@claude-plugins-official marketplace
+ *    plugin. The legacy `use_clerk_plugin: true` AgentSchema field is
+ *    still honored for backcompat and is equivalent to `plugin: clerk`.
+ *  - format: default reply format for the channel. Passed to the
+ *    plugin via env var. "html" (default) auto-converts markdown.
+ *  - rate_limit_ms: minimum delay between outgoing messages.
+ *
+ * format and rate_limit_ms are pass-through — the plugin reads them
+ * from env vars at startup but may not act on every field yet. We
+ * define them in the schema so users can start setting them now.
+ */
+export const TelegramChannelSchema = z
+  .object({
+    plugin: z
+      .enum(["clerk", "official"])
+      .optional()
+      .describe(
+        "Which Telegram MCP plugin to load. 'clerk' = fork with enhanced " +
+        "streaming/reactions/history. 'official' = marketplace plugin."
+      ),
+    format: z
+      .enum(["html", "markdownv2", "text"])
+      .optional()
+      .describe("Default reply format passed to the plugin"),
+    rate_limit_ms: z
+      .number()
+      .optional()
+      .describe("Minimum delay between outgoing messages in ms"),
+  })
+  .optional();
+
+export const ChannelsSchema = z
+  .object({
+    telegram: TelegramChannelSchema,
+  })
+  .optional();
+
+/**
  * Subset of AgentSchema fields that can be set at the global `defaults:`
  * level in clerk.yaml. Every field is optional and no zod defaults are
  * applied — `mergeAgentConfig` (src/config/merge.ts) layers the parsed
@@ -133,6 +178,7 @@ export const AgentDefaultsSchema = z
     hooks: AgentHooksSchema,
     env: z.record(z.string(), z.string()).optional(),
     system_prompt_append: z.string().optional(),
+    channels: ChannelsSchema,
     dangerous_mode: z.boolean().optional(),
     skip_permission_prompt: z.boolean().optional(),
     use_clerk_plugin: z.boolean().optional(),
@@ -200,6 +246,11 @@ export const AgentSchema = z.object({
       "Text passed via claude's --append-system-prompt flag. " +
       "Appended to the default or CLAUDE.md-derived system prompt.",
     ),
+  channels: ChannelsSchema.describe(
+    "Per-channel configuration (today: telegram). " +
+    "channels.telegram.plugin: 'clerk' | 'official' replaces the legacy " +
+    "use_clerk_plugin boolean.",
+  ),
   dangerous_mode: z
     .boolean()
     .optional()
@@ -211,7 +262,11 @@ export const AgentSchema = z.object({
   use_clerk_plugin: z
     .boolean()
     .optional()
-    .describe("If true, use clerk's enhanced Telegram plugin instead of the official one (requires native Linux for auto-accept)"),
+    .describe(
+      "DEPRECATED: prefer channels.telegram.plugin: 'clerk'. " +
+      "Kept for backward compatibility — both forms are accepted " +
+      "and produce the same scaffold output.",
+    ),
 });
 
 export const TelegramConfigSchema = z.object({
@@ -298,6 +353,8 @@ export type AgentConfig = z.infer<typeof AgentSchema>;
 export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;
 export type AgentHooks = z.infer<typeof AgentHooksSchema>;
 export type HookEntry = z.infer<typeof HookEntrySchema>;
+export type Channels = z.infer<typeof ChannelsSchema>;
+export type TelegramChannel = z.infer<typeof TelegramChannelSchema>;
 export type AgentSoul = z.infer<typeof AgentSoulSchema>;
 export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;

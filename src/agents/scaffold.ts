@@ -14,7 +14,11 @@ import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import type { AgentConfig, ClerkConfig, TelegramConfig } from "../config/schema.js";
 import { DEFAULT_TEMPLATE } from "../config/schema.js";
-import { mergeAgentConfig, translateHooksToClaudeShape } from "../config/merge.js";
+import {
+  mergeAgentConfig,
+  translateHooksToClaudeShape,
+  usesClerkTelegramPlugin,
+} from "../config/merge.js";
 import {
   getTemplatePath,
   getBaseTemplatePath,
@@ -181,6 +185,26 @@ function dedupe<T>(items: T[]): T[] {
  */
 function shellSingleQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\"'\"'") + "'";
+}
+
+/**
+ * Translate per-channel YAML fields into env vars the telegram-plugin
+ * will read at startup. Today: CLERK_TG_FORMAT and CLERK_TG_RATE_LIMIT_MS.
+ *
+ * Returns an object that can be merged into the user env. User-declared
+ * env vars with the same key take precedence (see the call site) since
+ * an explicit `env:` entry is a more precise signal than a channel
+ * default.
+ */
+function channelsToEnv(agent: AgentConfig): Record<string, string> {
+  const out: Record<string, string> = {};
+  const tg = agent.channels?.telegram;
+  if (!tg) return out;
+  if (tg.format !== undefined) out.CLERK_TG_FORMAT = tg.format;
+  if (tg.rate_limit_ms !== undefined) {
+    out.CLERK_TG_RATE_LIMIT_MS = String(tg.rate_limit_ms);
+  }
+  return out;
 }
 
 const ALL_BUILTIN_TOOLS = [
@@ -378,7 +402,7 @@ export function scaffoldAgent(
   const hindsightEnabled = memoryBackend === "hindsight";
   const permissionAllow = dedupe([
     ...baseAllow,
-    ...(agentConfig.use_clerk_plugin === true ? CLERK_TELEGRAM_MCP_TOOLS : []),
+    ...(usesClerkTelegramPlugin(agentConfig) ? CLERK_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
     ...CLERK_MCP_TOOLS,
   ]);
@@ -413,12 +437,16 @@ export function scaffoldAgent(
     forumChatId: telegramConfig.forum_chat_id,
     dangerousMode: agentConfig.dangerous_mode === true,
     skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
-    useClerkPlugin: agentConfig.use_clerk_plugin === true,
+    useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
     hindsightEnabled: hindsightAutoRecallEnabled,
     hindsightBankId,
     hindsightApiBaseUrl,
-    // Phase 2 — user-declared env vars + system prompt
-    userEnv: agentConfig.env,
+    // Phase 2 + 3 — user env merged with channel-derived env. User
+    // entries win on conflict (explicit beats channel default).
+    userEnv: (() => {
+      const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
+      return Object.keys(combined).length > 0 ? combined : undefined;
+    })(),
     systemPromptAppendShellQuoted: agentConfig.system_prompt_append
       ? shellSingleQuote(agentConfig.system_prompt_append)
       : undefined,
@@ -538,7 +566,7 @@ export function scaffoldAgent(
   // the MCP server definition from the project-level .mcp.json in the
   // working directory — NOT from settings.json mcpServers. Write it here
   // so the enhanced Telegram plugin can be launched as a dev channel.
-  if (agentConfig.use_clerk_plugin === true) {
+  if (usesClerkTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     if (!existsSync(mcpJsonPath)) {
       const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
@@ -737,7 +765,7 @@ export function reconcileAgent(
   const hindsightEnabled = memoryBackend === "hindsight";
   const desiredAllow = dedupe([
     ...baseAllow,
-    ...(agentConfig.use_clerk_plugin === true ? CLERK_TELEGRAM_MCP_TOOLS : []),
+    ...(usesClerkTelegramPlugin(agentConfig) ? CLERK_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
     ...CLERK_MCP_TOOLS,
   ]);
@@ -763,12 +791,15 @@ export function reconcileAgent(
       botToken: resolvedBotToken ?? rawBotToken,
       forumChatId: telegramConfig.forum_chat_id,
       dangerousMode: agentConfig.dangerous_mode === true,
-      useClerkPlugin: agentConfig.use_clerk_plugin === true,
+      useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
       hindsightEnabled: hindsightAutoRecallEnabled,
       hindsightBankId,
       hindsightApiBaseUrl,
-      // Phase 2 — user-declared env vars + system prompt + model
-      userEnv: agentConfig.env,
+      // Phase 2 + 3 — user env merged with channel-derived env.
+      userEnv: (() => {
+        const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
+        return Object.keys(combined).length > 0 ? combined : undefined;
+      })(),
       model: agentConfig.model,
       systemPromptAppendShellQuoted: agentConfig.system_prompt_append
         ? shellSingleQuote(agentConfig.system_prompt_append)
@@ -803,7 +834,7 @@ export function reconcileAgent(
         memory: agentConfig.memory,
         model: agentConfig.model,
         schedule: agentConfig.schedule,
-        useClerkPlugin: agentConfig.use_clerk_plugin === true,
+        useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
       };
       const beforeMd = readFileSync(claudeMdDest, "utf-8");
       const afterMd = renderTemplate(claudeMdSrc, claudeContext);
@@ -916,7 +947,7 @@ export function reconcileAgent(
   }
 
   // --- Reconcile .mcp.json (use_clerk_plugin agents only) ---
-  if (agentConfig.use_clerk_plugin === true) {
+  if (usesClerkTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
     const clerkCliPath = resolveClerkCliPath();

@@ -1034,6 +1034,90 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain('double-"quotes"');
   });
 
+  it("channels.telegram.plugin: 'clerk' writes .mcp.json like legacy use_clerk_plugin", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { plugin: "clerk" } },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "chan-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "chan-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+      undefined,
+      "/tmp/clerk.yaml",
+    );
+
+    // Same .mcp.json + permissions pre-approval as the legacy path
+    expect(existsSync(join(result.agentDir, ".mcp.json"))).toBe(true);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
+
+    // start.sh emits the dev-channels flag
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--dangerously-load-development-channels server:clerk-telegram");
+  });
+
+  it("channels.telegram.plugin: 'official' wins even if legacy use_clerk_plugin is true", () => {
+    const agentConfig = makeAgentConfig({
+      use_clerk_plugin: true,
+      channels: { telegram: { plugin: "official" } },
+    });
+    const result = scaffoldAgent(
+      "override-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+
+    // No .mcp.json because effective plugin is official
+    expect(existsSync(join(result.agentDir, ".mcp.json"))).toBe(false);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--channels plugin:telegram@claude-plugins-official");
+  });
+
+  it("channels.telegram.format and rate_limit_ms become env vars in start.sh", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { format: "markdownv2", rate_limit_ms: 500 } },
+    });
+    const result = scaffoldAgent(
+      "chan-env-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain('export CLERK_TG_FORMAT="markdownv2"');
+    expect(startSh).toContain('export CLERK_TG_RATE_LIMIT_MS="500"');
+  });
+
+  it("user env entry wins over channel-derived env default on key conflict", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { format: "markdownv2" } },
+      env: { CLERK_TG_FORMAT: "text" }, // explicit override
+    });
+    const result = scaffoldAgent(
+      "chan-env-override",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // Only the user value remains
+    expect(startSh).toContain('export CLERK_TG_FORMAT="text"');
+    expect(startSh).not.toContain('export CLERK_TG_FORMAT="markdownv2"');
+  });
+
   it("reconcile propagates hooks/env/model updates without touching user files", () => {
     const agentConfig = makeAgentConfig();
     const initial: ClerkConfig = {

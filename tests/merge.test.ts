@@ -242,6 +242,74 @@ describe("mergeAgentConfig", () => {
   });
 });
 
+describe("mergeAgentConfig channels block", () => {
+  it("flows defaults.channels.telegram.* to agents that leave them unset", () => {
+    const defaults: AgentDefaults = {
+      channels: { telegram: { plugin: "clerk", format: "html" } },
+    };
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.channels?.telegram?.plugin).toBe("clerk");
+    expect(result.channels?.telegram?.format).toBe("html");
+  });
+
+  it("per-field merges channels.telegram with agent winning", () => {
+    const defaults: AgentDefaults = {
+      channels: { telegram: { plugin: "clerk", format: "html", rate_limit_ms: 1000 } },
+    };
+    const agent = baseAgent({
+      channels: { telegram: { format: "markdownv2" } },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    // plugin and rate_limit flow from defaults; format is overridden
+    expect(result.channels?.telegram?.plugin).toBe("clerk");
+    expect(result.channels?.telegram?.format).toBe("markdownv2");
+    expect(result.channels?.telegram?.rate_limit_ms).toBe(1000);
+  });
+
+  it("leaves channels undefined when neither side sets it", () => {
+    const result = mergeAgentConfig({ model: "opus" }, baseAgent());
+    expect(result.channels).toBeUndefined();
+  });
+});
+
+describe("usesClerkTelegramPlugin backcompat", () => {
+  const { usesClerkTelegramPlugin } = require("../src/config/merge.js");
+
+  it("returns true when channels.telegram.plugin is 'clerk'", () => {
+    const agent = baseAgent({
+      channels: { telegram: { plugin: "clerk" } },
+    });
+    expect(usesClerkTelegramPlugin(agent)).toBe(true);
+  });
+
+  it("returns false when channels.telegram.plugin is 'official'", () => {
+    const agent = baseAgent({
+      channels: { telegram: { plugin: "official" } },
+    });
+    expect(usesClerkTelegramPlugin(agent)).toBe(false);
+  });
+
+  it("returns true for legacy use_clerk_plugin: true", () => {
+    const agent = baseAgent({ use_clerk_plugin: true });
+    expect(usesClerkTelegramPlugin(agent)).toBe(true);
+  });
+
+  it("new channels.telegram.plugin: 'official' overrides legacy use_clerk_plugin: true", () => {
+    // If a user sets both (stale migration), the new form wins because
+    // it's the more explicit signal.
+    const agent = baseAgent({
+      use_clerk_plugin: true,
+      channels: { telegram: { plugin: "official" } },
+    });
+    expect(usesClerkTelegramPlugin(agent)).toBe(false);
+  });
+
+  it("returns false when neither field is set", () => {
+    const agent = baseAgent();
+    expect(usesClerkTelegramPlugin(agent)).toBe(false);
+  });
+});
+
 describe("translateHooksToClaudeShape", () => {
   // Local import to keep the describe block self-contained; see merge.ts
   // for the source implementation.
