@@ -13,6 +13,8 @@ import {
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import type { AgentConfig, ClerkConfig, TelegramConfig } from "../config/schema.js";
+import { DEFAULT_TEMPLATE } from "../config/schema.js";
+import { mergeAgentConfig } from "../config/merge.js";
 import {
   getTemplatePath,
   getBaseTemplatePath,
@@ -307,18 +309,23 @@ function resolveClerkCliPath(): string {
  */
 export function scaffoldAgent(
   name: string,
-  agentConfig: AgentConfig,
+  agentConfigRaw: AgentConfig,
   agentsDir: string,
   telegramConfig: TelegramConfig,
   clerkConfig?: ClerkConfig,
   userIdOverride?: string,
   clerkConfigPath?: string,
 ): ScaffoldResult {
+  // Apply global defaults → per-agent cascade. When clerk.yaml has no
+  // `defaults:` block, the result is identical to agentConfigRaw, so
+  // existing behavior is preserved. See src/config/merge.ts.
+  const agentConfig = mergeAgentConfig(clerkConfig?.defaults, agentConfigRaw);
+
   const agentDir = resolve(agentsDir, name);
   const created: string[] = [];
   const skipped: string[] = [];
 
-  const templatePath = getTemplatePath(agentConfig.template);
+  const templatePath = getTemplatePath(agentConfig.template ?? DEFAULT_TEMPLATE);
   const basePath = getBaseTemplatePath();
 
   // Load user config for Telegram user ID
@@ -663,13 +670,17 @@ export interface ReconcileOptions {
 
 export function reconcileAgent(
   name: string,
-  agentConfig: AgentConfig,
+  agentConfigRaw: AgentConfig,
   agentsDir: string,
   telegramConfig: TelegramConfig,
   clerkConfig: ClerkConfig,
   clerkConfigPath?: string,
   options: ReconcileOptions = {},
 ): ReconcileResult {
+  // Apply global defaults → per-agent cascade (same semantics as
+  // scaffoldAgent). Every downstream read uses the merged config.
+  const agentConfig = mergeAgentConfig(clerkConfig.defaults, agentConfigRaw);
+
   const agentDir = resolve(agentsDir, name);
   const changes: string[] = [];
 
@@ -736,7 +747,7 @@ export function reconcileAgent(
   // template fixes through (e.g., the {{memory}} → [object Object] bug
   // we shipped earlier). Same context as scaffold's CLAUDE.md render.
   if (options.forceClaudeMd) {
-    const templatePath = getTemplatePath(agentConfig.template);
+    const templatePath = getTemplatePath(agentConfig.template ?? DEFAULT_TEMPLATE);
     const claudeMdSrc = join(templatePath, "CLAUDE.md.hbs");
     const claudeMdDest = join(agentDir, "CLAUDE.md");
     if (existsSync(claudeMdSrc) && existsSync(claudeMdDest)) {

@@ -68,7 +68,11 @@ describe("ClerkConfigSchema", () => {
 
     const result = ClerkConfigSchema.parse(config);
     expect(result.clerk.agents_dir).toBe("~/.clerk/agents");
-    expect(result.agents.assistant.template).toBe("default");
+    // template is now optional (no zod default) so the cascade in
+    // src/config/merge.ts can distinguish "unset" from "explicitly chose
+    // default". Consumers fall back to DEFAULT_TEMPLATE. See phase-1
+    // cleanup notes in config/schema.ts.
+    expect(result.agents.assistant.template).toBeUndefined();
     expect(result.agents.assistant.schedule).toEqual([]);
   });
 

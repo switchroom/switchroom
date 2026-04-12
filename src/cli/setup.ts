@@ -847,7 +847,7 @@ async function stepScaffoldAgents(
           : "up to date";
       console.log(
         `  ${chalk.green("+")} ${chalk.bold(name)}` +
-          chalk.gray(` (${agentConfig.template}) @${botInfo.username} - ${detail}`),
+          chalk.gray(` (${agentConfig.template ?? "default"}) @${botInfo.username} - ${detail}`),
       );
       scaffolded++;
     } catch (err) {

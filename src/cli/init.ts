@@ -78,7 +78,7 @@ export function registerInitCommand(program: Command): void {
             const detail = result.created.length > 0
               ? `${result.created.length} files created`
               : "up to date";
-            console.log(chalk.green(`  + ${name}`) + chalk.gray(` (${agentConfig.template}) — ${detail}`));
+            console.log(chalk.green(`  + ${name}`) + chalk.gray(` (${agentConfig.template ?? "default"}) — ${detail}`));
             scaffolded++;
           } catch (err) {
             console.error(

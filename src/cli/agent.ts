@@ -96,7 +96,7 @@ export function registerAgentCommand(program: Command): void {
               name,
               status: status?.active ?? "unknown",
               uptime: formatUptime(status?.uptime ?? null),
-              template: agentConfig.template,
+              template: agentConfig.template ?? "default",
               topic_name: agentConfig.topic_name,
               topic_emoji: agentConfig.topic_emoji,
             };
@@ -122,7 +122,7 @@ export function registerAgentCommand(program: Command): void {
             name,
             statusColor(status?.active ?? "unknown"),
             formatUptime(status?.uptime ?? null),
-            agentConfig.template,
+            agentConfig.template ?? "default",
             topicDisplay,
           ];
         });

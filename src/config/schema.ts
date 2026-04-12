@@ -45,11 +45,71 @@ export const AgentMemorySchema = z
   })
   .optional();
 
+/**
+ * Subset of AgentSchema fields that can be set at the global `defaults:`
+ * level in clerk.yaml. Every field is optional and no zod defaults are
+ * applied — `mergeAgentConfig` (src/config/merge.ts) layers the parsed
+ * defaults onto each per-agent config before scaffold/reconcile runs.
+ *
+ * Per-agent-only fields (topic_name, topic_emoji, topic_id) are
+ * intentionally excluded because they're identity-ish — defaulting a
+ * topic name across all agents would collapse them onto the same
+ * Telegram thread.
+ */
+export const AgentDefaultsSchema = z
+  .object({
+    template: z.string().optional(),
+    bot_token: z.string().optional(),
+    soul: z
+      .object({
+        name: z.string().optional(),
+        style: z.string().optional(),
+        boundaries: z.string().optional(),
+      })
+      .optional(),
+    tools: z
+      .object({
+        allow: z.array(z.string()).optional(),
+        deny: z.array(z.string()).optional(),
+      })
+      .optional(),
+    memory: z
+      .object({
+        collection: z.string().optional(),
+        auto_recall: z.boolean().optional(),
+        isolation: z.enum(["default", "strict"]).optional(),
+      })
+      .optional(),
+    schedule: z.array(ScheduleEntrySchema).optional(),
+    model: z.string().optional(),
+    mcp_servers: z.record(z.string(), z.unknown()).optional(),
+    dangerous_mode: z.boolean().optional(),
+    skip_permission_prompt: z.boolean().optional(),
+    use_clerk_plugin: z.boolean().optional(),
+  })
+  .optional();
+
+/**
+ * Fallback template name when neither an agent's config nor the global
+ * `defaults:` block specifies one. Consumers should read template via
+ * `agentConfig.template ?? DEFAULT_TEMPLATE` to get the effective value.
+ *
+ * We keep this as an explicit constant (rather than a zod default) so
+ * the `defaults.template` cascade can actually reach an agent whose
+ * field is left unset — zod defaults would fire at parse time and
+ * make the agent's template indistinguishable from an explicit choice.
+ */
+export const DEFAULT_TEMPLATE = "default";
+
 export const AgentSchema = z.object({
   template: z
     .string()
-    .default("default")
-    .describe("Template to scaffold from (e.g., 'health-coach')"),
+    .optional()
+    .describe(
+      "Template to scaffold from (e.g., 'health-coach'). " +
+      "Defaults to 'default' via DEFAULT_TEMPLATE if unset at both " +
+      "agent and clerk.yaml `defaults:` levels.",
+    ),
   bot_token: z
     .string()
     .optional()
@@ -153,6 +213,11 @@ export const ClerkConfigSchema = z.object({
   telegram: TelegramConfigSchema,
   memory: MemoryBackendConfigSchema.optional(),
   vault: VaultConfigSchema.optional(),
+  defaults: AgentDefaultsSchema.describe(
+    "Global defaults merged into every agent before per-agent config. " +
+    "Tools, mcp_servers, and schedule are unioned/concatenated; scalars and " +
+    "nested objects are shallow-merged with per-agent values winning.",
+  ),
   agents: z
     .record(
       z.string().regex(/^[a-z0-9][a-z0-9_-]*$/, {
@@ -165,6 +230,7 @@ export const ClerkConfigSchema = z.object({
 
 export type ClerkConfig = z.infer<typeof ClerkConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentSchema>;
+export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;
 export type AgentSoul = z.infer<typeof AgentSoulSchema>;
 export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;

@@ -715,6 +715,211 @@ describe("installHindsightPlugin", () => {
   });
 });
 
+describe("scaffoldAgent with global defaults cascade", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "clerk-defaults-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("applies defaults.tools.allow to agents that leave tools unset", () => {
+    const agentConfig = makeAgentConfig();
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        tools: { allow: ["Read", "Grep", "Edit"] },
+      },
+      agents: { "def-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "def-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    // Defaults flow through to permissions.allow
+    expect(settings.permissions.allow).toContain("Read");
+    expect(settings.permissions.allow).toContain("Grep");
+    expect(settings.permissions.allow).toContain("Edit");
+    // Clerk-MCP wildcards still pre-approved
+    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+  });
+
+  it("unions defaults.tools.allow with per-agent tools.allow", () => {
+    const agentConfig = makeAgentConfig({
+      tools: { allow: ["Bash", "Read"], deny: [] },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        tools: { allow: ["Read", "Grep"] },
+      },
+      agents: { "union-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "union-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    // Union contains all three
+    expect(settings.permissions.allow).toContain("Read");
+    expect(settings.permissions.allow).toContain("Grep");
+    expect(settings.permissions.allow).toContain("Bash");
+    // Read appears once (deduped)
+    const reads = (settings.permissions.allow as string[]).filter((t) => t === "Read");
+    expect(reads.length).toBe(1);
+  });
+
+  it("propagates defaults.use_clerk_plugin to scaffold path", () => {
+    // When the default is set globally, an agent that doesn't mention
+    // use_clerk_plugin still gets .mcp.json written and the
+    // mcp__clerk-telegram__* tools pre-approved.
+    const agentConfig = makeAgentConfig();
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: { use_clerk_plugin: true },
+      agents: { "plugin-default-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "plugin-default-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+      undefined,
+      "/tmp/clerk.yaml",
+    );
+
+    // .mcp.json was written (the use_clerk_plugin scaffold branch)
+    expect(existsSync(join(result.agentDir, ".mcp.json"))).toBe(true);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
+  });
+
+  it("per-agent mcp_servers override defaults.mcp_servers by key", () => {
+    const agentConfig = makeAgentConfig({
+      mcp_servers: {
+        linear: { type: "http", url: "https://agent.linear.example" },
+      },
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: {
+        mcp_servers: {
+          linear: { type: "http", url: "https://default.linear.example" },
+          github: { type: "http", url: "https://default.github.example" },
+        },
+      },
+      agents: { "mcp-agent": agentConfig },
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "mcp-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    // Agent's linear entry wins
+    expect(settings.mcpServers.linear.url).toBe("https://agent.linear.example");
+    // Default's github entry flows through
+    expect(settings.mcpServers.github.url).toBe("https://default.github.example");
+  });
+
+  it("reconcile respects defaults cascade too", () => {
+    // Scaffold with defaults.tools.allow, then reconcile after changing
+    // clerk.yaml defaults — the merged allow-list should update without
+    // touching the per-agent config.
+    const agentConfig = makeAgentConfig();
+    const initial: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      defaults: { tools: { allow: ["Read"] } },
+      agents: { "rec-agent": agentConfig },
+    } as ClerkConfig;
+    scaffoldAgent("rec-agent", agentConfig, tmpDir, telegramConfig, initial);
+
+    const settingsPath = join(tmpDir, "rec-agent", ".claude", "settings.json");
+    const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(before.permissions.allow).toContain("Read");
+    expect(before.permissions.allow).not.toContain("Grep");
+
+    // Update defaults and reconcile
+    const updated: ClerkConfig = {
+      ...initial,
+      defaults: { tools: { allow: ["Read", "Grep", "Edit"] } },
+    } as ClerkConfig;
+    reconcileAgent("rec-agent", agentConfig, tmpDir, telegramConfig, updated);
+
+    const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(after.permissions.allow).toContain("Read");
+    expect(after.permissions.allow).toContain("Grep");
+    expect(after.permissions.allow).toContain("Edit");
+  });
+
+  it("is a no-op when clerk.yaml has no defaults block (backcompat)", () => {
+    // The refactor moved scaffold through mergeAgentConfig. This test
+    // asserts that omitting `defaults` produces the same settings.json
+    // as the pre-refactor code path would have.
+    const agentConfig = makeAgentConfig({
+      tools: { allow: ["Bash", "Edit"], deny: [] },
+      use_clerk_plugin: true,
+    });
+    const clerkConfig: ClerkConfig = {
+      clerk: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "nodef-agent": agentConfig },
+      // defaults intentionally omitted
+    } as ClerkConfig;
+
+    const result = scaffoldAgent(
+      "nodef-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+      undefined,
+      "/tmp/clerk.yaml",
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+
+    expect(settings.permissions.allow).toContain("Bash");
+    expect(settings.permissions.allow).toContain("Edit");
+    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
+    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+  });
+});
+
 describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", () => {
   let tmpDir: string;
 
