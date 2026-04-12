@@ -75,8 +75,8 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("$NVM_DIR/nvm.sh");
     expect(startSh).toContain(`CLAUDE_CONFIG_DIR="${result.agentDir}/.claude"`);
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
-    // Default is the clerk fork (loaded via --dangerously-load-development-channels)
-    expect(startSh).toContain("exec claude --dangerously-load-development-channels server:clerk-telegram");
+    // Default is the clerk fork with --continue for session resumption
+    expect(startSh).toContain("exec claude --continue --dangerously-load-development-channels server:clerk-telegram");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
     // CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
     // telegram-plugin reads to detect self-restart commands. Must be set.
