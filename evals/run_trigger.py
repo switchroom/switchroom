@@ -71,17 +71,21 @@ async def call_claude(
             args.extend(["--append-system-prompt", system_prompt])
         else:
             args.extend(["--system-prompt", system_prompt])
-    # Use the agent's CLAUDE_CONFIG_DIR for OAuth credentials if available.
-    # --bare is NOT used because it skips keychain/OAuth reads.
-    env = None
+    # Use CLAUDE_CONFIG_DIR for OAuth credentials. Run from /tmp to
+    # avoid CLAUDE.md auto-discovery from the project directory — the
+    # project's CLAUDE.md adds conversational instructions that compete
+    # with the eval's system prompt (especially the "respond with ONLY
+    # JSON" routing instruction).
+    env = {**os.environ, "CLERK_EVAL_MODE": "1"}
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
-        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+        env["CLAUDE_CONFIG_DIR"] = config_dir
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        cwd="/tmp",  # clean dir — no CLAUDE.md interference
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -110,12 +114,16 @@ async def run_single(
     model: str,
     run_index: int,
 ) -> dict:
-    system_prompt = ROUTING_SYSTEM_PROMPT.format(skill_list=build_skill_list())
+    # Put routing instructions IN the user prompt — claude -p ignores
+    # --system-prompt in practice (it gets overridden by Claude Code's
+    # own system prompt framing). Combining everything into one prompt
+    # ensures the model sees the routing task.
+    routing_context = ROUTING_SYSTEM_PROMPT.format(skill_list=build_skill_list())
+    combined_prompt = f"{routing_context}\n\nUser query: {eval_item['query']}"
 
     response_text = await call_claude(
-        eval_item["query"],
+        combined_prompt,
         model,
-        system_prompt=system_prompt,
     )
     selected = parse_selected_skill(response_text)
 

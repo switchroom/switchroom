@@ -51,15 +51,16 @@ async def call_claude(
             args.extend(["--append-system-prompt", system_prompt])
         else:
             args.extend(["--system-prompt", system_prompt])
-    env = None
+    env = {**os.environ, "CLERK_EVAL_MODE": "1"}
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
-        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+        env["CLAUDE_CONFIG_DIR"] = config_dir
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        cwd="/tmp",  # clean dir — no CLAUDE.md interference
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

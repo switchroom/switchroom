@@ -286,6 +286,9 @@ function buildSessionGreetingScript(
 # Telegram on SessionStart. Zero model tokens — pure curl.
 # Regenerated on every reconcile so config changes are reflected.
 
+# Skip greeting for eval runs and one-shot claude -p calls.
+[ "$CLERK_EVAL_MODE" = "1" ] && exit 0
+
 # Source bot token at runtime (never baked into scripts).
 source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
 [ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
