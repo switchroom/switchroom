@@ -151,6 +151,27 @@ function streamKey(chatId: string, threadId?: number): string {
  */
 const suppressPtyPreview = new Set<string>()
 
+/**
+ * Structured outbound message log. Every path that sends a message to
+ * Telegram (reply tool, stream_reply, backstop, PTY preview) calls
+ * this so duplicates can be traced from the logs. Written to stderr
+ * which goes to the systemd journal.
+ */
+function logOutbound(
+  path: 'reply' | 'stream_reply' | 'backstop' | 'pty_preview' | 'edit' | 'forward',
+  chatId: string,
+  messageId: number | null,
+  chars: number,
+  extra?: string,
+): void {
+  const ts = new Date().toISOString()
+  process.stderr.write(
+    `telegram channel [outbound] ${ts} path=${path} chat=${chatId} ` +
+    `msg_id=${messageId ?? 'pending'} chars=${chars}` +
+    (extra ? ` ${extra}` : '') + '\n',
+  )
+}
+
 if (!TOKEN) {
   process.stderr.write(
     `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
@@ -1091,6 +1112,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 { threadId, chat_id },
               )
               sentIds.push(sent.message_id)
+              logOutbound('reply', chat_id, sent.message_id, chunks[i].length,
+                `chunk=${i + 1}/${chunks.length}`)
             } catch (err) {
               // Handle thread-not-found: retry this chunk without thread_id
               if (err instanceof Error && err.message === 'THREAD_NOT_FOUND') {
@@ -1111,7 +1134,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           )
         } finally {
           stopTypingLoop(chat_id)
-          suppressPtyPreview.delete(replySKey)
+          // NOTE: do NOT delete suppressPtyPreview here. If we release the
+          // lock between the reply completing and turn_end clearing state,
+          // the PTY tail can sneak in another partial of the same text and
+          // create a duplicate preview message. turn_end clears it instead.
         }
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
@@ -1652,6 +1678,7 @@ function handlePtyPartial(text: string): void {
           () => bot.api.sendMessage(chatId, sendText, sendOpts),
           { threadId, chat_id: chatId },
         )
+        logOutbound('pty_preview', chatId, sent.message_id, sendText.length, 'initial_send')
         return sent.message_id
       },
       async (id, editText) => {
@@ -1886,6 +1913,11 @@ function handleSessionEvent(ev: SessionEvent): void {
       // would see the OLD reply block in the xterm buffer and we'd
       // suppress emits until enough new text differed.
       lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
+      // Release the PTY preview suppression lock that the reply handler
+      // set during its send. Must happen HERE (turn boundary) not in the
+      // reply handler's finally — otherwise PTY partials can sneak in
+      // between reply completion and turn_end, creating duplicates.
+      suppressPtyPreview.delete(streamKey(chatId, threadId))
       // Also clear any buffered partial — turn is done, that text is
       // either already shown or about to be replaced by the canonical
       // reply.
