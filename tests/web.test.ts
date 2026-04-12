@@ -88,7 +88,7 @@ describe("handleGetAgents", () => {
     expect(coach.active).toBe("active");
     expect(coach.uptime).toBe("2025-01-01T00:00:00Z");
     expect(coach.memory).toBe("128MB");
-    expect(coach.template).toBe("health-coach");
+    expect(coach.extends).toBe("health-coach");
     expect(coach.topic_name).toBe("Fitness Coach");
     expect(coach.topic_emoji).toBe("\u{1F3CB}\u{FE0F}");
     expect(coach.auth.authenticated).toBe(true);
@@ -114,7 +114,7 @@ describe("handleGetAgents", () => {
 
     const result = handleGetAgents(mockConfig);
     const expectedKeys: (keyof AgentInfo)[] = [
-      "name", "active", "uptime", "memory", "template",
+      "name", "active", "uptime", "memory", "extends",
       "topic_name", "topic_emoji", "auth", "memoryCollection",
     ];
 

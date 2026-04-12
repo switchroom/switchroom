@@ -127,7 +127,7 @@ function checkDependencies(): CheckResult[] {
     checkBinary(
       "expect",
       "expect",
-      "sudo apt install expect (only required for use_clerk_plugin agents)",
+      "sudo apt install expect (only required for clerk-telegram plugin agents)",
     ),
     checkBinary("docker", "docker", "Install Docker (only required for Hindsight memory)"),
     checkBinary("systemctl", "systemctl", "Clerk requires a systemd-based Linux distro"),

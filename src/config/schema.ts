@@ -101,8 +101,7 @@ export const AgentHooksSchema = z
  *  - plugin: "clerk" enables the forked clerk-telegram MCP (loaded via
  *    --dangerously-load-development-channels). "official" uses the
  *    upstream plugin:telegram@claude-plugins-official marketplace
- *    plugin. The legacy `use_clerk_plugin: true` AgentSchema field is
- *    still honored for backcompat and is equivalent to `plugin: clerk`.
+ *    plugin. Unset → behaves like "official".
  *  - format: default reply format for the channel. Passed to the
  *    plugin via env var. "html" (default) auto-converts markdown.
  *  - rate_limit_ms: minimum delay between outgoing messages.
@@ -275,9 +274,9 @@ export const AgentSchema = z.object({
       "agent's skills/ directory. Unioned with defaults.skills.",
     ),
   channels: ChannelsSchema.describe(
-    "Per-channel configuration (today: telegram). " +
-    "channels.telegram.plugin: 'clerk' | 'official' replaces the legacy " +
-    "use_clerk_plugin boolean.",
+    "Per-channel configuration. Today only `telegram` is defined; the " +
+    "shape is designed to expand to other channels (Slack, Discord, " +
+    "Matrix, Email) as they're added.",
   ),
   dangerous_mode: z
     .boolean()

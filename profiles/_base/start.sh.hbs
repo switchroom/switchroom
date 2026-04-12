@@ -22,10 +22,12 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{#if hindsightApiToken}}export HINDSIGHT_API_TOKEN="{{hindsightApiToken}}"
 {{/if}}
 {{/if}}
-{{#if userEnv}}
+{{#if userEnvQuoted}}
 # User-declared env vars from clerk.yaml (agent + defaults merged).
-# These take precedence over the vars above because they appear later.
-{{#each userEnv}}export {{@key}}="{{this}}"
+# Values are POSIX-single-quoted in scaffold.ts so arbitrary bytes
+# (including &, $, backtick, newline, embedded quotes) survive shell
+# parsing. Triple braces skip Handlebars HTML-escape of the quoted form.
+{{#each userEnvQuoted}}export {{@key}}={{{this}}}
 {{/each}}
 {{/if}}
 cd "{{agentDir}}"
