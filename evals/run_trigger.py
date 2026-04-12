@@ -18,14 +18,14 @@ RESULTS_DIR = EVALS_DIR / "results"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 SKILL_DESCRIPTIONS = {
-    "clerk-status": "Show which clerk agents are running, their uptime, and current state.",
-    "clerk-health": "Run diagnostics on clerk agents, check for errors, doctor-style health check.",
-    "clerk-config": "Show the active configuration for an agent: model, tools, system prompt, settings.",
-    "clerk-schedule": "List, create, or manage cron schedules and timers for agents.",
-    "clerk-restart": "Restart a running clerk agent (with confirmation).",
-    "clerk-reconcile": "Re-apply or update an agent's configuration from the config file.",
-    "clerk-logs": "Fetch and display recent log output from a clerk agent.",
-    "clerk-architecture": "Explain how clerk works: config cascade, plugin system, agent lifecycle.",
+    "clerk-status": "Shows which clerk agents are running, their uptime, and current state. Use when the user asks about status, 'what's running', uptime, 'are my agents OK', or wants an overview of all agents.",
+    "clerk-health": "Runs a health check and diagnostics on the clerk setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.",
+    "clerk-config": "Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.",
+    "clerk-schedule": "Lists cron jobs, scheduled tasks, and systemd timers with next fire times. Use when the user mentions schedules, cron, timers, recurring tasks, automation, 'what runs automatically', 'when does X run', 'automated tasks', or 'what tasks are configured'.",
+    "clerk-restart": "Restarts or reboots a clerk agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.",
+    "clerk-reconcile": "Re-applies clerk.yaml changes to running agents. Use when the user edited clerk.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited clerk.yaml', or 'how do I apply changes'.",
+    "clerk-logs": "Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.",
+    "clerk-architecture": "Explains how clerk works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does clerk work', 'how does it decide', 'which settings apply', architecture, design, or internals.",
 }
 
 ROUTING_SYSTEM_PROMPT = """You are a skill router for the clerk-ai platform.

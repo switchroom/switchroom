@@ -1,6 +1,6 @@
 ---
 name: clerk-schedule
-description: Lists all active scheduled tasks (systemd timers) with next fire times, last run results, and configured prompts. Use when the user asks about schedules, cron jobs, timers, 'what runs automatically', recurring tasks, or 'when does X run'.
+description: Lists cron jobs, scheduled tasks, and systemd timers with next fire times. Use when the user mentions schedules, cron, timers, recurring tasks, automation, 'what runs automatically', 'when does X run', 'automated tasks', or 'what tasks are configured'.
 ---
 
 # Scheduled Tasks

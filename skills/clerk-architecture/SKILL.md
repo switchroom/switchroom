@@ -1,6 +1,6 @@
 ---
 name: clerk-architecture
-description: Provides context about clerk's architecture — config cascade, profile system, sub-agent delegation, session management, Telegram plugin, and scheduling. Use when answering questions about how clerk works, its design, or internal architecture.
+description: Explains how clerk works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does clerk work', 'how does it decide', 'which settings apply', architecture, design, or internals.
 user-invocable: false
 ---
 

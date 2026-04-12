@@ -1,6 +1,6 @@
 ---
 name: clerk-config
-description: Shows the effective configuration for a clerk agent after the three-layer cascade (defaults → profile → agent). Reveals where each setting comes from. Use when the user asks about config, settings, 'what model am I using', 'how is agent X configured', or wants to understand their setup.
+description: Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.
 ---
 
 # Agent Configuration Viewer
