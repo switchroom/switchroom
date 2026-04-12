@@ -1,10 +1,17 @@
 # clerk.yaml — Full example configuration
-# Each agent gets its own Telegram bot (one bot per agent).
+#
+# Clerk uses a three-layer cascade for agent config:
+#   1. defaults:  → global baseline for every agent
+#   2. profiles:  → named presets agents opt into via `extends:`
+#   3. agents:    → per-agent overrides (only express differences)
+#
+# Each agent gets its own Telegram topic in a forum group.
 # Create bots via @BotFather: /newbot for each agent.
 
 clerk:
   version: 1
   agents_dir: ~/.clerk/agents
+  skills_dir: ~/.clerk/skills           # shared skill pool (symlinked per agent)
 
 telegram:
   bot_token: "vault:telegram-bot-token"
@@ -20,68 +27,93 @@ memory:
 vault:
   path: ~/.clerk/vault.enc
 
+# --- Global defaults (implicit bottom-of-cascade profile) ---
+# Every agent inherits this. Per-agent fields win on conflict.
+# tools/skills/schedule are unioned; scalars are overridden.
+defaults:
+  model: claude-sonnet-4-6
+  channels:
+    telegram:
+      plugin: clerk                     # use the enhanced clerk-telegram MCP
+      format: html
+  tools:
+    allow: [all]
+  env:
+    CLERK_AUDIT_URL: "https://audit.example"
+  hooks:
+    PreToolUse:
+      - command: "/opt/clerk-audit.sh"
+        timeout: 5
+  skills: [checkin]
+  system_prompt_append: |
+    Always respond concisely.
+
+# --- Named profiles (opt-in presets) ---
+# Agents inherit from a profile via `extends: <name>`.
+# Inline profiles here take priority over filesystem profiles/<name>/
+# (which can additionally bundle CLAUDE.md.hbs + skills/).
+profiles:
+  coder:
+    tools:
+      allow: [Bash, Read, Write, Edit, Grep, Glob]
+    system_prompt_append: |
+      You write production-quality TypeScript. Prefer explicit types.
+    skills: [code-review, architecture]
+
+  advisor:
+    tools:
+      deny: [Bash, Edit, Write]
+    soul:
+      style: warm, empathetic, non-prescriptive
+      boundaries: not a licensed professional — always recommend consulting a qualified expert
+    system_prompt_append: |
+      Prioritize listening and asking clarifying questions.
+
+# --- Agents ---
+# Minimal per-agent declarations. Everything else inherited.
 agents:
   coach:
-    bot_token: "vault:coach-bot-token"
-    template: health-coach
     topic_name: "Fitness"
     topic_emoji: "🏋️"
+    extends: advisor                    # inherits from inline profile above
     soul:
       name: Coach
-      style: motivational, direct, accountability-focused
-      boundaries: not a licensed professional, always recommend consulting a qualified expert
-    tools:
-      allow: [calendar, notion, web-search, hindsight]
-      deny: [bash, edit, write]
+      style: motivational, direct       # overrides advisor.soul.style
     memory:
       collection: fitness
-      auto_recall: true
     schedule:
       - cron: "0 8 * * *"
         prompt: "Good morning check-in: ask about sleep, energy, and plans for today"
       - cron: "0 20 * * 0"
         prompt: "Weekly review: summarize this week's activity and progress"
 
-  exec-assistant:
-    bot_token: "vault:exec-bot-token"
-    template: executive-assistant
+  dev:
+    topic_name: "Code"
+    topic_emoji: "💻"
+    extends: coder                      # inherits from inline profile above
+    model: claude-opus-4-6              # override defaults.model for this agent
+    memory:
+      collection: coding
+    cli_args: ["--effort", "high"]      # escape hatch: extra exec claude flags
+
+  assistant:
+    topic_name: "General"
+    topic_emoji: "💬"
+    memory:
+      collection: general
+    # No `extends:` → uses the "default" filesystem profile (profiles/default/)
+    # No tool/model overrides → inherits everything from defaults:
+
+  exec:
     topic_name: "Executive"
     topic_emoji: "📋"
+    extends: advisor
     soul:
       name: Friday
       style: efficient, proactive, anticipates needs
-      boundaries: summarize before acting, confirm before sending external communications
-    tools:
-      allow: [calendar, notion, web-search, hindsight]
-      deny: [bash, edit, write]
+    skills: [daily-briefing, meeting-prep]
     memory:
       collection: executive
-      auto_recall: true
     schedule:
       - cron: "0 7 * * 1-5"
         prompt: "Daily briefing: summarize today's calendar, pending tasks, and priorities"
-
-  coding:
-    bot_token: "vault:coding-bot-token"
-    template: coding
-    topic_name: "Code"
-    topic_emoji: "💻"
-    soul:
-      name: Dev
-      style: concise, technical, senior-engineer level
-    tools:
-      allow: [all]
-    memory:
-      collection: coding
-      auto_recall: true
-
-  assistant:
-    bot_token: "vault:assistant-bot-token"
-    template: default
-    topic_name: "General"
-    topic_emoji: "💬"
-    tools:
-      allow: [all]
-    memory:
-      collection: general
-      auto_recall: true

@@ -1,5 +1,5 @@
 # clerk.yaml — Minimal single-agent setup
-# One bot, one agent, one topic.
+# One bot, one agent, two lines per agent.
 
 clerk:
   version: 1
@@ -12,9 +12,14 @@ memory:
   backend: hindsight
   shared_collection: shared
 
+defaults:
+  model: claude-sonnet-4-6
+  channels:
+    telegram:
+      plugin: clerk
+  tools:
+    allow: [all]
+
 agents:
   assistant:
-    template: default
     topic_name: "General"
-    tools:
-      allow: [all]
