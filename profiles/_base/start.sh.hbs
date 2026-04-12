@@ -14,13 +14,12 @@ export CLERK_AGENT_NAME="{{name}}"
 # Reads env vars at hook startup; settings.json autoMemoryEnabled: false
 # disables Claude Code's built-in file-based auto-memory so we don't run
 # two memory systems against each other.
-export HINDSIGHT_API_URL="{{hindsightApiBaseUrl}}"
-export HINDSIGHT_BANK_ID="{{hindsightBankId}}"
+# Values are POSIX-single-quoted in scaffold.ts for shell safety.
+export HINDSIGHT_API_URL={{{hindsightApiBaseUrlQ}}}
+export HINDSIGHT_BANK_ID={{{hindsightBankIdQ}}}
 export HINDSIGHT_AUTO_RECALL=true
 export HINDSIGHT_AUTO_RETAIN=true
 export HINDSIGHT_AGENT_NAME="{{name}}"
-{{#if hindsightApiToken}}export HINDSIGHT_API_TOKEN="{{hindsightApiToken}}"
-{{/if}}
 {{/if}}
 {{#if userEnvQuoted}}
 # User-declared env vars from clerk.yaml (agent + defaults merged).
@@ -31,6 +30,6 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{/each}}
 {{/if}}
 cd "{{agentDir}}"
-{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
-{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if model}} --model {{model}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+{{#if useClerkPlugin}}exec claude --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+{{else}}exec claude --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 {{/if}}

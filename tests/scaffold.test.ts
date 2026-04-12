@@ -565,7 +565,8 @@ describe("reconcileAgent", () => {
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
 
     const after = readFileSync(startShPath, "utf-8");
-    expect(after).toContain("HINDSIGHT_API_URL=\"http://127.0.0.1:18888\"");
+    // Hindsight vars are now POSIX-single-quoted for shell safety
+    expect(after).toContain("HINDSIGHT_API_URL='http://127.0.0.1:18888'");
     expect(after).toContain("--plugin-dir");
     expect(after).toContain(".claude/plugins/hindsight-memory");
   });
@@ -990,7 +991,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.model).toBe("claude-opus-4-6");
     // And --model is appended to exec claude in start.sh
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--model claude-opus-4-6");
+    expect(startSh).toContain("--model 'claude-opus-4-6'");
   });
 
   it("exports user env vars in start.sh in declaration order", () => {
@@ -1210,7 +1211,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
     const startSh = readFileSync(join(tmpDir, "rec-phase2", "start.sh"), "utf-8");
     expect(startSh).toContain("export NEW_VAR='hello'");
-    expect(startSh).toContain("--model claude-sonnet-4-6");
+    expect(startSh).toContain("--model 'claude-sonnet-4-6'");
   });
 
   it("is a no-op when clerk.yaml has no defaults block (backcompat)", () => {

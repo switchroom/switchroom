@@ -563,6 +563,7 @@ export function scaffoldAgent(
     topicEmoji: agentConfig.topic_emoji,
     soul: agentConfig.soul,
     tools,
+    toolsDeny: tools.deny ?? [],
     permissionAllow,
     defaultModeAcceptEdits: hasAllWildcard,
     memory: agentConfig.memory,
@@ -575,8 +576,12 @@ export function scaffoldAgent(
     skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
     useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
     hindsightEnabled: hindsightAutoRecallEnabled,
-    hindsightBankId,
-    hindsightApiBaseUrl,
+    // POSIX-single-quote shell-context values as defense-in-depth.
+    // The schema validates these too, but quoting closes the gap for
+    // any future relaxation of the schema validators.
+    hindsightBankIdQ: shellSingleQuote(hindsightBankId),
+    hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
+    modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
     // Phase 2 + 3 — user env merged with channel-derived env. User
     // entries win on conflict (explicit beats channel default). Each
     // value is POSIX-single-quoted at build time so `&`, `$`, backtick,
@@ -625,7 +630,7 @@ export function scaffoldAgent(
   );
   // Make start.sh executable
   if (existsSync(join(agentDir, "start.sh"))) {
-    chmodSync(join(agentDir, "start.sh"), 0o755);
+    chmodSync(join(agentDir, "start.sh"), 0o700);
   }
 
   writeIfMissing(
@@ -975,10 +980,9 @@ export function reconcileAgent(
       dangerousMode: agentConfig.dangerous_mode === true,
       useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
       hindsightEnabled: hindsightAutoRecallEnabled,
-      hindsightBankId,
-      hindsightApiBaseUrl,
-      // Phase 2 + 3 — user env merged with channel-derived env,
-      // pre-quoted so shell-sensitive bytes survive.
+      hindsightBankIdQ: shellSingleQuote(hindsightBankId),
+      hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
+      modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
       userEnvQuoted: (() => {
         const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
         if (Object.keys(combined).length === 0) return undefined;

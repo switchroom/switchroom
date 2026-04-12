@@ -1,7 +1,7 @@
 {
   "permissions": {
-    "allow": [{{#each permissionAllow}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}],
-    "deny": [{{#each tools.deny}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}]{{#if defaultModeAcceptEdits}},
+    "allow": {{{json permissionAllow}}},
+    "deny": {{{json toolsDeny}}}{{#if defaultModeAcceptEdits}},
     "defaultMode": "acceptEdits"{{/if}}
   },
   "enabledPlugins": {
