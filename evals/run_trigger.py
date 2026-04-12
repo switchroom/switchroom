@@ -4,14 +4,12 @@
 import argparse
 import asyncio
 import json
-import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
 import yaml
 
 EVALS_DIR = Path(__file__).parent
@@ -59,6 +57,34 @@ def build_skill_list() -> str:
     return "\n".join(lines)
 
 
+async def call_claude(
+    prompt: str,
+    model: str,
+    system_prompt: str | None = None,
+    append_system: bool = False,
+    timeout: int = 60,
+) -> str:
+    args = ["claude", "-p", prompt, "--model", model, "--print", "--no-session-persistence", "--bare"]
+    if system_prompt:
+        if append_system:
+            args.extend(["--append-system-prompt", system_prompt])
+        else:
+            args.extend(["--system-prompt", system_prompt])
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"claude -p timed out after {timeout}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude -p failed (exit {proc.returncode}): {stderr.decode().strip()}")
+    return stdout.decode("utf-8").strip()
+
+
 def parse_selected_skill(response_text: str) -> str | None:
     # Try strict JSON first
     try:
@@ -72,20 +98,17 @@ def parse_selected_skill(response_text: str) -> str | None:
 
 
 async def run_single(
-    client: anthropic.AsyncAnthropic,
     eval_item: dict,
     model: str,
     run_index: int,
 ) -> dict:
-    system = ROUTING_SYSTEM_PROMPT.format(skill_list=build_skill_list())
+    system_prompt = ROUTING_SYSTEM_PROMPT.format(skill_list=build_skill_list())
 
-    response = await client.messages.create(
-        model=model,
-        max_tokens=128,
-        system=system,
-        messages=[{"role": "user", "content": eval_item["query"]}],
+    response_text = await call_claude(
+        eval_item["query"],
+        model,
+        system_prompt=system_prompt,
     )
-    response_text = response.content[0].text
     selected = parse_selected_skill(response_text)
 
     expected = eval_item["expected_skill"]
@@ -108,7 +131,6 @@ async def run_single(
 
 
 async def run_eval_multi(
-    client: anthropic.AsyncAnthropic,
     eval_item: dict,
     model: str,
     runs: int,
@@ -116,15 +138,14 @@ async def run_eval_multi(
 ) -> list[dict]:
     async def bounded(run_idx):
         async with semaphore:
-            return await run_single(client, eval_item, model, run_idx)
+            return await run_single(eval_item, model, run_idx)
 
     return await asyncio.gather(*[bounded(i) for i in range(runs)])
 
 
 async def run_all(evals: list[dict], model: str, runs: int, parallel: int) -> list[dict]:
-    client = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(parallel)
-    tasks = [run_eval_multi(client, e, model, runs, semaphore) for e in evals]
+    tasks = [run_eval_multi(e, model, runs, semaphore) for e in evals]
     batches = await asyncio.gather(*tasks)
     return [r for batch in batches for r in batch]
 
@@ -137,10 +158,6 @@ def main():
     parser.add_argument("--filter", help="Filter evals by expected_skill or tag")
     parser.add_argument("--dataset", default=str(EVALS_DIR / "trigger_dataset.yaml"))
     args = parser.parse_args()
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Error: ANTHROPIC_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
 
     dataset = yaml.safe_load(Path(args.dataset).read_text())
     evals = dataset["trigger_evals"]
