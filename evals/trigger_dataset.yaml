@@ -1,0 +1,186 @@
+trigger_evals:
+  # ── status vs health (both about agent state) ────────────────────────────────
+  - id: "t-status-001"
+    query: "Are my agents running?"
+    expected_skill: "clerk-status"
+    expected_not_skills: ["clerk-health", "clerk-restart"]
+    tags: ["routing", "status"]
+
+  - id: "t-status-002"
+    query: "What's the current state of all my agents?"
+    expected_skill: "clerk-status"
+    expected_not_skills: ["clerk-health", "clerk-logs"]
+    tags: ["routing", "status"]
+
+  - id: "t-status-003"
+    query: "Show me agent uptime"
+    expected_skill: "clerk-status"
+    expected_not_skills: ["clerk-health", "clerk-logs"]
+    tags: ["routing", "status"]
+
+  - id: "t-health-001"
+    query: "Something is wrong with my agent, can you diagnose it?"
+    expected_skill: "clerk-health"
+    expected_not_skills: ["clerk-status", "clerk-restart"]
+    tags: ["routing", "health"]
+
+  - id: "t-health-002"
+    query: "Run a diagnostic check on my setup"
+    expected_skill: "clerk-health"
+    expected_not_skills: ["clerk-status", "clerk-config"]
+    tags: ["routing", "health"]
+
+  - id: "t-health-003"
+    query: "My agent keeps failing, what's wrong?"
+    expected_skill: "clerk-health"
+    expected_not_skills: ["clerk-status", "clerk-logs"]
+    tags: ["routing", "health"]
+
+  # ── restart vs reconcile (both change agent state) ────────────────────────────
+  - id: "t-restart-001"
+    query: "Restart the assistant agent"
+    expected_skill: "clerk-restart"
+    expected_not_skills: ["clerk-reconcile", "clerk-status"]
+    tags: ["routing", "restart"]
+
+  - id: "t-restart-002"
+    query: "The agent is frozen, reboot it"
+    expected_skill: "clerk-restart"
+    expected_not_skills: ["clerk-reconcile", "clerk-health"]
+    tags: ["routing", "restart"]
+
+  - id: "t-restart-003"
+    query: "Kill and restart all agents"
+    expected_skill: "clerk-restart"
+    expected_not_skills: ["clerk-reconcile", "clerk-status"]
+    tags: ["routing", "restart"]
+
+  - id: "t-reconcile-001"
+    query: "I updated my CLAUDE.md, apply the new config"
+    expected_skill: "clerk-reconcile"
+    expected_not_skills: ["clerk-restart", "clerk-config"]
+    tags: ["routing", "reconcile"]
+
+  - id: "t-reconcile-002"
+    query: "Sync my latest settings to the running agent without restarting"
+    expected_skill: "clerk-reconcile"
+    expected_not_skills: ["clerk-restart", "clerk-config"]
+    tags: ["routing", "reconcile"]
+
+  - id: "t-reconcile-003"
+    query: "Re-apply my agent profile"
+    expected_skill: "clerk-reconcile"
+    expected_not_skills: ["clerk-restart", "clerk-schedule"]
+    tags: ["routing", "reconcile"]
+
+  # ── config vs architecture (both about how clerk works) ───────────────────────
+  - id: "t-config-001"
+    query: "What model is my agent using?"
+    expected_skill: "clerk-config"
+    expected_not_skills: ["clerk-architecture", "clerk-status"]
+    tags: ["routing", "config"]
+
+  - id: "t-config-002"
+    query: "Show the tools available to the assistant"
+    expected_skill: "clerk-config"
+    expected_not_skills: ["clerk-architecture", "clerk-status"]
+    tags: ["routing", "config"]
+
+  - id: "t-config-003"
+    query: "What's the active system prompt for my agent?"
+    expected_skill: "clerk-config"
+    expected_not_skills: ["clerk-architecture", "clerk-logs"]
+    tags: ["routing", "config"]
+
+  - id: "t-arch-001"
+    query: "How does clerk actually work under the hood?"
+    expected_skill: "clerk-architecture"
+    expected_not_skills: ["clerk-config", "clerk-status"]
+    tags: ["routing", "architecture"]
+
+  - id: "t-arch-002"
+    query: "Explain the config cascade and how agents inherit settings"
+    expected_skill: "clerk-architecture"
+    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    tags: ["routing", "architecture"]
+
+  - id: "t-arch-003"
+    query: "What's the difference between a profile and an agent?"
+    expected_skill: "clerk-architecture"
+    expected_not_skills: ["clerk-config", "clerk-status"]
+    tags: ["routing", "architecture"]
+
+  # ── logs vs status (both about agent info) ────────────────────────────────────
+  - id: "t-logs-001"
+    query: "Show me the recent log output from the assistant"
+    expected_skill: "clerk-logs"
+    expected_not_skills: ["clerk-status", "clerk-health"]
+    tags: ["routing", "logs"]
+
+  - id: "t-logs-002"
+    query: "What did my agent do in the last 30 minutes?"
+    expected_skill: "clerk-logs"
+    expected_not_skills: ["clerk-status", "clerk-health"]
+    tags: ["routing", "logs"]
+
+  - id: "t-logs-003"
+    query: "Tail the logs for the monitor agent"
+    expected_skill: "clerk-logs"
+    expected_not_skills: ["clerk-status", "clerk-health"]
+    tags: ["routing", "logs"]
+
+  - id: "t-status-004"
+    query: "Is the monitor agent online or offline?"
+    expected_skill: "clerk-status"
+    expected_not_skills: ["clerk-logs", "clerk-health"]
+    tags: ["routing", "status"]
+
+  # ── schedule edge cases ────────────────────────────────────────────────────────
+  - id: "t-schedule-001"
+    query: "Set up a daily 9am digest"
+    expected_skill: "clerk-schedule"
+    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    tags: ["routing", "schedule"]
+
+  - id: "t-schedule-002"
+    query: "List my cron jobs"
+    expected_skill: "clerk-schedule"
+    expected_not_skills: ["clerk-status", "clerk-config"]
+    tags: ["routing", "schedule"]
+
+  - id: "t-schedule-003"
+    query: "Delete the weekly report trigger"
+    expected_skill: "clerk-schedule"
+    expected_not_skills: ["clerk-reconcile", "clerk-restart"]
+    tags: ["routing", "schedule"]
+
+  # ── harder near-miss scenarios ─────────────────────────────────────────────────
+  - id: "t-near-001"
+    query: "The assistant crashed, what happened?"
+    expected_skill: "clerk-logs"
+    expected_not_skills: ["clerk-health", "clerk-restart"]
+    tags: ["routing", "near-miss"]
+
+  - id: "t-near-002"
+    query: "Is clerk healthy?"
+    expected_skill: "clerk-health"
+    expected_not_skills: ["clerk-status", "clerk-logs"]
+    tags: ["routing", "near-miss"]
+
+  - id: "t-near-003"
+    query: "Apply my updated config file to the running agent"
+    expected_skill: "clerk-reconcile"
+    expected_not_skills: ["clerk-restart", "clerk-config"]
+    tags: ["routing", "near-miss"]
+
+  - id: "t-near-004"
+    query: "What's the clerk plugin system and how do hooks work?"
+    expected_skill: "clerk-architecture"
+    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    tags: ["routing", "near-miss", "architecture"]
+
+  - id: "t-near-005"
+    query: "Show agent info"
+    expected_skill: "clerk-status"
+    expected_not_skills: ["clerk-logs", "clerk-config"]
+    tags: ["routing", "near-miss"]

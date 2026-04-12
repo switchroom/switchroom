@@ -1,0 +1,361 @@
+evals:
+  # ── clerk-status ────────────────────────────────────────────────────────────
+  - id: "status-001"
+    question: "What agents are running right now?"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "clerk agent list|agent list|running agents"
+    expected_not_contains:
+      - "I don't have access|I cannot|I'm unable"
+    tags: ["status"]
+
+  - id: "status-002"
+    question: "Show me the status of all my clerk agents"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "clerk agent list|agent status|list"
+    expected_not_contains:
+      - "I don't know|no information"
+    tags: ["status"]
+
+  - id: "status-003"
+    question: "Is the assistant agent up?"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "clerk agent|status|running|check"
+    expected_not_contains:
+      - "I cannot determine"
+    tags: ["status"]
+
+  - id: "status-004"
+    question: "How long has the scheduler been running?"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "uptime|started|running|clerk agent"
+    expected_not_contains:
+      - "I don't have access"
+    tags: ["status", "uptime"]
+
+  - id: "status-005"
+    question: "List all clerk agents and their current state"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "clerk agent list|agent list"
+    expected_not_contains:
+      - "I'm not able"
+    tags: ["status"]
+
+  - id: "status-006"
+    question: "Which agents are stopped?"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "clerk agent list|status|stopped"
+    tags: ["status"]
+
+  - id: "status-007"
+    question: "Show me uptime for all agents"
+    primary_skill: "clerk-status"
+    expected_contains:
+      - "uptime|clerk agent|running"
+    tags: ["status", "uptime"]
+
+  # ── clerk-health ─────────────────────────────────────────────────────────────
+  - id: "health-001"
+    question: "Something seems broken with my agents, can you check?"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "diagnostic|health|check|doctor"
+    expected_not_contains:
+      - "I cannot help"
+    tags: ["health"]
+
+  - id: "health-002"
+    question: "Run a health check on the assistant agent"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "health|diagnostic|check"
+    tags: ["health"]
+
+  - id: "health-003"
+    question: "My agent keeps crashing, can you diagnose it?"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "diagnostic|health|logs|error|crash"
+    tags: ["health", "diagnostic"]
+
+  - id: "health-004"
+    question: "Run clerk doctor"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "doctor|diagnostic|health|check"
+    tags: ["health"]
+
+  - id: "health-005"
+    question: "Are there any errors in my agent setup?"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "health|diagnostic|error|check"
+    tags: ["health"]
+
+  - id: "health-006"
+    question: "Check if everything is configured correctly"
+    primary_skill: "clerk-health"
+    expected_contains:
+      - "health|diagnostic|check|configuration"
+    tags: ["health", "diagnostic"]
+
+  # ── clerk-config ──────────────────────────────────────────────────────────────
+  - id: "config-001"
+    question: "What model is the assistant agent using?"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "model|configuration|config|settings"
+    expected_not_contains:
+      - "I don't have access"
+    tags: ["config"]
+
+  - id: "config-002"
+    question: "Show me the full config for the scheduler agent"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "config|configuration|settings"
+    tags: ["config"]
+
+  - id: "config-003"
+    question: "What tools does the assistant have access to?"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "tools|config|configuration|settings"
+    tags: ["config", "tools"]
+
+  - id: "config-004"
+    question: "What's the system prompt for my agent?"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "system prompt|config|configuration"
+    tags: ["config"]
+
+  - id: "config-005"
+    question: "Show the active settings for my clerk agents"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "settings|config|configuration"
+    tags: ["config"]
+
+  - id: "config-006"
+    question: "Which model am I running on?"
+    primary_skill: "clerk-config"
+    expected_contains:
+      - "model|config|configuration"
+    tags: ["config"]
+
+  # ── clerk-schedule ────────────────────────────────────────────────────────────
+  - id: "schedule-001"
+    question: "Show me all scheduled tasks"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "schedule|cron|timer|scheduled"
+    expected_not_contains:
+      - "I cannot"
+    tags: ["schedule"]
+
+  - id: "schedule-002"
+    question: "Create a cron job to run a digest every morning at 8am"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "cron|schedule|0 8|8:00|morning"
+    tags: ["schedule", "cron"]
+
+  - id: "schedule-003"
+    question: "What timers are set up for the assistant?"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "timer|schedule|cron"
+    tags: ["schedule"]
+
+  - id: "schedule-004"
+    question: "List all cron schedules"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "cron|schedule|list"
+    tags: ["schedule", "cron"]
+
+  - id: "schedule-005"
+    question: "Delete the weekly report schedule"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "schedule|delete|remove|cron"
+    tags: ["schedule"]
+
+  - id: "schedule-006"
+    question: "Add a trigger that runs every hour"
+    primary_skill: "clerk-schedule"
+    expected_contains:
+      - "schedule|cron|trigger|every hour|0 \\*"
+    tags: ["schedule", "cron"]
+
+  # ── clerk-restart ─────────────────────────────────────────────────────────────
+  - id: "restart-001"
+    question: "Restart the assistant agent"
+    primary_skill: "clerk-restart"
+    expected_contains:
+      - "restart|confirm|are you sure|clerk agent restart"
+    expected_not_contains:
+      - "I cannot restart"
+    tags: ["restart"]
+
+  - id: "restart-002"
+    question: "Reboot the scheduler"
+    primary_skill: "clerk-restart"
+    expected_contains:
+      - "restart|reboot|confirm"
+    tags: ["restart"]
+
+  - id: "restart-003"
+    question: "My agent is frozen, restart it"
+    primary_skill: "clerk-restart"
+    expected_contains:
+      - "restart|confirm|clerk agent restart"
+    tags: ["restart"]
+
+  - id: "restart-004"
+    question: "Do a hard restart of the monitor agent"
+    primary_skill: "clerk-restart"
+    expected_contains:
+      - "restart|confirm|clerk agent restart"
+    tags: ["restart"]
+
+  - id: "restart-005"
+    question: "Bounce all agents"
+    primary_skill: "clerk-restart"
+    expected_contains:
+      - "restart|bounce|confirm|all agents"
+    tags: ["restart"]
+
+  # ── clerk-reconcile ───────────────────────────────────────────────────────────
+  - id: "reconcile-001"
+    question: "Re-apply my agent config"
+    primary_skill: "clerk-reconcile"
+    expected_contains:
+      - "reconcile|apply|config|re-apply"
+    expected_not_contains:
+      - "I cannot"
+    tags: ["reconcile"]
+
+  - id: "reconcile-002"
+    question: "I updated the CLAUDE.md, push the changes to the agent"
+    primary_skill: "clerk-reconcile"
+    expected_contains:
+      - "reconcile|apply|update|config"
+    tags: ["reconcile"]
+
+  - id: "reconcile-003"
+    question: "Sync the latest config to the running agent"
+    primary_skill: "clerk-reconcile"
+    expected_contains:
+      - "reconcile|sync|apply|config"
+    tags: ["reconcile"]
+
+  - id: "reconcile-004"
+    question: "Update the assistant agent settings without restarting"
+    primary_skill: "clerk-reconcile"
+    expected_contains:
+      - "reconcile|update|settings|config"
+    tags: ["reconcile"]
+
+  - id: "reconcile-005"
+    question: "Apply my profile changes to all agents"
+    primary_skill: "clerk-reconcile"
+    expected_contains:
+      - "reconcile|apply|profile|config"
+    tags: ["reconcile"]
+
+  # ── clerk-logs ────────────────────────────────────────────────────────────────
+  - id: "logs-001"
+    question: "Show me the logs for the assistant agent"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|log|output|clerk"
+    expected_not_contains:
+      - "I don't have access"
+    tags: ["logs"]
+
+  - id: "logs-002"
+    question: "What did the scheduler agent do in the last hour?"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|log|output|history"
+    tags: ["logs"]
+
+  - id: "logs-003"
+    question: "Tail the logs for the monitor agent"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|tail|log|output"
+    tags: ["logs"]
+
+  - id: "logs-004"
+    question: "Show recent errors from my agents"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|error|log|output"
+    tags: ["logs", "errors"]
+
+  - id: "logs-005"
+    question: "Get the last 100 lines of assistant logs"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|log|lines|output"
+    tags: ["logs"]
+
+  - id: "logs-006"
+    question: "What was the last thing the agent did?"
+    primary_skill: "clerk-logs"
+    expected_contains:
+      - "logs|log|recent|history|output"
+    tags: ["logs"]
+
+  # ── clerk-architecture ────────────────────────────────────────────────────────
+  - id: "arch-001"
+    question: "How does clerk work?"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "clerk|agent|config|architecture|how"
+    expected_not_contains:
+      - "I don't know"
+    tags: ["architecture"]
+
+  - id: "arch-002"
+    question: "Explain the config cascade in clerk"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "config|cascade|profile|agent|inherit"
+    tags: ["architecture", "config"]
+
+  - id: "arch-003"
+    question: "What is the clerk plugin system?"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "plugin|system|hook|clerk"
+    tags: ["architecture", "plugins"]
+
+  - id: "arch-004"
+    question: "How do agents get their instructions?"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "CLAUDE.md|config|instructions|agent|profile"
+    tags: ["architecture"]
+
+  - id: "arch-005"
+    question: "What's the difference between a profile and an agent in clerk?"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "profile|agent|difference|config"
+    tags: ["architecture"]
+
+  - id: "arch-006"
+    question: "Walk me through the clerk agent lifecycle"
+    primary_skill: "clerk-architecture"
+    expected_contains:
+      - "lifecycle|agent|start|config|clerk"
+    tags: ["architecture"]
