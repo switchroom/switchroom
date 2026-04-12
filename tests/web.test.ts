@@ -38,6 +38,11 @@ import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { execFileSync } from "node:child_process";
 import type { ClerkConfig } from "../src/config/schema.js";
 
+// Bun's vitest compat layer doesn't implement vi.mocked(). Use a
+// cast helper so we can call .mockReturnValue() etc on the mock-wrapped
+// imports without TypeScript complaining.
+const asMock = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
+
 const mockConfig: ClerkConfig = {
   clerk: { version: 1, agents_dir: "~/.clerk/agents" },
   telegram: { bot_token: "test-token", forum_chat_id: "-1001234" },
@@ -69,12 +74,12 @@ describe("handleGetAgents", () => {
   });
 
   it("returns combined status and auth info for each agent", () => {
-    vi.mocked(getAllAgentStatuses).mockReturnValue({
+    asMock(getAllAgentStatuses).mockReturnValue({
       coach: { active: "active", uptime: "2025-01-01T00:00:00Z", memory: "128MB", pid: 1234 },
       sage: { active: "inactive", uptime: null, memory: null, pid: null },
     });
 
-    vi.mocked(getAllAuthStatuses).mockReturnValue({
+    asMock(getAllAuthStatuses).mockReturnValue({
       coach: { authenticated: true, subscriptionType: "max", timeUntilExpiry: "7h 30m", expiresAt: Date.now() + 27000000 },
       sage: { authenticated: false },
     });
@@ -103,11 +108,11 @@ describe("handleGetAgents", () => {
   });
 
   it("returns correct shape with all fields", () => {
-    vi.mocked(getAllAgentStatuses).mockReturnValue({
+    asMock(getAllAgentStatuses).mockReturnValue({
       coach: { active: "active", uptime: null, memory: null, pid: null },
       sage: { active: "inactive", uptime: null, memory: null, pid: null },
     });
-    vi.mocked(getAllAuthStatuses).mockReturnValue({
+    asMock(getAllAuthStatuses).mockReturnValue({
       coach: { authenticated: false },
       sage: { authenticated: false },
     });
@@ -133,14 +138,14 @@ describe("handleStartAgent", () => {
   });
 
   it("calls startAgent and returns ok on success", () => {
-    vi.mocked(startAgent).mockImplementation(() => {});
+    asMock(startAgent).mockImplementation(() => {});
     const result = handleStartAgent("coach");
     expect(result).toEqual({ ok: true });
     expect(startAgent).toHaveBeenCalledWith("coach");
   });
 
   it("returns error when startAgent throws", () => {
-    vi.mocked(startAgent).mockImplementation(() => {
+    asMock(startAgent).mockImplementation(() => {
       throw new Error("service not found");
     });
     const result = handleStartAgent("missing");
@@ -155,14 +160,14 @@ describe("handleStopAgent", () => {
   });
 
   it("calls stopAgent and returns ok on success", () => {
-    vi.mocked(stopAgent).mockImplementation(() => {});
+    asMock(stopAgent).mockImplementation(() => {});
     const result = handleStopAgent("coach");
     expect(result).toEqual({ ok: true });
     expect(stopAgent).toHaveBeenCalledWith("coach");
   });
 
   it("returns error when stopAgent throws", () => {
-    vi.mocked(stopAgent).mockImplementation(() => {
+    asMock(stopAgent).mockImplementation(() => {
       throw new Error("cannot stop");
     });
     const result = handleStopAgent("coach");
@@ -177,14 +182,14 @@ describe("handleRestartAgent", () => {
   });
 
   it("calls restartAgent and returns ok on success", () => {
-    vi.mocked(restartAgent).mockImplementation(() => {});
+    asMock(restartAgent).mockImplementation(() => {});
     const result = handleRestartAgent("sage");
     expect(result).toEqual({ ok: true });
     expect(restartAgent).toHaveBeenCalledWith("sage");
   });
 
   it("returns error when restartAgent throws", () => {
-    vi.mocked(restartAgent).mockImplementation(() => {
+    asMock(restartAgent).mockImplementation(() => {
       throw new Error("restart failed");
     });
     const result = handleRestartAgent("sage");
@@ -199,7 +204,7 @@ describe("handleGetLogs", () => {
   });
 
   it("returns logs from journalctl", () => {
-    vi.mocked(execFileSync).mockReturnValue("line 1\nline 2\nline 3\n" as any);
+    asMock(execFileSync).mockReturnValue("line 1\nline 2\nline 3\n" as any);
 
     const result = handleGetLogs("coach", 50);
     expect(result.ok).toBe(true);
@@ -212,7 +217,7 @@ describe("handleGetLogs", () => {
   });
 
   it("uses default of 50 lines", () => {
-    vi.mocked(execFileSync).mockReturnValue("output" as any);
+    asMock(execFileSync).mockReturnValue("output" as any);
 
     handleGetLogs("sage");
     expect(execFileSync).toHaveBeenCalledWith(
@@ -223,7 +228,7 @@ describe("handleGetLogs", () => {
   });
 
   it("returns error when journalctl fails", () => {
-    vi.mocked(execFileSync).mockImplementation(() => {
+    asMock(execFileSync).mockImplementation(() => {
       throw new Error("no journal data");
     });
 

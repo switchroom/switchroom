@@ -23,12 +23,17 @@ import {
 // ─── validateBotToken ────────────────────────────────────────────────────────
 
 describe("validateBotToken", () => {
+  // Bun's vitest compat doesn't support vi.stubGlobal(). Assign the
+  // mock directly on globalThis and restore the original after.
+  let origFetch: typeof fetch;
+
   beforeEach(() => {
-    vi.stubGlobal("fetch", vi.fn());
+    origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn() as unknown as typeof fetch;
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
+    globalThis.fetch = origFetch;
   });
 
   it("should return bot info on valid token", async () => {
