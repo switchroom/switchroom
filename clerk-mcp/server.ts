@@ -2,10 +2,9 @@
 /**
  * Clerk Management MCP Server
  *
- * Thin MCP wrapper around the `clerk` CLI. Exposes agent lifecycle,
- * auth status, topic mapping, and memory operations as MCP tools so
- * that Claude Code agents can manage the clerk fleet without needing
- * direct Bash access.
+ * Thin MCP wrapper around the `clerk` CLI. Exposes memory operations as MCP
+ * tools so that Claude Code agents can search and inspect agent memories
+ * without needing direct Bash access.
  *
  * Runs as a child process of each agent via stdio transport.
  * Configuration is passed via the CLERK_CONFIG environment variable
@@ -61,50 +60,6 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "clerk_agent_list",
-      description:
-        "List all clerk agents with their current status (name, active/inactive, uptime, template, topic).",
-      inputSchema: { type: "object" as const, properties: {} },
-    },
-    {
-      name: "clerk_agent_start",
-      description: "Start a clerk agent by name.",
-      inputSchema: {
-        type: "object" as const,
-        properties: { name: { type: "string", description: "Agent name" } },
-        required: ["name"],
-      },
-    },
-    {
-      name: "clerk_agent_stop",
-      description: "Stop a clerk agent by name.",
-      inputSchema: {
-        type: "object" as const,
-        properties: { name: { type: "string", description: "Agent name" } },
-        required: ["name"],
-      },
-    },
-    {
-      name: "clerk_agent_restart",
-      description: "Restart a clerk agent by name.",
-      inputSchema: {
-        type: "object" as const,
-        properties: { name: { type: "string", description: "Agent name" } },
-        required: ["name"],
-      },
-    },
-    {
-      name: "clerk_auth_status",
-      description:
-        "Show authentication status for all agents (authenticated, subscription type, token expiry).",
-      inputSchema: { type: "object" as const, properties: {} },
-    },
-    {
-      name: "clerk_topics_list",
-      description: "List Telegram forum topic-to-agent mappings.",
-      inputSchema: { type: "object" as const, properties: {} },
-    },
-    {
       name: "clerk_memory_search",
       description:
         "Search agent memories via Hindsight. Returns the CLI command to execute.",
@@ -134,39 +89,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
-    case "clerk_agent_list": {
-      const output = clerk(["agent", "list"]);
-      return textResult(output);
-    }
-
-    case "clerk_agent_start": {
-      const agentName = (args as { name: string }).name;
-      const output = clerk(["agent", "start", agentName]);
-      return textResult(output || `Agent "${agentName}" start requested.`);
-    }
-
-    case "clerk_agent_stop": {
-      const agentName = (args as { name: string }).name;
-      const output = clerk(["agent", "stop", agentName]);
-      return textResult(output || `Agent "${agentName}" stop requested.`);
-    }
-
-    case "clerk_agent_restart": {
-      const agentName = (args as { name: string }).name;
-      const output = clerk(["agent", "restart", agentName]);
-      return textResult(output || `Agent "${agentName}" restart requested.`);
-    }
-
-    case "clerk_auth_status": {
-      const output = clerk(["auth", "status"]);
-      return textResult(output);
-    }
-
-    case "clerk_topics_list": {
-      const output = clerk(["topics", "list"]);
-      return textResult(output);
-    }
-
     case "clerk_memory_search": {
       const { query, agent } = args as { query: string; agent?: string };
       const searchArgs = ["memory", "search", query];
