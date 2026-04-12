@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -64,16 +65,23 @@ async def call_claude(
     append_system: bool = False,
     timeout: int = 60,
 ) -> str:
-    args = ["claude", "-p", prompt, "--model", model, "--print", "--no-session-persistence", "--bare"]
+    args = ["claude", "-p", prompt, "--model", model, "--print", "--no-session-persistence"]
     if system_prompt:
         if append_system:
             args.extend(["--append-system-prompt", system_prompt])
         else:
             args.extend(["--system-prompt", system_prompt])
+    # Use the agent's CLAUDE_CONFIG_DIR for OAuth credentials if available.
+    # --bare is NOT used because it skips keychain/OAuth reads.
+    env = None
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
