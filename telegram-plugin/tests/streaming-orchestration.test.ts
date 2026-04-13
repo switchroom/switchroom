@@ -192,19 +192,191 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     expect(map.size).toBe(0)
   })
 
-  it('send transport error leaves the stream in the map with null message_id (pinned)', async () => {
-    bot.api.sendMessage.mockImplementationOnce(async () => {
-      throw new Error('network down')
-    })
-    const map = new Map<string, DraftStreamHandle>()
+  it('failed first send leaves a retry-able stream: next update re-attempts send', async () => {
+    // First send fails; draft-stream swallows the error, leaves
+    // messageId=null. A subsequent update() triggers a fresh send on the
+    // same stream object — this is what makes a momentary network blip
+    // recoverable without the caller needing to evict-and-recreate.
+    bot.api.sendMessage
+      .mockImplementationOnce(async () => { throw new Error('network down') })
+      .mockImplementationOnce(async () => ({ message_id: 777 }))
 
-    modelStreamReply({ bot, map, chatId: '1', text: 'first try' })
+    const map = new Map<string, DraftStreamHandle>()
+    const { stream } = modelStreamReply({ bot, map, chatId: '1', text: 'first try' })
     await microtaskFlush()
 
-    const stream = map.get('1:_')
-    expect(stream).toBeDefined()
-    expect(stream!.getMessageId()).toBeNull()
-    // Pinned: failed-send should arguably evict the entry. When we fix
-    // this, flip the expectation to `expect(map.has('1:_')).toBe(false)`.
+    expect(stream.getMessageId()).toBeNull()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+
+    // Caller issues next snapshot — should retry send, not try to edit null.
+    vi.advanceTimersByTime(1000)
+    modelStreamReply({ bot, map, chatId: '1', text: 'second try' })
+    await microtaskFlush()
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.editMessageText).not.toHaveBeenCalled()
+    expect(stream.getMessageId()).toBe(777)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// suppressPtyPreview claim/release — the "duplicate Telegram message" race
+// ---------------------------------------------------------------------------
+//
+// The reply tool handler claims the stream by:
+//   1. adding the streamKey to suppressPtyPreview BEFORE touching the stream
+//   2. finalizing and deleting the active stream
+//   3. sending the canonical reply
+//   4. NOT releasing the suppress lock in the `finally` — turn_end does that
+//
+// This prevents the PTY tail from seeing an empty activeDraftStreams in step
+// 2 and creating a fresh preview that would surface as a duplicate.
+
+function modelPtyPartial(params: {
+  bot: ReturnType<typeof createMockBot>
+  map: Map<string, DraftStreamHandle>
+  suppress: Set<string>
+  chatId: string
+  threadId?: number
+  text: string
+  throttleMs?: number
+}): DraftStreamHandle | null {
+  const key = streamKey(params.chatId, params.threadId)
+  if (params.suppress.has(key)) return null
+  let stream = params.map.get(key)
+  if (!stream) {
+    stream = createStreamController({
+      bot: params.bot,
+      chatId: params.chatId,
+      threadId: params.threadId,
+      parseMode: 'HTML',
+      throttleMs: params.throttleMs ?? 600,
+    })
+    params.map.set(key, stream)
+  }
+  void stream.update(params.text)
+  return stream
+}
+
+async function modelReplyClaim(params: {
+  bot: ReturnType<typeof createMockBot>
+  map: Map<string, DraftStreamHandle>
+  suppress: Set<string>
+  chatId: string
+  threadId?: number
+}): Promise<{ previewId: number | null }> {
+  const key = streamKey(params.chatId, params.threadId)
+  params.suppress.add(key) // step 1: claim BEFORE touching the stream
+  const open = params.map.get(key)
+  let previewId: number | null = null
+  if (open && !open.isFinal()) {
+    await open.finalize()
+    previewId = open.getMessageId()
+    params.map.delete(key)
+  }
+  return { previewId }
+}
+
+function modelTurnEnd(params: {
+  suppress: Set<string>
+  chatId: string
+  threadId?: number
+}): void {
+  params.suppress.delete(streamKey(params.chatId, params.threadId))
+}
+
+describe('suppressPtyPreview claim/release race', () => {
+  const bot = createMockBot()
+  installBotResetHook(bot)
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('PTY partials during a reply claim are dropped (no duplicate send)', async () => {
+    const map = new Map<string, DraftStreamHandle>()
+    const suppress = new Set<string>()
+
+    // Step 1: PTY creates a preview
+    modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'drafting' })
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+
+    // Step 2: reply claims — finalizes preview, deletes map entry
+    const { previewId } = await modelReplyClaim({ bot, map, suppress, chatId: '1' })
+    expect(previewId).toBe(500)
+    expect(map.has('1:_')).toBe(false)
+    expect(suppress.has('1:_')).toBe(true)
+
+    // Step 3: while suppressed, PTY fires another partial — should be dropped
+    const result = modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'more content' })
+    await microtaskFlush()
+
+    expect(result).toBeNull()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1) // no duplicate send
+    expect(map.has('1:_')).toBe(false) // no ghost stream created
+  })
+
+  it('claim is added BEFORE stream deletion (race-tight ordering)', async () => {
+    // If suppress.add happens AFTER map.delete, a PTY partial firing in
+    // between would create a new stream. We model the claim in the exact
+    // order the real code uses — any reordering here should fail this test.
+    const map = new Map<string, DraftStreamHandle>()
+    const suppress = new Set<string>()
+
+    modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'preview' })
+    await microtaskFlush()
+
+    // Interleave: start claim, but simulate a partial arriving mid-claim.
+    // In the real code, suppress.add is synchronous and happens before any
+    // await. So by the time PTY could fire, suppress is already set.
+    suppress.add('1:_') // the claim's first action
+    const result = modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'racy partial' })
+    await microtaskFlush()
+
+    expect(result).toBeNull()
+    // Finish the claim
+    const open = map.get('1:_')!
+    await open.finalize()
+    map.delete('1:_')
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1) // only the original
+  })
+
+  it('turn_end releases suppress; next turn PTY partial creates a fresh stream', async () => {
+    const map = new Map<string, DraftStreamHandle>()
+    const suppress = new Set<string>()
+
+    modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'first preview' })
+    await microtaskFlush()
+    await modelReplyClaim({ bot, map, suppress, chatId: '1' })
+
+    // Reply lands (simulated by a direct send). Turn ends.
+    modelTurnEnd({ suppress, chatId: '1' })
+    expect(suppress.has('1:_')).toBe(false)
+
+    // Next turn — a new PTY partial can now create a stream again.
+    const result = modelPtyPartial({ bot, map, suppress, chatId: '1', text: 'next turn preview' })
+    await microtaskFlush()
+
+    expect(result).not.toBeNull()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2) // original preview + new one
+  })
+
+  it('suppress is scoped by chat+thread — claim in chat A does not block chat B', async () => {
+    const map = new Map<string, DraftStreamHandle>()
+    const suppress = new Set<string>()
+
+    modelPtyPartial({ bot, map, suppress, chatId: 'A', text: 'A draft' })
+    await microtaskFlush()
+    await modelReplyClaim({ bot, map, suppress, chatId: 'A' })
+
+    // Chat B is untouched by A's claim — a PTY partial for B should work
+    const result = modelPtyPartial({ bot, map, suppress, chatId: 'B', text: 'B draft' })
+    await microtaskFlush()
+
+    expect(result).not.toBeNull()
+    expect(suppress.has('A:_')).toBe(true)
+    expect(suppress.has('B:_')).toBe(false)
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
   })
 })
