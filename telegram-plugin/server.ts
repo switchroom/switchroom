@@ -40,6 +40,7 @@ import { join, extname, sep, basename, dirname } from 'path'
 import { StatusReactionController } from './status-reactions.js'
 import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
+import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
@@ -1771,80 +1772,41 @@ let pendingPtyPartial: string | null = null
  * lands we'll flush it.
  */
 function handlePtyPartial(text: string): void {
-  if (currentSessionChatId == null) {
-    pendingPtyPartial = text
-    logStreamingEvent({
-      kind: 'pty_partial_received',
-      chatId: null,
-      suppressed: false,
-      hasStream: false,
-      charCount: text.length,
-      bufferedWithoutChatId: true,
-    })
-    return
+  // Adapt module-level mutable state into the handler's state shape.
+  // Only `pendingPtyPartial` can be mutated by the pure handler — the
+  // other fields are passed by reference (Map/Set instances) or read-only.
+  const state: PtyHandlerState = {
+    currentSessionChatId,
+    currentSessionThreadId,
+    pendingPtyPartial: pendingPtyPartial != null ? { text: pendingPtyPartial } : null,
+    activeDraftStreams,
+    suppressPtyPreview,
+    lastPtyPreviewByChat,
   }
-  const chatId = currentSessionChatId
-  const threadId = currentSessionThreadId
-  const sKey = streamKey(chatId, threadId)
-  const suppressed = suppressPtyPreview.has(sKey)
-  logStreamingEvent({
-    kind: 'pty_partial_received',
-    chatId,
-    suppressed,
-    hasStream: activeDraftStreams.has(sKey),
-    charCount: text.length,
-    bufferedWithoutChatId: false,
+  handlePtyPartialPure(text, state, {
+    bot,
+    retry: robustApiCall,
+    renderText: markdownToHtml,
+    logEvent: logStreamingEvent,
+    onStreamSend: (chatId, messageId, charCount) => {
+      logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
+      logStreamingEvent({ kind: 'draft_send', chatId, messageId, charCount })
+    },
+    onStreamEdit: (chatId, messageId, charCount) =>
+      logStreamingEvent({
+        kind: 'draft_edit',
+        chatId,
+        messageId,
+        charCount,
+        sameAsLast: false,
+      }),
+    onFirstPartial: (chatId, charCount) => {
+      process.stderr.write(
+        `telegram channel: pty first partial — chat=${chatId} chars=${charCount}\n`,
+      )
+    },
   })
-
-  // Reply tool handler has claimed this chat's preview stream for an
-  // in-flight canonical send. Drop PTY extractions so we don't fight the
-  // reply or create a second message mid-handoff.
-  if (suppressed) return
-
-  // Ignore previews that match what we already showed (avoids redundant
-  // edits when the extractor re-fires on a still-frame buffer).
-  if (lastPtyPreviewByChat.get(sKey) === text) return
-  const isFirstPartial = !lastPtyPreviewByChat.has(sKey)
-  lastPtyPreviewByChat.set(sKey, text)
-  if (isFirstPartial) {
-    process.stderr.write(
-      `telegram channel: pty first partial — chat=${chatId} chars=${text.length}\n`,
-    )
-  }
-
-  let stream = activeDraftStreams.get(sKey)
-  if (!stream) {
-    stream = createStreamController({
-      bot,
-      chatId,
-      threadId,
-      parseMode: 'HTML',
-      disableLinkPreview: true,
-      throttleMs: 600,
-      retry: robustApiCall,
-      onSend: (messageId, charCount) => {
-        logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
-        logStreamingEvent({ kind: 'draft_send', chatId, messageId, charCount })
-      },
-      onEdit: (messageId, charCount) =>
-        logStreamingEvent({
-          kind: 'draft_edit',
-          chatId,
-          messageId,
-          charCount,
-          sameAsLast: false,
-        }),
-    })
-    activeDraftStreams.set(sKey, stream)
-  }
-
-  // Convert markdown → HTML so the streaming preview already has the
-  // right formatting. The reply tool will eventually do the same when
-  // it lands the canonical text, so the preview and final message
-  // will match exactly (and the editMessageText "not modified" path
-  // will handle any duplicates harmlessly).
-  const rendered = markdownToHtml(text)
-  void stream.update(rendered).catch(() => {})
+  pendingPtyPartial = state.pendingPtyPartial?.text ?? null
 }
 
 /**
