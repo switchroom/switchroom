@@ -50,9 +50,15 @@ import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
 import { handleStreamReply } from './stream-reply-handler.js'
+import { createChatLock } from './chat-lock.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
-import { startPtyTail, V1ToolActivityExtractor, type PtyTailHandle } from './pty-tail.js'
+import {
+  startPtyTail,
+  V1ToolActivityExtractor,
+  shouldSuppressToolActivity,
+  type PtyTailHandle,
+} from './pty-tail.js'
 import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory } from './history.js'
 import {
   parseQueuePrefix,
@@ -238,6 +244,13 @@ function resetOrphanedReplyTimeout(): void {
  * open, we finalize the prior stream silently before starting fresh.
  */
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
+/**
+ * Parallel to `activeDraftStreams`: tracks the parseMode baked into each
+ * live stream controller so `handleStreamReply` can detect a mid-lifetime
+ * format switch (e.g. PTY-tail seeded the lane as 'text', now an explicit
+ * stream_reply arrives with format:'html') and rotate the stream.
+ */
+const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 
 function streamKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
@@ -305,6 +318,15 @@ process.on('uncaughtException', err => {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+const chatLock = createChatLock()
+// Locked view of bot — .api methods are auto-serialized per chat_id (first
+// positional arg). Use this (not raw bot) inside MCP tool handlers so
+// concurrent reply/stream_reply/react/edit/etc. to the same chat cannot
+// reorder on the wire.
+const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+function withChatLock<T>(chatId: string, fn: () => Promise<T>): Promise<T> {
+  return chatLock.run(chatId, fn)
+}
 let botUsername = ''
 
 type PendingEntry = {
@@ -1153,12 +1175,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           await openStream.finalize().catch(() => { /* best effort */ })
           previewMessageId = openStream.getMessageId()
           activeDraftStreams.delete(replySKey)
+          activeDraftParseModes.delete(replySKey)
           lastPtyPreviewByChat.delete(replySKey)
         }
 
         const deleteStalePreview = async (id: number): Promise<void> => {
           try {
-            await bot.api.deleteMessage(chat_id, id)
+            await lockedBot.api.deleteMessage(chat_id, id)
           } catch (err) {
             // Best-effort. Leaving a stale preview is worse than nothing,
             // but we can't block the real reply on it. Log and move on.
@@ -1211,7 +1234,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
               try {
                 await robustApiCall(
-                  () => bot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
+                  () => lockedBot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
                   { threadId, chat_id },
                 )
                 sentIds.push(previewMessageId!)
@@ -1238,7 +1261,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
             try {
               const sent = await robustApiCall(
-                () => bot.api.sendMessage(chat_id, chunks[i], sendOpts),
+                () => lockedBot.api.sendMessage(chat_id, chunks[i], sendOpts),
                 { threadId, chat_id },
               )
               sentIds.push(sent.message_id)
@@ -1250,7 +1273,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 threadId = undefined
                 const retryOpts = { ...sendOpts }
                 delete (retryOpts as any).message_thread_id
-                const sent = await bot.api.sendMessage(chat_id, chunks[i], retryOpts)
+                const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts)
                 sentIds.push(sent.message_id)
               } else {
                 throw err
@@ -1283,13 +1306,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await robustApiCall(
-              () => bot.api.sendPhoto(chat_id, input, baseOpts),
+              () => lockedBot.api.sendPhoto(chat_id, input, baseOpts),
               { threadId, chat_id },
             )
             sentIds.push(sent.message_id)
           } else {
             const sent = await robustApiCall(
-              () => bot.api.sendDocument(chat_id, input, baseOpts),
+              () => lockedBot.api.sendDocument(chat_id, input, baseOpts),
               { threadId, chat_id },
             )
             sentIds.push(sent.message_id)
@@ -1355,9 +1378,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             lane: args.lane as string | undefined,
           },
-          { activeDraftStreams },
+          { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
-            bot,
+            bot: lockedBot,
             retry: robustApiCall,
             markdownToHtml,
             escapeMarkdownV2,
@@ -1386,7 +1409,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
-        await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+        await lockedBot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
         return { content: [{ type: 'text', text: 'reacted' }] }
@@ -1428,7 +1451,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           editText = editRawText
         }
         const edited = await robustApiCall(
-          () => bot.api.editMessageText(
+          () => lockedBot.api.editMessageText(
             args.chat_id as string,
             Number(args.message_id),
             editText,
@@ -1469,7 +1492,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'pin_message': {
         assertAllowedChat(args.chat_id as string)
-        await bot.api.pinChatMessage(args.chat_id as string, Number(args.message_id))
+        await lockedBot.api.pinChatMessage(args.chat_id as string, Number(args.message_id))
         return { content: [{ type: 'text', text: `pinned message ${args.message_id}` }] }
       }
       case 'delete_message': {
@@ -1477,7 +1500,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const delMessageId = Number(args.message_id)
         assertAllowedChat(delChatId)
         await robustApiCall(
-          () => bot.api.deleteMessage(delChatId, delMessageId),
+          () => lockedBot.api.deleteMessage(delChatId, delMessageId),
           { chat_id: delChatId },
         )
         // Remove the row from the local history buffer so get_recent_messages
@@ -1552,7 +1575,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(fwdChatId)
         const threadId = resolveThreadId(fwdChatId, args.message_thread_id as string | undefined)
         const fwd = await robustApiCall(
-          () => bot.api.forwardMessage(fwdChatId, fwdFromChatId, fwdMsgId, {
+          () => lockedBot.api.forwardMessage(fwdChatId, fwdFromChatId, fwdMsgId, {
             ...(threadId != null ? { message_thread_id: threadId } : {}),
           }),
           { threadId, chat_id: fwdChatId },
@@ -1723,6 +1746,7 @@ function handlePtyPartial(text: string): void {
     currentSessionThreadId,
     pendingPtyPartial: pendingPtyPartial != null ? { text: pendingPtyPartial } : null,
     activeDraftStreams,
+    activeDraftParseModes,
     suppressPtyPreview,
     lastPtyPreviewByChat,
   }
@@ -1780,6 +1804,13 @@ function handlePtyActivity(text: string): void {
   // ephemeral and a stale "Running Bash: ..." from before the chat was
   // known would only confuse the user.
   if (currentSessionChatId == null) return
+  // Bug 2 fix: suppress per-tool narration for noisy core tools
+  // (Bash/Read/Write/Edit/Grep/Glob). The user wants human-meaningful
+  // rollups, not "Running Bash: ..." per call. Longer-running,
+  // human-visible tools (sub-agent Task, WebFetch, WebSearch, MCP tool
+  // calls whose names map to the generic "Running <Tool>" path) still
+  // pass through.
+  if (shouldSuppressToolActivity(text)) return
   const chatId = currentSessionChatId
   const threadId = currentSessionThreadId
   const access = loadAccess()
@@ -1792,7 +1823,7 @@ function handlePtyActivity(text: string): void {
       format: 'text',
       lane: 'activity',
     },
-    { activeDraftStreams },
+    { activeDraftStreams, activeDraftParseModes },
     {
       bot,
       retry: robustApiCall,
@@ -1831,6 +1862,7 @@ function closeActivityLane(chatId: string, threadId: number | undefined): void {
   const stream = activeDraftStreams.get(key)
   if (stream == null) return
   activeDraftStreams.delete(key)
+  activeDraftParseModes.delete(key)
   void stream.finalize().catch(() => { /* already logged */ })
 }
 
@@ -3134,6 +3166,7 @@ async function handleInbound(
         if (priorStream && !priorStream.isFinal()) {
           void priorStream.finalize().catch(() => {})
           activeDraftStreams.delete(sKey)
+          activeDraftParseModes.delete(sKey)
         }
 
         const ctrl = new StatusReactionController(async (emoji) => {

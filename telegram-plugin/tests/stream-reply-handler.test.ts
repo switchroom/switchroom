@@ -12,10 +12,18 @@ import {
   type StreamReplyState,
 } from '../stream-reply-handler.js'
 import type { DraftStreamHandle } from '../draft-stream.js'
+import { markdownToHtml as realMarkdownToHtml } from '../format.js'
 import { createMockBot, installBotResetHook, microtaskFlush } from './bot-api.harness.js'
+import {
+  handlePtyPartialPure,
+  type PtyHandlerState,
+} from '../pty-partial-handler.js'
 
 function makeState(): StreamReplyState {
-  return { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+  return {
+    activeDraftStreams: new Map<string, DraftStreamHandle>(),
+    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+  }
 }
 
 function makeDeps(
@@ -321,6 +329,182 @@ describe('handleStreamReply', () => {
 
     expect(state.activeDraftStreams.has('1:_:thinking')).toBe(false)
     expect(state.activeDraftStreams.has('1:_')).toBe(true)
+  })
+
+  it('bug 1: parseMode mismatch with existing stream rotates to fresh stream with new parseMode + rendered text', async () => {
+    // Reproduces the reported bug: PTY-tail auto-stream seeds a stream
+    // with format:'text' (parseMode undefined). A later explicit
+    // stream_reply on the same key with format:'html' + markdown text
+    // must NOT inherit the stale parseMode — it must finalize the old
+    // stream and create a fresh one with parse_mode=HTML so the markdown
+    // converts to HTML tags instead of sending literal asterisks.
+    const state = makeState()
+    const deps = makeDeps(bot, {
+      markdownToHtml: realMarkdownToHtml,
+      defaultFormat: 'text',
+    })
+
+    // First call: PTY-tail-style, format:'text'
+    const p1 = handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await p1
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
+
+    vi.advanceTimersByTime(1000)
+
+    // Second call on the same stream key: model explicitly uses html +
+    // markdown. Must produce a new send (stream rotated), parse_mode HTML,
+    // and literal markdown converted to Telegram HTML tags.
+    const p2 = handleStreamReply(
+      { chat_id: '1', text: '**bold** and `code`', format: 'html' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await p2
+
+    // A fresh stream means a second sendMessage, not an edit of the old
+    // one (the old stream was finalized + discarded).
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    const secondSend = bot.api.sendMessage.mock.calls[1]
+    expect(secondSend[2]?.parse_mode).toBe('HTML')
+    // markdownToHtml renders `**bold**` → `<b>bold</b>` and
+    // `` `code` `` → `<code>code</code>`.
+    expect(secondSend[1]).toContain('<b>bold</b>')
+    expect(secondSend[1]).toContain('<code>code</code>')
+    expect(secondSend[1]).not.toContain('**')
+    expect(secondSend[1]).not.toMatch(/`code`/)
+  })
+
+  // ─── Regression: PTY-tail duplicate message. Before the fix,
+  // stream_reply did not add itself to suppressPtyPreview, so a PTY
+  // partial firing after a finalized stream (TUI capture of the same
+  // assistant text) created a duplicate message with the raw TUI text
+  // and visibly escaped HTML tags. See log sequence: msg 559 finalized,
+  // then msg 560 draft_send path=pty_preview with the same content.
+  // Now stream_reply claims the suppress slot on the first call.
+
+  it('adds sKey (without lane) to suppressPtyPreview on first call', async () => {
+    const state: StreamReplyState = {
+      ...makeState(),
+      suppressPtyPreview: new Set<string>(),
+    }
+    const deps = makeDeps(bot)
+
+    const pending = handleStreamReply({ chat_id: '42', text: 'hi' }, state, deps)
+    await microtaskFlush()
+    await pending
+
+    expect(state.suppressPtyPreview!.has('42:_')).toBe(true)
+  })
+
+  it('suppression key ignores lane — claims default PTY lane', async () => {
+    const state: StreamReplyState = {
+      ...makeState(),
+      suppressPtyPreview: new Set<string>(),
+    }
+    const deps = makeDeps(bot)
+
+    const pending = handleStreamReply(
+      { chat_id: '42', text: 'hi', lane: 'thinking' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pending
+
+    // The stream itself is keyed with the lane...
+    expect(state.activeDraftStreams.has('42:_:thinking')).toBe(true)
+    // ...but the PTY-suppression key is lane-less so the PTY handler
+    // (which has no concept of lanes) actually sees it as suppressed.
+    expect(state.suppressPtyPreview!.has('42:_')).toBe(true)
+    expect(state.suppressPtyPreview!.has('42:_:thinking')).toBe(false)
+  })
+
+  it('suppression survives done=true so late PTY partials are still dropped', async () => {
+    // This covers the exact production sequence from telegram-plugin.log:
+    // stream_reply done=true → draft_edit final → PTY partial arrives
+    // 500ms later with the TUI capture → must NOT create a new message.
+    const state: StreamReplyState = {
+      ...makeState(),
+      suppressPtyPreview: new Set<string>(),
+    }
+    const deps = makeDeps(bot)
+
+    const pending = handleStreamReply(
+      { chat_id: '42', text: 'final', done: true },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pending
+
+    // After done=true the stream is gone from activeDraftStreams...
+    expect(state.activeDraftStreams.has('42:_')).toBe(false)
+    // ...but the suppress slot must remain so a PTY partial landing
+    // AFTER finalize is dropped. server.ts clears this on turn_end.
+    expect(state.suppressPtyPreview!.has('42:_')).toBe(true)
+  })
+
+  it('end-to-end: PTY partial after stream_reply finalize is suppressed (no dup message)', async () => {
+    // Reproduces the production sequence:
+    //   1. stream_reply done=true for chat 42
+    //   2. PTY-tail fires with the TUI capture of the same assistant text
+    //   3. PTY handler sees suppress flag and drops the partial
+    // Before the fix, step 2 created a duplicate Telegram message with
+    // raw TUI text and visibly-escaped HTML tags (see log msg 559 → 560).
+    const activeDraftStreams = new Map<string, DraftStreamHandle>()
+    const suppressPtyPreview = new Set<string>()
+    const streamState: StreamReplyState = {
+      activeDraftStreams,
+      activeDraftParseModes: new Map(),
+      suppressPtyPreview,
+    }
+    const streamDeps = makeDeps(bot)
+
+    // Step 1: stream_reply finalizes.
+    const pending = handleStreamReply(
+      { chat_id: '42', text: 'final answer', done: true },
+      streamState,
+      streamDeps,
+    )
+    await microtaskFlush()
+    await pending
+    const sendsAfterStream = bot.api.sendMessage.mock.calls.length
+
+    // Step 2: PTY partial fires into the SHARED state — same Sets/Maps.
+    const ptyState: PtyHandlerState = {
+      currentSessionChatId: '42',
+      currentSessionThreadId: undefined,
+      pendingPtyPartial: null,
+      activeDraftStreams,
+      suppressPtyPreview,
+      lastPtyPreviewByChat: new Map(),
+    }
+    const action = handlePtyPartialPure(
+      'TUI capture: <b>final answer</b>',
+      ptyState,
+      { bot, renderText: (t) => t },
+    )
+    await microtaskFlush()
+
+    // Step 3: partial was dropped — no extra sendMessage call.
+    expect(action).toBe('suppressed')
+    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsAfterStream)
+  })
+
+  it('works without suppressPtyPreview (backwards compat)', async () => {
+    // Callers that don't thread the set through must still function.
+    const state = makeState() // no suppressPtyPreview
+    const deps = makeDeps(bot)
+
+    const pending = handleStreamReply({ chat_id: '42', text: 'hi' }, state, deps)
+    await microtaskFlush()
+    const result = await pending
+    expect(result.messageId).toBe(500)
   })
 
   it('streamExisted flag in logStreamingEvent reflects map state', async () => {

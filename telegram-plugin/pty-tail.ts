@@ -324,6 +324,77 @@ export class V1ToolActivityExtractor implements ToolActivityExtractor {
   }
 }
 
+/**
+ * Activity-line prefixes produced by the noisy core tools (Bash, Read,
+ * Write, Edit, Grep, Glob). The PTY tail extracts an activity line per
+ * tool call, but surfacing each one to the user is noise — the user
+ * wants human-meaningful rollups ("Running sub-agent...",
+ * "Fetching URL...") not per-tool narration of "Running Bash: cd ...".
+ *
+ * Used by `shouldSuppressToolActivity` to filter at the consumer layer.
+ * The extractor itself still returns these lines unchanged, so anything
+ * that wants the raw stream (tests, telemetry) keeps working.
+ */
+export const NOISY_TOOL_ACTIVITY_PREFIXES: readonly string[] = [
+  'Running Bash',
+  'Reading file',
+  'Writing file',
+  'Editing file',
+  'Searching with Grep',
+  'Searching with Glob',
+  // Claude Code's in-progress spinner uses bare verbs ("Reading…",
+  // "Writing…", "Editing…", "Searching…") which the bullet-line regex
+  // captures as the tool token. activityVerb falls through to the
+  // default `Running ${tool}`, producing these synthetic prefixes.
+  'Running Reading',
+  'Running Writing',
+  'Running Editing',
+  'Running Searching',
+  'Running Read',
+  'Running Write',
+  'Running Edit',
+  'Running Grep',
+  'Running Glob',
+]
+
+/**
+ * Substrings that mark a Claude Code TUI keyboard hint the Telegram
+ * user cannot action ("ctrl+o to expand", "esc to interrupt",
+ * "shift+tab to cycle", etc.). If any of these appear anywhere in an
+ * activity line, the line is suppressed — surfacing the hint is
+ * confusing UX (user pokes at their phone, nothing happens) and the
+ * line carries no information beyond "Claude is doing something".
+ */
+export const TUI_HINT_MARKERS: readonly string[] = [
+  'ctrl+',
+  'ctrl-',
+  'esc to ',
+  'shift+',
+  'shift-',
+  'alt+',
+  'tab to ',
+]
+
+/**
+ * True if an activity line is per-tool narration for a noisy core tool
+ * (Bash/Read/Write/Edit/Grep/Glob) that should NOT be surfaced to the
+ * Telegram activity lane. Human-meaningful rollups ("Running sub-agent",
+ * "Fetching URL", "Searching the web", and anything unknown mapped to
+ * "Running <CustomTool>") pass through. Also suppresses any line that
+ * carries a Claude Code TUI keyboard hint, regardless of tool prefix.
+ */
+export function shouldSuppressToolActivity(line: string): boolean {
+  const lower = line.toLowerCase()
+  for (const marker of TUI_HINT_MARKERS) {
+    if (lower.includes(marker)) return true
+  }
+  for (const prefix of NOISY_TOOL_ACTIVITY_PREFIXES) {
+    if (line === prefix) return true
+    if (line.startsWith(prefix + ':')) return true
+  }
+  return false
+}
+
 function activityVerb(tool: string): string {
   switch (tool) {
     case 'Bash': return 'Running Bash'

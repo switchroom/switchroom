@@ -490,6 +490,158 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
     expect(rActivity.messageId).not.toBe(rAnswer.messageId)
   })
 
+  // ---- closeActivityLane / turn-boundary coverage --------------------
+  //
+  // These cases model the `closeActivityLane(chatId, threadId)` helper in
+  // server.ts that fires on `turn_end`. It must (a) finalize + remove the
+  // activity-lane stream from the map, (b) be a no-op if no activity
+  // stream exists, and (c) allow a fresh activity stream on the NEXT
+  // turn (new message id — not editing the now-closed previous one).
+
+  function modelCloseActivityLane(
+    state: StreamReplyState,
+    chatId: string,
+    threadId?: number,
+  ): Promise<void> {
+    const key = `${chatId}:${threadId ?? '_'}:activity`
+    const stream = state.activeDraftStreams.get(key)
+    if (stream == null) return Promise.resolve()
+    state.activeDraftStreams.delete(key)
+    return stream.finalize().catch(() => { /* swallow */ })
+  }
+
+  it('closeActivityLane removes the stream entry and is idempotent', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    await handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+
+    await modelCloseActivityLane(state, '1', undefined)
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(false)
+
+    // Calling again with no stream present must not throw.
+    await expect(modelCloseActivityLane(state, '1', undefined)).resolves.toBeUndefined()
+    await expect(modelCloseActivityLane(state, 'never-existed', undefined)).resolves.toBeUndefined()
+  })
+
+  it('next turn after closeActivityLane creates a fresh message (no edit of closed stream)', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    // Turn 1
+    await handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    const firstId = state.activeDraftStreams.get('1:_:activity')!.getMessageId()
+    const sendsBefore = bot.api.sendMessage.mock.calls.length
+
+    // Turn boundary
+    await modelCloseActivityLane(state, '1', undefined)
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(false)
+
+    // Turn 2 — new activity must send a fresh message, not edit the old one
+    await handleStreamReply(
+      { chat_id: '1', text: 'Reading file: foo.ts', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+    const secondId = state.activeDraftStreams.get('1:_:activity')!.getMessageId()
+    expect(secondId).not.toBe(firstId)
+    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsBefore + 1)
+  })
+
+  it('closeActivityLane leaves the answer lane untouched (independent lifecycle)', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    await handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await handleStreamReply(
+      { chat_id: '1', text: 'Drafting answer…', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+
+    await modelCloseActivityLane(state, '1', undefined)
+
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(false)
+    // Answer lane survives — turn_end finalizes answer via its own
+    // done=true path, not via closeActivityLane.
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+  })
+
+  // handlePtyActivity's "drop when no chat id" guard lives in server.ts.
+  // We model the guard shape directly: when currentSessionChatId is null
+  // the call short-circuits BEFORE handleStreamReply, so nothing lands
+  // in the map and no bot traffic fires.
+  it('handlePtyActivity guard: drops events when currentSessionChatId is null', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    let currentSessionChatId: string | null = null
+    const handlePtyActivity = (text: string) => {
+      if (currentSessionChatId == null) return
+      void handleStreamReply(
+        { chat_id: currentSessionChatId, text, lane: 'activity', format: 'text' },
+        state, deps,
+      )
+    }
+
+    const sendsBefore = bot.api.sendMessage.mock.calls.length
+    handlePtyActivity('Running Bash: git status')
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.size).toBe(0)
+    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsBefore)
+
+    // Once chat id is known, the next activity line DOES land.
+    currentSessionChatId = '1'
+    handlePtyActivity('Running Bash: git status')
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsBefore + 1)
+  })
+
+  it('activity lane across chat ids: closing lane for chat A does not touch chat B', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    await handleStreamReply(
+      { chat_id: 'A', text: 'A running', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await handleStreamReply(
+      { chat_id: 'B', text: 'B running', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.has('A:_:activity')).toBe(true)
+    expect(state.activeDraftStreams.has('B:_:activity')).toBe(true)
+
+    await modelCloseActivityLane(state, 'A', undefined)
+
+    expect(state.activeDraftStreams.has('A:_:activity')).toBe(false)
+    expect(state.activeDraftStreams.has('B:_:activity')).toBe(true)
+  })
+
   it('activity lane updates edit the activity message, not the answer message', async () => {
     const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
     const deps = makeActivityDeps(bot)

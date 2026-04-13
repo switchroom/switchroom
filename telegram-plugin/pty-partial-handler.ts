@@ -49,6 +49,13 @@ export interface PtyHandlerState {
   /** Active streams, keyed by `chat_id:thread_id`. */
   activeDraftStreams: Map<string, DraftStreamHandle>
   /**
+   * Parallel to activeDraftStreams: parseMode baked into each controller.
+   * Lets `handleStreamReply` detect and rotate streams whose parseMode no
+   * longer matches the caller's resolved format (bug 1). Optional for
+   * backwards compatibility.
+   */
+  activeDraftParseModes?: Map<string, 'HTML' | 'MarkdownV2' | undefined>
+  /**
    * Chats whose PTY preview is claimed by an in-flight reply handler.
    * Partials for these chats are dropped to avoid duplicates.
    */
@@ -145,6 +152,7 @@ export function handlePtyPartialPure(
       onEdit: (messageId, charCount) => deps.onStreamEdit?.(chatId, messageId, charCount),
     })
     state.activeDraftStreams.set(sKey, stream)
+    state.activeDraftParseModes?.set(sKey, 'HTML')
   }
 
   const rendered = deps.renderText(text)

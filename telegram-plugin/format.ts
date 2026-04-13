@@ -253,26 +253,43 @@ export function splitHtmlChunks(html: string, maxLen = 4000): string[] {
     // &lt;, &#x1f4a9;). If the cut would land mid-entity, back up to
     // before the `&`. Telegram rejects messages with broken entities.
     cut = backOffEntity(rest, cut)
+    // Same idea for a bisected tag: if the cut lands inside `<...>` (or
+    // between `<` and its closing `>`), back up to before the `<`.
+    // Otherwise we'd emit a chunk ending in `<a` or `<a href="..` which
+    // Telegram rejects outright.
+    cut = backOffOpenTag(rest, cut)
+    // Pathological: the tag-back-off retreated to 0 because `rest`
+    // begins with a tag and the nearest space we picked landed inside
+    // that tag. Fall back to the hard maxLen cut — that position lives
+    // in content past the opening tag (since the tag itself is at the
+    // start) so it won't bisect anything, and we make forward progress.
+    if (cut <= 0) {
+      cut = Math.min(maxLen, rest.length)
+      cut = backOffOpenTag(rest, cut)
+      // If even the maxLen cut bisects a tag, emit the whole remainder
+      // as one chunk rather than spin forever. Telegram will reject
+      // a 4k+ message before it rejects a split one, but this only
+      // fires on genuinely malformed input.
+      if (cut <= 0) cut = rest.length
+    }
 
     let segment = rest.slice(0, cut)
     rest = rest.slice(cut).replace(/^\n+/, '')
 
-    // Track open tags in this segment
+    // Track open tags in this segment — we keep the FULL opening tag
+    // string (including attributes) so we can reopen `<a href="...">`
+    // in the next chunk without dropping the href.
     const openTags = getOpenTags(segment)
 
-    // Close any open tags at the end of this chunk
+    // Close any open tags at the end of this chunk (by tag name)
     for (let i = openTags.length - 1; i >= 0; i--) {
-      segment += `</${openTags[i]}>`
+      segment += `</${openTags[i].name}>`
     }
     chunks.push(segment)
 
-    // Reopen tags at the start of the next chunk
+    // Reopen tags at the start of the next chunk, preserving attrs
     if (rest.length > 0 && openTags.length > 0) {
-      const reopenPrefix = openTags.map(tag => {
-        // For tags with attributes (like <code class="...">), we'd need the full open tag.
-        // Our markdown conversion produces simple tags, so just reopen the tag name.
-        return `<${tag}>`
-      }).join('')
+      const reopenPrefix = openTags.map(t => t.openTag).join('')
       rest = reopenPrefix + rest
     }
   }
@@ -303,21 +320,57 @@ function backOffEntity(text: string, cut: number): number {
   return cut
 }
 
+/**
+ * If `cut` lands inside an HTML tag (between `<` and the next `>`), back
+ * up to before the `<`. Telegram rejects messages that contain a stray
+ * `<` without a matching `>` (e.g. chunk ending `<a href="..`).
+ */
+function backOffOpenTag(text: string, cut: number): number {
+  if (cut <= 0 || cut >= text.length) return cut
+  // Scan backward for the nearest `<` or `>` before the cut. If we hit
+  // `>` first the cut is outside any tag → safe. If we hit `<` first,
+  // check whether its closing `>` lies at or after the cut → bisected.
+  for (let i = cut - 1; i >= 0; i--) {
+    const ch = text[i]
+    if (ch === '>') return cut
+    if (ch === '<') {
+      const closeIdx = text.indexOf('>', i)
+      if (closeIdx >= cut) return i
+      return cut
+    }
+  }
+  return cut
+}
+
+/** A tag still open at the end of a fragment. */
+interface OpenTag {
+  name: string       // lowercase tag name, e.g. "a", "tg-spoiler"
+  openTag: string    // full opening string with attrs, e.g. `<a href="...">`
+}
+
 /** Parse an HTML fragment and return the list of tags still open at the end. */
-function getOpenTags(html: string): string[] {
-  const tagStack: string[] = []
-  const tagRe = /<\/?([a-z][a-z0-9]*)[^>]*>/gi
+function getOpenTags(html: string): OpenTag[] {
+  const tagStack: OpenTag[] = []
+  // Allow hyphens in tag names so `tg-spoiler` and `tg-emoji` parse as a
+  // single tag rather than `tg` plus stray text.
+  const tagRe = /<(\/?)([a-z][a-z0-9-]*)\b[^>]*>/gi
   let m: RegExpExecArray | null
   while ((m = tagRe.exec(html)) !== null) {
     const full = m[0]
-    const tagName = m[1].toLowerCase()
-    if (full.startsWith('</')) {
-      // Closing tag — pop from stack
-      const idx = tagStack.lastIndexOf(tagName)
-      if (idx !== -1) tagStack.splice(idx, 1)
+    const isClosing = m[1] === '/'
+    const tagName = m[2].toLowerCase()
+    if (isClosing) {
+      // Closing tag — pop the most recent matching entry off the stack
+      for (let i = tagStack.length - 1; i >= 0; i--) {
+        if (tagStack[i].name === tagName) {
+          tagStack.splice(i, 1)
+          break
+        }
+      }
     } else if (!full.endsWith('/>')) {
-      // Opening tag (not self-closing)
-      tagStack.push(tagName)
+      // Opening tag (not self-closing) — remember the full open string
+      // so reopen in the next chunk preserves attributes.
+      tagStack.push({ name: tagName, openTag: full })
     }
   }
   return tagStack
