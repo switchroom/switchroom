@@ -1378,7 +1378,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             lane: args.lane as string | undefined,
           },
-          { activeDraftStreams, activeDraftParseModes },
+          { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
             bot: lockedBot,
             retry: robustApiCall,

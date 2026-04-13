@@ -55,6 +55,21 @@ export interface StreamReplyState {
    * construct a StreamReplyState without it.
    */
   activeDraftParseModes?: Map<string, 'HTML' | 'MarkdownV2' | undefined>
+  /**
+   * Chats whose PTY preview is claimed by an in-flight reply/stream_reply
+   * handler. PTY-tail partials for these keys are dropped to avoid
+   * duplicate messages. Historically only the `reply` tool added to this
+   * set; `stream_reply` did not, so a PTY partial firing after a
+   * finalized stream would create a duplicate message with the raw TUI
+   * text (see regression in telegram-plugin.log where msg 559 was
+   * followed by a duplicate msg 560 via path=pty_preview). stream_reply
+   * now claims the slot on the first call so later PTY partials are
+   * suppressed for the rest of the turn.
+   *
+   * Optional for backwards compatibility with callers that don't yet
+   * thread this state through — without it the bug reopens silently.
+   */
+  suppressPtyPreview?: Set<string>
 }
 
 export interface StreamReplyDeps {
@@ -148,6 +163,12 @@ export async function handleStreamReply(
   const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
 
   const sKey = streamKey(chat_id, threadId, args.lane)
+  // Claim the PTY-preview slot so any PTY-tail partial that fires mid-
+  // or post-turn for this chat+thread is dropped. Keyed WITHOUT lane
+  // because the PTY handler uses the lane-less key and we need to
+  // suppress its default lane regardless of which lane stream_reply
+  // targets. Cleared on turn_end by server.ts.
+  state.suppressPtyPreview?.add(streamKey(chat_id, threadId))
   let stream = state.activeDraftStreams.get(sKey)
 
   // Bug 1 fix: parseMode is baked into the stream controller at creation

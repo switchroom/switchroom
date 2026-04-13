@@ -450,6 +450,82 @@ describe('splitHtmlChunks', () => {
       expect(c).not.toMatch(/^4A9;/)
     }
   })
+
+  // ─── Regression: tag-name parsing must allow `-` so `tg-spoiler` and
+  // `tg-emoji` survive chunk boundaries instead of being truncated to `tg`.
+  test('preserves <tg-spoiler> across chunk boundaries', () => {
+    const html = '<tg-spoiler>' + 'x'.repeat(5000) + '</tg-spoiler>'
+    const chunks = splitHtmlChunks(html, 2000)
+    expect(chunks.length).toBeGreaterThan(1)
+    // Chunk0 must close with the FULL tag name, not a truncated `</tg>`
+    expect(chunks[0]).toMatch(/<\/tg-spoiler>$/)
+    expect(chunks[0]).not.toMatch(/<\/tg>$/)
+    // Chunk1 must reopen with the full tag name
+    expect(chunks[1]).toMatch(/^<tg-spoiler>/)
+    expect(chunks[1]).not.toMatch(/^<tg>/)
+  })
+
+  test('preserves <tg-emoji> across chunk boundaries', () => {
+    const html = '<tg-emoji emoji-id="5368324170671202286">' + 'y'.repeat(5000) + '</tg-emoji>'
+    const chunks = splitHtmlChunks(html, 2000)
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks[0]).toMatch(/<\/tg-emoji>$/)
+    expect(chunks[1]).toMatch(/^<tg-emoji/)
+  })
+
+  // ─── Regression: reopening `<a href="...">` in the next chunk must
+  // preserve the href attribute. Previously the splitter emitted bare
+  // `<a>` which Telegram rejects.
+  test('preserves <a href="..."> attributes across chunk boundaries', () => {
+    const href = 'https://example.com/some/deep/path?x=1'
+    // Put a natural split point well into the link text so paragraph/space
+    // breaks don't land inside the opening tag itself.
+    const html = `<a href="${href}">` + 'word '.repeat(1000) + '</a>'
+    const chunks = splitHtmlChunks(html, 2000)
+    expect(chunks.length).toBeGreaterThan(1)
+    // First chunk must close the anchor
+    expect(chunks[0]).toMatch(/<\/a>$/)
+    // Second chunk must reopen with the FULL href attribute, not bare `<a>`
+    expect(chunks[1]).toMatch(new RegExp(`^<a href="${href.replace(/[.?/]/g, '\\$&')}">`))
+    expect(chunks[1]).not.toMatch(/^<a>/)
+  })
+
+  test('preserves <code class="language-ts"> attributes across boundaries', () => {
+    const html = '<pre><code class="language-ts">' + 'z '.repeat(2000) + '</code></pre>'
+    const chunks = splitHtmlChunks(html, 2000)
+    expect(chunks.length).toBeGreaterThan(1)
+    // Reopened chunk should carry the class attribute
+    expect(chunks[1]).toContain('<code class="language-ts">')
+  })
+
+  // ─── Regression: splitter must not cut INSIDE an open tag. Previously,
+  // `<a href="..."` followed by a long run of non-space text made the
+  // space-fallback pick position 2 (the space inside `<a href=`) and emit
+  // a chunk consisting of just `<a`, which Telegram rejects.
+  test('does not cut inside an open tag when tag contains the only nearby space', () => {
+    const html = '<a href="https://example.com/very/long/url">' + 'y'.repeat(5000) + '</a>'
+    const chunks = splitHtmlChunks(html, 2000)
+    // No chunk should end mid-tag (e.g. `<a` or `<a href="..`)
+    for (const c of chunks) {
+      // A chunk ending with `<` or `<tagname` with no closing `>` is malformed.
+      // Quick check: count unclosed `<`s by stripping complete tags.
+      const withoutTags = c.replace(/<[^>]*>/g, '')
+      expect(withoutTags).not.toContain('<')
+    }
+  })
+
+  test('backs off when the cut lands between < and > of an opening tag', () => {
+    // Construct a case where `cut` would naturally land inside `<b attr="...">`
+    const filler = 'a '.repeat(1000) // lots of spaces so splitter has choices
+    const html = filler + '<b class="very-long-classname-that-pushes-the-tag-past-cut">' + 'x'.repeat(5000) + '</b>'
+    const chunks = splitHtmlChunks(html, 2000)
+    // None of the chunks should contain a stray `<` without a matching `>`.
+    for (const c of chunks) {
+      const withoutTags = c.replace(/<[^>]*>/g, '')
+      expect(withoutTags).not.toContain('<')
+      expect(withoutTags).not.toContain('>')
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
