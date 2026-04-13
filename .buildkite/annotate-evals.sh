@@ -34,8 +34,8 @@ print(f"| {status} {label} | {passed}/{total} ({pct:.0f}%) | {failed} failed |")
 PY
 }
 
-trigger_file="$(latest_of 'trigger-*.json' || true)"
-quality_file="$(latest_of 'quality-*.json' || true)"
+trigger_file="$(latest_of 'trigger_*.json' || true)"
+quality_file="$(latest_of 'quality_*.json' || true)"
 
 if [[ -z "${trigger_file:-}" && -z "${quality_file:-}" ]]; then
   buildkite-agent annotate \
