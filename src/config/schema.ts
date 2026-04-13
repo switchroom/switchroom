@@ -288,6 +288,16 @@ export const TelegramChannelSchema = z
       .number()
       .optional()
       .describe("Minimum delay between outgoing messages in ms"),
+    stream_mode: z
+      .enum(["pty", "checklist"])
+      .optional()
+      .describe(
+        "How live progress is streamed to Telegram during a turn. " +
+        "'pty' (default) surfaces text snapshots of Claude Code's TUI — " +
+        "compatible but can flicker as Ink re-renders. 'checklist' drives " +
+        "a structured progress card from session-tail events — stable " +
+        "order, per-tool status emojis, fires only on semantic transitions."
+      ),
   })
   .optional();
 
