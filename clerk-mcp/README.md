@@ -1,31 +1,43 @@
 # Clerk Management MCP Server
 
-A lightweight MCP server that exposes clerk management commands as tools, allowing Claude Code agents to manage the clerk fleet without direct Bash access.
+A small MCP server that exposes clerk's memory commands as tools, so Claude
+Code agents can search and inspect agent memories without shelling out to
+Bash.
+
+## Scope
+
+This server is intentionally narrow: it wraps `clerk memory` only. Agent
+lifecycle (`start`/`stop`/`restart`), auth status, and topic listing are
+**not** exposed here — they live in the Telegram plugin's `/clerkstart`,
+`/stop`, `/restart`, `/auth`, `/topics` slash commands (see
+[`telegram-plugin/README.md`](../telegram-plugin/README.md)).
+
+If you want the agent itself to be able to manage other agents, use the
+slash commands from chat or grant the agent Bash access to the `clerk` CLI.
 
 ## How it works
 
-The server is a thin wrapper around the `clerk` CLI. Each tool invocation calls the corresponding `clerk` subcommand and returns the output. The server runs as a child process of each agent via stdio transport.
+The server is a thin wrapper around the `clerk` CLI. Each tool invocation
+calls the corresponding `clerk` subcommand and returns the output. The
+server runs as a child process of each agent via stdio transport.
 
 ## Configuration
 
-Set the `CLERK_CONFIG` environment variable to the path of your `clerk.yaml` file. If not set, the clerk CLI will use its default config search behavior.
+Set the `CLERK_CONFIG` environment variable to the path of your
+`clerk.yaml` file. If not set, the clerk CLI uses its default config
+search behavior.
 
-## Available Tools
+## Available tools
 
 | Tool | Description | Input |
 |------|-------------|-------|
-| `clerk_agent_list` | List all agents with status (name, active, uptime, template, topic) | none |
-| `clerk_agent_start` | Start an agent | `{ name: string }` |
-| `clerk_agent_stop` | Stop an agent | `{ name: string }` |
-| `clerk_agent_restart` | Restart an agent | `{ name: string }` |
-| `clerk_auth_status` | Show auth status for all agents | none |
-| `clerk_topics_list` | List topic-to-agent mappings | none |
-| `clerk_memory_search` | Search memories via Hindsight | `{ query: string, agent?: string }` |
-| `clerk_memory_stats` | Show per-agent collection info | none |
+| `clerk_memory_search` | Search agent memories via Hindsight | `{ query: string, agent?: string }` |
+| `clerk_memory_stats` | Show per-agent memory collection info and stats | none |
 
-## Usage
+## Setup
 
-The server is automatically added to each agent's `settings.json` during scaffolding. Manual setup:
+The server is added to each agent's `settings.json` automatically during
+scaffolding. Manual setup:
 
 ```json
 {

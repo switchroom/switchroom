@@ -1,6 +1,29 @@
 # Deterministic MCP-level streaming — design notes
 
-Status: research. No architectural change is implemented on this branch.
+> **⚠️ Historical research notes.** This document captures the H1–H5
+> failure-mode analysis and the Opt-1…Opt-6 design space that informed the
+> streaming work in early April 2026. The recommendation (Opt-1: deprecate
+> `reply`, force `stream_reply`) was **not** taken in that form. Instead,
+> `reply` and `stream_reply` are both still exposed, and the model is steered
+> to `stream_reply` for any multi-tool turn via the per-agent CLAUDE.md
+> ("`stream_reply` is the HARD DEFAULT for any turn that will use more than
+> one tool call").
+>
+> Subsequent fixes (commits `5c398f7`, `2777b23`, `0796d68`, `c869f44`) hardened
+> the actual streaming pipeline: chunk-split tag integrity for `tg-spoiler` /
+> `tg-emoji` / attribute-bearing tags, PTY-suppression for `stream_reply`
+> (eliminating duplicate-message + visibly-escaped-HTML symptoms),
+> spinner-verb and TUI-hint suppression in the activity lane, and per-chat
+> outbound ordering with parseMode rotation. Those changes are covered by
+> regression tests in `telegram-plugin/tests/{telegram-format,stream-reply-handler,pty-tail}.test.ts`.
+>
+> Read this document for the *analysis* and the *option-space*, not as a
+> roadmap. The Phase 0 metrics (`streaming-metrics.ts` + `streaming-report.ts`)
+> are still gated by `CLERK_STREAMING_METRICS=1` and remain useful for ad-hoc
+> investigation.
+
+Status: research (April 2026). Architectural changes did not ship as
+proposed; see header note above.
 Companion instrumentation: `telegram-plugin/streaming-metrics.ts` +
 `telegram-plugin/streaming-report.ts`. Gated by `CLERK_STREAMING_METRICS=1`.
 

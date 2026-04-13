@@ -20,6 +20,49 @@ agents:
 
 Everything else (model, tools, memory, channels, sub-agents, session policy, scheduled tasks) inherits from sensible defaults.
 
+## What You Get
+
+| Feature | Description |
+|---------|-------------|
+| **Telegram interface** | Talk to agents from your phone, anywhere |
+| **Config cascade** | Defaults → profiles → per-agent. Change one line, all agents update |
+| **Sub-agent delegation** | Opus plans, Sonnet implements in the background |
+| **Scheduled tasks** | Cron-based, systemd timers, survive reboots |
+| **Persistent memory** | Hindsight semantic memory with knowledge graphs |
+| **Session continuity** | Resume sessions across restarts with freshness gating |
+| **Enhanced Telegram** | 10 MCP tools, emoji reactions, message history, rich formatting |
+| **Encrypted vault** | AES-256-GCM for secrets |
+| **Preflight checks** | Catch broken configs before they hang |
+
+## Compared To
+
+| | Clerk | OpenClaw | NanoClaw |
+|---|---|---|---|
+| Runtime | Claude Code CLI | Custom runtime | Agents SDK |
+| Auth | Pro/Max OAuth | API key | API key |
+| Channels | Telegram (enhanced) | WhatsApp, TG, Slack | WhatsApp, TG, Slack |
+| Memory | Hindsight (semantic) | File-based | Per-container |
+| Scheduling | systemd timers | Built-in cron engine | Built-in scheduler |
+| Sub-agents | Native Claude Code | Custom orchestration | N/A |
+| Config | YAML with cascade | JSON/TOML per agent | ENV vars |
+| Setup | `clerk setup` | Docker compose | Docker compose |
+
+## Architecture
+
+```
+You (Telegram)
+    │
+    ▼
+@YourBot ──── clerk-telegram MCP ──── Claude Code CLI
+                  │                        │
+                  ├─ SQLite history         ├─ .claude/agents/*.md (sub-agents)
+                  ├─ Emoji reactions        ├─ settings.json (tools, hooks, MCP)
+                  └─ Format conversion      ├─ Hindsight plugin (memory)
+                                           └─ systemd (agent + cron timers)
+```
+
+Clerk is **not a harness**. Each agent runs the unmodified `claude` binary, authenticated directly with Anthropic.
+
 ## Quick Start
 
 ```bash
@@ -40,31 +83,6 @@ clerk setup
 ```
 
 After setup, talk to your agent from Telegram. You don't touch the server again.
-
-## What You Get
-
-| Feature | Description |
-|---------|-------------|
-| **Telegram interface** | Talk to agents from your phone, anywhere |
-| **Config cascade** | Defaults → profiles → per-agent. Change one line, all agents update |
-| **Sub-agent delegation** | Opus plans, Sonnet implements in the background |
-| **Scheduled tasks** | Cron-based, systemd timers, survive reboots |
-| **Persistent memory** | Hindsight semantic memory with knowledge graphs |
-| **Session continuity** | Resume sessions across restarts with freshness gating |
-| **Enhanced Telegram** | 10 MCP tools, emoji reactions, message history, rich formatting |
-| **Encrypted vault** | AES-256-GCM for secrets |
-| **Preflight checks** | Catch broken configs before they hang |
-
-## Documentation
-
-| Guide | Description |
-|-------|-------------|
-| **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles, escape hatches |
-| **[Telegram Plugin](docs/telegram-plugin.md)** | Enhanced plugin features, 10 MCP tools, emoji reactions |
-| **[Sub-Agents](docs/sub-agents.md)** | Model routing, delegation patterns, frontmatter spec |
-| **[Scheduling](docs/scheduling.md)** | Cron tasks, systemd timers, model selection |
-| **[Session Management](docs/session-optimization.md)** | Continuity, compaction, freshness policy |
-| **[Compliance](docs/compliance-attestation.md)** | Anthropic compliance analysis |
 
 ## Example Configuration
 
@@ -97,7 +115,8 @@ defaults:
 profiles:
   advisor:
     tools: { deny: [Bash, Edit, Write] }
-    soul: { style: warm, empathetic }
+    soul:
+      style: "warm, empathetic"
 
 agents:
   assistant:
@@ -107,7 +126,8 @@ agents:
   coach:
     topic_name: "Coach"
     extends: advisor
-    soul: { name: Coach }
+    soul:
+      name: Coach
 ```
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
@@ -125,41 +145,29 @@ clerk agent reconcile <name|all>         # Re-apply clerk.yaml
 clerk agent start|stop|restart <name>    # Lifecycle (with preflight)
 clerk agent attach <name>                # Interactive tmux session
 clerk agent logs <name> [-f]             # View logs
+clerk agent grant <name> <tool>          # Grant a tool permission and reconcile
+clerk agent permissions <name>           # Show allow/deny list
+clerk agent dangerous <name> [off]       # Toggle full tool access
 
-clerk memory setup|search|stats          # Hindsight memory
-clerk topics sync|list                   # Telegram forum topics
-clerk vault init|set|get|list            # Encrypted secrets
+clerk auth login|status|refresh          # Per-agent OAuth
+clerk memory setup|search|stats|reflect  # Hindsight memory
+clerk topics sync|list|cleanup           # Telegram forum topics
+clerk vault init|set|get|list|remove     # Encrypted secrets
+clerk handoff <agent>                    # Cross-session handoff summarizer
 clerk web                                # Web dashboard
 ```
 
-## Architecture
+## Documentation
 
-```
-You (Telegram)
-    │
-    ▼
-@YourBot ──── clerk-telegram MCP ──── Claude Code CLI
-                  │                        │
-                  ├─ SQLite history         ├─ .claude/agents/*.md (sub-agents)
-                  ├─ Emoji reactions        ├─ settings.json (tools, hooks, MCP)
-                  └─ Format conversion      ├─ Hindsight plugin (memory)
-                                           └─ systemd (agent + cron timers)
-```
-
-Clerk is **not a harness**. Each agent runs the unmodified `claude` binary, authenticated directly with Anthropic.
-
-## Compared To
-
-| | Clerk | OpenClaw | NanoClaw |
-|---|---|---|---|
-| Runtime | Claude Code CLI | Custom runtime | Agents SDK |
-| Auth | Pro/Max OAuth | API key | API key |
-| Channels | Telegram (enhanced) | WhatsApp, TG, Slack | WhatsApp, TG, Slack |
-| Memory | Hindsight (semantic) | File-based | Per-container |
-| Scheduling | systemd timers | Built-in cron engine | Built-in scheduler |
-| Sub-agents | Native Claude Code | Custom orchestration | N/A |
-| Config | YAML with cascade | JSON/TOML per agent | ENV vars |
-| Setup | `clerk setup` | Docker compose | Docker compose |
+| Guide | Description |
+|-------|-------------|
+| **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles, escape hatches |
+| **[Telegram Plugin](docs/telegram-plugin.md)** | Enhanced plugin features, 10 MCP tools, emoji reactions |
+| **[Sub-Agents](docs/sub-agents.md)** | Model routing, delegation patterns, frontmatter spec |
+| **[Scheduling](docs/scheduling.md)** | Cron tasks, systemd timers, model selection |
+| **[Session Management](docs/session-optimization.md)** | Continuity, compaction, freshness policy |
+| **[Compliance](docs/compliance-attestation.md)** | Anthropic compliance analysis |
+| **[Publishing](docs/publishing.md)** | Cutting a release of the clerk Claude Code plugin |
 
 ## License
 

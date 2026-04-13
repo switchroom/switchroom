@@ -22,12 +22,15 @@ bun run test
 
 See [PRD.md](PRD.md) for architecture details.
 
-## Templates
+## Profiles
 
-Community templates are welcome! Add them to `templates/` with:
+Community profiles are welcome! Add them to `profiles/<name>/` with:
 - `CLAUDE.md.hbs` — agent behavior
 - `SOUL.md.hbs` — agent persona
-- Any domain-specific skills in `skills/`
+- Optional `skills/` for domain-specific skills
+
+Agents inherit a profile via `extends: <name>` in `clerk.yaml`. See
+[docs/configuration.md](docs/configuration.md) for the cascade semantics.
 
 ## Code Style
 

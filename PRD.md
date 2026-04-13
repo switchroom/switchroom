@@ -1,5 +1,26 @@
 # Clerk — Product Requirements Document
 
+> **⚠️ Historical design document.** This PRD reflects the original product
+> design and remains useful for understanding clerk's intent and architectural
+> rationale. Several sections are now out of date relative to the shipped
+> code — in particular the Telegram plugin model (the clerk fork is now the
+> default, with `channels.telegram.plugin: official` as the opt-out — the
+> old `use_clerk_plugin: true` key no longer exists), the CLI surface
+> (`clerk setup`, `clerk doctor`, `clerk update`, `clerk agent reconcile`,
+> `clerk agent grant|dangerous|permissions` are not listed below), and the
+> memory model (file-based `MEMORY.md` auto-memory is disabled in favour of
+> Hindsight). For current behaviour, treat the canonical sources as:
+>
+> - [`README.md`](README.md) — what clerk is and how to use it
+> - [`docs/configuration.md`](docs/configuration.md) — config schema & cascade
+> - [`docs/telegram-plugin.md`](docs/telegram-plugin.md) — Telegram plugin
+> - [`docs/sub-agents.md`](docs/sub-agents.md) — sub-agent delegation
+> - [`docs/scheduling.md`](docs/scheduling.md) — scheduled tasks
+> - [`docs/compliance-attestation.md`](docs/compliance-attestation.md) — compliance
+>
+> The "Phased Delivery" roadmap below is largely complete; phases are kept
+> here as a record of the project's evolution rather than a forward plan.
+
 ## Overview
 
 Clerk is an open-source multi-agent orchestrator for Claude Code. It manages multiple long-running Claude Code sessions, each with its own persona, memory, tools, and Telegram topic — all using your official Claude Pro/Max subscription.

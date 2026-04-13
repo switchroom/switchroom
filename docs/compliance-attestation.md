@@ -4,9 +4,9 @@
 
 Clerk is a multi-agent orchestration tool for Claude Code. This document provides a point-in-time attestation that Clerk's architecture is designed to comply with Anthropic's terms of service and usage policies for Claude Code.
 
-**Attestation date:** 2026-04-07T13:00:00Z
+**Attestation date:** 2026-04-13T00:00:00Z (revised; supersedes 2026-04-07)
 **Model used for analysis:** Claude Opus 4.6 (1M context)
-**Reviewed against:** Anthropic's published documentation and policies as of April 7, 2026
+**Reviewed against:** Anthropic's published documentation and policies as of April 13, 2026
 
 ---
 
@@ -49,29 +49,26 @@ Clerk does **not**:
 
 Clerk never touches, reads, or proxies the access token, refresh token, or any authentication credential used for inference. The authentication relationship is directly between the user's Claude Code session and Anthropic.
 
-### 2. Uses the Official Telegram Plugin
+### 2. Telegram Plugin: Clerk Fork by Default, Official Available as Opt-Out
 
-**Anthropic's documentation:** Claude Code supports an official plugin marketplace including a Telegram channel plugin. The `--channels plugin:telegram@claude-plugins-official` flag loads the approved, published Telegram plugin.
+**Anthropic's documentation:** Claude Code supports an official plugin marketplace including a Telegram channel plugin (`--channels plugin:telegram@claude-plugins-official`), and a documented mechanism for loading unpublished MCP-based channels during development (`--dangerously-load-development-channels server:<name>`).
 
 **Source:** [Plugins - Claude Code Docs](https://code.claude.com/docs/en/plugins); [Channels - Claude Code Docs](https://code.claude.com/docs/en/channels)
 
-**Clerk's compliance:** By default, each agent uses `claude --channels plugin:telegram@claude-plugins-official` — the official, Anthropic-approved Telegram plugin from the marketplace. Clerk does not modify the official plugin. Each agent:
-- Gets its own Telegram bot token in `telegram/.env`
-- Uses the official plugin's access.json format for group configuration
-- Runs the plugin exactly as Anthropic intended, with no modifications
+**Clerk's compliance:** Clerk ships a forked Telegram plugin (`telegram-plugin/`, loaded as a Claude Code development channel) and uses it as the **default** for all agents. Operators can opt out per-agent with `channels.telegram.plugin: official` in `clerk.yaml`, which falls back to the upstream marketplace plugin.
 
-### 3. Optional Clerk-Enhanced Plugin (Development Channel)
+Both modes are compliance-equivalent:
 
-Clerk also ships an optional forked Telegram plugin, enabled per-agent via `use_clerk_plugin: true` in `clerk.yaml`. When enabled, the agent launches with `claude --dangerously-load-development-channels server:clerk-telegram` — Claude Code's documented mechanism for loading unpublished channels during development.
+- **Default (clerk fork):** launches with `claude --dangerously-load-development-channels server:clerk-telegram`. The fork is a standard MCP server using the first-party `--dangerously-load-development-channels` flag. It adds HTML formatting, smart chunking, message coalescing, status reactions, persistent SQLite history, forum-topic routing, and bot commands — all client-side message-handling concerns.
+- **Opt-out (`channels.telegram.plugin: official`):** launches with `claude --channels plugin:telegram@claude-plugins-official` — the upstream marketplace plugin, unmodified.
 
-**Source:** [Channels - Claude Code Docs](https://code.claude.com/docs/en/channels)
+In both modes:
+- Each agent gets its own Telegram bot token in `telegram/.env`
+- Agent configuration uses an `access.json` file for group/topic policy
+- The plugin polls Telegram independently with the agent's own bot token
+- Neither plugin modifies the `claude` binary, intercepts OAuth tokens, or routes subscription credentials anywhere other than directly between the user's Claude Code session and Anthropic
 
-**Clerk's compliance:** The enhanced plugin is a standard MCP server loaded via the first-party `--dangerously-load-development-channels` flag. It does not:
-- Modify the `claude` binary
-- Intercept authentication, OAuth tokens, or inference requests
-- Route subscription credentials through any intermediary
-
-Like the official plugin, it polls Telegram with the agent's own bot token and hands messages to Claude Code via the documented channel protocol. It adds HTML formatting, smart chunking, message coalescing, bot commands, and pre-approved MCP permissions — all client-side message-handling concerns. Operators who want to stay strictly on Anthropic-published code should leave `use_clerk_plugin` off (the default).
+Operators who require strict use of Anthropic-published code paths should set `channels.telegram.plugin: official`. The default is the clerk fork because it provides the production-quality streaming, formatting, and history features needed for a long-running agent fleet.
 
 ### 4. MCP Servers Are Explicitly Supported
 
@@ -108,10 +105,18 @@ Each agent runs an unmodified `claude` CLI session with standard command-line fl
 ExecStart=/usr/bin/script -qfc "/bin/bash -l {agentDir}/start.sh" {logFile}
 ```
 
-### start.sh runs the official claude CLI with the official Telegram plugin:
+### start.sh runs the unmodified claude CLI with one of the two channel modes:
 ```bash
+# Default (clerk fork):
+exec claude --dangerously-load-development-channels server:clerk-telegram
+
+# Opt-out (channels.telegram.plugin: official):
 exec claude --channels plugin:telegram@claude-plugins-official
 ```
+
+In both cases the binary is the official `claude` CLI installed via `npm
+install -g @anthropic-ai/claude-code`. Clerk does not patch, repackage, or
+shim it.
 
 ### Each agent has its own bot token:
 ```
@@ -121,11 +126,11 @@ TELEGRAM_BOT_TOKEN=<agent-specific-token>
 
 ### Message flow (per agent):
 ```
-User → Telegram API → Official Telegram Plugin → Claude Code
-Claude Code → Official Telegram Plugin → Telegram API → User
+User → Telegram API → Telegram Plugin (clerk fork or official) → Claude Code
+Claude Code → Telegram Plugin → Telegram API → User
 ```
 
-At no point does any Clerk component sit between Claude Code and Anthropic's inference API. There is no daemon or router — each agent's official plugin polls Telegram independently.
+At no point does any Clerk component sit between Claude Code and Anthropic's inference API. There is no daemon or router — each agent's plugin polls Telegram independently using the agent's own bot token.
 
 ---
 
