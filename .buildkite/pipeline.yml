@@ -203,5 +203,9 @@ steps:
     allow_dependency_failure: true
     command: |
       mkdir -p evals/results
-      buildkite-agent artifact download "evals/results/*.json" evals/results/ || true
+      # Download to "." — buildkite-agent preserves the artifact's original
+      # upload path (`evals/results/...`), so destination must be the build
+      # root, not `evals/results/`, otherwise files land at
+      # `evals/results/evals/results/*.json` and the script can't find them.
+      buildkite-agent artifact download "evals/results/*.json" . || true
       bash .buildkite/annotate-evals.sh
