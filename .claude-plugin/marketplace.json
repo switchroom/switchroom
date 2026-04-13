@@ -1,0 +1,23 @@
+{
+  "name": "clerk",
+  "owner": {
+    "name": "Ken Thompson",
+    "email": "me@kenthompson.com.au"
+  },
+  "metadata": {
+    "description": "Clerk plugin marketplace — skills for managing clerk multi-agent setups from inside Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "clerk",
+      "source": "./",
+      "description": "Skills for operating clerk: install, status, logs, config, restart, reconcile, schedule, health, architecture, and Telegram integration guidance.",
+      "homepage": "https://github.com/mekenthompson/clerk",
+      "repository": "https://github.com/mekenthompson/clerk",
+      "license": "MIT",
+      "keywords": ["clerk", "agents", "telegram", "orchestration", "skills"],
+      "category": "agents",
+      "tags": ["clerk", "multi-agent", "telegram", "ops"]
+    }
+  ]
+}

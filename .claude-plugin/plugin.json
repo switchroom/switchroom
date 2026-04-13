@@ -1,0 +1,20 @@
+{
+  "name": "clerk",
+  "version": "0.1.0",
+  "description": "Operate clerk — a multi-agent orchestrator for Claude Code — from inside a Claude Code session via skills for install, status, logs, config, restart, reconcile, schedule, and health.",
+  "author": {
+    "name": "Ken Thompson"
+  },
+  "homepage": "https://github.com/mekenthompson/clerk",
+  "repository": "https://github.com/mekenthompson/clerk",
+  "license": "MIT",
+  "keywords": [
+    "clerk",
+    "agents",
+    "multi-agent",
+    "telegram",
+    "orchestration",
+    "claude-code",
+    "skills"
+  ]
+}

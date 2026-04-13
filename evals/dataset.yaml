@@ -359,3 +359,66 @@ evals:
     expected_contains:
       - "lifecycle|agent|start|config|clerk"
     tags: ["architecture"]
+
+  # ── clerk-install ───────────────────────────────────────────────────────────
+  - id: "install-001"
+    question: "How do I install clerk on a fresh Ubuntu box?"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "bun|git clone|clerk setup|apt install"
+    expected_not_contains:
+      - "I don't know|I cannot help"
+    tags: ["install"]
+
+  - id: "install-002"
+    question: "Set up clerk for me"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "clerk setup|git clone|install|prerequisite"
+    tags: ["install"]
+
+  - id: "install-003"
+    question: "I'm new to clerk, how do I get started?"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "install|clerk setup|prerequisite|Ubuntu|bun"
+    tags: ["install", "onboarding"]
+
+  - id: "install-004"
+    question: "Bootstrap clerk on this server"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "command -v clerk|already installed|clerk --version|install"
+    tags: ["install"]
+
+  - id: "install-005"
+    question: "Can I install clerk on macOS?"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "Linux|Ubuntu|VPS|server"
+    expected_not_contains:
+      - "brew install clerk"
+    tags: ["install", "platform"]
+
+  - id: "install-006"
+    question: "Install clerk and its dependencies"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "bun|docker|tmux|claude|node"
+    tags: ["install", "dependencies"]
+
+  - id: "install-007"
+    question: "Clerk is already installed — should I reinstall?"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "already installed|clerk doctor|clerk setup|uninstall"
+    expected_not_contains:
+      - "yes, reinstall now|run install again"
+    tags: ["install", "idempotence"]
+
+  - id: "install-008"
+    question: "What do I need before running clerk setup?"
+    primary_skill: "clerk-install"
+    expected_contains:
+      - "Ubuntu|RAM|bun|node|claude|docker|prerequisite"
+    tags: ["install", "prerequisites"]

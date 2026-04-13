@@ -184,3 +184,47 @@ trigger_evals:
     expected_skill: "clerk-status"
     expected_not_skills: ["clerk-logs", "clerk-config"]
     tags: ["routing", "near-miss"]
+
+  # ── clerk-install vs clerk-manage / clerk-health ──────────────────────────────
+  - id: "t-install-001"
+    query: "Install clerk on this machine"
+    expected_skill: "clerk-install"
+    expected_not_skills: ["clerk-manage", "clerk-health", "clerk-reconcile"]
+    tags: ["routing", "install"]
+
+  - id: "t-install-002"
+    query: "How do I get started with clerk?"
+    expected_skill: "clerk-install"
+    expected_not_skills: ["clerk-architecture", "clerk-manage"]
+    tags: ["routing", "install", "onboarding"]
+
+  - id: "t-install-003"
+    query: "Bootstrap clerk from scratch"
+    expected_skill: "clerk-install"
+    expected_not_skills: ["clerk-reconcile", "clerk-manage"]
+    tags: ["routing", "install"]
+
+  - id: "t-install-004"
+    query: "Set up clerk for the first time"
+    expected_skill: "clerk-install"
+    expected_not_skills: ["clerk-manage", "clerk-config"]
+    tags: ["routing", "install"]
+
+  - id: "t-install-005"
+    query: "I'm new to clerk, where do I begin?"
+    expected_skill: "clerk-install"
+    expected_not_skills: ["clerk-architecture", "clerk-telegram-guide"]
+    tags: ["routing", "install", "onboarding"]
+
+  # Near-miss: "install a new agent" is NOT clerk-install (that's clerk-manage)
+  - id: "t-install-near-001"
+    query: "Add a new agent to my clerk setup"
+    expected_skill: "clerk-manage"
+    expected_not_skills: ["clerk-install"]
+    tags: ["routing", "near-miss", "install"]
+
+  - id: "t-install-near-002"
+    query: "Reinstall my clerk agents"
+    expected_skill: "clerk-manage"
+    expected_not_skills: ["clerk-install"]
+    tags: ["routing", "near-miss", "install"]

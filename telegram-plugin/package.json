@@ -2,7 +2,7 @@
   "name": "clerk-telegram-plugin",
   "version": "0.1.0",
   "description": "Forked Telegram plugin for Clerk with forum topic routing support",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
