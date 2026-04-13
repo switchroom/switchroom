@@ -4,30 +4,32 @@
 #   buildkite-agent pipeline upload
 # so this file is loaded on every build.
 #
-# Agent prerequisites:
-#   - bun           (TS runtime + test runner)
-#   - python3       (eval runners)
-#   - claude        (Claude Code CLI, only needed for the evals stages)
+# Runs on Buildkite-hosted agents (queue: hosted, LINUX_AMD64_2X4 shape) so
+# no self-hosted infrastructure is required. Bun is bootstrapped per-step
+# because the default hosted image doesn't include it; we cache it under
+# ~/.bun across builds via the hosted-agent built-in cache.
 #
-# Auth for the evals stages:
-#   - Set ANTHROPIC_API_KEY in pipeline env (Pipeline Settings → Environment),
+# Auth for the eval stages:
+#   - Set ANTHROPIC_API_KEY in pipeline env (Pipeline Settings → Environment)
 #     or expose it via an agent environment hook. Without it the eval steps
-#     are skipped (gated by the `if:` clause).
+#     are skipped (gated by the `if:` clause); tests still run.
 
 agents:
-  queue: "default"
+  queue: "hosted"
 
 steps:
   - label: ":lock: Type check"
     key: lint
     command: |
+      curl -fsSL https://bun.sh/install | bash
+      export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile
       bun lint
-    plugins:
-      - cache#v1.8.1:
-          paths:
-            - "node_modules/"
-          manifest: "bun.lock"
+    cache:
+      paths:
+        - "~/.bun"
+        - "node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1   # agent lost
@@ -38,13 +40,15 @@ steps:
   - label: ":vitest: Core tests"
     key: tests-core
     command: |
+      curl -fsSL https://bun.sh/install | bash
+      export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile
       bun run test:vitest
-    plugins:
-      - cache#v1.8.1:
-          paths:
-            - "node_modules/"
-          manifest: "bun.lock"
+    cache:
+      paths:
+        - "~/.bun"
+        - "node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}"
     artifact_paths:
       - "coverage/**/*"
     retry:
@@ -57,14 +61,16 @@ steps:
   - label: ":telegram: Plugin tests (402)"
     key: tests-plugin
     command: |
+      curl -fsSL https://bun.sh/install | bash
+      export PATH="$$HOME/.bun/bin:$$PATH"
       cd telegram-plugin
       bun install --frozen-lockfile
       bun test
-    plugins:
-      - cache#v1.8.1:
-          paths:
-            - "telegram-plugin/node_modules/"
-          manifest: "telegram-plugin/bun.lock"
+    cache:
+      paths:
+        - "~/.bun"
+        - "telegram-plugin/node_modules/"
+      key: "v1-tg-{{ checksum 'telegram-plugin/bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1
@@ -85,6 +91,7 @@ steps:
     if: build.env("ANTHROPIC_API_KEY") != null
     command: |
       pip install -q pyyaml
+      npm i -g @anthropic-ai/claude-code
       python3 evals/run_trigger.py --parallel 5
     artifact_paths:
       - "evals/results/**/*.json"
@@ -102,6 +109,7 @@ steps:
     if: build.env("ANTHROPIC_API_KEY") != null
     command: |
       pip install -q pyyaml
+      npm i -g @anthropic-ai/claude-code
       python3 evals/run_quality.py --parallel 5
     artifact_paths:
       - "evals/results/**/*.json"
