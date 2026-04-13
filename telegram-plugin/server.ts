@@ -53,6 +53,7 @@ import { handleStreamReply } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
+import { createProgressDriver, type ProgressDriver } from './progress-card-driver.js'
 import {
   startPtyTail,
   V1ToolActivityExtractor,
@@ -1650,6 +1651,58 @@ await mcp.connect(new StdioServerTransport())
 // (e.g., this plugin is being run outside a Claude Code session for tests).
 const sessionTailEnabled = process.env.CLERK_SESSION_TAIL !== 'off'
 let sessionTailHandle: SessionTailHandle | null = null
+
+// Progress-card driver — opt-in via CLERK_TG_STREAM_MODE=checklist. The
+// driver translates session-tail events into an edit-in-place Telegram
+// message per turn, surfaced on the stream_reply "progress" lane.
+//
+// emit() is wired into the same stream_reply code path the model uses,
+// so existing chunking, 4096-char guards, format handling, and edit
+// throttle all apply. When mode != "checklist", the driver is never
+// instantiated and there's zero overhead.
+const streamMode = process.env.CLERK_TG_STREAM_MODE ?? 'pty'
+let progressDriver: ProgressDriver | null = null
+if (streamMode === 'checklist') {
+  progressDriver = createProgressDriver({
+    emit: ({ chatId, threadId, html, done }) => {
+      // Fire-and-forget — handleStreamReply is async but we don't await
+      // (the driver owns cadence; the call just posts/edits). Errors
+      // are logged and swallowed so a dropped edit never kills the
+      // session.
+      const args = {
+        chat_id: chatId,
+        text: html,
+        done,
+        message_thread_id: threadId,
+        lane: 'progress',
+        format: 'html',
+      }
+      handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
+        bot: lockedBot,
+        retry: robustApiCall,
+        markdownToHtml,
+        escapeMarkdownV2,
+        repairEscapedWhitespace,
+        takeHandoffPrefix: () => '',
+        assertAllowedChat,
+        resolveThreadId,
+        disableLinkPreview: true,
+        defaultFormat: 'html',
+        logStreamingEvent,
+        endStatusReaction,
+        historyEnabled: false,
+        recordOutbound: () => {},
+        writeError: (line) => process.stderr.write(line),
+      }).catch((err) => {
+        process.stderr.write(
+          `telegram channel: progress-card emit failed: ${(err as Error).message}\n`,
+        )
+      })
+    },
+  })
+  process.stderr.write('telegram channel: progress-card driver active (stream_mode=checklist)\n')
+}
+
 if (sessionTailEnabled) {
   try {
     // Claude Code writes its session JSONL under
@@ -1666,7 +1719,13 @@ if (sessionTailEnabled) {
     sessionTailHandle = startSessionTail({
       cwd: sessionCwd,
       log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
-      onEvent: handleSessionEvent,
+      onEvent: (ev) => {
+        handleSessionEvent(ev)
+        // Fan out to the progress-card driver when enabled. It tracks
+        // the current chat/thread from the enqueue event itself, so
+        // callers pass null here.
+        progressDriver?.ingest(ev, null)
+      },
     })
     process.stderr.write(
       `telegram channel: session tail watching ${sessionTailHandle.getActiveFile() ?? '(no active file yet)'}\n`,

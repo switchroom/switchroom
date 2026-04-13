@@ -533,7 +533,8 @@ export function installClerkSkills(agentDir: string): void {
 
 /**
  * Translate per-channel YAML fields into env vars the telegram-plugin
- * will read at startup. Today: CLERK_TG_FORMAT and CLERK_TG_RATE_LIMIT_MS.
+ * will read at startup. Today: CLERK_TG_FORMAT, CLERK_TG_RATE_LIMIT_MS,
+ * CLERK_TG_STREAM_MODE.
  *
  * Returns an object that can be merged into the user env. User-declared
  * env vars with the same key take precedence (see the call site) since
@@ -547,6 +548,9 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.format !== undefined) out.CLERK_TG_FORMAT = tg.format;
   if (tg.rate_limit_ms !== undefined) {
     out.CLERK_TG_RATE_LIMIT_MS = String(tg.rate_limit_ms);
+  }
+  if (tg.stream_mode !== undefined) {
+    out.CLERK_TG_STREAM_MODE = tg.stream_mode;
   }
   return out;
 }
