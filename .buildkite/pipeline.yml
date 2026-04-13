@@ -15,6 +15,12 @@
 #     POST/PATCH /v2/organizations/{org}/clusters/{cluster_id}/secrets
 #   If the secret is missing AND ANTHROPIC_API_KEY is not in env, the
 #   eval steps no-op (exit 0) so they don't block the build.
+#
+# Step skipping (if_changed):
+#   Each step declares the file globs that should trigger it. Pure-doc
+#   commits (no .ts/.py/.yml/.md-skill changes) build empty (just the
+#   pipeline upload) — no compute spent. Touching `.buildkite/pipeline.yml`
+#   re-runs everything by listing it in every if_changed.
 
 agents:
   queue: "hosted"
@@ -22,6 +28,15 @@ agents:
 steps:
   - label: ":lock: Type check"
     key: lint
+    if_changed:
+      - "**/*.ts"
+      - "**/*.tsx"
+      - "tsconfig.json"
+      - "package.json"
+      - "bun.lock"
+      - "telegram-plugin/package.json"
+      - "telegram-plugin/bun.lock"
+      - ".buildkite/pipeline.yml"
     command: |
       curl -fsSL https://bun.sh/install | bash
       export PATH="$$HOME/.bun/bin:$$PATH"
@@ -41,6 +56,17 @@ steps:
 
   - label: ":vitest: Core tests"
     key: tests-core
+    if_changed:
+      - "src/**"
+      - "tests/**"
+      - "telegram-plugin/**/*.ts"
+      - "vitest.config.ts"
+      - "tsconfig.json"
+      - "package.json"
+      - "bun.lock"
+      - "telegram-plugin/package.json"
+      - "telegram-plugin/bun.lock"
+      - ".buildkite/pipeline.yml"
     command: |
       curl -fsSL https://bun.sh/install | bash
       export PATH="$$HOME/.bun/bin:$$PATH"
@@ -66,6 +92,9 @@ steps:
 
   - label: ":telegram: Plugin tests (402)"
     key: tests-plugin
+    if_changed:
+      - "telegram-plugin/**"
+      - ".buildkite/pipeline.yml"
     command: |
       curl -fsSL https://bun.sh/install | bash
       export PATH="$$HOME/.bun/bin:$$PATH"
@@ -94,6 +123,15 @@ steps:
 
   - label: ":compass: Skills evals — trigger routing"
     key: evals-trigger
+    if_changed:
+      # Skill text changes can flip routing decisions
+      - "skills/**/SKILL.md"
+      # Eval framework + dataset
+      - "evals/run_trigger.py"
+      - "evals/trigger_dataset.yaml"
+      # Profile CLAUDE.md text influences how the model interprets queries
+      - "profiles/**/CLAUDE.md*"
+      - ".buildkite/pipeline.yml"
     command: |
       # Prefer the API key (separate billing pool) over the OAuth token
       # (subscription, weekly cap). Both are stored as cluster secrets.
@@ -124,6 +162,11 @@ steps:
 
   - label: ":sparkles: Skills evals — quality"
     key: evals-quality
+    if_changed:
+      - "skills/**/SKILL.md"
+      - "evals/run_quality.py"
+      - "evals/dataset.yaml"
+      - ".buildkite/pipeline.yml"
     command: |
       KEY_FETCHED="$$(buildkite-agent secret get ANTHROPIC_API_KEY 2>/dev/null || true)"
       if [[ -n "$$KEY_FETCHED" ]]; then

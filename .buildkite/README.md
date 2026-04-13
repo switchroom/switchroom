@@ -37,14 +37,19 @@ The agent box needs:
 
 ## Stage map
 
-| Stage | Command | Notes |
-|-------|---------|-------|
-| Type check | `bun lint` (= `tsc --noEmit`) | Cached `node_modules/` keyed on `bun.lock` |
-| Core tests | `bun run test:vitest` | Vitest suite for `src/` and most of `tests/` |
-| Plugin tests | `cd telegram-plugin && bun test` | 402 tests, 19 files — Bun-only because of `bun:sqlite` |
-| Trigger evals | `python3 evals/run_trigger.py --parallel 5` | Skill-routing dataset (~30 near-miss scenarios). Soft-fails so flakes warn, not block |
-| Quality evals | `python3 evals/run_quality.py --parallel 5` | Per-skill content evals (~50 across 8 skills). Soft-fails |
-| Eval summary | `annotate-evals.sh` | Reads result JSONs, posts pass/fail annotation |
+| Stage | Command | When it runs (`if_changed`) |
+|-------|---------|------------------------------|
+| Type check | `bun lint` (= `tsc --noEmit`) | Any `*.ts`, `tsconfig.json`, package/lockfile |
+| Core tests | `bun run test:vitest` | `src/`, `tests/`, `telegram-plugin/**/*.ts`, vitest config, lockfiles |
+| Plugin tests | `cd telegram-plugin && bun test` | `telegram-plugin/**` |
+| Trigger evals | `python3 evals/run_trigger.py --parallel 5` | `skills/**/SKILL.md`, eval framework, profile CLAUDE.md |
+| Quality evals | `python3 evals/run_quality.py --parallel 5` | `skills/**/SKILL.md`, eval framework, dataset |
+| Eval summary | `annotate-evals.sh` | Always (after eval steps); no-ops if no result files |
+
+A pure-docs commit (no `*.ts`, `*.py`, `*.yml`, or `SKILL.md` changes) builds
+empty after the pipeline upload — zero compute. Touching
+`.buildkite/pipeline.yml` re-runs every step (it's listed in every
+`if_changed:` so a pipeline change is its own integration test).
 
 ## Local validation
 
