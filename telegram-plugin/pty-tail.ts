@@ -324,6 +324,41 @@ export class V1ToolActivityExtractor implements ToolActivityExtractor {
   }
 }
 
+/**
+ * Activity-line prefixes produced by the noisy core tools (Bash, Read,
+ * Write, Edit, Grep, Glob). The PTY tail extracts an activity line per
+ * tool call, but surfacing each one to the user is noise — the user
+ * wants human-meaningful rollups ("Running sub-agent...",
+ * "Fetching URL...") not per-tool narration of "Running Bash: cd ...".
+ *
+ * Used by `shouldSuppressToolActivity` to filter at the consumer layer.
+ * The extractor itself still returns these lines unchanged, so anything
+ * that wants the raw stream (tests, telemetry) keeps working.
+ */
+export const NOISY_TOOL_ACTIVITY_PREFIXES: readonly string[] = [
+  'Running Bash',
+  'Reading file',
+  'Writing file',
+  'Editing file',
+  'Searching with Grep',
+  'Searching with Glob',
+]
+
+/**
+ * True if an activity line is per-tool narration for a noisy core tool
+ * (Bash/Read/Write/Edit/Grep/Glob) that should NOT be surfaced to the
+ * Telegram activity lane. Human-meaningful rollups ("Running sub-agent",
+ * "Fetching URL", "Searching the web", and anything unknown mapped to
+ * "Running <CustomTool>") pass through.
+ */
+export function shouldSuppressToolActivity(line: string): boolean {
+  for (const prefix of NOISY_TOOL_ACTIVITY_PREFIXES) {
+    if (line === prefix) return true
+    if (line.startsWith(prefix + ':')) return true
+  }
+  return false
+}
+
 function activityVerb(tool: string): string {
   switch (tool) {
     case 'Bash': return 'Running Bash'
