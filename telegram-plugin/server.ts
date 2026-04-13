@@ -39,6 +39,7 @@ import { homedir } from 'os'
 import { join, extname, sep, basename, dirname } from 'path'
 import { StatusReactionController } from './status-reactions.js'
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
+import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
 import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory } from './history.js'
@@ -116,6 +117,7 @@ function endStatusReaction(
  * the bot API directly.
  */
 let currentSessionChatId: string | null = null
+let currentTurnStartedAt = 0
 let currentSessionThreadId: number | undefined = undefined
 let currentTurnReplyCalled = false
 let currentTurnCapturedText: string[] = []
@@ -1138,6 +1140,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        logStreamingEvent({
+          kind: 'reply_called',
+          chatId: chat_id,
+          charCount: effectiveText.length,
+          replacedPreview: previewMessageId != null,
+          previewMessageId,
+        })
+
         // If the caller wants a quoted reply, edit-in-place won't carry
         // the quote. Drop the preview up front and take the normal send
         // path so chunk[0] gets `reply_parameters` attached.
@@ -1335,6 +1345,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const sKey = streamKey(chat_id, threadId)
         let stream = activeDraftStreams.get(sKey)
+        logStreamingEvent({
+          kind: 'stream_reply_called',
+          chatId: chat_id,
+          charCount: effectiveText.length,
+          done,
+          streamExisted: stream != null,
+        })
 
         // First reply after a session start: on the FIRST stream chunk
         // (no active stream yet) consume the pending handoff topic and
@@ -1356,12 +1373,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               ? { link_preview_options: { is_disabled: true } }
               : {}),
           }
+          let lastEditedText: string | null = null
           stream = createDraftStream(
             async (sendText) => {
               const sent = await robustApiCall(
                 () => bot.api.sendMessage(chat_id, sendText, sendOpts),
                 { threadId, chat_id },
               )
+              logStreamingEvent({
+                kind: 'draft_send',
+                chatId: chat_id,
+                messageId: sent.message_id,
+                charCount: sendText.length,
+              })
+              lastEditedText = sendText
               return sent.message_id
             },
             async (id, editText) => {
@@ -1369,6 +1394,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 () => bot.api.editMessageText(chat_id, id, editText, sendOpts),
                 { threadId, chat_id },
               )
+              logStreamingEvent({
+                kind: 'draft_edit',
+                chatId: chat_id,
+                messageId: id,
+                charCount: editText.length,
+                sameAsLast: lastEditedText === editText,
+              })
+              lastEditedText = editText
             },
             { throttleMs: 600 },
           )
@@ -1746,16 +1779,33 @@ let pendingPtyPartial: string | null = null
 function handlePtyPartial(text: string): void {
   if (currentSessionChatId == null) {
     pendingPtyPartial = text
+    logStreamingEvent({
+      kind: 'pty_partial_received',
+      chatId: null,
+      suppressed: false,
+      hasStream: false,
+      charCount: text.length,
+      bufferedWithoutChatId: true,
+    })
     return
   }
   const chatId = currentSessionChatId
   const threadId = currentSessionThreadId
   const sKey = streamKey(chatId, threadId)
+  const suppressed = suppressPtyPreview.has(sKey)
+  logStreamingEvent({
+    kind: 'pty_partial_received',
+    chatId,
+    suppressed,
+    hasStream: activeDraftStreams.has(sKey),
+    charCount: text.length,
+    bufferedWithoutChatId: false,
+  })
 
   // Reply tool handler has claimed this chat's preview stream for an
   // in-flight canonical send. Drop PTY extractions so we don't fight the
   // reply or create a second message mid-handoff.
-  if (suppressPtyPreview.has(sKey)) return
+  if (suppressed) return
 
   // Ignore previews that match what we already showed (avoids redundant
   // edits when the extractor re-fires on a still-frame buffer).
@@ -1775,6 +1825,7 @@ function handlePtyPartial(text: string): void {
       ...(threadId != null ? { message_thread_id: threadId } : {}),
       link_preview_options: { is_disabled: true },
     }
+    let lastPtyEditedText: string | null = null
     stream = createDraftStream(
       async (sendText) => {
         const sent = await robustApiCall(
@@ -1782,6 +1833,13 @@ function handlePtyPartial(text: string): void {
           { threadId, chat_id: chatId },
         )
         logOutbound('pty_preview', chatId, sent.message_id, sendText.length, 'initial_send')
+        logStreamingEvent({
+          kind: 'draft_send',
+          chatId,
+          messageId: sent.message_id,
+          charCount: sendText.length,
+        })
+        lastPtyEditedText = sendText
         return sent.message_id
       },
       async (id, editText) => {
@@ -1789,6 +1847,14 @@ function handlePtyPartial(text: string): void {
           () => bot.api.editMessageText(chatId, id, editText, sendOpts),
           { threadId, chat_id: chatId },
         )
+        logStreamingEvent({
+          kind: 'draft_edit',
+          chatId,
+          messageId: id,
+          charCount: editText.length,
+          sameAsLast: lastPtyEditedText === editText,
+        })
+        lastPtyEditedText = editText
       },
       { throttleMs: 600 },
     )
@@ -1830,6 +1896,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         currentSessionThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
         currentTurnReplyCalled = false
         currentTurnCapturedText = []
+        currentTurnStartedAt = Date.now()
 
         // Flush any PTY partial that arrived before we knew the chat id.
         // This is the race-fix: a fast model can start generating reply
@@ -2070,6 +2137,15 @@ function handleSessionEvent(ev: SessionEvent): void {
       // controller's terminal state is idempotent.
       if (ctrl) ctrl.setDone()
       activeStatusReactions.delete(statusKey(chatId, threadId))
+      {
+        const sKey = streamKey(chatId, threadId)
+        logStreamingEvent({
+          kind: 'turn_end',
+          chatId,
+          durationMs: currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0,
+          suppressClearedCount: suppressPtyPreview.has(sKey) ? 1 : 0,
+        })
+      }
       // Clear PTY preview state for this chat so the next turn starts
       // fresh. If we left the previous preview in place, the extractor
       // would see the OLD reply block in the xterm buffer and we'd
