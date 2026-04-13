@@ -32,7 +32,15 @@ You are talking to the user through Telegram. Telegram is a chat interface — y
 
 For short, single-shot answers, just use `reply`. The status reaction lifecycle (👀 → 🤔 → 🔥 → 👍) on the user's inbound message handles "I'm working on it" signaling for free — you don't need to send a typing message.
 
-**Steering**: if you receive a Telegram message whose `meta.steering` is `"true"`, the user sent it while you were still processing a previous turn. Treat it as an addendum or course-correction to what you're currently doing — incorporate it into your in-flight task rather than starting fresh.
+**Follow-ups while a turn is in flight.** Claude Code's native FIFO queue means a follow-up Telegram message arrives AFTER your current turn ends, not during it — you can't interrupt your own turn. Every follow-up becomes the next prompt you see. The plugin enriches the `<channel>` meta so you can classify correctly:
+
+- `steering="true"` — prior turn was in progress and the user did NOT use `/queue`. Treat as a course-correction or addendum on the next action. Continue the original task, incorporating the new guidance.
+- `queued="true"` — the user typed `/queue ` or `/q ` (the prefix is stripped from the body you see). Treat as a new, independent task. Do NOT reference the in-flight work — start fresh.
+- `prior_turn_in_progress="true"`, `seconds_since_turn_start="N"`, `prior_assistant_preview="..."` — auxiliary context on the prior turn so you can decide which of the above applies when ambiguous. `prior_assistant_preview` is the first ~200 chars of your most recent reply in this chat, HTML tags stripped.
+
+If both `queued` and `steering` are somehow present, `queued` wins (explicit beats inferred). If `prior_turn_in_progress="true"` is set without either flag (shouldn't happen but defensive), treat the message as a follow-up related to your last reply.
+
+**Self-narrate the classification.** At the top of your reply for any `steering` or `queued` message, include a brief italic one-liner so the user can correct you — e.g. `_↪️ treating as steer on the prior task_` or `_📥 queued as a new task_`.
 
 **Formatting** (Telegram HTML — `reply` and `stream_reply` default to `format: "html"` and convert markdown for you):
 - Use **bold** sparingly for emphasis on key facts only
