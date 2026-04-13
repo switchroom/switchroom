@@ -231,6 +231,145 @@ describe('createDraftStream', () => {
     expect(m.editCalls[0].t).toBeGreaterThanOrEqual(sendT + 1000)
   })
 
+  it('recovers from "message to edit not found" by re-sending', async () => {
+    const m = makeMock()
+    m.edit = async (_id: number, _text: string) => {
+      throw new Error('Bad Request: message to edit not found')
+    }
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000 })
+
+    void stream.update('first')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+    expect(stream.getMessageId()).toBe(100)
+
+    vi.advanceTimersByTime(1000)
+    void stream.update('second')
+    await microtaskFlush()
+    // Edit fails → stream requeues for a fresh send on next iteration
+    await microtaskFlush()
+
+    // After recovery, the stream should have a NEW message id from the re-send
+    expect(m.sendCalls.length).toBe(2)
+    expect(m.sendCalls[1].text).toBe('second')
+    expect(stream.getMessageId()).toBe(101)
+  })
+
+  it('also recognizes MESSAGE_ID_INVALID as a not-found signal', async () => {
+    const m = makeMock()
+    m.edit = async () => { throw new Error('MESSAGE_ID_INVALID') }
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000 })
+
+    void stream.update('first')
+    await microtaskFlush()
+    vi.advanceTimersByTime(1000)
+    void stream.update('second')
+    await microtaskFlush()
+    await microtaskFlush()
+
+    expect(m.sendCalls.length).toBe(2)
+    expect(stream.getMessageId()).toBe(101)
+  })
+
+  it('non-recoverable edit errors do NOT requeue (no infinite retry loop)', async () => {
+    const m = makeMock()
+    m.edit = async () => { throw new Error('Forbidden: bot was blocked by user') }
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000 })
+
+    void stream.update('first')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+
+    vi.advanceTimersByTime(1000)
+    void stream.update('second')
+    await microtaskFlush()
+
+    // The generic error path doesn't re-send; messageId stays captured,
+    // and the next update can retry edit normally.
+    expect(m.sendCalls.length).toBe(1)
+    expect(stream.getMessageId()).toBe(100)
+  })
+
+  // ─── Pre-send idle coalesce (idleMs) ──────────────────────────────────
+
+  it('idleMs=0 preserves legacy behavior (first update fires immediately)', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000, idleMs: 0 })
+    void stream.update('hi')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+  })
+
+  it('idleMs defers the first send, collapsing a burst into one API call', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000, idleMs: 200 })
+
+    // Rapid burst — none should fire yet
+    void stream.update('a')
+    void stream.update('ab')
+    void stream.update('abc')
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(0)
+
+    // Advance past the idle window
+    vi.advanceTimersByTime(200)
+    await microtaskFlush()
+
+    // Exactly one send with the LATEST text
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('abc')
+  })
+
+  it('idleMs timer is reset on each subsequent update within the window', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000, idleMs: 200 })
+
+    void stream.update('a')
+    vi.advanceTimersByTime(150)
+    void stream.update('ab') // resets the 200ms clock
+    vi.advanceTimersByTime(150)
+    void stream.update('abc') // resets again
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(0)
+
+    // Now let the clock run out
+    vi.advanceTimersByTime(200)
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('abc')
+  })
+
+  it('idleMs only applies to the FIRST send; subsequent edits use throttleMs', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000, idleMs: 200 })
+
+    void stream.update('first')
+    vi.advanceTimersByTime(200)
+    await microtaskFlush()
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.editCalls.length).toBe(0)
+
+    // A subsequent update should NOT wait for idleMs — it waits for
+    // throttleMs - (time since last send) instead.
+    vi.advanceTimersByTime(1000)
+    void stream.update('second')
+    await microtaskFlush()
+    expect(m.editCalls.length).toBe(1)
+  })
+
+  it('finalize() during idle wait flushes the pending text immediately', async () => {
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, { throttleMs: 1000, idleMs: 500 })
+
+    void stream.update('x')
+    // Don't advance past idleMs — finalize while still waiting
+    await stream.finalize()
+
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('x')
+    expect(stream.isFinal()).toBe(true)
+  })
+
   it('floors throttleMs at 250ms', async () => {
     const m = makeMock()
     const stream = createDraftStream(m.send, m.edit, { throttleMs: 50 })

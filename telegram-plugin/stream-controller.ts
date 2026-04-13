@@ -54,6 +54,8 @@ export interface StreamControllerConfig {
   parseMode?: 'HTML' | 'MarkdownV2'
   disableLinkPreview?: boolean
   throttleMs?: number
+  /** Pre-send idle debounce. See DraftStreamConfig.idleMs. */
+  idleMs?: number
   /**
    * Retry wrapper around bot.api calls. Defaults to calling `fn` directly
    * (no retry) so tests that don't care about policy can omit it. In
@@ -79,6 +81,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     parseMode,
     disableLinkPreview = true,
     throttleMs,
+    idleMs,
     retry = <T>(fn: () => Promise<T>) => fn(),
     onSend,
     onEdit,
@@ -106,6 +109,9 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       )
       onEdit?.(id, text.length)
     },
-    throttleMs != null ? { throttleMs } : {},
+    {
+      ...(throttleMs != null ? { throttleMs } : {}),
+      ...(idleMs != null ? { idleMs } : {}),
+    },
   )
 }

@@ -43,6 +43,18 @@ export interface DraftStreamConfig {
    * caller should fall back to a fresh sendMessage.
    */
   maxChars?: number
+  /**
+   * Optional debounce window applied BEFORE the first send of a stream.
+   * When > 0, the first update() defers the send by idleMs, restarting
+   * the timer on each additional update that arrives during the window.
+   * Useful when the caller bursts several update() calls at turn start
+   * and you'd rather collapse them into a single send than pay the
+   * latency of an immediate first-fire + follow-up edit.
+   *
+   * Default 0 (no pre-send debounce — first update fires immediately).
+   * Only affects the first send; subsequent edits use throttleMs.
+   */
+  idleMs?: number
   /** Optional logger for debugging. Receives one string per event. */
   log?: (msg: string) => void
 }
@@ -82,6 +94,7 @@ export function createDraftStream(
 ): DraftStreamHandle {
   const throttleMs = Math.max(MIN_THROTTLE_MS, config.throttleMs ?? DEFAULT_THROTTLE_MS)
   const maxChars = config.maxChars ?? TELEGRAM_MAX_CHARS
+  const idleMs = Math.max(0, config.idleMs ?? 0)
   const log = config.log
 
   let messageId: number | null = null
@@ -141,13 +154,25 @@ export function createDraftStream(
       lastSentText = textToSend
       lastSentAt = Date.now()
     } catch (err) {
-      // Telegram returns "message is not modified" when the new text equals
-      // the current text — treat as success.
       const msg = (err as Error).message ?? String(err)
+      // "message is not modified" — the new text equals the current
+      // server-side text. Treat as success.
       if (/not modified/i.test(msg)) {
         lastSentText = textToSend
         lastSentAt = Date.now()
         log?.(`stream → not modified (id: ${messageId})`)
+      } else if (
+        /message to edit not found/i.test(msg)
+        || /message_id_invalid/i.test(msg)
+        || /MESSAGE_ID_INVALID/.test(msg)
+      ) {
+        // The preview was deleted by the user (or Telegram) between send
+        // and edit. Clear the captured id + lastSentText and requeue the
+        // text so the next loop iteration re-sends from scratch.
+        log?.(`stream → message not found (id: ${messageId}), re-sending`)
+        messageId = null
+        lastSentText = null
+        if (pendingText == null) pendingText = textToSend
       } else {
         log?.(`stream → edit failed: ${msg}`)
         // Don't throw; the loop will try again on the next update.
@@ -188,6 +213,20 @@ export function createDraftStream(
       const waitPromise = new Promise<void>(resolve => {
         waiters.push(resolve)
       })
+
+      // Pre-send idle debounce: for the FIRST send of a stream, optionally
+      // defer by idleMs so a burst of update() calls collapses into one
+      // send. Each incoming update resets the timer. Once the initial
+      // send has landed (messageId != null), this path is skipped and the
+      // regular throttle kicks in.
+      if (idleMs > 0 && messageId == null && inFlight == null) {
+        if (scheduledTimer != null) clearTimeout(scheduledTimer)
+        scheduledTimer = setTimeout(() => {
+          scheduledTimer = null
+          inFlight = flushLoop().finally(() => { inFlight = null })
+        }, idleMs)
+        return waitPromise
+      }
 
       // If nothing in flight and the throttle window is open, fire now.
       if (inFlight == null && Date.now() - lastSentAt >= throttleMs) {
