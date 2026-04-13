@@ -128,6 +128,24 @@ describe('handleStreamReply', () => {
     expect(deps.takeHandoffPrefix).toHaveBeenCalledTimes(1)
   })
 
+  it('done=true throws when text exceeds 4096 (no silent id:pending)', async () => {
+    // Pins the bug found in prod: a >4096-char text would hit draft-stream's
+    // length guard, silently stop, and the handler would return
+    // status:finalized, messageId:null — the MCP response reads
+    // "finalized (id: pending)" looking like success. Fix: throw so the
+    // MCP client sees isError:true and can fall back to `reply`.
+    const state = makeState()
+    const deps = makeDeps(bot)
+    const tooLong = 'x'.repeat(5000)
+
+    await expect(
+      handleStreamReply({ chat_id: '1', text: tooLong, done: true }, state, deps),
+    ).rejects.toThrow(/stream_reply finalized without sending/)
+
+    // Mock bot should NOT have received any sendMessage call.
+    expect(bot.api.sendMessage).not.toHaveBeenCalled()
+  })
+
   it('done=true finalizes and deletes from map (does NOT fire terminal reaction)', async () => {
     // Pins the intentional non-behavior: stream_reply(done=true) must NOT
     // fire the 👍 terminal reaction. That is now the exclusive job of

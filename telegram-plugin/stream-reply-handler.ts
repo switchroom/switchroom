@@ -245,6 +245,19 @@ export async function handleStreamReply(
     // send additional replies. The 👍 now fires only from turn_end in
     // server.ts, which is the true agent-idle boundary.
 
+    // Hard-fail surface: if the stream finalized without ever assigning
+    // a message id, the initial send never landed (4096+ chars hits
+    // draft-stream's length guard and silently stops). Throw so the MCP
+    // caller sees isError:true instead of a misleading "finalized
+    // (id: pending)". The caller can fall back to `reply`, which chunks.
+    if (stream.getMessageId() == null) {
+      throw new Error(
+        `stream_reply finalized without sending any message (length=${rawText.length}, ` +
+          `max=4096). Telegram's per-message limit is 4096 chars and stream_reply does not ` +
+          `auto-chunk. Split the text or use \`reply\` (which chunks).`,
+      )
+    }
+
     if (deps.historyEnabled) {
       const finalId = stream.getMessageId()
       if (finalId != null) {
