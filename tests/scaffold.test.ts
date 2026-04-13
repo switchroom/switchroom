@@ -75,9 +75,14 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("$NVM_DIR/nvm.sh");
     expect(startSh).toContain(`CLAUDE_CONFIG_DIR="${result.agentDir}/.claude"`);
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
-    // Default is the clerk fork with $CONTINUE_FLAG for session resumption
-    // (defaults to --continue; session policy checks may clear it)
+    // Fresh session every start — Hindsight auto-recall + handoff briefing
     expect(startSh).toContain("exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram");
+    expect(startSh).toContain('CONTINUE_FLAG=""');
+    // Default: session-handoff enabled. start.sh reads .handoff.md and
+    // merges it into --append-system-prompt; plugin reads .handoff-topic.
+    expect(startSh).toContain(".handoff.md");
+    expect(startSh).toContain("clerk handoff");
+    expect(startSh).toContain("CLERK_HANDOFF_SHOW_LINE=true");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
     // CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
     // telegram-plugin reads to detect self-restart commands. Must be set.
@@ -925,10 +930,22 @@ describe("scaffoldAgent with global defaults cascade", () => {
         ],
       },
     ]);
+    // User's Stop hook + clerk-owned handoff Stop hook (added
+    // automatically when session_continuity is enabled; default on).
     expect(settings.hooks.Stop).toEqual([
       {
         hooks: [
           { type: "command", command: "/opt/retain.sh", async: true },
+        ],
+      },
+      {
+        hooks: [
+          {
+            type: "command",
+            command: "clerk handoff hooks-agent",
+            timeout: 35,
+            async: true,
+          },
         ],
       },
     ]);
@@ -1031,13 +1048,18 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    // --append-system-prompt argument is single-quote-wrapped
-    expect(startSh).toContain("--append-system-prompt '");
+    // system_prompt_append is now assigned into a shell var
+    // (APPEND_PROMPT=...) so the handoff briefing can be concatenated
+    // onto it before passing to claude. The single-quote wrapping still
+    // applies to the config value itself.
+    expect(startSh).toContain("APPEND_PROMPT='");
     // Embedded single quote becomes '"'"'
     expect(startSh).toContain(`'"'"'care'"'"'`);
     // Dollar signs and double quotes survive untouched inside single quotes
     expect(startSh).toContain("$VAR");
     expect(startSh).toContain('double-"quotes"');
+    // The exec line passes the var, quoted
+    expect(startSh).toContain('--append-system-prompt "$APPEND_PROMPT"');
   });
 
   it("settings_raw deep-merges into the generated settings.json", () => {
@@ -1490,8 +1512,11 @@ describe("phase-6b bug fixes", () => {
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.hooks.UserPromptSubmit).toBeDefined();
-    // Stop was dropped — the whole event is gone
-    expect(after.hooks.Stop).toBeUndefined();
+    // User Stop was dropped. The clerk-owned handoff Stop (auto-added
+    // when session_continuity is enabled — the default) remains.
+    expect(after.hooks.Stop).toBeDefined();
+    expect(JSON.stringify(after.hooks.Stop)).toContain("clerk handoff");
+    expect(JSON.stringify(after.hooks.Stop)).not.toContain("/opt/b.sh");
   });
 
   it("reconcile retracts settings_raw keys that were removed from clerk.yaml", () => {
@@ -1941,7 +1966,7 @@ describe("sub-agent file generation", () => {
   });
 });
 
-describe("session freshness check in start.sh", () => {
+describe("session freshness in start.sh", () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -1952,124 +1977,85 @@ describe("session freshness check in start.sh", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("includes the idle check when session.max_idle is set", () => {
-    const agentConfig = makeAgentConfig({
-      session: { max_idle: "2h" },
-    });
-    const result = scaffoldAgent(
-      "idle-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-
-    // Check block appears with the correct threshold (2h = 7200s)
-    expect(startSh).toContain("CONTINUE_FLAG=");
-    expect(startSh).toContain("-gt 7200");
-    // exec line uses $CONTINUE_FLAG instead of hardcoded --continue
-    expect(startSh).toContain("exec claude $CONTINUE_FLAG");
-  });
-
-  it("includes the turn check when session.max_turns is set", () => {
-    const agentConfig = makeAgentConfig({
-      session: { max_turns: 50 },
-    });
-    const result = scaffoldAgent(
-      "turns-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-
-    expect(startSh).toContain("-gt 50");
-    expect(startSh).toContain('"type":"user"');
-  });
-
-  it("includes both checks when both thresholds are set", () => {
-    const agentConfig = makeAgentConfig({
-      session: { max_idle: "30m", max_turns: 20 },
-    });
-    const result = scaffoldAgent(
-      "both-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-
-    // 30m = 1800s
-    expect(startSh).toContain("-gt 1800");
-    expect(startSh).toContain("-gt 20");
-  });
-
-  it("omits both checks when no session policy is set (always --continue)", () => {
+  it("defaults to fresh session — Hindsight recall handles continuity", () => {
     const agentConfig = makeAgentConfig();
     const result = scaffoldAgent(
-      "default-agent",
+      "fresh-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    // No idle or turn check blocks
+    expect(startSh).toContain('CONTINUE_FLAG=""');
+    expect(startSh).toContain("exec claude $CONTINUE_FLAG");
     expect(startSh).not.toContain("_IDLE");
     expect(startSh).not.toContain("_TURNS");
-    // Still uses $CONTINUE_FLAG (which stays as --continue since no check clears it)
-    expect(startSh).toContain("CONTINUE_FLAG");
+    expect(startSh).not.toContain(".resume-next-start");
   });
 
-  it("session policy flows through defaults cascade", () => {
+  it("installs the Stop hook for handoff by default", () => {
     const agentConfig = makeAgentConfig();
     const clerkConfig: ClerkConfig = {
       clerk: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
-      defaults: {
-        session: { max_idle: "1h", max_turns: 100 },
-      },
-      agents: { "cascade-agent": agentConfig },
+      agents: { "handoff-default-agent": agentConfig },
     } as ClerkConfig;
-
     const result = scaffoldAgent(
-      "cascade-agent",
+      "handoff-default-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
       clerkConfig,
     );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-
-    // 1h = 3600s
-    expect(startSh).toContain("-gt 3600");
-    expect(startSh).toContain("-gt 100");
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.hooks.Stop).toBeDefined();
+    expect(JSON.stringify(settings.hooks.Stop)).toContain(
+      "clerk handoff handoff-default-agent",
+    );
   });
 
-  it("reconcile propagates session policy changes to start.sh", () => {
-    const initial = makeAgentConfig();
+  it("omits the Stop hook when session_continuity.enabled is false", () => {
+    const agentConfig = makeAgentConfig({
+      session_continuity: { enabled: false },
+    });
     const clerkConfig: ClerkConfig = {
       clerk: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
-      agents: { "rec-session": initial },
+      agents: { "handoff-off-agent": agentConfig },
     } as ClerkConfig;
-    scaffoldAgent("rec-session", initial, tmpDir, telegramConfig, clerkConfig);
-
-    const before = readFileSync(join(tmpDir, "rec-session", "start.sh"), "utf-8");
-    expect(before).not.toContain("_IDLE");
-
-    // Add session policy via reconcile
-    const updated = makeAgentConfig({ session: { max_idle: "4h" } });
-    const updatedConfig: ClerkConfig = {
-      ...clerkConfig,
-      agents: { "rec-session": updated },
-    } as ClerkConfig;
-    reconcileAgent("rec-session", updated, tmpDir, telegramConfig, updatedConfig);
-
-    const after = readFileSync(join(tmpDir, "rec-session", "start.sh"), "utf-8");
-    // 4h = 14400s
-    expect(after).toContain("-gt 14400");
+    const result = scaffoldAgent(
+      "handoff-off-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      clerkConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.hooks.Stop).toBeUndefined();
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).not.toContain(".handoff.md");
+    expect(startSh).not.toContain("CLERK_HANDOFF_SHOW_LINE");
   });
+
+  it("threads show_handoff_line=false through to start.sh env", () => {
+    const agentConfig = makeAgentConfig({
+      session_continuity: { show_handoff_line: false },
+    });
+    const result = scaffoldAgent(
+      "no-line-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("CLERK_HANDOFF_SHOW_LINE=false");
+  });
+
 });
 
 describe("scaffoldAgent with inline profiles (extends cascade)", () => {

@@ -203,6 +203,53 @@ export const SessionSchema = z
   .optional();
 
 /**
+ * Session-handoff continuity. Fresh sessions start with a clean context
+ * window; to avoid losing "where were we?" between sessions, a Stop hook
+ * summarizes the previous session into a compact briefing that the next
+ * start.sh injects via --append-system-prompt. The telegram plugin also
+ * prepends a one-shot "↩️ Picked up where we left off — <topic>" line to
+ * the first assistant reply of the new session.
+ *
+ *   - enabled: master switch. When false, no Stop hook is installed and
+ *     start.sh skips all handoff logic.
+ *   - show_handoff_line: if false, the plugin still gets the briefing in
+ *     its system prompt but suppresses the user-visible continuity line.
+ *   - summarizer_model: which Anthropic model produces the briefing.
+ *     Haiku is the cost-sensitive default; swap for testing.
+ *   - max_turns_in_briefing: hard cap on how many recent user/assistant
+ *     turn pairs are fed to the summarizer. Bounds cost and latency.
+ */
+export const SessionContinuitySchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe("Master switch for the session-handoff briefing (default true)."),
+    show_handoff_line: z
+      .boolean()
+      .optional()
+      .describe(
+        "Whether the telegram plugin prepends a visible '↩️ Picked up…' " +
+        "line to the first assistant reply after a restart (default true).",
+      ),
+    summarizer_model: z
+      .string()
+      .regex(
+        /^[a-zA-Z0-9][a-zA-Z0-9._\-/\[\]:]*$/,
+        "Model name must be alphanumeric with ._-/[]: only",
+      )
+      .optional()
+      .describe("Anthropic model used to produce the handoff briefing."),
+    max_turns_in_briefing: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Cap on recent user/assistant turn pairs fed to the summarizer."),
+  })
+  .optional();
+
+/**
  * Per-channel configuration. Today the only channel is Telegram but
  * the shape is designed to expand (Slack, Discord, Matrix, Email) —
  * each channel lives under its own key with channel-specific options.
@@ -311,6 +358,7 @@ const profileFields = {
     .optional()
     .describe("Named sub-agent definitions rendered to .claude/agents/<name>.md"),
   session: SessionSchema,
+  session_continuity: SessionContinuitySchema,
   channels: ChannelsSchema,
   dangerous_mode: z.boolean().optional(),
   skip_permission_prompt: z.boolean().optional(),
@@ -413,6 +461,11 @@ export const AgentSchema = z.object({
   session: SessionSchema.describe(
     "Session lifecycle policy. Controls --continue vs fresh start on " +
     "agent restart based on idle time and turn count thresholds.",
+  ),
+  session_continuity: SessionContinuitySchema.describe(
+    "Handoff-briefing settings. When enabled (default), a Stop hook " +
+    "summarizes each session at shutdown and start.sh injects that " +
+    "briefing into the next session via --append-system-prompt.",
   ),
   channels: ChannelsSchema.describe(
     "Per-channel configuration. Today only `telegram` is defined; the " +

@@ -322,6 +322,17 @@ export function mergeAgentConfig(
     merged.session = combined as AgentConfig["session"];
   }
 
+  // --- session_continuity: shallow field merge, agent wins ---
+  if (defaults.session_continuity || merged.session_continuity) {
+    const base = defaults.session_continuity ?? {};
+    const override = merged.session_continuity ?? {};
+    const combined: Record<string, unknown> = { ...base };
+    for (const [k, v] of Object.entries(override)) {
+      if (v !== undefined) combined[k] = v;
+    }
+    merged.session_continuity = combined as AgentConfig["session_continuity"];
+  }
+
   // --- channels: per-channel shallow merge, agent wins ---
   //
   // Today only telegram exists; the structure generalizes for future

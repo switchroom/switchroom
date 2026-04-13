@@ -31,40 +31,61 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 {{/if}}
 cd "{{agentDir}}"
 
-# --- Session freshness check ---
-# Decide whether to resume the previous session (--continue) or start
-# fresh based on idle time and turn count. A fresh session gets a clean
-# context window; Hindsight auto-recall brings back relevant memories.
-CONTINUE_FLAG="--continue"
-{{#if sessionMaxIdleSecs}}
-_SESSION_DIR="$CLAUDE_CONFIG_DIR/sessions"
-if [ -d "$_SESSION_DIR" ]; then
-  _LATEST=$(ls -t "$_SESSION_DIR/"*.jsonl 2>/dev/null | head -1)
-  if [ -n "$_LATEST" ]; then
-    _LAST_MOD=$(stat -c %Y "$_LATEST" 2>/dev/null || echo 0)
+# Fresh session every start — avoids context-window blowout after heavy
+# autonomous work. Hindsight auto-recall surfaces relevant past memories
+# on every user message via the UserPromptSubmit hook.
+CONTINUE_FLAG=""
+
+{{#if handoffEnabled}}
+# --- Session handoff briefing ---
+# On a normal shutdown the Stop hook writes .handoff.md (compact
+# summary of the prior session) into the agent dir. Here we merge that
+# briefing into --append-system-prompt so the fresh session wakes up
+# already knowing what was going on. If the prior session crashed
+# without firing the Stop hook, we fall back to a synchronous
+# summarization capped at 2s — if that doesn't finish, skip gracefully
+# and rely on Hindsight's per-turn auto-recall.
+HANDOFF_FILE="{{agentDir}}/.handoff.md"
+if [ ! -s "$HANDOFF_FILE" ]; then
+  _LATEST_JSONL=$(ls -t "$CLAUDE_CONFIG_DIR/projects/"*/*.jsonl 2>/dev/null | head -1)
+  if [ -n "$_LATEST_JSONL" ]; then
+    _LAST_MOD=$(stat -c %Y "$_LATEST_JSONL" 2>/dev/null || echo 0)
     _NOW=$(date +%s)
-    _IDLE=$((_NOW - _LAST_MOD))
-    if [ "$_IDLE" -gt {{sessionMaxIdleSecs}} ]; then
-      CONTINUE_FLAG=""
+    if [ $((_NOW - _LAST_MOD)) -lt 600 ]; then
+      timeout 2 clerk handoff "{{name}}" 2>/dev/null || true
     fi
   fi
 fi
-{{/if}}
-{{#if sessionMaxTurns}}
-if [ -n "$CONTINUE_FLAG" ]; then
-  _SESSION_DIR="$CLAUDE_CONFIG_DIR/sessions"
-  if [ -d "$_SESSION_DIR" ]; then
-    _LATEST=$(ls -t "$_SESSION_DIR/"*.jsonl 2>/dev/null | head -1)
-    if [ -n "$_LATEST" ]; then
-      _TURNS=$(grep -c '"type":"user"' "$_LATEST" 2>/dev/null || echo 0)
-      if [ "$_TURNS" -gt {{sessionMaxTurns}} ]; then
-        CONTINUE_FLAG=""
-      fi
-    fi
+# Telegram plugin reads this to decide whether to prepend the visible
+# "↩️ Picked up where we left off — <topic>" line on the first reply.
+export CLERK_HANDOFF_SHOW_LINE={{#if handoffShowLine}}true{{else}}false{{/if}}
+APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
+if [ -s "$HANDOFF_FILE" ]; then
+  _HANDOFF_CONTENT=$(cat "$HANDOFF_FILE")
+  if [ -n "$APPEND_PROMPT" ]; then
+    APPEND_PROMPT="$APPEND_PROMPT
+
+---
+
+$_HANDOFF_CONTENT"
+  else
+    APPEND_PROMPT="$_HANDOFF_CONTENT"
   fi
 fi
+{{else}}
+APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 {{/if}}
 
-{{#if useClerkPlugin}}exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
-{{else}}exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if systemPromptAppendShellQuoted}} --append-system-prompt {{{systemPromptAppendShellQuoted}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+{{#if useClerkPlugin}}
+if [ -n "$APPEND_PROMPT" ]; then
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+else
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+fi
+{{else}}
+if [ -n "$APPEND_PROMPT" ]; then
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+else
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+fi
 {{/if}}

@@ -127,27 +127,74 @@ let currentTurnCapturedText: string[] = []
  * event and synthetically triggers turn_end processing.
  */
 let orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null = null
-const ORPHANED_REPLY_TIMEOUT_MS = 30_000
+
+import {
+  isContextExhaustionText,
+  shouldArmOrphanedReplyTimeout,
+  ORPHANED_REPLY_TIMEOUT_MS,
+} from './context-exhaustion.js'
+
+import {
+  resolveAgentDirFromEnv,
+  consumeHandoffTopic,
+  shouldShowHandoffLine,
+  formatHandoffLine,
+  type HandoffFormat,
+} from './handoff-continuity.js'
+
+/**
+ * One-shot carry-over from the session-end summarizer: a short topic
+ * string to prepend to the very first assistant reply as a "↩️ Picked
+ * up where we left off — <topic>" line. Populated at plugin bootstrap
+ * by reading + deleting the `.handoff-topic` sidecar; cleared the
+ * first time a reply/stream_reply call consumes it.
+ */
+let pendingHandoffTopic: string | null = null
+
+function initHandoffContinuity(): void {
+  if (!shouldShowHandoffLine()) {
+    pendingHandoffTopic = null
+    return
+  }
+  const agentDir = resolveAgentDirFromEnv()
+  if (agentDir == null) {
+    pendingHandoffTopic = null
+    return
+  }
+  pendingHandoffTopic = consumeHandoffTopic(agentDir)
+}
+
+function takeHandoffPrefix(format: HandoffFormat): string {
+  if (pendingHandoffTopic == null) return ''
+  const line = formatHandoffLine(pendingHandoffTopic, format)
+  pendingHandoffTopic = null
+  return line
+}
 
 function resetOrphanedReplyTimeout(): void {
   if (orphanedReplyTimeoutId != null) {
     clearTimeout(orphanedReplyTimeoutId)
     orphanedReplyTimeoutId = null
   }
-  // Only arm the timer if we have a chat and some captured text but
-  // the reply tool hasn't been called yet.
   if (
-    currentSessionChatId != null &&
-    currentTurnCapturedText.length > 0 &&
-    !currentTurnReplyCalled
+    shouldArmOrphanedReplyTimeout({
+      currentSessionChatId,
+      capturedTextCount: currentTurnCapturedText.length,
+      replyCalled: currentTurnReplyCalled,
+    })
   ) {
     orphanedReplyTimeoutId = setTimeout(() => {
       orphanedReplyTimeoutId = null
-      if (currentSessionChatId != null && currentTurnCapturedText.length > 0 && !currentTurnReplyCalled) {
+      if (
+        shouldArmOrphanedReplyTimeout({
+          currentSessionChatId,
+          capturedTextCount: currentTurnCapturedText.length,
+          replyCalled: currentTurnReplyCalled,
+        })
+      ) {
         process.stderr.write(
           `telegram channel: orphaned-reply timeout (${ORPHANED_REPLY_TIMEOUT_MS}ms with no turn_end) — forcing backstop\n`,
         )
-        // Synthesize a turn_end event to trigger the backstop
         handleSessionEvent({ kind: 'turn_end', durationMs: -1 })
       }
     }, ORPHANED_REPLY_TIMEOUT_MS)
@@ -1009,6 +1056,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           effectiveText = text
         }
 
+        // First reply after a session start: prepend the one-shot
+        // "↩️ Picked up where we left off — <topic>" continuity line.
+        // takeHandoffPrefix consumes the pending topic so only the
+        // first reply of the session gets prefixed.
+        {
+          const prefix = takeHandoffPrefix(
+            format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
+          )
+          if (prefix.length > 0) effectiveText = prefix + effectiveText
+        }
+
         assertAllowedChat(chat_id)
 
         // Resolve thread ID: explicit arg > auto-captured from inbound
@@ -1277,6 +1335,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const sKey = streamKey(chat_id, threadId)
         let stream = activeDraftStreams.get(sKey)
+
+        // First reply after a session start: on the FIRST stream chunk
+        // (no active stream yet) consume the pending handoff topic and
+        // prepend the continuity line. Subsequent edits of the same
+        // stream don't re-consume.
+        if (!stream) {
+          const prefix = takeHandoffPrefix(
+            format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
+          )
+          if (prefix.length > 0) effectiveText = prefix + effectiveText
+        }
 
         // No active stream → create one bound to this chat+thread.
         if (!stream) {
@@ -1839,7 +1908,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Detect this and auto-restart the agent with a fresh session.
       // Hindsight auto-recall brings back relevant memories so context
       // isn't truly lost. Tell the user what happened before restarting.
-      if (ev.text.includes('Prompt is too long') && currentSessionChatId != null) {
+      if (isContextExhaustionText(ev.text) && currentSessionChatId != null) {
         const chatId = currentSessionChatId
         const threadId = currentSessionThreadId
         process.stderr.write(
@@ -3096,6 +3165,8 @@ async function handleInbound(
 bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
+
+initHandoffContinuity()
 
 // Use grammy's concurrent runner instead of bot.start(). Default polling
 // blocks the next getUpdates call until the current handler chain settles

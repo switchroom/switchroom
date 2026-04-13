@@ -842,6 +842,11 @@ export function scaffoldAgent(
     // Session freshness check thresholds (shell variables in start.sh)
     sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
     sessionMaxTurns: agentConfig.session?.max_turns,
+    // Session-handoff continuity (default on). Thread into start.sh so
+    // the template can gate the handoff merge block and export the
+    // CLERK_HANDOFF_SHOW_LINE env var read by the telegram plugin.
+    handoffEnabled: agentConfig.session_continuity?.enabled !== false,
+    handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
   };
 
   // --- Create directory structure ---
@@ -930,6 +935,28 @@ export function scaffoldAgent(
         timeout: 5,
       };
       const clerkSessionStart = [{ hooks: [greetingHook] }];
+      // Clerk-owned Stop hook: produce the session-handoff briefing so
+      // the next session can wake up with a compact summary injected
+      // via --append-system-prompt. Gated on session_continuity.enabled
+      // (default true). async+timeout so it never blocks shutdown.
+      const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
+      const handoffConfigArg = clerkConfigPath
+        ? ` --config ${shellSingleQuote(resolve(clerkConfigPath))}`
+        : "";
+      const clerkStop = handoffEnabled
+        ? [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: `clerk${handoffConfigArg} handoff ${name}`,
+                  timeout: 35,
+                  async: true,
+                },
+              ],
+            },
+          ]
+        : [];
       if (userHooks) {
         settings.hooks = {
           ...userHooks,
@@ -937,9 +964,20 @@ export function scaffoldAgent(
             ...((userHooks.SessionStart as unknown[]) ?? []),
             ...clerkSessionStart,
           ],
+          ...(clerkStop.length > 0
+            ? {
+                Stop: [
+                  ...((userHooks.Stop as unknown[]) ?? []),
+                  ...clerkStop,
+                ],
+              }
+            : {}),
         };
       } else {
-        settings.hooks = { SessionStart: clerkSessionStart };
+        settings.hooks = {
+          SessionStart: clerkSessionStart,
+          ...(clerkStop.length > 0 ? { Stop: clerkStop } : {}),
+        };
       }
       // Explicit model override: written to settings.model so the user
       // doesn't have to pass --model on every invocation.
@@ -1336,6 +1374,8 @@ export function reconcileAgent(
         : undefined,
       sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
       sessionMaxTurns: agentConfig.session?.max_turns,
+      handoffEnabled: agentConfig.session_continuity?.enabled !== false,
+      handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
     };
     const beforeStartSh = readFileSync(startShPath, "utf-8");
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
@@ -1468,6 +1508,21 @@ export function reconcileAgent(
       timeout: 5,
     };
     const clerkSessionStart = [{ hooks: [greetingHook] }];
+    const handoffEnabledReconcile = agentConfig.session_continuity?.enabled !== false;
+    const clerkStop = handoffEnabledReconcile
+      ? [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `clerk handoff ${name}`,
+                timeout: 35,
+                async: true,
+              },
+            ],
+          },
+        ]
+      : [];
     if (userHooks) {
       settings.hooks = {
         ...userHooks,
@@ -1475,9 +1530,20 @@ export function reconcileAgent(
           ...((userHooks.SessionStart as unknown[]) ?? []),
           ...clerkSessionStart,
         ],
+        ...(clerkStop.length > 0
+          ? {
+              Stop: [
+                ...((userHooks.Stop as unknown[]) ?? []),
+                ...clerkStop,
+              ],
+            }
+          : {}),
       };
     } else {
-      settings.hooks = { SessionStart: clerkSessionStart };
+      settings.hooks = {
+        SessionStart: clerkSessionStart,
+        ...(clerkStop.length > 0 ? { Stop: clerkStop } : {}),
+      };
     }
 
     // --- Reconcile sub-agent definitions (.claude/agents/<name>.md) ---

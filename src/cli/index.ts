@@ -12,6 +12,7 @@ import { registerWebCommand } from "./web.js";
 import { registerSetupCommand } from "./setup.js";
 import { registerDoctorCommand } from "./doctor.js";
 import { registerUpdateCommand } from "./update.js";
+import { registerHandoffCommand } from "./handoff.js";
 
 const pkg = JSON.parse(
   readFileSync(resolve(import.meta.dirname, "../../package.json"), "utf-8")
@@ -36,3 +37,4 @@ registerAuthCommand(program);
 registerVaultCommand(program);
 registerMemoryCommand(program);
 registerWebCommand(program);
+registerHandoffCommand(program);
