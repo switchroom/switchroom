@@ -380,3 +380,152 @@ describe('suppressPtyPreview claim/release race', () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
   })
 })
+
+// ---------------------------------------------------------------------------
+// PTY activity-lane wiring — onActivity → stream_reply on lane "activity"
+// ---------------------------------------------------------------------------
+//
+// These tests model the wiring added in server.ts: when pty-tail's
+// `onActivity(text)` fires, the plugin pushes `text` through
+// handleStreamReply with `lane: "activity"`, producing a distinct Telegram
+// message (different message id) from the answer-lane stream.
+//
+// We don't import server.ts directly (it has top-level side effects: it
+// connects the bot, starts tails, etc.). Instead we reproduce the wire
+// shape by calling handleStreamReply with the same lane arg the real code
+// uses — that exercises stream-reply-handler's streamKey + Map behavior
+// which is where the two-lane separation actually lives.
+
+import { handleStreamReply, type StreamReplyDeps, type StreamReplyState } from '../stream-reply-handler.js'
+
+function makeActivityDeps(
+  bot: ReturnType<typeof createMockBot>,
+  overrides?: Partial<StreamReplyDeps>,
+): StreamReplyDeps {
+  return {
+    bot,
+    markdownToHtml: (t) => t,
+    escapeMarkdownV2: (t) => t,
+    repairEscapedWhitespace: (t) => t,
+    takeHandoffPrefix: () => '',
+    assertAllowedChat: () => {},
+    resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
+    disableLinkPreview: true,
+    defaultFormat: 'text',
+    logStreamingEvent: () => {},
+    endStatusReaction: () => {},
+    historyEnabled: false,
+    recordOutbound: () => {},
+    writeError: () => {},
+    throttleMs: 600,
+    ...overrides,
+  }
+}
+
+describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")', () => {
+  const bot = createMockBot()
+  installBotResetHook(bot)
+
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('onActivity callback fires handleStreamReply on lane "activity" with expected text', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    // Simulate what server.ts's handlePtyActivity does when pty-tail emits
+    // the first activity line.
+    const onActivity = (text: string) => {
+      void handleStreamReply(
+        { chat_id: '1', text, lane: 'activity', format: 'text' },
+        state,
+        deps,
+      )
+    }
+
+    onActivity('Running Bash: git status')
+    await microtaskFlush()
+
+    // Lane-specific stream key must be present; the default (answer) lane
+    // must NOT — activity is its own channel.
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+    expect(state.activeDraftStreams.has('1:_')).toBe(false)
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendMessage.mock.calls[0][0]).toBe('1')
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('Running Bash: git status')
+  })
+
+  it('two concurrent lanes (activity + answer) each get their own message id', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    // Activity lane fires first — model started running tools
+    const pActivity = handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', lane: 'activity', format: 'text' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const rActivity = await pActivity
+
+    // Answer lane — model starts emitting the reply
+    const pAnswer = handleStreamReply(
+      { chat_id: '1', text: 'Here is the answer', format: 'text' }, // default lane
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const rAnswer = await pAnswer
+
+    // Both lanes have distinct stream keys in the map
+    expect(state.activeDraftStreams.has('1:_:activity')).toBe(true)
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+    expect(state.activeDraftStreams.size).toBe(2)
+
+    // Two separate Telegram sends — two message ids
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(rActivity.messageId).not.toBeNull()
+    expect(rAnswer.messageId).not.toBeNull()
+    expect(rActivity.messageId).not.toBe(rAnswer.messageId)
+  })
+
+  it('activity lane updates edit the activity message, not the answer message', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    // Seed both lanes
+    await handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await handleStreamReply(
+      { chat_id: '1', text: 'Drafting answer…', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    const activityId = state.activeDraftStreams.get('1:_:activity')!.getMessageId()
+    const answerId = state.activeDraftStreams.get('1:_')!.getMessageId()
+    expect(activityId).not.toBe(answerId)
+
+    // Advance past throttle window so subsequent updates can flush
+    vi.advanceTimersByTime(700)
+    await microtaskFlush()
+
+    // Next activity update should edit the activity message
+    await handleStreamReply(
+      { chat_id: '1', text: 'Reading file: foo.ts', lane: 'activity', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    const editCalls = bot.api.editMessageText.mock.calls
+    expect(editCalls.length).toBeGreaterThanOrEqual(1)
+    // The most recent edit must have targeted the activity message id
+    const lastEdit = editCalls[editCalls.length - 1]
+    expect(lastEdit[1]).toBe(activityId)
+    expect(lastEdit[2]).toBe('Reading file: foo.ts')
+  })
+})

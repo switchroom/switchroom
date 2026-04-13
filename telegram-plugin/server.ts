@@ -52,7 +52,7 @@ import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handle
 import { handleStreamReply } from './stream-reply-handler.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
-import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
+import { startPtyTail, V1ToolActivityExtractor, type PtyTailHandle } from './pty-tail.js'
 import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory } from './history.js'
 import {
   parseQueuePrefix,
@@ -1684,6 +1684,8 @@ if (ptyTailEnabled) {
       logFile: serviceLogPath,
       log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
       onPartial: handlePtyPartial,
+      activityExtractor: new V1ToolActivityExtractor(),
+      onActivity: handlePtyActivity,
     })
     process.stderr.write(
       `telegram channel: pty tail watching ${serviceLogPath}\n`,
@@ -1755,6 +1757,82 @@ function handlePtyPartial(text: string): void {
  * the PTY tail when the buffer hasn't changed materially.
  */
 const lastPtyPreviewByChat = new Map<string, string>()
+
+/**
+ * Called by the PTY tail when the activity extractor surfaces a new
+ * tool-call status line ("Running Bash: ls", "Reading file: foo.ts").
+ *
+ * Routes through `handleStreamReply` on the dedicated `"activity"` lane
+ * so the status renders as its own Telegram message, distinct from the
+ * answer message on the default lane. The activity lane's stream is
+ * keyed as `${chat}:${thread}:activity` (see stream-reply-handler's
+ * `streamKey`), so it cannot collide with the answer-lane stream.
+ *
+ * Design note: we deliberately do NOT run this through
+ * `handlePtyPartialPure` — that handler owns the answer-lane suppress/
+ * dedup/claim semantics and expects a single stream per chat+thread.
+ * The activity lane is a parallel channel with its own lifecycle,
+ * finalized at turn_end (see the `turn_end` case in handleSessionEvent).
+ */
+function handlePtyActivity(text: string): void {
+  // Activity without a known chat id has nowhere to go — drop it. The
+  // main lane buffers in `pendingPtyPartial`, but status updates are
+  // ephemeral and a stale "Running Bash: ..." from before the chat was
+  // known would only confuse the user.
+  if (currentSessionChatId == null) return
+  const chatId = currentSessionChatId
+  const threadId = currentSessionThreadId
+  const access = loadAccess()
+  void handleStreamReply(
+    {
+      chat_id: chatId,
+      text,
+      done: false,
+      message_thread_id: threadId != null ? String(threadId) : undefined,
+      format: 'text',
+      lane: 'activity',
+    },
+    { activeDraftStreams },
+    {
+      bot,
+      retry: robustApiCall,
+      markdownToHtml,
+      escapeMarkdownV2,
+      repairEscapedWhitespace,
+      takeHandoffPrefix: () => '',
+      assertAllowedChat,
+      resolveThreadId,
+      disableLinkPreview: access.disableLinkPreview !== false,
+      defaultFormat: 'text',
+      logStreamingEvent,
+      endStatusReaction,
+      historyEnabled: false, // activity lane is ephemeral — don't persist
+      recordOutbound,
+      writeError: (line) => process.stderr.write(line),
+      throttleMs: 600,
+    },
+  ).catch((err) => {
+    process.stderr.write(
+      `telegram channel: pty activity stream failed: ${(err as Error).message}\n`,
+    )
+  })
+}
+
+/**
+ * Finalize the activity-lane stream (if any) at the end of a turn. We
+ * do NOT emit a closing "done" text — Telegram will simply leave the
+ * last status visible, which is the desired UX (the answer message is
+ * the real output; the activity is a live breadcrumb trail). Calling
+ * `finalize` on the stream is only needed to release internal throttle
+ * timers and delete the map entry so the next turn starts fresh.
+ */
+function closeActivityLane(chatId: string, threadId: number | undefined): void {
+  const key = `${chatId}:${threadId ?? '_'}:activity`
+  const stream = activeDraftStreams.get(key)
+  if (stream == null) return
+  activeDraftStreams.delete(key)
+  void stream.finalize().catch(() => { /* already logged */ })
+}
 
 /**
  * Resolve a session event into a status reaction transition on whichever
@@ -2044,6 +2122,10 @@ function handleSessionEvent(ev: SessionEvent): void {
       // either already shown or about to be replaced by the canonical
       // reply.
       pendingPtyPartial = null
+      // Close the activity lane for this chat+thread. Leaves the final
+      // status visible in Telegram (no "done" chip); next turn opens a
+      // fresh activity stream on the first tool-call bullet.
+      closeActivityLane(chatId, threadId)
       currentSessionChatId = null
       currentSessionThreadId = undefined
       currentTurnReplyCalled = false
