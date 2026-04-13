@@ -43,12 +43,16 @@ steps:
       curl -fsSL https://bun.sh/install | bash
       export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile
+      # vitest also runs telegram-plugin/tests/*.test.ts (excluding bun-only
+      # history.test.ts) for cross-package coverage, so install plugin deps.
+      (cd telegram-plugin && bun install --frozen-lockfile)
       bun run test:vitest
     cache:
       paths:
         - "~/.bun"
         - "node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}"
+        - "telegram-plugin/node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
     artifact_paths:
       - "coverage/**/*"
     retry:

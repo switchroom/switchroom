@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { mergeAgentConfig, resolveAgentConfig } from "../src/config/merge.js";
+import {
+  mergeAgentConfig,
+  resolveAgentConfig,
+  usesClerkTelegramPlugin,
+  deepMergeJson,
+  translateHooksToClaudeShape,
+} from "../src/config/merge.js";
 import type { AgentConfig, AgentDefaults, Profile } from "../src/config/schema.js";
 
 function baseAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -329,7 +335,7 @@ describe("mergeAgentConfig channels block", () => {
 });
 
 describe("usesClerkTelegramPlugin", () => {
-  const { usesClerkTelegramPlugin } = require("../src/config/merge.js");
+  // usesClerkTelegramPlugin imported at top of file
 
   it("returns true when channels.telegram.plugin is 'clerk'", () => {
     const agent = baseAgent({
@@ -452,7 +458,7 @@ describe("mergeAgentConfig escape hatches", () => {
 });
 
 describe("deepMergeJson", () => {
-  const { deepMergeJson } = require("../src/config/merge.js");
+  // deepMergeJson imported at top of file
 
   it("per-key merges nested objects recursively", () => {
     const out = deepMergeJson(
@@ -483,8 +489,7 @@ describe("deepMergeJson", () => {
 describe("translateHooksToClaudeShape", () => {
   // Local import to keep the describe block self-contained; see merge.ts
   // for the source implementation.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { translateHooksToClaudeShape } = require("../src/config/merge.js");
+  // translateHooksToClaudeShape imported at top of file
 
   it("wraps flat hook entries in Claude Code's nested shape", () => {
     const out = translateHooksToClaudeShape({
