@@ -3,8 +3,9 @@
  *
  * Invoked by a Stop hook at session end (and as a lazy fallback in
  * start.sh). Reads the session JSONL, builds a structured markdown
- * briefing via a fast Anthropic model (Haiku by default), and writes
- * two sidecars into the agent's directory:
+ * briefing by spawning `claude -p` (using the Claude Code OAuth
+ * subscription the agent already runs under — no API key required),
+ * and writes two sidecars into the agent's directory:
  *
  *   - .handoff.md        Full briefing, injected into the next session
  *                        via --append-system-prompt.
@@ -17,14 +18,14 @@
  * Hindsight as a tagged memory so older handoffs remain semantically
  * recallable across arbitrarily many sessions.
  *
- * Best-effort at every step — missing API key, API failure, missing
- * JSONL, Hindsight unreachable: warn to stderr, resolve cleanly. The
- * Stop hook must never block agent shutdown.
+ * Best-effort at every step — missing `claude` CLI, subprocess failure,
+ * missing JSONL, Hindsight unreachable: warn to stderr, resolve
+ * cleanly. The Stop hook must never block agent shutdown.
  */
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "node:child_process";
 
 export const DEFAULT_SUMMARIZER_MODEL = "claude-haiku-4-5-20251001";
 export const DEFAULT_MAX_TURNS = 50;
@@ -190,15 +191,20 @@ export function writeSidecarsAtomic(
   renameSync(topicTmp, topicPath);
 }
 
-export type AnthropicClientLike = {
-  messages: {
-    create: (req: {
-      model: string;
-      max_tokens: number;
-      system: string;
-      messages: { role: "user"; content: string }[];
-    }) => Promise<{ content: { type: string; text?: string }[] }>;
-  };
+/**
+ * Shells out to `claude -p` and returns stdout. Uses the Claude Code
+ * OAuth subscription the agent already runs under — no API key needed.
+ * `--no-session-persistence` keeps this invocation out of session
+ * history so the summarizer doesn't pollute the session JSONL it's
+ * reading from. Tests inject a stub instead of spawning.
+ */
+export type ClaudeCliRunner = {
+  run(opts: {
+    model: string;
+    system: string;
+    user: string;
+    timeoutMs: number;
+  }): Promise<string>;
 };
 
 export type SummarizeOpts = {
@@ -210,12 +216,12 @@ export type SummarizeOpts = {
   timeoutMs?: number;
   hindsightUrl?: string;
   hindsightBankId?: string;
-  anthropic?: AnthropicClientLike;
+  runner?: ClaudeCliRunner;
   fetch?: typeof fetch;
 };
 
 /**
- * Full pipeline: extract turns → call Anthropic → parse response →
+ * Full pipeline: extract turns → call `claude -p` → parse response →
  * atomic sidecar write → Hindsight mirror. Resolves with a status
  * string (for logging); never throws.
  */
@@ -228,35 +234,25 @@ export async function summarize(opts: SummarizeOpts): Promise<string> {
   if (turns.length === 0) {
     return "no-turns";
   }
-  const client = opts.anthropic ?? createAnthropicClient();
-  if (!client) {
-    return "no-api-key";
-  }
+  const runner = opts.runner ?? defaultClaudeCliRunner;
   const prompt = buildHandoffPrompt(turns);
 
-  let response: { content: { type: string; text?: string }[] };
+  let raw: string;
   try {
-    response = await withTimeout(
-      client.messages.create({
-        model,
-        max_tokens: 2000,
-        system: prompt.system,
-        messages: [{ role: "user", content: prompt.user }],
-      }),
+    raw = await runner.run({
+      model,
+      system: prompt.system,
+      user: prompt.user,
       timeoutMs,
-    );
+    });
   } catch (err) {
     process.stderr.write(
-      `handoff-summarizer: anthropic call failed — ${errMsg(err)}\n`,
+      `handoff-summarizer: claude -p call failed — ${errMsg(err)}\n`,
     );
-    return "api-error";
+    return "cli-error";
   }
 
-  const raw = response.content
-    .filter((b) => b.type === "text" && typeof b.text === "string")
-    .map((b) => b.text as string)
-    .join("\n")
-    .trim();
+  raw = raw.trim();
   if (!raw) {
     return "empty-response";
   }
@@ -281,16 +277,55 @@ export async function summarize(opts: SummarizeOpts): Promise<string> {
   return "ok";
 }
 
-function createAnthropicClient(): AnthropicClientLike | null {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key || key.trim().length === 0) {
-    process.stderr.write(
-      "handoff-summarizer: ANTHROPIC_API_KEY unset; skipping\n",
-    );
-    return null;
-  }
-  return new Anthropic({ apiKey: key }) as unknown as AnthropicClientLike;
-}
+/**
+ * Spawns `claude -p <user> --append-system-prompt <system> --model
+ * <model> --no-session-persistence`, collects stdout, enforces a
+ * wall-clock timeout. Uses the caller's `$PATH` to locate `claude`.
+ */
+export const defaultClaudeCliRunner: ClaudeCliRunner = {
+  async run({ model, system, user, timeoutMs }) {
+    return await new Promise<string>((resolve, reject) => {
+      const args = [
+        "-p",
+        user,
+        "--model",
+        model,
+        "--append-system-prompt",
+        system,
+        "--no-session-persistence",
+      ];
+      const child = spawn("claude", args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+      });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error(`timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+      child.stdout.on("data", (d) => {
+        stdout += d.toString("utf-8");
+      });
+      child.stderr.on("data", (d) => {
+        stderr += d.toString("utf-8");
+      });
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve(stdout);
+        } else {
+          const tail = stderr.trim().split("\n").slice(-3).join(" | ");
+          reject(new Error(`claude -p exited ${code}: ${tail || "(no stderr)"}`));
+        }
+      });
+    });
+  },
+};
 
 function errMsg(err: unknown): string {
   if (err && typeof err === "object" && "message" in err) {

@@ -11,7 +11,7 @@ import {
   findLatestSessionJsonl,
   TOPIC_MAX_CHARS,
   DEFAULT_SUMMARIZER_MODEL,
-  type AnthropicClientLike,
+  type ClaudeCliRunner,
 } from "../src/agents/handoff-summarizer.js";
 
 function makeJsonl(lines: Record<string, unknown>[]): string {
@@ -188,7 +188,7 @@ describe("summarize pipeline", () => {
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      anthropic: fakeClient("## Topic: x\n\nbody"),
+      runner: fakeRunner("## Topic: x\n\nbody"),
     });
     expect(status).toBe("no-turns");
   });
@@ -208,7 +208,7 @@ describe("summarize pipeline", () => {
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      anthropic: fakeClient("## Topic: greeting\n\n## Summary\nSaid hi."),
+      runner: fakeRunner("## Topic: greeting\n\n## Summary\nSaid hi."),
     });
     expect(status).toBe("ok");
     expect(readFileSync(join(tmp, ".handoff-topic"), "utf-8")).toBe("greeting");
@@ -230,13 +230,13 @@ describe("summarize pipeline", () => {
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      anthropic: fakeClient("## Summary\nno topic line"),
+      runner: fakeRunner("## Summary\nno topic line"),
     });
     expect(status).toBe("parse-error");
     expect(existsSync(join(tmp, ".handoff-topic"))).toBe(false);
   });
 
-  it("returns 'api-error' and does not write when API throws", async () => {
+  it("returns 'cli-error' and does not write when claude -p throws", async () => {
     const jsonlPath = join(tmp, "turns.jsonl");
     writeFileSync(
       jsonlPath,
@@ -252,9 +252,9 @@ describe("summarize pipeline", () => {
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      anthropic: failingClient(new Error("boom")),
+      runner: failingRunner(new Error("boom")),
     });
-    expect(status).toBe("api-error");
+    expect(status).toBe("cli-error");
     expect(existsSync(join(tmp, ".handoff.md"))).toBe(false);
     errStderr.mockRestore();
   });
@@ -279,7 +279,7 @@ describe("summarize pipeline", () => {
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      anthropic: fakeClient("## Topic: x\n\ndone"),
+      runner: fakeRunner("## Topic: x\n\ndone"),
       hindsightUrl: "http://localhost:9999",
       hindsightBankId: "mybank",
       fetch: fakeFetch,
@@ -327,22 +327,16 @@ describe("findLatestSessionJsonl", () => {
   });
 });
 
-// Helpers: fake Anthropic clients without hitting the network.
+// Helpers: fake claude CLI runners without spawning real subprocesses.
 
-function fakeClient(responseText: string): AnthropicClientLike {
-  return {
-    messages: {
-      create: async () => ({ content: [{ type: "text", text: responseText }] }),
-    },
-  };
+function fakeRunner(responseText: string): ClaudeCliRunner {
+  return { run: async () => responseText };
 }
 
-function failingClient(err: Error): AnthropicClientLike {
+function failingRunner(err: Error): ClaudeCliRunner {
   return {
-    messages: {
-      create: async () => {
-        throw err;
-      },
+    run: async () => {
+      throw err;
     },
   };
 }
