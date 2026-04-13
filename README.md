@@ -1,5 +1,10 @@
 # Clerk
 
+[![Build status](https://badge.buildkite.com/443b450a779c30f5824660f5062f8c29101cd4419831ee3aff.svg)](https://buildkite.com/ken-thompson/clerk)
+[![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fclerk-tests.json)](https://buildkite.com/ken-thompson/clerk)
+[![Trigger evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fclerk-trigger-evals.json)](https://buildkite.com/ken-thompson/clerk)
+[![Quality evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fclerk-quality-evals.json)](https://buildkite.com/ken-thompson/clerk)
+
 **Run Claude Code agents 24/7 on a server, talk to them from Telegram.**
 
 Clerk turns a $6/mo Linux server + your Claude Pro/Max subscription into a fleet of always-on AI agents. Each agent is a real Claude Code session — not a wrapper, not a harness, not a proxy. Clerk handles the lifecycle so you don't have to.

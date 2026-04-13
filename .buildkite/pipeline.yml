@@ -209,3 +209,6 @@ steps:
       # `evals/results/evals/results/*.json` and the script can't find them.
       buildkite-agent artifact download "evals/results/*.json" . || true
       bash .buildkite/annotate-evals.sh
+      # Publish dynamic shields.io badges (best-effort — never fails the build)
+      export GITHUB_GIST_TOKEN="$$(buildkite-agent secret get GITHUB_GIST_TOKEN 2>/dev/null || true)"
+      bash .buildkite/publish-badges.sh

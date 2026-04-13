@@ -8,8 +8,9 @@ prompts inside `skills/` against a real Claude model.
 
 | File | Purpose |
 |------|---------|
-| `pipeline.yml` | The full pipeline definition (lint, tests, evals, summary annotation) |
+| `pipeline.yml` | The full pipeline definition (lint, tests, evals, summary annotation, badge publish) |
 | `annotate-evals.sh` | Reads `evals/results/*.json` and posts a Buildkite annotation summarising pass rates |
+| `publish-badges.sh` | Writes shields.io-compatible badge JSON for tests + trigger evals + quality evals into a public Gist so the repo README can render dynamic status badges. Best-effort; swallows errors. Needs `GITHUB_GIST_TOKEN` cluster secret. |
 
 ## One-time setup in Buildkite
 
