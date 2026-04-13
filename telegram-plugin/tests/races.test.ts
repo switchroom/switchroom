@@ -293,7 +293,13 @@ describe('Race: context-exhaustion restart mid-steer', () => {
 describe('Race: fake-timer-based timing assertions', () => {
   beforeEach(() => {
     vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-04-13T00:00:00Z'))
+    // bun's vitest shim doesn't implement setSystemTime. The test only
+    // needs Date.now() to move with advanceTimersByTime — useFakeTimers
+    // already provides that on both vitest and bun. Guard so the test
+    // runs on either runtime without requiring setSystemTime.
+    if (typeof (vi as { setSystemTime?: (d: Date) => void }).setSystemTime === 'function') {
+      vi.setSystemTime(new Date('2026-04-13T00:00:00Z'))
+    }
   })
   afterEach(() => {
     vi.useRealTimers()

@@ -41,6 +41,7 @@ import { StatusReactionController } from './status-reactions.js'
 import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
+import { handleStreamReply } from './stream-reply-handler.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
@@ -1332,114 +1333,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: result }] }
       }
       case 'stream_reply': {
-        const chat_id = args.chat_id as string
-        const text = repairEscapedWhitespace(args.text as string)
-        const done = Boolean(args.done)
         const access = loadAccess()
-        const configParseMode = access.parseMode ?? 'html'
-        const format = (args.format as string | undefined) ?? configParseMode
-
-        let parseMode: 'HTML' | 'MarkdownV2' | undefined
-        let effectiveText: string
-        if (format === 'html') {
-          parseMode = 'HTML' as const
-          effectiveText = markdownToHtml(text)
-        } else if (format === 'markdownv2') {
-          parseMode = 'MarkdownV2' as const
-          effectiveText = escapeMarkdownV2(text)
-        } else {
-          parseMode = undefined
-          effectiveText = text
-        }
-
-        assertAllowedChat(chat_id)
-        const threadId = resolveThreadId(
-          chat_id,
-          args.message_thread_id as string | undefined,
-        )
-
-        const sKey = streamKey(chat_id, threadId)
-        let stream = activeDraftStreams.get(sKey)
-        logStreamingEvent({
-          kind: 'stream_reply_called',
-          chatId: chat_id,
-          charCount: effectiveText.length,
-          done,
-          streamExisted: stream != null,
-        })
-
-        // First reply after a session start: on the FIRST stream chunk
-        // (no active stream yet) consume the pending handoff topic and
-        // prepend the continuity line. Subsequent edits of the same
-        // stream don't re-consume.
-        if (!stream) {
-          const prefix = takeHandoffPrefix(
-            format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
-          )
-          if (prefix.length > 0) effectiveText = prefix + effectiveText
-        }
-
-        // No active stream → create one bound to this chat+thread.
-        if (!stream) {
-          stream = createStreamController({
+        const result = await handleStreamReply(
+          {
+            chat_id: args.chat_id as string,
+            text: args.text as string,
+            done: Boolean(args.done),
+            message_thread_id: args.message_thread_id as string | undefined,
+            format: args.format as string | undefined,
+          },
+          { activeDraftStreams },
+          {
             bot,
-            chatId: chat_id,
-            threadId,
-            parseMode,
-            disableLinkPreview: access.disableLinkPreview !== false,
-            throttleMs: 600,
             retry: robustApiCall,
-            onSend: (messageId, charCount) =>
-              logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
-            onEdit: (messageId, charCount) =>
-              logStreamingEvent({
-                kind: 'draft_edit',
-                chatId: chat_id,
-                messageId,
-                charCount,
-                sameAsLast: false,
-              }),
-          })
-          activeDraftStreams.set(sKey, stream)
-        }
-
-        await stream.update(effectiveText)
-
-        if (done) {
-          await stream.finalize()
-          activeDraftStreams.delete(sKey)
-          // The stream becoming final is the equivalent of `reply` landing
-          // — mark the status reaction controller done.
-          endStatusReaction(chat_id, threadId, 'done')
-
-          // Persist the final stream snapshot to history. We use the
-          // pre-conversion `text` (caller's snapshot) so the stored row
-          // matches what the model produced semantically rather than the
-          // HTML-rendered wire form.
-          if (HISTORY_ENABLED) {
-            const finalId = stream.getMessageId()
-            if (finalId != null) {
-              try {
-                recordOutbound({
-                  chat_id,
-                  thread_id: threadId ?? null,
-                  message_ids: [finalId],
-                  texts: [text],
-                })
-              } catch (err) {
-                process.stderr.write(
-                  `telegram channel: history recordOutbound (stream_reply) failed: ${err}\n`,
-                )
-              }
-            }
-          }
-        }
-
-        const id = stream.getMessageId()
-        const status = done ? 'finalized' : 'updated'
+            markdownToHtml,
+            escapeMarkdownV2,
+            repairEscapedWhitespace,
+            takeHandoffPrefix,
+            assertAllowedChat,
+            resolveThreadId,
+            disableLinkPreview: access.disableLinkPreview !== false,
+            defaultFormat: access.parseMode ?? 'html',
+            logStreamingEvent,
+            endStatusReaction,
+            historyEnabled: HISTORY_ENABLED,
+            recordOutbound,
+            writeError: (line) => process.stderr.write(line),
+            throttleMs: 600,
+          },
+        )
         return {
           content: [
-            { type: 'text', text: `${status} (id: ${id ?? 'pending'})` },
+            {
+              type: 'text',
+              text: `${result.status} (id: ${result.messageId ?? 'pending'})`,
+            },
           ],
         }
       }
