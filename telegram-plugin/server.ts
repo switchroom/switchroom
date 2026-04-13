@@ -38,7 +38,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep, basename, dirname } from 'path'
 import { StatusReactionController } from './status-reactions.js'
-import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
+import { type DraftStreamHandle } from './draft-stream.js'
+import { createStreamController } from './stream-controller.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
@@ -1379,45 +1380,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // No active stream → create one bound to this chat+thread.
         if (!stream) {
-          const sendOpts = {
-            ...(parseMode ? { parse_mode: parseMode } : {}),
-            ...(threadId != null ? { message_thread_id: threadId } : {}),
-            ...(access.disableLinkPreview !== false
-              ? { link_preview_options: { is_disabled: true } }
-              : {}),
-          }
-          let lastEditedText: string | null = null
-          stream = createDraftStream(
-            async (sendText) => {
-              const sent = await robustApiCall(
-                () => bot.api.sendMessage(chat_id, sendText, sendOpts),
-                { threadId, chat_id },
-              )
-              logStreamingEvent({
-                kind: 'draft_send',
-                chatId: chat_id,
-                messageId: sent.message_id,
-                charCount: sendText.length,
-              })
-              lastEditedText = sendText
-              return sent.message_id
-            },
-            async (id, editText) => {
-              await robustApiCall(
-                () => bot.api.editMessageText(chat_id, id, editText, sendOpts),
-                { threadId, chat_id },
-              )
+          stream = createStreamController({
+            bot,
+            chatId: chat_id,
+            threadId,
+            parseMode,
+            disableLinkPreview: access.disableLinkPreview !== false,
+            throttleMs: 600,
+            retry: robustApiCall,
+            onSend: (messageId, charCount) =>
+              logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
+            onEdit: (messageId, charCount) =>
               logStreamingEvent({
                 kind: 'draft_edit',
                 chatId: chat_id,
-                messageId: id,
-                charCount: editText.length,
-                sameAsLast: lastEditedText === editText,
-              })
-              lastEditedText = editText
-            },
-            { throttleMs: 600 },
-          )
+                messageId,
+                charCount,
+                sameAsLast: false,
+              }),
+          })
           activeDraftStreams.set(sKey, stream)
         }
 
@@ -1833,44 +1814,27 @@ function handlePtyPartial(text: string): void {
 
   let stream = activeDraftStreams.get(sKey)
   if (!stream) {
-    const sendOpts = {
-      parse_mode: 'HTML' as const,
-      ...(threadId != null ? { message_thread_id: threadId } : {}),
-      link_preview_options: { is_disabled: true },
-    }
-    let lastPtyEditedText: string | null = null
-    stream = createDraftStream(
-      async (sendText) => {
-        const sent = await robustApiCall(
-          () => bot.api.sendMessage(chatId, sendText, sendOpts),
-          { threadId, chat_id: chatId },
-        )
-        logOutbound('pty_preview', chatId, sent.message_id, sendText.length, 'initial_send')
-        logStreamingEvent({
-          kind: 'draft_send',
-          chatId,
-          messageId: sent.message_id,
-          charCount: sendText.length,
-        })
-        lastPtyEditedText = sendText
-        return sent.message_id
+    stream = createStreamController({
+      bot,
+      chatId,
+      threadId,
+      parseMode: 'HTML',
+      disableLinkPreview: true,
+      throttleMs: 600,
+      retry: robustApiCall,
+      onSend: (messageId, charCount) => {
+        logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
+        logStreamingEvent({ kind: 'draft_send', chatId, messageId, charCount })
       },
-      async (id, editText) => {
-        await robustApiCall(
-          () => bot.api.editMessageText(chatId, id, editText, sendOpts),
-          { threadId, chat_id: chatId },
-        )
+      onEdit: (messageId, charCount) =>
         logStreamingEvent({
           kind: 'draft_edit',
           chatId,
-          messageId: id,
-          charCount: editText.length,
-          sameAsLast: lastPtyEditedText === editText,
-        })
-        lastPtyEditedText = editText
-      },
-      { throttleMs: 600 },
-    )
+          messageId,
+          charCount,
+          sameAsLast: false,
+        }),
+    })
     activeDraftStreams.set(sKey, stream)
   }
 
