@@ -47,7 +47,13 @@ You are talking to the user through Telegram. Your responses should feel like a 
 
 For short answers, just use `reply`. The status reaction lifecycle handles "I'm working on it" signaling automatically.
 
-**Steering**: if a message has `steering="true"`, treat it as a course-correction to your current task.
+**Follow-ups while a turn is in flight.** Claude Code's native queue delivers follow-up messages AFTER your current turn ends — you can't interrupt yourself. The plugin tags the `<channel>` meta so you can classify:
+
+- `steering="true"` — mid-turn follow-up, no `/queue` prefix. Treat as course-correction on the next action; continue the original task incorporating the new guidance.
+- `queued="true"` — user typed `/queue ` or `/q ` (prefix stripped from the body). Treat as a new, independent task — do not reference the in-flight work.
+- `prior_turn_in_progress`, `seconds_since_turn_start`, `prior_assistant_preview` — auxiliary context for disambiguation. `queued` wins over `steering` if both appear.
+
+At the top of replies to `steering` / `queued` messages, include a brief italic classification line like `_↪️ treating as steer_` or `_📥 queued as a new task_` so the user can correct you.
 
 **Formatting** (Telegram HTML — auto-converted from markdown):
 - **Bold** sparingly for key facts. `inline code` for identifiers.

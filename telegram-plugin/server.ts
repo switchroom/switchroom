@@ -42,6 +42,10 @@ import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { startPtyTail, type PtyTailHandle } from './pty-tail.js'
 import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory } from './history.js'
+import {
+  parseQueuePrefix,
+  formatPriorAssistantPreview,
+} from './steering.js'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -84,6 +88,14 @@ const chatThreadMap = new Map<string, number>()
  */
 const activeStatusReactions = new Map<string, StatusReactionController>()
 
+/**
+ * Epoch-millisecond timestamp of when each in-progress turn's inbound
+ * message was received. Populated at the same site that creates the
+ * StatusReactionController, cleared when the controller is deleted.
+ * Used to compute `seconds_since_turn_start` for mid-turn follow-ups.
+ */
+const activeTurnStartedAt = new Map<string, number>()
+
 function statusKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
 }
@@ -99,6 +111,7 @@ function endStatusReaction(
   if (outcome === 'done') ctrl.setDone()
   else ctrl.setError()
   activeStatusReactions.delete(key)
+  activeTurnStartedAt.delete(key)
 }
 
 /**
@@ -1934,6 +1947,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
         if (ctrl) ctrl.setError()
         activeStatusReactions.delete(statusKey(chatId, threadId))
+        activeTurnStartedAt.delete(statusKey(chatId, threadId))
         currentSessionChatId = null
         currentSessionThreadId = undefined
         currentTurnReplyCalled = false
@@ -2013,6 +2027,7 @@ function handleSessionEvent(ev: SessionEvent): void {
                   )
                   if (backstopCtrl) backstopCtrl.setDone()
                   activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
+                  activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
                   return
                 }
               } catch {
@@ -2059,6 +2074,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               if (backstopCtrl) backstopCtrl.setError()
             } finally {
               activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
+              activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
             }
           })()
           return
@@ -2070,6 +2086,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // controller's terminal state is idempotent.
       if (ctrl) ctrl.setDone()
       activeStatusReactions.delete(statusKey(chatId, threadId))
+      activeTurnStartedAt.delete(statusKey(chatId, threadId))
       // Clear PTY preview state for this chat so the next turn starts
       // fresh. If we left the previous preview in place, the extractor
       // would see the OLD reply block in the xterm buffer and we'd
@@ -3034,6 +3051,14 @@ async function handleInbound(
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
 
+  // `/queue ` opt-in: strip the prefix before anything else so downstream
+  // history and notification see the "real" body. The flag is forwarded
+  // as meta.queued below so the model knows this was an explicit "new
+  // task, not a steer" declaration from the user.
+  const parsedQueue = parseQueuePrefix(text)
+  const isQueuedPrefix = parsedQueue.queued
+  const effectiveText = isQueuedPrefix ? parsedQueue.body : text
+
   // Status reaction controller — gives the user a glanceable lifecycle
   // signal on their inbound message: 👀 received → 🤔 thinking → 🔥/👨‍💻/⚡
   // working → 👍 done → 😱 error. The reply tool handler marks it done
@@ -3053,10 +3078,14 @@ async function handleInbound(
   // custom ackReaction in access.json, fall through to the legacy single-
   // emoji path so we don't break their existing config.
   let isSteering = false
+  let priorTurnStartedAt: number | undefined
   if (msgId != null) {
     const key = statusKey(chat_id, messageThreadId)
     const priorActive = activeStatusReactions.get(key)
     isSteering = priorActive != null
+    if (isSteering) {
+      priorTurnStartedAt = activeTurnStartedAt.get(key)
+    }
 
     if (access.statusReactions !== false) {
       if (isSteering) {
@@ -3073,6 +3102,7 @@ async function handleInbound(
         if (priorActive) {
           priorActive.cancel()
           activeStatusReactions.delete(key)
+          activeTurnStartedAt.delete(key)
         }
         const sKey = streamKey(chat_id, messageThreadId)
         const priorStream = activeDraftStreams.get(sKey)
@@ -3087,6 +3117,7 @@ async function handleInbound(
           ])
         })
         activeStatusReactions.set(key, ctrl)
+        activeTurnStartedAt.set(key, Date.now())
 
         // 👀 immediately
         ctrl.setQueued()
@@ -3122,7 +3153,7 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
-        text,
+        text: effectiveText,
         attachment_kind: attachment?.kind,
       })
     } catch (err) {
@@ -3131,12 +3162,50 @@ async function handleInbound(
     }
   }
 
+  // If a prior turn is still in progress for this chat+thread, enrich
+  // the notification with situational-awareness attributes so the model
+  // can decide whether to treat this as a steer, a queued new task, or
+  // something in between. See design doc: Options D (enriched meta) +
+  // B (explicit /queue prefix). steering="true" and queued="true" are
+  // mutually exclusive — the explicit /queue prefix wins.
+  // priorTurnInProgress mirrors isSteering (both derived from "was there
+  // a live controller when this message arrived?"). A /queue-prefixed
+  // message that arrives mid-turn still has a prior turn in progress —
+  // the prefix only changes the classification flag, not the fact.
+  const priorTurnInProgress = isSteering
+  let secondsSinceTurnStart: number | undefined
+  let priorAssistantPreview: string | undefined
+  if (priorTurnInProgress) {
+    if (priorTurnStartedAt != null) {
+      secondsSinceTurnStart = Math.max(0, Math.floor((Date.now() - priorTurnStartedAt) / 1000))
+    }
+    if (HISTORY_ENABLED) {
+      try {
+        const rows = queryHistory({
+          chat_id,
+          thread_id: messageThreadId ?? null,
+          limit: 10,
+        })
+        // query returns oldest-first; walk backwards for the most recent assistant text.
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const r = rows[i]!
+          if (r.role === 'assistant' && r.text && r.text.length > 0) {
+            priorAssistantPreview = formatPriorAssistantPreview(r.text, 200)
+            break
+          }
+        }
+      } catch {
+        // Preview is best-effort; history failures shouldn't block delivery.
+      }
+    }
+  }
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: effectiveText,
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
@@ -3145,7 +3214,11 @@ async function handleInbound(
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
-        ...(isSteering ? { steering: 'true' } : {}),
+        ...(isQueuedPrefix ? { queued: 'true' } : {}),
+        ...(isSteering && !isQueuedPrefix ? { steering: 'true' } : {}),
+        ...(priorTurnInProgress ? { prior_turn_in_progress: 'true' } : {}),
+        ...(priorTurnInProgress && secondsSinceTurnStart != null ? { seconds_since_turn_start: String(secondsSinceTurnStart) } : {}),
+        ...(priorTurnInProgress && priorAssistantPreview != null && priorAssistantPreview.length > 0 ? { prior_assistant_preview: priorAssistantPreview } : {}),
         ...(attachment ? {
           attachment_kind: attachment.kind,
           attachment_file_id: attachment.file_id,
