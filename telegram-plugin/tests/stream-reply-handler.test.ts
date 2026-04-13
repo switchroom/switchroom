@@ -246,6 +246,83 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>a\nb</html>')
   })
 
+  it('different lanes for same chat produce independent Telegram messages', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const p1 = handleStreamReply(
+      { chat_id: '1', text: 'thinking aloud', lane: 'thinking' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const r1 = await p1
+
+    const p2 = handleStreamReply(
+      { chat_id: '1', text: 'final answer' }, // no lane = answer
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const r2 = await p2
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(r1.messageId).not.toBe(r2.messageId) // separate messages
+    expect(state.activeDraftStreams.size).toBe(2)
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+    expect(state.activeDraftStreams.has('1:_:thinking')).toBe(true)
+  })
+
+  it('same lane updates the same message (no duplicate send per lane)', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const p1 = handleStreamReply(
+      { chat_id: '1', text: 'step 1', lane: 'thinking' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await p1
+
+    vi.advanceTimersByTime(1000)
+    const p2 = handleStreamReply(
+      { chat_id: '1', text: 'step 1 — step 2', lane: 'thinking' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await p2
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>step 1 — step 2</html>')
+  })
+
+  it('done=true on one lane does not affect other lanes', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const pThink = handleStreamReply(
+      { chat_id: '1', text: 'thinking', lane: 'thinking', done: true },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pThink
+
+    const pAnswer = handleStreamReply(
+      { chat_id: '1', text: 'answering' }, // still in progress
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pAnswer
+
+    expect(state.activeDraftStreams.has('1:_:thinking')).toBe(false)
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+  })
+
   it('streamExisted flag in logStreamingEvent reflects map state', async () => {
     const state = makeState()
     const logStreamingEvent = vi.fn()

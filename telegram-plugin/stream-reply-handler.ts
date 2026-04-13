@@ -29,6 +29,13 @@ export interface StreamReplyArgs {
   done?: boolean
   message_thread_id?: string
   format?: string
+  /**
+   * Optional named lane. Each lane gets its own Telegram message per
+   * chat+thread — useful for surfacing "thinking" alongside the main
+   * "answer" stream. Lane names are caller-defined. Omit for the
+   * default (unnamed) lane, which preserves legacy behavior.
+   */
+  lane?: string
 }
 
 export interface StreamReplyState {
@@ -94,8 +101,9 @@ export interface StreamReplyResult {
   status: 'updated' | 'finalized'
 }
 
-function streamKey(chatId: string, threadId?: number): string {
-  return `${chatId}:${threadId ?? '_'}`
+function streamKey(chatId: string, threadId?: number, lane?: string): string {
+  const base = `${chatId}:${threadId ?? '_'}`
+  return lane != null && lane.length > 0 ? `${base}:${lane}` : base
 }
 
 export async function handleStreamReply(
@@ -124,7 +132,7 @@ export async function handleStreamReply(
   deps.assertAllowedChat(chat_id)
   const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
 
-  const sKey = streamKey(chat_id, threadId)
+  const sKey = streamKey(chat_id, threadId, args.lane)
   let stream = state.activeDraftStreams.get(sKey)
   const streamExisted = stream != null
 

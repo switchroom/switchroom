@@ -911,6 +911,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             enum: ['html', 'markdownv2', 'text'],
             description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML.",
           },
+          lane: {
+            type: 'string',
+            description: "Optional lane name. Each lane gets its own Telegram message per chat+thread. Use for surfacing 'thinking' alongside the main answer stream — e.g. lane: 'thinking' for reasoning progress. Omit for the default answer lane.",
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1341,6 +1345,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             done: Boolean(args.done),
             message_thread_id: args.message_thread_id as string | undefined,
             format: args.format as string | undefined,
+            lane: args.lane as string | undefined,
           },
           { activeDraftStreams },
           {
