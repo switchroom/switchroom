@@ -1,0 +1,129 @@
+# Clerk CI pipeline.
+#
+# Set the Buildkite pipeline's initial command to:
+#   buildkite-agent pipeline upload
+# so this file is loaded on every build.
+#
+# Agent prerequisites:
+#   - bun           (TS runtime + test runner)
+#   - python3       (eval runners)
+#   - claude        (Claude Code CLI, only needed for the evals stages)
+#
+# Auth for the evals stages:
+#   - Set ANTHROPIC_API_KEY in pipeline env (Pipeline Settings → Environment),
+#     or expose it via an agent environment hook. Without it the eval steps
+#     are skipped (gated by the `if:` clause).
+
+agents:
+  queue: "default"
+
+steps:
+  - label: ":lock: Type check"
+    key: lint
+    command: |
+      bun install --frozen-lockfile
+      bun lint
+    plugins:
+      - cache#v1.8.1:
+          paths:
+            - "node_modules/"
+          manifest: "bun.lock"
+    retry:
+      automatic:
+        - exit_status: -1   # agent lost
+          limit: 2
+        - exit_status: 143  # SIGTERM (spot termination)
+          limit: 2
+
+  - label: ":vitest: Core tests"
+    key: tests-core
+    command: |
+      bun install --frozen-lockfile
+      bun run test:vitest
+    plugins:
+      - cache#v1.8.1:
+          paths:
+            - "node_modules/"
+          manifest: "bun.lock"
+    artifact_paths:
+      - "coverage/**/*"
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
+  - label: ":telegram: Plugin tests (402)"
+    key: tests-plugin
+    command: |
+      cd telegram-plugin
+      bun install --frozen-lockfile
+      bun test
+    plugins:
+      - cache#v1.8.1:
+          paths:
+            - "telegram-plugin/node_modules/"
+          manifest: "telegram-plugin/bun.lock"
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
+  - wait
+
+  # ---------------------------------------------------------------------------
+  # Skills evals — only run when API auth is available.
+  # Soft-fail so eval flakiness surfaces as a warning rather than blocking
+  # the build. Failures still create artifacts and an annotation summary.
+  # ---------------------------------------------------------------------------
+
+  - label: ":compass: Skills evals — trigger routing"
+    key: evals-trigger
+    if: build.env("ANTHROPIC_API_KEY") != null
+    command: |
+      pip install -q pyyaml
+      python3 evals/run_trigger.py --parallel 5
+    artifact_paths:
+      - "evals/results/**/*.json"
+    soft_fail:
+      - exit_status: 1
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
+  - label: ":sparkles: Skills evals — quality"
+    key: evals-quality
+    if: build.env("ANTHROPIC_API_KEY") != null
+    command: |
+      pip install -q pyyaml
+      python3 evals/run_quality.py --parallel 5
+    artifact_paths:
+      - "evals/results/**/*.json"
+    soft_fail:
+      - exit_status: 1
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
+  - wait: ~
+    continue_on_failure: true
+
+  - label: ":bar_chart: Eval summary"
+    if: build.env("ANTHROPIC_API_KEY") != null
+    depends_on:
+      - evals-trigger
+      - evals-quality
+    allow_dependency_failure: true
+    command: |
+      mkdir -p evals/results
+      buildkite-agent artifact download "evals/results/*.json" evals/results/ || true
+      bash .buildkite/annotate-evals.sh
