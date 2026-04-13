@@ -10,9 +10,10 @@
 # ~/.bun across builds via the hosted-agent built-in cache.
 #
 # Auth for the eval stages:
-#   - Set ANTHROPIC_API_KEY in pipeline env (Pipeline Settings → Environment)
-#     or expose it via an agent environment hook. Without it the eval steps
-#     are skipped (gated by the `if:` clause); tests still run.
+#   - Set ANTHROPIC_API_KEY (API key) or CLAUDE_CODE_OAUTH_TOKEN (Pro/Max
+#     OAuth token) in pipeline env (Pipeline Settings → Environment), or
+#     expose it via an agent environment hook. Without either, the eval
+#     steps are skipped (gated by the `if:` clause); tests still run.
 
 agents:
   queue: "hosted"
@@ -92,7 +93,7 @@ steps:
 
   - label: ":compass: Skills evals — trigger routing"
     key: evals-trigger
-    if: build.env("ANTHROPIC_API_KEY") != null
+    if: build.env("ANTHROPIC_API_KEY") != null || build.env("CLAUDE_CODE_OAUTH_TOKEN") != null
     command: |
       pip install -q pyyaml
       npm i -g @anthropic-ai/claude-code
@@ -110,7 +111,7 @@ steps:
 
   - label: ":sparkles: Skills evals — quality"
     key: evals-quality
-    if: build.env("ANTHROPIC_API_KEY") != null
+    if: build.env("ANTHROPIC_API_KEY") != null || build.env("CLAUDE_CODE_OAUTH_TOKEN") != null
     command: |
       pip install -q pyyaml
       npm i -g @anthropic-ai/claude-code
@@ -130,7 +131,7 @@ steps:
     continue_on_failure: true
 
   - label: ":bar_chart: Eval summary"
-    if: build.env("ANTHROPIC_API_KEY") != null
+    if: build.env("ANTHROPIC_API_KEY") != null || build.env("CLAUDE_CODE_OAUTH_TOKEN") != null
     depends_on:
       - evals-trigger
       - evals-quality
