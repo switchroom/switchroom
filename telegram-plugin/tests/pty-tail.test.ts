@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import { Terminal } from '@xterm/headless'
-import { V1Extractor, V1ToolActivityExtractor, startPtyTail } from '../pty-tail.js'
+import {
+  V1Extractor,
+  V1ToolActivityExtractor,
+  shouldSuppressToolActivity,
+  startPtyTail,
+} from '../pty-tail.js'
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -423,4 +428,58 @@ describe('startPtyTail integration — onActivity wiring + dedup + throttle', ()
       rmSync(dir, { recursive: true, force: true })
     }
   }, 10_000)
+})
+
+describe('shouldSuppressToolActivity (bug 2: suppress noisy per-tool narration)', () => {
+  it('suppresses Bash/Read/Write/Edit/Grep/Glob per-call narration', () => {
+    // These are the core tools the user complained about — rapid-fire
+    // narration like "Running Bash: cd .." per call is noise.
+    expect(shouldSuppressToolActivity('Running Bash: git status')).toBe(true)
+    expect(shouldSuppressToolActivity('Reading file: /tmp/foo.ts')).toBe(true)
+    expect(shouldSuppressToolActivity('Writing file: /tmp/out.md')).toBe(true)
+    expect(shouldSuppressToolActivity('Editing file: server.ts')).toBe(true)
+    expect(shouldSuppressToolActivity('Searching with Grep: foo')).toBe(true)
+    expect(shouldSuppressToolActivity('Searching with Glob: **/*.ts')).toBe(true)
+  })
+
+  it('passes through human-meaningful activity (sub-agent, web, custom tools)', () => {
+    // These ARE useful to surface — they run long, and the user actually
+    // wants to know the agent is doing them.
+    expect(shouldSuppressToolActivity('Running sub-agent: @researcher')).toBe(false)
+    expect(shouldSuppressToolActivity('Fetching URL: https://example.com')).toBe(false)
+    expect(shouldSuppressToolActivity('Searching the web: foo')).toBe(false)
+    // Unknown / custom tool goes through the generic "Running <Tool>"
+    // path and must NOT be suppressed — only the named noisy set is.
+    expect(shouldSuppressToolActivity('Running MyCustomTool: xyz')).toBe(false)
+  })
+
+  it('bug 2: sequence of Bash/Grep/Read activity lines is entirely suppressed from outbound stream', async () => {
+    // End-to-end shape: simulate the V1ToolActivityExtractor emitting the
+    // noisy per-tool lines (as it still will — the filter is at the
+    // consumer layer). The filter should drop all of them before they
+    // reach the stream. The test uses the extractor directly to produce
+    // realistic strings, then runs them through the suppression check
+    // to assert nothing leaks to outbound.
+    const ax = new V1ToolActivityExtractor()
+    const outbound: string[] = []
+    const emitToStream = (line: string) => {
+      if (shouldSuppressToolActivity(line)) return
+      outbound.push(line)
+    }
+
+    for (const tui of [
+      '● Bash(cd /tmp && ls)\r\n',
+      '● Grep(pattern: "foo")\r\n',
+      '● Read(/home/user/bar.ts)\r\n',
+      '● Bash(git status)\r\n',
+    ]) {
+      const term = await feedToTerm(tui)
+      const line = ax.extract(term)
+      expect(line).not.toBeNull()
+      emitToStream(line!)
+    }
+
+    // All four were noisy-core-tool narration → outbound must be empty.
+    expect(outbound).toEqual([])
+  })
 })

@@ -12,10 +12,14 @@ import {
   type StreamReplyState,
 } from '../stream-reply-handler.js'
 import type { DraftStreamHandle } from '../draft-stream.js'
+import { markdownToHtml as realMarkdownToHtml } from '../format.js'
 import { createMockBot, installBotResetHook, microtaskFlush } from './bot-api.harness.js'
 
 function makeState(): StreamReplyState {
-  return { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+  return {
+    activeDraftStreams: new Map<string, DraftStreamHandle>(),
+    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+  }
 }
 
 function makeDeps(
@@ -321,6 +325,54 @@ describe('handleStreamReply', () => {
 
     expect(state.activeDraftStreams.has('1:_:thinking')).toBe(false)
     expect(state.activeDraftStreams.has('1:_')).toBe(true)
+  })
+
+  it('bug 1: parseMode mismatch with existing stream rotates to fresh stream with new parseMode + rendered text', async () => {
+    // Reproduces the reported bug: PTY-tail auto-stream seeds a stream
+    // with format:'text' (parseMode undefined). A later explicit
+    // stream_reply on the same key with format:'html' + markdown text
+    // must NOT inherit the stale parseMode — it must finalize the old
+    // stream and create a fresh one with parse_mode=HTML so the markdown
+    // converts to HTML tags instead of sending literal asterisks.
+    const state = makeState()
+    const deps = makeDeps(bot, {
+      markdownToHtml: realMarkdownToHtml,
+      defaultFormat: 'text',
+    })
+
+    // First call: PTY-tail-style, format:'text'
+    const p1 = handleStreamReply(
+      { chat_id: '1', text: 'Running Bash: ls', format: 'text' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await p1
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
+
+    vi.advanceTimersByTime(1000)
+
+    // Second call on the same stream key: model explicitly uses html +
+    // markdown. Must produce a new send (stream rotated), parse_mode HTML,
+    // and literal markdown converted to Telegram HTML tags.
+    const p2 = handleStreamReply(
+      { chat_id: '1', text: '**bold** and `code`', format: 'html' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await p2
+
+    // A fresh stream means a second sendMessage, not an edit of the old
+    // one (the old stream was finalized + discarded).
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    const secondSend = bot.api.sendMessage.mock.calls[1]
+    expect(secondSend[2]?.parse_mode).toBe('HTML')
+    // markdownToHtml renders `**bold**` → `<b>bold</b>` and
+    // `` `code` `` → `<code>code</code>`.
+    expect(secondSend[1]).toContain('<b>bold</b>')
+    expect(secondSend[1]).toContain('<code>code</code>')
+    expect(secondSend[1]).not.toContain('**')
+    expect(secondSend[1]).not.toMatch(/`code`/)
   })
 
   it('streamExisted flag in logStreamingEvent reflects map state', async () => {

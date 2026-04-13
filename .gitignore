@@ -23,6 +23,7 @@ Thumbs.db
 
 # Build
 *.tsbuildinfo
+telegram-plugin/server.js
 
 # Python bytecode (from vendored Hindsight plugin)
 __pycache__/

@@ -40,6 +40,21 @@ export interface StreamReplyArgs {
 
 export interface StreamReplyState {
   activeDraftStreams: Map<string, DraftStreamHandle>
+  /**
+   * Tracks the parseMode each active stream was created with, keyed the
+   * same way as `activeDraftStreams`. Used by `handleStreamReply` to
+   * detect when a subsequent call's resolved parseMode differs from the
+   * one baked into the existing stream controller — in that case the
+   * stale stream is finalized + discarded and a fresh one is created
+   * with the new parseMode (see bug 1: PTY-tail creates an activity-lane
+   * stream with parseMode=undefined; a later explicit stream_reply on
+   * the same key with format:'html' would otherwise inherit undefined
+   * and send literal markdown).
+   *
+   * Optional for backwards compatibility with external callers that
+   * construct a StreamReplyState without it.
+   */
+  activeDraftParseModes?: Map<string, 'HTML' | 'MarkdownV2' | undefined>
 }
 
 export interface StreamReplyDeps {
@@ -134,6 +149,28 @@ export async function handleStreamReply(
 
   const sKey = streamKey(chat_id, threadId, args.lane)
   let stream = state.activeDraftStreams.get(sKey)
+
+  // Bug 1 fix: parseMode is baked into the stream controller at creation
+  // time. If a prior call created the stream with a different parseMode
+  // (e.g. PTY-tail auto-stream using 'text' → undefined, followed by an
+  // explicit stream_reply with format:'html'), reusing it would send
+  // literal markdown. Finalize + discard the stale stream so the block
+  // below creates a fresh one with the correct parseMode.
+  if (stream != null && state.activeDraftParseModes != null) {
+    const existingParseMode = state.activeDraftParseModes.get(sKey)
+    if (existingParseMode !== parseMode) {
+      try {
+        await stream.finalize()
+      } catch {
+        /* best-effort: the in-flight edit may 429 or race, but we must
+         * not block the caller's new message on it. */
+      }
+      state.activeDraftStreams.delete(sKey)
+      state.activeDraftParseModes.delete(sKey)
+      stream = undefined
+    }
+  }
+
   const streamExisted = stream != null
 
   deps.logStreamingEvent({
@@ -173,6 +210,7 @@ export async function handleStreamReply(
         }),
     })
     state.activeDraftStreams.set(sKey, stream)
+    state.activeDraftParseModes?.set(sKey, parseMode)
   }
 
   await stream.update(effectiveText)
@@ -180,6 +218,7 @@ export async function handleStreamReply(
   if (done) {
     await stream.finalize()
     state.activeDraftStreams.delete(sKey)
+    state.activeDraftParseModes?.delete(sKey)
     deps.endStatusReaction(chat_id, threadId, 'done')
 
     if (deps.historyEnabled) {
