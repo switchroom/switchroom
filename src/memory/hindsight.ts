@@ -6,6 +6,7 @@ export interface McpServerConfig {
   args?: string[];
   env?: Record<string, string>;
   url?: string;
+  headers?: Record<string, string>;
 }
 
 /**
@@ -18,7 +19,7 @@ export interface McpServerConfig {
  * accordingly.
  */
 export function generateHindsightMcpConfig(
-  _collection: string,
+  collection: string,
   memoryConfig: MemoryBackendConfig,
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
@@ -26,6 +27,9 @@ export function generateHindsightMcpConfig(
   return {
     type: "http",
     url,
+    headers: {
+      "X-Bank-Id": collection,
+    },
   };
 }
 
