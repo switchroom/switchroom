@@ -13,6 +13,8 @@ dist/
 
 # OpenClaw export bundle — contains real secrets, never commit
 /switchroom-export/
+/clerk-export/
+/clerk-export-with-secrets.tar.gz
 
 # OS
 .DS_Store
