@@ -680,4 +680,77 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
     expect(lastEdit[1]).toBe(activityId)
     expect(lastEdit[2]).toBe('Reading file: foo.ts')
   })
+
+  // ---- closeProgressLane / turn-boundary coverage --------------------
+  //
+  // Bug 2 regression: on turn_end the server also closes the `progress`
+  // lane (the one the progress-card driver owns). Without this, the
+  // same Telegram messageId is re-edited across turns and the user
+  // sees a visible shrink-flicker when a new turn opens with 0 items
+  // on top of the previous turn's 10-item "Done" state. These tests
+  // model `closeProgressLane(chatId, threadId)` exactly like the
+  // existing closeActivityLane cases above.
+
+  function modelCloseProgressLane(
+    state: StreamReplyState,
+    chatId: string,
+    threadId?: number,
+  ): Promise<void> {
+    const key = `${chatId}:${threadId ?? '_'}:progress`
+    const stream = state.activeDraftStreams.get(key)
+    if (stream == null) return Promise.resolve()
+    state.activeDraftStreams.delete(key)
+    return stream.finalize().catch(() => { /* swallow */ })
+  }
+
+  it('closeProgressLane removes the stream entry and is idempotent', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    await handleStreamReply(
+      { chat_id: '1', text: '⚙️ Working…', lane: 'progress', format: 'html' },
+      state, deps,
+    )
+    await microtaskFlush()
+    expect(state.activeDraftStreams.has('1:_:progress')).toBe(true)
+
+    await modelCloseProgressLane(state, '1', undefined)
+    expect(state.activeDraftStreams.has('1:_:progress')).toBe(false)
+
+    // Idempotent.
+    await expect(modelCloseProgressLane(state, '1', undefined)).resolves.toBeUndefined()
+    await expect(modelCloseProgressLane(state, 'never', undefined)).resolves.toBeUndefined()
+  })
+
+  it('next turn after closeProgressLane posts a FRESH progress message (new messageId)', async () => {
+    const state: StreamReplyState = { activeDraftStreams: new Map<string, DraftStreamHandle>() }
+    const deps = makeActivityDeps(bot)
+
+    // Turn 1: progress card lives at some messageId.
+    await handleStreamReply(
+      { chat_id: '1', text: '⚙️ Working… (turn 1)', lane: 'progress', format: 'html' },
+      state, deps,
+    )
+    await microtaskFlush()
+    const firstProgressId = state.activeDraftStreams.get('1:_:progress')!.getMessageId()
+    const sendsBefore = bot.api.sendMessage.mock.calls.length
+
+    // turn_end closes the progress lane.
+    await modelCloseProgressLane(state, '1', undefined)
+    expect(state.activeDraftStreams.has('1:_:progress')).toBe(false)
+
+    // Turn 2: the fresh progress-card open must send a NEW message, not
+    // edit the previous one — this is what prevents the shrink-flicker
+    // described in the bug report.
+    await handleStreamReply(
+      { chat_id: '1', text: '⚙️ Working… (turn 2)', lane: 'progress', format: 'html' },
+      state, deps,
+    )
+    await microtaskFlush()
+
+    expect(state.activeDraftStreams.has('1:_:progress')).toBe(true)
+    const secondProgressId = state.activeDraftStreams.get('1:_:progress')!.getMessageId()
+    expect(secondProgressId).not.toBe(firstProgressId)
+    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsBefore + 1)
+  })
 })

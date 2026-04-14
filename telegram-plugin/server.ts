@@ -1990,6 +1990,24 @@ function closeActivityLane(chatId: string, threadId: number | undefined): void {
 }
 
 /**
+ * Finalize the progress-card lane stream at the end of a turn. Without
+ * this, the same Telegram messageId keeps getting edited across turns,
+ * so when a new turn opens with a fresh "Working…" skeleton the user
+ * sees the previous turn's "Done"-state 10-item checklist shrink into
+ * a 0-item new card — a jarring visible flicker. Closing the lane here
+ * drops the entry from activeDraftStreams so the next turn posts a
+ * fresh Telegram message (new messageId) for its progress card.
+ */
+function closeProgressLane(chatId: string, threadId: number | undefined): void {
+  const key = `${chatId}:${threadId ?? '_'}:progress`
+  const stream = activeDraftStreams.get(key)
+  if (stream == null) return
+  activeDraftStreams.delete(key)
+  activeDraftParseModes.delete(key)
+  void stream.finalize().catch(() => { /* already logged */ })
+}
+
+/**
  * Resolve a session event into a status reaction transition on whichever
  * controller is currently active for the in-flight chat. Bookkeeping is
  * minimal: we trust the JSONL ordering (Claude processes turns serially),
@@ -2285,6 +2303,10 @@ function handleSessionEvent(ev: SessionEvent): void {
       // status visible in Telegram (no "done" chip); next turn opens a
       // fresh activity stream on the first tool-call bullet.
       closeActivityLane(chatId, threadId)
+      // Close the progress lane as well so the next turn posts a fresh
+      // progress-card Telegram message instead of re-editing the prior
+      // turn's card (see closeProgressLane for the full rationale).
+      closeProgressLane(chatId, threadId)
       currentSessionChatId = null
       currentSessionThreadId = undefined
       currentTurnReplyCalled = false

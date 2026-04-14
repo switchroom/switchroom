@@ -9,9 +9,13 @@ import { createProgressDriver, summariseTurn } from '../progress-card-driver.js'
 import { initialState, reduce } from '../progress-card.js'
 import type { SessionEvent } from '../session-tail.js'
 
-function harness(minIntervalMs = 500, coalesceMs = 400, opts?: { captureSummaries?: boolean }) {
+function harness(
+  minIntervalMs = 500,
+  coalesceMs = 400,
+  opts?: { captureSummaries?: boolean; heartbeatMs?: number },
+) {
   let now = 1000
-  const timers: Array<{ fireAt: number; fn: () => void; ref: number }> = []
+  const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
   let nextRef = 0
   const emits: Array<{ chatId: string; threadId?: string; html: string; done: boolean }> = []
   const summaries: string[] = []
@@ -21,6 +25,7 @@ function harness(minIntervalMs = 500, coalesceMs = 400, opts?: { captureSummarie
     onTurnEnd: opts?.captureSummaries ? (s) => summaries.push(s) : undefined,
     minIntervalMs,
     coalesceMs,
+    heartbeatMs: opts?.heartbeatMs,
     now: () => now,
     setTimeout: (fn, ms) => {
       const ref = nextRef++
@@ -28,6 +33,16 @@ function harness(minIntervalMs = 500, coalesceMs = 400, opts?: { captureSummarie
       return { ref }
     },
     clearTimeout: (handle) => {
+      const target = (handle as { ref: number }).ref
+      const idx = timers.findIndex((t) => t.ref === target)
+      if (idx !== -1) timers.splice(idx, 1)
+    },
+    setInterval: (fn, ms) => {
+      const ref = nextRef++
+      timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+      return { ref }
+    },
+    clearInterval: (handle) => {
       const target = (handle as { ref: number }).ref
       const idx = timers.findIndex((t) => t.ref === target)
       if (idx !== -1) timers.splice(idx, 1)
@@ -41,8 +56,14 @@ function harness(minIntervalMs = 500, coalesceMs = 400, opts?: { captureSummarie
       timers.sort((a, b) => a.fireAt - b.fireAt)
       const next = timers[0]
       if (!next || next.fireAt > now) break
-      timers.shift()
-      next.fn()
+      if (next.repeat != null) {
+        // Intervals: reschedule for the next tick before firing.
+        next.fireAt += next.repeat
+        next.fn()
+      } else {
+        timers.shift()
+        next.fn()
+      }
     }
   }
 
@@ -315,6 +336,52 @@ describe('progress-card checklist rendering', () => {
     // Final checklist still visible.
     expect(final.html).toContain('✅ Read a.ts')
     expect(final.html).toContain('✅ Bash echo hi')
+  })
+})
+
+describe('progress-card driver heartbeat', () => {
+  // Bug 3 regression: once a turn settles into "1 long-running Agent
+  // item", no new session-tail events fire and the driver's
+  // change-only emit logic produces zero further renders — so the
+  // elapsed-time counter in the header never visibly ticks. The
+  // heartbeat forces a re-render every `heartbeatMs` while any chat
+  // has an open turn.
+  it('emits periodic renders while a turn is open even with no events flowing', () => {
+    const { driver, emits, advance } = harness(500, 400, { heartbeatMs: 5000 })
+    driver.ingest(enqueue('c1'), null) // initial render
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent' }, 'c1') // stage change
+    const emitsBefore = emits.length
+
+    // Advance 15s with ZERO events. Heartbeat fires every 5s; whether
+    // each tick actually emits depends on whether the render output
+    // differs (which it does, since the header shows elapsed time and
+    // the running item's (dur) bumps past each second boundary).
+    advance(15_000)
+    const delta = emits.length - emitsBefore
+    // Must see at least one heartbeat-driven render — otherwise the
+    // card is frozen for the full 15s with no events, which is the
+    // exact bug we're fixing.
+    expect(delta).toBeGreaterThanOrEqual(1)
+  })
+
+  it('stops the heartbeat after turn_end (no extra renders once the turn is done)', () => {
+    const { driver, emits, advance } = harness(500, 400, { heartbeatMs: 5000 })
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c1')
+    const countAfterEnd = emits.length
+
+    // Long idle — heartbeat must be dormant.
+    advance(60_000)
+    expect(emits.length).toBe(countAfterEnd)
+  })
+
+  it('can be disabled by setting heartbeatMs=0', () => {
+    const { driver, emits, advance } = harness(500, 400, { heartbeatMs: 0 })
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent' }, 'c1')
+    const countBefore = emits.length
+    advance(30_000)
+    expect(emits.length).toBe(countBefore)
   })
 })
 

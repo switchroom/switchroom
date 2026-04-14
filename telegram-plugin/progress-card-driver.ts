@@ -49,6 +49,18 @@ export interface ProgressDriverConfig {
   /** `setTimeout` override for tests. */
   setTimeout?: (fn: () => void, ms: number) => { ref: unknown }
   clearTimeout?: (ref: unknown) => void
+  /** `setInterval` override for tests (used by the heartbeat). */
+  setInterval?: (fn: () => void, ms: number) => { ref: unknown }
+  clearInterval?: (ref: unknown) => void
+  /**
+   * Heartbeat cadence for the no-events-flowing re-render. When a turn
+   * has settled into a long-running tool call (e.g. a sub-agent that
+   * emits no session-JSONL events for minutes), the elapsed-time counter
+   * in the card header never visibly ticks because no event fires a
+   * re-render. The heartbeat forces a flush every `heartbeatMs` while
+   * any chat has a running turn. Default 5000. Set to 0 to disable.
+   */
+  heartbeatMs?: number
 }
 
 /**
@@ -82,6 +94,8 @@ interface PerChatState {
 export interface ProgressDriver {
   /** Feed a session-tail event. Fires emit() as the cadence allows. */
   ingest(event: SessionEvent, chatId: string | null, threadId?: string): void
+  /** Stop internal timers (heartbeat). Idempotent. */
+  dispose?(): void
   /**
    * Begin a new turn synchronously — called from the inbound-message
    * handler the instant a user's message clears the gate, BEFORE any
@@ -115,8 +129,66 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       const handle = (ref as { ref: ReturnType<typeof setTimeout> }).ref
       clearTimeout(handle)
     })
+  const setI =
+    config.setInterval ??
+    ((fn, ms) => {
+      const h = setInterval(fn, ms)
+      return { ref: h }
+    })
+  const clearI =
+    config.clearInterval ??
+    ((ref) => {
+      const handle = (ref as { ref: ReturnType<typeof setInterval> }).ref
+      clearInterval(handle)
+    })
+  const heartbeatMs = config.heartbeatMs ?? 5000
 
   const chats = new Map<string, PerChatState>()
+  let heartbeatHandle: { ref: unknown } | null = null
+  // Tracks the last elapsed-seconds bucket we emitted for each chat so
+  // the heartbeat can coalesce — if the HTML hasn't changed AND the
+  // header elapsed counter (rounded to the heartbeat cadence) would
+  // still render identically, skip the edit.
+  const lastHeartbeatBucket = new Map<string, number>()
+
+  function startHeartbeatIfNeeded(): void {
+    if (heartbeatMs <= 0) return
+    if (heartbeatHandle != null) return
+    if (chats.size === 0) return
+    heartbeatHandle = setI(() => {
+      // Force a re-render for any chat with an open turn so the header
+      // elapsed time and per-item `(dur)` tick visibly — even when no
+      // session-JSONL events have arrived for a while (common while a
+      // sub-agent is running). Coalesce: only actually emit if either
+      // the rendered HTML changed or the elapsed-time bucket
+      // (rounded to the heartbeat period) advanced.
+      for (const [k, cs] of chats) {
+        if (cs.state.stage === 'done') continue
+        const html = render(cs.state, now())
+        const bucket = Math.floor(now() / heartbeatMs)
+        const prevBucket = lastHeartbeatBucket.get(k)
+        if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
+        lastHeartbeatBucket.set(k, bucket)
+        cs.lastEmittedHtml = html
+        cs.lastEmittedAt = now()
+        config.emit({
+          chatId: cs.chatId,
+          threadId: cs.threadId,
+          html,
+          done: false,
+        })
+      }
+      // If every chat has ended, stop the heartbeat to avoid an
+      // always-on timer.
+      if (chats.size === 0) stopHeartbeat()
+    }, heartbeatMs)
+  }
+
+  function stopHeartbeat(): void {
+    if (heartbeatHandle == null) return
+    clearI(heartbeatHandle)
+    heartbeatHandle = null
+  }
 
   function key(chatId: string, threadId?: string): string {
     return threadId != null ? `${chatId}:${threadId}` : chatId
@@ -182,6 +254,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           pendingTimer: null,
         }
         chats.set(k, chatState)
+        // New chat became active — ensure the heartbeat is running so
+        // the elapsed counter visibly ticks even during long stretches
+        // with no session events (e.g. sub-agent work).
+        startHeartbeatIfNeeded()
       }
 
       const prev = chatState.state
@@ -214,6 +290,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           }
           // Drop the chat state so a subsequent turn starts clean.
           chats.delete(k)
+          lastHeartbeatBucket.delete(k)
+          // Stop heartbeat when no chats remain active.
+          if (chats.size === 0) stopHeartbeat()
         }
         return
       }
@@ -264,6 +343,16 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     peek(chatId, threadId) {
       const k = key(chatId, threadId)
       return chats.get(k)?.state
+    },
+
+    dispose() {
+      stopHeartbeat()
+      for (const cs of chats.values()) {
+        if (cs.pendingTimer != null) {
+          clearT(cs.pendingTimer)
+          cs.pendingTimer = null
+        }
+      }
     },
   }
 }

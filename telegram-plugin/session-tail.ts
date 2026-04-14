@@ -251,14 +251,28 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
   let stopped = false
   let pendingPartial = '' // last read may end mid-line; stash for next read
 
+  // Per-file cursor + partial bookkeeping. This is the Bug 1 fix: when
+  // Claude Code's Agent/Task tool spawns a sub-agent, that sub-agent
+  // writes its OWN session JSONL which briefly becomes newest-mtime in
+  // the projects dir. Without per-file tracking, `findActiveSessionFile`
+  // flips to the sub-agent JSONL, `attachToFile` seeks to its end, and
+  // when the parent JSONL reclaims newest-mtime we'd seek to ITS end
+  // too — missing every event written while we were attached elsewhere
+  // (critical ones like tool_result and turn_end). Tracking cursors per
+  // file by absolute path lets us pick up exactly where we left off on
+  // re-attach.
+  const fileCursors = new Map<string, { cursor: number; pendingPartial: string }>()
+
   function readNew(): void {
     if (stopped || !currentFile) return
     try {
       const stat = statSync(currentFile)
       if (stat.size < cursor) {
-        // File was truncated/replaced — reset cursor
+        // File was truncated/replaced — reset cursor and clear any
+        // stored per-file state for this path.
         cursor = 0
         pendingPartial = ''
+        if (currentFile != null) fileCursors.delete(currentFile)
       }
       if (stat.size === cursor) return
       const buf = Buffer.alloc(stat.size - cursor)
@@ -291,19 +305,35 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
 
   function attachToFile(file: string): void {
     if (currentFile === file) return
+    // Save state for the file we're switching AWAY from, so that if we
+    // later re-attach (e.g. a sub-agent briefly led on mtime, now the
+    // parent leads again) we resume from exactly where we stopped.
+    if (currentFile != null) {
+      fileCursors.set(currentFile, { cursor, pendingPartial })
+    }
     if (watcher) {
       try { watcher.close() } catch { /* ignore */ }
       watcher = null
     }
     currentFile = file
-    pendingPartial = ''
-    // Seek to the current end so we only see new events, not history
-    try {
-      cursor = statSync(file).size
-    } catch {
-      cursor = 0
+    const prior = fileCursors.get(file)
+    if (prior != null) {
+      // Re-attach: pick up exactly where we left off so we don't skip
+      // events written while we were watching a different file.
+      cursor = prior.cursor
+      pendingPartial = prior.pendingPartial
+      log?.(`session-tail: re-attached to ${file} (cursor=${cursor}, restored)`)
+    } else {
+      // First attach to this file — seek to current end so we only see
+      // new events, not history.
+      pendingPartial = ''
+      try {
+        cursor = statSync(file).size
+      } catch {
+        cursor = 0
+      }
+      log?.(`session-tail: attached to ${file} (cursor=${cursor})`)
     }
-    log?.(`session-tail: attached to ${file} (cursor=${cursor})`)
     try {
       watcher = watch(file, () => readNew())
     } catch (err) {
