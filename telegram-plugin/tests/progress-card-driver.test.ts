@@ -71,7 +71,7 @@ describe('progress-card driver', () => {
     driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c1')
     expect(emits).toHaveLength(1)
     expect(emits[0].html).toContain('<b>🔧 Run</b>')
-    expect(emits[0].html).toContain('⚡ Read')
+    expect(emits[0].html).toContain('⚡ <b>Read</b>')
   })
 
   it('emits immediately on turn_end with done=true', () => {

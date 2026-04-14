@@ -147,11 +147,11 @@ describe('progress-card render', () => {
     expect(out).not.toContain('<b>🔧 Run</b>')
   })
 
-  it('renders running item with elapsed time', () => {
+  it('renders running item with elapsed time (tool name bolded)', () => {
     const s = fold([enqueue('test'), { kind: 'tool_use', toolName: 'Bash' }])
     // tool_use fired at t=1100, render at t=3200 → 2.1s elapsed for the item
     const out = render(s, 3200)
-    expect(out).toContain('⚡ Bash')
+    expect(out).toContain('⚡ <b>Bash</b>')
     expect(out).toContain('(00:02)')
   })
 
@@ -207,7 +207,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1800)
     const out = render(st, 2000)
     expect(out).not.toContain('×5')
-    expect(out).toContain('⚡ Read')
+    expect(out).toContain('⚡ <b>Read</b>')
   })
 
   it('does NOT roll up mixed tools', () => {

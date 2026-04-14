@@ -15,6 +15,7 @@
  */
 
 import type { SessionEvent } from './session-tail.js'
+import { toolLabel } from './tool-labels.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -25,6 +26,10 @@ export interface ChecklistItem {
   readonly id: number
   /** Claude Code tool name, e.g. "Read", "Bash", "Grep". */
   readonly tool: string
+  /** Short human-readable label derived from the tool's input (file path,
+   *  command, query, etc.). Empty string when the tool has no natural
+   *  label (e.g. TodoWrite) or input was missing. */
+  readonly label: string
   /** Current state. */
   readonly state: ItemState
   /** Unix ms when tool_use fired. */
@@ -104,6 +109,7 @@ export function reduce(
       const nextItem: ChecklistItem = {
         id: state.items.length,
         tool: event.toolName,
+        label: toolLabel(event.toolName, event.input),
         state: 'running',
         startedAt: now,
       }
@@ -117,13 +123,15 @@ export function reduce(
 
     case 'tool_result': {
       if (state.turnStartedAt === 0) return state
-      // Flip the most-recent running item to done. Paired by order —
-      // Claude Code runs tools sequentially, so the oldest running item
-      // is the one this result corresponds to.
+      // Flip the most-recent running item to done/failed. Paired by order
+      // — Claude Code runs tools sequentially, so the oldest running item
+      // is the one this result corresponds to. is_error=true on the
+      // tool_result JSONL line flips state to 'failed' (❌).
       const idx = state.items.findIndex((it) => it.state === 'running')
       if (idx === -1) return state
       const items = state.items.slice()
-      items[idx] = { ...items[idx], state: 'done', finishedAt: now }
+      const nextState: ItemState = event.isError === true ? 'failed' : 'done'
+      items[idx] = { ...items[idx], state: nextState, finishedAt: now }
       return { ...state, items }
     }
 
@@ -182,6 +190,13 @@ function extractUserText(raw: string): string {
   return body.trim()
 }
 
+/** Render a single checklist line — tool name + optional label code span. */
+function renderItemCore(tool: string, label: string, bold = false): string {
+  const toolHtml = bold ? `<b>${escapeHtml(tool)}</b>` : escapeHtml(tool)
+  if (!label) return toolHtml
+  return `${toolHtml}: <code>${escapeHtml(label)}</code>`
+}
+
 /**
  * Render the current state to Telegram HTML. `now` is the wall-clock time
  * used for elapsed-time calculations so the render is deterministic in tests.
@@ -215,21 +230,22 @@ export function render(state: ProgressCardState, now: number): string {
   const compacted = compactItems(state.items)
   for (const item of compacted) {
     const emoji = STATE_EMOJI[item.state]
-    const tool = escapeHtml(item.tool)
     if (item.state === 'running') {
       const dur = formatDuration(now - item.startedAt)
-      lines.push(`  ${emoji} ${tool} <i>(${dur})</i>`)
-    } else if (item.state === 'done' && item.finishedAt != null) {
-      const dur = formatDuration(item.finishedAt - item.startedAt)
+      lines.push(`  ${emoji} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`)
+    } else if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
       if (item.kind === 'rollup') {
-        lines.push(`  ${emoji} ${tool} <i>×${item.count}</i>`)
+        lines.push(`  ${emoji} ${escapeHtml(item.tool)} <i>×${item.count}</i>`)
       } else {
         // Short tools don't need duration — they're ~always sub-second.
+        const dur = formatDuration(item.finishedAt - item.startedAt)
         const needsDuration = item.finishedAt - item.startedAt >= 1000
-        lines.push(`  ${emoji} ${tool}${needsDuration ? ` <i>(${dur})</i>` : ''}`)
+        lines.push(
+          `  ${emoji} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`,
+        )
       }
     } else {
-      lines.push(`  ${emoji} ${tool}`)
+      lines.push(`  ${emoji} ${renderItemCore(item.tool, item.label)}`)
     }
   }
 
@@ -256,7 +272,8 @@ interface RolledItem extends ChecklistItem {
 
 const ROLLUP_THRESHOLD = 5
 
-function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] {
+// Exported for tests.
+export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] {
   const out: RolledItem[] = []
   let run: ChecklistItem[] = []
 
@@ -268,6 +285,7 @@ function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] {
       out.push({
         id: first.id,
         tool: first.tool,
+        label: '',
         state: 'done',
         startedAt: first.startedAt,
         finishedAt: last.finishedAt,

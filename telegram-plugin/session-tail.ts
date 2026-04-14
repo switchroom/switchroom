@@ -76,9 +76,9 @@ export type SessionEvent =
   | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string }
   | { kind: 'dequeue' }
   | { kind: 'thinking' }
-  | { kind: 'tool_use'; toolName: string }
+  | { kind: 'tool_use'; toolName: string; input?: Record<string, unknown> }
   | { kind: 'text'; text: string }
-  | { kind: 'tool_result'; toolUseId: string; toolName: string | null }
+  | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean }
   | { kind: 'turn_end'; durationMs: number }
 
 /**
@@ -143,7 +143,12 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
       if (ct === 'thinking') {
         events.push({ kind: 'thinking' })
       } else if (ct === 'tool_use') {
-        events.push({ kind: 'tool_use', toolName: (c.name as string | undefined) ?? '' })
+        const input = c.input as Record<string, unknown> | undefined
+        events.push({
+          kind: 'tool_use',
+          toolName: (c.name as string | undefined) ?? '',
+          input: input && typeof input === 'object' ? input : undefined,
+        })
       } else if (ct === 'text') {
         const text = (c.text as string | undefined) ?? ''
         events.push({ kind: 'text', text })
@@ -164,6 +169,7 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
           kind: 'tool_result',
           toolUseId: (c.tool_use_id as string | undefined) ?? '',
           toolName: null,
+          isError: c.is_error === true ? true : undefined,
         })
       }
     }
