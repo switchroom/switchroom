@@ -67,6 +67,32 @@ describe('progress-card driver', () => {
     expect(emits[0].html).toContain('💬 hi')
   })
 
+  it('startTurn fires an initial "Working…" render BEFORE any tool_use event', () => {
+    // This is the anti-latency fix: the inbound-message handler calls
+    // startTurn synchronously, so the card lands within ~1s of the user's
+    // message even if the session-tail enqueue event is still several
+    // hundred ms away.
+    const { driver, emits } = harness()
+    driver.startTurn({ chatId: 'c1', userText: 'please investigate' })
+    expect(emits).toHaveLength(1)
+    expect(emits[0].chatId).toBe('c1')
+    expect(emits[0].done).toBe(false)
+    // Distinctive Working… banner is present.
+    expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
+    // No tool_use has been fed in yet — there must be no checklist items.
+    expect(emits[0].html).not.toContain('⚡ <b>')
+    // And the echoed user request shows up so the card ties back to the
+    // user's message.
+    expect(emits[0].html).toContain('please investigate')
+  })
+
+  it('startTurn passes threadId through for forum-topic chats', () => {
+    const { driver, emits } = harness()
+    driver.startTurn({ chatId: 'c1', threadId: 't42', userText: 'hi' })
+    expect(emits).toHaveLength(1)
+    expect(emits[0].threadId).toBe('t42')
+  })
+
   it('emits immediately on stage change (plan → run)', () => {
     const { driver, emits } = harness()
     driver.ingest(enqueue('c1'), null)
