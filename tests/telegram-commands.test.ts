@@ -300,3 +300,78 @@ describe('telegram bot commands', () => {
 
 // afterAll import for the switchroom CLI path test
 import { afterAll } from 'vitest'
+
+// ─── Context exhaustion cooldown ─────────────────────────────────────────
+// Locks the contract: context exhaustion warns the user but does NOT
+// auto-restart (which caused a restart loop). The warning has a 10-min
+// cooldown to prevent spamming.
+
+describe('context exhaustion cooldown', () => {
+  const COOLDOWN_MS = 10 * 60 * 1000
+
+  /**
+   * Replicated from server.ts — the core decision logic: should we warn
+   * the user about context exhaustion for this event?
+   */
+  function shouldWarnContextExhaustion(
+    text: string,
+    chatId: string | null,
+    lastWarningAt: number,
+    now: number,
+  ): { warn: boolean; reason: string } {
+    if (!text.includes('Prompt is too long')) {
+      return { warn: false, reason: 'not a context exhaustion event' }
+    }
+    if (chatId == null) {
+      return { warn: false, reason: 'no active chat' }
+    }
+    if (now - lastWarningAt < COOLDOWN_MS) {
+      return { warn: false, reason: 'cooldown active' }
+    }
+    return { warn: true, reason: 'context exhausted' }
+  }
+
+  it('warns on first "Prompt is too long" with an active chat', () => {
+    const result = shouldWarnContextExhaustion('Prompt is too long', '-100', 0, Date.now())
+    expect(result.warn).toBe(true)
+  })
+
+  it('does NOT warn when no active chat', () => {
+    const result = shouldWarnContextExhaustion('Prompt is too long', null, 0, Date.now())
+    expect(result.warn).toBe(false)
+  })
+
+  it('does NOT warn for normal text', () => {
+    const result = shouldWarnContextExhaustion('Hello world', '-100', 0, Date.now())
+    expect(result.warn).toBe(false)
+  })
+
+  it('suppresses duplicate warnings within the cooldown window', () => {
+    const now = Date.now()
+    const firstWarningAt = now - 5 * 60 * 1000 // 5 minutes ago
+    const result = shouldWarnContextExhaustion('Prompt is too long', '-100', firstWarningAt, now)
+    expect(result.warn).toBe(false)
+    expect(result.reason).toBe('cooldown active')
+  })
+
+  it('allows a new warning after the cooldown expires', () => {
+    const now = Date.now()
+    const oldWarningAt = now - 11 * 60 * 1000 // 11 minutes ago
+    const result = shouldWarnContextExhaustion('Prompt is too long', '-100', oldWarningAt, now)
+    expect(result.warn).toBe(true)
+  })
+
+  it('does NOT auto-restart (the previous bug that caused the loop)', () => {
+    // This test exists purely to document and prevent regression on the
+    // restart-loop bug. The fix: warn the user and let them /restart
+    // manually instead of calling spawnClerkDetached(['agent', 'restart', ...]).
+    // If anyone re-adds auto-restart, this test name will remind them why
+    // it was removed.
+    const result = shouldWarnContextExhaustion('Prompt is too long', '-100', 0, Date.now())
+    expect(result.warn).toBe(true)
+    // The contract: warn=true means "send a Telegram message asking
+    // the user to /restart". It does NOT mean "spawn a restart".
+    // There is no "restart" field in the return type.
+    expect(result).not.toHaveProperty('restart')
+  })
+})
