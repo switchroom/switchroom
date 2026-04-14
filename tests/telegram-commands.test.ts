@@ -787,3 +787,40 @@ describe('/auth subcommand router', () => {
   })
 })
 
+// ─── /reauth one-shot shortcut ───────────────────────────────────────────
+// Top-level /reauth command with smart defaults: current agent, active slot.
+// /reauth         → start reauth flow
+// /reauth <code>  → complete pending reauth (slot auto-resolved from session)
+
+describe('/reauth one-shot', () => {
+  function routeReauth(raw: string, myAgent: string): { argv: string[]; label: string } {
+    const parts = raw.trim().split(/\s+/).filter(Boolean)
+    if (parts.length === 0) {
+      return { argv: ['auth', 'reauth', myAgent], label: `auth reauth ${myAgent}` }
+    }
+    const code = parts[0]
+    const slot = parts[1]
+    const argv = ['auth', 'code', myAgent, code, ...(slot ? ['--slot', slot] : [])]
+    return { argv, label: `auth code ${myAgent}` }
+  }
+
+  it('no args → starts reauth for self', () => {
+    expect(routeReauth('', 'assistant').argv).toEqual(['auth', 'reauth', 'assistant'])
+  })
+
+  it('one arg → treated as code, completes pending reauth for self', () => {
+    expect(routeReauth('ABC123', 'assistant').argv).toEqual(['auth', 'code', 'assistant', 'ABC123'])
+  })
+
+  it('two args → code + explicit slot override', () => {
+    expect(routeReauth('ABC123 slot-2', 'assistant').argv).toEqual([
+      'auth', 'code', 'assistant', 'ABC123', '--slot', 'slot-2',
+    ])
+  })
+
+  it('always defaults agent to self (never prompts for it)', () => {
+    expect(routeReauth('', 'coach').argv).toEqual(['auth', 'reauth', 'coach'])
+    expect(routeReauth('XYZ', 'coach').argv).toEqual(['auth', 'code', 'coach', 'XYZ'])
+  })
+})
+
