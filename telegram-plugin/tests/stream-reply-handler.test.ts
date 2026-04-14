@@ -652,4 +652,133 @@ describe('handleStreamReply', () => {
       expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
     })
   })
+
+  describe('quote-reply default', () => {
+    it('auto-quotes the latest inbound message when reply_to is omitted', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => 4242,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+      await pending
+
+      expect(lookup).toHaveBeenCalledWith('1', null)
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+        message_id: 4242,
+      })
+    })
+
+    it('explicit reply_to overrides the auto-quote lookup', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => 4242,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'hi', reply_to: '777' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      // Lookup is skipped entirely when reply_to is explicit.
+      expect(lookup).not.toHaveBeenCalled()
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+        message_id: 777,
+      })
+    })
+
+    it('quote:false opts out — no reply_parameters sent', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => 4242,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'hi', quote: false },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      expect(lookup).not.toHaveBeenCalled()
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+    })
+
+    it('no reply_parameters when history lookup returns null (empty history)', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => null,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+      await pending
+
+      expect(lookup).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+    })
+
+    it('no auto-quote when getLatestInboundMessageId dep is omitted (legacy callers)', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot) // no lookup dep
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+    })
+
+    it('passes thread id to the lookup', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => 55,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'hi', message_thread_id: '7' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      expect(lookup).toHaveBeenCalledWith('1', 7)
+    })
+
+    it('edit-path does not include reply_parameters (only initial send)', async () => {
+      const state = makeState()
+      const lookup = vi.fn<(chatId: string, threadId: number | null) => number | null>(
+        () => 4242,
+      )
+      const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
+
+      // First call → send with reply_parameters.
+      await handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+
+      // Second call on the same stream → edit. editMessageText must NOT
+      // receive reply_parameters (Telegram rejects it on edit).
+      vi.advanceTimersByTime(1000)
+      await handleStreamReply({ chat_id: '1', text: 'hi there' }, state, deps)
+      await microtaskFlush()
+
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+        message_id: 4242,
+      })
+      expect(bot.api.editMessageText).toHaveBeenCalled()
+      const editOpts = bot.api.editMessageText.mock.calls[0][3]
+      expect((editOpts as { reply_parameters?: unknown })?.reply_parameters).toBeUndefined()
+    })
+  })
 })

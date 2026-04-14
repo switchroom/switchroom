@@ -36,6 +36,24 @@ export interface StreamReplyArgs {
    * default (unnamed) lane, which preserves legacy behavior.
    */
   lane?: string
+  /**
+   * Explicit quote-reply target. When set, the initial streamed message
+   * quote-threads under this message_id. Overrides the default auto-quote
+   * behavior and ignores `quote`.
+   */
+  reply_to?: string
+  /**
+   * Opt out of the default quote-reply behavior. The handler's default
+   * (when `reply_to` is unset) is to look up the latest inbound user
+   * message via `getLatestInboundMessageId` and quote-reply to it. Pass
+   * `false` to send a bare (non-quoted) streamed message.
+   *
+   * The default is `undefined` (treated as true) so callers that pre-date
+   * this feature keep working. Only the progress-card / activity-lane
+   * internal callers routinely opt out, since those aren't user-visible
+   * conversation replies.
+   */
+  quote?: boolean
 }
 
 export interface StreamReplyState {
@@ -87,6 +105,14 @@ export interface StreamReplyDeps {
   assertAllowedChat: (chatId: string) => void
   /** Resolves the effective thread id (explicit, last-inbound, or undefined). */
   resolveThreadId: (chatId: string, explicit?: string) => number | undefined
+  /**
+   * Resolves the default quote-reply target: the message_id of the latest
+   * inbound user message in this chat+thread, or null if none (empty
+   * history, or history disabled). Called only when the caller didn't
+   * pass `reply_to` and didn't opt out via `quote:false`. Optional —
+   * omit to disable the auto-quote default (legacy behavior).
+   */
+  getLatestInboundMessageId?: (chatId: string, threadId: number | null) => number | null
   /** Config: disable link previews. Default true. */
   disableLinkPreview: boolean
   /** Config: fallback parse mode when args.format is omitted ('html' | 'markdownv2' | 'text'). */
@@ -277,6 +303,26 @@ export async function handleStreamReply(
   }
 
   if (!stream) {
+    // Resolve the effective quote-reply target. Explicit `reply_to` wins;
+    // otherwise (unless the caller opted out with `quote:false`) fall back
+    // to the latest inbound user message in this chat+thread. Resolved
+    // only on stream creation — subsequent `stream_reply` calls for the
+    // same turn edit the existing message, which Telegram doesn't allow
+    // us to add a quote reference to retroactively.
+    let replyToMessageId: number | undefined
+    if (args.reply_to != null) {
+      replyToMessageId = Number(args.reply_to)
+    } else if (args.quote !== false && deps.getLatestInboundMessageId != null) {
+      try {
+        const latest = deps.getLatestInboundMessageId(chat_id, threadId ?? null)
+        if (latest != null) replyToMessageId = latest
+      } catch (err) {
+        deps.writeError(
+          `telegram channel: stream_reply quote-lookup failed: ${err}\n`,
+        )
+      }
+    }
+
     stream = createStreamController({
       bot: deps.bot,
       chatId: chat_id,
@@ -285,6 +331,7 @@ export async function handleStreamReply(
       disableLinkPreview: deps.disableLinkPreview,
       throttleMs: deps.throttleMs ?? 600,
       retry: deps.retry,
+      ...(replyToMessageId != null ? { replyToMessageId } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
       onEdit: (messageId, charCount) =>
