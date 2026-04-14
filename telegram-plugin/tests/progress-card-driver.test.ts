@@ -421,3 +421,78 @@ describe('summariseTurn', () => {
     expect(summariseTurn(s, 2000)).toBe('1 tool, 1s')
   })
 })
+
+describe('progress-card driver — multi-agent rate limit', () => {
+  it('expands coalesce window once edit budget is hot (>18 in 60s)', () => {
+    // Use a small threshold so we can exercise the path without
+    // simulating 18 distinct events. editBudgetCoalesceMs=2000, threshold=3.
+    let now = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const emits: Array<{ chatId: string; html: string; done: boolean }> = []
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ chatId: a.chatId, html: a.html, done: a.done }),
+      minIntervalMs: 100,
+      coalesceMs: 100,
+      heartbeatMs: 0,
+      editBudgetThreshold: 3,
+      editBudgetCoalesceMs: 2000,
+      now: () => now,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (h) => {
+        const t = (h as { ref: number }).ref
+        const i = timers.findIndex((x) => x.ref === t)
+        if (i !== -1) timers.splice(i, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (h) => {
+        const t = (h as { ref: number }).ref
+        const i = timers.findIndex((x) => x.ref === t)
+        if (i !== -1) timers.splice(i, 1)
+      },
+    })
+    const advance = (ms: number): void => {
+      now += ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const t = timers[0]
+        if (!t || t.fireAt > now) break
+        if (t.repeat != null) { t.fireAt += t.repeat; t.fn() } else { timers.shift(); t.fn() }
+      }
+    }
+
+    // Fire 4 distinct visible-state events 200ms apart — each forces an
+    // emit (well past the 100ms coalesce). After 3 emits we go hot.
+    driver.ingest(
+      { kind: 'enqueue', chatId: 'c', messageId: '1', threadId: null, rawContent: '<channel chat_id="c">go</channel>' },
+      null,
+    )
+    expect(emits.length).toBe(1) // enqueue is immediate
+
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'a', input: { file_path: '/x' } }, 'c')
+    advance(200)
+    driver.ingest({ kind: 'tool_result', toolUseId: 'a', toolName: 'Read' }, 'c')
+    advance(200)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'b', input: { file_path: '/y' } }, 'c')
+    advance(200)
+    // Should have ~4 emits by now (enqueue + 3 visible updates). Now hot.
+    const emitsBeforeHot = emits.length
+    expect(emitsBeforeHot).toBeGreaterThanOrEqual(3)
+
+    // Schedule another visible event. With budget hot, coalesce expands
+    // to 2000ms so a 500ms wait must NOT fire it.
+    driver.ingest({ kind: 'tool_result', toolUseId: 'b', toolName: 'Read' }, 'c')
+    advance(500)
+    expect(emits.length).toBe(emitsBeforeHot) // suppressed by hot coalesce
+    advance(2000)
+    expect(emits.length).toBe(emitsBeforeHot + 1) // finally fires
+  })
+})

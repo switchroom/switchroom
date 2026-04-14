@@ -371,3 +371,295 @@ describe('progress-card integration harness', () => {
     driver.dispose?.()
   })
 })
+
+// ─── Multi-agent integration scenarios (design doc §5) ───────────────────
+//
+// These mirror §5.1–§5.7 of telegram-plugin/docs/multi-agent-card-design.md.
+// Each scenario exercises the full pipeline (tail + correlation + render)
+// with PROGRESS_CARD_MULTI_AGENT=1. §5.8 (rate-limit budget) is covered
+// by the driver unit test instead — it needs a synthetic clock.
+//
+// The harness materializes a `<sessionId>/subagents/agent-<id>.jsonl`
+// file alongside the parent JSONL so the new tail subdir watcher picks
+// it up.
+
+const subAgentUserLine = (promptText: string): string =>
+  JSON.stringify({
+    isSidechain: true,
+    type: 'user',
+    message: { role: 'user', content: promptText },
+  }) + '\n'
+
+const subAgentToolUseLine = (toolUseId: string, name: string, input: Record<string, unknown>): string =>
+  JSON.stringify({
+    isSidechain: true,
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: toolUseId, name, input }] },
+  }) + '\n'
+
+const subAgentToolResultLine = (toolUseId: string, isError = false): string =>
+  JSON.stringify({
+    isSidechain: true,
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: toolUseId, is_error: isError }] },
+  }) + '\n'
+
+const subAgentTurnEndLine = (): string =>
+  JSON.stringify({ isSidechain: true, type: 'system', subtype: 'turn_duration', durationMs: 1 }) + '\n'
+
+const parentAgentToolUseLine = (toolUseId: string, description: string, prompt: string, subagentType = 'researcher'): string =>
+  JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          id: toolUseId,
+          name: 'Agent',
+          input: { subagent_type: subagentType, description, prompt },
+        },
+      ],
+    },
+  }) + '\n'
+
+function mkSubagentJsonl(projectsDir: string, sessionStem: string, agentId: string): string {
+  const dir = join(projectsDir, sessionStem, 'subagents')
+  mkdirSync(dir, { recursive: true })
+  const file = join(dir, `agent-${agentId}.jsonl`)
+  writeFileSync(file, '')
+  return file
+}
+
+describe('progress-card multi-agent harness', () => {
+  const FLAG = 'PROGRESS_CARD_MULTI_AGENT'
+  function withFlag<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = process.env[FLAG]
+    process.env[FLAG] = '1'
+    return fn().finally(() => {
+      if (prev != null) process.env[FLAG] = prev
+      else delete process.env[FLAG]
+    })
+  }
+
+  it('5.1 — 4 parallel sub-agents, all correlate', async () => {
+    await withFlag(async () => {
+      const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+      const bot = mockBot()
+      const driver = createProgressDriver({
+        emit: bot.emit,
+        coalesceMs: 20,
+        minIntervalMs: 20,
+        heartbeatMs: 0,
+      })
+      const sessionStem = 'session-A'
+      const parent = join(projectsDir, `${sessionStem}.jsonl`)
+      writeFileSync(parent, '')
+
+      const tail = startSessionTail({
+        cwd, claudeHome, rescanIntervalMs: 20,
+        onEvent: (ev) => driver.ingest(ev, null),
+      })
+
+      try {
+        await wait(80)
+        appendFileSync(parent, enqueueLine('c1', 'fan out 4 investigators'))
+        for (let i = 1; i <= 4; i++) {
+          appendFileSync(parent, parentAgentToolUseLine(`toolu_p${i}`, `task ${i}`, `PROMPT-${i}`))
+        }
+        await wait(150)
+
+        // Pre-correlation: [Main] shows Agent lines but no [Sub-agents] block
+        const preHtml = bot.edits[bot.edits.length - 1].html
+        expect(preHtml).toContain('[Main')
+        expect(preHtml).toContain('task 1')
+        expect(preHtml).toContain('task 4')
+        expect(preHtml).not.toContain('[Sub-agents')
+
+        // Now create 4 sub-agent JSONLs in random-ish order with matching prompts
+        const order = [3, 1, 4, 2]
+        for (const i of order) {
+          const file = mkSubagentJsonl(projectsDir, sessionStem, `aid${i}`)
+          appendFileSync(file, subAgentUserLine(`PROMPT-${i}`))
+        }
+        await wait(200)
+
+        const html = bot.edits[bot.edits.length - 1].html
+        expect(html).toContain('[Sub-agents · 4 running]')
+        for (let i = 1; i <= 4; i++) {
+          expect(html).toContain(`task ${i}`)
+        }
+
+        // Each sub-agent emits a Read tool_use
+        for (let i = 1; i <= 4; i++) {
+          const file = join(projectsDir, sessionStem, 'subagents', `agent-aid${i}.jsonl`)
+          appendFileSync(file, subAgentToolUseLine(`toolu_s${i}`, 'Read', { file_path: `/f${i}` }))
+        }
+        await wait(200)
+        const midHtml = bot.edits[bot.edits.length - 1].html
+        expect(midHtml).toContain('└ 🔧')
+
+        // Parent tool_results for all 4
+        for (let i = 1; i <= 4; i++) {
+          appendFileSync(parent, toolResultLine(`toolu_p${i}`))
+        }
+        appendFileSync(parent, turnEndLine())
+        await wait(250)
+
+        const finalHtml = bot.edits[bot.edits.length - 1].html
+        expect(finalHtml).toMatch(/\[Sub-agents · 4 done\]/)
+        const doneEdits = bot.edits.filter((e) => e.done)
+        expect(doneEdits.length).toBeGreaterThanOrEqual(1)
+      } finally {
+        tail.stop()
+        driver.dispose?.()
+      }
+    })
+  }, 15_000)
+
+  it('5.2 — sub-agent finishes before parent tool_result (early ✅, then isError flips ❌)', async () => {
+    await withFlag(async () => {
+      const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+      const bot = mockBot()
+      const driver = createProgressDriver({
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+      })
+      const stem = 'session-B'
+      const parent = join(projectsDir, `${stem}.jsonl`)
+      writeFileSync(parent, '')
+      const tail = startSessionTail({
+        cwd, claudeHome, rescanIntervalMs: 20,
+        onEvent: (ev) => driver.ingest(ev, null),
+      })
+      try {
+        await wait(80)
+        appendFileSync(parent, enqueueLine('c1', 'one sub'))
+        appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'investigate', 'PA'))
+        const sub = mkSubagentJsonl(projectsDir, stem, 'aidX')
+        appendFileSync(sub, subAgentUserLine('PA'))
+        appendFileSync(sub, subAgentTurnEndLine())
+        await wait(200)
+        const earlyHtml = bot.edits[bot.edits.length - 1].html
+        // Tentative ✅ for the sub-agent on early turn_end
+        expect(earlyHtml).toMatch(/✅ investigate/)
+        // Parent tool_result with isError=true overrides → ❌
+        appendFileSync(parent, toolResultLine('toolu_p1', true))
+        appendFileSync(parent, turnEndLine())
+        await wait(250)
+        const finalHtml = bot.edits[bot.edits.length - 1].html
+        expect(finalHtml).toMatch(/❌ investigate/)
+      } finally {
+        tail.stop()
+        driver.dispose?.()
+      }
+    })
+  }, 15_000)
+
+  it('5.3 — sub-agent JSONL appears AFTER parent tool_use (forward race)', async () => {
+    await withFlag(async () => {
+      const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+      const bot = mockBot()
+      const driver = createProgressDriver({
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+      })
+      const stem = 'session-C'
+      const parent = join(projectsDir, `${stem}.jsonl`)
+      writeFileSync(parent, '')
+      const tail = startSessionTail({
+        cwd, claudeHome, rescanIntervalMs: 20,
+        onEvent: (ev) => driver.ingest(ev, null),
+      })
+      try {
+        await wait(80)
+        appendFileSync(parent, enqueueLine('c1', 'race fwd'))
+        appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'thing', 'PROMPT-X'))
+        await wait(120)
+        const before = bot.edits[bot.edits.length - 1].html
+        expect(before).not.toContain('[Sub-agents')
+        // Now create the JSONL
+        const sub = mkSubagentJsonl(projectsDir, stem, 'aidA')
+        appendFileSync(sub, subAgentUserLine('PROMPT-X'))
+        await wait(200)
+        const after = bot.edits[bot.edits.length - 1].html
+        expect(after).toContain('[Sub-agents')
+        expect(after).toContain('thing')
+      } finally {
+        tail.stop()
+        driver.dispose?.()
+      }
+    })
+  }, 15_000)
+
+  it('5.4 — sub-agent JSONL appears BEFORE parent tool_use (reverse race adoption)', async () => {
+    await withFlag(async () => {
+      const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+      const bot = mockBot()
+      const driver = createProgressDriver({
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+      })
+      const stem = 'session-D'
+      const parent = join(projectsDir, `${stem}.jsonl`)
+      writeFileSync(parent, '')
+      const tail = startSessionTail({
+        cwd, claudeHome, rescanIntervalMs: 20,
+        onEvent: (ev) => driver.ingest(ev, null),
+      })
+      try {
+        await wait(80)
+        appendFileSync(parent, enqueueLine('c1', 'race rev'))
+        // Create sub JSONL first with prompt; no parent tool_use yet
+        const sub = mkSubagentJsonl(projectsDir, stem, 'aidR')
+        appendFileSync(sub, subAgentUserLine('PROMPT-Y'))
+        await wait(200)
+        const orphanHtml = bot.edits[bot.edits.length - 1].html
+        expect(orphanHtml).toContain('(uncorrelated)')
+        // Now parent emits the Agent tool_use → adoption
+        appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'reverse race target', 'PROMPT-Y'))
+        await wait(200)
+        const adoptedHtml = bot.edits[bot.edits.length - 1].html
+        expect(adoptedHtml).toContain('reverse race target')
+        expect(adoptedHtml).not.toContain('(uncorrelated)')
+      } finally {
+        tail.stop()
+        driver.dispose?.()
+      }
+    })
+  }, 15_000)
+
+  it('5.5 — sub-sub-agent renders only as (spawned N) suffix on parent', async () => {
+    await withFlag(async () => {
+      const { claudeHome, cwd, projectsDir } = mkProjectsDir()
+      const bot = mockBot()
+      const driver = createProgressDriver({
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+      })
+      const stem = 'session-E'
+      const parent = join(projectsDir, `${stem}.jsonl`)
+      writeFileSync(parent, '')
+      const tail = startSessionTail({
+        cwd, claudeHome, rescanIntervalMs: 20,
+        onEvent: (ev) => driver.ingest(ev, null),
+      })
+      try {
+        await wait(80)
+        appendFileSync(parent, enqueueLine('c1', 'nested'))
+        appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'parent sub', 'PROMPT-N'))
+        const subA = mkSubagentJsonl(projectsDir, stem, 'aidA')
+        appendFileSync(subA, subAgentUserLine('PROMPT-N'))
+        // Sub-agent A emits a nested Agent call (sub-sub-agent)
+        appendFileSync(
+          subA,
+          subAgentToolUseLine('toolu_inner', 'Agent', { description: 'inner', prompt: 'PROMPT-INNER' }),
+        )
+        await wait(250)
+        const html = bot.edits[bot.edits.length - 1].html
+        expect(html).toContain('parent sub')
+        expect(html).toContain('(spawned 1)')
+        // Sub-sub-agent must NOT appear as its own row
+        expect(html).not.toContain('inner')
+      } finally {
+        tail.stop()
+        driver.dispose?.()
+      }
+    })
+  }, 15_000)
+})

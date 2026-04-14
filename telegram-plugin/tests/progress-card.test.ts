@@ -337,3 +337,318 @@ describe('progress-card render', () => {
     expect(diff.length).toBeLessThanOrEqual(2)
   })
 })
+
+// ─── Multi-agent correlation reducer tests ───────────────────────────────
+//
+// Renderer is unchanged in this PR, so we only assert state-shape — the
+// rendered HTML is verified by the renderer PR.
+
+describe('progress-card reducer — multi-agent correlation', () => {
+  it('forward race: parent Agent tool_use stages a pendingAgentSpawn', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'design ux', prompt: 'PROMPT-A', subagent_type: 'researcher' },
+      },
+    ])
+    expect(st.pendingAgentSpawns.size).toBe(1)
+    expect(st.pendingAgentSpawns.get('toolu_p1')?.promptText).toBe('PROMPT-A')
+    expect(st.subAgents.size).toBe(0)
+  })
+
+  it('forward race: sub_agent_started moves pending → subAgents and links checklist item', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'design ux', prompt: 'PROMPT-A' },
+      },
+      { kind: 'sub_agent_started', agentId: 'aaa', firstPromptText: 'PROMPT-A' },
+    ])
+    expect(st.pendingAgentSpawns.size).toBe(0)
+    expect(st.subAgents.size).toBe(1)
+    const sa = st.subAgents.get('aaa')!
+    expect(sa.parentToolUseId).toBe('toolu_p1')
+    expect(sa.description).toBe('design ux')
+    expect(sa.state).toBe('running')
+    // Checklist item linked
+    const agentItem = st.items.find((i) => i.toolUseId === 'toolu_p1')!
+    expect(agentItem.spawnedAgentId).toBe('aaa')
+  })
+
+  it('reverse race: sub_agent_started lands first as orphan, then parent adopts', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_started', agentId: 'bbb', firstPromptText: 'PROMPT-B' },
+    ])
+    expect(st.subAgents.get('bbb')?.parentToolUseId).toBeNull()
+    expect(st.subAgents.get('bbb')?.description).toBe('(uncorrelated)')
+    const st2 = reduce(
+      st,
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p2',
+        input: { description: 'audit', prompt: 'PROMPT-B' },
+      },
+      9999,
+    )
+    expect(st2.pendingAgentSpawns.size).toBe(0)
+    expect(st2.subAgents.get('bbb')?.parentToolUseId).toBe('toolu_p2')
+    expect(st2.subAgents.get('bbb')?.description).toBe('audit')
+  })
+
+  it('two parallel Agent calls with identical prompts: FIFO arrival order assigns', () => {
+    // Parent emits two Agent tool_uses with the SAME prompt text. Two
+    // sub-agent JSONLs appear in some order. Each sub_agent_started
+    // adopts the FIRST remaining pending spawn (FIFO).
+    let st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'first', prompt: 'DUP' },
+      },
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p2',
+        input: { description: 'second', prompt: 'DUP' },
+      },
+    ])
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'DUP' }, 5000)
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'DUP' }, 5100)
+    // Both correlated, deterministic FIFO
+    expect(st.subAgents.get('A')?.parentToolUseId).toBe('toolu_p1')
+    expect(st.subAgents.get('B')?.parentToolUseId).toBe('toolu_p2')
+    expect(st.pendingAgentSpawns.size).toBe(0)
+  })
+
+  it('sub_agent_tool_use increments toolCount and sets currentTool', () => {
+    let st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x1', toolName: 'Read', input: { file_path: '/f' } },
+      6000,
+    )
+    const sa = st.subAgents.get('X')!
+    expect(sa.toolCount).toBe(1)
+    expect(sa.currentTool?.tool).toBe('Read')
+    // Tool result clears currentTool
+    st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 'toolu_x1' }, 6100)
+    expect(st.subAgents.get('X')!.currentTool).toBeUndefined()
+  })
+
+  it("parent's tool_result is authoritative: overrides early sub_agent_turn_end on isError", () => {
+    let st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_turn_end', agentId: 'X' },
+    ])
+    expect(st.subAgents.get('X')?.state).toBe('done')
+    st = reduce(
+      st,
+      { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent', isError: true },
+      7000,
+    )
+    expect(st.subAgents.get('X')?.state).toBe('failed')
+  })
+
+  it('sub_agent_nested_spawn increments nestedSpawnCount but does not create a row', () => {
+    let st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'parent', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    st = reduce(st, { kind: 'sub_agent_nested_spawn', agentId: 'X' }, 8000)
+    st = reduce(st, { kind: 'sub_agent_nested_spawn', agentId: 'X' }, 8100)
+    expect(st.subAgents.get('X')?.nestedSpawnCount).toBe(2)
+    expect(st.subAgents.size).toBe(1) // no row for the nested ones
+  })
+
+  it('flag-off renderer ignores subAgents (byte-identical legacy output)', () => {
+    // Force flag off
+    const prev = process.env.PROGRESS_CARD_MULTI_AGENT
+    delete process.env.PROGRESS_CARD_MULTI_AGENT
+    try {
+      const st = fold([
+        enqueue('go'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_p1',
+          input: { description: 'd', prompt: 'P' },
+        },
+        { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      ])
+      const html = render(st, 5000)
+      expect(html).not.toContain('[Main')
+      expect(html).not.toContain('[Sub-agents')
+      expect(html).toContain('Agent')
+    } finally {
+      if (prev != null) process.env.PROGRESS_CARD_MULTI_AGENT = prev
+    }
+  })
+
+  it('flag-on renderer adds [Main]/[Sub-agents] sections with chrono ordering and subagent_type', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('go'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_p1',
+          input: { description: 'design ux', prompt: 'P1', subagent_type: 'researcher' },
+        },
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_p2',
+          input: { description: 'audit', prompt: 'P2', subagent_type: 'worker' },
+        },
+      ])
+      // Sub-agents land in REVERSE chronological order to test sort
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P2' }, 5000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P1' }, 5100)
+      const html = render(st, 6000)
+      expect(html).toContain('[Main · 2 tools]')
+      expect(html).toContain('[Sub-agents · 2 running]')
+      expect(html).toContain('design ux')
+      expect(html).toContain('audit')
+      expect(html).toContain('researcher')
+      expect(html).toContain('worker')
+      // Chrono order: B started first (5000) so it should appear before A (5100)
+      const idxB = html.indexOf('audit')
+      const idxA = html.indexOf('design ux')
+      // 'design ux' also appears in [Main]; find inside [Sub-agents]
+      const subSection = html.slice(html.indexOf('[Sub-agents'))
+      const subB = subSection.indexOf('audit')
+      const subA = subSection.indexOf('design ux')
+      expect(subB).toBeLessThan(subA)
+      void idxA; void idxB
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('flag-on: nested spawn renders (spawned N) suffix; running Agent line stays 🤖 until tool_result', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('go'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_p1',
+          input: { description: 'parent task', prompt: 'P' },
+        },
+        { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      ])
+      st = reduce(st, { kind: 'sub_agent_nested_spawn', agentId: 'X' }, 6000)
+      st = reduce(st, { kind: 'sub_agent_nested_spawn', agentId: 'X' }, 6100)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 't1', toolName: 'Read', input: { file_path: '/f' } },
+        6200,
+      )
+      const html = render(st, 7000)
+      expect(html).toContain('(spawned 2)')
+      // Main agent line uses 🤖 not ✅ while running
+      const mainSection = html.split('[Sub-agents')[0]
+      expect(mainSection).toContain('🤖')
+      expect(mainSection).not.toContain('✅ Agent')
+      // Sub-agent activity line shows the current tool
+      expect(html).toContain('└ 🔧')
+      expect(html).toContain('Read')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('flag-on turn_end: sub-agents collapse to one-line summary, [Main] Agent flips to ✅', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('go'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_p1',
+          input: { description: 'task A', prompt: 'P' },
+        },
+        { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+        {
+          kind: 'sub_agent_tool_use',
+          agentId: 'X',
+          toolUseId: 't1',
+          toolName: 'Read',
+          input: { file_path: '/a' },
+        },
+        { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 't1' },
+      ])
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent' }, 7000)
+      st = reduce(st, { kind: 'turn_end', durationMs: 1 }, 7500)
+      const html = render(st, 8000)
+      expect(html).toContain('✅')
+      expect(html).toContain('task A')
+      // Collapsed form contains "· N tools"
+      expect(html).toMatch(/✅ task A.*· 1 tools/)
+      // No two-line `└` activity in the collapsed form
+      const subSection = html.split('[Sub-agents')[1] ?? ''
+      expect(subSection).not.toContain('└ 🔧')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('turn_end closes running sub-agents and clears pending spawns', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p2',
+        input: { description: 'd2', prompt: 'P2' },
+      },
+      // P2's sub-agent JSONL never appears
+      { kind: 'turn_end', durationMs: 1 },
+    ])
+    expect(st.subAgents.get('X')?.state).toBe('done')
+    expect(st.pendingAgentSpawns.size).toBe(0)
+    expect(st.stage).toBe('done')
+  })
+})
