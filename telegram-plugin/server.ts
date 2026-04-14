@@ -2969,6 +2969,24 @@ bot.command('auth', async ctx => {
   }
 })
 
+// /reauth — one-shot shortcut with smart defaults.
+//   /reauth         → start reauth for the current agent's active slot
+//   /reauth <code>  → complete the pending reauth (auto-resolves slot from session)
+// Any second arg is treated as a slot override (rare).
+bot.command('reauth', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const parts = getCommandArgs(ctx).trim().split(/\s+/).filter(Boolean)
+  const me = getMyAgentName()
+  if (parts.length === 0) {
+    await runSwitchroomCommand(ctx, ['auth', 'reauth', me], `auth reauth ${me}`)
+    return
+  }
+  const code = parts[0]
+  const slot = parts[1]
+  const args = ['auth', 'code', me, code, ...(slot ? ['--slot', slot] : [])]
+  await runSwitchroomCommand(ctx, args, `auth code ${me}`)
+})
+
 // /topics — show topic mappings
 bot.command('topics', async ctx => {
   if (!isAuthorizedSender(ctx)) return
