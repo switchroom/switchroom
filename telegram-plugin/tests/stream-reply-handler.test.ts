@@ -549,4 +549,69 @@ describe('handleStreamReply', () => {
     expect(streamReplyCalledEvents[0].streamExisted).toBe(false)
     expect(streamReplyCalledEvents[1].streamExisted).toBe(true)
   })
+
+  describe('progressCardActive suppression', () => {
+    // Pins the duplicate-message bug: with progress-card in checklist mode,
+    // the card emits on lane='progress' and the model's stream_reply with
+    // no lane emits on the default lane — two Telegram messages for one
+    // turn. With progressCardActive=true, intermediate default-lane calls
+    // are suppressed so the card owns mid-turn display; only the final
+    // done=true call posts (the answer).
+    it('suppresses default-lane intermediate calls when progress card is active', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot, { progressCardActive: true })
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'working...' }, state, deps)
+      await microtaskFlush()
+      const result = await pending
+
+      expect(bot.api.sendMessage).not.toHaveBeenCalled()
+      expect(state.activeDraftStreams.size).toBe(0)
+      expect(result).toEqual({ messageId: null, status: 'updated' })
+    })
+
+    it('still posts final done=true call when progress card is active', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot, { progressCardActive: true })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'final answer', done: true },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      const result = await pending
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>final answer</html>')
+      expect(result.status).toBe('finalized')
+      expect(result.messageId).toBe(500)
+    })
+
+    it('does NOT suppress named-lane calls (progress card uses lane=progress itself)', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot, { progressCardActive: true })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'card snapshot', lane: 'progress' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it('legacy behavior preserved when progressCardActive is false', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot, { progressCardActive: false })
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    })
+  })
 })

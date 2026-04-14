@@ -226,6 +226,80 @@ describe('createPtyPartialHandler — session + buffer replay', () => {
     expect(bot.api.editMessageText.mock.calls[0][2]).toBe('hello world')
   })
 
+  it('claim survives turn_end — late PTY partial after reply does NOT send a duplicate', async () => {
+    // Regression: user saw a formatted canonical reply, then ~30s later
+    // the same content re-landed as a fresh unformatted message. Root
+    // cause was `suppressPtyPreview.delete` at turn_end opening a window
+    // during which a delayed PTY partial would call draft_send afresh
+    // with raw TUI text. The claim must persist across turn_end.
+    const state = makeState()
+    const handler = createPtyPartialHandler(state, makeDeps(bot))
+
+    handler.onSessionEnqueue('1')
+    handler.onPartial('draft')
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+
+    // Reply tool claims and finalizes (same shape as server.ts reply handler)
+    state.suppressPtyPreview.add('1:_')
+    const open = state.activeDraftStreams.get('1:_')!
+    await open.finalize()
+    state.activeDraftStreams.delete('1:_')
+
+    // Turn ends
+    state.currentSessionChatId = '1'
+    handler.onTurnEnd()
+
+    // A delayed PTY partial arrives AFTER turn_end — this used to create
+    // a second message; with the fix the claim still holds.
+    state.currentSessionChatId = '1'
+    vi.advanceTimersByTime(30_000)
+    expect(handler.onPartial('stale TUI text')).toBe('suppressed')
+    await microtaskFlush()
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1) // no duplicate
+  })
+
+  it('onInboundNewCycle releases the claim so the next turn streams live preview', async () => {
+    const state = makeState()
+    const handler = createPtyPartialHandler(state, makeDeps(bot))
+
+    // Prior turn ran, landed a reply, turn ended — claim still held.
+    state.suppressPtyPreview.add('1:_')
+    state.currentSessionChatId = '1'
+    handler.onTurnEnd()
+    expect(state.suppressPtyPreview.has('1:_')).toBe(true)
+
+    // New inbound user message fires the new-cycle boundary.
+    handler.onInboundNewCycle('1')
+    expect(state.suppressPtyPreview.has('1:_')).toBe(false)
+
+    // PTY partial for the fresh turn creates a stream normally.
+    handler.onSessionEnqueue('1')
+    expect(handler.onPartial('new turn draft')).toBe('update-new')
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalled()
+  })
+
+  it('orphaned-reply path is untouched — no claim was set, PTY still streams', async () => {
+    // Safety check: if the agent turn ends WITHOUT ever calling reply
+    // (orphaned-reply / backstop path), suppressPtyPreview was never
+    // added for this chat, so PTY partials keep working across the
+    // turn_end boundary as before.
+    const state = makeState()
+    const handler = createPtyPartialHandler(state, makeDeps(bot))
+
+    handler.onSessionEnqueue('9')
+    // No reply tool call, no claim added.
+    state.currentSessionChatId = '9'
+    handler.onTurnEnd()
+
+    state.currentSessionChatId = '9'
+    expect(handler.onPartial('still streaming')).toBe('update-new')
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
   it('claim from reply handler (suppressPtyPreview) is honored mid-stream', async () => {
     const state = makeState()
     const handler = createPtyPartialHandler(state, makeDeps(bot))

@@ -124,6 +124,20 @@ export interface StreamReplyDeps {
   /** Error-path stderr. */
   writeError: (line: string) => void
   throttleMs?: number
+  /**
+   * When true, the progress-card driver is emitting a live checklist on
+   * the `progress` lane and owns mid-turn display. In that mode, a
+   * caller-initiated `stream_reply` on the default (unnamed) lane with
+   * `done=false` is suppressed — the card already shows what's happening,
+   * and a parallel default-lane message is visible noise (a duplicate
+   * surface for the same turn). The final `done=true` call still posts
+   * as the answer message.
+   *
+   * Named-lane calls (lane: 'progress', 'thinking', etc.) are always
+   * honored — this flag only gates the default lane. Omit or leave false
+   * to preserve legacy behavior.
+   */
+  progressCardActive?: boolean
 }
 
 export interface StreamReplyResult {
@@ -145,6 +159,27 @@ export async function handleStreamReply(
   const rawText = deps.repairEscapedWhitespace(args.text)
   const done = Boolean(args.done)
   const format = args.format ?? deps.defaultFormat
+
+  // Suppress intermediate default-lane updates when the progress card is
+  // active. The card owns the mid-turn surface on the `progress` lane; a
+  // parallel default-lane stream would render as a second Telegram
+  // message showing the same "I'm working on X" narrative the card
+  // already conveys. Only the final `done=true` call survives — that's
+  // the answer message, which the card does NOT replace (the card is
+  // historical status, the answer is the content).
+  const isDefaultLane = args.lane == null || args.lane.length === 0
+  if (deps.progressCardActive === true && isDefaultLane && !done) {
+    deps.logStreamingEvent({
+      kind: 'stream_reply_called',
+      chatId: chat_id,
+      charCount: rawText.length,
+      done: false,
+      streamExisted: state.activeDraftStreams.has(
+        streamKey(chat_id, deps.resolveThreadId(chat_id, args.message_thread_id), args.lane),
+      ),
+    })
+    return { messageId: null, status: 'updated' }
+  }
 
   let parseMode: 'HTML' | 'MarkdownV2' | undefined
   let effectiveText: string

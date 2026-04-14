@@ -1403,6 +1403,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             recordOutbound,
             writeError: (line) => process.stderr.write(line),
             throttleMs: 600,
+            progressCardActive: streamMode === 'checklist',
           },
         )
         return {
@@ -1781,7 +1782,15 @@ if (ptyTailEnabled) {
       log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
       onPartial: handlePtyPartial,
       activityExtractor: new V1ToolActivityExtractor(),
-      onActivity: handlePtyActivity,
+      // In `checklist` mode the progress card already shows every tool
+      // call as a checklist item (progress-card reducer appends on
+      // tool_use). Firing the activity lane too would post a second
+      // Telegram message ("Running Update: …") below the card, which
+      // the user sees as a duplicate/fragmented progress surface. Route
+      // onActivity to a no-op in that mode so the card owns the whole
+      // progress display. Any other mode (legacy / off) keeps the
+      // activity lane as before.
+      onActivity: streamMode === 'checklist' ? () => {} : handlePtyActivity,
     })
     process.stderr.write(
       `telegram channel: pty tail watching ${serviceLogPath}\n`,
@@ -2218,11 +2227,15 @@ function handleSessionEvent(ev: SessionEvent): void {
       // would see the OLD reply block in the xterm buffer and we'd
       // suppress emits until enough new text differed.
       lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
-      // Release the PTY preview suppression lock that the reply handler
-      // set during its send. Must happen HERE (turn boundary) not in the
-      // reply handler's finally — otherwise PTY partials can sneak in
-      // between reply completion and turn_end, creating duplicates.
-      suppressPtyPreview.delete(streamKey(chatId, threadId))
+      // NOTE: we intentionally do NOT clear `suppressPtyPreview` here.
+      // PTY partials can arrive AFTER turn_end (delayed xterm flush,
+      // orphaned-reply path, stale buffer). If we released the claim
+      // now, those late partials would slip through as a fresh
+      // `draft_send` with raw TUI text — the user sees the same content
+      // sent twice, the second copy unformatted (bypassed markdownToHtml).
+      // The claim is released instead on the NEXT inbound user message
+      // for this chat+thread (see handleInbound), which is the true
+      // "new cycle" boundary.
       // Also clear any buffered partial — turn is done, that text is
       // either already shown or about to be replaced by the canonical
       // reply.
@@ -3241,6 +3254,12 @@ async function handleInbound(
           activeDraftStreams.delete(sKey)
           activeDraftParseModes.delete(sKey)
         }
+        // Release the PTY-preview claim from the previous cycle. We
+        // deliberately hold the claim past turn_end (see turn_end
+        // handler) so late PTY partials from the prior turn can't
+        // create a duplicate message; the next user inbound is the
+        // true "new cycle" boundary where the claim must drop.
+        suppressPtyPreview.delete(sKey)
 
         const ctrl = new StatusReactionController(async (emoji) => {
           await bot.api.setMessageReaction(chat_id, msgId, [

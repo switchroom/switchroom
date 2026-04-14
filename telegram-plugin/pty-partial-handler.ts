@@ -189,18 +189,37 @@ export function createPtyPartialHandler(
       }
       return null
     },
-    /** Called on turn_end — clears session state and the dedup caches. */
+    /**
+     * Called on turn_end — clears session state and the dedup cache.
+     *
+     * NOTE: we intentionally do NOT clear `suppressPtyPreview` here.
+     * PTY partials can arrive after turn_end (delayed xterm flush,
+     * orphaned-reply paths). Releasing the claim at turn_end would
+     * let those late partials slip through as a fresh draft_send with
+     * raw TUI text — the user sees the same content sent twice, the
+     * second copy unformatted. The claim is dropped instead on the
+     * next inbound user message (see handleInbound in server.ts).
+     */
     onTurnEnd(): void {
       const key = state.currentSessionChatId != null
         ? streamKey(state.currentSessionChatId, state.currentSessionThreadId)
         : null
       if (key != null) {
         state.lastPtyPreviewByChat.delete(key)
-        state.suppressPtyPreview.delete(key)
       }
       state.currentSessionChatId = null
       state.currentSessionThreadId = undefined
       state.pendingPtyPartial = null
+    },
+    /**
+     * Called when a new inbound user message arrives for a chat+thread.
+     * This is the true "new cycle" boundary — release any PTY-preview
+     * claim held over from the prior turn so the fresh turn's live
+     * preview can fire. Mirrors the non-steering branch in
+     * handleInbound.
+     */
+    onInboundNewCycle(chatId: string, threadId?: number): void {
+      state.suppressPtyPreview.delete(streamKey(chatId, threadId))
     },
   }
 }
