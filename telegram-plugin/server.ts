@@ -924,7 +924,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stream_reply',
       description:
-        'Send or update a streaming reply that edits one message in-place rather than sending many. Call repeatedly during long tasks with full snapshots of your current message; the plugin throttles edits to ~1/sec to respect Telegram\'s rate limit. Set done=true on your final call to lock the message. The first call sends a fresh message; subsequent calls edit it. Use this instead of `reply` when you want to show progressive updates ("reading file..." → "found it, now searching..." → "here\'s the answer") without spamming the chat. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. NOTE: when the agent is configured with stream_mode=checklist (default), an event-driven progress card owns the mid-turn surface on the `progress` lane. In that mode, default-lane (unnamed) calls with done=false are silently suppressed — only your final done=true call posts as the answer. Use lane:"thinking" (or any named lane) if you need a parallel mid-turn surface, or set stream_mode=pty to get the legacy behavior.',
+        'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -932,7 +932,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string', description: 'Full text snapshot. NOT a delta — pass the complete current content each call.' },
           done: {
             type: 'boolean',
-            description: 'True if this is the final update. After done=true the stream is locked and further calls are no-ops. Default false.',
+            description: 'Must be true. Posts this text as the final answer for the turn and locks the message.',
           },
           message_thread_id: {
             type: 'string',
@@ -942,10 +942,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['html', 'markdownv2', 'text'],
             description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML.",
-          },
-          lane: {
-            type: 'string',
-            description: "Optional lane name. Each lane gets its own Telegram message per chat+thread. Use for surfacing 'thinking' alongside the main answer stream — e.g. lane: 'thinking' for reasoning progress. Omit for the default answer lane.",
           },
         },
         required: ['chat_id', 'text'],
@@ -1383,7 +1379,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             done: Boolean(args.done),
             message_thread_id: args.message_thread_id as string | undefined,
             format: args.format as string | undefined,
-            lane: args.lane as string | undefined,
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {

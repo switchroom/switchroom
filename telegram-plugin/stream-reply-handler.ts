@@ -166,19 +166,18 @@ export async function handleStreamReply(
   deps.assertAllowedChat(chat_id)
   const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
 
-  // Suppress intermediate default-lane updates when the progress card is
-  // active. The card owns the mid-turn surface on the `progress` lane; a
-  // parallel default-lane stream would render as a second Telegram
-  // message showing the same "I'm working on X" narrative the card
-  // already conveys. Only the final `done=true` call survives — that's
-  // the answer message, which the card does NOT replace (the card is
-  // historical status, the answer is the content).
+  // In checklist mode the progress card is the mid-turn surface. A
+  // caller-initiated default-lane stream_reply(done=false) creates a
+  // second surface that either duplicates the card's narrative or
+  // races it. We reject it with a clear error so the caller learns
+  // in-context rather than through silent suppression + a missing
+  // message later. Internal callers (the progress-card driver itself)
+  // pass lane:'progress' and are allowed through.
   const isDefaultLane = args.lane == null || args.lane.length === 0
   if (deps.progressCardActive === true && isDefaultLane && !done) {
-    // Claim the PTY-preview slot even when suppressing: the progress
-    // card may not have emitted yet (first call of the turn), and a PTY
-    // partial landing in that window would otherwise leak through as a
-    // raw-TUI draft_send. Keyed WITHOUT lane (PTY uses lane-less keys).
+    // Claim the PTY-preview slot so any PTY partial that fires after
+    // this rejected call doesn't leak a raw-TUI draft. The claim is
+    // keyed lane-less because the PTY handler uses lane-less keys.
     state.suppressPtyPreview?.add(streamKey(chat_id, threadId))
     deps.logStreamingEvent({
       kind: 'stream_reply_called',
@@ -189,7 +188,12 @@ export async function handleStreamReply(
         streamKey(chat_id, threadId, args.lane),
       ),
     })
-    return { messageId: null, status: 'updated' }
+    throw new Error(
+      'stream_reply(done=false) is not supported in checklist mode. ' +
+        'The progress card already renders mid-turn status (Plan → Run → Done ' +
+        'with live tool bullets). Call stream_reply exactly once per turn ' +
+        'with done=true and your complete final answer.',
+    )
   }
 
   let parseMode: 'HTML' | 'MarkdownV2' | undefined
