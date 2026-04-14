@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
 import { loadConfig } from "../config/loader.js";
 import { resolvePath } from "../config/loader.js";
 import {
@@ -70,6 +71,22 @@ function promptLine(prompt: string, hidden = false): Promise<string> {
   });
 }
 
+/**
+ * Read all bytes from stdin until EOF. Used for piped input so that
+ * multi-line values (JSON, PEM, SSH keys, etc.) are preserved verbatim
+ * instead of being truncated to a single line by readline.
+ */
+function readStdinToEnd(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stdin.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    process.stdin.on("error", reject);
+  });
+}
+
 async function getPassphrase(confirm = false): Promise<string> {
   // Check env var first
   const envPassphrase = process.env.CLERK_VAULT_PASSPHRASE;
@@ -120,12 +137,45 @@ export function registerVaultCommand(program: Command): void {
   vault
     .command("set <key>")
     .description("Set a secret in the vault")
-    .action(async (key: string) => {
+    .option(
+      "-f, --file <path>",
+      "Read the secret value from a file (preserves multi-line content)"
+    )
+    .action(async (key: string, opts: { file?: string }) => {
       try {
         const parentOpts = program.opts();
         const vaultPath = getVaultPath(parentOpts.config);
+        // When stdin is piped we need to consume it for the secret value,
+        // so the passphrase must come from the env var rather than a prompt.
+        if (!process.stdin.isTTY && !process.env.CLERK_VAULT_PASSPHRASE && !opts.file) {
+          console.error(
+            chalk.red(
+              "Error: piping a value to `vault set` requires CLERK_VAULT_PASSPHRASE to be set"
+            )
+          );
+          process.exit(1);
+        }
         const passphrase = await getPassphrase();
-        const value = await promptLine("Secret value: ", true);
+
+        let value: string;
+        if (opts.file) {
+          // --file flag: read value from a file verbatim.
+          try {
+            value = readFileSync(resolvePath(opts.file), "utf8");
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(chalk.red(`Error reading file: ${msg}`));
+            process.exit(1);
+          }
+        } else if (!process.stdin.isTTY) {
+          // Piped/non-TTY stdin: slurp all bytes so multi-line values
+          // (JSON, PEM, SSH keys) are preserved instead of being
+          // truncated to the first line by readline.
+          value = await readStdinToEnd();
+        } else {
+          // Interactive TTY: keep the existing password-masked prompt.
+          value = await promptLine("Secret value: ", true);
+        }
 
         if (!value) {
           console.error(chalk.red("Error: Value cannot be empty"));
