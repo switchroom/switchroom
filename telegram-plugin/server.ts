@@ -1652,15 +1652,15 @@ await mcp.connect(new StdioServerTransport())
 const sessionTailEnabled = process.env.CLERK_SESSION_TAIL !== 'off'
 let sessionTailHandle: SessionTailHandle | null = null
 
-// Progress-card driver — opt-in via CLERK_TG_STREAM_MODE=checklist. The
-// driver translates session-tail events into an edit-in-place Telegram
+// Progress-card driver — default on; opt out via CLERK_TG_STREAM_MODE=pty.
+// The driver translates session-tail events into an edit-in-place Telegram
 // message per turn, surfaced on the stream_reply "progress" lane.
 //
 // emit() is wired into the same stream_reply code path the model uses,
 // so existing chunking, 4096-char guards, format handling, and edit
 // throttle all apply. When mode != "checklist", the driver is never
 // instantiated and there's zero overhead.
-const streamMode = process.env.CLERK_TG_STREAM_MODE ?? 'pty'
+const streamMode = process.env.CLERK_TG_STREAM_MODE ?? 'checklist'
 let progressDriver: ProgressDriver | null = null
 if (streamMode === 'checklist') {
   progressDriver = createProgressDriver({

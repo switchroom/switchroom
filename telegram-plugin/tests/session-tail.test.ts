@@ -78,7 +78,7 @@ describe('projectTranscriptLine', () => {
     expect(projectTranscriptLine(line)).toEqual([{ kind: 'thinking' }])
   })
 
-  it('parses assistant message with tool_use block', () => {
+  it('parses assistant message with tool_use block (empty input)', () => {
     const line = JSON.stringify({
       type: 'assistant',
       message: {
@@ -86,7 +86,47 @@ describe('projectTranscriptLine', () => {
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'tool_use', toolName: 'Bash' },
+      { kind: 'tool_use', toolName: 'Bash', input: {} },
+    ])
+  })
+
+  it('parses assistant message with tool_use block (carries input args)', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Read', input: { file_path: '/x/foo.ts' } },
+        ],
+      },
+    })
+    expect(projectTranscriptLine(line)).toEqual([
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/foo.ts' } },
+    ])
+  })
+
+  it('parses tool_use with missing input as undefined', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'tool_use', name: 'Bash' }],
+      },
+    })
+    expect(projectTranscriptLine(line)).toEqual([
+      { kind: 'tool_use', toolName: 'Bash', input: undefined },
+    ])
+  })
+
+  it('parses tool_result with is_error flagged', () => {
+    const line = JSON.stringify({
+      type: 'user',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'abc', is_error: true, content: 'boom' },
+        ],
+      },
+    })
+    expect(projectTranscriptLine(line)).toEqual([
+      { kind: 'tool_result', toolUseId: 'abc', toolName: null, isError: true },
     ])
   })
 

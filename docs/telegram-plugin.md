@@ -77,24 +77,28 @@ agents:
 How live progress is surfaced while a turn is in flight. Configure via
 `channels.telegram.stream_mode` in `clerk.yaml`:
 
-- **`pty`** (default) — tails Claude Code's TUI output and re-renders a
-  snapshot on each frame. Broad compatibility but can visibly flicker as
-  Ink does differential re-renders during quick tool calls.
-- **`checklist`** — event-driven progress card. Reads canonical
+- **`checklist`** (default) — event-driven progress card. Reads canonical
   `tool_use` / `tool_result` / `turn_end` events from the session JSONL
   and renders a stable, fixed-order checklist with per-item state emojis
-  (⏸ pending · ⚡ running · ✅ done · ❌ failed). Each item appears once
-  and never reorders; only the current ⚡ line ticks elapsed time. Fires
+  (⏸ pending · ⚡ running · ✅ done · ❌ failed) and a short label per
+  item derived from its input args (`Read: tests/merge.test.ts`,
+  `Bash: bun test`, `Grep: "TODO" in src/`). Each item appears once and
+  never reorders; only the current ⚡ line ticks elapsed time. Fires
   only on semantic transitions with a 500ms min-edit floor and a 400ms
-  coalesce window, so bursts of quick tools render as a single edit. No
-  flicker.
+  coalesce window, so bursts of quick tools render as a single edit.
+  No flicker.
+- **`pty`** — tails Claude Code's TUI output and re-renders a snapshot
+  on each frame. Legacy fallback — can visibly flicker as Ink does
+  differential re-renders during quick tool calls. Keep this mode only
+  if you've customised agent hooks or prompts in a way that breaks the
+  session-tail projection.
 
 ```yaml
 agents:
   coder:
     channels:
       telegram:
-        stream_mode: checklist
+        stream_mode: pty   # opt out of the checklist card
 ```
 
 Progress-card messages are sent on a dedicated `lane: "progress"` via
@@ -110,7 +114,7 @@ The clerk fork reads additional env vars from `start.sh`:
 |---------|--------|---------|
 | `CLERK_TG_FORMAT` | `channels.telegram.format` | Default reply format (`html`, `markdownv2`, `text`) |
 | `CLERK_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
-| `CLERK_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `pty` (default) or `checklist` — see "Streaming modes" above |
+| `CLERK_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty` — see "Streaming modes" above |
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
 | `CLERK_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `CLERK_CONFIG` | Auto-set by scaffold | Path to clerk.yaml for config resolution |
