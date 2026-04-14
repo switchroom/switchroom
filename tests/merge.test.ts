@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   mergeAgentConfig,
   resolveAgentConfig,
-  usesClerkTelegramPlugin,
+  usesSwitchroomTelegramPlugin,
   deepMergeJson,
   translateHooksToClaudeShape,
 } from "../src/config/merge.js";
@@ -190,14 +190,14 @@ describe("mergeAgentConfig", () => {
 
   it("per-key merges env with agent winning on conflict", () => {
     const defaults: AgentDefaults = {
-      env: { CLERK_AUDIT_URL: "https://audit.example", LOG_LEVEL: "info" },
+      env: { SWITCHROOM_AUDIT_URL: "https://audit.example", LOG_LEVEL: "info" },
     };
     const agent = baseAgent({
       env: { LOG_LEVEL: "debug", AGENT_ID: "coach" },
     });
     const result = mergeAgentConfig(defaults, agent);
     expect(result.env).toEqual({
-      CLERK_AUDIT_URL: "https://audit.example",
+      SWITCHROOM_AUDIT_URL: "https://audit.example",
       LOG_LEVEL: "debug", // agent wins
       AGENT_ID: "coach",
     });
@@ -307,23 +307,23 @@ describe("mergeAgentConfig session policy", () => {
 describe("mergeAgentConfig channels block", () => {
   it("flows defaults.channels.telegram.* to agents that leave them unset", () => {
     const defaults: AgentDefaults = {
-      channels: { telegram: { plugin: "clerk", format: "html" } },
+      channels: { telegram: { plugin: "switchroom", format: "html" } },
     };
     const result = mergeAgentConfig(defaults, baseAgent());
-    expect(result.channels?.telegram?.plugin).toBe("clerk");
+    expect(result.channels?.telegram?.plugin).toBe("switchroom");
     expect(result.channels?.telegram?.format).toBe("html");
   });
 
   it("per-field merges channels.telegram with agent winning", () => {
     const defaults: AgentDefaults = {
-      channels: { telegram: { plugin: "clerk", format: "html", rate_limit_ms: 1000 } },
+      channels: { telegram: { plugin: "switchroom", format: "html", rate_limit_ms: 1000 } },
     };
     const agent = baseAgent({
       channels: { telegram: { format: "markdownv2" } },
     });
     const result = mergeAgentConfig(defaults, agent);
     // plugin and rate_limit flow from defaults; format is overridden
-    expect(result.channels?.telegram?.plugin).toBe("clerk");
+    expect(result.channels?.telegram?.plugin).toBe("switchroom");
     expect(result.channels?.telegram?.format).toBe("markdownv2");
     expect(result.channels?.telegram?.rate_limit_ms).toBe(1000);
   });
@@ -334,30 +334,30 @@ describe("mergeAgentConfig channels block", () => {
   });
 });
 
-describe("usesClerkTelegramPlugin", () => {
-  // usesClerkTelegramPlugin imported at top of file
+describe("usesSwitchroomTelegramPlugin", () => {
+  // usesSwitchroomTelegramPlugin imported at top of file
 
-  it("returns true when channels.telegram.plugin is 'clerk'", () => {
+  it("returns true when channels.telegram.plugin is 'switchroom'", () => {
     const agent = baseAgent({
-      channels: { telegram: { plugin: "clerk" } },
+      channels: { telegram: { plugin: "switchroom" } },
     });
-    expect(usesClerkTelegramPlugin(agent)).toBe(true);
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(true);
   });
 
   it("returns false when channels.telegram.plugin is 'official'", () => {
     const agent = baseAgent({
       channels: { telegram: { plugin: "official" } },
     });
-    expect(usesClerkTelegramPlugin(agent)).toBe(false);
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(false);
   });
 
-  it("defaults to true (clerk fork) when channels field is unset", () => {
-    expect(usesClerkTelegramPlugin(baseAgent())).toBe(true);
+  it("defaults to true (switchroom fork) when channels field is unset", () => {
+    expect(usesSwitchroomTelegramPlugin(baseAgent())).toBe(true);
   });
 
-  it("defaults to true (clerk fork) when channels.telegram.plugin is unset", () => {
+  it("defaults to true (switchroom fork) when channels.telegram.plugin is unset", () => {
     const agent = baseAgent({ channels: { telegram: { format: "html" } } });
-    expect(usesClerkTelegramPlugin(agent)).toBe(true);
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(true);
   });
 });
 

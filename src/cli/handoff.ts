@@ -10,7 +10,7 @@ import {
 } from "../agents/handoff-summarizer.js";
 
 /**
- * `clerk handoff <agent>` — summarize the agent's most recent session
+ * `switchroom handoff <agent>` — summarize the agent's most recent session
  * and write the .handoff.md + .handoff-topic sidecars. Invoked by the
  * Stop hook and by start.sh's lazy fallback. Exits 0 on every failure
  * mode (missing API key, no JSONL, API error) — the Stop hook must
@@ -36,7 +36,7 @@ export function registerHandoffCommand(program: Command): void {
           const agentConfig = config.agents[agentName];
           if (!agentConfig) {
             process.stderr.write(
-              `handoff: agent "${agentName}" not defined in clerk.yaml\n`,
+              `handoff: agent "${agentName}" not defined in switchroom.yaml\n`,
             );
             return;
           }

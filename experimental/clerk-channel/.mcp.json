@@ -1,6 +1,0 @@
-{
-  "clerk-telegram": {
-    "command": "bun",
-    "args": ["server.ts"]
-  }
-}

@@ -16,9 +16,9 @@ import {
 function getVaultPath(configPath?: string): string {
   try {
     const config = loadConfig(configPath);
-    return resolvePath(config.vault?.path ?? "~/.clerk/vault.enc");
+    return resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
   } catch {
-    return resolvePath("~/.clerk/vault.enc");
+    return resolvePath("~/.switchroom/vault.enc");
   }
 }
 
@@ -89,7 +89,7 @@ function readStdinToEnd(): Promise<string> {
 
 async function getPassphrase(confirm = false): Promise<string> {
   // Check env var first
-  const envPassphrase = process.env.CLERK_VAULT_PASSPHRASE;
+  const envPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (envPassphrase) {
     return envPassphrase;
   }
@@ -147,10 +147,10 @@ export function registerVaultCommand(program: Command): void {
         const vaultPath = getVaultPath(parentOpts.config);
         // When stdin is piped we need to consume it for the secret value,
         // so the passphrase must come from the env var rather than a prompt.
-        if (!process.stdin.isTTY && !process.env.CLERK_VAULT_PASSPHRASE && !opts.file) {
+        if (!process.stdin.isTTY && !process.env.SWITCHROOM_VAULT_PASSPHRASE && !opts.file) {
           console.error(
             chalk.red(
-              "Error: piping a value to `vault set` requires CLERK_VAULT_PASSPHRASE to be set"
+              "Error: piping a value to `vault set` requires SWITCHROOM_VAULT_PASSPHRASE to be set"
             )
           );
           process.exit(1);

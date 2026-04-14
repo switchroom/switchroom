@@ -57,7 +57,7 @@ describe("extractTurnsFromJsonl", () => {
           type: "queue-operation",
           operation: "enqueue",
           content:
-            '<channel source="clerk-telegram" chat_id="1" message_id="2">\nHi bot\n</channel>',
+            '<channel source="switchroom-telegram" chat_id="1" message_id="2">\nHi bot\n</channel>',
         },
       ]),
     );

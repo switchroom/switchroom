@@ -3,7 +3,7 @@ import { toolLabel } from '../tool-labels.js'
 
 describe('toolLabel', () => {
   it('Read: uses basename of file_path', () => {
-    expect(toolLabel('Read', { file_path: '/home/ken/code/clerk/src/foo.ts' })).toBe('foo.ts')
+    expect(toolLabel('Read', { file_path: '/home/ken/code/switchroom/src/foo.ts' })).toBe('foo.ts')
     expect(toolLabel('Read', { file_path: '/home/ken/.claude/settings.json' })).toBe(
       'settings.json',
     )
@@ -14,9 +14,9 @@ describe('toolLabel', () => {
   })
 
   it('Write / Edit / NotebookEdit use file_path basename', () => {
-    expect(toolLabel('Write', { file_path: '/x/clerk/new.ts' })).toBe('new.ts')
-    expect(toolLabel('Edit', { file_path: '/x/clerk/existing.ts' })).toBe('existing.ts')
-    expect(toolLabel('NotebookEdit', { file_path: '/x/clerk/nb.ipynb' })).toBe('nb.ipynb')
+    expect(toolLabel('Write', { file_path: '/x/switchroom/new.ts' })).toBe('new.ts')
+    expect(toolLabel('Edit', { file_path: '/x/switchroom/existing.ts' })).toBe('existing.ts')
+    expect(toolLabel('NotebookEdit', { file_path: '/x/switchroom/nb.ipynb' })).toBe('nb.ipynb')
   })
 
   it('Bash: shows first line of command', () => {
@@ -35,11 +35,11 @@ describe('toolLabel', () => {
     // No path given → "(in repo)"
     expect(toolLabel('Grep', { pattern: 'TODO' })).toBe('"TODO" (in repo)')
     // Directory path → shows dir with trailing slash
-    expect(toolLabel('Grep', { pattern: 'clerk vault', path: 'src' })).toBe(
-      '"clerk vault" (in src/)',
+    expect(toolLabel('Grep', { pattern: 'switchroom vault', path: 'src' })).toBe(
+      '"switchroom vault" (in src/)',
     )
     // File path → basename
-    expect(toolLabel('Grep', { pattern: 'x', path: '/home/ken/clerk/src/foo.ts' })).toBe(
+    expect(toolLabel('Grep', { pattern: 'x', path: '/home/ken/switchroom/src/foo.ts' })).toBe(
       '"x" (in foo.ts)',
     )
   })
@@ -69,7 +69,7 @@ describe('toolLabel', () => {
   })
 
   it('unknown tools try common keys', () => {
-    expect(toolLabel('MyTool', { file_path: '/x/clerk/foo.ts' })).toBe('foo.ts')
+    expect(toolLabel('MyTool', { file_path: '/x/switchroom/foo.ts' })).toBe('foo.ts')
     expect(toolLabel('MyTool', { url: 'https://a.b' })).toBe('a.b')
     expect(toolLabel('MyTool', { command: 'ls\nmore' })).toBe('ls')
     expect(toolLabel('MyTool', {})).toBe('')

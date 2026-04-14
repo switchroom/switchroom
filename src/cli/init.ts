@@ -12,7 +12,7 @@ export function registerInitCommand(program: Command): void {
     .description("Initialize all agents: scaffold directories and install systemd units")
     .option(
       "--example <name>",
-      "Copy an example config before initializing (e.g., 'clerk' or 'minimal')"
+      "Copy an example config before initializing (e.g., 'switchroom' or 'minimal')"
     )
     .action(async (opts) => {
       try {
@@ -30,7 +30,7 @@ export function registerInitCommand(program: Command): void {
             import.meta.dirname,
             `../../examples/${opts.example}.yaml`
           );
-          const dest = resolve(process.cwd(), "clerk.yaml");
+          const dest = resolve(process.cwd(), "switchroom.yaml");
 
           if (!existsSync(exampleFile)) {
             console.error(
@@ -38,7 +38,7 @@ export function registerInitCommand(program: Command): void {
             );
             console.error(
               chalk.gray(
-                `  Available examples: clerk, minimal`
+                `  Available examples: switchroom, minimal`
               )
             );
             process.exit(1);
@@ -46,20 +46,20 @@ export function registerInitCommand(program: Command): void {
 
           if (existsSync(dest)) {
             console.error(
-              chalk.yellow("clerk.yaml already exists — skipping example copy")
+              chalk.yellow("switchroom.yaml already exists — skipping example copy")
             );
           } else {
             copyFileSync(exampleFile, dest);
-            console.log(chalk.green(`Copied ${opts.example}.yaml -> clerk.yaml`));
+            console.log(chalk.green(`Copied ${opts.example}.yaml -> switchroom.yaml`));
           }
         }
 
         const config = loadConfig(parentOpts.config);
-        const clerkConfigPath = parentOpts.config ?? findConfigFile();
+        const switchroomConfigPath = parentOpts.config ?? findConfigFile();
         const agentsDir = resolveAgentsDir(config);
         const agentNames = Object.keys(config.agents);
 
-        console.log(chalk.bold("\nInitializing clerk agents...\n"));
+        console.log(chalk.bold("\nInitializing switchroom agents...\n"));
 
         // Scaffold each agent
         let scaffolded = 0;
@@ -73,7 +73,7 @@ export function registerInitCommand(program: Command): void {
               config.telegram,
               config,
               undefined,
-              clerkConfigPath,
+              switchroomConfigPath,
             );
             const detail = result.created.length > 0
               ? `${result.created.length} files created`
@@ -92,7 +92,7 @@ export function registerInitCommand(program: Command): void {
         try {
           installAllUnits(config);
           for (const name of agentNames) {
-            console.log(chalk.green(`  + clerk-${name}.service`));
+            console.log(chalk.green(`  + switchroom-${name}.service`));
           }
         } catch (err) {
           console.error(
@@ -109,7 +109,7 @@ export function registerInitCommand(program: Command): void {
           chalk.gray(`  Agents dir: ${agentsDir}`)
         );
         console.log(
-          chalk.gray(`  Start all:  clerk agent start all\n`)
+          chalk.gray(`  Start all:  switchroom agent start all\n`)
         );
       } catch (err) {
         if (err instanceof ConfigError) {

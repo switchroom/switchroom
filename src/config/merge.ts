@@ -1,7 +1,7 @@
 /**
  * Three-layer cascade merge: global defaults → per-agent config.
  *
- * clerk.yaml supports a top-level `defaults:` block that is merged into
+ * switchroom.yaml supports a top-level `defaults:` block that is merged into
  * each agent's config before scaffold/reconcile runs. This lets users
  * declare "every agent gets this model / these tools / this MCP server /
  * this schedule" in one place instead of copy-pasting per agent.
@@ -31,23 +31,23 @@
 import type { AgentConfig, AgentDefaults, AgentHooks, Profile } from "./schema.js";
 
 /**
- * Resolve whether an agent should load the forked clerk-telegram MCP.
+ * Resolve whether an agent should load the forked switchroom-telegram MCP.
  * Reads `channels.telegram.plugin`:
- *   - "clerk"    → load the fork via --dangerously-load-development-channels
+ *   - "switchroom"    → load the fork via --dangerously-load-development-channels
  *   - "official" → use the upstream marketplace plugin
- *   - unset      → clerk fork (default — the fork provides streaming,
+ *   - unset      → switchroom fork (default — the fork provides streaming,
  *                   reactions, history, formatting, and access control
  *                   that the upstream plugin lacks)
  *
  * Users who explicitly want the upstream plugin can set
  * `channels.telegram.plugin: official`.
  */
-export function usesClerkTelegramPlugin(agent: AgentConfig): boolean {
+export function usesSwitchroomTelegramPlugin(agent: AgentConfig): boolean {
   return agent.channels?.telegram?.plugin !== "official";
 }
 
 /**
- * Translate clerk's ergonomic hook shape into Claude Code's native
+ * Translate switchroom's ergonomic hook shape into Claude Code's native
  * settings.json shape. The flat form:
  *
  *   hooks:
@@ -152,7 +152,7 @@ export function deepMergeJson(base: unknown, override: unknown): unknown {
  *
  * Resolution:
  *   1. If `agent.extends` is set and a matching profile exists in the
- *      clerk.yaml `profiles:` map, stack it between defaults and the
+ *      switchroom.yaml `profiles:` map, stack it between defaults and the
  *      agent (defaults → profile → agent order, each layer wins over
  *      the one below it).
  *   2. If `agent.extends` is set but no inline profile matches, the

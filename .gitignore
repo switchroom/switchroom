@@ -12,7 +12,7 @@ dist/
 *.enc
 
 # OpenClaw export bundle — contains real secrets, never commit
-/clerk-export/
+/switchroom-export/
 
 # OS
 .DS_Store

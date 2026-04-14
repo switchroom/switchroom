@@ -377,7 +377,7 @@ describe("Inbound message structure", () => {
       username: "testuser",
       text: "(photo)",
       ts: "2024-01-01T00:00:00.000Z",
-      imagePath: "/home/user/.clerk/inbox/1234-abc.jpg",
+      imagePath: "/home/user/.switchroom/inbox/1234-abc.jpg",
     };
     expect(msg.imagePath).toContain("inbox");
   });

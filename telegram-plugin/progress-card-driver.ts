@@ -416,7 +416,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // semantics with session-tail-driven enqueues (including the
       // "fire immediately" branch for enqueue events). The rawContent
       // wrapper matches the shape extractUserText expects.
-      const raw = `<channel source="clerk-telegram" chat_id="${chatId}"${threadId != null ? ` message_thread_id="${threadId}"` : ''}>${userText}</channel>`
+      const raw = `<channel source="switchroom-telegram" chat_id="${chatId}"${threadId != null ? ` message_thread_id="${threadId}"` : ''}>${userText}</channel>`
       this.ingest(
         {
           kind: 'enqueue',

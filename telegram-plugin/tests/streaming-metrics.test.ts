@@ -13,7 +13,7 @@ let originalFlag: string | undefined
 beforeEach(() => {
   writes = []
   originalWrite = process.stderr.write.bind(process.stderr)
-  originalFlag = process.env.CLERK_STREAMING_METRICS
+  originalFlag = process.env.SWITCHROOM_STREAMING_METRICS
   // Cast to any to sidestep the overloaded signature — we only need the
   // first (string) form for our gate.
   process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -24,13 +24,13 @@ beforeEach(() => {
 
 afterEach(() => {
   process.stderr.write = originalWrite
-  if (originalFlag === undefined) delete process.env.CLERK_STREAMING_METRICS
-  else process.env.CLERK_STREAMING_METRICS = originalFlag
+  if (originalFlag === undefined) delete process.env.SWITCHROOM_STREAMING_METRICS
+  else process.env.SWITCHROOM_STREAMING_METRICS = originalFlag
 })
 
 describe('logStreamingEvent — stderr failure', () => {
   it('swallows write errors so the host never breaks', () => {
-    process.env.CLERK_STREAMING_METRICS = '1'
+    process.env.SWITCHROOM_STREAMING_METRICS = '1'
     const boom = () => {
       throw new Error('stderr broken')
     }
@@ -46,8 +46,8 @@ describe('logStreamingEvent — stderr failure', () => {
 })
 
 describe('logStreamingEvent — env gate', () => {
-  it('is a no-op when CLERK_STREAMING_METRICS is unset', () => {
-    delete process.env.CLERK_STREAMING_METRICS
+  it('is a no-op when SWITCHROOM_STREAMING_METRICS is unset', () => {
+    delete process.env.SWITCHROOM_STREAMING_METRICS
     logStreamingEvent({
       kind: 'pty_partial_received',
       chatId: 'c1',
@@ -59,8 +59,8 @@ describe('logStreamingEvent — env gate', () => {
     expect(writes).toHaveLength(0)
   })
 
-  it('is a no-op when CLERK_STREAMING_METRICS is "0"', () => {
-    process.env.CLERK_STREAMING_METRICS = '0'
+  it('is a no-op when SWITCHROOM_STREAMING_METRICS is "0"', () => {
+    process.env.SWITCHROOM_STREAMING_METRICS = '0'
     logStreamingEvent({
       kind: 'turn_end',
       chatId: 'c1',
@@ -71,7 +71,7 @@ describe('logStreamingEvent — env gate', () => {
   })
 
   it('writes exactly one line to stderr when flag is "1"', () => {
-    process.env.CLERK_STREAMING_METRICS = '1'
+    process.env.SWITCHROOM_STREAMING_METRICS = '1'
     logStreamingEvent({
       kind: 'stream_reply_called',
       chatId: 'c1',
@@ -87,7 +87,7 @@ describe('logStreamingEvent — env gate', () => {
 
 describe('logStreamingEvent — output format', () => {
   beforeEach(() => {
-    process.env.CLERK_STREAMING_METRICS = '1'
+    process.env.SWITCHROOM_STREAMING_METRICS = '1'
   })
 
   function emitAndParse(ev: StreamingEvent): Record<string, unknown> {

@@ -10,7 +10,7 @@ import {
   getHindsightMcpUrl,
   generateHindsightComposeSnippet,
 } from "../src/setup/hindsight.js";
-import type { ClerkConfig, MemoryBackendConfig } from "../src/config/schema.js";
+import type { SwitchroomConfig, MemoryBackendConfig } from "../src/config/schema.js";
 
 function makeMemoryConfig(
   overrides: Partial<MemoryBackendConfig> = {},
@@ -26,16 +26,16 @@ function makeMemoryConfig(
   };
 }
 
-function makeClerkConfig(
+function makeSwitchroomConfig(
   agents: Record<string, any> = {},
   memory?: Partial<MemoryBackendConfig>,
-): ClerkConfig {
+): SwitchroomConfig {
   return {
-    clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+    switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
     telegram: { bot_token: "test-token", forum_chat_id: "-100123" },
     memory: makeMemoryConfig(memory),
     agents,
-  } as ClerkConfig;
+  } as SwitchroomConfig;
 }
 
 describe("generateHindsightMcpConfig", () => {
@@ -89,7 +89,7 @@ describe("generateDockerComposeSnippet", () => {
 
 describe("getCollectionForAgent", () => {
   it("returns explicit collection name from agent config", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       coach: {
         extends: "default",
         topic_name: "Coach",
@@ -102,7 +102,7 @@ describe("getCollectionForAgent", () => {
   });
 
   it("defaults to agent name when no collection is specified", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       coach: {
         extends: "default",
         topic_name: "Coach",
@@ -114,7 +114,7 @@ describe("getCollectionForAgent", () => {
   });
 
   it("defaults to agent name when memory config is absent", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       writer: {
         extends: "default",
         topic_name: "Writer",
@@ -128,7 +128,7 @@ describe("getCollectionForAgent", () => {
 
 describe("isStrictIsolation", () => {
   it("returns true for strict isolation", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       journal: {
         extends: "default",
         topic_name: "Journal",
@@ -141,7 +141,7 @@ describe("isStrictIsolation", () => {
   });
 
   it("returns false for default isolation", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       coach: {
         extends: "default",
         topic_name: "Coach",
@@ -154,7 +154,7 @@ describe("isStrictIsolation", () => {
   });
 
   it("returns false when memory config is absent", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       bot: {
         extends: "default",
         topic_name: "Bot",
@@ -168,7 +168,7 @@ describe("isStrictIsolation", () => {
 
 describe("reflectAcrossAgents", () => {
   it("excludes strict agents from reflection", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       coach: {
         extends: "default",
         topic_name: "Coach",
@@ -204,7 +204,7 @@ describe("reflectAcrossAgents", () => {
   });
 
   it("returns empty eligible when all agents are strict", () => {
-    const config = makeClerkConfig({
+    const config = makeSwitchroomConfig({
       secret: {
         extends: "default",
         topic_name: "Secret",
@@ -232,9 +232,9 @@ describe("generateHindsightComposeSnippet", () => {
   it("generates valid compose snippet without provider", () => {
     const snippet = generateHindsightComposeSnippet();
 
-    expect(snippet).toContain("clerk-hindsight");
+    expect(snippet).toContain("switchroom-hindsight");
     expect(snippet).toContain("image: ghcr.io/vectorize-io/hindsight:latest");
-    expect(snippet).toContain("clerk-hindsight-data:/home/hindsight/.pg0");
+    expect(snippet).toContain("switchroom-hindsight-data:/home/hindsight/.pg0");
     expect(snippet).toContain("restart: unless-stopped");
     expect(snippet).not.toContain("LLM_PROVIDER");
   });

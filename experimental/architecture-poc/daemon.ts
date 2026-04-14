@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Proof-of-concept: clerk-telegram-daemon
+ * Proof-of-concept: switchroom-telegram-daemon
  *
  * Validates assumptions 1-3:
  *   1. Bun process can listen on a Unix socket
@@ -8,7 +8,7 @@
  *   3. JSON newline-delimited protocol works for bidirectional async messaging
  *
  * This daemon:
- *   - Listens on /tmp/clerk-telegram.sock
+ *   - Listens on /tmp/switchroom-telegram.sock
  *   - Accepts multiple plugin connections
  *   - Maintains a routing table: topic_id -> socket
  *   - Routes inbound "Telegram messages" to the correct plugin by topic_id
@@ -17,7 +17,7 @@
 
 import { unlinkSync } from "fs";
 
-const SOCKET_PATH = process.env.CLERK_SOCKET ?? "/tmp/clerk-telegram.sock";
+const SOCKET_PATH = process.env.SWITCHROOM_SOCKET ?? "/tmp/switchroom-telegram.sock";
 
 // Clean up stale socket file
 try { unlinkSync(SOCKET_PATH); } catch {}

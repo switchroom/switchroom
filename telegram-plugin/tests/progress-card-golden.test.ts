@@ -19,7 +19,7 @@ const SAMPLE_JSONL = [
   JSON.stringify({
     type: 'queue-operation',
     operation: 'enqueue',
-    content: '<channel source="clerk-telegram" chat_id="123">fix the failing tests and push</channel>',
+    content: '<channel source="switchroom-telegram" chat_id="123">fix the failing tests and push</channel>',
   }),
   // Assistant thinks
   JSON.stringify({
@@ -31,7 +31,7 @@ const SAMPLE_JSONL = [
     type: 'assistant',
     message: {
       content: [
-        { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/home/ken/code/clerk/tests/merge.test.ts' } },
+        { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/home/ken/code/switchroom/tests/merge.test.ts' } },
       ],
     },
   }),
@@ -55,7 +55,7 @@ const SAMPLE_JSONL = [
     type: 'assistant',
     message: {
       content: [
-        { type: 'tool_use', id: 't3', name: 'Edit', input: { file_path: '/home/ken/code/clerk/src/config/merge.ts' } },
+        { type: 'tool_use', id: 't3', name: 'Edit', input: { file_path: '/home/ken/code/switchroom/src/config/merge.ts' } },
       ],
     },
   }),

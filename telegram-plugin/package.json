@@ -1,11 +1,11 @@
 {
-  "name": "@clerk-ai/telegram-plugin",
+  "name": "@switchroom-ai/telegram-plugin",
   "version": "0.1.0",
-  "description": "Telegram MCP plugin for Clerk — forum topic routing, status reactions, SQLite history.",
+  "description": "Telegram MCP plugin for Switchroom — forum topic routing, status reactions, SQLite history.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "clerk-telegram-plugin": "./dist/server.js"
+    "switchroom-telegram-plugin": "./dist/server.js"
   },
   "main": "./dist/server.js",
   "files": [
@@ -29,18 +29,18 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mekenthompson/clerk.git",
+    "url": "https://github.com/mekenthompson/switchroom.git",
     "directory": "telegram-plugin"
   },
-  "homepage": "https://github.com/mekenthompson/clerk/tree/main/telegram-plugin#readme",
+  "homepage": "https://github.com/mekenthompson/switchroom/tree/main/telegram-plugin#readme",
   "bugs": {
-    "url": "https://github.com/mekenthompson/clerk/issues"
+    "url": "https://github.com/mekenthompson/switchroom/issues"
   },
   "publishConfig": {
     "access": "public"
   },
   "keywords": [
-    "clerk",
+    "switchroom",
     "claude-code",
     "telegram",
     "mcp",

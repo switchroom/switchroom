@@ -286,7 +286,7 @@ describe('E2E: handoff continuity', () => {
 
   it('bootstrap with sidecar + show-line=true → first reply prepends the line', () => {
     writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'shipped the feature\n', 'utf8')
-    process.env.CLERK_HANDOFF_SHOW_LINE = 'true'
+    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = 'true'
     expect(shouldShowHandoffLine()).toBe(true)
     const topic = consumeHandoffTopic(tmp)
     expect(topic).toBe('shipped the feature')
@@ -297,7 +297,7 @@ describe('E2E: handoff continuity', () => {
 
   it('bootstrap with sidecar + show-line=false → no prefix', () => {
     writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'x\n', 'utf8')
-    process.env.CLERK_HANDOFF_SHOW_LINE = 'false'
+    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = 'false'
     expect(shouldShowHandoffLine()).toBe(false)
   })
 
@@ -388,7 +388,7 @@ describe('E2E: streaming metrics gate', () => {
   beforeEach(() => {
     writes = []
     original = process.stderr.write.bind(process.stderr)
-    priorFlag = process.env.CLERK_STREAMING_METRICS
+    priorFlag = process.env.SWITCHROOM_STREAMING_METRICS
     process.stderr.write = ((chunk: string | Uint8Array) => {
       writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
       return true
@@ -397,24 +397,24 @@ describe('E2E: streaming metrics gate', () => {
 
   afterEach(() => {
     process.stderr.write = original
-    if (priorFlag === undefined) delete process.env.CLERK_STREAMING_METRICS
-    else process.env.CLERK_STREAMING_METRICS = priorFlag
+    if (priorFlag === undefined) delete process.env.SWITCHROOM_STREAMING_METRICS
+    else process.env.SWITCHROOM_STREAMING_METRICS = priorFlag
   })
 
   it('no emission when unset', () => {
-    delete process.env.CLERK_STREAMING_METRICS
+    delete process.env.SWITCHROOM_STREAMING_METRICS
     logStreamingEvent({ kind: 'turn_end', chatId: 'c1', durationMs: 1, suppressClearedCount: 0 })
     expect(writes.length).toBe(0)
   })
 
   it('no emission when set to 0', () => {
-    process.env.CLERK_STREAMING_METRICS = '0'
+    process.env.SWITCHROOM_STREAMING_METRICS = '0'
     logStreamingEvent({ kind: 'turn_end', chatId: 'c1', durationMs: 1, suppressClearedCount: 0 })
     expect(writes.length).toBe(0)
   })
 
   it('emits well-formed JSON for each of the 6 event kinds when set to 1', () => {
-    process.env.CLERK_STREAMING_METRICS = '1'
+    process.env.SWITCHROOM_STREAMING_METRICS = '1'
     const kinds: StreamingEvent[] = [
       { kind: 'pty_partial_received', chatId: 'c1', suppressed: false, hasStream: false, charCount: 5, bufferedWithoutChatId: false },
       { kind: 'stream_reply_called', chatId: 'c1', charCount: 10, done: false, streamExisted: false },

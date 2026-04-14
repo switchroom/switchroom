@@ -1,12 +1,12 @@
 {
-  "name": "clerk-ai",
+  "name": "switchroom-ai",
   "version": "0.1.0",
   "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys, no Docker.",
   "type": "module",
   "bin": {
-    "clerk": "./dist/cli/clerk.js"
+    "switchroom": "./dist/cli/switchroom.js"
   },
-  "main": "./dist/cli/clerk.js",
+  "main": "./dist/cli/switchroom.js",
   "files": [
     "dist",
     "profiles",
@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "dev": "bun bin/clerk.ts",
+    "dev": "bun bin/switchroom.ts",
     "build": "node scripts/build.mjs",
     "test": "vitest run && bun test telegram-plugin/tests/history.test.ts",
     "test:vitest": "vitest run",
@@ -45,11 +45,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mekenthompson/clerk.git"
+    "url": "https://github.com/mekenthompson/switchroom.git"
   },
-  "homepage": "https://github.com/mekenthompson/clerk#readme",
+  "homepage": "https://github.com/mekenthompson/switchroom#readme",
   "bugs": {
-    "url": "https://github.com/mekenthompson/clerk/issues"
+    "url": "https://github.com/mekenthompson/switchroom/issues"
   },
   "publishConfig": {
     "access": "public"

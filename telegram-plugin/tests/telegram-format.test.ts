@@ -616,9 +616,9 @@ describe('repairEscapedWhitespace', () => {
     // Reproduces the actual stream_reply failure: a model produced a message
     // with <b>/<code> tags and literal `\n` escape sequences instead of real
     // newlines, and Telegram rendered the `\n` as visible characters.
-    const input = 'Audit done:\\n\\n<b>README.md</b>\\n• Missing <code>clerk update</code>\\n• Missing <code>clerk agent grant</code>'
+    const input = 'Audit done:\\n\\n<b>README.md</b>\\n• Missing <code>switchroom update</code>\\n• Missing <code>switchroom agent grant</code>'
     const repaired = repairEscapedWhitespace(input)
-    expect(repaired).toBe('Audit done:\n\n<b>README.md</b>\n• Missing <code>clerk update</code>\n• Missing <code>clerk agent grant</code>')
+    expect(repaired).toBe('Audit done:\n\n<b>README.md</b>\n• Missing <code>switchroom update</code>\n• Missing <code>switchroom agent grant</code>')
     // And the repaired text should still be recognized as Telegram HTML
     // so the markdownToHtml pass-through works correctly.
     expect(isLikelyTelegramHtml(repaired)).toBe(true)

@@ -481,7 +481,7 @@ function truncate(s: string, n: number): string {
  */
 function extractUserText(raw: string): string {
   // The enqueue raw content typically looks like:
-  //   <channel source="clerk-telegram" chat_id="…" …>USER TEXT</channel>
+  //   <channel source="switchroom-telegram" chat_id="…" …>USER TEXT</channel>
   const m = raw.match(/<channel[^>]*>([\s\S]*?)<\/channel>/)
   const body = m ? m[1] : raw
   return body.trim()

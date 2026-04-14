@@ -8,7 +8,7 @@ import {
 
 describe("generateUnit", () => {
   it("generates valid unit file content", () => {
-    const unit = generateUnit("health-coach", "/home/user/.clerk/agents/health-coach");
+    const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
 
     expect(unit).toContain("[Unit]");
     expect(unit).toContain("[Service]");
@@ -16,29 +16,29 @@ describe("generateUnit", () => {
   });
 
   it("sets the correct Description", () => {
-    const unit = generateUnit("health-coach", "/home/user/.clerk/agents/health-coach");
-    expect(unit).toContain("Description=clerk agent: health-coach");
+    const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
+    expect(unit).toContain("Description=switchroom agent: health-coach");
   });
 
   it("uses script -qfc for PTY provision", () => {
-    const unit = generateUnit("health-coach", "/home/user/.clerk/agents/health-coach");
+    const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
     expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
-    expect(unit).toContain("/home/user/.clerk/agents/health-coach/start.sh");
+    expect(unit).toContain("/home/user/.switchroom/agents/health-coach/start.sh");
   });
 
   it("logs to service.log in agent dir", () => {
-    const unit = generateUnit("health-coach", "/home/user/.clerk/agents/health-coach");
-    expect(unit).toContain("/home/user/.clerk/agents/health-coach/service.log");
+    const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
+    expect(unit).toContain("/home/user/.switchroom/agents/health-coach/service.log");
   });
 
   it("sets the correct WorkingDirectory", () => {
-    const unit = generateUnit("health-coach", "/home/user/.clerk/agents/health-coach");
-    expect(unit).toContain("WorkingDirectory=/home/user/.clerk/agents/health-coach");
+    const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
+    expect(unit).toContain("WorkingDirectory=/home/user/.switchroom/agents/health-coach");
   });
 
   it("handles agent names with hyphens correctly", () => {
     const unit = generateUnit("my-cool-agent", "/agents/my-cool-agent");
-    expect(unit).toContain("Description=clerk agent: my-cool-agent");
+    expect(unit).toContain("Description=switchroom agent: my-cool-agent");
     expect(unit).toContain("/agents/my-cool-agent/start.sh");
     expect(unit).toContain("WorkingDirectory=/agents/my-cool-agent");
   });
@@ -143,10 +143,10 @@ describe("generateTimerUnit", () => {
 
 describe("generateTimerServiceUnit", () => {
   it("generates a oneshot service pointing at the cron script", () => {
-    const service = generateTimerServiceUnit("coach", 0, "/home/user/.clerk/agents/coach");
+    const service = generateTimerServiceUnit("coach", 0, "/home/user/.switchroom/agents/coach");
     expect(service).toContain("Type=oneshot");
     expect(service).toContain("cron-0.sh");
-    expect(service).toContain("WorkingDirectory=/home/user/.clerk/agents/coach");
+    expect(service).toContain("WorkingDirectory=/home/user/.switchroom/agents/coach");
   });
 
   it("uses the correct index in the script path", () => {

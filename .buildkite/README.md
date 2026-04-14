@@ -1,6 +1,6 @@
 # Buildkite CI
 
-This directory drives clerk's CI on Buildkite. The pipeline runs three test
+This directory drives switchroom's CI on Buildkite. The pipeline runs three test
 stages on every commit, plus an optional skills-eval stage that exercises the
 prompts inside `skills/` against a real Claude model.
 
@@ -14,7 +14,7 @@ prompts inside `skills/` against a real Claude model.
 
 ## One-time setup in Buildkite
 
-1. Create a new pipeline pointing at this repo (`mekenthompson/clerk`).
+1. Create a new pipeline pointing at this repo (`mekenthompson/switchroom`).
 2. Set the **initial command** in Pipeline Settings to:
    ```
    buildkite-agent pipeline upload
@@ -66,11 +66,11 @@ buildkite-agent pipeline upload --debug --dry-run < .buildkite/pipeline.yml
 
 ## Secrets
 
-The Buildkite API token (`bkua_*`) is stored in clerk's encrypted vault under
+The Buildkite API token (`bkua_*`) is stored in switchroom's encrypted vault under
 the key `buildkite-api-token`. Retrieve it with:
 
 ```bash
-clerk vault get buildkite-api-token
+switchroom vault get buildkite-api-token
 ```
 
 Use it for any `bk` CLI calls that need API access (creating pipelines,

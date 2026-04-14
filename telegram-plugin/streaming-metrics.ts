@@ -2,7 +2,7 @@
  * Streaming observability — pure, dependency-free event emitter.
  *
  * Emits one JSON line per event to stderr, prefixed `[streaming-metrics]`.
- * Gated by `CLERK_STREAMING_METRICS=1` so production stays quiet.
+ * Gated by `SWITCHROOM_STREAMING_METRICS=1` so production stays quiet.
  *
  * Event wiring lives in server.ts at well-known locations (PTY partial,
  * reply/stream_reply tool handlers, draft-stream send/edit callbacks,
@@ -58,7 +58,7 @@ export type StreamingEvent =
  * process.env without needing to reload the module.
  */
 function enabled(): boolean {
-  return process.env.CLERK_STREAMING_METRICS === '1'
+  return process.env.SWITCHROOM_STREAMING_METRICS === '1'
 }
 
 /**

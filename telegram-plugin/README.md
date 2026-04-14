@@ -1,4 +1,4 @@
-# Clerk Telegram Plugin
+# Switchroom Telegram Plugin
 
 A production-grade Telegram channel for Claude Code. Forked from the
 [official Claude Code Telegram plugin](https://github.com/anthropics/claude-plugins-official)
@@ -33,14 +33,14 @@ adds the ergonomics and reliability that an always-on agent fleet needs:
 - **Activity lane suppression** — filters Claude Code TUI noise (spinner verbs
   like "Running Reading", keyboard hints like "ctrl+o to expand") that the
   user can't action and shouldn't see.
-- **Clerk slash-commands** — `/agents`, `/restart`, `/logs`, `/memory`,
+- **Switchroom slash-commands** — `/agents`, `/restart`, `/logs`, `/memory`,
   `/grant`, `/dangerous`, `/permissions`, `/reconcile` etc., handled by the
   plugin without consuming Claude Code tokens.
 - **10 MCP tools** — `reply`, `stream_reply`, `react`, `edit_message`,
   `delete_message`, `forward_message`, `pin_message`, `send_typing`,
   `download_attachment`, `get_recent_messages`.
 
-The fork is the **default** for clerk agents (no config needed). Set
+The fork is the **default** for switchroom agents (no config needed). Set
 `channels.telegram.plugin: official` to fall back to the upstream plugin.
 
 ## What changed from the official plugin
@@ -269,36 +269,36 @@ When a voice message or audio file is received, the inbound metadata includes:
 
 **Whisper transcription**: To auto-transcribe voice messages, set up a Whisper MCP server (e.g. [whisper-mcp](https://github.com/modelcontextprotocol/servers)) and instruct your agent to download voice attachments and pass them to the Whisper tool for transcription.
 
-## Clerk bot commands
+## Switchroom bot commands
 
-The plugin includes built-in `/commands` that execute `clerk` CLI operations directly — no Claude Code tokens consumed, instant response.
+The plugin includes built-in `/commands` that execute `switchroom` CLI operations directly — no Claude Code tokens consumed, instant response.
 
 ### Available commands
 
-Each plugin instance is bound to one agent (via `CLERK_AGENT_NAME` set by `start.sh`), so per-agent commands default to **the current agent**. Pass an explicit name only when you want to act on a different one.
+Each plugin instance is bound to one agent (via `SWITCHROOM_AGENT_NAME` set by `start.sh`), so per-agent commands default to **the current agent**. Pass an explicit name only when you want to act on a different one.
 
 | Command | Description |
 |---------|-------------|
 | `/agents` | List all agents and their status |
-| `/clerkstart [name]` | Start an agent (default: this agent) |
+| `/switchroomstart [name]` | Start an agent (default: this agent) |
 | `/stop [name]` | Stop an agent (default: this agent) |
 | `/restart [name\|all]` | Restart an agent (default: this agent; pass `all` for every agent) |
 | `/auth` | Show auth/token status |
 | `/topics` | Show topic-to-agent mappings |
 | `/logs [name] [lines]` | Show agent logs (default: this agent, 20 lines, max: 200). `/logs 50` works too. |
 | `/memory <query>` | Search agent memory |
-| `/reconcile [name\|all]` | Re-apply clerk.yaml + restart (default: this agent) |
+| `/reconcile [name\|all]` | Re-apply switchroom.yaml + restart (default: this agent) |
 | `/permissions [agent]` | Show allow/deny list (default: this agent) |
 | `/grant <tool>` / `/grant <agent> <tool>` | Grant a tool permission and reconcile (default: this agent) |
 | `/dangerous [off]` / `/dangerous <agent> [off]` | Toggle full tool access (default: this agent) |
-| `/clerkhelp` | List all available clerk bot commands |
+| `/switchroomhelp` | List all available switchroom bot commands |
 
 ### How it works
 
 Commands are intercepted by Grammy's command handlers *before* reaching the general message handler, so they never trigger Claude Code. Each command:
 
 1. Checks sender authorization (must be in the allowlist or an allowed group)
-2. Runs the corresponding `clerk` CLI command via `execFileSync`
+2. Runs the corresponding `switchroom` CLI command via `execFileSync`
 3. Formats the output for Telegram (monospace code block, truncated at 4000 chars)
 4. Replies in the correct forum topic if applicable
 
@@ -306,12 +306,12 @@ Commands are intercepted by Grammy's command handlers *before* reaching the gene
 
 | Env var | Description |
 |---------|-------------|
-| `CLERK_CLI_PATH` | Path to the `clerk` binary (default: `clerk` on PATH) |
-| `CLERK_CONFIG` | Path to clerk config file — passed as `--config` to all commands |
+| `SWITCHROOM_CLI_PATH` | Path to the `switchroom` binary (default: `switchroom` on PATH) |
+| `SWITCHROOM_CONFIG` | Path to switchroom config file — passed as `--config` to all commands |
 
 ### Notes
 
-- `/clerkstart` is used instead of `/start` to avoid conflicting with Telegram's built-in `/start` command (used for pairing).
+- `/switchroomstart` is used instead of `/start` to avoid conflicting with Telegram's built-in `/start` command (used for pairing).
 - Commands work in both DM and group/topic contexts.
 - In groups, only users in the group's allowlist can execute commands.
 - Commands are registered with BotFather automatically on startup.
@@ -347,4 +347,4 @@ bun test
 
 ## Use case: multi-agent orchestration
 
-In a Clerk multi-agent setup, each agent instance runs this plugin with its **own bot token** (one bot per agent — Telegram's `getUpdates` long-poll holds an exclusive lock per token, so sharing a token between processes drops messages at random) and its own `TELEGRAM_TOPIC_ID`, routing each forum topic in a shared group to a dedicated agent.
+In a Switchroom multi-agent setup, each agent instance runs this plugin with its **own bot token** (one bot per agent — Telegram's `getUpdates` long-poll holds an exclusive lock per token, so sharing a token between processes drops messages at random) and its own `TELEGRAM_TOPIC_ID`, routing each forum topic in a shared group to a dedicated agent.

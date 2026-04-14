@@ -14,7 +14,7 @@
 
 import { unlinkSync } from "fs";
 
-const SOCKET_PATH = "/tmp/clerk-test-integration.sock";
+const SOCKET_PATH = "/tmp/switchroom-test-integration.sock";
 try { unlinkSync(SOCKET_PATH); } catch {}
 
 // ---- Inline daemon (same logic as daemon.ts) ----

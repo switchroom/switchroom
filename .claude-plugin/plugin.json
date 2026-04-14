@@ -1,15 +1,15 @@
 {
-  "name": "clerk",
+  "name": "switchroom",
   "version": "0.1.0",
-  "description": "Operate clerk — a multi-agent orchestrator for Claude Code — from inside a Claude Code session via skills for install, status, logs, config, restart, reconcile, schedule, and health.",
+  "description": "Operate switchroom — a multi-agent orchestrator for Claude Code — from inside a Claude Code session via skills for install, status, logs, config, restart, reconcile, schedule, and health.",
   "author": {
     "name": "Ken Thompson"
   },
-  "homepage": "https://github.com/mekenthompson/clerk",
-  "repository": "https://github.com/mekenthompson/clerk",
+  "homepage": "https://github.com/mekenthompson/switchroom",
+  "repository": "https://github.com/mekenthompson/switchroom",
   "license": "MIT",
   "keywords": [
-    "clerk",
+    "switchroom",
     "agents",
     "multi-agent",
     "telegram",

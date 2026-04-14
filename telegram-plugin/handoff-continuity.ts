@@ -152,11 +152,11 @@ export function writeLastTurnSummary(agentDir: string, summary: string): void {
 }
 
 /**
- * Reads CLERK_HANDOFF_SHOW_LINE. Defaults to true when unset so users
- * opt out explicitly via clerk.yaml rather than opt in.
+ * Reads SWITCHROOM_HANDOFF_SHOW_LINE. Defaults to true when unset so users
+ * opt out explicitly via switchroom.yaml rather than opt in.
  */
 export function shouldShowHandoffLine(): boolean {
-  const v = process.env.CLERK_HANDOFF_SHOW_LINE;
+  const v = process.env.SWITCHROOM_HANDOFF_SHOW_LINE;
   if (v === undefined) return true;
   return v.toLowerCase() !== "false";
 }

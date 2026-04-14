@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { loadConfig, findConfigFile, ConfigError } from "../config/loader.js";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 
 /**
  * Wraps an async action handler to catch and display ConfigError nicely.
@@ -28,13 +28,13 @@ export function withConfigError(fn: (...args: any[]) => Promise<void>) {
 /**
  * Load config using the --config option from the parent command.
  */
-export function getConfig(program: Command): ClerkConfig {
+export function getConfig(program: Command): SwitchroomConfig {
   const parentOpts = program.opts();
   return loadConfig(parentOpts.config);
 }
 
 /**
- * Resolve the absolute path of the clerk.yaml file that would be loaded
+ * Resolve the absolute path of the switchroom.yaml file that would be loaded
  * given the parent command's --config option (or by searching cwd).
  */
 export function getConfigPath(program: Command): string {

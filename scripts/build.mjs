@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = resolve(root, "dist/cli");
-const outFile = resolve(outDir, "clerk.js");
+const outFile = resolve(outDir, "switchroom.js");
 
 console.log("[build] cleaning dist/");
 rmSync(resolve(root, "dist"), { recursive: true, force: true });
@@ -26,9 +26,9 @@ if (!hasBun) {
   process.exit(1);
 }
 
-console.log("[build] bundling bin/clerk.ts -> dist/cli/clerk.js");
+console.log("[build] bundling bin/switchroom.ts -> dist/cli/switchroom.js");
 execSync(
-  `bun build ${JSON.stringify(resolve(root, "bin/clerk.ts"))} --outdir ${JSON.stringify(outDir)} --target node`,
+  `bun build ${JSON.stringify(resolve(root, "bin/switchroom.ts"))} --outdir ${JSON.stringify(outDir)} --target node`,
   { stdio: "inherit", cwd: root }
 );
 

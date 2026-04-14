@@ -18,7 +18,7 @@ export function registerWebCommand(program: Command): void {
           process.exit(1);
         }
 
-        console.log(chalk.bold("\nStarting Clerk dashboard...\n"));
+        console.log(chalk.bold("\nStarting Switchroom dashboard...\n"));
         console.log(chalk.gray(`  Agents: ${Object.keys(config.agents).join(", ")}`));
         console.log(chalk.gray(`  Port:   ${port}\n`));
 

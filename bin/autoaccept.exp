@@ -1,6 +1,6 @@
 #!/usr/bin/expect -f
 #
-# Clerk autoaccept: automatically respond to Claude Code interactive
+# Switchroom autoaccept: automatically respond to Claude Code interactive
 # prompts that appear when launching with
 # `--dangerously-load-development-channels`.
 #

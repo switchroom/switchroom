@@ -49,13 +49,13 @@ function mockBot() {
 
 // ─── Realistic JSONL line builders ────────────────────────────────────────
 // Matches the shape produced by Claude Code 2.1.x (verified against
-// /home/kenthompson/.clerk/agents/assistant/.claude/projects/.../*.jsonl).
+// /home/kenthompson/.switchroom/agents/assistant/.claude/projects/.../*.jsonl).
 
 const enqueueLine = (chatId: string, text = 'hello'): string =>
   JSON.stringify({
     type: 'queue-operation',
     operation: 'enqueue',
-    content: `<channel source="clerk-telegram" chat_id="${chatId}" message_id="1" user="u" ts="2026-04-14T00:00:00.000Z">\n${text}\n</channel>`,
+    content: `<channel source="switchroom-telegram" chat_id="${chatId}" message_id="1" user="u" ts="2026-04-14T00:00:00.000Z">\n${text}\n</channel>`,
   }) + '\n'
 
 const toolUseLine = (id: string, name: string, input: Record<string, unknown>): string =>

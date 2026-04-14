@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installClerkSkills } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills } from "../src/agents/scaffold.js";
 import { renderTemplate } from "../src/agents/profiles.js";
-import type { AgentConfig, ClerkConfig, TelegramConfig } from "../src/config/schema.js";
+import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 
 const telegramConfig: TelegramConfig = {
   bot_token: "123456:ABC-DEF",
@@ -24,7 +24,7 @@ describe("scaffoldAgent", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
   });
 
   afterEach(() => {
@@ -76,18 +76,18 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain(`CLAUDE_CONFIG_DIR="${result.agentDir}/.claude"`);
     expect(startSh).toContain(`TELEGRAM_STATE_DIR="${result.agentDir}/telegram"`);
     // Fresh session every start — Hindsight auto-recall + handoff briefing
-    expect(startSh).toContain("exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:clerk-telegram");
+    expect(startSh).toContain("exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram");
     expect(startSh).toContain('CONTINUE_FLAG=""');
     // Default: session-handoff enabled. start.sh reads .handoff.md and
     // merges it into --append-system-prompt; plugin reads .handoff-topic.
     expect(startSh).toContain(".handoff.md");
-    expect(startSh).toContain("clerk handoff");
-    expect(startSh).toContain("CLERK_HANDOFF_SHOW_LINE=true");
+    expect(startSh).toContain("switchroom handoff");
+    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=true");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
-    // CLERK_AGENT_NAME is the canonical "which agent am I" identifier the
+    // SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
     // telegram-plugin reads to detect self-restart commands. Must be set.
-    expect(startSh).toContain('CLERK_AGENT_NAME="my-agent"');
-    expect(startSh).not.toContain("CLERK_SOCKET_PATH");
+    expect(startSh).toContain('SWITCHROOM_AGENT_NAME="my-agent"');
+    expect(startSh).not.toContain("SWITCHROOM_SOCKET_PATH");
     expect(startSh).not.toContain("--dangerously-skip-permissions");
     // Must NOT use $(node -v) since node isn't on PATH under systemd user units
     expect(startSh).not.toContain("$(node -v)");
@@ -124,17 +124,17 @@ describe("scaffoldAgent", () => {
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
 
-    // Always pre-approves the clerk MCP wildcards alongside user-listed tools
+    // Always pre-approves the switchroom MCP wildcards alongside user-listed tools
     expect(settings.permissions.allow).toContain("calendar");
     expect(settings.permissions.allow).toContain("notion");
-    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
     expect(settings.permissions.deny).toEqual(["bash"]);
     expect(settings.permissions.defaultMode).toBeUndefined();
   });
 
   it("expands tools.allow: [all] into the full built-in tool list", () => {
     // Claude Code rejects the literal string "all" in permissions.allow.
-    // When users write `tools.allow: [all]` in clerk.yaml, the scaffold
+    // When users write `tools.allow: [all]` in switchroom.yaml, the scaffold
     // expands it to the full set of built-in Claude Code tools so the
     // agent never blocks on a runtime permission prompt.
     const config = makeAgentConfig({
@@ -155,10 +155,10 @@ describe("scaffoldAgent", () => {
     expect(settings.permissions.allow).not.toContain("all");
   });
 
-  it("pre-approves clerk-telegram MCP tool names when channels.telegram.plugin is 'clerk'", () => {
+  it("pre-approves switchroom-telegram MCP tool names when channels.telegram.plugin is 'switchroom'", () => {
     const config = makeAgentConfig({
       tools: { allow: ["calendar"], deny: [] },
-      channels: { telegram: { plugin: "clerk" } },
+      channels: { telegram: { plugin: "switchroom" } },
     });
     const result = scaffoldAgent("fork-agent", config, tmpDir, telegramConfig);
     const settings = JSON.parse(
@@ -166,28 +166,28 @@ describe("scaffoldAgent", () => {
     );
 
     expect(settings.permissions.allow).toContain("calendar");
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram");
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__react");
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__edit_message");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__react");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__edit_message");
   });
 
-  it("writes project-level .mcp.json when channels.telegram.plugin is 'clerk'", () => {
-    const agentConfig = makeAgentConfig({ channels: { telegram: { plugin: "clerk" } } });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+  it("writes project-level .mcp.json when channels.telegram.plugin is 'switchroom'", () => {
+    const agentConfig = makeAgentConfig({ channels: { telegram: { plugin: "switchroom" } } });
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "fork-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "fork-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
       undefined,
-      "/fake/clerk.yaml",
+      "/fake/switchroom.yaml",
     );
 
     const mcpJsonPath = join(result.agentDir, ".mcp.json");
@@ -195,15 +195,15 @@ describe("scaffoldAgent", () => {
 
     const mcpJson = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
     expect(mcpJson.mcpServers).toBeDefined();
-    expect(mcpJson.mcpServers["clerk-telegram"]).toBeDefined();
-    expect(mcpJson.mcpServers["clerk-telegram"].command).toBe("bun");
-    expect(mcpJson.mcpServers["clerk-telegram"].env.TELEGRAM_STATE_DIR).toBe(
+    expect(mcpJson.mcpServers["switchroom-telegram"]).toBeDefined();
+    expect(mcpJson.mcpServers["switchroom-telegram"].command).toBe("bun");
+    expect(mcpJson.mcpServers["switchroom-telegram"].env.TELEGRAM_STATE_DIR).toBe(
       join(result.agentDir, "telegram"),
     );
-    expect(mcpJson.mcpServers["clerk-telegram"].env.CLERK_CONFIG).toBe(
-      "/fake/clerk.yaml",
+    expect(mcpJson.mcpServers["switchroom-telegram"].env.SWITCHROOM_CONFIG).toBe(
+      "/fake/switchroom.yaml",
     );
-    expect(mcpJson.mcpServers["clerk-telegram"].env.CLERK_CLI_PATH).toBeDefined();
+    expect(mcpJson.mcpServers["switchroom-telegram"].env.SWITCHROOM_CLI_PATH).toBeDefined();
   });
 
   it("does not write .mcp.json when channels.telegram.plugin is 'official'", () => {
@@ -273,8 +273,8 @@ describe("scaffoldAgent", () => {
     expect(settings.skipDangerousModePermissionPrompt).toBeUndefined();
   });
 
-  it("does not include clerk-telegram MCP server in settings.json (it lives in .mcp.json)", () => {
-    // The clerk fork loads via --dangerously-load-development-channels
+  it("does not include switchroom-telegram MCP server in settings.json (it lives in .mcp.json)", () => {
+    // The switchroom fork loads via --dangerously-load-development-channels
     // which reads from .mcp.json, not settings.json. Verify it doesn't
     // leak into settings.json.
     const config = makeAgentConfig();
@@ -283,7 +283,7 @@ describe("scaffoldAgent", () => {
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
 
-    expect(settings.mcpServers?.["clerk-telegram"]).toBeUndefined();
+    expect(settings.mcpServers?.["switchroom-telegram"]).toBeUndefined();
   });
 
   it("writes comment in .env when bot token is unresolvable vault reference", () => {
@@ -291,10 +291,10 @@ describe("scaffoldAgent", () => {
       bot_token: "vault:telegram-bot-token",
       forum_chat_id: "-1001234567890",
     };
-    // With no CLERK_VAULT_PASSPHRASE or TELEGRAM_BOT_TOKEN set, should write comment
-    const origPassphrase = process.env.CLERK_VAULT_PASSPHRASE;
+    // With no SWITCHROOM_VAULT_PASSPHRASE or TELEGRAM_BOT_TOKEN set, should write comment
+    const origPassphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     const origToken = process.env.TELEGRAM_BOT_TOKEN;
-    delete process.env.CLERK_VAULT_PASSPHRASE;
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
     delete process.env.TELEGRAM_BOT_TOKEN;
 
     try {
@@ -304,7 +304,7 @@ describe("scaffoldAgent", () => {
 
       expect(envContent).toContain("# Set your bot token");
     } finally {
-      if (origPassphrase !== undefined) process.env.CLERK_VAULT_PASSPHRASE = origPassphrase;
+      if (origPassphrase !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = origPassphrase;
       if (origToken !== undefined) process.env.TELEGRAM_BOT_TOKEN = origToken;
     }
   });
@@ -341,8 +341,8 @@ describe("scaffoldAgent", () => {
 
   it("injects Hindsight MCP config when memory backend is hindsight", () => {
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -350,14 +350,14 @@ describe("scaffoldAgent", () => {
         config: { provider: "ollama", docker_service: true },
       },
       agents: { "memory-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "memory-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const settings = JSON.parse(
@@ -372,8 +372,8 @@ describe("scaffoldAgent", () => {
 
   it("respects memory.config.url override for Hindsight MCP", () => {
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -385,14 +385,14 @@ describe("scaffoldAgent", () => {
         },
       },
       agents: { "memory-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "memory-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const settings = JSON.parse(
@@ -407,23 +407,23 @@ describe("reconcileAgent", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-reconcile-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-reconcile-"));
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function buildClerkConfig(
+  function buildSwitchroomConfig(
     agentConfig: AgentConfig,
-    memory?: ClerkConfig["memory"],
-  ): ClerkConfig {
+    memory?: SwitchroomConfig["memory"],
+  ): SwitchroomConfig {
     return {
-      clerk: { version: 1, agents_dir: tmpDir },
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory,
       agents: { "test-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
   }
 
   it("throws when the agent directory does not exist", () => {
@@ -434,7 +434,7 @@ describe("reconcileAgent", () => {
         agentConfig,
         tmpDir,
         telegramConfig,
-        buildClerkConfig(agentConfig),
+        buildSwitchroomConfig(agentConfig),
       ),
     ).toThrow(/Agent directory does not exist/);
   });
@@ -442,15 +442,15 @@ describe("reconcileAgent", () => {
   it("adds Hindsight MCP entry to settings.json after enabling memory backend", () => {
     // Step 1: scaffold an agent without memory
     const agentConfig = makeAgentConfig();
-    const initialConfig = buildClerkConfig(agentConfig);
+    const initialConfig = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
 
     const settingsPath = join(tmpDir, "test-agent", ".claude", "settings.json");
     const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(before.mcpServers?.hindsight).toBeUndefined();
 
-    // Step 2: turn on hindsight in clerk.yaml and reconcile
-    const updatedConfig = buildClerkConfig(agentConfig, {
+    // Step 2: turn on hindsight in switchroom.yaml and reconcile
+    const updatedConfig = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
       shared_collection: "shared",
       config: {
@@ -475,9 +475,9 @@ describe("reconcileAgent", () => {
     expect(after.permissions.allow).toContain("mcp__hindsight__*");
   });
 
-  it("rewrites .mcp.json for clerk-telegram-plugin agents to include hindsight", () => {
-    const agentConfig = makeAgentConfig({ channels: { telegram: { plugin: "clerk" } } });
-    const initialConfig = buildClerkConfig(agentConfig);
+  it("rewrites .mcp.json for switchroom-telegram-plugin agents to include hindsight", () => {
+    const agentConfig = makeAgentConfig({ channels: { telegram: { plugin: "switchroom" } } });
+    const initialConfig = buildSwitchroomConfig(agentConfig);
     scaffoldAgent(
       "test-agent",
       agentConfig,
@@ -485,15 +485,15 @@ describe("reconcileAgent", () => {
       telegramConfig,
       initialConfig,
       undefined,
-      "/tmp/clerk.yaml",
+      "/tmp/switchroom.yaml",
     );
 
     const mcpJsonPath = join(tmpDir, "test-agent", ".mcp.json");
     const before = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
-    expect(before.mcpServers["clerk-telegram"]).toBeDefined();
+    expect(before.mcpServers["switchroom-telegram"]).toBeDefined();
     expect(before.mcpServers.hindsight).toBeUndefined();
 
-    const updatedConfig = buildClerkConfig(agentConfig, {
+    const updatedConfig = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
       shared_collection: "shared",
       config: {
@@ -509,12 +509,12 @@ describe("reconcileAgent", () => {
       tmpDir,
       telegramConfig,
       updatedConfig,
-      "/tmp/clerk.yaml",
+      "/tmp/switchroom.yaml",
     );
 
     expect(result.changes).toContain(mcpJsonPath);
     const after = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
-    expect(after.mcpServers["clerk-telegram"]).toBeDefined();
+    expect(after.mcpServers["switchroom-telegram"]).toBeDefined();
     expect(after.mcpServers.hindsight).toBeDefined();
     expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
   });
@@ -525,7 +525,7 @@ describe("reconcileAgent", () => {
     // so config changes (like enabling Hindsight or switching ports)
     // propagate without forcing a full re-scaffold.
     const agentConfig = makeAgentConfig();
-    const initialConfig = buildClerkConfig(agentConfig);
+    const initialConfig = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
 
     const userEditedFiles = [
@@ -542,7 +542,7 @@ describe("reconcileAgent", () => {
       }
     }
 
-    const updatedConfig = buildClerkConfig(agentConfig, {
+    const updatedConfig = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
       shared_collection: "shared",
     });
@@ -557,15 +557,15 @@ describe("reconcileAgent", () => {
 
   it("re-renders start.sh when config drives template changes (Hindsight enable)", () => {
     const agentConfig = makeAgentConfig();
-    const initialConfig = buildClerkConfig(agentConfig);
+    const initialConfig = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
 
     const startShPath = join(tmpDir, "test-agent", "start.sh");
     const before = readFileSync(startShPath, "utf-8");
     expect(before).not.toContain("HINDSIGHT_API_URL");
 
-    // Enable Hindsight via clerk.yaml and reconcile
-    const withMemory = buildClerkConfig(agentConfig, {
+    // Enable Hindsight via switchroom.yaml and reconcile
+    const withMemory = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
       shared_collection: "shared",
       config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
@@ -581,10 +581,10 @@ describe("reconcileAgent", () => {
 
   it("returns no changes when settings already match", () => {
     const agentConfig = makeAgentConfig();
-    const config = buildClerkConfig(agentConfig);
+    const config = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, config);
 
-    // First reconcile may apply scaffold->reconcile drift (e.g. clerk-mcp entry)
+    // First reconcile may apply scaffold->reconcile drift (e.g. switchroom-mcp entry)
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, config);
     // Second should be a no-op
     const result = reconcileAgent(
@@ -599,7 +599,7 @@ describe("reconcileAgent", () => {
 
   it("removes hindsight MCP entry when backend is disabled", () => {
     const agentConfig = makeAgentConfig();
-    const withMemory = buildClerkConfig(agentConfig, {
+    const withMemory = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
       shared_collection: "shared",
     });
@@ -610,7 +610,7 @@ describe("reconcileAgent", () => {
     expect(beforeReconcile.permissions.allow).toContain("mcp__hindsight__*");
 
     // Reconcile against a config with backend=none
-    const withoutMemory = buildClerkConfig(agentConfig, {
+    const withoutMemory = buildSwitchroomConfig(agentConfig, {
       backend: "none",
       shared_collection: "shared",
     });
@@ -627,7 +627,7 @@ describe("installHindsightPlugin", () => {
   let agentDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-plugin-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-plugin-"));
     agentDir = join(tmpDir, "agent");
     mkdirSync(join(agentDir, ".claude"), { recursive: true });
   });
@@ -637,18 +637,18 @@ describe("installHindsightPlugin", () => {
   });
 
   it("returns null when memory backend is not hindsight", () => {
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: { backend: "none", shared_collection: "shared" },
       agents: { agent: { extends: "default", topic_name: "x", schedule: [] } },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     expect(installHindsightPlugin("agent", agentDir, config)).toBeNull();
   });
 
   it("returns null when agent has memory.auto_recall: false", () => {
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: { backend: "hindsight", shared_collection: "shared" },
       agents: {
@@ -659,13 +659,13 @@ describe("installHindsightPlugin", () => {
           memory: { collection: "general", auto_recall: false, isolation: "default" },
         },
       },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     expect(installHindsightPlugin("agent", agentDir, config)).toBeNull();
   });
 
   it("copies the vendored plugin tree and returns metadata when configured", () => {
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -680,7 +680,7 @@ describe("installHindsightPlugin", () => {
           memory: { collection: "general", auto_recall: true, isolation: "default" },
         },
       },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = installHindsightPlugin("agent", agentDir, config);
     expect(result).not.toBeNull();
     expect(result!.pluginDir).toBe(join(agentDir, ".claude", "plugins", "hindsight-memory"));
@@ -695,12 +695,12 @@ describe("installHindsightPlugin", () => {
   });
 
   it("falls back to agent name when no explicit collection is set", () => {
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: { backend: "hindsight", shared_collection: "shared" },
       agents: { coach: { extends: "default", topic_name: "x", schedule: [] } },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     mkdirSync(join(tmpDir, "coach", ".claude"), { recursive: true });
     const result = installHindsightPlugin("coach", join(tmpDir, "coach"), config);
     expect(result).not.toBeNull();
@@ -708,8 +708,8 @@ describe("installHindsightPlugin", () => {
   });
 
   it("strips the /mcp/ suffix from memory.config.url to get the REST base", () => {
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -717,7 +717,7 @@ describe("installHindsightPlugin", () => {
         config: { provider: "openai", docker_service: true, url: "http://localhost:18888/mcp/" },
       },
       agents: { agent: { extends: "default", topic_name: "x", schedule: [] } },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = installHindsightPlugin("agent", agentDir, config);
     expect(result).not.toBeNull();
     expect(result!.apiBaseUrl).toBe("http://localhost:18888");
@@ -728,7 +728,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-defaults-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-defaults-"));
   });
 
   afterEach(() => {
@@ -737,21 +737,21 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
   it("applies defaults.tools.allow to agents that leave tools unset", () => {
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         tools: { allow: ["Read", "Grep", "Edit"] },
       },
       agents: { "def-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "def-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -761,29 +761,29 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.permissions.allow).toContain("Read");
     expect(settings.permissions.allow).toContain("Grep");
     expect(settings.permissions.allow).toContain("Edit");
-    // Clerk-MCP wildcards still pre-approved
-    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+    // Switchroom-MCP wildcards still pre-approved
+    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
   });
 
   it("unions defaults.tools.allow with per-agent tools.allow", () => {
     const agentConfig = makeAgentConfig({
       tools: { allow: ["Bash", "Read"], deny: [] },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         tools: { allow: ["Read", "Grep"] },
       },
       agents: { "union-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "union-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -800,32 +800,32 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
   it("propagates defaults.channels.telegram.plugin to scaffold path", () => {
     // When the default is set globally, an agent that doesn't mention
-    // channels.telegram.plugin=clerk still gets .mcp.json written and the
-    // mcp__clerk-telegram__* tools pre-approved.
+    // channels.telegram.plugin=switchroom still gets .mcp.json written and the
+    // mcp__switchroom-telegram__* tools pre-approved.
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
-      defaults: { channels: { telegram: { plugin: "clerk" } } },
+      defaults: { channels: { telegram: { plugin: "switchroom" } } },
       agents: { "plugin-default-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "plugin-default-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
       undefined,
-      "/tmp/clerk.yaml",
+      "/tmp/switchroom.yaml",
     );
 
-    // .mcp.json was written (the clerk-telegram-plugin scaffold branch)
+    // .mcp.json was written (the switchroom-telegram-plugin scaffold branch)
     expect(existsSync(join(result.agentDir, ".mcp.json"))).toBe(true);
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
   });
 
   it("per-agent mcp_servers override defaults.mcp_servers by key", () => {
@@ -834,8 +834,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
         linear: { type: "http", url: "https://agent.linear.example" },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         mcp_servers: {
@@ -844,14 +844,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
         },
       },
       agents: { "mcp-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "mcp-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -865,15 +865,15 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
   it("reconcile respects defaults cascade too", () => {
     // Scaffold with defaults.tools.allow, then reconcile after changing
-    // clerk.yaml defaults — the merged allow-list should update without
+    // switchroom.yaml defaults — the merged allow-list should update without
     // touching the per-agent config.
     const agentConfig = makeAgentConfig();
-    const initial: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const initial: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: { tools: { allow: ["Read"] } },
       agents: { "rec-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     scaffoldAgent("rec-agent", agentConfig, tmpDir, telegramConfig, initial);
 
     const settingsPath = join(tmpDir, "rec-agent", ".claude", "settings.json");
@@ -882,10 +882,10 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(before.permissions.allow).not.toContain("Grep");
 
     // Update defaults and reconcile
-    const updated: ClerkConfig = {
+    const updated: SwitchroomConfig = {
       ...initial,
       defaults: { tools: { allow: ["Read", "Grep", "Edit"] } },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("rec-agent", agentConfig, tmpDir, telegramConfig, updated);
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
@@ -894,7 +894,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(after.permissions.allow).toContain("Edit");
   });
 
-  it("writes user hooks from clerk.yaml into settings.json under hooks", () => {
+  it("writes user hooks from switchroom.yaml into settings.json under hooks", () => {
     const agentConfig = makeAgentConfig({
       hooks: {
         UserPromptSubmit: [
@@ -905,18 +905,18 @@ describe("scaffoldAgent with global defaults cascade", () => {
         ],
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "hooks-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "hooks-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -930,7 +930,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
         ],
       },
     ]);
-    // User's Stop hook + clerk-owned handoff Stop hook (added
+    // User's Stop hook + switchroom-owned handoff Stop hook (added
     // automatically when session_continuity is enabled; default on).
     expect(settings.hooks.Stop).toEqual([
       {
@@ -942,7 +942,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
         hooks: [
           {
             type: "command",
-            command: "clerk handoff hooks-agent",
+            command: "switchroom handoff hooks-agent",
             timeout: 35,
             async: true,
           },
@@ -957,8 +957,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
         UserPromptSubmit: [{ command: "/agent/recall.sh" }],
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         hooks: {
@@ -967,14 +967,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
         },
       },
       agents: { "hook-union-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "hook-union-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -991,18 +991,18 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
   it("writes model override into settings.json when set", () => {
     const agentConfig = makeAgentConfig({ model: "claude-opus-4-6" });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "model-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "model-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -1017,7 +1017,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
   it("exports user env vars in start.sh in declaration order", () => {
     const agentConfig = makeAgentConfig({
       env: {
-        CLERK_AUDIT_URL: "https://audit.example",
+        SWITCHROOM_AUDIT_URL: "https://audit.example",
         LOG_LEVEL: "debug",
       },
     });
@@ -1031,7 +1031,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
     // Env values are POSIX-single-quoted by scaffold so shell-sensitive
     // bytes survive. See scaffold.ts userEnvQuoted.
-    expect(startSh).toContain("export CLERK_AUDIT_URL='https://audit.example'");
+    expect(startSh).toContain("export SWITCHROOM_AUDIT_URL='https://audit.example'");
     expect(startSh).toContain("export LOG_LEVEL='debug'");
   });
 
@@ -1069,28 +1069,28 @@ describe("scaffoldAgent with global defaults cascade", () => {
         permissions: { defaultMode: "bypassPermissions" },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "raw-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "raw-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
 
-    // Escape hatch wins — overrides clerk's default permissions.defaultMode
+    // Escape hatch wins — overrides switchroom's default permissions.defaultMode
     expect(settings.effort).toBe("high");
     expect(settings.permissions.defaultMode).toBe("bypassPermissions");
-    // And the pre-existing clerk-managed keys still present
-    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+    // And the pre-existing switchroom-managed keys still present
+    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
   });
 
   it("claude_md_raw is appended to CLAUDE.md on scaffold", () => {
@@ -1124,24 +1124,24 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toMatch(/exec claude.*'--effort' 'high' '--add-dir' '\/tmp\/has space'/);
   });
 
-  it("channels.telegram.plugin: 'clerk' writes .mcp.json for forked telegram plugin", () => {
+  it("channels.telegram.plugin: 'switchroom' writes .mcp.json for forked telegram plugin", () => {
     const agentConfig = makeAgentConfig({
-      channels: { telegram: { plugin: "clerk" } },
+      channels: { telegram: { plugin: "switchroom" } },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "chan-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "chan-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
       undefined,
-      "/tmp/clerk.yaml",
+      "/tmp/switchroom.yaml",
     );
 
     // Same .mcp.json + permissions pre-approval as the legacy path
@@ -1149,11 +1149,11 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
 
     // start.sh emits the dev-channels flag
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--dangerously-load-development-channels server:clerk-telegram");
+    expect(startSh).toContain("--dangerously-load-development-channels server:switchroom-telegram");
   });
 
   it("channels.telegram.plugin: 'official' keeps the upstream marketplace plugin", () => {
@@ -1167,7 +1167,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
       telegramConfig,
     );
 
-    // No .mcp.json because the clerk-telegram fork isn't loaded
+    // No .mcp.json because the switchroom-telegram fork isn't loaded
     expect(existsSync(join(result.agentDir, ".mcp.json"))).toBe(false);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     expect(startSh).toContain("--channels plugin:telegram@claude-plugins-official");
@@ -1185,14 +1185,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    expect(startSh).toContain("export CLERK_TG_FORMAT='markdownv2'");
-    expect(startSh).toContain("export CLERK_TG_RATE_LIMIT_MS='500'");
+    expect(startSh).toContain("export SWITCHROOM_TG_FORMAT='markdownv2'");
+    expect(startSh).toContain("export SWITCHROOM_TG_RATE_LIMIT_MS='500'");
   });
 
   it("user env entry wins over channel-derived env default on key conflict", () => {
     const agentConfig = makeAgentConfig({
       channels: { telegram: { format: "markdownv2" } },
-      env: { CLERK_TG_FORMAT: "text" }, // explicit override
+      env: { SWITCHROOM_TG_FORMAT: "text" }, // explicit override
     });
     const result = scaffoldAgent(
       "chan-env-override",
@@ -1203,29 +1203,29 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
     // Only the user value remains
-    expect(startSh).toContain("export CLERK_TG_FORMAT='text'");
-    expect(startSh).not.toContain("export CLERK_TG_FORMAT='markdownv2'");
+    expect(startSh).toContain("export SWITCHROOM_TG_FORMAT='text'");
+    expect(startSh).not.toContain("export SWITCHROOM_TG_FORMAT='markdownv2'");
   });
 
   it("reconcile propagates hooks/env/model updates without touching user files", () => {
     const agentConfig = makeAgentConfig();
-    const initial: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const initial: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "rec-phase2": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     scaffoldAgent("rec-phase2", agentConfig, tmpDir, telegramConfig, initial);
 
-    // Update agent config in-place (a real user would edit clerk.yaml)
+    // Update agent config in-place (a real user would edit switchroom.yaml)
     const updatedAgent = makeAgentConfig({
       model: "claude-sonnet-4-6",
       hooks: { Stop: [{ command: "/new/hook.sh", async: true }] },
       env: { NEW_VAR: "hello" },
     });
-    const updated: ClerkConfig = {
+    const updated: SwitchroomConfig = {
       ...initial,
       agents: { "rec-phase2": updatedAgent },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("rec-phase2", updatedAgent, tmpDir, telegramConfig, updated);
 
     const settings = JSON.parse(
@@ -1239,29 +1239,29 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("--model 'claude-sonnet-4-6'");
   });
 
-  it("is a no-op when clerk.yaml has no defaults block (backcompat)", () => {
+  it("is a no-op when switchroom.yaml has no defaults block (backcompat)", () => {
     // The refactor moved scaffold through mergeAgentConfig. This test
     // asserts that omitting `defaults` produces the same settings.json
     // as the pre-refactor code path would have.
     const agentConfig = makeAgentConfig({
       tools: { allow: ["Bash", "Edit"], deny: [] },
-      channels: { telegram: { plugin: "clerk" } },
+      channels: { telegram: { plugin: "switchroom" } },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "nodef-agent": agentConfig },
       // defaults intentionally omitted
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "nodef-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
       undefined,
-      "/tmp/clerk.yaml",
+      "/tmp/switchroom.yaml",
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -1269,8 +1269,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
     expect(settings.permissions.allow).toContain("Bash");
     expect(settings.permissions.allow).toContain("Edit");
-    expect(settings.permissions.allow).toContain("mcp__clerk-telegram__reply");
-    expect(settings.permissions.allow).toContain("mcp__clerk__*");
+    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
+    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
   });
 });
 
@@ -1280,7 +1280,7 @@ describe("scaffoldAgent global skills pool", () => {
   let origHome: string | undefined;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-skills-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-skills-"));
     skillsPool = join(tmpDir, "skills-pool");
 
     // Populate a fake skills pool with three fake skills
@@ -1303,24 +1303,24 @@ describe("scaffoldAgent global skills pool", () => {
   function buildConfig(
     agentConfig: AgentConfig,
     skillsDir?: string,
-  ): ClerkConfig {
+  ): SwitchroomConfig {
     return {
-      clerk: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsDir ?? skillsPool },
+      switchroom: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsDir ?? skillsPool },
       telegram: telegramConfig,
       agents: { "skills-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
   }
 
   it("symlinks declared skills from the pool into the agent skills dir", () => {
     const agentConfig = makeAgentConfig({ skills: ["checkin", "retain"] });
-    const clerkConfig = buildConfig(agentConfig);
+    const switchroomConfig = buildConfig(agentConfig);
 
     const result = scaffoldAgent(
       "skills-agent",
       agentConfig,
       join(tmpDir, "agents"),
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const checkinPath = join(result.agentDir, "skills", "checkin");
@@ -1334,19 +1334,19 @@ describe("scaffoldAgent global skills pool", () => {
 
   it("unions defaults.skills with agent.skills in the symlink pass", () => {
     const agentConfig = makeAgentConfig({ skills: ["weekly-review"] });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsPool },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: join(tmpDir, "agents"), skills_dir: skillsPool },
       telegram: telegramConfig,
       defaults: { skills: ["checkin", "retain"] },
       agents: { "skills-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "skills-agent",
       agentConfig,
       join(tmpDir, "agents"),
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     for (const name of ["checkin", "retain", "weekly-review"]) {
@@ -1356,7 +1356,7 @@ describe("scaffoldAgent global skills pool", () => {
 
   it("warns and skips missing skills without throwing", () => {
     const agentConfig = makeAgentConfig({ skills: ["checkin", "does-not-exist"] });
-    const clerkConfig = buildConfig(agentConfig);
+    const switchroomConfig = buildConfig(agentConfig);
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = scaffoldAgent(
@@ -1364,7 +1364,7 @@ describe("scaffoldAgent global skills pool", () => {
       agentConfig,
       join(tmpDir, "agents"),
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     warnSpy.mockRestore();
 
@@ -1372,7 +1372,7 @@ describe("scaffoldAgent global skills pool", () => {
     expect(existsSync(join(result.agentDir, "skills", "does-not-exist"))).toBe(false);
   });
 
-  it("reconcile removes stale symlinks when a skill is dropped from clerk.yaml", () => {
+  it("reconcile removes stale symlinks when a skill is dropped from switchroom.yaml", () => {
     const before = makeAgentConfig({ skills: ["checkin", "retain"] });
     const initial = buildConfig(before);
     const result = scaffoldAgent(
@@ -1405,13 +1405,13 @@ describe("scaffoldAgent global skills pool", () => {
     // A reconcile that removes nothing from the pool must leave that
     // file in place.
     const agentConfig = makeAgentConfig({ skills: ["checkin"] });
-    const clerkConfig = buildConfig(agentConfig);
+    const switchroomConfig = buildConfig(agentConfig);
     const result = scaffoldAgent(
       "skills-agent",
       agentConfig,
       join(tmpDir, "agents"),
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const templateSkill = join(result.agentDir, "skills", "template-skill");
@@ -1424,7 +1424,7 @@ describe("scaffoldAgent global skills pool", () => {
       agentConfig,
       join(tmpDir, "agents"),
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     // template-skill survives because it's a real directory, not a
@@ -1437,7 +1437,7 @@ describe("phase-6b bug fixes", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-phase6b-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-phase6b-"));
   });
 
   afterEach(() => {
@@ -1481,92 +1481,92 @@ describe("phase-6b bug fixes", () => {
     expect(startSh).toContain(`'--note' 'can'"'"'t stop $PATH'`);
   });
 
-  it("reconcile drops settings.hooks events that were removed from clerk.yaml", () => {
+  it("reconcile drops settings.hooks events that were removed from switchroom.yaml", () => {
     const withHooks = makeAgentConfig({
       hooks: {
         UserPromptSubmit: [{ command: "/opt/a.sh" }],
         Stop: [{ command: "/opt/b.sh", async: true }],
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "drift-agent": withHooks },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
-    scaffoldAgent("drift-agent", withHooks, tmpDir, telegramConfig, clerkConfig);
+    scaffoldAgent("drift-agent", withHooks, tmpDir, telegramConfig, switchroomConfig);
     const settingsPath = join(tmpDir, "drift-agent", ".claude", "settings.json");
     const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(before.hooks.UserPromptSubmit).toBeDefined();
     expect(before.hooks.Stop).toBeDefined();
 
-    // User removes Stop from clerk.yaml
+    // User removes Stop from switchroom.yaml
     const lessHooks = makeAgentConfig({
       hooks: { UserPromptSubmit: [{ command: "/opt/a.sh" }] },
     });
-    const updated: ClerkConfig = {
-      ...clerkConfig,
+    const updated: SwitchroomConfig = {
+      ...switchroomConfig,
       agents: { "drift-agent": lessHooks },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("drift-agent", lessHooks, tmpDir, telegramConfig, updated);
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.hooks.UserPromptSubmit).toBeDefined();
-    // User Stop was dropped. The clerk-owned handoff Stop (auto-added
+    // User Stop was dropped. The switchroom-owned handoff Stop (auto-added
     // when session_continuity is enabled — the default) remains.
     expect(after.hooks.Stop).toBeDefined();
-    expect(JSON.stringify(after.hooks.Stop)).toContain("clerk handoff");
+    expect(JSON.stringify(after.hooks.Stop)).toContain("switchroom handoff");
     expect(JSON.stringify(after.hooks.Stop)).not.toContain("/opt/b.sh");
   });
 
-  it("reconcile retracts settings_raw keys that were removed from clerk.yaml", () => {
+  it("reconcile retracts settings_raw keys that were removed from switchroom.yaml", () => {
     const withRaw = makeAgentConfig({
       settings_raw: { effort: "high", customKey: "original" },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "raw-drift": withRaw },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
-    scaffoldAgent("raw-drift", withRaw, tmpDir, telegramConfig, clerkConfig);
+    scaffoldAgent("raw-drift", withRaw, tmpDir, telegramConfig, switchroomConfig);
     const settingsPath = join(tmpDir, "raw-drift", ".claude", "settings.json");
     const before = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(before.effort).toBe("high");
     expect(before.customKey).toBe("original");
     // Side-car tracks what was injected
-    expect(before._clerkManagedRawKeys).toEqual(["effort", "customKey"]);
+    expect(before._switchroomManagedRawKeys).toEqual(["effort", "customKey"]);
 
-    // User removes customKey from clerk.yaml
+    // User removes customKey from switchroom.yaml
     const lessRaw = makeAgentConfig({ settings_raw: { effort: "high" } });
-    const updated: ClerkConfig = {
-      ...clerkConfig,
+    const updated: SwitchroomConfig = {
+      ...switchroomConfig,
       agents: { "raw-drift": lessRaw },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("raw-drift", lessRaw, tmpDir, telegramConfig, updated);
 
     const after = JSON.parse(readFileSync(settingsPath, "utf-8"));
     expect(after.effort).toBe("high"); // still present
     expect(after.customKey).toBeUndefined(); // retracted
-    expect(after._clerkManagedRawKeys).toEqual(["effort"]);
+    expect(after._switchroomManagedRawKeys).toEqual(["effort"]);
   });
 
   it("reconcile retracts all settings_raw keys when the field is cleared entirely", () => {
     const withRaw = makeAgentConfig({
       settings_raw: { effort: "high", apiKeyHelper: "/bin/true" },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "clear-drift": withRaw },
-    } as ClerkConfig;
-    scaffoldAgent("clear-drift", withRaw, tmpDir, telegramConfig, clerkConfig);
+    } as SwitchroomConfig;
+    scaffoldAgent("clear-drift", withRaw, tmpDir, telegramConfig, switchroomConfig);
 
     const emptyRaw = makeAgentConfig();
-    const updated: ClerkConfig = {
-      ...clerkConfig,
+    const updated: SwitchroomConfig = {
+      ...switchroomConfig,
       agents: { "clear-drift": emptyRaw },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("clear-drift", emptyRaw, tmpDir, telegramConfig, updated);
 
     const after = JSON.parse(
@@ -1574,7 +1574,7 @@ describe("phase-6b bug fixes", () => {
     );
     expect(after.effort).toBeUndefined();
     expect(after.apiKeyHelper).toBeUndefined();
-    expect(after._clerkManagedRawKeys).toBeUndefined();
+    expect(after._switchroomManagedRawKeys).toBeUndefined();
   });
 
   it("reconcile is idempotent across two back-to-back runs with the same config", () => {
@@ -1584,20 +1584,20 @@ describe("phase-6b bug fixes", () => {
       model: "claude-sonnet-4-6",
       settings_raw: { effort: "high" },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "idem-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
-    scaffoldAgent("idem-agent", agentConfig, tmpDir, telegramConfig, clerkConfig);
-    reconcileAgent("idem-agent", agentConfig, tmpDir, telegramConfig, clerkConfig);
+    scaffoldAgent("idem-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("idem-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
     const result = reconcileAgent(
       "idem-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     // Second reconcile is a no-op — no files touched
     expect(result.changes).toEqual([]);
@@ -1609,8 +1609,8 @@ describe("phase-6b bug fixes", () => {
     // and the profile has no schedule field at all. Covered indirectly
     // by scaffolding an agent whose cascade exercises the path.
     const agentConfig = makeAgentConfig({ extends: "coder" });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         schedule: [{ cron: "0 9 * * *", prompt: "standup" }],
@@ -1619,11 +1619,11 @@ describe("phase-6b bug fixes", () => {
         coder: { tools: { allow: ["Bash"] } }, // no schedule
       },
       agents: { "sched-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     // This call would previously TypeError via [...undefined]
     expect(() =>
-      scaffoldAgent("sched-agent", agentConfig, tmpDir, telegramConfig, clerkConfig),
+      scaffoldAgent("sched-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig),
     ).not.toThrow();
   });
 });
@@ -1632,7 +1632,7 @@ describe("scheduled task cron script generation", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-cron-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-cron-"));
   });
 
   afterEach(() => {
@@ -1691,12 +1691,12 @@ describe("scheduled task cron script generation", () => {
     const initial = makeAgentConfig({
       schedule: [{ cron: "0 8 * * *", prompt: "v1 prompt" }],
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "cron-rec": initial },
-    } as ClerkConfig;
-    scaffoldAgent("cron-rec", initial, tmpDir, telegramConfig, clerkConfig);
+    } as SwitchroomConfig;
+    scaffoldAgent("cron-rec", initial, tmpDir, telegramConfig, switchroomConfig);
 
     const scriptPath = join(tmpDir, "cron-rec", "telegram", "cron-0.sh");
     expect(readFileSync(scriptPath, "utf-8")).toContain("v1 prompt");
@@ -1704,10 +1704,10 @@ describe("scheduled task cron script generation", () => {
     const updated = makeAgentConfig({
       schedule: [{ cron: "0 8 * * *", prompt: "v2 prompt updated" }],
     });
-    const updatedConfig: ClerkConfig = {
-      ...clerkConfig,
+    const updatedConfig: SwitchroomConfig = {
+      ...switchroomConfig,
       agents: { "cron-rec": updated },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = reconcileAgent("cron-rec", updated, tmpDir, telegramConfig, updatedConfig);
 
     expect(result.changes).toContain(scriptPath);
@@ -1718,21 +1718,21 @@ describe("scheduled task cron script generation", () => {
     const agentConfig = makeAgentConfig({
       schedule: [{ cron: "0 17 * * *", prompt: "Agent evening check" }],
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         schedule: [{ cron: "0 8 * * *", prompt: "Global morning briefing" }],
       },
       agents: { "cascade-cron": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "cascade-cron",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     // Defaults schedule is prepended — cron-0 is the global entry
@@ -1755,7 +1755,7 @@ describe("sub-agent file generation", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-subagents-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-subagents-"));
   });
 
   afterEach(() => {
@@ -1776,18 +1776,18 @@ describe("sub-agent file generation", () => {
         },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "sa-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "sa-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const mdPath = join(result.agentDir, ".claude", "agents", "worker.md");
@@ -1816,8 +1816,8 @@ describe("sub-agent file generation", () => {
         },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         subagents: {
@@ -1830,14 +1830,14 @@ describe("sub-agent file generation", () => {
         },
       },
       agents: { "merge-sa": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "merge-sa",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const agentsDir = join(result.agentDir, ".claude", "agents");
@@ -1864,8 +1864,8 @@ describe("sub-agent file generation", () => {
         },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         subagents: {
@@ -1877,14 +1877,14 @@ describe("sub-agent file generation", () => {
         },
       },
       agents: { "override-sa": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "override-sa",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
 
     const content = readFileSync(
@@ -1906,12 +1906,12 @@ describe("sub-agent file generation", () => {
         },
       },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "rec-sa": initial },
-    } as ClerkConfig;
-    scaffoldAgent("rec-sa", initial, tmpDir, telegramConfig, clerkConfig);
+    } as SwitchroomConfig;
+    scaffoldAgent("rec-sa", initial, tmpDir, telegramConfig, switchroomConfig);
 
     const mdPath = join(tmpDir, "rec-sa", ".claude", "agents", "worker.md");
     expect(readFileSync(mdPath, "utf-8")).toContain("Version 1.");
@@ -1926,10 +1926,10 @@ describe("sub-agent file generation", () => {
         },
       },
     });
-    const updatedConfig: ClerkConfig = {
-      ...clerkConfig,
+    const updatedConfig: SwitchroomConfig = {
+      ...switchroomConfig,
       agents: { "rec-sa": updated },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = reconcileAgent(
       "rec-sa",
       updated,
@@ -1970,7 +1970,7 @@ describe("session freshness in start.sh", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-session-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-session-"));
   });
 
   afterEach(() => {
@@ -1996,24 +1996,24 @@ describe("session freshness in start.sh", () => {
 
   it("installs the Stop hook for handoff by default", () => {
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "handoff-default-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = scaffoldAgent(
       "handoff-default-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
     expect(settings.hooks.Stop).toBeDefined();
     expect(JSON.stringify(settings.hooks.Stop)).toContain(
-      "clerk handoff handoff-default-agent",
+      "switchroom handoff handoff-default-agent",
     );
   });
 
@@ -2021,17 +2021,17 @@ describe("session freshness in start.sh", () => {
     const agentConfig = makeAgentConfig({
       session_continuity: { enabled: false },
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "handoff-off-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     const result = scaffoldAgent(
       "handoff-off-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -2039,7 +2039,7 @@ describe("session freshness in start.sh", () => {
     expect(settings.hooks.Stop).toBeUndefined();
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     expect(startSh).not.toContain(".handoff.md");
-    expect(startSh).not.toContain("CLERK_HANDOFF_SHOW_LINE");
+    expect(startSh).not.toContain("SWITCHROOM_HANDOFF_SHOW_LINE");
   });
 
   it("threads show_handoff_line=false through to start.sh env", () => {
@@ -2053,7 +2053,7 @@ describe("session freshness in start.sh", () => {
       telegramConfig,
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("CLERK_HANDOFF_SHOW_LINE=false");
+    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=false");
   });
 
 });
@@ -2062,7 +2062,7 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-profiles-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-profiles-"));
   });
 
   afterEach(() => {
@@ -2071,8 +2071,8 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
 
   it("merges inline profile between defaults and per-agent config", () => {
     const agentConfig = makeAgentConfig({ extends: "coder" });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       defaults: {
         tools: { allow: ["Read"] },
@@ -2085,14 +2085,14 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
         },
       },
       agents: { "profile-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "profile-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -2115,21 +2115,21 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
       extends: "coder",
       model: "claude-opus-4-6",
     });
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       profiles: {
         coder: { model: "claude-sonnet-4-6" },
       },
       agents: { "override-agent": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent(
       "override-agent",
       agentConfig,
       tmpDir,
       telegramConfig,
-      clerkConfig,
+      switchroomConfig,
     );
     const settings = JSON.parse(
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
@@ -2142,7 +2142,7 @@ describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", 
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-automem-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-automem-"));
   });
 
   afterEach(() => {
@@ -2153,8 +2153,8 @@ describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", 
     const agentConfig = makeAgentConfig({
       memory: { collection: "general", auto_recall: true, isolation: "default" },
     });
-    const config: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -2162,7 +2162,7 @@ describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", 
         config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
       },
       agents: { hindsight_agent: agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
     const result = scaffoldAgent("hindsight_agent", agentConfig, tmpDir, telegramConfig, config);
     const settings = JSON.parse(
@@ -2178,8 +2178,8 @@ describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", 
     const agentConfig = makeAgentConfig({
       memory: { collection: "general", auto_recall: true, isolation: "default" },
     });
-    const withMemory: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const withMemory: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       memory: {
         backend: "hindsight",
@@ -2187,13 +2187,13 @@ describe("scaffoldAgent disables Claude Code auto-memory when Hindsight is on", 
         config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
       },
       agents: { hindsight_agent: agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     scaffoldAgent("hindsight_agent", agentConfig, tmpDir, telegramConfig, withMemory);
 
-    const withoutMemory: ClerkConfig = {
+    const withoutMemory: SwitchroomConfig = {
       ...withMemory,
       memory: { backend: "none", shared_collection: "shared" },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
     reconcileAgent("hindsight_agent", agentConfig, tmpDir, telegramConfig, withoutMemory);
 
     const afterSettings = JSON.parse(
@@ -2207,7 +2207,7 @@ describe("renderTemplate", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-tpl-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-tpl-"));
   });
 
   afterEach(() => {
@@ -2239,30 +2239,30 @@ describe("renderTemplate", () => {
   });
 });
 
-describe("installClerkSkills", () => {
+describe("installSwitchroomSkills", () => {
   let tmpDir: string;
   let fakeSkillsDir: string;
   let agentDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-builtin-skills-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-builtin-skills-"));
     agentDir = join(tmpDir, "my-agent");
     mkdirSync(agentDir, { recursive: true });
 
-    // Create a fake built-in skills directory with two clerk-* skills and
-    // one non-clerk directory that must be ignored.
+    // Create a fake built-in skills directory with two switchroom-* skills and
+    // one non-switchroom directory that must be ignored.
     fakeSkillsDir = join(tmpDir, "fake-skills");
-    for (const name of ["clerk-manage", "clerk-health"]) {
+    for (const name of ["switchroom-manage", "switchroom-health"]) {
       const d = join(fakeSkillsDir, name);
       mkdirSync(d, { recursive: true });
       writeFileSync(join(d, "SKILL.md"), `# ${name}\n`, "utf-8");
     }
-    // A clerk-* dir WITHOUT a SKILL.md — should be skipped
-    mkdirSync(join(fakeSkillsDir, "clerk-noskill"), { recursive: true });
-    // A non-clerk dir WITH a SKILL.md — should also be skipped (name filter)
-    const nonClerk = join(fakeSkillsDir, "some-other-skill");
-    mkdirSync(nonClerk, { recursive: true });
-    writeFileSync(join(nonClerk, "SKILL.md"), "# other\n", "utf-8");
+    // A switchroom-* dir WITHOUT a SKILL.md — should be skipped
+    mkdirSync(join(fakeSkillsDir, "switchroom-noskill"), { recursive: true });
+    // A non-switchroom dir WITH a SKILL.md — should also be skipped (name filter)
+    const nonSwitchroom = join(fakeSkillsDir, "some-other-skill");
+    mkdirSync(nonSwitchroom, { recursive: true });
+    writeFileSync(join(nonSwitchroom, "SKILL.md"), "# other\n", "utf-8");
   });
 
   afterEach(() => {
@@ -2270,23 +2270,23 @@ describe("installClerkSkills", () => {
   });
 
   /**
-   * Helper that calls installClerkSkills but overrides import.meta.dirname
+   * Helper that calls installSwitchroomSkills but overrides import.meta.dirname
    * by instead directly symlinking from our fakeSkillsDir. Since the real
-   * installClerkSkills resolves relative to the compiled module path, we
+   * installSwitchroomSkills resolves relative to the compiled module path, we
    * test the exported function with the real skills/ directory and separately
    * verify the logic using a thin wrapper that accepts the skills dir as
    * a parameter.
    */
   function runWithFakeSkills(targetAgentDir: string): void {
-    // Manually replicate installClerkSkills logic against fakeSkillsDir so
+    // Manually replicate installSwitchroomSkills logic against fakeSkillsDir so
     // we can test the filtering and symlinking behaviour without touching
     // the live skills/ directory.
     const targetSkillsDir = join(targetAgentDir, ".claude", "skills");
     mkdirSync(targetSkillsDir, { recursive: true });
-    for (const name of ["clerk-manage", "clerk-health", "clerk-noskill", "some-other-skill"]) {
+    for (const name of ["switchroom-manage", "switchroom-health", "switchroom-noskill", "some-other-skill"]) {
       const src = join(fakeSkillsDir, name);
       if (!existsSync(src)) continue;
-      if (!name.startsWith("clerk-")) continue;
+      if (!name.startsWith("switchroom-")) continue;
       let stat;
       try { stat = lstatSync(src); } catch { continue; }
       if (!stat.isDirectory()) continue;
@@ -2297,24 +2297,24 @@ describe("installClerkSkills", () => {
     }
   }
 
-  it("symlinks clerk-* skills that have a SKILL.md into .claude/skills/", () => {
+  it("symlinks switchroom-* skills that have a SKILL.md into .claude/skills/", () => {
     runWithFakeSkills(agentDir);
 
     const skillsDir = join(agentDir, ".claude", "skills");
-    expect(existsSync(join(skillsDir, "clerk-manage"))).toBe(true);
-    expect(existsSync(join(skillsDir, "clerk-health"))).toBe(true);
+    expect(existsSync(join(skillsDir, "switchroom-manage"))).toBe(true);
+    expect(existsSync(join(skillsDir, "switchroom-health"))).toBe(true);
     // Verify they are symlinks pointing into fakeSkillsDir
-    expect(readlinkSync(join(skillsDir, "clerk-manage"))).toBe(join(fakeSkillsDir, "clerk-manage"));
-    expect(readlinkSync(join(skillsDir, "clerk-health"))).toBe(join(fakeSkillsDir, "clerk-health"));
+    expect(readlinkSync(join(skillsDir, "switchroom-manage"))).toBe(join(fakeSkillsDir, "switchroom-manage"));
+    expect(readlinkSync(join(skillsDir, "switchroom-health"))).toBe(join(fakeSkillsDir, "switchroom-health"));
   });
 
-  it("skips clerk-* directories that have no SKILL.md", () => {
+  it("skips switchroom-* directories that have no SKILL.md", () => {
     runWithFakeSkills(agentDir);
     const skillsDir = join(agentDir, ".claude", "skills");
-    expect(existsSync(join(skillsDir, "clerk-noskill"))).toBe(false);
+    expect(existsSync(join(skillsDir, "switchroom-noskill"))).toBe(false);
   });
 
-  it("skips non-clerk directories even when they have a SKILL.md", () => {
+  it("skips non-switchroom directories even when they have a SKILL.md", () => {
     runWithFakeSkills(agentDir);
     const skillsDir = join(agentDir, ".claude", "skills");
     expect(existsSync(join(skillsDir, "some-other-skill"))).toBe(false);
@@ -2325,12 +2325,12 @@ describe("installClerkSkills", () => {
     // Second call must not throw and symlinks must still be intact
     expect(() => runWithFakeSkills(agentDir)).not.toThrow();
     const skillsDir = join(agentDir, ".claude", "skills");
-    expect(existsSync(join(skillsDir, "clerk-manage"))).toBe(true);
-    expect(readlinkSync(join(skillsDir, "clerk-manage"))).toBe(join(fakeSkillsDir, "clerk-manage"));
+    expect(existsSync(join(skillsDir, "switchroom-manage"))).toBe(true);
+    expect(readlinkSync(join(skillsDir, "switchroom-manage"))).toBe(join(fakeSkillsDir, "switchroom-manage"));
   });
 
-  it("does not disturb pre-existing non-clerk skills in .claude/skills/", () => {
-    // Place a non-clerk skill manually before running
+  it("does not disturb pre-existing non-switchroom skills in .claude/skills/", () => {
+    // Place a non-switchroom skill manually before running
     const skillsDir = join(agentDir, ".claude", "skills");
     mkdirSync(skillsDir, { recursive: true });
     const existing = join(skillsDir, "my-custom-skill");
@@ -2342,8 +2342,8 @@ describe("installClerkSkills", () => {
     // Custom skill is untouched
     expect(existsSync(existing)).toBe(true);
     expect(readFileSync(join(existing, "SKILL.md"), "utf-8")).toContain("# custom");
-    // Clerk skills were also linked
-    expect(existsSync(join(skillsDir, "clerk-manage"))).toBe(true);
+    // Switchroom skills were also linked
+    expect(existsSync(join(skillsDir, "switchroom-manage"))).toBe(true);
   });
 
   it("creates .claude/skills/ if it does not exist yet", () => {
@@ -2352,13 +2352,13 @@ describe("installClerkSkills", () => {
     // Do NOT pre-create .claude/skills/
     runWithFakeSkills(freshAgentDir);
     expect(existsSync(join(freshAgentDir, ".claude", "skills"))).toBe(true);
-    expect(existsSync(join(freshAgentDir, ".claude", "skills", "clerk-manage"))).toBe(true);
+    expect(existsSync(join(freshAgentDir, ".claude", "skills", "switchroom-manage"))).toBe(true);
   });
 
-  it("scaffoldAgent installs clerk skills into .claude/skills/ automatically", () => {
-    // The real installClerkSkills resolves to the project's skills/ directory.
+  it("scaffoldAgent installs switchroom skills into .claude/skills/ automatically", () => {
+    // The real installSwitchroomSkills resolves to the project's skills/ directory.
     // Verify that after scaffoldAgent the .claude/skills directory exists and
-    // contains at least one clerk-* symlink (assuming the real skills/ is present).
+    // contains at least one switchroom-* symlink (assuming the real skills/ is present).
     const result = scaffoldAgent(
       "auto-skills-agent",
       makeAgentConfig(),
@@ -2367,30 +2367,30 @@ describe("installClerkSkills", () => {
     );
     const claudeSkillsDir = join(result.agentDir, ".claude", "skills");
     expect(existsSync(claudeSkillsDir)).toBe(true);
-    // At least one clerk-* entry should be present (from the real skills/)
+    // At least one switchroom-* entry should be present (from the real skills/)
     const entries = require("node:fs").readdirSync(claudeSkillsDir) as string[];
-    const clerkEntries = entries.filter((e: string) => e.startsWith("clerk-"));
-    expect(clerkEntries.length).toBeGreaterThan(0);
+    const switchroomEntries = entries.filter((e: string) => e.startsWith("switchroom-"));
+    expect(switchroomEntries.length).toBeGreaterThan(0);
   });
 
-  it("reconcileAgent installs clerk skills into .claude/skills/ automatically", () => {
+  it("reconcileAgent installs switchroom skills into .claude/skills/ automatically", () => {
     const agentConfig = makeAgentConfig();
-    const clerkConfig: ClerkConfig = {
-      clerk: { version: 1, agents_dir: tmpDir },
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       agents: { "rec-skills": agentConfig },
-    } as ClerkConfig;
+    } as SwitchroomConfig;
 
-    scaffoldAgent("rec-skills", agentConfig, tmpDir, telegramConfig, clerkConfig);
+    scaffoldAgent("rec-skills", agentConfig, tmpDir, telegramConfig, switchroomConfig);
     // Remove .claude/skills to simulate a fresh state
     rmSync(join(tmpDir, "rec-skills", ".claude", "skills"), { recursive: true, force: true });
 
-    reconcileAgent("rec-skills", agentConfig, tmpDir, telegramConfig, clerkConfig);
+    reconcileAgent("rec-skills", agentConfig, tmpDir, telegramConfig, switchroomConfig);
 
     const claudeSkillsDir = join(tmpDir, "rec-skills", ".claude", "skills");
     expect(existsSync(claudeSkillsDir)).toBe(true);
     const entries = require("node:fs").readdirSync(claudeSkillsDir) as string[];
-    const clerkEntries = entries.filter((e: string) => e.startsWith("clerk-"));
-    expect(clerkEntries.length).toBeGreaterThan(0);
+    const switchroomEntries = entries.filter((e: string) => e.startsWith("switchroom-"));
+    expect(switchroomEntries.length).toBeGreaterThan(0);
   });
 });

@@ -36,13 +36,13 @@ describe('V1Extractor', () => {
     expect(extractor.extract(term)).toBeNull()
   })
 
-  it('returns null when no clerk-telegram tool block is present', async () => {
+  it('returns null when no switchroom-telegram tool block is present', async () => {
     const term = await feedToTerm('● Bash(ls -la)\r\n  ⎿  total 4\r\n     drwx 2 user user\r\n')
     expect(extractor.extract(term)).toBeNull()
   })
 
   it('extracts a complete reply text on a single line', async () => {
-    const tui = '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Hello world")\r\n'
+    const tui = '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Hello world")\r\n'
     const term = await feedToTerm(tui)
     expect(extractor.extract(term)).toBe('Hello world')
   })
@@ -50,7 +50,7 @@ describe('V1Extractor', () => {
   it('extracts a multi-line reply with continuation indentation', async () => {
     // Synthesized to match the real shape from the live server's service.log
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "-1009999999999", text: "Yes — I can',
+      '● switchroom-telegram - reply (MCP)(chat_id: "-1009999999999", text: "Yes — I can',
       '                              attach files to replies. Images send as inline',
       '                              photos, and other file types go as documents (up',
       '                              to 50MB each). Just point me at a file path or ask',
@@ -71,7 +71,7 @@ describe('V1Extractor', () => {
   it('extracts an in-progress reply (no closing paren yet)', async () => {
     // Mid-stream: the text is still being generated, no `")` closer
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Working on this',
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Working on this',
       '                              for you, just need a second',
     ].join('\r\n')
     const term = await feedToTerm(tui)
@@ -83,12 +83,12 @@ describe('V1Extractor', () => {
 
   it('takes the most recent reply when there are several in the buffer', async () => {
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "First reply")',
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "First reply")',
       '',
       '● Bash(echo hi)',
       '  ⎿  hi',
       '',
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Second reply, the latest one")',
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Second reply, the latest one")',
       '',
     ].join('\r\n')
     const term = await feedToTerm(tui)
@@ -96,14 +96,14 @@ describe('V1Extractor', () => {
   })
 
   it('also matches stream_reply tool calls', async () => {
-    const tui = '● clerk-telegram - stream_reply (MCP)(chat_id: "123", text: "Streaming partial")\r\n'
+    const tui = '● switchroom-telegram - stream_reply (MCP)(chat_id: "123", text: "Streaming partial")\r\n'
     const term = await feedToTerm(tui)
     expect(extractor.extract(term)).toBe('Streaming partial')
   })
 
   it('stops accumulating at a new tool block (next bullet)', async () => {
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Reply text',
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Reply text',
       '                              continuation here',
       '● Bash(ls)',
       '  ⎿  output',
@@ -117,7 +117,7 @@ describe('V1Extractor', () => {
 
   it('stops accumulating at a tool result marker (⎿)', async () => {
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Done")',
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Done")',
       '  ⎿  sent (id: 100)',
       '',
     ].join('\r\n')
@@ -129,7 +129,7 @@ describe('V1Extractor', () => {
     // Real Claude Code output is wrapped in cursor positioning + colors.
     // The xterm parser should strip them; we just see the rendered text.
     const tui =
-      '\x1b[2C\x1b[1;36m●\x1b[0m\x1b[1C\x1b[1mclerk-telegram - reply (MCP)\x1b[0m(chat_id: "123", text: "Bold reply")\r\n'
+      '\x1b[2C\x1b[1;36m●\x1b[0m\x1b[1C\x1b[1mswitchroom-telegram - reply (MCP)\x1b[0m(chat_id: "123", text: "Bold reply")\r\n'
     const term = await feedToTerm(tui)
     expect(extractor.extract(term)).toBe('Bold reply')
   })
@@ -137,7 +137,7 @@ describe('V1Extractor', () => {
   it('reports progressive growth as more bytes arrive', async () => {
     const term = new Terminal({ cols: 132, rows: 40, scrollback: 5000, allowProposedApi: true })
     // Feed in chunks
-    await new Promise<void>(r => term.write('● clerk-telegram - reply (MCP)(chat_id: "1", text: "Hel', () => r()))
+    await new Promise<void>(r => term.write('● switchroom-telegram - reply (MCP)(chat_id: "1", text: "Hel', () => r()))
     expect(extractor.extract(term)).toBe('Hel')
 
     await new Promise<void>(r => term.write('lo wo', () => r()))
@@ -152,7 +152,7 @@ describe('V1Extractor', () => {
       '────────────────────────────────────────',
       '▐▛███▜▌   Claude Code v2.1.101',
       '▝▜█████▛▘  Opus 4.6 (1M context) · Claude Max',
-      '   Listening for channel messages from: server:clerk-telegram',
+      '   Listening for channel messages from: server:switchroom-telegram',
       '   Experimental · inbound messages will be pushed into this session',
       '────────────────────────────────────────',
       '❯',
@@ -179,21 +179,21 @@ describe('V1Extractor', () => {
   // whose body contained literal JSON.
 
   it('extracts text correctly when it is NOT the last parameter', async () => {
-    const tui = '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Hello", reply_to: "86")\r\n'
+    const tui = '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Hello", reply_to: "86")\r\n'
     const term = await feedToTerm(tui)
     expect(extractor.extract(term)).toBe('Hello')
   })
 
   it('extracts text when followed by multiple trailing params', async () => {
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Done now", reply_to: "86", format: "text")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Done now", reply_to: "86", format: "text")\r\n'
     const term = await feedToTerm(tui)
     expect(extractor.extract(term)).toBe('Done now')
   })
 
   it('handles escaped double quotes inside text without early termination', async () => {
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Understood — I\\"ll stop the duplicate \\"progress stream + final reply\\" pattern", reply_to: "86")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Understood — I\\"ll stop the duplicate \\"progress stream + final reply\\" pattern", reply_to: "86")\r\n'
     // Widen the terminal so the long single line doesn't get hard-wrapped
     // by xterm at the default 132 cols — which would truncate the trailing
     // characters and look like a regression even though the parser is
@@ -212,7 +212,7 @@ describe('V1Extractor', () => {
 
   it('handles escaped backslashes correctly', async () => {
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Windows path: C:\\\\temp\\\\file.txt", reply_to: "1")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Windows path: C:\\\\temp\\\\file.txt", reply_to: "1")\r\n'
     const term = await feedToTerm(tui)
     const result = extractor.extract(term)
     expect(result).toBe('Windows path: C:\\temp\\file.txt')
@@ -221,7 +221,7 @@ describe('V1Extractor', () => {
 
   it('handles escaped newline sequences inside text', async () => {
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Line one\\nLine two", reply_to: "1")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Line one\\nLine two", reply_to: "1")\r\n'
     const term = await feedToTerm(tui)
     const result = extractor.extract(term)
     // The continuation-line collapse turns the unescaped \n into a space.
@@ -232,7 +232,7 @@ describe('V1Extractor', () => {
   it('does not include subsequent param names when text is mid-call', async () => {
     // This is the exact scenario that produced the bug screenshot.
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "8248703757", text: "Short answer coming once I\\"ve looked.", reply_to: "86")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "8248703757", text: "Short answer coming once I\\"ve looked.", reply_to: "86")\r\n'
     const term = await feedToTerm(tui)
     const result = extractor.extract(term)
     expect(result).toBe('Short answer coming once I"ve looked.')
@@ -244,7 +244,7 @@ describe('V1Extractor', () => {
     // Partial render: text parameter has started but the closing quote
     // hasn't arrived yet. The extractor should return what it has so far.
     const tui =
-      '● clerk-telegram - reply (MCP)(chat_id: "123", text: "Halfway through a thou'
+      '● switchroom-telegram - reply (MCP)(chat_id: "123", text: "Halfway through a thou'
     const term = await feedToTerm(tui)
     const result = extractor.extract(term)
     expect(result).toBe('Halfway through a thou')
@@ -253,7 +253,7 @@ describe('V1Extractor', () => {
   it('stops at first unescaped closing quote even if more text follows', async () => {
     // Only the FIRST unescaped `"` terminates the string. Anything after
     // is a different param (or the tool-call close paren).
-    const tui = '● clerk-telegram - reply (MCP)(chat_id: "1", text: "First", text: "Second")\r\n'
+    const tui = '● switchroom-telegram - reply (MCP)(chat_id: "1", text: "First", text: "Second")\r\n'
     const term = await feedToTerm(tui)
     // Extractor should latch onto the FIRST `text: "` and return its value
     // cleanly, NOT merge the two values.
@@ -268,7 +268,7 @@ describe('V1Extractor against real captured production output', () => {
     // "Yes — I can / attach files to replies. Images send as inline / photos..."
     // verified manually via xterm.js dump in earlier debugging.
     const tui = [
-      '● clerk-telegram - reply (MCP)(chat_id: "-1009999999999", text: "Yes — I can',
+      '● switchroom-telegram - reply (MCP)(chat_id: "-1009999999999", text: "Yes — I can',
       '                              attach files to replies. Images send as inline',
       '                              photos, and other file types go as documents (up',
       '                              to 50MB each). Just point me at a file path or ask',
@@ -314,9 +314,9 @@ describe('V1ToolActivityExtractor', () => {
     expect(out).not.toContain('/bar')
   })
 
-  it('returns null for clerk-telegram tool calls (owned by V1Extractor)', async () => {
+  it('returns null for switchroom-telegram tool calls (owned by V1Extractor)', async () => {
     const term = await feedToTerm(
-      '● clerk-telegram - reply (MCP)(chat_id: "1", text: "hi")\r\n',
+      '● switchroom-telegram - reply (MCP)(chat_id: "1", text: "hi")\r\n',
     )
     expect(ax.extract(term)).toBeNull()
   })
@@ -388,7 +388,7 @@ describe('startPtyTail integration — onActivity wiring + dedup + throttle', ()
       // not once per byte-batch.
       const bashCount = activities.filter(a => a === 'Running Bash: echo hi').length
       expect(bashCount).toBe(1)
-      // Reply text should not have been emitted — no clerk-telegram marker in the log.
+      // Reply text should not have been emitted — no switchroom-telegram marker in the log.
       expect(partials).toHaveLength(0)
     } finally {
       handle.stop()
@@ -417,7 +417,7 @@ describe('startPtyTail integration — onActivity wiring + dedup + throttle', ()
       await new Promise(r => setTimeout(r, 300))
       appendFileSync(
         logFile,
-        '● clerk-telegram - reply (MCP)(chat_id: "1", text: "hello world")\r\n',
+        '● switchroom-telegram - reply (MCP)(chat_id: "1", text: "hello world")\r\n',
       )
       await new Promise(r => setTimeout(r, 400))
 

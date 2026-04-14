@@ -1,0 +1,157 @@
+# switchroom.yaml — Full example configuration
+#
+# Switchroom uses a three-layer cascade for agent config:
+#   1. defaults:  → global baseline for every agent
+#   2. profiles:  → named presets agents opt into via `extends:`
+#   3. agents:    → per-agent overrides (only express differences)
+#
+# Each agent gets its own Telegram topic in a forum group.
+# Create bots via @BotFather: /newbot for each agent.
+
+switchroom:
+  version: 1
+  agents_dir: ~/.switchroom/agents
+  skills_dir: ~/.switchroom/skills           # shared skill pool (symlinked per agent)
+
+telegram:
+  bot_token: "vault:telegram-bot-token"
+  forum_chat_id: "-1001234567890"
+
+memory:
+  backend: hindsight
+  shared_collection: shared
+  config:
+    provider: ollama
+    model: nomic-embed-text
+
+vault:
+  path: ~/.switchroom/vault.enc
+
+# --- Global defaults (implicit bottom-of-cascade profile) ---
+# Every agent inherits this. Per-agent fields win on conflict.
+# tools/skills/schedule are unioned; scalars are overridden.
+defaults:
+  model: claude-sonnet-4-6
+  # The switchroom-telegram fork is the default. Uncomment to fall back to
+  # the upstream marketplace plugin: channels.telegram.plugin: official
+  channels:
+    telegram:
+      format: html
+  tools:
+    allow: [all]
+  env:
+    SWITCHROOM_AUDIT_URL: "https://audit.example"
+  hooks:
+    PreToolUse:
+      - command: "/opt/switchroom-audit.sh"
+        timeout: 5
+  skills: [checkin]
+  system_prompt_append: |
+    Always respond concisely.
+
+  # --- Default sub-agents ---
+  # Every agent gets these workers. They run on cheaper/faster models
+  # in the background so the main agent stays available for new requests.
+  # Override per-agent or per-profile by redefining the same name.
+  subagents:
+    worker:
+      description: "Handles implementation tasks: writing, editing, building, testing. Use for any task that takes more than a few seconds."
+      model: sonnet
+      background: true
+      isolation: worktree
+      maxTurns: 50
+      color: blue
+      prompt: |
+        You are a worker sub-agent. Implement the task described in your
+        prompt precisely and completely. Commit your work when done.
+        If requirements are ambiguous, state your assumptions rather
+        than guessing. Return a concise summary of what you did.
+    researcher:
+      description: "Explores codebases, reads documentation, searches for information. Use for any research or investigation task."
+      model: haiku
+      background: true
+      color: green
+      prompt: |
+        You are a research sub-agent. Investigate the topic described
+        in your prompt thoroughly. Return structured findings — not
+        raw file contents. Keep your report under 500 words unless
+        the parent explicitly asks for more detail.
+    reviewer:
+      description: "Reviews code, plans, documents for quality, correctness, and completeness. Use after a worker finishes or before shipping."
+      model: sonnet
+      color: purple
+      prompt: |
+        You are a review sub-agent. Examine the work described in
+        your prompt for correctness, completeness, security, and
+        quality. Report findings as a punch list: what's good, what
+        needs fixing, what's missing. Be rigorous but concise.
+
+# --- Named profiles (opt-in presets) ---
+# Agents inherit from a profile via `extends: <name>`.
+# Inline profiles here take priority over filesystem profiles/<name>/
+# (which can additionally bundle CLAUDE.md.hbs + skills/).
+profiles:
+  coder:
+    tools:
+      allow: [Bash, Read, Write, Edit, Grep, Glob]
+    system_prompt_append: |
+      You write production-quality TypeScript. Prefer explicit types.
+    skills: [code-review, architecture]
+
+  advisor:
+    tools:
+      deny: [Bash, Edit, Write]
+    soul:
+      style: warm, empathetic, non-prescriptive
+      boundaries: not a licensed professional — always recommend consulting a qualified expert
+    system_prompt_append: |
+      Prioritize listening and asking clarifying questions.
+
+# --- Agents ---
+# Minimal per-agent declarations. Everything else inherited.
+agents:
+  coach:
+    topic_name: "Fitness"
+    topic_emoji: "🏋️"
+    extends: advisor                    # inherits from inline profile above
+    soul:
+      name: Coach
+      style: motivational, direct       # overrides advisor.soul.style
+    memory:
+      collection: fitness
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "Good morning check-in: ask about sleep, energy, and plans for today"
+      - cron: "0 20 * * 0"
+        prompt: "Weekly review: summarize this week's activity and progress"
+
+  dev:
+    topic_name: "Code"
+    topic_emoji: "💻"
+    extends: coder                      # inherits from inline profile above
+    model: claude-opus-4-6              # override defaults.model for this agent
+    memory:
+      collection: coding
+    cli_args: ["--effort", "high"]      # escape hatch: extra exec claude flags
+
+  assistant:
+    topic_name: "General"
+    topic_emoji: "💬"
+    memory:
+      collection: general
+    # No `extends:` → uses the "default" filesystem profile (profiles/default/)
+    # No tool/model overrides → inherits everything from defaults:
+
+  exec:
+    topic_name: "Executive"
+    topic_emoji: "📋"
+    extends: advisor
+    soul:
+      name: Friday
+      style: efficient, proactive, anticipates needs
+    skills: [daily-briefing, meeting-prep]
+    memory:
+      collection: executive
+    schedule:
+      - cron: "0 7 * * 1-5"
+        prompt: "Daily briefing: summarize today's calendar, pending tasks, and priorities"
