@@ -24,6 +24,15 @@ export type ItemState = 'pending' | 'running' | 'done' | 'failed'
 export interface ChecklistItem {
   /** Index within the current turn — sequential, stable. */
   readonly id: number
+  /**
+   * Claude Code tool_use content-block id (e.g. "toolu_01ABC…"). Used
+   * to pair the tool_result back to its tool_use by id rather than by
+   * running-item order — required for correct handling of parallel
+   * tool_use calls within a single assistant message. Null when the
+   * session JSONL line omitted it (older event shape or synthetic test
+   * events), in which case the reducer falls back to FIFO pairing.
+   */
+  readonly toolUseId: string | null
   /** Claude Code tool name, e.g. "Read", "Bash", "Grep". */
   readonly tool: string
   /** Short human-readable label derived from the tool's input (file path,
@@ -108,6 +117,7 @@ export function reduce(
       )
       const nextItem: ChecklistItem = {
         id: state.items.length,
+        toolUseId: event.toolUseId ?? null,
         tool: event.toolName,
         label: toolLabel(event.toolName, event.input),
         state: 'running',
@@ -123,11 +133,22 @@ export function reduce(
 
     case 'tool_result': {
       if (state.turnStartedAt === 0) return state
-      // Flip the most-recent running item to done/failed. Paired by order
-      // — Claude Code runs tools sequentially, so the oldest running item
-      // is the one this result corresponds to. is_error=true on the
-      // tool_result JSONL line flips state to 'failed' (❌).
-      const idx = state.items.findIndex((it) => it.state === 'running')
+      // Pair by tool_use_id when present: the model can emit parallel
+      // tool_use calls in a single assistant message, so FIFO pairing
+      // by running-item order is not sufficient. Falls back to the
+      // oldest running item when the result has no toolUseId or no
+      // running item matches (older JSONL shape, synthetic test events).
+      // is_error=true on the tool_result JSONL line flips state to
+      // 'failed' (❌).
+      let idx = -1
+      if (event.toolUseId) {
+        idx = state.items.findIndex(
+          (it) => it.state === 'running' && it.toolUseId === event.toolUseId,
+        )
+      }
+      if (idx === -1) {
+        idx = state.items.findIndex((it) => it.state === 'running')
+      }
       if (idx === -1) return state
       const items = state.items.slice()
       const nextState: ItemState = event.isError === true ? 'failed' : 'done'

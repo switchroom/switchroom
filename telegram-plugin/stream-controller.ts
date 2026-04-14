@@ -65,6 +65,14 @@ export interface StreamControllerConfig {
   /** Observers — fire after each successful send/edit. Optional. */
   onSend?: (messageId: number, chars: number) => void
   onEdit?: (messageId: number, chars: number) => void
+  /**
+   * Optional diagnostic logger. Receives the draft-stream's internal
+   * status lines (edit-failed, not-modified, re-sending, finalize).
+   * When omitted, those lines are dropped — which is what the plugin
+   * did for its entire history, silently hiding transient edit errors.
+   * Pass a stderr writer in production to surface them.
+   */
+  log?: (msg: string) => void
 }
 
 /**
@@ -85,6 +93,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     retry = <T>(fn: () => Promise<T>) => fn(),
     onSend,
     onEdit,
+    log,
   } = cfg
 
   const sendOpts: StreamSendOpts = {
@@ -112,6 +121,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     {
       ...(throttleMs != null ? { throttleMs } : {}),
       ...(idleMs != null ? { idleMs } : {}),
+      ...(log != null ? { log } : {}),
     },
   )
 }

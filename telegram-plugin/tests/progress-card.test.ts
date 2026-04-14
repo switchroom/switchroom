@@ -86,6 +86,36 @@ describe('progress-card reducer', () => {
     expect(s.items.map((i) => i.state)).toEqual(['done', 'done', 'running'])
   })
 
+  it('pairs tool_result to tool_use by toolUseId (parallel tool calls)', () => {
+    // Pin the fix for the parallel-tool_use pairing bug: when the model
+    // emits two tool_use calls in a single assistant message and the
+    // results arrive out-of-order, the reducer must pair by tool_use_id
+    // rather than by FIFO running-item order.
+    const s = fold([
+      enqueue('test'),
+      { kind: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_A' },
+      { kind: 'tool_use', toolName: 'Read', toolUseId: 'toolu_B' },
+      // Out-of-order results: B finishes first, with an error
+      { kind: 'tool_result', toolUseId: 'toolu_B', toolName: null, isError: true },
+      { kind: 'tool_result', toolUseId: 'toolu_A', toolName: null },
+    ])
+    expect(s.items.map((i) => [i.tool, i.state])).toEqual([
+      ['Bash', 'done'],
+      ['Read', 'failed'],
+    ])
+  })
+
+  it('falls back to FIFO pairing when tool_result has no toolUseId', () => {
+    // Older event shapes (before session-tail surfaced tool_use_id) omit
+    // the field; the reducer must still close the oldest running item.
+    const s = fold([
+      enqueue('test'),
+      { kind: 'tool_use', toolName: 'Bash' },
+      { kind: 'tool_result', toolUseId: '', toolName: null },
+    ])
+    expect(s.items[0].state).toBe('done')
+  })
+
   it('turn_end closes all running items and flips stage to done', () => {
     const s = fold([
       enqueue('test'),

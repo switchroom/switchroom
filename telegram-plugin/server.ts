@@ -1854,6 +1854,7 @@ function handlePtyPartial(text: string): void {
         `telegram channel: pty first partial — chat=${chatId} chars=${charCount}\n`,
       )
     },
+    writeError: (line) => process.stderr.write(line),
   })
   pendingPtyPartial = state.pendingPtyPartial?.text ?? null
 }

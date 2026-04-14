@@ -205,6 +205,22 @@ export async function handleStreamReply(
     effectiveText = rawText
   }
 
+  // Over-limit pre-check. Throws BEFORE touching stream state so that
+  // (a) a first call over 4096 fails cleanly instead of creating a
+  // half-initialized stream, and (b) a mid-stream update over 4096
+  // fails loudly instead of setting the internal `stopped=true` flag
+  // and silently dropping all subsequent text. Either way the caller
+  // sees isError:true and can fall back to `reply`, which chunks.
+  // Check the rendered text (post-markdown-to-HTML) because that's
+  // what actually goes to Telegram's 4096-char wire limit.
+  if (effectiveText.length > 4096) {
+    throw new Error(
+      `stream_reply rejected: text exceeds Telegram's 4096-char limit ` +
+        `(length=${effectiveText.length}, format=${format}). stream_reply does not ` +
+        `auto-chunk — split the text or use \`reply\`, which chunks.`,
+    )
+  }
+
   const sKey = streamKey(chat_id, threadId, args.lane)
   // Claim the PTY-preview slot so any PTY-tail partial that fires mid-
   // or post-turn for this chat+thread is dropped. Keyed WITHOUT lane
@@ -275,6 +291,21 @@ export async function handleStreamReply(
           charCount,
           sameAsLast: false,
         }),
+      // Route draft-stream diagnostics through the handler's stderr
+      // writer so transient failures are observable. Filter routine
+      // success chatter (sent/edited/finalized) — those are already
+      // captured by the structured onSend/onEdit observers — and only
+      // surface warnings/errors (stopped, edit failed, not-found
+      // recovery).
+      log: (msg) => {
+        if (
+          msg.startsWith('stream → sent')
+          || msg.startsWith('stream → edited')
+          || msg.startsWith('stream → not modified')
+          || msg.startsWith('stream finalized')
+        ) return
+        deps.writeError(`telegram channel: stream_reply ${msg}\n`)
+      },
     })
     state.activeDraftStreams.set(sKey, stream)
     state.activeDraftParseModes?.set(sKey, parseMode)
