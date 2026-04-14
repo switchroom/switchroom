@@ -584,24 +584,28 @@ describe('handleStreamReply', () => {
     expect(streamReplyCalledEvents[1].streamExisted).toBe(true)
   })
 
-  describe('progressCardActive suppression', () => {
-    // Pins the duplicate-message bug: with progress-card in checklist mode,
-    // the card emits on lane='progress' and the model's stream_reply with
-    // no lane emits on the default lane — two Telegram messages for one
-    // turn. With progressCardActive=true, intermediate default-lane calls
-    // are suppressed so the card owns mid-turn display; only the final
-    // done=true call posts (the answer).
-    it('suppresses default-lane intermediate calls when progress card is active', async () => {
-      const state = makeState()
+  describe('progressCardActive enforcement', () => {
+    // In checklist mode the progress-card driver owns the mid-turn
+    // surface. A default-lane stream_reply(done=false) is rejected with
+    // an error so the caller (the model) learns in-context to only call
+    // stream_reply with done=true. Previously this was silently
+    // suppressed — the loud error makes the contract deterministic.
+    it('rejects default-lane done=false with a clear error when progress card is active', async () => {
+      const state: StreamReplyState = {
+        ...makeState(),
+        suppressPtyPreview: new Set<string>(),
+      }
       const deps = makeDeps(bot, { progressCardActive: true })
 
-      const pending = handleStreamReply({ chat_id: '1', text: 'working...' }, state, deps)
-      await microtaskFlush()
-      const result = await pending
+      await expect(
+        handleStreamReply({ chat_id: '1', text: 'working...' }, state, deps),
+      ).rejects.toThrow(/stream_reply\(done=false\) is not supported in checklist mode/)
 
       expect(bot.api.sendMessage).not.toHaveBeenCalled()
       expect(state.activeDraftStreams.size).toBe(0)
-      expect(result).toEqual({ messageId: null, status: 'updated' })
+      // PTY-preview slot still claimed so a late PTY partial doesn't
+      // leak a raw-TUI draft_send after the rejection.
+      expect(state.suppressPtyPreview?.has('1:_')).toBe(true)
     })
 
     it('still posts final done=true call when progress card is active', async () => {
@@ -622,7 +626,7 @@ describe('handleStreamReply', () => {
       expect(result.messageId).toBe(500)
     })
 
-    it('does NOT suppress named-lane calls (progress card uses lane=progress itself)', async () => {
+    it('does NOT reject named-lane calls (internal progress-card driver uses lane=progress)', async () => {
       const state = makeState()
       const deps = makeDeps(bot, { progressCardActive: true })
 

@@ -33,6 +33,7 @@ interface Fixture {
     chat_id: string
     text: string
     done?: boolean
+    lane?: string
   }) => Promise<{ messageId: number | null; status: string }>
   /**
    * Fire-and-forget variant: starts handleStreamReply but doesn't await it.
@@ -43,11 +44,12 @@ interface Fixture {
     chat_id: string
     text: string
     done?: boolean
+    lane?: string
   }) => Promise<{ messageId: number | null; status: string }>
   turnEnd: () => void
 }
 
-function setup(): Fixture {
+function setup(opts: { progressCardActive?: boolean } = {}): Fixture {
   const bot = createMockBot()
   const map = new Map<string, DraftStreamHandle>()
   const suppress = new Set<string>()
@@ -61,14 +63,26 @@ function setup(): Fixture {
     suppressPtyPreview: suppress,
     lastPtyPreviewByChat: lastPreview,
   }
-  const srState: StreamReplyState = { activeDraftStreams: map }
+  // Wire suppressPtyPreview into srState only when checklist mode is
+  // active. Legacy PTY-tail tests ("PTY partial after stream_reply
+  // started feeds into the same stream") rely on the slot staying
+  // empty; in checklist mode stream_reply claims it first and PTY
+  // short-circuits to 'suppressed'. Keep the two worlds separate.
+  const srState: StreamReplyState = opts.progressCardActive === true
+    ? { activeDraftStreams: map, suppressPtyPreview: suppress }
+    : { activeDraftStreams: map }
 
   const pty = createPtyPartialHandler(ptyState, {
     bot,
     renderText: (t) => `<i>${t}</i>`, // PTY preview: italic
   })
 
-  const callStreamReply = (args: { chat_id: string; text: string; done?: boolean }) =>
+  const callStreamReply = (args: {
+    chat_id: string
+    text: string
+    done?: boolean
+    lane?: string
+  }) =>
     handleStreamReply(args, srState, {
       bot,
       markdownToHtml: (t) => `<b>${t}</b>`, // stream_reply: bold
@@ -85,6 +99,7 @@ function setup(): Fixture {
       recordOutbound: () => {},
       writeError: () => {},
       throttleMs: 600,
+      progressCardActive: opts.progressCardActive === true,
     })
 
   const turnEnd = () => {
@@ -239,6 +254,107 @@ describe('streaming e2e smoke', () => {
 
     expect(f.map.has('A:_')).toBe(false)
     expect(f.map.has('B:_')).toBe(true)
+  })
+
+  // --- checklist-mode contract ----------------------------------------
+  //
+  // In checklist mode the progress-card driver owns the mid-turn surface.
+  // The model-facing stream_reply tool must:
+  //   - reject any call with done=false (throws, surfaces to the model as
+  //     an MCP tool error so it learns in-context not to call it)
+  //   - accept done=true and post the answer as a single message
+  //
+  // Internal callers (the progress-card driver) pass lane:'progress' and
+  // bypass the rejection. End-to-end shape exercised here mirrors
+  // production when CLERK_TG_STREAM_MODE=checklist (the default).
+
+  it('checklist mode: done=false (default lane) throws a clear tool error', async () => {
+    holder.current = setup({ progressCardActive: true })
+    const f = holder.current
+
+    await expect(
+      f.fireStreamReply({ chat_id: '42', text: 'looking into this…' }),
+    ).rejects.toThrow(/stream_reply\(done=false\) is not supported in checklist mode/)
+
+    expect(f.bot.api.sendMessage).not.toHaveBeenCalled()
+    expect(f.bot.api.editMessageText).not.toHaveBeenCalled()
+    // PTY slot is still claimed — stops a late PTY partial from leaking
+    // a raw-TUI draft after the rejection.
+    expect(f.suppress.has('42:_')).toBe(true)
+  })
+
+  it('checklist mode: done=true posts the answer as one message', async () => {
+    holder.current = setup({ progressCardActive: true })
+    const f = holder.current
+
+    const pdone = f.fireStreamReply({ chat_id: '1', text: 'THE ANSWER', done: true })
+    await microtaskFlush()
+    const r = await pdone
+
+    expect(r.status).toBe('finalized')
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][0]).toBe('1')
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>THE ANSWER</b>')
+    expect(f.map.has('1:_')).toBe(false)
+  })
+
+  it('checklist mode: rejection does NOT block a subsequent done=true answer', async () => {
+    holder.current = setup({ progressCardActive: true })
+    const f = holder.current
+
+    await expect(
+      f.fireStreamReply({ chat_id: '1', text: 'wrong call' }),
+    ).rejects.toThrow()
+
+    vi.advanceTimersByTime(1000)
+    await microtaskFlush()
+    const pdone = f.fireStreamReply({ chat_id: '1', text: 'right answer', done: true })
+    await microtaskFlush()
+    await pdone
+
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>right answer</b>')
+  })
+
+  it('checklist mode: internal lane=progress callers bypass the rejection', async () => {
+    // Progress-card driver path: emits card edits via lane:'progress'.
+    // The lane parameter is stripped from the MCP tool schema so models
+    // can't use it — this exercises the in-process internal code path.
+    holder.current = setup({ progressCardActive: true })
+    const f = holder.current
+
+    const p = f.fireStreamReply({
+      chat_id: '1',
+      text: 'Plan → Run → Done',
+      lane: 'progress',
+    })
+    await microtaskFlush()
+    const r = await p
+
+    expect(r.status).toBe('updated')
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>Plan → Run → Done</b>')
+    expect(f.map.has('1:_:progress')).toBe(true)
+  })
+
+  it('non-checklist mode: done=false still works (pty-mode regression check)', async () => {
+    holder.current = setup({ progressCardActive: false })
+    const f = holder.current
+
+    const p1 = f.fireStreamReply({ chat_id: '1', text: 'chunk 1' })
+    await microtaskFlush()
+    await p1
+
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>chunk 1</b>')
+
+    vi.advanceTimersByTime(1000)
+    await microtaskFlush()
+    const p2 = f.fireStreamReply({ chat_id: '1', text: 'chunk 2', done: true })
+    await microtaskFlush()
+    await p2
+
+    expect(f.bot.api.editMessageText).toHaveBeenCalled()
   })
 
   it('done=true with changed text flushes the final edit before clearing', async () => {
