@@ -144,15 +144,18 @@ describe('progress-card reducer', () => {
     expect(s3).toEqual(initialState())
   })
 
-  it('stray tool_use while one is already running closes the prior', () => {
-    // Defensive — Claude Code shouldn't emit overlapping tool_use events,
-    // but if it does, the old one flips to done before the new appears.
+  it('parallel tool_use keeps both running for correct tool_result pairing', () => {
+    // Claude Code DOES emit parallel tool_use blocks within a single
+    // assistant message (e.g. Bash + Read batched). The reducer keeps
+    // both running so the subsequent tool_results can pair by
+    // toolUseId rather than the old auto-done-on-new-tool_use shortcut
+    // which mis-paired the first result onto the wrong item.
     const s = fold([
       enqueue('test'),
       { kind: 'tool_use', toolName: 'A' },
       { kind: 'tool_use', toolName: 'B' },
     ])
-    expect(s.items[0].state).toBe('done')
+    expect(s.items[0].state).toBe('running')
     expect(s.items[1].state).toBe('running')
   })
 

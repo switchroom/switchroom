@@ -144,6 +144,15 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const heartbeatMs = config.heartbeatMs ?? 5000
 
   const chats = new Map<string, PerChatState>()
+  // Track the last enqueued chat so non-enqueue session events (tool_use,
+  // tool_result, turn_end) which arrive with chatIdMaybe=null from the
+  // session-tail supervisor still route to the correct chat. Without
+  // this, every post-enqueue event would fall out of `ingest` at the
+  // `chatId == null` guard and the card would stay frozen at the
+  // initial "Working…" skeleton — exactly the symptom PR #25 failed to
+  // resolve.
+  let currentChatId: string | null = null
+  let currentThreadId: string | undefined
   let heartbeatHandle: { ref: unknown } | null = null
   // Tracks the last elapsed-seconds bucket we emitted for each chat so
   // the heartbeat can coalesce — if the HTML hasn't changed AND the
@@ -234,6 +243,16 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (event.kind === 'enqueue') {
         chatId = event.chatId
         threadId = event.threadId ?? undefined
+        // Remember the active chat so subsequent events in this turn
+        // (routed from the session-tail with chatIdMaybe=null) still
+        // find their way here.
+        currentChatId = chatId
+        currentThreadId = threadId
+      } else if (chatId == null) {
+        // Non-enqueue event with no explicit chat: fall back to the
+        // most recently enqueued chat for this driver.
+        chatId = currentChatId
+        threadId = threadId ?? currentThreadId
       }
       if (chatId == null) return
 
@@ -291,6 +310,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           // Drop the chat state so a subsequent turn starts clean.
           chats.delete(k)
           lastHeartbeatBucket.delete(k)
+          if (currentChatId === chatId && currentThreadId === threadId) {
+            currentChatId = null
+            currentThreadId = undefined
+          }
           // Stop heartbeat when no chats remain active.
           if (chats.size === 0) stopHeartbeat()
         }

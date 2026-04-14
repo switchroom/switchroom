@@ -109,12 +109,15 @@ export function reduce(
 
     case 'tool_use': {
       if (state.turnStartedAt === 0) return state
-      // Close out any still-running item (a tool_use fires only after
-      // the prior tool_result — so this shouldn't happen, but be
-      // defensive). Then append the new item as running.
-      const closed = state.items.map((it) =>
-        it.state === 'running' ? { ...it, state: 'done' as const, finishedAt: now } : it,
-      )
+      // Append the new item as running. We do NOT defensively close out
+      // prior still-running items: Claude Code emits parallel tool_use
+      // blocks within a single assistant message (e.g. Bash + Read
+      // batched), and those arrive as separate SessionEvents. Prior
+      // logic that auto-closed running items on each new tool_use
+      // mis-paired the subsequent tool_results — the first result would
+      // land on the WRONG item (by FIFO fallback) because its
+      // toolUseId-matched item had already been force-done. Pairing is
+      // now entirely up to tool_result (by toolUseId when available).
       const nextItem: ChecklistItem = {
         id: state.items.length,
         toolUseId: event.toolUseId ?? null,
@@ -125,7 +128,7 @@ export function reduce(
       }
       return {
         ...state,
-        items: [...closed, nextItem],
+        items: [...state.items, nextItem],
         stage: 'run',
         thinking: false,
       }
