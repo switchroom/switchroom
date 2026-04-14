@@ -76,6 +76,21 @@ You (Telegram)
 
 Clerk is **not a harness**. Each agent runs the unmodified `claude` binary, authenticated directly with Anthropic.
 
+## Install
+
+```bash
+# Install the CLI globally (Node 20.11+ required)
+npm install -g clerk-ai
+
+# Sanity check
+clerk --version
+
+# First-time setup (interactive — installs deps, scaffolds config, links Telegram)
+clerk setup
+```
+
+Once installed, `clerk setup` walks you through prerequisites (claude CLI, tmux, OAuth) and creates your first agent. See **Quick Start** below for the manual path.
+
 ## Quick Start
 
 ```bash

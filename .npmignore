@@ -1,0 +1,32 @@
+# Belt-and-braces — primary control is the "files" whitelist in package.json.
+# This file just hard-blocks anything that could leak via subtree includes.
+clerk-export/
+.clerk-export/
+clerk-export-with-secrets.tar.gz
+clerk-import-prompt.md
+*.enc
+.env
+.env.*
+node_modules/
+agents/
+test/
+tests/
+evals/
+experimental/
+vendor/
+docs/
+examples/
+.buildkite/
+.claude-plugin/
+.git/
+.github/
+*.tsbuildinfo
+coverage/
+__pycache__/
+*.pyc
+PRD.md
+CONTRIBUTING.md
+vitest.config.ts
+tsconfig.json
+package-lock.json
+bun.lock

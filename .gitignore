@@ -11,6 +11,9 @@ dist/
 # Vault
 *.enc
 
+# OpenClaw export bundle — contains real secrets, never commit
+/clerk-export/
+
 # OS
 .DS_Store
 Thumbs.db
