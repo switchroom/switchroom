@@ -153,6 +153,16 @@ let currentTurnStartedAt = 0
 let currentSessionThreadId: number | undefined = undefined
 let currentTurnReplyCalled = false
 let currentTurnCapturedText: string[] = []
+
+/**
+ * Cooldown for the "Prompt is too long" context exhaustion warning.
+ * When the context window fills, EVERY subsequent user message also gets
+ * "Prompt is too long" — without a cooldown the bot would spam the same
+ * warning on each one. 10 minutes is long enough that the user has time
+ * to /restart, short enough that they'll be reminded if they forget.
+ */
+const CONTEXT_EXHAUSTION_COOLDOWN_MS = 10 * 60 * 1000
+let lastContextExhaustionWarningAt = 0
 /**
  * Timeout fallback for orphaned-reply detection. Some error paths in
  * Claude Code (like "Prompt is too long") produce an assistant text
@@ -2124,30 +2134,39 @@ function handleSessionEvent(ev: SessionEvent): void {
       // event — so the orphaned-reply backstop never triggers and the
       // user gets permanent silence on every subsequent message.
       //
-      // Detect this and auto-restart the agent with a fresh session.
-      // Hindsight auto-recall brings back relevant memories so context
-      // isn't truly lost. Tell the user what happened before restarting.
+      // IMPORTANT: do NOT auto-restart. The previous auto-restart
+      // implementation caused a restart loop: restart → agent resumes
+      // heavy work (handoff hook, pending tasks) → context fills again
+      // → auto-restart → repeat. Instead, notify the user once and
+      // let them decide when to restart manually. The cooldown prevents
+      // spamming the same warning on every subsequent message that also
+      // gets "Prompt is too long".
       if (isContextExhaustionText(ev.text) && currentSessionChatId != null) {
         const chatId = currentSessionChatId
         const threadId = currentSessionThreadId
+
+        // Cooldown: only warn once per 10 minutes
+        const now = Date.now()
+        if (now - lastContextExhaustionWarningAt < CONTEXT_EXHAUSTION_COOLDOWN_MS) {
+          // Already warned recently — suppress duplicate warnings
+          return
+        }
+        lastContextExhaustionWarningAt = now
+
         process.stderr.write(
-          `telegram channel: context exhaustion detected ("Prompt is too long") — auto-restarting agent with fresh session\n`,
+          `telegram channel: context exhaustion detected ("Prompt is too long") — notifying user (no auto-restart)\n`,
         )
-        // Notify the user before we die
-        const restartOpts = {
+        const warnOpts = {
           parse_mode: 'HTML' as const,
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }
         void bot.api.sendMessage(
           chatId,
-          '⚠️ <b>Context window full</b> — the session has too much history for the model to process. Restarting with a fresh session now. Hindsight will recall relevant past context automatically.',
-          restartOpts,
-        ).catch(() => {}).finally(() => {
-          // Fire the restart in a detached child so we don't block on our own death
-          setTimeout(() => {
-            spawnSwitchroomDetached(['agent', 'restart', getMyAgentName()])
-          }, 1000)
-        })
+          '⚠️ <b>Context window full</b> — the session has too much history for the model to process new messages. ' +
+            'Send <code>/restart</code> to start a fresh session (Hindsight will recall relevant past context automatically). ' +
+            'I won\'t auto-restart to avoid a restart loop.',
+          warnOpts,
+        ).catch(() => {})
 
         // Clean up state
         const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
