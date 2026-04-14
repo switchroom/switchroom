@@ -1097,6 +1097,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         const text = repairEscapedWhitespace(args.text as string)
+        const files = (args.files as string[] | undefined) ?? []
         // Quote-reply default: if the caller didn't pass reply_to (and didn't
         // opt out with quote:false), auto-populate reply_to with the most
         // recent inbound user message in this chat+thread. This shifts the
@@ -2439,6 +2440,52 @@ function switchroomExec(args: string[], timeoutMs = 15000): string {
 }
 
 /**
+ * Restart-pending marker: written by /restart before the detached
+ * `switchroom agent restart` kills us, read by the new bot on boot so
+ * it can post a "✅ restarted" follow-up. Without this, the ack from
+ * the old bot is the last thing the user sees and they have no way to
+ * tell when the new bot is actually ready.
+ */
+type RestartMarker = {
+  chat_id: string
+  thread_id: number | null
+  ack_message_id: number | null
+  ts: number
+}
+
+function restartMarkerPath(): string | null {
+  const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) return null
+  return join(agentDir, 'restart-pending.json')
+}
+
+function writeRestartMarker(marker: RestartMarker): void {
+  const p = restartMarkerPath()
+  if (!p) return
+  try {
+    writeFileSync(p, JSON.stringify(marker))
+  } catch (err) {
+    process.stderr.write(`telegram channel: writeRestartMarker failed: ${err}\n`)
+  }
+}
+
+function readRestartMarker(): RestartMarker | null {
+  const p = restartMarkerPath()
+  if (!p) return null
+  try {
+    return JSON.parse(readFileSync(p, 'utf8')) as RestartMarker
+  } catch {
+    return null
+  }
+}
+
+function clearRestartMarker(): void {
+  const p = restartMarkerPath()
+  if (!p) return
+  try { rmSync(p, { force: true }) } catch { /* best effort */ }
+}
+
+/**
  * Spawn `switchroom` in a detached background process. Used by `/restart`,
  * `/reconcile --restart`, and `/update` when the target operation would
  * SIGTERM the bot's own systemd unit — execFileSync would die mid-call
@@ -2702,7 +2749,57 @@ bot.command('restart', async ctx => {
   // forget the switchroom command in a detached child, then return so the
   // bot has a clean handle to the message before it gets SIGTERM'd.
   if (isSelfTargetingCommand(name)) {
-    await switchroomReply(ctx, `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>… back in a few seconds.`, { html: true })
+    // Debounce: if a restart fired in the last 15s (marker still present),
+    // the user is double-tapping /restart because they didn't see the ack.
+    // Don't stack systemctl restarts — that's what produced the 3-in-a-row
+    // respawn storm at 18:20. Drop a short note instead.
+    const existing = readRestartMarker()
+    if (existing && Date.now() - existing.ts < 15_000) {
+      await switchroomReply(
+        ctx,
+        `⏳ Restart of <b>${escapeHtmlForTg(name)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate.`,
+        { html: true },
+      )
+      return
+    }
+
+    // Send the ack via the raw API so we can capture message_id and
+    // persist it to the history DB. switchroomReply → ctx.reply didn't
+    // record outbound, so the ack disappeared from history after restart.
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const ackText = `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>… back in a few seconds.`
+    let ackId: number | null = null
+    try {
+      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      ackId = sent.message_id
+      if (HISTORY_ENABLED) {
+        try {
+          recordOutbound({
+            chat_id: chatId,
+            thread_id: threadId ?? null,
+            message_ids: [sent.message_id],
+            texts: [`🔄 Restarting ${name}… back in a few seconds.`],
+            attachment_kinds: [],
+          })
+        } catch (err) {
+          process.stderr.write(`telegram channel: recordOutbound(restart ack) failed: ${err}\n`)
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`telegram channel: restart ack send failed: ${err}\n`)
+    }
+
+    writeRestartMarker({
+      chat_id: chatId,
+      thread_id: threadId ?? null,
+      ack_message_id: ackId,
+      ts: Date.now(),
+    })
     spawnSwitchroomDetached(['agent', 'restart', name])
     return
   }
@@ -3521,6 +3618,50 @@ void (async () => {
         process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
       }
       void registerSwitchroomBotCommands().catch(() => {})
+
+      // Restart follow-up: if a marker was dropped by the previous bot
+      // process before it got SIGTERM'd, send a "✅ restarted — ready"
+      // message so the user sees an explicit completion signal instead
+      // of just silence after the "🔄 Restarting…" ack.
+      try {
+        const marker = readRestartMarker()
+        if (marker) {
+          clearRestartMarker()
+          const ageMs = Date.now() - marker.ts
+          // Skip stale markers (>5 min) — that's not this restart.
+          if (ageMs < 5 * 60_000) {
+            const ageSec = Math.max(1, Math.round(ageMs / 1000))
+            const text = `✅ Restarted — ready. (took ~${ageSec}s)`
+            try {
+              const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
+                parse_mode: 'HTML',
+                link_preview_options: { is_disabled: true },
+                ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
+                ...(marker.ack_message_id != null
+                  ? { reply_parameters: { message_id: marker.ack_message_id } }
+                  : {}),
+              })
+              if (HISTORY_ENABLED) {
+                try {
+                  recordOutbound({
+                    chat_id: marker.chat_id,
+                    thread_id: marker.thread_id,
+                    message_ids: [sent.message_id],
+                    texts: [text],
+                    attachment_kinds: [],
+                  })
+                } catch (err) {
+                  process.stderr.write(`telegram channel: recordOutbound(restart followup) failed: ${err}\n`)
+                }
+              }
+            } catch (err) {
+              process.stderr.write(`telegram channel: restart followup send failed: ${err}\n`)
+            }
+          }
+        }
+      } catch (err) {
+        process.stderr.write(`telegram channel: restart marker check failed: ${err}\n`)
+      }
 
       // run() returns a RunnerHandle. Call .task() to await background completion.
       runnerHandle = run(bot)
