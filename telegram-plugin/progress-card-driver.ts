@@ -154,6 +154,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
       const k = key(chatId, threadId)
       let chatState = chats.get(k)
+      // Drop late events for a turn that already ended. Without this, a
+      // stray tool_result arriving after turn_end would spawn a fresh
+      // initialState and paint a half-empty card. enqueue always starts
+      // a new turn so it bypasses this guard.
+      if (chatState == null && event.kind !== 'enqueue') return
       if (chatState == null) {
         chatState = {
           chatId,
@@ -214,6 +219,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       const sinceLast = now() - chatState.lastEmittedAt
       const delay = Math.max(coalesceMs, minIntervalMs - sinceLast, 0)
       chatState.pendingTimer = setT(() => {
+        // Defensive: if the chat was deleted between schedule and fire
+        // (e.g. a turn_end racing with an async boundary added later),
+        // don't resurrect it with a stale flush.
+        if (!chats.has(k)) return
         chatState!.pendingTimer = null
         flush(chatState!, /*forceDone*/ false)
       }, delay)

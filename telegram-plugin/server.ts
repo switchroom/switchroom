@@ -924,7 +924,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stream_reply',
       description:
-        'Send or update a streaming reply that edits one message in-place rather than sending many. Call repeatedly during long tasks with full snapshots of your current message; the plugin throttles edits to ~1/sec to respect Telegram\'s rate limit. Set done=true on your final call to lock the message. The first call sends a fresh message; subsequent calls edit it. Use this instead of `reply` when you want to show progressive updates ("reading file..." → "found it, now searching..." → "here\'s the answer") without spamming the chat. Hard-stops at 4096 chars.',
+        'Send or update a streaming reply that edits one message in-place rather than sending many. Call repeatedly during long tasks with full snapshots of your current message; the plugin throttles edits to ~1/sec to respect Telegram\'s rate limit. Set done=true on your final call to lock the message. The first call sends a fresh message; subsequent calls edit it. Use this instead of `reply` when you want to show progressive updates ("reading file..." → "found it, now searching..." → "here\'s the answer") without spamming the chat. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. NOTE: when the agent is configured with stream_mode=checklist (default), an event-driven progress card owns the mid-turn surface on the `progress` lane. In that mode, default-lane (unnamed) calls with done=false are silently suppressed — only your final done=true call posts as the answer. Use lane:"thinking" (or any named lane) if you need a parallel mid-turn surface, or set stream_mode=pty to get the legacy behavior.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1854,6 +1854,7 @@ function handlePtyPartial(text: string): void {
         `telegram channel: pty first partial — chat=${chatId} chars=${charCount}\n`,
       )
     },
+    writeError: (line) => process.stderr.write(line),
   })
   pendingPtyPartial = state.pendingPtyPartial?.text ?? null
 }

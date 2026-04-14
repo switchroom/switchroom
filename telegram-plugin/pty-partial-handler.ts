@@ -84,6 +84,13 @@ export interface PtyHandlerDeps {
   onStreamEdit?: (chatId: string, messageId: number, charCount: number) => void
   /** Called on first partial seen for a chat (previously a stderr line). */
   onFirstPartial?: (chatId: string, charCount: number) => void
+  /**
+   * Optional stderr writer for draft-stream diagnostic lines (edit-failed,
+   * not-modified, re-sending, finalize). Without this, those are dropped —
+   * previously making transient edit failures invisible in PTY-tail live-
+   * preview mode.
+   */
+  writeError?: (line: string) => void
 }
 
 function streamKey(chatId: string, threadId?: number): string {
@@ -150,6 +157,21 @@ export function handlePtyPartialPure(
       retry: deps.retry,
       onSend: (messageId, charCount) => deps.onStreamSend?.(chatId, messageId, charCount),
       onEdit: (messageId, charCount) => deps.onStreamEdit?.(chatId, messageId, charCount),
+      ...(deps.writeError != null
+        ? {
+            log: (msg: string) => {
+              // Filter routine success chatter; only surface warnings
+              // and recovery paths to stderr.
+              if (
+                msg.startsWith('stream → sent')
+                || msg.startsWith('stream → edited')
+                || msg.startsWith('stream → not modified')
+                || msg.startsWith('stream finalized')
+              ) return
+              deps.writeError!(`telegram channel: pty_preview ${msg}\n`)
+            },
+          }
+        : {}),
     })
     state.activeDraftStreams.set(sKey, stream)
     state.activeDraftParseModes?.set(sKey, 'HTML')

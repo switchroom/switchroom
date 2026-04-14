@@ -82,11 +82,11 @@ describe('projectTranscriptLine', () => {
     const line = JSON.stringify({
       type: 'assistant',
       message: {
-        content: [{ type: 'tool_use', name: 'Bash', input: {} }],
+        content: [{ type: 'tool_use', name: 'Bash', id: 'toolu_01', input: {} }],
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'tool_use', toolName: 'Bash', input: {} },
+      { kind: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_01', input: {} },
     ])
   })
 
@@ -95,12 +95,12 @@ describe('projectTranscriptLine', () => {
       type: 'assistant',
       message: {
         content: [
-          { type: 'tool_use', name: 'Read', input: { file_path: '/x/foo.ts' } },
+          { type: 'tool_use', name: 'Read', id: 'toolu_02', input: { file_path: '/x/foo.ts' } },
         ],
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/foo.ts' } },
+      { kind: 'tool_use', toolName: 'Read', toolUseId: 'toolu_02', input: { file_path: '/x/foo.ts' } },
     ])
   })
 
@@ -108,11 +108,11 @@ describe('projectTranscriptLine', () => {
     const line = JSON.stringify({
       type: 'assistant',
       message: {
-        content: [{ type: 'tool_use', name: 'Bash' }],
+        content: [{ type: 'tool_use', name: 'Bash', id: 'toolu_03' }],
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'tool_use', toolName: 'Bash', input: undefined },
+      { kind: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_03', input: undefined },
     ])
   })
 
@@ -148,13 +148,13 @@ describe('projectTranscriptLine', () => {
       message: {
         content: [
           { type: 'thinking', thinking: '...' },
-          { type: 'tool_use', name: 'mcp__clerk-telegram__reply' },
+          { type: 'tool_use', name: 'mcp__clerk-telegram__reply', id: 'toolu_04' },
         ],
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
       { kind: 'thinking' },
-      { kind: 'tool_use', toolName: 'mcp__clerk-telegram__reply' },
+      { kind: 'tool_use', toolName: 'mcp__clerk-telegram__reply', toolUseId: 'toolu_04', input: undefined },
     ])
   })
 

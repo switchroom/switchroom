@@ -22,8 +22,16 @@
  * locate the projects dir without parsing TUI output or shelling out.
  */
 
-import { existsSync, readFileSync, statSync, watch, type FSWatcher } from 'fs'
-import { readdirSync } from 'fs'
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readSync,
+  statSync,
+  watch,
+  type FSWatcher,
+} from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -76,7 +84,7 @@ export type SessionEvent =
   | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string }
   | { kind: 'dequeue' }
   | { kind: 'thinking' }
-  | { kind: 'tool_use'; toolName: string; input?: Record<string, unknown> }
+  | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown> }
   | { kind: 'text'; text: string }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean }
   | { kind: 'turn_end'; durationMs: number }
@@ -147,6 +155,13 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
         events.push({
           kind: 'tool_use',
           toolName: (c.name as string | undefined) ?? '',
+          // Claude Code content blocks carry a stable `id` for each
+          // tool_use (e.g. "toolu_01ABC..."). Surfacing it here lets
+          // the progress-card reducer pair tool_result events by id
+          // instead of by running-item order, which is the only
+          // correct pairing when the model emits parallel tool_use
+          // calls within a single assistant message.
+          toolUseId: (c.id as string | undefined) ?? null,
           input: input && typeof input === 'object' ? input : undefined,
         })
       } else if (ct === 'text') {
@@ -247,11 +262,11 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       }
       if (stat.size === cursor) return
       const buf = Buffer.alloc(stat.size - cursor)
-      const fd = require('node:fs').openSync(currentFile, 'r')
+      const fd = openSync(currentFile, 'r')
       try {
-        require('node:fs').readSync(fd, buf, 0, buf.length, cursor)
+        readSync(fd, buf, 0, buf.length, cursor)
       } finally {
-        require('node:fs').closeSync(fd)
+        closeSync(fd)
       }
       cursor = stat.size
       const text = pendingPartial + buf.toString('utf-8')

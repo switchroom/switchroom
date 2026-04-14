@@ -160,6 +160,12 @@ export async function handleStreamReply(
   const done = Boolean(args.done)
   const format = args.format ?? deps.defaultFormat
 
+  // Access check runs BEFORE the progress-card short-circuit: a denied
+  // chat id must throw regardless of streaming mode. Previously the
+  // suppression path silently "succeeded" for unauthorized chats.
+  deps.assertAllowedChat(chat_id)
+  const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
+
   // Suppress intermediate default-lane updates when the progress card is
   // active. The card owns the mid-turn surface on the `progress` lane; a
   // parallel default-lane stream would render as a second Telegram
@@ -169,13 +175,18 @@ export async function handleStreamReply(
   // historical status, the answer is the content).
   const isDefaultLane = args.lane == null || args.lane.length === 0
   if (deps.progressCardActive === true && isDefaultLane && !done) {
+    // Claim the PTY-preview slot even when suppressing: the progress
+    // card may not have emitted yet (first call of the turn), and a PTY
+    // partial landing in that window would otherwise leak through as a
+    // raw-TUI draft_send. Keyed WITHOUT lane (PTY uses lane-less keys).
+    state.suppressPtyPreview?.add(streamKey(chat_id, threadId))
     deps.logStreamingEvent({
       kind: 'stream_reply_called',
       chatId: chat_id,
       charCount: rawText.length,
       done: false,
       streamExisted: state.activeDraftStreams.has(
-        streamKey(chat_id, deps.resolveThreadId(chat_id, args.message_thread_id), args.lane),
+        streamKey(chat_id, threadId, args.lane),
       ),
     })
     return { messageId: null, status: 'updated' }
@@ -194,8 +205,21 @@ export async function handleStreamReply(
     effectiveText = rawText
   }
 
-  deps.assertAllowedChat(chat_id)
-  const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
+  // Over-limit pre-check. Throws BEFORE touching stream state so that
+  // (a) a first call over 4096 fails cleanly instead of creating a
+  // half-initialized stream, and (b) a mid-stream update over 4096
+  // fails loudly instead of setting the internal `stopped=true` flag
+  // and silently dropping all subsequent text. Either way the caller
+  // sees isError:true and can fall back to `reply`, which chunks.
+  // Check the rendered text (post-markdown-to-HTML) because that's
+  // what actually goes to Telegram's 4096-char wire limit.
+  if (effectiveText.length > 4096) {
+    throw new Error(
+      `stream_reply rejected: text exceeds Telegram's 4096-char limit ` +
+        `(length=${effectiveText.length}, format=${format}). stream_reply does not ` +
+        `auto-chunk — split the text or use \`reply\`, which chunks.`,
+    )
+  }
 
   const sKey = streamKey(chat_id, threadId, args.lane)
   // Claim the PTY-preview slot so any PTY-tail partial that fires mid-
@@ -217,9 +241,12 @@ export async function handleStreamReply(
     if (existingParseMode !== parseMode) {
       try {
         await stream.finalize()
-      } catch {
-        /* best-effort: the in-flight edit may 429 or race, but we must
-         * not block the caller's new message on it. */
+      } catch (err) {
+        // Best-effort: the in-flight edit may 429 or race. Surface to
+        // stderr so the orphaned message id isn't invisible.
+        deps.writeError(
+          `telegram channel: stream_reply parseMode-rotation finalize failed: ${err}\n`,
+        )
       }
       state.activeDraftStreams.delete(sKey)
       state.activeDraftParseModes.delete(sKey)
@@ -264,6 +291,21 @@ export async function handleStreamReply(
           charCount,
           sameAsLast: false,
         }),
+      // Route draft-stream diagnostics through the handler's stderr
+      // writer so transient failures are observable. Filter routine
+      // success chatter (sent/edited/finalized) — those are already
+      // captured by the structured onSend/onEdit observers — and only
+      // surface warnings/errors (stopped, edit failed, not-found
+      // recovery).
+      log: (msg) => {
+        if (
+          msg.startsWith('stream → sent')
+          || msg.startsWith('stream → edited')
+          || msg.startsWith('stream → not modified')
+          || msg.startsWith('stream finalized')
+        ) return
+        deps.writeError(`telegram channel: stream_reply ${msg}\n`)
+      },
     })
     state.activeDraftStreams.set(sKey, stream)
     state.activeDraftParseModes?.set(sKey, parseMode)

@@ -128,22 +128,56 @@ describe('handleStreamReply', () => {
     expect(deps.takeHandoffPrefix).toHaveBeenCalledTimes(1)
   })
 
-  it('done=true throws when text exceeds 4096 (no silent id:pending)', async () => {
-    // Pins the bug found in prod: a >4096-char text would hit draft-stream's
-    // length guard, silently stop, and the handler would return
-    // status:finalized, messageId:null — the MCP response reads
-    // "finalized (id: pending)" looking like success. Fix: throw so the
-    // MCP client sees isError:true and can fall back to `reply`.
+  it('throws when text exceeds 4096 (no silent id:pending)', async () => {
+    // Pins the bug found in prod: a >4096-char text would hit draft-
+    // stream's length guard, silently stop, and the handler would return
+    // status:finalized, messageId:null — the MCP response read
+    // "finalized (id: pending)" looking like success. Fixed upstream by
+    // an over-limit pre-check that throws BEFORE touching stream state,
+    // so both first-send-over-limit AND mid-stream-over-limit fail loudly
+    // instead of corrupting the stream. done=true not required.
     const state = makeState()
     const deps = makeDeps(bot)
     const tooLong = 'x'.repeat(5000)
 
     await expect(
       handleStreamReply({ chat_id: '1', text: tooLong, done: true }, state, deps),
-    ).rejects.toThrow(/stream_reply finalized without sending/)
+    ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
 
     // Mock bot should NOT have received any sendMessage call.
     expect(bot.api.sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('mid-stream over-limit throws without corrupting stream state', async () => {
+    // A stream that starts small but a later update() goes over 4096.
+    // Before the upfront length check, the draft-stream would set its
+    // internal stopped=true flag and silently drop all further text —
+    // including the done=true final answer. The pre-check now throws
+    // on the over-limit call, leaving the stream intact so the caller
+    // can fall back to `reply`. The previously-sent short text stays
+    // visible in Telegram; the throw is the signal to the caller.
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    await handleStreamReply(
+      { chat_id: '1', text: 'short' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+
+    // Second call: now over limit.
+    await expect(
+      handleStreamReply(
+        { chat_id: '1', text: 'y'.repeat(5000), done: true },
+        state,
+        deps,
+      ),
+    ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
+
+    // No additional API calls from the rejected update.
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
   })
 
   it('done=true finalizes and deletes from map (does NOT fire terminal reaction)', async () => {
