@@ -48,6 +48,7 @@ type SqliteDatabase = {
   prepare(sql: string): {
     run(...params: unknown[]): unknown
     all(...params: unknown[]): unknown[]
+    get(...params: unknown[]): unknown
   }
   transaction(fn: (...args: unknown[]) => unknown): (...args: unknown[]) => unknown
   close(): void
@@ -328,6 +329,42 @@ export function deleteFromHistory(args: DeleteFromHistoryArgs): void {
  * already sent a message during the backstop's delay window, avoiding
  * a duplicate send.
  */
+/**
+ * Look up the most recent inbound (user → bot) message id for a chat, optionally
+ * scoped to a forum-topic thread. Returns `null` if no inbound message exists
+ * yet (fresh chat, or history was disabled when the message arrived).
+ *
+ * Used by the `reply` and `stream_reply` tool handlers to auto-populate
+ * `reply_parameters` so outbound messages quote-thread under whatever the
+ * user last said — the common case for a conversational bot — without the
+ * agent having to pass `reply_to` explicitly every turn.
+ *
+ * `thread_id` filter semantics match `query()`:
+ *   - omitted / undefined → any message in the chat
+ *   - explicit number → only that thread
+ *   - explicit null → only chat-root (non-thread)
+ */
+export function getLatestInboundMessageId(
+  chatId: string,
+  threadId?: number | null,
+): number | null {
+  const params: unknown[] = [chatId]
+  let sql = "SELECT message_id FROM messages WHERE chat_id = ? AND role = 'user'"
+  if (threadId !== undefined) {
+    if (threadId === null) {
+      sql += ' AND thread_id IS NULL'
+    } else {
+      sql += ' AND thread_id = ?'
+      params.push(threadId)
+    }
+  }
+  sql += ' ORDER BY ts DESC, message_id DESC LIMIT 1'
+  const row = requireDb().prepare(sql).get(...params as any[]) as
+    | { message_id: number }
+    | undefined
+  return row?.message_id ?? null
+}
+
 export function getRecentOutboundCount(
   chatId: string,
   withinSeconds: number,

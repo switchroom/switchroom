@@ -9,6 +9,7 @@ import {
   recordEdit,
   query,
   getRecentOutboundCount,
+  getLatestInboundMessageId,
   _resetForTests,
 } from '../history.js'
 
@@ -119,6 +120,55 @@ describe('recordInbound + query', () => {
     recordInbound({ chat_id: '-200', thread_id: null, message_id: 1, user: 'b', user_id: '2', ts: 100, text: 'B' })
     expect(query({ chat_id: '-100' }).map(r => r.text)).toEqual(['A'])
     expect(query({ chat_id: '-200' }).map(r => r.text)).toEqual(['B'])
+  })
+})
+
+describe('getLatestInboundMessageId', () => {
+  beforeEach(() => initHistory(stateDir, 30))
+
+  it('returns null when no inbound messages exist', () => {
+    expect(getLatestInboundMessageId('-100')).toBeNull()
+  })
+
+  it('returns the highest-ts inbound message_id for a chat', () => {
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 1, user: 'a', user_id: '1', ts: 100, text: 'a' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 2, user: 'a', user_id: '1', ts: 200, text: 'b' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 3, user: 'a', user_id: '1', ts: 150, text: 'c' })
+    // ts=200 wins even though id 3 > id 2 but lower ts.
+    expect(getLatestInboundMessageId('-100')).toBe(2)
+  })
+
+  it('ignores outbound (assistant) messages', () => {
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 1, user: 'a', user_id: '1', ts: 100, text: 'hi' })
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [2],
+      texts: ['bot reply'],
+      ts: 200,
+    })
+    // Assistant row has higher ts but must not be returned.
+    expect(getLatestInboundMessageId('-100')).toBe(1)
+  })
+
+  it('scopes by thread when threadId passed', () => {
+    recordInbound({ chat_id: '-100', thread_id: 7, message_id: 10, user: 'a', user_id: '1', ts: 100, text: 'topicA' })
+    recordInbound({ chat_id: '-100', thread_id: 8, message_id: 20, user: 'a', user_id: '1', ts: 200, text: 'topicB' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 30, user: 'a', user_id: '1', ts: 300, text: 'root' })
+
+    expect(getLatestInboundMessageId('-100', 7)).toBe(10)
+    expect(getLatestInboundMessageId('-100', 8)).toBe(20)
+    expect(getLatestInboundMessageId('-100', null)).toBe(30)
+    // Omitted thread → any thread (highest ts wins).
+    expect(getLatestInboundMessageId('-100')).toBe(30)
+  })
+
+  it('isolates chats', () => {
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 1, user: 'a', user_id: '1', ts: 100, text: 'a' })
+    recordInbound({ chat_id: '-200', thread_id: null, message_id: 99, user: 'b', user_id: '2', ts: 100, text: 'b' })
+    expect(getLatestInboundMessageId('-100')).toBe(1)
+    expect(getLatestInboundMessageId('-200')).toBe(99)
+    expect(getLatestInboundMessageId('-300')).toBeNull()
   })
 })
 

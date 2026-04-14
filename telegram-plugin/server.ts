@@ -60,7 +60,7 @@ import {
   shouldSuppressToolActivity,
   type PtyTailHandle,
 } from './pty-tail.js'
-import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory } from './history.js'
+import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory, getLatestInboundMessageId } from './history.js'
 import {
   parseQueuePrefix,
   formatPriorAssistantPreview,
@@ -835,7 +835,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. The reply and stream_reply tools quote-reply to the latest inbound user message by default, so you do NOT need to pass reply_to for normal responses. Pass reply_to (a message_id) only when quoting a specific earlier message, or pass quote:false to send a bare (non-quoted) message.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, edit_message for interim progress updates, and delete_message when you need to truly remove a message (prefer edit_message if you just want to change text — delete is for retraction). Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings. Use send_typing to show a typing indicator during long operations. Use pin_message to pin important outputs. Use forward_message to quote/resurface earlier messages.',
       '',
@@ -889,7 +889,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id for forum topic routing, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -897,7 +897,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           reply_to: {
             type: 'string',
-            description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+            description: 'Message ID to thread under. Overrides the default (latest inbound).',
+          },
+          quote: {
+            type: 'boolean',
+            description: 'Opt out of the default quote-reply behavior. Default: true (quotes the latest inbound user message). Pass false to send a bare message with no quote reference. Ignored when reply_to is explicitly set.',
           },
           message_thread_id: {
             type: 'string',
@@ -924,7 +928,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stream_reply',
       description:
-        'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
+        'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. By default the streamed message quote-replies to the latest inbound user message in this chat+thread — pass quote:false to opt out, or reply_to to target a specific message. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -942,6 +946,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['html', 'markdownv2', 'text'],
             description: "Rendering mode. 'html' (default) converts markdown to Telegram HTML.",
+          },
+          reply_to: {
+            type: 'string',
+            description: 'Message ID to quote-reply to. Overrides the default (latest inbound).',
+          },
+          quote: {
+            type: 'boolean',
+            description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1084,8 +1096,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         const text = repairEscapedWhitespace(args.text as string)
-        const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
-        const files = (args.files as string[] | undefined) ?? []
+        // Quote-reply default: if the caller didn't pass reply_to (and didn't
+        // opt out with quote:false), auto-populate reply_to with the most
+        // recent inbound user message in this chat+thread. This shifts the
+        // "quote the user's message" default into the plugin so the agent
+        // doesn't have to remember to pass reply_to every turn. Callers who
+        // want a bare (non-quoted) message pass quote:false.
+        const quoteOptIn = args.quote !== false
+        let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const access = loadAccess()
         const configParseMode = access.parseMode ?? 'html'
         const format = (args.format as string | undefined) ?? configParseMode
@@ -1121,6 +1139,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // Resolve thread ID: explicit arg > auto-captured from inbound
         let threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+
+        // Quote-reply default (see quoteOptIn above). Only fire when history
+        // is enabled — without the SQLite buffer we have nothing to look up.
+        // We scope the lookup to the resolved thread when one exists so a
+        // forum-topic reply doesn't cross-quote a message from a different
+        // topic in the same chat.
+        if (reply_to == null && quoteOptIn && HISTORY_ENABLED) {
+          try {
+            const latest = getLatestInboundMessageId(chat_id, threadId ?? null)
+            if (latest != null) reply_to = latest
+          } catch (err) {
+            // Best-effort: a history lookup failure must not block sending.
+            process.stderr.write(
+              `telegram channel: quote-reply lookup failed: ${(err as Error).message}\n`,
+            )
+          }
+        }
 
         for (const f of files) {
           assertSendable(f)
@@ -1379,6 +1414,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             done: Boolean(args.done),
             message_thread_id: args.message_thread_id as string | undefined,
             format: args.format as string | undefined,
+            reply_to: args.reply_to as string | undefined,
+            quote: args.quote as boolean | undefined,
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
@@ -1396,6 +1433,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             endStatusReaction,
             historyEnabled: HISTORY_ENABLED,
             recordOutbound,
+            // Wire the quote-reply default only when history is enabled —
+            // without the SQLite buffer we have nothing to look up. Other
+            // internal callers (progress-card driver, PTY-tail) construct
+            // their own deps without this and keep the legacy non-quoting
+            // behavior, which is what we want for those lanes.
+            ...(HISTORY_ENABLED
+              ? { getLatestInboundMessageId }
+              : {}),
             writeError: (line) => process.stderr.write(line),
             throttleMs: 600,
             progressCardActive: streamMode === 'checklist',

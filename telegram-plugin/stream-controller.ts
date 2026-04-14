@@ -40,6 +40,13 @@ export interface StreamSendOpts {
   parse_mode?: 'HTML' | 'MarkdownV2'
   message_thread_id?: number
   link_preview_options?: { is_disabled: boolean }
+  /**
+   * Telegram's reply_parameters, used for quote-replying to an earlier
+   * message. Only meaningful on the initial `sendMessage` — `editMessageText`
+   * cannot add a quote reference to an existing message, so the controller
+   * strips this from edit opts internally.
+   */
+  reply_parameters?: { message_id: number }
 }
 
 export type RetryPolicy = <T>(
@@ -53,6 +60,13 @@ export interface StreamControllerConfig {
   threadId?: number
   parseMode?: 'HTML' | 'MarkdownV2'
   disableLinkPreview?: boolean
+  /**
+   * Optional quote-reply target. When set, the initial send attaches
+   * `reply_parameters: { message_id: replyToMessageId }` so the first
+   * streamed message quote-threads under the referenced message. Edits
+   * don't include it (Telegram rejects reply_parameters on edit).
+   */
+  replyToMessageId?: number
   throttleMs?: number
   /** Pre-send idle debounce. See DraftStreamConfig.idleMs. */
   idleMs?: number
@@ -94,12 +108,22 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     onSend,
     onEdit,
     log,
+    replyToMessageId,
   } = cfg
 
-  const sendOpts: StreamSendOpts = {
+  // Base opts shared by send + edit. The initial send adds reply_parameters
+  // on top (see below); edits must NOT carry reply_parameters — Telegram's
+  // editMessageText rejects it.
+  const baseOpts: StreamSendOpts = {
     ...(parseMode ? { parse_mode: parseMode } : {}),
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+  }
+  const sendOpts: StreamSendOpts = {
+    ...baseOpts,
+    ...(replyToMessageId != null
+      ? { reply_parameters: { message_id: replyToMessageId } }
+      : {}),
   }
 
   return createDraftStream(
@@ -113,7 +137,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     },
     async (id, text) => {
       await retry(
-        () => bot.api.editMessageText(chatId, id, text, sendOpts),
+        () => bot.api.editMessageText(chatId, id, text, baseOpts),
         { threadId, chat_id: chatId },
       )
       onEdit?.(id, text.length)
