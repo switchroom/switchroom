@@ -1,7 +1,7 @@
 {
   "name": "clerk-ai",
   "version": "0.1.0",
-  "description": "Multi-agent orchestrator for Claude Code. One Telegram group, many specialized agents.",
+  "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys, no Docker.",
   "type": "module",
   "bin": {
     "clerk": "./bin/clerk.ts"
@@ -39,9 +39,20 @@
   },
   "keywords": [
     "claude-code",
+    "claude-pro",
+    "claude-max",
+    "claude-subscription",
+    "anthropic",
+    "openclaw-alternative",
+    "nanoclaw-alternative",
+    "opencode-alternative",
     "multi-agent",
     "telegram",
+    "telegram-bot",
     "orchestrator",
-    "ai-agent"
+    "ai-agent",
+    "self-hosted",
+    "oauth",
+    "24-7"
   ]
 }
