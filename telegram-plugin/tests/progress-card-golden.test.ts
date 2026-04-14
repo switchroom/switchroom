@@ -104,17 +104,19 @@ describe('progress-card golden turn', () => {
     // Structural assertions — don't brittle-pin the whole string, but
     // lock in the key visual elements and their ordering.
     expect(html).toContain('💬 fix the failing tests and push')
-    expect(html).toContain('<b>✅ Done</b>')
+    expect(html).toContain('✅ <b>Done</b>')
 
     // Checklist: 4 items, in order, with labels derived from input args.
-    expect(html).toContain('✅ Read: <code>clerk/tests/merge.test.ts</code>')
-    expect(html).toContain('✅ Bash: <code>bun test</code>')
-    expect(html).toContain('✅ Edit: <code>clerk/src/config/merge.ts</code>')
-    expect(html).toContain('❌ Bash: <code>git push</code>')
+    // Path labels shortened to basename; no <code> wrapping — the line
+    // reads as a natural sentence.
+    expect(html).toContain('✅ Read merge.test.ts')
+    expect(html).toContain('✅ Bash bun test')
+    expect(html).toContain('✅ Edit merge.ts')
+    expect(html).toContain('❌ Bash git push')
 
     // Ordering: Read appears before Edit, Edit before the failed Bash.
-    const readIdx = html.indexOf('Read: <code>')
-    const editIdx = html.indexOf('Edit: <code>')
+    const readIdx = html.indexOf('Read merge.test.ts')
+    const editIdx = html.indexOf('Edit merge.ts')
     const failIdx = html.indexOf('❌ Bash')
     expect(readIdx).toBeLessThan(editIdx)
     expect(editIdx).toBeLessThan(failIdx)
@@ -137,10 +139,10 @@ describe('progress-card golden turn', () => {
 
     const html = render(state, t + 300)
 
-    expect(html).toContain('<b>🔧 Run</b>')
+    expect(html).toContain('⚙️ <b>Working…</b>')
     expect(html).toContain('✅ Read')
-    expect(html).toContain('⚡ <b>Bash</b>: <code>bun test</code>')
+    expect(html).toContain('🔧 <b>Bash</b> bun test')
     // Running item has elapsed-time suffix
-    expect(html).toMatch(/⚡ <b>Bash<\/b>: <code>bun test<\/code> <i>\(\d/)
+    expect(html).toMatch(/🔧 <b>Bash<\/b> bun test <i>\(\d/)
   })
 })

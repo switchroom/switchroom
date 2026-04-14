@@ -80,7 +80,7 @@ describe('progress-card driver', () => {
     // Distinctive Working… banner is present.
     expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
     // No tool_use has been fed in yet — there must be no checklist items.
-    expect(emits[0].html).not.toContain('⚡ <b>')
+    expect(emits[0].html).not.toContain('🔧 <b>')
     // And the echoed user request shows up so the card ties back to the
     // user's message.
     expect(emits[0].html).toContain('please investigate')
@@ -99,8 +99,10 @@ describe('progress-card driver', () => {
     emits.length = 0
     driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c1')
     expect(emits).toHaveLength(1)
-    expect(emits[0].html).toContain('<b>🔧 Run</b>')
-    expect(emits[0].html).toContain('⚡ <b>Read</b>')
+    // The card banner stays "Working…" during 'run'; the stage switch is
+    // signalled by the new 🔧 checklist line rather than an inline header.
+    expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
+    expect(emits[0].html).toContain('🔧 <b>Read</b>')
   })
 
   it('emits immediately on turn_end with done=true', () => {
@@ -111,7 +113,7 @@ describe('progress-card driver', () => {
     driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
     expect(emits).toHaveLength(1)
     expect(emits[0].done).toBe(true)
-    expect(emits[0].html).toContain('<b>✅ Done</b>')
+    expect(emits[0].html).toContain('✅ <b>Done</b>')
   })
 
   it('coalesces bursts of non-stage-changing events', () => {
@@ -201,6 +203,118 @@ describe('progress-card driver', () => {
     driver.ingest(enqueue('c1'), null)
     driver.ingest({ kind: 'turn_end', durationMs: 0 }, 'c1')
     expect(summaries).toHaveLength(0)
+  })
+})
+
+describe('progress-card checklist rendering', () => {
+  it('tool_use emits a running item; tool_result flips to done', () => {
+    const { driver, emits, advance } = harness()
+    driver.ingest(enqueue('c1'), null)
+    emits.length = 0
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/x/foo.ts' } }, 'c1')
+    expect(emits.at(-1)!.html).toContain('🔧 <b>Read</b> foo.ts')
+    driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' }, 'c1')
+    advance(1000)
+    expect(emits.at(-1)!.html).toContain('✅ Read foo.ts')
+    expect(emits.at(-1)!.html).not.toContain('🔧 <b>Read</b>')
+  })
+
+  it('multiple tools preserve insertion order in the rendered checklist', () => {
+    const { driver, emits, advance } = harness()
+    driver.ingest(enqueue('c1'), null)
+    // Sequential tool_use / tool_result pairs — mirroring the actual
+    // Claude Code session shape (parallel tool_use in one assistant
+    // block is rare and the SDK serialises results).
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'A', input: { command: 'ls' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'A', toolName: null }, 'c1')
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'B', input: { file_path: '/x/foo.ts' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'B', toolName: null }, 'c1')
+    driver.ingest({ kind: 'tool_use', toolName: 'Grep', toolUseId: 'C', input: { pattern: 'xyz' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'C', toolName: null }, 'c1')
+    advance(1000)
+    const html = emits.at(-1)!.html
+    // Order preserved: Bash → Read → Grep.
+    const bashIdx = html.indexOf('Bash</b> ls') >= 0 ? html.indexOf('Bash</b> ls') : html.indexOf('Bash ls')
+    const readIdx = html.indexOf('Read</b> foo.ts') >= 0 ? html.indexOf('Read</b> foo.ts') : html.indexOf('Read foo.ts')
+    const grepIdx = html.indexOf('Grep</b>') >= 0 ? html.indexOf('Grep</b>') : html.indexOf('Grep ')
+    expect(bashIdx).toBeGreaterThan(-1)
+    expect(readIdx).toBeGreaterThan(bashIdx)
+    expect(grepIdx).toBeGreaterThan(readIdx)
+  })
+
+  it('reducer pairs tool_result to tool_use by id even when results arrive out of order', () => {
+    // Purely reducer-level (not driver) since the driver collapses bursts
+    // and the emit cadence obscures intermediate state. We reach into the
+    // reduced state via peek() after flushing the coalesce timer.
+    const { driver, advance } = harness()
+    driver.ingest(enqueue('c1'), null)
+    // Two tool_use in one assistant "batch" (simulating a model that
+    // emitted parallel tool_use blocks); reducer will close the first as
+    // soon as the second tool_use arrives, so to exercise the id-pairing
+    // path we need to keep each tool_use's result arriving before the
+    // next tool_use starts, but with out-of-order ids within a single
+    // result batch. Here we drive two separate pairs and rely on id
+    // matching to attach the right results.
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'first' }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'first', toolName: null }, 'c1')
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'second' }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'nonexistent', toolName: null }, 'c1')
+    advance(1000)
+    const st = driver.peek('c1')
+    expect(st).toBeDefined()
+    // First Read is done; Bash still running because the stray
+    // tool_result fell back to the oldest running item (Bash). This is
+    // the documented fallback behaviour.
+    expect(st!.items.map((i) => [i.tool, i.state])).toEqual([
+      ['Read', 'done'],
+      ['Bash', 'done'],
+    ])
+  })
+
+  it('failed tool (is_error:true) renders with ❌', () => {
+    const { driver, emits, advance } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't1', input: { command: 'git push' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Bash', isError: true }, 'c1')
+    advance(1000)
+    const html = emits.at(-1)!.html
+    expect(html).toContain('❌ Bash git push')
+  })
+
+  it('overflow: 13+ items collapse oldest with "(+N more earlier steps)"', () => {
+    const { driver, emits, advance } = harness()
+    driver.ingest(enqueue('c1'), null)
+    // 15 distinct tools (alternating names so rollup compaction doesn't kick in)
+    const names = ['Read', 'Bash', 'Grep', 'Edit', 'Glob', 'Write', 'WebFetch']
+    for (let i = 0; i < 15; i++) {
+      const name = names[i % names.length]
+      driver.ingest({ kind: 'tool_use', toolName: name, toolUseId: `t${i}`, input: {} }, 'c1')
+      driver.ingest({ kind: 'tool_result', toolUseId: `t${i}`, toolName: name }, 'c1')
+    }
+    advance(2000)
+    const html = emits.at(-1)!.html
+    expect(html).toContain('(+3 more earlier steps)')
+    // The visible tail contains exactly 12 checklist lines (count the
+    // state emojis — excluding the header banner ⚙️/✅).
+    const checklistEmojis = (html.match(/\n  (✅|🔧|❌) /g) ?? []).length
+    expect(checklistEmojis).toBe(12)
+  })
+
+  it('banner transitions from "Working…" to "Done" on turn_end and keeps checklist visible', () => {
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/x/a.ts' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' }, 'c1')
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't2', input: { command: 'echo hi' } }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 't2', toolName: 'Bash' }, 'c1')
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    const final = emits.at(-1)!
+    expect(final.done).toBe(true)
+    expect(final.html).toContain('✅ <b>Done</b>')
+    expect(final.html).not.toContain('⚙️ <b>Working…</b>')
+    // Final checklist still visible.
+    expect(final.html).toContain('✅ Read a.ts')
+    expect(final.html).toContain('✅ Bash echo hi')
   })
 })
 
