@@ -172,9 +172,9 @@ describe('progress-card render', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
     expect(out).toContain('💬 fix tests')
-    expect(out).toContain('<b>🤔 Plan</b>')
-    expect(out).toContain('🔧 Run')
-    expect(out).not.toContain('<b>🔧 Run</b>')
+    // The old static "🤔 Plan → 🔧 Run → ✅ Done" phase line is gone;
+    // the checklist body is empty until tool_use events arrive.
+    expect(out).not.toContain('🤔 Plan')
   })
 
   it('renders a distinctive "Working…" header while in-progress', () => {
@@ -199,7 +199,7 @@ describe('progress-card render', () => {
     const s = fold([enqueue('test'), { kind: 'tool_use', toolName: 'Bash' }])
     // tool_use fired at t=1100, render at t=3200 → 2.1s elapsed for the item
     const out = render(s, 3200)
-    expect(out).toContain('⚡ <b>Bash</b>')
+    expect(out).toContain('🔧 <b>Bash</b>')
     expect(out).toContain('(00:02)')
   })
 
@@ -255,7 +255,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1800)
     const out = render(st, 2000)
     expect(out).not.toContain('×5')
-    expect(out).toContain('⚡ <b>Read</b>')
+    expect(out).toContain('🔧 <b>Read</b>')
   })
 
   it('does NOT roll up mixed tools', () => {
@@ -292,13 +292,18 @@ describe('progress-card render', () => {
     expect(out).not.toContain('<script>')
   })
 
-  it('bolds the current stage', () => {
+  it('header banner reflects the active stage', () => {
+    // Stage is no longer rendered as an inline Plan→Run→Done line; the
+    // single source of truth is the header banner at the top of the card.
     let st = fold([enqueue('test')])
-    expect(render(st, 1500)).toContain('<b>🤔 Plan</b>')
+    expect(render(st, 1500)).toContain('⚙️ <b>Working…</b>')
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1500)
-    expect(render(st, 1600)).toContain('<b>🔧 Run</b>')
+    expect(render(st, 1600)).toContain('⚙️ <b>Working…</b>')
+    expect(render(st, 1600)).toContain('🔧 <b>Read</b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
-    expect(render(st, 1700)).toContain('<b>✅ Done</b>')
+    const done = render(st, 1700)
+    expect(done).toContain('✅ <b>Done</b>')
+    expect(done).not.toContain('⚙️ <b>Working…</b>')
   })
 
   it('hides thought line on done stage', () => {

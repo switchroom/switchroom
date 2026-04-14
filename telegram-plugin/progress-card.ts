@@ -175,12 +175,18 @@ export function reduce(
 
 const STATE_EMOJI: Record<ItemState, string> = {
   pending: '⏸',
-  running: '⚡',
+  running: '🔧',
   done: '✅',
   failed: '❌',
 }
 
-const STAGE_ARROW = '→'
+/**
+ * Max checklist lines to render inline. Older completed items collapse
+ * into a synthetic "(+N more earlier steps)" rollup line so the card
+ * stays compact during long turns. Chosen to fit comfortably on a
+ * mobile Telegram screen without scroll.
+ */
+const MAX_VISIBLE_ITEMS = 12
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
@@ -211,11 +217,52 @@ function extractUserText(raw: string): string {
   return body.trim()
 }
 
-/** Render a single checklist line — tool name + optional label code span. */
+/**
+ * Render a single checklist line body: tool name + a short label hint.
+ *
+ * Format: `<tool> <label>` (space-separated, no code-span wrapping) so the
+ * line reads like a natural sentence — "Read MANIFEST.md", "Grep "foo" (in
+ * src/)", "Bash git status". The sub-agent `Agent` tool uses a colon
+ * separator ("Agent: <description>") because the description tends to be
+ * a full phrase, not a filename.
+ *
+ * `running` items bold the tool name so the eye jumps to the line that's
+ * currently in flight.
+ */
 function renderItemCore(tool: string, label: string, bold = false): string {
   const toolHtml = bold ? `<b>${escapeHtml(tool)}</b>` : escapeHtml(tool)
   if (!label) return toolHtml
-  return `${toolHtml}: <code>${escapeHtml(label)}</code>`
+  const separator = tool === 'Agent' || tool === 'Task' ? ': ' : ' '
+  return `${toolHtml}${separator}${escapeHtml(label)}`
+}
+
+/**
+ * Cap the visible checklist at MAX_VISIBLE_ITEMS. When more items exist,
+ * the OLDEST completed items collapse into a "(+N more earlier steps)"
+ * synthetic line rendered by render(); any still-running item is always
+ * kept visible, even if that means pushing the visible tail beyond the cap.
+ *
+ * Exported for tests.
+ */
+export function applyVisibleCap(
+  items: ReadonlyArray<RolledItem>,
+): { items: RolledItem[]; overflowCount: number } {
+  if (items.length <= MAX_VISIBLE_ITEMS) {
+    return { items: items.slice(), overflowCount: 0 }
+  }
+  // Take the last N; anything before that is collapsed. Running items
+  // tend to be at the tail (new tool_use appends), so this naturally
+  // keeps them visible.
+  const tail = items.slice(items.length - MAX_VISIBLE_ITEMS)
+  const dropped = items.length - tail.length
+  // Count the dropped items by their underlying `count` when rolled up,
+  // so a collapsed "Read ×6" contributes 6 to the overflow count rather
+  // than 1. Gives the user a meaningful "+N" signal.
+  let overflow = 0
+  for (let i = 0; i < dropped; i++) {
+    overflow += items[i].count ?? 1
+  }
+  return { items: tail, overflowCount: overflow }
 }
 
 /**
@@ -244,18 +291,16 @@ export function render(state: ProgressCardState, now: number): string {
   // Thin visual separator so the bullets below don't blur into the header.
   lines.push('─ ─ ─')
 
-  // Stage indicator
-  const stageParts: string[] = [
-    state.stage === 'plan' ? '<b>🤔 Plan</b>' : '🤔 Plan',
-    state.stage === 'run' ? '<b>🔧 Run</b>' : '🔧 Run',
-    state.stage === 'done' ? '<b>✅ Done</b>' : '✅ Done',
-  ]
-  lines.push(stageParts.join(` ${STAGE_ARROW} `))
-  lines.push('')
-
-  // Checklist — preserve insertion order; running items show elapsed time
+  // Checklist — preserve insertion order; running items show elapsed time.
+  // The old static "🤔 Plan → 🔧 Run → ✅ Done" phase line is gone: users
+  // asked for a live per-tool-call checklist instead. The header banner
+  // (⚙️ Working… / ✅ Done) carries the overall phase.
   const compacted = compactItems(state.items)
-  for (const item of compacted) {
+  const visible = applyVisibleCap(compacted)
+  if (visible.overflowCount > 0) {
+    lines.push(`  … (+${visible.overflowCount} more earlier steps)`)
+  }
+  for (const item of visible.items) {
     const emoji = STATE_EMOJI[item.state]
     if (item.state === 'running') {
       const dur = formatDuration(now - item.startedAt)
