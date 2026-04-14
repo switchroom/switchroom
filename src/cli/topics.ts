@@ -41,7 +41,7 @@ export function registerTopicsCommand(program: Command): void {
     .command("topics")
     .description("Manage Telegram forum topics for agents");
 
-  // clerk topics sync
+  // switchroom topics sync
   topics
     .command("sync")
     .description("Create forum topics for agents that don't have one yet")
@@ -54,7 +54,7 @@ export function registerTopicsCommand(program: Command): void {
 
         const agentNames = Object.keys(config.agents);
         if (agentNames.length === 0) {
-          console.log(chalk.yellow("No agents defined in clerk.yaml"));
+          console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           return;
         }
 
@@ -92,7 +92,7 @@ export function registerTopicsCommand(program: Command): void {
       })
     );
 
-  // clerk topics list
+  // switchroom topics list
   topics
     .command("list")
     .description("List agent topic mappings")
@@ -102,7 +102,7 @@ export function registerTopicsCommand(program: Command): void {
 
         const agentNames = Object.keys(config.agents);
         if (agentNames.length === 0) {
-          console.log(chalk.yellow("No agents defined in clerk.yaml"));
+          console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           return;
         }
 
@@ -128,7 +128,7 @@ export function registerTopicsCommand(program: Command): void {
       })
     );
 
-  // clerk topics cleanup
+  // switchroom topics cleanup
   topics
     .command("cleanup")
     .description("Close orphaned topics (in state but not in current config)")

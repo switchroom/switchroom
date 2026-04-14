@@ -14,26 +14,26 @@ let logPath: string
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'plugin-logger-'))
   logPath = join(tmpDir, 'nested', 'subdir', 'telegram-plugin.log')
-  process.env.CLERK_TELEGRAM_LOG_PATH = logPath
+  process.env.SWITCHROOM_TELEGRAM_LOG_PATH = logPath
   _resetForTests()
 })
 
 afterEach(() => {
   _resetForTests()
-  delete process.env.CLERK_TELEGRAM_LOG_PATH
+  delete process.env.SWITCHROOM_TELEGRAM_LOG_PATH
   try { rmSync(tmpDir, { recursive: true, force: true }) } catch { /* ignore */ }
 })
 
 describe('resolveLogPath', () => {
-  it('uses CLERK_TELEGRAM_LOG_PATH when set', () => {
-    expect(resolveLogPath({ CLERK_TELEGRAM_LOG_PATH: '/tmp/custom.log' })).toBe(
+  it('uses SWITCHROOM_TELEGRAM_LOG_PATH when set', () => {
+    expect(resolveLogPath({ SWITCHROOM_TELEGRAM_LOG_PATH: '/tmp/custom.log' })).toBe(
       '/tmp/custom.log',
     )
   })
 
-  it('falls back to a path under ~/.clerk/logs when env is unset', () => {
+  it('falls back to a path under ~/.switchroom/logs when env is unset', () => {
     const out = resolveLogPath({})
-    expect(out).toMatch(/\.clerk\/logs\/telegram-plugin\.log$/)
+    expect(out).toMatch(/\.switchroom\/logs\/telegram-plugin\.log$/)
   })
 })
 
@@ -89,7 +89,7 @@ describe('installPluginLogger — stderr interception', () => {
 
   it('swallows filesystem errors and never throws from stderr.write', () => {
     // Point at an unwritable path (a file that cannot become a directory).
-    process.env.CLERK_TELEGRAM_LOG_PATH = '/proc/1/cannot-write-here.log'
+    process.env.SWITCHROOM_TELEGRAM_LOG_PATH = '/proc/1/cannot-write-here.log'
     _resetForTests()
     installPluginLogger()
     expect(() => process.stderr.write('still ok\n')).not.toThrow()

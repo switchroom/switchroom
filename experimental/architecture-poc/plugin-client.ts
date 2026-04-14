@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Proof-of-concept: clerk-channel MCP plugin (client side)
+ * Proof-of-concept: switchroom-channel MCP plugin (client side)
  *
  * Validates assumptions 1-3:
  *   1. Bun process can connect to a Unix socket as a client
@@ -15,7 +15,7 @@
  *   - Forward outbound replies from Claude through the daemon to Telegram
  */
 
-const SOCKET_PATH = process.env.CLERK_SOCKET ?? "/tmp/clerk-telegram.sock";
+const SOCKET_PATH = process.env.SWITCHROOM_SOCKET ?? "/tmp/switchroom-telegram.sock";
 const TOPIC_ID = Number(process.env.TELEGRAM_TOPIC_ID ?? "42");
 
 type MessageEnvelope =
@@ -124,7 +124,7 @@ function sendReply(chatId: string, text: string): boolean {
 await connectToDaemon();
 
 // In production, the MCP server would be running here too:
-//   const mcpServer = new Server({ name: "clerk-telegram", version: "1.0.0" }, { capabilities: { tools: {} } });
+//   const mcpServer = new Server({ name: "switchroom-telegram", version: "1.0.0" }, { capabilities: { tools: {} } });
 //   const transport = new StdioServerTransport();
 //   await mcpServer.connect(transport);
 //

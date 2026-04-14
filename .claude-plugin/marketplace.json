@@ -1,23 +1,23 @@
 {
-  "name": "clerk",
+  "name": "switchroom",
   "owner": {
     "name": "Ken Thompson",
     "email": "me@kenthompson.com.au"
   },
   "metadata": {
-    "description": "Clerk plugin marketplace — skills for managing clerk multi-agent setups from inside Claude Code."
+    "description": "Switchroom plugin marketplace — skills for managing switchroom multi-agent setups from inside Claude Code."
   },
   "plugins": [
     {
-      "name": "clerk",
+      "name": "switchroom",
       "source": "./",
-      "description": "Skills for operating clerk: install, status, logs, config, restart, reconcile, schedule, health, architecture, and Telegram integration guidance.",
-      "homepage": "https://github.com/mekenthompson/clerk",
-      "repository": "https://github.com/mekenthompson/clerk",
+      "description": "Skills for operating switchroom: install, status, logs, config, restart, reconcile, schedule, health, architecture, and Telegram integration guidance.",
+      "homepage": "https://github.com/mekenthompson/switchroom",
+      "repository": "https://github.com/mekenthompson/switchroom",
       "license": "MIT",
-      "keywords": ["clerk", "agents", "telegram", "orchestration", "skills"],
+      "keywords": ["switchroom", "agents", "telegram", "orchestration", "skills"],
       "category": "agents",
-      "tags": ["clerk", "multi-agent", "telegram", "ops"]
+      "tags": ["switchroom", "multi-agent", "telegram", "ops"]
     }
   ]
 }

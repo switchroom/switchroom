@@ -1,4 +1,4 @@
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import { loadTopicState, saveTopicState, type TopicState, type TopicEntry } from "./state.js";
 
 export interface TopicSyncResult {
@@ -130,13 +130,13 @@ async function createForumTopic(
  * Creates topics that don't exist yet, skips ones already mapped.
  */
 export async function syncTopics(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   statePath?: string
 ): Promise<TopicSyncResult[]> {
   const botToken = resolveBotToken(config.telegram.bot_token);
   if (!botToken) {
     throw new TopicSyncError(
-      "Cannot resolve bot token. Set TELEGRAM_BOT_TOKEN environment variable or configure a literal token in clerk.yaml."
+      "Cannot resolve bot token. Set TELEGRAM_BOT_TOKEN environment variable or configure a literal token in switchroom.yaml."
     );
   }
 
@@ -205,7 +205,7 @@ export async function syncTopics(
  * List all known agent-to-topic mappings from state file.
  */
 export function listTopics(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   statePath?: string
 ): { agent: string; topic_name: string; topic_id: number | null }[] {
   const state = loadTopicState(statePath);
@@ -241,7 +241,7 @@ export function resolveTopicId(
  * Returns the list of orphaned agent names and their topic IDs.
  */
 export function findOrphanedTopics(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   statePath?: string
 ): { agent: string; topic_id: number; topic_name: string }[] {
   const state = loadTopicState(statePath);
@@ -299,7 +299,7 @@ async function closeForumTopic(
  * Clean up orphaned topics: close them in Telegram and remove from state.
  */
 export async function cleanupOrphanedTopics(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   statePath?: string
 ): Promise<{ agent: string; topic_id: number; closed: boolean }[]> {
   const botToken = resolveBotToken(config.telegram.bot_token);

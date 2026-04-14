@@ -1,4 +1,4 @@
-# Clerk Skills Eval Framework
+# Switchroom Skills Eval Framework
 
 Evaluates Claude Code custom skills for quality and routing correctness.
 
@@ -17,7 +17,7 @@ Tests that each skill produces the right kind of response.
 python evals/run_quality.py
 
 # Filter by skill
-python evals/run_quality.py --filter clerk-status
+python evals/run_quality.py --filter switchroom-status
 
 # Run with ablation (compare with and without skill content)
 python evals/run_quality.py --ablation
@@ -41,7 +41,7 @@ python evals/run_trigger.py
 python evals/run_trigger.py --runs 3
 
 # Filter by skill
-python evals/run_trigger.py --filter clerk-status
+python evals/run_trigger.py --filter switchroom-status
 ```
 
 ## Output

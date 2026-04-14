@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { dirname } from "node:path";
+import { resolveStatePath } from "../config/paths.js";
 
 export interface TopicEntry {
   topic_id: number;
@@ -12,8 +13,7 @@ export interface TopicState {
 }
 
 function defaultStatePath(): string {
-  const home = process.env.HOME ?? "/root";
-  return resolve(home, ".clerk", "topics.json");
+  return resolveStatePath("topics.json");
 }
 
 export function loadTopicState(statePath?: string): TopicState {

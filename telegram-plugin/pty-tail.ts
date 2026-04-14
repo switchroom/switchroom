@@ -9,16 +9,16 @@
  * do via `script -qfc ... service.log`) and parse the rendered TUI.
  *
  * Critical observation from the live server's service.log: when the
- * model is generating a reply via the clerk-telegram MCP tool, Claude
+ * model is generating a reply via the switchroom-telegram MCP tool, Claude
  * Code's Ink TUI renders the in-progress tool call as:
  *
- *   ● clerk-telegram - reply (MCP)(chat_id: "...", text: "Yes — I can
+ *   ● switchroom-telegram - reply (MCP)(chat_id: "...", text: "Yes — I can
  *                                 attach files to replies. Images send
  *                                 as inline photos...")
  *
  * The text parameter expands character-by-character as the model
  * streams. By tailing service.log, feeding the bytes into a headless
- * xterm.js, and scanning the resulting buffer for `● clerk-telegram -
+ * xterm.js, and scanning the resulting buffer for `● switchroom-telegram -
  * reply` blocks, we can extract the streaming reply text in real time.
  *
  * Architecture:
@@ -56,7 +56,7 @@ import { Terminal } from '@xterm/headless'
  * time. Must be large enough to contain at least one full-screen Ink
  * redraw — Ink's renderer is differential and emits cursor-forward
  * escapes for unchanged cells, so without a baseline the terminal
- * ends up with blank cells where the "● clerk-telegram - stream_reply"
+ * ends up with blank cells where the "● switchroom-telegram - stream_reply"
  * marker characters should be, and the v1 extractor's substring match
  * silently misses every partial. 1 MB is empirically ~15–30 s of
  * steady output, comfortably covering a full-frame redraw.
@@ -87,8 +87,8 @@ export interface MessageRegionExtractor {
  * v1 extractor for Claude Code 2.1.x.
  *
  * Heuristic: scan the buffer from the bottom for the most recent line
- * that contains `● clerk-telegram - reply (MCP)` or
- * `● clerk-telegram - stream_reply (MCP)`. Once found, locate the
+ * that contains `● switchroom-telegram - reply (MCP)` or
+ * `● switchroom-telegram - stream_reply (MCP)`. Once found, locate the
  * `text: "` literal and extract the value using an escape-aware
  * character walk that terminates at the first UNESCAPED closing `"`.
  *
@@ -104,7 +104,7 @@ export interface MessageRegionExtractor {
  * `\\`) so a text value that contains literal quotes renders correctly
  * in the preview instead of truncating at the first inner quote.
  *
- * Falls back to scanning for any `● clerk-telegram - reply` substring
+ * Falls back to scanning for any `● switchroom-telegram - reply` substring
  * even if it's not the very first character of the line — Ink sometimes
  * indents tool calls under thinking blocks.
  */
@@ -119,8 +119,8 @@ export class V1Extractor implements MessageRegionExtractor {
     for (let i = buf.length - 1; i >= 0; i--) {
       const text = buf.getLine(i)?.translateToString(true) ?? ''
       if (
-        text.includes('clerk-telegram - reply') ||
-        text.includes('clerk-telegram - stream_reply')
+        text.includes('switchroom-telegram - reply') ||
+        text.includes('switchroom-telegram - stream_reply')
       ) {
         startLine = i
         break
@@ -252,11 +252,11 @@ export interface ToolActivityExtractor {
  *     ● Read(/path/to/file.ts)
  *     ● Grep(pattern, path: "...")
  *     ● Glob(**\/*.ts)
- *     ● clerk-telegram - reply (MCP)(...)
+ *     ● switchroom-telegram - reply (MCP)(...)
  *
  * For the core tools we render a short verbed one-liner ("Running Bash:
  * git status", "Reading file.ts", "Searching with Grep: pattern"). For
- * clerk-telegram tool calls we return null — those are already surfaced
+ * switchroom-telegram tool calls we return null — those are already surfaced
  * by V1Extractor on the main lane, and echoing them on the activity lane
  * would be confusing.
  */
@@ -273,8 +273,8 @@ export class V1ToolActivityExtractor implements ToolActivityExtractor {
       const after = raw.slice(bulletIdx + 1).trimStart()
       if (after === '') continue
 
-      // Skip clerk-telegram tool calls — V1Extractor owns those.
-      if (after.startsWith('clerk-telegram')) return null
+      // Skip switchroom-telegram tool calls — V1Extractor owns those.
+      if (after.startsWith('switchroom-telegram')) return null
 
       // Match `ToolName(` or `ToolName -` patterns. Accept the conventional
       // Claude Code tool names; anything else is "Running <Tool>".
@@ -609,8 +609,8 @@ export function startPtyTail(config: PtyTailConfig): PtyTailHandle {
     // *differential* updates (cursor-forward escapes for unchanged cells),
     // so a fresh terminal starting at EOF sees `\e[1C` skipping over cells
     // that Ink assumes already contain characters from a prior full frame.
-    // Without a baseline, marker strings like "clerk-telegram" render
-    // with gaps (e.g. "clerk te egram") and the extractor's substring
+    // Without a baseline, marker strings like "switchroom-telegram" render
+    // with gaps (e.g. "switchroom te egram") and the extractor's substring
     // check fails → no partials ever emit.
     //
     // 1 MB is deliberately generous: even a few seconds of steady Ink

@@ -10,9 +10,9 @@ import {
   resolveBotToken,
   TopicSyncError,
 } from "../src/telegram/topic-manager.js";
-import type { ClerkConfig } from "../src/config/schema.js";
+import type { SwitchroomConfig } from "../src/config/schema.js";
 
-function makeConfig(agents: Record<string, { topic_name: string; topic_emoji?: string; topic_id?: number }>): ClerkConfig {
+function makeConfig(agents: Record<string, { topic_name: string; topic_emoji?: string; topic_id?: number }>): SwitchroomConfig {
   const agentsMap: Record<string, any> = {};
   for (const [name, cfg] of Object.entries(agents)) {
     agentsMap[name] = {
@@ -25,13 +25,13 @@ function makeConfig(agents: Record<string, { topic_name: string; topic_emoji?: s
   }
 
   return {
-    clerk: { version: 1 as const, agents_dir: "~/.clerk/agents" },
+    switchroom: { version: 1 as const, agents_dir: "~/.switchroom/agents" },
     telegram: {
       bot_token: "123:FAKE_TOKEN",
       forum_chat_id: "-1001234567890",
     },
     agents: agentsMap,
-  } as ClerkConfig;
+  } as SwitchroomConfig;
 }
 
 describe("TopicState", () => {
@@ -39,7 +39,7 @@ describe("TopicState", () => {
   let statePath: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     statePath = join(tmpDir, "topics.json");
   });
 
@@ -133,7 +133,7 @@ describe("listTopics", () => {
   let statePath: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     statePath = join(tmpDir, "topics.json");
   });
 
@@ -178,7 +178,7 @@ describe("resolveTopicId", () => {
   let statePath: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     statePath = join(tmpDir, "topics.json");
   });
 
@@ -211,7 +211,7 @@ describe("syncTopics", () => {
   const originalEnv = process.env.TELEGRAM_BOT_TOKEN;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     statePath = join(tmpDir, "topics.json");
     delete process.env.TELEGRAM_BOT_TOKEN;
   });

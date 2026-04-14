@@ -1,4 +1,4 @@
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import { openVault } from "./vault.js";
 import { resolvePath } from "../config/loader.js";
 
@@ -39,10 +39,10 @@ function resolveValue(
 }
 
 export function resolveVaultReferences(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   passphrase: string
-): ClerkConfig {
-  const vaultPath = resolvePath(config.vault?.path ?? "~/.clerk/vault.enc");
+): SwitchroomConfig {
+  const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
   const secrets = openVault(passphrase, vaultPath);
-  return resolveValue(config, secrets) as ClerkConfig;
+  return resolveValue(config, secrets) as SwitchroomConfig;
 }

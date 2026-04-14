@@ -23,6 +23,8 @@ import {
   enableScheduleTimers,
   daemonReload,
 } from "../agents/systemd.js";
+import { detectInFlight, waitUntilIdle } from "../agents/in-flight.js";
+import { askYesNo } from "../setup/prompt.js";
 
 /**
  * Pre-restart preflight check. Verifies the agent's runtime
@@ -49,11 +51,11 @@ function preflightCheck(
   const unitPath = resolve(
     process.env.HOME ?? "/root",
     ".config/systemd/user",
-    `clerk-${name}.service`,
+    `switchroom-${name}.service`,
   );
   if (!existsSync(unitPath)) {
     errors.push(
-      `systemd unit not found at ${unitPath}. Run: clerk agent create ${name}`,
+      `systemd unit not found at ${unitPath}. Run: switchroom agent create ${name}`,
     );
   } else if (usesDevChannels) {
     // 3. If using dev channels, the unit MUST use the expect wrapper
@@ -62,7 +64,7 @@ function preflightCheck(
       errors.push(
         `systemd unit is missing the expect autoaccept wrapper — ` +
         `dev channels will hang on the confirmation dialog. ` +
-        `Fix: clerk systemd install (regenerates the unit)`,
+        `Fix: switchroom systemd install (regenerates the unit)`,
       );
     }
   }
@@ -87,7 +89,7 @@ function preflightCheck(
     if (!envContent.includes("TELEGRAM_BOT_TOKEN=") || envContent.includes("# Set your bot token")) {
       errors.push(
         `telegram/.env is missing TELEGRAM_BOT_TOKEN. ` +
-        `Set it or run: clerk setup`,
+        `Set it or run: switchroom setup`,
       );
     }
   } else {
@@ -97,7 +99,7 @@ function preflightCheck(
   // 6. .claude/settings.json exists
   if (!existsSync(resolve(agentDir, ".claude", "settings.json"))) {
     errors.push(
-      `.claude/settings.json not found. Run: clerk agent reconcile ${name}`,
+      `.claude/settings.json not found. Run: switchroom agent reconcile ${name}`,
     );
   }
 
@@ -163,7 +165,7 @@ export function registerAgentCommand(program: Command): void {
     .command("agent")
     .description("Manage individual agents");
 
-  // clerk agent list
+  // switchroom agent list
   agent
     .command("list")
     .description("List all agents with their status")
@@ -178,7 +180,7 @@ export function registerAgentCommand(program: Command): void {
           if (opts.json) {
             console.log(JSON.stringify({ agents: [] }));
           } else {
-            console.log(chalk.yellow("No agents defined in clerk.yaml"));
+            console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           }
           return;
         }
@@ -228,9 +230,9 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent create <name>
+  // switchroom agent create <name>
   //
-  // The profile an agent extends is declared in clerk.yaml via
+  // The profile an agent extends is declared in switchroom.yaml via
   // `extends: <profile>`, not on the CLI — there's only one source of
   // truth. This command just materializes the directory/files.
   agent
@@ -244,7 +246,7 @@ export function registerAgentCommand(program: Command): void {
 
         if (!agentConfig) {
           console.error(
-            chalk.red(`Agent "${name}" is not defined in clerk.yaml`)
+            chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
           );
           console.error(
             chalk.gray(
@@ -267,9 +269,9 @@ export function registerAgentCommand(program: Command): void {
 
         // Also generate and install the systemd unit
         const agentDir = resolve(agentsDir, name);
-        // Effective clerk-plugin flag is driven by channels.telegram.plugin.
-        // This mirrors usesClerkTelegramPlugin() in src/config/merge.ts.
-        const useAutoaccept = agentConfig.channels?.telegram?.plugin === "clerk";
+        // Effective switchroom-plugin flag is driven by channels.telegram.plugin.
+        // This mirrors usesSwitchroomTelegramPlugin() in src/config/merge.ts.
+        const useAutoaccept = agentConfig.channels?.telegram?.plugin === "switchroom";
         const unitContent = generateUnit(name, agentDir, useAutoaccept);
         installUnit(name, unitContent);
 
@@ -283,12 +285,12 @@ export function registerAgentCommand(program: Command): void {
         }
 
         console.log(chalk.green(`  Agent "${name}" scaffolded at ${agentDir}`));
-        console.log(chalk.green(`  Systemd unit installed: clerk-${name}.service`));
-        console.log(chalk.gray(`\n  Start with: clerk agent start ${name}\n`));
+        console.log(chalk.green(`  Systemd unit installed: switchroom-${name}.service`));
+        console.log(chalk.gray(`\n  Start with: switchroom agent start ${name}\n`));
       })
     );
 
-  // clerk agent start <name|all>
+  // switchroom agent start <name|all>
   agent
     .command("start <name>")
     .description("Start an agent (or 'all' to start all agents)")
@@ -302,7 +304,7 @@ export function registerAgentCommand(program: Command): void {
 
         for (const n of names) {
           if (!config.agents[n]) {
-            console.error(chalk.red(`Agent "${n}" is not defined in clerk.yaml`));
+            console.error(chalk.red(`Agent "${n}" is not defined in switchroom.yaml`));
             continue;
           }
 
@@ -335,7 +337,7 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent stop <name|all>
+  // switchroom agent stop <name|all>
   agent
     .command("stop <name>")
     .description("Stop an agent (or 'all' to stop all agents)")
@@ -347,7 +349,7 @@ export function registerAgentCommand(program: Command): void {
 
         for (const n of names) {
           if (!config.agents[n]) {
-            console.error(chalk.red(`Agent "${n}" is not defined in clerk.yaml`));
+            console.error(chalk.red(`Agent "${n}" is not defined in switchroom.yaml`));
             continue;
           }
           try {
@@ -362,57 +364,148 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent restart <name|all>
+  // switchroom agent restart <name|all>
   agent
     .command("restart <name>")
     .description("Restart an agent (or 'all' to restart all agents)")
-    .option("--force", "Skip preflight checks and restart anyway")
+    .option("--force", "Skip preflight + in-flight checks and restart anyway")
+    .option(
+      "--wait",
+      "Wait (up to 5 min) for in-flight work to finish instead of prompting"
+    )
+    .option(
+      "--wait-timeout <ms>",
+      "Override --wait timeout in milliseconds (default 300000)"
+    )
     .action(
-      withConfigError(async (name: string, opts: { force?: boolean }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        const names =
-          name === "all" ? Object.keys(config.agents) : [name];
+      withConfigError(
+        async (
+          name: string,
+          opts: { force?: boolean; wait?: boolean; waitTimeout?: string }
+        ) => {
+          const config = getConfig(program);
+          const agentsDir = resolveAgentsDir(config);
+          const names =
+            name === "all" ? Object.keys(config.agents) : [name];
 
-        for (const n of names) {
-          if (!config.agents[n]) {
-            console.error(chalk.red(`Agent "${n}" is not defined in clerk.yaml`));
-            continue;
-          }
+          let sawAbort = false;
 
-          // Preflight: verify runtime dependencies before restart.
-          // Catches problems (missing expect, broken unit, missing
-          // token) that would leave the agent unable to start.
-          if (!opts.force) {
-            const agentDir = resolve(agentsDir, n);
-            const usesDevChannels =
-              config.agents[n].channels?.telegram?.plugin !== "official";
-            const errors = preflightCheck(n, agentDir, usesDevChannels);
-            if (errors.length > 0) {
-              console.error(chalk.red(`\n  Preflight failed for ${n}:\n`));
-              for (const e of errors) {
-                console.error(chalk.red(`    ✗ ${e}`));
-              }
-              console.error(
-                chalk.gray(`\n  Fix the issues above, or use --force to skip preflight.\n`)
-              );
+          for (const n of names) {
+            if (!config.agents[n]) {
+              console.error(chalk.red(`Agent "${n}" is not defined in switchroom.yaml`));
               continue;
+            }
+
+            const agentDir = resolve(agentsDir, n);
+
+            // Preflight: verify runtime dependencies before restart.
+            // Catches problems (missing expect, broken unit, missing
+            // token) that would leave the agent unable to start.
+            if (!opts.force) {
+              const usesDevChannels =
+                config.agents[n].channels?.telegram?.plugin !== "official";
+              const errors = preflightCheck(n, agentDir, usesDevChannels);
+              if (errors.length > 0) {
+                console.error(chalk.red(`\n  Preflight failed for ${n}:\n`));
+                for (const e of errors) {
+                  console.error(chalk.red(`    ✗ ${e}`));
+                }
+                console.error(
+                  chalk.gray(
+                    `\n  Fix the issues above, or use --force to skip preflight.\n`
+                  )
+                );
+                continue;
+              }
+            }
+
+            // In-flight check: is the agent currently mid-turn? Killing
+            // it will lose whatever work the model + tools have in
+            // progress. --force skips; --wait polls; otherwise prompt.
+            if (!opts.force) {
+              const activity = detectInFlight({ agentDir });
+              if (activity.busy) {
+                const timeoutMs = opts.waitTimeout
+                  ? Number(opts.waitTimeout)
+                  : 5 * 60 * 1000;
+
+                console.log(
+                  chalk.yellow(`\n  ${n} appears to be mid-turn:`)
+                );
+                console.log(
+                  chalk.gray(
+                    `    sessions=${activity.activeSessions}  sub-agents=${activity.activeSubagents}`
+                  )
+                );
+                for (const d of activity.details.slice(0, 5)) {
+                  console.log(chalk.gray(`    - ${d}`));
+                }
+                if (activity.lastActivityMs > 0) {
+                  const ageSec = Math.round(
+                    (Date.now() - activity.lastActivityMs) / 1000
+                  );
+                  console.log(
+                    chalk.gray(`    last activity: ${ageSec}s ago`)
+                  );
+                }
+                console.log();
+
+                if (opts.wait) {
+                  console.log(
+                    chalk.gray(
+                      `  Waiting up to ${Math.round(timeoutMs / 1000)}s for ${n} to go idle...`
+                    )
+                  );
+                  const final = await waitUntilIdle({
+                    agentDir,
+                    timeoutMs,
+                  });
+                  if (final.busy) {
+                    console.error(
+                      chalk.red(
+                        `  Timed out waiting for ${n} to go idle. Skipping restart — pass --force to override.`
+                      )
+                    );
+                    sawAbort = true;
+                    continue;
+                  }
+                  console.log(chalk.green(`  ${n} went idle — restarting.`));
+                } else {
+                  const proceed = await askYesNo(
+                    `Kill in-flight work and restart ${n} anyway?`,
+                    false
+                  );
+                  if (!proceed) {
+                    console.log(
+                      chalk.gray(
+                        `  Aborted restart of ${n}. Re-run with --wait to wait, or --force to skip the check.`
+                      )
+                    );
+                    sawAbort = true;
+                    continue;
+                  }
+                }
+              }
+            }
+
+            try {
+              restartAgent(n);
+              console.log(chalk.green(`Restarted ${n}`));
+            } catch (err) {
+              console.error(
+                chalk.red(`Failed to restart ${n}: ${(err as Error).message}`)
+              );
             }
           }
 
-          try {
-            restartAgent(n);
-            console.log(chalk.green(`Restarted ${n}`));
-          } catch (err) {
-            console.error(
-              chalk.red(`Failed to restart ${n}: ${(err as Error).message}`)
-            );
+          if (sawAbort) {
+            process.exitCode = 1;
           }
         }
-      })
+      )
     );
 
-  // clerk agent attach <name>
+  // switchroom agent attach <name>
   agent
     .command("attach <name>")
     .description("Attach to an agent's tmux session")
@@ -421,7 +514,7 @@ export function registerAgentCommand(program: Command): void {
         const config = getConfig(program);
 
         if (!config.agents[name]) {
-          console.error(chalk.red(`Agent "${name}" is not defined in clerk.yaml`));
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
           process.exit(1);
         }
 
@@ -430,7 +523,7 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent logs <name>
+  // switchroom agent logs <name>
   agent
     .command("logs <name>")
     .description("Show agent logs")
@@ -440,7 +533,7 @@ export function registerAgentCommand(program: Command): void {
         const config = getConfig(program);
 
         if (!config.agents[name]) {
-          console.error(chalk.red(`Agent "${name}" is not defined in clerk.yaml`));
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
           process.exit(1);
         }
 
@@ -448,11 +541,11 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent reconcile <name|all>
+  // switchroom agent reconcile <name|all>
   agent
     .command("reconcile <name>")
     .description(
-      "Re-apply clerk.yaml to an existing agent (rewrites .mcp.json + settings.json + start.sh without touching CLAUDE.md/SOUL.md)"
+      "Re-apply switchroom.yaml to an existing agent (rewrites .mcp.json + settings.json + start.sh without touching CLAUDE.md/SOUL.md)"
     )
     .option("--restart", "Restart the agent after reconciling")
     .option(
@@ -473,7 +566,7 @@ export function registerAgentCommand(program: Command): void {
           const agentConfig = config.agents[n];
           if (!agentConfig) {
             console.error(
-              chalk.red(`Agent "${n}" is not defined in clerk.yaml`)
+              chalk.red(`Agent "${n}" is not defined in switchroom.yaml`)
             );
             continue;
           }
@@ -526,7 +619,7 @@ export function registerAgentCommand(program: Command): void {
           if (!opts.restart) {
             console.log(
               chalk.gray(
-                "  Tip: pass --restart to apply changes immediately, or run `clerk agent restart <name>`."
+                "  Tip: pass --restart to apply changes immediately, or run `switchroom agent restart <name>`."
               )
             );
           }
@@ -534,18 +627,18 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent grant <name> <tool>
+  // switchroom agent grant <name> <tool>
   agent
     .command("grant <name> <tool>")
     .description(
-      "Add a tool name (or 'all') to an agent's tools.allow in clerk.yaml, then reconcile"
+      "Add a tool name (or 'all') to an agent's tools.allow in switchroom.yaml, then reconcile"
     )
     .option("--no-restart", "Skip restarting the agent after granting")
     .action(
       withConfigError(async (name: string, tool: string, opts: { restart?: boolean }) => {
         const configPath = getConfigPath(program);
         if (!existsSync(configPath)) {
-          console.error(chalk.red(`clerk.yaml not found at ${configPath}`));
+          console.error(chalk.red(`switchroom.yaml not found at ${configPath}`));
           process.exit(1);
         }
 
@@ -554,7 +647,7 @@ export function registerAgentCommand(program: Command): void {
         const doc = YAML.parseDocument(raw);
         const agents = doc.get("agents") as YAML.YAMLMap | null;
         if (!agents || !agents.has(name)) {
-          console.error(chalk.red(`Agent "${name}" is not defined in clerk.yaml`));
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
           process.exit(1);
         }
         const agentNode = agents.get(name) as YAML.YAMLMap;
@@ -605,11 +698,11 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent dangerous <name>
+  // switchroom agent dangerous <name>
   agent
     .command("dangerous <name>")
     .description(
-      "Enable full tool access for an agent (sets tools.allow: [all] in clerk.yaml). Reconciles + restarts."
+      "Enable full tool access for an agent (sets tools.allow: [all] in switchroom.yaml). Reconciles + restarts."
     )
     .option("--off", "Disable: clear tools.allow")
     .option("--no-restart", "Skip restarting the agent")
@@ -617,7 +710,7 @@ export function registerAgentCommand(program: Command): void {
       withConfigError(async (name: string, opts: { off?: boolean; restart?: boolean }) => {
         const configPath = getConfigPath(program);
         if (!existsSync(configPath)) {
-          console.error(chalk.red(`clerk.yaml not found at ${configPath}`));
+          console.error(chalk.red(`switchroom.yaml not found at ${configPath}`));
           process.exit(1);
         }
 
@@ -625,7 +718,7 @@ export function registerAgentCommand(program: Command): void {
         const doc = YAML.parseDocument(raw);
         const agents = doc.get("agents") as YAML.YAMLMap | null;
         if (!agents || !agents.has(name)) {
-          console.error(chalk.red(`Agent "${name}" is not defined in clerk.yaml`));
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
           process.exit(1);
         }
         const agentNode = agents.get(name) as YAML.YAMLMap;
@@ -680,7 +773,7 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent permissions <name>
+  // switchroom agent permissions <name>
   agent
     .command("permissions <name>")
     .description("Show the current permissions.allow list for an agent")
@@ -719,7 +812,7 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
-  // clerk agent destroy <name>
+  // switchroom agent destroy <name>
   agent
     .command("destroy <name>")
     .description("Remove an agent's directory and systemd unit")
@@ -756,7 +849,7 @@ export function registerAgentCommand(program: Command): void {
         // Remove systemd unit
         try {
           uninstallUnit(name);
-          console.log(chalk.green(`  Removed systemd unit: clerk-${name}.service`));
+          console.log(chalk.green(`  Removed systemd unit: switchroom-${name}.service`));
         } catch (err) {
           console.error(
             chalk.red(`  Failed to remove unit: ${(err as Error).message}`)

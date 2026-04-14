@@ -1,4 +1,4 @@
-# Clerk CI pipeline.
+# Switchroom CI pipeline.
 #
 # Set the Buildkite pipeline's initial command to:
 #   buildkite-agent pipeline upload

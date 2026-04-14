@@ -13,7 +13,7 @@ export function registerSystemdCommand(program: Command): void {
     .command("systemd")
     .description("Manage systemd user units for agents");
 
-  // clerk systemd install
+  // switchroom systemd install
   systemd
     .command("install")
     .description("Generate and install systemd units for all agents")
@@ -27,12 +27,12 @@ export function registerSystemdCommand(program: Command): void {
         try {
           installAllUnits(config);
           for (const name of agentNames) {
-            console.log(chalk.green(`  + clerk-${name}.service`));
+            console.log(chalk.green(`  + switchroom-${name}.service`));
           }
           console.log(
             chalk.bold(`\nInstalled ${agentNames.length} units. Daemon reloaded.`)
           );
-          console.log(chalk.gray(`  Enable with: clerk agent start all\n`));
+          console.log(chalk.gray(`  Enable with: switchroom agent start all\n`));
         } catch (err) {
           console.error(
             chalk.red(`Failed to install units: ${(err as Error).message}`)
@@ -42,7 +42,7 @@ export function registerSystemdCommand(program: Command): void {
       })
     );
 
-  // clerk systemd status
+  // switchroom systemd status
   systemd
     .command("status")
     .description("Show status of all agent systemd units")
@@ -53,7 +53,7 @@ export function registerSystemdCommand(program: Command): void {
         const statuses = getAllAgentStatuses(config);
 
         if (agentNames.length === 0) {
-          console.log(chalk.yellow("No agents defined in clerk.yaml"));
+          console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           return;
         }
 
@@ -68,7 +68,7 @@ export function registerSystemdCommand(program: Command): void {
 
         for (const name of agentNames) {
           const status = statuses[name];
-          const unitName = `clerk-${name}.service`;
+          const unitName = `switchroom-${name}.service`;
           const state = status?.active ?? "unknown";
           const stateStr =
             state === "running" || state === "active"
@@ -85,7 +85,7 @@ export function registerSystemdCommand(program: Command): void {
       })
     );
 
-  // clerk systemd uninstall
+  // switchroom systemd uninstall
   systemd
     .command("uninstall")
     .description("Remove all agent systemd units")
@@ -99,11 +99,11 @@ export function registerSystemdCommand(program: Command): void {
         for (const name of agentNames) {
           try {
             uninstallUnit(name);
-            console.log(chalk.green(`  - clerk-${name}.service`));
+            console.log(chalk.green(`  - switchroom-${name}.service`));
           } catch (err) {
             console.error(
               chalk.red(
-                `  Failed to remove clerk-${name}.service: ${(err as Error).message}`
+                `  Failed to remove switchroom-${name}.service: ${(err as Error).message}`
               )
             );
           }

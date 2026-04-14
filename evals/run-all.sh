@@ -1,16 +1,16 @@
 #!/bin/bash
 # Run the full eval suite in an isolated process (via systemd-run).
-# Results written to evals/results/. Run from the clerk repo root.
+# Results written to evals/results/. Run from the switchroom repo root.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.clerk/agents/assistant/.claude}"
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.switchroom/agents/assistant/.claude}"
 PARALLEL="${1:-3}"
-LOG="/tmp/clerk-evals-$(date +%Y%m%d_%H%M%S).log"
+LOG="/tmp/switchroom-evals-$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== Clerk Skills Eval Suite ===" | tee "$LOG"
+echo "=== Switchroom Skills Eval Suite ===" | tee "$LOG"
 echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" | tee -a "$LOG"
 echo "Parallel: $PARALLEL" | tee -a "$LOG"
 echo "Log: $LOG" | tee -a "$LOG"

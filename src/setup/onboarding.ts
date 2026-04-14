@@ -1,5 +1,6 @@
 import { existsSync, copyFileSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { resolveStatePath } from "../config/paths.js";
 
 /**
  * Search for an existing .claude.json (onboarding state) from the user's
@@ -29,10 +30,10 @@ export function findExistingClaudeJson(): string | null {
     "  Claude Code has not been set up on this machine yet."
   );
   console.warn(
-    "  Run `claude` in a terminal first to complete initial setup, then run `clerk setup` again."
+    "  Run `claude` in a terminal first to complete initial setup, then run `switchroom setup` again."
   );
   console.warn(
-    "  Alternatively, agents can be onboarded individually via `clerk agent attach <name>`."
+    "  Alternatively, agents can be onboarded individually via `switchroom agent attach <name>`."
   );
 
   return null;
@@ -155,12 +156,11 @@ export interface UserConfig {
 }
 
 function userConfigPath(): string {
-  const home = process.env.HOME ?? "/root";
-  return join(home, ".clerk", "user.json");
+  return resolveStatePath("user.json");
 }
 
 /**
- * Save the user's Telegram ID and optional username to ~/.clerk/user.json.
+ * Save the user's Telegram ID and optional username to ~/.switchroom/user.json.
  */
 export function saveUserConfig(userId: string, username?: string): void {
   const configPath = userConfigPath();
@@ -179,7 +179,7 @@ export function saveUserConfig(userId: string, username?: string): void {
 }
 
 /**
- * Load the user config from ~/.clerk/user.json.
+ * Load the user config from ~/.switchroom/user.json.
  * Returns the config object or null if the file doesn't exist or is invalid.
  */
 export function loadUserConfig(): UserConfig | null {
@@ -241,7 +241,7 @@ export function preTrustWorkspace(agentDir: string): void {
 
 /**
  * Create a minimal .claude config.json when no existing Claude installation
- * is available. The agent will need to complete onboarding via `clerk agent attach`.
+ * is available. The agent will need to complete onboarding via `switchroom agent attach`.
  */
 export function createMinimalClaudeConfig(agentDir: string): void {
   const claudeDir = join(agentDir, ".claude");
@@ -258,7 +258,7 @@ export function createMinimalClaudeConfig(agentDir: string): void {
       mode: 0o600,
     });
     console.warn(
-      `  WARNING: Created minimal config for ${agentDir}. Complete onboarding via \`clerk agent attach\`.`
+      `  WARNING: Created minimal config for ${agentDir}. Complete onboarding via \`switchroom agent attach\`.`
     );
   }
 }

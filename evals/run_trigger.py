@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trigger routing eval runner for clerk skills."""
+"""Trigger routing eval runner for switchroom skills."""
 
 import argparse
 import asyncio
@@ -18,17 +18,17 @@ RESULTS_DIR = EVALS_DIR / "results"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 SKILL_DESCRIPTIONS = {
-    "clerk-status": "Shows which clerk agents are running, their uptime, and current state. Use when the user asks about status, 'what's running', uptime, 'are my agents OK', or wants an overview of all agents.",
-    "clerk-health": "Runs a health check and diagnostics on the clerk setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.",
-    "clerk-config": "Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.",
-    "clerk-schedule": "Lists cron jobs, scheduled tasks, and systemd timers with next fire times. Use when the user mentions schedules, cron, timers, recurring tasks, automation, 'what runs automatically', 'when does X run', 'automated tasks', or 'what tasks are configured'.",
-    "clerk-restart": "Restarts or reboots a clerk agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.",
-    "clerk-reconcile": "Re-applies clerk.yaml changes to running agents. Use when the user edited clerk.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited clerk.yaml', or 'how do I apply changes'.",
-    "clerk-logs": "Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.",
-    "clerk-architecture": "Explains how clerk works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does clerk work', 'how does it decide', 'which settings apply', architecture, design, or internals.",
+    "switchroom-status": "Shows which switchroom agents are running, their uptime, and current state. Use when the user asks about status, 'what's running', uptime, 'are my agents OK', or wants an overview of all agents.",
+    "switchroom-health": "Runs a health check and diagnostics on the switchroom setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.",
+    "switchroom-config": "Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.",
+    "switchroom-schedule": "Lists cron jobs, scheduled tasks, and systemd timers with next fire times. Use when the user mentions schedules, cron, timers, recurring tasks, automation, 'what runs automatically', 'when does X run', 'automated tasks', or 'what tasks are configured'.",
+    "switchroom-restart": "Restarts or reboots a switchroom agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.",
+    "switchroom-reconcile": "Re-applies switchroom.yaml changes to running agents. Use when the user edited switchroom.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited switchroom.yaml', or 'how do I apply changes'.",
+    "switchroom-logs": "Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.",
+    "switchroom-architecture": "Explains how switchroom works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does switchroom work', 'how does it decide', 'which settings apply', architecture, design, or internals.",
 }
 
-ROUTING_SYSTEM_PROMPT = """You are a skill router for the clerk-ai platform.
+ROUTING_SYSTEM_PROMPT = """You are a skill router for the switchroom-ai platform.
 Given a user query, select the single best skill from the list below.
 
 Available skills:
@@ -76,7 +76,7 @@ async def call_claude(
     # project's CLAUDE.md adds conversational instructions that compete
     # with the eval's system prompt (especially the "respond with ONLY
     # JSON" routing instruction).
-    env = {**os.environ, "CLERK_EVAL_MODE": "1"}
+    env = {**os.environ, "SWITCHROOM_EVAL_MODE": "1"}
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
@@ -170,7 +170,7 @@ async def run_all(evals: list[dict], model: str, runs: int, parallel: int, timeo
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run trigger routing evals for clerk skills")
+    parser = argparse.ArgumentParser(description="Run trigger routing evals for switchroom skills")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model to use")
     parser.add_argument("--parallel", type=int, default=5, help="Concurrent requests")
     parser.add_argument("--runs", type=int, default=1, help="Runs per eval (for flakiness detection)")

@@ -2,7 +2,7 @@
 # UserPromptSubmit hook for Hindsight auto-recall.
 #
 # Wired into an agent's .claude/settings.json hooks.UserPromptSubmit when
-# clerk.yaml has memory.backend == hindsight AND the agent has
+# switchroom.yaml has memory.backend == hindsight AND the agent has
 # memory.auto_recall != false. On every inbound user prompt, this script:
 #
 #   1. Reads the JSON event from stdin (per Claude Code's hook contract)
@@ -16,9 +16,9 @@
 # Configuration is via env vars (set in the hook command line, see
 # scaffold.ts for the wiring):
 #
-#   CLERK_HINDSIGHT_URL    - Hindsight API base URL (default http://127.0.0.1:8888)
-#   CLERK_HINDSIGHT_BANK   - Memory bank/collection name (required)
-#   CLERK_RECALL_MAX_TOKENS - Token budget for recall (default 800 — small to
+#   SWITCHROOM_HINDSIGHT_URL    - Hindsight API base URL (default http://127.0.0.1:8888)
+#   SWITCHROOM_HINDSIGHT_BANK   - Memory bank/collection name (required)
+#   SWITCHROOM_RECALL_MAX_TOKENS - Token budget for recall (default 800 — small to
 #                             keep auto-recall lightweight; the agent can
 #                             call recall directly via MCP for deeper queries)
 #
@@ -31,10 +31,10 @@
 
 set -u
 
-HINDSIGHT_URL="${CLERK_HINDSIGHT_URL:-http://127.0.0.1:8888}"
-BANK="${CLERK_HINDSIGHT_BANK:-}"
-MAX_TOKENS="${CLERK_RECALL_MAX_TOKENS:-800}"
-TIMEOUT="${CLERK_RECALL_TIMEOUT_SECONDS:-3}"
+HINDSIGHT_URL="${SWITCHROOM_HINDSIGHT_URL:-http://127.0.0.1:8888}"
+BANK="${SWITCHROOM_HINDSIGHT_BANK:-}"
+MAX_TOKENS="${SWITCHROOM_RECALL_MAX_TOKENS:-800}"
+TIMEOUT="${SWITCHROOM_RECALL_TIMEOUT_SECONDS:-3}"
 
 if [ -z "$BANK" ]; then
   exit 0
@@ -62,7 +62,7 @@ fi
 
 # Strip a leading Telegram channel XML wrapper. The plugin sends prompts
 # like:
-#   <channel source="clerk-telegram" chat_id="..." ...>
+#   <channel source="switchroom-telegram" chat_id="..." ...>
 #   actual user text
 #   </channel>
 #

@@ -19,7 +19,7 @@ import {
   parseVaultReference,
   resolveVaultReferences,
 } from "../src/vault/resolver.js";
-import type { ClerkConfig } from "../src/config/schema.js";
+import type { SwitchroomConfig } from "../src/config/schema.js";
 
 describe("vault", () => {
   let tmpDir: string;
@@ -27,7 +27,7 @@ describe("vault", () => {
   const passphrase = "test-passphrase-123";
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-vault-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-vault-test-"));
     vaultPath = join(tmpDir, "vault.enc");
   });
 
@@ -141,13 +141,13 @@ describe("vault", () => {
 });
 
 describe("vault set CLI — multi-line values", () => {
-  const binPath = fileURLToPath(new URL("../bin/clerk.ts", import.meta.url));
+  const binPath = fileURLToPath(new URL("../bin/switchroom.ts", import.meta.url));
   const passphrase = "cli-test-passphrase";
   let tmpDir: string;
   let vaultPath: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "clerk-vault-cli-test-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-vault-cli-test-"));
     vaultPath = join(tmpDir, "vault.enc");
     createVault(passphrase, vaultPath);
   });
@@ -159,20 +159,20 @@ describe("vault set CLI — multi-line values", () => {
   function runCli(args: string[], input?: string) {
     // Pass --config via a throwaway path; we only need `vault set` to run.
     // The vault path is resolved from the default loader fallback, so we
-    // override it via CLERK_VAULT_PATH-like behavior by writing a minimal
+    // override it via SWITCHROOM_VAULT_PATH-like behavior by writing a minimal
     // config. Simpler: invoke with --config pointing at a tiny yaml that
     // sets vault.path.
-    const configPath = join(tmpDir, "clerk.yaml");
+    const configPath = join(tmpDir, "switchroom.yaml");
     writeFileSync(
       configPath,
-      `clerk:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
     );
     return spawnSync(
       "bun",
       [binPath, "--config", configPath, "vault", ...args],
       {
         input,
-        env: { ...process.env, CLERK_VAULT_PASSPHRASE: passphrase },
+        env: { ...process.env, SWITCHROOM_VAULT_PASSPHRASE: passphrase },
         encoding: "utf8",
       }
     );
@@ -243,7 +243,7 @@ describe("vault resolver", () => {
     const passphrase = "test-resolve-passphrase";
 
     beforeEach(() => {
-      tmpDir = mkdtempSync(join(tmpdir(), "clerk-resolve-test-"));
+      tmpDir = mkdtempSync(join(tmpdir(), "switchroom-resolve-test-"));
       vaultPath = join(tmpDir, "vault.enc");
       createVault(passphrase, vaultPath);
       setSecret(passphrase, vaultPath, "telegram-bot-token", "123:ABC");
@@ -255,8 +255,8 @@ describe("vault resolver", () => {
     });
 
     it("resolves vault references in config", () => {
-      const config: ClerkConfig = {
-        clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+      const config: SwitchroomConfig = {
+        switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
         telegram: {
           bot_token: "vault:telegram-bot-token",
           forum_chat_id: "-100123",
@@ -277,8 +277,8 @@ describe("vault resolver", () => {
     });
 
     it("leaves non-vault strings unchanged", () => {
-      const config: ClerkConfig = {
-        clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+      const config: SwitchroomConfig = {
+        switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
         telegram: {
           bot_token: "plain-token",
           forum_chat_id: "-100123",

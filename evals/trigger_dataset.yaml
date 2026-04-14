@@ -2,229 +2,229 @@ trigger_evals:
   # ── status vs health (both about agent state) ────────────────────────────────
   - id: "t-status-001"
     query: "Are my agents running?"
-    expected_skill: "clerk-status"
-    expected_not_skills: ["clerk-health", "clerk-restart"]
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-health", "switchroom-restart"]
     tags: ["routing", "status"]
 
   - id: "t-status-002"
     query: "What's the current state of all my agents?"
-    expected_skill: "clerk-status"
-    expected_not_skills: ["clerk-health", "clerk-logs"]
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-health", "switchroom-logs"]
     tags: ["routing", "status"]
 
   - id: "t-status-003"
     query: "Show me agent uptime"
-    expected_skill: "clerk-status"
-    expected_not_skills: ["clerk-health", "clerk-logs"]
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-health", "switchroom-logs"]
     tags: ["routing", "status"]
 
   - id: "t-health-001"
     query: "Something is wrong with my agent, can you diagnose it?"
-    expected_skill: "clerk-health"
-    expected_not_skills: ["clerk-status", "clerk-restart"]
+    expected_skill: "switchroom-health"
+    expected_not_skills: ["switchroom-status", "switchroom-restart"]
     tags: ["routing", "health"]
 
   - id: "t-health-002"
     query: "Run a diagnostic check on my setup"
-    expected_skill: "clerk-health"
-    expected_not_skills: ["clerk-status", "clerk-config"]
+    expected_skill: "switchroom-health"
+    expected_not_skills: ["switchroom-status", "switchroom-config"]
     tags: ["routing", "health"]
 
   - id: "t-health-003"
     query: "My agent keeps failing, what's wrong?"
-    expected_skill: "clerk-health"
-    expected_not_skills: ["clerk-status", "clerk-logs"]
+    expected_skill: "switchroom-health"
+    expected_not_skills: ["switchroom-status", "switchroom-logs"]
     tags: ["routing", "health"]
 
   # ── restart vs reconcile (both change agent state) ────────────────────────────
   - id: "t-restart-001"
     query: "Restart the assistant agent"
-    expected_skill: "clerk-restart"
-    expected_not_skills: ["clerk-reconcile", "clerk-status"]
+    expected_skill: "switchroom-restart"
+    expected_not_skills: ["switchroom-reconcile", "switchroom-status"]
     tags: ["routing", "restart"]
 
   - id: "t-restart-002"
     query: "The agent is frozen, reboot it"
-    expected_skill: "clerk-restart"
-    expected_not_skills: ["clerk-reconcile", "clerk-health"]
+    expected_skill: "switchroom-restart"
+    expected_not_skills: ["switchroom-reconcile", "switchroom-health"]
     tags: ["routing", "restart"]
 
   - id: "t-restart-003"
     query: "Kill and restart all agents"
-    expected_skill: "clerk-restart"
-    expected_not_skills: ["clerk-reconcile", "clerk-status"]
+    expected_skill: "switchroom-restart"
+    expected_not_skills: ["switchroom-reconcile", "switchroom-status"]
     tags: ["routing", "restart"]
 
   - id: "t-reconcile-001"
     query: "I updated my CLAUDE.md, apply the new config"
-    expected_skill: "clerk-reconcile"
-    expected_not_skills: ["clerk-restart", "clerk-config"]
+    expected_skill: "switchroom-reconcile"
+    expected_not_skills: ["switchroom-restart", "switchroom-config"]
     tags: ["routing", "reconcile"]
 
   - id: "t-reconcile-002"
     query: "Sync my latest settings to the running agent without restarting"
-    expected_skill: "clerk-reconcile"
-    expected_not_skills: ["clerk-restart", "clerk-config"]
+    expected_skill: "switchroom-reconcile"
+    expected_not_skills: ["switchroom-restart", "switchroom-config"]
     tags: ["routing", "reconcile"]
 
   - id: "t-reconcile-003"
     query: "Re-apply my agent profile"
-    expected_skill: "clerk-reconcile"
-    expected_not_skills: ["clerk-restart", "clerk-schedule"]
+    expected_skill: "switchroom-reconcile"
+    expected_not_skills: ["switchroom-restart", "switchroom-schedule"]
     tags: ["routing", "reconcile"]
 
-  # ── config vs architecture (both about how clerk works) ───────────────────────
+  # ── config vs architecture (both about how switchroom works) ───────────────────────
   - id: "t-config-001"
     query: "What model is my agent using?"
-    expected_skill: "clerk-config"
-    expected_not_skills: ["clerk-architecture", "clerk-status"]
+    expected_skill: "switchroom-config"
+    expected_not_skills: ["switchroom-architecture", "switchroom-status"]
     tags: ["routing", "config"]
 
   - id: "t-config-002"
     query: "Show the tools available to the assistant"
-    expected_skill: "clerk-config"
-    expected_not_skills: ["clerk-architecture", "clerk-status"]
+    expected_skill: "switchroom-config"
+    expected_not_skills: ["switchroom-architecture", "switchroom-status"]
     tags: ["routing", "config"]
 
   - id: "t-config-003"
     query: "What's the active system prompt for my agent?"
-    expected_skill: "clerk-config"
-    expected_not_skills: ["clerk-architecture", "clerk-logs"]
+    expected_skill: "switchroom-config"
+    expected_not_skills: ["switchroom-architecture", "switchroom-logs"]
     tags: ["routing", "config"]
 
   - id: "t-arch-001"
-    query: "How does clerk actually work under the hood?"
-    expected_skill: "clerk-architecture"
-    expected_not_skills: ["clerk-config", "clerk-status"]
+    query: "How does switchroom actually work under the hood?"
+    expected_skill: "switchroom-architecture"
+    expected_not_skills: ["switchroom-config", "switchroom-status"]
     tags: ["routing", "architecture"]
 
   - id: "t-arch-002"
     query: "Explain the config cascade and how agents inherit settings"
-    expected_skill: "clerk-architecture"
-    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    expected_skill: "switchroom-architecture"
+    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
     tags: ["routing", "architecture"]
 
   - id: "t-arch-003"
     query: "What's the difference between a profile and an agent?"
-    expected_skill: "clerk-architecture"
-    expected_not_skills: ["clerk-config", "clerk-status"]
+    expected_skill: "switchroom-architecture"
+    expected_not_skills: ["switchroom-config", "switchroom-status"]
     tags: ["routing", "architecture"]
 
   # ── logs vs status (both about agent info) ────────────────────────────────────
   - id: "t-logs-001"
     query: "Show me the recent log output from the assistant"
-    expected_skill: "clerk-logs"
-    expected_not_skills: ["clerk-status", "clerk-health"]
+    expected_skill: "switchroom-logs"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
     tags: ["routing", "logs"]
 
   - id: "t-logs-002"
     query: "What did my agent do in the last 30 minutes?"
-    expected_skill: "clerk-logs"
-    expected_not_skills: ["clerk-status", "clerk-health"]
+    expected_skill: "switchroom-logs"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
     tags: ["routing", "logs"]
 
   - id: "t-logs-003"
     query: "Tail the logs for the monitor agent"
-    expected_skill: "clerk-logs"
-    expected_not_skills: ["clerk-status", "clerk-health"]
+    expected_skill: "switchroom-logs"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
     tags: ["routing", "logs"]
 
   - id: "t-status-004"
     query: "Is the monitor agent online or offline?"
-    expected_skill: "clerk-status"
-    expected_not_skills: ["clerk-logs", "clerk-health"]
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-logs", "switchroom-health"]
     tags: ["routing", "status"]
 
   # ── schedule edge cases ────────────────────────────────────────────────────────
   - id: "t-schedule-001"
     query: "Set up a daily 9am digest"
-    expected_skill: "clerk-schedule"
-    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    expected_skill: "switchroom-schedule"
+    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
     tags: ["routing", "schedule"]
 
   - id: "t-schedule-002"
     query: "List my cron jobs"
-    expected_skill: "clerk-schedule"
-    expected_not_skills: ["clerk-status", "clerk-config"]
+    expected_skill: "switchroom-schedule"
+    expected_not_skills: ["switchroom-status", "switchroom-config"]
     tags: ["routing", "schedule"]
 
   - id: "t-schedule-003"
     query: "Delete the weekly report trigger"
-    expected_skill: "clerk-schedule"
-    expected_not_skills: ["clerk-reconcile", "clerk-restart"]
+    expected_skill: "switchroom-schedule"
+    expected_not_skills: ["switchroom-reconcile", "switchroom-restart"]
     tags: ["routing", "schedule"]
 
   # ── harder near-miss scenarios ─────────────────────────────────────────────────
   - id: "t-near-001"
     query: "The assistant crashed, what happened?"
-    expected_skill: "clerk-logs"
-    expected_not_skills: ["clerk-health", "clerk-restart"]
+    expected_skill: "switchroom-logs"
+    expected_not_skills: ["switchroom-health", "switchroom-restart"]
     tags: ["routing", "near-miss"]
 
   - id: "t-near-002"
-    query: "Is clerk healthy?"
-    expected_skill: "clerk-health"
-    expected_not_skills: ["clerk-status", "clerk-logs"]
+    query: "Is switchroom healthy?"
+    expected_skill: "switchroom-health"
+    expected_not_skills: ["switchroom-status", "switchroom-logs"]
     tags: ["routing", "near-miss"]
 
   - id: "t-near-003"
     query: "Apply my updated config file to the running agent"
-    expected_skill: "clerk-reconcile"
-    expected_not_skills: ["clerk-restart", "clerk-config"]
+    expected_skill: "switchroom-reconcile"
+    expected_not_skills: ["switchroom-restart", "switchroom-config"]
     tags: ["routing", "near-miss"]
 
   - id: "t-near-004"
-    query: "What's the clerk plugin system and how do hooks work?"
-    expected_skill: "clerk-architecture"
-    expected_not_skills: ["clerk-config", "clerk-reconcile"]
+    query: "What's the switchroom plugin system and how do hooks work?"
+    expected_skill: "switchroom-architecture"
+    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
     tags: ["routing", "near-miss", "architecture"]
 
   - id: "t-near-005"
     query: "Show agent info"
-    expected_skill: "clerk-status"
-    expected_not_skills: ["clerk-logs", "clerk-config"]
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-logs", "switchroom-config"]
     tags: ["routing", "near-miss"]
 
-  # ── clerk-install vs clerk-manage / clerk-health ──────────────────────────────
+  # ── switchroom-install vs switchroom-manage / switchroom-health ──────────────────────────────
   - id: "t-install-001"
-    query: "Install clerk on this machine"
-    expected_skill: "clerk-install"
-    expected_not_skills: ["clerk-manage", "clerk-health", "clerk-reconcile"]
+    query: "Install switchroom on this machine"
+    expected_skill: "switchroom-install"
+    expected_not_skills: ["switchroom-manage", "switchroom-health", "switchroom-reconcile"]
     tags: ["routing", "install"]
 
   - id: "t-install-002"
-    query: "How do I get started with clerk?"
-    expected_skill: "clerk-install"
-    expected_not_skills: ["clerk-architecture", "clerk-manage"]
+    query: "How do I get started with switchroom?"
+    expected_skill: "switchroom-install"
+    expected_not_skills: ["switchroom-architecture", "switchroom-manage"]
     tags: ["routing", "install", "onboarding"]
 
   - id: "t-install-003"
-    query: "Bootstrap clerk from scratch"
-    expected_skill: "clerk-install"
-    expected_not_skills: ["clerk-reconcile", "clerk-manage"]
+    query: "Bootstrap switchroom from scratch"
+    expected_skill: "switchroom-install"
+    expected_not_skills: ["switchroom-reconcile", "switchroom-manage"]
     tags: ["routing", "install"]
 
   - id: "t-install-004"
-    query: "Set up clerk for the first time"
-    expected_skill: "clerk-install"
-    expected_not_skills: ["clerk-manage", "clerk-config"]
+    query: "Set up switchroom for the first time"
+    expected_skill: "switchroom-install"
+    expected_not_skills: ["switchroom-manage", "switchroom-config"]
     tags: ["routing", "install"]
 
   - id: "t-install-005"
-    query: "I'm new to clerk, where do I begin?"
-    expected_skill: "clerk-install"
-    expected_not_skills: ["clerk-architecture", "clerk-telegram-guide"]
+    query: "I'm new to switchroom, where do I begin?"
+    expected_skill: "switchroom-install"
+    expected_not_skills: ["switchroom-architecture", "switchroom-telegram-guide"]
     tags: ["routing", "install", "onboarding"]
 
-  # Near-miss: "install a new agent" is NOT clerk-install (that's clerk-manage)
+  # Near-miss: "install a new agent" is NOT switchroom-install (that's switchroom-manage)
   - id: "t-install-near-001"
-    query: "Add a new agent to my clerk setup"
-    expected_skill: "clerk-manage"
-    expected_not_skills: ["clerk-install"]
+    query: "Add a new agent to my switchroom setup"
+    expected_skill: "switchroom-manage"
+    expected_not_skills: ["switchroom-install"]
     tags: ["routing", "near-miss", "install"]
 
   - id: "t-install-near-002"
-    query: "Reinstall my clerk agents"
-    expected_skill: "clerk-manage"
-    expected_not_skills: ["clerk-install"]
+    query: "Reinstall my switchroom agents"
+    expected_skill: "switchroom-manage"
+    expected_not_skills: ["switchroom-install"]
     tags: ["routing", "near-miss", "install"]

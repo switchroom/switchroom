@@ -14,12 +14,12 @@ import {
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import type { AgentConfig, ClerkConfig, TelegramConfig } from "../config/schema.js";
+import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { DEFAULT_PROFILE } from "../config/schema.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
-  usesClerkTelegramPlugin,
+  usesSwitchroomTelegramPlugin,
   deepMergeJson,
 } from "../config/merge.js";
 import {
@@ -28,9 +28,10 @@ import {
   renderTemplate,
   copyProfileSkills,
 } from "./profiles.js";
-import { getHindsightSettingsEntry, getClerkMcpSettingsEntry } from "../memory/scaffold-integration.js";
+import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
+import { resolveDualPath } from "../config/paths.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import {
   findExistingClaudeJson,
@@ -49,7 +50,7 @@ export interface ScaffoldResult {
 
 /**
  * Resolve a bot token value. If it's a vault reference, try to resolve it
- * via CLERK_VAULT_PASSPHRASE or fall back to TELEGRAM_BOT_TOKEN env var.
+ * via SWITCHROOM_VAULT_PASSPHRASE or fall back to TELEGRAM_BOT_TOKEN env var.
  * Returns the resolved token or undefined if unresolvable.
  */
 function resolveBotToken(rawToken: string): string | undefined {
@@ -58,12 +59,12 @@ function resolveBotToken(rawToken: string): string | undefined {
   }
 
   // Try vault resolution via passphrase
-  const passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+  const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (passphrase) {
     try {
       const { openVault } = require("../vault/vault.js") as typeof import("../vault/vault.js");
       const { resolvePath } = require("../config/loader.js") as typeof import("../config/loader.js");
-      const vaultPath = resolvePath(process.env.CLERK_VAULT_PATH ?? "~/.clerk/vault.enc");
+      const vaultPath = resolvePath(process.env.SWITCHROOM_VAULT_PATH ?? "~/.switchroom/vault.enc");
       const secrets = openVault(passphrase, vaultPath);
       const key = parseVaultReference(rawToken);
       if (secrets[key]) {
@@ -119,20 +120,20 @@ export function setupPlugins(agentDir: string): void {
 }
 
 /**
- * Pre-approved MCP tool names for the clerk enhanced Telegram plugin.
- * When channels.telegram.plugin is "clerk" we pre-approve these so the agent
+ * Pre-approved MCP tool names for the switchroom enhanced Telegram plugin.
+ * When channels.telegram.plugin is "switchroom" we pre-approve these so the agent
  * never has to prompt for MCP tool permissions.
  */
-const CLERK_TELEGRAM_MCP_TOOLS = [
-  "mcp__clerk-telegram",
-  "mcp__clerk-telegram__reply",
-  "mcp__clerk-telegram__stream_reply",
-  "mcp__clerk-telegram__react",
-  "mcp__clerk-telegram__edit_message",
-  "mcp__clerk-telegram__send_typing",
-  "mcp__clerk-telegram__pin_message",
-  "mcp__clerk-telegram__forward_message",
-  "mcp__clerk-telegram__download_attachment",
+const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
+  "mcp__switchroom-telegram",
+  "mcp__switchroom-telegram__reply",
+  "mcp__switchroom-telegram__stream_reply",
+  "mcp__switchroom-telegram__react",
+  "mcp__switchroom-telegram__edit_message",
+  "mcp__switchroom-telegram__send_typing",
+  "mcp__switchroom-telegram__pin_message",
+  "mcp__switchroom-telegram__forward_message",
+  "mcp__switchroom-telegram__download_attachment",
 ];
 
 /**
@@ -146,18 +147,18 @@ const HINDSIGHT_MCP_TOOLS = [
 ];
 
 /**
- * Pre-approved MCP tool names for the clerk management MCP server.
- * Lets agents call clerk_agent_*, clerk_auth_status, clerk_memory_search
+ * Pre-approved MCP tool names for the switchroom management MCP server.
+ * Lets agents call switchroom_agent_*, switchroom_auth_status, switchroom_memory_search
  * etc. without prompting.
  */
-const CLERK_MCP_TOOLS = [
-  "mcp__clerk",
-  "mcp__clerk__*",
+const SWITCHROOM_MCP_TOOLS = [
+  "mcp__switchroom",
+  "mcp__switchroom__*",
 ];
 
 /**
  * Built-in Claude Code tools. When `tools.allow: [all]` is set in
- * clerk.yaml, every one of these is pre-approved so the agent never
+ * switchroom.yaml, every one of these is pre-approved so the agent never
  * blocks on a permission prompt at runtime.
  *
  * Claude Code does NOT accept a literal "all" or "*" in permissions.allow,
@@ -237,7 +238,7 @@ function buildSessionGreetingScript(
   if (agentConfig.session?.max_idle) session.push(`idle ${agentConfig.session.max_idle}`);
   if (agentConfig.session?.max_turns) session.push(`${agentConfig.session.max_turns} turns`);
   const sessionStr = session.length ? session.join(", ") : "unlimited (default)";
-  const plugin = agentConfig.channels?.telegram?.plugin ?? "clerk (default)";
+  const plugin = agentConfig.channels?.telegram?.plugin ?? "switchroom (default)";
 
   // Telegram HTML — keep it compact for mobile. Omit rows that are
   // null (unset with no interesting default to show).
@@ -282,12 +283,12 @@ function buildSessionGreetingScript(
   }
 
   return `#!/bin/bash
-# Auto-generated by clerk scaffold/reconcile. Sends config summary to
+# Auto-generated by switchroom scaffold/reconcile. Sends config summary to
 # Telegram on SessionStart. Zero model tokens — pure curl.
 # Regenerated on every reconcile so config changes are reflected.
 
 # Skip greeting for eval runs and one-shot claude -p calls.
-[ "$CLERK_EVAL_MODE" = "1" ] && exit 0
+[ "$SWITCHROOM_EVAL_MODE" = "1" ] && exit 0
 
 # Source bot token at runtime (never baked into scripts).
 source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
@@ -333,7 +334,7 @@ function buildCronScript(
 ): string {
   const dest = userId ?? chatId;
   return `#!/bin/bash
-# Auto-generated by clerk scaffold/reconcile.
+# Auto-generated by switchroom scaffold/reconcile.
 # One-shot scheduled task — runs claude -p, sends output to Telegram.
 
 export NVM_DIR="$HOME/.nvm"
@@ -363,16 +364,12 @@ curl -s "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \\
 }
 
 /**
- * Resolve the global clerk skills pool directory. Honors the optional
- * `clerk.skills_dir` override in clerk.yaml and falls back to
- * `~/.clerk/skills`. Expands a leading `~/` against $HOME.
+ * Resolve the global switchroom skills pool directory. Honors the optional
+ * `switchroom.skills_dir` override in switchroom.yaml and falls back to
+ * `~/.switchroom/skills`. Expands a leading `~/` against $HOME.
  */
 function resolveSkillsPoolDir(override: string | undefined): string {
-  const raw = override ?? "~/.clerk/skills";
-  if (raw.startsWith("~/")) {
-    return resolve(process.env.HOME ?? "/root", raw.slice(2));
-  }
-  return resolve(raw);
+  return resolveDualPath(override ?? "~/.switchroom/skills");
 }
 
 /**
@@ -472,20 +469,20 @@ function syncGlobalSkills(
 }
 
 /**
- * Symlink every clerk-* skill from the clerk project's built-in skills/
+ * Symlink every switchroom-* skill from the switchroom project's built-in skills/
  * directory into <agentDir>/.claude/skills/<name>.
  *
  * This runs unconditionally on every scaffold/reconcile so all agents
- * automatically get the management skills (clerk-config, clerk-health,
- * etc.) without needing to list them in clerk.yaml.
+ * automatically get the management skills (switchroom-config, switchroom-health,
+ * etc.) without needing to list them in switchroom.yaml.
  *
  * Rules:
- *   - Only directories that start with "clerk-" and contain a SKILL.md
+ *   - Only directories that start with "switchroom-" and contain a SKILL.md
  *     file are linked.
  *   - The destination .claude/skills/ directory is created if absent.
  *   - Existing entries at the destination are left untouched (idempotent).
  */
-export function installClerkSkills(agentDir: string): void {
+export function installSwitchroomSkills(agentDir: string): void {
   const builtinSkillsDir = resolve(import.meta.dirname, "../../skills");
   if (!existsSync(builtinSkillsDir)) return;
 
@@ -500,7 +497,7 @@ export function installClerkSkills(agentDir: string): void {
   }
 
   for (const name of entries) {
-    if (!name.startsWith("clerk-")) continue;
+    if (!name.startsWith("switchroom-")) continue;
     const src = join(builtinSkillsDir, name);
     // Only link directories that contain SKILL.md
     let srcStat;
@@ -525,7 +522,7 @@ export function installClerkSkills(agentDir: string): void {
       symlinkSync(src, dest);
     } catch (err) {
       console.warn(
-        `  WARNING: failed to symlink clerk skill "${name}": ${(err as Error).message}`,
+        `  WARNING: failed to symlink switchroom skill "${name}": ${(err as Error).message}`,
       );
     }
   }
@@ -533,8 +530,8 @@ export function installClerkSkills(agentDir: string): void {
 
 /**
  * Translate per-channel YAML fields into env vars the telegram-plugin
- * will read at startup. Today: CLERK_TG_FORMAT, CLERK_TG_RATE_LIMIT_MS,
- * CLERK_TG_STREAM_MODE.
+ * will read at startup. Today: SWITCHROOM_TG_FORMAT, SWITCHROOM_TG_RATE_LIMIT_MS,
+ * SWITCHROOM_TG_STREAM_MODE.
  *
  * Returns an object that can be merged into the user env. User-declared
  * env vars with the same key take precedence (see the call site) since
@@ -545,26 +542,26 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   const out: Record<string, string> = {};
   const tg = agent.channels?.telegram;
   if (!tg) return out;
-  if (tg.format !== undefined) out.CLERK_TG_FORMAT = tg.format;
+  if (tg.format !== undefined) out.SWITCHROOM_TG_FORMAT = tg.format;
   if (tg.rate_limit_ms !== undefined) {
-    out.CLERK_TG_RATE_LIMIT_MS = String(tg.rate_limit_ms);
+    out.SWITCHROOM_TG_RATE_LIMIT_MS = String(tg.rate_limit_ms);
   }
   if (tg.stream_mode !== undefined) {
-    out.CLERK_TG_STREAM_MODE = tg.stream_mode;
+    out.SWITCHROOM_TG_STREAM_MODE = tg.stream_mode;
   }
   return out;
 }
 
 /**
- * Top-level settings.json keys that clerk's scaffold/reconcile
+ * Top-level settings.json keys that switchroom's scaffold/reconcile
  * pipeline owns and rebuilds on every run. When the settings_raw
  * escape hatch injects additional top-level keys (e.g. `effort`,
- * `apiKeyHelper`), they're tracked via the `_clerkManagedRawKeys`
+ * `apiKeyHelper`), they're tracked via the `_switchroomManagedRawKeys`
  * side-car so reconcile can retract them if the user removes them
- * from clerk.yaml. Keys in this set are never retracted because the
- * scaffold path rebuilds them deterministically from clerk.yaml.
+ * from switchroom.yaml. Keys in this set are never retracted because the
+ * scaffold path rebuilds them deterministically from switchroom.yaml.
  */
-const CLERK_OWNED_SETTINGS_KEYS = new Set<string>([
+const SWITCHROOM_OWNED_SETTINGS_KEYS = new Set<string>([
   "permissions",
   "mcpServers",
   "enabledPlugins",
@@ -617,8 +614,8 @@ function copyDirRecursive(src: string, dest: string): void {
 }
 
 /**
- * Vendored hindsight-memory plugin location inside the clerk repo.
- * Pinned to the version we ship; updated by `clerk update`.
+ * Vendored hindsight-memory plugin location inside the switchroom repo.
+ * Pinned to the version we ship; updated by `switchroom update`.
  */
 function resolveHindsightVendorPath(): string {
   return resolve(import.meta.dirname, "../../vendor/hindsight-memory");
@@ -641,9 +638,9 @@ export interface HindsightPluginInstall {
  * env vars and the --plugin-dir flag.
  *
  * Returns null when:
- *  - clerk.yaml memory backend is not hindsight
+ *  - switchroom.yaml memory backend is not hindsight
  *  - the agent has memory.auto_recall: false
- *  - the vendored plugin source isn't present (e.g., bare clerk install
+ *  - the vendored plugin source isn't present (e.g., bare switchroom install
  *    without the vendor dir)
  *
  * The plugin reads its config from environment variables (HINDSIGHT_*)
@@ -652,13 +649,13 @@ export interface HindsightPluginInstall {
 export function installHindsightPlugin(
   agentName: string,
   agentDir: string,
-  clerkConfig: ClerkConfig | undefined,
+  switchroomConfig: SwitchroomConfig | undefined,
 ): HindsightPluginInstall | null {
-  if (!clerkConfig) return null;
-  const memory = clerkConfig.memory;
+  if (!switchroomConfig) return null;
+  const memory = switchroomConfig.memory;
   if (memory?.backend !== "hindsight") return null;
 
-  const agentMemory = clerkConfig.agents[agentName]?.memory;
+  const agentMemory = switchroomConfig.agents[agentName]?.memory;
   if (agentMemory?.auto_recall === false) return null;
 
   const sourcePath = resolveHindsightVendorPath();
@@ -668,7 +665,7 @@ export function installHindsightPlugin(
 
   // Copy the vendored plugin into the agent's .claude/plugins dir.
   // Force overwrite on every reconcile so plugin updates from
-  // `clerk update` propagate.
+  // `switchroom update` propagate.
   const destPath = join(agentDir, ".claude", "plugins", "hindsight-memory");
   if (existsSync(destPath)) {
     rmSync(destPath, { recursive: true, force: true });
@@ -687,22 +684,22 @@ export function installHindsightPlugin(
 }
 
 /**
- * Attempt to locate the clerk CLI binary. Used to populate CLERK_CLI_PATH
- * in the .mcp.json env for the clerk-telegram MCP server. Falls back to
- * the literal string "clerk" if `which clerk` is unavailable.
+ * Attempt to locate the switchroom CLI binary. Used to populate SWITCHROOM_CLI_PATH
+ * in the .mcp.json env for the switchroom-telegram MCP server. Falls back to
+ * the literal string "switchroom" if `which switchroom` is unavailable.
  */
-function resolveClerkCliPath(): string {
+function resolveSwitchroomCliPath(): string {
   try {
-    const result = execSync("which clerk", { stdio: ["ignore", "pipe", "ignore"] })
+    const result = execSync("which switchroom", { stdio: ["ignore", "pipe", "ignore"] })
       .toString()
       .trim();
     if (result) {
       return result;
     }
   } catch {
-    /* clerk not on PATH */
+    /* switchroom not on PATH */
   }
-  return "clerk";
+  return "switchroom";
 }
 
 /**
@@ -716,17 +713,17 @@ export function scaffoldAgent(
   agentConfigRaw: AgentConfig,
   agentsDir: string,
   telegramConfig: TelegramConfig,
-  clerkConfig?: ClerkConfig,
+  switchroomConfig?: SwitchroomConfig,
   userIdOverride?: string,
-  clerkConfigPath?: string,
+  switchroomConfigPath?: string,
 ): ScaffoldResult {
   // Apply the full cascade: global defaults → inline profile (from
-  // `extends:`) → per-agent config. When clerk.yaml has no `defaults:`
+  // `extends:`) → per-agent config. When switchroom.yaml has no `defaults:`
   // or `profiles:` and no `extends:` on the agent, the result is
   // identical to agentConfigRaw so existing behavior is preserved.
   const agentConfig = resolveAgentConfig(
-    clerkConfig?.defaults,
-    clerkConfig?.profiles,
+    switchroomConfig?.defaults,
+    switchroomConfig?.profiles,
     agentConfigRaw,
   );
 
@@ -761,7 +758,7 @@ export function scaffoldAgent(
   //     literal string "all" in the permissions.allow list. The correct
   //     equivalent is to use defaultMode: "acceptEdits" with an empty
   //     allow list.
-  //   - If channels.telegram.plugin is "clerk", pre-approve the clerk-telegram
+  //   - If channels.telegram.plugin is "switchroom", pre-approve the switchroom-telegram
   //     MCP tool names so the agent never has to confirm MCP tool
   //     permissions at runtime.
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
@@ -770,13 +767,13 @@ export function scaffoldAgent(
   const baseAllow = hasAllWildcard
     ? ALL_BUILTIN_TOOLS
     : rawAllow.filter((t) => t !== "all");
-  const memoryBackend = clerkConfig?.memory?.backend;
+  const memoryBackend = switchroomConfig?.memory?.backend;
   const hindsightEnabled = memoryBackend === "hindsight";
   const permissionAllow = dedupe([
     ...baseAllow,
-    ...(usesClerkTelegramPlugin(agentConfig) ? CLERK_TELEGRAM_MCP_TOOLS : []),
+    ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    ...CLERK_MCP_TOOLS,
+    ...SWITCHROOM_MCP_TOOLS,
   ]);
 
   // Compute Hindsight plugin context for the start.sh + settings.json
@@ -786,8 +783,8 @@ export function scaffoldAgent(
   const hindsightAutoRecallEnabled = hindsightEnabled
     && agentConfig.memory?.auto_recall !== false;
   const hindsightBankId = agentConfig.memory?.collection ?? name;
-  const hindsightApiBaseUrl = (clerkConfig?.memory?.config?.url as string | undefined)
-    ? (clerkConfig!.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
+  const hindsightApiBaseUrl = (switchroomConfig?.memory?.config?.url as string | undefined)
+    ? (switchroomConfig!.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
     : "http://127.0.0.1:8888";
 
   // Build the template rendering context
@@ -810,7 +807,7 @@ export function scaffoldAgent(
     forumChatId: telegramConfig.forum_chat_id,
     dangerousMode: agentConfig.dangerous_mode === true,
     skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
-    useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
+    useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
     hindsightEnabled: hindsightAutoRecallEnabled,
     // POSIX-single-quote shell-context values as defense-in-depth.
     // The schema validates these too, but quoting closes the gap for
@@ -848,7 +845,7 @@ export function scaffoldAgent(
     sessionMaxTurns: agentConfig.session?.max_turns,
     // Session-handoff continuity (default on). Thread into start.sh so
     // the template can gate the handoff merge block and export the
-    // CLERK_HANDOFF_SHOW_LINE env var read by the telegram plugin.
+    // SWITCHROOM_HANDOFF_SHOW_LINE env var read by the telegram plugin.
     handoffEnabled: agentConfig.session_continuity?.enabled !== false,
     handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
   };
@@ -886,7 +883,7 @@ export function scaffoldAgent(
   );
 
   // --- Merge MCP configs into settings.json ---
-  if (clerkConfig) {
+  if (switchroomConfig) {
     const settingsPath = join(agentDir, ".claude", "settings.json");
     if (existsSync(settingsPath)) {
       const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
@@ -895,65 +892,65 @@ export function scaffoldAgent(
       }
 
       // Hindsight memory MCP
-      const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
+      const hindsightEntry = getHindsightSettingsEntry(name, switchroomConfig);
       if (hindsightEntry && !settings.mcpServers[hindsightEntry.key]) {
         settings.mcpServers[hindsightEntry.key] = hindsightEntry.value;
       }
 
-      // Clerk management MCP
-      const clerkMcpEntry = getClerkMcpSettingsEntry();
-      if (!settings.mcpServers[clerkMcpEntry.key]) {
-        settings.mcpServers[clerkMcpEntry.key] = clerkMcpEntry.value;
+      // Switchroom management MCP
+      const switchroomMcpEntry = getSwitchroomMcpSettingsEntry();
+      if (!settings.mcpServers[switchroomMcpEntry.key]) {
+        settings.mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
       // The vendored plugin's own hooks.json wires SessionStart /
       // UserPromptSubmit / Stop / SessionEnd via Claude Code's plugin
       // loader once start.sh passes --plugin-dir.
-      installHindsightPlugin(name, agentDir, clerkConfig);
+      installHindsightPlugin(name, agentDir, switchroomConfig);
 
       // Disable Claude Code's built-in auto-memory so the model doesn't
       // get dueling instructions (write to local .md files vs use
       // Hindsight). The settings flag gates the memory system-prompt
       // block at the source.
-      const hindsightOn = clerkConfig.memory?.backend === "hindsight"
-        && clerkConfig.agents[name]?.memory?.auto_recall !== false;
+      const hindsightOn = switchroomConfig.memory?.backend === "hindsight"
+        && switchroomConfig.agents[name]?.memory?.auto_recall !== false;
       if (hindsightOn) {
         settings.autoMemoryEnabled = false;
       }
 
       // --- Phase 2: user-declared hooks and model ---
       //
-      // Hooks from clerk.yaml (merged with defaults) are translated from
-      // clerk's flat shape to Claude Code's nested shape and assigned
-      // wholesale to settings.hooks. Clerk owns the entire settings.hooks
+      // Hooks from switchroom.yaml (merged with defaults) are translated from
+      // switchroom's flat shape to Claude Code's nested shape and assigned
+      // wholesale to settings.hooks. Switchroom owns the entire settings.hooks
       // object — plugin-installed hooks (hindsight) live in the plugin's
       // own hooks.json and are loaded via --plugin-dir, so they're not
       // affected by this and Claude Code merges them at runtime.
       const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
-      // Clerk-owned SessionStart hook: send the config greeting via curl.
+      // Switchroom-owned SessionStart hook: send the config greeting via curl.
       // This is injected alongside user hooks and always present.
       const greetingHook = {
         type: "command",
         command: `bash "${join(agentDir, "telegram", "session-greeting.sh")}"`,
         timeout: 5,
       };
-      const clerkSessionStart = [{ hooks: [greetingHook] }];
-      // Clerk-owned Stop hook: produce the session-handoff briefing so
+      const switchroomSessionStart = [{ hooks: [greetingHook] }];
+      // Switchroom-owned Stop hook: produce the session-handoff briefing so
       // the next session can wake up with a compact summary injected
       // via --append-system-prompt. Gated on session_continuity.enabled
       // (default true). async+timeout so it never blocks shutdown.
       const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
-      const handoffConfigArg = clerkConfigPath
-        ? ` --config ${shellSingleQuote(resolve(clerkConfigPath))}`
+      const handoffConfigArg = switchroomConfigPath
+        ? ` --config ${shellSingleQuote(resolve(switchroomConfigPath))}`
         : "";
-      const clerkStop = handoffEnabled
+      const switchroomStop = handoffEnabled
         ? [
             {
               hooks: [
                 {
                   type: "command",
-                  command: `clerk${handoffConfigArg} handoff ${name}`,
+                  command: `switchroom${handoffConfigArg} handoff ${name}`,
                   timeout: 35,
                   async: true,
                 },
@@ -966,21 +963,21 @@ export function scaffoldAgent(
           ...userHooks,
           SessionStart: [
             ...((userHooks.SessionStart as unknown[]) ?? []),
-            ...clerkSessionStart,
+            ...switchroomSessionStart,
           ],
-          ...(clerkStop.length > 0
+          ...(switchroomStop.length > 0
             ? {
                 Stop: [
                   ...((userHooks.Stop as unknown[]) ?? []),
-                  ...clerkStop,
+                  ...switchroomStop,
                 ],
               }
             : {}),
         };
       } else {
         settings.hooks = {
-          SessionStart: clerkSessionStart,
-          ...(clerkStop.length > 0 ? { Stop: clerkStop } : {}),
+          SessionStart: switchroomSessionStart,
+          ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
         };
       }
       // Explicit model override: written to settings.model so the user
@@ -993,53 +990,53 @@ export function scaffoldAgent(
       //
       // Final step before writing: deep-merge any user-declared raw
       // settings onto the computed object. This lets power users reach
-      // Claude Code settings keys clerk doesn't wrap directly (e.g.
-      // `effort`, `apiKeyHelper`, future keys). Happens last so clerk's
+      // Claude Code settings keys switchroom doesn't wrap directly (e.g.
+      // `effort`, `apiKeyHelper`, future keys). Happens last so switchroom's
       // typed fields can be overridden — that's the point of the hatch.
-      // Also stamp the `_clerkManagedRawKeys` side-car so reconcile can
-      // retract non-clerk-owned keys if the user removes them later.
+      // Also stamp the `_switchroomManagedRawKeys` side-car so reconcile can
+      // retract non-switchroom-owned keys if the user removes them later.
       const mergedSettings = agentConfig.settings_raw
         ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
         : settings;
       if (agentConfig.settings_raw && Object.keys(agentConfig.settings_raw).length > 0) {
-        mergedSettings._clerkManagedRawKeys = Object.keys(agentConfig.settings_raw);
+        mergedSettings._switchroomManagedRawKeys = Object.keys(agentConfig.settings_raw);
       }
 
       writeFileSync(settingsPath, JSON.stringify(mergedSettings, null, 2) + "\n", "utf-8");
     }
   }
 
-  // --- Write project-level .mcp.json for clerk-telegram development channel ---
+  // --- Write project-level .mcp.json for switchroom-telegram development channel ---
   //
-  // When channels.telegram.plugin is "clerk", Claude Code's
+  // When channels.telegram.plugin is "switchroom", Claude Code's
   // `--dangerously-load-development-channels server:NAME` flag resolves
   // the MCP server definition from the project-level .mcp.json in the
   // working directory — NOT from settings.json mcpServers. Write it here
   // so the enhanced Telegram plugin can be launched as a dev channel.
-  if (usesClerkTelegramPlugin(agentConfig)) {
+  if (usesSwitchroomTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     if (!existsSync(mcpJsonPath)) {
       const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
-      const clerkCliPath = resolveClerkCliPath();
-      const resolvedConfigPath = clerkConfigPath
-        ? resolve(clerkConfigPath)
-        : resolve(process.cwd(), "clerk.yaml");
+      const switchroomCliPath = resolveSwitchroomCliPath();
+      const resolvedConfigPath = switchroomConfigPath
+        ? resolve(switchroomConfigPath)
+        : resolve(process.cwd(), "switchroom.yaml");
 
       const mcpServers: Record<string, McpServerConfig> = {
-        "clerk-telegram": {
+        "switchroom-telegram": {
           command: "bun",
           args: ["run", "--cwd", pluginDir, "--shell=bun", "--silent", "start"],
           env: {
             TELEGRAM_STATE_DIR: join(agentDir, "telegram"),
-            CLERK_CONFIG: resolvedConfigPath,
-            CLERK_CLI_PATH: clerkCliPath,
+            SWITCHROOM_CONFIG: resolvedConfigPath,
+            SWITCHROOM_CLI_PATH: switchroomCliPath,
           },
         },
       };
 
       // Add hindsight memory MCP if configured
-      if (hindsightEnabled && clerkConfig) {
-        const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
+      if (hindsightEnabled && switchroomConfig) {
+        const hindsightEntry = getHindsightSettingsEntry(name, switchroomConfig);
         if (hindsightEntry) {
           mcpServers[hindsightEntry.key] = hindsightEntry.value;
         }
@@ -1205,7 +1202,7 @@ export function scaffoldAgent(
   // Each schedule entry gets a self-contained bash script that runs
   // `claude -p` with the configured model and sends output to Telegram.
   // The corresponding systemd timer+service units are installed by
-  // `clerk agent create` / `clerk systemd install` (in cli/agent.ts),
+  // `switchroom agent create` / `switchroom systemd install` (in cli/agent.ts),
   // not here — scaffold writes the scripts, CLI wires the timers.
   if (agentConfig.schedule.length > 0) {
     const cronChatId = userId ?? telegramConfig.forum_chat_id;
@@ -1221,7 +1218,7 @@ export function scaffoldAgent(
   // --- Copy skill files from profile ---
   copyProfileSkills(profilePath, join(agentDir, "skills"));
 
-  // --- Symlink global skills from clerk.skills_dir ---
+  // --- Symlink global skills from switchroom.skills_dir ---
   //
   // Skills named in `agents.x.skills: [name1, name2]` (merged with
   // defaults.skills) are resolved to <skills_dir>/<name> and symlinked
@@ -1231,12 +1228,12 @@ export function scaffoldAgent(
     syncGlobalSkills(
       agentDir,
       agentConfig.skills,
-      clerkConfig?.clerk?.skills_dir,
+      switchroomConfig?.switchroom?.skills_dir,
     );
   }
 
-  // --- Install built-in clerk-* skills into .claude/skills/ ---
-  installClerkSkills(agentDir);
+  // --- Install built-in switchroom-* skills into .claude/skills/ ---
+  installSwitchroomSkills(agentDir);
 
   // --- Set up plugin symlinks ---
   setupPlugins(agentDir);
@@ -1245,7 +1242,7 @@ export function scaffoldAgent(
 }
 
 /**
- * Result of reconciling an existing agent against the current clerk.yaml.
+ * Result of reconciling an existing agent against the current switchroom.yaml.
  */
 export interface ReconcileResult {
   agentDir: string;
@@ -1253,21 +1250,21 @@ export interface ReconcileResult {
 }
 
 /**
- * Re-apply clerk.yaml-derived state to an existing agent without touching
+ * Re-apply switchroom.yaml-derived state to an existing agent without touching
  * user-edited files (CLAUDE.md, SOUL.md, telegram/.env, etc.).
  *
  * Specifically rewrites:
  *   - start.sh (purely template-driven, safe to overwrite)
- *   - .mcp.json (when channels.telegram.plugin is "clerk")
+ *   - .mcp.json (when channels.telegram.plugin is "switchroom")
  *   - .claude/settings.json mcpServers
  *   - .claude/settings.json permissions.allow / .deny / defaultMode
  *   - .claude/plugins/hindsight-memory/ (vendored plugin tree)
  *
  * Does NOT touch CLAUDE.md, SOUL.md, telegram/.env, or any user content.
  *
- * This is the operation a non-developer needs after editing clerk.yaml —
+ * This is the operation a non-developer needs after editing switchroom.yaml —
  * e.g., adding a new MCP server, enabling memory, changing the tool
- * allowlist. It is the lifecycle gap between `clerk agent create` (which
+ * allowlist. It is the lifecycle gap between `switchroom agent create` (which
  * scaffolds once) and a full re-scaffold (which would clobber CLAUDE.md).
  *
  * Throws if the agent directory does not exist.
@@ -1277,7 +1274,7 @@ export interface ReconcileOptions {
    * If true, also re-render CLAUDE.md from the template.
    * Default false (CLAUDE.md is user-protected). Use this when the
    * template itself has changed and you want to force the new version
-   * onto an existing agent — e.g., after a `clerk update` that ships
+   * onto an existing agent — e.g., after a `switchroom update` that ships
    * a template fix.
    */
   forceClaudeMd?: boolean;
@@ -1288,15 +1285,15 @@ export function reconcileAgent(
   agentConfigRaw: AgentConfig,
   agentsDir: string,
   telegramConfig: TelegramConfig,
-  clerkConfig: ClerkConfig,
-  clerkConfigPath?: string,
+  switchroomConfig: SwitchroomConfig,
+  switchroomConfigPath?: string,
   options: ReconcileOptions = {},
 ): ReconcileResult {
   // Apply the full defaults → profile → agent cascade (same semantics
   // as scaffoldAgent). Every downstream read uses the resolved config.
   const agentConfig = resolveAgentConfig(
-    clerkConfig.defaults,
-    clerkConfig.profiles,
+    switchroomConfig.defaults,
+    switchroomConfig.profiles,
     agentConfigRaw,
   );
 
@@ -1305,7 +1302,7 @@ export function reconcileAgent(
 
   if (!existsSync(agentDir)) {
     throw new Error(
-      `Agent directory does not exist: ${agentDir}. Run \`clerk agent create ${name}\` first.`,
+      `Agent directory does not exist: ${agentDir}. Run \`switchroom agent create ${name}\` first.`,
     );
   }
 
@@ -1316,13 +1313,13 @@ export function reconcileAgent(
   const baseAllow = hasAllWildcard
     ? ALL_BUILTIN_TOOLS
     : rawAllow.filter((t) => t !== "all");
-  const memoryBackend = clerkConfig.memory?.backend;
+  const memoryBackend = switchroomConfig.memory?.backend;
   const hindsightEnabled = memoryBackend === "hindsight";
   const desiredAllow = dedupe([
     ...baseAllow,
-    ...(usesClerkTelegramPlugin(agentConfig) ? CLERK_TELEGRAM_MCP_TOOLS : []),
+    ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    ...CLERK_MCP_TOOLS,
+    ...SWITCHROOM_MCP_TOOLS,
   ]);
   const desiredDeny = tools.deny ?? [];
 
@@ -1341,8 +1338,8 @@ export function reconcileAgent(
   const hindsightAutoRecallEnabled = hindsightEnabled
     && agentConfig.memory?.auto_recall !== false;
   const hindsightBankId = agentConfig.memory?.collection ?? name;
-  const hindsightApiBaseUrl = (clerkConfig.memory?.config?.url as string | undefined)
-    ? (clerkConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
+  const hindsightApiBaseUrl = (switchroomConfig.memory?.config?.url as string | undefined)
+    ? (switchroomConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
     : "http://127.0.0.1:8888";
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
@@ -1355,7 +1352,7 @@ export function reconcileAgent(
       botToken: resolvedBotToken ?? rawBotToken,
       forumChatId: telegramConfig.forum_chat_id,
       dangerousMode: agentConfig.dangerous_mode === true,
-      useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
+      useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
       hindsightEnabled: hindsightAutoRecallEnabled,
       hindsightBankIdQ: shellSingleQuote(hindsightBankId),
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
@@ -1392,7 +1389,7 @@ export function reconcileAgent(
 
   // --- Force-reconcile CLAUDE.md (only when --force-claude-md given) ---
   // CLAUDE.md is normally user-protected because users hand-edit it for
-  // persona/behavior tuning. The --force flag lets `clerk update` push
+  // persona/behavior tuning. The --force flag lets `switchroom update` push
   // template fixes through (e.g., the {{memory}} → [object Object] bug
   // we shipped earlier). Same context as scaffold's CLAUDE.md render.
   if (options.forceClaudeMd) {
@@ -1410,7 +1407,7 @@ export function reconcileAgent(
         memory: agentConfig.memory,
         model: agentConfig.model,
         schedule: agentConfig.schedule,
-        useClerkPlugin: usesClerkTelegramPlugin(agentConfig),
+        useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
       };
       const beforeMd = readFileSync(claudeMdDest, "utf-8");
       const afterMd = renderTemplate(claudeMdSrc, claudeContext);
@@ -1427,7 +1424,7 @@ export function reconcileAgent(
     const before = readFileSync(settingsPath, "utf-8");
     const settings = JSON.parse(before);
 
-    // Permissions: clerk-managed keys are allow, deny, defaultMode.
+    // Permissions: switchroom-managed keys are allow, deny, defaultMode.
     // Preserve any other keys the user may have added under permissions.
     settings.permissions = settings.permissions ?? {};
     settings.permissions.allow = desiredAllow;
@@ -1438,21 +1435,21 @@ export function reconcileAgent(
       delete settings.permissions.defaultMode;
     }
 
-    // mcpServers: rebuild from current clerk.yaml. Preserves user-defined
+    // mcpServers: rebuild from current switchroom.yaml. Preserves user-defined
     // mcp_servers from agentConfig.mcp_servers in addition to the built-ins.
     const mcpServers: Record<string, unknown> = {};
 
     // Hindsight first (so it's the most visible to a reader)
-    const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
+    const hindsightEntry = getHindsightSettingsEntry(name, switchroomConfig);
     if (hindsightEntry) {
       mcpServers[hindsightEntry.key] = hindsightEntry.value;
     }
 
-    // Clerk management MCP
-    const clerkMcpEntry = getClerkMcpSettingsEntry(clerkConfigPath);
-    mcpServers[clerkMcpEntry.key] = clerkMcpEntry.value;
+    // Switchroom management MCP
+    const switchroomMcpEntry = getSwitchroomMcpSettingsEntry(switchroomConfigPath);
+    mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
 
-    // User-defined extras from clerk.yaml agents.<name>.mcp_servers
+    // User-defined extras from switchroom.yaml agents.<name>.mcp_servers
     if (agentConfig.mcp_servers) {
       for (const [key, value] of Object.entries(agentConfig.mcp_servers)) {
         mcpServers[key] = value;
@@ -1466,8 +1463,8 @@ export function reconcileAgent(
     // plugin's own hooks.json registers SessionStart / UserPromptSubmit /
     // Stop / SessionEnd hooks via Claude Code's plugin loader. Always
     // re-copy on reconcile so plugin updates propagate via
-    // `clerk update` → reconcile.
-    installHindsightPlugin(name, agentDir, clerkConfig);
+    // `switchroom update` → reconcile.
+    installHindsightPlugin(name, agentDir, switchroomConfig);
 
     // Disable Claude Code's built-in auto-memory when Hindsight is on.
     // This stops the dueling-instruction problem (see research notes
@@ -1479,19 +1476,19 @@ export function reconcileAgent(
       delete settings.autoMemoryEnabled;
     }
 
-    // --- Phase 5: drop non-clerk-owned top-level keys from a prior
+    // --- Phase 5: drop non-switchroom-owned top-level keys from a prior
     // settings_raw run before rewriting. Reconcile tracks which keys
-    // were injected last time via a `_clerkManagedRawKeys` side-car
-    // and removes them here so removed clerk.yaml entries don't leave
-    // stale drift behind. Keys that are also clerk-owned (permissions,
+    // were injected last time via a `_switchroomManagedRawKeys` side-car
+    // and removes them here so removed switchroom.yaml entries don't leave
+    // stale drift behind. Keys that are also switchroom-owned (permissions,
     // mcpServers, hooks, model, etc) are left alone because the
-    // scaffold rebuild below re-derives them from clerk.yaml anyway.
-    const META_KEY = "_clerkManagedRawKeys";
+    // scaffold rebuild below re-derives them from switchroom.yaml anyway.
+    const META_KEY = "_switchroomManagedRawKeys";
     const priorRawKeys = Array.isArray(settings[META_KEY])
       ? (settings[META_KEY] as string[])
       : [];
     for (const k of priorRawKeys) {
-      if (!CLERK_OWNED_SETTINGS_KEYS.has(k) && k in settings) {
+      if (!SWITCHROOM_OWNED_SETTINGS_KEYS.has(k) && k in settings) {
         delete settings[k];
       }
     }
@@ -1499,27 +1496,27 @@ export function reconcileAgent(
 
     // --- Phase 2: reconcile user hooks (replace, don't merge) ---
     //
-    // Fully replace settings.hooks from clerk.yaml each reconcile, so
-    // removing a hook event from clerk.yaml also removes it from
+    // Fully replace settings.hooks from switchroom.yaml each reconcile, so
+    // removing a hook event from switchroom.yaml also removes it from
     // settings.json. Plugin-installed hooks (hindsight) live in the
     // plugin's own hooks.json and are loaded via --plugin-dir, so
-    // they're not affected by this. Clerk-owned.
+    // they're not affected by this. Switchroom-owned.
     const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
-    // Clerk-owned SessionStart hook: send config greeting via curl.
+    // Switchroom-owned SessionStart hook: send config greeting via curl.
     const greetingHook = {
       type: "command",
       command: `bash "${join(agentDir, "telegram", "session-greeting.sh")}"`,
       timeout: 5,
     };
-    const clerkSessionStart = [{ hooks: [greetingHook] }];
+    const switchroomSessionStart = [{ hooks: [greetingHook] }];
     const handoffEnabledReconcile = agentConfig.session_continuity?.enabled !== false;
-    const clerkStop = handoffEnabledReconcile
+    const switchroomStop = handoffEnabledReconcile
       ? [
           {
             hooks: [
               {
                 type: "command",
-                command: `clerk handoff ${name}`,
+                command: `switchroom handoff ${name}`,
                 timeout: 35,
                 async: true,
               },
@@ -1532,28 +1529,28 @@ export function reconcileAgent(
         ...userHooks,
         SessionStart: [
           ...((userHooks.SessionStart as unknown[]) ?? []),
-          ...clerkSessionStart,
+          ...switchroomSessionStart,
         ],
-        ...(clerkStop.length > 0
+        ...(switchroomStop.length > 0
           ? {
               Stop: [
                 ...((userHooks.Stop as unknown[]) ?? []),
-                ...clerkStop,
+                ...switchroomStop,
               ],
             }
           : {}),
       };
     } else {
       settings.hooks = {
-        SessionStart: clerkSessionStart,
-        ...(clerkStop.length > 0 ? { Stop: clerkStop } : {}),
+        SessionStart: switchroomSessionStart,
+        ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
       };
     }
 
     // --- Reconcile sub-agent definitions (.claude/agents/<name>.md) ---
     //
     // Same generation as scaffold — overwrites on every reconcile so
-    // config changes propagate. Sub-agent files are fully clerk-owned.
+    // config changes propagate. Sub-agent files are fully switchroom-owned.
     if (agentConfig.subagents) {
       const saDir = join(agentDir, ".claude", "agents");
       mkdirSync(saDir, { recursive: true });
@@ -1620,9 +1617,9 @@ export function reconcileAgent(
 
     // --- Phase 5: settings_raw escape hatch ---
     //
-    // Apply fresh after the scaffold-rebuild of clerk-owned fields.
+    // Apply fresh after the scaffold-rebuild of switchroom-owned fields.
     // Stamp the new META_KEY so the next reconcile knows which keys
-    // to retract if the user removes them from clerk.yaml.
+    // to retract if the user removes them from switchroom.yaml.
     const mergedSettings = agentConfig.settings_raw
       ? (deepMergeJson(settings, agentConfig.settings_raw) as Record<string, unknown>)
       : settings;
@@ -1666,37 +1663,37 @@ export function reconcileAgent(
   // --- Reconcile global skills pool symlinks ---
   //
   // Mirrors the scaffold syncGlobalSkills call so reconcile picks up
-  // added/removed entries in clerk.yaml.
+  // added/removed entries in switchroom.yaml.
   if (agentConfig.skills) {
-    syncGlobalSkills(agentDir, agentConfig.skills, clerkConfig.clerk.skills_dir);
+    syncGlobalSkills(agentDir, agentConfig.skills, switchroomConfig.switchroom.skills_dir);
   }
 
-  // --- Install built-in clerk-* skills into .claude/skills/ ---
-  installClerkSkills(agentDir);
+  // --- Install built-in switchroom-* skills into .claude/skills/ ---
+  installSwitchroomSkills(agentDir);
 
-  // --- Reconcile .mcp.json (clerk-telegram plugin agents only) ---
-  if (usesClerkTelegramPlugin(agentConfig)) {
+  // --- Reconcile .mcp.json (switchroom-telegram plugin agents only) ---
+  if (usesSwitchroomTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
-    const clerkCliPath = resolveClerkCliPath();
-    const resolvedConfigPath = clerkConfigPath
-      ? resolve(clerkConfigPath)
-      : resolve(process.cwd(), "clerk.yaml");
+    const switchroomCliPath = resolveSwitchroomCliPath();
+    const resolvedConfigPath = switchroomConfigPath
+      ? resolve(switchroomConfigPath)
+      : resolve(process.cwd(), "switchroom.yaml");
 
     const mcpServers: Record<string, McpServerConfig> = {
-      "clerk-telegram": {
+      "switchroom-telegram": {
         command: "bun",
         args: ["run", "--cwd", pluginDir, "--shell=bun", "--silent", "start"],
         env: {
           TELEGRAM_STATE_DIR: join(agentDir, "telegram"),
-          CLERK_CONFIG: resolvedConfigPath,
-          CLERK_CLI_PATH: clerkCliPath,
+          SWITCHROOM_CONFIG: resolvedConfigPath,
+          SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
       },
     };
 
     if (hindsightEnabled) {
-      const hindsightEntry = getHindsightSettingsEntry(name, clerkConfig);
+      const hindsightEntry = getHindsightSettingsEntry(name, switchroomConfig);
       if (hindsightEntry) {
         mcpServers[hindsightEntry.key] = hindsightEntry.value;
       }
@@ -1745,7 +1742,7 @@ function buildAccessJson(
   if (allowFrom.length === 0) {
     console.warn(
       "  WARNING: No user ID available for access.json allowFrom. " +
-      "DM the bot /start and run `clerk setup` again to pair your Telegram account."
+      "DM the bot /start and run `switchroom setup` again to pair your Telegram account."
     );
   }
   const access: Record<string, unknown> = {

@@ -1,8 +1,8 @@
-# Publishing the clerk Claude Code plugin
+# Publishing the switchroom Claude Code plugin
 
-The clerk repo doubles as a Claude Code **plugin marketplace**. The marketplace
+The switchroom repo doubles as a Claude Code **plugin marketplace**. The marketplace
 manifest lives at `.claude-plugin/marketplace.json` and advertises a single
-plugin, `clerk`, sourced from the repo root. The plugin manifest at
+plugin, `switchroom`, sourced from the repo root. The plugin manifest at
 `.claude-plugin/plugin.json` points at the existing `skills/` directory at the
 repo root (the default location Claude Code looks for skills), so no files need
 to move.
@@ -12,21 +12,21 @@ to move.
 Inside any Claude Code session:
 
 ```
-/plugin marketplace add mekenthompson/clerk
-/plugin install clerk@clerk
+/plugin marketplace add mekenthompson/switchroom
+/plugin install switchroom@switchroom
 ```
 
-The first command registers this GitHub repo as a marketplace named `clerk`.
-The second installs the `clerk` plugin from that marketplace. All 11 skills
-(`clerk-install`, `clerk-status`, `clerk-logs`, `clerk-config`,
-`clerk-restart`, `clerk-reconcile`, `clerk-schedule`, `clerk-health`,
-`clerk-manage`, `clerk-architecture`, `clerk-telegram-guide`) become available
-under the `clerk:` namespace.
+The first command registers this GitHub repo as a marketplace named `switchroom`.
+The second installs the `switchroom` plugin from that marketplace. All 11 skills
+(`switchroom-install`, `switchroom-status`, `switchroom-logs`, `switchroom-config`,
+`switchroom-restart`, `switchroom-reconcile`, `switchroom-schedule`, `switchroom-health`,
+`switchroom-manage`, `switchroom-architecture`, `switchroom-telegram-guide`) become available
+under the `switchroom:` namespace.
 
 To pull updates later:
 
 ```
-/plugin marketplace update clerk
+/plugin marketplace update switchroom
 ```
 
 ## For maintainers: cutting a release
@@ -44,7 +44,7 @@ To pull updates later:
    git tag vX.Y.Z
    git push origin main --tags
    ```
-4. Users running `/plugin marketplace update clerk` will see the new version on
+4. Users running `/plugin marketplace update switchroom` will see the new version on
    their next refresh. There is no separate publish step — GitHub is the
    distribution channel.
 
@@ -61,17 +61,17 @@ Use [semver](https://semver.org):
 Point Claude Code at this checkout as a marketplace:
 
 ```
-/plugin marketplace add /home/testuser/code/clerk
-/plugin install clerk@clerk
+/plugin marketplace add /home/testuser/code/switchroom
+/plugin install switchroom@switchroom
 ```
 
 After editing `plugin.json` or `marketplace.json`, re-run `/plugin marketplace
-update clerk` to pick up the changes (or remove and re-add the marketplace).
+update switchroom` to pick up the changes (or remove and re-add the marketplace).
 
 ## Layout notes
 
 Claude Code's plugin convention puts skills under `<plugin-root>/skills/`.
-Because clerk already kept its skills at `<repo-root>/skills/`, the marketplace
+Because switchroom already kept its skills at `<repo-root>/skills/`, the marketplace
 entry uses `"source": "./"` — the repo root *is* the plugin root. No skill files
 were moved. The only new artifacts are:
 

@@ -1,6 +1,6 @@
 # Session Optimization
 
-Strategies for managing context and tokens in long-running clerk agents.
+Strategies for managing context and tokens in long-running switchroom agents.
 
 ## Context Budget
 
@@ -14,9 +14,9 @@ Every turn includes fixed-cost components:
 
 ## Three Layers of Continuity
 
-Clerk agents have three mechanisms that survive restarts and compaction:
+Switchroom agents have three mechanisms that survive restarts and compaction:
 
-1. **Claude Code session** — `--continue` resumes the full conversation. Configurable freshness via `session.max_idle` and `session.max_turns` in clerk.yaml.
+1. **Claude Code session** — `--continue` resumes the full conversation. Configurable freshness via `session.max_idle` and `session.max_turns` in switchroom.yaml.
 
 2. **Hindsight memory** — auto-retain fires every 10 turns, saving the full transcript to a semantic bank. Auto-recall fires every turn, bringing back relevant memories. Important facts survive compaction because they're stored externally.
 
@@ -24,7 +24,7 @@ Clerk agents have three mechanisms that survive restarts and compaction:
 
 ## Session Freshness Policy
 
-Configure automatic fresh-session boundaries in clerk.yaml:
+Configure automatic fresh-session boundaries in switchroom.yaml:
 
 ```yaml
 defaults:
@@ -55,7 +55,7 @@ The main agent (Opus) handles planning and review. `@worker` (Sonnet) handles im
 
 - Restrict tools per agent: `tools.deny: [Bash, Edit, Write]` saves ~500 tokens.
 - Only enable MCP servers the agent uses.
-- The clerk MCP server (~800 tokens for 8 tools) replaces Bash access for agent management.
+- The switchroom MCP server (~800 tokens for 8 tools) replaces Bash access for agent management.
 
 ## Compaction
 

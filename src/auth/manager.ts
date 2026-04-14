@@ -1,16 +1,16 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 
 // TODO: Fetch subscriptionType / rateLimitTier from Anthropic's profile/me
-// endpoint after OAuth token exchange. When users run `clerk auth` manually
+// endpoint after OAuth token exchange. When users run `switchroom auth` manually
 // (instead of `claude auth login`), the resulting .credentials.json is
 // missing subscriptionType and rateLimitTier — Claude Code normally
 // populates these by calling Anthropic's profile/me endpoint after the
 // token exchange. We should replicate that call and write the real values
 // into the credentials file. Do NOT hardcode "max" — use whatever the API
-// returns. Until this is implemented, users running clerk auth manually
+// returns. Until this is implemented, users running switchroom auth manually
 // may need to add these fields to .credentials.json by hand.
 
 export interface AuthStatus {
@@ -77,7 +77,7 @@ export function getAuthStatus(name: string, agentDir: string): AuthStatus {
 }
 
 export function getAllAuthStatuses(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
 ): Record<string, AuthStatus> {
   const agentsDir = resolveAgentsDir(config);
   const statuses: Record<string, AuthStatus> = {};
@@ -94,8 +94,8 @@ export function getAllAuthStatuses(
  * Display instructions for completing Claude Code onboarding for an agent.
  *
  * Claude Code handles its own OAuth during onboarding. The flow is:
- * 1. Start the agent: clerk agent start <name>
- * 2. Attach to the session: clerk agent attach <name>
+ * 1. Start the agent: switchroom agent start <name>
+ * 2. Attach to the session: switchroom agent attach <name>
  * 3. Complete Claude Code onboarding (theme, login, trust)
  * 4. Detach from tmux (Ctrl+B, D)
  * 5. The agent is now running and authenticated
@@ -120,8 +120,8 @@ export function loginAgent(
     instructions: [
       `To authenticate agent "${name}", complete Claude Code's onboarding:`,
       ``,
-      `  1. Start the agent:    clerk agent start ${name}`,
-      `  2. Attach to session:  clerk agent attach ${name}`,
+      `  1. Start the agent:    switchroom agent start ${name}`,
+      `  2. Attach to session:  switchroom agent attach ${name}`,
       `  3. Complete onboarding (select theme, log in, trust project)`,
       `  4. Detach from tmux:   Ctrl+B, then D`,
       ``,
@@ -139,7 +139,7 @@ export function refreshAgent(
     instructions: [
       `To refresh auth for agent "${name}", attach and re-authenticate:`,
       ``,
-      `  1. clerk agent attach ${name}`,
+      `  1. switchroom agent attach ${name}`,
       `  2. Run /login or restart the session`,
       `  3. Detach: Ctrl+B, then D`,
     ],

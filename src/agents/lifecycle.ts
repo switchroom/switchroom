@@ -1,7 +1,8 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
+import { resolveStatePath } from "../config/paths.js";
 
 export interface AgentStatus {
   active: string;
@@ -11,7 +12,7 @@ export interface AgentStatus {
 }
 
 function serviceName(name: string): string {
-  return `clerk-${name}`;
+  return `switchroom-${name}`;
 }
 
 function systemctl(args: string[]): string {
@@ -119,7 +120,7 @@ export function getAgentStatus(name: string): AgentStatus {
 }
 
 export function getAllAgentStatuses(
-  config: ClerkConfig
+  config: SwitchroomConfig
 ): Record<string, AgentStatus> {
   const statuses: Record<string, AgentStatus> = {};
   for (const agentName of Object.keys(config.agents)) {
@@ -129,7 +130,7 @@ export function getAllAgentStatuses(
 }
 
 export function attachAgent(name: string): void {
-  const agentsDir = process.env.CLERK_AGENTS_DIR ?? resolve(process.env.HOME ?? "/root", ".clerk/agents");
+  const agentsDir = process.env.SWITCHROOM_AGENTS_DIR ?? resolveStatePath("agents");
   const logFile = resolve(agentsDir, name, "service.log");
 
   if (!existsSync(logFile)) {

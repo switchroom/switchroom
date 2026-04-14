@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quality eval runner for clerk skills."""
+"""Quality eval runner for switchroom skills."""
 
 import argparse
 import asyncio
@@ -51,7 +51,7 @@ async def call_claude(
             args.extend(["--append-system-prompt", system_prompt])
         else:
             args.extend(["--system-prompt", system_prompt])
-    env = {**os.environ, "CLERK_EVAL_MODE": "1"}
+    env = {**os.environ, "SWITCHROOM_EVAL_MODE": "1"}
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
         env["CLAUDE_CONFIG_DIR"] = config_dir
@@ -159,7 +159,7 @@ async def run_all(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run quality evals for clerk skills")
+    parser = argparse.ArgumentParser(description="Run quality evals for switchroom skills")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model to use")
     parser.add_argument("--parallel", type=int, default=5, help="Concurrent requests")
     parser.add_argument("--ablation", action="store_true", help="Also run without skill")

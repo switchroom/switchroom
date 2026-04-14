@@ -53,7 +53,7 @@ export const AgentMemorySchema = z
   .optional();
 
 /**
- * A single hook entry in clerk.yaml. We accept the ergonomic flat form
+ * A single hook entry in switchroom.yaml. We accept the ergonomic flat form
  * (`{ command, timeout?, async?, env?, matcher? }`) and translate to
  * Claude Code's nested `{ hooks: [{ type: "command", ... }] }` shape in
  * scaffold.ts. Keeping the flat form in YAML makes the common case
@@ -82,7 +82,7 @@ export const HookEntrySchema = z.object({
 });
 
 /**
- * Per-event arrays of hook entries. Clerk accepts any Claude Code hook
+ * Per-event arrays of hook entries. Switchroom accepts any Claude Code hook
  * lifecycle event; the list below is the current set as of 2026-04.
  * Unknown event names pass through as-is so future Claude Code events
  * don't break the schema.
@@ -100,7 +100,7 @@ export const AgentHooksSchema = z
   .optional();
 
 /**
- * A sub-agent definition that clerk renders into a
+ * A sub-agent definition that switchroom renders into a
  * `.claude/agents/<name>.md` file. Maps 1:1 onto Claude Code's
  * custom sub-agent frontmatter spec (code.claude.com/docs/en/sub-agents).
  *
@@ -255,7 +255,7 @@ export const SessionContinuitySchema = z
  * each channel lives under its own key with channel-specific options.
  *
  * Telegram options:
- *  - plugin: "clerk" (default) uses the enhanced clerk-telegram MCP
+ *  - plugin: "switchroom" (default) uses the enhanced switchroom-telegram MCP
  *    with streaming edits, emoji reactions, SQLite history, formatted
  *    output, and per-agent access control. Loaded via
  *    --dangerously-load-development-channels. "official" falls back to
@@ -272,10 +272,10 @@ export const SessionContinuitySchema = z
 export const TelegramChannelSchema = z
   .object({
     plugin: z
-      .enum(["clerk", "official"])
+      .enum(["switchroom", "official"])
       .optional()
       .describe(
-        "Which Telegram MCP plugin to load. Default is 'clerk' — the " +
+        "Which Telegram MCP plugin to load. Default is 'switchroom' — the " +
         "enhanced fork with streaming edits, reactions, history, and " +
         "access control. Set to 'official' for the upstream marketplace " +
         "plugin (basic send/receive only)."
@@ -311,9 +311,9 @@ export const ChannelsSchema = z
  * A Profile is a named bundle of config that agents inherit from via
  * `extends: <name>`. Profiles can be defined two ways:
  *
- *   1. Inline in clerk.yaml under top-level `profiles: { name: {...} }`
+ *   1. Inline in switchroom.yaml under top-level `profiles: { name: {...} }`
  *   2. As a filesystem directory at `profiles/<name>/` inside the
- *      clerk repo, containing CLAUDE.md.hbs + SOUL.md.hbs + skills/
+ *      switchroom repo, containing CLAUDE.md.hbs + SOUL.md.hbs + skills/
  *
  * Inline profiles take priority when both exist with the same name.
  *
@@ -395,7 +395,7 @@ export const AgentDefaultsSchema = z.object(defaultsFields).optional();
 /**
  * Name of the implicit filesystem profile used when no `extends:`
  * field is declared and no inline profile matches. Corresponds to the
- * `profiles/default/` directory bundled with clerk.
+ * `profiles/default/` directory bundled with switchroom.
  */
 export const DEFAULT_PROFILE = "default";
 
@@ -405,7 +405,7 @@ export const AgentSchema = z.object({
     .optional()
     .describe(
       "Name of a profile to inherit from (e.g., 'coding', 'health-coach'). " +
-      "Profiles may be defined inline under clerk.yaml `profiles:` or as a " +
+      "Profiles may be defined inline under switchroom.yaml `profiles:` or as a " +
       "filesystem directory `profiles/<name>/`. Defaults to DEFAULT_PROFILE " +
       "('default') when unset.",
     ),
@@ -421,7 +421,7 @@ export const AgentSchema = z.object({
   topic_id: z
     .number()
     .optional()
-    .describe("Telegram topic thread ID (auto-populated by clerk topics sync)"),
+    .describe("Telegram topic thread ID (auto-populated by switchroom topics sync)"),
   soul: AgentSoulSchema,
   tools: AgentToolsSchema,
   memory: AgentMemorySchema,
@@ -457,7 +457,7 @@ export const AgentSchema = z.object({
     .array(z.string())
     .optional()
     .describe(
-      "Names of skills from clerk.skills_dir to symlink into this " +
+      "Names of skills from switchroom.skills_dir to symlink into this " +
       "agent's skills/ directory. Unioned with defaults.skills.",
     ),
   subagents: z
@@ -496,7 +496,7 @@ export const AgentSchema = z.object({
     .describe(
       "Escape hatch: raw object deep-merged into the generated " +
       "settings.json as the final step. Use for Claude Code settings " +
-      "keys clerk doesn't wrap directly (e.g. effort, apiKeyHelper). " +
+      "keys switchroom doesn't wrap directly (e.g. effort, apiKeyHelper). " +
       "Power-user-only — prefer the typed fields when they exist."
     ),
   claude_md_raw: z
@@ -513,7 +513,7 @@ export const AgentSchema = z.object({
     .optional()
     .describe(
       "Escape hatch: extra arguments appended to the `exec claude` " +
-      "invocation in start.sh. Use for Claude Code CLI flags clerk " +
+      "invocation in start.sh. Use for Claude Code CLI flags switchroom " +
       "doesn't expose directly (e.g. --effort high, " +
       "--exclude-dynamic-system-prompt-sections)."
     ),
@@ -569,12 +569,12 @@ export const MemoryBackendConfigSchema = z.object({
 export const VaultConfigSchema = z.object({
   path: z
     .string()
-    .default("~/.clerk/vault.enc")
+    .default("~/.switchroom/vault.enc")
     .describe("Path to encrypted vault file"),
 });
 
-export const ClerkConfigSchema = z.object({
-  clerk: z.object({
+export const SwitchroomConfigSchema = z.object({
+  switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
     agents_dir: z
       .string()
@@ -582,7 +582,7 @@ export const ClerkConfigSchema = z.object({
         /^[a-zA-Z0-9~._\-/]+$/,
         "agents_dir must not contain shell-special characters ($, `, \", ', \\, etc.)",
       )
-      .default("~/.clerk/agents")
+      .default("~/.switchroom/agents")
       .describe("Base directory for agent installations"),
     skills_dir: z
       .string()
@@ -590,10 +590,10 @@ export const ClerkConfigSchema = z.object({
         /^[a-zA-Z0-9~._\-/]+$/,
         "skills_dir must not contain shell-special characters ($, `, \", ', \\, etc.)",
       )
-      .default("~/.clerk/skills")
+      .default("~/.switchroom/skills")
       .describe(
         "Shared skills pool. Each subdirectory is a named skill " +
-        "(matching a clerk.yaml `skills:` entry). Scaffold symlinks " +
+        "(matching a switchroom.yaml `skills:` entry). Scaffold symlinks " +
         "selected skills into each agent's skills/ directory."
       ),
   }),
@@ -624,7 +624,7 @@ export const ClerkConfigSchema = z.object({
     .describe("Map of agent name to agent configuration"),
 });
 
-export type ClerkConfig = z.infer<typeof ClerkConfigSchema>;
+export type SwitchroomConfig = z.infer<typeof SwitchroomConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentSchema>;
 export type AgentDefaults = z.infer<typeof AgentDefaultsSchema>;
 export type Profile = z.infer<typeof ProfileSchema>;

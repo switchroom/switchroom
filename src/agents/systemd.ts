@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { writeFileSync, readFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
-import type { ClerkConfig, ScheduleEntry } from "../config/schema.js";
+import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 
 const SYSTEMD_USER_DIR = resolve(
@@ -10,7 +10,7 @@ const SYSTEMD_USER_DIR = resolve(
 );
 
 function unitName(name: string): string {
-  return `clerk-${name}`;
+  return `switchroom-${name}`;
 }
 
 function unitFilePath(name: string): string {
@@ -33,7 +33,7 @@ export function generateUnit(name: string, agentDir: string, useAutoaccept = fal
     : `/usr/bin/script -qfc "/bin/bash -l ${agentDir}/start.sh" ${logFile}`;
 
   return `[Unit]
-Description=clerk agent: ${name}
+Description=switchroom agent: ${name}
 After=network-online.target
 Wants=network-online.target
 
@@ -63,12 +63,12 @@ export function uninstallUnit(name: string): void {
   }
 }
 
-export function installAllUnits(config: ClerkConfig): void {
+export function installAllUnits(config: SwitchroomConfig): void {
   const agentsDir = resolveAgentsDir(config);
 
   for (const agentName of Object.keys(config.agents)) {
     const agentDir = resolve(agentsDir, agentName);
-    const useAutoaccept = config.agents[agentName].channels?.telegram?.plugin === "clerk";
+    const useAutoaccept = config.agents[agentName].channels?.telegram?.plugin === "switchroom";
     const content = generateUnit(agentName, agentDir, useAutoaccept);
     installUnit(agentName, content);
   }
@@ -161,7 +161,7 @@ export function generateTimerUnit(
   const onCalendar = cronToOnCalendar(cronExpr);
   const desc = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
   return `[Unit]
-Description=clerk scheduled: ${agentName} #${index} — ${desc}
+Description=switchroom scheduled: ${agentName} #${index} — ${desc}
 
 [Timer]
 OnCalendar=${onCalendar}
@@ -183,7 +183,7 @@ export function generateTimerServiceUnit(
 ): string {
   const scriptPath = join(agentDir, "telegram", `cron-${index}.sh`);
   return `[Unit]
-Description=clerk scheduled task: ${agentName} #${index}
+Description=switchroom scheduled task: ${agentName} #${index}
 
 [Service]
 Type=oneshot
@@ -196,17 +196,17 @@ WorkingDirectory=${agentDir}
  * Timer unit file path for a scheduled task.
  */
 function timerFilePath(agentName: string, index: number): string {
-  return resolve(SYSTEMD_USER_DIR, `clerk-${agentName}-cron-${index}.timer`);
+  return resolve(SYSTEMD_USER_DIR, `switchroom-${agentName}-cron-${index}.timer`);
 }
 
 function timerServiceFilePath(agentName: string, index: number): string {
-  return resolve(SYSTEMD_USER_DIR, `clerk-${agentName}-cron-${index}.service`);
+  return resolve(SYSTEMD_USER_DIR, `switchroom-${agentName}-cron-${index}.service`);
 }
 
 /**
  * Install timer + service units for all scheduled tasks of an agent.
  * Also removes stale timers that no longer have a corresponding
- * schedule entry (e.g. user removed a schedule from clerk.yaml).
+ * schedule entry (e.g. user removed a schedule from switchroom.yaml).
  */
 export function installScheduleTimers(
   agentName: string,
@@ -225,7 +225,7 @@ export function installScheduleTimers(
   }
 
   // Remove stale timers (indices beyond current schedule length)
-  const prefix = `clerk-${agentName}-cron-`;
+  const prefix = `switchroom-${agentName}-cron-`;
   if (existsSync(SYSTEMD_USER_DIR)) {
     for (const file of readdirSync(SYSTEMD_USER_DIR)) {
       if (!file.startsWith(prefix)) continue;
@@ -247,7 +247,7 @@ export function installScheduleTimers(
  */
 export function enableScheduleTimers(agentName: string, count: number): void {
   for (let i = 0; i < count; i++) {
-    const timerName = `clerk-${agentName}-cron-${i}.timer`;
+    const timerName = `switchroom-${agentName}-cron-${i}.timer`;
     try {
       execSync(`systemctl --user enable --now ${timerName}`, { stdio: "pipe" });
     } catch { /* best effort */ }

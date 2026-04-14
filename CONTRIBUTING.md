@@ -1,6 +1,6 @@
-# Contributing to Clerk
+# Contributing to Switchroom
 
-Thanks for your interest in contributing to Clerk!
+Thanks for your interest in contributing to Switchroom!
 
 ## Getting Started
 
@@ -29,7 +29,7 @@ Community profiles are welcome! Add them to `profiles/<name>/` with:
 - `SOUL.md.hbs` — agent persona
 - Optional `skills/` for domain-specific skills
 
-Agents inherit a profile via `extends: <name>` in `clerk.yaml`. See
+Agents inherit a profile via `extends: <name>` in `switchroom.yaml`. See
 [docs/configuration.md](docs/configuration.md) for the cascade semantics.
 
 ## Code Style

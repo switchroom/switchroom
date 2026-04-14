@@ -1,6 +1,6 @@
 # Scheduled Tasks
 
-Clerk runs scheduled tasks as **systemd user timers** — reliable, OS-level, survive reboots and session crashes. Each task fires a one-shot `claude -p` call with the configured model and sends output to Telegram.
+Switchroom runs scheduled tasks as **systemd user timers** — reliable, OS-level, survive reboots and session crashes. Each task fires a one-shot `claude -p` call with the configured model and sends output to Telegram.
 
 ## Quick Start
 
@@ -14,20 +14,20 @@ defaults:
       model: claude-opus-4-6    # override for important tasks
 ```
 
-Run `clerk agent create <name>` or `clerk agent reconcile <name>` to install the timers.
+Run `switchroom agent create <name>` or `switchroom agent reconcile <name>` to install the timers.
 
 ## How It Works
 
-For each schedule entry, clerk generates:
+For each schedule entry, switchroom generates:
 
 1. **`telegram/cron-N.sh`** — self-contained bash script that:
    - Sources nvm (so `claude` is on PATH)
    - Runs `claude -p "prompt" --model <model> --no-session-persistence`
    - Sends the output to your Telegram DM via curl
 
-2. **`clerk-<agent>-cron-N.timer`** — systemd timer with `OnCalendar` converted from the cron expression
+2. **`switchroom-<agent>-cron-N.timer`** — systemd timer with `OnCalendar` converted from the cron expression
 
-3. **`clerk-<agent>-cron-N.service`** — systemd oneshot service that runs the script
+3. **`switchroom-<agent>-cron-N.service`** — systemd oneshot service that runs the script
 
 ## Configuration
 
@@ -97,21 +97,21 @@ This means a scheduled task won't see the agent's conversation history or Hindsi
 
 ```bash
 # List all active timers
-systemctl --user list-timers "clerk-*"
+systemctl --user list-timers "switchroom-*"
 
 # Check a specific timer
-systemctl --user status clerk-assistant-cron-0.timer
+systemctl --user status switchroom-assistant-cron-0.timer
 
 # Manually trigger a scheduled task
-systemctl --user start clerk-assistant-cron-0.service
+systemctl --user start switchroom-assistant-cron-0.service
 
 # View output from the last run
-journalctl --user -u clerk-assistant-cron-0.service --no-pager -n 20
+journalctl --user -u switchroom-assistant-cron-0.service --no-pager -n 20
 ```
 
 ## Comparison with Claude Code's Native Scheduling
 
-| | Clerk (systemd timers) | Claude Code CronCreate | Claude Code Desktop |
+| | Switchroom (systemd timers) | Claude Code CronCreate | Claude Code Desktop |
 |---|---|---|---|
 | **Survives restart** | Yes (OS-level) | No (session-scoped) | Yes (app must be open) |
 | **Headless** | Yes | Yes | No (Desktop app only) |

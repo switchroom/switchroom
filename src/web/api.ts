@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import {
   getAllAgentStatuses,
   startAgent,
@@ -26,7 +26,7 @@ export interface AgentInfo {
   memoryCollection: string;
 }
 
-export function handleGetAgents(config: ClerkConfig): AgentInfo[] {
+export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
   const statuses = getAllAgentStatuses(config);
   const authStatuses = getAllAuthStatuses(config);
   const agents: AgentInfo[] = [];
@@ -91,7 +91,7 @@ export function handleGetLogs(
   try {
     const output = execFileSync(
       "journalctl",
-      ["--user", "-u", `clerk-${name}`, "--no-pager", "-n", String(lines)],
+      ["--user", "-u", `switchroom-${name}`, "--no-pager", "-n", String(lines)],
       { encoding: "utf-8", timeout: 5000 }
     );
     return { ok: true, logs: output };

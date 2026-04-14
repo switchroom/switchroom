@@ -22,7 +22,7 @@ export function registerMemoryCommand(program: Command): void {
     .command("memory")
     .description("Hindsight memory operations");
 
-  // clerk memory search <query>
+  // switchroom memory search <query>
   memory
     .command("search <query>")
     .description("Search agent memories via Hindsight")
@@ -33,7 +33,7 @@ export function registerMemoryCommand(program: Command): void {
 
         if (opts.agent) {
           if (!config.agents[opts.agent]) {
-            console.error(chalk.red(`Agent "${opts.agent}" is not defined in clerk.yaml`));
+            console.error(chalk.red(`Agent "${opts.agent}" is not defined in switchroom.yaml`));
             process.exit(1);
           }
           const collection = getCollectionForAgent(opts.agent, config);
@@ -60,7 +60,7 @@ export function registerMemoryCommand(program: Command): void {
       }),
     );
 
-  // clerk memory stats
+  // switchroom memory stats
   memory
     .command("stats")
     .description("List agents with their collection names and isolation mode")
@@ -70,7 +70,7 @@ export function registerMemoryCommand(program: Command): void {
         const agentNames = Object.keys(config.agents);
 
         if (agentNames.length === 0) {
-          console.log(chalk.yellow("No agents defined in clerk.yaml"));
+          console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           return;
         }
 
@@ -108,7 +108,7 @@ export function registerMemoryCommand(program: Command): void {
       }),
     );
 
-  // clerk memory reflect
+  // switchroom memory reflect
   memory
     .command("reflect")
     .description("Show cross-agent reflection plan")
@@ -145,7 +145,7 @@ export function registerMemoryCommand(program: Command): void {
       }),
     );
 
-  // clerk memory setup
+  // switchroom memory setup
   memory
     .command("setup")
     .description("Manage the Hindsight Docker container")
@@ -161,10 +161,10 @@ export function registerMemoryCommand(program: Command): void {
         const status = getHindsightStatus();
         if (status) {
           console.log(chalk.bold("\n  Hindsight container status:"));
-          console.log(`  ${chalk.cyan("clerk-hindsight")}: ${status}\n`);
+          console.log(`  ${chalk.cyan("switchroom-hindsight")}: ${status}\n`);
         } else {
           console.log(chalk.yellow("\n  Hindsight container not found.\n"));
-          console.log(chalk.gray("  Run 'clerk memory setup' to start it."));
+          console.log(chalk.gray("  Run 'switchroom memory setup' to start it."));
         }
         return;
       }
@@ -175,10 +175,10 @@ export function registerMemoryCommand(program: Command): void {
           process.exit(1);
         }
         if (!isHindsightContainerExists()) {
-          console.log(chalk.yellow("  No clerk-hindsight container found."));
+          console.log(chalk.yellow("  No switchroom-hindsight container found."));
           return;
         }
-        console.log(chalk.gray("  Stopping clerk-hindsight..."));
+        console.log(chalk.gray("  Stopping switchroom-hindsight..."));
         stopHindsight();
         console.log(chalk.green("  Hindsight container stopped and removed."));
         return;
@@ -192,12 +192,12 @@ export function registerMemoryCommand(program: Command): void {
       }
 
       if (isHindsightRunning()) {
-        console.log(chalk.green("\n  Hindsight container is already running (clerk-hindsight).\n"));
+        console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;
       }
 
       if (isHindsightContainerExists()) {
-        console.log(chalk.gray("  Removing stopped clerk-hindsight container..."));
+        console.log(chalk.gray("  Removing stopped switchroom-hindsight container..."));
         stopHindsight();
       }
 
@@ -221,8 +221,9 @@ export function registerMemoryCommand(program: Command): void {
 
       // Resolve OpenAI key from vault if available, falling back to env
       let apiKey: string | undefined = process.env.OPENAI_API_KEY;
-      const passphrase = process.env.CLERK_VAULT_PASSPHRASE;
-      const vaultPath = (process.env.HOME ?? "") + "/.clerk/vault.enc";
+      const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+      const { resolveStatePath } = await import("../config/paths.js");
+      const vaultPath = resolveStatePath("vault.enc");
       if (!apiKey && passphrase && existsSync(vaultPath)) {
         try {
           const { getSecret } = await import("../vault/vault.js");
@@ -236,13 +237,13 @@ export function registerMemoryCommand(program: Command): void {
       console.log(chalk.gray("  Starting Hindsight Docker container..."));
       try {
         startHindsight(provider, apiKey, ports);
-        console.log(chalk.green(`\n  Hindsight container started (clerk-hindsight) on port ${ports.apiPort}.\n`));
+        console.log(chalk.green(`\n  Hindsight container started (switchroom-hindsight) on port ${ports.apiPort}.\n`));
       } catch (err) {
         console.error(chalk.red(`\n  Failed to start Hindsight: ${(err as Error).message}\n`));
         process.exit(1);
       }
 
-      // Update clerk.yaml with the chosen URL so agents pick it up
+      // Update switchroom.yaml with the chosen URL so agents pick it up
       const url = `http://127.0.0.1:${ports.apiPort}/mcp/`;
       const configPath = getConfigPath(program);
       try {
@@ -267,21 +268,21 @@ export function registerMemoryCommand(program: Command): void {
           console.log(chalk.gray(`  Updated ${configPath} with memory.config.url = ${url}`));
           console.log(
             chalk.gray(
-              "  Run `clerk agent reconcile all --restart` to apply this to existing agents."
+              "  Run `switchroom agent reconcile all --restart` to apply this to existing agents."
             )
           );
         }
       } catch (err) {
         console.error(
           chalk.yellow(
-            `  Note: could not auto-update clerk.yaml: ${(err as Error).message}\n` +
+            `  Note: could not auto-update switchroom.yaml: ${(err as Error).message}\n` +
             `  Add memory.config.url: ${url} manually.`
           )
         );
       }
     });
 
-  // clerk memory docker-compose
+  // switchroom memory docker-compose
   memory
     .command("docker-compose")
     .description("Output a docker-compose snippet for Hindsight")

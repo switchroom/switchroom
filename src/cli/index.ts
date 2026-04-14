@@ -19,12 +19,12 @@ const pkg = JSON.parse(
 );
 
 export const program = new Command()
-  .name("clerk")
+  .name("switchroom")
   .description(
     "Multi-agent orchestrator for Claude Code. One Telegram group, many specialized agents."
   )
   .version(pkg.version)
-  .option("-c, --config <path>", "Path to clerk.yaml config file");
+  .option("-c, --config <path>", "Path to switchroom.yaml config file");
 
 registerSetupCommand(program);
 registerDoctorCommand(program);

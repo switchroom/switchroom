@@ -4,10 +4,11 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
+import { resolveStatePath } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 
 /**
  * Result of a single doctor check.
@@ -127,18 +128,18 @@ function checkDependencies(): CheckResult[] {
     checkBinary(
       "expect",
       "expect",
-      "sudo apt install expect (only required for clerk-telegram plugin agents)",
+      "sudo apt install expect (only required for switchroom-telegram plugin agents)",
     ),
     checkBinary("docker", "docker", "Install Docker (only required for Hindsight memory)"),
-    checkBinary("systemctl", "systemctl", "Clerk requires a systemd-based Linux distro"),
+    checkBinary("systemctl", "systemctl", "Switchroom requires a systemd-based Linux distro"),
   ];
 }
 
-function checkConfig(config: ClerkConfig, configPath: string): CheckResult[] {
+function checkConfig(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
 
   results.push({
-    name: "clerk.yaml loaded",
+    name: "switchroom.yaml loaded",
     status: "ok",
     detail: configPath,
   });
@@ -149,7 +150,7 @@ function checkConfig(config: ClerkConfig, configPath: string): CheckResult[] {
     status: agentCount > 0 ? "ok" : "warn",
     detail: agentCount > 0 ? `${agentCount} agent(s)` : "no agents",
     fix: agentCount === 0
-      ? "Add at least one agent under `agents:` in clerk.yaml"
+      ? "Add at least one agent under `agents:` in switchroom.yaml"
       : undefined,
   });
 
@@ -166,10 +167,10 @@ function checkConfig(config: ClerkConfig, configPath: string): CheckResult[] {
   return results;
 }
 
-function checkVault(config: ClerkConfig): CheckResult[] {
+function checkVault(config: SwitchroomConfig): CheckResult[] {
   const vaultPath = config.vault?.path
     ? config.vault.path.replace(/^~/, process.env.HOME ?? "")
-    : join(process.env.HOME ?? "", ".clerk/vault.enc");
+    : resolveStatePath("vault.enc");
 
   if (!existsSync(vaultPath)) {
     return [
@@ -177,12 +178,12 @@ function checkVault(config: ClerkConfig): CheckResult[] {
         name: "vault file present",
         status: "warn",
         detail: `${vaultPath} not found`,
-        fix: "Run `clerk vault init` if you plan to store secrets in the vault",
+        fix: "Run `switchroom vault init` if you plan to store secrets in the vault",
       },
     ];
   }
 
-  const passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+  const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (!passphrase) {
     return [
       {
@@ -193,8 +194,8 @@ function checkVault(config: ClerkConfig): CheckResult[] {
       {
         name: "vault unlock",
         status: "warn",
-        detail: "CLERK_VAULT_PASSPHRASE not set; cannot verify decrypt",
-        fix: "Export CLERK_VAULT_PASSPHRASE to verify the vault unlocks",
+        detail: "SWITCHROOM_VAULT_PASSPHRASE not set; cannot verify decrypt",
+        fix: "Export SWITCHROOM_VAULT_PASSPHRASE to verify the vault unlocks",
       },
     ];
   }
@@ -216,13 +217,13 @@ function checkVault(config: ClerkConfig): CheckResult[] {
         name: "vault unlock",
         status: "fail",
         detail: (err as Error).message,
-        fix: "CLERK_VAULT_PASSPHRASE is wrong, or the vault file is corrupted",
+        fix: "SWITCHROOM_VAULT_PASSPHRASE is wrong, or the vault file is corrupted",
       },
     ];
   }
 }
 
-function checkHindsight(config: ClerkConfig): CheckResult[] {
+function checkHindsight(config: SwitchroomConfig): CheckResult[] {
   const memoryBackend = config.memory?.backend;
   if (memoryBackend !== "hindsight") {
     return [];
@@ -253,7 +254,7 @@ function checkHindsight(config: ClerkConfig): CheckResult[] {
         status: "fail",
         detail: `${host}:${port} not responding`,
         fix:
-          "Run `clerk memory setup` to start the Hindsight container, " +
+          "Run `switchroom memory setup` to start the Hindsight container, " +
           "or check `docker ps --filter name=hindsight`",
       },
     ];
@@ -268,7 +269,7 @@ function checkHindsight(config: ClerkConfig): CheckResult[] {
   ];
 }
 
-function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
+function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
   const agentsDir = resolveAgentsDir(config);
   const statuses = getAllAgentStatuses(config);
@@ -283,7 +284,7 @@ function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
         name: `${name}: scaffold`,
         status: "fail",
         detail: `${agentDir} missing`,
-        fix: `Run \`clerk agent create ${name}\``,
+        fix: `Run \`switchroom agent create ${name}\``,
       });
       continue;
     }
@@ -302,7 +303,7 @@ function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
         name: `${name}: service`,
         status: "warn",
         detail: active,
-        fix: `Run \`clerk agent start ${name}\``,
+        fix: `Run \`switchroom agent start ${name}\``,
       });
     }
 
@@ -313,7 +314,7 @@ function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
         name: `${name}: auth`,
         status: "fail",
         detail: "not authenticated",
-        fix: `Run \`clerk auth login ${name}\` and complete the OAuth flow`,
+        fix: `Run \`switchroom auth login ${name}\` and complete the OAuth flow`,
       });
     } else {
       results.push({
@@ -323,42 +324,42 @@ function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
       });
     }
 
-    // 4. MCP wireup drift detection (clerk-telegram plugin agents)
-    if (agentConfig.channels?.telegram?.plugin === "clerk") {
+    // 4. MCP wireup drift detection (switchroom-telegram plugin agents)
+    if (agentConfig.channels?.telegram?.plugin === "switchroom") {
       const mcpJsonPath = join(agentDir, ".mcp.json");
       if (!existsSync(mcpJsonPath)) {
         results.push({
           name: `${name}: .mcp.json`,
           status: "fail",
           detail: "missing",
-          fix: `Run \`clerk agent reconcile ${name}\``,
+          fix: `Run \`switchroom agent reconcile ${name}\``,
         });
       } else {
         try {
           const mcp = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
-          const hasClerkTelegram = !!mcp.mcpServers?.["clerk-telegram"];
+          const hasSwitchroomTelegram = !!mcp.mcpServers?.["switchroom-telegram"];
           const memoryEnabled = config.memory?.backend === "hindsight";
           const hasHindsight = !!mcp.mcpServers?.hindsight;
 
-          if (!hasClerkTelegram) {
+          if (!hasSwitchroomTelegram) {
             results.push({
               name: `${name}: .mcp.json`,
               status: "fail",
-              detail: "missing clerk-telegram entry",
-              fix: `Run \`clerk agent reconcile ${name} --restart\``,
+              detail: "missing switchroom-telegram entry",
+              fix: `Run \`switchroom agent reconcile ${name} --restart\``,
             });
           } else if (memoryEnabled && !hasHindsight) {
             results.push({
               name: `${name}: .mcp.json`,
               status: "warn",
-              detail: "memory enabled in clerk.yaml but hindsight missing from .mcp.json",
-              fix: `Run \`clerk agent reconcile ${name} --restart\``,
+              detail: "memory enabled in switchroom.yaml but hindsight missing from .mcp.json",
+              fix: `Run \`switchroom agent reconcile ${name} --restart\``,
             });
           } else {
             results.push({
               name: `${name}: .mcp.json`,
               status: "ok",
-              detail: memoryEnabled ? "clerk-telegram + hindsight" : "clerk-telegram",
+              detail: memoryEnabled ? "switchroom-telegram + hindsight" : "switchroom-telegram",
             });
           }
         } catch (err) {
@@ -366,7 +367,7 @@ function checkAgents(config: ClerkConfig, configPath: string): CheckResult[] {
             name: `${name}: .mcp.json`,
             status: "fail",
             detail: `parse error: ${(err as Error).message}`,
-            fix: `Run \`clerk agent reconcile ${name}\``,
+            fix: `Run \`switchroom agent reconcile ${name}\``,
           });
         }
       }
@@ -402,7 +403,7 @@ function printSection(title: string, results: CheckResult[]): {
 export function registerDoctorCommand(program: Command): void {
   program
     .command("doctor")
-    .description("Diagnose Clerk's setup: deps, vault, memory, agents, MCP wireup")
+    .description("Diagnose Switchroom's setup: deps, vault, memory, agents, MCP wireup")
     .option("--json", "Output as JSON")
     .action(
       withConfigError(async (opts: { json?: boolean }) => {

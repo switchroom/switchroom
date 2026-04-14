@@ -85,9 +85,9 @@ describe("saveUserConfig / loadUserConfig", () => {
   });
 
   it("returns null for corrupt JSON", () => {
-    const clerkDir = join(TEST_DIR, ".clerk");
-    mkdirSync(clerkDir, { recursive: true });
-    writeFileSync(join(clerkDir, "user.json"), "not json", "utf-8");
+    const switchroomDir = join(TEST_DIR, ".switchroom");
+    mkdirSync(switchroomDir, { recursive: true });
+    writeFileSync(join(switchroomDir, "user.json"), "not json", "utf-8");
 
     const config = loadUserConfig();
     expect(config).toBeNull();

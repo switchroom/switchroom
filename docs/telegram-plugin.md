@@ -1,12 +1,12 @@
-# Clerk's Telegram Plugin
+# Switchroom's Telegram Plugin
 
-Clerk ships an enhanced Telegram MCP plugin (`clerk-telegram`) that replaces the official `telegram@claude-plugins-official` marketplace plugin. It is the **default** for all agents — you don't need to configure anything to use it.
+Switchroom ships an enhanced Telegram MCP plugin (`switchroom-telegram`) that replaces the official `telegram@claude-plugins-official` marketplace plugin. It is the **default** for all agents — you don't need to configure anything to use it.
 
 ## Why a fork?
 
-The official Telegram plugin provides basic message send/receive. Clerk's fork adds everything needed for a production agent experience: streaming edits, emoji-driven progress signals, persistent message history, forum topic support, rich formatting, and per-agent access control.
+The official Telegram plugin provides basic message send/receive. Switchroom's fork adds everything needed for a production agent experience: streaming edits, emoji-driven progress signals, persistent message history, forum topic support, rich formatting, and per-agent access control.
 
-## What the clerk fork adds
+## What the switchroom fork adds
 
 ### Message tools (10 MCP tools)
 
@@ -75,7 +75,7 @@ agents:
 ### Streaming modes
 
 How live progress is surfaced while a turn is in flight. Configure via
-`channels.telegram.stream_mode` in `clerk.yaml`:
+`channels.telegram.stream_mode` in `switchroom.yaml`:
 
 - **`checklist`** (default) — event-driven progress card. Reads canonical
   `tool_use` / `tool_result` / `turn_end` events from the session JSONL
@@ -108,13 +108,13 @@ call.
 
 ## Configuration
 
-The clerk fork reads additional env vars from `start.sh`:
+The switchroom fork reads additional env vars from `start.sh`:
 
 | Env var | Source | Purpose |
 |---------|--------|---------|
-| `CLERK_TG_FORMAT` | `channels.telegram.format` | Default reply format (`html`, `markdownv2`, `text`) |
-| `CLERK_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
-| `CLERK_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty` — see "Streaming modes" above |
+| `SWITCHROOM_TG_FORMAT` | `channels.telegram.format` | Default reply format (`html`, `markdownv2`, `text`) |
+| `SWITCHROOM_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
+| `SWITCHROOM_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty` — see "Streaming modes" above |
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
-| `CLERK_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
-| `CLERK_CONFIG` | Auto-set by scaffold | Path to clerk.yaml for config resolution |
+| `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
+| `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |

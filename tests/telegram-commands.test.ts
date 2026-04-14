@@ -7,7 +7,7 @@ import { execFileSync } from 'child_process'
 
 // --- Replicated helpers from server.ts ---
 
-function formatClerkOutput(output: string, maxLen = 4000): string {
+function formatSwitchroomOutput(output: string, maxLen = 4000): string {
   const trimmed = output.trim()
   if (trimmed.length <= maxLen) return trimmed
   return trimmed.slice(0, maxLen - 20) + '\n... (truncated)'
@@ -18,33 +18,33 @@ function codeBlock(text: string): string {
   return '```\n' + escaped + '\n```'
 }
 
-function resolveClerkCli(): string {
-  return process.env.CLERK_CLI_PATH ?? 'clerk'
+function resolveSwitchroomCli(): string {
+  return process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
 }
 
 // --- Tests ---
 
 describe('telegram bot commands', () => {
-  describe('formatClerkOutput', () => {
+  describe('formatSwitchroomOutput', () => {
     it('returns trimmed output when short', () => {
-      expect(formatClerkOutput('  hello world  ')).toBe('hello world')
+      expect(formatSwitchroomOutput('  hello world  ')).toBe('hello world')
     })
 
     it('truncates output exceeding maxLen', () => {
       const long = 'x'.repeat(5000)
-      const result = formatClerkOutput(long, 4000)
+      const result = formatSwitchroomOutput(long, 4000)
       expect(result.length).toBeLessThanOrEqual(4000)
       expect(result).toContain('... (truncated)')
     })
 
     it('handles empty output', () => {
-      expect(formatClerkOutput('')).toBe('')
-      expect(formatClerkOutput('   ')).toBe('')
+      expect(formatSwitchroomOutput('')).toBe('')
+      expect(formatSwitchroomOutput('   ')).toBe('')
     })
 
     it('respects custom maxLen', () => {
       const text = 'a'.repeat(100)
-      const result = formatClerkOutput(text, 50)
+      const result = formatSwitchroomOutput(text, 50)
       expect(result.length).toBeLessThanOrEqual(50)
       expect(result).toContain('... (truncated)')
     })
@@ -69,7 +69,7 @@ describe('telegram bot commands', () => {
   describe('command argument parsing', () => {
     // Simulates how Grammy provides ctx.match for /command <args>
 
-    it('extracts agent name from /clerkstart health-coach', () => {
+    it('extracts agent name from /switchroomstart health-coach', () => {
       const match = 'health-coach'
       const name = match.trim()
       expect(name).toBe('health-coach')
@@ -125,35 +125,35 @@ describe('telegram bot commands', () => {
     })
   })
 
-  describe('clerk CLI path resolution', () => {
-    const originalEnv = process.env.CLERK_CLI_PATH
+  describe('switchroom CLI path resolution', () => {
+    const originalEnv = process.env.SWITCHROOM_CLI_PATH
 
     beforeEach(() => {
-      delete process.env.CLERK_CLI_PATH
+      delete process.env.SWITCHROOM_CLI_PATH
     })
 
-    it('defaults to "clerk" when CLERK_CLI_PATH is not set', () => {
-      expect(resolveClerkCli()).toBe('clerk')
+    it('defaults to "switchroom" when SWITCHROOM_CLI_PATH is not set', () => {
+      expect(resolveSwitchroomCli()).toBe('switchroom')
     })
 
-    it('uses CLERK_CLI_PATH when set', () => {
-      process.env.CLERK_CLI_PATH = '/usr/local/bin/clerk'
-      expect(resolveClerkCli()).toBe('/usr/local/bin/clerk')
+    it('uses SWITCHROOM_CLI_PATH when set', () => {
+      process.env.SWITCHROOM_CLI_PATH = '/usr/local/bin/switchroom'
+      expect(resolveSwitchroomCli()).toBe('/usr/local/bin/switchroom')
     })
 
     // Restore after tests
     afterAll(() => {
       if (originalEnv !== undefined) {
-        process.env.CLERK_CLI_PATH = originalEnv
+        process.env.SWITCHROOM_CLI_PATH = originalEnv
       } else {
-        delete process.env.CLERK_CLI_PATH
+        delete process.env.SWITCHROOM_CLI_PATH
       }
     })
   })
 
   describe('error handling', () => {
-    it('detects ENOENT (clerk not found) in error message', () => {
-      const error = new Error('spawn clerk ENOENT')
+    it('detects ENOENT (switchroom not found) in error message', () => {
+      const error = new Error('spawn switchroom ENOENT')
       expect(error.message).toContain('ENOENT')
     })
 
@@ -181,7 +181,7 @@ describe('telegram bot commands', () => {
     })
   })
 
-  describe('clerk command execution (mocked)', () => {
+  describe('switchroom command execution (mocked)', () => {
     it('builds correct args for agent list', () => {
       const args = ['agent', 'list']
       expect(args).toEqual(['agent', 'list'])
@@ -206,14 +206,14 @@ describe('telegram bot commands', () => {
       expect(args).toEqual(['memory', 'search', 'user preferences'])
     })
 
-    it('prepends --config when CLERK_CONFIG is set', () => {
+    it('prepends --config when SWITCHROOM_CONFIG is set', () => {
       const config = '/path/to/config.yaml'
       const baseArgs = ['agent', 'list']
       const fullArgs = config ? ['--config', config, ...baseArgs] : baseArgs
       expect(fullArgs).toEqual(['--config', '/path/to/config.yaml', 'agent', 'list'])
     })
 
-    it('does not prepend --config when CLERK_CONFIG is not set', () => {
+    it('does not prepend --config when SWITCHROOM_CONFIG is not set', () => {
       const config: string | undefined = undefined
       const baseArgs = ['agent', 'list']
       const fullArgs = config ? ['--config', config, ...baseArgs] : baseArgs
@@ -223,9 +223,9 @@ describe('telegram bot commands', () => {
 
   describe('self-targeting command detection', () => {
     // Locks the contract behind the /restart, /reconcile, /update self-kill
-    // fix in server.ts. The bot needs to detect when a clerk subcommand
+    // fix in server.ts. The bot needs to detect when a switchroom subcommand
     // would SIGTERM its own systemd unit (mid-execFileSync) and switch to
-    // a detached spawn instead. See spawnClerkDetached +
+    // a detached spawn instead. See spawnSwitchroomDetached +
     // isSelfTargetingCommand in telegram-plugin/server.ts.
     function isSelfTargetingCommand(name: string, myAgentName: string): boolean {
       if (name === 'all') return true
@@ -259,35 +259,35 @@ describe('telegram bot commands', () => {
     // Claude Code spawns MCP plugins with cwd = $HOME regardless of the
     // parent claude process cwd, so basename(cwd) returns the OS username
     // (e.g., "testuser") instead of the agent name. The plugin must
-    // read CLERK_AGENT_NAME from the env (set in start.sh) and only fall
+    // read SWITCHROOM_AGENT_NAME from the env (set in start.sh) and only fall
     // back to cwd parsing when the env var is missing.
     function getMyAgentName(env: NodeJS.ProcessEnv, cwd: string): string {
-      const fromEnv = env.CLERK_AGENT_NAME
+      const fromEnv = env.SWITCHROOM_AGENT_NAME
       if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
       // Replicates `basename(cwd)` from path.basename
       return cwd.split('/').filter(Boolean).pop() ?? ''
     }
 
-    it('reads CLERK_AGENT_NAME from env when set', () => {
-      const env = { CLERK_AGENT_NAME: 'assistant' }
+    it('reads SWITCHROOM_AGENT_NAME from env when set', () => {
+      const env = { SWITCHROOM_AGENT_NAME: 'assistant' }
       // cwd is irrelevant when env is set — Claude Code's MCP plugin spawn
       // sets cwd to $HOME but the env var carries the truth.
       expect(getMyAgentName(env, '/home/testuser')).toBe('assistant')
     })
 
-    it('trims whitespace from CLERK_AGENT_NAME', () => {
-      const env = { CLERK_AGENT_NAME: '  coach  ' }
+    it('trims whitespace from SWITCHROOM_AGENT_NAME', () => {
+      const env = { SWITCHROOM_AGENT_NAME: '  coach  ' }
       expect(getMyAgentName(env, '/home/testuser')).toBe('coach')
     })
 
     it('falls back to basename(cwd) when env var is unset', () => {
       const env = {}
-      expect(getMyAgentName(env, '/home/testuser/.clerk/agents/assistant')).toBe('assistant')
+      expect(getMyAgentName(env, '/home/testuser/.switchroom/agents/assistant')).toBe('assistant')
     })
 
     it('falls back to basename(cwd) when env var is empty', () => {
-      const env = { CLERK_AGENT_NAME: '' }
-      expect(getMyAgentName(env, '/home/testuser/.clerk/agents/assistant')).toBe('assistant')
+      const env = { SWITCHROOM_AGENT_NAME: '' }
+      expect(getMyAgentName(env, '/home/testuser/.switchroom/agents/assistant')).toBe('assistant')
     })
 
     it('returns empty string when both env and cwd are unhelpful (defensive)', () => {
@@ -298,5 +298,5 @@ describe('telegram bot commands', () => {
   })
 })
 
-// afterAll import for the clerk CLI path test
+// afterAll import for the switchroom CLI path test
 import { afterAll } from 'vitest'

@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node
 import { join } from "node:path";
 import { loadTopicState, saveTopicState, type TopicState } from "../src/telegram/state.js";
 import { syncTopics, findOrphanedTopics } from "../src/telegram/topic-manager.js";
-import type { ClerkConfig } from "../src/config/schema.js";
+import type { SwitchroomConfig } from "../src/config/schema.js";
 
 const TEST_DIR = join(import.meta.dirname, ".tmp-test-topics");
 
@@ -13,7 +13,7 @@ function cleanup() {
   }
 }
 
-function makeConfig(agents: Record<string, { topic_name: string; topic_id?: number }>): ClerkConfig {
+function makeConfig(agents: Record<string, { topic_name: string; topic_id?: number }>): SwitchroomConfig {
   const agentEntries: Record<string, any> = {};
   for (const [name, cfg] of Object.entries(agents)) {
     agentEntries[name] = {
@@ -26,10 +26,10 @@ function makeConfig(agents: Record<string, { topic_name: string; topic_id?: numb
   }
 
   return {
-    clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+    switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
     telegram: { bot_token: "fake-token", forum_chat_id: "-100123" },
     agents: agentEntries,
-  } as ClerkConfig;
+  } as SwitchroomConfig;
 }
 
 beforeEach(() => {

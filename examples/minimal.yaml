@@ -1,7 +1,7 @@
-# clerk.yaml — Minimal single-agent setup
-# One bot, one agent. The clerk-telegram fork is the default.
+# switchroom.yaml — Minimal single-agent setup
+# One bot, one agent. The switchroom-telegram fork is the default.
 
-clerk:
+switchroom:
   version: 1
 
 telegram:

@@ -1,17 +1,17 @@
-# Clerk — Product Requirements Document
+# Switchroom — Product Requirements Document
 
 > **⚠️ Historical design document.** This PRD reflects the original product
-> design and remains useful for understanding clerk's intent and architectural
+> design and remains useful for understanding switchroom's intent and architectural
 > rationale. Several sections are now out of date relative to the shipped
-> code — in particular the Telegram plugin model (the clerk fork is now the
+> code — in particular the Telegram plugin model (the switchroom fork is now the
 > default, with `channels.telegram.plugin: official` as the opt-out — the
-> old `use_clerk_plugin: true` key no longer exists), the CLI surface
-> (`clerk setup`, `clerk doctor`, `clerk update`, `clerk agent reconcile`,
-> `clerk agent grant|dangerous|permissions` are not listed below), and the
+> old `use_switchroom_plugin: true` key no longer exists), the CLI surface
+> (`switchroom setup`, `switchroom doctor`, `switchroom update`, `switchroom agent reconcile`,
+> `switchroom agent grant|dangerous|permissions` are not listed below), and the
 > memory model (file-based `MEMORY.md` auto-memory is disabled in favour of
 > Hindsight). For current behaviour, treat the canonical sources as:
 >
-> - [`README.md`](README.md) — what clerk is and how to use it
+> - [`README.md`](README.md) — what switchroom is and how to use it
 > - [`docs/configuration.md`](docs/configuration.md) — config schema & cascade
 > - [`docs/telegram-plugin.md`](docs/telegram-plugin.md) — Telegram plugin
 > - [`docs/sub-agents.md`](docs/sub-agents.md) — sub-agent delegation
@@ -23,9 +23,9 @@
 
 ## Overview
 
-Clerk is an open-source multi-agent orchestrator for Claude Code. It manages multiple long-running Claude Code sessions, each with its own persona, memory, tools, and Telegram topic — all using your official Claude Pro/Max subscription.
+Switchroom is an open-source multi-agent orchestrator for Claude Code. It manages multiple long-running Claude Code sessions, each with its own persona, memory, tools, and Telegram topic — all using your official Claude Pro/Max subscription.
 
-Clerk is **not a harness or wrapper**. It never intercepts Claude's authentication or inference. It is scaffolding and lifecycle management: it creates directories, generates systemd units, and provides a CLI to manage your agents. Each agent is a real `claude --channels` session, officially authenticated.
+Switchroom is **not a harness or wrapper**. It never intercepts Claude's authentication or inference. It is scaffolding and lifecycle management: it creates directories, generates systemd units, and provides a CLI to manage your agents. Each agent is a real `claude --channels` session, officially authenticated.
 
 ## Problem
 
@@ -42,9 +42,9 @@ Running multiple specialized Claude Code agents (health coach, executive assista
 
 A config-driven CLI that:
 
-1. Reads a single `clerk.yaml` manifest defining all agents
+1. Reads a single `switchroom.yaml` manifest defining all agents
 2. Scaffolds agent directories from templates (SOUL.md, CLAUDE.md, settings, skills)
-3. Manages OAuth login per agent via `clerk auth login <agent>`
+3. Manages OAuth login per agent via `switchroom auth login <agent>`
 4. Generates systemd + tmux units for headless operation with interactive access
 5. Assigns one Telegram bot per agent, each using the official `plugin:telegram@claude-plugins-official`
 6. Integrates Hindsight for per-agent semantic memory with knowledge graphs
@@ -78,7 +78,7 @@ One bot per agent. Each agent uses the official Telegram plugin.
         ▼          ▼           ▼
 ┌────────────┐┌────────────┐┌────────────┐
 │  tmux:     ││  tmux:     ││  tmux:     │
-│  clerk-    ││  clerk-    ││  clerk-    │
+│  switchroom-    ││  switchroom-    ││  switchroom-    │
 │  coach     ││  exec      ││  general   │
 │            ││            ││            │
 │ claude     ││ claude     ││ claude     │
@@ -99,11 +99,11 @@ One bot per agent. Each agent uses the official Telegram plugin.
 
 ### Auth Model
 
-Each agent gets its own `CLAUDE_CONFIG_DIR` containing an independent `.credentials.json`. This avoids the token refresh race condition (single-use refresh tokens, 8-hour access token lifetime). Clerk manages the login flow:
+Each agent gets its own `CLAUDE_CONFIG_DIR` containing an independent `.credentials.json`. This avoids the token refresh race condition (single-use refresh tokens, 8-hour access token lifetime). Switchroom manages the login flow:
 
 ```
-clerk auth login health-coach
-  → Sets CLAUDE_CONFIG_DIR=~/.clerk/agents/health-coach/.claude
+switchroom auth login health-coach
+  → Sets CLAUDE_CONFIG_DIR=~/.switchroom/agents/health-coach/.claude
   → Runs claude auth login
   → Prints URL for browser (works remotely via SSH)
   → Tokens saved to agent's own config dir
@@ -133,19 +133,19 @@ Hindsight provides 4-strategy retrieval (semantic + BM25 + entity graph + tempor
 
 ### Telegram Model
 
-Each agent gets its own Telegram bot. Clerk supports **two channel modes** per agent:
+Each agent gets its own Telegram bot. Switchroom supports **two channel modes** per agent:
 
 **Mode A — Official plugin (default):**
 - Launches with `claude --channels plugin:telegram@claude-plugins-official`
 - Uses Anthropic's approved marketplace plugin — no prompts, no dev-channel flag
 - Simplest path, minimal dependencies
 
-**Mode B — Clerk enhanced plugin (`use_clerk_plugin: true`):**
-- Launches with `claude --dangerously-load-development-channels server:clerk-telegram`
+**Mode B — Switchroom enhanced plugin (`use_switchroom_plugin: true`):**
+- Launches with `claude --dangerously-load-development-channels server:switchroom-telegram`
 - MCP server definition is read from a project-level `.mcp.json` in the agent's working directory (NOT from `settings.json`)
 - Adds HTML formatting, smart message chunking, coalescing, bot commands, and richer attachment handling
 - Requires `expect` to auto-accept the dev-channel confirmation prompt at startup (`bin/autoaccept.exp`)
-- MCP tool names (`mcp__clerk-telegram__*`) are pre-approved in `settings.json` so the agent never blocks on a permission prompt
+- MCP tool names (`mcp__switchroom-telegram__*`) are pre-approved in `settings.json` so the agent never blocks on a permission prompt
 - Targets Ubuntu 24.04 LTS (TIOCSTI is blocked on modern kernels; we use `expect` instead)
 
 Shared across both modes:
@@ -167,11 +167,11 @@ Templates provide starting points for common personas (health coach, executive a
 ## Manifest Format
 
 ```yaml
-# clerk.yaml
+# switchroom.yaml
 
-clerk:
+switchroom:
   version: 1
-  agents_dir: ~/.clerk/agents    # Where agent directories live
+  agents_dir: ~/.switchroom/agents    # Where agent directories live
 
 telegram:
   bot_token: "vault:telegram-bot-token"   # From encrypted vault
@@ -185,7 +185,7 @@ memory:
     # or: provider: anthropic
 
 vault:
-  path: ~/.clerk/vault.enc
+  path: ~/.switchroom/vault.enc
 
 agents:
   coach:
@@ -241,82 +241,82 @@ agents:
 ### Initialization
 
 ```
-clerk init                          # Scaffold from clerk.yaml
-clerk init --example wellness       # Start from example config
-clerk init --docker                 # Generate docker-compose.yml instead
+switchroom init                          # Scaffold from switchroom.yaml
+switchroom init --example wellness       # Start from example config
+switchroom init --docker                 # Generate docker-compose.yml instead
 ```
 
 ### Agent Lifecycle
 
 ```
-clerk agent list                    # Show all agents + status + uptime
-clerk agent create <name> [--template <t>]  # Add agent to manifest + scaffold
-clerk agent start <name|all>        # Start systemd unit + tmux session
-clerk agent stop <name|all>         # Stop agent
-clerk agent restart <name|all>      # Restart agent
-clerk agent attach <name>           # tmux attach for interactive access
-clerk agent logs <name> [-f]        # Follow journal logs
-clerk agent destroy <name>          # Remove agent + data (with confirmation)
+switchroom agent list                    # Show all agents + status + uptime
+switchroom agent create <name> [--template <t>]  # Add agent to manifest + scaffold
+switchroom agent start <name|all>        # Start systemd unit + tmux session
+switchroom agent stop <name|all>         # Stop agent
+switchroom agent restart <name|all>      # Restart agent
+switchroom agent attach <name>           # tmux attach for interactive access
+switchroom agent logs <name> [-f]        # Follow journal logs
+switchroom agent destroy <name>          # Remove agent + data (with confirmation)
 ```
 
 ### Authentication
 
 ```
-clerk auth login <name|all>         # OAuth login for agent(s)
-clerk auth status                   # Show all agents' auth status, subscription, expiry
-clerk auth refresh <name>           # Force token refresh
+switchroom auth login <name|all>         # OAuth login for agent(s)
+switchroom auth status                   # Show all agents' auth status, subscription, expiry
+switchroom auth refresh <name>           # Force token refresh
 ```
 
 ### Telegram Topics
 
 ```
-clerk topics sync                   # Create/update forum topics from manifest
-clerk topics list                   # Show topic → agent mapping
+switchroom topics sync                   # Create/update forum topics from manifest
+switchroom topics list                   # Show topic → agent mapping
 ```
 
 ### Secrets Vault
 
 ```
-clerk vault init                    # Create encrypted vault
-clerk vault set <key>               # Prompt for value, encrypt and store
-clerk vault get <key>               # Decrypt and display
-clerk vault list                    # Show key names (not values)
-clerk vault remove <key>            # Delete a secret
+switchroom vault init                    # Create encrypted vault
+switchroom vault set <key>               # Prompt for value, encrypt and store
+switchroom vault get <key>               # Decrypt and display
+switchroom vault list                    # Show key names (not values)
+switchroom vault remove <key>            # Delete a secret
 ```
 
 ### Memory
 
 ```
-clerk memory search <query> [--agent <name>]   # Search memories
-clerk memory stats                              # Per-agent memory counts
-clerk memory reflect                            # Cross-agent synthesis
+switchroom memory search <query> [--agent <name>]   # Search memories
+switchroom memory stats                              # Per-agent memory counts
+switchroom memory reflect                            # Cross-agent synthesis
 ```
 
 ### Systemd
 
 ```
-clerk systemd install               # Generate + enable all units
-clerk systemd status                # Show all service statuses
-clerk systemd uninstall             # Disable + remove units
+switchroom systemd install               # Generate + enable all units
+switchroom systemd status                # Show all service statuses
+switchroom systemd uninstall             # Disable + remove units
 ```
 
 ### Web Dashboard
 
 ```
-clerk web [--port 8080]             # Start lightweight dashboard
+switchroom web [--port 8080]             # Start lightweight dashboard
 ```
 
 ## Generated Agent Directory
 
 ```
-~/.clerk/agents/health-coach/
+~/.switchroom/agents/health-coach/
 ├── .claude/                        # CLAUDE_CONFIG_DIR for this agent
 │   ├── .credentials.json           # OAuth tokens (auto-managed)
 │   ├── config.json                 # Claude Code config
 │   └── settings.json               # MCP servers, permissions (defaultMode acceptEdits
 │                                   #   when tools.allow has "all")
 ├── .mcp.json                       # Project-level MCP server config
-│                                   #   (only when use_clerk_plugin: true —
+│                                   #   (only when use_switchroom_plugin: true —
 │                                   #    dev-channel loader reads from here,
 │                                   #    not from settings.json)
 ├── CLAUDE.md                       # Agent behavior instructions
@@ -338,23 +338,23 @@ clerk web [--port 8080]             # Start lightweight dashboard
 
 ```bash
 # Prerequisites: Node 22+, Bun, Claude Code CLI, tmux
-npm install -g @clerk-ai/clerk    # or: bun install -g @clerk-ai/clerk
+npm install -g @switchroom-ai/switchroom    # or: bun install -g @switchroom-ai/switchroom
 
-clerk init
-clerk vault init
-clerk vault set telegram-bot-token
-clerk auth login --all
-clerk topics sync
-clerk agent start all
+switchroom init
+switchroom vault init
+switchroom vault set telegram-bot-token
+switchroom auth login --all
+switchroom topics sync
+switchroom agent start all
 ```
 
 ### 2. Docker Compose (Optional)
 
 ```bash
-clerk init --docker
+switchroom init --docker
 # Edit .env with TELEGRAM_BOT_TOKEN
 docker compose up -d
-# Auth: docker exec -it clerk-health-coach clerk auth login health-coach
+# Auth: docker exec -it switchroom-health-coach switchroom auth login health-coach
 ```
 
 ### 3. Manual / Bare
@@ -364,7 +364,7 @@ Use templates and docs to set up your own process supervision.
 ## Phased Delivery
 
 ### Phase 1 — Foundation
-- clerk.yaml schema (Zod validation)
+- switchroom.yaml schema (Zod validation)
 - Config loader
 - Agent directory scaffolding from templates
 - systemd + tmux unit generation
@@ -376,12 +376,12 @@ Use templates and docs to set up your own process supervision.
 - Add message_thread_id to inbound metadata
 - Add message_thread_id + TELEGRAM_TOPIC_ID filtering to reply tool
 - Topic-aware file sending
-- clerk topics sync (auto-create forum topics via Bot API)
+- switchroom topics sync (auto-create forum topics via Bot API)
 
 ### Phase 3 — Auth & Secrets
-- clerk auth login/status/refresh (OAuth flow per agent)
+- switchroom auth login/status/refresh (OAuth flow per agent)
 - Encrypted vault (AES-256-GCM, Argon2id key derivation)
-- Secret references in clerk.yaml (vault:key-name)
+- Secret references in switchroom.yaml (vault:key-name)
 - CLI: vault init/set/get/list/remove, auth commands
 
 ### Phase 4 — Memory
@@ -395,7 +395,7 @@ Use templates and docs to set up your own process supervision.
 - health-coach template (SOUL.md, CLAUDE.md, skills)
 - executive-assistant template (daily briefing, task prioritization, meeting prep)
 - default + coding templates
-- /clerk in-session skill for agent management
+- /switchroom in-session skill for agent management
 - Shared skills: cross-reflect, agent-handoff
 
 ### Phase 6 — Web Dashboard
@@ -407,7 +407,7 @@ Use templates and docs to set up your own process supervision.
 - Vault key management
 
 ### Phase 7 — Enhanced Telegram Plugin
-Opt-in via `use_clerk_plugin: true` on any agent. Implemented as a forked MCP server in `telegram-plugin/`, loaded as a Claude Code development channel.
+Opt-in via `use_switchroom_plugin: true` on any agent. Implemented as a forked MCP server in `telegram-plugin/`, loaded as a Claude Code development channel.
 
 - HTML message formatting (bold, italics, code blocks, links)
 - Smart message chunking (respects Telegram's 4096-char limit)
@@ -417,14 +417,14 @@ Opt-in via `use_clerk_plugin: true` on any agent. Implemented as a forked MCP se
 - Attachment download helpers (photos, files, voice)
 - Pre-approved MCP tool permissions (no runtime prompts)
 - `expect`-based auto-accept for the dev-channel confirmation prompt at startup
-- Project-level `.mcp.json` scaffolding with `TELEGRAM_STATE_DIR`, `CLERK_CONFIG`, `CLERK_CLI_PATH` env
+- Project-level `.mcp.json` scaffolding with `TELEGRAM_STATE_DIR`, `SWITCHROOM_CONFIG`, `SWITCHROOM_CLI_PATH` env
 
 ### Phase 8 — Docker Support
 - Base agent Dockerfile (Node 22 + Bun + Claude Code + tmux)
-- docker-compose.yml generation from clerk.yaml
+- docker-compose.yml generation from switchroom.yaml
 - Volume management for credentials, memory, config
 - Container health checks
-- `clerk init --docker` path
+- `switchroom init --docker` path
 
 ## Non-Goals (v1)
 
@@ -437,10 +437,10 @@ Opt-in via `use_clerk_plugin: true` on any agent. Implemented as a forked MCP se
 
 ## Success Criteria
 
-- `clerk init && clerk auth login --all && clerk agent start all` works in under 5 minutes
+- `switchroom init && switchroom auth login --all && switchroom agent start all` works in under 5 minutes
 - Each agent responds only in its assigned Telegram topic
 - Agents maintain isolated memory across restarts
 - Token refresh works unattended for weeks
-- Adding a new agent takes <2 minutes (edit YAML, clerk agent create, clerk auth login)
+- Adding a new agent takes <2 minutes (edit YAML, switchroom agent create, switchroom auth login)
 - Templates provide useful starting points that users customize
 - Project runs on any Linux box with Node 22+, Bun, and tmux

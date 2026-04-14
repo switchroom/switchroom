@@ -45,7 +45,7 @@ describe("getAuthStatus", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = resolve(tmpdir(), `clerk-auth-test-${Date.now()}`);
+    tempDir = resolve(tmpdir(), `switchroom-auth-test-${Date.now()}`);
     mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
   });
 
@@ -151,7 +151,7 @@ describe("loginAgent", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = resolve(tmpdir(), `clerk-login-test-${Date.now()}`);
+    tempDir = resolve(tmpdir(), `switchroom-login-test-${Date.now()}`);
     mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
   });
 
@@ -163,8 +163,8 @@ describe("loginAgent", () => {
     const result = loginAgent("test-agent", tempDir);
     expect(result.instructions).toBeDefined();
     expect(result.instructions.length).toBeGreaterThan(0);
-    expect(result.instructions.some(l => l.includes("clerk agent start"))).toBe(true);
-    expect(result.instructions.some(l => l.includes("clerk agent attach"))).toBe(true);
+    expect(result.instructions.some(l => l.includes("switchroom agent start"))).toBe(true);
+    expect(result.instructions.some(l => l.includes("switchroom agent attach"))).toBe(true);
   });
 
   it("returns already-authenticated message for authenticated agent", () => {

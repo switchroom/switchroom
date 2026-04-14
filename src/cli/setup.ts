@@ -3,7 +3,7 @@ import chalk from "chalk";
 import { existsSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig, resolveAgentsDir, resolvePath, ConfigError } from "../config/loader.js";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import { scaffoldAgent } from "../agents/scaffold.js";
 import { installAllUnits } from "../agents/systemd.js";
 import { syncTopics } from "../telegram/topic-manager.js";
@@ -66,7 +66,7 @@ export function registerSetupCommand(program: Command): void {
         opts.nonInteractive === true || !process.stdin.isTTY;
 
       console.log(
-        chalk.bold("\n  clerk setup\n") +
+        chalk.bold("\n  switchroom setup\n") +
           chalk.gray(
             "  Interactive onboarding wizard. Sets up everything in one command.\n",
           ),
@@ -78,7 +78,7 @@ export function registerSetupCommand(program: Command): void {
 
       try {
         // ── Step 1: Config file ──────────────────────────────────
-        const { config, configPath: clerkConfigPath } = await stepConfigFile(
+        const { config, configPath: switchroomConfigPath } = await stepConfigFile(
           parentOpts.config,
           nonInteractive,
         );
@@ -122,7 +122,7 @@ export function registerSetupCommand(program: Command): void {
           userId,
           forumChatId,
           nonInteractive,
-          clerkConfigPath,
+          switchroomConfigPath,
         );
 
         // ── Step 8: Dangerous mode ──────────────────────────────
@@ -157,7 +157,7 @@ export function registerSetupCommand(program: Command): void {
 // ─── Step 1: Config File ─────────────────────────────────────────────────────
 
 interface LoadedConfig {
-  config: ClerkConfig;
+  config: SwitchroomConfig;
   configPath: string;
 }
 
@@ -170,10 +170,10 @@ async function stepConfigFile(
   const cwd = process.cwd();
   const existingConfig =
     configPath ??
-    (existsSync(resolve(cwd, "clerk.yaml"))
-      ? resolve(cwd, "clerk.yaml")
-      : existsSync(resolve(cwd, "clerk.yml"))
-        ? resolve(cwd, "clerk.yml")
+    (existsSync(resolve(cwd, "switchroom.yaml"))
+      ? resolve(cwd, "switchroom.yaml")
+      : existsSync(resolve(cwd, "switchroom.yml"))
+        ? resolve(cwd, "switchroom.yml")
         : null);
 
   if (existingConfig && existsSync(existingConfig)) {
@@ -196,7 +196,7 @@ async function stepConfigFile(
   }
 
   if (nonInteractive) {
-    throw new ConfigError("No clerk.yaml found and running in non-interactive mode");
+    throw new ConfigError("No switchroom.yaml found and running in non-interactive mode");
   }
 
   return await copyExampleConfig(cwd, nonInteractive);
@@ -210,26 +210,26 @@ async function copyExampleConfig(
   let choice: string;
 
   if (nonInteractive) {
-    choice = "clerk";
+    choice = "switchroom";
   } else {
     choice = await askChoice("  Which example config?", [
-      "clerk — Full example with 4 agents",
+      "switchroom — Full example with 4 agents",
       "minimal — Minimal single-agent config",
     ]);
     choice = choice.split(" ")[0];
   }
 
   const srcFile = resolve(examplesDir, `${choice}.yaml`);
-  const destFile = resolve(cwd, "clerk.yaml");
+  const destFile = resolve(cwd, "switchroom.yaml");
 
   if (!existsSync(srcFile)) {
     throw new ConfigError(`Example config not found: ${choice}.yaml`);
   }
 
   copyFileSync(srcFile, destFile);
-  console.log(chalk.green(`  Copied ${choice}.yaml -> clerk.yaml`));
+  console.log(chalk.green(`  Copied ${choice}.yaml -> switchroom.yaml`));
   console.log(
-    chalk.yellow("  Edit clerk.yaml to customize, then re-run clerk setup."),
+    chalk.yellow("  Edit switchroom.yaml to customize, then re-run switchroom setup."),
   );
 
   const config = loadConfig(destFile);
@@ -248,7 +248,7 @@ interface BotTokenInfo {
 }
 
 async function stepBotToken(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<{ botToken: string; botUsername: string; agentBots: Record<string, BotTokenInfo> }> {
   stepHeader(2, "Bot tokens", STEP_ACTIVE);
@@ -338,7 +338,7 @@ async function stepBotToken(
 async function resolveOrPromptToken(
   rawToken: string,
   label: string,
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<string> {
   // Check env var first
@@ -352,11 +352,11 @@ async function resolveOrPromptToken(
 
   // Try vault resolution
   if (!token && rawToken.startsWith("vault:")) {
-    const passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+    const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (passphrase) {
       try {
         const { openVault } = await import("../vault/vault.js");
-        const vaultPath = resolvePath(config.vault?.path ?? "~/.clerk/vault.enc");
+        const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
         if (existsSync(vaultPath)) {
           const secrets = openVault(passphrase, vaultPath);
           const key = rawToken.replace("vault:", "");
@@ -377,12 +377,12 @@ async function resolveOrPromptToken(
   return token;
 }
 
-async function storeTokenInVault(config: ClerkConfig, token: string): Promise<void> {
-  const vaultPath = resolvePath(config.vault?.path ?? "~/.clerk/vault.enc");
+async function storeTokenInVault(config: SwitchroomConfig, token: string): Promise<void> {
+  const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
 
   if (!existsSync(vaultPath)) {
     console.log(chalk.gray("  Creating encrypted vault..."));
-    let passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+    let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (!passphrase) {
       passphrase = await ask("  Vault passphrase (for encrypting secrets)");
       if (!passphrase) throw new Error("Vault passphrase is required");
@@ -394,7 +394,7 @@ async function storeTokenInVault(config: ClerkConfig, token: string): Promise<vo
     setSecret(passphrase, vaultPath, key, token);
     console.log(chalk.green(`  ${STEP_DONE} Bot token stored in vault`));
   } else {
-    let passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+    let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (!passphrase) {
       passphrase = await ask("  Vault passphrase");
     }
@@ -491,7 +491,7 @@ async function stepDmPairing(
 // ─── Step 4: Group Setup ─────────────────────────────────────────────────────
 
 async function stepGroupSetup(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   botToken: string,
   botUsername: string,
   nonInteractive: boolean,
@@ -541,7 +541,7 @@ async function stepGroupSetup(
 
   if (nonInteractive) {
     throw new Error(
-      "No forum_chat_id configured. Set it in clerk.yaml before running setup.",
+      "No forum_chat_id configured. Set it in switchroom.yaml before running setup.",
     );
   }
 
@@ -587,7 +587,7 @@ async function detectGroup(
       ),
     );
 
-    // Update clerk.yaml with the detected chat ID
+    // Update switchroom.yaml with the detected chat ID
     const chatIdStr = String(result.chatId);
     updateConfigChatId(chatIdStr);
 
@@ -607,8 +607,8 @@ async function detectGroup(
 
 function updateConfigChatId(chatId: string): void {
   const configPaths = [
-    resolve(process.cwd(), "clerk.yaml"),
-    resolve(process.cwd(), "clerk.yml"),
+    resolve(process.cwd(), "switchroom.yaml"),
+    resolve(process.cwd(), "switchroom.yml"),
   ];
 
   for (const configPath of configPaths) {
@@ -629,7 +629,7 @@ function updateConfigChatId(chatId: string): void {
 // ─── Step 5: Create Topics ───────────────────────────────────────────────────
 
 async function stepCreateTopics(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   botToken: string,
   nonInteractive: boolean,
 ): Promise<void> {
@@ -660,7 +660,7 @@ async function stepCreateTopics(
     );
     if (!nonInteractive) {
       console.log(
-        chalk.gray("  You can run 'clerk topics sync' later to retry."),
+        chalk.gray("  You can run 'switchroom topics sync' later to retry."),
       );
     }
   }
@@ -669,14 +669,14 @@ async function stepCreateTopics(
 // ─── Step 6: Memory Backend ─────────────────────────────────────────────────
 
 async function stepMemoryBackend(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
   stepHeader(6, "Memory backend", STEP_ACTIVE);
 
   // Check if memory backend is configured and is hindsight
   const memoryBackend = config.memory?.backend ?? "hindsight";
-  const envBackend = process.env.CLERK_MEMORY_BACKEND;
+  const envBackend = process.env.SWITCHROOM_MEMORY_BACKEND;
 
   if (envBackend === "none" || memoryBackend === "none") {
     console.log(chalk.gray("  Memory backend disabled (set to 'none')."));
@@ -706,24 +706,24 @@ async function stepMemoryBackend(
     );
     console.log(chalk.gray("  To set up Hindsight manually:"));
     console.log(chalk.gray("    1. Install Docker: https://docs.docker.com/get-docker/"));
-    console.log(chalk.gray("    2. Run: docker run -d --name clerk-hindsight \\"));
+    console.log(chalk.gray("    2. Run: docker run -d --name switchroom-hindsight \\"));
     console.log(chalk.gray("         --restart unless-stopped \\"));
-    console.log(chalk.gray("         -v clerk-hindsight-data:/home/hindsight/.pg0 \\"));
+    console.log(chalk.gray("         -v switchroom-hindsight-data:/home/hindsight/.pg0 \\"));
     console.log(chalk.gray("         ghcr.io/vectorize-io/hindsight:latest"));
-    console.log(chalk.gray("    3. Re-run: clerk setup"));
+    console.log(chalk.gray("    3. Re-run: switchroom setup"));
     console.log(chalk.green(`  ${STEP_DONE} Manual setup instructions shown`));
     return;
   }
 
   // Check if already running
   if (isHindsightRunning()) {
-    console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (clerk-hindsight)`));
+    console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (switchroom-hindsight)`));
     return;
   }
 
   // Check if container exists but is stopped
   if (isHindsightContainerExists()) {
-    console.log(chalk.gray("  Found stopped clerk-hindsight container, removing..."));
+    console.log(chalk.gray("  Found stopped switchroom-hindsight container, removing..."));
     stopHindsight();
   }
 
@@ -736,9 +736,9 @@ async function stepMemoryBackend(
     if (apiKeyInput) {
       hindsightApiKey = apiKeyInput;
       // Store in vault
-      const vaultPath = resolvePath(config.vault?.path ?? "~/.clerk/vault.enc");
+      const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
       try {
-        let passphrase = process.env.CLERK_VAULT_PASSPHRASE;
+        let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
         if (!passphrase) {
           passphrase = await ask("  Vault passphrase");
         }
@@ -766,7 +766,7 @@ async function stepMemoryBackend(
 
     // Verify it started
     if (isHindsightRunning()) {
-      spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (clerk-hindsight)`));
+      spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));
       console.log(chalk.gray("  API: http://localhost:8888/mcp"));
       console.log(chalk.gray("  UI:  http://localhost:9999"));
     } else {
@@ -775,10 +775,10 @@ async function stepMemoryBackend(
   } catch (err) {
     spin.stop(chalk.red(`Failed to start Hindsight: ${(err as Error).message}`));
     console.log(chalk.gray("  You can start it manually:"));
-    console.log(chalk.gray("    docker run -d --name clerk-hindsight \\"));
+    console.log(chalk.gray("    docker run -d --name switchroom-hindsight \\"));
     console.log(chalk.gray("      --restart unless-stopped \\"));
     console.log(chalk.gray("      -p 8888:8888 -p 9999:9999 \\"));
-    console.log(chalk.gray("      -v clerk-hindsight-data:/home/hindsight/.pg0 \\"));
+    console.log(chalk.gray("      -v switchroom-hindsight-data:/home/hindsight/.pg0 \\"));
     console.log(chalk.gray("      ghcr.io/vectorize-io/hindsight:latest"));
   }
 }
@@ -786,12 +786,12 @@ async function stepMemoryBackend(
 // ─── Step 7: Scaffold Agents ─────────────────────────────────────────────────
 
 async function stepScaffoldAgents(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   agentBots: Record<string, BotTokenInfo>,
   userId: string,
   forumChatId: string,
   nonInteractive: boolean,
-  clerkConfigPath?: string,
+  switchroomConfigPath?: string,
 ): Promise<void> {
   stepHeader(7, "Scaffold agents", STEP_ACTIVE);
 
@@ -808,8 +808,8 @@ async function stepScaffoldAgents(
     console.log(
       chalk.yellow(
         "  Claude Code has not been set up on this machine yet.\n" +
-        "  Run `claude` in a terminal first to complete initial setup, then run `clerk setup` again.\n" +
-        "  Continuing with minimal config — agents will need onboarding via `clerk agent attach <name>`."
+        "  Run `claude` in a terminal first to complete initial setup, then run `switchroom setup` again.\n" +
+        "  Continuing with minimal config — agents will need onboarding via `switchroom agent attach <name>`."
       ),
     );
   }
@@ -830,7 +830,7 @@ async function stepScaffoldAgents(
         config.telegram,
         config,
         userId !== "0" ? userId : undefined,
-        clerkConfigPath,
+        switchroomConfigPath,
       );
 
       // Write access.json with user ID (overwrite with latest from setup)
@@ -871,7 +871,7 @@ async function stepScaffoldAgents(
       ),
     );
     console.log(
-      chalk.gray("  You can run 'clerk systemd install' later to retry."),
+      chalk.gray("  You can run 'switchroom systemd install' later to retry."),
     );
   }
 }
@@ -879,7 +879,7 @@ async function stepScaffoldAgents(
 // ─── Step 8: Dangerous Mode ─────────────────────────────────────────────────
 
 async function stepDangerousMode(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
   stepHeader(8, "Auto-approve mode", STEP_ACTIVE);
@@ -887,7 +887,7 @@ async function stepDangerousMode(
   let enableDangerous = false;
 
   if (nonInteractive) {
-    enableDangerous = process.env.CLERK_DANGEROUS_MODE === "true" || process.env.CLERK_DANGEROUS_MODE === "1";
+    enableDangerous = process.env.SWITCHROOM_DANGEROUS_MODE === "true" || process.env.SWITCHROOM_DANGEROUS_MODE === "1";
   } else {
     console.log(chalk.gray("  This skips permission prompts for all tool calls."));
     console.log(chalk.gray("  Recommended for headless agents. Tool approval can also be done via Telegram DM."));
@@ -899,8 +899,8 @@ async function stepDangerousMode(
 
   if (enableDangerous) {
     const configPaths = [
-      resolve(process.cwd(), "clerk.yaml"),
-      resolve(process.cwd(), "clerk.yml"),
+      resolve(process.cwd(), "switchroom.yaml"),
+      resolve(process.cwd(), "switchroom.yml"),
     ];
 
     for (const configPath of configPaths) {
@@ -943,7 +943,7 @@ async function stepDangerousMode(
 // ─── Step 9: Agent Onboarding Guidance ───────────────────────────────────────
 
 async function stepOnboardingGuidance(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
   stepHeader(9, "Agent onboarding", STEP_ACTIVE);
@@ -973,8 +973,8 @@ async function stepOnboardingGuidance(
       console.log(
         `  ${chalk.yellow("!!")} ${chalk.bold(name)} - needs onboarding`,
       );
-      console.log(chalk.gray(`      clerk agent start ${name}`));
-      console.log(chalk.gray(`      clerk agent attach ${name}`));
+      console.log(chalk.gray(`      switchroom agent start ${name}`));
+      console.log(chalk.gray(`      switchroom agent attach ${name}`));
       console.log(
         chalk.gray(
           "      Complete onboarding (theme, login, trust), then Ctrl+B D",
@@ -1004,7 +1004,7 @@ async function stepOnboardingGuidance(
 // ─── Step 9: Verification ────────────────────────────────────────────────────
 
 async function stepVerification(
-  config: ClerkConfig,
+  config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
   stepHeader(10, "Verification", STEP_ACTIVE);
@@ -1014,14 +1014,14 @@ async function stepVerification(
   const firstAgent = config.agents[firstName];
 
   console.log(chalk.gray("  To verify your setup:"));
-  console.log(chalk.gray(`    1. Start an agent:  clerk agent start ${firstName}`));
-  console.log(chalk.gray(`    2. Check status:    clerk agent list`));
+  console.log(chalk.gray(`    1. Start an agent:  switchroom agent start ${firstName}`));
+  console.log(chalk.gray(`    2. Check status:    switchroom agent list`));
   console.log(
     chalk.gray(
       `    3. Send a message in the "${firstAgent.topic_name}" topic`,
     ),
   );
-  console.log(chalk.gray("    4. Check auth:      clerk auth status"));
+  console.log(chalk.gray("    4. Check auth:      switchroom auth status"));
 
   if (!nonInteractive) {
     const startNow = await askYesNo(
@@ -1032,12 +1032,12 @@ async function stepVerification(
       try {
         const { execSync } = await import("node:child_process");
         console.log(chalk.gray(`  Starting ${firstName}...`));
-        execSync(`clerk agent start ${firstName}`, { stdio: "inherit" });
+        execSync(`switchroom agent start ${firstName}`, { stdio: "inherit" });
         console.log(chalk.green(`  ${STEP_DONE} Agent started`));
       } catch {
         console.log(
           chalk.yellow(
-            `  Could not start automatically. Run: clerk agent start ${firstName}`,
+            `  Could not start automatically. Run: switchroom agent start ${firstName}`,
           ),
         );
       }

@@ -266,7 +266,7 @@ describe('streaming e2e smoke', () => {
   //
   // Internal callers (the progress-card driver) pass lane:'progress' and
   // bypass the rejection. End-to-end shape exercised here mirrors
-  // production when CLERK_TG_STREAM_MODE=checklist (the default).
+  // production when SWITCHROOM_TG_STREAM_MODE=checklist (the default).
 
   it('checklist mode: done=false (default lane) throws a clear tool error', async () => {
     holder.current = setup({ progressCardActive: true })

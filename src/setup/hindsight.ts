@@ -93,12 +93,12 @@ export function isDockerAvailable(): boolean {
 }
 
 /**
- * Check if the clerk-hindsight container is currently running.
+ * Check if the switchroom-hindsight container is currently running.
  */
 export function isHindsightRunning(): boolean {
   try {
     const output = execSync(
-      'docker ps --filter name=clerk-hindsight --format "{{.Status}}"',
+      'docker ps --filter name=switchroom-hindsight --format "{{.Status}}"',
       { stdio: "pipe", encoding: "utf-8" },
     );
     return output.trim().length > 0;
@@ -108,12 +108,12 @@ export function isHindsightRunning(): boolean {
 }
 
 /**
- * Check if the clerk-hindsight container exists (running or stopped).
+ * Check if the switchroom-hindsight container exists (running or stopped).
  */
 export function isHindsightContainerExists(): boolean {
   try {
     const output = execSync(
-      'docker ps -a --filter name=clerk-hindsight --format "{{.Names}}"',
+      'docker ps -a --filter name=switchroom-hindsight --format "{{.Names}}"',
       { stdio: "pipe", encoding: "utf-8" },
     );
     return output.trim().length > 0;
@@ -142,11 +142,11 @@ export function startHindsight(
   if (apiKey) envArgs.push("-e", `HINDSIGHT_API_LLM_API_KEY=${apiKey}`);
   const args = [
     "run", "-d",
-    "--name", "clerk-hindsight",
+    "--name", "switchroom-hindsight",
     "--restart", "unless-stopped",
     "-p", `127.0.0.1:${apiPort}:8888`,
     "-p", `127.0.0.1:${uiPort}:9999`,
-    "-v", "clerk-hindsight-data:/home/hindsight/.pg0",
+    "-v", "switchroom-hindsight-data:/home/hindsight/.pg0",
     ...envArgs,
     "ghcr.io/vectorize-io/hindsight:latest",
   ];
@@ -159,10 +159,10 @@ export function startHindsight(
  */
 export function stopHindsight(): void {
   try {
-    execSync("docker stop clerk-hindsight", { stdio: "pipe" });
+    execSync("docker stop switchroom-hindsight", { stdio: "pipe" });
   } catch { /* container may already be stopped */ }
   try {
-    execSync("docker rm clerk-hindsight", { stdio: "pipe" });
+    execSync("docker rm switchroom-hindsight", { stdio: "pipe" });
   } catch { /* container may already be removed */ }
 }
 
@@ -173,7 +173,7 @@ export function stopHindsight(): void {
 export function getHindsightStatus(): string | null {
   try {
     const output = execSync(
-      'docker ps -a --filter name=clerk-hindsight --format "{{.Status}}"',
+      'docker ps -a --filter name=switchroom-hindsight --format "{{.Status}}"',
       { stdio: "pipe", encoding: "utf-8" },
     );
     const status = output.trim();
@@ -205,9 +205,9 @@ export function generateHindsightComposeSnippet(provider?: string): string {
 
   return [
     "services:",
-    "  clerk-hindsight:",
+    "  switchroom-hindsight:",
     "    image: ghcr.io/vectorize-io/hindsight:latest",
-    "    container_name: clerk-hindsight",
+    "    container_name: switchroom-hindsight",
     "    ports:",
     "      - \"8888:8888\"",
     "      - \"9999:9999\"",
@@ -215,10 +215,10 @@ export function generateHindsightComposeSnippet(provider?: string): string {
       ? ["    environment:", ...envLines]
       : []),
     "    volumes:",
-    "      - clerk-hindsight-data:/home/hindsight/.pg0",
+    "      - switchroom-hindsight-data:/home/hindsight/.pg0",
     "    restart: unless-stopped",
     "",
     "volumes:",
-    "  clerk-hindsight-data:",
+    "  switchroom-hindsight-data:",
   ].join("\n");
 }

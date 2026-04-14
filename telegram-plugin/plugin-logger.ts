@@ -5,8 +5,8 @@
  * the bun subprocess's stderr, which Claude Code does NOT forward anywhere.
  * That makes the plugin effectively blind in production. This module
  * installs a one-time redirect at startup so every stderr write is ALSO
- * appended to a logfile at `~/.clerk/logs/telegram-plugin.log` (override
- * via `CLERK_TELEGRAM_LOG_PATH`), with simple size-based rotation.
+ * appended to a logfile at `~/.switchroom/logs/telegram-plugin.log` (override
+ * via `SWITCHROOM_TELEGRAM_LOG_PATH`), with simple size-based rotation.
  *
  * Design choices:
  * - Wrap `process.stderr.write` rather than editing every callsite. The
@@ -23,7 +23,7 @@ import { appendFileSync, mkdirSync, renameSync, statSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
 
-const DEFAULT_LOG_PATH = join(homedir(), '.clerk', 'logs', 'telegram-plugin.log')
+const DEFAULT_LOG_PATH = join(homedir(), '.switchroom', 'logs', 'telegram-plugin.log')
 const ROTATE_AT_BYTES = 5 * 1024 * 1024 // 5 MB
 
 export interface PluginLoggerHandle {
@@ -41,7 +41,7 @@ let activeHandle: PluginLoggerHandle | null = null
  * resolution logic without actually installing the interceptor.
  */
 export function resolveLogPath(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.CLERK_TELEGRAM_LOG_PATH
+  const override = env.SWITCHROOM_TELEGRAM_LOG_PATH
   if (override && override.length > 0) return override
   return DEFAULT_LOG_PATH
 }

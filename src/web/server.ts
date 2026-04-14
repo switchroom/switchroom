@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, extname, join } from "node:path";
 import { spawn } from "node:child_process";
-import type { ClerkConfig } from "../config/schema.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import {
   handleGetAgents,
   handleStartAgent,
@@ -30,11 +30,11 @@ function jsonResponse(data: unknown, status = 200): Response {
 }
 
 /**
- * Check bearer token auth if CLERK_WEB_TOKEN is set.
+ * Check bearer token auth if SWITCHROOM_WEB_TOKEN is set.
  * Returns null if auth passes, or a 401 Response if it fails.
  */
 function checkAuth(req: Request): Response | null {
-  const token = process.env.CLERK_WEB_TOKEN;
+  const token = process.env.SWITCHROOM_WEB_TOKEN;
   if (!token) return null; // No token configured, allow all
 
   const authHeader = req.headers.get("Authorization");
@@ -52,7 +52,7 @@ function checkAuth(req: Request): Response | null {
  * Token can be passed as ?token= query param.
  */
 function checkWsAuth(req: Request): boolean {
-  const token = process.env.CLERK_WEB_TOKEN;
+  const token = process.env.SWITCHROOM_WEB_TOKEN;
   if (!token) return true;
 
   const url = new URL(req.url);
@@ -96,7 +96,7 @@ function parseRoute(
   return null;
 }
 
-export function startWebServer(config: ClerkConfig, port: number): void {
+export function startWebServer(config: SwitchroomConfig, port: number): void {
   const uiDir = resolve(import.meta.dirname, "ui");
 
   const server = Bun.serve({
@@ -123,7 +123,7 @@ export function startWebServer(config: ClerkConfig, port: number): void {
         return undefined as unknown as Response;
       }
 
-      // API routes — require auth if CLERK_WEB_TOKEN is set
+      // API routes — require auth if SWITCHROOM_WEB_TOKEN is set
       const route = parseRoute(pathname, req.method);
       if (route) {
         const authError = checkAuth(req);
@@ -219,7 +219,7 @@ export function startWebServer(config: ClerkConfig, port: number): void {
 
             const child = spawn(
               "journalctl",
-              ["--user", "-u", `clerk-${agentName}`, "-f", "--no-pager", "-n", "20"],
+              ["--user", "-u", `switchroom-${agentName}`, "-f", "--no-pager", "-n", "20"],
               { stdio: ["ignore", "pipe", "pipe"] }
             );
 
@@ -258,5 +258,5 @@ export function startWebServer(config: ClerkConfig, port: number): void {
     },
   });
 
-  console.log(`Clerk dashboard running at http://localhost:${server.port}`);
+  console.log(`Switchroom dashboard running at http://localhost:${server.port}`);
 }

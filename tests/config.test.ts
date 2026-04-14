@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { ClerkConfigSchema } from "../src/config/schema.js";
+import { SwitchroomConfigSchema } from "../src/config/schema.js";
 
-describe("ClerkConfigSchema", () => {
+describe("SwitchroomConfigSchema", () => {
   it("parses a full valid config", () => {
     const config = {
-      clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+      switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
       telegram: {
         bot_token: "vault:telegram-bot-token",
         forum_chat_id: "-1001234567890",
@@ -14,7 +14,7 @@ describe("ClerkConfigSchema", () => {
         shared_collection: "shared",
         config: { provider: "ollama", model: "nomic-embed-text" },
       },
-      vault: { path: "~/.clerk/vault.enc" },
+      vault: { path: "~/.switchroom/vault.enc" },
       agents: {
         "health-coach": {
           extends: "health-coach",
@@ -41,8 +41,8 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
-    expect(result.clerk.version).toBe(1);
+    const result = SwitchroomConfigSchema.parse(config);
+    expect(result.switchroom.version).toBe(1);
     expect(result.agents["health-coach"].topic_name).toBe("Health");
     expect(result.agents["health-coach"].tools?.allow).toEqual([
       "calendar",
@@ -54,7 +54,7 @@ describe("ClerkConfigSchema", () => {
 
   it("parses a minimal config with defaults", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: {
         bot_token: "123:ABC",
         forum_chat_id: "-100123",
@@ -66,8 +66,8 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
-    expect(result.clerk.agents_dir).toBe("~/.clerk/agents");
+    const result = SwitchroomConfigSchema.parse(config);
+    expect(result.switchroom.agents_dir).toBe("~/.switchroom/agents");
     // `extends` is optional (no zod default) so that the merge cascade
     // in src/config/merge.ts can distinguish "unset" from "explicitly
     // chose 'default'". Consumers fall back to DEFAULT_PROFILE when it
@@ -78,40 +78,40 @@ describe("ClerkConfigSchema", () => {
 
   it("rejects invalid version", () => {
     const config = {
-      clerk: { version: 2 },
+      switchroom: { version: 2 },
       telegram: { bot_token: "x", forum_chat_id: "y" },
       agents: {},
     };
 
-    expect(() => ClerkConfigSchema.parse(config)).toThrow();
+    expect(() => SwitchroomConfigSchema.parse(config)).toThrow();
   });
 
   it("rejects missing telegram config", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       agents: {
         test: { topic_name: "Test" },
       },
     };
 
-    expect(() => ClerkConfigSchema.parse(config)).toThrow();
+    expect(() => SwitchroomConfigSchema.parse(config)).toThrow();
   });
 
   it("rejects missing topic_name on agent", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: { bot_token: "x", forum_chat_id: "y" },
       agents: {
         test: { extends: "default" },
       },
     };
 
-    expect(() => ClerkConfigSchema.parse(config)).toThrow();
+    expect(() => SwitchroomConfigSchema.parse(config)).toThrow();
   });
 
   it("accepts strict memory isolation", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: { bot_token: "x", forum_chat_id: "y" },
       agents: {
         private: {
@@ -124,13 +124,13 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
+    const result = SwitchroomConfigSchema.parse(config);
     expect(result.agents.private.memory?.isolation).toBe("strict");
   });
 
   it("rejects invalid memory isolation value", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: { bot_token: "x", forum_chat_id: "y" },
       agents: {
         test: {
@@ -140,12 +140,12 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    expect(() => ClerkConfigSchema.parse(config)).toThrow();
+    expect(() => SwitchroomConfigSchema.parse(config)).toThrow();
   });
 
   it("handles multiple agents", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: { bot_token: "x", forum_chat_id: "y" },
       agents: {
         health: { topic_name: "Health", extends: "health-coach" },
@@ -154,13 +154,13 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
+    const result = SwitchroomConfigSchema.parse(config);
     expect(Object.keys(result.agents)).toHaveLength(3);
   });
 
   it("accepts vault references in bot_token", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: {
         bot_token: "vault:my-telegram-token",
         forum_chat_id: "-100123",
@@ -170,13 +170,13 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
+    const result = SwitchroomConfigSchema.parse(config);
     expect(result.telegram.bot_token).toBe("vault:my-telegram-token");
   });
 
   it("accepts per-agent bot_token", () => {
     const config = {
-      clerk: { version: 1 },
+      switchroom: { version: 1 },
       telegram: {
         bot_token: "vault:default-token",
         forum_chat_id: "-100123",
@@ -193,7 +193,7 @@ describe("ClerkConfigSchema", () => {
       },
     };
 
-    const result = ClerkConfigSchema.parse(config);
+    const result = SwitchroomConfigSchema.parse(config);
     expect(result.agents.coach.bot_token).toBe("vault:coach-bot-token");
     expect(result.agents.assistant.bot_token).toBeUndefined();
   });

@@ -1,4 +1,4 @@
-import type { ClerkConfig, MemoryBackendConfig } from "../config/schema.js";
+import type { SwitchroomConfig, MemoryBackendConfig } from "../config/schema.js";
 
 export interface McpServerConfig {
   type?: string;
@@ -12,7 +12,7 @@ export interface McpServerConfig {
  * Generate the MCP server config entry for Hindsight.
  *
  * Hindsight exposes MCP via Streamable HTTP at /mcp/. The host/port can be
- * overridden in clerk.yaml's memory.config.url; defaults to localhost:8888
+ * overridden in switchroom.yaml's memory.config.url; defaults to localhost:8888
  * (the upstream default). Note that 8888 conflicts with Coolify and other
  * common services — host the container on 18888 and set memory.config.url
  * accordingly.
@@ -66,7 +66,7 @@ export function generateDockerComposeSnippet(
  */
 export function getCollectionForAgent(
   agentName: string,
-  config: ClerkConfig,
+  config: SwitchroomConfig,
 ): string {
   const agentConfig = config.agents[agentName];
   return agentConfig?.memory?.collection ?? agentName;
@@ -78,7 +78,7 @@ export function getCollectionForAgent(
  */
 export function isStrictIsolation(
   agentName: string,
-  config: ClerkConfig,
+  config: SwitchroomConfig,
 ): boolean {
   const agentConfig = config.agents[agentName];
   return agentConfig?.memory?.isolation === "strict";

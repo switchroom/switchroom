@@ -130,7 +130,7 @@ describe("findExistingClaudeJson", () => {
 
   beforeEach(() => {
     originalHome = process.env.HOME;
-    tempDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tempDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     process.env.HOME = tempDir;
   });
 
@@ -193,7 +193,7 @@ describe("copyOnboardingState", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tempDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
   });
 
   afterEach(() => {
@@ -261,7 +261,7 @@ describe("copyExistingCredentials", () => {
 
   beforeEach(() => {
     originalHome = process.env.HOME;
-    tempDir = mkdtempSync(join(tmpdir(), "clerk-test-"));
+    tempDir = mkdtempSync(join(tmpdir(), "switchroom-test-"));
     process.env.HOME = tempDir;
   });
 

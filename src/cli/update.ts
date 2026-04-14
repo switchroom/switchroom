@@ -10,17 +10,17 @@ import { resolveAgentsDir } from "../config/loader.js";
 import { getConfigPath } from "./helpers.js";
 
 /**
- * Locate the directory where clerk is installed (the git checkout root).
+ * Locate the directory where switchroom is installed (the git checkout root).
  *
  * Strategy:
  *   1. Walk up from this source file looking for a package.json with
- *      `"name": "clerk-ai"` and a `.git` sibling. This handles both `bun
+ *      `"name": "switchroom-ai"` and a `.git` sibling. This handles both `bun
  *      link`-installed and direct-checkout invocations.
- *   2. Fall back to `realpath $(command -v clerk)` and walk up from there.
+ *   2. Fall back to `realpath $(command -v switchroom)` and walk up from there.
  *
  * Returns null if no install dir can be located.
  */
-function locateClerkInstallDir(): string | null {
+function locateSwitchroomInstallDir(): string | null {
   // Strategy 1: walk up from import.meta.dirname
   let dir = import.meta.dirname;
   for (let i = 0; i < 10 && dir && dir !== "/"; i++) {
@@ -28,7 +28,7 @@ function locateClerkInstallDir(): string | null {
     if (existsSync(pkgPath)) {
       try {
         const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-        if (pkg.name === "clerk-ai" && existsSync(join(dir, ".git"))) {
+        if (pkg.name === "switchroom-ai" && existsSync(join(dir, ".git"))) {
           return dir;
         }
       } catch { /* ignore */ }
@@ -36,9 +36,9 @@ function locateClerkInstallDir(): string | null {
     dir = dirname(dir);
   }
 
-  // Strategy 2: realpath of the clerk binary
+  // Strategy 2: realpath of the switchroom binary
   try {
-    const which = execSync("command -v clerk", {
+    const which = execSync("command -v switchroom", {
       stdio: ["ignore", "pipe", "ignore"],
     })
       .toString()
@@ -53,7 +53,7 @@ function locateClerkInstallDir(): string | null {
         d = dirname(d);
       }
     }
-  } catch { /* clerk not on PATH */ }
+  } catch { /* switchroom not on PATH */ }
 
   return null;
 }
@@ -89,7 +89,7 @@ export function registerUpdateCommand(program: Command): void {
   program
     .command("update")
     .description(
-      "Pull the latest Clerk source, reinstall deps, reconcile agents to clerk.yaml, and restart them"
+      "Pull the latest Switchroom source, reinstall deps, reconcile agents to switchroom.yaml, and restart them"
     )
     .option("--check", "Show pending changes without applying them")
     .option(
@@ -98,18 +98,18 @@ export function registerUpdateCommand(program: Command): void {
     )
     .action(
       withConfigError(async (opts: { check?: boolean; restart?: boolean }) => {
-        const installDir = locateClerkInstallDir();
+        const installDir = locateSwitchroomInstallDir();
         if (!installDir) {
           console.error(
             chalk.red(
-              "Could not locate Clerk's install directory. " +
-                "Run `clerk update` from a clerk checkout, or reinstall Clerk."
+              "Could not locate Switchroom's install directory. " +
+                "Run `switchroom update` from a switchroom checkout, or reinstall Switchroom."
             )
           );
           process.exit(1);
         }
 
-        console.log(chalk.bold(`\nUpdating Clerk at ${installDir}\n`));
+        console.log(chalk.bold(`\nUpdating Switchroom at ${installDir}\n`));
 
         // 1. Capture current commit
         const before = runCaptured("git rev-parse --short HEAD", installDir)?.trim() ?? "unknown";
@@ -132,7 +132,7 @@ export function registerUpdateCommand(program: Command): void {
         if (!log) {
           console.log(chalk.green("\n  Already up to date.\n"));
           if (opts.check) return;
-          // Still reconcile in case clerk.yaml changed locally without an update
+          // Still reconcile in case switchroom.yaml changed locally without an update
         } else {
           const lines = log.split("\n");
           console.log(chalk.bold(`\n  ${lines.length} new commit(s) on origin/${branch}:`));
@@ -186,7 +186,7 @@ export function registerUpdateCommand(program: Command): void {
         const agentNames = Object.keys(config.agents);
 
         if (agentNames.length === 0) {
-          console.log(chalk.yellow("\n  No agents defined in clerk.yaml — nothing to reconcile.\n"));
+          console.log(chalk.yellow("\n  No agents defined in switchroom.yaml — nothing to reconcile.\n"));
           return;
         }
 
@@ -241,7 +241,7 @@ export function registerUpdateCommand(program: Command): void {
         } else if (opts.restart === false) {
           console.log(
             chalk.gray(
-              "\n  --no-restart given; agents NOT restarted. Run `clerk agent restart all` to apply."
+              "\n  --no-restart given; agents NOT restarted. Run `switchroom agent restart all` to apply."
             )
           );
         }

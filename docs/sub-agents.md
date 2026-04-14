@@ -1,6 +1,6 @@
 # Sub-Agent Delegation
 
-Clerk generates Claude Code custom sub-agent files (`.claude/agents/<name>.md`) from your clerk.yaml config. This enables the "Opus plans, Sonnet implements" pattern — the main agent delegates to cheaper models running in the background.
+Switchroom generates Claude Code custom sub-agent files (`.claude/agents/<name>.md`) from your switchroom.yaml config. This enables the "Opus plans, Sonnet implements" pattern — the main agent delegates to cheaper models running in the background.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ defaults:
       model: sonnet
 ```
 
-After `clerk agent create` or `clerk agent reconcile`, these become `.claude/agents/worker.md`, `.claude/agents/researcher.md`, etc. Claude Code loads them automatically.
+After `switchroom agent create` or `switchroom agent reconcile`, these become `.claude/agents/worker.md`, `.claude/agents/researcher.md`, etc. Claude Code loads them automatically.
 
 ## How Delegation Works
 
@@ -57,12 +57,12 @@ Each sub-agent supports the full Claude Code frontmatter spec:
 
 Claude Code resolves the model in this order (highest wins):
 
-1. `CLAUDE_CODE_SUBAGENT_MODEL` env var (clerk doesn't set this)
+1. `CLAUDE_CODE_SUBAGENT_MODEL` env var (switchroom doesn't set this)
 2. Per-invocation `model` parameter (user/agent can override)
-3. Sub-agent definition's `model` frontmatter (what clerk sets)
+3. Sub-agent definition's `model` frontmatter (what switchroom sets)
 4. Main conversation's model
 
-This means clerk's sub-agent files set sensible defaults at level 3, but the user can always override at level 2.
+This means switchroom's sub-agent files set sensible defaults at level 3, but the user can always override at level 2.
 
 ## Cascade Behavior
 
@@ -96,13 +96,13 @@ The dev agent's `worker` completely replaces the default `worker`.
 
 ## Built-in Claude Code Sub-Agents
 
-Clerk's custom sub-agents coexist with Claude Code's built-in ones:
+Switchroom's custom sub-agents coexist with Claude Code's built-in ones:
 
 | Agent | Model | Purpose |
 |-------|-------|---------|
 | **Explore** (built-in) | Haiku | Fast codebase search |
 | **Plan** (built-in) | Inherit | Research for planning |
 | **general-purpose** (built-in) | Inherit | Complex multi-step tasks |
-| **worker** (clerk) | Sonnet | Implementation tasks |
-| **researcher** (clerk) | Haiku | Exploration and investigation |
-| **reviewer** (clerk) | Sonnet | Quality review |
+| **worker** (switchroom) | Sonnet | Implementation tasks |
+| **researcher** (switchroom) | Haiku | Exploration and investigation |
+| **reviewer** (switchroom) | Sonnet | Quality review |

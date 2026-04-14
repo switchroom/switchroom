@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build script for @clerk-ai/telegram-plugin npm publish.
+// Build script for @switchroom-ai/telegram-plugin npm publish.
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, chmodSync, mkdirSync, rmSync } from "node:fs";
 import { resolve, dirname } from "node:path";

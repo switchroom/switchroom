@@ -15,7 +15,7 @@ vi.mock("../src/auth/manager.js", () => ({
 
 // Mock config loader
 vi.mock("../src/config/loader.js", () => ({
-  resolveAgentsDir: vi.fn(() => "/home/test/.clerk/agents"),
+  resolveAgentsDir: vi.fn(() => "/home/test/.switchroom/agents"),
 }));
 
 // Mock child_process
@@ -36,15 +36,15 @@ import {
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { execFileSync } from "node:child_process";
-import type { ClerkConfig } from "../src/config/schema.js";
+import type { SwitchroomConfig } from "../src/config/schema.js";
 
 // Bun's vitest compat layer doesn't implement vi.mocked(). Use a
 // cast helper so we can call .mockReturnValue() etc on the mock-wrapped
 // imports without TypeScript complaining.
 const asMock = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
 
-const mockConfig: ClerkConfig = {
-  clerk: { version: 1, agents_dir: "~/.clerk/agents" },
+const mockConfig: SwitchroomConfig = {
+  switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
   telegram: { bot_token: "test-token", forum_chat_id: "-1001234" },
   agents: {
     coach: {
@@ -211,7 +211,7 @@ describe("handleGetLogs", () => {
     expect(result.logs).toContain("line 1");
     expect(execFileSync).toHaveBeenCalledWith(
       "journalctl",
-      ["--user", "-u", "clerk-coach", "--no-pager", "-n", "50"],
+      ["--user", "-u", "switchroom-coach", "--no-pager", "-n", "50"],
       expect.objectContaining({ encoding: "utf-8" })
     );
   });
@@ -222,7 +222,7 @@ describe("handleGetLogs", () => {
     handleGetLogs("sage");
     expect(execFileSync).toHaveBeenCalledWith(
       "journalctl",
-      ["--user", "-u", "clerk-sage", "--no-pager", "-n", "50"],
+      ["--user", "-u", "switchroom-sage", "--no-pager", "-n", "50"],
       expect.any(Object)
     );
   });

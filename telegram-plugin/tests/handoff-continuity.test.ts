@@ -189,29 +189,29 @@ describe("writeLastTurnSummary", () => {
 });
 
 describe("shouldShowHandoffLine", () => {
-  const prior = process.env.CLERK_HANDOFF_SHOW_LINE;
+  const prior = process.env.SWITCHROOM_HANDOFF_SHOW_LINE;
   afterEach(() => {
-    if (prior === undefined) delete process.env.CLERK_HANDOFF_SHOW_LINE;
-    else process.env.CLERK_HANDOFF_SHOW_LINE = prior;
+    if (prior === undefined) delete process.env.SWITCHROOM_HANDOFF_SHOW_LINE;
+    else process.env.SWITCHROOM_HANDOFF_SHOW_LINE = prior;
   });
 
   it("defaults to true when unset", () => {
-    delete process.env.CLERK_HANDOFF_SHOW_LINE;
+    delete process.env.SWITCHROOM_HANDOFF_SHOW_LINE;
     expect(shouldShowHandoffLine()).toBe(true);
   });
 
   it("returns true for 'true'", () => {
-    process.env.CLERK_HANDOFF_SHOW_LINE = "true";
+    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = "true";
     expect(shouldShowHandoffLine()).toBe(true);
   });
 
   it("returns false for 'false' (case-insensitive)", () => {
-    process.env.CLERK_HANDOFF_SHOW_LINE = "FALSE";
+    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = "FALSE";
     expect(shouldShowHandoffLine()).toBe(false);
   });
 
   it("returns true for any other value (safe default)", () => {
-    process.env.CLERK_HANDOFF_SHOW_LINE = "yes";
+    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = "yes";
     expect(shouldShowHandoffLine()).toBe(true);
   });
 });

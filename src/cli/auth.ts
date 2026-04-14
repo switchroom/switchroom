@@ -31,7 +31,7 @@ export function registerAuthCommand(program: Command): void {
     .command("auth")
     .description("Manage OAuth authentication per agent");
 
-  // clerk auth login <name|all>
+  // switchroom auth login <name|all>
   auth
     .command("login <name>")
     .description(
@@ -58,7 +58,7 @@ export function registerAuthCommand(program: Command): void {
 
         if (!config.agents[name]) {
           console.error(
-            chalk.red(`Agent "${name}" is not defined in clerk.yaml`)
+            chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
           );
           console.error(
             chalk.gray(
@@ -79,7 +79,7 @@ export function registerAuthCommand(program: Command): void {
       })
     );
 
-  // clerk auth status
+  // switchroom auth status
   auth
     .command("status")
     .description("Show authentication status for all agents")
@@ -94,7 +94,7 @@ export function registerAuthCommand(program: Command): void {
           if (opts.json) {
             console.log(JSON.stringify({ agents: [] }));
           } else {
-            console.log(chalk.yellow("No agents defined in clerk.yaml"));
+            console.log(chalk.yellow("No agents defined in switchroom.yaml"));
           }
           return;
         }
@@ -155,7 +155,7 @@ export function registerAuthCommand(program: Command): void {
       })
     );
 
-  // clerk auth refresh <name>
+  // switchroom auth refresh <name>
   auth
     .command("refresh <name>")
     .description("Show instructions for refreshing OAuth tokens for an agent")
@@ -166,7 +166,7 @@ export function registerAuthCommand(program: Command): void {
 
         if (!config.agents[name]) {
           console.error(
-            chalk.red(`Agent "${name}" is not defined in clerk.yaml`)
+            chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
           );
           console.error(
             chalk.gray(

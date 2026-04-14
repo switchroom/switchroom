@@ -13,8 +13,8 @@ import {
 
 describe('sanitizeCwdToProjectName', () => {
   it('replaces non-alphanumeric chars with hyphens', () => {
-    expect(sanitizeCwdToProjectName('/home/user/.clerk/agents/assistant')).toBe(
-      '-home-user--clerk-agents-assistant',
+    expect(sanitizeCwdToProjectName('/home/user/.switchroom/agents/assistant')).toBe(
+      '-home-user--switchroom-agents-assistant',
     )
   })
 
@@ -58,7 +58,7 @@ describe('projectTranscriptLine', () => {
       type: 'queue-operation',
       operation: 'enqueue',
       content:
-        '<channel source="clerk-telegram" chat_id="-1009999999999" message_id="103" user="meken" user_id="1234567890" ts="2026-04-11T07:04:23.000Z">\nGo look at my new project\n</channel>',
+        '<channel source="switchroom-telegram" chat_id="-1009999999999" message_id="103" user="meken" user_id="1234567890" ts="2026-04-11T07:04:23.000Z">\nGo look at my new project\n</channel>',
     })
     const result = projectTranscriptLine(line)
     expect(result).toHaveLength(1)
@@ -154,13 +154,13 @@ describe('projectTranscriptLine', () => {
       message: {
         content: [
           { type: 'thinking', thinking: '...' },
-          { type: 'tool_use', name: 'mcp__clerk-telegram__reply', id: 'toolu_04' },
+          { type: 'tool_use', name: 'mcp__switchroom-telegram__reply', id: 'toolu_04' },
         ],
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
       { kind: 'thinking' },
-      { kind: 'tool_use', toolName: 'mcp__clerk-telegram__reply', toolUseId: 'toolu_04', input: undefined },
+      { kind: 'tool_use', toolName: 'mcp__switchroom-telegram__reply', toolUseId: 'toolu_04', input: undefined },
     ])
   })
 
@@ -212,9 +212,9 @@ describe('projectTranscriptLine', () => {
   })
 
   it('parses real production-shape enqueue line from server', () => {
-    // Lifted verbatim from a live ~/.clerk/agents/assistant/.claude/projects/.../<sid>.jsonl
+    // Lifted verbatim from a live ~/.switchroom/agents/assistant/.claude/projects/.../<sid>.jsonl
     const line =
-      '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-04-11T07:04:25.333Z","sessionId":"00000000-0000-0000-0000-000000000000","content":"<channel source=\\"clerk-telegram\\" chat_id=\\"-1009999999999\\" message_id=\\"103\\" user=\\"mekenthompson\\" user_id=\\"1234567890\\" ts=\\"2026-04-11T07:04:23.000Z\\">\\nGo look at my new project\\n</channel>"}'
+      '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-04-11T07:04:25.333Z","sessionId":"00000000-0000-0000-0000-000000000000","content":"<channel source=\\"switchroom-telegram\\" chat_id=\\"-1009999999999\\" message_id=\\"103\\" user=\\"mekenthompson\\" user_id=\\"1234567890\\" ts=\\"2026-04-11T07:04:23.000Z\\">\\nGo look at my new project\\n</channel>"}'
     const result = projectTranscriptLine(line)
     expect(result).toHaveLength(1)
     expect(result[0]).toMatchObject({

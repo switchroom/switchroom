@@ -1,0 +1,6 @@
+{
+  "switchroom-telegram": {
+    "command": "bun",
+    "args": ["server.ts"]
+  }
+}

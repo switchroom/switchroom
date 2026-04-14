@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Telegram channel for Claude Code — Clerk fork with topic/forum routing.
+ * Telegram channel for Claude Code — Switchroom fork with topic/forum routing.
  *
  * Forked from the official Telegram plugin. Adds:
  * - TELEGRAM_TOPIC_ID env var to filter messages by forum topic
@@ -39,12 +39,13 @@ import { homedir } from 'os'
 import { join, extname, sep, basename, dirname } from 'path'
 import { installPluginLogger } from './plugin-logger.js'
 import { StatusReactionController } from './status-reactions.js'
+import { isTelegramReplyTool, isTelegramSurfaceTool } from './tool-names.js'
 
 // Route all process.stderr.write calls (including downstream "telegram channel:",
 // "[streaming-metrics] ...", and draft-stream edit-error lines) to a rotating
-// file at ~/.clerk/logs/telegram-plugin.log. Claude Code does not forward the
+// file at ~/.switchroom/logs/telegram-plugin.log. Claude Code does not forward the
 // bun subprocess's stderr anywhere, so without this the plugin is blind to
-// its own logs in production. Override path via CLERK_TELEGRAM_LOG_PATH.
+// its own logs in production. Override path via SWITCHROOM_TELEGRAM_LOG_PATH.
 installPluginLogger()
 import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
@@ -1691,10 +1692,10 @@ await mcp.connect(new StdioServerTransport())
 // ignored. See ./session-tail.ts for the implementation. Disabled if
 // CLAUDE_CONFIG_DIR is not set AND ~/.claude/projects doesn't exist
 // (e.g., this plugin is being run outside a Claude Code session for tests).
-const sessionTailEnabled = process.env.CLERK_SESSION_TAIL !== 'off'
+const sessionTailEnabled = process.env.SWITCHROOM_SESSION_TAIL !== 'off'
 let sessionTailHandle: SessionTailHandle | null = null
 
-// Progress-card driver — default on; opt out via CLERK_TG_STREAM_MODE=pty.
+// Progress-card driver — default on; opt out via SWITCHROOM_TG_STREAM_MODE=pty.
 // The driver translates session-tail events into an edit-in-place Telegram
 // message per turn, surfaced on the stream_reply "progress" lane.
 //
@@ -1702,7 +1703,7 @@ let sessionTailHandle: SessionTailHandle | null = null
 // so existing chunking, 4096-char guards, format handling, and edit
 // throttle all apply. When mode != "checklist", the driver is never
 // instantiated and there's zero overhead.
-const streamMode = process.env.CLERK_TG_STREAM_MODE ?? 'checklist'
+const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 let progressDriver: ProgressDriver | null = null
 if (streamMode === 'checklist') {
   progressDriver = createProgressDriver({
@@ -1770,11 +1771,17 @@ if (sessionTailEnabled) {
       cwd: sessionCwd,
       log: (msg) => process.stderr.write(`telegram channel: ${msg}\n`),
       onEvent: (ev) => {
-        handleSessionEvent(ev)
-        // Fan out to the progress-card driver when enabled. It tracks
-        // the current chat/thread from the enqueue event itself, so
-        // callers pass null here.
+        // Order matters for the Done transition on turn_end: the driver's
+        // synchronous flush(forceDone=true) → emit → handleStreamReply
+        // pushes the final "Done" HTML into the existing progress-lane
+        // stream.update(...) BEFORE handleSessionEvent's closeProgressLane
+        // finalizes and deletes that stream. If we invert the order, the
+        // stream is gone by the time the driver's emit tries to reuse it,
+        // so handleStreamReply creates a fresh stream (new Telegram
+        // message) and the original progress card stays stuck on
+        // "Working…" — exactly the regression reported in bug #TG-DONE.
         progressDriver?.ingest(ev, null)
+        handleSessionEvent(ev)
       },
     })
     process.stderr.write(
@@ -1801,9 +1808,9 @@ if (sessionTailEnabled) {
 // finalizes it (replacing the preview with the canonical text), so the
 // user sees one message that grows as the model writes — no duplicates.
 //
-// Disabled if CLERK_PTY_TAIL=off, or if the service.log path can't be
-// determined (no clerk daemon, running plugin standalone for tests).
-const ptyTailEnabled = process.env.CLERK_PTY_TAIL !== 'off'
+// Disabled if SWITCHROOM_PTY_TAIL=off, or if the service.log path can't be
+// determined (no switchroom daemon, running plugin standalone for tests).
+const ptyTailEnabled = process.env.SWITCHROOM_PTY_TAIL !== 'off'
 let ptyTailHandle: PtyTailHandle | null = null
 if (ptyTailEnabled) {
   try {
@@ -1815,7 +1822,7 @@ if (ptyTailEnabled) {
     const agentDir = process.env.CLAUDE_CONFIG_DIR
       ? dirname(process.env.CLAUDE_CONFIG_DIR)
       : process.cwd()
-    const serviceLogPath = process.env.CLERK_SERVICE_LOG_PATH
+    const serviceLogPath = process.env.SWITCHROOM_SERVICE_LOG_PATH
       ?? join(agentDir, 'service.log')
     ptyTailHandle = startPtyTail({
       logFile: serviceLogPath,
@@ -2008,6 +2015,23 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
 }
 
 /**
+ * True if `toolName` is one of THIS plugin's MCP-published tools, regardless
+ * of the registration key the host .mcp.json used. Claude Code prefixes
+ * every tool name with `mcp__<server-key>__` and the user's .mcp.json may
+ * register the server under any name (`clerk-telegram`, `switchroom-telegram`,
+ * custom fork, …). Earlier code hardcoded a single prefix, which quietly
+ * broke the orphaned-reply backstop and status-reaction suppression for
+ * anyone whose config didn't happen to match — notably the default
+ * `clerk-telegram` key still shipping in existing agent configs. Matching
+ * on the `__<toolname>` suffix keeps the check robust across rename.
+ *
+ * Bug 2 (regression 2026-04-14): suffix-agnostic matching meant
+ * `stream_reply` tool calls were NOT recorded in currentTurnReplyCalled,
+ * so turn_end treated the turn as "no reply produced" and the backstop
+ * forwarded the model's idle text ("Idle; awaiting next instruction.")
+ * as a duplicate Telegram message.
+ */
+/**
  * Resolve a session event into a status reaction transition on whichever
  * controller is currently active for the in-flight chat. Bookkeeping is
  * minimal: we trust the JSONL ordering (Claude processes turns serially),
@@ -2058,8 +2082,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Track that the model called the reply tool — this is the signal
       // we use in turn_end to decide whether the orphaned-reply backstop
       // should fire.
-      if (name === 'mcp__clerk-telegram__reply'
-        || name === 'mcp__clerk-telegram__stream_reply') {
+      if (isTelegramReplyTool(name)) {
         currentTurnReplyCalled = true
         // Reply tool called → cancel the orphaned-reply timeout (the
         // reply handler itself will finalize the turn).
@@ -2069,10 +2092,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         }
       }
       if (!ctrl) return
-      if (name === 'mcp__clerk-telegram__reply'
-        || name === 'mcp__clerk-telegram__stream_reply'
-        || name === 'mcp__clerk-telegram__edit_message'
-        || name === 'mcp__clerk-telegram__react') {
+      if (isTelegramSurfaceTool(name)) {
         // The reply tool's CallToolRequest handler will mark setDone()
         // when the actual API send completes. Don't preempt it here.
         return
@@ -2124,7 +2144,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         ).catch(() => {}).finally(() => {
           // Fire the restart in a detached child so we don't block on our own death
           setTimeout(() => {
-            spawnClerkDetached(['agent', 'restart', getMyAgentName()])
+            spawnSwitchroomDetached(['agent', 'restart', getMyAgentName()])
           }, 1000)
         })
 
@@ -2401,16 +2421,16 @@ bot.command('status', async ctx => {
 })
 
 // ---------------------------------------------------------------------------
-// Clerk CLI bot commands — intercept /commands and run clerk directly.
+// Switchroom CLI bot commands — intercept /commands and run switchroom directly.
 // Zero Claude tokens, instant response.
 // ---------------------------------------------------------------------------
 
-const CLERK_CLI = process.env.CLERK_CLI_PATH ?? 'clerk'
-const CLERK_CONFIG = process.env.CLERK_CONFIG
+const SWITCHROOM_CLI = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
+const SWITCHROOM_CONFIG = process.env.SWITCHROOM_CONFIG
 
-function clerkExec(args: string[], timeoutMs = 15000): string {
-  const fullArgs = CLERK_CONFIG ? ['--config', CLERK_CONFIG, ...args] : args
-  return execFileSync(CLERK_CLI, fullArgs, {
+function switchroomExec(args: string[], timeoutMs = 15000): string {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
+  return execFileSync(SWITCHROOM_CLI, fullArgs, {
     encoding: 'utf-8',
     timeout: timeoutMs,
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -2419,7 +2439,7 @@ function clerkExec(args: string[], timeoutMs = 15000): string {
 }
 
 /**
- * Spawn `clerk` in a detached background process. Used by `/restart`,
+ * Spawn `switchroom` in a detached background process. Used by `/restart`,
  * `/reconcile --restart`, and `/update` when the target operation would
  * SIGTERM the bot's own systemd unit — execFileSync would die mid-call
  * and the user would see a misleading "command failed" error even
@@ -2433,9 +2453,9 @@ function clerkExec(args: string[], timeoutMs = 15000): string {
  * Returns immediately. The caller should acknowledge to the user
  * BEFORE calling this so they see something before the bot dies.
  */
-function spawnClerkDetached(args: string[]): void {
-  const fullArgs = CLERK_CONFIG ? ['--config', CLERK_CONFIG, ...args] : args
-  const child = spawn(CLERK_CLI, fullArgs, {
+function spawnSwitchroomDetached(args: string[]): void {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
+  const child = spawn(SWITCHROOM_CLI, fullArgs, {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -2446,12 +2466,12 @@ function spawnClerkDetached(args: string[]): void {
 /**
  * The agent name we're running as, derived from the cwd. start.sh sets
  * cwd to the agent's directory, so basename(cwd) is the agent name as
- * used in clerk.yaml. Used to detect "self-restart" vs "restart some
+ * used in switchroom.yaml. Used to detect "self-restart" vs "restart some
  * other agent".
  */
 /**
- * The clerk agent name this plugin is running inside. Reads
- * CLERK_AGENT_NAME (set by start.sh from the Handlebars `{{name}}`
+ * The switchroom agent name this plugin is running inside. Reads
+ * SWITCHROOM_AGENT_NAME (set by start.sh from the Handlebars `{{name}}`
  * variable) and falls back to basename(cwd) only as a last resort.
  *
  * We can't rely on basename(cwd) alone because Claude Code spawns MCP
@@ -2463,13 +2483,13 @@ function spawnClerkDetached(args: string[]): void {
  * fell into the blocking execFileSync path that gets killed mid-call.
  */
 export function getMyAgentName(): string {
-  const fromEnv = process.env.CLERK_AGENT_NAME
+  const fromEnv = process.env.SWITCHROOM_AGENT_NAME
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
   return basename(process.cwd())
 }
 
 /**
- * True if a `clerk agent <verb> <name>` command targets the agent the
+ * True if a `switchroom agent <verb> <name>` command targets the agent the
  * bot is running inside — meaning it'll restart/kill our own systemd
  * unit and we should fire-and-forget instead of execFileSync.
  */
@@ -2479,16 +2499,16 @@ export function isSelfTargetingCommand(name: string): boolean {
 }
 
 /**
- * Run a clerk command, capturing both stdout and stderr together.
+ * Run a switchroom command, capturing both stdout and stderr together.
  *
  * Some commands (`update`, `doctor` with failures) write progress to
  * stderr; the user wants to see that in their Telegram reply too. This
  * helper merges them via /bin/sh so we don't lose anything.
  */
-function clerkExecCombined(args: string[], timeoutMs = 15000): string {
-  const fullArgs = CLERK_CONFIG ? ['--config', CLERK_CONFIG, ...args] : args
+function switchroomExecCombined(args: string[], timeoutMs = 15000): string {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
   // Quote each arg for the shell
-  const quoted = [CLERK_CLI, ...fullArgs]
+  const quoted = [SWITCHROOM_CLI, ...fullArgs]
     .map((a) => `'${String(a).replace(/'/g, "'\\''")}'`)
     .join(' ')
   return execSync(`${quoted} 2>&1`, {
@@ -2500,7 +2520,7 @@ function clerkExecCombined(args: string[], timeoutMs = 15000): string {
   })
 }
 
-function formatClerkOutput(output: string, maxLen = 4000): string {
+function formatSwitchroomOutput(output: string, maxLen = 4000): string {
   const trimmed = output.trim()
   if (trimmed.length <= maxLen) return trimmed
   return trimmed.slice(0, maxLen - 20) + '\n... (truncated)'
@@ -2528,7 +2548,7 @@ function isAuthorizedSender(ctx: Context): boolean {
 }
 
 /** Send a reply, respecting message_thread_id for forum topics. */
-async function clerkReply(ctx: Context, text: string, options: { html?: boolean } = {}): Promise<void> {
+async function switchroomReply(ctx: Context, text: string, options: { html?: boolean } = {}): Promise<void> {
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
   await ctx.reply(text, {
@@ -2553,38 +2573,38 @@ function preBlock(text: string): string {
   return '<pre>' + escapeHtmlForTg(text) + '</pre>'
 }
 
-/** Execute a clerk command and reply with the result. */
-async function runClerkCommand(ctx: Context, args: string[], label: string): Promise<void> {
+/** Execute a switchroom command and reply with the result. */
+async function runSwitchroomCommand(ctx: Context, args: string[], label: string): Promise<void> {
   try {
-    const output = stripAnsi(clerkExec(args))
-    const formatted = formatClerkOutput(output)
+    const output = stripAnsi(switchroomExec(args))
+    const formatted = formatSwitchroomOutput(output)
     if (formatted) {
-      await clerkReply(ctx, preBlock(formatted), { html: true })
+      await switchroomReply(ctx, preBlock(formatted), { html: true })
     } else {
-      await clerkReply(ctx, `${label}: done (no output)`)
+      await switchroomReply(ctx, `${label}: done (no output)`)
     }
   } catch (err: unknown) {
     const error = err as { status?: number; stderr?: string; message?: string }
     if (error.message?.includes('ENOENT')) {
-      await clerkReply(ctx, 'clerk CLI not found. Ensure <code>clerk</code> is on PATH or set CLERK_CLI_PATH.', { html: true })
+      await switchroomReply(ctx, 'switchroom CLI not found. Ensure <code>switchroom</code> is on PATH or set SWITCHROOM_CLI_PATH.', { html: true })
       return
     }
     if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) {
-      await clerkReply(ctx, `${label}: command timed out after 15s`)
+      await switchroomReply(ctx, `${label}: command timed out after 15s`)
       return
     }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await clerkReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatClerkOutput(detail))}`, { html: true })
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
 
 /**
- * Run a clerk command with --json and parse the result.
+ * Run a switchroom command with --json and parse the result.
  * Returns null if the command fails or output is not valid JSON.
  */
-function clerkExecJson<T = unknown>(args: string[]): T | null {
+function switchroomExecJson<T = unknown>(args: string[]): T | null {
   try {
-    const output = clerkExec([...args, '--json'])
+    const output = switchroomExec([...args, '--json'])
     return JSON.parse(stripAnsi(output)) as T
   } catch {
     return null
@@ -2600,11 +2620,11 @@ function statusIcon(status: string): string {
 }
 
 /**
- * Send a clerk command's output as a compact, mobile-friendly message.
+ * Send a switchroom command's output as a compact, mobile-friendly message.
  * Uses bullet lists and key:value pairs instead of fixed-width tables.
  * Falls back to <pre> block if structured parsing fails.
  */
-async function runClerkCommandFormatted(
+async function runSwitchroomCommandFormatted(
   ctx: Context,
   args: string[],
   label: string,
@@ -2613,22 +2633,22 @@ async function runClerkCommandFormatted(
   try {
     const formatted = formatter()
     if (formatted) {
-      await clerkReply(ctx, formatted, { html: true })
+      await switchroomReply(ctx, formatted, { html: true })
       return
     }
     // Fall back to plain CLI output if structured formatting failed
-    await runClerkCommand(ctx, args, label)
+    await runSwitchroomCommand(ctx, args, label)
   } catch (err: unknown) {
     const error = err as { stderr?: string; message?: string }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await clerkReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatClerkOutput(detail))}`, { html: true })
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
 
 // /agents — list all agents
 bot.command('agents', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  await runClerkCommandFormatted(ctx, ['agent', 'list'], 'agent list', () => {
+  await runSwitchroomCommandFormatted(ctx, ['agent', 'list'], 'agent list', () => {
     type AgentListResp = {
       agents: Array<{
         name: string
@@ -2639,7 +2659,7 @@ bot.command('agents', async ctx => {
         topic_emoji?: string
       }>
     }
-    const data = clerkExecJson<AgentListResp>(['agent', 'list'])
+    const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
     if (!data) return null
     if (data.agents.length === 0) return '<i>No agents defined</i>'
     const lines = ['<b>Agents</b>']
@@ -2654,20 +2674,20 @@ bot.command('agents', async ctx => {
   })
 })
 
-// /clerkstart [name] — start an agent. Defaults to the current agent
-// (the one this bot is bound to) so the common case is just `/clerkstart`.
-// (use clerkstart to avoid conflict with Telegram's built-in /start)
-bot.command('clerkstart', async ctx => {
+// /switchroomstart [name] — start an agent. Defaults to the current agent
+// (the one this bot is bound to) so the common case is just `/switchroomstart`.
+// (use switchroomstart to avoid conflict with Telegram's built-in /start)
+bot.command('switchroomstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
-  await runClerkCommand(ctx, ['agent', 'start', name], `start ${name}`)
+  await runSwitchroomCommand(ctx, ['agent', 'start', name], `start ${name}`)
 })
 
 // /stop [name] — stop an agent. Defaults to the current agent.
 bot.command('stop', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
-  await runClerkCommand(ctx, ['agent', 'stop', name], `stop ${name}`)
+  await runSwitchroomCommand(ctx, ['agent', 'stop', name], `stop ${name}`)
 })
 
 // /restart [name|all] — restart an agent. Defaults to the current agent
@@ -2679,20 +2699,20 @@ bot.command('restart', async ctx => {
   // Self-restart: the systemctl restart cascades into killing our own
   // process. execFileSync would die mid-call and report "command failed"
   // even though the restart actually succeeds. Ack first, fire-and-
-  // forget the clerk command in a detached child, then return so the
+  // forget the switchroom command in a detached child, then return so the
   // bot has a clean handle to the message before it gets SIGTERM'd.
   if (isSelfTargetingCommand(name)) {
-    await clerkReply(ctx, `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>… back in a few seconds.`, { html: true })
-    spawnClerkDetached(['agent', 'restart', name])
+    await switchroomReply(ctx, `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>… back in a few seconds.`, { html: true })
+    spawnSwitchroomDetached(['agent', 'restart', name])
     return
   }
-  await runClerkCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
+  await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
 })
 
 // /auth — show token/auth health
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  await runClerkCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
+  await runSwitchroomCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
     type AuthStatusResp = {
       agents: Array<{
         name: string
@@ -2702,7 +2722,7 @@ bot.command('auth', async ctx => {
         rate_limit_tier: string | null
       }>
     }
-    const data = clerkExecJson<AuthStatusResp>(['auth', 'status'])
+    const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
     if (!data) return null
     if (data.agents.length === 0) return '<i>No agents defined</i>'
     const lines = ['<b>Auth status</b>']
@@ -2719,7 +2739,7 @@ bot.command('auth', async ctx => {
 // /topics — show topic mappings
 bot.command('topics', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  await runClerkCommand(ctx, ['topics', 'list'], 'topics list')
+  await runSwitchroomCommand(ctx, ['topics', 'list'], 'topics list')
 })
 
 // /logs [name] [lines] — show agent logs.
@@ -2742,7 +2762,7 @@ bot.command('logs', async ctx => {
   }
   const lines = linesArg ? parseInt(linesArg, 10) : 20
   const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
-  await runClerkCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`)
+  await runSwitchroomCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`)
 })
 
 // /memory <query> — search agent memory
@@ -2750,10 +2770,10 @@ bot.command('memory', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const query = ctx.match?.trim()
   if (!query) {
-    await clerkReply(ctx, 'Usage: /memory <search query>')
+    await switchroomReply(ctx, 'Usage: /memory <search query>')
     return
   }
-  await runClerkCommand(ctx, ['memory', 'search', query], 'memory search')
+  await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search')
 })
 
 // /doctor — health check (deps, vault, hindsight, services, MCP wireup)
@@ -2763,7 +2783,7 @@ bot.command('doctor', async ctx => {
     // doctor exits non-zero if anything is failing — capture combined output
     let output: string
     try {
-      output = clerkExecCombined(['doctor'], 30000)
+      output = switchroomExecCombined(['doctor'], 30000)
     } catch (err: unknown) {
       // Non-zero exit is expected when checks fail; the combined output is on the error
       const e = err as { stdout?: string; message?: string }
@@ -2771,7 +2791,7 @@ bot.command('doctor', async ctx => {
     }
     const trimmed = stripAnsi(output).trim()
     if (!trimmed) {
-      await clerkReply(ctx, 'doctor: no output')
+      await switchroomReply(ctx, 'doctor: no output')
       return
     }
     // Replace ✓/✗/! glyphs with emoji for mobile readability
@@ -2779,18 +2799,18 @@ bot.command('doctor', async ctx => {
       .replace(/^( *)✓ /gm, '$1🟢 ')
       .replace(/^( *)✗ /gm, '$1🔴 ')
       .replace(/^( *)! /gm, '$1🟡 ')
-    await clerkReply(ctx, preBlock(formatClerkOutput(pretty)), { html: true })
+    await switchroomReply(ctx, preBlock(formatSwitchroomOutput(pretty)), { html: true })
   } catch (err: unknown) {
     const error = err as { message?: string }
-    await clerkReply(
+    await switchroomReply(
       ctx,
-      `<b>doctor failed:</b>\n${preBlock(formatClerkOutput(error.message ?? 'unknown error'))}`,
+      `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput(error.message ?? 'unknown error'))}`,
       { html: true },
     )
   }
 })
 
-// /reconcile [name|all] — re-apply clerk.yaml to an agent.
+// /reconcile [name|all] — re-apply switchroom.yaml to an agent.
 // Defaults to the current agent; pass "all" to reconcile every agent.
 bot.command('reconcile', async ctx => {
   if (!isAuthorizedSender(ctx)) return
@@ -2799,15 +2819,15 @@ bot.command('reconcile', async ctx => {
   // Same self-kill problem as /restart — fire-and-forget the detached
   // child after acknowledging.
   if (isSelfTargetingCommand(arg)) {
-    await clerkReply(
+    await switchroomReply(
       ctx,
       `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting… back in a few seconds.`,
       { html: true },
     )
-    spawnClerkDetached(['agent', 'reconcile', arg, '--restart'])
+    spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
     return
   }
-  await runClerkCommand(
+  await runSwitchroomCommand(
     ctx,
     ['agent', 'reconcile', arg, '--restart'],
     `reconcile ${arg}`,
@@ -2822,7 +2842,7 @@ bot.command('grant', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const parts = (ctx.match ?? '').trim().split(/\s+/).filter(Boolean)
   if (parts.length === 0) {
-    await clerkReply(ctx, 'Usage: /grant <tool>  or  /grant <agent> <tool>')
+    await switchroomReply(ctx, 'Usage: /grant <tool>  or  /grant <agent> <tool>')
     return
   }
   let agentName: string
@@ -2835,7 +2855,7 @@ bot.command('grant', async ctx => {
     agentName = parts[0]
     tool = parts.slice(1).join(' ')
   }
-  await runClerkCommand(
+  await runSwitchroomCommand(
     ctx,
     ['agent', 'grant', agentName, tool],
     `grant ${agentName} ${tool}`,
@@ -2862,7 +2882,7 @@ bot.command('dangerous', async ctx => {
   }
   const args = ['agent', 'dangerous', agentName]
   if (off) args.push('--off')
-  await runClerkCommand(ctx, args, `dangerous ${agentName}${off ? ' off' : ''}`)
+  await runSwitchroomCommand(ctx, args, `dangerous ${agentName}${off ? ' off' : ''}`)
 })
 
 // /permissions [agent] — show current allow list.
@@ -2870,12 +2890,12 @@ bot.command('dangerous', async ctx => {
 bot.command('permissions', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const agentName = (ctx.match ?? '').trim() || getMyAgentName()
-  await runClerkCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
+  await runSwitchroomCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
 })
 
 // /update — git pull, reinstall, reconcile, restart agents.
 //
-// `clerk update` always restarts agents, including the one running this
+// `switchroom update` always restarts agents, including the one running this
 // bot. The blocking execFileSync path used to die mid-call when systemd
 // SIGTERM'd the agent, leaving the user with a misleading "command
 // failed" error. Use the detached spawn helper instead: ack the user
@@ -2883,20 +2903,20 @@ bot.command('permissions', async ctx => {
 // with /doctor.
 bot.command('update', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  await clerkReply(
+  await switchroomReply(
     ctx,
-    '🔄 Running <b>clerk update</b> — git pull, deps, reconcile, restart. The bot will be back in ~30 seconds; check <code>/doctor</code> after to confirm.',
+    '🔄 Running <b>switchroom update</b> — git pull, deps, reconcile, restart. The bot will be back in ~30 seconds; check <code>/doctor</code> after to confirm.',
     { html: true },
   )
-  spawnClerkDetached(['update'])
+  spawnSwitchroomDetached(['update'])
 })
 
-// /clerkhelp — show all available bot commands
-bot.command('clerkhelp', async ctx => {
+// /switchroomhelp — show all available bot commands
+bot.command('switchroomhelp', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const me = getMyAgentName()
   const helpText = [
-    'Clerk Bot Commands',
+    'Switchroom Bot Commands',
     '',
     `This bot is bound to the ${me} agent. Commands default to ${me};`,
     'pass an agent name to override.',
@@ -2909,13 +2929,13 @@ bot.command('clerkhelp', async ctx => {
     '/memory <query> - Search agent memory',
     '',
     'Operate (default: current agent)',
-    '/clerkstart [name] - Start an agent',
+    '/switchroomstart [name] - Start an agent',
     '/stop [name] - Stop an agent',
     '/restart [name|all] - Restart an agent (or all)',
     '',
     'Maintain',
     '/doctor - Health check (deps, vault, hindsight, services, MCP)',
-    '/reconcile [name|all] - Re-apply clerk.yaml (default: current agent)',
+    '/reconcile [name|all] - Re-apply switchroom.yaml (default: current agent)',
     '/update - Pull latest, reinstall deps, reconcile, restart',
     '',
     'Permissions (default: current agent)',
@@ -2923,32 +2943,32 @@ bot.command('clerkhelp', async ctx => {
     '/grant <tool> | /grant <agent> <tool> - Grant a tool permission and reconcile',
     '/dangerous [off] | /dangerous <agent> [off] - Toggle full tool access',
     '',
-    '/clerkhelp - Show this help message',
+    '/switchroomhelp - Show this help message',
     '',
-    'These commands run the clerk CLI directly — no AI tokens used.',
+    'These commands run the switchroom CLI directly — no AI tokens used.',
   ].join('\n')
-  await clerkReply(ctx, helpText)
+  await switchroomReply(ctx, helpText)
 })
 
-// Register clerk commands with BotFather (called during startup alongside existing commands).
-async function registerClerkBotCommands(): Promise<void> {
+// Register switchroom commands with BotFather (called during startup alongside existing commands).
+async function registerSwitchroomBotCommands(): Promise<void> {
   // Register in all_private_chats scope (extends existing commands)
-  const clerkCommands = [
+  const switchroomCommands = [
     { command: 'agents', description: 'List all agents and their status' },
     { command: 'auth', description: 'Show auth/token status' },
     { command: 'topics', description: 'Show topic-to-agent mappings' },
     { command: 'logs', description: 'Show agent logs (default: this agent)' },
     { command: 'memory', description: 'Search agent memory' },
-    { command: 'clerkstart', description: 'Start an agent (default: this agent)' },
+    { command: 'switchroomstart', description: 'Start an agent (default: this agent)' },
     { command: 'stop', description: 'Stop an agent (default: this agent)' },
     { command: 'restart', description: 'Restart an agent (default: this agent)' },
     { command: 'doctor', description: 'Health check (deps, vault, services, MCP)' },
-    { command: 'reconcile', description: 'Re-apply clerk.yaml (default: this agent)' },
+    { command: 'reconcile', description: 'Re-apply switchroom.yaml (default: this agent)' },
     { command: 'update', description: 'Pull latest, reinstall, reconcile, restart' },
     { command: 'permissions', description: 'Show agent permissions (default: this agent)' },
     { command: 'grant', description: 'Grant a tool permission (default: this agent)' },
     { command: 'dangerous', description: 'Toggle full tool access (default: this agent)' },
-    { command: 'clerkhelp', description: 'Show all clerk bot commands' },
+    { command: 'switchroomhelp', description: 'Show all switchroom bot commands' },
   ]
 
   // Combine with existing base commands
@@ -2959,13 +2979,13 @@ async function registerClerkBotCommands(): Promise<void> {
   ]
 
   await bot.api.setMyCommands(
-    [...baseCommands, ...clerkCommands],
+    [...baseCommands, ...switchroomCommands],
     { scope: { type: 'all_private_chats' } },
   )
 
-  // Also register in group chats where clerk commands are most useful
+  // Also register in group chats where switchroom commands are most useful
   await bot.api.setMyCommands(
-    clerkCommands,
+    switchroomCommands,
     { scope: { type: 'all_group_chats' } },
   )
 }
@@ -3500,7 +3520,7 @@ void (async () => {
       if (TOPIC_ID != null) {
         process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
       }
-      void registerClerkBotCommands().catch(() => {})
+      void registerSwitchroomBotCommands().catch(() => {})
 
       // run() returns a RunnerHandle. Call .task() to await background completion.
       runnerHandle = run(bot)

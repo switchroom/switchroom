@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-GIST_ID="${CLERK_BADGE_GIST_ID:-002f3482b19111d35e57c1903b3733e2}"
+GIST_ID="${SWITCHROOM_BADGE_GIST_ID:-002f3482b19111d35e57c1903b3733e2}"
 
 if [[ -z "${GITHUB_GIST_TOKEN:-}" ]]; then
   echo "publish-badges: GITHUB_GIST_TOKEN not set — skipping"
@@ -74,7 +74,7 @@ build_patch_body() {
   python3 <<PY
 import json, os, sys
 files = {}
-for name in ["clerk-build.json","clerk-tests.json","clerk-trigger-evals.json","clerk-quality-evals.json"]:
+for name in ["switchroom-build.json","switchroom-tests.json","switchroom-trigger-evals.json","switchroom-quality-evals.json"]:
     path = "/tmp/badges-out/" + name
     if os.path.exists(path):
         files[name] = {"content": open(path).read()}
@@ -84,20 +84,20 @@ PY
 
 mkdir -p /tmp/badges-out
 
-build_build_badge > /tmp/badges-out/clerk-build.json
-build_tests_badge > /tmp/badges-out/clerk-tests.json
+build_build_badge > /tmp/badges-out/switchroom-build.json
+build_tests_badge > /tmp/badges-out/switchroom-tests.json
 
 trigger_file="$(latest_of 'trigger_*.json' || true)"
 quality_file="$(latest_of 'quality_*.json' || true)"
 
 if [[ -n "${trigger_file:-}" ]]; then
-  badge_from "$trigger_file" "trigger evals" > /tmp/badges-out/clerk-trigger-evals.json
-  echo "publish-badges: trigger = $(cat /tmp/badges-out/clerk-trigger-evals.json)"
+  badge_from "$trigger_file" "trigger evals" > /tmp/badges-out/switchroom-trigger-evals.json
+  echo "publish-badges: trigger = $(cat /tmp/badges-out/switchroom-trigger-evals.json)"
 fi
 
 if [[ -n "${quality_file:-}" ]]; then
-  badge_from "$quality_file" "quality evals" > /tmp/badges-out/clerk-quality-evals.json
-  echo "publish-badges: quality = $(cat /tmp/badges-out/clerk-quality-evals.json)"
+  badge_from "$quality_file" "quality evals" > /tmp/badges-out/switchroom-quality-evals.json
+  echo "publish-badges: quality = $(cat /tmp/badges-out/switchroom-quality-evals.json)"
 fi
 
 BODY="$(build_patch_body)"
