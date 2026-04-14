@@ -1,17 +1,49 @@
 {
-  "name": "clerk-telegram-plugin",
+  "name": "@clerk-ai/telegram-plugin",
   "version": "0.1.0",
-  "description": "Forked Telegram plugin for Clerk with forum topic routing support",
+  "description": "Telegram MCP plugin for Clerk — forum topic routing, status reactions, SQLite history.",
   "license": "MIT",
   "type": "module",
-  "bin": "./server.ts",
+  "bin": {
+    "clerk-telegram-plugin": "./dist/server.js"
+  },
+  "main": "./dist/server.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "start": "bun server.ts"
+    "start": "bun server.ts",
+    "build": "node scripts/build.mjs",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@xterm/headless": "^6.0.0",
     "grammy": "^1.21.0"
-  }
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mekenthompson/clerk.git",
+    "directory": "telegram-plugin"
+  },
+  "homepage": "https://github.com/mekenthompson/clerk/tree/main/telegram-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/mekenthompson/clerk/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "clerk",
+    "claude-code",
+    "telegram",
+    "mcp",
+    "model-context-protocol"
+  ]
 }
