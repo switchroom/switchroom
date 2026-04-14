@@ -177,6 +177,24 @@ describe('progress-card render', () => {
     expect(out).not.toContain('<b>🔧 Run</b>')
   })
 
+  it('renders a distinctive "Working…" header while in-progress', () => {
+    const s = fold([enqueue('fix tests')])
+    const out = render(s, 5000)
+    // Distinctive banner that no normal reply would ever produce.
+    expect(out).toContain('⚙️ <b>Working…</b>')
+    // Separator between header and bullets — avoids the "one blob" look.
+    expect(out).toContain('─ ─ ─')
+    // While in-progress, no "Done" banner.
+    expect(out).not.toContain('✅ <b>Done</b> ·')
+  })
+
+  it('swaps the header to "Done" when the turn ends', () => {
+    const s = fold([enqueue('fix tests'), { kind: 'turn_end', durationMs: 1000 }])
+    const out = render(s, 5000)
+    expect(out).toContain('✅ <b>Done</b>')
+    expect(out).not.toContain('⚙️ <b>Working…</b>')
+  })
+
   it('renders running item with elapsed time (tool name bolded)', () => {
     const s = fold([enqueue('test'), { kind: 'tool_use', toolName: 'Bash' }])
     // tool_use fired at t=1100, render at t=3200 → 2.1s elapsed for the item

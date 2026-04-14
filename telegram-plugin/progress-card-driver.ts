@@ -82,6 +82,19 @@ interface PerChatState {
 export interface ProgressDriver {
   /** Feed a session-tail event. Fires emit() as the cadence allows. */
   ingest(event: SessionEvent, chatId: string | null, threadId?: string): void
+  /**
+   * Begin a new turn synchronously — called from the inbound-message
+   * handler the instant a user's message clears the gate, BEFORE any
+   * session-tail event arrives. Primes per-chat state and fires an
+   * immediate render of the "⚙️ Working…" skeleton card so the user
+   * sees the card land within ~1s of their message. Subsequent tool_use
+   * / tool_result / turn_end events (from the session JSONL tail) fold
+   * into the same state and continue editing the card in place.
+   *
+   * Safe to call redundantly: a second startTurn for the same chat
+   * before turn_end just re-primes state with the new userRequest.
+   */
+  startTurn(args: { chatId: string; threadId?: string; userText: string }): void
   /** Current state for a chat (for tests / inspection). */
   peek(chatId: string, threadId?: string): ProgressCardState | undefined
 }
@@ -226,6 +239,26 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         chatState!.pendingTimer = null
         flush(chatState!, /*forceDone*/ false)
       }, delay)
+    },
+
+    startTurn({ chatId, threadId, userText }) {
+      // Synthesize an enqueue event and run it through the normal ingest
+      // path. This guarantees we share all the flush/cadence/teardown
+      // semantics with session-tail-driven enqueues (including the
+      // "fire immediately" branch for enqueue events). The rawContent
+      // wrapper matches the shape extractUserText expects.
+      const raw = `<channel source="clerk-telegram" chat_id="${chatId}"${threadId != null ? ` message_thread_id="${threadId}"` : ''}>${userText}</channel>`
+      this.ingest(
+        {
+          kind: 'enqueue',
+          chatId,
+          messageId: null,
+          threadId: threadId ?? null,
+          rawContent: raw,
+        },
+        chatId,
+        threadId,
+      )
     },
 
     peek(chatId, threadId) {

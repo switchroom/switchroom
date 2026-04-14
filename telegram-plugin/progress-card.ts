@@ -230,13 +230,19 @@ export function render(state: ProgressCardState, now: number): string {
 
   const lines: string[] = []
 
-  // Header: user request + elapsed
+  // Header: distinctive status banner so the card never looks like a normal
+  // reply. While in-flight, lead with ⚙️ <b>Working…</b>; on completion swap
+  // to ✅ <b>Done</b>. The elapsed clock lives on the same line so users can
+  // see "is it still moving?" at a glance.
   const elapsed = formatDuration(now - state.turnStartedAt)
+  const headerIcon = state.stage === 'done' ? '✅' : '⚙️'
+  const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
+  lines.push(`${headerIcon} <b>${headerLabel}</b> · ⏱ ${elapsed}`)
   if (state.userRequest) {
     lines.push(`💬 ${escapeHtml(truncate(state.userRequest, 120))}`)
   }
-  lines.push(`⏱ ${elapsed}`)
-  lines.push('')
+  // Thin visual separator so the bullets below don't blur into the header.
+  lines.push('─ ─ ─')
 
   // Stage indicator
   const stageParts: string[] = [

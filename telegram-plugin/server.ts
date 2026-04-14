@@ -3285,6 +3285,28 @@ async function handleInbound(
     }
   }
 
+  // Prime the progress card synchronously, BEFORE the MCP notification
+  // and before any session-tail event lands. The session JSONL enqueue
+  // event typically arrives 1–3s after the model wakes up; for very
+  // fast turns that finish inside that window, the user would otherwise
+  // see the card materialize at turn-end. Firing startTurn here lands
+  // the "⚙️ Working…" skeleton within ~1s of the inbound message. If a
+  // steering message extended an already-live turn, skip — the existing
+  // card keeps updating for the in-flight turn.
+  if (!isSteering) {
+    try {
+      progressDriver?.startTurn({
+        chatId: chat_id,
+        threadId: messageThreadId != null ? String(messageThreadId) : undefined,
+        userText: effectiveText,
+      })
+    } catch (err) {
+      process.stderr.write(
+        `telegram channel: progress-card startTurn failed: ${(err as Error).message}\n`,
+      )
+    }
+  }
+
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   // Persist to history before notifying Claude. We're past the gate, the
