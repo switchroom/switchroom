@@ -49,6 +49,58 @@ export interface ChecklistItem {
 
 export type Stage = 'plan' | 'run' | 'done'
 
+/**
+ * Multi-agent foundation (gated by PROGRESS_CARD_MULTI_AGENT=1):
+ *
+ * Per-sub-agent state, populated by the new `sub_agent_*` events. Today
+ * (in this PR) the renderer doesn't read any of it — it lives alongside
+ * the existing per-tool checklist purely as a structural foundation. The
+ * later renderer PR consumes `subAgents` and `pendingAgentSpawns` to draw
+ * the two-section [Main] / [Sub-agents] card.
+ *
+ * `parentToolUseId` links a sub-agent back to the parent's `Agent`/`Task`
+ * tool_use that spawned it, established by prompt-text correlation in the
+ * correlation PR. Null while we haven't yet seen the parent (rare reverse
+ * race) or when correlation fails entirely (orphan).
+ */
+export interface SubAgentState {
+  readonly agentId: string
+  readonly description: string
+  readonly subagentType?: string
+  readonly parentToolUseId: string | null
+  readonly state: ItemState
+  readonly startedAt: number
+  readonly finishedAt?: number
+  readonly toolCount: number
+  /**
+   * The first user-message text from the sub-agent's JSONL — kept so the
+   * reverse-race adoption path (orphan first, parent later) can match
+   * against incoming pendingAgentSpawns entries.
+   */
+  readonly firstPromptText?: string
+  readonly currentTool?: {
+    readonly tool: string
+    readonly label: string
+    readonly toolUseId: string
+    readonly startedAt: number
+  }
+  /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
+  readonly nestedSpawnCount: number
+}
+
+/**
+ * A parent `Agent`/`Task` tool_use whose sub-agent JSONL hasn't appeared
+ * yet. Once `sub_agent_started` arrives with matching `firstPromptText`
+ * the entry is moved into `subAgents` and removed from this map.
+ */
+export interface PendingAgentSpawn {
+  readonly parentToolUseId: string
+  readonly description: string
+  readonly subagentType?: string
+  readonly promptText: string
+  readonly startedAt: number
+}
+
 export interface ProgressCardState {
   /** Unix ms when the turn started (enqueue event). 0 when idle. */
   readonly turnStartedAt: number
@@ -62,6 +114,17 @@ export interface ProgressCardState {
   readonly thinking: boolean
   /** Latest short `text` content from the assistant (for the thought line). */
   readonly latestText?: string
+  /**
+   * Multi-agent: per-sub-agent state, keyed by `agentId` (sub-agent JSONL
+   * filename stem). Empty in single-agent turns. Always present so the
+   * shape is stable across flag-on / flag-off renders.
+   */
+  readonly subAgents: ReadonlyMap<string, SubAgentState>
+  /**
+   * Multi-agent: parent Agent/Task tool_uses awaiting a sub-agent JSONL
+   * to correlate with. Keyed by the parent's `toolUseId`.
+   */
+  readonly pendingAgentSpawns: ReadonlyMap<string, PendingAgentSpawn>
 }
 
 export function initialState(): ProgressCardState {
@@ -70,7 +133,19 @@ export function initialState(): ProgressCardState {
     items: [],
     stage: 'plan',
     thinking: false,
+    subAgents: new Map(),
+    pendingAgentSpawns: new Map(),
   }
+}
+
+/**
+ * Single feature flag for the whole multi-agent path. Read once and
+ * latched at driver/renderer construction time so toggling mid-process
+ * has no half-state risk. Flag OFF = byte-identical legacy behavior; the
+ * new state fields stay empty and the renderer ignores them.
+ */
+export function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PROGRESS_CARD_MULTI_AGENT === '1'
 }
 
 // ─── Reducer ────────────────────────────────────────────────────────────────
