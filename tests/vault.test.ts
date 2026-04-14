@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   createVault,
   openVault,
@@ -137,6 +139,76 @@ describe("vault", () => {
     });
   });
 });
+
+describe("vault set CLI — multi-line values", () => {
+  const binPath = fileURLToPath(new URL("../bin/clerk.ts", import.meta.url));
+  const passphrase = "cli-test-passphrase";
+  let tmpDir: string;
+  let vaultPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "clerk-vault-cli-test-"));
+    vaultPath = join(tmpDir, "vault.enc");
+    createVault(passphrase, vaultPath);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCli(args: string[], input?: string) {
+    // Pass --config via a throwaway path; we only need `vault set` to run.
+    // The vault path is resolved from the default loader fallback, so we
+    // override it via CLERK_VAULT_PATH-like behavior by writing a minimal
+    // config. Simpler: invoke with --config pointing at a tiny yaml that
+    // sets vault.path.
+    const configPath = join(tmpDir, "clerk.yaml");
+    writeFileSync(
+      configPath,
+      `clerk:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+    );
+    return spawnSync(
+      "bun",
+      [binPath, "--config", configPath, "vault", ...args],
+      {
+        input,
+        env: { ...process.env, CLERK_VAULT_PASSPHRASE: passphrase },
+        encoding: "utf8",
+      }
+    );
+  }
+
+  it("preserves multi-line value piped via non-TTY stdin", () => {
+    const multiLine = "line-a\nline-b\nline-c";
+    const result = runCli(["set", "multi"], multiLine);
+    expect(result.status).toBe(0);
+
+    const stored = getSecret(passphrase, vaultPath, "multi");
+    expect(stored).toBe(multiLine);
+  });
+
+  it("preserves a PEM-like value piped via non-TTY stdin", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDa\nabc\n-----END PRIVATE KEY-----\n";
+    const result = runCli(["set", "pem"], pem);
+    expect(result.status).toBe(0);
+
+    const stored = getSecret(passphrase, vaultPath, "pem");
+    expect(stored).toBe(pem);
+  });
+
+  it("reads value verbatim from --file flag", () => {
+    const json = '{\n  "key": "value",\n  "nested": {"x": 1}\n}\n';
+    const filePath = join(tmpDir, "secret.json");
+    writeFileSync(filePath, json);
+
+    const result = runCli(["set", "cfg", "--file", filePath]);
+    expect(result.status).toBe(0);
+
+    const stored = getSecret(passphrase, vaultPath, "cfg");
+    expect(stored).toBe(json);
+  });
+}, 30_000);
 
 describe("vault resolver", () => {
   describe("isVaultReference", () => {
