@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   projectTranscriptLine,
+  projectSubagentLine,
   sanitizeCwdToProjectName,
   getProjectsDirForCwd,
   startSessionTail,
@@ -337,5 +338,72 @@ describe('startSessionTail — re-attach resumes from saved cursor', () => {
     } finally {
       handle.stop()
     }
+  })
+})
+
+describe('projectSubagentLine', () => {
+  it('emits sub_agent_started exactly once for the first user message (string content)', () => {
+    const st = { hasEmittedStart: false }
+    const line = JSON.stringify({
+      isSidechain: true,
+      agentId: 'aaa',
+      type: 'user',
+      message: { role: 'user', content: 'hello sub-agent' },
+    })
+    const events = projectSubagentLine(line, 'aaa', st)
+    expect(events).toEqual([
+      { kind: 'sub_agent_started', agentId: 'aaa', firstPromptText: 'hello sub-agent' },
+    ])
+    expect(st.hasEmittedStart).toBe(true)
+    // Second user message → tool_results, NOT another sub_agent_started
+    const line2 = JSON.stringify({
+      type: 'user',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_x', is_error: false }],
+      },
+    })
+    const events2 = projectSubagentLine(line2, 'aaa', st)
+    expect(events2).toEqual([
+      { kind: 'sub_agent_tool_result', agentId: 'aaa', toolUseId: 'toolu_x', isError: undefined },
+    ])
+  })
+
+  it('emits sub_agent_tool_use for regular tools; nested Agent fires ONLY nested_spawn', () => {
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } },
+          { type: 'tool_use', id: 'toolu_b', name: 'Agent', input: { description: 'nested', prompt: 'nested-p' } },
+        ],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    // 2 events: 1 sub_agent_tool_use (Read) + 1 nested_spawn (the Agent).
+    // Per design §5.5 we do NOT also emit sub_agent_tool_use for the
+    // nested Agent — that would surface the sub-sub-agent's description
+    // as the parent sub-agent's currentTool and break "no recursion in
+    // rendering."
+    expect(events.length).toBe(2)
+    expect(events[0].kind).toBe('sub_agent_tool_use')
+    expect(events[1]).toEqual({ kind: 'sub_agent_nested_spawn', agentId: 'X' })
+  })
+
+  it('emits sub_agent_turn_end on system turn_duration', () => {
+    const st = { hasEmittedStart: true }
+    const events = projectSubagentLine(
+      JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 42 }),
+      'X',
+      st,
+    )
+    expect(events).toEqual([{ kind: 'sub_agent_turn_end', agentId: 'X' }])
+  })
+
+  it('skips malformed lines silently', () => {
+    const st = { hasEmittedStart: false }
+    expect(projectSubagentLine('{not-json', 'X', st)).toEqual([])
+    expect(projectSubagentLine('{}', 'X', st)).toEqual([])
+    expect(st.hasEmittedStart).toBe(false)
   })
 })

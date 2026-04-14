@@ -45,6 +45,14 @@ export interface ChecklistItem {
   readonly startedAt: number
   /** Unix ms when tool_result arrived. Only set on done/failed. */
   readonly finishedAt?: number
+  /**
+   * Multi-agent: for `Agent`/`Task` tool_use items only, the `agentId`
+   * of the correlated sub-agent. Set when `sub_agent_started` lands and
+   * matches this item's prompt text. Renderer (later PR) uses it to
+   * keep the [Main] line in 🤖 (not ✅) until the parent's tool_result
+   * arrives. Null until correlation succeeds.
+   */
+  readonly spawnedAgentId?: string | null
 }
 
 export type Stage = 'plan' | 'run' | 'done'
@@ -201,11 +209,61 @@ export function reduce(
         state: 'running',
         startedAt: now,
       }
+      // Multi-agent: if this is an Agent/Task tool_use, stage a pending
+      // spawn awaiting the matching sub-agent JSONL. Correlation key is
+      // the prompt text (the sub-agent's first user message contains
+      // exactly this string). Reverse-race: if a sub-agent already
+      // landed as orphan with this prompt text, adopt it now.
+      let pendingAgentSpawns = state.pendingAgentSpawns
+      let subAgents = state.subAgents
+      if (
+        (event.toolName === 'Agent' || event.toolName === 'Task') &&
+        event.toolUseId &&
+        event.input
+      ) {
+        const promptText = String(event.input.prompt ?? '')
+        const description = String(event.input.description ?? '') || promptText.slice(0, 50)
+        const subagentType =
+          typeof event.input.subagent_type === 'string'
+            ? (event.input.subagent_type as string)
+            : undefined
+        // Reverse-race adoption: scan orphan sub-agents (parentToolUseId
+        // null) for a prompt-text match and adopt the FIRST matching one.
+        // FIFO disambiguates duplicate-prompt bursts (rare).
+        let adopted = false
+        for (const [agentId, sa] of subAgents) {
+          if (sa.parentToolUseId == null && sa.firstPromptText === promptText) {
+            const next = new Map(subAgents)
+            next.set(agentId, {
+              ...sa,
+              parentToolUseId: event.toolUseId,
+              description,
+              subagentType,
+            })
+            subAgents = next
+            adopted = true
+            break
+          }
+        }
+        if (!adopted) {
+          const nextPending = new Map(pendingAgentSpawns)
+          nextPending.set(event.toolUseId, {
+            parentToolUseId: event.toolUseId,
+            description,
+            subagentType,
+            promptText,
+            startedAt: now,
+          })
+          pendingAgentSpawns = nextPending
+        }
+      }
       return {
         ...state,
         items: [...state.items, nextItem],
         stage: 'run',
         thinking: false,
+        pendingAgentSpawns,
+        subAgents,
       }
     }
 
@@ -231,7 +289,128 @@ export function reduce(
       const items = state.items.slice()
       const nextState: ItemState = event.isError === true ? 'failed' : 'done'
       items[idx] = { ...items[idx], state: nextState, finishedAt: now }
-      return { ...state, items }
+      // Multi-agent: a parent Agent/Task tool_result is the authoritative
+      // close-out for its sub-agent. Find any sub-agent linked to this
+      // toolUseId (via parentToolUseId) and finalize it. Also clear any
+      // matching pendingAgentSpawn (sub-agent JSONL never appeared).
+      let subAgents = state.subAgents
+      let pendingAgentSpawns = state.pendingAgentSpawns
+      if (event.toolUseId) {
+        for (const [agentId, sa] of subAgents) {
+          if (sa.parentToolUseId === event.toolUseId) {
+            const next = new Map(subAgents)
+            next.set(agentId, { ...sa, state: nextState, finishedAt: now })
+            subAgents = next
+            break
+          }
+        }
+        if (pendingAgentSpawns.has(event.toolUseId)) {
+          const next = new Map(pendingAgentSpawns)
+          next.delete(event.toolUseId)
+          pendingAgentSpawns = next
+        }
+      }
+      return { ...state, items, subAgents, pendingAgentSpawns }
+    }
+
+    case 'sub_agent_started': {
+      if (state.turnStartedAt === 0) return state
+      // Already known? (Defensive — re-attach can re-emit.)
+      if (state.subAgents.has(event.agentId)) return state
+      // Try to correlate by prompt-text against pendingAgentSpawns. On
+      // hit: move pending → subAgents, link the matching [Main]
+      // ChecklistItem via spawnedAgentId, and consume the pending entry.
+      // On miss: register as orphan; the parent's tool_use may arrive
+      // later (reverse race) and adopt via the tool_use case.
+      let parentToolUseId: string | null = null
+      let description = '(uncorrelated)'
+      let subagentType: string | undefined
+      let pendingAgentSpawns = state.pendingAgentSpawns
+      let items = state.items
+      for (const [parentId, pending] of pendingAgentSpawns) {
+        if (pending.promptText === event.firstPromptText) {
+          parentToolUseId = parentId
+          description = pending.description
+          subagentType = pending.subagentType
+          const nextPending = new Map(pendingAgentSpawns)
+          nextPending.delete(parentId)
+          pendingAgentSpawns = nextPending
+          // Link the [Main] checklist item back so renderer can keep
+          // its 🤖 state consistent.
+          items = items.map((it) =>
+            it.toolUseId === parentId
+              ? { ...it, spawnedAgentId: event.agentId }
+              : it,
+          )
+          break
+        }
+      }
+      const sub: SubAgentState = {
+        agentId: event.agentId,
+        description,
+        subagentType: subagentType ?? event.subagentType,
+        parentToolUseId,
+        state: 'running',
+        startedAt: now,
+        toolCount: 0,
+        firstPromptText: event.firstPromptText,
+        nestedSpawnCount: 0,
+      }
+      const subAgents = new Map(state.subAgents)
+      subAgents.set(event.agentId, sub)
+      return { ...state, subAgents, pendingAgentSpawns, items }
+    }
+
+    case 'sub_agent_tool_use': {
+      const sa = state.subAgents.get(event.agentId)
+      if (!sa) return state
+      const next = new Map(state.subAgents)
+      next.set(event.agentId, {
+        ...sa,
+        toolCount: sa.toolCount + 1,
+        currentTool: event.toolUseId
+          ? {
+              tool: event.toolName,
+              label: toolLabel(event.toolName, event.input),
+              toolUseId: event.toolUseId,
+              startedAt: now,
+            }
+          : sa.currentTool,
+      })
+      return { ...state, subAgents: next }
+    }
+
+    case 'sub_agent_tool_result': {
+      const sa = state.subAgents.get(event.agentId)
+      if (!sa) return state
+      // Per design §3.3: per-tool errors don't fail the agent; only the
+      // parent's tool_result does. We just clear currentTool if it
+      // matches.
+      if (sa.currentTool && sa.currentTool.toolUseId === event.toolUseId) {
+        const next = new Map(state.subAgents)
+        next.set(event.agentId, { ...sa, currentTool: undefined })
+        return { ...state, subAgents: next }
+      }
+      return state
+    }
+
+    case 'sub_agent_turn_end': {
+      const sa = state.subAgents.get(event.agentId)
+      if (!sa) return state
+      // Tentative close: parent's tool_result is still authoritative.
+      // If it later arrives with isError=true, the tool_result case
+      // overrides this 'done' with 'failed'.
+      const next = new Map(state.subAgents)
+      next.set(event.agentId, { ...sa, state: 'done', finishedAt: now })
+      return { ...state, subAgents: next }
+    }
+
+    case 'sub_agent_nested_spawn': {
+      const sa = state.subAgents.get(event.agentId)
+      if (!sa) return state
+      const next = new Map(state.subAgents)
+      next.set(event.agentId, { ...sa, nestedSpawnCount: sa.nestedSpawnCount + 1 })
+      return { ...state, subAgents: next }
     }
 
     case 'turn_end': {
@@ -240,7 +419,20 @@ export function reduce(
       const items = state.items.map((it) =>
         it.state === 'running' ? { ...it, state: 'done' as const, finishedAt: now } : it,
       )
-      return { ...state, items, stage: 'done', thinking: false }
+      // Close any still-running sub-agents + clear pending spawns that
+      // never correlated.
+      const subAgents = new Map<string, SubAgentState>()
+      for (const [k, sa] of state.subAgents) {
+        subAgents.set(k, sa.state === 'running' ? { ...sa, state: 'done', finishedAt: now } : sa)
+      }
+      return {
+        ...state,
+        items,
+        subAgents,
+        pendingAgentSpawns: new Map(),
+        stage: 'done',
+        thinking: false,
+      }
     }
 
     case 'dequeue':
@@ -346,6 +538,11 @@ export function applyVisibleCap(
 /**
  * Render the current state to Telegram HTML. `now` is the wall-clock time
  * used for elapsed-time calculations so the render is deterministic in tests.
+ *
+ * Multi-agent: when `PROGRESS_CARD_MULTI_AGENT=1` AND there is any sub-agent
+ * activity (subAgents non-empty OR pendingAgentSpawns non-empty), the card
+ * splits into [Main] / [Sub-agents] sections. Otherwise the layout is
+ * byte-identical to the legacy single-section card.
  */
 export function render(state: ProgressCardState, now: number): string {
   if (state.turnStartedAt === 0) {
@@ -369,6 +566,16 @@ export function render(state: ProgressCardState, now: number): string {
   // Thin visual separator so the bullets below don't blur into the header.
   lines.push('─ ─ ─')
 
+  const multiAgentActive =
+    isMultiAgentEnabled() &&
+    (state.subAgents.size > 0 || state.pendingAgentSpawns.size > 0)
+
+  // [Main] header only when multi-agent rendering is active. Keeps the
+  // single-agent case visually unchanged (no header, just the checklist).
+  if (multiAgentActive) {
+    lines.push(`[Main · ${state.items.length} tools]`)
+  }
+
   // Checklist — preserve insertion order; running items show elapsed time.
   // The old static "🤔 Plan → 🔧 Run → ✅ Done" phase line is gone: users
   // asked for a live per-tool-call checklist instead. The header banner
@@ -379,23 +586,18 @@ export function render(state: ProgressCardState, now: number): string {
     lines.push(`  … (+${visible.overflowCount} more earlier steps)`)
   }
   for (const item of visible.items) {
-    const emoji = STATE_EMOJI[item.state]
-    if (item.state === 'running') {
-      const dur = formatDuration(now - item.startedAt)
-      lines.push(`  ${emoji} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`)
-    } else if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
-      if (item.kind === 'rollup') {
-        lines.push(`  ${emoji} ${escapeHtml(item.tool)} <i>×${item.count}</i>`)
-      } else {
-        // Short tools don't need duration — they're ~always sub-second.
-        const dur = formatDuration(item.finishedAt - item.startedAt)
-        const needsDuration = item.finishedAt - item.startedAt >= 1000
-        lines.push(
-          `  ${emoji} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`,
-        )
+    lines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
+  }
+
+  // [Sub-agents] section
+  if (multiAgentActive && state.subAgents.size > 0) {
+    lines.push('') // blank separator
+    const counts = countSubAgentStates(state.subAgents)
+    lines.push(`[Sub-agents · ${formatSubAgentCounts(counts)}]`)
+    for (const sa of sortSubAgentsChrono(state.subAgents)) {
+      for (const l of renderSubAgent(sa, now, state.stage === 'done')) {
+        lines.push(l)
       }
-    } else {
-      lines.push(`  ${emoji} ${renderItemCore(item.tool, item.label)}`)
     }
   }
 
@@ -406,6 +608,142 @@ export function render(state: ProgressCardState, now: number): string {
   }
 
   return lines.join('\n')
+}
+
+/**
+ * Render one [Main]-section line. Encapsulates the existing per-state
+ * branches (running/rollup/done) so the main render() loop reads cleanly.
+ *
+ * Multi-agent twist (Ken locked-in #4): an `Agent`/`Task` item with a
+ * correlated, still-running sub-agent stays in the 🤖 emoji even if its
+ * own state field already happens to be 'running' — and we DON'T flip it
+ * to ✅ on a tentative `sub_agent_turn_end`. Only the parent's own
+ * tool_result (which mutates `item.state` to 'done'/'failed') flips it.
+ */
+function renderMainItem(
+  item: RolledItem,
+  now: number,
+  multiAgentActive: boolean,
+  subAgents: ReadonlyMap<string, SubAgentState>,
+): string {
+  const isAgent = item.tool === 'Agent' || item.tool === 'Task'
+  const indent = multiAgentActive ? '  ' : '  '
+
+  if (isAgent && item.state === 'running' && multiAgentActive) {
+    // Hold the 🤖 emoji while the sub-agent (if correlated) is alive.
+    // Show elapsed since the parent's tool_use fired.
+    const dur = formatDuration(now - item.startedAt)
+    return `${indent}🤖 ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
+  }
+
+  const emoji = STATE_EMOJI[item.state]
+  if (item.state === 'running') {
+    const dur = formatDuration(now - item.startedAt)
+    return `${indent}${emoji} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
+  }
+  if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
+    if (item.kind === 'rollup') {
+      return `${indent}${emoji} ${escapeHtml(item.tool)} <i>×${item.count}</i>`
+    }
+    const dur = formatDuration(item.finishedAt - item.startedAt)
+    const needsDuration = item.finishedAt - item.startedAt >= 1000
+    // For Agent/Task in multi-agent mode, prefix emoji is the regular
+    // ✅/❌ — design §1.4 shows "✅ Agent: …" on the final card. The
+    // sub-agent's own state lives in the [Sub-agents] section.
+    return `${indent}${emoji} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
+  }
+  // pending fallback
+  void subAgents
+  return `${indent}${emoji} ${renderItemCore(item.tool, item.label)}`
+}
+
+/**
+ * Sort sub-agents by chronological start time — oldest first (Ken
+ * locked-in #1). Stable across renders so rows don't shuffle as states
+ * transition. We deliberately do NOT bucket by state (failed-first /
+ * done-first) because state changes mid-turn would cause visible
+ * reorder.
+ */
+function sortSubAgentsChrono(
+  subAgents: ReadonlyMap<string, SubAgentState>,
+): SubAgentState[] {
+  return Array.from(subAgents.values()).sort((a, b) => a.startedAt - b.startedAt)
+}
+
+interface SubAgentCounts {
+  running: number
+  done: number
+  failed: number
+}
+
+function countSubAgentStates(
+  subAgents: ReadonlyMap<string, SubAgentState>,
+): SubAgentCounts {
+  let running = 0
+  let done = 0
+  let failed = 0
+  for (const sa of subAgents.values()) {
+    if (sa.state === 'running') running++
+    else if (sa.state === 'done') done++
+    else if (sa.state === 'failed') failed++
+  }
+  return { running, done, failed }
+}
+
+function formatSubAgentCounts(c: SubAgentCounts): string {
+  const parts: string[] = []
+  if (c.running > 0) parts.push(`${c.running} running`)
+  if (c.done > 0) parts.push(`${c.done} done`)
+  if (c.failed > 0) parts.push(`${c.failed} failed`)
+  return parts.length === 0 ? '0' : parts.join(', ')
+}
+
+/**
+ * Render a sub-agent block. Two lines while running (header + current
+ * activity), one line when done/failed (compact summary).
+ *
+ * Header line includes:
+ *  - state emoji (🤖 running, ✅ done, ❌ failed)
+ *  - description (or '(uncorrelated)' for orphans)
+ *  - subagent_type after a ` · ` separator (Ken locked-in #2 — always show)
+ *  - elapsed time
+ *  - `(spawned N)` suffix when nestedSpawnCount > 0 (Ken locked-in #3)
+ *
+ * The `forceCollapse` arg is set on `turn_end` (Ken locked-in #5) so the
+ * archived card never carries the running two-line shape.
+ */
+function renderSubAgent(
+  sa: SubAgentState,
+  now: number,
+  forceCollapse: boolean,
+): string[] {
+  const desc = sa.description || '(uncorrelated)'
+  const typeSuffix = sa.subagentType ? ` · ${escapeHtml(sa.subagentType)}` : ''
+  const spawnedSuffix = sa.nestedSpawnCount > 0
+    ? ` <i>(spawned ${sa.nestedSpawnCount})</i>`
+    : ''
+
+  if (sa.state !== 'running' || forceCollapse) {
+    const emoji = sa.state === 'failed' ? '❌' : '✅'
+    const end = sa.finishedAt ?? now
+    const dur = formatDuration(end - sa.startedAt)
+    return [
+      `  ${emoji} ${escapeHtml(truncate(desc, 50))}${typeSuffix} · ${dur} · ${sa.toolCount} tools${spawnedSuffix}`,
+    ]
+  }
+
+  // Running: two-line block.
+  const elapsed = formatDuration(now - sa.startedAt)
+  const headerLine = `  🤖 <b>${escapeHtml(truncate(desc, 50))}</b>${typeSuffix} · ⏱ ${elapsed}${spawnedSuffix}`
+  if (sa.currentTool) {
+    const cur = sa.currentTool
+    const curDur = formatDuration(now - cur.startedAt)
+    return [
+      headerLine,
+      `     └ 🔧 ${renderItemCore(cur.tool, cur.label)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
+    ]
+  }
+  return [headerLine, `     └ <i>(idle)</i> · ${sa.toolCount} tools`]
 }
 
 /**

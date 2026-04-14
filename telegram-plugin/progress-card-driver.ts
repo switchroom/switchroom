@@ -61,6 +61,19 @@ export interface ProgressDriverConfig {
    * any chat has a running turn. Default 5000. Set to 0 to disable.
    */
   heartbeatMs?: number
+  /**
+   * Multi-agent rate-limit guardrail (design §4.4). Telegram caps edits
+   * at ~20/min/chat. With N parallel sub-agents emitting bursty events
+   * the default 400ms coalesce + 500ms floor can exceed the cap. When
+   * we observe more than `editBudgetThreshold` edits in the trailing
+   * 60s for a chat, the coalesce window expands to `editBudgetCoalesceMs`
+   * until the rate drops back. Heartbeat is also suppressed while the
+   * budget is hot.
+   *
+   * Defaults: threshold=18, coalesce window when hot=3000ms.
+   */
+  editBudgetThreshold?: number
+  editBudgetCoalesceMs?: number
 }
 
 /**
@@ -142,6 +155,27 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       clearInterval(handle)
     })
   const heartbeatMs = config.heartbeatMs ?? 5000
+  const editBudgetThreshold = config.editBudgetThreshold ?? 18
+  const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
+  // Per-chat sliding 60s window of recent emit timestamps. When the
+  // window holds more than `editBudgetThreshold` entries we're "hot"
+  // and coalesce more aggressively.
+  const editTimestamps = new Map<string, number[]>()
+  function recordEdit(k: string): void {
+    const arr = editTimestamps.get(k) ?? []
+    arr.push(now())
+    // Drop entries older than 60s.
+    const cutoff = now() - 60_000
+    while (arr.length > 0 && arr[0] < cutoff) arr.shift()
+    editTimestamps.set(k, arr)
+  }
+  function isBudgetHot(k: string): boolean {
+    const arr = editTimestamps.get(k)
+    if (!arr) return false
+    const cutoff = now() - 60_000
+    while (arr.length > 0 && arr[0] < cutoff) arr.shift()
+    return arr.length >= editBudgetThreshold
+  }
 
   const chats = new Map<string, PerChatState>()
   // Track the last enqueued chat so non-enqueue session events (tool_use,
@@ -173,6 +207,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // (rounded to the heartbeat period) advanced.
       for (const [k, cs] of chats) {
         if (cs.state.stage === 'done') continue
+        // Skip heartbeat while the chat is hot — sub-agent bursts are
+        // already producing edits, the elapsed counter is ticking from
+        // those, and an extra heartbeat edit just spends budget. (Design
+        // §4.4: "heartbeat respects budget too".)
+        if (isBudgetHot(k)) continue
         const html = render(cs.state, now())
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(k)
@@ -180,6 +219,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         lastHeartbeatBucket.set(k, bucket)
         cs.lastEmittedHtml = html
         cs.lastEmittedAt = now()
+        recordEdit(k)
         config.emit({
           chatId: cs.chatId,
           threadId: cs.threadId,
@@ -208,6 +248,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()
+    const k = key(chatState.chatId, chatState.threadId)
+    recordEdit(k)
     config.emit({
       chatId: chatState.chatId,
       threadId: chatState.threadId,
@@ -230,6 +272,24 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     for (let i = 0; i < a.items.length; i++) {
       if (a.items[i].state !== b.items[i].state) return true
       if (a.items[i].tool !== b.items[i].tool) return true
+      // Multi-agent: spawnedAgentId attached on correlation matters for
+      // the [Main] line's 🤖 vs ✅ glyph (PR 3 renderer).
+      if (a.items[i].spawnedAgentId !== b.items[i].spawnedAgentId) return true
+    }
+    // Multi-agent: any change in sub-agent shape or per-sub-agent state
+    // is user-visible. Cheap O(N) scan; N is the sub-agent count, which
+    // is bounded by how many parallel Agent calls one turn makes (~4–12
+    // in practice).
+    if (a.subAgents.size !== b.subAgents.size) return true
+    for (const [k, sa] of a.subAgents) {
+      const sb = b.subAgents.get(k)
+      if (!sb) return true
+      if (sa.state !== sb.state) return true
+      if (sa.toolCount !== sb.toolCount) return true
+      if (sa.description !== sb.description) return true
+      if (sa.parentToolUseId !== sb.parentToolUseId) return true
+      if (sa.nestedSpawnCount !== sb.nestedSpawnCount) return true
+      if ((sa.currentTool?.toolUseId ?? null) !== (sb.currentTool?.toolUseId ?? null)) return true
     }
     return false
   }
@@ -310,6 +370,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           // Drop the chat state so a subsequent turn starts clean.
           chats.delete(k)
           lastHeartbeatBucket.delete(k)
+          editTimestamps.delete(k)
           if (currentChatId === chatId && currentThreadId === threadId) {
             currentChatId = null
             currentThreadId = undefined
@@ -331,8 +392,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // defer to at least minIntervalMs after the last emit. Also always
       // coalesce bursts — even a burst that runs past minIntervalMs gets
       // at most one flush per coalesce window.
+      //
+      // Multi-agent rate-limit: if the chat has emitted >threshold edits
+      // in the last 60s, expand the coalesce window to
+      // editBudgetCoalesceMs (default 3s) so the Telegram 20/min cap is
+      // never exceeded by sub-agent bursts.
       const sinceLast = now() - chatState.lastEmittedAt
-      const delay = Math.max(coalesceMs, minIntervalMs - sinceLast, 0)
+      const effectiveCoalesce = isBudgetHot(k) ? editBudgetCoalesceMs : coalesceMs
+      const delay = Math.max(effectiveCoalesce, minIntervalMs - sinceLast, 0)
       chatState.pendingTimer = setT(() => {
         // Defensive: if the chat was deleted between schedule and fire
         // (e.g. a turn_end racing with an async boundary added later),
