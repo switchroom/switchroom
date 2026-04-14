@@ -22,8 +22,16 @@
  * locate the projects dir without parsing TUI output or shelling out.
  */
 
-import { existsSync, readFileSync, statSync, watch, type FSWatcher } from 'fs'
-import { readdirSync } from 'fs'
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readSync,
+  statSync,
+  watch,
+  type FSWatcher,
+} from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -247,11 +255,11 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       }
       if (stat.size === cursor) return
       const buf = Buffer.alloc(stat.size - cursor)
-      const fd = require('node:fs').openSync(currentFile, 'r')
+      const fd = openSync(currentFile, 'r')
       try {
-        require('node:fs').readSync(fd, buf, 0, buf.length, cursor)
+        readSync(fd, buf, 0, buf.length, cursor)
       } finally {
-        require('node:fs').closeSync(fd)
+        closeSync(fd)
       }
       cursor = stat.size
       const text = pendingPartial + buf.toString('utf-8')
