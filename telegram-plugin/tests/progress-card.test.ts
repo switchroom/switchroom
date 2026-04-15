@@ -10,7 +10,9 @@ import {
   initialState,
   reduce,
   render,
+  compactItems,
   type ProgressCardState,
+  type ChecklistItem,
 } from '../progress-card.js'
 
 function fold(events: SessionEvent[], startNow = 1000): ProgressCardState {
@@ -235,7 +237,7 @@ describe('progress-card render', () => {
     expect(out).toContain('(00:03)')
   })
 
-  it('rolls up 5+ consecutive identical done tools', () => {
+  it('rolls up 2+ consecutive identical done tools (threshold lowered from 5)', () => {
     let st: ProgressCardState = initialState()
     st = reduce(st, enqueue('scan'), 1000)
     for (let i = 0; i < 6; i++) {
@@ -273,6 +275,94 @@ describe('progress-card render', () => {
     expect(out).not.toContain('×')
     expect(out.match(/Read/g) ?? []).toHaveLength(3)
     expect(out.match(/Grep/g) ?? []).toHaveLength(3)
+  })
+
+  it('rolls up exactly 2 identical done items (B1: new lower threshold)', () => {
+    // The old threshold was 5. With the new threshold=2, just two consecutive
+    // identical tool+label items should collapse.
+    let st = initialState()
+    st = reduce(st, enqueue('scan'), 1000)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Bash', input: { command: 'git status' } }, 1100)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'a', toolName: 'Bash' }, 1200)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Bash', input: { command: 'git status' } }, 1300)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'b', toolName: 'Bash' }, 1400)
+    const out = render(st, 2000)
+    expect(out).toContain('×2')
+    // Label is shown in the rollup (B3: identical label preserved)
+    expect(out).toContain('git status')
+    // Only one Bash line, not two
+    expect(out.match(/Bash/g) ?? []).toHaveLength(1)
+  })
+
+  it('includes label in rollup when all items share the same label (B3: semantic label dedup)', () => {
+    // B3: when items have identical tool+label, the label is preserved in the
+    // rollup. Instead of "Read ×3" (which drops context), user sees "Read foo.ts ×3".
+    let st = initialState()
+    st = reduce(st, enqueue('scan'), 1000)
+    for (let i = 0; i < 3; i++) {
+      st = reduce(st, { kind: 'tool_use', toolName: 'Read', input: { file_path: '/project/src/foo.ts' } }, 1100 + i * 100)
+      st = reduce(st, { kind: 'tool_result', toolUseId: `r${i}`, toolName: 'Read' }, 1150 + i * 100)
+    }
+    const out = render(st, 2000)
+    // Should show "Read foo.ts ×3", not just "Read ×3"
+    expect(out).toContain('foo.ts')
+    expect(out).toContain('×3')
+    expect(out.match(/Read/g) ?? []).toHaveLength(1)
+  })
+
+  it('collapses 3+ same-tool mixed-label items into a label-free rollup (C1: heuristic)', () => {
+    // C1: when 3+ consecutive items have the same tool but different labels,
+    // they collapse to "Tool ×N" (no label). Better than 3–5 separate lines;
+    // accepts the loss of individual file names as a noise-reduction trade-off.
+    let st = initialState()
+    st = reduce(st, enqueue('scan'), 1000)
+    const files = ['alpha.ts', 'beta.ts', 'gamma.ts']
+    for (let i = 0; i < files.length; i++) {
+      st = reduce(st, { kind: 'tool_use', toolName: 'Read', input: { file_path: `/src/${files[i]}` } }, 1100 + i * 100)
+      st = reduce(st, { kind: 'tool_result', toolUseId: `r${i}`, toolName: 'Read' }, 1150 + i * 100)
+    }
+    const out = render(st, 2000)
+    // Three different file names → no single representative label → label dropped
+    expect(out).toContain('✅ Read')
+    expect(out).toContain('×3')
+    expect(out).not.toContain('alpha')
+    expect(out).not.toContain('beta')
+    expect(out).not.toContain('gamma')
+    expect(out.match(/Read/g) ?? []).toHaveLength(1)
+  })
+
+  it('does NOT collapse 2 same-tool mixed-label items (below MIXED_ROLLUP_THRESHOLD=3)', () => {
+    // Two Read calls with different files stay separate — only 3+ triggers
+    // the mixed-label heuristic rollup.
+    let st = initialState()
+    st = reduce(st, enqueue('scan'), 1000)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Read', input: { file_path: '/src/a.ts' } }, 1100)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'r0', toolName: 'Read' }, 1200)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Read', input: { file_path: '/src/b.ts' } }, 1300)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'r1', toolName: 'Read' }, 1400)
+    const out = render(st, 2000)
+    // Two different files — no rollup, both visible
+    expect(out).not.toContain('×')
+    expect(out).toContain('a.ts')
+    expect(out).toContain('b.ts')
+  })
+
+  it('mixed-label run of 4 collapses; same-label pair within the same tool stays labeled', () => {
+    // Regression: ensure a run that has ≥3 mixed labels collapses even if some
+    // items within it share a label.
+    let st = initialState()
+    st = reduce(st, enqueue('scan'), 1000)
+    const files = ['a.ts', 'a.ts', 'b.ts', 'c.ts'] // first two are same, last two differ
+    for (let i = 0; i < files.length; i++) {
+      st = reduce(st, { kind: 'tool_use', toolName: 'Read', input: { file_path: `/src/${files[i]}` } }, 1100 + i * 100)
+      st = reduce(st, { kind: 'tool_result', toolUseId: `r${i}`, toolName: 'Read' }, 1150 + i * 100)
+    }
+    const out = render(st, 2000)
+    // The run [a.ts, a.ts, b.ts, c.ts] has 4 items with mixed labels → C1 applies
+    expect(out).toContain('×4')
+    // No individual file names shown (label dropped because mixed)
+    expect(out).not.toContain('a.ts')
+    expect(out).not.toContain('b.ts')
   })
 
   it('truncates long user requests', () => {
@@ -650,5 +740,121 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.subAgents.get('X')?.state).toBe('done')
     expect(st.pendingAgentSpawns.size).toBe(0)
     expect(st.stage).toBe('done')
+  })
+})
+
+// ─── compactItems unit tests ─────────────────────────────────────────────
+// Direct tests of the pure compactItems() function. The render() integration
+// tests above verify end-to-end output; these pin the compaction logic itself
+// so regressions are caught at the unit level before they bubble up.
+
+function makeItem(
+  id: number,
+  tool: string,
+  label: string,
+  state: 'done' | 'running' | 'failed' = 'done',
+): ChecklistItem {
+  return {
+    id,
+    toolUseId: null,
+    tool,
+    label,
+    state,
+    startedAt: 1000 + id * 100,
+    finishedAt: state === 'done' ? 1050 + id * 100 : undefined,
+  }
+}
+
+describe('compactItems', () => {
+  it('single item stays as single', () => {
+    const out = compactItems([makeItem(0, 'Read', 'foo.ts')])
+    expect(out).toHaveLength(1)
+    expect(out[0].kind).toBe('single')
+  })
+
+  it('two identical tool+label done items → rollup with label (B1+B3)', () => {
+    const out = compactItems([makeItem(0, 'Read', 'foo.ts'), makeItem(1, 'Read', 'foo.ts')])
+    expect(out).toHaveLength(1)
+    expect(out[0].kind).toBe('rollup')
+    expect(out[0].count).toBe(2)
+    expect(out[0].label).toBe('foo.ts')
+  })
+
+  it('three mixed-label same-tool done items → rollup without label (C1)', () => {
+    const out = compactItems([
+      makeItem(0, 'Read', 'a.ts'),
+      makeItem(1, 'Read', 'b.ts'),
+      makeItem(2, 'Read', 'c.ts'),
+    ])
+    expect(out).toHaveLength(1)
+    expect(out[0].kind).toBe('rollup')
+    expect(out[0].count).toBe(3)
+    expect(out[0].label).toBe('') // label dropped — no single representative
+  })
+
+  it('two mixed-label same-tool done items → NOT collapsed (below MIXED_ROLLUP_THRESHOLD)', () => {
+    const out = compactItems([makeItem(0, 'Read', 'a.ts'), makeItem(1, 'Read', 'b.ts')])
+    expect(out).toHaveLength(2)
+    expect(out[0].kind).toBe('single')
+    expect(out[1].kind).toBe('single')
+  })
+
+  it('running item in a run prevents any rollup', () => {
+    const out = compactItems([
+      makeItem(0, 'Bash', 'git status'),
+      makeItem(1, 'Bash', 'git status'),
+      makeItem(2, 'Bash', 'git status', 'running'),
+    ])
+    // allDone=false → no rollup
+    expect(out).toHaveLength(3)
+    expect(out.every(x => x.kind === 'single')).toBe(true)
+  })
+
+  it('failed item in a run prevents rollup', () => {
+    const out = compactItems([
+      makeItem(0, 'Bash', 'npm test'),
+      makeItem(1, 'Bash', 'npm test', 'failed'),
+      makeItem(2, 'Bash', 'npm test'),
+    ])
+    expect(out).toHaveLength(3)
+    expect(out.every(x => x.kind === 'single')).toBe(true)
+  })
+
+  it('rollup preserves first.startedAt and last.finishedAt', () => {
+    const items: ChecklistItem[] = [
+      { id: 0, toolUseId: null, tool: 'Read', label: 'x', state: 'done', startedAt: 100, finishedAt: 200 },
+      { id: 1, toolUseId: null, tool: 'Read', label: 'x', state: 'done', startedAt: 300, finishedAt: 500 },
+    ]
+    const out = compactItems(items)
+    expect(out[0].startedAt).toBe(100)
+    expect(out[0].finishedAt).toBe(500)
+  })
+
+  it('two runs in sequence each compact independently', () => {
+    // [Read foo.ts ×2] [Bash git ×2] → two rollups
+    const out = compactItems([
+      makeItem(0, 'Read', 'foo.ts'),
+      makeItem(1, 'Read', 'foo.ts'),
+      makeItem(2, 'Bash', 'git status'),
+      makeItem(3, 'Bash', 'git status'),
+    ])
+    expect(out).toHaveLength(2)
+    expect(out[0]).toMatchObject({ kind: 'rollup', tool: 'Read', label: 'foo.ts', count: 2 })
+    expect(out[1]).toMatchObject({ kind: 'rollup', tool: 'Bash', label: 'git status', count: 2 })
+  })
+
+  it('interleaved tools break runs correctly', () => {
+    // Read, Bash, Read — each run is length 1, no rollup
+    const out = compactItems([
+      makeItem(0, 'Read', 'foo.ts'),
+      makeItem(1, 'Bash', 'git status'),
+      makeItem(2, 'Read', 'foo.ts'),
+    ])
+    expect(out).toHaveLength(3)
+    expect(out.every(x => x.kind === 'single')).toBe(true)
+  })
+
+  it('empty input returns empty output', () => {
+    expect(compactItems([])).toEqual([])
   })
 })
