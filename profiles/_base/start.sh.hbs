@@ -13,6 +13,14 @@ export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 # basename(process.cwd()) inside the plugin because Claude Code spawns
 # MCP servers with cwd = $HOME regardless of the parent's cwd.
 export SWITCHROOM_AGENT_NAME="{{name}}"
+{{#if switchroomConfigPathQ}}
+# SWITCHROOM_CONFIG lets the agent's own shell tool invoke `switchroom`
+# without passing `--config` every time. The telegram-plugin MCP server
+# already gets this via .mcp.json env, but the Claude Code process
+# doesn't inherit that — so without this export, `switchroom auth status`
+# from Bash inside the agent fails with "No switchroom.yaml found".
+export SWITCHROOM_CONFIG={{{switchroomConfigPathQ}}}
+{{/if}}
 {{#if hindsightEnabled}}
 # Hindsight memory plugin (vendored at .claude/plugins/hindsight-memory/).
 # Reads env vars at hook startup; settings.json autoMemoryEnabled: false
