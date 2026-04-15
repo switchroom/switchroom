@@ -192,6 +192,7 @@ import {
   removeActivePin,
   clearActivePins,
 } from './active-pins.js'
+import { sweepActivePins, sweepBotAuthoredPins } from './active-pins-sweep.js'
 
 /**
  * One-shot carry-over from the session-end summarizer: a short topic
@@ -1746,26 +1747,20 @@ if (streamMode === 'checklist') {
   // Failsafe: unpin any progress cards left over from a prior session
   // that crashed or was killed mid-turn. The in-memory pin map is lost
   // on restart, so without this sweep the stale pins stick forever.
-  // Best-effort — log and continue on any unpin error (the message may
-  // have been deleted, the bot may have been demoted, etc.).
+  // The /restart, /reconcile --restart, and /update command handlers
+  // also call sweepActivePins proactively before spawning the restart
+  // child — this startup sweep is the backstop for crash/kill paths
+  // that never reach that code.
   const startupAgentDir = resolveAgentDirFromEnv()
   if (startupAgentDir != null) {
-    const stalePins = readActivePins(startupAgentDir)
-    if (stalePins.length > 0) {
-      process.stderr.write(
-        `telegram channel: sweeping ${stalePins.length} stale progress-card pin(s) from prior session\n`,
-      )
-      for (const pin of stalePins) {
-        lockedBot.api
-          .unpinChatMessage(pin.chatId, pin.messageId)
-          .catch((err: Error) => {
-            process.stderr.write(
-              `telegram channel: stale-pin cleanup failed for ${pin.chatId}/${pin.messageId}: ${err.message}\n`,
-            )
-          })
-      }
-      clearActivePins(startupAgentDir)
-    }
+    void sweepActivePins(
+      startupAgentDir,
+      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      {
+        log: (msg) =>
+          process.stderr.write(`telegram channel: startup pin sweep — ${msg}\n`),
+      },
+    )
   }
 
   /**
@@ -1813,25 +1808,30 @@ if (streamMode === 'checklist') {
         if (isFirstEmit && !progressPinnedMsgIds.has(turnKey)) {
           progressPinnedMsgIds.set(turnKey, result.messageId)
           const pinnedMessageId = result.messageId
+          // Write the sidecar BEFORE calling pinChatMessage so a
+          // fast-follow self-restart can never leave a pinned card on
+          // Telegram without a matching sidecar entry. The pre-restart
+          // and startup sweeps both key off the sidecar, so a late
+          // write is indistinguishable from a missing pin. If the pin
+          // API then fails, we revert the sidecar entry below.
+          const agentDir = resolveAgentDirFromEnv()
+          if (agentDir != null) {
+            addActivePin(agentDir, {
+              chatId,
+              messageId: pinnedMessageId,
+              turnKey,
+              pinnedAt: Date.now(),
+            })
+          }
           lockedBot.api
             .pinChatMessage(chatId, pinnedMessageId, { disable_notification: true })
-            .then(() => {
-              // Persist after the API confirms the pin — if pinning
-              // failed we don't want a phantom entry in the sidecar.
-              const agentDir = resolveAgentDirFromEnv()
-              if (agentDir != null) {
-                addActivePin(agentDir, {
-                  chatId,
-                  messageId: pinnedMessageId,
-                  turnKey,
-                  pinnedAt: Date.now(),
-                })
-              }
-            })
             .catch((err: Error) => {
               process.stderr.write(
                 `telegram channel: progress-card pin failed: ${err.message}\n`,
               )
+              if (agentDir != null) {
+                removeActivePin(agentDir, chatId, pinnedMessageId)
+              }
             })
         }
       }).catch((err: Error) => {
@@ -1873,20 +1873,25 @@ if (streamMode === 'checklist') {
           })
       }
 
-      // Send a completion notification to the main chat (not the thread).
-      // In forum chats this goes to the general topic (no message_thread_id)
-      // so the user gets a top-level notification. In non-forum chats the
-      // threadId is undefined anyway, so it's just a normal message.
+      // Completion notification: only send in multi-topic forum mode, where
+      // the progress card lives in a specific topic thread and the user may
+      // have navigated away. The top-level General-topic ping lets them know
+      // the work is done without requiring them to check the topic.
       //
-      // Format: "✅ Done — <summary>" — compact, links back to context.
-      const completionText = `✅ Done — ${summary}`
-      lockedBot.api
-        .sendMessage(chatId, completionText)
-        .catch((err: Error) => {
-          process.stderr.write(
-            `telegram channel: progress-card completion message failed: ${err.message}\n`,
-          )
-        })
+      // In non-forum chats (threadId undefined) the agent's final reply is
+      // already in the user's face — a separate "Done" message is pure noise
+      // that appears confusingly right as the user sends their next request
+      // (onTurnComplete fires at force-close time, not necessarily at turn_end).
+      if (threadId != null) {
+        const completionText = `✅ Done — ${summary}`
+        lockedBot.api
+          .sendMessage(chatId, completionText)
+          .catch((err: Error) => {
+            process.stderr.write(
+              `telegram channel: progress-card completion message failed: ${err.message}\n`,
+            )
+          })
+      }
     },
   })
   process.stderr.write('telegram channel: progress-card driver active (stream_mode=checklist)\n')
@@ -2672,6 +2677,37 @@ function spawnSwitchroomDetached(args: string[]): void {
 }
 
 /**
+ * Unpin every still-pinned progress card before a self-restart.
+ *
+ * The startup sweep in the progress-driver bootstrap handles
+ * crashes and SIGKILLs that never reach command handlers, but we
+ * want the pins to disappear *as the user reads the ack message*
+ * rather than a few seconds later when the new bot boots. Call this
+ * from /restart, /reconcile --restart, and /update right after
+ * sending the ack and before spawning the detached switchroom
+ * child. Bounded by a 2s timeout so a hung Telegram API can't
+ * block the restart.
+ */
+async function sweepPinsBeforeSelfRestart(): Promise<void> {
+  const agentDir = resolveAgentDirFromEnv()
+  if (agentDir == null) return
+  try {
+    await sweepActivePins(
+      agentDir,
+      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      {
+        log: (msg) =>
+          process.stderr.write(`telegram channel: pre-restart pin sweep — ${msg}\n`),
+      },
+    )
+  } catch (err) {
+    process.stderr.write(
+      `telegram channel: pre-restart pin sweep threw: ${(err as Error).message}\n`,
+    )
+  }
+}
+
+/**
  * The agent name we're running as, derived from the cwd. start.sh sets
  * cwd to the agent's directory, so basename(cwd) is the agent name as
  * used in switchroom.yaml. Used to detect "self-restart" vs "restart some
@@ -3017,6 +3053,11 @@ bot.command('restart', async ctx => {
       ack_message_id: ackId,
       ts: Date.now(),
     })
+    // Clear any still-pinned progress cards before systemd kills us.
+    // The new bot's startup sweep is the backstop, but doing it here
+    // means the unpin lands while the user is still looking at the
+    // ack message instead of ~10s later.
+    await sweepPinsBeforeSelfRestart()
     // --force: the agent is busy by definition (it's processing this very
     // /restart turn). Without --force the CLI preflight falls to an interactive
     // askYesNo prompt on a detached stdin, gets EOF, returns false, and aborts
@@ -3273,6 +3314,7 @@ bot.command('reconcile', async ctx => {
       ack_message_id: ackId,
       ts: Date.now(),
     })
+    await sweepPinsBeforeSelfRestart()
     spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
     return
   }
@@ -3357,6 +3399,7 @@ bot.command('update', async ctx => {
     '🔄 Running <b>switchroom update</b> — git pull, deps, reconcile, restart. The bot will be back in ~30 seconds; check <code>/doctor</code> after to confirm.',
     { html: true },
   )
+  await sweepPinsBeforeSelfRestart()
   spawnSwitchroomDetached(['update'])
 })
 
@@ -4012,6 +4055,48 @@ void (async () => {
         process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
       }
       void registerSwitchroomBotCommands().catch(() => {})
+
+      // Boot-time stale-pin sweep. Complements the sidecar-driven
+      // `sweepActivePins` above: walks every allowlisted chat and
+      // unpins any bot-authored pins that are still visible on
+      // Telegram. Needed because pins can leak past the sidecar (pin
+      // API succeeded but sidecar write failed, or the sidecar file
+      // was lost). Fire-and-forget — never block polling on a slow
+      // or flaky Telegram API.
+      try {
+        const bootAccess = loadAccess()
+        const chatSet = new Set<string>(bootAccess.allowFrom)
+        for (const gid of Object.keys(bootAccess.groups)) chatSet.add(gid)
+        const chatIds = [...chatSet]
+        if (chatIds.length > 0) {
+          void sweepBotAuthoredPins(
+            chatIds,
+            me.id,
+            async (chatId) => {
+              const chat = await lockedBot.api.getChat(chatId)
+              const pinned = (chat as { pinned_message?: { message_id: number; from?: { id: number } } }).pinned_message
+              if (!pinned) return null
+              return {
+                messageId: pinned.message_id,
+                fromId: pinned.from?.id ?? null,
+              }
+            },
+            (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+            {
+              log: (msg) =>
+                process.stderr.write(`telegram channel: bot-authored pin sweep — ${msg}\n`),
+            },
+          ).catch((err: Error) =>
+            process.stderr.write(
+              `telegram channel: bot-authored pin sweep failed: ${err.message}\n`,
+            ),
+          )
+        }
+      } catch (err) {
+        process.stderr.write(
+          `telegram channel: bot-authored pin sweep setup failed: ${err}\n`,
+        )
+      }
 
       // Restart follow-up: if a marker was dropped by the previous bot
       // process before it got SIGTERM'd, send a "✅ restarted — ready"
