@@ -116,6 +116,41 @@ describe("scaffoldAgent", () => {
     expect(exportIdx).toBeLessThan(execIdx);
   });
 
+  it("start.sh exports SWITCHROOM_CONFIG when a config path is passed", () => {
+    // Without this export, `switchroom <anything>` from the agent's own
+    // Bash tool fails with "No switchroom.yaml found" because the CLI's
+    // search paths (cwd + ~/.switchroom) don't cover where the user
+    // actually keeps their config. The telegram plugin already gets the
+    // var via .mcp.json, but the Claude Code process itself doesn't
+    // inherit that — start.sh has to export it.
+    const config = makeAgentConfig();
+    const configPath = join(tmpDir, "switchroom.yaml");
+    writeFileSync(configPath, "switchroom: { agents_dir: . }\n");
+    const result = scaffoldAgent(
+      "cfg-agent",
+      config,
+      tmpDir,
+      telegramConfig,
+      undefined,
+      undefined,
+      configPath,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    expect(startSh).toContain(`export SWITCHROOM_CONFIG='${configPath}'`);
+    const exportIdx = startSh.indexOf("export SWITCHROOM_CONFIG=");
+    const execIdx = startSh.indexOf("exec claude");
+    expect(exportIdx).toBeGreaterThanOrEqual(0);
+    expect(exportIdx).toBeLessThan(execIdx);
+  });
+
+  it("start.sh omits SWITCHROOM_CONFIG export when no config path is passed", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("no-cfg-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).not.toContain("export SWITCHROOM_CONFIG=");
+  });
+
   it("session greeting uses Switchroom branding with 🎛️ icon", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("greet-agent", config, tmpDir, telegramConfig);
