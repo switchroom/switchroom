@@ -196,6 +196,59 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain("${TEXT//__SWITCHROOM_MODEL__/$MODEL}");
   });
 
+  it("session greeting renders a Quota row with ccusage + budget substitution", () => {
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "quota-agent": config },
+      quota: { weekly_budget_usd: 50, monthly_budget_usd: 200 },
+    } as SwitchroomConfig;
+
+    const result = scaffoldAgent(
+      "quota-agent",
+      config,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    // Quota row is a runtime placeholder in the TEXT template
+    expect(greeting).toMatch(/<b>Quota<\/b>\s+__SWITCHROOM_QUOTA__/);
+    // Budget values are baked into the script so the shell doesn't
+    // re-read switchroom.yaml
+    expect(greeting).toContain('WEEKLY_BUDGET="50"');
+    expect(greeting).toContain('MONTHLY_BUDGET="200"');
+    // ccusage is invoked with --json --offline so pricing doesn't
+    // require a network fetch
+    expect(greeting).toContain("ccusage@latest weekly --json --offline");
+    expect(greeting).toContain("ccusage@latest monthly --json --offline");
+    // The placeholder is replaced via shell parameter expansion
+    expect(greeting).toContain("${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}");
+    // Graceful fallback when ccusage/jq is unavailable
+    expect(greeting).toContain('[ -z "$QUOTA_STATUS" ] && QUOTA_STATUS="—"');
+  });
+
+  it("session greeting Quota row falls back to raw usage when no budget is set", () => {
+    const config = makeAgentConfig();
+    // No switchroomConfig passed → no quota section → empty budgets
+    const result = scaffoldAgent("no-budget-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    expect(greeting).toMatch(/<b>Quota<\/b>\s+__SWITCHROOM_QUOTA__/);
+    // Budgets are empty strings when unset — fmt_usage treats empty as
+    // "no budget" and skips the ratio
+    expect(greeting).toContain('WEEKLY_BUDGET=""');
+    expect(greeting).toContain('MONTHLY_BUDGET=""');
+  });
+
   it("generates telegram .env with bot token", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("bot-agent", config, tmpDir, telegramConfig);
