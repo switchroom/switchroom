@@ -789,38 +789,72 @@ describe('/auth subcommand router', () => {
 
 // ─── /reauth one-shot shortcut ───────────────────────────────────────────
 // Top-level /reauth command with smart defaults: current agent, active slot.
-// /reauth         → start reauth flow
-// /reauth <code>  → complete pending reauth (slot auto-resolved from session)
+// /reauth                → start reauth flow for current agent
+// /reauth <code>         → complete pending reauth (detected via looksLikeAuthCode)
+// /reauth <http://...>   → complete pending reauth (URL path)
+// /reauth <agent-name>   → start reauth for named agent (not a code)
 
 describe('/reauth one-shot', () => {
-  function routeReauth(raw: string, myAgent: string): { argv: string[]; label: string } {
-    const parts = raw.trim().split(/\s+/).filter(Boolean)
-    if (parts.length === 0) {
-      return { argv: ['auth', 'reauth', myAgent], label: `auth reauth ${myAgent}` }
-    }
-    const code = parts[0]
-    const slot = parts[1]
-    const argv = ['auth', 'code', myAgent, code, ...(slot ? ['--slot', slot] : [])]
-    return { argv, label: `auth code ${myAgent}` }
+  // Matches the FIXED dispatch logic in server.ts (using looksLikeAuthCode
+  // instead of only checking http/session_ prefixes).
+  function routeReauth(
+    raw: string,
+    myAgent: string,
+  ): { action: 'start'; agent: string } | { action: 'code'; agent: string; raw: string } {
+    const trimmed = raw.trim()
+    if (!trimmed) return { action: 'start', agent: myAgent }
+    // URL → always treat as code completion
+    if (trimmed.startsWith('http')) return { action: 'code', agent: myAgent, raw: trimmed }
+    // Looks like an auth code (session_, sk-ant-, or long alphanumeric) → code completion
+    if (looksLikeAuthCode(trimmed)) return { action: 'code', agent: myAgent, raw: trimmed }
+    // Otherwise → start reauth for the named agent
+    return { action: 'start', agent: trimmed }
   }
 
   it('no args → starts reauth for self', () => {
-    expect(routeReauth('', 'assistant').argv).toEqual(['auth', 'reauth', 'assistant'])
+    expect(routeReauth('', 'assistant')).toEqual({ action: 'start', agent: 'assistant' })
   })
 
-  it('one arg → treated as code, completes pending reauth for self', () => {
-    expect(routeReauth('ABC123', 'assistant').argv).toEqual(['auth', 'code', 'assistant', 'ABC123'])
+  it('sk-ant-oat token → code completion for self (was the bug: used to be treated as agent name)', () => {
+    // Pre-fix: /reauth sk-ant-oat01-abc123 was treated as "start reauth for agent sk-ant-oat01-abc123"
+    // Post-fix: looksLikeAuthCode detects it and routes to auth code
+    const r = routeReauth('sk-ant-oat01-abc_DEF-xyz', 'assistant')
+    expect(r).toEqual({ action: 'code', agent: 'assistant', raw: 'sk-ant-oat01-abc_DEF-xyz' })
   })
 
-  it('two args → code + explicit slot override', () => {
-    expect(routeReauth('ABC123 slot-2', 'assistant').argv).toEqual([
-      'auth', 'code', 'assistant', 'ABC123', '--slot', 'slot-2',
-    ])
+  it('session_ prefix → code completion for self', () => {
+    const r = routeReauth('session_abc123def456', 'assistant')
+    expect(r).toEqual({ action: 'code', agent: 'assistant', raw: 'session_abc123def456' })
   })
 
-  it('always defaults agent to self (never prompts for it)', () => {
-    expect(routeReauth('', 'coach').argv).toEqual(['auth', 'reauth', 'coach'])
-    expect(routeReauth('XYZ', 'coach').argv).toEqual(['auth', 'code', 'coach', 'XYZ'])
+  it('http URL → code completion for self', () => {
+    const r = routeReauth('https://claude.ai/oauth/authorize?code=abc', 'assistant')
+    expect(r).toEqual({ action: 'code', agent: 'assistant', raw: 'https://claude.ai/oauth/authorize?code=abc' })
+  })
+
+  it('long alphanumeric code → code completion for self', () => {
+    const r = routeReauth('ABC123XYZabc', 'assistant')
+    expect(r).toEqual({ action: 'code', agent: 'assistant', raw: 'ABC123XYZabc' })
+  })
+
+  it('short agent name → starts reauth for that agent (not treated as code)', () => {
+    // "coach" is 5 chars — under the 6-char min for looksLikeAuthCode
+    const r = routeReauth('coach', 'assistant')
+    expect(r).toEqual({ action: 'start', agent: 'coach' })
+  })
+
+  it('agent name with hyphens (6+ chars) could match looksLikeAuthCode — documents the ambiguity', () => {
+    // An agent name like "health-coach" (12 chars, alphanumeric + hyphens) would
+    // be detected as a code by looksLikeAuthCode. This is a known trade-off:
+    // agent names that look like codes get routed as code completion.
+    // Mitigation: users should use /auth reauth <agent> for named-agent reauth.
+    const r = routeReauth('health-coach', 'assistant')
+    // This is the current behavior — document it so future changes are explicit.
+    expect(r.action).toBe('code') // looksLikeAuthCode('health-coach') === true
+  })
+
+  it('empty string after trimming → starts reauth for self', () => {
+    expect(routeReauth('   ', 'coach')).toEqual({ action: 'start', agent: 'coach' })
   })
 })
 
@@ -931,6 +965,216 @@ describe('reauth auto-intercept', () => {
     const pending = { agent: 'assistant', startedAt: Date.now() }
     const result = shouldIntercept('  ABC123XYZ  ', pending)
     expect(result).toEqual({ argv: ['auth', 'code', 'assistant', 'ABC123XYZ'] })
+  })
+})
+
+// ─── /reconcile debounce ─────────────────────────────────────────────────
+// /reconcile self-restart now uses the same 15s debounce + restart-marker
+// pattern as /restart so the new bot posts a follow-up and duplicate taps
+// don't stack systemd reconcile+restarts.
+
+describe('/reconcile debounce', () => {
+  const DEBOUNCE_MS = 15_000
+
+  type RestartMarker = {
+    chat_id: string
+    thread_id: number | null
+    ack_message_id: number | null
+    ts: number
+  }
+
+  // Same debounce logic used for both /restart and /reconcile.
+  function shouldDebounce(existing: RestartMarker | null, now: number): boolean {
+    if (!existing) return false
+    return (now - existing.ts) < DEBOUNCE_MS
+  }
+
+  it('allows the first /reconcile (no marker)', () => {
+    expect(shouldDebounce(null, Date.now())).toBe(false)
+  })
+
+  it('debounces a duplicate /reconcile within 15s', () => {
+    const now = 1_000_000
+    const marker: RestartMarker = { chat_id: '1', thread_id: null, ack_message_id: 1, ts: now - 5_000 }
+    expect(shouldDebounce(marker, now)).toBe(true)
+  })
+
+  it('allows /reconcile after 15s', () => {
+    const now = 1_000_000
+    const marker: RestartMarker = { chat_id: '1', thread_id: null, ack_message_id: null, ts: now - 15_000 }
+    expect(shouldDebounce(marker, now)).toBe(false)
+  })
+
+  it('/restart and /reconcile share the same marker file — a /restart debounces a following /reconcile', () => {
+    // Both handlers write to restart-pending.json and both read it for debounce.
+    // A rapid /restart followed by /reconcile (or vice versa) within 15s
+    // should be debounced — they share the same mechanism.
+    const now = 1_000_000
+    const restartMarker: RestartMarker = { chat_id: '1', thread_id: null, ack_message_id: 99, ts: now - 3_000 }
+    // Reconcile arriving 3s after restart → debounced
+    expect(shouldDebounce(restartMarker, now)).toBe(true)
+  })
+})
+
+// ─── formatAuthOutputForTelegram ─────────────────────────────────────────
+// Pure function: formats switchroom auth output for Telegram HTML.
+// Extracts login URLs, bolds key lines, wraps commands in <code>.
+
+describe('formatAuthOutputForTelegram', () => {
+  function stripAnsi(text: string): string {
+    return text
+      .replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1B[@-_]/g, '')
+      .replace(/\r/g, '')
+  }
+
+  function preBlock(text: string): string {
+    return '<pre>' + text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>'
+  }
+
+  function escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+
+  function formatAuthOutputForTelegram(output: string): string {
+    const trimmed = stripAnsi(output).trim()
+    const url = trimmed.match(/https:\/\/\S+/)?.[0] ?? null
+    const lines = trimmed.split(/\n+/).map(l => l.trim()).filter(Boolean)
+
+    if (!url) {
+      return preBlock(trimmed.length > 4000 ? trimmed.slice(0, 3980) + '\n... (truncated)' : trimmed)
+    }
+
+    const body = lines.filter(line => line !== url)
+    const rendered = body.map(line => {
+      if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) {
+        return `<b>${escapeHtml(line)}</b>`
+      }
+      if (line.startsWith('Then finish with:') || line.startsWith('Cancel with:')) {
+        return escapeHtml(line)
+      }
+      if (line.startsWith('switchroom auth ')) {
+        return `<code>${escapeHtml(line)}</code>`
+      }
+      return escapeHtml(line)
+    })
+
+    rendered.push('', `<a href="${escapeHtml(url)}">Open Claude login</a>`, escapeHtml(url))
+    return rendered.join('\n')
+  }
+
+  it('wraps plain output (no URL) in a code block', () => {
+    const result = formatAuthOutputForTelegram('Agent already authenticated.\n  Expires: 7h 28m')
+    expect(result).toContain('<pre>')
+    expect(result).toContain('Agent already authenticated.')
+  })
+
+  it('extracts URL and converts it to a clickable link', () => {
+    const output = [
+      'Started Claude auth for agent "assistant" in tmux session switchroom-auth-assistant.',
+      'Open this URL in your browser:',
+      'https://claude.ai/oauth/authorize?code=true&client_id=abc123',
+      '',
+      'After Claude shows you a browser code, finish with:',
+      '  switchroom auth code assistant <browser-code>',
+    ].join('\n')
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).toContain('<a href="https://claude.ai/oauth/authorize?code=true&amp;client_id=abc123">Open Claude login</a>')
+    expect(result).not.toContain('<pre>')
+  })
+
+  it('bolds "Started Claude auth" header line', () => {
+    const output = 'Started Claude auth for agent "assistant".\nhttps://claude.ai/oauth/authorize?foo=bar'
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).toContain('<b>Started Claude auth')
+  })
+
+  it('bolds "Auth session already running" line', () => {
+    const output = 'Auth session already running for agent "assistant".\nhttps://claude.ai/oauth/authorize?foo=bar'
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).toContain('<b>Auth session already running')
+  })
+
+  it('wraps switchroom auth commands in <code>', () => {
+    const output = [
+      'Started Claude auth.',
+      'switchroom auth code assistant <browser-code>',
+      'https://claude.ai/oauth/authorize?foo=bar',
+    ].join('\n')
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).toContain('<code>switchroom auth code assistant &lt;browser-code&gt;</code>')
+  })
+
+  it('HTML-escapes agent names and tokens in output', () => {
+    const output = 'Error: <unknown> agent & token="test"\nhttps://claude.ai/oauth/authorize?x=1'
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).not.toContain('<unknown>')
+    expect(result).toContain('&lt;unknown&gt;')
+    expect(result).toContain('&amp;')
+  })
+
+  it('strips ANSI escape codes from CLI output', () => {
+    const output = '\x1B[32mStarted Claude auth for agent "assistant".\x1B[0m\nhttps://claude.ai/x'
+    const result = formatAuthOutputForTelegram(output)
+    expect(result).not.toContain('\x1B')
+    expect(result).toContain('Started Claude auth')
+  })
+})
+
+// ─── /logs argument parsing ──────────────────────────────────────────────
+
+describe('/logs argument parsing', () => {
+  function parseLogsArgs(
+    matchStr: string,
+    myAgent: string,
+  ): { name: string; lineCount: number } {
+    const parts = matchStr.trim().split(/\s+/).filter(Boolean)
+    let name: string
+    let linesArg: string | undefined
+    if (parts.length === 0) {
+      name = myAgent
+    } else if (parts.length === 1 && /^\d+$/.test(parts[0])) {
+      name = myAgent
+      linesArg = parts[0]
+    } else {
+      name = parts[0]
+      linesArg = parts[1]
+    }
+    const lines = linesArg ? parseInt(linesArg, 10) : 20
+    const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
+    return { name, lineCount }
+  }
+
+  it('no args → current agent, 20 lines', () => {
+    expect(parseLogsArgs('', 'assistant')).toEqual({ name: 'assistant', lineCount: 20 })
+  })
+
+  it('single numeric arg → current agent, that many lines', () => {
+    expect(parseLogsArgs('50', 'assistant')).toEqual({ name: 'assistant', lineCount: 50 })
+  })
+
+  it('agent name only → named agent, 20 lines', () => {
+    expect(parseLogsArgs('coach', 'assistant')).toEqual({ name: 'coach', lineCount: 20 })
+  })
+
+  it('agent + line count', () => {
+    expect(parseLogsArgs('coach 100', 'assistant')).toEqual({ name: 'coach', lineCount: 100 })
+  })
+
+  it('clamps line count to 200 max', () => {
+    expect(parseLogsArgs('coach 9999', 'assistant')).toEqual({ name: 'coach', lineCount: 200 })
+  })
+
+  it('falls back to 20 for invalid line count', () => {
+    expect(parseLogsArgs('coach abc', 'assistant')).toEqual({ name: 'coach', lineCount: 20 })
+    expect(parseLogsArgs('0', 'assistant')).toEqual({ name: 'assistant', lineCount: 20 })
+  })
+
+  it('single numeric arg does not mistake it for agent name', () => {
+    // "50" alone → line count for current agent, NOT agent named "50"
+    const result = parseLogsArgs('50', 'assistant')
+    expect(result.name).toBe('assistant')
+    expect(result.lineCount).toBe(50)
   })
 })
 
