@@ -922,6 +922,9 @@ export function scaffoldAgent(
     // any future relaxation of the schema validators.
     hindsightBankIdQ: shellSingleQuote(hindsightBankId),
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
+    switchroomConfigPathQ: switchroomConfigPath
+      ? shellSingleQuote(resolve(switchroomConfigPath))
+      : undefined,
     modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
     // Phase 2 + 3 — user env merged with channel-derived env. User
     // entries win on conflict (explicit beats channel default). Each
