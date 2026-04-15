@@ -573,6 +573,27 @@ export const VaultConfigSchema = z.object({
     .describe("Path to encrypted vault file"),
 });
 
+/**
+ * Optional spend budgets used by the session greeting to render a
+ * Quota row ("wk $12 / $50 (24%) · mo $103 / $200 (52%)"). Values are
+ * in USD and compared against `ccusage` local usage totals at runtime
+ * inside the greeting shell script — no network call, no subscription
+ * API (Anthropic exposes none). When a budget is unset, the greeting
+ * falls back to raw usage without a ratio.
+ */
+export const QuotaConfigSchema = z.object({
+  weekly_budget_usd: z
+    .number()
+    .positive()
+    .optional()
+    .describe("Weekly USD spend budget. If unset, the greeting shows raw usage only."),
+  monthly_budget_usd: z
+    .number()
+    .positive()
+    .optional()
+    .describe("Monthly USD spend budget. If unset, the greeting shows raw usage only."),
+});
+
 export const SwitchroomConfigSchema = z.object({
   switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
@@ -600,6 +621,10 @@ export const SwitchroomConfigSchema = z.object({
   telegram: TelegramConfigSchema,
   memory: MemoryBackendConfigSchema.optional(),
   vault: VaultConfigSchema.optional(),
+  quota: QuotaConfigSchema.optional().describe(
+    "Optional weekly/monthly USD spend budgets rendered in the session " +
+    "greeting. Usage is read from ccusage at runtime; no network calls.",
+  ),
   defaults: AgentDefaultsSchema.describe(
     "Implicit bottom-of-cascade profile applied to every agent before " +
     "per-agent config and `extends:` resolution. Tools, mcp_servers, and " +
@@ -639,3 +664,4 @@ export type ScheduleEntry = z.infer<typeof ScheduleEntrySchema>;
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
+export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
