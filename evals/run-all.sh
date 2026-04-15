@@ -2,7 +2,7 @@
 # Run the full eval suite in an isolated process (via systemd-run).
 # Results written to evals/results/. Run from the switchroom repo root.
 
-set -euo pipefail
+set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
