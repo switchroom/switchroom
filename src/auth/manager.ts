@@ -471,16 +471,41 @@ export function submitAuthCode(
   }
 
   tmux(["send-keys", "-t", sessionName, code.trim(), "Enter"]);
-  sleepMs(1500);
-  const output = captureTmuxPane(sessionName);
-  const token = parseSetupTokenValue(output);
+
+  // Poll the log file for the token rather than relying on a single tmux
+  // pane capture. The auth session was started with `| tee <logPath>` so the
+  // full output accumulates in the log file even as the terminal scrolls.
+  // This is more reliable than a fixed 1.5s sleep + pane capture, which races
+  // against claude setup-token's processing time and tmux scroll limits.
+  const logPath = authLogPath(agentDir);
+  let token: string | null = null;
+  const deadline = Date.now() + 20_000; // poll up to 20s
+  while (Date.now() < deadline) {
+    sleepMs(500);
+    if (existsSync(logPath)) {
+      try {
+        const logContent = readFileSync(logPath, "utf-8");
+        token = parseSetupTokenValue(logContent);
+        if (token) break;
+      } catch {
+        // log not readable yet — keep polling
+      }
+    }
+  }
+
+  // Fallback: pane capture handles edge cases where the log file isn't
+  // available (e.g. configDir isolation for force-reauth flows).
+  if (!token) {
+    const paneOutput = captureTmuxPane(sessionName);
+    token = parseSetupTokenValue(paneOutput);
+  }
 
   if (!token) {
     return {
       completed: false,
       tokenSaved: false,
       instructions: [
-        `Submitted code to Claude for agent "${name}", but no token is visible yet.`,
+        `Submitted code to Claude for agent "${name}", but no token was found after 20s.`,
         `If the code was invalid, Claude will say so in the auth session.`,
         `Inspect with: tmux attach -t ${sessionName}`,
         `Retry with:   switchroom auth code ${name} <browser-code>`,

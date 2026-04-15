@@ -346,6 +346,27 @@ describe("reauth token-loading bug regression", () => {
     expect(result.instructions.some(l => l.includes("No pending auth session"))).toBe(true);
   });
 
+  it("parseSetupTokenValue finds token in log file content (file-polling path)", () => {
+    // The fixed submitAuthCode polls .setup-token.log for the token rather than
+    // relying solely on a single tmux pane capture. Verify that the parser
+    // finds a token embedded in typical claude setup-token log output.
+    const logContent = [
+      "Starting Claude OAuth setup...",
+      "Browser didn't open? Use the url below to sign in",
+      "",
+      "https://claude.ai/oauth/authorize?code=true&client_id=abc123",
+      "",
+      "Paste code here if prompted > ",
+      // User pasted the browser code; claude responds with the long-lived token:
+      "Success! Your Claude Code OAuth token:",
+      "sk-ant-oat01-LOGFILE-TOKEN-abc_DEF-XYZ",
+      "",
+    ].join("\n");
+
+    const token = parseSetupTokenValue(logContent);
+    expect(token).toBe("sk-ant-oat01-LOGFILE-TOKEN-abc_DEF-XYZ");
+  });
+
   it("parseSetupTokenValue rejects non-token output gracefully", () => {
     // If the tmux pane scrape returns something other than a token (e.g. the
     // code prompt line), the parser must return null — not a garbage token.
