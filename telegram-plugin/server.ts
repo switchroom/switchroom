@@ -879,6 +879,17 @@ const pendingPermissions = new Map<string, { tool_name: string; description: str
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 
+// Vault passphrase cache: chat_id → { passphrase, expiresAt }
+const vaultPassphraseCache = new Map<string, { passphrase: string; expiresAt: number }>()
+const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000  // 30 min
+
+// Pending vault ops: waiting for passphrase or value input
+type PendingVaultOp =
+  | { kind: 'passphrase'; op: 'list' | 'get' | 'delete' | 'set'; key?: string; startedAt: number }
+  | { kind: 'value'; op: 'set'; key: string; passphrase: string; startedAt: number }
+const VAULT_INPUT_TTL_MS = 5 * 60 * 1000  // 5 min before prompts expire
+const pendingVaultOps = new Map<string, PendingVaultOp>()
+
 /** A single token (no spaces) that looks like a Claude OAuth browser code. */
 export function looksLikeAuthCode(text: string): boolean {
   const trimmed = text.trim()
@@ -2873,6 +2884,38 @@ ${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
 
+/** Run a `switchroom vault` sub-command with a passphrase injected via env.
+ *  Optionally pipes stdinValue to the process stdin (used for `vault set`).
+ */
+function runVaultCli(
+  args: string[],
+  passphrase: string,
+  stdinValue?: string,
+): { ok: boolean; output: string } {
+  const env = { ...process.env, SWITCHROOM_VAULT_PASSPHRASE: passphrase }
+  try {
+    let result: string
+    if (stdinValue !== undefined) {
+      result = execFileSync(
+        process.env.SWITCHROOM_CLI_PATH ?? 'switchroom',
+        ['vault', ...args],
+        { input: stdinValue, encoding: 'utf8', env, timeout: 10000 },
+      )
+    } else {
+      result = execFileSync(
+        process.env.SWITCHROOM_CLI_PATH ?? 'switchroom',
+        ['vault', ...args],
+        { encoding: 'utf8', env, timeout: 10000 },
+      )
+    }
+    return { ok: true, output: result.trim() }
+  } catch (err: unknown) {
+    const e = err as { stdout?: string; stderr?: string; message?: string }
+    const detail = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim()
+    return { ok: false, output: detail }
+  }
+}
+
 /** Execute a switchroom command and reply with the result. */
 async function runSwitchroomCommand(ctx: Context, args: string[], label: string): Promise<void> {
   try {
@@ -3187,6 +3230,135 @@ bot.command('reauth', async ctx => {
   pendingReauthFlows.set(chatId, { agent: raw, startedAt: Date.now() });
 })
 
+// ── Vault helpers ─────────────────────────────────────────────────────────
+
+/** Execute a vault operation and reply with the result. */
+async function executeVaultOp(
+  ctx: Context,
+  chatId: string,
+  op: 'list' | 'get' | 'set' | 'delete',
+  key: string | undefined,
+  passphrase: string,
+  setValue: string | undefined,
+): Promise<void> {
+  if (op === 'list') {
+    const r = runVaultCli(['list'], passphrase)
+    if (!r.ok) {
+      await switchroomReply(ctx, `<b>vault list failed:</b>\n${preBlock(r.output)}`, { html: true })
+      return
+    }
+    const keys = r.output.split('\n').filter(Boolean)
+    if (keys.length === 0) {
+      await switchroomReply(ctx, 'Vault is empty.', { html: true })
+    } else {
+      await switchroomReply(ctx, `<b>Vault keys (${keys.length}):</b>\n${keys.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')}`, { html: true })
+    }
+  } else if (op === 'get') {
+    const r = runVaultCli(['get', key!], passphrase)
+    if (!r.ok) {
+      await switchroomReply(ctx, `<b>vault get failed:</b>\n${preBlock(r.output)}`, { html: true })
+      return
+    }
+    // Send value — delete after 60s for sensitive data
+    const sent = await switchroomReply(ctx, `<code>${escapeHtmlForTg(key!)}</code> =\n<code>${escapeHtmlForTg(r.output)}</code>`, { html: true })
+    const sentMsg = sent as { message_id?: number } | undefined
+    if (sentMsg?.message_id) {
+      setTimeout(() => {
+        ctx.api.deleteMessage(chatId, sentMsg.message_id!).catch(() => {})
+      }, 60_000)
+      await switchroomReply(ctx, '⚠️ Value shown above will auto-delete in 60s.', { html: true })
+    }
+  } else if (op === 'set') {
+    if (setValue === undefined) {
+      // Prompt for value
+      pendingVaultOps.set(chatId, {
+        kind: 'value',
+        op: 'set',
+        key: key!,
+        passphrase,
+        startedAt: Date.now(),
+      })
+      await switchroomReply(ctx, `Send the value for <code>${escapeHtmlForTg(key!)}</code>.\nFor SSH keys, PEM certs, or JSON — send as a <code>\`\`\`code block\`\`\`</code> and I'll strip the fences.`, { html: true })
+      return
+    }
+    const r = runVaultCli(['set', key!], passphrase, setValue)
+    if (!r.ok) {
+      await switchroomReply(ctx, `<b>vault set failed:</b>\n${preBlock(r.output)}`, { html: true })
+    } else {
+      await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> saved to vault.`, { html: true })
+    }
+  } else if (op === 'delete') {
+    const r = runVaultCli(['remove', key!], passphrase)
+    if (!r.ok) {
+      await switchroomReply(ctx, `<b>vault delete failed:</b>\n${preBlock(r.output)}`, { html: true })
+    } else {
+      await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> removed from vault.`, { html: true })
+    }
+  }
+}
+
+// /vault <subcommand> [key]
+//   /vault list              — list all keys
+//   /vault get <key>         — get a secret value
+//   /vault set <key>         — set a secret (prompts for value)
+//   /vault delete <key>      — delete a secret
+bot.command('vault', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+
+  const chatId = String(ctx.chat!.id)
+  const args = (ctx.match ?? '').trim().split(/\s+/).filter(Boolean)
+  const sub = args[0]?.toLowerCase()
+  const key = args[1]
+
+  if (!sub || sub === 'help') {
+    await switchroomReply(ctx, [
+      '<b>Vault commands</b>',
+      '/vault list — list all secret keys',
+      '/vault get &lt;key&gt; — read a secret value',
+      '/vault set &lt;key&gt; — set a secret (prompts for value)',
+      '/vault delete &lt;key&gt; — remove a secret',
+      '',
+      'Your passphrase is cached in memory for 30 min after first use.',
+    ].join('\n'), { html: true })
+    return
+  }
+
+  if (!['list', 'get', 'set', 'delete', 'remove'].includes(sub)) {
+    await switchroomReply(ctx, `Unknown vault subcommand: <code>${escapeHtmlForTg(sub)}</code>. Try /vault help`, { html: true })
+    return
+  }
+
+  if ((sub === 'get' || sub === 'delete' || sub === 'remove') && !key) {
+    await switchroomReply(ctx, `Usage: /vault ${sub} &lt;key&gt;`, { html: true })
+    return
+  }
+
+  if (sub === 'set' && !key) {
+    await switchroomReply(ctx, 'Usage: /vault set &lt;key&gt; — key is required', { html: true })
+    return
+  }
+
+  // Check passphrase cache
+  const cached = vaultPassphraseCache.get(chatId)
+  const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
+
+  if (!passphrase) {
+    // Need passphrase — store the pending op and ask
+    const opSub = (sub === 'remove' ? 'delete' : sub) as 'list' | 'get' | 'delete' | 'set'
+    pendingVaultOps.set(chatId, {
+      kind: 'passphrase',
+      op: opSub,
+      key: key,
+      startedAt: Date.now(),
+    })
+    await switchroomReply(ctx, '🔐 Send your vault passphrase (held in memory 30 min, never logged or stored on disk):', { html: true })
+    return
+  }
+
+  // Have passphrase — execute immediately
+  await executeVaultOp(ctx, chatId, (sub === 'remove' ? 'delete' : sub) as 'list' | 'get' | 'set' | 'delete', key, passphrase, undefined)
+})
+
 // /topics — show topic mappings
 bot.command('topics', async ctx => {
   if (!isAuthorizedSender(ctx)) return
@@ -3444,6 +3616,12 @@ bot.command('switchroomhelp', async ctx => {
     '/grant <tool> | /grant <agent> <tool> - Grant a tool permission and reconcile',
     '/dangerous [off] | /dangerous <agent> [off] - Toggle full tool access',
     '',
+    'Secrets',
+    '/vault list - List all vault keys',
+    '/vault get <key> - Read a secret value',
+    '/vault set <key> - Set a secret (prompts for value)',
+    '/vault delete <key> - Remove a secret',
+    '',
     '/switchroomhelp - Show this help message',
     '',
     'These commands run the switchroom CLI directly — no AI tokens used.',
@@ -3470,6 +3648,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
     { command: 'permissions', description: 'Show agent permissions (default: this agent)' },
     { command: 'grant', description: 'Grant a tool permission (default: this agent)' },
     { command: 'dangerous', description: 'Toggle full tool access (default: this agent)' },
+    { command: 'vault', description: 'Manage encrypted secrets vault' },
     { command: 'switchroomhelp', description: 'Show all switchroom bot commands' },
   ]
 
@@ -3806,6 +3985,46 @@ async function handleInbound(
     }
     // Expired — clean up and fall through to normal handling
     pendingReauthFlows.delete(chat_id)
+  }
+
+  // Vault intercept: if we're waiting for a passphrase or value input
+  const pendingVault = pendingVaultOps.get(chat_id)
+  if (pendingVault) {
+    const elapsed = Date.now() - pendingVault.startedAt
+    if (elapsed > VAULT_INPUT_TTL_MS) {
+      pendingVaultOps.delete(chat_id)
+      // fall through to normal LLM handling
+    } else {
+      pendingVaultOps.delete(chat_id)
+      if (pendingVault.kind === 'passphrase') {
+        const passphrase = text.trim()
+        if (!passphrase) {
+          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault again.', { html: true })
+          return
+        }
+        // Cache passphrase
+        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
+        // Delete the passphrase message for security
+        if (msgId != null) {
+          void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        }
+        // Execute the pending op
+        await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else {
+        // kind === 'value': extract value from code block if present
+        let value = text
+        const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
+        if (codeBlockMatch) {
+          value = codeBlockMatch[1]!
+        }
+        // Delete the message containing the secret
+        if (msgId != null) {
+          void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        }
+        await executeVaultOp(ctx, chat_id, 'set', pendingVault.key, pendingVault.passphrase, value.trim())
+      }
+      return
+    }
   }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
