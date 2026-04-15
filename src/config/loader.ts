@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { ZodError } from "zod";
@@ -23,10 +24,20 @@ function formatZodErrors(error: ZodError): string[] {
 }
 
 export function findConfigFile(startDir?: string): string {
-  // Prefer switchroom.yaml but accept legacy clerk.yaml during the rename
-  // transition so existing checkouts keep working without an immediate file
-  // rename.
+  // Search order (first hit wins):
+  // 1. $SWITCHROOM_CONFIG env var (explicit override for daemonized agents)
+  // 2. Explicit startDir
+  // 3. Current working directory
+  // 4. ~/.switchroom/switchroom.yaml (user-wide default)
+  //
+  // Legacy `clerk.yaml` filenames are still accepted at every location for the
+  // rename transition.
+  const envPath = process.env.SWITCHROOM_CONFIG;
+  const home = homedir();
+  const userDir = resolve(home, ".switchroom");
+
   const searchPaths = [
+    envPath ? resolve(envPath) : null,
     startDir ? resolve(startDir, "switchroom.yaml") : null,
     startDir ? resolve(startDir, "switchroom.yml") : null,
     startDir ? resolve(startDir, "clerk.yaml") : null,
@@ -35,6 +46,10 @@ export function findConfigFile(startDir?: string): string {
     resolve(process.cwd(), "switchroom.yml"),
     resolve(process.cwd(), "clerk.yaml"),
     resolve(process.cwd(), "clerk.yml"),
+    resolve(userDir, "switchroom.yaml"),
+    resolve(userDir, "switchroom.yml"),
+    resolve(userDir, "clerk.yaml"),
+    resolve(userDir, "clerk.yml"),
   ].filter(Boolean) as string[];
 
   for (const path of searchPaths) {
