@@ -544,7 +544,19 @@ export function applyVisibleCap(
  * splits into [Main] / [Sub-agents] sections. Otherwise the layout is
  * byte-identical to the legacy single-section card.
  */
-export function render(state: ProgressCardState, now: number): string {
+/**
+ * Optional task-counter hint passed to render() by the driver when multiple
+ * concurrent tasks are active in the same chat (e.g. parallel forum topics).
+ * When provided, the header shows "(N/M)" so users can see "task 1 of 2".
+ */
+export interface TaskNum {
+  /** 1-based position of this task among the active tasks. */
+  index: number
+  /** Total number of currently active tasks in the chat. */
+  total: number
+}
+
+export function render(state: ProgressCardState, now: number, taskNum?: TaskNum): string {
   if (state.turnStartedAt === 0) {
     // Idle — emit a minimal placeholder so the stream has a body.
     return '🤔 Waiting…'
@@ -556,10 +568,13 @@ export function render(state: ProgressCardState, now: number): string {
   // reply. While in-flight, lead with ⚙️ <b>Working…</b>; on completion swap
   // to ✅ <b>Done</b>. The elapsed clock lives on the same line so users can
   // see "is it still moving?" at a glance.
+  // When multiple tasks are active (forum topics), show "(N/M)" so the user
+  // knows this is task 1 of 2, etc.
   const elapsed = formatDuration(now - state.turnStartedAt)
   const headerIcon = state.stage === 'done' ? '✅' : '⚙️'
   const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
-  lines.push(`${headerIcon} <b>${headerLabel}</b> · ⏱ ${elapsed}`)
+  const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
+  lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
   if (state.userRequest) {
     lines.push(`💬 ${escapeHtml(truncate(state.userRequest, 120))}`)
   }

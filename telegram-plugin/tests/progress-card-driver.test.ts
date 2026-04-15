@@ -6,23 +6,28 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { createProgressDriver, summariseTurn } from '../progress-card-driver.js'
-import { initialState, reduce } from '../progress-card.js'
+import { initialState, reduce, render } from '../progress-card.js'
 import type { SessionEvent } from '../session-tail.js'
 
 function harness(
   minIntervalMs = 500,
   coalesceMs = 400,
-  opts?: { captureSummaries?: boolean; heartbeatMs?: number },
+  opts?: {
+    captureSummaries?: boolean
+    heartbeatMs?: number
+    onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
+  },
 ) {
   let now = 1000
   const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
   let nextRef = 0
-  const emits: Array<{ chatId: string; threadId?: string; html: string; done: boolean }> = []
+  const emits: Array<{ chatId: string; threadId?: string; html: string; done: boolean; isFirstEmit: boolean }> = []
   const summaries: string[] = []
 
   const driver = createProgressDriver({
     emit: (a) => emits.push(a),
     onTurnEnd: opts?.captureSummaries ? (s) => summaries.push(s) : undefined,
+    onTurnComplete: opts?.onTurnComplete,
     minIntervalMs,
     coalesceMs,
     heartbeatMs: opts?.heartbeatMs,
@@ -494,5 +499,175 @@ describe('progress-card driver — multi-agent rate limit', () => {
     expect(emits.length).toBe(emitsBeforeHot) // suppressed by hot coalesce
     advance(2000)
     expect(emits.length).toBe(emitsBeforeHot + 1) // finally fires
+  })
+})
+
+// ─── isFirstEmit flag ─────────────────────────────────────────────────────
+// Locks the contract that isFirstEmit=true on the very first flush per turn
+// and isFirstEmit=false on all subsequent flushes. Server.ts uses this to
+// know when to pin the newly-created Telegram message.
+
+describe('isFirstEmit flag', () => {
+  it('is true on the very first emit, false on subsequent emits', () => {
+    const { driver, emits, advance } = harness(0, 0)
+    driver.ingest(enqueue('c'), 'c')
+    advance(0)
+    expect(emits).toHaveLength(1)
+    expect(emits[0].isFirstEmit).toBe(true)
+
+    driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c')
+    advance(600)
+    expect(emits.length).toBeGreaterThan(1)
+    for (const e of emits.slice(1)) {
+      expect(e.isFirstEmit).toBe(false)
+    }
+  })
+
+  it('resets to true for a new turn (fresh enqueue)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+    // Turn 1
+    driver.ingest(enqueue('c'), 'c')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+    const turn1Emits = emits.length
+
+    // Turn 2
+    driver.ingest(enqueue('c', 'second request'), 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(turn1Emits)
+    expect(emits[turn1Emits].isFirstEmit).toBe(true)
+  })
+
+  it('is false on the done=true emit (turn_end fires after first message exists)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+    driver.ingest(enqueue('c'), 'c')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+    const doneEmit = emits.find(e => e.done)
+    expect(doneEmit).toBeDefined()
+    expect(doneEmit!.isFirstEmit).toBe(false)
+  })
+})
+
+// ─── onTurnComplete callback ──────────────────────────────────────────────
+// Locks the contract: onTurnComplete fires once per turn on turn_end,
+// with chatId, threadId, summary, taskIndex, and taskTotal.
+
+describe('onTurnComplete callback', () => {
+  it('fires once on turn_end with summary and task counts', () => {
+    const completions: Array<{ chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }> = []
+    const { driver, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    driver.ingest(enqueue('c', 'fix the tests'), 'c')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 3000 }, 'c')
+    advance(0)
+
+    expect(completions).toHaveLength(1)
+    expect(completions[0].chatId).toBe('c')
+    expect(completions[0].threadId).toBeUndefined()
+    expect(completions[0].summary).toContain('fix the tests')
+    expect(completions[0].taskIndex).toBe(1)
+    expect(completions[0].taskTotal).toBe(1)
+  })
+
+  it('does NOT fire on normal tool events — only on turn_end', () => {
+    const completions: { summary: string }[] = []
+    const { driver, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    driver.ingest(enqueue('c', 'task'), 'c')
+    advance(0)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c')
+    advance(600)
+    driver.ingest({ kind: 'tool_result', toolUseId: 'a', toolName: 'Read' }, 'c')
+    advance(600)
+    // No turn_end yet
+    expect(completions).toHaveLength(0)
+  })
+
+  it('reports taskIndex=1, taskTotal=1 for a single-chat turn', () => {
+    const completions: { taskIndex: number; taskTotal: number }[] = []
+    const { driver, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    driver.ingest(enqueue('c'), 'c')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+
+    expect(completions[0]).toMatchObject({ taskIndex: 1, taskTotal: 1 })
+  })
+})
+
+// ─── task N/M counter in rendered HTML ───────────────────────────────────
+// When multiple turns are active simultaneously (forum topics on same chatId),
+// the rendered card header shows "(N/M)" so the user can tell which task.
+
+describe('task N/M counter', () => {
+  it('single turn: no N/M suffix in header', () => {
+    const { driver, emits, advance } = harness(0, 0)
+    driver.ingest(enqueue('c', 'do something'), 'c')
+    advance(0)
+    // No taskNum means no suffix
+    expect(emits[0].html).not.toMatch(/\(\d+\/\d+\)/)
+  })
+})
+
+// ─── render() TaskNum ──────────────────────────────────────────────────────
+// Direct tests of the render() taskNum parameter added for the pinned-card feature.
+
+describe('render() taskNum header suffix', () => {
+  function enqueueState(text: string) {
+    return reduce(
+      initialState(),
+      {
+        kind: 'enqueue',
+        chatId: 'c',
+        messageId: '1',
+        threadId: null,
+        rawContent: `<channel chat_id="c">${text}</channel>`,
+      },
+      1000,
+    )
+  }
+
+  it('no suffix when taskNum is undefined (single task)', () => {
+    const st = enqueueState('test')
+    const out = render(st, 2000)
+    expect(out).not.toMatch(/\(\d+\/\d+\)/)
+  })
+
+  it('no suffix when total=1 (still a single task)', () => {
+    const st = enqueueState('test')
+    const out = render(st, 2000, { index: 1, total: 1 })
+    expect(out).not.toMatch(/\(\d+\/\d+\)/)
+  })
+
+  it('shows (1/2) when this is the first of two tasks', () => {
+    const st = enqueueState('test')
+    const out = render(st, 2000, { index: 1, total: 2 })
+    expect(out).toContain('(1/2)')
+    expect(out).toContain('Working…')
+  })
+
+  it('shows (2/2) when this is the second of two tasks', () => {
+    const st = enqueueState('test')
+    const out = render(st, 2000, { index: 2, total: 2 })
+    expect(out).toContain('(2/2)')
+  })
+
+  it('shows (2/3) correctly', () => {
+    const st = enqueueState('test')
+    const out = render(st, 2000, { index: 2, total: 3 })
+    expect(out).toContain('(2/3)')
+  })
+
+  it('N/M suffix also appears on Done stage', () => {
+    let st = enqueueState('test')
+    st = reduce(st, { kind: 'turn_end', durationMs: 1000 }, 2000)
+    const out = render(st, 2000, { index: 1, total: 2 })
+    expect(out).toContain('(1/2)')
+    expect(out).toContain('Done')
   })
 })

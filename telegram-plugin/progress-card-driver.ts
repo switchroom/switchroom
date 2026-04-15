@@ -21,25 +21,50 @@ import {
   reduce,
   render,
   type ProgressCardState,
+  type TaskNum,
 } from './progress-card.js'
 
 export interface ProgressDriverConfig {
-  /** Emit rendered HTML for the given chat+thread. Caller owns the send. */
+  /**
+   * Emit rendered HTML for the given chat+thread. Caller owns the send.
+   *
+   * `isFirstEmit` is true exactly once per turn — on the very first flush
+   * that creates the Telegram message. The caller can use this signal to
+   * pin the new message: after this call resolves, the message_id will be
+   * available in the caller's draft-stream handle.
+   */
   emit: (args: {
     chatId: string
     threadId?: string
     html: string
     done: boolean
+    /** True only on the first flush for this turn (message creation). */
+    isFirstEmit: boolean
   }) => void
   /**
    * Optional callback fired once per turn immediately after the final
    * render on `turn_end`. Receives a compact, one-line plain-text
    * summary suitable for the session-handoff continuity line. The outer
    * layer typically pipes this into `writeLastTurnSummary(agentDir, …)`
-   * so that a session restart can show "↩️ Picked up — &lt;summary&gt;"
+   * so that a session restart can show "↩️ Picked up — <summary>"
    * even if the Stop-hook summarizer didn't run.
    */
   onTurnEnd?: (summary: string) => void
+  /**
+   * Fired once per turn when `turn_end` is processed, with full chat
+   * context. Use this for per-chat post-completion work: unpin the card,
+   * send a completion summary to the main chat, etc.
+   *
+   * Fires BEFORE the per-chat state is deleted, so `summary` is still
+   * accessible. The caller must NOT re-enter the driver from this callback.
+   */
+  onTurnComplete?: (args: {
+    chatId: string
+    threadId?: string
+    summary: string
+    taskIndex: number
+    taskTotal: number
+  }) => void
   /** Min ms between edits for a given chat+thread. Default 500. */
   minIntervalMs?: number
   /** Coalesce window — burst events within this land as one render. Default 400. */
@@ -102,6 +127,8 @@ interface PerChatState {
   lastEmittedAt: number
   lastEmittedHtml: string | null
   pendingTimer: unknown
+  /** True until the very first flush fires for this turn. Cleared after first emit. */
+  isFirstEmit: boolean
 }
 
 export interface ProgressDriver {
@@ -243,18 +270,40 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     return threadId != null ? `${chatId}:${threadId}` : chatId
   }
 
+  /**
+   * Count how many active tasks (PerChatState entries) share the same base
+   * chatId (ignoring thread suffix). Used to compute the N/M task counter.
+   */
+  function taskNumFor(chatState: PerChatState): TaskNum {
+    const baseChatId = chatState.chatId
+    // Collect all keys for this chatId and sort them deterministically so
+    // the index is stable across re-renders. Sort by insertion-order key.
+    const matches: string[] = []
+    for (const [k, cs] of chats) {
+      if (cs.chatId === baseChatId) matches.push(k)
+    }
+    matches.sort()
+    const thisKey = key(chatState.chatId, chatState.threadId)
+    const index = matches.indexOf(thisKey) + 1 // 1-based
+    return { index: Math.max(1, index), total: matches.length }
+  }
+
   function flush(chatState: PerChatState, forceDone: boolean): void {
-    const html = render(chatState.state, now())
+    const taskNum = taskNumFor(chatState)
+    const html = render(chatState.state, now(), taskNum.total > 1 ? taskNum : undefined)
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()
     const k = key(chatState.chatId, chatState.threadId)
     recordEdit(k)
+    const isFirst = chatState.isFirstEmit
+    chatState.isFirstEmit = false
     config.emit({
       chatId: chatState.chatId,
       threadId: chatState.threadId,
       html,
       done: chatState.state.stage === 'done',
+      isFirstEmit: isFirst,
     })
   }
 
@@ -331,6 +380,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           lastEmittedAt: 0,
           lastEmittedHtml: null,
           pendingTimer: null,
+          isFirstEmit: true,
         }
         chats.set(k, chatState)
         // New chat became active — ensure the heartbeat is running so
@@ -360,11 +410,29 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           // Emit a one-line summary for the handoff sidecar (see
           // writeLastTurnSummary in handoff-continuity.ts). Best-effort:
           // the outer callback swallows IO errors.
+          const summary = summariseTurn(chatState.state, now())
+          const taskNum = taskNumFor(chatState)
           if (config.onTurnEnd) {
             try {
-              config.onTurnEnd(summariseTurn(chatState.state, now()))
+              config.onTurnEnd(summary)
             } catch {
               /* never let a summary write break the stream */
+            }
+          }
+          // Fire per-chat completion callback (for pin/unpin + completion
+          // message). Must fire BEFORE chats.delete() so taskNumFor() can
+          // still see this chat when computing the total.
+          if (config.onTurnComplete) {
+            try {
+              config.onTurnComplete({
+                chatId: chatState.chatId,
+                threadId: chatState.threadId,
+                summary,
+                taskIndex: taskNum.index,
+                taskTotal: taskNum.total,
+              })
+            } catch {
+              /* never let completion callback break the stream */
             }
           }
           // Drop the chat state so a subsequent turn starts clean.

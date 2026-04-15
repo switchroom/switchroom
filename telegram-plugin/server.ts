@@ -1737,8 +1737,21 @@ let sessionTailHandle: SessionTailHandle | null = null
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 let progressDriver: ProgressDriver | null = null
 if (streamMode === 'checklist') {
+  /**
+   * Tracks the pinned message_id for each active progress card, keyed by
+   * `chatId` (or `chatId:threadId` for forum topics). Written on first
+   * emit (when the Telegram message is created), read on completion to
+   * unpin. Cleaned up after onTurnComplete fires.
+   */
+  const progressPinnedMsgIds = new Map<string, number>()
+
+  /** Build a stable lookup key for pin tracking (mirrors PerChatState.key). */
+  function progressPinKey(chatId: string, threadId?: string): string {
+    return threadId != null ? `${chatId}:${threadId}` : chatId
+  }
+
   progressDriver = createProgressDriver({
-    emit: ({ chatId, threadId, html, done }) => {
+    emit: ({ chatId, threadId, html, done, isFirstEmit }) => {
       // Fire-and-forget — handleStreamReply is async but we don't await
       // (the driver owns cadence; the call just posts/edits). Errors
       // are logged and swallowed so a dropped edit never kills the
@@ -1767,9 +1780,24 @@ if (streamMode === 'checklist') {
         historyEnabled: false,
         recordOutbound: () => {},
         writeError: (line) => process.stderr.write(line),
-      }).catch((err) => {
+      }).then((result) => {
+        if (!result?.messageId) return
+        const pinKey = progressPinKey(chatId, threadId)
+        // First emit: pin the newly created progress card. Use
+        // disable_notification so the pin doesn't produce an extra push.
+        if (isFirstEmit && !progressPinnedMsgIds.has(pinKey)) {
+          progressPinnedMsgIds.set(pinKey, result.messageId)
+          lockedBot.api
+            .pinChatMessage(chatId, result.messageId, { disable_notification: true })
+            .catch((err: Error) => {
+              process.stderr.write(
+                `telegram channel: progress-card pin failed: ${err.message}\n`,
+              )
+            })
+        }
+      }).catch((err: Error) => {
         process.stderr.write(
-          `telegram channel: progress-card emit failed: ${(err as Error).message}\n`,
+          `telegram channel: progress-card emit failed: ${err.message}\n`,
         )
       })
     },
@@ -1780,6 +1808,37 @@ if (streamMode === 'checklist') {
       // swallows IO errors.
       const agentDir = resolveAgentDirFromEnv()
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
+    },
+    onTurnComplete: ({ chatId, threadId, summary }) => {
+      const pinKey = progressPinKey(chatId, threadId)
+      const pinnedId = progressPinnedMsgIds.get(pinKey)
+      progressPinnedMsgIds.delete(pinKey)
+
+      // Unpin the progress card now that the turn is done.
+      if (pinnedId != null) {
+        lockedBot.api
+          .unpinChatMessage(chatId, pinnedId)
+          .catch((err: Error) => {
+            process.stderr.write(
+              `telegram channel: progress-card unpin failed: ${err.message}\n`,
+            )
+          })
+      }
+
+      // Send a completion notification to the main chat (not the thread).
+      // In forum chats this goes to the general topic (no message_thread_id)
+      // so the user gets a top-level notification. In non-forum chats the
+      // threadId is undefined anyway, so it's just a normal message.
+      //
+      // Format: "✅ Done — <summary>" — compact, links back to context.
+      const completionText = `✅ Done — ${summary}`
+      lockedBot.api
+        .sendMessage(chatId, completionText)
+        .catch((err: Error) => {
+          process.stderr.write(
+            `telegram channel: progress-card completion message failed: ${err.message}\n`,
+          )
+        })
     },
   })
   process.stderr.write('telegram channel: progress-card driver active (stream_mode=checklist)\n')
