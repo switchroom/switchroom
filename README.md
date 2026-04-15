@@ -103,7 +103,7 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash 
 npm install -g @anthropic-ai/claude-code
 
 # Install Switchroom
-git clone https://github.com/mekenthompson/switchroom.git ~/code/switchroom
+git clone https://github.com/switchroom/switchroom.git ~/code/switchroom
 cd ~/code/switchroom && bun install && bun link
 
 # Setup
