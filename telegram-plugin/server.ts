@@ -3010,8 +3010,9 @@ bot.command('auth', async ctx => {
 })
 
 // /reauth — alias for starting reauth OR completing it.
-// /reauth [agent] -> starts reauth
-// /reauth <browser-code> -> completes auth for current agent
+// /reauth          -> starts reauth for current agent
+// /reauth <code>   -> completes auth (code detected via looksLikeAuthCode)
+// /reauth <agent>  -> starts reauth for named agent (single word that isn't a code)
 bot.command('reauth', async ctx => {
   if (!isAuthorizedSender(ctx)) return;
   const raw = getCommandArgs(ctx).trim();
@@ -3023,8 +3024,11 @@ bot.command('reauth', async ctx => {
     return;
   }
 
-  // If it looks like a URL or session code, treat it as /auth code
-  if (raw.startsWith('http') || raw.startsWith('session_')) {
+  // If it looks like an auth code (URL, session_, sk-ant-, or long alphanumeric),
+  // treat it as completing the current auth flow rather than naming an agent.
+  // Previously only checked http/session_ prefixes — sk-ant-* tokens were
+  // incorrectly treated as agent names, causing "unknown agent" errors.
+  if (raw.startsWith('http') || looksLikeAuthCode(raw)) {
     await runSwitchroomCommand(ctx, ['auth', 'code', name, raw], `auth code ${name}`);
     pendingReauthFlows.delete(chatId);
     return;
@@ -3116,13 +3120,52 @@ bot.command('reconcile', async ctx => {
   const arg = (ctx.match ?? '').trim() || getMyAgentName()
   // Reconcile + --restart kills our own systemd unit when arg targets us.
   // Same self-kill problem as /restart — fire-and-forget the detached
-  // child after acknowledging.
+  // child after acknowledging. Uses the same debounce + restart-marker
+  // pattern as /restart so the new bot posts a "🎛️ restarted" follow-up.
   if (isSelfTargetingCommand(arg)) {
-    await switchroomReply(
-      ctx,
-      `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting… back in a few seconds.`,
-      { html: true },
-    )
+    // Debounce: guard against double-tap storm (same 15s window as /restart).
+    const existing = readRestartMarker()
+    if (existing && Date.now() - existing.ts < 15_000) {
+      await switchroomReply(
+        ctx,
+        `⏳ Reconcile of <b>${escapeHtmlForTg(arg)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate.`,
+        { html: true },
+      )
+      return
+    }
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const ackText = `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting… back in a few seconds.`
+    let ackId: number | null = null
+    try {
+      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      ackId = sent.message_id
+      if (HISTORY_ENABLED) {
+        try {
+          recordOutbound({
+            chat_id: chatId,
+            thread_id: threadId ?? null,
+            message_ids: [sent.message_id],
+            texts: [`🔁 Reconciling ${arg} and restarting… back in a few seconds.`],
+            attachment_kinds: [],
+          })
+        } catch (err) {
+          process.stderr.write(`telegram channel: recordOutbound(reconcile ack) failed: ${err}\n`)
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`telegram channel: reconcile ack send failed: ${err}\n`)
+    }
+    writeRestartMarker({
+      chat_id: chatId,
+      thread_id: threadId ?? null,
+      ack_message_id: ackId,
+      ts: Date.now(),
+    })
     spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
     return
   }
