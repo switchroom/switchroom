@@ -864,6 +864,26 @@ const mcp = new Server(
 // Stores full permission details for "See more" expansion keyed by request_id.
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
+// Tracks pending reauth flows keyed by chat_id.  When a /reauth or
+// /auth reauth starts successfully, we record the agent name and timestamp.
+// The next plain-text message that looks like a browser code will be
+// intercepted in handleInbound and forwarded to `switchroom auth code`
+// without hitting the LLM.  Expires after 10 minutes.
+const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
+const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
+
+/** A single token (no spaces) that looks like a Claude OAuth browser code. */
+export function looksLikeAuthCode(text: string): boolean {
+  const trimmed = text.trim()
+  // Reject if it contains spaces (a normal sentence) or is empty
+  if (!trimmed || /\s/.test(trimmed)) return false
+  // Accept session_ prefix, sk-ant- tokens, or short alphanumeric codes (6-200 chars)
+  if (trimmed.startsWith('session_')) return true
+  if (trimmed.startsWith('sk-ant-')) return true
+  if (/^[A-Za-z0-9_-]{6,200}$/.test(trimmed)) return true
+  return false
+}
+
 // Receive permission_request from CC → format → send to all allowlisted DMs.
 // Groups are intentionally excluded — the security thread resolution was
 // "single-user mode for official plugins." Anyone in access.allowFrom
@@ -2912,6 +2932,11 @@ bot.command('auth', async ctx => {
   if (sub === 'login' || sub === 'reauth' || sub === 'link') {
     const name = parts[1] ?? currentAgent
     await runSwitchroomAuthCommand(ctx, ['auth', sub, name], `auth ${sub} ${name}`)
+    // Record pending reauth so the next bare code message is auto-intercepted
+    if (sub === 'reauth' || sub === 'login') {
+      const chatId = String(ctx.chat!.id)
+      pendingReauthFlows.set(chatId, { agent: name, startedAt: Date.now() })
+    }
     return
   }
 
@@ -2932,12 +2957,14 @@ bot.command('auth', async ctx => {
       return;
     }
     await runSwitchroomCommand(ctx, ['auth', 'code', name, code], `auth code ${name}`);
+    pendingReauthFlows.delete(String(ctx.chat!.id));
     return;
   }
 
   if (sub === 'cancel') {
     const name = parts[1] ?? currentAgent
     await runSwitchroomCommand(ctx, ['auth', 'cancel', name], `auth cancel ${name}`)
+    pendingReauthFlows.delete(String(ctx.chat!.id))
     return
   }
 
@@ -2989,19 +3016,23 @@ bot.command('reauth', async ctx => {
   if (!isAuthorizedSender(ctx)) return;
   const raw = getCommandArgs(ctx).trim();
   const name = getMyAgentName();
+  const chatId = String(ctx.chat!.id);
   if (!raw) {
     await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', name], `auth reauth ${name}`);
+    pendingReauthFlows.set(chatId, { agent: name, startedAt: Date.now() });
     return;
   }
-  
+
   // If it looks like a URL or session code, treat it as /auth code
   if (raw.startsWith('http') || raw.startsWith('session_')) {
     await runSwitchroomCommand(ctx, ['auth', 'code', name, raw], `auth code ${name}`);
+    pendingReauthFlows.delete(chatId);
     return;
   }
-  
+
   // Otherwise treat as agent name to start reauth
   await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', raw], `auth reauth ${raw}`);
+  pendingReauthFlows.set(chatId, { agent: raw, startedAt: Date.now() });
 })
 
 // /topics — show topic mappings
@@ -3550,6 +3581,38 @@ async function handleInbound(
       ]).catch(() => {})
     }
     return
+  }
+
+  // Auth-code intercept: if a reauth flow is pending for this chat and the
+  // message looks like a bare browser code, handle it directly without
+  // involving the LLM.  The user just pastes the code after clicking the
+  // login link — no /auth code command needed.
+  const pendingReauth = pendingReauthFlows.get(chat_id)
+  if (pendingReauth && looksLikeAuthCode(text)) {
+    const elapsed = Date.now() - pendingReauth.startedAt
+    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
+      pendingReauthFlows.delete(chat_id)
+      try {
+        const output = stripAnsi(switchroomExecCombined(
+          ['auth', 'code', pendingReauth.agent, text.trim()],
+          30000,
+        ))
+        const formatted = formatAuthOutputForTelegram(output)
+        await switchroomReply(ctx, formatted, { html: true })
+      } catch (err: unknown) {
+        const error = err as { stderr?: string; message?: string }
+        const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+        await switchroomReply(ctx, `<b>auth code failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+      }
+      if (msgId != null) {
+        void bot.api.setMessageReaction(chat_id, msgId, [
+          { type: 'emoji', emoji: '🔑' as ReactionTypeEmoji['emoji'] },
+        ]).catch(() => {})
+      }
+      return
+    }
+    // Expired — clean up and fall through to normal handling
+    pendingReauthFlows.delete(chat_id)
   }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).

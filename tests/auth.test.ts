@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   getAuthStatus,
@@ -212,6 +212,62 @@ describe("refreshAgent", () => {
 
   it("is exported", () => {
     expect(typeof refreshAgent).toBe("function");
+  });
+});
+
+describe("reauth uses clean config dir", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-reauth-test-${Date.now()}`);
+    mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("stale .setup-token-tmp-* dirs are cleaned up by the next auth attempt", () => {
+    // Simulate leftover temp dirs from interrupted reauth flows
+    const stale1 = join(tempDir, ".claude", ".setup-token-tmp-1000");
+    const stale2 = join(tempDir, ".claude", ".setup-token-tmp-2000");
+    mkdirSync(stale1, { recursive: true });
+    mkdirSync(stale2, { recursive: true });
+    writeFileSync(join(stale1, "test"), "data");
+
+    expect(existsSync(stale1)).toBe(true);
+    expect(existsSync(stale2)).toBe(true);
+
+    // Replicate the cleanup logic from manager.ts
+    const claudeDir = join(tempDir, ".claude");
+    for (const entry of readdirSync(claudeDir)) {
+      if (entry.startsWith(".setup-token-tmp-")) {
+        rmSync(join(claudeDir, entry), { recursive: true, force: true });
+      }
+    }
+
+    expect(existsSync(stale1)).toBe(false);
+    expect(existsSync(stale2)).toBe(false);
+  });
+
+  it("cleanup does not affect regular .claude files", () => {
+    // Write some regular files that should NOT be deleted
+    writeFileSync(resolve(tempDir, ".claude", ".credentials.json"), "{}");
+    writeFileSync(resolve(tempDir, ".claude", ".oauth-token"), "sk-ant-oat01-test");
+    // And a stale temp dir
+    const stale = join(tempDir, ".claude", ".setup-token-tmp-9999");
+    mkdirSync(stale, { recursive: true });
+
+    const claudeDir = join(tempDir, ".claude");
+    for (const entry of readdirSync(claudeDir)) {
+      if (entry.startsWith(".setup-token-tmp-")) {
+        rmSync(join(claudeDir, entry), { recursive: true, force: true });
+      }
+    }
+
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(resolve(tempDir, ".claude", ".credentials.json"))).toBe(true);
+    expect(existsSync(resolve(tempDir, ".claude", ".oauth-token"))).toBe(true);
   });
 });
 

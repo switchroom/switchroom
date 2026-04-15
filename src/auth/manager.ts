@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
@@ -222,6 +222,21 @@ function clearAuthSessionMeta(agentDir: string): void {
   rmSync(authSessionMetaPath(agentDir), { force: true });
 }
 
+/** Remove any leftover .setup-token-tmp-* dirs from interrupted reauth flows. */
+function cleanupAuthTempDirs(agentDir: string): void {
+  const dir = claudeDir(agentDir);
+  if (!existsSync(dir)) return;
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (entry.startsWith(".setup-token-tmp-")) {
+        rmSync(join(dir, entry), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    // best effort
+  }
+}
+
 export function formatTimeUntilExpiry(expiresAt: number): string {
   const remaining = expiresAt - Date.now();
   if (remaining <= 0) return "expired";
@@ -365,13 +380,21 @@ export function startAuthSession(
   }
 
   mkdirSync(claudeDir(agentDir), { recursive: true });
+  cleanupAuthTempDirs(agentDir);
   const logPath = authLogPath(agentDir);
   rmSync(logPath, { force: true });
 
+  // When forcing a reauth, use a clean temporary config dir so claude
+  // setup-token doesn't see existing credentials and reuse the same
+  // Anthropic account.  This lets the user log in with a different account.
+  const configDir = opts.force
+    ? join(claudeDir(agentDir), `.setup-token-tmp-${Date.now()}`)
+    : claudeDir(agentDir);
+
   const command = [
-    `mkdir -p ${shellQuote(claudeDir(agentDir))}`,
-    `env CLAUDE_CONFIG_DIR=${shellQuote(claudeDir(agentDir))} claude setup-token | tee ${shellQuote(logPath)}`,
-  ].join(" && ");
+    `mkdir -p ${shellQuote(configDir)}`,
+    `env CLAUDE_CONFIG_DIR=${shellQuote(configDir)} claude setup-token | tee ${shellQuote(logPath)}`,
+  ].join(" && ") + (opts.force ? `; rm -rf ${shellQuote(configDir)}` : "");
 
   tmux(["new-session", "-d", "-s", sessionName, "-c", agentDir, `bash -lc ${shellQuote(command)}`]);
   writeAuthSessionMeta(agentDir, {
@@ -501,6 +524,7 @@ export function cancelAuthSession(
     tmux(["kill-session", "-t", sessionName]);
   }
   clearAuthSessionMeta(agentDir);
+  cleanupAuthTempDirs(agentDir);
 
   return {
     instructions: [`Cancelled pending auth session for agent "${name}".`],
