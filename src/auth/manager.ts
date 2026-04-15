@@ -272,12 +272,32 @@ function hasPendingAuthSession(name: string, agentDir: string): boolean {
   return tmuxSessionExists(authSessionName(name));
 }
 
+function readCredentials(agentDir: string): CredentialsFile["claudeAiOauth"] | null {
+  const credPath = credentialsPath(agentDir);
+  if (!existsSync(credPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(credPath, "utf-8")) as CredentialsFile;
+    return parsed.claudeAiOauth ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getAuthStatus(name: string, agentDir: string): AuthStatus {
+  const pendingAuth = hasPendingAuthSession(name, agentDir);
+  const creds = readCredentials(agentDir);
   const oauthToken = readOAuthToken(agentDir);
+
   if (oauthToken) {
     const meta = readJsonFile<OAuthTokenMeta>(oauthTokenMetaPath(agentDir));
     const expiresAt = meta?.expiresAt;
     const isExpired = expiresAt != null && expiresAt <= Date.now();
+
+    // Prefer credentials.json subscription metadata when available — it carries
+    // the real plan name (max/pro/free) and rate-limit tier. Fall back to the
+    // literal "oauth-token" string only if credentials are absent.
+    const subscriptionType = creds?.subscriptionType ?? "oauth-token";
+    const rateLimitTier = creds?.rateLimitTier;
 
     return {
       authenticated: !isExpired,
@@ -285,40 +305,28 @@ export function getAuthStatus(name: string, agentDir: string): AuthStatus {
       timeUntilExpiry:
         expiresAt != null ? formatTimeUntilExpiry(expiresAt) : undefined,
       source: "oauth-token",
-      subscriptionType: "oauth-token",
-      pendingAuth: hasPendingAuthSession(name, agentDir),
+      subscriptionType,
+      rateLimitTier,
+      pendingAuth,
     };
   }
 
-  const credPath = credentialsPath(agentDir);
-  if (!existsSync(credPath)) {
-    return { authenticated: false, pendingAuth: hasPendingAuthSession(name, agentDir) };
+  if (!creds?.accessToken) {
+    return { authenticated: false, pendingAuth };
   }
 
-  let creds: CredentialsFile;
-  try {
-    creds = JSON.parse(readFileSync(credPath, "utf-8"));
-  } catch {
-    return { authenticated: false, pendingAuth: hasPendingAuthSession(name, agentDir) };
-  }
-
-  const oauth = creds.claudeAiOauth;
-  if (!oauth?.accessToken) {
-    return { authenticated: false, pendingAuth: hasPendingAuthSession(name, agentDir) };
-  }
-
-  const expiresAt = oauth.expiresAt;
+  const expiresAt = creds.expiresAt;
   const isExpired = expiresAt != null && expiresAt <= Date.now();
 
   return {
     authenticated: !isExpired,
-    subscriptionType: oauth.subscriptionType,
-    expiresAt: oauth.expiresAt,
+    subscriptionType: creds.subscriptionType,
+    expiresAt: creds.expiresAt,
     timeUntilExpiry:
       expiresAt != null ? formatTimeUntilExpiry(expiresAt) : undefined,
-    rateLimitTier: oauth.rateLimitTier,
+    rateLimitTier: creds.rateLimitTier,
     source: "credentials",
-    pendingAuth: hasPendingAuthSession(name, agentDir),
+    pendingAuth,
   };
 }
 

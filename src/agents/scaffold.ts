@@ -351,27 +351,36 @@ fi
 printf '%s' "$MODEL" > "$MODEL_CACHE" 2>/dev/null || true
 
 # Resolve auth status from token files at runtime.
+# Prefer .oauth-token (the authoritative token after switchroom auth code)
+# but merge in subscriptionType + rateLimitTier from .credentials.json when
+# both files exist — the oauth-token flow alone does not carry plan metadata.
 AUTH_STATUS=""
 CLAUDE_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 if command -v jq >/dev/null 2>&1; then
+  SUB=""
+  TIER=""
+  if [ -f "$CLAUDE_DIR/.credentials.json" ]; then
+    SUB="$(jq -r '.claudeAiOauth.subscriptionType // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
+    TIER="$(jq -r '.claudeAiOauth.rateLimitTier // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
+  fi
   if [ -f "$CLAUDE_DIR/.oauth-token" ] && [ -f "$CLAUDE_DIR/.oauth-token.meta.json" ]; then
     EXP_AT="$(jq -r '.expiresAt // empty' "$CLAUDE_DIR/.oauth-token.meta.json" 2>/dev/null)"
+    PLAN="\${SUB:-oauth}"
     if [ -n "$EXP_AT" ]; then
       NOW_MS=$(($(date +%s) * 1000))
       REM_MS=$((EXP_AT - NOW_MS))
       if [ "$REM_MS" -gt 0 ]; then
         REM_H=$((REM_MS / 3600000))
         REM_M=$(((REM_MS % 3600000) / 60000))
-        AUTH_STATUS="✓ oauth · expires \${REM_H}h \${REM_M}m"
+        AUTH_STATUS="✓ \${PLAN} · expires \${REM_H}h \${REM_M}m"
       else
-        AUTH_STATUS="⚠️ oauth token expired"
+        AUTH_STATUS="⚠️ \${PLAN} token expired"
       fi
     else
-      AUTH_STATUS="✓ oauth"
+      AUTH_STATUS="✓ \${PLAN}"
     fi
   elif [ -f "$CLAUDE_DIR/.credentials.json" ]; then
     EXP_AT="$(jq -r '.claudeAiOauth.expiresAt // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
-    SUB="$(jq -r '.claudeAiOauth.subscriptionType // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
     if [ -n "$EXP_AT" ]; then
       NOW_MS=$(($(date +%s) * 1000))
       REM_MS=$((EXP_AT - NOW_MS))

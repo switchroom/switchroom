@@ -82,12 +82,19 @@ describe("getAuthStatus", () => {
     expect(status.timeUntilExpiry).not.toBe("expired");
   });
 
-  it("prefers oauth token files over credentials.json", () => {
+  it("prefers oauth token expiry over credentials.json but merges plan metadata", () => {
+    // When both files exist, oauth-token.meta.json is the authoritative expiry
+    // (it's the token actually in use after `switchroom auth code`), but the
+    // richer subscription metadata — plan name, rate-limit tier — only lives in
+    // credentials.json. Doctor/greeting should show the merged view.
+    const credExpiry = Date.now() + 8 * 60 * 60_000;
+    const oauthExpiry = Date.now() + 365 * 24 * 60 * 60_000;
     const creds = {
       claudeAiOauth: {
         accessToken: "sk-ant-oat01-credential-token",
-        expiresAt: Date.now() + 8 * 60 * 60_000,
+        expiresAt: credExpiry,
         subscriptionType: "max",
+        rateLimitTier: "default_claude_max_20x",
       },
     };
     writeFileSync(
@@ -99,7 +106,30 @@ describe("getAuthStatus", () => {
       resolve(tempDir, ".claude", ".oauth-token.meta.json"),
       JSON.stringify({
         createdAt: Date.now(),
-        expiresAt: Date.now() + 365 * 24 * 60 * 60_000,
+        expiresAt: oauthExpiry,
+        source: "claude-setup-token",
+      })
+    );
+
+    const status = getAuthStatus("test-agent", tempDir);
+    expect(status.authenticated).toBe(true);
+    expect(status.source).toBe("oauth-token");
+    expect(status.expiresAt).toBe(oauthExpiry);
+    // Merged from credentials
+    expect(status.subscriptionType).toBe("max");
+    expect(status.rateLimitTier).toBe("default_claude_max_20x");
+  });
+
+  it("falls back to literal 'oauth-token' when credentials.json is absent", () => {
+    // Pure setup-token flow, no pre-existing credentials file — plan metadata
+    // is unavailable, so we keep the legacy placeholder.
+    const oauthExpiry = Date.now() + 365 * 24 * 60 * 60_000;
+    writeFileSync(resolve(tempDir, ".claude", ".oauth-token"), "sk-ant-oat01-env-token\n");
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token.meta.json"),
+      JSON.stringify({
+        createdAt: Date.now(),
+        expiresAt: oauthExpiry,
         source: "claude-setup-token",
       })
     );
@@ -108,6 +138,7 @@ describe("getAuthStatus", () => {
     expect(status.authenticated).toBe(true);
     expect(status.source).toBe("oauth-token");
     expect(status.subscriptionType).toBe("oauth-token");
+    expect(status.rateLimitTier).toBeUndefined();
   });
 
   it("returns not authenticated when credentials file is missing", () => {
@@ -334,8 +365,12 @@ describe("reauth token-loading bug regression", () => {
     const status = getAuthStatus("test-agent", tempDir);
     expect(status.source).toBe("oauth-token");
     expect(status.authenticated).toBe(true);
-    // Subscription type is "oauth-token" for the oauth-token path
-    expect(status.subscriptionType).toBe("oauth-token");
+    // The oauth-token path is authoritative for the expiry (365d from now
+    // vs 8h in credentials.json) but we now merge in the subscription type
+    // from credentials.json so doctor can show the real plan name instead
+    // of the literal "oauth-token" placeholder.
+    expect(status.subscriptionType).toBe("pro");
+    expect(status.expiresAt).toBeGreaterThan(Date.now() + 364 * 24 * 60 * 60_000);
   });
 
   it("submitAuthCode returns error when no pending tmux session exists", () => {

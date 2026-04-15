@@ -8,6 +8,7 @@ import { resolveStatePath } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
+import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 /**
@@ -269,6 +270,134 @@ function checkHindsight(config: SwitchroomConfig): CheckResult[] {
   ];
 }
 
+/**
+ * Parse a simple KEY=VALUE env file. Quotes around values are stripped.
+ * Lines starting with `#` and blank lines are ignored.
+ * @internal exported for testing
+ */
+export function parseEnvFile(path: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!existsSync(path)) return out;
+  let content: string;
+  try {
+    content = readFileSync(path, "utf-8");
+  } catch {
+    return out;
+  }
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Call Telegram Bot API getMe with a short timeout. Returns the bot username
+ * on success, or an error message on failure.
+ * @internal exported for testing
+ */
+export async function telegramGetMe(
+  token: string,
+  timeoutMs = 5000,
+): Promise<{ ok: true; username: string } | { ok: false; error: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`, {
+      signal: ctrl.signal,
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      result?: { username?: string };
+      description?: string;
+    };
+    if (!body.ok) {
+      return { ok: false, error: body.description ?? `HTTP ${res.status}` };
+    }
+    return { ok: true, username: body.result?.username ?? "(no username)" };
+  } catch (err) {
+    const e = err as Error;
+    return {
+      ok: false,
+      error: e.name === "AbortError" ? `timeout after ${timeoutMs}ms` : e.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function checkTelegram(config: SwitchroomConfig): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const agentsDir = resolveAgentsDir(config);
+
+  // Collect unique bot tokens across all agents that use the switchroom
+  // telegram plugin. Multiple agents typically share one bot in the common
+  // single-bot setup, so we dedupe before calling getMe.
+  //
+  // Plugin defaults to "switchroom" when unset, so treat undefined as "switchroom".
+  const tokensByAgent: Array<{ agent: string; token: string; source: string }> = [];
+  for (const [name, agentConfig] of Object.entries(config.agents)) {
+    const plugin = agentConfig.channels?.telegram?.plugin ?? "switchroom";
+    if (plugin !== "switchroom") continue;
+    const envPath = join(agentsDir, name, "telegram", ".env");
+    const env = parseEnvFile(envPath);
+    const token = env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      results.push({
+        name: `${name}: bot token`,
+        status: "fail",
+        detail: `TELEGRAM_BOT_TOKEN missing from ${envPath}`,
+        fix: `Run \`switchroom agent reconcile ${name}\` and ensure the vault contains telegram_bot_token`,
+      });
+      continue;
+    }
+    tokensByAgent.push({ agent: name, token, source: envPath });
+  }
+
+  // Dedupe by token — one getMe call per distinct bot.
+  const seen = new Map<string, string[]>();
+  for (const { agent, token } of tokensByAgent) {
+    if (!seen.has(token)) seen.set(token, []);
+    seen.get(token)!.push(agent);
+  }
+
+  for (const [token, agents] of seen) {
+    const label =
+      agents.length === 1
+        ? `${agents[0]}: bot reachable`
+        : `bot reachable (${agents.join(", ")})`;
+    const result = await telegramGetMe(token);
+    if (result.ok) {
+      results.push({
+        name: label,
+        status: "ok",
+        detail: `@${result.username}`,
+      });
+    } else {
+      results.push({
+        name: label,
+        status: "fail",
+        detail: result.error,
+        fix:
+          "Verify the token is valid (api.telegram.org/bot<TOKEN>/getMe) and that outbound HTTPS is allowed",
+      });
+    }
+  }
+
+  return results;
+}
+
 function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
   const agentsDir = resolveAgentsDir(config);
@@ -313,15 +442,74 @@ function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[
       results.push({
         name: `${name}: auth`,
         status: "fail",
-        detail: "not authenticated",
+        detail: auth?.pendingAuth
+          ? "pending (auth flow in progress)"
+          : "not authenticated",
         fix: `Run \`switchroom auth login ${name}\` and complete the OAuth flow`,
       });
     } else {
+      // Rich auth detail: plan · expires in · rate-limit tier
+      const parts: string[] = [];
+      parts.push(auth.subscriptionType ?? "authenticated");
+      if (auth.timeUntilExpiry) parts.push(`expires ${auth.timeUntilExpiry}`);
+      if (auth.rateLimitTier) parts.push(`tier ${auth.rateLimitTier}`);
+
+      // Warn when expiry is near (<24h)
+      const remainingMs =
+        auth.expiresAt != null ? auth.expiresAt - Date.now() : Number.POSITIVE_INFINITY;
+      const nearExpiry = remainingMs > 0 && remainingMs < 24 * 60 * 60 * 1000;
+
       results.push({
         name: `${name}: auth`,
-        status: "ok",
-        detail: auth.subscriptionType ?? "authenticated",
+        status: nearExpiry ? "warn" : "ok",
+        detail: parts.join(" · "),
+        fix: nearExpiry
+          ? `Token expires soon — run \`switchroom auth login ${name}\` to refresh`
+          : undefined,
       });
+    }
+
+    // 3b. Slot health (only if multi-slot or any slot unhealthy)
+    let slots: SlotInfo[] = [];
+    try {
+      slots = getSlotInfos(agentDir);
+    } catch { /* no slots layout yet */ }
+
+    if (slots.length > 0) {
+      // SlotInfo.health may be "active" (active + healthy), "healthy",
+      // "expired", "quota-exhausted", or "missing".
+      const healthy = slots.filter(
+        (s) => s.health === "healthy" || s.health === "active",
+      ).length;
+      const expired = slots.filter((s) => s.health === "expired").length;
+      const quotaOut = slots.filter((s) => s.health === "quota-exhausted").length;
+      const active = slots.find((s) => s.active);
+
+      // Only surface a slot row when multi-slot or any issue
+      if (slots.length > 1 || expired > 0 || quotaOut > 0) {
+        const issues: string[] = [];
+        if (quotaOut > 0) issues.push(`${quotaOut} quota-exhausted`);
+        if (expired > 0) issues.push(`${expired} expired`);
+
+        const status: CheckStatus =
+          quotaOut > 0 || expired === slots.length ? "warn" : "ok";
+
+        const detail =
+          `${slots.length} slot(s) · active=${active?.slot ?? "none"} · ${healthy} healthy` +
+          (issues.length ? ` · ${issues.join(", ")}` : "");
+
+        results.push({
+          name: `${name}: auth slots`,
+          status,
+          detail,
+          fix:
+            quotaOut > 0
+              ? `Quota-exhausted slot(s) will auto-recover. Add a fresh slot with \`switchroom auth add ${name} <slot>\``
+              : expired > 0
+                ? `Expired slot(s) — run \`switchroom auth login ${name} --slot <name>\``
+                : undefined,
+        });
+      }
     }
 
     // 4. MCP wireup drift detection (switchroom-telegram plugin agents)
@@ -415,6 +603,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Configuration", results: checkConfig(config, configPath) },
           { title: "Vault", results: checkVault(config) },
           { title: "Memory (Hindsight)", results: checkHindsight(config) },
+          { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
         ];
 
