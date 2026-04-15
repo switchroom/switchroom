@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
+import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 import { DEFAULT_PROFILE } from "../config/schema.js";
 import {
   resolveAgentConfig,
@@ -206,6 +206,7 @@ function buildSessionGreetingScript(
   telegramConfig: TelegramConfig,
   topicId: number | undefined,
   userId: string | undefined,
+  quotaConfig: QuotaConfig | undefined,
 ): string {
   // Send to DM users AND the forum group (if topic is configured).
   // The DM is the primary channel for personal agents; the forum
@@ -243,13 +244,15 @@ function buildSessionGreetingScript(
 
   // Telegram HTML — keep it compact for mobile. Omit rows that are
   // null (unset with no interesting default to show).
-  // __SWITCHROOM_MODEL__ and __SWITCHROOM_AUTH__ are resolved at runtime
-  // by the shell script so the greeting always reflects current state.
+  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, and __SWITCHROOM_QUOTA__
+  // are resolved at runtime by the shell script so the greeting always
+  // reflects current state.
   const text = [
     `<b>🎛️ Switchroom · ${escapeHtml(name)} online</b>`,
     ``,
     `<b>Model</b>  __SWITCHROOM_MODEL__`,
     `<b>Auth</b>  __SWITCHROOM_AUTH__`,
+    `<b>Quota</b>  __SWITCHROOM_QUOTA__`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
     deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
@@ -259,6 +262,11 @@ function buildSessionGreetingScript(
     `<b>Session</b>  ${escapeHtml(sessionStr)}`,
     `<b>Channel</b>  ${escapeHtml(plugin)}`,
   ].filter(Boolean).join("\n");
+
+  // Budget values baked into the script so the shell doesn't have to
+  // re-read switchroom.yaml. Empty string = unset (raw usage shown).
+  const weeklyBudget = quotaConfig?.weekly_budget_usd?.toString() ?? "";
+  const monthlyBudget = quotaConfig?.monthly_budget_usd?.toString() ?? "";
 
   // Build curl calls for each destination. TEXT is a shell variable resolved
   // at runtime (after placeholder substitution), so we use $TEXT not a quoted literal.
@@ -399,9 +407,50 @@ if command -v jq >/dev/null 2>&1; then
 fi
 [ -z "$AUTH_STATUS" ] && AUTH_STATUS="—"
 
+# Resolve Claude quota usage (week + month) via ccusage — parses local
+# transcripts, no network call. Anthropic exposes no subscription-quota
+# endpoint, so this is usage-tracked-locally, optionally compared
+# against budgets baked in from switchroom.yaml.
+QUOTA_STATUS=""
+WEEKLY_BUDGET="${weeklyBudget}"
+MONTHLY_BUDGET="${monthlyBudget}"
+if command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+  WK_COST=""
+  MO_COST=""
+  # --offline avoids a pricing-data fetch; cached data is accurate enough
+  # for a status line. Both commands are bounded by a short timeout so a
+  # slow ccusage run can never block the greeting hook past a few seconds.
+  WK_JSON="$(timeout 8 npx --yes ccusage@latest weekly --json --offline 2>/dev/null || true)"
+  if [ -n "$WK_JSON" ]; then
+    WK_COST="$(printf '%s' "$WK_JSON" | jq -r '.weekly[-1].totalCost // empty' 2>/dev/null)"
+  fi
+  MO_JSON="$(timeout 8 npx --yes ccusage@latest monthly --json --offline 2>/dev/null || true)"
+  if [ -n "$MO_JSON" ]; then
+    MO_COST="$(printf '%s' "$MO_JSON" | jq -r '.monthly[-1].totalCost // empty' 2>/dev/null)"
+  fi
+  fmt_usage() {
+    local cost="$1" budget="$2" label="$3"
+    [ -z "$cost" ] && cost="0"
+    if [ -n "$budget" ]; then
+      local pct
+      pct="$(awk -v c="$cost" -v b="$budget" 'BEGIN { if (b > 0) printf "%.0f", (c / b) * 100; else printf "0" }')"
+      printf '%s $%.2f / $%s (%s%%)' "$label" "$cost" "$budget" "$pct"
+    else
+      printf '%s $%.2f' "$label" "$cost"
+    fi
+  }
+  if [ -n "$WK_COST" ] || [ -n "$MO_COST" ]; then
+    WK_PART="$(fmt_usage "$WK_COST" "$WEEKLY_BUDGET" "wk")"
+    MO_PART="$(fmt_usage "$MO_COST" "$MONTHLY_BUDGET" "mo")"
+    QUOTA_STATUS="$WK_PART · $MO_PART"
+  fi
+fi
+[ -z "$QUOTA_STATUS" ] && QUOTA_STATUS="—"
+
 TEXT=${shellSingleQuote(text)}
 TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
 TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
+TEXT="\${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}"
 
 ${curlCalls.join("\n\n")}
 `;
@@ -1306,6 +1355,7 @@ export function scaffoldAgent(
     telegramConfig,
     topicId,
     userId,
+    switchroomConfig?.quota,
   );
   writeFileSync(greetingPath, greetingScript, { encoding: "utf-8", mode: 0o700 });
 
@@ -1719,6 +1769,7 @@ export function reconcileAgent(
       telegramConfig,
       topicId,
       greetingUserId,
+      switchroomConfig?.quota,
     );
     writeFileSync(greetingPath, greetingScript, { encoding: "utf-8", mode: 0o700 });
     if (agentConfig.model !== undefined) {
