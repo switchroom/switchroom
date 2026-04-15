@@ -16,6 +16,9 @@ dist/
 /clerk-export/
 /clerk-export-with-secrets.tar.gz
 
+# Personal notes, drafts, and host-specific scratch work
+/private/
+
 # OS
 .DS_Store
 Thumbs.db

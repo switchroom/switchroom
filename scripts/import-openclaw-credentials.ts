@@ -37,14 +37,15 @@ export interface ImportPlanEntry {
   action: ImportAction;
 }
 
-// Mapping from source filename → vault key, lifted verbatim from
-// clerk-export/credentials/CREDENTIAL_MAP.md. Every file listed here is
-// stored as a `kind:"string"` entry (plaintext or JSON blob preserved
-// as-is). Multi-file and skipped entries are handled outside this table.
+// Mapping from OpenClaw source filename → Switchroom vault key. Every
+// entry here is stored as a `kind:"string"` entry (plaintext or JSON
+// blob preserved as-is). Multi-file and skipped entries are handled
+// outside this table. Covers the credential file names OpenClaw ships
+// by default; anything not listed here surfaces as a `warn` entry so
+// the operator can extend the mapping for their own deployment.
 const FILE_TO_VAULT_KEY: Record<string, string> = {
   "anthropic-buildkite-token": "anthropic/buildkite-api-key",
   "anthropic-personal-api-key": "anthropic/personal-api-key",
-
   "buildkite-api-token": "buildkite/api-token",
   "calendar-admin-api-key": "calendar/admin-api-key",
   "calendar-jwt-secret": "calendar/jwt-secret",
@@ -56,10 +57,8 @@ const FILE_TO_VAULT_KEY: Record<string, string> = {
   "cluedin-agent-keys.json": "cluedin/agent-keys",
   "compass-mac.json": "compass/credentials",
   "coolify-api-token": "coolify/api-token",
-
   "discord-pairing.json": "discord/pairing",
   "elevenlabs-api-key": "elevenlabs/api-key",
-
   "google-buildkite.json": "google/buildkite-client",
   "google-photos.json": "google/photos-client",
   "google-tokens-buildkite.json": "google/buildkite-tokens",
@@ -70,19 +69,13 @@ const FILE_TO_VAULT_KEY: Record<string, string> = {
   "linear-api-key": "linear/api-key",
   "linear-personal-api-key": "linear/personal-api-key",
   "microsoft-azure.json": "microsoft/azure-app",
-
   "nas-ssh-key": "nas/ssh-key",
   "notion-api-key": "notion/api-key",
   "notion-token": "notion/token",
   "perplexity-api-key": "perplexity/api-key",
-
-
   "telegram-allowFrom.json": "telegram/main-allowfrom",
   "telegram-bot-token": "telegram/main-bot-token",
-
   "telegram-default-allowFrom.json": "telegram/default-allowfrom",
-
-
   "telegram-pairing.json": "telegram/main-pairing",
   "wsl-ssh-key": "wsl/ssh-key",
 };
