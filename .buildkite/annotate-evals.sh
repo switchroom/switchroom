@@ -38,10 +38,7 @@ trigger_file="$(latest_of 'trigger_*.json' || true)"
 quality_file="$(latest_of 'quality_*.json' || true)"
 
 if [[ -z "${trigger_file:-}" && -z "${quality_file:-}" ]]; then
-  buildkite-agent annotate \
-    --style "warning" \
-    --context "evals-summary" \
-    "No eval result files found in \`evals/results/\`. Eval steps may have been skipped or failed before producing output."
+  echo "annotate-evals: no eval result files present — skipping annotation"
   exit 0
 fi
 
