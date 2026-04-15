@@ -1,5 +1,5 @@
 import type { SwitchroomConfig } from "../config/schema.js";
-import { openVault } from "./vault.js";
+import { openVault, type VaultEntry } from "./vault.js";
 import { resolvePath } from "../config/loader.js";
 
 export function isVaultReference(value: string): boolean {
@@ -15,15 +15,23 @@ export function parseVaultReference(value: string): string {
 
 function resolveValue(
   value: unknown,
-  secrets: Record<string, string>
+  secrets: Record<string, VaultEntry>
 ): unknown {
   if (typeof value === "string" && isVaultReference(value)) {
     const key = parseVaultReference(value);
-    const secret = secrets[key];
-    if (secret === undefined) {
+    const entry = secrets[key];
+    if (entry === undefined) {
       throw new Error(`Vault secret not found: ${key}`);
     }
-    return secret;
+    if (entry.kind === "string") {
+      return entry.value;
+    }
+    if (entry.kind === "binary") {
+      return entry.value;
+    }
+    throw new Error(
+      `Vault secret "${key}" is kind="${entry.kind}"; materialization into config is not yet supported (Phase 9.1 step 2).`
+    );
   }
   if (Array.isArray(value)) {
     return value.map((item) => resolveValue(item, secrets));
