@@ -14,7 +14,7 @@ prompts inside `skills/` against a real Claude model.
 
 ## One-time setup in Buildkite
 
-1. Create a new pipeline pointing at this repo (`mekenthompson/switchroom`).
+1. Create a new pipeline pointing at this repo (`switchroom/switchroom`).
 2. Set the **initial command** in Pipeline Settings to:
    ```
    buildkite-agent pipeline upload
