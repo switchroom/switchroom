@@ -1,6 +1,6 @@
 # Skills Migration Plan — OpenClaw → Switchroom
 
-Status: **Draft, awaiting architecture decision**
+Status: **In progress — 9.1 through 9.5 complete, 9.6 pending**
 Owner: unassigned
 Slots into PRD as: **Phase 9 — Skills Migration** (after Phase 6 dashboard)
 
@@ -47,12 +47,19 @@ Confirm this split before any port work begins.
 
 Must land before Tier 1 ports can start.
 
-1. **Vault schema extension — multi-file secrets.** `garmin` stores tokens as a *directory* of files, not a single value. Vault today stores single values. Decide: store as base64-packed archive unpacked at runtime, or extend the vault schema to accept directories natively.
+1. **Vault schema extension — multi-file secrets.** `garmin` stores tokens as a *directory* of files, not a single value. **Decision (2026-04-15):** extend the vault schema natively with a discriminated `VaultEntry` union:
+   ```ts
+   type VaultEntry =
+     | { kind: "string"; value: string }
+     | { kind: "binary"; value: string /* base64 */ }
+     | { kind: "files"; files: Record<string /* filename */, { encoding: "utf8"|"base64"; value: string }> };
+   ```
+   Legacy `Record<string,string>` entries auto-migrate to `{kind:"string",value}` on load. Resolver materializes `kind:"files"` entries to a secure per-invocation temp dir under `$XDG_RUNTIME_DIR/switchroom/vault/<ref>/` (mode 0700) and substitutes the reference with the dir path. Reference syntax: `vault:<key>` (string or dir path) and `vault:<key>#<filename>` (specific file contents as string).
 2. **Env-var naming convention.** Standardize `<SKILL>_<FIELD>` — e.g. `GARMIN_TOKEN_DIR`, `COMPASS_CREDS`, `HOTDOC_CREDS`, `HA_SSH_KEY`. Document in `docs/configuration.md`.
-3. **Python dependency strategy.** Several skills bundle their own `/data/openclaw-home/.local/lib/python3.11/site-packages`. Decide: per-agent venv, shared `~/.switchroom/deps/python/`, or document system-level installs as a prerequisite.
-4. **Node dependency strategy.** `compass` imports from a node_modules path on disk (`compass-education`). Same question as Python — per-skill `package.json`, shared, or documented system-level.
+3. **Python dependency strategy.** **Decision (2026-04-15):** per-skill `requirements.txt` with a venv cached at `~/.switchroom/deps/python/<skill>/`, built lazily on first invocation. `switchroom health` reports missing/stale caches. No system-level installs, no per-agent duplication.
+4. **Node dependency strategy.** **Decision (2026-04-15):** same shape as Python — per-skill `package.json` with `node_modules` cached at `~/.switchroom/deps/node/<skill>/`, installed lazily on first invocation.
 5. **Browser binary.** Playwright + Puppeteer skills (`compass`, `doctor-appointments`) need Chromium. Document install path and decide whether Switchroom should check for it at `switchroom health`.
-6. **Token refresh helpers.** OpenClaw has custom binaries at `/data/openclaw-home/bin/` (`google-cal-token`, `ms-graph-token`) used by multiple skills. These need Switchroom-native equivalents or a shared MCP server exposing OAuth refresh.
+6. **Token refresh helpers.** **Decision (2026-04-15):** port `google-cal-token` and `ms-graph-token` as a shared `token-helpers` skill (shell scripts that read refresh tokens from the vault and write updated access tokens back). *Not* an MCP server — that's reserved for cases where cross-agent cached token state matters. Promote later only if needed.
 
 ---
 
@@ -92,11 +99,42 @@ Priority ordering reflects daily-use value and rewrite depth, from `clerk-export
 Maps to PRD phase format:
 
 ### Phase 9.1 — Architecture + prerequisites
-- Confirm hybrid shape split (A/B/C above)
-- Land vault multi-file support
-- Document env-var convention
-- Decide Python + Node dependency strategy
-- Ship `switchroom health` checks for Chromium/Playwright presence
+
+Concrete execution steps (in order):
+
+1. **Vault multi-file schema (src/vault/vault.ts)**
+   - Introduce `VaultEntry` discriminated union (string | binary | files).
+   - Change internal `VaultData.secrets` type from `Record<string,string>` to `Record<string,VaultEntry>`.
+   - Auto-migrate legacy string entries on read (`typeof value === "string"` → wrap as `{kind:"string",value}`).
+   - Update `setSecret`/`getSecret` to accept/return `VaultEntry`; add convenience helpers `setStringSecret`, `setFilesSecret`.
+   - Tests in `tests/vault.test.ts`: legacy read, round-trip all three kinds, concurrent write safety.
+
+2. **Resolver materialization (src/vault/resolver.ts)**
+   - Extend `resolveValue`: when a `vault:<key>` reference points at a `kind:"files"` entry, materialize to `$XDG_RUNTIME_DIR/switchroom/vault/<agent>/<key>/` (fallback `/tmp/switchroom-vault-<uid>-<agent>/<key>/`), mode 0700, and substitute with the dir path.
+   - Support `vault:<key>#<filename>` syntax for inlining a specific file's contents.
+   - Cleanup hook: temp dirs wiped on agent process exit (or on next resolve).
+   - Tests: materialization creates expected files, permissions correct, cleanup fires.
+
+3. **Dependency cache helpers (new src/deps/python.ts + src/deps/node.ts)**
+   - `ensurePythonEnv(skillName, requirementsPath)` → lazy-builds venv at `~/.switchroom/deps/python/<skill>/`, returns bin path. Stamps a hash of `requirements.txt` and rebuilds on mismatch.
+   - `ensureNodeEnv(skillName, packageJsonPath)` → same shape for `~/.switchroom/deps/node/<skill>/`.
+   - CLI exposure: `switchroom deps rebuild <skill>` for manual recovery.
+   - Tests: lazy build, hash invalidation, rebuild idempotency.
+
+4. **Env-var convention doc (docs/configuration.md)**
+   - Document `<SKILL>_<FIELD>` naming, vault reference syntax (`vault:<key>` and `vault:<key>#<filename>`), and the `deps/python` + `deps/node` layout.
+
+5. **`token-helpers` skill (skills/token-helpers/)**
+   - `SKILL.md` describing when to use it.
+   - `google-cal-token.sh` and `ms-graph-token.sh`: read refresh token from vault via `switchroom vault get`, POST to respective OAuth endpoint, persist new access token back to vault.
+   - Tests: mocked OAuth endpoint, vault round-trip.
+
+6. **`switchroom health` checks**
+   - Chromium/Playwright presence, Python 3.11+, Node 18+, `~/.switchroom/deps/` writable.
+   - Emit actionable warnings per missing dep.
+
+7. **Import OpenClaw tokens (bulk lift)**
+   - One-shot script `scripts/import-openclaw-credentials.ts` that reads existing `/data/openclaw-config/credentials/` tree and populates the vault using the new schema. Run once per host, then the path goes away.
 
 ### Phase 9.2 — Tier 1 ports
 - `ken-voice`, `home-assistant`, `garmin`
@@ -126,10 +164,10 @@ Maps to PRD phase format:
 
 ## Open questions (need user input before Phase 9.1 closes)
 
-1. **Credential refresh policy.** Lift existing OpenClaw tokens into the Switchroom vault as-is, or force a clean re-auth of every credential during migration? Re-auth is safer but slower.
-2. **`ziggy-relay` disposition.** Port the existing Discord relay daemon, or replace with a native Telegram↔Discord bridge and retire the skill?
-3. **Parallel vs. cutover.** Keep OpenClaw running in parallel during migration (weeks of double-running), or cut over per-tier as each lands?
-4. **Catalog skills.** Any of the 53 public catalog skills (notion, slack, github, things-mac, spotify-player, etc.) that must ride along with the custom skill migration, or genuinely defer?
+1. ~~**Credential refresh policy.**~~ **Resolved 2026-04-15:** Lift existing OpenClaw tokens into the Switchroom vault as-is. Only force re-auth when a token has actually expired — no forced rotation during migration.
+2. ~~**`ziggy-relay` disposition.**~~ **Deferred 2026-04-15:** Out of scope for this phase — revisit later.
+3. ~~**Parallel vs. cutover.**~~ **Resolved 2026-04-15:** Run OpenClaw and Switchroom in parallel throughout migration. User manages OpenClaw lifecycle; Switchroom migration can proceed without coordinated cutover.
+4. ~~**Catalog skills.**~~ **Resolved 2026-04-15:** None of the 53 OpenClaw public catalog skills migrate. Scope is strictly the 11 custom skills.
 
 ---
 
