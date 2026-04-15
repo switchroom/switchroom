@@ -21,8 +21,11 @@ import {
 import {
   isVaultReference,
   parseVaultReference,
+  parseVaultReferenceDetailed,
   resolveVaultReferences,
+  cleanupMaterializedSecrets,
 } from "../src/vault/resolver.js";
+import { readFileSync, statSync, existsSync } from "node:fs";
 import type { SwitchroomConfig } from "../src/config/schema.js";
 
 describe("vault", () => {
@@ -407,6 +410,174 @@ describe("vault resolver", () => {
 
       const resolved = resolveVaultReferences(config, passphrase);
       expect(resolved.telegram.bot_token).toBe("plain-token");
+    });
+  });
+
+  describe("parseVaultReferenceDetailed", () => {
+    it("returns key only when no fragment is present", () => {
+      expect(parseVaultReferenceDetailed("vault:my-secret")).toEqual({
+        key: "my-secret",
+      });
+    });
+
+    it("splits key and filename on '#'", () => {
+      expect(parseVaultReferenceDetailed("vault:garmin#oauth_token.json")).toEqual({
+        key: "garmin",
+        filename: "oauth_token.json",
+      });
+    });
+
+    it("handles filenames with dots and dashes", () => {
+      expect(parseVaultReferenceDetailed("vault:ha#id_rsa.pub")).toEqual({
+        key: "ha",
+        filename: "id_rsa.pub",
+      });
+    });
+  });
+
+  describe("files-kind materialization", () => {
+    let tmpDir: string;
+    let vaultPath: string;
+    const passphrase = "materialize-test";
+
+    // Pin XDG_RUNTIME_DIR to a per-test tmpdir so materialization lands
+    // somewhere we can assert on and cleanly wipe.
+    let origXdg: string | undefined;
+    let xdgDir: string;
+
+    beforeEach(() => {
+      tmpDir = mkdtempSync(join(tmpdir(), "switchroom-materialize-test-"));
+      vaultPath = join(tmpDir, "vault.enc");
+      createVault(passphrase, vaultPath);
+      setFilesSecret(passphrase, vaultPath, "garmin", {
+        "oauth_token.json": {
+          encoding: "utf8",
+          value: '{"access":"at","refresh":"rt"}',
+        },
+        "device_id.bin": {
+          encoding: "base64",
+          value: Buffer.from([0xde, 0xad, 0xbe, 0xef]).toString("base64"),
+        },
+      });
+      setStringSecret(passphrase, vaultPath, "plain", "plain-value");
+
+      xdgDir = join(tmpDir, "xdg");
+      origXdg = process.env.XDG_RUNTIME_DIR;
+      process.env.XDG_RUNTIME_DIR = xdgDir;
+    });
+
+    afterEach(() => {
+      cleanupMaterializedSecrets();
+      if (origXdg === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = origXdg;
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function buildConfig(botTokenRef: string): SwitchroomConfig {
+      return {
+        switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
+        telegram: { bot_token: botTokenRef, forum_chat_id: "-100123" },
+        vault: { path: vaultPath },
+        agents: {
+          test: { extends: "default", topic_name: "Test", schedule: [] },
+        },
+      };
+    }
+
+    it("materializes a kind=files entry to a temp dir and substitutes the path", () => {
+      // Stash the files-kind ref into the telegram.bot_token slot (any
+      // string field works for this test).
+      const config = buildConfig("vault:garmin");
+      const resolved = resolveVaultReferences(config, passphrase);
+
+      const dir = resolved.telegram.bot_token;
+      expect(typeof dir).toBe("string");
+      expect(existsSync(dir)).toBe(true);
+
+      // Files landed at the expected names.
+      const tokenPath = join(dir, "oauth_token.json");
+      const binPath = join(dir, "device_id.bin");
+      expect(existsSync(tokenPath)).toBe(true);
+      expect(existsSync(binPath)).toBe(true);
+
+      // utf8 file round-trips verbatim.
+      expect(readFileSync(tokenPath, "utf8")).toBe(
+        '{"access":"at","refresh":"rt"}'
+      );
+
+      // base64 file decoded to raw bytes.
+      const binBytes = readFileSync(binPath);
+      expect(Array.from(binBytes)).toEqual([0xde, 0xad, 0xbe, 0xef]);
+    });
+
+    it("writes the materialization dir with mode 0700", () => {
+      const config = buildConfig("vault:garmin");
+      const resolved = resolveVaultReferences(config, passphrase);
+      const dir = resolved.telegram.bot_token;
+
+      const mode = statSync(dir).mode & 0o777;
+      expect(mode).toBe(0o700);
+    });
+
+    it("writes each materialized file with mode 0600", () => {
+      const config = buildConfig("vault:garmin");
+      const resolved = resolveVaultReferences(config, passphrase);
+      const dir = resolved.telegram.bot_token;
+
+      const tokenMode = statSync(join(dir, "oauth_token.json")).mode & 0o777;
+      expect(tokenMode).toBe(0o600);
+    });
+
+    it("supports vault:<key>#<filename> to inline a specific file's contents", () => {
+      const config = buildConfig("vault:garmin#oauth_token.json");
+      const resolved = resolveVaultReferences(config, passphrase);
+      expect(resolved.telegram.bot_token).toBe(
+        '{"access":"at","refresh":"rt"}'
+      );
+    });
+
+    it("throws when #<filename> targets a non-files kind", () => {
+      const config = buildConfig("vault:plain#anything");
+      expect(() => resolveVaultReferences(config, passphrase)).toThrow(
+        /expected kind="files"/
+      );
+    });
+
+    it("throws when #<filename> does not exist in the files entry", () => {
+      const config = buildConfig("vault:garmin#missing.txt");
+      expect(() => resolveVaultReferences(config, passphrase)).toThrow(
+        /has no file named "missing.txt"/
+      );
+    });
+
+    it("cleanupMaterializedSecrets wipes all materialized dirs", () => {
+      const config = buildConfig("vault:garmin");
+      const resolved = resolveVaultReferences(config, passphrase);
+      const dir = resolved.telegram.bot_token;
+      expect(existsSync(dir)).toBe(true);
+
+      cleanupMaterializedSecrets();
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    it("rematerializing overwrites any stale dir from a prior resolve", () => {
+      const config = buildConfig("vault:garmin");
+
+      const first = resolveVaultReferences(config, passphrase);
+      const dir1 = first.telegram.bot_token;
+
+      // Drop a leftover file into the dir so we can observe it being wiped.
+      require("node:fs").writeFileSync(join(dir1, "stale.txt"), "stale");
+      expect(existsSync(join(dir1, "stale.txt"))).toBe(true);
+
+      const second = resolveVaultReferences(config, passphrase);
+      const dir2 = second.telegram.bot_token;
+
+      // Same path (deterministic, keyed by pid+key) but the stale file
+      // is gone.
+      expect(dir2).toBe(dir1);
+      expect(existsSync(join(dir2, "stale.txt"))).toBe(false);
+      expect(existsSync(join(dir2, "oauth_token.json"))).toBe(true);
     });
   });
 });
