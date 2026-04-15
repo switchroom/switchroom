@@ -1,9 +1,17 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
-import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentsDir, resolvePath } from "../config/loader.js";
 import { resolveStatePath } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
@@ -133,6 +141,222 @@ function checkDependencies(): CheckResult[] {
     ),
     checkBinary("docker", "docker", "Install Docker (only required for Hindsight memory)"),
     checkBinary("systemctl", "systemctl", "Switchroom requires a systemd-based Linux distro"),
+  ];
+}
+
+interface SemVer {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/**
+ * Parse `Python X.Y.Z` output from `python3 --version`. Returns null if
+ * the string does not look like a recognizable Python version banner.
+ * @internal exported for testing
+ */
+export function parsePythonVersion(output: string): SemVer | null {
+  const match = output.match(/Python\s+(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: match[3] ? Number(match[3]) : 0,
+  };
+}
+
+/**
+ * Parse `vX.Y.Z` output from `node --version`. Returns null if the string
+ * does not look like a recognizable node version banner.
+ * @internal exported for testing
+ */
+export function parseNodeVersion(output: string): SemVer | null {
+  const match = output.trim().match(/^v(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function semverAtLeast(v: SemVer, major: number, minor = 0): boolean {
+  if (v.major > major) return true;
+  if (v.major < major) return false;
+  return v.minor >= minor;
+}
+
+/**
+ * Runs `<bin> --version` and returns the parsed version and raw output.
+ * Returns null when the binary is not on PATH or exits non-zero.
+ */
+function readVersion(
+  bin: string,
+  parser: (output: string) => SemVer | null,
+): { semver: SemVer | null; raw: string; path: string } | null {
+  const path = which(bin);
+  if (!path) return null;
+  try {
+    const raw = execSync(`${path} --version 2>&1`, {
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      .toString()
+      .trim();
+    return { semver: parser(raw), raw, path };
+  } catch {
+    return null;
+  }
+}
+
+function checkPythonVersion(): CheckResult {
+  const result = readVersion("python3", parsePythonVersion);
+  if (!result) {
+    return {
+      name: "Python 3.11+",
+      status: "warn",
+      detail: "python3 not found",
+      fix: "sudo apt install python3 (required for Python-based skills)",
+    };
+  }
+  if (!result.semver) {
+    return {
+      name: "Python 3.11+",
+      status: "warn",
+      detail: `unparseable version: ${result.raw}`,
+    };
+  }
+  const { major, minor, patch } = result.semver;
+  const label = `${major}.${minor}.${patch}`;
+  if (!semverAtLeast(result.semver, 3, 11)) {
+    return {
+      name: "Python 3.11+",
+      status: "warn",
+      detail: `${label} (too old)`,
+      fix: "Install Python 3.11 or newer for skill venv support",
+    };
+  }
+  return { name: "Python 3.11+", status: "ok", detail: label };
+}
+
+function checkNodeVersion(): CheckResult {
+  const result = readVersion("node", parseNodeVersion);
+  if (!result) {
+    return {
+      name: "Node 18+",
+      status: "fail",
+      detail: "node not found",
+      fix: "Install Node 18 or newer via nvm",
+    };
+  }
+  if (!result.semver) {
+    return {
+      name: "Node 18+",
+      status: "warn",
+      detail: `unparseable version: ${result.raw}`,
+    };
+  }
+  const { major, minor, patch } = result.semver;
+  const label = `${major}.${minor}.${patch}`;
+  if (!semverAtLeast(result.semver, 18)) {
+    return {
+      name: "Node 18+",
+      status: "fail",
+      detail: `${label} (too old)`,
+      fix: "Upgrade to Node 18 or newer (nvm install --lts)",
+    };
+  }
+  return { name: "Node 18+", status: "ok", detail: label };
+}
+
+/**
+ * Look for a chromium binary on PATH, then fall back to the Playwright
+ * browser cache at ~/.cache/ms-playwright/. Returns the path to the
+ * first match, or null.
+ * @internal exported for testing
+ */
+export function findChromium(
+  homeDir: string = process.env.HOME ?? "",
+): string | null {
+  const candidates = [
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+  ];
+  for (const bin of candidates) {
+    const path = which(bin);
+    if (path) return path;
+  }
+
+  const playwrightCache = join(homeDir, ".cache", "ms-playwright");
+  if (!existsSync(playwrightCache)) return null;
+  try {
+    const entries = readdirSync(playwrightCache).filter((e) =>
+      e.startsWith("chromium"),
+    );
+    for (const entry of entries) {
+      const linuxPath = join(
+        playwrightCache,
+        entry,
+        "chrome-linux",
+        "chrome",
+      );
+      if (existsSync(linuxPath)) return linuxPath;
+    }
+  } catch {
+    /* unreadable */
+  }
+  return null;
+}
+
+function checkChromium(): CheckResult {
+  const path = findChromium();
+  if (path) {
+    return { name: "Chromium", status: "ok", detail: path };
+  }
+  return {
+    name: "Chromium",
+    status: "warn",
+    detail: "not found (only required for playwright-based skills)",
+    fix:
+      "bun x playwright install chromium (per-project) " +
+      "or sudo apt install chromium",
+  };
+}
+
+/**
+ * Check that ~/.switchroom/deps/ exists (or can be created) and is
+ * writable. This is the root for per-skill Python venvs and Node
+ * module caches created by src/deps/python.ts and src/deps/node.ts.
+ * @internal exported for testing
+ */
+export function checkDepsCacheWritable(
+  depsRoot: string = resolvePath("~/.switchroom/deps"),
+): CheckResult {
+  try {
+    mkdirSync(depsRoot, { recursive: true });
+    accessSync(depsRoot, fsConstants.W_OK);
+    return {
+      name: "~/.switchroom/deps writable",
+      status: "ok",
+      detail: depsRoot,
+    };
+  } catch (err) {
+    return {
+      name: "~/.switchroom/deps writable",
+      status: "fail",
+      detail: (err as Error).message,
+      fix: `Ensure ${depsRoot} is writable by your user`,
+    };
+  }
+}
+
+export function checkSkillsPrerequisites(): CheckResult[] {
+  return [
+    checkPythonVersion(),
+    checkNodeVersion(),
+    checkChromium(),
+    checkDepsCacheWritable(),
   ];
 }
 
@@ -600,6 +824,7 @@ export function registerDoctorCommand(program: Command): void {
 
         const sections: Array<{ title: string; results: CheckResult[] }> = [
           { title: "Dependencies", results: checkDependencies() },
+          { title: "Skills Prerequisites", results: checkSkillsPrerequisites() },
           { title: "Configuration", results: checkConfig(config, configPath) },
           { title: "Vault", results: checkVault(config) },
           { title: "Memory (Hindsight)", results: checkHindsight(config) },
