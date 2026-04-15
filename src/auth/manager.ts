@@ -446,12 +446,31 @@ export function refreshAgent(
   return { instructions: result.instructions };
 }
 
+/**
+ * Read the current contents of the setup-token log file and try to extract
+ * an OAuth token. Returns null if the file is missing, unreadable, or doesn't
+ * yet contain a token. Exported for unit testing.
+ */
+export function readTokenFromLogFile(logPath: string): string | null {
+  if (!existsSync(logPath)) return null;
+  try {
+    const content = readFileSync(logPath, "utf-8");
+    return parseSetupTokenValue(content);
+  } catch {
+    return null;
+  }
+}
+
 export function submitAuthCode(
   name: string,
   agentDir: string,
   code: string,
   slot?: string,
+  _opts: { pollIntervalMs?: number; pollTimeoutMs?: number } = {},
 ): AuthCodeResult {
+  const pollIntervalMs = _opts.pollIntervalMs ?? 500;
+  const pollTimeoutMs = _opts.pollTimeoutMs ?? 20_000;
+
   // If slot is omitted, try to read pending session meta to discover it.
   let targetSlot = slot;
   if (!targetSlot) {
@@ -479,18 +498,11 @@ export function submitAuthCode(
   // against claude setup-token's processing time and tmux scroll limits.
   const logPath = authLogPath(agentDir);
   let token: string | null = null;
-  const deadline = Date.now() + 20_000; // poll up to 20s
+  const deadline = Date.now() + pollTimeoutMs;
   while (Date.now() < deadline) {
-    sleepMs(500);
-    if (existsSync(logPath)) {
-      try {
-        const logContent = readFileSync(logPath, "utf-8");
-        token = parseSetupTokenValue(logContent);
-        if (token) break;
-      } catch {
-        // log not readable yet — keep polling
-      }
-    }
+    sleepMs(pollIntervalMs);
+    token = readTokenFromLogFile(logPath);
+    if (token) break;
   }
 
   // Fallback: pane capture handles edge cases where the log file isn't
@@ -505,7 +517,7 @@ export function submitAuthCode(
       completed: false,
       tokenSaved: false,
       instructions: [
-        `Submitted code to Claude for agent "${name}", but no token was found after 20s.`,
+        `Submitted code to Claude for agent "${name}", but no token was found after ${Math.round(pollTimeoutMs / 1000)}s.`,
         `If the code was invalid, Claude will say so in the auth session.`,
         `Inspect with: tmux attach -t ${sessionName}`,
         `Retry with:   switchroom auth code ${name} <browser-code>`,

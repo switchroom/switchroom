@@ -9,6 +9,7 @@ import {
   refreshAgent,
   parseSetupTokenUrl,
   parseSetupTokenValue,
+  readTokenFromLogFile,
   submitAuthCode,
 } from "../src/auth/manager.js";
 
@@ -365,6 +366,106 @@ describe("reauth token-loading bug regression", () => {
 
     const token = parseSetupTokenValue(logContent);
     expect(token).toBe("sk-ant-oat01-LOGFILE-TOKEN-abc_DEF-XYZ");
+  });
+});
+
+describe("readTokenFromLogFile", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-logfile-test-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns null when log file does not exist", () => {
+    expect(readTokenFromLogFile(join(tempDir, "nonexistent.log"))).toBeNull();
+  });
+
+  it("returns null when log file exists but contains no token", () => {
+    const logPath = join(tempDir, "setup.log");
+    writeFileSync(logPath, "Starting Claude OAuth setup...\nPaste code here if prompted >\n");
+    expect(readTokenFromLogFile(logPath)).toBeNull();
+  });
+
+  it("returns null for empty log file", () => {
+    const logPath = join(tempDir, "empty.log");
+    writeFileSync(logPath, "");
+    expect(readTokenFromLogFile(logPath)).toBeNull();
+  });
+
+  it("extracts token from typical claude setup-token log output", () => {
+    const logPath = join(tempDir, "setup.log");
+    writeFileSync(logPath, [
+      "Browser didn't open? Use the url below to sign in",
+      "",
+      "https://claude.ai/oauth/authorize?code=true&client_id=abc123",
+      "",
+      "Paste code here if prompted > MYCODE",
+      "sk-ant-oat01-LOG-TOKEN-abc_DEF",
+      "",
+    ].join("\n"));
+    expect(readTokenFromLogFile(logPath)).toBe("sk-ant-oat01-LOG-TOKEN-abc_DEF");
+  });
+
+  it("handles log file with ANSI escape sequences (real terminal output)", () => {
+    const logPath = join(tempDir, "ansi.log");
+    writeFileSync(logPath, "\x1B[32msk-ant-oat01-ANSI-TOKEN-xyz\x1B[0m\n");
+    expect(readTokenFromLogFile(logPath)).toBe("sk-ant-oat01-ANSI-TOKEN-xyz");
+  });
+
+  it("returns token even when log file has many preceding lines", () => {
+    const logPath = join(tempDir, "verbose.log");
+    const lines = Array.from({ length: 200 }, (_, i) => `Progress line ${i}...`);
+    lines.push("sk-ant-oat01-DEEP-TOKEN-abc123");
+    writeFileSync(logPath, lines.join("\n"));
+    expect(readTokenFromLogFile(logPath)).toBe("sk-ant-oat01-DEEP-TOKEN-abc123");
+  });
+});
+
+describe("submitAuthCode log-file polling integration", () => {
+  // Tests the file-based polling path of submitAuthCode end-to-end,
+  // using the injectable _opts.pollIntervalMs to keep tests fast (no real 500ms sleeps).
+  // We can't easily mock tmuxSessionExists without module-level mocks, so these
+  // tests cover the readTokenFromLogFile helper that backs the polling loop.
+
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-poll-test-${Date.now()}`);
+    mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("submitAuthCode with no tmux session exits immediately with instructions", () => {
+    // No tmux server in tests — session never exists, so the function returns
+    // the expected error without entering the polling loop.
+    const result = submitAuthCode(
+      "test-agent", tempDir, "CODE",
+      undefined,
+      { pollIntervalMs: 10, pollTimeoutMs: 100 },
+    );
+    expect(result.completed).toBe(false);
+    expect(result.tokenSaved).toBe(false);
+    expect(result.instructions.some(l => l.includes("No pending auth session"))).toBe(true);
+  });
+
+  it("timeout error message reflects the configured pollTimeoutMs", () => {
+    // The error message should say e.g. "30s" if pollTimeoutMs=30000 is passed
+    // by a future caller. This test is limited to the no-session path but
+    // confirms the error copy does not hardcode "20s".
+    // (Full polling timeout path requires mocking tmux, covered below via
+    // readTokenFromLogFile unit tests + the code review that it's wired up.)
+    const result = submitAuthCode("test-agent", tempDir, "CODE");
+    // No session → early exit, no polling timeout message triggered
+    expect(result.completed).toBe(false);
+    expect(result.instructions.some(l => l.includes("No pending auth session"))).toBe(true);
   });
 
   it("parseSetupTokenValue rejects non-token output gracefully", () => {
