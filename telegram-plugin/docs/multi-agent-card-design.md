@@ -391,7 +391,7 @@ The parent's `Agent` `tool_use` has these fields: `id` (toolu_…), `name`,
 `input.subagent_type`, `input.description`, `input.prompt`. **No agentId.** The
 sub-agent JSONL filename embeds `agentId`. The first user message inside the
 subagent JSONL contains exactly the `input.prompt` string (verified empirically
-against `/home/testuser/.claude/projects/-home-kenthompson/0887bb59-…`).
+against `~/.claude/projects/-home-<user>/0887bb59-…`).
 
 So the only deterministic correlation is:
 
