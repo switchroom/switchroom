@@ -1,64 +1,42 @@
-# Switchroom — Self-hosted Claude Code agents on your Pro/Max subscription (OpenClaw alternative)
+# Switchroom — Transparent Claude Code agents on Telegram
 
 [![Build status](https://badge.buildkite.com/443b450a779c30f5824660f5062f8c29101cd4419831ee3aff.svg)](https://buildkite.com/ken-thompson/switchroom)
 [![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-tests.json)](https://buildkite.com/ken-thompson/switchroom)
 [![Trigger evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-trigger-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 [![Quality evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-quality-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 
-**Run Claude Code agents 24/7 on a server, talk to them from Telegram.**
+**Run Claude Code agents 24/7 on a server, talk to them from Telegram — and see exactly what they're doing.**
 
-Switchroom turns a $6/mo Linux server plus your Claude Pro ($20/mo) or Claude Max ($100/mo) subscription into a fleet of always-on AI agents. Each agent is a real Claude Code session — not a wrapper, not a harness, not a proxy. Switchroom handles the lifecycle so you don't have to.
+## The problem with Claude Code's built-in Telegram channel
 
-Switchroom is an **open-source alternative to OpenClaw and NanoClaw** that works with your **Claude Pro or Max subscription** via official OAuth — no Anthropic API key, no per-token billing, no Docker containers per agent. If you came here because OpenClaw stopped working with Claude subscription accounts, Switchroom is the drop-in path forward.
+Claude Code ships a Telegram channel integration. It works, barely. You send a message, the agent does something, eventually a reply shows up. What happens in between is a complete black box. There's no visibility into what tools are running, whether the agent is stuck, whether it spawned a sub-agent, or how long anything took. It ghosts you.
 
-## Who this is for
+That's the problem Switchroom solves.
 
-- **You're a Claude Pro or Max subscriber** who wants your $20/$100 a month to do more than chat — you want agents that run tasks while you sleep.
-- **You were using OpenClaw or NanoClaw** and need an alternative that works with Claude subscriptions instead of an API key.
-- **You run a small fleet** (1–20 agents) on a cheap VPS and don't want Docker-per-agent or Kubernetes.
+## What Switchroom does differently
 
-## Why Switchroom?
+Switchroom is a **Telegram-native orchestration layer** built on top of Claude Code — not a fork, not a wrapper, fully compliant with the official `claude` CLI and OAuth. It extends Claude Code's channel integration with live progress tracking you can actually follow.
 
-**Claude Code native.** Every agent runs the unmodified `claude` CLI binary with official OAuth against your Claude Pro or Max account. No credential interception, no API key routing, no third-party inference.
+Every time an agent starts work, a **progress card** appears in Telegram and stays pinned while the task is running. The card updates in place as tools execute — you see each step as it happens, not just the final answer.
 
-**Simpler than the alternatives.** OpenClaw needs Docker containers per agent and a custom runtime. NanoClaw needs the Agents SDK and container orchestration. Switchroom is `switchroom setup` → talk to your agent from Telegram.
-
-**Smart defaults, opt-in complexity.** A minimal agent is two lines of YAML:
-
-```yaml
-agents:
-  assistant:
-    topic_name: "General"
+```
+⚙️ Working… · ⏱ 12s
+💬 refactor the auth module to use JWT
+─ ─ ─
+  … (+3 more earlier steps)
+✅ Read src/auth/session.ts
+✅ Grep "cookie" (in src/)
+🤖 Edit src/auth/jwt.ts · 4s
 ```
 
-Everything else (model, tools, memory, channels, sub-agents, session policy, scheduled tasks) inherits from sensible defaults.
+When the task finishes, the card updates to Done and unpins. If two tasks are running in parallel (different agents, different topics), cards are labeled `(1/2)` and `(2/2)` so you can track both at a glance.
 
-## What You Get
-
-| Feature | Description |
-|---------|-------------|
-| **Telegram interface** | Talk to agents from your phone, anywhere |
-| **Config cascade** | Defaults → profiles → per-agent. Change one line, all agents update |
-| **Sub-agent delegation** | Opus plans, Sonnet implements in the background |
-| **Scheduled tasks** | Cron-based, systemd timers, survive reboots |
-| **Persistent memory** | Hindsight semantic memory with knowledge graphs |
-| **Session continuity** | Resume sessions across restarts with freshness gating |
-| **Enhanced Telegram** | 10 MCP tools, emoji reactions, message history, rich formatting |
-| **Encrypted vault** | AES-256-GCM for secrets |
-| **Preflight checks** | Catch broken configs before they hang |
-
-## Compared To
-
-| | Switchroom | OpenClaw | NanoClaw |
-|---|---|---|---|
-| Runtime | Claude Code CLI | Custom runtime | Agents SDK |
-| Auth | Pro/Max OAuth | API key | API key |
-| Channels | Telegram (enhanced) | WhatsApp, TG, Slack | WhatsApp, TG, Slack |
-| Memory | Hindsight (semantic) | File-based | Per-container |
-| Scheduling | systemd timers | Built-in cron engine | Built-in scheduler |
-| Sub-agents | Native Claude Code | Custom orchestration | N/A |
-| Config | YAML with cascade | JSON/TOML per agent | ENV vars |
-| Setup | `switchroom setup` | Docker compose | Docker compose |
+**Key UX guarantees:**
+- Cards update at most every 5 seconds — fast enough to follow, no flood
+- The last 5 steps are always visible; older ones collapse into `(+N more earlier steps)`
+- Running steps show elapsed time so you can see if something is stuck
+- Sub-agents get their own section in the card — you see nested work, not just top-level calls
+- No silent gaps. No ghosts.
 
 ## Architecture
 
@@ -68,45 +46,67 @@ You (Telegram)
     ▼
 @YourBot ──── switchroom-telegram MCP ──── Claude Code CLI
                   │                        │
-                  ├─ SQLite history         ├─ .claude/agents/*.md (sub-agents)
-                  ├─ Emoji reactions        ├─ settings.json (tools, hooks, MCP)
-                  └─ Format conversion      ├─ Hindsight plugin (memory)
-                                           └─ systemd (agent + cron timers)
+                  ├─ Progress cards         ├─ .claude/agents/*.md (sub-agents)
+                  ├─ Pin / unpin lifecycle  ├─ settings.json (tools, hooks, MCP)
+                  ├─ SQLite history         ├─ Hindsight plugin (memory)
+                  ├─ Emoji reactions        └─ systemd (agent + cron timers)
+                  └─ Format conversion
 ```
 
-Switchroom is **not a harness**. Each agent runs the unmodified `claude` binary, authenticated directly with Anthropic.
+Switchroom is **not a harness**. Each agent runs the unmodified `claude` binary, authenticated directly with Anthropic via official OAuth. No credential interception, no API key routing.
+
+## Everything else you get
+
+| Feature | Description |
+|---------|-------------|
+| **Claude Pro/Max auth** | OAuth — no API key, no per-token billing |
+| **Multi-agent** | Opus plans, Sonnet implements in the background. Sub-agent activity surfaces in the card. |
+| **Config cascade** | Defaults → profiles → per-agent YAML. Change one line, all agents update. |
+| **Scheduled tasks** | Cron-based systemd timers, survive reboots |
+| **Persistent memory** | Hindsight semantic memory with knowledge graphs |
+| **Session continuity** | Resume sessions across restarts with freshness gating |
+| **Encrypted vault** | AES-256-GCM for secrets |
+| **10 Telegram MCP tools** | Reply, pin, react, history, attachments, stream progress, and more |
+
+## Compared to alternatives
+
+| | Switchroom | Claude Code channels | OpenClaw | NanoClaw |
+|---|---|---|---|---|
+| Progress visibility | Live progress cards, pinned | None — black box | None | None |
+| Runtime | Claude Code CLI | Claude Code CLI | Custom runtime | Agents SDK |
+| Auth | Pro/Max OAuth | Pro/Max OAuth | API key | API key |
+| Sub-agent tracking | Yes, visible in card | No | No | No |
+| Parallel task display | Labeled cards (1/N) | No | No | No |
+| Config | YAML with cascade | None | JSON/TOML | ENV vars |
+| Setup | `switchroom setup` | Built-in (limited) | Docker compose | Docker compose |
 
 ## Install
 
 ```bash
-# Install the CLI globally (Node 20.11+ required)
+# Node 20.11+ required
 npm install -g switchroom-ai
 
-# Sanity check
 switchroom --version
 
-# First-time setup (interactive — installs deps, scaffolds config, links Telegram)
+# Interactive wizard — installs deps, scaffolds config, links Telegram
 switchroom setup
 ```
 
-Once installed, `switchroom setup` walks you through prerequisites (claude CLI, tmux, OAuth) and creates your first agent. See **Quick Start** below for the manual path.
-
-## Quick Start
+## Quick Start (manual)
 
 ```bash
 # Prerequisites: Ubuntu 24.04 LTS, 4GB RAM
-sudo apt update && sudo apt install -y tmux expect docker.io
+sudo apt update && sudo apt install -y tmux expect
 curl -fsSL https://bun.sh/install | bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && \
   source ~/.bashrc && nvm install 22
 npm install -g @anthropic-ai/claude-code
-sudo usermod -aG docker $USER && newgrp docker
 
 # Install Switchroom
 git clone https://github.com/mekenthompson/switchroom.git ~/code/switchroom
 cd ~/code/switchroom && bun install && bun link
 
-# Setup (interactive wizard)
+# Setup
 switchroom setup
 ```
 
@@ -140,12 +140,6 @@ defaults:
   session:
     max_idle: 2h
 
-profiles:
-  advisor:
-    tools: { deny: [Bash, Edit, Write] }
-    soul:
-      style: "warm, empathetic"
-
 agents:
   assistant:
     topic_name: "General"
@@ -173,7 +167,7 @@ switchroom agent reconcile <name|all>         # Re-apply switchroom.yaml
 switchroom agent start|stop|restart <name>    # Lifecycle (with preflight)
 switchroom agent attach <name>                # Interactive tmux session
 switchroom agent logs <name> [-f]             # View logs
-switchroom agent grant <name> <tool>          # Grant a tool permission and reconcile
+switchroom agent grant <name> <tool>          # Grant a tool permission
 switchroom agent permissions <name>           # Show allow/deny list
 switchroom agent dangerous <name> [off]       # Toggle full tool access
 
@@ -189,38 +183,37 @@ switchroom web                                # Web dashboard
 
 | Guide | Description |
 |-------|-------------|
-| **[OpenClaw alternative](docs/vs-openclaw.md)** | Switchroom vs OpenClaw — why subscription auth, config cascade, and no-Docker matter |
-| **[NanoClaw alternative](docs/vs-nanoclaw.md)** | Switchroom vs NanoClaw — Claude Code CLI vs Agents SDK tradeoffs |
-| **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles, escape hatches |
-| **[Telegram Plugin](docs/telegram-plugin.md)** | Enhanced plugin features, 10 MCP tools, emoji reactions |
+| **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles |
+| **[Telegram Plugin](docs/telegram-plugin.md)** | Progress cards, 10 MCP tools, emoji reactions |
 | **[Sub-Agents](docs/sub-agents.md)** | Model routing, delegation patterns, frontmatter spec |
 | **[Scheduling](docs/scheduling.md)** | Cron tasks, systemd timers, model selection |
 | **[Session Management](docs/session-optimization.md)** | Continuity, compaction, freshness policy |
+| **[OpenClaw alternative](docs/vs-openclaw.md)** | Switchroom vs OpenClaw |
+| **[NanoClaw alternative](docs/vs-nanoclaw.md)** | Switchroom vs NanoClaw |
 | **[Compliance](docs/compliance-attestation.md)** | Anthropic compliance analysis |
-| **[Publishing](docs/publishing.md)** | Cutting a release of the switchroom Claude Code plugin |
 
 ## FAQ
 
-### Can I use Switchroom with a Claude Pro or Max subscription instead of the API?
-Yes — that's the whole point. Switchroom runs the unmodified `claude` CLI and signs in with the same OAuth flow you use on the desktop app. No API key, no per-token billing. Your $20/mo Pro or $100/mo Max plan powers every agent in your fleet.
+**Can I use a Claude Pro or Max subscription instead of an API key?**
+Yes — that's the whole point. Switchroom runs the unmodified `claude` CLI with the same OAuth flow you use on the desktop app. No API key, no per-token billing.
 
-### Is Switchroom an alternative to OpenClaw?
-Yes. Switchroom covers the same use case — run Claude on a server, talk to it from a chat app — but uses your Claude subscription via OAuth instead of an Anthropic API key, and runs the native `claude` binary instead of a custom runtime in Docker. If you used OpenClaw with a Claude Pro/Max account and can't anymore, Switchroom is built specifically for that workflow.
+**How is this different from Claude Code's built-in Telegram channel?**
+The built-in channel gives you a message in, message out experience with no visibility into what the agent is doing. Switchroom adds live progress cards that pin to the top of each topic and update in real time as tools execute. You can always see what's happening.
 
-### How is Switchroom different from OpenClaw and NanoClaw?
-OpenClaw requires Docker containers per agent and a custom runtime. NanoClaw uses the Anthropic Agents SDK and container orchestration. Switchroom is a thin lifecycle manager around the real Claude Code CLI — systemd units, YAML cascade, no containers. See [vs-openclaw](docs/vs-openclaw.md) and [vs-nanoclaw](docs/vs-nanoclaw.md) for details.
+**Does it work with multiple agents at the same time?**
+Yes. Each agent gets its own Telegram forum topic. When multiple agents are working simultaneously, each has its own pinned progress card labeled `(1/N)`, `(2/N)` etc.
 
-### Does Switchroom need Docker?
-No. Switchroom uses systemd units per agent on a regular Ubuntu server. Docker is listed as a prerequisite only because some sub-agent worktrees use it optionally.
+**Can I see what sub-agents are doing?**
+Yes. When an agent delegates to a sub-agent (e.g. a worker or researcher), the sub-agent's activity appears in its own section of the progress card. You see the full hierarchy, not just the top-level agent.
 
-### Can I run multiple agents on one server?
-Yes. Switchroom is designed for small fleets (tested from 1 to ~20 agents on a 4GB VPS). Each agent gets its own systemd service, Telegram forum topic, memory collection, and optional cron schedule.
+**What does Switchroom cost to run?**
+A cheap Linux VPS (~$6/mo on Hetzner/DigitalOcean/etc), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. Switchroom itself is MIT-licensed open source.
 
-### What does Switchroom cost to run?
-One cheap Linux VPS (Hetzner/DigitalOcean/etc, ~$6/mo), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. No per-agent or per-token surcharge from Switchroom itself — it's MIT-licensed open source.
+**Is this against Anthropic's terms of service?**
+Switchroom uses the official `claude` binary with the official OAuth flow. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
 
-### Is this against Anthropic's terms of service?
-Switchroom uses the official `claude` binary with the official OAuth flow — the same way the desktop app authenticates. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
+**Is Switchroom an alternative to OpenClaw?**
+Yes. Switchroom covers the same use case but uses your Claude subscription via OAuth instead of an API key, and runs the native `claude` binary instead of a custom runtime in Docker. See [vs-openclaw](docs/vs-openclaw.md).
 
 ## License
 
