@@ -6,7 +6,7 @@ import { loadConfig } from "../config/loader.js";
 import { resolvePath } from "../config/loader.js";
 import {
   createVault,
-  setSecret,
+  setStringSecret,
   getSecret,
   listSecrets,
   removeSecret,
@@ -182,7 +182,7 @@ export function registerVaultCommand(program: Command): void {
           process.exit(1);
         }
 
-        setSecret(passphrase, vaultPath, key, value);
+        setStringSecret(passphrase, vaultPath, key, value);
         console.log(chalk.green(`✓ Secret '${key}' saved`));
       } catch (err) {
         if (err instanceof VaultError || err instanceof Error) {
@@ -202,13 +202,22 @@ export function registerVaultCommand(program: Command): void {
         const vaultPath = getVaultPath(parentOpts.config);
         const passphrase = await getPassphrase();
 
-        const value = getSecret(passphrase, vaultPath, key);
-        if (value === null) {
+        const entry = getSecret(passphrase, vaultPath, key);
+        if (entry === null) {
           console.error(chalk.yellow(`Secret '${key}' not found`));
           process.exit(1);
         }
 
-        console.log(value);
+        if (entry.kind === "string" || entry.kind === "binary") {
+          console.log(entry.value);
+        } else {
+          console.error(
+            chalk.yellow(
+              `Secret '${key}' is kind="${entry.kind}" — use 'switchroom vault get-file <key> <filename>' to read a specific file.`
+            )
+          );
+          process.exit(1);
+        }
       } catch (err) {
         if (err instanceof VaultError || err instanceof Error) {
           console.error(chalk.red(`Error: ${err.message}`));

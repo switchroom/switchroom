@@ -67,8 +67,9 @@ function resolveBotToken(rawToken: string): string | undefined {
       const vaultPath = resolvePath(process.env.SWITCHROOM_VAULT_PATH ?? "~/.switchroom/vault.enc");
       const secrets = openVault(passphrase, vaultPath);
       const key = parseVaultReference(rawToken);
-      if (secrets[key]) {
-        return secrets[key];
+      const entry = secrets[key];
+      if (entry && entry.kind === "string") {
+        return entry.value;
       }
     } catch { /* vault not available */ }
   }

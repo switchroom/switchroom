@@ -10,6 +10,14 @@ export class VaultError extends Error {
   }
 }
 
+export type VaultEntry =
+  | { kind: "string"; value: string }
+  | { kind: "binary"; value: string }
+  | {
+      kind: "files";
+      files: Record<string, { encoding: "utf8" | "base64"; value: string }>;
+    };
+
 interface VaultFile {
   salt: string;
   iv: string;
@@ -17,8 +25,10 @@ interface VaultFile {
   tag: string;
 }
 
+type StoredSecrets = Record<string, VaultEntry | string>;
+
 interface VaultData {
-  secrets: Record<string, string>;
+  secrets: StoredSecrets;
 }
 
 function deriveKey(passphrase: string, salt: Buffer): Buffer {
@@ -47,6 +57,21 @@ function decrypt(key: Buffer, iv: string, data: string, tag: string): string {
   return decrypted.toString("utf8");
 }
 
+function normalizeEntry(raw: VaultEntry | string): VaultEntry {
+  if (typeof raw === "string") {
+    return { kind: "string", value: raw };
+  }
+  return raw;
+}
+
+function normalizeSecrets(raw: StoredSecrets): Record<string, VaultEntry> {
+  const out: Record<string, VaultEntry> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = normalizeEntry(v);
+  }
+  return out;
+}
+
 export function createVault(passphrase: string, vaultPath: string): void {
   if (existsSync(vaultPath)) {
     throw new VaultError(`Vault file already exists: ${vaultPath}`);
@@ -72,7 +97,10 @@ export function createVault(passphrase: string, vaultPath: string): void {
   writeFileSync(vaultPath, JSON.stringify(vaultFile, null, 2), { encoding: "utf8", mode: 0o600 });
 }
 
-export function openVault(passphrase: string, vaultPath: string): Record<string, string> {
+export function openVault(
+  passphrase: string,
+  vaultPath: string
+): Record<string, VaultEntry> {
   if (!existsSync(vaultPath)) {
     throw new VaultError(`Vault file not found: ${vaultPath}`);
   }
@@ -101,13 +129,13 @@ export function openVault(passphrase: string, vaultPath: string): Record<string,
     throw new VaultError("Vault data is corrupted");
   }
 
-  return vaultData.secrets;
+  return normalizeSecrets(vaultData.secrets ?? {});
 }
 
 export function saveVault(
   passphrase: string,
   vaultPath: string,
-  secrets: Record<string, string>
+  secrets: Record<string, VaultEntry>
 ): void {
   if (!existsSync(vaultPath)) {
     throw new VaultError(`Vault file not found: ${vaultPath}`);
@@ -137,10 +165,10 @@ export function setSecret(
   passphrase: string,
   vaultPath: string,
   key: string,
-  value: string
+  entry: VaultEntry
 ): void {
   const secrets = openVault(passphrase, vaultPath);
-  secrets[key] = value;
+  secrets[key] = entry;
   saveVault(passphrase, vaultPath, secrets);
 }
 
@@ -148,9 +176,42 @@ export function getSecret(
   passphrase: string,
   vaultPath: string,
   key: string
-): string | null {
+): VaultEntry | null {
   const secrets = openVault(passphrase, vaultPath);
   return secrets[key] ?? null;
+}
+
+export function setStringSecret(
+  passphrase: string,
+  vaultPath: string,
+  key: string,
+  value: string
+): void {
+  setSecret(passphrase, vaultPath, key, { kind: "string", value });
+}
+
+export function getStringSecret(
+  passphrase: string,
+  vaultPath: string,
+  key: string
+): string | null {
+  const entry = getSecret(passphrase, vaultPath, key);
+  if (entry === null) return null;
+  if (entry.kind !== "string") {
+    throw new VaultError(
+      `Secret "${key}" is kind="${entry.kind}", not "string". Use getSecret() for the full entry.`
+    );
+  }
+  return entry.value;
+}
+
+export function setFilesSecret(
+  passphrase: string,
+  vaultPath: string,
+  key: string,
+  files: Record<string, { encoding: "utf8" | "base64"; value: string }>
+): void {
+  setSecret(passphrase, vaultPath, key, { kind: "files", files });
 }
 
 export function listSecrets(passphrase: string, vaultPath: string): string[] {

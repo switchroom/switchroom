@@ -8,7 +8,7 @@ import { scaffoldAgent } from "../agents/scaffold.js";
 import { installAllUnits } from "../agents/systemd.js";
 import { syncTopics } from "../telegram/topic-manager.js";
 import { loadTopicState } from "../telegram/state.js";
-import { createVault, setSecret } from "../vault/vault.js";
+import { createVault, setStringSecret } from "../vault/vault.js";
 import { getAuthStatus } from "../auth/manager.js";
 import {
   validateBotToken,
@@ -360,7 +360,8 @@ async function resolveOrPromptToken(
         if (existsSync(vaultPath)) {
           const secrets = openVault(passphrase, vaultPath);
           const key = rawToken.replace("vault:", "");
-          if (secrets[key]) token = secrets[key];
+          const entry = secrets[key];
+          if (entry && entry.kind === "string") token = entry.value;
         }
       } catch { /* Vault not available */ }
     }
@@ -391,7 +392,7 @@ async function storeTokenInVault(config: SwitchroomConfig, token: string): Promi
     console.log(chalk.green(`  ${STEP_DONE} Vault created at ${vaultPath}`));
 
     const key = config.telegram.bot_token.replace("vault:", "");
-    setSecret(passphrase, vaultPath, key, token);
+    setStringSecret(passphrase, vaultPath, key, token);
     console.log(chalk.green(`  ${STEP_DONE} Bot token stored in vault`));
   } else {
     let passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
@@ -401,7 +402,7 @@ async function storeTokenInVault(config: SwitchroomConfig, token: string): Promi
     if (passphrase) {
       try {
         const key = config.telegram.bot_token.replace("vault:", "");
-        setSecret(passphrase, vaultPath, key, token);
+        setStringSecret(passphrase, vaultPath, key, token);
         console.log(chalk.green(`  ${STEP_DONE} Bot token stored in vault`));
       } catch (err) {
         console.log(chalk.yellow(`  Warning: Could not store in vault: ${(err as Error).message}`));
@@ -746,7 +747,7 @@ async function stepMemoryBackend(
           if (!existsSync(vaultPath)) {
             createVault(passphrase, vaultPath);
           }
-          setSecret(passphrase, vaultPath, "hindsight-api-key", apiKeyInput);
+          setStringSecret(passphrase, vaultPath, "hindsight-api-key", apiKeyInput);
           console.log(chalk.green(`  ${STEP_DONE} API key stored in vault as 'hindsight-api-key'`));
         }
       } catch (err) {

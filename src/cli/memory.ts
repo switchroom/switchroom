@@ -226,8 +226,8 @@ export function registerMemoryCommand(program: Command): void {
       const vaultPath = resolveStatePath("vault.enc");
       if (!apiKey && passphrase && existsSync(vaultPath)) {
         try {
-          const { getSecret } = await import("../vault/vault.js");
-          const fromVault = getSecret(passphrase, vaultPath, "openai-api-key");
+          const { getStringSecret } = await import("../vault/vault.js");
+          const fromVault = getStringSecret(passphrase, vaultPath, "openai-api-key");
           if (fromVault) apiKey = fromVault;
         } catch { /* ignore — fall through to provider default */ }
       }
