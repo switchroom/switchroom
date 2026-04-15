@@ -643,7 +643,8 @@ function renderMainItem(
   }
   if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
     if (item.kind === 'rollup') {
-      return `${indent}${emoji} ${escapeHtml(item.tool)} <i>×${item.count}</i>`
+      const labelHtml = item.label ? ` ${escapeHtml(item.label)}` : ''
+      return `${indent}${emoji} ${escapeHtml(item.tool)}${labelHtml} <i>×${item.count}</i>`
     }
     const dur = formatDuration(item.finishedAt - item.startedAt)
     const needsDuration = item.finishedAt - item.startedAt >= 1000
@@ -747,18 +748,30 @@ function renderSubAgent(
 }
 
 /**
- * Collapse runs of 5+ consecutive identical tools (e.g. a slurry of Reads)
- * into a single rollup item "<tool> ×N". Partial runs remain expanded so
- * the user still sees progress. This is structural (affects the checklist
- * shape) but deterministic — given the same items list you get the same
- * output.
+ * Collapse runs of consecutive identical tools (e.g. a slurry of Reads)
+ * into a single rollup item "<tool> [label] ×N". Two thresholds apply:
+ *
+ * - ROLLUP_THRESHOLD (2): identical tool + identical label → collapses to
+ *   "<tool> <label> ×N", preserving the shared label in the rollup so the
+ *   user can still see "Read foo.ts ×3" instead of three identical lines.
+ *
+ * - MIXED_ROLLUP_THRESHOLD (3): identical tool, differing labels → collapses
+ *   to "<tool> ×N" (no label) when there are 3+ items. The label is dropped
+ *   because there is no single representative value, and showing one
+ *   arbitrarily would be misleading. Users see "Read ×4" (heuristic summary).
+ *
+ * Partial runs (any item still running) are never collapsed — the running
+ * item is always shown individually so the user can see live progress.
  */
 interface RolledItem extends ChecklistItem {
   readonly kind?: 'single' | 'rollup'
   readonly count?: number
 }
 
-const ROLLUP_THRESHOLD = 5
+/** Minimum run length to collapse same-tool + same-label items. */
+const ROLLUP_THRESHOLD = 2
+/** Minimum run length to collapse same-tool, mixed-label items (C1 heuristic). */
+const MIXED_ROLLUP_THRESHOLD = 3
 
 // Exported for tests.
 export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] {
@@ -767,11 +780,29 @@ export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] 
 
   const flush = (): void => {
     if (run.length === 0) return
-    if (run.length >= ROLLUP_THRESHOLD && run.every((r) => r.state === 'done')) {
-      const first = run[0]
-      const last = run[run.length - 1]
+    const first = run[0]
+    const last = run[run.length - 1]
+    const allDone = run.every((r) => r.state === 'done')
+    const sameLabel = run.every((r) => r.label === first.label)
+
+    if (allDone && sameLabel && run.length >= ROLLUP_THRESHOLD) {
+      // B3 + B1: identical tool + identical label → rollup keeping the label
       out.push({
         id: first.id,
+        toolUseId: null,
+        tool: first.tool,
+        label: first.label,
+        state: 'done',
+        startedAt: first.startedAt,
+        finishedAt: last.finishedAt,
+        kind: 'rollup',
+        count: run.length,
+      })
+    } else if (allDone && !sameLabel && run.length >= MIXED_ROLLUP_THRESHOLD) {
+      // C1: same tool, mixed labels → rollup without label (heuristic summary)
+      out.push({
+        id: first.id,
+        toolUseId: null,
         tool: first.tool,
         label: '',
         state: 'done',

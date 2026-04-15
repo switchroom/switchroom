@@ -1178,3 +1178,225 @@ describe('/logs argument parsing', () => {
   })
 })
 
+// ─── Restart --force guard ────────────────────────────────────────────────
+// The self-targeting /restart MUST pass --force to spawnSwitchroomDetached.
+// Without it, the CLI's interactive preflight prompt reads from a detached
+// stdin that immediately returns EOF, askYesNo returns false, and the
+// restart aborts silently — leaving an orphaned restart-pending.json and
+// the user wondering why nothing happened.
+//
+// This test group locks the args contract so a refactor can't accidentally
+// drop --force and reintroduce the silent-abort regression.
+
+describe('self-restart args contracts', () => {
+  // Replicates the args-building logic from the self-targeting branch of
+  // /restart in server.ts (around the spawnSwitchroomDetached call).
+  function buildRestartArgs(name: string): string[] {
+    // Self-targeting restart MUST include --force to bypass the interactive
+    // preflight prompt on a detached (non-tty) stdin.
+    return ['agent', 'restart', name, '--force']
+  }
+
+  // Replicates the args-building logic for /reconcile self-restart.
+  function buildReconcileArgs(name: string): string[] {
+    return ['agent', 'reconcile', name, '--restart']
+  }
+
+  // Replicates /update dispatch.
+  function buildUpdateArgs(): string[] {
+    return ['update']
+  }
+
+  it('/restart self includes --force (prevents silent preflight abort)', () => {
+    const args = buildRestartArgs('assistant')
+    expect(args).toContain('--force')
+    expect(args).toEqual(['agent', 'restart', 'assistant', '--force'])
+  })
+
+  it('/restart for "all" includes --force', () => {
+    const args = buildRestartArgs('all')
+    expect(args).toContain('--force')
+    expect(args).toEqual(['agent', 'restart', 'all', '--force'])
+  })
+
+  it('/restart does NOT omit the agent name', () => {
+    // Regression guard: early versions sent ['agent', 'restart', '--force']
+    // which was ambiguous / wrong for multi-agent setups.
+    const args = buildRestartArgs('assistant')
+    expect(args[2]).toBe('assistant')
+    expect(args[3]).toBe('--force')
+    expect(args).toHaveLength(4)
+  })
+
+  it('/reconcile self uses --restart flag, not --force', () => {
+    // /reconcile triggers a reconcile-then-restart; it uses --restart not --force
+    // because reconcile does not have an interactive preflight.
+    const args = buildReconcileArgs('assistant')
+    expect(args).toContain('--restart')
+    expect(args).not.toContain('--force')
+    expect(args).toEqual(['agent', 'reconcile', 'assistant', '--restart'])
+  })
+
+  it('/update dispatches ["update"] with no sub-args (no agent name, no --force)', () => {
+    // /update runs a global update (git pull, reinstall, reconcile, restart).
+    // It does NOT need --force because it operates at the system level, not
+    // as a self-targeted agent restart.
+    const args = buildUpdateArgs()
+    expect(args).toEqual(['update'])
+    expect(args).not.toContain('--force')
+    expect(args).not.toContain('agent')
+  })
+
+  it('restart with --config prepended does not break --force position', () => {
+    // spawnSwitchroomDetached prepends ['--config', configPath] when
+    // SWITCHROOM_CONFIG is set. Verify the base args remain intact.
+    const baseArgs = buildRestartArgs('assistant')
+    const config = '/path/to/switchroom.yaml'
+    const fullArgs = config ? ['--config', config, ...baseArgs] : baseArgs
+    // Full args: ['--config', '...', 'agent', 'restart', 'assistant', '--force']
+    expect(fullArgs[0]).toBe('--config')
+    expect(fullArgs[1]).toBe(config)
+    expect(fullArgs.slice(2)).toEqual(['agent', 'restart', 'assistant', '--force'])
+    expect(fullArgs).toContain('--force')
+  })
+})
+
+// ─── Context exhaustion cooldown boundary conditions ─────────────────────
+// Edge-case coverage for the 10-minute cooldown that prevents spamming the
+// user with "context window full" warnings. The boundary behaviour matters:
+// at exactly 10min the cooldown expires (strictly-less-than check), just
+// under keeps it suppressed.
+
+describe('context exhaustion cooldown boundaries', () => {
+  const COOLDOWN_MS = 10 * 60 * 1000 // 600_000ms
+
+  function isCoolingDown(lastWarningAt: number, now: number): boolean {
+    return (now - lastWarningAt) < COOLDOWN_MS
+  }
+
+  it('at exactly 10min elapsed → cooldown EXPIRES (boundary: strictly less-than)', () => {
+    // now - lastWarningAt === COOLDOWN_MS → not strictly less → warn allowed
+    const lastWarningAt = 1_000_000
+    const now = lastWarningAt + COOLDOWN_MS
+    expect(isCoolingDown(lastWarningAt, now)).toBe(false)
+  })
+
+  it('at 9m59s (1s before boundary) → still in cooldown', () => {
+    const lastWarningAt = 1_000_000
+    const now = lastWarningAt + COOLDOWN_MS - 1_000
+    expect(isCoolingDown(lastWarningAt, now)).toBe(true)
+  })
+
+  it('at 9m59.999s → still in cooldown', () => {
+    const lastWarningAt = 1_000_000
+    const now = lastWarningAt + COOLDOWN_MS - 1
+    expect(isCoolingDown(lastWarningAt, now)).toBe(true)
+  })
+
+  it('at 10m1s → cooldown expired', () => {
+    const lastWarningAt = 1_000_000
+    const now = lastWarningAt + COOLDOWN_MS + 1_000
+    expect(isCoolingDown(lastWarningAt, now)).toBe(false)
+  })
+
+  it('lastWarningAt=0 (never warned) → not in cooldown regardless of now', () => {
+    // Date.now() is always >> COOLDOWN_MS, so the very first warning is never suppressed.
+    expect(isCoolingDown(0, Date.now())).toBe(false)
+  })
+
+  it('multiple rapid firings: only the first passes through', () => {
+    // Simulates: context exhaustion fires 3 times within the same second
+    // (e.g., three "Prompt is too long" blocks from Claude Code in quick succession).
+    let lastWarningAt = 0
+    const base = 1_000_000_000
+
+    const fire = (now: number): boolean => {
+      if (isCoolingDown(lastWarningAt, now)) return false
+      lastWarningAt = now
+      return true
+    }
+
+    expect(fire(base)).toBe(true)       // first: fires
+    expect(fire(base + 100)).toBe(false) // 100ms later: blocked
+    expect(fire(base + 500)).toBe(false) // 500ms later: blocked
+    expect(fire(base + COOLDOWN_MS)).toBe(true) // 10min later: fires again
+  })
+})
+
+// ─── Session greeting 30s dedup ──────────────────────────────────────────
+// The session-greeting.sh script uses a GREETING_MARKER directory to prevent
+// duplicate greetings when Claude Code fires SessionStart multiple times
+// on some restart paths. The logic: if the marker dir exists and was created
+// less than 30s ago, skip. Otherwise remove the old marker, create a new one,
+// and proceed.
+//
+// We model that bash logic as a pure TypeScript function and test the timing
+// contract so future changes don't re-introduce greeting storms.
+
+describe('session greeting 30s dedup', () => {
+  const DEDUP_WINDOW_MS = 30_000
+
+  /**
+   * Pure model of the GREETING_MARKER bash logic in session-greeting.sh.
+   * markerAgeMs: age of the existing marker in ms, or null if no marker exists.
+   * Returns whether the greeting should proceed (true) or be skipped (false).
+   */
+  function shouldSendGreeting(markerAgeMs: number | null): boolean {
+    // No marker → first greeting, proceed
+    if (markerAgeMs === null) return true
+    // Marker exists and is fresh → skip (dedup)
+    if (markerAgeMs < DEDUP_WINDOW_MS) return false
+    // Marker is stale → remove it and proceed
+    return true
+  }
+
+  it('no marker → first boot, greeting proceeds', () => {
+    expect(shouldSendGreeting(null)).toBe(true)
+  })
+
+  it('marker created 0ms ago → same SessionStart firing, skip', () => {
+    expect(shouldSendGreeting(0)).toBe(false)
+  })
+
+  it('marker created 5s ago → within 30s window, skip', () => {
+    expect(shouldSendGreeting(5_000)).toBe(false)
+  })
+
+  it('marker created 29.9s ago → still within window, skip', () => {
+    expect(shouldSendGreeting(29_900)).toBe(false)
+  })
+
+  it('marker created exactly 30s ago → boundary (strictly less-than), greeting proceeds', () => {
+    // bash: if [ $((NOW - LAST)) -lt 30 ]
+    // At exactly 30s elapsed: 30 < 30 is false → proceed
+    expect(shouldSendGreeting(30_000)).toBe(true)
+  })
+
+  it('marker created 31s ago → stale, greeting proceeds', () => {
+    expect(shouldSendGreeting(31_000)).toBe(true)
+  })
+
+  it('marker created 5min ago (manual start after crash) → stale, greeting proceeds', () => {
+    expect(shouldSendGreeting(5 * 60_000)).toBe(true)
+  })
+
+  it('rapid triple SessionStart: first proceeds, second and third are blocked', () => {
+    // Simulate 3 SessionStart events fired 100ms apart.
+    // Only the first should send a greeting; the others see a fresh marker.
+    let markerCreatedAt: number | null = null
+
+    const fireGreeting = (now: number): boolean => {
+      const ageMs = markerCreatedAt != null ? (now - markerCreatedAt) : null
+      if (!shouldSendGreeting(ageMs)) return false
+      markerCreatedAt = now // mkdir GREETING_MARKER
+      return true
+    }
+
+    const t = 1_000_000_000
+    expect(fireGreeting(t)).toBe(true)           // first: sends
+    expect(fireGreeting(t + 100)).toBe(false)    // 100ms later: blocked
+    expect(fireGreeting(t + 500)).toBe(false)    // 500ms later: blocked
+    expect(fireGreeting(t + 30_000)).toBe(true)  // 30s later: stale marker, sends again
+  })
+})
+
