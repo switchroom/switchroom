@@ -75,7 +75,7 @@ Skills live in `switchroom.skills_dir` (default `~/.switchroom/skills/`). Each s
 
 ## Skill Secrets, Env Vars, and Dependency Caches
 
-Ported skills (see `docs/skills-migration-plan.md`) follow a few conventions that keep them decoupled from the host filesystem.
+Ported skills follow a few conventions that keep them decoupled from the host filesystem.
 
 ### Env-var naming
 

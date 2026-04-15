@@ -8,7 +8,7 @@ allowed-tools: Bash(switchroom vault *), Bash(./scripts/*)
 
 Shared shell scripts that exchange a long-lived OAuth refresh token for a short-lived access token and persist the new access token back to the Switchroom vault.
 
-This is a library skill — other skills call into it rather than the user invoking it directly. It replaces the OpenClaw `google-cal-token` and `ms-graph-token` skills; that migration decision is documented in `docs/skills-migration-plan.md` (Phase 9 prerequisite 6).
+This is a library skill — other skills call into it rather than the user invoking it directly. It replaces the OpenClaw `google-cal-token` and `ms-graph-token` skills, consolidated here so a single refresh pipeline covers both providers.
 
 ## When to use
 
