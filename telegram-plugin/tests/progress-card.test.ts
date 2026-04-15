@@ -266,7 +266,8 @@ describe('progress-card render', () => {
   it('does NOT roll up mixed tools', () => {
     let st: ProgressCardState = initialState()
     st = reduce(st, enqueue('scan'), 1000)
-    const tools = ['Read', 'Grep', 'Read', 'Grep', 'Read', 'Grep']
+    // 5 tools fits within MAX_VISIBLE_ITEMS so all are visible and none are rolled up
+    const tools = ['Read', 'Grep', 'Read', 'Grep', 'Read']
     for (let i = 0; i < tools.length; i++) {
       st = reduce(st, { kind: 'tool_use', toolName: tools[i] }, 1100 + i * 100)
       st = reduce(st, { kind: 'tool_result', toolUseId: `${i}`, toolName: tools[i] }, 1150 + i * 100)
@@ -274,7 +275,7 @@ describe('progress-card render', () => {
     const out = render(st, 2000)
     expect(out).not.toContain('×')
     expect(out.match(/Read/g) ?? []).toHaveLength(3)
-    expect(out.match(/Grep/g) ?? []).toHaveLength(3)
+    expect(out.match(/Grep/g) ?? []).toHaveLength(2)
   })
 
   it('rolls up exactly 2 identical done items (B1: new lower threshold)', () => {
