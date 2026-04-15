@@ -1,6 +1,6 @@
 # Skills Migration Plan — OpenClaw → Switchroom
 
-Status: **In progress — 9.1 through 9.5 complete, 9.6 pending**
+Status: **In progress — 9.1 planned and scoped, execution starting (step 1: vault schema)**
 Owner: unassigned
 Slots into PRD as: **Phase 9 — Skills Migration** (after Phase 6 dashboard)
 
