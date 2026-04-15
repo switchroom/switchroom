@@ -824,3 +824,113 @@ describe('/reauth one-shot', () => {
   })
 })
 
+// ─── looksLikeAuthCode — browser code detection ────────────────────────────
+// Replicated from server.ts to test the pure matching logic.
+
+function looksLikeAuthCode(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed || /\s/.test(trimmed)) return false
+  if (trimmed.startsWith('session_')) return true
+  if (trimmed.startsWith('sk-ant-')) return true
+  if (/^[A-Za-z0-9_-]{6,200}$/.test(trimmed)) return true
+  return false
+}
+
+describe('looksLikeAuthCode', () => {
+  it('accepts session_ prefixed codes', () => {
+    expect(looksLikeAuthCode('session_abc123')).toBe(true)
+  })
+
+  it('accepts sk-ant- tokens', () => {
+    expect(looksLikeAuthCode('sk-ant-oat01-abc_DEF-123')).toBe(true)
+  })
+
+  it('accepts short alphanumeric codes', () => {
+    expect(looksLikeAuthCode('ABC123')).toBe(true)
+    expect(looksLikeAuthCode('a1b2c3d4e5')).toBe(true)
+  })
+
+  it('accepts codes with underscores and hyphens', () => {
+    expect(looksLikeAuthCode('my_auth-code_123')).toBe(true)
+  })
+
+  it('rejects empty strings', () => {
+    expect(looksLikeAuthCode('')).toBe(false)
+    expect(looksLikeAuthCode('   ')).toBe(false)
+  })
+
+  it('rejects strings with spaces (natural language)', () => {
+    expect(looksLikeAuthCode('hello world')).toBe(false)
+    expect(looksLikeAuthCode('fix the bug please')).toBe(false)
+  })
+
+  it('rejects very short codes (under 6 chars)', () => {
+    expect(looksLikeAuthCode('abc')).toBe(false)
+    expect(looksLikeAuthCode('12345')).toBe(false)
+  })
+
+  it('rejects codes with special characters', () => {
+    expect(looksLikeAuthCode('code!@#')).toBe(false)
+    expect(looksLikeAuthCode('hello.world')).toBe(false)
+  })
+
+  it('trims leading/trailing whitespace before checking', () => {
+    expect(looksLikeAuthCode('  ABC123  ')).toBe(true)
+  })
+})
+
+// ─── Reauth auto-intercept routing ──────────────────────────────────────────
+// When a reauth flow is pending, plain text messages that look like auth codes
+// should be intercepted and routed to `auth code` without involving the LLM.
+
+describe('reauth auto-intercept', () => {
+  const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
+
+  type PendingReauth = { agent: string; startedAt: number }
+
+  /** Simulates the intercept logic from handleInbound */
+  function shouldIntercept(
+    text: string,
+    pending: PendingReauth | undefined,
+  ): { argv: string[] } | null {
+    if (!pending) return null
+    if (!looksLikeAuthCode(text)) return null
+    const elapsed = Date.now() - pending.startedAt
+    if (elapsed >= REAUTH_INTERCEPT_TTL_MS) return null
+    return { argv: ['auth', 'code', pending.agent, text.trim()] }
+  }
+
+  it('intercepts a code when reauth is pending', () => {
+    const pending = { agent: 'assistant', startedAt: Date.now() }
+    const result = shouldIntercept('ABC123XYZ', pending)
+    expect(result).toEqual({ argv: ['auth', 'code', 'assistant', 'ABC123XYZ'] })
+  })
+
+  it('intercepts a session_ code', () => {
+    const pending = { agent: 'coach', startedAt: Date.now() }
+    const result = shouldIntercept('session_abcdef', pending)
+    expect(result).toEqual({ argv: ['auth', 'code', 'coach', 'session_abcdef'] })
+  })
+
+  it('does not intercept when no reauth is pending', () => {
+    expect(shouldIntercept('ABC123XYZ', undefined)).toBeNull()
+  })
+
+  it('does not intercept natural language messages', () => {
+    const pending = { agent: 'assistant', startedAt: Date.now() }
+    expect(shouldIntercept('fix the bug', pending)).toBeNull()
+    expect(shouldIntercept('what is the status?', pending)).toBeNull()
+  })
+
+  it('does not intercept after TTL expires', () => {
+    const pending = { agent: 'assistant', startedAt: Date.now() - 11 * 60_000 }
+    expect(shouldIntercept('ABC123XYZ', pending)).toBeNull()
+  })
+
+  it('trims the code before building argv', () => {
+    const pending = { agent: 'assistant', startedAt: Date.now() }
+    const result = shouldIntercept('  ABC123XYZ  ', pending)
+    expect(result).toEqual({ argv: ['auth', 'code', 'assistant', 'ABC123XYZ'] })
+  })
+})
+
