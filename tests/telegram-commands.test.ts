@@ -276,7 +276,7 @@ describe('telegram bot commands', () => {
     // Locks the env-var-first contract behind getMyAgentName in server.ts.
     // Claude Code spawns MCP plugins with cwd = $HOME regardless of the
     // parent claude process cwd, so basename(cwd) returns the OS username
-    // (e.g., "kenthompson") instead of the agent name. The plugin must
+    // (e.g., "testuser") instead of the agent name. The plugin must
     // read SWITCHROOM_AGENT_NAME from the env (set in start.sh) and only fall
     // back to cwd parsing when the env var is missing.
     function getMyAgentName(env: NodeJS.ProcessEnv, cwd: string): string {
@@ -290,22 +290,22 @@ describe('telegram bot commands', () => {
       const env = { SWITCHROOM_AGENT_NAME: 'assistant' }
       // cwd is irrelevant when env is set — Claude Code's MCP plugin spawn
       // sets cwd to $HOME but the env var carries the truth.
-      expect(getMyAgentName(env, '/home/kenthompson')).toBe('assistant')
+      expect(getMyAgentName(env, '/home/testuser')).toBe('assistant')
     })
 
     it('trims whitespace from SWITCHROOM_AGENT_NAME', () => {
       const env = { SWITCHROOM_AGENT_NAME: '  coach  ' }
-      expect(getMyAgentName(env, '/home/kenthompson')).toBe('coach')
+      expect(getMyAgentName(env, '/home/testuser')).toBe('coach')
     })
 
     it('falls back to basename(cwd) when env var is unset', () => {
       const env = {}
-      expect(getMyAgentName(env, '/home/kenthompson/.switchroom/agents/assistant')).toBe('assistant')
+      expect(getMyAgentName(env, '/home/testuser/.switchroom/agents/assistant')).toBe('assistant')
     })
 
     it('falls back to basename(cwd) when env var is empty', () => {
       const env = { SWITCHROOM_AGENT_NAME: '' }
-      expect(getMyAgentName(env, '/home/kenthompson/.switchroom/agents/assistant')).toBe('assistant')
+      expect(getMyAgentName(env, '/home/testuser/.switchroom/agents/assistant')).toBe('assistant')
     })
 
     it('returns empty string when both env and cwd are unhelpful (defensive)', () => {

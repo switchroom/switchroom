@@ -49,7 +49,7 @@ function mockBot() {
 
 // ─── Realistic JSONL line builders ────────────────────────────────────────
 // Matches the shape produced by Claude Code 2.1.x (verified against
-// /home/kenthompson/.switchroom/agents/assistant/.claude/projects/.../*.jsonl).
+// ~/.switchroom/agents/<agent>/.claude/projects/.../*.jsonl).
 
 const enqueueLine = (chatId: string, text = 'hello'): string =>
   JSON.stringify({

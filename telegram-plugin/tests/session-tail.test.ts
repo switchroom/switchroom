@@ -214,7 +214,7 @@ describe('projectTranscriptLine', () => {
   it('parses real production-shape enqueue line from server', () => {
     // Lifted verbatim from a live ~/.switchroom/agents/assistant/.claude/projects/.../<sid>.jsonl
     const line =
-      '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-04-11T07:04:25.333Z","sessionId":"00000000-0000-0000-0000-000000000000","content":"<channel source=\\"switchroom-telegram\\" chat_id=\\"-1009999999999\\" message_id=\\"103\\" user=\\"mekenthompson\\" user_id=\\"1234567890\\" ts=\\"2026-04-11T07:04:23.000Z\\">\\nGo look at my new project\\n</channel>"}'
+      '{"type":"queue-operation","operation":"enqueue","timestamp":"2026-04-11T07:04:25.333Z","sessionId":"00000000-0000-0000-0000-000000000000","content":"<channel source=\\"switchroom-telegram\\" chat_id=\\"-1009999999999\\" message_id=\\"103\\" user=\\"testuser\\" user_id=\\"1234567890\\" ts=\\"2026-04-11T07:04:23.000Z\\">\\nGo look at my new project\\n</channel>"}'
     const result = projectTranscriptLine(line)
     expect(result).toHaveLength(1)
     expect(result[0]).toMatchObject({
