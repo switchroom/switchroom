@@ -2662,6 +2662,54 @@ function preBlock(text: string): string {
   return '<pre>' + escapeHtmlForTg(text) + '</pre>'
 }
 
+function formatAuthOutputForTelegram(output: string): string {
+  const trimmed = stripAnsi(output).trim()
+  const url = trimmed.match(/https:\/\/\S+/)?.[0] ?? null
+  const lines = trimmed.split(/\n+/).map(l => l.trim()).filter(Boolean)
+
+  if (!url) {
+    return preBlock(formatSwitchroomOutput(trimmed))
+  }
+
+  const body = lines.filter(line => line !== url)
+  const rendered = body.map(line => {
+    if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) {
+      return `<b>${escapeHtmlForTg(line)}</b>`
+    }
+    if (line.startsWith('Then finish with:') || line.startsWith('Cancel with:')) {
+      return escapeHtmlForTg(line)
+    }
+    if (line.startsWith('switchroom auth ')) {
+      return `<code>${escapeHtmlForTg(line)}</code>`
+    }
+    return escapeHtmlForTg(line)
+  })
+
+  rendered.push('', `<a href="${escapeHtmlForTg(url)}">Open Claude login</a>`, escapeHtmlForTg(url))
+  return rendered.join('\n')
+}
+
+async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
+  try {
+    const output = switchroomExecCombined(args, 30000)
+    const formatted = formatAuthOutputForTelegram(output)
+    await switchroomReply(ctx, formatted, { html: true })
+  } catch (err: unknown) {
+    const error = err as { status?: number; stderr?: string; message?: string }
+    if (error.message?.includes('ENOENT')) {
+      await switchroomReply(ctx, 'switchroom CLI not found. Ensure <code>switchroom</code> is on PATH or set SWITCHROOM_CLI_PATH.', { html: true })
+      return
+    }
+    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) {
+      await switchroomReply(ctx, `${label}: command timed out after 30s`)
+      return
+    }
+    const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>
+${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+  }
+}
+
 /** Execute a switchroom command and reply with the result. */
 async function runSwitchroomCommand(ctx: Context, args: string[], label: string): Promise<void> {
   try {
@@ -2853,138 +2901,107 @@ bot.command('restart', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
 })
 
-// /auth — multi-account / token management dispatcher.
-//
-// Subcommands:
-//   /auth                       → same as /auth status
-//   /auth status                → system-wide auth table
-//   /auth list [<agent>]        → per-slot listing for one agent
-//   /auth add [<agent>] [<slot>]→ start OAuth for a new slot
-//   /auth code <agent> <code> [<slot>] → finish pending flow
-//   /auth use <agent> <slot>    → switch active slot
-//   /auth reauth [<agent>] [<slot>]    → replace token for active/slot
-//   /auth rm <agent> <slot>     → delete a slot
-//   /auth cancel [<agent>]      → cancel pending flow
-//
-// `<agent>` defaults to SWITCHROOM_AGENT_NAME (the running self) when
-// omitted. Everything shells to the CLI — no LLM in the loop.
+// /auth — show token/auth health, or start/complete re-auth flows.
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const raw = getCommandArgs(ctx).trim()
-  const parts = raw.split(/\s+/).filter(Boolean)
+
+  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
   const sub = (parts[0] ?? 'status').toLowerCase()
-  const rest = parts.slice(1)
-  const me = getMyAgentName()
+  const currentAgent = getMyAgentName()
 
-  const showStatus = async (): Promise<void> => {
-    await runSwitchroomCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
-      type AuthStatusResp = {
-        agents: Array<{
-          name: string
-          authenticated: boolean
-          subscription_type: string | null
-          expires_in: string | null
-          rate_limit_tier: string | null
-        }>
-      }
-      const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
-      if (!data) return null
-      if (data.agents.length === 0) return '<i>No agents defined</i>'
-      const lines = ['<b>Auth status</b>']
-      for (const a of data.agents) {
-        const icon = a.authenticated ? '✓' : '✗'
-        const sub2 = a.subscription_type ?? '—'
-        const expires = a.expires_in ?? '—'
-        lines.push(`${icon} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(sub2)} · expires ${escapeHtmlForTg(expires)}`)
-      }
-      return lines.join('\n')
-    })
-  }
-
-  const knownSubs = new Set(['status', 'list', 'add', 'code', 'use', 'reauth', 'rm', 'cancel'])
-  if (parts.length === 0 || sub === 'status') {
-    await showStatus()
+  if (sub === 'login' || sub === 'reauth' || sub === 'link') {
+    const name = parts[1] ?? currentAgent
+    await runSwitchroomAuthCommand(ctx, ['auth', sub, name], `auth ${sub} ${name}`)
     return
   }
-  if (!knownSubs.has(sub)) {
+
+  if (sub === 'code') {
+    let name = currentAgent;
+    let code = '';
+    // If user provided 2 args, it's likely '/auth code <code-or-url>'
+    // If user provided 3 args, it's '/auth code <agent> <code-or-url>'
+    if (parts.length >= 3) {
+      name = parts[1];
+      code = parts.slice(2).join(' ');
+    } else if (parts.length === 2) {
+      code = parts[1];
+    }
+    
+    if (!code) {
+      await switchroomReply(ctx, 'Usage: /auth code [agent] <browser-code>');
+      return;
+    }
+    await runSwitchroomCommand(ctx, ['auth', 'code', name, code], `auth code ${name}`);
+    return;
+  }
+
+  if (sub === 'cancel') {
+    const name = parts[1] ?? currentAgent
+    await runSwitchroomCommand(ctx, ['auth', 'cancel', name], `auth cancel ${name}`)
+    return
+  }
+
+  if (sub !== 'status') {
     await switchroomReply(
       ctx,
-      `Unknown /auth subcommand: <code>${escapeHtmlForTg(sub)}</code>\nKnown: status, list, add, code, use, reauth, rm, cancel`,
-      { html: true },
+      `Usage:
+/auth
+/auth login [agent]
+/auth reauth [agent]
+/auth link [agent]
+/auth code [agent] <browser-code>
+/auth cancel [agent]`,
     )
     return
   }
 
-  if (sub === 'list') {
-    const agent = rest[0] ?? me
-    await runSwitchroomCommand(ctx, ['auth', 'list', agent], `auth list ${agent}`)
-    return
-  }
-  if (sub === 'add') {
-    const agent = rest[0] ?? me
-    const slot = rest[1]
-    const args = ['auth', 'add', agent, ...(slot ? ['--slot', slot] : [])]
-    await runSwitchroomCommand(ctx, args, `auth add ${agent}`)
-    return
-  }
-  if (sub === 'code') {
-    if (rest.length < 2) {
-      await switchroomReply(ctx, 'Usage: /auth code <agent> <code> [<slot>]')
-      return
+  await runSwitchroomCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
+    type AuthStatusResp = {
+      agents: Array<{
+        name: string
+        authenticated: boolean
+        auth_source: string | null
+        pending_auth: boolean
+        subscription_type: string | null
+        expires_in: string | null
+        rate_limit_tier: string | null
+      }>
     }
-    const agent = rest[0]
-    const code = rest[1]
-    const slot = rest[2]
-    const args = ['auth', 'code', agent, code, ...(slot ? ['--slot', slot] : [])]
-    await runSwitchroomCommand(ctx, args, `auth code ${agent}`)
-    return
-  }
-  if (sub === 'use') {
-    if (rest.length < 2) {
-      await switchroomReply(ctx, 'Usage: /auth use <agent> <slot>')
-      return
+    const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
+    if (!data) return null
+    if (data.agents.length === 0) return '<i>No agents defined</i>'
+    const lines = ['<b>Auth status</b>']
+    for (const a of data.agents) {
+      const icon = a.authenticated ? '✓' : (a.pending_auth ? '…' : '✗')
+      const source = a.auth_source ?? (a.pending_auth ? 'pending' : '—')
+      const subLabel = a.subscription_type ?? '—'
+      const expires = a.expires_in ?? '—'
+      lines.push(`${icon} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(source)} · ${escapeHtmlForTg(subLabel)} · expires ${escapeHtmlForTg(expires)}`)
     }
-    await runSwitchroomCommand(ctx, ['auth', 'use', rest[0], rest[1]], `auth use ${rest[0]}`)
-    return
-  }
-  if (sub === 'reauth') {
-    const agent = rest[0] ?? me
-    const slot = rest[1]
-    const args = ['auth', 'reauth', agent, ...(slot ? ['--slot', slot] : [])]
-    await runSwitchroomCommand(ctx, args, `auth reauth ${agent}`)
-    return
-  }
-  if (sub === 'rm') {
-    if (rest.length < 2) {
-      await switchroomReply(ctx, 'Usage: /auth rm <agent> <slot>')
-      return
-    }
-    await runSwitchroomCommand(ctx, ['auth', 'rm', rest[0], rest[1]], `auth rm ${rest[0]}`)
-    return
-  }
-  if (sub === 'cancel') {
-    const agent = rest[0] ?? me
-    await runSwitchroomCommand(ctx, ['auth', 'cancel', agent], `auth cancel ${agent}`)
-    return
-  }
+    return lines.join('\n')
+  })
 })
 
-// /reauth — one-shot shortcut with smart defaults.
-//   /reauth         → start reauth for the current agent's active slot
-//   /reauth <code>  → complete the pending reauth (auto-resolves slot from session)
-// Any second arg is treated as a slot override (rare).
+// /reauth — alias for starting reauth OR completing it.
+// /reauth [agent] -> starts reauth
+// /reauth <browser-code> -> completes auth for current agent
 bot.command('reauth', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const parts = getCommandArgs(ctx).trim().split(/\s+/).filter(Boolean)
-  const me = getMyAgentName()
-  if (parts.length === 0) {
-    await runSwitchroomCommand(ctx, ['auth', 'reauth', me], `auth reauth ${me}`)
-    return
+  if (!isAuthorizedSender(ctx)) return;
+  const raw = getCommandArgs(ctx).trim();
+  const name = getMyAgentName();
+  if (!raw) {
+    await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', name], `auth reauth ${name}`);
+    return;
   }
-  const code = parts[0]
-  const slot = parts[1]
-  const args = ['auth', 'code', me, code, ...(slot ? ['--slot', slot] : [])]
-  await runSwitchroomCommand(ctx, args, `auth code ${me}`)
+  
+  // If it looks like a URL or session code, treat it as /auth code
+  if (raw.startsWith('http') || raw.startsWith('session_')) {
+    await runSwitchroomCommand(ctx, ['auth', 'code', name, raw], `auth code ${name}`);
+    return;
+  }
+  
+  // Otherwise treat as agent name to start reauth
+  await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', raw], `auth reauth ${raw}`);
 })
 
 // /topics — show topic mappings
@@ -3175,6 +3192,11 @@ bot.command('switchroomhelp', async ctx => {
     'Status & lifecycle',
     '/agents - List all agents and their status',
     '/auth - Show auth/token status',
+    '/auth reauth [agent] - Start Claude browser auth for an agent',
+    '/auth link [agent] - Show the current Claude login link',
+    '/auth code [agent] <browser-code> - Finish a pending auth flow',
+    '/auth cancel [agent] - Cancel a pending auth flow',
+    '/reauth [agent] - Alias for /auth reauth [agent]',
     '/auth login [agent] - Start Claude browser auth for an agent',
     '/auth reauth [agent] - Replace the current Claude account/token',
     '/auth code [agent] <browser-code> - Finish a pending auth flow',
@@ -3210,7 +3232,8 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   // Register in all_private_chats scope (extends existing commands)
   const switchroomCommands = [
     { command: 'agents', description: 'List all agents and their status' },
-    { command: 'auth', description: 'Show auth/token status' },
+    { command: 'auth', description: 'Show auth/token status or auth actions' },
+    { command: 'reauth', description: 'Start Claude browser auth (default: this agent)' },
     { command: 'topics', description: 'Show topic-to-agent mappings' },
     { command: 'logs', description: 'Show agent logs (default: this agent)' },
     { command: 'memory', description: 'Search agent memory' },
