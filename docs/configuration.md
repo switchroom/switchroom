@@ -73,6 +73,55 @@ agents:
 
 Skills live in `switchroom.skills_dir` (default `~/.switchroom/skills/`). Each subdirectory is a named skill. Agents select skills via `skills: [name1, name2]` — scaffold symlinks them into the agent's `skills/` directory.
 
+## Skill Secrets, Env Vars, and Dependency Caches
+
+Ported skills (see `docs/skills-migration-plan.md`) follow a few conventions that keep them decoupled from the host filesystem.
+
+### Env-var naming
+
+Each skill exposes its secrets to scripts via env vars of the form `<SKILL>_<FIELD>`, upper-snake-case. The skill's `SKILL.md` is authoritative for the exact names; examples:
+
+| Skill | Env var | Resolved from |
+|---|---|---|
+| `garmin` | `GARMIN_TOKEN_DIR` | `vault:garmin-tokens` (kind="files" → temp dir path) |
+| `compass` | `COMPASS_CREDS` | `vault:compass-creds` (kind="string") |
+| `doctor-appointments` | `HOTDOC_CREDS` | `vault:hotdoc-creds` (kind="string") |
+| `home-assistant` | `HA_SSH_KEY` | `vault:ha-ssh-key#id_rsa` (specific file inlined) |
+
+The left side (`<SKILL>_<FIELD>`) is the runtime contract with the skill's scripts; the right side is the Switchroom vault reference that fills it in. Use `env:` in the agent config to wire them together — vault references resolve at scaffold/start time.
+
+### Vault reference syntax
+
+References use the `vault:` scheme and accept an optional `#<filename>` fragment:
+
+| Reference | Kind | Substituted with |
+|---|---|---|
+| `vault:<key>` | `string` | the raw string value |
+| `vault:<key>` | `binary` | the base64 payload as-is |
+| `vault:<key>` | `files` | path to a per-process temp dir materialized from the files |
+| `vault:<key>#<filename>` | `files` | the named file's contents inlined as a string |
+
+Materialized `kind="files"` dirs land under `$XDG_RUNTIME_DIR/switchroom/vault/<pid>/<key>/` (fallback `$TMPDIR/switchroom-vault-<uid>-<pid>/<key>/`), dir mode `0700`, files mode `0600`. They are wiped on process exit (SIGINT/SIGTERM/normal exit) and re-wiped whenever the same key is re-resolved within the same process, so a file removed from the vault between resolves never lingers on disk.
+
+Manage entries with `switchroom vault set <key>`, `switchroom vault get <key>`, and `switchroom vault list`. Multi-line string values are preserved verbatim via piped stdin or `--file <path>`; file-kind entries are set programmatically via `setFilesSecret` (a CLI surface for multi-file set is tracked separately).
+
+### Per-skill dependency caches
+
+Skills that need a Python venv or a Node `node_modules` tree get a lazy, hash-stamped cache per skill — no system-level installs, no per-agent duplication.
+
+| Kind | Source file | Cache layout |
+|---|---|---|
+| Python | `skills/<skill>/requirements.txt` | `~/.switchroom/deps/python/<skill>/` (standard venv; `bin/python`, `bin/pip`) |
+| Node | `skills/<skill>/package.json` (+ lockfile) | `~/.switchroom/deps/node/<skill>/` (with `node_modules/`, `node_modules/.bin/`) |
+
+First invocation builds the env and stamps a sha256 of the inputs (`.requirements.sha256` / `.package.sha256`). Subsequent invocations short-circuit when the hash matches; any change to `requirements.txt`, `package.json`, or any recognized lockfile (`bun.lock`, `bun.lockb`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) busts the cache and triggers a clean rebuild.
+
+Manual recovery: `switchroom deps rebuild <skill>` force-rebuilds one skill's caches; pass `--python` or `--node` to scope.
+
+Host prerequisites:
+- Python venvs need `python3-venv` (on Debian/Ubuntu: `apt install python3.12-venv`). `switchroom health` reports missing deps.
+- Node envs use `bun` by default. `npm` is available as an alternate installer.
+
 ## Escape Hatches
 
 For Claude Code settings switchroom doesn't wrap:
