@@ -3875,7 +3875,7 @@ void (async () => {
           // Skip stale markers (>5 min) — that's not this restart.
           if (ageMs < 5 * 60_000) {
             const ageSec = Math.max(1, Math.round(ageMs / 1000))
-            const text = `✅ Restarted — ready. (took ~${ageSec}s)`
+            const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
             try {
               const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
                 parse_mode: 'HTML',

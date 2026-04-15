@@ -242,10 +242,13 @@ function buildSessionGreetingScript(
 
   // Telegram HTML — keep it compact for mobile. Omit rows that are
   // null (unset with no interesting default to show).
+  // __SWITCHROOM_MODEL__ and __SWITCHROOM_AUTH__ are resolved at runtime
+  // by the shell script so the greeting always reflects current state.
   const text = [
-    `<b>🤖 ${name} online</b>`,
+    `<b>🎛️ Switchroom · ${escapeHtml(name)} online</b>`,
     ``,
-    `<b>Model</b>  ${escapeHtml(model)}`,
+    `<b>Model</b>  __SWITCHROOM_MODEL__`,
+    `<b>Auth</b>  __SWITCHROOM_AUTH__`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
     deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
@@ -256,11 +259,8 @@ function buildSessionGreetingScript(
     `<b>Channel</b>  ${escapeHtml(plugin)}`,
   ].filter(Boolean).join("\n");
 
-  const threadArg = topicId != null
-    ? `  -d message_thread_id="${topicId}" \\\n`
-    : "";
-
-  // Build curl calls for each destination
+  // Build curl calls for each destination. TEXT is a shell variable resolved
+  // at runtime (after placeholder substitution), so we use $TEXT not a quoted literal.
   const curlTemplate = (destChatId: string, threadId?: number) => {
     const threadLine = threadId != null
       ? `\n  -d message_thread_id="${threadId}" \\`
@@ -269,7 +269,7 @@ function buildSessionGreetingScript(
   -d chat_id="${destChatId}" \\${threadLine}
   -d parse_mode="HTML" \\
   -d disable_web_page_preview=true \\
-  --data-urlencode text=${shellSingleQuote(text)} > /dev/null 2>&1 || true`;
+  --data-urlencode text="$TEXT" > /dev/null 2>&1 || true`;
   };
 
   const curlCalls: string[] = [];
@@ -293,6 +293,105 @@ function buildSessionGreetingScript(
 # Source bot token at runtime (never baked into scripts).
 source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
 [ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
+
+# Capture hook stdin once — used for dedupe (session_id) and model resolution.
+HOOK_INPUT=""
+if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
+
+# Idempotency guard: Claude Code fires SessionStart multiple times on some
+# restart paths. Use a 30s time-window marker instead of per-session-id dedup.
+# Atomic via mkdir so concurrent invocations race cleanly.
+GREETING_MARKER="$TELEGRAM_STATE_DIR/greeting-lock"
+NOW=$(date +%s)
+if [ -d "$GREETING_MARKER" ]; then
+  LAST=$(stat -c %Y "$GREETING_MARKER" 2>/dev/null || echo 0)
+  if [ $((NOW - LAST)) -lt 30 ]; then
+    exit 0
+  fi
+  rmdir "$GREETING_MARKER" 2>/dev/null || true
+fi
+mkdir "$GREETING_MARKER" 2>/dev/null || exit 0
+
+# Resolve the active model from SessionStart hook stdin.
+# Fallback chain: hook .model → current transcript → newest transcript
+# across this project's JSONLs → user default from ~/.claude.json → cache.
+MODEL=""
+CWD=""
+if command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
+  MODEL="$(printf '%s' "$HOOK_INPUT" | jq -r '.model // empty' 2>/dev/null)"
+  CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
+  if [ -z "$MODEL" ]; then
+    TRANSCRIPT="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+    if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+      MODEL="$(grep -o '"model":"[^"]*"' "$TRANSCRIPT" | tail -1 | cut -d'"' -f4)"
+    fi
+  fi
+fi
+[ -z "$CWD" ] && CWD="$PWD"
+if [ -z "$MODEL" ]; then
+  CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  ENCODED="$(printf '%s' "$CWD" | sed 's|/|-|g')"
+  PROJECT_DIR="$CONFIG_DIR/projects/$ENCODED"
+  if [ -d "$PROJECT_DIR" ]; then
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      CANDIDATE="$(grep -o '"model":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)"
+      if [ -n "$CANDIDATE" ]; then MODEL="$CANDIDATE"; break; fi
+    done <<< "$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null)"
+  fi
+fi
+if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ]; then
+  MODEL="$(jq -r '.model // empty' "$HOME/.claude.json" 2>/dev/null)"
+fi
+MODEL_CACHE="$TELEGRAM_STATE_DIR/last-model"
+if [ -z "$MODEL" ] && [ -f "$MODEL_CACHE" ]; then
+  MODEL="$(cat "$MODEL_CACHE" 2>/dev/null)"
+fi
+[ -z "$MODEL" ] && MODEL="default"
+printf '%s' "$MODEL" > "$MODEL_CACHE" 2>/dev/null || true
+
+# Resolve auth status from token files at runtime.
+AUTH_STATUS=""
+CLAUDE_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+if command -v jq >/dev/null 2>&1; then
+  if [ -f "$CLAUDE_DIR/.oauth-token" ] && [ -f "$CLAUDE_DIR/.oauth-token.meta.json" ]; then
+    EXP_AT="$(jq -r '.expiresAt // empty' "$CLAUDE_DIR/.oauth-token.meta.json" 2>/dev/null)"
+    if [ -n "$EXP_AT" ]; then
+      NOW_MS=$(($(date +%s) * 1000))
+      REM_MS=$((EXP_AT - NOW_MS))
+      if [ "$REM_MS" -gt 0 ]; then
+        REM_H=$((REM_MS / 3600000))
+        REM_M=$(((REM_MS % 3600000) / 60000))
+        AUTH_STATUS="✓ oauth · expires \${REM_H}h \${REM_M}m"
+      else
+        AUTH_STATUS="⚠️ oauth token expired"
+      fi
+    else
+      AUTH_STATUS="✓ oauth"
+    fi
+  elif [ -f "$CLAUDE_DIR/.credentials.json" ]; then
+    EXP_AT="$(jq -r '.claudeAiOauth.expiresAt // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
+    SUB="$(jq -r '.claudeAiOauth.subscriptionType // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
+    if [ -n "$EXP_AT" ]; then
+      NOW_MS=$(($(date +%s) * 1000))
+      REM_MS=$((EXP_AT - NOW_MS))
+      if [ "$REM_MS" -gt 0 ]; then
+        REM_H=$((REM_MS / 3600000))
+        REM_M=$(((REM_MS % 3600000) / 60000))
+        AUTH_STATUS="✓ \${SUB:-credentials} · expires \${REM_H}h \${REM_M}m"
+      else
+        AUTH_STATUS="⚠️ credentials expired"
+      fi
+    else
+      AUTH_STATUS="✓ \${SUB:-credentials}"
+    fi
+  fi
+fi
+[ -z "$AUTH_STATUS" ] && AUTH_STATUS="—"
+
+TEXT=${shellSingleQuote(text)}
+TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
+TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
 
 ${curlCalls.join("\n\n")}
 `;
