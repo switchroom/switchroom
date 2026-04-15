@@ -36,6 +36,8 @@ export interface ProgressDriverConfig {
   emit: (args: {
     chatId: string
     threadId?: string
+    /** Unique key for this turn (chatId:threadId:seq). Use for pin/unpin tracking. */
+    turnKey: string
     html: string
     done: boolean
     /** True only on the first flush for this turn (message creation). */
@@ -61,6 +63,8 @@ export interface ProgressDriverConfig {
   onTurnComplete?: (args: {
     chatId: string
     threadId?: string
+    /** Unique key for this turn (chatId:threadId:seq). Use for pin/unpin tracking. */
+    turnKey: string
     summary: string
     taskIndex: number
     taskTotal: number
@@ -123,6 +127,12 @@ export function summariseTurn(state: ProgressCardState, now: number): string {
 interface PerChatState {
   chatId: string
   threadId?: string
+  /** Unique key for this turn: `chatId:threadId:seq`. Used as the chats-map key. */
+  turnKey: string
+  /** 1-based index of this card among all cards created for this chat:thread in this session. */
+  taskIndex: number
+  /** Total cards created for this chat:thread so far (snapshot at card creation). */
+  taskTotal: number
   state: ProgressCardState
   lastEmittedAt: number
   lastEmittedHtml: string | null
@@ -139,14 +149,13 @@ export interface ProgressDriver {
   /**
    * Begin a new turn synchronously — called from the inbound-message
    * handler the instant a user's message clears the gate, BEFORE any
-   * session-tail event arrives. Primes per-chat state and fires an
-   * immediate render of the "⚙️ Working…" skeleton card so the user
-   * sees the card land within ~1s of their message. Subsequent tool_use
-   * / tool_result / turn_end events (from the session JSONL tail) fold
-   * into the same state and continue editing the card in place.
+   * session-tail event arrives. Creates a fresh progress card and fires
+   * an immediate render of the "⚙️ Working…" skeleton so the user sees
+   * it within ~1s of their message.
    *
-   * Safe to call redundantly: a second startTurn for the same chat
-   * before turn_end just re-primes state with the new userRequest.
+   * If a card is already active for this chat, it is force-closed (done=true,
+   * onTurnComplete fired) before the new card is created. Each call always
+   * produces an independent card with its own pin lifecycle.
    */
   startTurn(args: { chatId: string; threadId?: string; userText: string }): void
   /** Current state for a chat (for tests / inspection). */
@@ -205,15 +214,26 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   }
 
   const chats = new Map<string, PerChatState>()
-  // Track the last enqueued chat so non-enqueue session events (tool_use,
+  // Per-chat turn sequence counters. Key = baseKey(chatId, threadId).
+  // Each new startTurn increments the counter; the value is the NEXT seq
+  // to allocate (so current total = value - 1 once at least one was allocated).
+  const baseTurnSeqs = new Map<string, number>()
+
+  /** Allocate a new turn slot for chatId:threadId. Returns the unique turnKey and 1-based index. */
+  function allocateTurnSlot(chatId: string, threadId?: string): { turnKey: string; index: number; total: number } {
+    const base = baseKey(chatId, threadId)
+    const seq = (baseTurnSeqs.get(base) ?? 0) + 1
+    baseTurnSeqs.set(base, seq)
+    return { turnKey: `${base}:${seq}`, index: seq, total: seq }
+  }
+
+  // Track the last enqueued turn key so non-enqueue session events (tool_use,
   // tool_result, turn_end) which arrive with chatIdMaybe=null from the
-  // session-tail supervisor still route to the correct chat. Without
-  // this, every post-enqueue event would fall out of `ingest` at the
-  // `chatId == null` guard and the card would stay frozen at the
-  // initial "Working…" skeleton — exactly the symptom PR #25 failed to
-  // resolve.
+  // session-tail supervisor still route to the correct card.
   let currentChatId: string | null = null
   let currentThreadId: string | undefined
+  /** Full turn key (chatId:threadId:seq) for the currently active turn. */
+  let currentTurnKey: string | null = null
   let heartbeatHandle: { ref: unknown } | null = null
   // Tracks the last elapsed-seconds bucket we emitted for each chat so
   // the heartbeat can coalesce — if the HTML hasn't changed AND the
@@ -232,26 +252,28 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // sub-agent is running). Coalesce: only actually emit if either
       // the rendered HTML changed or the elapsed-time bucket
       // (rounded to the heartbeat period) advanced.
-      for (const [k, cs] of chats) {
+      for (const [, cs] of chats) {
         if (cs.state.stage === 'done') continue
         // Skip heartbeat while the chat is hot — sub-agent bursts are
         // already producing edits, the elapsed counter is ticking from
         // those, and an extra heartbeat edit just spends budget. (Design
         // §4.4: "heartbeat respects budget too".)
-        if (isBudgetHot(k)) continue
+        if (isBudgetHot(cs.turnKey)) continue
         const html = render(cs.state, now())
         const bucket = Math.floor(now() / heartbeatMs)
-        const prevBucket = lastHeartbeatBucket.get(k)
+        const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
         if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
-        lastHeartbeatBucket.set(k, bucket)
+        lastHeartbeatBucket.set(cs.turnKey, bucket)
         cs.lastEmittedHtml = html
         cs.lastEmittedAt = now()
-        recordEdit(k)
+        recordEdit(cs.turnKey)
         config.emit({
           chatId: cs.chatId,
           threadId: cs.threadId,
+          turnKey: cs.turnKey,
           html,
           done: false,
+          isFirstEmit: false,
         })
       }
       // If every chat has ended, stop the heartbeat to avoid an
@@ -266,26 +288,20 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     heartbeatHandle = null
   }
 
-  function key(chatId: string, threadId?: string): string {
+  /** Base key for a chat:thread (no turn seq). Used as prefix for turn keys. */
+  function baseKey(chatId: string, threadId?: string): string {
     return threadId != null ? `${chatId}:${threadId}` : chatId
   }
 
   /**
-   * Count how many active tasks (PerChatState entries) share the same base
-   * chatId (ignoring thread suffix). Used to compute the N/M task counter.
+   * Return the N/M task counter for a card. Index and total are derived
+   * from the per-chat sequence counter so they remain accurate even when
+   * other cards have been cleaned up.
    */
   function taskNumFor(chatState: PerChatState): TaskNum {
-    const baseChatId = chatState.chatId
-    // Collect all keys for this chatId and sort them deterministically so
-    // the index is stable across re-renders. Sort by insertion-order key.
-    const matches: string[] = []
-    for (const [k, cs] of chats) {
-      if (cs.chatId === baseChatId) matches.push(k)
-    }
-    matches.sort()
-    const thisKey = key(chatState.chatId, chatState.threadId)
-    const index = matches.indexOf(thisKey) + 1 // 1-based
-    return { index: Math.max(1, index), total: matches.length }
+    const base = baseKey(chatState.chatId, chatState.threadId)
+    const total = baseTurnSeqs.get(base) ?? chatState.taskIndex
+    return { index: chatState.taskIndex, total }
   }
 
   function flush(chatState: PerChatState, forceDone: boolean): void {
@@ -294,15 +310,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()
-    const k = key(chatState.chatId, chatState.threadId)
-    recordEdit(k)
+    recordEdit(chatState.turnKey)
     const isFirst = chatState.isFirstEmit
     chatState.isFirstEmit = false
     config.emit({
       chatId: chatState.chatId,
       threadId: chatState.threadId,
+      turnKey: chatState.turnKey,
       html,
-      done: chatState.state.stage === 'done',
+      // forceDone=true signals an externally-imposed close (e.g. a new startTurn
+      // interrupting a still-running card). Use it to override the stage check so
+      // the Telegram message is correctly marked done even if turn_end never ran.
+      done: forceDone || chatState.state.stage === 'done',
       isFirstEmit: isFirst,
     })
   }
@@ -352,11 +371,61 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (event.kind === 'enqueue') {
         chatId = event.chatId
         threadId = event.threadId ?? undefined
-        // Remember the active chat so subsequent events in this turn
-        // (routed from the session-tail with chatIdMaybe=null) still
-        // find their way here.
+
+        // Allocate a new turn slot FIRST — this increments baseTurnSeqs so
+        // that taskNumFor() on the old card will see the correct total (N+1)
+        // when we render its final "done" frame below.
+        const slot = allocateTurnSlot(chatId, threadId)
+
+        // If an existing card is still active for this chat, force-close it
+        // so it gets properly done/unpinned before the new card takes over.
+        if (currentTurnKey != null) {
+          const existing = chats.get(currentTurnKey)
+          if (existing != null && existing.chatId === chatId) {
+            if (existing.pendingTimer != null) {
+              clearT(existing.pendingTimer)
+              existing.pendingTimer = null
+            }
+            flush(existing, /*forceDone*/ true)
+            const existingTaskNum = taskNumFor(existing)
+            const existingSummary = summariseTurn(existing.state, now())
+            if (config.onTurnComplete) {
+              try {
+                config.onTurnComplete({
+                  chatId: existing.chatId,
+                  threadId: existing.threadId,
+                  turnKey: existing.turnKey,
+                  summary: existingSummary,
+                  taskIndex: existingTaskNum.index,
+                  taskTotal: existingTaskNum.total,
+                })
+              } catch { /* never let completion callback break the stream */ }
+            }
+            chats.delete(currentTurnKey)
+            lastHeartbeatBucket.delete(currentTurnKey)
+            editTimestamps.delete(currentTurnKey)
+          }
+        }
         currentChatId = chatId
         currentThreadId = threadId
+        currentTurnKey = slot.turnKey
+
+        const chatState: PerChatState = {
+          chatId,
+          threadId,
+          turnKey: slot.turnKey,
+          taskIndex: slot.index,
+          taskTotal: slot.total,
+          state: reduce(initialState(), event, now()),
+          lastEmittedAt: 0,
+          lastEmittedHtml: null,
+          pendingTimer: null,
+          isFirstEmit: true,
+        }
+        chats.set(slot.turnKey, chatState)
+        startHeartbeatIfNeeded()
+        flush(chatState, /*forceDone*/ false)
+        return
       } else if (chatId == null) {
         // Non-enqueue event with no explicit chat: fall back to the
         // most recently enqueued chat for this driver.
@@ -365,29 +434,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }
       if (chatId == null) return
 
-      const k = key(chatId, threadId)
+      // Route to the current active turn key. Drop late events for a turn
+      // that already ended — without this, a stray tool_result after turn_end
+      // would resurrect the card. currentTurnKey is cleared on turn_end.
+      const k = currentTurnKey
+      if (k == null) return
       let chatState = chats.get(k)
-      // Drop late events for a turn that already ended. Without this, a
-      // stray tool_result arriving after turn_end would spawn a fresh
-      // initialState and paint a half-empty card. enqueue always starts
-      // a new turn so it bypasses this guard.
-      if (chatState == null && event.kind !== 'enqueue') return
-      if (chatState == null) {
-        chatState = {
-          chatId,
-          threadId,
-          state: initialState(),
-          lastEmittedAt: 0,
-          lastEmittedHtml: null,
-          pendingTimer: null,
-          isFirstEmit: true,
-        }
-        chats.set(k, chatState)
-        // New chat became active — ensure the heartbeat is running so
-        // the elapsed counter visibly ticks even during long stretches
-        // with no session events (e.g. sub-agent work).
-        startHeartbeatIfNeeded()
-      }
+      if (chatState == null) return
 
       const prev = chatState.state
       chatState.state = reduce(chatState.state, event, now())
@@ -427,6 +480,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
               config.onTurnComplete({
                 chatId: chatState.chatId,
                 threadId: chatState.threadId,
+                turnKey: chatState.turnKey,
                 summary,
                 taskIndex: taskNum.index,
                 taskTotal: taskNum.total,
@@ -436,12 +490,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
             }
           }
           // Drop the chat state so a subsequent turn starts clean.
-          chats.delete(k)
-          lastHeartbeatBucket.delete(k)
-          editTimestamps.delete(k)
-          if (currentChatId === chatId && currentThreadId === threadId) {
+          chats.delete(chatState.turnKey)
+          lastHeartbeatBucket.delete(chatState.turnKey)
+          editTimestamps.delete(chatState.turnKey)
+          if (currentTurnKey === chatState.turnKey) {
             currentChatId = null
             currentThreadId = undefined
+            currentTurnKey = null
           }
           // Stop heartbeat when no chats remain active.
           if (chats.size === 0) stopHeartbeat()
@@ -466,13 +521,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // editBudgetCoalesceMs (default 3s) so the Telegram 20/min cap is
       // never exceeded by sub-agent bursts.
       const sinceLast = now() - chatState.lastEmittedAt
-      const effectiveCoalesce = isBudgetHot(k) ? editBudgetCoalesceMs : coalesceMs
+      const effectiveCoalesce = isBudgetHot(chatState.turnKey) ? editBudgetCoalesceMs : coalesceMs
       const delay = Math.max(effectiveCoalesce, minIntervalMs - sinceLast, 0)
+      const capturedTurnKey = chatState.turnKey
       chatState.pendingTimer = setT(() => {
         // Defensive: if the chat was deleted between schedule and fire
         // (e.g. a turn_end racing with an async boundary added later),
         // don't resurrect it with a stale flush.
-        if (!chats.has(k)) return
+        if (!chats.has(capturedTurnKey)) return
         chatState!.pendingTimer = null
         flush(chatState!, /*forceDone*/ false)
       }, delay)
@@ -481,9 +537,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     startTurn({ chatId, threadId, userText }) {
       // Synthesize an enqueue event and run it through the normal ingest
       // path. This guarantees we share all the flush/cadence/teardown
-      // semantics with session-tail-driven enqueues (including the
-      // "fire immediately" branch for enqueue events). The rawContent
-      // wrapper matches the shape extractUserText expects.
+      // semantics with session-tail-driven enqueues.
+      //
+      // Each call creates a NEW card — if a card is already active for
+      // this chat it is force-closed first so it gets properly done/unpinned.
       const raw = `<channel source="switchroom-telegram" chat_id="${chatId}"${threadId != null ? ` message_thread_id="${threadId}"` : ''}>${userText}</channel>`
       this.ingest(
         {
@@ -499,8 +556,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     },
 
     peek(chatId, threadId) {
-      const k = key(chatId, threadId)
-      return chats.get(k)?.state
+      // Return the current active turn state for this chat:thread.
+      if (currentTurnKey != null) {
+        const cs = chats.get(currentTurnKey)
+        if (cs != null && cs.chatId === chatId && cs.threadId === threadId) {
+          return cs.state
+        }
+      }
+      // Fallback: find any active card for this chatId (threadId match optional).
+      for (const cs of chats.values()) {
+        if (cs.chatId === chatId && cs.threadId === threadId) return cs.state
+      }
+      return undefined
     },
 
     dispose() {

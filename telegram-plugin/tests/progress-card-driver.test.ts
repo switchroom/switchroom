@@ -21,7 +21,7 @@ function harness(
   let now = 1000
   const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
   let nextRef = 0
-  const emits: Array<{ chatId: string; threadId?: string; html: string; done: boolean; isFirstEmit: boolean }> = []
+  const emits: Array<{ chatId: string; threadId?: string; turnKey: string; html: string; done: boolean; isFirstEmit: boolean }> = []
   const summaries: string[] = []
 
   const driver = createProgressDriver({
@@ -319,11 +319,11 @@ describe('progress-card checklist rendering', () => {
     }
     advance(2000)
     const html = emits.at(-1)!.html
-    expect(html).toContain('(+3 more earlier steps)')
-    // The visible tail contains exactly 12 checklist lines (count the
-    // state emojis — excluding the header banner ⚙️/✅).
+    expect(html).toContain('(+10 more earlier steps)')
+    // The visible tail contains exactly MAX_VISIBLE_ITEMS (5) checklist lines
+    // (count the state emojis — excluding the header banner ⚙️/✅).
     const checklistEmojis = (html.match(/\n  (✅|🔧|❌) /g) ?? []).length
-    expect(checklistEmojis).toBe(12)
+    expect(checklistEmojis).toBe(5)
   })
 
   it('banner transitions from "Working…" to "Done" on turn_end and keeps checklist visible', () => {
@@ -669,5 +669,163 @@ describe('render() taskNum header suffix', () => {
     const out = render(st, 2000, { index: 1, total: 2 })
     expect(out).toContain('(1/2)')
     expect(out).toContain('Done')
+  })
+})
+
+// ─── one-card-per-task (multi-card) ──────────────────────────────────────────
+// Each startTurn/enqueue creates an independent card with its own lifecycle:
+// - distinct turnKey
+// - first card is force-closed (done emit + onTurnComplete) when second starts
+// - N/M label reflects sequential card count
+// - isFirstEmit is true exactly once per card
+// - session events route to the most recent (current) card
+
+describe('one card per task', () => {
+  it('each startTurn produces a distinct turnKey', () => {
+    const { driver, emits, advance } = harness(0, 0)
+    driver.startTurn({ chatId: 'c', userText: 'task one' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+    driver.startTurn({ chatId: 'c', userText: 'task two' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+
+    const keys = emits.map(e => e.turnKey)
+    const uniqueKeys = new Set(keys)
+    // Both tasks produce emits with different turnKeys
+    expect(uniqueKeys.size).toBe(2)
+    // turnKeys are deterministic: chatId:seq
+    expect(keys[0]).toBe('c:1')
+    const doneKeys = emits.filter(e => e.done).map(e => e.turnKey)
+    expect(doneKeys).toEqual(['c:1', 'c:2'])
+  })
+
+  it('second startTurn mid-turn force-closes first card as done before creating second', () => {
+    const completions: Array<{ turnKey: string; taskIndex: number; taskTotal: number }> = []
+    const { driver, emits, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    // Turn 1 starts, some work, then turn 2 interrupts before turn_end
+    driver.startTurn({ chatId: 'c', userText: 'first' })
+    advance(0)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c')
+    advance(0)
+
+    const emitsAfterT1 = emits.length
+
+    // Turn 2 starts — should force-close turn 1
+    driver.startTurn({ chatId: 'c', userText: 'second (steering)' })
+    advance(0)
+
+    // Turn 1 should have emitted a done=true before turn 2's first emit
+    const doneEmitForT1 = emits.slice(emitsAfterT1).find(e => e.done && e.turnKey === 'c:1')
+    expect(doneEmitForT1).toBeDefined()
+
+    // onTurnComplete fired for turn 1
+    expect(completions).toHaveLength(1)
+    expect(completions[0].turnKey).toBe('c:1')
+    expect(completions[0].taskIndex).toBe(1)
+
+    // Turn 2's first emit has isFirstEmit=true
+    const t2First = emits.find(e => e.turnKey === 'c:2' && e.isFirstEmit)
+    expect(t2First).toBeDefined()
+
+    // Now turn 2 ends normally
+    driver.ingest({ kind: 'turn_end', durationMs: 200 }, 'c')
+    advance(0)
+    expect(completions).toHaveLength(2)
+    expect(completions[1].turnKey).toBe('c:2')
+  })
+
+  it('N/M counter reflects sequential task index (1/2, 2/2)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    // Task 1
+    driver.startTurn({ chatId: 'c', userText: 'first task' })
+    advance(0)
+    // Turn 2 starts mid-turn (steering)
+    driver.startTurn({ chatId: 'c', userText: 'second task' })
+    advance(0)
+
+    // First emit of task 1 should not have N/M (it was 1/1 at creation time)
+    const t1First = emits.find(e => e.turnKey === 'c:1' && e.isFirstEmit)
+    expect(t1First?.html).not.toMatch(/\(\d+\/\d+\)/)
+
+    // Force-close of task 1 (from startTurn 2) now has total=2, so shows (1/2)
+    const t1Done = emits.find(e => e.turnKey === 'c:1' && e.done)
+    expect(t1Done?.html).toContain('(1/2)')
+
+    // Task 2 first emit should show (2/2)
+    const t2First = emits.find(e => e.turnKey === 'c:2' && e.isFirstEmit)
+    expect(t2First?.html).toContain('(2/2)')
+  })
+
+  it('session events after second startTurn route to second card, not first', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.startTurn({ chatId: 'c', userText: 'first' })
+    advance(0)
+    driver.startTurn({ chatId: 'c', userText: 'second' })
+    advance(0)
+    emits.length = 0
+
+    // tool_use should land on card 2
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c')
+    advance(600)
+
+    const bashEmit = emits.find(e => e.html.includes('Bash'))
+    expect(bashEmit).toBeDefined()
+    expect(bashEmit!.turnKey).toBe('c:2')
+  })
+
+  it('isFirstEmit is true exactly once per card across two startTurn calls', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.startTurn({ chatId: 'c', userText: 'first' })
+    advance(0)
+    driver.startTurn({ chatId: 'c', userText: 'second' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+
+    const firstEmits = emits.filter(e => e.isFirstEmit)
+    expect(firstEmits).toHaveLength(2)
+    expect(firstEmits[0].turnKey).toBe('c:1')
+    expect(firstEmits[1].turnKey).toBe('c:2')
+  })
+
+  it('different chats each get their own turn sequence (no cross-chat interference)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.startTurn({ chatId: 'c1', userText: 'chat one' })
+    advance(0)
+    driver.startTurn({ chatId: 'c2', userText: 'chat two' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c1')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c2')
+    advance(0)
+
+    const c1Keys = emits.filter(e => e.chatId === 'c1').map(e => e.turnKey)
+    const c2Keys = emits.filter(e => e.chatId === 'c2').map(e => e.turnKey)
+    expect(new Set(c1Keys)).toEqual(new Set(['c1:1']))
+    expect(new Set(c2Keys)).toEqual(new Set(['c2:1']))
+  })
+
+  it('onTurnComplete receives turnKey for each card separately', () => {
+    const completions: Array<{ turnKey: string }> = []
+    const { driver, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    driver.startTurn({ chatId: 'c', userText: 'task 1' })
+    advance(0)
+    // Turn 2 force-closes turn 1 via onTurnComplete
+    driver.startTurn({ chatId: 'c', userText: 'task 2' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 200 }, 'c')
+    advance(0)
+
+    expect(completions).toHaveLength(2)
+    expect(completions.map(c => c.turnKey)).toEqual(['c:1', 'c:2'])
   })
 })

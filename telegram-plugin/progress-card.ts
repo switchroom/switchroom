@@ -456,7 +456,7 @@ const STATE_EMOJI: Record<ItemState, string> = {
  * stays compact during long turns. Chosen to fit comfortably on a
  * mobile Telegram screen without scroll.
  */
-const MAX_VISIBLE_ITEMS = 12
+const MAX_VISIBLE_ITEMS = 5
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`

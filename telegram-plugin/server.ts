@@ -186,6 +186,12 @@ import {
   writeLastTurnSummary,
   type HandoffFormat,
 } from './handoff-continuity.js'
+import {
+  readActivePins,
+  addActivePin,
+  removeActivePin,
+  clearActivePins,
+} from './active-pins.js'
 
 /**
  * One-shot carry-over from the session-end summarizer: a short topic
@@ -1737,21 +1743,41 @@ let sessionTailHandle: SessionTailHandle | null = null
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 let progressDriver: ProgressDriver | null = null
 if (streamMode === 'checklist') {
+  // Failsafe: unpin any progress cards left over from a prior session
+  // that crashed or was killed mid-turn. The in-memory pin map is lost
+  // on restart, so without this sweep the stale pins stick forever.
+  // Best-effort — log and continue on any unpin error (the message may
+  // have been deleted, the bot may have been demoted, etc.).
+  const startupAgentDir = resolveAgentDirFromEnv()
+  if (startupAgentDir != null) {
+    const stalePins = readActivePins(startupAgentDir)
+    if (stalePins.length > 0) {
+      process.stderr.write(
+        `telegram channel: sweeping ${stalePins.length} stale progress-card pin(s) from prior session\n`,
+      )
+      for (const pin of stalePins) {
+        lockedBot.api
+          .unpinChatMessage(pin.chatId, pin.messageId)
+          .catch((err: Error) => {
+            process.stderr.write(
+              `telegram channel: stale-pin cleanup failed for ${pin.chatId}/${pin.messageId}: ${err.message}\n`,
+            )
+          })
+      }
+      clearActivePins(startupAgentDir)
+    }
+  }
+
   /**
    * Tracks the pinned message_id for each active progress card, keyed by
-   * `chatId` (or `chatId:threadId` for forum topics). Written on first
-   * emit (when the Telegram message is created), read on completion to
-   * unpin. Cleaned up after onTurnComplete fires.
+   * `turnKey` (chatId:threadId:seq) so each card has its own pin lifecycle.
+   * Written on first emit (when the Telegram message is created), read on
+   * completion to unpin. Cleaned up after onTurnComplete fires.
    */
   const progressPinnedMsgIds = new Map<string, number>()
 
-  /** Build a stable lookup key for pin tracking (mirrors PerChatState.key). */
-  function progressPinKey(chatId: string, threadId?: string): string {
-    return threadId != null ? `${chatId}:${threadId}` : chatId
-  }
-
   progressDriver = createProgressDriver({
-    emit: ({ chatId, threadId, html, done, isFirstEmit }) => {
+    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
       // Fire-and-forget — handleStreamReply is async but we don't await
       // (the driver owns cadence; the call just posts/edits). Errors
       // are logged and swallowed so a dropped edit never kills the
@@ -1782,13 +1808,26 @@ if (streamMode === 'checklist') {
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
         if (!result?.messageId) return
-        const pinKey = progressPinKey(chatId, threadId)
         // First emit: pin the newly created progress card. Use
         // disable_notification so the pin doesn't produce an extra push.
-        if (isFirstEmit && !progressPinnedMsgIds.has(pinKey)) {
-          progressPinnedMsgIds.set(pinKey, result.messageId)
+        if (isFirstEmit && !progressPinnedMsgIds.has(turnKey)) {
+          progressPinnedMsgIds.set(turnKey, result.messageId)
+          const pinnedMessageId = result.messageId
           lockedBot.api
-            .pinChatMessage(chatId, result.messageId, { disable_notification: true })
+            .pinChatMessage(chatId, pinnedMessageId, { disable_notification: true })
+            .then(() => {
+              // Persist after the API confirms the pin — if pinning
+              // failed we don't want a phantom entry in the sidecar.
+              const agentDir = resolveAgentDirFromEnv()
+              if (agentDir != null) {
+                addActivePin(agentDir, {
+                  chatId,
+                  messageId: pinnedMessageId,
+                  turnKey,
+                  pinnedAt: Date.now(),
+                })
+              }
+            })
             .catch((err: Error) => {
               process.stderr.write(
                 `telegram channel: progress-card pin failed: ${err.message}\n`,
@@ -1809,19 +1848,28 @@ if (streamMode === 'checklist') {
       const agentDir = resolveAgentDirFromEnv()
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
     },
-    onTurnComplete: ({ chatId, threadId, summary }) => {
-      const pinKey = progressPinKey(chatId, threadId)
-      const pinnedId = progressPinnedMsgIds.get(pinKey)
-      progressPinnedMsgIds.delete(pinKey)
+    onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
+      const pinnedId = progressPinnedMsgIds.get(turnKey)
+      progressPinnedMsgIds.delete(turnKey)
 
       // Unpin the progress card now that the turn is done.
       if (pinnedId != null) {
+        const pinnedMessageId = pinnedId
         lockedBot.api
-          .unpinChatMessage(chatId, pinnedId)
+          .unpinChatMessage(chatId, pinnedMessageId)
           .catch((err: Error) => {
             process.stderr.write(
               `telegram channel: progress-card unpin failed: ${err.message}\n`,
             )
+          })
+          .finally(() => {
+            // Drop the sidecar entry regardless of unpin outcome — if
+            // the API errored the message is likely gone already, and
+            // we don't want to retry forever on startup.
+            const agentDir = resolveAgentDirFromEnv()
+            if (agentDir != null) {
+              removeActivePin(agentDir, chatId, pinnedMessageId)
+            }
           })
       }
 
