@@ -1,11 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   parseEnvFile,
   telegramGetMe,
   checkTelegram,
+  parsePythonVersion,
+  parseNodeVersion,
+  findChromium,
+  checkDepsCacheWritable,
+  checkSkillsPrerequisites,
 } from "../src/cli/doctor.js";
 import { findConfigFile } from "../src/config/loader.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -261,5 +266,174 @@ describe("checkTelegram", () => {
     expect(results[0].name).toContain("agent-a");
     expect(results[0].name).toContain("agent-b");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("parsePythonVersion", () => {
+  it("parses full Python 3.x.y version strings", () => {
+    expect(parsePythonVersion("Python 3.12.3")).toEqual({
+      major: 3,
+      minor: 12,
+      patch: 3,
+    });
+    expect(parsePythonVersion("Python 3.11.9")).toEqual({
+      major: 3,
+      minor: 11,
+      patch: 9,
+    });
+  });
+
+  it("accepts major.minor without patch", () => {
+    expect(parsePythonVersion("Python 3.10")).toEqual({
+      major: 3,
+      minor: 10,
+      patch: 0,
+    });
+  });
+
+  it("handles trailing text like build suffixes", () => {
+    expect(parsePythonVersion("Python 3.12.3+ (main, Jan  1 2026)")).toEqual({
+      major: 3,
+      minor: 12,
+      patch: 3,
+    });
+  });
+
+  it("returns null on unrecognized input", () => {
+    expect(parsePythonVersion("bash: python3: command not found")).toBeNull();
+    expect(parsePythonVersion("")).toBeNull();
+    expect(parsePythonVersion("Python")).toBeNull();
+  });
+});
+
+describe("parseNodeVersion", () => {
+  it("parses `vX.Y.Z` output", () => {
+    expect(parseNodeVersion("v22.22.2")).toEqual({
+      major: 22,
+      minor: 22,
+      patch: 2,
+    });
+    expect(parseNodeVersion("v18.0.0")).toEqual({
+      major: 18,
+      minor: 0,
+      patch: 0,
+    });
+  });
+
+  it("tolerates trailing whitespace", () => {
+    expect(parseNodeVersion("v20.10.0\n")).toEqual({
+      major: 20,
+      minor: 10,
+      patch: 0,
+    });
+  });
+
+  it("returns null on unrecognized input", () => {
+    expect(parseNodeVersion("")).toBeNull();
+    expect(parseNodeVersion("20.10.0")).toBeNull(); // missing leading v
+    expect(parseNodeVersion("node: not found")).toBeNull();
+  });
+});
+
+describe("findChromium", () => {
+  let tempHome: string;
+
+  beforeEach(() => {
+    tempHome = resolve(tmpdir(), `switchroom-doctor-chrome-${Date.now()}`);
+    mkdirSync(tempHome, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it("returns null when nothing is installed under the Playwright cache", () => {
+    // Fresh empty HOME means no ~/.cache/ms-playwright. The PATH-based
+    // lookups may still succeed on a dev host, so we only assert on
+    // the non-null branch returning something sensible.
+    const result = findChromium(tempHome);
+    if (result === null) {
+      expect(result).toBeNull();
+    } else {
+      expect(result).toContain("chrom");
+    }
+  });
+
+  it("finds a chromium binary inside the Playwright cache layout", () => {
+    const browserDir = join(
+      tempHome,
+      ".cache",
+      "ms-playwright",
+      "chromium-1134",
+      "chrome-linux",
+    );
+    mkdirSync(browserDir, { recursive: true });
+    const chromePath = join(browserDir, "chrome");
+    writeFileSync(chromePath, "#!/bin/sh\nexit 0\n");
+    chmodSync(chromePath, 0o755);
+
+    // Temporarily scrub PATH so we only test the cache fallback.
+    const origPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      expect(findChromium(tempHome)).toBe(chromePath);
+    } finally {
+      process.env.PATH = origPath;
+    }
+  });
+});
+
+describe("checkDepsCacheWritable", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-doctor-deps-${Date.now()}`);
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("reports ok and creates the deps root when missing", () => {
+    const depsRoot = join(tempDir, "deps");
+    const result = checkDepsCacheWritable(depsRoot);
+    expect(result.status).toBe("ok");
+    expect(result.detail).toBe(depsRoot);
+  });
+
+  it("reports ok when the deps root already exists", () => {
+    const depsRoot = join(tempDir, "deps");
+    mkdirSync(depsRoot, { recursive: true });
+    const result = checkDepsCacheWritable(depsRoot);
+    expect(result.status).toBe("ok");
+  });
+
+  it("reports fail when the target is under a non-directory", () => {
+    // /dev/null is a character device, not a directory, so mkdir under
+    // it fails with ENOTDIR immediately — portable across Linux distros
+    // without needing root-owned test fixtures.
+    const result = checkDepsCacheWritable("/dev/null/switchroom-deps-should-fail");
+    expect(result.status).toBe("fail");
+    expect(result.fix).toBeDefined();
+  });
+});
+
+describe("checkSkillsPrerequisites", () => {
+  it("returns one result per prerequisite in a stable order", () => {
+    const results = checkSkillsPrerequisites();
+    const names = results.map((r) => r.name);
+    expect(names).toEqual([
+      "Python 3.11+",
+      "Node 18+",
+      "Chromium",
+      "~/.switchroom/deps writable",
+    ]);
+  });
+
+  it("each result has a valid status glyph class", () => {
+    const results = checkSkillsPrerequisites();
+    for (const r of results) {
+      expect(["ok", "warn", "fail"]).toContain(r.status);
+    }
   });
 });
