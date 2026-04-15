@@ -93,6 +93,74 @@ describe("scaffoldAgent", () => {
     expect(startSh).not.toContain("$(node -v)");
   });
 
+  it("start.sh exports CLAUDE_CODE_OAUTH_TOKEN from .oauth-token if present", () => {
+    // Root-cause fix for the reauth token-loading bug: the token is saved to
+    // .oauth-token on disk, but must also be exported into the live Claude
+    // process env — otherwise Claude ignores .oauth-token and falls back to
+    // .credentials.json (old account).
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("token-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // Must unset first (clear any inherited value from the outer shell)
+    expect(startSh).toContain("unset CLAUDE_CODE_OAUTH_TOKEN");
+    // Must read the token from $CLAUDE_CONFIG_DIR/.oauth-token when it exists
+    expect(startSh).toMatch(/if \[ -f "\$CLAUDE_CONFIG_DIR\/\.oauth-token" \]/);
+    expect(startSh).toContain("export CLAUDE_CODE_OAUTH_TOKEN=");
+    expect(startSh).toContain(".oauth-token");
+    // The export must come BEFORE the exec claude line
+    const exportIdx = startSh.indexOf("export CLAUDE_CODE_OAUTH_TOKEN=");
+    const execIdx = startSh.indexOf("exec claude");
+    expect(exportIdx).toBeGreaterThanOrEqual(0);
+    expect(execIdx).toBeGreaterThanOrEqual(0);
+    expect(exportIdx).toBeLessThan(execIdx);
+  });
+
+  it("session greeting uses Switchroom branding with 🎛️ icon", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("greet-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    expect(greeting).toContain("🎛️ Switchroom");
+    expect(greeting).toContain("greet-agent");
+    expect(greeting).not.toContain("🤖");
+  });
+
+  it("session greeting shows dynamic auth status at runtime", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("auth-greet-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    // Must resolve auth from token files at runtime (not baked-in static text)
+    expect(greeting).toContain(".oauth-token.meta.json");
+    expect(greeting).toContain(".credentials.json");
+    expect(greeting).toContain("__SWITCHROOM_AUTH__");
+    expect(greeting).toContain("AUTH_STATUS");
+    // Auth row must be in the TEXT template
+    expect(greeting).toMatch(/<b>Auth<\/b>\s+__SWITCHROOM_AUTH__/);
+  });
+
+  it("session greeting shows dynamic model at runtime", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("model-greet-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    // Model must be a runtime placeholder, not a baked static value
+    expect(greeting).toContain("__SWITCHROOM_MODEL__");
+    expect(greeting).toContain("MODEL=");
+    // The placeholder must be replaced via shell parameter expansion
+    expect(greeting).toContain("${TEXT//__SWITCHROOM_MODEL__/$MODEL}");
+  });
+
   it("generates telegram .env with bot token", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("bot-agent", config, tmpDir, telegramConfig);

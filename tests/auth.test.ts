@@ -9,6 +9,7 @@ import {
   refreshAgent,
   parseSetupTokenUrl,
   parseSetupTokenValue,
+  submitAuthCode,
 } from "../src/auth/manager.js";
 
 describe("formatTimeUntilExpiry", () => {
@@ -282,5 +283,113 @@ describe("setup-token parsing", () => {
   it("extracts a setup-token oauth token from output", () => {
     const sample = "Success! Export this token:\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-abc_DEF-123\n";
     expect(parseSetupTokenValue(sample)).toBe("sk-ant-oat01-abc_DEF-123");
+  });
+});
+
+describe("reauth token-loading bug regression", () => {
+  // Root cause (fixed): switchroom auth code saves the token to .oauth-token
+  // on disk, but the start.sh template was not exporting CLAUDE_CODE_OAUTH_TOKEN
+  // into the live Claude process. Claude fell back to .credentials.json (old
+  // account) even though the new token was on disk. This test suite guards
+  // against that regression by verifying the token round-trip at the TS layer.
+
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-reauth-regression-${Date.now()}`);
+    mkdirSync(resolve(tempDir, ".claude"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("getAuthStatus prefers .oauth-token over .credentials.json (env-export source)", () => {
+    // Simulate: old credentials on disk AND new oauth token saved by submitAuthCode.
+    // getAuthStatus must return source="oauth-token" so start.sh exports the right token.
+    const creds = {
+      claudeAiOauth: {
+        accessToken: "sk-ant-oat01-OLD-credentials-token",
+        expiresAt: Date.now() + 8 * 60 * 60_000,
+        subscriptionType: "pro",
+      },
+    };
+    writeFileSync(
+      resolve(tempDir, ".claude", ".credentials.json"),
+      JSON.stringify(creds),
+    );
+
+    const newToken = "sk-ant-oat01-NEW-oauth-token-abc123";
+    writeFileSync(resolve(tempDir, ".claude", ".oauth-token"), newToken + "\n");
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token.meta.json"),
+      JSON.stringify({
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 365 * 24 * 60 * 60_000,
+        source: "claude-setup-token",
+      }),
+    );
+
+    const status = getAuthStatus("test-agent", tempDir);
+    expect(status.source).toBe("oauth-token");
+    expect(status.authenticated).toBe(true);
+    // Subscription type is "oauth-token" for the oauth-token path
+    expect(status.subscriptionType).toBe("oauth-token");
+  });
+
+  it("submitAuthCode returns error when no pending tmux session exists", () => {
+    // The code submission path correctly detects missing sessions rather than
+    // silently failing or writing a garbage token.
+    const result = submitAuthCode("test-agent", tempDir, "TESTCODE");
+    expect(result.completed).toBe(false);
+    expect(result.tokenSaved).toBe(false);
+    expect(result.instructions.some(l => l.includes("No pending auth session"))).toBe(true);
+  });
+
+  it("parseSetupTokenValue rejects non-token output gracefully", () => {
+    // If the tmux pane scrape returns something other than a token (e.g. the
+    // code prompt line), the parser must return null — not a garbage token.
+    expect(parseSetupTokenValue("Paste code here if prompted >")).toBeNull();
+    expect(parseSetupTokenValue("")).toBeNull();
+    expect(parseSetupTokenValue("Error: invalid code")).toBeNull();
+  });
+
+  it("parseSetupTokenValue accepts valid oat01 token formats", () => {
+    expect(parseSetupTokenValue("sk-ant-oat01-abc_DEF-XYZ")).toBe("sk-ant-oat01-abc_DEF-XYZ");
+    // Also handles numeric suffix variants (oat0+)
+    expect(parseSetupTokenValue("sk-ant-oat02-abc_DEF-XYZ")).toBe("sk-ant-oat02-abc_DEF-XYZ");
+    // With ANSI escape codes stripped
+    expect(parseSetupTokenValue("\x1B[32msk-ant-oat01-token123\x1B[0m")).toBe("sk-ant-oat01-token123");
+  });
+
+  it("getAuthStatus returns unauthenticated when .oauth-token is empty", () => {
+    // An empty .oauth-token file (e.g. from a failed write) must not be treated
+    // as valid — fall through to credentials.json or return unauthenticated.
+    writeFileSync(resolve(tempDir, ".claude", ".oauth-token"), "");
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token.meta.json"),
+      JSON.stringify({ createdAt: Date.now(), expiresAt: Date.now() + 365 * 24 * 60 * 60_000, source: "claude-setup-token" }),
+    );
+
+    const status = getAuthStatus("test-agent", tempDir);
+    // Empty token → should NOT report authenticated via oauth-token path
+    expect(status.source).not.toBe("oauth-token");
+  });
+
+  it("getAuthStatus correctly reports expired oauth token", () => {
+    const expiredMs = Date.now() - 60_000; // 1 minute ago
+    writeFileSync(resolve(tempDir, ".claude", ".oauth-token"), "sk-ant-oat01-expiredtoken");
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token.meta.json"),
+      JSON.stringify({
+        createdAt: expiredMs - 365 * 24 * 60 * 60_000,
+        expiresAt: expiredMs,
+        source: "claude-setup-token",
+      }),
+    );
+
+    const status = getAuthStatus("test-agent", tempDir);
+    expect(status.authenticated).toBe(false);
+    expect(status.timeUntilExpiry).toBe("expired");
   });
 });

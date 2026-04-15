@@ -3,6 +3,10 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.bun/bin:$PATH"
 export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
+unset CLAUDE_CODE_OAUTH_TOKEN
+if [ -f "$CLAUDE_CONFIG_DIR/.oauth-token" ]; then
+  export CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '\r\n' < "$CLAUDE_CONFIG_DIR/.oauth-token")"
+fi
 export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
 # telegram-plugin reads to detect self-restart commands. We can't rely on
