@@ -82,7 +82,7 @@ export function findActiveSessionFile(projectsDir: string): string | null {
 // ─── Event types we project up to consumers ─────────────────────────────────
 
 export type SessionEvent =
-  | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string }
+  | { kind: 'enqueue'; chatId: string | null; messageId: string | null; threadId: string | null; rawContent: string; isSync?: boolean }
   | { kind: 'dequeue' }
   | { kind: 'thinking' }
   | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown> }

@@ -738,27 +738,32 @@ describe('one card per task', () => {
     expect(completions[1].turnKey).toBe('c:2')
   })
 
-  it('N/M counter reflects sequential task index (1/2, 2/2)', () => {
+  it('N/M counter does NOT appear for sequential tasks — only when cards are simultaneously active', () => {
+    // Fix for UX bug: the old cumulative baseTurnSeqs counter caused sequential
+    // turns to show "(1/2)", "(2/2)", … "(11/11)" which was confusing — it looked
+    // like "task 11 of 11 (all done)" rather than simply "turn 11 in this session".
+    // The counter should only appear when 2+ cards are active AT THE SAME TIME.
+    // With force-close semantics (startTurn deletes the old card before creating
+    // the new one), there's never more than 1 active card, so the counter is
+    // always hidden for sequential turns.
     const { driver, emits, advance } = harness(0, 0)
 
     // Task 1
     driver.startTurn({ chatId: 'c', userText: 'first task' })
     advance(0)
-    // Turn 2 starts mid-turn (steering)
+    // Turn 2 starts mid-turn (force-closes turn 1)
     driver.startTurn({ chatId: 'c', userText: 'second task' })
     advance(0)
 
-    // First emit of task 1 should not have N/M (it was 1/1 at creation time)
+    // No N/M suffix on any emit — sequential turns, only 1 active at a time
     const t1First = emits.find(e => e.turnKey === 'c:1' && e.isFirstEmit)
     expect(t1First?.html).not.toMatch(/\(\d+\/\d+\)/)
 
-    // Force-close of task 1 (from startTurn 2) now has total=2, so shows (1/2)
     const t1Done = emits.find(e => e.turnKey === 'c:1' && e.done)
-    expect(t1Done?.html).toContain('(1/2)')
+    expect(t1Done?.html).not.toMatch(/\(\d+\/\d+\)/)
 
-    // Task 2 first emit should show (2/2)
     const t2First = emits.find(e => e.turnKey === 'c:2' && e.isFirstEmit)
-    expect(t2First?.html).toContain('(2/2)')
+    expect(t2First?.html).not.toMatch(/\(\d+\/\d+\)/)
   })
 
   it('session events after second startTurn route to second card, not first', () => {
@@ -827,5 +832,50 @@ describe('one card per task', () => {
 
     expect(completions).toHaveLength(2)
     expect(completions.map(c => c.turnKey)).toEqual(['c:1', 'c:2'])
+  })
+
+  it('session-tail echo enqueue after startTurn is dropped (single card per turn)', () => {
+    // Regression: the inbound handler calls startTurn() synchronously, and
+    // then the SAME enqueue shows up later via session-tail (Claude writes
+    // the MCP queue-operation to JSONL). Without the isSync guard both
+    // fired, spawning a second card that took over updates while the first
+    // stayed pinned at "Working… 0ms".
+    const completions: Array<{ turnKey: string }> = []
+    const { driver, emits, advance } = harness(0, 0, { onTurnComplete: (a) => completions.push(a) })
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    // Session-tail echo arrives (no isSync flag) for the same chat+thread.
+    driver.ingest(enqueue('c', 'hello'), null)
+    advance(0)
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c')
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c')
+    advance(0)
+
+    // Exactly one first-emit (one card) and one completion for c:1.
+    const firstEmits = emits.filter(e => e.isFirstEmit)
+    expect(firstEmits).toHaveLength(1)
+    expect(firstEmits[0].turnKey).toBe('c:1')
+    expect(completions).toHaveLength(1)
+    expect(completions[0].turnKey).toBe('c:1')
+    // And the tool_use landed on the same card, not a new one.
+    const bashEmit = emits.find(e => e.html.includes('Bash'))
+    expect(bashEmit?.turnKey).toBe('c:1')
+  })
+
+  it('session-tail enqueue still creates a card when no startTurn primed it', () => {
+    // Belt-and-suspenders: if the sync startTurn path is ever skipped
+    // (e.g. during a cold start or an unexpected flow), the session-tail
+    // enqueue must still open a card — the isSync guard only drops echoes,
+    // not lone session-tail enqueues.
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.ingest(enqueue('c', 'hello'), null)
+    advance(0)
+
+    const firstEmits = emits.filter(e => e.isFirstEmit)
+    expect(firstEmits).toHaveLength(1)
+    expect(firstEmits[0].turnKey).toBe('c:1')
   })
 })

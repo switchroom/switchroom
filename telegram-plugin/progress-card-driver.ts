@@ -295,13 +295,27 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
   /**
    * Return the N/M task counter for a card. Index and total are derived
-   * from the per-chat sequence counter so they remain accurate even when
-   * other cards have been cleaned up.
+   * from the currently ACTIVE cards for this chat:thread — NOT the
+   * session-cumulative baseTurnSeqs counter. Using the cumulative counter
+   * causes "(11/11)" to appear after 11 sequential turns, which reads as
+   * "task 11 of 11" (confusingly final-looking) rather than conveying
+   * parallel concurrency. The N/M suffix is only meaningful when 2+ cards
+   * are simultaneously active; for sequential turns it should be absent.
    */
   function taskNumFor(chatState: PerChatState): TaskNum {
     const base = baseKey(chatState.chatId, chatState.threadId)
-    const total = baseTurnSeqs.get(base) ?? chatState.taskIndex
-    return { index: chatState.taskIndex, total }
+    // Count only currently active cards for this chat:thread so that
+    // sequential turns always return total=1 (counter hidden) and only
+    // parallel active turns (2+ simultaneous cards) show "(N/M)".
+    let activeCount = 0
+    let activeIndex = 1
+    for (const [, cs] of chats) {
+      if (baseKey(cs.chatId, cs.threadId) === base) {
+        activeCount++
+        if (cs.turnKey === chatState.turnKey) activeIndex = activeCount
+      }
+    }
+    return { index: activeIndex, total: activeCount }
   }
 
   function flush(chatState: PerChatState, forceDone: boolean): void {
@@ -371,6 +385,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (event.kind === 'enqueue') {
         chatId = event.chatId
         threadId = event.threadId ?? undefined
+
+        // A session-tail enqueue (isSync not set) arriving while a card is
+        // already live for the same chat+thread is an echo of a sync
+        // startTurn() call — drop it. startTurn owns the turn lifecycle for
+        // non-steering messages; if we fell through we'd orphan the pinned
+        // card and spawn a second "Working…" message that takes over all
+        // the updates while the original stays stuck at 0ms.
+        if (!event.isSync && currentTurnKey != null) {
+          const existing = chats.get(currentTurnKey)
+          if (
+            existing != null &&
+            existing.chatId === chatId &&
+            existing.threadId === threadId
+          ) {
+            return
+          }
+        }
 
         // Allocate a new turn slot FIRST — this increments baseTurnSeqs so
         // that taskNumFor() on the old card will see the correct total (N+1)
@@ -549,6 +580,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           messageId: null,
           threadId: threadId ?? null,
           rawContent: raw,
+          isSync: true,
         },
         chatId,
         threadId,
