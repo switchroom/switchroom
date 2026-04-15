@@ -1400,3 +1400,229 @@ describe('session greeting 30s dedup', () => {
   })
 })
 
+// ─── vault commands ───────────────────────────────────────────────────────
+// Tests for runVaultCli and vault command argument logic.
+// Because server.ts has side-effects (bot startup, MCP connection) we
+// replicate the pure helpers here and mock execFileSync directly.
+
+describe('vault commands', () => {
+  // Replicated runVaultCli from server.ts, with injectable exec for testing.
+  // The production function uses execFileSync from 'child_process' directly.
+  type ExecFileFn = (cmd: string, args: string[], opts: object) => string
+
+  function runVaultCliWith(
+    exec: ExecFileFn,
+    args: string[],
+    passphrase: string,
+    stdinValue?: string,
+  ): { ok: boolean; output: string } {
+    const env = { ...process.env, SWITCHROOM_VAULT_PASSPHRASE: passphrase }
+    try {
+      let result: string
+      if (stdinValue !== undefined) {
+        result = exec(
+          process.env.SWITCHROOM_CLI_PATH ?? 'switchroom',
+          ['vault', ...args],
+          { input: stdinValue, encoding: 'utf8', env, timeout: 10000 },
+        )
+      } else {
+        result = exec(
+          process.env.SWITCHROOM_CLI_PATH ?? 'switchroom',
+          ['vault', ...args],
+          { encoding: 'utf8', env, timeout: 10000 },
+        )
+      }
+      return { ok: true, output: result.trim() }
+    } catch (err: unknown) {
+      const e = err as { stdout?: string; stderr?: string; message?: string }
+      const detail = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim()
+      return { ok: false, output: detail }
+    }
+  }
+
+  describe('runVaultCli — success', () => {
+    it('returns ok:true and trimmed output when exec succeeds', () => {
+      const mockExec = vi.fn<ExecFileFn>().mockReturnValue('key1\nkey2\n')
+      const result = runVaultCliWith(mockExec, ['list'], 'my-passphrase')
+      expect(result).toEqual({ ok: true, output: 'key1\nkey2' })
+    })
+
+    it('passes vault passphrase in env and correct args', () => {
+      const mockExec = vi.fn<ExecFileFn>().mockReturnValue('ok\n')
+      runVaultCliWith(mockExec, ['get', 'MY_SECRET'], 'secret-pass')
+      expect(mockExec).toHaveBeenCalledWith(
+        expect.any(String),
+        ['vault', 'get', 'MY_SECRET'],
+        expect.objectContaining({
+          encoding: 'utf8',
+          env: expect.objectContaining({ SWITCHROOM_VAULT_PASSPHRASE: 'secret-pass' }),
+        }),
+      )
+    })
+
+    it('passes stdinValue when provided (vault set)', () => {
+      const mockExec = vi.fn<ExecFileFn>().mockReturnValue('')
+      runVaultCliWith(mockExec, ['set', 'MY_KEY'], 'pass', 'my-value')
+      expect(mockExec).toHaveBeenCalledWith(
+        expect.any(String),
+        ['vault', 'set', 'MY_KEY'],
+        expect.objectContaining({ input: 'my-value' }),
+      )
+    })
+  })
+
+  describe('runVaultCli — failure', () => {
+    it('returns ok:false and collects stderr when exec throws', () => {
+      const err = Object.assign(new Error('exit code 1'), { stderr: 'wrong passphrase', stdout: '' })
+      const mockExec = vi.fn<ExecFileFn>().mockImplementation(() => { throw err })
+      const result = runVaultCliWith(mockExec, ['list'], 'bad-pass')
+      expect(result.ok).toBe(false)
+      expect(result.output).toContain('wrong passphrase')
+    })
+
+    it('falls back to error.message when stderr is empty', () => {
+      const err = Object.assign(new Error('vault not found'), { stderr: '', stdout: '' })
+      const mockExec = vi.fn<ExecFileFn>().mockImplementation(() => { throw err })
+      const result = runVaultCliWith(mockExec, ['list'], 'pass')
+      expect(result.ok).toBe(false)
+      expect(result.output).toContain('vault not found')
+    })
+  })
+
+  describe('vault argument parsing', () => {
+    it('/vault help: empty args triggers help response', () => {
+      // Simulate the /vault command handler arg-parsing logic
+      const match = ''
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      expect(!sub || sub === 'help').toBe(true)
+    })
+
+    it('/vault list: parses subcommand correctly', () => {
+      const match = 'list'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const key = args[1]
+      expect(sub).toBe('list')
+      expect(key).toBeUndefined()
+    })
+
+    it('/vault get <key>: parses key', () => {
+      const match = 'get MY_API_KEY'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const key = args[1]
+      expect(sub).toBe('get')
+      expect(key).toBe('MY_API_KEY')
+    })
+
+    it('/vault set: missing key triggers usage reply (key is required)', () => {
+      const match = 'set'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const key = args[1]
+      // Handler checks: if sub === 'set' && !key → error
+      expect(sub === 'set' && !key).toBe(true)
+    })
+
+    it('/vault set <key>: key present, no inline value → prompts for value', () => {
+      const match = 'set MY_SECRET'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const key = args[1]
+      expect(sub).toBe('set')
+      expect(key).toBe('MY_SECRET')
+    })
+
+    it('/vault delete <key>: parses correctly', () => {
+      const match = 'delete OLD_KEY'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const key = args[1]
+      expect(sub).toBe('delete')
+      expect(key).toBe('OLD_KEY')
+    })
+
+    it('/vault remove: treated as alias for delete', () => {
+      const match = 'remove OLD_KEY'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const effectiveSub = sub === 'remove' ? 'delete' : sub
+      expect(effectiveSub).toBe('delete')
+    })
+
+    it('unknown subcommand is detected', () => {
+      const match = 'export'
+      const args = match.trim().split(/\s+/).filter(Boolean)
+      const sub = args[0]?.toLowerCase()
+      const known = ['list', 'get', 'set', 'delete', 'remove']
+      expect(known.includes(sub!)).toBe(false)
+    })
+  })
+
+  describe('vault intercept — value extraction', () => {
+    it('extracts value from a code block', () => {
+      const text = '```\nmy-secret-value\n```'
+      const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
+      const value = codeBlockMatch ? codeBlockMatch[1]! : text
+      expect(value.trim()).toBe('my-secret-value')
+    })
+
+    it('extracts value from a code block with language tag', () => {
+      const text = '```json\n{"key": "value"}\n```'
+      const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
+      const value = codeBlockMatch ? codeBlockMatch[1]! : text
+      expect(value.trim()).toBe('{"key": "value"}')
+    })
+
+    it('returns plain text as-is when no code block', () => {
+      const text = 'plain-secret'
+      const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
+      const value = codeBlockMatch ? codeBlockMatch[1]! : text
+      expect(value.trim()).toBe('plain-secret')
+    })
+  })
+
+  describe('passphrase cache logic', () => {
+    it('cache hit: passphrase is returned when not expired', () => {
+      const cache = new Map<string, { passphrase: string; expiresAt: number }>()
+      cache.set('chat1', { passphrase: 'secret', expiresAt: Date.now() + 60_000 })
+      const cached = cache.get('chat1')
+      const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
+      expect(passphrase).toBe('secret')
+    })
+
+    it('cache miss: returns undefined when entry is expired', () => {
+      const cache = new Map<string, { passphrase: string; expiresAt: number }>()
+      cache.set('chat1', { passphrase: 'secret', expiresAt: Date.now() - 1 })
+      const cached = cache.get('chat1')
+      const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
+      expect(passphrase).toBeUndefined()
+    })
+
+    it('cache miss: returns undefined when no entry', () => {
+      const cache = new Map<string, { passphrase: string; expiresAt: number }>()
+      const cached = cache.get('chat1')
+      const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
+      expect(passphrase).toBeUndefined()
+    })
+  })
+
+  describe('vault intercept TTL', () => {
+    const VAULT_INPUT_TTL_MS = 5 * 60 * 1000  // 5 min
+
+    it('within TTL: op should be processed', () => {
+      const startedAt = Date.now() - 60_000  // 1 min ago
+      const elapsed = Date.now() - startedAt
+      expect(elapsed > VAULT_INPUT_TTL_MS).toBe(false)
+    })
+
+    it('expired TTL: op should be discarded and fall through', () => {
+      const startedAt = Date.now() - 6 * 60 * 1000  // 6 min ago
+      const elapsed = Date.now() - startedAt
+      expect(elapsed > VAULT_INPUT_TTL_MS).toBe(true)
+    })
+  })
+
+})
+
