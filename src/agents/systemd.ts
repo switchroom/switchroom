@@ -1,8 +1,9 @@
 import { execSync } from "node:child_process";
-import { writeFileSync, readFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import { usesSwitchroomTelegramPlugin } from "../config/merge.js";
 
 const SYSTEMD_USER_DIR = resolve(
   process.env.HOME ?? "/root",
@@ -68,7 +69,7 @@ export function installAllUnits(config: SwitchroomConfig): void {
 
   for (const agentName of Object.keys(config.agents)) {
     const agentDir = resolve(agentsDir, agentName);
-    const useAutoaccept = config.agents[agentName].channels?.telegram?.plugin === "switchroom";
+    const useAutoaccept = usesSwitchroomTelegramPlugin(config.agents[agentName]);
     const content = generateUnit(agentName, agentDir, useAutoaccept);
     installUnit(agentName, content);
   }
