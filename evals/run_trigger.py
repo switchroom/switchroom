@@ -15,18 +15,52 @@ import yaml
 
 EVALS_DIR = Path(__file__).parent
 RESULTS_DIR = EVALS_DIR / "results"
+SKILLS_DIR = EVALS_DIR.parent / "skills"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
-SKILL_DESCRIPTIONS = {
-    "switchroom-status": "Shows which switchroom agents are running, their uptime, and current state. Use when the user asks about status, 'what's running', uptime, 'are my agents OK', or wants an overview of all agents.",
-    "switchroom-health": "Runs a health check and diagnostics on the switchroom setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.",
-    "switchroom-config": "Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.",
-    "switchroom-schedule": "Lists cron jobs, scheduled tasks, and systemd timers with next fire times. Use when the user mentions schedules, cron, timers, recurring tasks, automation, 'what runs automatically', 'when does X run', 'automated tasks', or 'what tasks are configured'.",
-    "switchroom-restart": "Restarts or reboots a switchroom agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.",
-    "switchroom-reconcile": "Re-applies switchroom.yaml changes to running agents. Use when the user edited switchroom.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited switchroom.yaml', or 'how do I apply changes'.",
-    "switchroom-logs": "Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.",
-    "switchroom-architecture": "Explains how switchroom works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does switchroom work', 'how does it decide', 'which settings apply', architecture, design, or internals.",
-}
+# Skills exposed to the trigger router. Descriptions are loaded from each
+# SKILL.md frontmatter at runtime so the eval stays in sync with the real
+# prompts agents see.
+ROUTABLE_SKILLS = [
+    "switchroom-status",
+    "switchroom-health",
+    "switchroom-install",
+    "switchroom-manage",
+    "switchroom-config",
+    "switchroom-schedule",
+    "switchroom-restart",
+    "switchroom-reconcile",
+    "switchroom-logs",
+    "switchroom-architecture",
+]
+
+
+def load_skill_description(skill_name: str) -> str:
+    path = SKILLS_DIR / skill_name / "SKILL.md"
+    if not path.exists():
+        return ""
+    text = path.read_text()
+    if not text.startswith("---"):
+        return ""
+    end = text.find("\n---", 3)
+    if end == -1:
+        return ""
+    try:
+        fm = yaml.safe_load(text[3:end])
+    except yaml.YAMLError:
+        return ""
+    return fm.get("description", "") if isinstance(fm, dict) else ""
+
+
+def get_skill_descriptions() -> dict[str, str]:
+    out = {}
+    for name in ROUTABLE_SKILLS:
+        desc = load_skill_description(name)
+        if not desc:
+            print(f"WARN: skill {name} missing description in SKILL.md frontmatter", file=sys.stderr)
+            continue
+        out[name] = desc
+    return out
 
 ROUTING_SYSTEM_PROMPT = """You are a skill router for the switchroom-ai platform.
 Given a user query, select the single best skill from the list below.
@@ -53,7 +87,7 @@ def git_sha() -> str:
 
 def build_skill_list() -> str:
     lines = []
-    for name, desc in SKILL_DESCRIPTIONS.items():
+    for name, desc in get_skill_descriptions().items():
         lines.append(f"- {name}: {desc}")
     return "\n".join(lines)
 

@@ -1,6 +1,6 @@
 ---
 name: switchroom-reconcile
-description: Re-applies switchroom.yaml changes to running agents. Use when the user edited switchroom.yaml and wants to apply, sync, reconcile, update, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited switchroom.yaml', or 'how do I apply changes'.
+description: Re-applies switchroom.yaml config changes to running agents (the `switchroom agent reconcile` command). Use only when the user has edited switchroom.yaml and wants to apply, sync, reconcile, or push config changes. Triggers on 'apply the changes', 'sync my config', 'I just edited switchroom.yaml', or 'how do I apply changes'. Do NOT use for adding or creating new agents (use switchroom-manage) or bootstrapping switchroom itself (use switchroom-install).
 allowed-tools: Bash(switchroom *)
 ---
 
