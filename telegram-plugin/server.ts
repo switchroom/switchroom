@@ -2,6 +2,15 @@
 /**
  * Telegram channel for Claude Code — Switchroom fork with topic/forum routing.
  *
+ * Dual-mode entrypoint:
+ *   - If a persistent gateway is running (Unix socket exists), delegates to
+ *     the thin bridge (bridge/bridge.ts) which proxies MCP ↔ gateway IPC.
+ *   - Otherwise, runs the legacy monolith (everything in this file).
+ *
+ * The gateway owns the bot connection, polling, admin commands, and all
+ * Telegram API calls. The bridge is an ephemeral MCP adapter that lives
+ * only as long as the Claude Code session.
+ *
  * Forked from the official Telegram plugin. Adds:
  * - TELEGRAM_TOPIC_ID env var to filter messages by forum topic
  * - message_thread_id in inbound notification metadata
@@ -34,7 +43,7 @@ import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execFileSync, execSync, spawn } from 'child_process'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename, dirname } from 'path'
 import { installPluginLogger } from './plugin-logger.js'
@@ -47,6 +56,48 @@ import { isTelegramReplyTool, isTelegramSurfaceTool } from './tool-names.js'
 // bun subprocess's stderr anywhere, so without this the plugin is blind to
 // its own logs in production. Override path via SWITCHROOM_TELEGRAM_LOG_PATH.
 installPluginLogger()
+
+// ─── Dual-mode detection ─────────────────────────────────────────────────
+// If the persistent gateway is running (socket exists AND accepts connections),
+// delegate to the thin bridge. Just checking file existence is not enough:
+// if the gateway crashes without cleanup, a stale socket file remains on disk
+// and every new session would silently fail to deliver messages.
+{
+  const _stateDir = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+  const _gatewaySocket = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(_stateDir, 'gateway.sock')
+  let _gatewayLive = false
+  if (existsSync(_gatewaySocket)) {
+    // Probe the socket: attempt a TCP-level connect then immediately close.
+    // If the gateway is alive, connect succeeds; if the socket is stale
+    // (process gone), we get ECONNREFUSED and fall through to legacy mode.
+    try {
+      await Bun.connect({
+        unix: _gatewaySocket,
+        socket: {
+          open(s) { s.end() },
+          data() {},
+          close() {},
+          error() {},
+          drain() {},
+        },
+      })
+      _gatewayLive = true
+    } catch {
+      process.stderr.write(
+        `telegram channel: socket ${_gatewaySocket} exists but gateway is not responding — ` +
+        `removing stale socket and running legacy monolith\n`,
+      )
+      try { rmSync(_gatewaySocket, { force: true }) } catch {}
+    }
+  }
+  if (_gatewayLive) {
+    process.stderr.write(`telegram channel: gateway detected at ${_gatewaySocket}, running as bridge\n`)
+    await import('./bridge/bridge.js')
+    await new Promise(() => {})
+  }
+  process.stderr.write('telegram channel: no gateway socket found, running legacy monolith\n')
+}
+
 import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
@@ -4433,6 +4484,52 @@ void (async () => {
         }
       } catch (err) {
         process.stderr.write(`telegram channel: restart marker check failed: ${err}\n`)
+      }
+
+      // Crash recovery notification: if there was no restart marker (i.e.
+      // this wasn't a graceful /restart or /update) but the service was
+      // previously running (we have history and an allowlisted DM chat),
+      // notify the owner that we recovered from an unexpected crash/kill.
+      // This covers SIGKILL, OOM, systemd auto-restart after exit-on-failure.
+      try {
+        const marker = readRestartMarker()
+        if (!marker) {
+          const bootAccess = loadAccess()
+          const ownerChatId = bootAccess.allowFrom[0]
+          if (ownerChatId && HISTORY_ENABLED) {
+            try {
+              const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
+              if (recent.length > 0) {
+                const lastTs = recent[0].ts * 1000
+                const downtime = Date.now() - lastTs
+                // Only notify if last activity was within 30 min (suggests unexpected crash, not a long idle)
+                if (downtime < 30 * 60_000) {
+                  const downSec = Math.max(1, Math.round(downtime / 1000))
+                  const text = `⚡ Recovered from unexpected restart. (down ~${downSec}s)`
+                  const sent = await lockedBot.api.sendMessage(ownerChatId, text, {
+                    parse_mode: 'HTML',
+                    link_preview_options: { is_disabled: true },
+                  })
+                  if (HISTORY_ENABLED) {
+                    try {
+                      recordOutbound({
+                        chat_id: ownerChatId,
+                        thread_id: null,
+                        message_ids: [sent.message_id],
+                        texts: [text],
+                        attachment_kinds: [],
+                      })
+                    } catch { /* best effort */ }
+                  }
+                }
+              }
+            } catch (histErr) {
+              process.stderr.write(`telegram channel: crash recovery history check failed: ${histErr}\n`)
+            }
+          }
+        }
+      } catch (err) {
+        process.stderr.write(`telegram channel: crash recovery notification failed: ${err}\n`)
       }
 
       // run() returns a RunnerHandle. Call .task() to await background completion.

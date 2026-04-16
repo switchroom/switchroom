@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { usesSwitchroomTelegramPlugin } from "../config/merge.js";
@@ -22,21 +22,19 @@ export function generateUnit(name: string, agentDir: string, useAutoaccept = fal
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
 
-  // When using dev channels (forked plugin), use expect to handle the
-  // interactive confirmation prompts. TIOCSTI-based keystroke injection
-  // is disabled on Ubuntu 24.04+ kernels, so expect is the reliable
-  // approach. It's standard on every Linux distro (apt install expect).
-  //
-  // We wrap the expect invocation in `script` so systemd still gets a
-  // single log file with the full output.
   const execStart = useAutoaccept
     ? `/usr/bin/script -qfc "/usr/bin/expect -f ${autoacceptExp} ${agentDir}/start.sh" ${logFile}`
     : `/usr/bin/script -qfc "/bin/bash -l ${agentDir}/start.sh" ${logFile}`;
 
+  const afterDeps = ["network-online.target"];
+  if (useAutoaccept) afterDeps.push(`${unitName(GATEWAY_UNIT_NAME)}.service`);
+
   return `[Unit]
 Description=switchroom agent: ${name}
-After=network-online.target
+After=${afterDeps.join(" ")}
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -44,7 +42,7 @@ ExecStart=${execStart}
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
-RestartSec=15
+RestartSec=5
 WorkingDirectory=${agentDir}
 
 [Install]
@@ -64,17 +62,70 @@ export function uninstallUnit(name: string): void {
   }
 }
 
+const GATEWAY_UNIT_NAME = "gateway";
+
+export function generateGatewayUnit(stateDir: string): string {
+  const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
+  const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
+  const logFile = resolve(stateDir, "gateway.log");
+  const homeDir = process.env.HOME ?? "/root";
+  const bunBin = resolve(homeDir, ".bun/bin/bun");
+  const bunBinDir = dirname(bunBin);
+  const nodeBinDir = dirname(process.execPath);
+  const switchroomCli = resolve(bunBinDir, "switchroom");
+  const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
+
+  return `[Unit]
+Description=switchroom telegram gateway
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/script -qfc "${bunBin} ${gatewayEntry}" ${logFile}
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=3
+WorkingDirectory=${stateDir}
+Environment=PATH=${unitPath}
+Environment=SWITCHROOM_CLI_PATH=${switchroomCli}
+Environment=TELEGRAM_STATE_DIR=${stateDir}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
 export function installAllUnits(config: SwitchroomConfig): void {
   const agentsDir = resolveAgentsDir(config);
+  let anyUsesTelegram = false;
+  const installedAgents: string[] = [];
 
   for (const agentName of Object.keys(config.agents)) {
     const agentDir = resolve(agentsDir, agentName);
     const useAutoaccept = usesSwitchroomTelegramPlugin(config.agents[agentName]);
+    if (useAutoaccept) anyUsesTelegram = true;
     const content = generateUnit(agentName, agentDir, useAutoaccept);
     installUnit(agentName, content);
+    installedAgents.push(unitName(agentName));
+  }
+
+  if (anyUsesTelegram) {
+    const firstTelegramAgent = Object.keys(config.agents).find(
+      (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
+    )!;
+    const stateDir = resolve(agentsDir, firstTelegramAgent, "telegram");
+    const gatewayContent = generateGatewayUnit(stateDir);
+    installUnit(GATEWAY_UNIT_NAME, gatewayContent);
+    installedAgents.push(unitName(GATEWAY_UNIT_NAME));
   }
 
   daemonReload();
+  enableUnits(installedAgents);
+  ensureLinger();
 }
 
 export function daemonReload(): void {
@@ -83,6 +134,26 @@ export function daemonReload(): void {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to reload systemd user daemon: ${message}`);
+  }
+}
+
+function enableUnits(unitNames: string[]): void {
+  if (unitNames.length === 0) return;
+  const services = unitNames.map((n) => `${n}.service`).join(" ");
+  try {
+    execSync(`systemctl --user enable ${services}`, { stdio: "pipe" });
+  } catch {
+    // non-fatal — units are installed but won't auto-start on boot
+  }
+}
+
+function ensureLinger(): void {
+  const user = process.env.USER ?? process.env.LOGNAME;
+  if (!user) return;
+  try {
+    execSync(`loginctl enable-linger ${user}`, { stdio: "pipe" });
+  } catch {
+    // non-fatal — may need sudo; services still work for logged-in sessions
   }
 }
 

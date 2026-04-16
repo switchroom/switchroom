@@ -37,7 +37,7 @@ function enqueue(text: string): SessionEvent {
 
 describe('progress-card reducer', () => {
   it('idle state renders a placeholder', () => {
-    expect(render(initialState(), 0)).toBe('🤔 Waiting…')
+    expect(render(initialState(), 0)).toBe('○ Waiting…')
   })
 
   it('enqueue initialises the turn and extracts user text', () => {
@@ -128,13 +128,53 @@ describe('progress-card reducer', () => {
     expect(s.stage).toBe('done')
   })
 
-  it('text event updates latestText', () => {
+  it('text event updates latestText and creates narrative steps', () => {
     const s = fold([
       enqueue('test'),
       { kind: 'text', text: 'thinking about it' },
       { kind: 'text', text: 'actually…' },
     ])
     expect(s.latestText).toBe('actually…')
+    expect(s.narratives).toHaveLength(2)
+    expect(s.narratives[0].text).toBe('thinking about it')
+    expect(s.narratives[0].state).toBe('done')
+    expect(s.narratives[1].text).toBe('actually…')
+    expect(s.narratives[1].state).toBe('active')
+  })
+
+  it('text event extracts first line as narrative label', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: 'First line\nSecond line\nThird line' },
+    ])
+    expect(s.narratives[0].text).toBe('First line')
+  })
+
+  it('empty text event does not create narrative', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: '   ' },
+    ])
+    expect(s.narratives).toHaveLength(0)
+  })
+
+  it('tool_use increments active narrative toolCount', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: 'Let me check' },
+      { kind: 'tool_use', toolName: 'Read' },
+      { kind: 'tool_use', toolName: 'Grep' },
+    ])
+    expect(s.narratives[0].toolCount).toBe(2)
+  })
+
+  it('turn_end closes active narratives', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: 'Working on it' },
+      { kind: 'turn_end', durationMs: 500 },
+    ])
+    expect(s.narratives[0].state).toBe('done')
   })
 
   it('events outside the turn lifecycle are no-ops', () => {
@@ -176,20 +216,16 @@ describe('progress-card render', () => {
   it('renders plan stage with no items', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
-    expect(out).toContain('💬 fix tests')
-    // The old static "🤔 Plan → 🔧 Run → ✅ Done" phase line is gone;
-    // the checklist body is empty until tool_use events arrive.
+    expect(out).toContain('<blockquote>fix tests</blockquote>')
     expect(out).not.toContain('🤔 Plan')
   })
 
   it('renders a distinctive "Working…" header while in-progress', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
-    // Distinctive banner that no normal reply would ever produce.
     expect(out).toContain('⚙️ <b>Working…</b>')
-    // Separator between header and bullets — avoids the "one blob" look.
-    expect(out).toContain('─ ─ ─')
-    // While in-progress, no "Done" banner.
+    expect(out).toContain('<blockquote>')
+    expect(out).not.toContain('─ ─ ─')
     expect(out).not.toContain('✅ <b>Done</b> ·')
   })
 
@@ -202,38 +238,28 @@ describe('progress-card render', () => {
 
   it('renders running item with elapsed time (tool name bolded)', () => {
     const s = fold([enqueue('test'), { kind: 'tool_use', toolName: 'Bash' }])
-    // tool_use fired at t=1100, render at t=3200 → 2.1s elapsed for the item
     const out = render(s, 3200)
-    expect(out).toContain('🔧 <b>Bash</b>')
+    expect(out).toContain('◉ <b>Bash</b>')
     expect(out).toContain('(00:02)')
   })
 
   it('renders done items without duration when sub-second', () => {
     const s = fold([
       enqueue('test'),
-      { kind: 'tool_use', toolName: 'Read' }, // t=1100
-      { kind: 'tool_result', toolUseId: 'x', toolName: 'Read' }, // t=1200
+      { kind: 'tool_use', toolName: 'Read' },
+      { kind: 'tool_result', toolUseId: 'x', toolName: 'Read' },
     ])
     const out = render(s, 1300)
-    expect(out).toContain('✅ Read')
+    expect(out).toContain('● Read')
     expect(out).not.toContain('(00:00)')
   })
 
   it('renders done items with duration when over 1s', () => {
-    const s = fold(
-      [
-        enqueue('test'),
-        { kind: 'tool_use', toolName: 'Bash' },
-        { kind: 'tool_result', toolUseId: 'x', toolName: 'Bash' },
-      ],
-      1000,
-    )
-    // Manually advance the clock between the two events by reducing separately
     let st = reduce(initialState(), enqueue('test'), 1000)
     st = reduce(st, { kind: 'tool_use', toolName: 'Bash' }, 1100)
     st = reduce(st, { kind: 'tool_result', toolUseId: 'x', toolName: 'Bash' }, 4200)
     const out = render(st, 4300)
-    expect(out).toContain('✅ Bash')
+    expect(out).toContain('● Bash')
     expect(out).toContain('(00:03)')
   })
 
@@ -245,8 +271,7 @@ describe('progress-card render', () => {
       st = reduce(st, { kind: 'tool_result', toolUseId: `${i}`, toolName: 'Read' }, 1150 + i * 100)
     }
     const out = render(st, 2000)
-    expect(out).toContain('✅ Read <i>×6</i>')
-    // Only one rollup line, not six
+    expect(out).toContain('● Read <i>×6</i>')
     expect(out.match(/Read/g) ?? []).toHaveLength(1)
   })
 
@@ -260,7 +285,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1800)
     const out = render(st, 2000)
     expect(out).not.toContain('×5')
-    expect(out).toContain('🔧 <b>Read</b>')
+    expect(out).toContain('◉ <b>Read</b>')
   })
 
   it('does NOT roll up mixed tools', () => {
@@ -312,9 +337,6 @@ describe('progress-card render', () => {
   })
 
   it('collapses 3+ same-tool mixed-label items into a label-free rollup (C1: heuristic)', () => {
-    // C1: when 3+ consecutive items have the same tool but different labels,
-    // they collapse to "Tool ×N" (no label). Better than 3–5 separate lines;
-    // accepts the loss of individual file names as a noise-reduction trade-off.
     let st = initialState()
     st = reduce(st, enqueue('scan'), 1000)
     const files = ['alpha.ts', 'beta.ts', 'gamma.ts']
@@ -323,8 +345,7 @@ describe('progress-card render', () => {
       st = reduce(st, { kind: 'tool_result', toolUseId: `r${i}`, toolName: 'Read' }, 1150 + i * 100)
     }
     const out = render(st, 2000)
-    // Three different file names → no single representative label → label dropped
-    expect(out).toContain('✅ Read')
+    expect(out).toContain('● Read')
     expect(out).toContain('×3')
     expect(out).not.toContain('alpha')
     expect(out).not.toContain('beta')
@@ -370,9 +391,9 @@ describe('progress-card render', () => {
     const long = 'a'.repeat(300)
     const s = fold([enqueue(long)])
     const out = render(s, 2000)
-    // Header uses 120-char truncate with ellipsis
     expect(out).toContain('aaa…')
-    expect(out.split('\n')[0].length).toBeLessThanOrEqual(125)
+    const bqLine = out.split('\n').find(l => l.includes('<blockquote>'))!
+    expect(bqLine.length).toBeLessThan(160)
   })
 
   it('escapes HTML in user text and latestText', () => {
@@ -387,13 +408,11 @@ describe('progress-card render', () => {
   })
 
   it('header banner reflects the active stage', () => {
-    // Stage is no longer rendered as an inline Plan→Run→Done line; the
-    // single source of truth is the header banner at the top of the card.
     let st = fold([enqueue('test')])
     expect(render(st, 1500)).toContain('⚙️ <b>Working…</b>')
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1500)
     expect(render(st, 1600)).toContain('⚙️ <b>Working…</b>')
-    expect(render(st, 1600)).toContain('🔧 <b>Read</b>')
+    expect(render(st, 1600)).toContain('◉ <b>Read</b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
     const done = render(st, 1700)
     expect(done).toContain('✅ <b>Done</b>')
@@ -402,8 +421,10 @@ describe('progress-card render', () => {
 
   it('hides thought line on done stage', () => {
     let st = fold([enqueue('test'), { kind: 'text', text: 'thinking…' }])
-    expect(render(st, 1500)).toContain('💭')
+    // Text events now create narrative steps; thought bubble suppressed when narratives exist
+    expect(render(st, 1500)).toContain('◉ <b>thinking…</b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
+    expect(render(st, 1700)).toContain('● thinking…')
     expect(render(st, 1700)).not.toContain('💭')
   })
 
@@ -419,13 +440,54 @@ describe('progress-card render', () => {
     ])
     const a = render(st, 5000).split('\n')
     const b = render(st, 5100).split('\n')
-    // The ✅ Read line is identical between the two renders.
-    const readLineA = a.find((l) => l.includes('✅ Read'))
-    const readLineB = b.find((l) => l.includes('✅ Read'))
+    const readLineA = a.find((l) => l.includes('● Read'))
+    const readLineB = b.find((l) => l.includes('● Read'))
     expect(readLineA).toBe(readLineB)
     // Only the header (⏱) and the running Bash line differ.
     const diff = a.filter((l, i) => l !== b[i])
     expect(diff.length).toBeLessThanOrEqual(2)
+  })
+  it('renders narrative steps when text events exist', () => {
+    let st = reduce(initialState(), enqueue('fix tests'), 1000)
+    st = reduce(st, { kind: 'text', text: 'Let me check the test files' }, 1100)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1200)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'a', toolName: 'Read' }, 1500)
+    st = reduce(st, { kind: 'text', text: 'Found the issue in merge.ts' }, 2000)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Edit' }, 2100)
+    const out = render(st, 3000)
+    // Narrative steps are primary — no tool names visible
+    expect(out).toContain('● Let me check the test files')
+    expect(out).toContain('◉ <b>Found the issue in merge.ts</b>')
+    expect(out).not.toContain('Read')
+    expect(out).not.toContain('Edit')
+  })
+
+  it('falls back to tool checklist when no narratives exist', () => {
+    let st = reduce(initialState(), enqueue('test'), 1000)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1100)
+    const out = render(st, 2000)
+    expect(out).toContain('◉ <b>Read</b>')
+    expect(out).not.toContain('●')
+  })
+
+  it('narrative overflow shows (+N earlier)', () => {
+    let st = reduce(initialState(), enqueue('test'), 1000)
+    for (let i = 0; i < 7; i++) {
+      st = reduce(st, { kind: 'text', text: `Step ${i + 1}` }, 1100 + i * 100)
+    }
+    const out = render(st, 2000)
+    expect(out).toContain('(+2 earlier)')
+    expect(out).not.toContain('Step 1')
+    expect(out).not.toContain('Step 2')
+    expect(out).toContain('Step 3')
+    expect(out).toContain('Step 7')
+  })
+
+  it('thinking indicator shows when no narratives and model is thinking', () => {
+    let st = reduce(initialState(), enqueue('test'), 1000)
+    st = reduce(st, { kind: 'thinking' }, 1100)
+    const out = render(st, 1500)
+    expect(out).toContain('◉ <i>Thinking…</i>')
   })
 })
 
@@ -674,9 +736,9 @@ describe('progress-card reducer — multi-agent correlation', () => {
       // Main agent line uses 🤖 not ✅ while running
       const mainSection = html.split('[Sub-agents')[0]
       expect(mainSection).toContain('🤖')
-      expect(mainSection).not.toContain('✅ Agent')
+      expect(mainSection).not.toContain('● Agent')
       // Sub-agent activity line shows the current tool
-      expect(html).toContain('└ 🔧')
+      expect(html).toContain('└ ◉')
       expect(html).toContain('Read')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
@@ -707,13 +769,11 @@ describe('progress-card reducer — multi-agent correlation', () => {
       st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent' }, 7000)
       st = reduce(st, { kind: 'turn_end', durationMs: 1 }, 7500)
       const html = render(st, 8000)
-      expect(html).toContain('✅')
+      expect(html).toContain('●')
       expect(html).toContain('task A')
-      // Collapsed form contains "· N tools"
-      expect(html).toMatch(/✅ task A.*· 1 tools/)
-      // No two-line `└` activity in the collapsed form
+      expect(html).toMatch(/● task A.*· 1 tools/)
       const subSection = html.split('[Sub-agents')[1] ?? ''
-      expect(subSection).not.toContain('└ 🔧')
+      expect(subSection).not.toContain('└ ◉')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
     }

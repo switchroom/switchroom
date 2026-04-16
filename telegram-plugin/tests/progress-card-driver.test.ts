@@ -92,7 +92,7 @@ describe('progress-card driver', () => {
     expect(emits).toHaveLength(1)
     expect(emits[0].chatId).toBe('c1')
     expect(emits[0].done).toBe(false)
-    expect(emits[0].html).toContain('💬 hi')
+    expect(emits[0].html).toContain('<blockquote>hi</blockquote>')
   })
 
   it('startTurn fires an initial "Working…" render BEFORE any tool_use event', () => {
@@ -108,7 +108,7 @@ describe('progress-card driver', () => {
     // Distinctive Working… banner is present.
     expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
     // No tool_use has been fed in yet — there must be no checklist items.
-    expect(emits[0].html).not.toContain('🔧 <b>')
+    expect(emits[0].html).not.toContain('◉ <b>')
     // And the echoed user request shows up so the card ties back to the
     // user's message.
     expect(emits[0].html).toContain('please investigate')
@@ -130,7 +130,7 @@ describe('progress-card driver', () => {
     // The card banner stays "Working…" during 'run'; the stage switch is
     // signalled by the new 🔧 checklist line rather than an inline header.
     expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
-    expect(emits[0].html).toContain('🔧 <b>Read</b>')
+    expect(emits[0].html).toContain('◉ <b>Read</b>')
   })
 
   it('emits immediately on turn_end with done=true', () => {
@@ -157,8 +157,8 @@ describe('progress-card driver', () => {
     advance(1000)
     expect(emits.length).toBe(3) // exactly one more flush for the burst
     const last = emits[emits.length - 1]
-    expect(last.html).toContain('✅ Read')
-    expect(last.html).toContain('✅ Grep')
+    expect(last.html).toContain('● Read')
+    expect(last.html).toContain('● Grep')
   })
 
   it('never emits the same HTML twice in a row (deduped)', () => {
@@ -193,7 +193,7 @@ describe('progress-card driver', () => {
     // New turn
     driver.ingest(enqueue('c1', 'second'), null)
     expect(emits).toHaveLength(1)
-    expect(emits[0].html).toContain('💬 second')
+    expect(emits[0].html).toContain('<blockquote>second</blockquote>')
     // No leaked items from the prior turn
     expect(emits[0].html).not.toContain('Read')
   })
@@ -240,11 +240,11 @@ describe('progress-card checklist rendering', () => {
     driver.ingest(enqueue('c1'), null)
     emits.length = 0
     driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/x/foo.ts' } }, 'c1')
-    expect(emits.at(-1)!.html).toContain('🔧 <b>Read</b> foo.ts')
+    expect(emits.at(-1)!.html).toContain('◉ <b>Read</b> foo.ts')
     driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' }, 'c1')
     advance(1000)
-    expect(emits.at(-1)!.html).toContain('✅ Read foo.ts')
-    expect(emits.at(-1)!.html).not.toContain('🔧 <b>Read</b>')
+    expect(emits.at(-1)!.html).toContain('● Read foo.ts')
+    expect(emits.at(-1)!.html).not.toContain('◉ <b>Read</b>')
   })
 
   it('multiple tools preserve insertion order in the rendered checklist', () => {
@@ -306,7 +306,7 @@ describe('progress-card checklist rendering', () => {
     driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Bash', isError: true }, 'c1')
     advance(1000)
     const html = emits.at(-1)!.html
-    expect(html).toContain('❌ Bash git push')
+    expect(html).toContain('✗ Bash git push')
   })
 
   it('overflow: 13+ items collapse oldest with "(+N more earlier steps)"', () => {
@@ -321,11 +321,9 @@ describe('progress-card checklist rendering', () => {
     }
     advance(2000)
     const html = emits.at(-1)!.html
-    expect(html).toContain('(+10 more earlier steps)')
-    // The visible tail contains exactly MAX_VISIBLE_ITEMS (5) checklist lines
-    // (count the state emojis — excluding the header banner ⚙️/✅).
-    const checklistEmojis = (html.match(/\n  (✅|🔧|❌) /g) ?? []).length
-    expect(checklistEmojis).toBe(5)
+    expect(html).toContain('(+10 earlier)')
+    const checklistSymbols = (html.match(/\n(●|◉|✗|○) /g) ?? []).length
+    expect(checklistSymbols).toBe(5)
   })
 
   it('banner transitions from "Working…" to "Done" on turn_end and keeps checklist visible', () => {
@@ -341,8 +339,8 @@ describe('progress-card checklist rendering', () => {
     expect(final.html).toContain('✅ <b>Done</b>')
     expect(final.html).not.toContain('⚙️ <b>Working…</b>')
     // Final checklist still visible.
-    expect(final.html).toContain('✅ Read a.ts')
-    expect(final.html).toContain('✅ Bash echo hi')
+    expect(final.html).toContain('● Read a.ts')
+    expect(final.html).toContain('● Bash echo hi')
   })
 })
 

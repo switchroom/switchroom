@@ -109,6 +109,14 @@ export interface PendingAgentSpawn {
   readonly startedAt: number
 }
 
+export interface NarrativeStep {
+  readonly id: number
+  readonly text: string
+  readonly state: 'done' | 'active'
+  readonly startedAt: number
+  readonly toolCount: number
+}
+
 export interface ProgressCardState {
   /** Unix ms when the turn started (enqueue event). 0 when idle. */
   readonly turnStartedAt: number
@@ -122,6 +130,8 @@ export interface ProgressCardState {
   readonly thinking: boolean
   /** Latest short `text` content from the assistant (for the thought line). */
   readonly latestText?: string
+  /** Narrative steps derived from assistant text blocks. */
+  readonly narratives: ReadonlyArray<NarrativeStep>
   /**
    * Multi-agent: per-sub-agent state, keyed by `agentId` (sub-agent JSONL
    * filename stem). Empty in single-agent turns. Always present so the
@@ -139,6 +149,7 @@ export function initialState(): ProgressCardState {
   return {
     turnStartedAt: 0,
     items: [],
+    narratives: [],
     stage: 'plan',
     thinking: false,
     subAgents: new Map(),
@@ -157,6 +168,13 @@ export function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 // ─── Reducer ────────────────────────────────────────────────────────────────
+
+function extractNarrativeLabel(text: string): string {
+  const trimmed = text.trim()
+  if (!trimmed) return ''
+  const line = trimmed.split('\n')[0]
+  return line.length > 80 ? line.slice(0, 79) + '…' : line
+}
 
 /**
  * Fold a single event into the state. Events outside the turn lifecycle
@@ -186,8 +204,26 @@ export function reduce(
 
     case 'text': {
       if (state.turnStartedAt === 0) return state
-      // Retain only the most recent text chunk for the thought line.
-      return { ...state, latestText: event.text, thinking: false }
+      const label = extractNarrativeLabel(event.text)
+      if (!label) {
+        return { ...state, latestText: event.text, thinking: false }
+      }
+      const prevNarratives = state.narratives.map(n =>
+        n.state === 'active' ? { ...n, state: 'done' as const } : n,
+      )
+      const newNarrative: NarrativeStep = {
+        id: prevNarratives.length,
+        text: label,
+        state: 'active',
+        startedAt: now,
+        toolCount: 0,
+      }
+      return {
+        ...state,
+        narratives: [...prevNarratives, newNarrative],
+        latestText: event.text,
+        thinking: false,
+      }
     }
 
     case 'tool_use': {
@@ -257,9 +293,17 @@ export function reduce(
           pendingAgentSpawns = nextPending
         }
       }
+      let narratives = state.narratives
+      if (narratives.length > 0) {
+        const last = narratives[narratives.length - 1]
+        if (last.state === 'active') {
+          narratives = [...narratives.slice(0, -1), { ...last, toolCount: last.toolCount + 1 }]
+        }
+      }
       return {
         ...state,
         items: [...state.items, nextItem],
+        narratives,
         stage: 'run',
         thinking: false,
         pendingAgentSpawns,
@@ -415,19 +459,20 @@ export function reduce(
 
     case 'turn_end': {
       if (state.turnStartedAt === 0) return state
-      // Close any stragglers + mark the turn done. Stage jumps to 'done'.
       const items = state.items.map((it) =>
         it.state === 'running' ? { ...it, state: 'done' as const, finishedAt: now } : it,
       )
-      // Close any still-running sub-agents + clear pending spawns that
-      // never correlated.
       const subAgents = new Map<string, SubAgentState>()
       for (const [k, sa] of state.subAgents) {
         subAgents.set(k, sa.state === 'running' ? { ...sa, state: 'done', finishedAt: now } : sa)
       }
+      const narratives = state.narratives.map(n =>
+        n.state === 'active' ? { ...n, state: 'done' as const } : n,
+      )
       return {
         ...state,
         items,
+        narratives,
         subAgents,
         pendingAgentSpawns: new Map(),
         stage: 'done',
@@ -443,11 +488,16 @@ export function reduce(
 
 // ─── Renderer ───────────────────────────────────────────────────────────────
 
-const STATE_EMOJI: Record<ItemState, string> = {
-  pending: '⏸',
-  running: '🔧',
-  done: '✅',
-  failed: '❌',
+const STEP_DONE = '●'
+const STEP_ACTIVE = '◉'
+const STEP_FAILED = '✗'
+const STEP_PENDING = '○'
+
+const TOOL_SYMBOL: Record<ItemState, string> = {
+  pending: STEP_PENDING,
+  running: STEP_ACTIVE,
+  done: STEP_DONE,
+  failed: STEP_FAILED,
 }
 
 /**
@@ -558,55 +608,47 @@ export interface TaskNum {
 
 export function render(state: ProgressCardState, now: number, taskNum?: TaskNum): string {
   if (state.turnStartedAt === 0) {
-    // Idle — emit a minimal placeholder so the stream has a body.
-    return '🤔 Waiting…'
+    return `${STEP_PENDING} Waiting…`
   }
 
   const lines: string[] = []
 
-  // Header: distinctive status banner so the card never looks like a normal
-  // reply. While in-flight, lead with ⚙️ <b>Working…</b>; on completion swap
-  // to ✅ <b>Done</b>. The elapsed clock lives on the same line so users can
-  // see "is it still moving?" at a glance.
-  // When multiple tasks are active (forum topics), show "(N/M)" so the user
-  // knows this is task 1 of 2, etc.
+  if (state.userRequest) {
+    lines.push(`<blockquote>${escapeHtml(truncate(state.userRequest, 120))}</blockquote>`)
+  }
+
   const elapsed = formatDuration(now - state.turnStartedAt)
   const headerIcon = state.stage === 'done' ? '✅' : '⚙️'
   const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
-  if (state.userRequest) {
-    lines.push(`💬 ${escapeHtml(truncate(state.userRequest, 120))}`)
-  }
-  // Thin visual separator so the bullets below don't blur into the header.
-  lines.push('─ ─ ─')
 
   const multiAgentActive =
     isMultiAgentEnabled() &&
     (state.subAgents.size > 0 || state.pendingAgentSpawns.size > 0)
 
-  // [Main] header only when multi-agent rendering is active. Keeps the
-  // single-agent case visually unchanged (no header, just the checklist).
-  if (multiAgentActive) {
-    lines.push(`[Main · ${state.items.length} tools]`)
+  const hasNarratives = state.narratives.length > 0
+
+  if (hasNarratives) {
+    lines.push('')
+    renderNarrativeChecklist(state.narratives, now, lines)
+  } else if (state.items.length > 0) {
+    lines.push('')
+    if (multiAgentActive) {
+      lines.push(`[Main · ${state.items.length} tools]`)
+    }
+    const compacted = compactItems(state.items)
+    const visible = applyVisibleCap(compacted)
+    if (visible.overflowCount > 0) {
+      lines.push(`<i>(+${visible.overflowCount} earlier)</i>`)
+    }
+    for (const item of visible.items) {
+      lines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
+    }
   }
 
-  // Checklist — preserve insertion order; running items show elapsed time.
-  // The old static "🤔 Plan → 🔧 Run → ✅ Done" phase line is gone: users
-  // asked for a live per-tool-call checklist instead. The header banner
-  // (⚙️ Working… / ✅ Done) carries the overall phase.
-  const compacted = compactItems(state.items)
-  const visible = applyVisibleCap(compacted)
-  if (visible.overflowCount > 0) {
-    lines.push(`  … (+${visible.overflowCount} more earlier steps)`)
-  }
-  for (const item of visible.items) {
-    lines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
-  }
-
-  // [Sub-agents] section
   if (multiAgentActive && state.subAgents.size > 0) {
-    lines.push('') // blank separator
+    lines.push('')
     const counts = countSubAgentStates(state.subAgents)
     lines.push(`[Sub-agents · ${formatSubAgentCounts(counts)}]`)
     for (const sa of sortSubAgentsChrono(state.subAgents)) {
@@ -616,13 +658,37 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum)
     }
   }
 
-  // Thought line (only if we have latest text and haven't finished)
-  if (state.stage !== 'done' && state.latestText) {
-    lines.push('')
-    lines.push(`💭 <i>${escapeHtml(truncate(state.latestText.trim(), 160))}</i>`)
+  if (state.stage !== 'done') {
+    if (state.thinking) {
+      lines.push('')
+      lines.push(`${STEP_ACTIVE} <i>Thinking…</i>`)
+    } else if (!hasNarratives && state.latestText) {
+      lines.push('')
+      lines.push(`💭 <i>${escapeHtml(truncate(state.latestText.trim(), 160))}</i>`)
+    }
   }
 
   return lines.join('\n')
+}
+
+function renderNarrativeChecklist(
+  narratives: ReadonlyArray<NarrativeStep>,
+  now: number,
+  lines: string[],
+): void {
+  if (narratives.length > MAX_VISIBLE_ITEMS) {
+    const overflow = narratives.length - MAX_VISIBLE_ITEMS
+    lines.push(`<i>(+${overflow} earlier)</i>`)
+  }
+  const visible = narratives.slice(-MAX_VISIBLE_ITEMS)
+  for (const step of visible) {
+    if (step.state === 'active') {
+      const dur = formatDuration(now - step.startedAt)
+      lines.push(`${STEP_ACTIVE} <b>${escapeHtml(step.text)}</b> <i>(${dur})</i>`)
+    } else {
+      lines.push(`${STEP_DONE} ${escapeHtml(step.text)}`)
+    }
+  }
 }
 
 /**
@@ -642,7 +708,7 @@ function renderMainItem(
   subAgents: ReadonlyMap<string, SubAgentState>,
 ): string {
   const isAgent = item.tool === 'Agent' || item.tool === 'Task'
-  const indent = multiAgentActive ? '  ' : '  '
+  const indent = multiAgentActive ? '  ' : ''
 
   if (isAgent && item.state === 'running' && multiAgentActive) {
     // Hold the 🤖 emoji while the sub-agent (if correlated) is alive.
@@ -651,26 +717,22 @@ function renderMainItem(
     return `${indent}🤖 ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
   }
 
-  const emoji = STATE_EMOJI[item.state]
+  const symbol = TOOL_SYMBOL[item.state]
   if (item.state === 'running') {
     const dur = formatDuration(now - item.startedAt)
-    return `${indent}${emoji} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
+    return `${indent}${symbol} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
   }
   if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
     if (item.kind === 'rollup') {
       const labelHtml = item.label ? ` ${escapeHtml(item.label)}` : ''
-      return `${indent}${emoji} ${escapeHtml(item.tool)}${labelHtml} <i>×${item.count}</i>`
+      return `${indent}${symbol} ${escapeHtml(item.tool)}${labelHtml} <i>×${item.count}</i>`
     }
     const dur = formatDuration(item.finishedAt - item.startedAt)
     const needsDuration = item.finishedAt - item.startedAt >= 1000
-    // For Agent/Task in multi-agent mode, prefix emoji is the regular
-    // ✅/❌ — design §1.4 shows "✅ Agent: …" on the final card. The
-    // sub-agent's own state lives in the [Sub-agents] section.
-    return `${indent}${emoji} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
+    return `${indent}${symbol} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
   }
-  // pending fallback
   void subAgents
-  return `${indent}${emoji} ${renderItemCore(item.tool, item.label)}`
+  return `${indent}${symbol} ${renderItemCore(item.tool, item.label)}`
 }
 
 /**
@@ -740,11 +802,11 @@ function renderSubAgent(
     : ''
 
   if (sa.state !== 'running' || forceCollapse) {
-    const emoji = sa.state === 'failed' ? '❌' : '✅'
+    const symbol = sa.state === 'failed' ? STEP_FAILED : STEP_DONE
     const end = sa.finishedAt ?? now
     const dur = formatDuration(end - sa.startedAt)
     return [
-      `  ${emoji} ${escapeHtml(truncate(desc, 50))}${typeSuffix} · ${dur} · ${sa.toolCount} tools${spawnedSuffix}`,
+      `  ${symbol} ${escapeHtml(truncate(desc, 50))}${typeSuffix} · ${dur} · ${sa.toolCount} tools${spawnedSuffix}`,
     ]
   }
 
@@ -756,7 +818,7 @@ function renderSubAgent(
     const curDur = formatDuration(now - cur.startedAt)
     return [
       headerLine,
-      `     └ 🔧 ${renderItemCore(cur.tool, cur.label)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
+      `     └ ${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
     ]
   }
   return [headerLine, `     └ <i>(idle)</i> · ${sa.toolCount} tools`]

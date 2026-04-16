@@ -103,25 +103,15 @@ describe('progress-card golden turn', () => {
 
     // Structural assertions — don't brittle-pin the whole string, but
     // lock in the key visual elements and their ordering.
-    expect(html).toContain('💬 fix the failing tests and push')
+    expect(html).toContain('<blockquote>fix the failing tests and push</blockquote>')
     expect(html).toContain('✅ <b>Done</b>')
 
-    // Checklist: 4 items, in order, with labels derived from input args.
-    // Path labels shortened to basename; no <code> wrapping — the line
-    // reads as a natural sentence.
-    expect(html).toContain('✅ Read merge.test.ts')
-    expect(html).toContain('✅ Bash bun test')
-    expect(html).toContain('✅ Edit merge.ts')
-    expect(html).toContain('❌ Bash git push')
+    // Text events create narrative steps; the final text block becomes a narrative
+    expect(html).toContain('● Tests fixed but push was rejected.')
 
-    // Ordering: Read appears before Edit, Edit before the failed Bash.
-    const readIdx = html.indexOf('Read merge.test.ts')
-    const editIdx = html.indexOf('Edit merge.ts')
-    const failIdx = html.indexOf('❌ Bash')
-    expect(readIdx).toBeLessThan(editIdx)
-    expect(editIdx).toBeLessThan(failIdx)
-
-    // No thought line on Done stage.
+    // Tool items are still rendered as fallback (narrative takes priority,
+    // but tool items still appear when no narrative covers them)
+    // With narratives present, tool checklist is suppressed — narratives are primary
     expect(html).not.toContain('💭')
   })
 
@@ -140,9 +130,8 @@ describe('progress-card golden turn', () => {
     const html = render(state, t + 300)
 
     expect(html).toContain('⚙️ <b>Working…</b>')
-    expect(html).toContain('✅ Read')
-    expect(html).toContain('🔧 <b>Bash</b> bun test')
-    // Running item has elapsed-time suffix
-    expect(html).toMatch(/🔧 <b>Bash<\/b> bun test <i>\(\d/)
+    expect(html).toContain('● Read')
+    expect(html).toContain('◉ <b>Bash</b> bun test')
+    expect(html).toMatch(/◉ <b>Bash<\/b> bun test <i>\(\d/)
   })
 })

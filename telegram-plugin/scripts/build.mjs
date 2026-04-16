@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = resolve(root, "dist");
-const outFile = resolve(outDir, "server.js");
 
 console.log("[build] cleaning dist/");
 rmSync(outDir, { recursive: true, force: true });
@@ -20,17 +19,30 @@ try {
   process.exit(1);
 }
 
-console.log("[build] bundling server.ts -> dist/server.js");
-execSync(
-  `bun build ${JSON.stringify(resolve(root, "server.ts"))} --outdir ${JSON.stringify(outDir)} --target node`,
-  { stdio: "inherit", cwd: root }
-);
+const entries = [
+  { src: "server.ts", out: "server.js", label: "server (legacy + dual-mode shim)" },
+  { src: "gateway/gateway.ts", out: "gateway/gateway.js", label: "gateway (persistent service)" },
+  { src: "bridge/bridge.ts", out: "bridge/bridge.js", label: "bridge (MCP proxy)" },
+];
 
-let src = readFileSync(outFile, "utf8");
-if (src.startsWith("#!/usr/bin/env bun")) {
-  src = src.replace(/^#!\/usr\/bin\/env bun/, "#!/usr/bin/env node");
-  writeFileSync(outFile, src);
+for (const { src, out, label } of entries) {
+  const srcPath = resolve(root, src);
+  const outPath = resolve(outDir, out);
+  const outDirForEntry = dirname(outPath);
+  mkdirSync(outDirForEntry, { recursive: true });
+
+  console.log(`[build] bundling ${src} -> dist/${out}`);
+  execSync(
+    `bun build ${JSON.stringify(srcPath)} --outdir ${JSON.stringify(outDirForEntry)} --target node`,
+    { stdio: "inherit", cwd: root }
+  );
+
+  let content = readFileSync(outPath, "utf8");
+  if (content.startsWith("#!/usr/bin/env bun")) {
+    content = content.replace(/^#!\/usr\/bin\/env bun/, "#!/usr/bin/env node");
+    writeFileSync(outPath, content);
+  }
+  chmodSync(outPath, 0o755);
 }
-chmodSync(outFile, 0o755);
 
 console.log("[build] done");
