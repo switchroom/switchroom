@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   generateUnit,
+  generateGatewayUnit,
   cronToOnCalendar,
   generateTimerUnit,
   generateTimerServiceUnit,
@@ -54,7 +55,19 @@ describe("generateUnit", () => {
   it("configures restart on failure", () => {
     const unit = generateUnit("test", "/tmp/test");
     expect(unit).toContain("Restart=on-failure");
-    expect(unit).toContain("RestartSec=15");
+    expect(unit).toContain("RestartSec=5");
+    expect(unit).toContain("StartLimitBurst=5");
+    expect(unit).toContain("StartLimitIntervalSec=120");
+  });
+
+  it("places StartLimitBurst and StartLimitIntervalSec in [Unit] section, not [Service]", () => {
+    const unit = generateUnit("test", "/tmp/test");
+    const unitSection = unit.split("[Service]")[0];
+    const serviceSection = unit.split("[Service]")[1].split("[Install]")[0];
+    expect(unitSection).toContain("StartLimitBurst=5");
+    expect(unitSection).toContain("StartLimitIntervalSec=120");
+    expect(serviceSection).not.toContain("StartLimitBurst");
+    expect(serviceSection).not.toContain("StartLimitIntervalSec");
   });
 
   it("sets Type=simple for script-based execution", () => {
@@ -154,6 +167,61 @@ describe("generateTimerServiceUnit", () => {
   it("uses the correct index in the script path", () => {
     const service = generateTimerServiceUnit("agent", 3, "/tmp/agents/agent");
     expect(service).toContain("cron-3.sh");
+  });
+});
+
+describe("generateGatewayUnit", () => {
+  it("generates valid systemd unit for gateway", () => {
+    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram");
+    expect(unit).toContain("[Unit]");
+    expect(unit).toContain("[Service]");
+    expect(unit).toContain("[Install]");
+    expect(unit).toContain("Description=switchroom telegram gateway");
+  });
+
+  it("uses Restart=always with fast restart interval", () => {
+    const unit = generateGatewayUnit("/tmp/telegram");
+    expect(unit).toContain("Restart=always");
+    expect(unit).toContain("RestartSec=3");
+  });
+
+  it("sets TELEGRAM_STATE_DIR environment", () => {
+    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram");
+    expect(unit).toContain("Environment=TELEGRAM_STATE_DIR=/home/user/.claude/channels/telegram");
+  });
+
+  it("references gateway entry point", () => {
+    const unit = generateGatewayUnit("/tmp/telegram");
+    expect(unit).toContain("gateway/gateway.ts");
+  });
+
+  it("includes rate limiting", () => {
+    const unit = generateGatewayUnit("/tmp/telegram");
+    expect(unit).toContain("StartLimitBurst=10");
+    expect(unit).toContain("StartLimitIntervalSec=60");
+  });
+
+  it("places StartLimitBurst and StartLimitIntervalSec in [Unit] section, not [Service]", () => {
+    const unit = generateGatewayUnit("/tmp/telegram");
+    const unitSection = unit.split("[Service]")[0];
+    const serviceSection = unit.split("[Service]")[1].split("[Install]")[0];
+    expect(unitSection).toContain("StartLimitBurst=10");
+    expect(unitSection).toContain("StartLimitIntervalSec=60");
+    expect(serviceSection).not.toContain("StartLimitBurst");
+    expect(serviceSection).not.toContain("StartLimitIntervalSec");
+  });
+});
+
+describe("generateUnit with gateway dependency", () => {
+  it("adds gateway After dependency when useAutoaccept is true", () => {
+    const unit = generateUnit("agent", "/tmp/agent", true);
+    expect(unit).toContain("After=network-online.target switchroom-gateway.service");
+  });
+
+  it("does not add gateway dependency when useAutoaccept is false", () => {
+    const unit = generateUnit("agent", "/tmp/agent", false);
+    expect(unit).toContain("After=network-online.target");
+    expect(unit).not.toContain("switchroom-gateway.service");
   });
 });
 

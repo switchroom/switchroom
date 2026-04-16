@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "switchroom-telegram-plugin": "./dist/server.js"
+    "switchroom-telegram-plugin": "./dist/server.js",
+    "switchroom-telegram-gateway": "./dist/gateway/gateway.js"
   },
   "main": "./dist/server.js",
   "files": [

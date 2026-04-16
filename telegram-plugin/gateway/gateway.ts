@@ -1,0 +1,2698 @@
+#!/usr/bin/env bun
+/**
+ * Persistent Telegram gateway — owns the bot connection, polling, all admin
+ * commands, inbound message routing, and outbound tool execution. Stays
+ * alive across Claude Code session restarts via systemd.
+ *
+ * Bridge instances (one per agent/topic) connect over a Unix domain socket
+ * (IPC), register, and exchange tool calls + session events. When no bridge
+ * is connected, inbound LLM messages get a "⏳ Agent is restarting…" reply.
+ */
+
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { run, type RunnerHandle } from '@grammyjs/runner'
+import type { ReactionTypeEmoji } from 'grammy/types'
+import { randomBytes } from 'crypto'
+import { execFileSync, execSync, spawn } from 'child_process'
+import {
+  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
+  statSync, renameSync, realpathSync, chmodSync, openSync, closeSync,
+} from 'fs'
+import { homedir } from 'os'
+import { join, extname, sep, basename } from 'path'
+
+import { installPluginLogger } from '../plugin-logger.js'
+import { StatusReactionController } from '../status-reactions.js'
+import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
+import { type DraftStreamHandle } from '../draft-stream.js'
+import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
+import { handleStreamReply } from '../stream-reply-handler.js'
+import { createChatLock } from '../chat-lock.js'
+import { logStreamingEvent } from '../streaming-metrics.js'
+import { type SessionEvent } from '../session-tail.js'
+import { createProgressDriver, type ProgressDriver } from '../progress-card-driver.js'
+import {
+  shouldSuppressToolActivity,
+} from '../pty-tail.js'
+import {
+  initHistory, recordInbound, recordOutbound, recordEdit,
+  deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
+} from '../history.js'
+import { parseQueuePrefix, formatPriorAssistantPreview } from '../steering.js'
+import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace } from '../format.js'
+import {
+  isContextExhaustionText,
+  shouldArmOrphanedReplyTimeout,
+  ORPHANED_REPLY_TIMEOUT_MS,
+} from '../context-exhaustion.js'
+import {
+  resolveAgentDirFromEnv,
+  consumeHandoffTopic,
+  shouldShowHandoffLine,
+  formatHandoffLine,
+  writeLastTurnSummary,
+  type HandoffFormat,
+} from '../handoff-continuity.js'
+import {
+  readActivePins,
+  addActivePin,
+  removeActivePin,
+  clearActivePins,
+} from '../active-pins.js'
+import { sweepActivePins, sweepBotAuthoredPins } from '../active-pins-sweep.js'
+
+import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
+import type {
+  ToolCallMessage,
+  ToolCallResult,
+  SessionEventForward,
+  PermissionRequestForward,
+  HeartbeatMessage,
+  InboundMessage,
+} from './ipc-protocol.js'
+
+// ─── Stderr logging ───────────────────────────────────────────────────────
+installPluginLogger()
+
+// ─── Env + state dir ──────────────────────────────────────────────────────
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+const ACCESS_FILE = join(STATE_DIR, 'access.json')
+const APPROVED_DIR = join(STATE_DIR, 'approved')
+const ENV_FILE = join(STATE_DIR, '.env')
+const INBOX_DIR = join(STATE_DIR, 'inbox')
+
+try {
+  chmodSync(ENV_FILE, 0o600)
+  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+    const m = line.match(/^(\w+)=(.*)$/)
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  }
+} catch {}
+
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN
+if (!TOKEN) {
+  process.stderr.write(
+    `telegram gateway: TELEGRAM_BOT_TOKEN required\n` +
+    `  set in ${ENV_FILE}\n` +
+    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
+  )
+  process.exit(1)
+}
+
+const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID ? Number(process.env.TELEGRAM_TOPIC_ID) : undefined
+
+// ─── Bot + chat lock ──────────────────────────────────────────────────────
+const bot = new Bot(TOKEN)
+const chatLock = createChatLock()
+const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+let botUsername = ''
+
+// ─── Access control ───────────────────────────────────────────────────────
+
+type PendingEntry = {
+  senderId: string
+  chatId: string
+  createdAt: number
+  expiresAt: number
+  replies: number
+}
+
+type GroupPolicy = {
+  requireMention: boolean
+  allowFrom: string[]
+}
+
+type Access = {
+  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  allowFrom: string[]
+  groups: Record<string, GroupPolicy>
+  pending: Record<string, PendingEntry>
+  mentionPatterns?: string[]
+  ackReaction?: string
+  replyToMode?: 'off' | 'first' | 'all'
+  textChunkLimit?: number
+  chunkMode?: 'length' | 'newline'
+  parseMode?: 'html' | 'markdownv2' | 'text'
+  disableLinkPreview?: boolean
+  coalescingGapMs?: number
+  statusReactions?: boolean
+  historyEnabled?: boolean
+  historyRetentionDays?: number
+}
+
+function defaultAccess(): Access {
+  return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
+}
+
+const MAX_CHUNK_LIMIT = 4096
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+function assertSendable(f: string): void {
+  // Reject non-absolute paths to prevent relative path traversal
+  if (!f.startsWith('/')) {
+    throw new Error(`refusing to send file with relative path: ${f}`)
+  }
+  let real: string, stateReal: string
+  try {
+    real = realpathSync(f)
+    stateReal = realpathSync(STATE_DIR)
+  } catch {
+    // Fail closed: if we can't resolve the real path (broken symlink, no
+    // permission, etc.), refuse to send. The old behavior silently allowed
+    // the file through on resolution failure.
+    throw new Error(`refusing to send file — cannot resolve real path: ${f}`)
+  }
+  // Block sending any channel state files (access.json, .env, history.db, etc.)
+  // except files in the inbox directory (which are user-downloaded attachments).
+  const inbox = join(stateReal, 'inbox')
+  if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
+    throw new Error(`refusing to send channel state: ${f}`)
+  }
+  // Block known sensitive paths
+  const SENSITIVE_PREFIXES = ['/proc/', '/sys/']
+  const SENSITIVE_EXACT = ['/etc/shadow', '/etc/gshadow']
+  for (const prefix of SENSITIVE_PREFIXES) {
+    if (real.startsWith(prefix)) {
+      throw new Error(`refusing to send system file: ${f}`)
+    }
+  }
+  for (const exact of SENSITIVE_EXACT) {
+    if (real === exact) {
+      throw new Error(`refusing to send system file: ${f}`)
+    }
+  }
+}
+
+function readAccessFile(): Access {
+  try {
+    const raw = readFileSync(ACCESS_FILE, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<Access>
+    return {
+      dmPolicy: parsed.dmPolicy ?? 'pairing',
+      allowFrom: parsed.allowFrom ?? [],
+      groups: parsed.groups ?? {},
+      pending: parsed.pending ?? {},
+      mentionPatterns: parsed.mentionPatterns,
+      ackReaction: parsed.ackReaction,
+      replyToMode: parsed.replyToMode,
+      textChunkLimit: parsed.textChunkLimit,
+      chunkMode: parsed.chunkMode,
+      parseMode: parsed.parseMode,
+      disableLinkPreview: parsed.disableLinkPreview,
+      coalescingGapMs: parsed.coalescingGapMs,
+      statusReactions: parsed.statusReactions,
+      historyEnabled: parsed.historyEnabled,
+      historyRetentionDays: parsed.historyRetentionDays,
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
+    try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
+    process.stderr.write(`telegram gateway: access.json is corrupt, moved aside. Starting fresh.\n`)
+    return defaultAccess()
+  }
+}
+
+const BOOT_ACCESS: Access | null = STATIC
+  ? (() => {
+      const a = readAccessFile()
+      if (a.dmPolicy === 'pairing') {
+        process.stderr.write('telegram gateway: static mode — dmPolicy "pairing" downgraded to "allowlist"\n')
+        a.dmPolicy = 'allowlist'
+      }
+      a.pending = {}
+      return a
+    })()
+  : null
+
+function loadAccess(): Access {
+  return BOOT_ACCESS ?? readAccessFile()
+}
+
+function assertAllowedChat(chat_id: string): void {
+  const access = loadAccess()
+  if (access.allowFrom.includes(chat_id)) return
+  if (chat_id in access.groups) return
+  throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
+}
+
+function saveAccess(a: Access): void {
+  if (STATIC) return
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const tmp = ACCESS_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, ACCESS_FILE)
+}
+
+function pruneExpired(a: Access): boolean {
+  const now = Date.now()
+  let changed = false
+  for (const [code, p] of Object.entries(a.pending)) {
+    if (p.expiresAt < now) {
+      delete a.pending[code]
+      changed = true
+    }
+  }
+  return changed
+}
+
+// ─── History ──────────────────────────────────────────────────────────────
+const HISTORY_ACCESS = loadAccess()
+const HISTORY_ENABLED = HISTORY_ACCESS.historyEnabled !== false
+if (HISTORY_ENABLED) {
+  try {
+    initHistory(STATE_DIR, HISTORY_ACCESS.historyRetentionDays ?? 30)
+    process.stderr.write(`telegram gateway: history capture enabled at ${join(STATE_DIR, 'history.db')}\n`)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: history init failed (${(err as Error).message}) — capture disabled\n`)
+  }
+}
+
+// ─── Approval polling ─────────────────────────────────────────────────────
+function checkApprovals(): void {
+  let files: string[]
+  try { files = readdirSync(APPROVED_DIR) } catch { return }
+  for (const senderId of files) {
+    const file = join(APPROVED_DIR, senderId)
+    void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.").then(
+      () => rmSync(file, { force: true }),
+      err => {
+        process.stderr.write(`telegram gateway: failed to send approval confirm: ${err}\n`)
+        rmSync(file, { force: true })
+      },
+    )
+  }
+}
+if (!STATIC) setInterval(checkApprovals, 5000).unref()
+
+// ─── Thread / status / stream state ───────────────────────────────────────
+const chatThreadMap = new Map<string, number>()
+const activeStatusReactions = new Map<string, StatusReactionController>()
+const activeTurnStartedAt = new Map<string, number>()
+const activeDraftStreams = new Map<string, DraftStreamHandle>()
+const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
+const suppressPtyPreview = new Set<string>()
+const lastPtyPreviewByChat = new Map<string, string>()
+
+let currentSessionChatId: string | null = null
+let currentTurnStartedAt = 0
+let currentSessionThreadId: number | undefined = undefined
+let currentTurnReplyCalled = false
+let currentTurnCapturedText: string[] = []
+let orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null = null
+
+const CONTEXT_EXHAUSTION_COOLDOWN_MS = 10 * 60 * 1000
+let lastContextExhaustionWarningAt = 0
+
+let pendingPtyPartial: string | null = null
+
+function statusKey(chatId: string, threadId?: number): string {
+  return `${chatId}:${threadId ?? '_'}`
+}
+
+function streamKey(chatId: string, threadId?: number): string {
+  return `${chatId}:${threadId ?? '_'}`
+}
+
+function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
+  const key = statusKey(chatId, threadId)
+  const ctrl = activeStatusReactions.get(key)
+  if (!ctrl) return
+  if (outcome === 'done') ctrl.setDone()
+  else ctrl.setError()
+  activeStatusReactions.delete(key)
+  activeTurnStartedAt.delete(key)
+}
+
+function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
+  if (explicit != null) return Number(explicit)
+  return chatThreadMap.get(chat_id)
+}
+
+// ─── Handoff continuity ───────────────────────────────────────────────────
+let pendingHandoffTopic: string | null = null
+
+function initHandoffContinuity(): void {
+  if (!shouldShowHandoffLine()) { pendingHandoffTopic = null; return }
+  const agentDir = resolveAgentDirFromEnv()
+  if (agentDir == null) { pendingHandoffTopic = null; return }
+  pendingHandoffTopic = consumeHandoffTopic(agentDir)
+}
+
+function takeHandoffPrefix(format: HandoffFormat): string {
+  if (pendingHandoffTopic == null) return ''
+  const line = formatHandoffLine(pendingHandoffTopic, format)
+  pendingHandoffTopic = null
+  return line
+}
+
+// ─── Text chunking ────────────────────────────────────────────────────────
+const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+
+function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
+  if (text.length <= limit) return [text]
+  const out: string[] = []
+  let rest = text
+  while (rest.length > limit) {
+    let cut = limit
+    if (mode === 'newline') {
+      const para = rest.lastIndexOf('\n\n', limit)
+      const line = rest.lastIndexOf('\n', limit)
+      const space = rest.lastIndexOf(' ', limit)
+      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
+    }
+    out.push(rest.slice(0, cut))
+    rest = rest.slice(cut).replace(/^\n+/, '')
+  }
+  if (rest) out.push(rest)
+  return out
+}
+
+function escapeMarkdownV2(text: string): string {
+  const specialChars = /[_*\[\]()~`>#+\-=|{}.!\\]/g
+  const parts: string[] = []
+  let last = 0
+  const codeRe = /(```[\s\S]*?```|`[^`\n]+`)/g
+  let m: RegExpExecArray | null
+  while ((m = codeRe.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index).replace(specialChars, '\\$&'))
+    parts.push(m[0])
+    last = m.index + m[0].length
+  }
+  if (last < text.length) parts.push(text.slice(last).replace(specialChars, '\\$&'))
+  return parts.join('')
+}
+
+// ─── Typing indicator ─────────────────────────────────────────────────────
+const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
+let typingBackoffMs = 0
+const TYPING_BACKOFF_MAX = 5 * 60 * 1000
+
+function startTypingLoop(chat_id: string): void {
+  stopTypingLoop(chat_id)
+  const send = () => {
+    bot.api.sendChatAction(chat_id, 'typing').then(
+      () => { typingBackoffMs = 0 },
+      (err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('401') || msg.includes('Unauthorized')) {
+          typingBackoffMs = Math.min(Math.max(typingBackoffMs * 2 || 1000, 1000), TYPING_BACKOFF_MAX)
+          stopTypingLoop(chat_id)
+          setTimeout(() => startTypingLoop(chat_id), typingBackoffMs)
+        }
+      },
+    )
+  }
+  send()
+  typingIntervals.set(chat_id, setInterval(send, 4000))
+}
+
+function stopTypingLoop(chat_id: string): void {
+  const iv = typingIntervals.get(chat_id)
+  if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
+}
+
+// ─── Robust API call wrapper ──────────────────────────────────────────────
+async function robustApiCall<T>(fn: () => Promise<T>, opts?: { threadId?: number; chat_id?: string }): Promise<T> {
+  const MAX_RETRIES = 3
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      const isGrammyErr = err instanceof GrammyError
+      const msg = err instanceof Error ? err.message : String(err)
+      const desc = isGrammyErr ? (err as GrammyError).description : msg
+
+      if (isGrammyErr && (err as GrammyError).error_code === 429) {
+        const retryAfter = ((err as any).parameters?.retry_after ?? 5) as number
+        process.stderr.write(`telegram gateway: 429 rate limited, waiting ${retryAfter}s\n`)
+        await new Promise(r => setTimeout(r, retryAfter * 1000))
+        continue
+      }
+      if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('not modified')) {
+        return undefined as unknown as T
+      }
+      if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('thread not found') && opts?.threadId && opts?.chat_id) {
+        throw Object.assign(new Error('THREAD_NOT_FOUND'), { original: err })
+      }
+      if (!isGrammyErr && (msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('fetch failed') || msg.includes('ENOTFOUND'))) {
+        if (attempt < MAX_RETRIES - 1) {
+          const delay = Math.pow(2, attempt) * 1000
+          process.stderr.write(`telegram gateway: network error, retrying in ${delay / 1000}s: ${msg}\n`)
+          await new Promise(r => setTimeout(r, delay))
+          continue
+        }
+      }
+      throw err
+    }
+  }
+  throw new Error('robustApiCall: max retries exceeded')
+}
+
+// ─── Structured outbound log ──────────────────────────────────────────────
+function logOutbound(
+  path: 'reply' | 'stream_reply' | 'backstop' | 'pty_preview' | 'edit' | 'forward',
+  chatId: string, messageId: number | null, chars: number, extra?: string,
+): void {
+  const ts = new Date().toISOString()
+  process.stderr.write(
+    `telegram gateway [outbound] ${ts} path=${path} chat=${chatId} ` +
+    `msg_id=${messageId ?? 'pending'} chars=${chars}` +
+    (extra ? ` ${extra}` : '') + '\n',
+  )
+}
+
+// ─── Permission handling ──────────────────────────────────────────────────
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+
+// Reauth flows
+const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
+const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
+
+// Vault
+const vaultPassphraseCache = new Map<string, { passphrase: string; expiresAt: number }>()
+const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
+type PendingVaultOp =
+  | { kind: 'passphrase'; op: 'list' | 'get' | 'delete' | 'set'; key?: string; startedAt: number }
+  | { kind: 'value'; op: 'set'; key: string; passphrase: string; startedAt: number }
+const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
+const pendingVaultOps = new Map<string, PendingVaultOp>()
+
+function looksLikeAuthCode(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed || /\s/.test(trimmed)) return false
+  if (trimmed.startsWith('session_')) return true
+  if (trimmed.startsWith('sk-ant-')) return true
+  if (/^[A-Za-z0-9_-]{6,200}$/.test(trimmed)) return true
+  return false
+}
+
+// ─── Coalescing ───────────────────────────────────────────────────────────
+type AttachmentMeta = {
+  kind: string
+  file_id: string
+  size?: number
+  mime?: string
+  name?: string
+}
+
+type CoalesceEntry = {
+  texts: string[]
+  ctx: Context
+  downloadImage?: () => Promise<string | undefined>
+  attachment?: AttachmentMeta
+  timer: ReturnType<typeof setTimeout>
+}
+
+const coalesceBuffer = new Map<string, CoalesceEntry>()
+
+function coalesceKey(chatId: string, userId: string): string {
+  return `${chatId}:${userId}`
+}
+
+// ─── Progress card + session/PTY tail state ───────────────────────────────
+const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
+let progressDriver: ProgressDriver | null = null
+let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
+
+// ─── IPC server ───────────────────────────────────────────────────────────
+const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
+// Ensure the directory for the socket exists
+mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+
+const ipcServer: IpcServer = createIpcServer({
+  socketPath: SOCKET_PATH,
+
+  onClientRegistered(client: IpcClient) {
+    process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
+    client.send({ type: 'status', status: 'agent_connected' })
+  },
+
+  onClientDisconnected(client: IpcClient) {
+    process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
+  },
+
+  async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> {
+    try {
+      const result = await executeToolCall(msg.tool, msg.args)
+      return { type: 'tool_call_result', id: msg.id, success: true, result }
+    } catch (err) {
+      return {
+        type: 'tool_call_result',
+        id: msg.id,
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      }
+    }
+  },
+
+  onSessionEvent(_client: IpcClient, msg: SessionEventForward) {
+    const ev = msg.event as unknown as SessionEvent
+    progressDriver?.ingest(ev, null)
+    handleSessionEvent(ev)
+  },
+
+  onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
+    const { requestId, toolName, description, inputPreview } = msg
+    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview })
+    const access = loadAccess()
+    const text = `🔐 Permission: ${toolName}`
+    const keyboard = new InlineKeyboard()
+      .text('See more', `perm:more:${requestId}`)
+      .text('✅ Allow', `perm:allow:${requestId}`)
+      .text('❌ Deny', `perm:deny:${requestId}`)
+    for (const chat_id of access.allowFrom) {
+      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+        process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
+      })
+    }
+  },
+
+  onHeartbeat(_client: IpcClient, _msg: HeartbeatMessage) {
+    // Heartbeat received — no action needed, the server tracks lastHeartbeat
+  },
+
+  log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
+})
+
+// ─── Tool execution ──────────────────────────────────────────────────────
+
+/** Allowlisted tool names that bridges may invoke via IPC. Prevents a rogue
+ *  bridge from calling arbitrary functions by name. */
+const ALLOWED_TOOLS = new Set([
+  'reply', 'stream_reply', 'react', 'download_attachment',
+  'edit_message', 'send_typing', 'pin_message', 'delete_message',
+  'forward_message', 'get_recent_messages',
+])
+
+async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
+  if (!ALLOWED_TOOLS.has(tool)) {
+    throw new Error(`tool not allowed: ${tool}`)
+  }
+  switch (tool) {
+    case 'reply':
+      return executeReply(args)
+    case 'stream_reply':
+      return executeStreamReply(args)
+    case 'react':
+      return executeReact(args)
+    case 'download_attachment':
+      return executeDownloadAttachment(args)
+    case 'edit_message':
+      return executeEditMessage(args)
+    case 'send_typing':
+      return executeSendTyping(args)
+    case 'pin_message':
+      return executePinMessage(args)
+    case 'delete_message':
+      return executeDeleteMessage(args)
+    case 'forward_message':
+      return executeForwardMessage(args)
+    case 'get_recent_messages':
+      return executeGetRecentMessages(args)
+    default:
+      throw new Error(`unknown tool: ${tool}`)
+  }
+}
+
+async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = args.chat_id as string
+  if (!chat_id) throw new Error('reply: chat_id is required')
+  const rawText = args.text as string | undefined
+  if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
+  const text = repairEscapedWhitespace(rawText)
+  const files = (args.files as string[] | undefined) ?? []
+  const quoteOptIn = args.quote !== false
+  let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+  const access = loadAccess()
+  const configParseMode = access.parseMode ?? 'html'
+  const format = (args.format as string | undefined) ?? configParseMode
+  const disableLinkPreview = args.disable_web_page_preview != null
+    ? Boolean(args.disable_web_page_preview)
+    : (access.disableLinkPreview ?? true)
+
+  let parseMode: 'HTML' | 'MarkdownV2' | undefined
+  let effectiveText: string
+  if (format === 'html') {
+    parseMode = 'HTML'
+    effectiveText = markdownToHtml(text)
+  } else if (format === 'markdownv2') {
+    parseMode = 'MarkdownV2'
+    effectiveText = escapeMarkdownV2(text)
+  } else {
+    parseMode = undefined
+    effectiveText = text
+  }
+
+  {
+    const prefix = takeHandoffPrefix(
+      format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
+    )
+    if (prefix.length > 0) effectiveText = prefix + effectiveText
+  }
+
+  assertAllowedChat(chat_id)
+
+  let threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+
+  if (reply_to == null && quoteOptIn && HISTORY_ENABLED) {
+    try {
+      const latest = getLatestInboundMessageId(chat_id, threadId ?? null)
+      if (latest != null) reply_to = latest
+    } catch (err) {
+      process.stderr.write(`telegram gateway: quote-reply lookup failed: ${(err as Error).message}\n`)
+    }
+  }
+
+  for (const f of files) {
+    assertSendable(f)
+    const st = statSync(f)
+    if (st.size > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
+    }
+  }
+
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? 4000, MAX_CHUNK_LIMIT))
+  const replyMode = access.replyToMode ?? 'first'
+  const chunks = parseMode === 'HTML'
+    ? splitHtmlChunks(effectiveText, limit)
+    : chunk(effectiveText, limit, access.chunkMode ?? 'length')
+  const sentIds: number[] = []
+
+  const replySKey = streamKey(chat_id, threadId)
+  suppressPtyPreview.add(replySKey)
+  let previewMessageId: number | null = null
+  const openStream = activeDraftStreams.get(replySKey)
+  if (openStream && !openStream.isFinal()) {
+    await openStream.finalize().catch(() => {})
+    previewMessageId = openStream.getMessageId()
+    activeDraftStreams.delete(replySKey)
+    activeDraftParseModes.delete(replySKey)
+    lastPtyPreviewByChat.delete(replySKey)
+  }
+
+  const deleteStalePreview = async (id: number): Promise<void> => {
+    try {
+      await lockedBot.api.deleteMessage(chat_id, id)
+    } catch (err) {
+      process.stderr.write(`telegram gateway: failed to delete stale preview ${id}: ${(err as Error).message}\n`)
+    }
+  }
+
+  logStreamingEvent({
+    kind: 'reply_called',
+    chatId: chat_id,
+    charCount: effectiveText.length,
+    replacedPreview: previewMessageId != null,
+    previewMessageId,
+  })
+
+  if (previewMessageId != null && reply_to != null && replyMode !== 'off') {
+    await deleteStalePreview(previewMessageId)
+    previewMessageId = null
+  }
+
+  startTypingLoop(chat_id)
+
+  try {
+    for (let i = 0; i < chunks.length; i++) {
+      const shouldReplyTo =
+        reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
+      const sendOpts = {
+        ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+        ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+      }
+
+      if (i === 0 && previewMessageId != null) {
+        const editOpts: Record<string, unknown> = {}
+        if (parseMode) editOpts.parse_mode = parseMode
+        if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
+        try {
+          await robustApiCall(
+            () => lockedBot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
+            { threadId, chat_id },
+          )
+          sentIds.push(previewMessageId!)
+          previewMessageId = null
+          continue
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          if (/not modified/i.test(msg)) {
+            sentIds.push(previewMessageId!)
+            previewMessageId = null
+            continue
+          }
+          process.stderr.write(`telegram gateway: preview edit-in-place failed (${msg}), sending fresh\n`)
+          await deleteStalePreview(previewMessageId!)
+          previewMessageId = null
+        }
+      }
+
+      try {
+        const sent = await robustApiCall(
+          () => lockedBot.api.sendMessage(chat_id, chunks[i], sendOpts),
+          { threadId, chat_id },
+        )
+        sentIds.push(sent.message_id)
+        logOutbound('reply', chat_id, sent.message_id, chunks[i].length, `chunk=${i + 1}/${chunks.length}`)
+      } catch (err) {
+        if (err instanceof Error && err.message === 'THREAD_NOT_FOUND') {
+          threadId = undefined
+          const retryOpts = { ...sendOpts }
+          delete (retryOpts as any).message_thread_id
+          const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts)
+          sentIds.push(sent.message_id)
+        } else {
+          throw err
+        }
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
+  } finally {
+    stopTypingLoop(chat_id)
+  }
+
+  for (const f of files) {
+    const ext = extname(f).toLowerCase()
+    const input = new InputFile(f)
+    const baseOpts = {
+      ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+    }
+    if (PHOTO_EXTS.has(ext)) {
+      const sent = await robustApiCall(() => lockedBot.api.sendPhoto(chat_id, input, baseOpts), { threadId, chat_id })
+      sentIds.push(sent.message_id)
+    } else {
+      const sent = await robustApiCall(() => lockedBot.api.sendDocument(chat_id, input, baseOpts), { threadId, chat_id })
+      sentIds.push(sent.message_id)
+    }
+  }
+
+  const result = sentIds.length === 1
+    ? `sent (id: ${sentIds[0]})`
+    : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+
+  if (HISTORY_ENABLED && sentIds.length > 0) {
+    try {
+      const fileCount = files.length
+      const textCount = sentIds.length - fileCount
+      const texts: string[] = []
+      const attachKinds: (string | null)[] = []
+      for (let i = 0; i < textCount; i++) { texts.push(chunks[i] ?? ''); attachKinds.push(null) }
+      for (let i = 0; i < fileCount; i++) {
+        const ext = extname(files[i] ?? '').toLowerCase()
+        texts.push(`(${PHOTO_EXTS.has(ext) ? 'photo' : 'document'}: ${files[i]})`)
+        attachKinds.push(PHOTO_EXTS.has(ext) ? 'photo' : 'document')
+      }
+      recordOutbound({ chat_id, thread_id: threadId ?? null, message_ids: sentIds, texts, attachment_kinds: attachKinds })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: history recordOutbound (reply) failed: ${err}\n`)
+    }
+  }
+
+  unpinProgressCardForChat?.(chat_id, threadId)
+
+  return { content: [{ type: 'text', text: result }] }
+}
+
+async function executeStreamReply(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
+  if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
+  const access = loadAccess()
+  const result = await handleStreamReply(
+    {
+      chat_id: args.chat_id as string,
+      text: args.text as string,
+      done: Boolean(args.done),
+      message_thread_id: args.message_thread_id as string | undefined,
+      format: args.format as string | undefined,
+      reply_to: args.reply_to as string | undefined,
+      quote: args.quote as boolean | undefined,
+    },
+    { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
+    {
+      bot: lockedBot,
+      retry: robustApiCall,
+      markdownToHtml,
+      escapeMarkdownV2,
+      repairEscapedWhitespace,
+      takeHandoffPrefix,
+      assertAllowedChat,
+      resolveThreadId,
+      disableLinkPreview: access.disableLinkPreview !== false,
+      defaultFormat: access.parseMode ?? 'html',
+      logStreamingEvent,
+      endStatusReaction,
+      historyEnabled: HISTORY_ENABLED,
+      recordOutbound,
+      ...(HISTORY_ENABLED ? { getLatestInboundMessageId } : {}),
+      writeError: (line) => process.stderr.write(line),
+      throttleMs: 600,
+      progressCardActive: streamMode === 'checklist',
+    },
+  )
+  if (result.status === 'finalized') {
+    const srChatId = args.chat_id as string
+    const srThreadId = resolveThreadId(srChatId, args.message_thread_id as string | undefined)
+    unpinProgressCardForChat?.(srChatId, srThreadId)
+  }
+  return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
+}
+
+async function executeReact(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('react: chat_id is required')
+  if (!args.message_id) throw new Error('react: message_id is required')
+  if (!args.emoji) throw new Error('react: emoji is required')
+  assertAllowedChat(args.chat_id as string)
+  await lockedBot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+    { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
+  ])
+  return { content: [{ type: 'text', text: 'reacted' }] }
+}
+
+async function executeDownloadAttachment(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.file_id) throw new Error('download_attachment: file_id is required')
+  const file_id = String(args.file_id)
+  // Validate file_id format — Telegram file IDs are alphanumeric with dashes/underscores
+  if (!/^[\w-]{10,200}$/.test(file_id)) {
+    throw new Error('download_attachment: invalid file_id format')
+  }
+  const file = await bot.api.getFile(file_id)
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  // Build download URL — token is embedded but NEVER included in error messages
+  const downloadUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  let res: Response
+  try {
+    res = await fetch(downloadUrl)
+  } catch (err) {
+    // Sanitize: never leak the token in network error messages
+    throw new Error(`download failed: network error`)
+  }
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const dlPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(dlPath, buf, { mode: 0o600 })
+  return { content: [{ type: 'text', text: dlPath }] }
+}
+
+async function executeEditMessage(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('edit_message: chat_id is required')
+  if (!args.message_id) throw new Error('edit_message: message_id is required')
+  if (args.text == null || args.text === '') throw new Error('edit_message: text is required and cannot be empty')
+  assertAllowedChat(args.chat_id as string)
+  const editAccess = loadAccess()
+  const editConfigMode = editAccess.parseMode ?? 'html'
+  const editFormat = (args.format as string | undefined) ?? editConfigMode
+  const editRawText = repairEscapedWhitespace(args.text as string)
+  let editParseMode: 'HTML' | 'MarkdownV2' | undefined
+  let editText: string
+  if (editFormat === 'html') {
+    editParseMode = 'HTML'
+    editText = markdownToHtml(editRawText)
+  } else if (editFormat === 'markdownv2') {
+    editParseMode = 'MarkdownV2'
+    editText = escapeMarkdownV2(editRawText)
+  } else {
+    editParseMode = undefined
+    editText = editRawText
+  }
+  const edited = await robustApiCall(
+    () => lockedBot.api.editMessageText(
+      args.chat_id as string, Number(args.message_id), editText,
+      ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+    ),
+  )
+  const id = typeof edited === 'object' && edited ? (edited as any).message_id : args.message_id
+  if (HISTORY_ENABLED) {
+    try {
+      recordEdit({ chat_id: args.chat_id as string, message_id: Number(args.message_id), text: args.text as string })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: history recordEdit failed: ${err}\n`)
+    }
+  }
+  return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+}
+
+async function executeSendTyping(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('send_typing: chat_id is required')
+  const stChatId = args.chat_id as string
+  assertAllowedChat(stChatId)
+  startTypingLoop(stChatId)
+  setTimeout(() => stopTypingLoop(stChatId), 30000)
+  for (const [key, ctrl] of activeStatusReactions.entries()) {
+    if (key.startsWith(`${stChatId}:`)) ctrl.setTool()
+  }
+  return { content: [{ type: 'text', text: 'typing indicator sent (auto-refreshes every 4s, stops after 30s or next reply)' }] }
+}
+
+async function executePinMessage(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('pin_message: chat_id is required')
+  if (!args.message_id) throw new Error('pin_message: message_id is required')
+  assertAllowedChat(args.chat_id as string)
+  await lockedBot.api.pinChatMessage(args.chat_id as string, Number(args.message_id))
+  return { content: [{ type: 'text', text: `pinned message ${args.message_id}` }] }
+}
+
+async function executeDeleteMessage(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('delete_message: chat_id is required')
+  if (!args.message_id) throw new Error('delete_message: message_id is required')
+  const delChatId = args.chat_id as string
+  const delMessageId = Number(args.message_id)
+  assertAllowedChat(delChatId)
+  await robustApiCall(() => lockedBot.api.deleteMessage(delChatId, delMessageId), { chat_id: delChatId })
+  if (HISTORY_ENABLED) {
+    try { deleteFromHistory({ chat_id: delChatId, message_id: delMessageId }) } catch (err) {
+      process.stderr.write(`telegram gateway: history deleteFromHistory failed: ${err}\n`)
+    }
+  }
+  return { content: [{ type: 'text', text: `deleted message ${delMessageId}` }] }
+}
+
+async function executeForwardMessage(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('forward_message: chat_id is required')
+  if (!args.from_chat_id) throw new Error('forward_message: from_chat_id is required')
+  if (!args.message_id) throw new Error('forward_message: message_id is required')
+  const fwdChatId = args.chat_id as string
+  const fwdFromChatId = args.from_chat_id as string
+  const fwdMsgId = Number(args.message_id)
+  assertAllowedChat(fwdChatId)
+  const threadId = resolveThreadId(fwdChatId, args.message_thread_id as string | undefined)
+  const fwd = await robustApiCall(
+    () => lockedBot.api.forwardMessage(fwdChatId, fwdFromChatId, fwdMsgId, {
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+    }),
+    { threadId, chat_id: fwdChatId },
+  )
+  if (HISTORY_ENABLED) {
+    try {
+      recordOutbound({
+        chat_id: fwdChatId,
+        thread_id: threadId ?? null,
+        message_ids: [fwd.message_id],
+        texts: [`(forwarded from ${fwdFromChatId}/${fwdMsgId})`],
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: history recordOutbound (forward) failed: ${err}\n`)
+    }
+  }
+  return { content: [{ type: 'text', text: `forwarded (id: ${fwd.message_id})` }] }
+}
+
+async function executeGetRecentMessages(args: Record<string, unknown>): Promise<unknown> {
+  if (!HISTORY_ENABLED) {
+    return {
+      content: [{ type: 'text', text: 'history capture is disabled — set historyEnabled: true in access.json and restart' }],
+      isError: true,
+    }
+  }
+  if (!args.chat_id) throw new Error('get_recent_messages: chat_id is required')
+  const chat_id = args.chat_id as string
+  assertAllowedChat(chat_id)
+  const rawThread = args.message_thread_id as string | undefined
+  let thread_id: number | null | undefined
+  if (rawThread === undefined) thread_id = undefined
+  else if (rawThread === '' || rawThread === '0' || rawThread === 'null') thread_id = null
+  else thread_id = Number(rawThread)
+  const limit = args.limit != null ? Number(args.limit) : 10
+  const before_message_id = args.before_message_id != null ? Number(args.before_message_id) : undefined
+
+  const rows = queryHistory({ chat_id, thread_id, limit, before_message_id })
+  const summary = rows
+    .map(r => {
+      const who = r.role === 'user' ? r.user ?? 'user' : 'assistant'
+      const time = new Date(r.ts * 1000).toISOString()
+      const attach = r.attachment_kind ? ` [${r.attachment_kind}]` : ''
+      return `[${time}] ${who}${attach}: ${r.text}`
+    })
+    .join('\n')
+  return {
+    content: [
+      { type: 'text', text: summary || '(no recent messages)' },
+      { type: 'text', text: JSON.stringify({ chat_id, thread_id: thread_id ?? null, count: rows.length, messages: rows }, null, 2) },
+    ],
+  }
+}
+
+// ─── Session event handling ───────────────────────────────────────────────
+
+function resetOrphanedReplyTimeout(): void {
+  if (orphanedReplyTimeoutId != null) {
+    clearTimeout(orphanedReplyTimeoutId)
+    orphanedReplyTimeoutId = null
+  }
+  if (shouldArmOrphanedReplyTimeout({
+    currentSessionChatId,
+    capturedTextCount: currentTurnCapturedText.length,
+    replyCalled: currentTurnReplyCalled,
+  })) {
+    orphanedReplyTimeoutId = setTimeout(() => {
+      orphanedReplyTimeoutId = null
+      if (shouldArmOrphanedReplyTimeout({
+        currentSessionChatId,
+        capturedTextCount: currentTurnCapturedText.length,
+        replyCalled: currentTurnReplyCalled,
+      })) {
+        process.stderr.write(
+          `telegram gateway: orphaned-reply timeout (${ORPHANED_REPLY_TIMEOUT_MS}ms) — forcing backstop\n`,
+        )
+        handleSessionEvent({ kind: 'turn_end', durationMs: -1 })
+      }
+    }, ORPHANED_REPLY_TIMEOUT_MS)
+  }
+}
+
+function closeActivityLane(chatId: string, threadId: number | undefined): void {
+  const key = `${chatId}:${threadId ?? '_'}:activity`
+  const stream = activeDraftStreams.get(key)
+  if (stream == null) return
+  activeDraftStreams.delete(key)
+  activeDraftParseModes.delete(key)
+  void stream.finalize().catch(() => {})
+}
+
+function closeProgressLane(chatId: string, threadId: number | undefined): void {
+  const key = `${chatId}:${threadId ?? '_'}:progress`
+  const stream = activeDraftStreams.get(key)
+  if (stream == null) return
+  activeDraftStreams.delete(key)
+  activeDraftParseModes.delete(key)
+  void stream.finalize().catch(() => {})
+}
+
+function handleSessionEvent(ev: SessionEvent): void {
+  switch (ev.kind) {
+    case 'enqueue': {
+      if (ev.chatId) {
+        currentSessionChatId = ev.chatId
+        currentSessionThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
+        currentTurnReplyCalled = false
+        currentTurnCapturedText = []
+        currentTurnStartedAt = Date.now()
+        if (pendingPtyPartial != null) {
+          const pending = pendingPtyPartial
+          pendingPtyPartial = null
+          handlePtyPartial(pending)
+        }
+      }
+      return
+    }
+    case 'dequeue': return
+    case 'thinking': {
+      if (currentSessionChatId == null) return
+      const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
+      if (ctrl) ctrl.setThinking()
+      return
+    }
+    case 'tool_use': {
+      if (currentSessionChatId == null) return
+      const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
+      const name = ev.toolName
+      if (isTelegramReplyTool(name)) {
+        currentTurnReplyCalled = true
+        if (orphanedReplyTimeoutId != null) {
+          clearTimeout(orphanedReplyTimeoutId)
+          orphanedReplyTimeoutId = null
+        }
+      }
+      if (!ctrl) return
+      if (isTelegramSurfaceTool(name)) return
+      ctrl.setTool(name)
+      return
+    }
+    case 'text': {
+      if (currentSessionChatId != null) {
+        currentTurnCapturedText.push(ev.text)
+      }
+      resetOrphanedReplyTimeout()
+
+      if (isContextExhaustionText(ev.text) && currentSessionChatId != null) {
+        const chatId = currentSessionChatId
+        const threadId = currentSessionThreadId
+        const now = Date.now()
+        if (now - lastContextExhaustionWarningAt < CONTEXT_EXHAUSTION_COOLDOWN_MS) return
+        lastContextExhaustionWarningAt = now
+        process.stderr.write(`telegram gateway: context exhaustion detected — notifying user\n`)
+        const warnOpts = {
+          parse_mode: 'HTML' as const,
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }
+        void bot.api.sendMessage(
+          chatId,
+          '⚠️ <b>Context window full</b> — send <code>/restart</code> to start a fresh session.',
+          warnOpts,
+        ).catch(() => {})
+        const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
+        if (ctrl) ctrl.setError()
+        activeStatusReactions.delete(statusKey(chatId, threadId))
+        activeTurnStartedAt.delete(statusKey(chatId, threadId))
+        currentSessionChatId = null
+        currentSessionThreadId = undefined
+        currentTurnReplyCalled = false
+        currentTurnCapturedText = []
+      }
+      return
+    }
+    case 'tool_result': return
+    case 'turn_end': {
+      if (orphanedReplyTimeoutId != null) {
+        clearTimeout(orphanedReplyTimeoutId)
+        orphanedReplyTimeoutId = null
+      }
+      if (currentSessionChatId == null) return
+      const chatId = currentSessionChatId
+      const threadId = currentSessionThreadId
+      const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
+
+      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) {
+        const capturedText = currentTurnCapturedText.join('\n').trim()
+        if (capturedText) {
+          const backstopChatId = chatId
+          const backstopThreadId = threadId
+          const backstopCtrl = ctrl
+
+          currentSessionChatId = null
+          currentSessionThreadId = undefined
+          currentTurnReplyCalled = false
+          currentTurnCapturedText = []
+
+          void (async () => {
+            await new Promise<void>(resolve => setTimeout(resolve, 500))
+            if (HISTORY_ENABLED) {
+              try {
+                const { getRecentOutboundCount } = await import('../history.js')
+                const recentCount = getRecentOutboundCount(backstopChatId, 2)
+                if (recentCount > 0) {
+                  process.stderr.write(`telegram gateway: backstop suppressed — reply tool sent ${recentCount} message(s)\n`)
+                  if (backstopCtrl) backstopCtrl.setDone()
+                  activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
+                  activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
+                  return
+                }
+              } catch {}
+            }
+
+            process.stderr.write(
+              `telegram gateway: orphaned-reply backstop firing — ${capturedText.length} chars without reply tool\n`,
+            )
+            const sendOpts = {
+              parse_mode: 'HTML' as const,
+              ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
+              link_preview_options: { is_disabled: true },
+            }
+            const renderedText = markdownToHtml(capturedText)
+            const limit = 4000
+            const htmlChunks = splitHtmlChunks(renderedText, limit)
+            const sentIds: number[] = []
+            try {
+              for (const c of htmlChunks) {
+                const sent = await bot.api.sendMessage(backstopChatId, c, sendOpts)
+                sentIds.push(sent.message_id)
+              }
+              if (HISTORY_ENABLED && sentIds.length > 0) {
+                try {
+                  recordOutbound({
+                    chat_id: backstopChatId,
+                    thread_id: backstopThreadId ?? null,
+                    message_ids: sentIds,
+                    texts: htmlChunks,
+                  })
+                } catch {}
+              }
+              if (backstopCtrl) backstopCtrl.setDone()
+            } catch (err) {
+              process.stderr.write(`telegram gateway: orphaned-reply backstop failed: ${(err as Error).message}\n`)
+              if (backstopCtrl) backstopCtrl.setError()
+            } finally {
+              activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
+              activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
+            }
+          })()
+          return
+        }
+      }
+
+      if (ctrl) ctrl.setDone()
+      activeStatusReactions.delete(statusKey(chatId, threadId))
+      activeTurnStartedAt.delete(statusKey(chatId, threadId))
+      {
+        const sKey = streamKey(chatId, threadId)
+        logStreamingEvent({
+          kind: 'turn_end',
+          chatId,
+          durationMs: currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0,
+          suppressClearedCount: suppressPtyPreview.has(sKey) ? 1 : 0,
+        })
+      }
+      lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
+      pendingPtyPartial = null
+      closeActivityLane(chatId, threadId)
+      closeProgressLane(chatId, threadId)
+      currentSessionChatId = null
+      currentSessionThreadId = undefined
+      currentTurnReplyCalled = false
+      currentTurnCapturedText = []
+      return
+    }
+  }
+}
+
+// ─── PTY partial handler ─────────────────────────────────────────────────
+function handlePtyPartial(text: string): void {
+  const state: PtyHandlerState = {
+    currentSessionChatId,
+    currentSessionThreadId,
+    pendingPtyPartial: pendingPtyPartial != null ? { text: pendingPtyPartial } : null,
+    activeDraftStreams,
+    activeDraftParseModes,
+    suppressPtyPreview,
+    lastPtyPreviewByChat,
+  }
+  handlePtyPartialPure(text, state, {
+    bot,
+    retry: robustApiCall,
+    renderText: markdownToHtml,
+    logEvent: logStreamingEvent,
+    onStreamSend: (chatId, messageId, charCount) => {
+      logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
+      logStreamingEvent({ kind: 'draft_send', chatId, messageId, charCount })
+    },
+    onStreamEdit: (chatId, messageId, charCount) =>
+      logStreamingEvent({ kind: 'draft_edit', chatId, messageId, charCount, sameAsLast: false }),
+    onFirstPartial: (chatId, charCount) => {
+      process.stderr.write(`telegram gateway: pty first partial — chat=${chatId} chars=${charCount}\n`)
+    },
+    writeError: (line) => process.stderr.write(line),
+  })
+  pendingPtyPartial = state.pendingPtyPartial?.text ?? null
+}
+
+function handlePtyActivity(text: string): void {
+  if (currentSessionChatId == null) return
+  if (shouldSuppressToolActivity(text)) return
+  const chatId = currentSessionChatId
+  const threadId = currentSessionThreadId
+  const access = loadAccess()
+  void handleStreamReply(
+    {
+      chat_id: chatId,
+      text,
+      done: false,
+      message_thread_id: threadId != null ? String(threadId) : undefined,
+      format: 'text',
+      lane: 'activity',
+    },
+    { activeDraftStreams, activeDraftParseModes },
+    {
+      bot,
+      retry: robustApiCall,
+      markdownToHtml,
+      escapeMarkdownV2,
+      repairEscapedWhitespace,
+      takeHandoffPrefix: () => '',
+      assertAllowedChat,
+      resolveThreadId,
+      disableLinkPreview: access.disableLinkPreview !== false,
+      defaultFormat: 'text',
+      logStreamingEvent,
+      endStatusReaction,
+      historyEnabled: false,
+      recordOutbound,
+      writeError: (line) => process.stderr.write(line),
+      throttleMs: 600,
+    },
+  ).catch((err) => {
+    process.stderr.write(`telegram gateway: pty activity stream failed: ${(err as Error).message}\n`)
+  })
+}
+
+// ─── Gate / inbound routing ───────────────────────────────────────────────
+
+type GateResult =
+  | { action: 'deliver'; access: Access }
+  | { action: 'drop' }
+  | { action: 'pair'; code: string; isResend: boolean }
+
+function gate(ctx: Context): GateResult {
+  const access = loadAccess()
+  const pruned = pruneExpired(access)
+  if (pruned) saveAccess(access)
+  if (access.dmPolicy === 'disabled') return { action: 'drop' }
+  const from = ctx.from
+  if (!from) return { action: 'drop' }
+  const senderId = String(from.id)
+  const chatType = ctx.chat?.type
+
+  if (chatType === 'private') {
+    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
+    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+
+    for (const [code, p] of Object.entries(access.pending)) {
+      if (p.senderId === senderId) {
+        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+        p.replies = (p.replies ?? 1) + 1
+        saveAccess(access)
+        return { action: 'pair', code, isResend: true }
+      }
+    }
+    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+    const code = randomBytes(3).toString('hex')
+    const now = Date.now()
+    access.pending[code] = {
+      senderId,
+      chatId: String(ctx.chat!.id),
+      createdAt: now,
+      expiresAt: now + 60 * 60 * 1000,
+      replies: 1,
+    }
+    saveAccess(access)
+    return { action: 'pair', code, isResend: false }
+  }
+
+  if (chatType === 'group' || chatType === 'supergroup') {
+    const groupId = String(ctx.chat!.id)
+    const policy = access.groups[groupId]
+    if (!policy) return { action: 'drop' }
+    const groupAllowFrom = policy.allowFrom ?? []
+    const requireMention = policy.requireMention ?? true
+    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return { action: 'drop' }
+    if (requireMention && !isMentioned(ctx, access.mentionPatterns)) return { action: 'drop' }
+    return { action: 'deliver', access }
+  }
+
+  return { action: 'drop' }
+}
+
+function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
+  const entities = ctx.message?.entities ?? ctx.message?.caption_entities ?? []
+  const text = ctx.message?.text ?? ctx.message?.caption ?? ''
+  for (const e of entities) {
+    if (e.type === 'mention') {
+      const mentioned = text.slice(e.offset, e.offset + e.length)
+      if (mentioned.toLowerCase() === `@${botUsername}`.toLowerCase()) return true
+    }
+    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) return true
+  }
+  if (ctx.message?.reply_to_message?.from?.username === botUsername) return true
+  for (const pat of extraPatterns ?? []) {
+    try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
+  }
+  return false
+}
+
+function isAuthorizedSender(ctx: Context): boolean {
+  const from = ctx.from
+  if (!from) return false
+  const senderId = String(from.id)
+  const access = loadAccess()
+  if (ctx.chat?.type === 'private') return access.allowFrom.includes(senderId)
+  if (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') {
+    const groupId = String(ctx.chat.id)
+    const policy = access.groups[groupId]
+    if (!policy) return false
+    const groupAllowFrom = policy.allowFrom ?? []
+    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return false
+    return true
+  }
+  return false
+}
+
+function safeName(s: string | undefined): string | undefined {
+  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+}
+
+// ─── Inbound message handling ─────────────────────────────────────────────
+
+async function handleInboundCoalesced(
+  ctx: Context,
+  text: string,
+  downloadImage: (() => Promise<string | undefined>) | undefined,
+  attachment?: AttachmentMeta,
+): Promise<void> {
+  if (downloadImage || attachment) return handleInbound(ctx, text, downloadImage, attachment)
+  const access = loadAccess()
+  const gapMs = access.coalescingGapMs ?? 1500
+  if (gapMs <= 0) return handleInbound(ctx, text, undefined, undefined)
+
+  const from = ctx.from
+  if (!from) return
+  const chatId = String(ctx.chat!.id)
+  const userId = String(from.id)
+  const key = coalesceKey(chatId, userId)
+
+  const existing = coalesceBuffer.get(key)
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.texts.push(text)
+    existing.ctx = ctx
+    existing.timer = setTimeout(() => flushCoalesce(key), gapMs)
+  } else {
+    const entry: CoalesceEntry = {
+      texts: [text],
+      ctx,
+      timer: setTimeout(() => flushCoalesce(key), gapMs),
+    }
+    coalesceBuffer.set(key, entry)
+  }
+}
+
+function flushCoalesce(key: string): void {
+  const entry = coalesceBuffer.get(key)
+  if (!entry) return
+  coalesceBuffer.delete(key)
+  void handleInbound(entry.ctx, entry.texts.join('\n'), entry.downloadImage, entry.attachment)
+}
+
+async function handleInbound(
+  ctx: Context,
+  text: string,
+  downloadImage: (() => Promise<string | undefined>) | undefined,
+  attachment?: AttachmentMeta,
+): Promise<void> {
+  const isTopicMessage = ctx.message?.is_topic_message ?? false
+  const messageThreadId = ctx.message?.message_thread_id
+
+  if (TOPIC_ID != null) {
+    if (!isTopicMessage || messageThreadId !== TOPIC_ID) return
+  }
+
+  const result = gate(ctx)
+  if (result.action === 'drop') return
+  if (result.action === 'pair') {
+    const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`)
+    return
+  }
+
+  const access = result.access
+  const from = ctx.from!
+  const chat_id = String(ctx.chat!.id)
+  const msgId = ctx.message?.message_id
+
+  if (messageThreadId != null) chatThreadMap.set(chat_id, messageThreadId)
+
+  // Permission-reply intercept
+  const permMatch = PERMISSION_REPLY_RE.exec(text)
+  if (permMatch) {
+    // Forward permission reply to connected bridge
+    const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+    const request_id = permMatch[2]!.toLowerCase()
+    ipcServer.broadcast({
+      type: 'permission',
+      requestId: request_id,
+      behavior,
+    })
+    if (msgId != null) {
+      const emoji = behavior === 'allow' ? '✅' : '❌'
+      void bot.api.setMessageReaction(chat_id, msgId, [
+        { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
+      ]).catch(() => {})
+    }
+    return
+  }
+
+  // Auth-code intercept
+  const pendingReauth = pendingReauthFlows.get(chat_id)
+  if (pendingReauth && looksLikeAuthCode(text)) {
+    const elapsed = Date.now() - pendingReauth.startedAt
+    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
+      pendingReauthFlows.delete(chat_id)
+      try {
+        const output = stripAnsi(switchroomExecCombined(['auth', 'code', pendingReauth.agent, text.trim()], 30000))
+        const formatted = formatAuthOutputForTelegram(output)
+        await switchroomReply(ctx, formatted, { html: true })
+      } catch (err: unknown) {
+        const error = err as { stderr?: string; message?: string }
+        const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+        await switchroomReply(ctx, `<b>auth code failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+      }
+      if (msgId != null) {
+        void bot.api.setMessageReaction(chat_id, msgId, [
+          { type: 'emoji', emoji: '🔑' as ReactionTypeEmoji['emoji'] },
+        ]).catch(() => {})
+      }
+      return
+    }
+    pendingReauthFlows.delete(chat_id)
+  }
+
+  // Vault intercept
+  const pendingVault = pendingVaultOps.get(chat_id)
+  if (pendingVault) {
+    const elapsed = Date.now() - pendingVault.startedAt
+    if (elapsed > VAULT_INPUT_TTL_MS) {
+      pendingVaultOps.delete(chat_id)
+    } else {
+      pendingVaultOps.delete(chat_id)
+      if (pendingVault.kind === 'passphrase') {
+        const passphrase = text.trim()
+        if (!passphrase) {
+          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault again.', { html: true })
+          return
+        }
+        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
+        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else {
+        let value = text
+        const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
+        if (codeBlockMatch) value = codeBlockMatch[1]!
+        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        await executeVaultOp(ctx, chat_id, 'set', pendingVault.key, pendingVault.passphrase, value.trim())
+      }
+      return
+    }
+  }
+
+  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+
+  const parsedQueue = parseQueuePrefix(text)
+  const isQueuedPrefix = parsedQueue.queued
+  const effectiveText = isQueuedPrefix ? parsedQueue.body : text
+
+  // Status reaction controller
+  let isSteering = false
+  let priorTurnStartedAt: number | undefined
+  if (msgId != null) {
+    const key = statusKey(chat_id, messageThreadId)
+    const priorActive = activeStatusReactions.get(key)
+    isSteering = priorActive != null
+    if (isSteering) priorTurnStartedAt = activeTurnStartedAt.get(key)
+
+    if (access.statusReactions !== false) {
+      if (isSteering) {
+        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '🤝' }]).catch(() => {})
+      } else {
+        if (priorActive) {
+          priorActive.cancel()
+          activeStatusReactions.delete(key)
+          activeTurnStartedAt.delete(key)
+        }
+        const sKey = streamKey(chat_id, messageThreadId)
+        const priorStream = activeDraftStreams.get(sKey)
+        if (priorStream && !priorStream.isFinal()) {
+          void priorStream.finalize().catch(() => {})
+          activeDraftStreams.delete(sKey)
+          activeDraftParseModes.delete(sKey)
+        }
+        suppressPtyPreview.delete(sKey)
+
+        const ctrl = new StatusReactionController(async (emoji) => {
+          await bot.api.setMessageReaction(chat_id, msgId, [
+            { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
+          ])
+        })
+        activeStatusReactions.set(key, ctrl)
+        activeTurnStartedAt.set(key, Date.now())
+        ctrl.setQueued()
+      }
+    } else if (access.ackReaction) {
+      void bot.api.setMessageReaction(chat_id, msgId, [
+        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
+      ]).catch(() => {})
+    }
+  }
+
+  if (!isSteering) {
+    try {
+      progressDriver?.startTurn({
+        chatId: chat_id,
+        threadId: messageThreadId != null ? String(messageThreadId) : undefined,
+        userText: effectiveText,
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
+    }
+  }
+
+  const imagePath = downloadImage ? await downloadImage() : undefined
+
+  if (HISTORY_ENABLED) {
+    try {
+      recordInbound({
+        chat_id,
+        thread_id: messageThreadId ?? null,
+        message_id: msgId,
+        user: from.username ?? String(from.id),
+        user_id: String(from.id),
+        ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
+        text: effectiveText,
+        attachment_kind: attachment?.kind,
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: history recordInbound failed: ${err}\n`)
+    }
+  }
+
+  // Build steering meta
+  const priorTurnInProgress = isSteering
+  let secondsSinceTurnStart: number | undefined
+  let priorAssistantPreview: string | undefined
+  if (priorTurnInProgress) {
+    if (priorTurnStartedAt != null) {
+      secondsSinceTurnStart = Math.max(0, Math.floor((Date.now() - priorTurnStartedAt) / 1000))
+    }
+    if (HISTORY_ENABLED) {
+      try {
+        const rows = queryHistory({ chat_id, thread_id: messageThreadId ?? null, limit: 10 })
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const r = rows[i]!
+          if (r.role === 'assistant' && r.text && r.text.length > 0) {
+            priorAssistantPreview = formatPriorAssistantPreview(r.text, 200)
+            break
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // Dispatch to connected bridge via IPC
+  const inboundMsg: InboundMessage = {
+    type: 'inbound',
+    chatId: chat_id,
+    ...(messageThreadId != null ? { threadId: messageThreadId } : {}),
+    messageId: msgId ?? 0,
+    user: from.username ?? String(from.id),
+    userId: from.id,
+    ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
+    text: effectiveText,
+    ...(imagePath ? { imagePath } : {}),
+    ...(attachment ? {
+      attachment: {
+        fileId: attachment.file_id,
+        mimeType: attachment.mime ?? 'application/octet-stream',
+        ...(attachment.name ? { fileName: attachment.name } : {}),
+      },
+    } : {}),
+    meta: {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(isQueuedPrefix ? { queued: 'true' } : {}),
+      ...(isSteering && !isQueuedPrefix ? { steering: 'true' } : {}),
+      ...(priorTurnInProgress ? { prior_turn_in_progress: 'true' } : {}),
+      ...(priorTurnInProgress && secondsSinceTurnStart != null ? { seconds_since_turn_start: String(secondsSinceTurnStart) } : {}),
+      ...(priorTurnInProgress && priorAssistantPreview != null && priorAssistantPreview.length > 0 ? { prior_assistant_preview: priorAssistantPreview } : {}),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
+    },
+  }
+
+  // Try to send to a connected bridge. If no bridge connected, tell the user.
+  ipcServer.broadcast(inboundMsg)
+  const delivered = ipcServer.clientCount() > 0
+
+  if (!delivered) {
+    const threadOpts = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
+    void bot.api.sendMessage(
+      chat_id,
+      '⏳ Agent is restarting, please wait…',
+      { ...threadOpts },
+    ).catch(() => {})
+  }
+}
+
+// ─── Switchroom CLI helpers ───────────────────────────────────────────────
+const SWITCHROOM_CLI = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
+const SWITCHROOM_CONFIG = process.env.SWITCHROOM_CONFIG
+
+function switchroomExec(args: string[], timeoutMs = 15000): string {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
+  return execFileSync(SWITCHROOM_CLI, fullArgs, {
+    encoding: 'utf-8',
+    timeout: timeoutMs,
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    maxBuffer: 4 * 1024 * 1024,
+  })
+}
+
+function switchroomExecCombined(args: string[], timeoutMs = 15000): string {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
+  const quoted = [SWITCHROOM_CLI, ...fullArgs].map((a) => `'${String(a).replace(/'/g, "'\\''")}'`).join(' ')
+  return execSync(`${quoted} 2>&1`, {
+    encoding: 'utf-8',
+    timeout: timeoutMs,
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    maxBuffer: 4 * 1024 * 1024,
+    shell: '/bin/bash',
+  })
+}
+
+function formatSwitchroomOutput(output: string, maxLen = 4000): string {
+  const trimmed = output.trim()
+  if (trimmed.length <= maxLen) return trimmed
+  return trimmed.slice(0, maxLen - 20) + '\n... (truncated)'
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+}
+
+function escapeHtmlForTg(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function preBlock(text: string): string {
+  return '<pre>' + escapeHtmlForTg(text) + '</pre>'
+}
+
+async function switchroomReply(ctx: Context, text: string, options: { html?: boolean } = {}): Promise<void> {
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  await ctx.reply(text, {
+    ...(threadId != null ? { message_thread_id: threadId } : {}),
+    ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
+  })
+}
+
+function getCommandArgs(ctx: Context): string {
+  const fromMatch = typeof ctx.match === 'string' ? ctx.match.trim() : ''
+  if (fromMatch) return fromMatch
+  const text = (ctx.msg as { text?: string } | undefined)?.text ?? (ctx.message as { text?: string } | undefined)?.text ?? ''
+  const m = text.match(/^\/\S+\s+([\s\S]*)$/)
+  return m ? m[1].trim() : ''
+}
+
+/** Validate that a string looks like a safe agent/resource name.
+ *  Agent names should be alphanumeric with hyphens/underscores only.
+ *  This prevents shell metacharacter injection even though both exec
+ *  functions already handle quoting. Defense in depth. */
+function assertSafeAgentName(name: string): void {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name) && name !== 'all') {
+    throw new Error(`invalid agent name: ${name}`)
+  }
+}
+
+function getMyAgentName(): string {
+  const fromEnv = process.env.SWITCHROOM_AGENT_NAME
+  if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
+  return basename(process.cwd())
+}
+
+function isSelfTargetingCommand(name: string): boolean {
+  if (name === 'all') return true
+  return name === getMyAgentName()
+}
+
+// ─── Restart marker ───────────────────────────────────────────────────────
+type RestartMarker = { chat_id: string; thread_id: number | null; ack_message_id: number | null; ts: number }
+
+function restartMarkerPath(): string | null {
+  const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) return null
+  return join(agentDir, 'restart-pending.json')
+}
+function writeRestartMarker(marker: RestartMarker): void {
+  const p = restartMarkerPath(); if (!p) return
+  try { writeFileSync(p, JSON.stringify(marker)) } catch (err) {
+    process.stderr.write(`telegram gateway: writeRestartMarker failed: ${err}\n`)
+  }
+}
+function readRestartMarker(): RestartMarker | null {
+  const p = restartMarkerPath(); if (!p) return null
+  try { return JSON.parse(readFileSync(p, 'utf8')) as RestartMarker } catch { return null }
+}
+function clearRestartMarker(): void {
+  const p = restartMarkerPath(); if (!p) return
+  try { rmSync(p, { force: true }) } catch {}
+}
+
+function spawnSwitchroomDetached(args: string[]): void {
+  const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
+  const logPath = join(STATE_DIR, 'detached-spawn.log')
+  let outFd: number | null = null
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    outFd = openSync(logPath, 'a')
+    writeFileSync(logPath, `\n[${new Date().toISOString()}] spawn ${SWITCHROOM_CLI} ${fullArgs.join(' ')}\n`, { flag: 'a' })
+  } catch {}
+  const child = spawn(SWITCHROOM_CLI, fullArgs, {
+    detached: true,
+    stdio: outFd != null ? ['ignore', outFd, outFd] : 'ignore',
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+  })
+  if (outFd != null) { try { closeSync(outFd) } catch {} }
+  child.unref()
+}
+
+async function sweepPinsBeforeSelfRestart(): Promise<void> {
+  const agentDir = resolveAgentDirFromEnv()
+  if (agentDir == null) return
+  try {
+    await sweepActivePins(
+      agentDir,
+      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      { log: (msg) => process.stderr.write(`telegram gateway: pre-restart pin sweep — ${msg}\n`) },
+    )
+  } catch (err) {
+    process.stderr.write(`telegram gateway: pre-restart pin sweep threw: ${(err as Error).message}\n`)
+  }
+}
+
+function formatAuthOutputForTelegram(output: string): string {
+  const trimmed = stripAnsi(output).trim()
+  const url = trimmed.match(/https:\/\/\S+/)?.[0] ?? null
+  const lines = trimmed.split(/\n+/).map(l => l.trim()).filter(Boolean)
+  if (!url) return preBlock(formatSwitchroomOutput(trimmed))
+  const body = lines.filter(line => line !== url)
+  const rendered = body.map(line => {
+    if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) return `<b>${escapeHtmlForTg(line)}</b>`
+    if (line.startsWith('Then finish with:') || line.startsWith('Cancel with:')) return escapeHtmlForTg(line)
+    if (line.startsWith('switchroom auth ')) return `<code>${escapeHtmlForTg(line)}</code>`
+    return escapeHtmlForTg(line)
+  })
+  rendered.push('', `<a href="${escapeHtmlForTg(url)}">Open Claude login</a>`, escapeHtmlForTg(url))
+  return rendered.join('\n')
+}
+
+async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
+  try {
+    const output = switchroomExecCombined(args, 30000)
+    await switchroomReply(ctx, formatAuthOutputForTelegram(output), { html: true })
+  } catch (err: unknown) {
+    const error = err as { status?: number; stderr?: string; message?: string }
+    if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
+    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`); return }
+    const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+  }
+}
+
+function runVaultCli(args: string[], passphrase: string, stdinValue?: string): { ok: boolean; output: string } {
+  const env = { ...process.env, SWITCHROOM_VAULT_PASSPHRASE: passphrase }
+  try {
+    let result: string
+    if (stdinValue !== undefined) {
+      result = execFileSync(process.env.SWITCHROOM_CLI_PATH ?? 'switchroom', ['vault', ...args], { input: stdinValue, encoding: 'utf8', env, timeout: 10000 })
+    } else {
+      result = execFileSync(process.env.SWITCHROOM_CLI_PATH ?? 'switchroom', ['vault', ...args], { encoding: 'utf8', env, timeout: 10000 })
+    }
+    return { ok: true, output: result.trim() }
+  } catch (err: unknown) {
+    const e = err as { stdout?: string; stderr?: string; message?: string }
+    return { ok: false, output: [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim() }
+  }
+}
+
+async function executeVaultOp(ctx: Context, chatId: string, op: 'list' | 'get' | 'set' | 'delete', key: string | undefined, passphrase: string, setValue: string | undefined): Promise<void> {
+  if (op === 'list') {
+    const r = runVaultCli(['list'], passphrase)
+    if (!r.ok) { await switchroomReply(ctx, `<b>vault list failed:</b>\n${preBlock(r.output)}`, { html: true }); return }
+    const keys = r.output.split('\n').filter(Boolean)
+    if (keys.length === 0) { await switchroomReply(ctx, 'Vault is empty.', { html: true }) }
+    else { await switchroomReply(ctx, `<b>Vault keys (${keys.length}):</b>\n${keys.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')}`, { html: true }) }
+  } else if (op === 'get') {
+    const r = runVaultCli(['get', key!], passphrase)
+    if (!r.ok) { await switchroomReply(ctx, `<b>vault get failed:</b>\n${preBlock(r.output)}`, { html: true }); return }
+    await switchroomReply(ctx, `<code>${escapeHtmlForTg(key!)}</code> =\n<code>${escapeHtmlForTg(r.output)}</code>`, { html: true })
+  } else if (op === 'set') {
+    if (setValue === undefined) {
+      pendingVaultOps.set(chatId, { kind: 'value', op: 'set', key: key!, passphrase, startedAt: Date.now() })
+      await switchroomReply(ctx, `Send the value for <code>${escapeHtmlForTg(key!)}</code>.`, { html: true })
+      return
+    }
+    const r = runVaultCli(['set', key!], passphrase, setValue)
+    if (!r.ok) { await switchroomReply(ctx, `<b>vault set failed:</b>\n${preBlock(r.output)}`, { html: true }) }
+    else { await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> saved to vault.`, { html: true }) }
+  } else if (op === 'delete') {
+    const r = runVaultCli(['remove', key!], passphrase)
+    if (!r.ok) { await switchroomReply(ctx, `<b>vault delete failed:</b>\n${preBlock(r.output)}`, { html: true }) }
+    else { await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> removed from vault.`, { html: true }) }
+  }
+}
+
+async function runSwitchroomCommand(ctx: Context, args: string[], label: string): Promise<void> {
+  try {
+    const output = stripAnsi(switchroomExec(args))
+    const formatted = formatSwitchroomOutput(output)
+    if (formatted) { await switchroomReply(ctx, preBlock(formatted), { html: true }) }
+    else { await switchroomReply(ctx, `${label}: done (no output)`) }
+  } catch (err: unknown) {
+    const error = err as { status?: number; stderr?: string; message?: string }
+    if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
+    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`); return }
+    const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+  }
+}
+
+function switchroomExecJson<T = unknown>(args: string[]): T | null {
+  try {
+    const output = switchroomExec([...args, '--json'])
+    return JSON.parse(stripAnsi(output)) as T
+  } catch { return null }
+}
+
+function statusIcon(status: string): string {
+  if (status === 'active' || status === 'running') return '🟢'
+  if (status === 'inactive' || status === 'stopped' || status === 'dead') return '🔴'
+  if (status === 'failed') return '⚠️'
+  return '⚪'
+}
+
+async function runSwitchroomCommandFormatted(ctx: Context, args: string[], label: string, formatter: () => string | null): Promise<void> {
+  try {
+    const formatted = formatter()
+    if (formatted) { await switchroomReply(ctx, formatted, { html: true }); return }
+    await runSwitchroomCommand(ctx, args, label)
+  } catch (err: unknown) {
+    const error = err as { stderr?: string; message?: string }
+    const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+  }
+}
+
+// ─── Bot commands ─────────────────────────────────────────────────────────
+
+bot.command('start', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const access = loadAccess()
+  if (access.dmPolicy === 'disabled') { await ctx.reply(`This bot isn't accepting new connections.`); return }
+  await ctx.reply(
+    `This bot bridges Telegram to a Claude Code session.\n\n` +
+    `To pair:\n1. DM me anything — you'll get a 6-char code\n` +
+    `2. In Claude Code: /telegram:access pair <code>\n\nAfter that, DMs here reach that session.`,
+  )
+})
+
+bot.command('help', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  await ctx.reply(
+    `Messages you send here route to a paired Claude Code session. ` +
+    `Text and photos are forwarded; replies and reactions come back.\n\n` +
+    `/start — pairing instructions\n/status — check your pairing state`,
+  )
+})
+
+bot.command('status', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const from = ctx.from; if (!from) return
+  const senderId = String(from.id)
+  const access = loadAccess()
+  if (access.allowFrom.includes(senderId)) {
+    await ctx.reply(`Paired as ${from.username ? `@${from.username}` : senderId}.`)
+    return
+  }
+  for (const [code, p] of Object.entries(access.pending)) {
+    if (p.senderId === senderId) {
+      await ctx.reply(`Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`)
+      return
+    }
+  }
+  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+})
+
+bot.command('agents', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await runSwitchroomCommandFormatted(ctx, ['agent', 'list'], 'agent list', () => {
+    type AgentListResp = { agents: Array<{ name: string; status: string; uptime: string; template: string; topic_name: string; topic_emoji?: string }> }
+    const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+    if (!data) return null
+    if (data.agents.length === 0) return '<i>No agents defined</i>'
+    const lines = ['<b>Agents</b>']
+    for (const a of data.agents) {
+      lines.push(`${statusIcon(a.status)} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(a.status)} · ${escapeHtmlForTg(a.uptime)}`)
+      lines.push(`    <i>${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}</i>`)
+    }
+    return lines.join('\n')
+  })
+})
+
+bot.command('switchroomstart', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'start', name], `start ${name}`)
+})
+
+bot.command('stop', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'stop', name], `stop ${name}`)
+})
+
+bot.command('restart', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  if (isSelfTargetingCommand(name)) {
+    const existing = readRestartMarker()
+    if (existing && Date.now() - existing.ts < 15_000) {
+      await switchroomReply(ctx, `⏳ Restart already in progress — ignoring duplicate.`, { html: true })
+      return
+    }
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const ackText = `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>…`
+    let ackId: number | null = null
+    try {
+      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      ackId = sent.message_id
+      if (HISTORY_ENABLED) {
+        try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [`🔄 Restarting ${name}…`], attachment_kinds: [] }) } catch {}
+      }
+    } catch {}
+    writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
+    await sweepPinsBeforeSelfRestart()
+    spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+    return
+  }
+  await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
+})
+
+bot.command('interrupt', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'interrupt', name], `interrupt ${name}`)
+})
+
+bot.command('auth', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
+  const sub = (parts[0] ?? 'status').toLowerCase()
+  const currentAgent = getMyAgentName()
+
+  if (sub === 'login' || sub === 'reauth' || sub === 'link') {
+    const name = parts[1] ?? currentAgent
+    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+    await runSwitchroomAuthCommand(ctx, ['auth', sub, name], `auth ${sub} ${name}`)
+    if (sub === 'reauth' || sub === 'login') pendingReauthFlows.set(String(ctx.chat!.id), { agent: name, startedAt: Date.now() })
+    return
+  }
+  if (sub === 'code') {
+    let name = currentAgent; let code = ''
+    if (parts.length >= 3) { name = parts[1]; code = parts.slice(2).join(' ') }
+    else if (parts.length === 2) { code = parts[1] }
+    if (!code) { await switchroomReply(ctx, 'Usage: /auth code [agent] <browser-code>'); return }
+    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+    await runSwitchroomCommand(ctx, ['auth', 'code', name, code], `auth code ${name}`)
+    pendingReauthFlows.delete(String(ctx.chat!.id))
+    return
+  }
+  if (sub === 'cancel') {
+    const name = parts[1] ?? currentAgent
+    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+    await runSwitchroomCommand(ctx, ['auth', 'cancel', name], `auth cancel ${name}`)
+    pendingReauthFlows.delete(String(ctx.chat!.id))
+    return
+  }
+  if (sub !== 'status') {
+    await switchroomReply(ctx, `Usage:\n/auth\n/auth login [agent]\n/auth reauth [agent]\n/auth code [agent] <browser-code>\n/auth cancel [agent]`)
+    return
+  }
+  await runSwitchroomCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
+    type AuthStatusResp = { agents: Array<{ name: string; authenticated: boolean; auth_source: string | null; pending_auth: boolean; subscription_type: string | null; expires_in: string | null }> }
+    const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
+    if (!data) return null
+    if (data.agents.length === 0) return '<i>No agents defined</i>'
+    const lines = ['<b>Auth status</b>']
+    for (const a of data.agents) {
+      const icon = a.authenticated ? '✓' : (a.pending_auth ? '…' : '✗')
+      const source = a.auth_source ?? (a.pending_auth ? 'pending' : '—')
+      const subLabel = a.subscription_type ?? '—'
+      const expires = a.expires_in ?? '—'
+      lines.push(`${icon} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(source)} · ${escapeHtmlForTg(subLabel)} · expires ${escapeHtmlForTg(expires)}`)
+    }
+    return lines.join('\n')
+  })
+})
+
+bot.command('reauth', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const raw = getCommandArgs(ctx).trim()
+  const name = getMyAgentName()
+  const chatId = String(ctx.chat!.id)
+  if (!raw) {
+    await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', name], `auth reauth ${name}`)
+    pendingReauthFlows.set(chatId, { agent: name, startedAt: Date.now() })
+    return
+  }
+  if (raw.startsWith('http') || looksLikeAuthCode(raw)) {
+    await runSwitchroomCommand(ctx, ['auth', 'code', name, raw], `auth code ${name}`)
+    pendingReauthFlows.delete(chatId)
+    return
+  }
+  // raw is treated as an agent name
+  try { assertSafeAgentName(raw) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', raw], `auth reauth ${raw}`)
+  pendingReauthFlows.set(chatId, { agent: raw, startedAt: Date.now() })
+})
+
+bot.command('vault', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const chatId = String(ctx.chat!.id)
+  const args = (ctx.match ?? '').trim().split(/\s+/).filter(Boolean)
+  const sub = args[0]?.toLowerCase()
+  const key = args[1]
+  if (!sub || sub === 'help') {
+    await switchroomReply(ctx, [
+      '<b>Vault commands</b>',
+      '/vault list — list all secret keys',
+      '/vault get &lt;key&gt; — read a secret value',
+      '/vault set &lt;key&gt; — set a secret',
+      '/vault delete &lt;key&gt; — remove a secret',
+    ].join('\n'), { html: true })
+    return
+  }
+  if (!['list', 'get', 'set', 'delete', 'remove'].includes(sub)) {
+    await switchroomReply(ctx, `Unknown vault subcommand: <code>${escapeHtmlForTg(sub)}</code>`, { html: true })
+    return
+  }
+  if ((sub === 'get' || sub === 'delete' || sub === 'remove') && !key) { await switchroomReply(ctx, `Usage: /vault ${sub} &lt;key&gt;`, { html: true }); return }
+  if (sub === 'set' && !key) { await switchroomReply(ctx, 'Usage: /vault set &lt;key&gt;', { html: true }); return }
+
+  const cached = vaultPassphraseCache.get(chatId)
+  const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
+  if (!passphrase) {
+    const opSub = (sub === 'remove' ? 'delete' : sub) as 'list' | 'get' | 'delete' | 'set'
+    pendingVaultOps.set(chatId, { kind: 'passphrase', op: opSub, key, startedAt: Date.now() })
+    await switchroomReply(ctx, '🔐 Send your vault passphrase:', { html: true })
+    return
+  }
+  await executeVaultOp(ctx, chatId, (sub === 'remove' ? 'delete' : sub) as 'list' | 'get' | 'set' | 'delete', key, passphrase, undefined)
+})
+
+bot.command('topics', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await runSwitchroomCommand(ctx, ['topics', 'list'], 'topics list')
+})
+
+bot.command('logs', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
+  let name: string; let linesArg: string | undefined
+  if (parts.length === 0) { name = getMyAgentName() }
+  else if (parts.length === 1 && /^\d+$/.test(parts[0])) { name = getMyAgentName(); linesArg = parts[0] }
+  else { name = parts[0]; linesArg = parts[1] }
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  const lines = linesArg ? parseInt(linesArg, 10) : 20
+  const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
+  await runSwitchroomCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`)
+})
+
+bot.command('memory', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const query = ctx.match?.trim()
+  if (!query) { await switchroomReply(ctx, 'Usage: /memory <search query>'); return }
+  await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search')
+})
+
+bot.command('doctor', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  try {
+    let output: string
+    try { output = switchroomExecCombined(['doctor'], 30000) }
+    catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'doctor failed' }
+    const trimmed = stripAnsi(output).trim()
+    if (!trimmed) { await switchroomReply(ctx, 'doctor: no output'); return }
+    const pretty = trimmed.replace(/^( *)✓ /gm, '$1🟢 ').replace(/^( *)✗ /gm, '$1🔴 ').replace(/^( *)! /gm, '$1🟡 ')
+    await switchroomReply(ctx, preBlock(formatSwitchroomOutput(pretty)), { html: true })
+  } catch (err: unknown) {
+    await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+  }
+})
+
+bot.command('reconcile', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const arg = (ctx.match ?? '').trim() || getMyAgentName()
+  try { assertSafeAgentName(arg) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  if (isSelfTargetingCommand(arg)) {
+    const existing = readRestartMarker()
+    if (existing && Date.now() - existing.ts < 15_000) {
+      await switchroomReply(ctx, `⏳ Reconcile already in progress — ignoring duplicate.`, { html: true })
+      return
+    }
+    const chatId = String(ctx.chat!.id)
+    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+    const ackText = `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting…`
+    try {
+      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [ackText], attachment_kinds: [] }) } catch {} }
+    } catch {}
+    writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: null, ts: Date.now() })
+    await sweepPinsBeforeSelfRestart()
+    spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
+    return
+  }
+  await runSwitchroomCommand(ctx, ['agent', 'reconcile', arg, '--restart'], `reconcile ${arg}`)
+})
+
+bot.command('grant', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
+  if (parts.length === 0) { await switchroomReply(ctx, 'Usage: /grant <tool>  or  /grant <agent> <tool>'); return }
+  let agentName: string; let tool: string
+  if (parts.length === 1) { agentName = getMyAgentName(); tool = parts[0] }
+  else { agentName = parts[0]; tool = parts.slice(1).join(' ') }
+  try { assertSafeAgentName(agentName) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'grant', agentName, tool], `grant ${agentName} ${tool}`)
+})
+
+bot.command('dangerous', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
+  let agentName: string; let off = false
+  if (parts.length === 0) { agentName = getMyAgentName() }
+  else if (parts.length === 1 && parts[0] === 'off') { agentName = getMyAgentName(); off = true }
+  else { agentName = parts[0]; if (parts[1] === 'off') off = true }
+  try { assertSafeAgentName(agentName) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  const args = ['agent', 'dangerous', agentName]; if (off) args.push('--off')
+  await runSwitchroomCommand(ctx, args, `dangerous ${agentName}${off ? ' off' : ''}`)
+})
+
+bot.command('permissions', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const agentName = (ctx.match ?? '').trim() || getMyAgentName()
+  try { assertSafeAgentName(agentName) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  await runSwitchroomCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
+})
+
+bot.command('update', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  await switchroomReply(ctx, '🔄 Running <b>switchroom update</b>… back in ~30 seconds.', { html: true })
+  await sweepPinsBeforeSelfRestart()
+  spawnSwitchroomDetached(['update'])
+})
+
+bot.command('switchroomhelp', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const me = getMyAgentName()
+  await switchroomReply(ctx, [
+    'Switchroom Bot Commands',
+    '',
+    `This bot is bound to the ${me} agent.`,
+    '',
+    '/agents - List all agents',
+    '/auth - Auth status or actions',
+    '/reauth [agent] - Start Claude auth',
+    '/topics - Show topic-to-agent mappings',
+    '/logs [name] [lines] - Show agent logs',
+    '/memory <query> - Search agent memory',
+    '/switchroomstart [name] - Start an agent',
+    '/stop [name] - Stop an agent',
+    '/restart [name|all] - Restart an agent',
+    '/interrupt [name] - Interrupt an agent turn',
+    '/doctor - Health check',
+    '/reconcile [name|all] - Re-apply config',
+    '/update - Pull + reinstall + restart',
+    '/permissions [agent] - Show permissions',
+    '/grant <tool> - Grant a tool permission',
+    '/dangerous [off] - Toggle full tool access',
+    '/vault - Manage encrypted secrets',
+    '/switchroomhelp - This help',
+  ].join('\n'))
+})
+
+async function registerSwitchroomBotCommands(): Promise<void> {
+  const switchroomCommands = [
+    { command: 'agents', description: 'List all agents' },
+    { command: 'auth', description: 'Auth status or actions' },
+    { command: 'reauth', description: 'Start Claude auth' },
+    { command: 'topics', description: 'Show topic mappings' },
+    { command: 'logs', description: 'Show agent logs' },
+    { command: 'memory', description: 'Search agent memory' },
+    { command: 'switchroomstart', description: 'Start an agent' },
+    { command: 'stop', description: 'Stop an agent' },
+    { command: 'restart', description: 'Restart an agent' },
+    { command: 'interrupt', description: 'Interrupt an agent turn' },
+    { command: 'doctor', description: 'Health check' },
+    { command: 'reconcile', description: 'Re-apply config' },
+    { command: 'update', description: 'Pull + install + restart' },
+    { command: 'permissions', description: 'Show permissions' },
+    { command: 'grant', description: 'Grant a tool permission' },
+    { command: 'dangerous', description: 'Toggle full tool access' },
+    { command: 'vault', description: 'Manage vault secrets' },
+    { command: 'switchroomhelp', description: 'Show all commands' },
+  ]
+  const baseCommands = [
+    { command: 'start', description: 'Welcome and setup' },
+    { command: 'help', description: 'What this bot can do' },
+    { command: 'status', description: 'Check pairing status' },
+  ]
+  await bot.api.setMyCommands([...baseCommands, ...switchroomCommands], { scope: { type: 'all_private_chats' } })
+  await bot.api.setMyCommands(switchroomCommands, { scope: { type: 'all_group_chats' } })
+}
+
+// ─── Inline-button handler for permissions ────────────────────────────────
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data
+  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
+  if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
+  const access = loadAccess()
+  const senderId = String(ctx.from.id)
+  if (!access.allowFrom.includes(senderId)) { await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {}); return }
+  const [, behavior, request_id] = m
+
+  if (behavior === 'more') {
+    const details = pendingPermissions.get(request_id)
+    if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
+    const { tool_name, description, input_preview } = details
+    let prettyInput: string
+    try { prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2) } catch { prettyInput = input_preview }
+    const expanded = `🔐 Permission: ${tool_name}\n\ntool_name: ${tool_name}\ndescription: ${description}\ninput_preview:\n${prettyInput}`
+    const keyboard = new InlineKeyboard().text('✅ Allow', `perm:allow:${request_id}`).text('❌ Deny', `perm:deny:${request_id}`)
+    await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  // Forward permission decision to connected bridges
+  ipcServer.broadcast({
+    type: 'permission',
+    requestId: request_id,
+    behavior: behavior as 'allow' | 'deny',
+  })
+  pendingPermissions.delete(request_id)
+  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  await ctx.answerCallbackQuery({ text: label }).catch(() => {})
+  const msg = ctx.callbackQuery.message
+  if (msg && 'text' in msg && msg.text) {
+    await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
+  }
+})
+
+// ─── Inbound message handlers ─────────────────────────────────────────────
+bot.on('message:text', async ctx => { await handleInboundCoalesced(ctx, ctx.message.text, undefined) })
+
+bot.on('message:photo', async ctx => {
+  const caption = ctx.message.caption ?? '(photo)'
+  await handleInbound(ctx, caption, async () => {
+    const photos = ctx.message.photo
+    const best = photos[photos.length - 1]
+    try {
+      const file = await ctx.api.getFile(best.file_id)
+      if (!file.file_path) return undefined
+      // Build download URL — token is embedded in the URL but never exposed
+      // in error messages or logs (caught and sanitized below)
+      const downloadUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+      const res = await fetch(downloadUrl)
+      if (!res.ok) {
+        process.stderr.write(`telegram gateway: photo download failed: HTTP ${res.status}\n`)
+        return undefined
+      }
+      const buf = Buffer.from(await res.arrayBuffer())
+      const rawExt = file.file_path.split('.').pop() ?? 'jpg'
+      const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'jpg'
+      const uniqueId = (best.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'photo'
+      const dlPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+      mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+      writeFileSync(dlPath, buf, { mode: 0o600 })
+      return dlPath
+    } catch (err) {
+      // Sanitize error to avoid leaking bot token in logs
+      const msg = err instanceof Error ? err.message : 'unknown error'
+      process.stderr.write(`telegram gateway: photo download failed: ${msg.replace(TOKEN!, '<REDACTED>')}\n`)
+      return undefined
+    }
+  })
+})
+
+bot.on('message:document', async ctx => {
+  const doc = ctx.message.document
+  const name = safeName(doc.file_name)
+  await handleInbound(ctx, ctx.message.caption ?? `(document: ${name ?? 'file'})`, undefined, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
+})
+
+bot.on('message:voice', async ctx => {
+  const voice = ctx.message.voice
+  await handleInbound(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
+})
+
+bot.on('message:audio', async ctx => {
+  const audio = ctx.message.audio
+  const name = safeName(audio.file_name)
+  await handleInbound(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
+})
+
+bot.on('message:video', async ctx => {
+  const video = ctx.message.video
+  await handleInbound(ctx, ctx.message.caption ?? '(video)', undefined, { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
+})
+
+bot.on('message:video_note', async ctx => {
+  const vn = ctx.message.video_note
+  await handleInbound(ctx, '(video note)', undefined, { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
+})
+
+bot.on('message:sticker', async ctx => {
+  const sticker = ctx.message.sticker
+  const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
+  await handleInbound(ctx, `(sticker${emoji})`, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
+})
+
+// ─── Error handler ────────────────────────────────────────────────────────
+bot.catch(err => {
+  process.stderr.write(`telegram gateway: handler error (polling continues): ${err.error}\n`)
+})
+
+// ─── Shutdown ─────────────────────────────────────────────────────────────
+let shuttingDown = false
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+  process.stderr.write('telegram gateway: shutting down\n')
+
+  // Clean up all timers and pending state
+  for (const [, iv] of typingIntervals) clearInterval(iv)
+  typingIntervals.clear()
+
+  for (const [, entry] of coalesceBuffer) clearTimeout(entry.timer)
+  coalesceBuffer.clear()
+
+  if (orphanedReplyTimeoutId != null) {
+    clearTimeout(orphanedReplyTimeoutId)
+    orphanedReplyTimeoutId = null
+  }
+
+  // Notify bridges and close IPC
+  ipcServer.broadcast({ type: 'status', status: 'gateway_shutting_down' })
+  await ipcServer.close()
+
+  // Safety net: force exit after 3 seconds if graceful stop hangs
+  const forceExitTimer = setTimeout(() => process.exit(0), 3000)
+  forceExitTimer.unref()
+
+  try {
+    if (runnerHandle != null) {
+      await runnerHandle.stop()
+    } else {
+      await bot.stop()
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: error during bot stop: ${err}\n`)
+  }
+  process.exit(0)
+}
+process.on('SIGTERM', () => void shutdown())
+process.on('SIGINT', () => void shutdown())
+
+// ─── Progress card driver ─────────────────────────────────────────────────
+if (streamMode === 'checklist') {
+  const startupAgentDir = resolveAgentDirFromEnv()
+  if (startupAgentDir != null) {
+    void sweepActivePins(
+      startupAgentDir,
+      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      { log: (msg) => process.stderr.write(`telegram gateway: startup pin sweep — ${msg}\n`) },
+    )
+  }
+
+  const progressPinnedMsgIds = new Map<string, number>()
+  const unpinnedTurnKeys = new Set<string>()
+
+  function unpinProgressCard(turnKey: string, chatId: string, pinnedId: number): void {
+    if (unpinnedTurnKeys.has(turnKey)) return
+    unpinnedTurnKeys.add(turnKey)
+    progressPinnedMsgIds.delete(turnKey)
+    lockedBot.api.unpinChatMessage(chatId, pinnedId).catch((err: Error) => {
+      process.stderr.write(`telegram gateway: progress-card unpin failed: ${err.message}\n`)
+    }).finally(() => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (agentDir != null) removeActivePin(agentDir, chatId, pinnedId)
+    })
+  }
+
+  unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {
+    const base = threadId != null ? `${chatId}:${threadId}` : chatId
+    for (const [turnKey, pinnedId] of progressPinnedMsgIds) {
+      if (turnKey.startsWith(`${base}:`)) unpinProgressCard(turnKey, chatId, pinnedId)
+    }
+  }
+
+  progressDriver = createProgressDriver({
+    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
+      const args = {
+        chat_id: chatId, text: html, done, message_thread_id: threadId,
+        lane: 'progress', format: 'html', turnKey,
+      }
+      handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
+        bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
+        takeHandoffPrefix: () => '', assertAllowedChat, resolveThreadId, disableLinkPreview: true,
+        defaultFormat: 'html', logStreamingEvent, endStatusReaction,
+        historyEnabled: false, recordOutbound: () => {},
+        writeError: (line) => process.stderr.write(line),
+      }).then((result) => {
+        if (!result?.messageId) return
+        if (isFirstEmit && !progressPinnedMsgIds.has(turnKey)) {
+          progressPinnedMsgIds.set(turnKey, result.messageId)
+          const pinnedMessageId = result.messageId
+          const agentDir = resolveAgentDirFromEnv()
+          if (agentDir != null) {
+            addActivePin(agentDir, { chatId, messageId: pinnedMessageId, turnKey, pinnedAt: Date.now() })
+          }
+          lockedBot.api.pinChatMessage(chatId, pinnedMessageId, { disable_notification: true }).catch((err: Error) => {
+            process.stderr.write(`telegram gateway: progress-card pin failed: ${err.message}\n`)
+            if (agentDir != null) removeActivePin(agentDir, chatId, pinnedMessageId)
+          })
+        }
+      }).catch((err: Error) => {
+        process.stderr.write(`telegram gateway: progress-card emit failed: ${err.message}\n`)
+      })
+    },
+    onTurnEnd: (summary) => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (agentDir != null) writeLastTurnSummary(agentDir, summary)
+    },
+    onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
+      const pinnedId = progressPinnedMsgIds.get(turnKey)
+      if (pinnedId != null) unpinProgressCard(turnKey, chatId, pinnedId)
+      unpinnedTurnKeys.delete(turnKey)
+      if (threadId != null) {
+        lockedBot.api.sendMessage(chatId, `✅ Done — ${summary}`).catch((err: Error) => {
+          process.stderr.write(`telegram gateway: completion message failed: ${err.message}\n`)
+        })
+      }
+    },
+    maxIdleMs: 5 * 60_000,
+  })
+  process.stderr.write('telegram gateway: progress-card driver active\n')
+}
+
+// ─── Startup ──────────────────────────────────────────────────────────────
+initHandoffContinuity()
+
+process.on('unhandledRejection', err => {
+  process.stderr.write(`telegram gateway: unhandled rejection: ${err}\n`)
+})
+process.on('uncaughtException', err => {
+  process.stderr.write(`telegram gateway: uncaught exception: ${err}\n`)
+})
+
+let runnerHandle: RunnerHandle | null = null
+
+void (async () => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const me = await bot.api.getMe()
+      botUsername = me.username
+      process.stderr.write(`telegram gateway: polling as @${me.username}\n`)
+      if (TOPIC_ID != null) process.stderr.write(`telegram gateway: topic filter active — thread_id=${TOPIC_ID}\n`)
+      void registerSwitchroomBotCommands().catch(() => {})
+
+      // Boot-time pin sweep
+      try {
+        const bootAccess = loadAccess()
+        const chatSet = new Set<string>(bootAccess.allowFrom)
+        for (const gid of Object.keys(bootAccess.groups)) chatSet.add(gid)
+        const chatIds = [...chatSet]
+        if (chatIds.length > 0) {
+          void sweepBotAuthoredPins(
+            chatIds, me.id,
+            async (chatId) => {
+              const chat = await lockedBot.api.getChat(chatId)
+              const pinned = (chat as { pinned_message?: { message_id: number; from?: { id: number } } }).pinned_message
+              if (!pinned) return null
+              return { messageId: pinned.message_id, fromId: pinned.from?.id ?? null }
+            },
+            (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+            { log: (msg) => process.stderr.write(`telegram gateway: bot-authored pin sweep — ${msg}\n`) },
+          ).catch(() => {})
+        }
+      } catch {}
+
+      // Restart follow-up
+      try {
+        const marker = readRestartMarker()
+        if (marker) {
+          clearRestartMarker()
+          const ageMs = Date.now() - marker.ts
+          if (ageMs < 5 * 60_000) {
+            const ageSec = Math.max(1, Math.round(ageMs / 1000))
+            const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
+            try {
+              const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
+                parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+                ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
+                ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
+              })
+              if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+            } catch {}
+          }
+        }
+      } catch {}
+
+      // Crash recovery
+      try {
+        const marker = readRestartMarker()
+        if (!marker) {
+          const bootAccess = loadAccess()
+          const ownerChatId = bootAccess.allowFrom[0]
+          if (ownerChatId && HISTORY_ENABLED) {
+            try {
+              const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
+              if (recent.length > 0) {
+                const lastTs = recent[0].ts * 1000
+                const downtime = Date.now() - lastTs
+                if (downtime < 30 * 60_000) {
+                  const downSec = Math.max(1, Math.round(downtime / 1000))
+                  const text = `⚡ Recovered from unexpected restart. (down ~${downSec}s)`
+                  const sent = await lockedBot.api.sendMessage(ownerChatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+                  if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: ownerChatId, thread_id: null, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+                }
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+
+      runnerHandle = run(bot)
+      await runnerHandle.task()
+      return
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 409) {
+        const delay = Math.min(1000 * attempt, 15000)
+        process.stderr.write(`telegram gateway: 409 Conflict, retrying in ${delay / 1000}s\n`)
+        await new Promise(r => setTimeout(r, delay))
+        continue
+      }
+      if (err instanceof Error && err.message === 'Aborted delay') return
+      process.stderr.write(`telegram gateway: polling failed: ${err}\n`)
+      return
+    }
+  }
+})()

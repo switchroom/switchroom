@@ -153,14 +153,14 @@ describe('progress-card integration harness', () => {
       // the driver unit tests, since the integration path's line-buffer
       // coalescing can race with the reducer's FIFO pairing fallback.
       const finalHtml = bot.edits[bot.edits.length - 1].html
-      expect(finalHtml).toMatch(/✅/u)
+      expect(finalHtml).toMatch(/●/u)
       // is_error=true on one of the parallel tool_results must render as
-      // a failed (❌) item in the final card. Historically this regressed
+      // a failed (✗) item in the final card. Historically this regressed
       // because the reducer's "close prior running item on new tool_use"
       // shortcut mis-paired the first tool_result onto the WRONG
       // parallel item — by the time the error-flagged tool_result
       // arrived, its matching tool_use was already force-done.
-      expect(finalHtml).toMatch(/❌/u)
+      expect(finalHtml).toMatch(/✗/u)
 
       // Assertion (d): turn_end produced exactly one done=true edit.
       const doneEdits = bot.edits.filter((e) => e.done)
@@ -496,7 +496,7 @@ describe('progress-card multi-agent harness', () => {
         }
         await wait(200)
         const midHtml = bot.edits[bot.edits.length - 1].html
-        expect(midHtml).toContain('└ 🔧')
+        expect(midHtml).toContain('└ ◉')
 
         // Parent tool_results for all 4
         for (let i = 1; i <= 4; i++) {
@@ -540,13 +540,13 @@ describe('progress-card multi-agent harness', () => {
         await wait(200)
         const earlyHtml = bot.edits[bot.edits.length - 1].html
         // Tentative ✅ for the sub-agent on early turn_end
-        expect(earlyHtml).toMatch(/✅ investigate/)
-        // Parent tool_result with isError=true overrides → ❌
+        expect(earlyHtml).toMatch(/● investigate/)
+        // Parent tool_result with isError=true overrides → ✗
         appendFileSync(parent, toolResultLine('toolu_p1', true))
         appendFileSync(parent, turnEndLine())
         await wait(250)
         const finalHtml = bot.edits[bot.edits.length - 1].html
-        expect(finalHtml).toMatch(/❌ investigate/)
+        expect(finalHtml).toMatch(/✗ investigate/)
       } finally {
         tail.stop()
         driver.dispose?.()
