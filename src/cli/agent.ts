@@ -23,6 +23,7 @@ import {
   installScheduleTimers,
   enableScheduleTimers,
   daemonReload,
+  resolveGatewayUnitName,
 } from "../agents/systemd.js";
 import { detectInFlight, waitUntilIdle } from "../agents/in-flight.js";
 import { askYesNo } from "../setup/prompt.js";
@@ -273,7 +274,8 @@ export function registerAgentCommand(program: Command): void {
         // Effective switchroom-plugin flag is driven by channels.telegram.plugin.
         // This mirrors usesSwitchroomTelegramPlugin() in src/config/merge.ts.
         const useAutoaccept = agentConfig.channels?.telegram?.plugin === "switchroom";
-        const unitContent = generateUnit(name, agentDir, useAutoaccept);
+        const gwName = resolveGatewayUnitName(config);
+        const unitContent = generateUnit(name, agentDir, useAutoaccept, gwName);
         installUnit(name, unitContent);
 
         // Install schedule timers if the agent has any

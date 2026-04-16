@@ -2,19 +2,21 @@
  * Pure helpers for mid-turn steering and the `/queue` opt-in.
  *
  * Context: Telegram messages that arrive while a prior turn is still in
- * flight are today queued by Claude Code's native FIFO (see
- * session-tail.ts:11) and relayed with `meta.steering="true"` so the
- * model knows it landed behaviourally-late. The plugin now additionally
- * enriches that notification with priors (seconds_since_turn_start,
- * prior_assistant_preview) and accepts an explicit `/queue ` / `/q `
- * prefix that the user can type to declare "this is a new task, not a
- * steer". These helpers are pure so server.ts stays testable without
- * standing up grammy.
+ * flight are now queued by default (queued="true"). The user can explicitly
+ * prefix with `/steer ` or `/s ` to declare "this is a course-correction,
+ * not a new task" (steering="true"). The legacy `/queue ` / `/q ` prefix
+ * still works as an alias for the new default (queued) behavior.
+ * These helpers are pure so server.ts stays testable without standing up
+ * grammy.
  */
 import { escapeHtml } from './format.js'
 
 /**
- * Detect and strip the `/queue ` or `/q ` opt-in prefix.
+ * Detect and strip the `/queue ` or `/q ` prefix.
+ *
+ * These are now aliases for the default queued behavior (mid-turn messages
+ * default to queued="true"), but the prefix is still accepted so existing
+ * muscle-memory and scripts keep working.
  *
  * Rules (intentionally strict so we don't match `/queued` or `/q\nfoo`):
  *   - Must start with `/queue ` or `/q ` (exactly one leading slash,
@@ -33,6 +35,28 @@ export function parseQueuePrefix(body: string): { queued: boolean; body: string 
   const m = /^\/(queue|q) (.*)$/is.exec(body)
   if (!m) return { queued: false, body }
   return { queued: true, body: m[2]!.trim() }
+}
+
+/**
+ * Detect and strip the `/steer ` or `/s ` explicit steer prefix.
+ *
+ * Mid-turn messages now default to queued="true". To explicitly mark a
+ * message as a course-correction for the in-flight turn, the user can
+ * prefix with `/steer ` or `/s `.
+ *
+ * Rules mirror parseQueuePrefix exactly:
+ *   - Must start with `/steer ` or `/s ` (keyword case-insensitive,
+ *     MANDATORY single space after keyword).
+ *   - No leading whitespace — first character must be `/`.
+ *   - Keyword must be `steer` or `s` exactly; `/steered`, `/steerfoo`,
+ *     `/steer\tfoo` all fail to match.
+ *   - On match, only the first prefix is stripped; body is trimmed.
+ *   - `/steer` alone (no trailing space) does NOT match.
+ */
+export function parseSteerPrefix(body: string): { steering: boolean; body: string } {
+  const m = /^\/(steer|s) (.*)$/is.exec(body)
+  if (!m) return { steering: false, body }
+  return { steering: true, body: m[2]!.trim() }
 }
 
 /**

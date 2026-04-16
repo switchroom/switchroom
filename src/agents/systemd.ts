@@ -18,7 +18,7 @@ function unitFilePath(name: string): string {
   return resolve(SYSTEMD_USER_DIR, `${unitName(name)}.service`);
 }
 
-export function generateUnit(name: string, agentDir: string, useAutoaccept = false): string {
+export function generateUnit(name: string, agentDir: string, useAutoaccept = false, gatewayUnitName?: string): string {
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
 
@@ -27,7 +27,7 @@ export function generateUnit(name: string, agentDir: string, useAutoaccept = fal
     : `/usr/bin/script -qfc "/bin/bash -l ${agentDir}/start.sh" ${logFile}`;
 
   const afterDeps = ["network-online.target"];
-  if (useAutoaccept) afterDeps.push(`${unitName(GATEWAY_UNIT_NAME)}.service`);
+  if (useAutoaccept) afterDeps.push(`${unitName(gatewayUnitName ?? GATEWAY_UNIT_NAME)}.service`);
 
   return `[Unit]
 Description=switchroom agent: ${name}
@@ -64,7 +64,14 @@ export function uninstallUnit(name: string): void {
 
 const GATEWAY_UNIT_NAME = "gateway";
 
-export function generateGatewayUnit(stateDir: string): string {
+export function resolveGatewayUnitName(config: SwitchroomConfig): string {
+  const first = Object.keys(config.agents).find(
+    (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
+  );
+  return first ? `${first}-gateway` : GATEWAY_UNIT_NAME;
+}
+
+export function generateGatewayUnit(stateDir: string, descSuffix?: string): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
   const logFile = resolve(stateDir, "gateway.log");
@@ -74,9 +81,10 @@ export function generateGatewayUnit(stateDir: string): string {
   const nodeBinDir = dirname(process.execPath);
   const switchroomCli = resolve(bunBinDir, "switchroom");
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
+  const desc = descSuffix ? `switchroom telegram gateway (${descSuffix})` : "switchroom telegram gateway";
 
   return `[Unit]
-Description=switchroom telegram gateway
+Description=${desc}
 After=network-online.target
 Wants=network-online.target
 StartLimitBurst=10
@@ -101,26 +109,30 @@ WantedBy=default.target
 
 export function installAllUnits(config: SwitchroomConfig): void {
   const agentsDir = resolveAgentsDir(config);
-  let anyUsesTelegram = false;
   const installedAgents: string[] = [];
+
+  // Determine the gateway unit name before generating agent units, since
+  // agents that use the switchroom Telegram plugin depend on it via After=.
+  const firstTelegramAgent = Object.keys(config.agents).find(
+    (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
+  );
+  const gwName = firstTelegramAgent
+    ? `${firstTelegramAgent}-gateway`
+    : GATEWAY_UNIT_NAME;
 
   for (const agentName of Object.keys(config.agents)) {
     const agentDir = resolve(agentsDir, agentName);
     const useAutoaccept = usesSwitchroomTelegramPlugin(config.agents[agentName]);
-    if (useAutoaccept) anyUsesTelegram = true;
-    const content = generateUnit(agentName, agentDir, useAutoaccept);
+    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName);
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
   }
 
-  if (anyUsesTelegram) {
-    const firstTelegramAgent = Object.keys(config.agents).find(
-      (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
-    )!;
+  if (firstTelegramAgent) {
     const stateDir = resolve(agentsDir, firstTelegramAgent, "telegram");
-    const gatewayContent = generateGatewayUnit(stateDir);
-    installUnit(GATEWAY_UNIT_NAME, gatewayContent);
-    installedAgents.push(unitName(GATEWAY_UNIT_NAME));
+    const gatewayContent = generateGatewayUnit(stateDir, firstTelegramAgent);
+    installUnit(gwName, gatewayContent);
+    installedAgents.push(unitName(gwName));
   }
 
   daemonReload();

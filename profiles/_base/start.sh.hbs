@@ -32,6 +32,16 @@ export HINDSIGHT_BANK_ID={{{hindsightBankIdQ}}}
 export HINDSIGHT_AUTO_RECALL=true
 export HINDSIGHT_AUTO_RETAIN=true
 export HINDSIGHT_AGENT_NAME="{{name}}"
+# Wait for Hindsight API to be reachable before launching Claude, otherwise
+# the MCP server connection fails at startup with "1 MCP server failed".
+HINDSIGHT_WAIT=0
+while [ $HINDSIGHT_WAIT -lt 30 ]; do
+  if curl -sf -o /dev/null --max-time 2 {{{hindsightApiBaseUrlQ}}}/mcp/; then
+    break
+  fi
+  sleep 1
+  HINDSIGHT_WAIT=$((HINDSIGHT_WAIT + 1))
+done
 {{/if}}
 {{#if userEnvQuoted}}
 # User-declared env vars from switchroom.yaml (agent + defaults merged).
