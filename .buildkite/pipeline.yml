@@ -77,7 +77,7 @@ steps:
       # Buildkite Test Engine: fetch the vitest collector token from the
       # cluster secret store. When unset, vitest.config.ts falls back to
       # the default reporter and no upload is attempted.
-      export BUILDKITE_ANALYTICS_TOKEN="$$(buildkite-agent secret get BUILDKITE_ANALYTICS_TOKEN_VITEST 2>/dev/null || true)"
+      export BUILDKITE_ANALYTICS_TOKEN="$$(buildkite-agent secret get ANALYTICS_TOKEN_VITEST 2>/dev/null || true)"
       bun run test:vitest
     cache:
       paths:
