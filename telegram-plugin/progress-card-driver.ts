@@ -103,6 +103,18 @@ export interface ProgressDriverConfig {
    */
   editBudgetThreshold?: number
   editBudgetCoalesceMs?: number
+  /**
+   * Zombie-card ceiling. If a chat's `lastEventAt` is older than this
+   * many ms, the heartbeat loop force-closes the card (flush done,
+   * onTurnComplete, delete from chats). This is the backstop for cards
+   * orphaned by a missed `turn_end` line or an enqueue echo-drop that
+   * routed events to a different card — without it, the heartbeat
+   * would re-render a stale card forever (50+ minute ghost cards).
+   *
+   * Default 30 minutes. Set to 0 to disable entirely (not recommended
+   * outside tests).
+   */
+  maxIdleMs?: number
 }
 
 /**
@@ -139,6 +151,18 @@ interface PerChatState {
   pendingTimer: unknown
   /** True until the very first flush fires for this turn. Cleared after first emit. */
   isFirstEmit: boolean
+  /**
+   * Wall-clock ms of the last real session event routed to this card.
+   * Distinct from `lastEmittedAt`: the heartbeat ticks `lastEmittedAt`
+   * every cycle, but `lastEventAt` only advances when an actual event
+   * (enqueue, tool_use, tool_result, turn_end, sub_agent_*) lands on
+   * this chat state. The heartbeat uses it as a zombie ceiling — a
+   * card whose `lastEventAt` is older than `maxIdleMs` has been
+   * orphaned (turn_end missed by the session-tail, or an enqueue
+   * echo-drop routed events to a different card) and is force-closed
+   * so it can't tick forever.
+   */
+  lastEventAt: number
 }
 
 export interface ProgressDriver {
@@ -193,6 +217,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const heartbeatMs = config.heartbeatMs ?? 5000
   const editBudgetThreshold = config.editBudgetThreshold ?? 18
   const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
+  const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
@@ -241,6 +266,55 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   // still render identically, skip the edit.
   const lastHeartbeatBucket = new Map<string, number>()
 
+  /**
+   * Force-close a card from outside its normal turn_end path. Used by
+   * the heartbeat zombie ceiling when a card has idled past `maxIdleMs`
+   * with no real events landing. Synthesizes a `turn_end` through the
+   * reducer so the final render shows the proper 'done' stage, fires
+   * the same callbacks an ordinary turn_end would, and fully clears
+   * chats / heartbeat bookkeeping. Must not re-enter ingest.
+   */
+  function closeZombie(cs: PerChatState): void {
+    if (cs.pendingTimer != null) {
+      clearT(cs.pendingTimer)
+      cs.pendingTimer = null
+    }
+    const durationMs = Math.max(0, now() - cs.state.turnStartedAt)
+    cs.state = reduce(cs.state, { kind: 'turn_end', durationMs }, now())
+    flush(cs, /*forceDone*/ true)
+    const taskNum = taskNumFor(cs)
+    const summary = summariseTurn(cs.state, now())
+    if (config.onTurnEnd) {
+      try {
+        config.onTurnEnd(summary)
+      } catch {
+        /* never let a summary write break the stream */
+      }
+    }
+    if (config.onTurnComplete) {
+      try {
+        config.onTurnComplete({
+          chatId: cs.chatId,
+          threadId: cs.threadId,
+          turnKey: cs.turnKey,
+          summary,
+          taskIndex: taskNum.index,
+          taskTotal: taskNum.total,
+        })
+      } catch {
+        /* never let completion callback break the stream */
+      }
+    }
+    chats.delete(cs.turnKey)
+    lastHeartbeatBucket.delete(cs.turnKey)
+    editTimestamps.delete(cs.turnKey)
+    if (currentTurnKey === cs.turnKey) {
+      currentChatId = null
+      currentThreadId = undefined
+      currentTurnKey = null
+    }
+  }
+
   function startHeartbeatIfNeeded(): void {
     if (heartbeatMs <= 0) return
     if (heartbeatHandle != null) return
@@ -252,8 +326,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // sub-agent is running). Coalesce: only actually emit if either
       // the rendered HTML changed or the elapsed-time bucket
       // (rounded to the heartbeat period) advanced.
+      //
+      // Zombie ceiling: collect any card whose last real event is
+      // older than maxIdleMs and force-close it after the iteration.
+      // Deferring the close keeps Map iteration safe and lets us batch
+      // the cleanup.
+      const zombies: PerChatState[] = []
       for (const [, cs] of chats) {
         if (cs.state.stage === 'done') continue
+        if (maxIdleMs > 0 && now() - cs.lastEventAt > maxIdleMs) {
+          zombies.push(cs)
+          continue
+        }
         // Skip heartbeat while the chat is hot — sub-agent bursts are
         // already producing edits, the elapsed counter is ticking from
         // those, and an extra heartbeat edit just spends budget. (Design
@@ -276,6 +360,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           isFirstEmit: false,
         })
       }
+      for (const cs of zombies) closeZombie(cs)
       // If every chat has ended, stop the heartbeat to avoid an
       // always-on timer.
       if (chats.size === 0) stopHeartbeat()
@@ -452,6 +537,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           lastEmittedHtml: null,
           pendingTimer: null,
           isFirstEmit: true,
+          lastEventAt: now(),
         }
         chats.set(slot.turnKey, chatState)
         startHeartbeatIfNeeded()
@@ -475,6 +561,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
       const prev = chatState.state
       chatState.state = reduce(chatState.state, event, now())
+      chatState.lastEventAt = now()
       const stageChanged = chatState.state.stage !== prev.stage
       const visibleChanged = visibleDiff(prev, chatState.state)
 

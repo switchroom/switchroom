@@ -15,6 +15,7 @@ function harness(
   opts?: {
     captureSummaries?: boolean
     heartbeatMs?: number
+    maxIdleMs?: number
     onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
   },
 ) {
@@ -31,6 +32,7 @@ function harness(
     minIntervalMs,
     coalesceMs,
     heartbeatMs: opts?.heartbeatMs,
+    maxIdleMs: opts?.maxIdleMs,
     now: () => now,
     setTimeout: (fn, ms) => {
       const ref = nextRef++
@@ -387,6 +389,144 @@ describe('progress-card driver heartbeat', () => {
     const countBefore = emits.length
     advance(30_000)
     expect(emits.length).toBe(countBefore)
+  })
+})
+
+describe('progress-card driver — zombie ceiling (maxIdleMs)', () => {
+  // Regression: a card orphaned by a missed `turn_end` or an enqueue
+  // echo-drop would sit in the driver's chats map forever and the
+  // heartbeat would re-render it indefinitely (50+ minute ghost cards
+  // ticking in the pinned slot). The `maxIdleMs` ceiling force-closes
+  // any card whose last real session event is older than the cutoff.
+  it('force-closes a card that has idled past maxIdleMs with no events', () => {
+    const completeCalls: Array<{ chatId: string; summary: string; taskIndex: number; taskTotal: number }> = []
+    const { driver, emits, advance } = harness(500, 400, {
+      heartbeatMs: 5_000,
+      onTurnComplete: (a) => completeCalls.push(a),
+    })
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent' }, 'c1')
+
+    // 29 minutes idle — the ghost ceiling (30 min default) has NOT
+    // tripped yet. Heartbeat ticks but card still lives.
+    advance(29 * 60_000)
+    expect(completeCalls).toHaveLength(0)
+    expect(driver.peek('c1')).toBeDefined()
+
+    // Cross the 30-minute ceiling. Next heartbeat tick after the
+    // crossing closes the zombie.
+    advance(2 * 60_000)
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0].chatId).toBe('c1')
+    // The final emit for this card must be done=true so the caller
+    // unpins / stops editing.
+    const lastC1 = [...emits].reverse().find((e) => e.chatId === 'c1')
+    expect(lastC1?.done).toBe(true)
+    // Chat state has been cleared so a fresh turn starts clean.
+    expect(driver.peek('c1')).toBeUndefined()
+  })
+
+  it('keeps the card alive while real events keep landing', () => {
+    const completeCalls: Array<{ chatId: string }> = []
+    const { driver, advance } = harness(500, 400, {
+      heartbeatMs: 5_000,
+      onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
+    })
+    driver.ingest(enqueue('c1'), null)
+    // Simulate a slow turn that emits a tool_use every 10 min for an
+    // hour — lastEventAt keeps advancing, so the 30-min ceiling must
+    // never trip.
+    for (let i = 0; i < 6; i++) {
+      advance(10 * 60_000)
+      driver.ingest({ kind: 'tool_use', toolName: 'Read' }, 'c1')
+    }
+    expect(completeCalls).toHaveLength(0)
+    expect(driver.peek('c1')).toBeDefined()
+  })
+
+  it('zombie close fires onTurnComplete exactly once and stops the heartbeat', () => {
+    const completeCalls: Array<{ chatId: string }> = []
+    const { driver, emits, advance } = harness(500, 400, {
+      heartbeatMs: 5_000,
+      onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
+    })
+    driver.ingest(enqueue('c1'), null)
+    advance(31 * 60_000) // crosses ceiling
+    expect(completeCalls).toHaveLength(1)
+
+    const postCloseEmits = emits.length
+    // Another hour with no card in the map — heartbeat should be
+    // dormant, no further emits.
+    advance(60 * 60_000)
+    expect(emits.length).toBe(postCloseEmits)
+  })
+
+  it('honours a custom maxIdleMs', () => {
+    const completeCalls: Array<{ chatId: string }> = []
+    let now = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const emits: Array<{ done: boolean }> = []
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ done: a.done }),
+      onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
+      heartbeatMs: 1000,
+      maxIdleMs: 5_000,
+      now: () => now,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+    })
+    const advance = (ms: number): void => {
+      now += ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers[0]
+        if (!next || next.fireAt > now) break
+        if (next.repeat != null) {
+          next.fireAt += next.repeat
+          next.fn()
+        } else {
+          timers.shift()
+          next.fn()
+        }
+      }
+    }
+    driver.ingest(enqueue('c1'), null)
+    advance(4_000)
+    expect(completeCalls).toHaveLength(0)
+    advance(2_000) // total idle ~6s, past the 5s cutoff
+    expect(completeCalls).toHaveLength(1)
+  })
+
+  it('maxIdleMs=0 disables the zombie ceiling entirely', () => {
+    const completeCalls: Array<{ chatId: string }> = []
+    const { driver, advance } = harness(500, 400, {
+      heartbeatMs: 5_000,
+      onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
+      maxIdleMs: 0,
+    })
+    driver.ingest(enqueue('c1'), null)
+    advance(4 * 60 * 60_000) // 4 hours idle
+    expect(completeCalls).toHaveLength(0)
+    expect(driver.peek('c1')).toBeDefined()
   })
 })
 
