@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/switchroom-logo.jpg" alt="Switchroom" width="420">
+</p>
+
 # Switchroom
 
 [![Build status](https://badge.buildkite.com/443b450a779c30f5824660f5062f8c29101cd4419831ee3aff.svg)](https://buildkite.com/ken-thompson/switchroom)
