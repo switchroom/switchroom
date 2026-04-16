@@ -3178,6 +3178,14 @@ bot.command('restart', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
 })
 
+// /interrupt [name] — send SIGINT to abort the agent's current turn without
+// restarting the process. Defaults to the current agent.
+bot.command('interrupt', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const name = ctx.match?.trim() || getMyAgentName()
+  await runSwitchroomCommand(ctx, ['agent', 'interrupt', name], `interrupt ${name}`)
+})
+
 // /auth — show token/auth health, or start/complete re-auth flows.
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return

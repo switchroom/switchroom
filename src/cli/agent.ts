@@ -10,6 +10,7 @@ import {
   startAgent,
   stopAgent,
   restartAgent,
+  interruptAgent,
   getAgentStatus,
   getAllAgentStatuses,
   attachAgent,
@@ -360,6 +361,26 @@ export function registerAgentCommand(program: Command): void {
               chalk.red(`Failed to stop ${n}: ${(err as Error).message}`)
             );
           }
+        }
+      })
+    );
+
+  // switchroom agent interrupt <name>
+  agent
+    .command("interrupt <name>")
+    .description("Send SIGINT to abort the agent's current turn without restarting")
+    .action(
+      withConfigError(async (name: string) => {
+        const config = getConfig(program);
+        if (!config.agents[name]) {
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
+          return;
+        }
+        try {
+          const { pid } = interruptAgent(name);
+          console.log(chalk.green(`Sent SIGINT to ${name} (PID ${pid}) — current turn should abort`));
+        } catch (err) {
+          console.error(chalk.red((err as Error).message));
         }
       })
     );
