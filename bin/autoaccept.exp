@@ -37,6 +37,18 @@ expect {
         send "\r"
         exp_continue
     }
+    -re {Choose.{1,30}text.{1,30}style} {
+        # First-run theme selection — pick option 1 (Auto)
+        sleep 0.5
+        send "\r"
+        exp_continue
+    }
+    -re {Anthropic.{1,80}Bedrock} {
+        # First-run API provider selection — pick Anthropic (option 1)
+        sleep 0.5
+        send "\r"
+        exp_continue
+    }
     -re {Enter.{1,30}confirm} {
         # Generic "Enter to confirm" prompt (dev channels, trust dialog)
         sleep 0.8

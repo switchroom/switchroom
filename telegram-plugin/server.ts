@@ -167,6 +167,16 @@ const activeStatusReactions = new Map<string, StatusReactionController>()
  */
 const activeTurnStartedAt = new Map<string, number>()
 
+/**
+ * Pending "⏳ Queued" notification messages, keyed by
+ * `${chat_id}:${thread_id ?? "_"}`. When a message arrives mid-turn, we
+ * send this notification and pin it so the user has a visible signal that
+ * their task is queued. On the next `enqueue` session event for that chat
+ * (i.e. when the model actually starts processing it), we unpin and delete
+ * the notification.
+ */
+const pendingQueueNotifications = new Map<string, { chatId: string; messageId: number; threadId: number | undefined }>()
+
 function statusKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
 }
@@ -2332,6 +2342,22 @@ function handleSessionEvent(ev: SessionEvent): void {
           pendingPtyPartial = null
           handlePtyPartial(pending)
         }
+
+        // Clean up any pending "⏳ Queued" notification for this chat now
+        // that the model is actually starting to process it.
+        const qKey = statusKey(ev.chatId, currentSessionThreadId)
+        const qn = pendingQueueNotifications.get(qKey)
+        if (qn != null) {
+          pendingQueueNotifications.delete(qKey)
+          void bot.api
+            .unpinChatMessage(qn.chatId, qn.messageId)
+            .catch(() => {})
+            .finally(() => {
+              void bot.api
+                .deleteMessage(qn.chatId, qn.messageId)
+                .catch(() => {})
+            })
+        }
       }
       return
     }
@@ -4200,6 +4226,37 @@ async function handleInbound(
             { type: 'emoji', emoji: '🤝' },
           ])
           .catch(() => {})
+        // Send + pin a "⏳ Queued" notification so the user has a visible
+        // signal that their message is waiting. We'll unpin + delete it
+        // when the model starts processing the queued turn (enqueue event).
+        const qKey = statusKey(chat_id, messageThreadId)
+        void (async () => {
+          try {
+            const sent = await bot.api.sendMessage(
+              chat_id,
+              '⏳ Queued — waiting for current task to finish',
+              {
+                ...(messageThreadId != null ? { message_thread_id: messageThreadId } : {}),
+              },
+            )
+            pendingQueueNotifications.set(qKey, {
+              chatId: chat_id,
+              messageId: sent.message_id,
+              threadId: messageThreadId,
+            })
+            await bot.api
+              .pinChatMessage(chat_id, sent.message_id, { disable_notification: true })
+              .catch((err: Error) => {
+                process.stderr.write(
+                  `telegram channel: queue-notification pin failed: ${err.message}\n`,
+                )
+              })
+          } catch (err) {
+            process.stderr.write(
+              `telegram channel: queue-notification send failed: ${(err as Error).message}\n`,
+            )
+          }
+        })()
       } else {
         // Normal new turn: cancel any (defunct) prior controller and any
         // leftover draft stream, start fresh.
