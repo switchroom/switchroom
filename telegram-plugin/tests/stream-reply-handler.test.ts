@@ -387,6 +387,199 @@ describe('handleStreamReply', () => {
     expect(state.activeDraftStreams.has('1:_')).toBe(true)
   })
 
+  // ─── Regression: concurrent turns on the same chat+thread+lane ───────
+  // Before the fix, two simultaneously active turns emitting on
+  // lane:'progress' (the progress-card driver's lane) computed the same
+  // streamKey and collapsed into one draft stream. Telegram saw a single
+  // message flapping between the two turns' narratives instead of two
+  // separate pinned cards. The fix threads a per-turn `turnKey` through
+  // `StreamReplyArgs` → `streamKey()` so each active turn gets its own
+  // slot in `activeDraftStreams` (and therefore its own Telegram message
+  // and its own pin via `progressPinnedMsgIds`).
+  it('concurrent turns with different turnKeys produce separate draft streams and messages', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    // Turn A: progress lane, turnKey "1:_:1"
+    const pA = handleStreamReply(
+      { chat_id: '1', text: 'turn A step 1', lane: 'progress', turnKey: '1:_:1' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const rA = await pA
+
+    // Turn B: progress lane, same chat+thread+lane but DIFFERENT turnKey
+    const pB = handleStreamReply(
+      { chat_id: '1', text: 'turn B step 1', lane: 'progress', turnKey: '1:_:2' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    const rB = await pB
+
+    // Two independent Telegram messages (not one edited twice).
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.editMessageText).not.toHaveBeenCalled()
+    expect(rA.messageId).not.toBe(rB.messageId)
+
+    // Two independent draft streams in state, each keyed by turnKey.
+    expect(state.activeDraftStreams.size).toBe(2)
+    expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(true)
+    expect(state.activeDraftStreams.has('1:_:progress:1:_:2')).toBe(true)
+
+    // Each message carried its own turn's text.
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>turn A step 1</html>')
+    expect(bot.api.sendMessage.mock.calls[1][1]).toBe('<html>turn B step 1</html>')
+  })
+
+  it('subsequent updates with same turnKey reuse the stream (edit in place)', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const p1 = handleStreamReply(
+      { chat_id: '1', text: 'A first', lane: 'progress', turnKey: '1:_:1' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await p1
+
+    vi.advanceTimersByTime(1000)
+
+    const p2 = handleStreamReply(
+      { chat_id: '1', text: 'A first + second', lane: 'progress', turnKey: '1:_:1' },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await p2
+
+    // One send (first call) + one edit (second call) on the same message.
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText.mock.calls[0][1]).toBe(500)
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>A first + second</html>')
+    expect(state.activeDraftStreams.size).toBe(1)
+    expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(true)
+  })
+
+  it('interleaved concurrent turns each update their own message independently', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    // Turn A opens
+    const pa1 = handleStreamReply(
+      { chat_id: '1', text: 'A step 1', lane: 'progress', turnKey: '1:_:1' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pa1
+
+    // Turn B opens
+    const pb1 = handleStreamReply(
+      { chat_id: '1', text: 'B step 1', lane: 'progress', turnKey: '1:_:2' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pb1
+
+    vi.advanceTimersByTime(1000)
+
+    // Turn A updates
+    const pa2 = handleStreamReply(
+      { chat_id: '1', text: 'A step 1 + 2', lane: 'progress', turnKey: '1:_:1' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pa2
+
+    vi.advanceTimersByTime(1000)
+
+    // Turn B updates
+    const pb2 = handleStreamReply(
+      { chat_id: '1', text: 'B step 1 + 2', lane: 'progress', turnKey: '1:_:2' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pb2
+
+    // Two sends (one per turn), two edits (one per turn's update).
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(2)
+
+    // The edits must target distinct message ids — one per turn's
+    // original message — not both collapse onto the same id.
+    const editTargets = bot.api.editMessageText.mock.calls.map((c) => c[1])
+    expect(new Set(editTargets).size).toBe(2)
+
+    // And each edit carries its own turn's text — no cross-contamination.
+    const editTexts = bot.api.editMessageText.mock.calls.map((c) => c[2])
+    expect(editTexts).toContain('<html>A step 1 + 2</html>')
+    expect(editTexts).toContain('<html>B step 1 + 2</html>')
+  })
+
+  it('done=true on one turnKey does not close the other concurrent turn', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const pA = handleStreamReply(
+      { chat_id: '1', text: 'A', lane: 'progress', turnKey: '1:_:1' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pA
+
+    const pB = handleStreamReply(
+      { chat_id: '1', text: 'B', lane: 'progress', turnKey: '1:_:2' },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pB
+
+    expect(state.activeDraftStreams.size).toBe(2)
+
+    // Advance past the throttle window so the finalize edit can flush
+    // instead of sitting on the debounce timer (fake timers).
+    vi.advanceTimersByTime(1000)
+
+    // Finalize turn A
+    const pAFinal = handleStreamReply(
+      { chat_id: '1', text: 'A final', lane: 'progress', turnKey: '1:_:1', done: true },
+      state, deps,
+    )
+    await microtaskFlush()
+    await pAFinal
+
+    // Turn A's slot is gone; turn B's is still live.
+    expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(false)
+    expect(state.activeDraftStreams.has('1:_:progress:1:_:2')).toBe(true)
+    expect(state.activeDraftStreams.size).toBe(1)
+  })
+
+  it('turnKey omitted falls back to legacy chat+thread+lane key (no regression for non-progress callers)', async () => {
+    // Other lanes (default, thinking, activity) don't pass turnKey. They
+    // must still multiplex the legacy way: one stream per chat+thread+lane.
+    // This pins the backwards-compatible behavior of streamKey() when
+    // turnKey is undefined — a non-progress caller shouldn't suddenly
+    // create a new stream on every call.
+    const state = makeState()
+    const deps = makeDeps(bot)
+
+    const p1 = handleStreamReply({ chat_id: '1', text: 'a1' }, state, deps)
+    await microtaskFlush()
+    await p1
+    vi.advanceTimersByTime(1000)
+    const p2 = handleStreamReply({ chat_id: '1', text: 'a2' }, state, deps)
+    await microtaskFlush()
+    await p2
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    expect(state.activeDraftStreams.size).toBe(1)
+    expect(state.activeDraftStreams.has('1:_')).toBe(true)
+  })
+
   it('bug 1: parseMode mismatch with existing stream rotates to fresh stream with new parseMode + rendered text', async () => {
     // Reproduces the reported bug: PTY-tail auto-stream seeds a stream
     // with format:'text' (parseMode undefined). A later explicit

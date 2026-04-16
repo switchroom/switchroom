@@ -54,6 +54,16 @@ export interface StreamReplyArgs {
    * conversation replies.
    */
   quote?: boolean
+  /**
+   * Optional turn identifier used to multiplex concurrent turns on the
+   * same chat+thread+lane. Without this, two concurrent turns emitting
+   * on the same lane (e.g. both on lane:'progress') collapse into a
+   * single draft stream and their Telegram messages flap between each
+   * other. The progress-card driver passes its unique per-turn key here
+   * so each active turn gets its own draft stream + pinned card. Other
+   * lane callers may leave this undefined to preserve legacy behavior.
+   */
+  turnKey?: string
 }
 
 export interface StreamReplyState {
@@ -171,9 +181,15 @@ export interface StreamReplyResult {
   status: 'updated' | 'finalized'
 }
 
-function streamKey(chatId: string, threadId?: number, lane?: string): string {
+function streamKey(
+  chatId: string,
+  threadId?: number,
+  lane?: string,
+  turnKey?: string,
+): string {
   const base = `${chatId}:${threadId ?? '_'}`
-  return lane != null && lane.length > 0 ? `${base}:${lane}` : base
+  const withLane = lane != null && lane.length > 0 ? `${base}:${lane}` : base
+  return turnKey != null && turnKey.length > 0 ? `${withLane}:${turnKey}` : withLane
 }
 
 export async function handleStreamReply(
@@ -211,7 +227,7 @@ export async function handleStreamReply(
       charCount: rawText.length,
       done: false,
       streamExisted: state.activeDraftStreams.has(
-        streamKey(chat_id, threadId, args.lane),
+        streamKey(chat_id, threadId, args.lane, args.turnKey),
       ),
     })
     throw new Error(
@@ -251,7 +267,7 @@ export async function handleStreamReply(
     )
   }
 
-  const sKey = streamKey(chat_id, threadId, args.lane)
+  const sKey = streamKey(chat_id, threadId, args.lane, args.turnKey)
   // Claim the PTY-preview slot so any PTY-tail partial that fires mid-
   // or post-turn for this chat+thread is dropped. Keyed WITHOUT lane
   // because the PTY handler uses the lane-less key and we need to

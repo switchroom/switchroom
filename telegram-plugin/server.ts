@@ -1795,6 +1795,11 @@ if (streamMode === 'checklist') {
         message_thread_id: threadId,
         lane: 'progress',
         format: 'html',
+        // Multiplex concurrent turns: without turnKey, two active turns
+        // on the same chat+thread+lane collapse into one draft stream
+        // and their messages flap. Pass the driver's unique per-turn
+        // key so each turn gets its own draft stream + pinned card.
+        turnKey,
       }
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot,
