@@ -67,6 +67,24 @@ export function disableAgent(name: string): void {
   }
 }
 
+export function interruptAgent(name: string): { pid: number } {
+  const status = getAgentStatus(name);
+  if (!status.pid) {
+    throw new Error(
+      `Agent "${name}" has no running PID (status: ${status.active})`
+    );
+  }
+  try {
+    systemctl(["kill", "--signal=INT", serviceName(name)]);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Failed to send SIGINT to agent "${name}": ${message}`
+    );
+  }
+  return { pid: status.pid };
+}
+
 export function getAgentStatus(name: string): AgentStatus {
   const service = serviceName(name);
 
