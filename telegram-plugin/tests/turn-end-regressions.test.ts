@@ -327,3 +327,182 @@ describe('bug 2 — stream_reply tool call sets reply-called flag regardless of 
     expect(result.wouldFireBackstop).toBe(true)
   })
 })
+
+// ─── Bug 3 — orphan progress card (TG-ORPHAN-CARD) ───────────────────────
+//
+// Progress cards stayed pinned in "Working…" when turn_end was delayed,
+// missed, or arrived after the model already sent its final reply.
+//
+// Fix: unpin fires on the FIRST of (turn_end, stream_reply(done=true), reply())
+// via a shared `unpinProgressCard` helper guarded by `unpinnedTurnKeys`.
+//
+// These tests simulate the pin/unpin lifecycle that server.ts manages.
+// They exercise the guard logic directly rather than importing server.ts
+// (which has top-level side-effects requiring env vars).
+
+describe('bug 3 — progress-card unpin fires on first of turn_end / reply / stream_reply(done)', () => {
+  /**
+   * Miniature simulation of the pin/unpin lifecycle from server.ts.
+   * Models the progressPinnedMsgIds map, unpinnedTurnKeys set, and the
+   * unpinProgressCard + unpinProgressCardForChat helpers.
+   */
+  function makeUnpinHarness() {
+    const progressPinnedMsgIds = new Map<string, number>()
+    const unpinnedTurnKeys = new Set<string>()
+    const unpinCalls: Array<{ turnKey: string; pinnedId: number }> = []
+
+    function unpinProgressCard(turnKey: string, _chatId: string, pinnedId: number): void {
+      if (unpinnedTurnKeys.has(turnKey)) return
+      unpinnedTurnKeys.add(turnKey)
+      progressPinnedMsgIds.delete(turnKey)
+      unpinCalls.push({ turnKey, pinnedId })
+    }
+
+    function unpinProgressCardForChat(chatId: string, threadId: number | undefined): void {
+      const base = threadId != null ? `${chatId}:${threadId}` : chatId
+      for (const [turnKey, pinnedId] of progressPinnedMsgIds) {
+        if (turnKey.startsWith(`${base}:`)) {
+          unpinProgressCard(turnKey, chatId, pinnedId)
+        }
+      }
+    }
+
+    function pinCard(turnKey: string, chatId: string, messageId: number): void {
+      progressPinnedMsgIds.set(turnKey, messageId)
+    }
+
+    function onTurnComplete(turnKey: string, chatId: string): void {
+      const pinnedId = progressPinnedMsgIds.get(turnKey)
+      if (pinnedId != null) {
+        unpinProgressCard(turnKey, chatId, pinnedId)
+      }
+      unpinnedTurnKeys.delete(turnKey)
+    }
+
+    return {
+      pinCard,
+      unpinProgressCardForChat,
+      onTurnComplete,
+      unpinCalls,
+      unpinnedTurnKeys,
+    }
+  }
+
+  it('reply() triggers unpin before turn_end arrives', () => {
+    const h = makeUnpinHarness()
+    // Card pinned at turn start
+    h.pinCard('100:1', '100', 42)
+
+    // model calls reply() → early unpin
+    h.unpinProgressCardForChat('100', undefined)
+
+    expect(h.unpinCalls).toHaveLength(1)
+    expect(h.unpinCalls[0]).toMatchObject({ turnKey: '100:1', pinnedId: 42 })
+  })
+
+  it('stream_reply(done=true) triggers unpin before turn_end arrives', () => {
+    const h = makeUnpinHarness()
+    h.pinCard('200:1', '200', 55)
+
+    // model calls stream_reply(done=true) → early unpin via chat lookup
+    h.unpinProgressCardForChat('200', undefined)
+
+    expect(h.unpinCalls).toHaveLength(1)
+    expect(h.unpinCalls[0]).toMatchObject({ turnKey: '200:1', pinnedId: 55 })
+  })
+
+  it('turn_end after reply-triggered unpin is a no-op (double-unpin guard)', () => {
+    const h = makeUnpinHarness()
+    h.pinCard('300:1', '300', 77)
+
+    // reply() fires first
+    h.unpinProgressCardForChat('300', undefined)
+    expect(h.unpinCalls).toHaveLength(1)
+
+    // turn_end fires later — onTurnComplete guard should make it a no-op
+    h.onTurnComplete('300:1', '300')
+
+    // Still only one unpin call
+    expect(h.unpinCalls).toHaveLength(1)
+    // Guard entry cleaned up by onTurnComplete
+    expect(h.unpinnedTurnKeys.has('300:1')).toBe(false)
+  })
+
+  it('turn_end fires first (normal path) — guard prevents double-unpin on late reply()', () => {
+    const h = makeUnpinHarness()
+    h.pinCard('400:1', '400', 88)
+
+    // turn_end fires first (normal path)
+    h.onTurnComplete('400:1', '400')
+    expect(h.unpinCalls).toHaveLength(1)
+    // Guard cleaned up by onTurnComplete
+    expect(h.unpinnedTurnKeys.has('400:1')).toBe(false)
+
+    // Late reply() fires (e.g. async handler after turn_end)
+    // unpinProgressCardForChat checks progressPinnedMsgIds which is already empty
+    h.unpinProgressCardForChat('400', undefined)
+    // No second unpin
+    expect(h.unpinCalls).toHaveLength(1)
+  })
+
+  it('concurrent turns on same chat each get their own unpin', () => {
+    const h = makeUnpinHarness()
+    // Two concurrent turns on chat 500 (e.g. two parallel sub-agents)
+    h.pinCard('500:1', '500', 10)
+    h.pinCard('500:2', '500', 11)
+
+    // reply() for the chat — unpins all matching cards
+    h.unpinProgressCardForChat('500', undefined)
+
+    expect(h.unpinCalls).toHaveLength(2)
+    const turnKeys = h.unpinCalls.map((c) => c.turnKey)
+    expect(turnKeys).toContain('500:1')
+    expect(turnKeys).toContain('500:2')
+  })
+
+  it('unpinProgressCardForChat only unpins cards for the matching chat+thread', () => {
+    const h = makeUnpinHarness()
+    h.pinCard('600:1', '600', 20)   // chat 600, no thread
+    h.pinCard('601:1', '601', 21)   // chat 601, no thread (different chat)
+
+    // Unpin for chat 600 only
+    h.unpinProgressCardForChat('600', undefined)
+
+    expect(h.unpinCalls).toHaveLength(1)
+    expect(h.unpinCalls[0]!.turnKey).toBe('600:1')
+  })
+
+  it('unpinProgressCardForChat scopes to thread when threadId is set', () => {
+    const h = makeUnpinHarness()
+    h.pinCard('700:99:1', '700', 30)  // chat 700, thread 99
+    h.pinCard('700:88:1', '700', 31)  // chat 700, thread 88
+
+    // Unpin for thread 99 only
+    h.unpinProgressCardForChat('700', 99)
+
+    expect(h.unpinCalls).toHaveLength(1)
+    expect(h.unpinCalls[0]!.turnKey).toBe('700:99:1')
+  })
+
+  it('maxIdleMs default in server.ts is reduced to 5 minutes', () => {
+    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+    // The createProgressDriver call should pass maxIdleMs: 5 * 60_000.
+    expect(serverSrc).toContain('maxIdleMs: 5 * 60_000')
+    // The old 30-minute default must not be the value passed.
+    expect(serverSrc).not.toMatch(/maxIdleMs:\s*30\s*\*\s*60_000/)
+  })
+
+  it('server.ts wires early-unpin in the reply() handler', () => {
+    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+    // Find the reply case block and confirm unpinProgressCardForChat is called.
+    // Use a broad search so minor whitespace changes don't break this.
+    expect(serverSrc).toContain('unpinProgressCardForChat?.(chat_id, threadId)')
+  })
+
+  it('server.ts wires early-unpin in the stream_reply handler', () => {
+    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+    // The stream_reply case should call unpinProgressCardForChat after finalization.
+    expect(serverSrc).toContain("if (result.status === 'finalized')")
+    expect(serverSrc).toContain('unpinProgressCardForChat?.(srChatId, srThreadId)')
+  })
+})

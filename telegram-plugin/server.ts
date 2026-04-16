@@ -1453,6 +1453,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // edit-in-place onto the existing preview message instead of
         // leaving a stale duplicate in the chat.
 
+        // Early unpin: the model's final answer has landed. Unpin any
+        // active progress card for this chat+thread so the user doesn't
+        // have to wait for turn_end (which may be delayed or missed).
+        // unpinProgressCardForChat is null when streamMode !== 'checklist'.
+        unpinProgressCardForChat?.(chat_id, threadId)
+
         return { content: [{ type: 'text', text: result }] }
       }
       case 'stream_reply': {
@@ -1496,6 +1502,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             progressCardActive: streamMode === 'checklist',
           },
         )
+        // Early unpin: when stream_reply(done=true) finalizes the model's
+        // answer, unpin any active progress card for this chat+thread.
+        // This MCP case is always the default lane (the model never passes
+        // lane:'progress' — only the internal progress-card driver does,
+        // and it bypasses this MCP handler entirely).
+        if (result.status === 'finalized') {
+          const srChatId = args.chat_id as string
+          const srThreadId = resolveThreadId(srChatId, args.message_thread_id as string | undefined)
+          unpinProgressCardForChat?.(srChatId, srThreadId)
+        }
         return {
           content: [
             {
@@ -1754,6 +1770,13 @@ let sessionTailHandle: SessionTailHandle | null = null
 // instantiated and there's zero overhead.
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 let progressDriver: ProgressDriver | null = null
+/**
+ * Unpin all active progress cards for a given chatId + threadId. Populated
+ * when streamMode === 'checklist'; null otherwise. Called from reply() and
+ * stream_reply(done=true) to eagerly unpin the progress card as soon as the
+ * model's final answer lands — without waiting for turn_end.
+ */
+let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
 if (streamMode === 'checklist') {
   // Failsafe: unpin any progress cards left over from a prior session
   // that crashed or was killed mid-turn. The in-memory pin map is lost
@@ -1781,6 +1804,52 @@ if (streamMode === 'checklist') {
    * completion to unpin. Cleaned up after onTurnComplete fires.
    */
   const progressPinnedMsgIds = new Map<string, number>()
+
+  /**
+   * Guards against double-unpin. Multiple paths can trigger unpin (turn_end,
+   * stream_reply(done=true), reply()). Only the first one actually fires the
+   * API call; the rest are no-ops. Keyed by turnKey.
+   */
+  const unpinnedTurnKeys = new Set<string>()
+
+  /**
+   * Unpin the progress card for a specific turnKey. Idempotent — safe to call
+   * from multiple paths (turn_end, stream_reply done, reply tool). Only the
+   * first call actually fires; subsequent calls for the same turnKey are
+   * no-ops via `unpinnedTurnKeys`.
+   */
+  function unpinProgressCard(turnKey: string, chatId: string, pinnedId: number): void {
+    if (unpinnedTurnKeys.has(turnKey)) return
+    unpinnedTurnKeys.add(turnKey)
+    progressPinnedMsgIds.delete(turnKey)
+    lockedBot.api
+      .unpinChatMessage(chatId, pinnedId)
+      .catch((err: Error) => {
+        process.stderr.write(
+          `telegram channel: progress-card unpin failed: ${err.message}\n`,
+        )
+      })
+      .finally(() => {
+        // Drop the sidecar entry regardless of unpin outcome — if
+        // the API errored the message is likely gone already, and
+        // we don't want to retry forever on startup.
+        const agentDir = resolveAgentDirFromEnv()
+        if (agentDir != null) {
+          removeActivePin(agentDir, chatId, pinnedId)
+        }
+      })
+  }
+
+  // Assign to the outer-scope variable so reply() and stream_reply(done=true)
+  // can call it without depending on the checklist-mode guard.
+  unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {
+    const base = threadId != null ? `${chatId}:${threadId}` : chatId
+    for (const [turnKey, pinnedId] of progressPinnedMsgIds) {
+      if (turnKey.startsWith(`${base}:`)) {
+        unpinProgressCard(turnKey, chatId, pinnedId)
+      }
+    }
+  }
 
   progressDriver = createProgressDriver({
     emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
@@ -1865,29 +1934,16 @@ if (streamMode === 'checklist') {
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
     },
     onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
+      // Unpin the progress card now that the turn is done. The guard inside
+      // unpinProgressCard ensures this is a no-op if reply() or
+      // stream_reply(done=true) already unpinned it first.
       const pinnedId = progressPinnedMsgIds.get(turnKey)
-      progressPinnedMsgIds.delete(turnKey)
-
-      // Unpin the progress card now that the turn is done.
       if (pinnedId != null) {
-        const pinnedMessageId = pinnedId
-        lockedBot.api
-          .unpinChatMessage(chatId, pinnedMessageId)
-          .catch((err: Error) => {
-            process.stderr.write(
-              `telegram channel: progress-card unpin failed: ${err.message}\n`,
-            )
-          })
-          .finally(() => {
-            // Drop the sidecar entry regardless of unpin outcome — if
-            // the API errored the message is likely gone already, and
-            // we don't want to retry forever on startup.
-            const agentDir = resolveAgentDirFromEnv()
-            if (agentDir != null) {
-              removeActivePin(agentDir, chatId, pinnedMessageId)
-            }
-          })
+        unpinProgressCard(turnKey, chatId, pinnedId)
       }
+      // Clean up the guard entry so memory doesn't grow unbounded across
+      // many sequential turns.
+      unpinnedTurnKeys.delete(turnKey)
 
       // Completion notification: only send in multi-topic forum mode, where
       // the progress card lives in a specific topic thread and the user may
@@ -1909,6 +1965,11 @@ if (streamMode === 'checklist') {
           })
       }
     },
+    // Reduce zombie ceiling from 30 min to 5 min. The early-unpin paths
+    // (reply / stream_reply done) now handle the common case; 5 min is
+    // plenty for a genuine long-running turn to show activity, and it
+    // cuts the worst-case orphan window from 30 min to 5 min.
+    maxIdleMs: 5 * 60_000,
   })
   process.stderr.write('telegram channel: progress-card driver active (stream_mode=checklist)\n')
 }
