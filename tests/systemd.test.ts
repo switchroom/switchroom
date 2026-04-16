@@ -5,6 +5,8 @@ import {
   generateTimerUnit,
   generateTimerServiceUnit,
 } from "../src/agents/systemd.js";
+import { usesSwitchroomTelegramPlugin } from "../src/config/merge.js";
+import type { AgentConfig } from "../src/config/schema.js";
 
 describe("generateUnit", () => {
   it("generates valid unit file content", () => {
@@ -152,5 +154,40 @@ describe("generateTimerServiceUnit", () => {
   it("uses the correct index in the script path", () => {
     const service = generateTimerServiceUnit("agent", 3, "/tmp/agents/agent");
     expect(service).toContain("cron-3.sh");
+  });
+});
+
+describe("autoaccept detection via usesSwitchroomTelegramPlugin", () => {
+  it("enables autoaccept when plugin is undefined (default)", () => {
+    const agent = { profile: "default" } as AgentConfig;
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(true);
+  });
+
+  it("enables autoaccept when plugin is explicitly 'switchroom'", () => {
+    const agent = { profile: "default", channels: { telegram: { plugin: "switchroom" } } } as AgentConfig;
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(true);
+  });
+
+  it("enables autoaccept when channels exists but telegram is undefined", () => {
+    const agent = { profile: "default", channels: {} } as AgentConfig;
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(true);
+  });
+
+  it("disables autoaccept when plugin is 'official'", () => {
+    const agent = { profile: "default", channels: { telegram: { plugin: "official" } } } as AgentConfig;
+    expect(usesSwitchroomTelegramPlugin(agent)).toBe(false);
+  });
+
+  it("produces correct systemd unit for each case", () => {
+    const defaultAgent = { profile: "default" } as AgentConfig;
+    const officialAgent = { profile: "default", channels: { telegram: { plugin: "official" } } } as AgentConfig;
+
+    const autoUnit = generateUnit("dev", "/tmp/dev", usesSwitchroomTelegramPlugin(defaultAgent));
+    expect(autoUnit).toContain("autoaccept.exp");
+    expect(autoUnit).toContain("/usr/bin/expect");
+
+    const plainUnit = generateUnit("plain", "/tmp/plain", usesSwitchroomTelegramPlugin(officialAgent));
+    expect(plainUnit).not.toContain("autoaccept.exp");
+    expect(plainUnit).toContain("/bin/bash");
   });
 });
