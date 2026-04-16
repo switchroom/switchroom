@@ -74,11 +74,36 @@ steps:
       # vitest also runs telegram-plugin/tests/*.test.ts (excluding bun-only
       # history.test.ts) for cross-package coverage, so install plugin deps.
       (cd telegram-plugin && bun install --frozen-lockfile)
-      # Buildkite Test Engine: fetch the vitest collector token from the
-      # cluster secret store. When unset, vitest.config.ts falls back to
+      # Buildkite Test Engine collector: streams per-test timing to the
+      # switchroom-vitest suite. When unset, vitest.config.ts falls back to
       # the default reporter and no upload is attempted.
       export BUILDKITE_ANALYTICS_TOKEN="$$(buildkite-agent secret get ANALYTICS_TOKEN_VITEST 2>/dev/null || true)"
-      bun run test:vitest
+      # Buildkite Test Engine Client (bktec): splits test files across
+      # parallel nodes using historical timing from the suite above.
+      # bktec is installed from GitHub releases; graceful fallback to plain
+      # vitest if the binary or token is unavailable.
+      #
+      # Token key cannot start with BUILDKITE/BK (cluster secret restriction),
+      # so it is stored as SWITCHROOM_TEST_ENGINE_API_TOKEN and re-exported.
+      export BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN="$$(buildkite-agent secret get SWITCHROOM_TEST_ENGINE_API_TOKEN 2>/dev/null || true)"
+      if [[ -n "$$BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN" ]]; then
+        # Install bktec (linux amd64 — matches Buildkite hosted agent shape)
+        BKTEC_VERSION="2.3.2"
+        curl -fsSL "https://github.com/buildkite/test-engine-client/releases/download/v$${BKTEC_VERSION}/bktec_$${BKTEC_VERSION}_linux_amd64" \
+          -o /usr/local/bin/bktec && chmod +x /usr/local/bin/bktec
+        export BUILDKITE_TEST_ENGINE_SUITE_SLUG="switchroom-vitest"
+        export BUILDKITE_TEST_ENGINE_TEST_RUNNER="custom"
+        # vitest accepts test file paths as positional args — bktec substitutes
+        # the assigned file list in place of {{testExamples}}.
+        export BUILDKITE_TEST_ENGINE_TEST_CMD="bunx vitest run {{testExamples}}"
+        # Match all test files that vitest.config.ts would include.
+        export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="{tests,test,experimental,src}/**/*.test.ts,telegram-plugin/tests/*.test.ts"
+        export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/history.test.ts"
+        bktec run
+      else
+        echo "bktec token unavailable — falling back to plain vitest"
+        bun run test:vitest
+      fi
     cache:
       paths:
         - "~/.bun"
