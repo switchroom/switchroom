@@ -307,11 +307,24 @@ source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
 HOOK_INPUT=""
 if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
 
+# Skip greeting for session recycling: agents without --continue exit after
+# each turn and systemd restarts them. If the gateway socket already existed
+# (age > 60s), the gateway was up before we booted — this is a session
+# recycle, not a cold boot, so the user doesn't need another greeting.
+# Explicit /restart has its own "Switchroom restarted — ready" message path.
+GATEWAY_SOCK="$TELEGRAM_STATE_DIR/gateway.sock"
+NOW=$(date +%s)
+if [ -S "$GATEWAY_SOCK" ]; then
+  SOCK_MTIME=$(stat -c %Y "$GATEWAY_SOCK" 2>/dev/null || echo 0)
+  if [ $((NOW - SOCK_MTIME)) -gt 60 ]; then
+    exit 0
+  fi
+fi
+
 # Idempotency guard: Claude Code fires SessionStart multiple times on some
 # restart paths. Use a 30s time-window marker instead of per-session-id dedup.
 # Atomic via mkdir so concurrent invocations race cleanly.
 GREETING_MARKER="$TELEGRAM_STATE_DIR/greeting-lock"
-NOW=$(date +%s)
 if [ -d "$GREETING_MARKER" ]; then
   LAST=$(stat -c %Y "$GREETING_MARKER" 2>/dev/null || echo 0)
   if [ $((NOW - LAST)) -lt 30 ]; then

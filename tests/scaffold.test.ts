@@ -249,6 +249,19 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain('MONTHLY_BUDGET=""');
   });
 
+  it("session greeting skips session recycling via gateway socket age check", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("recycle-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    expect(greeting).toContain("gateway.sock");
+    expect(greeting).toContain("SOCK_MTIME");
+    expect(greeting).toContain("session recycling");
+  });
+
   it("generates telegram .env with bot token", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("bot-agent", config, tmpDir, telegramConfig);
@@ -733,6 +746,30 @@ describe("reconcileAgent", () => {
     expect(after).toContain("HINDSIGHT_API_URL='http://127.0.0.1:18888'");
     expect(after).toContain("--plugin-dir");
     expect(after).toContain(".claude/plugins/hindsight-memory");
+  });
+
+  it("start.sh waits for Hindsight API before launching Claude", () => {
+    const agentConfig = makeAgentConfig();
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("HINDSIGHT_WAIT=0");
+    expect(startSh).toContain("curl -sf -o /dev/null --max-time 2");
+    expect(startSh).toContain("/mcp/");
+  });
+
+  it("start.sh omits Hindsight wait loop when memory is disabled", () => {
+    const agentConfig = makeAgentConfig();
+    const config = buildSwitchroomConfig(agentConfig);
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, config);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).not.toContain("HINDSIGHT_WAIT");
   });
 
   it("returns no changes when settings already match", () => {

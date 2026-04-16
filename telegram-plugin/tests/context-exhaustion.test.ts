@@ -76,6 +76,38 @@ describe('shouldArmOrphanedReplyTimeout', () => {
     ).toBe(false)
   })
 
+  it('does not arm when progress card is active', () => {
+    expect(
+      shouldArmOrphanedReplyTimeout({
+        currentSessionChatId: '123',
+        capturedTextCount: 3,
+        replyCalled: false,
+        progressCardActive: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('arms normally when progressCardActive is false', () => {
+    expect(
+      shouldArmOrphanedReplyTimeout({
+        currentSessionChatId: '123',
+        capturedTextCount: 1,
+        replyCalled: false,
+        progressCardActive: false,
+      }),
+    ).toBe(true)
+  })
+
+  it('arms when progressCardActive is omitted (backwards compat)', () => {
+    expect(
+      shouldArmOrphanedReplyTimeout({
+        currentSessionChatId: '123',
+        capturedTextCount: 1,
+        replyCalled: false,
+      }),
+    ).toBe(true)
+  })
+
   it('timeout constant is 30 seconds', () => {
     expect(ORPHANED_REPLY_TIMEOUT_MS).toBe(30_000)
   })
