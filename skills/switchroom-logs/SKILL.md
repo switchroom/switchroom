@@ -1,6 +1,6 @@
 ---
 name: switchroom-logs
-description: Fetches recent log output and errors from agent journals. Use when the user asks for logs, errors, 'what happened', 'why did it crash', 'show me what went wrong', debug output, failure details, 'check the logs', or 'show me the recent logs'.
+description: Fetches recent log output and stack traces from agent journals. Use when the user asks for logs, journal output, 'show me the logs', 'check the logs', 'tail the journal', OR when they ask about a specific crash or "what happened" — e.g. 'the assistant crashed, what happened?', 'why did it crash', 'the agent died, show me what happened'. Do NOT use for generic 'what's wrong with my setup' or 'my agent keeps failing' questions (use switchroom-health — that runs a full diagnostic), and do NOT use for current agent running state (use switchroom-status).
 ---
 
 # Agent Logs

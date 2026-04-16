@@ -1,6 +1,6 @@
 ---
 name: switchroom-config
-description: Shows what model, tools, and settings an agent is using. Use when the user asks 'what model is X using', 'show me the config', 'how is it configured', agent settings, effective configuration, or wants to inspect an agent's current setup.
+description: Shows the resolved config (model, tools, soul, settings, cascade) for a specific agent. Use when the user asks 'what model is X using', 'show me the config for <agent>', 'how is <agent> configured', effective configuration, or wants to inspect one agent's cascade resolution. Do NOT use for 'show agent info' / 'what agents are running' / status overviews (use switchroom-status).
 ---
 
 # Agent Configuration Viewer

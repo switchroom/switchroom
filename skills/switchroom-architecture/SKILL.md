@@ -1,6 +1,6 @@
 ---
 name: switchroom-architecture
-description: Explains how switchroom works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does switchroom work', 'how does it decide', 'which settings apply', architecture, design, or internals.
+description: Explains how switchroom works internally — config cascade, profiles, settings resolution, agent lifecycle, plugin system. Use when the user asks 'how does switchroom work internally', 'how does the cascade decide', 'which settings apply', architecture, design, or internals. Do NOT use for onboarding or getting-started questions ('how do I get started', 'I'm new to switchroom', 'bootstrap from scratch', 'set up for the first time') — those belong to switchroom-install.
 user-invocable: false
 ---
 

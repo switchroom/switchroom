@@ -1,11 +1,13 @@
 ---
 name: switchroom-install
-description: Install and set up switchroom on a fresh machine. Use when the user says 'install switchroom', 'set up switchroom', 'bootstrap switchroom', 'get switchroom running', 'I'm new to switchroom', or asks how to get started with switchroom from scratch.
+description: Install switchroom and its dependencies (bun, node, docker, tmux, claude CLI) on a fresh machine. Use for onboarding and first-time setup — when the user says 'install switchroom on this machine', 'set up switchroom for the first time', 'bootstrap switchroom from scratch', 'get switchroom running', 'how do I get started with switchroom', "I'm new to switchroom, where do I begin", or asks about switchroom dependencies or prerequisites. This is the onboarding entry point, not for managing existing agents.
 ---
 
 # Install Switchroom
 
-When the user asks to install, set up, or bootstrap switchroom, walk them through this flow. Switchroom turns a Linux server + their Claude Pro/Max subscription into always-on Claude Code agents reachable from Telegram.
+When the user asks to install, set up, bootstrap, or get started with switchroom — or when they're new to switchroom and want to know where to begin — walk them through this flow. Switchroom turns a Linux server + their Claude Pro/Max subscription into always-on Claude Code agents reachable from Telegram.
+
+Switchroom's dependencies are: **bun** (TypeScript runtime), **node** 22+ (via nvm), **docker** (for plugins), **tmux** (for agent sessions), and the **claude** Code CLI (authenticates against Claude Pro/Max). Always enumerate these explicitly when the user asks about dependencies or prerequisites.
 
 ## Step 0 — Detect existing install
 
@@ -15,7 +17,7 @@ Before doing anything, check whether switchroom is already installed:
 command -v switchroom && switchroom --version 2>/dev/null
 ```
 
-If switchroom is present, **stop** and tell the user it's already installed. Offer to run `switchroom setup` (re-run the wizard), `switchroom doctor` (diagnose), or `switchroom agent list` (see what's running). Do not reinstall.
+If switchroom is present, tell the user it's already installed and then — regardless — run the dependency audit in Step 2 so they see the state of **bun**, **node**, **docker**, **tmux**, and **claude**. Users who ask "install switchroom and its dependencies" want to see the dependency inventory even when switchroom itself is already installed. After the audit, offer `switchroom setup` (re-run the wizard), `switchroom doctor` (diagnose), or `switchroom agent list` (see what's running). Do not reinstall switchroom itself without explicit confirmation.
 
 ## Step 1 — Verify prerequisites
 

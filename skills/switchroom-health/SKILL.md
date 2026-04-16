@@ -1,11 +1,11 @@
 ---
 name: switchroom-health
-description: Runs a health check and diagnostics on the switchroom setup. Use when the user says 'health check', 'diagnose', 'troubleshoot', 'something's wrong', 'can you check my setup', or wants to verify everything is working correctly.
+description: Runs a health check and diagnostics on the switchroom setup. Use when the user says 'my agent keeps failing', 'my agents are broken', "what's wrong with my agents", 'agent keeps crashing', 'health check', 'diagnose', 'troubleshoot', "something's wrong", 'can you check my setup', or wants to verify everything is working correctly. Prefer this over logs when the user is reporting a generic failure and wants to know *what* is wrong, not *why* a specific crash happened.
 ---
 
 # Agent Health Diagnostics
 
-When the user reports something broken, mentions errors, asks to diagnose, or asks "what's wrong with my agents", run this skill to perform a full health check.
+When the user reports an agent failing, says their agents are broken, asks "what's wrong with my agent(s)", mentions errors, asks to diagnose, or asks to troubleshoot the setup, run this skill to perform a full health check. This skill answers the *what's wrong* question by checking the whole stack (CLI, auth, units, files, memory); use `switchroom-logs` only when the user specifically asks for logs of a particular crash.
 
 ## Step 1 — Run switchroom doctor
 

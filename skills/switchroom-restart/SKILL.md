@@ -1,6 +1,6 @@
 ---
 name: switchroom-restart
-description: Restarts or reboots a switchroom agent with preflight safety checks. Use when the user says restart, reboot, refresh, 'it seems stuck', 'kick it', bounce, or wants to stop and start an agent.
+description: Restarts or reboots switchroom agents with preflight safety checks (runs `switchroom agent restart <name>` or iterates over all agents). Use whenever the user wants to restart, reboot, refresh, bounce, 'kick', 'kill and restart', or 'stop and start' agents — whether a single named agent or "all agents". Also matches 'it seems stuck'. Do NOT use for 'reinstall my agents' or 'reprovision my agents' (those imply re-applying config — use switchroom-manage).
 allowed-tools: Bash(switchroom *) Bash(systemctl --user *)
 ---
 
