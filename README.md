@@ -1,41 +1,48 @@
-# Switchroom — Transparent Claude Code agents on Telegram
+# Switchroom
 
 [![Build status](https://badge.buildkite.com/443b450a779c30f5824660f5062f8c29101cd4419831ee3aff.svg)](https://buildkite.com/ken-thompson/switchroom)
 [![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-tests.json)](https://buildkite.com/ken-thompson/switchroom)
 [![Trigger evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-trigger-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 [![Quality evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-quality-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 
-**Run Claude Code agents 24/7 on a server, talk to them from Telegram — and see exactly what they're doing.**
+**Your Claude Code agents. On Telegram. Your subscription. No black box.**
 
-## The problem with Claude Code's built-in Telegram channel
+## Right, so what's this about
 
-Claude Code ships a Telegram channel integration. It works, barely. You send a message, the agent does something, eventually a reply shows up. What happens in between is a complete black box. There's no visibility into what tools are running, whether the agent is stuck, whether it spawned a sub-agent, or how long anything took. It ghosts you.
+So you had the bright idea. Run Claude Code agents 24/7 on a cheap Linux box, talk to them from Telegram, use the Claude Pro or Max subscription you're already paying for. Sensible. Obvious, even.
 
-That's the problem Switchroom solves.
+Then you tried OpenClaw. Followed the docs, spun it up, got it running, only to realise halfway through that you're pinging the Anthropic API on your own key and your token bill is quietly ticking over in the background. Bit of a bait and switch, that one. You signed up for "use your subscription," not "buy API credits on top of your subscription."
 
-## What Switchroom does differently
+So you gave Claude Code's built-in Telegram channel a crack instead. Sent a message. Waited. Something happened, maybe. Eventually a reply came back. What did the agent actually do? No idea. Which tools ran? No idea. Did it get stuck, crash, spawn a sub-agent, read half your repo? No idea. It's an MVP black box of death, and I got sick of squinting into it.
 
-Switchroom is a **Telegram-native orchestration layer** built on top of Claude Code — not a fork, not a wrapper, fully compliant with the official `claude` CLI and OAuth. It extends Claude Code's channel integration with live progress tracking you can actually follow.
+So I built this.
 
-Every time an agent starts work, a **progress card** appears in Telegram and stays pinned while the task is running. The card updates in place as tools execute — you see each step as it happens, not just the final answer.
+## What Switchroom is, and isn't
+
+Switchroom is an opinionated implementation of a Telegram plugin and agent lifecycle layer, sitting on top of the official `claude` CLI. No fork. No custom runtime in Docker. No API key interception. Your Claude Pro or Max subscription does the work, the same way it does on your desktop, authenticated via the same OAuth flow, fully compliant with Anthropic's terms.
+
+It is not trying to be a general-purpose LLM orchestrator. It doesn't care about OpenAI, Gemini, Llama, or swapping model providers. It is not a multi-channel bridge for Slack, Discord, Teams. It does one thing: makes Telegram the best possible interaction surface for Claude Code. Unashamedly.
+
+The whole thing is built around one idea. Every time an agent starts work, a **progress card** pops into Telegram and stays pinned while the task runs. It updates in place as tools execute, so you see each Read, Bash, Edit, Grep happen as it happens.
 
 ```
 ⚙️ Working… · ⏱ 12s
 💬 refactor the auth module to use JWT
-─ ─ ─
+  ─ ─ ─
   … (+3 more earlier steps)
-✅ Read src/auth/session.ts
-✅ Grep "cookie" (in src/)
-🤖 Edit src/auth/jwt.ts · 4s
+  ✅ Read src/auth/session.ts
+  ✅ Grep "cookie" (in src/)
+  🤖 Edit src/auth/jwt.ts · 4s
 ```
 
-When the task finishes, the card updates to Done and unpins. If two tasks are running in parallel (different agents, different topics), cards are labeled `(1/2)` and `(2/2)` so you can track both at a glance.
+When the agent finishes, the card flips to Done and unpins. Two agents working at the same time? Each gets its own card, labelled `(1/2)` and `(2/2)`, so you can follow both without losing the plot.
 
-**Key UX guarantees:**
-- Cards update at most every 5 seconds — fast enough to follow, no flood
-- The last 5 steps are always visible; older ones collapse into `(+N more earlier steps)`
-- Running steps show elapsed time so you can see if something is stuck
-- Sub-agents get their own section in the card — you see nested work, not just top-level calls
+## The UX bits that matter
+
+- Cards update at most once every 5 seconds. Fast enough to follow, not so fast it floods
+- Last 5 steps are always visible, older ones collapse into `(+N more earlier steps)`
+- Running steps show elapsed time so you can tell if something's stuck
+- Sub-agents get their own section in the card, so nested work is visible, not hidden
 - No silent gaps. No ghosts.
 
 ## Architecture
@@ -57,27 +64,27 @@ Switchroom is **not a harness**. Each agent runs the unmodified `claude` binary,
 
 ## Everything else you get
 
-| Feature | Description |
+| Feature | What it does |
 |---------|-------------|
-| **Claude Pro/Max auth** | OAuth — no API key, no per-token billing |
-| **Multi-agent** | Opus plans, Sonnet implements in the background. Sub-agent activity surfaces in the card. |
-| **Config cascade** | Defaults → profiles → per-agent YAML. Change one line, all agents update. |
-| **Scheduled tasks** | Cron-based systemd timers, survive reboots |
-| **Persistent memory** | Hindsight semantic memory with knowledge graphs |
-| **Session continuity** | Resume sessions across restarts with freshness gating |
-| **Encrypted vault** | AES-256-GCM for secrets |
-| **10 Telegram MCP tools** | Reply, pin, react, history, attachments, stream progress, and more |
+| **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. |
+| **Multi-agent** | Opus plans, Sonnet implements in the background. Sub-agent work surfaces in the card. |
+| **Config cascade** | Defaults, then profiles, then per-agent YAML. Change one line, every agent updates. |
+| **Scheduled tasks** | Cron-based systemd timers. Survive reboots. |
+| **Persistent memory** | Hindsight semantic memory with knowledge graphs. |
+| **Session continuity** | Resume sessions across restarts with freshness gating. |
+| **Encrypted vault** | AES-256-GCM for secrets. |
+| **10 Telegram MCP tools** | Reply, pin, react, history, attachments, stream progress, all of it. |
 
-## Compared to alternatives
+## How it stacks up against the alternatives
 
 | | Switchroom | Claude Code channels | OpenClaw | NanoClaw |
 |---|---|---|---|---|
-| Progress visibility | Live progress cards, pinned | None — black box | None | None |
+| Progress visibility | Live progress cards, pinned | None, black box | None | None |
 | Runtime | Claude Code CLI | Claude Code CLI | Custom runtime | Agents SDK |
 | Auth | Pro/Max OAuth | Pro/Max OAuth | API key | API key |
 | Sub-agent tracking | Yes, visible in card | No | No | No |
-| Parallel task display | Labeled cards (1/N) | No | No | No |
-| Config | YAML with cascade | None | JSON/TOML | ENV vars |
+| Parallel task display | Labelled cards `(1/N)` | No | No | No |
+| Config | YAML with cascade | None | JSON/TOML | Env vars |
 | Setup | `switchroom setup` | Built-in (limited) | Docker compose | Docker compose |
 
 ## Install
@@ -88,7 +95,7 @@ npm install -g switchroom-ai
 
 switchroom --version
 
-# Interactive wizard — installs deps, scaffolds config, links Telegram
+# Interactive wizard. Installs deps, scaffolds config, links Telegram.
 switchroom setup
 ```
 
@@ -110,7 +117,7 @@ cd ~/code/switchroom && bun install && bun link
 switchroom setup
 ```
 
-After setup, talk to your agent from Telegram. You don't touch the server again.
+After setup, you talk to your agent from Telegram. You don't touch the server again.
 
 ## Example Configuration
 
@@ -195,26 +202,26 @@ switchroom web                                # Web dashboard
 ## FAQ
 
 **Can I use a Claude Pro or Max subscription instead of an API key?**
-Yes — that's the whole point. Switchroom runs the unmodified `claude` CLI with the same OAuth flow you use on the desktop app. No API key, no per-token billing.
+Yes. That's the whole point. Switchroom runs the unmodified `claude` CLI with the same OAuth flow you use on the desktop app. No API key. No per-token billing.
 
 **How is this different from Claude Code's built-in Telegram channel?**
-The built-in channel gives you a message in, message out experience with no visibility into what the agent is doing. Switchroom adds live progress cards that pin to the top of each topic and update in real time as tools execute. You can always see what's happening.
+The built-in channel is message in, message out, with zero visibility into what the agent is doing in between. Switchroom adds live progress cards that pin to the top of each topic and update as tools execute. You can always see what's happening, which is the bit the built-in channel gets wrong.
 
 **Does it work with multiple agents at the same time?**
-Yes. Each agent gets its own Telegram forum topic. When multiple agents are working simultaneously, each has its own pinned progress card labeled `(1/N)`, `(2/N)` etc.
+Yes. Each agent gets its own Telegram forum topic. When multiple agents are working simultaneously, each has its own pinned progress card labelled `(1/N)`, `(2/N)` and so on.
 
 **Can I see what sub-agents are doing?**
-Yes. When an agent delegates to a sub-agent (e.g. a worker or researcher), the sub-agent's activity appears in its own section of the progress card. You see the full hierarchy, not just the top-level agent.
+Yes. When an agent delegates to a sub-agent (a worker, a researcher), the sub-agent's activity shows up in its own section of the progress card. You see the full hierarchy, not just the top-level agent.
 
-**What does Switchroom cost to run?**
-A cheap Linux VPS (~$6/mo on Hetzner/DigitalOcean/etc), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. Switchroom itself is MIT-licensed open source.
+**What does it cost to run?**
+A cheap Linux VPS (around $6/mo on Hetzner, DigitalOcean, wherever), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. Switchroom itself is MIT-licensed, free.
 
 **Is this against Anthropic's terms of service?**
-Switchroom uses the official `claude` binary with the official OAuth flow. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
+No. Switchroom uses the official `claude` binary with the official OAuth flow. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
 
 **Is Switchroom an alternative to OpenClaw?**
-Yes. Switchroom covers the same use case but uses your Claude subscription via OAuth instead of an API key, and runs the native `claude` binary instead of a custom runtime in Docker. See [vs-openclaw](docs/vs-openclaw.md).
+Yes. Same use case, but it uses your Claude subscription via OAuth instead of an API key, and runs the native `claude` binary instead of a custom runtime in Docker. See [vs-openclaw](docs/vs-openclaw.md).
 
 ## License
 
-MIT — See [CONTRIBUTING.md](CONTRIBUTING.md).
+MIT. See [CONTRIBUTING.md](CONTRIBUTING.md).
