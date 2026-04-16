@@ -38,7 +38,7 @@ import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
 } from '../history.js'
-import { parseQueuePrefix, formatPriorAssistantPreview } from '../steering.js'
+import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview } from '../steering.js'
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace } from '../format.js'
 import {
   isContextExhaustionText,
@@ -60,6 +60,12 @@ import {
   clearActivePins,
 } from '../active-pins.js'
 import { sweepActivePins, sweepBotAuthoredPins } from '../active-pins-sweep.js'
+import {
+  addActiveReaction,
+  removeActiveReaction,
+  clearActiveReactions,
+} from '../active-reactions.js'
+import { sweepActiveReactions } from '../active-reactions-sweep.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import type {
@@ -288,6 +294,7 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 // ─── Thread / status / stream state ───────────────────────────────────────
 const chatThreadMap = new Map<string, number>()
 const activeStatusReactions = new Map<string, StatusReactionController>()
+const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>()
 const activeTurnStartedAt = new Map<string, number>()
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
 const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
@@ -314,14 +321,24 @@ function streamKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
 }
 
+function purgeReactionTracking(key: string): void {
+  const msgInfo = activeReactionMsgIds.get(key)
+  activeStatusReactions.delete(key)
+  activeReactionMsgIds.delete(key)
+  activeTurnStartedAt.delete(key)
+  if (msgInfo) {
+    const agentDir = resolveAgentDirFromEnv()
+    if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
+  }
+}
+
 function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
   const key = statusKey(chatId, threadId)
   const ctrl = activeStatusReactions.get(key)
   if (!ctrl) return
   if (outcome === 'done') ctrl.setDone()
   else ctrl.setError()
-  activeStatusReactions.delete(key)
-  activeTurnStartedAt.delete(key)
+  purgeReactionTracking(key)
 }
 
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
@@ -466,6 +483,11 @@ function logOutbound(
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
+// ─── Pending steer requests (set by "↪️ Steer" button) ───────────────────
+// When a user taps the Steer button on a progress card, the next inbound
+// message from that chat is treated as steering="true" regardless of prefix.
+const pendingSteerChats = new Set<string>()
+
 // Reauth flows
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
@@ -527,10 +549,46 @@ const ipcServer: IpcServer = createIpcServer({
   onClientRegistered(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
     client.send({ type: 'status', status: 'agent_connected' })
+
+    // If the agent reconnected after a /restart, clear the marker and
+    // notify the user so Telegram doesn't stay stuck on "restarting…".
+    const marker = readRestartMarker()
+    if (marker) {
+      clearRestartMarker()
+      const ageMs = Date.now() - marker.ts
+      if (ageMs < 5 * 60_000) {
+        const ageSec = Math.max(1, Math.round(ageMs / 1000))
+        const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
+        lockedBot.api.sendMessage(marker.chat_id, text, {
+          parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+          ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
+          ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
+        }).then(sent => {
+          if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+        }).catch(() => {})
+      }
+    }
   },
 
   onClientDisconnected(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
+
+    // Flush all in-flight status reactions to 👍 so user messages don't stay
+    // stuck on intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
+    for (const [key, ctrl] of activeStatusReactions.entries()) {
+      ctrl.setDone()
+      activeStatusReactions.delete(key)
+      activeReactionMsgIds.delete(key)
+      activeTurnStartedAt.delete(key)
+    }
+    { const ad = resolveAgentDirFromEnv(); if (ad) clearActiveReactions(ad) }
+
+    // Finalize any open draft streams so they don't hang mid-edit.
+    for (const [key, stream] of activeDraftStreams.entries()) {
+      if (!stream.isFinal()) void stream.finalize().catch(() => {})
+      activeDraftStreams.delete(key)
+      activeDraftParseModes.delete(key)
+    }
   },
 
   async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> {
@@ -1053,6 +1111,7 @@ function resetOrphanedReplyTimeout(): void {
     currentSessionChatId,
     capturedTextCount: currentTurnCapturedText.length,
     replyCalled: currentTurnReplyCalled,
+    progressCardActive: progressDriver != null,
   })) {
     orphanedReplyTimeoutId = setTimeout(() => {
       orphanedReplyTimeoutId = null
@@ -1060,6 +1119,7 @@ function resetOrphanedReplyTimeout(): void {
         currentSessionChatId,
         capturedTextCount: currentTurnCapturedText.length,
         replyCalled: currentTurnReplyCalled,
+        progressCardActive: progressDriver != null,
       })) {
         process.stderr.write(
           `telegram gateway: orphaned-reply timeout (${ORPHANED_REPLY_TIMEOUT_MS}ms) — forcing backstop\n`,
@@ -1152,8 +1212,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         ).catch(() => {})
         const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
         if (ctrl) ctrl.setError()
-        activeStatusReactions.delete(statusKey(chatId, threadId))
-        activeTurnStartedAt.delete(statusKey(chatId, threadId))
+        purgeReactionTracking(statusKey(chatId, threadId))
         currentSessionChatId = null
         currentSessionThreadId = undefined
         currentTurnReplyCalled = false
@@ -1172,7 +1231,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       const threadId = currentSessionThreadId
       const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
 
-      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) {
+      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0 && progressDriver == null) {
         const capturedText = currentTurnCapturedText.join('\n').trim()
         if (capturedText) {
           const backstopChatId = chatId
@@ -1193,8 +1252,7 @@ function handleSessionEvent(ev: SessionEvent): void {
                 if (recentCount > 0) {
                   process.stderr.write(`telegram gateway: backstop suppressed — reply tool sent ${recentCount} message(s)\n`)
                   if (backstopCtrl) backstopCtrl.setDone()
-                  activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-                  activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
+                  purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
                   return
                 }
               } catch {}
@@ -1232,8 +1290,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               process.stderr.write(`telegram gateway: orphaned-reply backstop failed: ${(err as Error).message}\n`)
               if (backstopCtrl) backstopCtrl.setError()
             } finally {
-              activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-              activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
+              purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
             }
           })()
           return
@@ -1241,8 +1298,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
 
       if (ctrl) ctrl.setDone()
-      activeStatusReactions.delete(statusKey(chatId, threadId))
-      activeTurnStartedAt.delete(statusKey(chatId, threadId))
+      purgeReactionTracking(statusKey(chatId, threadId))
       {
         const sKey = streamKey(chatId, threadId)
         logStreamingEvent({
@@ -1574,9 +1630,16 @@ async function handleInbound(
 
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
 
-  const parsedQueue = parseQueuePrefix(text)
+  // Parse explicit prefixes first. `/steer ` / `/s ` opts IN to steering;
+  // `/queue ` / `/q ` are legacy aliases that opt in to the new default (queued).
+  // The "↪️ Steer" button sets pendingSteerChats so the next message is treated
+  // as steering even without a prefix — consume and clear that flag here.
+  const buttonSteer = pendingSteerChats.delete(chat_id)
+  const parsedSteer = parseSteerPrefix(text)
+  const isSteerPrefix = parsedSteer.steering || buttonSteer
+  const parsedQueue = isSteerPrefix ? { queued: false, body: parsedSteer.body } : parseQueuePrefix(text)
   const isQueuedPrefix = parsedQueue.queued
-  const effectiveText = isQueuedPrefix ? parsedQueue.body : text
+  const effectiveText = isSteerPrefix ? parsedSteer.body : (isQueuedPrefix ? parsedQueue.body : text)
 
   // Status reaction controller
   let isSteering = false
@@ -1584,17 +1647,30 @@ async function handleInbound(
   if (msgId != null) {
     const key = statusKey(chat_id, messageThreadId)
     const priorActive = activeStatusReactions.get(key)
-    isSteering = priorActive != null
-    if (isSteering) priorTurnStartedAt = activeTurnStartedAt.get(key)
+    const priorTurnInFlight = priorActive != null
+    // New default: mid-turn messages are queued unless the user explicitly
+    // steers. isSteering is true only when the steer prefix is present.
+    // (Legacy: without any prefix the old behavior was isSteering=true; now
+    // it's false so the message goes through as queued="true".)
+    isSteering = priorTurnInFlight && isSteerPrefix
+    if (priorTurnInFlight) priorTurnStartedAt = activeTurnStartedAt.get(key)
 
     if (access.statusReactions !== false) {
       if (isSteering) {
+        // Explicit steer: mark with 🤝 on the inbound message; leave the
+        // existing StatusReactionController running for the in-flight turn.
         void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '🤝' }]).catch(() => {})
+      } else if (priorTurnInFlight) {
+        // Queued mid-turn message (new default): don't touch the existing
+        // controller; just ack the inbound message with 👀 so the user
+        // knows we received it, without disrupting the in-flight reaction.
+        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '👀' }]).catch(() => {})
       } else {
+        // Fresh turn (no prior turn in flight): cancel any stale controller
+        // and start a new one for this message.
         if (priorActive) {
           priorActive.cancel()
-          activeStatusReactions.delete(key)
-          activeTurnStartedAt.delete(key)
+          purgeReactionTracking(key)
         }
         const sKey = streamKey(chat_id, messageThreadId)
         const priorStream = activeDraftStreams.get(sKey)
@@ -1611,8 +1687,13 @@ async function handleInbound(
           ])
         })
         activeStatusReactions.set(key, ctrl)
+        activeReactionMsgIds.set(key, { chatId: chat_id, messageId: msgId })
         activeTurnStartedAt.set(key, Date.now())
         ctrl.setQueued()
+        const agentDir = resolveAgentDirFromEnv()
+        if (agentDir != null) {
+          addActiveReaction(agentDir, { chatId: chat_id, messageId: msgId, threadId: messageThreadId ?? null, reactedAt: Date.now() })
+        }
       }
     } else if (access.ackReaction) {
       void bot.api.setMessageReaction(chat_id, msgId, [
@@ -1621,7 +1702,10 @@ async function handleInbound(
     }
   }
 
-  if (!isSteering) {
+  // Start a new progress card only for fresh turns (no prior turn in flight).
+  // Queued mid-turn messages piggyback on the existing card; steer messages
+  // also don't start a new card (the in-flight turn owns it).
+  if (!isSteering && priorTurnStartedAt == null) {
     try {
       progressDriver?.startTurn({
         chatId: chat_id,
@@ -1652,8 +1736,12 @@ async function handleInbound(
     }
   }
 
-  // Build steering meta
-  const priorTurnInProgress = isSteering
+  // Build steering meta.
+  // priorTurnInProgress is true for ANY mid-turn follow-up (queued or steering).
+  // isSteering = explicit /steer or /s prefix was used.
+  // isQueuedMidTurn = prior turn was in flight and no steer prefix (new default).
+  const priorTurnInProgress = isSteering || (priorTurnStartedAt != null)
+  const isQueuedMidTurn = priorTurnInProgress && !isSteering
   let secondsSinceTurnStart: number | undefined
   let priorAssistantPreview: string | undefined
   if (priorTurnInProgress) {
@@ -1700,8 +1788,11 @@ async function handleInbound(
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
       ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
       ...(imagePath ? { image_path: imagePath } : {}),
-      ...(isQueuedPrefix ? { queued: 'true' } : {}),
-      ...(isSteering && !isQueuedPrefix ? { steering: 'true' } : {}),
+      // queued="true" when mid-turn with no steer prefix (new default), or
+      // with explicit /queue or /q prefix (legacy alias).
+      ...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),
+      // steering="true" only when explicit /steer or /s prefix used.
+      ...(isSteering ? { steering: 'true' } : {}),
       ...(priorTurnInProgress ? { prior_turn_in_progress: 'true' } : {}),
       ...(priorTurnInProgress && secondsSinceTurnStart != null ? { seconds_since_turn_start: String(secondsSinceTurnStart) } : {}),
       ...(priorTurnInProgress && priorAssistantPreview != null && priorAssistantPreview.length > 0 ? { prior_assistant_preview: priorAssistantPreview } : {}),
@@ -1852,7 +1943,7 @@ function spawnSwitchroomDetached(args: string[]): void {
   child.unref()
 }
 
-async function sweepPinsBeforeSelfRestart(): Promise<void> {
+async function sweepBeforeSelfRestart(): Promise<void> {
   const agentDir = resolveAgentDirFromEnv()
   if (agentDir == null) return
   try {
@@ -1863,6 +1954,15 @@ async function sweepPinsBeforeSelfRestart(): Promise<void> {
     )
   } catch (err) {
     process.stderr.write(`telegram gateway: pre-restart pin sweep threw: ${(err as Error).message}\n`)
+  }
+  try {
+    await sweepActiveReactions(
+      agentDir,
+      (chatId, messageId) => lockedBot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji: '👍' as ReactionTypeEmoji['emoji'] }]),
+      { log: (msg) => process.stderr.write(`telegram gateway: pre-restart reaction sweep — ${msg}\n`) },
+    )
+  } catch (err) {
+    process.stderr.write(`telegram gateway: pre-restart reaction sweep threw: ${(err as Error).message}\n`)
   }
 }
 
@@ -2074,7 +2174,7 @@ bot.command('restart', async ctx => {
       }
     } catch {}
     writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
-    await sweepPinsBeforeSelfRestart()
+    await sweepBeforeSelfRestart()
     spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
     return
   }
@@ -2255,7 +2355,7 @@ bot.command('reconcile', async ctx => {
       if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [ackText], attachment_kinds: [] }) } catch {} }
     } catch {}
     writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: null, ts: Date.now() })
-    await sweepPinsBeforeSelfRestart()
+    await sweepBeforeSelfRestart()
     spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
     return
   }
@@ -2295,7 +2395,7 @@ bot.command('permissions', async ctx => {
 bot.command('update', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, '🔄 Running <b>switchroom update</b>… back in ~30 seconds.', { html: true })
-  await sweepPinsBeforeSelfRestart()
+  await sweepBeforeSelfRestart()
   spawnSwitchroomDetached(['update'])
 })
 
@@ -2358,9 +2458,31 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   await bot.api.setMyCommands(switchroomCommands, { scope: { type: 'all_group_chats' } })
 }
 
-// ─── Inline-button handler for permissions ────────────────────────────────
+// ─── Inline-button handler (steer + permissions) ─────────────────────────
+// Handles:
+//   - `steer:<chatId>` — "↪️ Steer" button on the progress card
+//   - `perm:(allow|deny|more):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // "↪️ Steer" button: mark the next inbound message from this chat as
+  // steering="true" regardless of prefix. Security: same allowFrom gate as
+  // the text-message path.
+  const steerM = /^steer:(-?\d+)$/.exec(data)
+  if (steerM) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chatId = steerM[1]!
+    pendingSteerChats.add(chatId)
+    await ctx.answerCallbackQuery({ text: 'Next message will steer the current task.' }).catch(() => {})
+    return
+  }
+
+  // Permission request buttons.
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
   const access = loadAccess()
@@ -2511,6 +2633,18 @@ async function shutdown(): Promise<void> {
 process.on('SIGTERM', () => void shutdown())
 process.on('SIGINT', () => void shutdown())
 
+// ─── Stale reaction sweep (gateway crash recovery) ────────────────────────
+{
+  const startupAgentDir = resolveAgentDirFromEnv()
+  if (startupAgentDir != null) {
+    void sweepActiveReactions(
+      startupAgentDir,
+      (chatId, messageId) => lockedBot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji: '👍' as ReactionTypeEmoji['emoji'] }]),
+      { log: (msg) => process.stderr.write(`telegram gateway: startup reaction sweep — ${msg}\n`) },
+    )
+  }
+}
+
 // ─── Progress card driver ─────────────────────────────────────────────────
 if (streamMode === 'checklist') {
   const startupAgentDir = resolveAgentDirFromEnv()
@@ -2569,6 +2703,15 @@ if (streamMode === 'checklist') {
             process.stderr.write(`telegram gateway: progress-card pin failed: ${err.message}\n`)
             if (agentDir != null) removeActivePin(agentDir, chatId, pinnedMessageId)
           })
+          // Add the "↪️ Steer" inline button to the progress card so the
+          // user can tap it to make their next message a steer.
+          const steerKeyboard = new InlineKeyboard().text('↪️ Steer', `steer:${chatId}`)
+          lockedBot.api.editMessageReplyMarkup(chatId, pinnedMessageId, { reply_markup: steerKeyboard }).catch(() => {})
+        }
+        if (done) {
+          // Turn complete: remove the Steer button so it can't be tapped
+          // after the card is closed.
+          lockedBot.api.editMessageReplyMarkup(chatId, result.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {})
         }
       }).catch((err: Error) => {
         process.stderr.write(`telegram gateway: progress-card emit failed: ${err.message}\n`)

@@ -27,10 +27,12 @@ export function shouldArmOrphanedReplyTimeout(params: {
   currentSessionChatId: string | null
   capturedTextCount: number
   replyCalled: boolean
+  progressCardActive?: boolean
 }): boolean {
   return (
     params.currentSessionChatId != null &&
     params.capturedTextCount > 0 &&
-    !params.replyCalled
+    !params.replyCalled &&
+    !params.progressCardActive
   )
 }
