@@ -583,6 +583,71 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.pendingAgentSpawns.size).toBe(0)
   })
 
+  it('reverse-race with duplicate prompts: oldest-startedAt orphan wins adoption', () => {
+    // Two sub-agent JSONLs land FIRST (reverse race), both with the
+    // same firstPromptText. Their `startedAt` stamps reflect the order
+    // they were discovered. When the parents arrive, they should adopt
+    // in the same order (parent_1 → oldest orphan, parent_2 → newer).
+    //
+    // Prior implementation used JS Map insertion order as the
+    // tiebreaker — which matches startedAt in this direct-reduce case
+    // but can diverge under concurrent JSONL file-watch delivery.
+    // The explicit startedAt tiebreaker makes adoption deterministic.
+    let st = fold([enqueue('go')])
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'older', firstPromptText: 'DUP' }, 5000)
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'newer', firstPromptText: 'DUP' }, 5100)
+    // Both orphans.
+    expect(st.subAgents.get('older')?.parentToolUseId).toBeNull()
+    expect(st.subAgents.get('newer')?.parentToolUseId).toBeNull()
+
+    // First parent lands — should adopt the oldest.
+    st = reduce(
+      st,
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'first', prompt: 'DUP' } },
+      5200,
+    )
+    expect(st.subAgents.get('older')?.parentToolUseId).toBe('toolu_p1')
+    expect(st.subAgents.get('older')?.description).toBe('first')
+    expect(st.subAgents.get('newer')?.parentToolUseId).toBeNull()
+
+    // Second parent adopts the remaining orphan.
+    st = reduce(
+      st,
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p2', input: { description: 'second', prompt: 'DUP' } },
+      5300,
+    )
+    expect(st.subAgents.get('newer')?.parentToolUseId).toBe('toolu_p2')
+    expect(st.subAgents.get('newer')?.description).toBe('second')
+    expect(st.pendingAgentSpawns.size).toBe(0)
+  })
+
+  it('reverse-race tiebreaker: later-arriving orphan with earlier startedAt is adopted first', () => {
+    // Construct a state where map-insertion-order DIFFERS from
+    // startedAt order. Simulates a file-watcher that delivered the
+    // "newer" sub-agent JSONL first despite it starting later — which
+    // can happen when FS events are buffered across CPU-bound gaps.
+    //
+    // Without the startedAt tiebreaker, first-match-wins on Map
+    // iteration would mis-pair; with it, the older `startedAt` always
+    // wins regardless of Map insertion order.
+    let st = fold([enqueue('go')])
+    // Insert "newer" (later startedAt) first in the map, then "older" (earlier startedAt).
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'newer', firstPromptText: 'DUP' }, 6100)
+    st = reduce(st, { kind: 'sub_agent_started', agentId: 'older', firstPromptText: 'DUP' }, 6000)
+
+    // Sanity: map iteration is insertion order.
+    expect([...st.subAgents.keys()]).toEqual(['newer', 'older'])
+
+    // First parent adopts — should pick 'older' despite 'newer' being first in map.
+    st = reduce(
+      st,
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'first', prompt: 'DUP' } },
+      6200,
+    )
+    expect(st.subAgents.get('older')?.parentToolUseId).toBe('toolu_p1')
+    expect(st.subAgents.get('newer')?.parentToolUseId).toBeNull()
+  })
+
   it('sub_agent_tool_use increments toolCount and sets currentTool', () => {
     let st = fold([
       enqueue('go'),
