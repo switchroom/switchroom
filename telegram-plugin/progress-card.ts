@@ -631,7 +631,26 @@ export interface TaskNum {
   total: number
 }
 
-export function render(state: ProgressCardState, now: number, taskNum?: TaskNum): string {
+/**
+ * Extra render hints the driver computes per flush. `stuckMs` is the
+ * gap between the caller's clock and the last real session event that
+ * updated this card. When it crosses STUCK_THRESHOLD_MS (2 min) the
+ * renderer inserts a ⚠️ stuck-warning line under the header. Zombie
+ * closure (driver `maxIdleMs`) still fires at its configured ceiling —
+ * the warning is the earlier, softer signal users see first.
+ */
+export interface RenderOptions {
+  stuckMs?: number
+}
+
+/**
+ * Below this age the renderer treats the card as "fresh" and hides the
+ * stuck-warning entirely. The 120s cutoff matches the spec in
+ * `docs/pinned-progress-card-reliability.md` §5 F10.
+ */
+export const STUCK_THRESHOLD_MS = 2 * 60_000
+
+export function render(state: ProgressCardState, now: number, taskNum?: TaskNum, opts?: RenderOptions): string {
   if (state.turnStartedAt === 0) {
     return `${STEP_PENDING} Waiting…`
   }
@@ -647,6 +666,20 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum)
   const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
+
+  // Stuck-warning: after 2 min of no session events the card is likely
+  // orphaned or the sub-agent is in a long-running silent tool call.
+  // Surface the gap early so users aren't left guessing until the 5-min
+  // zombie ceiling force-closes. Suppressed on 'done' because the warning
+  // becomes misleading once the turn has ended.
+  if (
+    state.stage !== 'done' &&
+    opts?.stuckMs != null &&
+    opts.stuckMs >= STUCK_THRESHOLD_MS
+  ) {
+    const gap = formatDuration(opts.stuckMs)
+    lines.push(`⚠️ <i>No events for ${gap} — likely stuck.</i>`)
+  }
 
   const multiAgentActive =
     isMultiAgentEnabled() &&

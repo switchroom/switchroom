@@ -375,7 +375,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // those, and an extra heartbeat edit just spends budget. (Design
         // §4.4: "heartbeat respects budget too".)
         if (isBudgetHot(cs.turnKey)) continue
-        const html = render(cs.state, now())
+        const stuckMs = Math.max(0, now() - cs.lastEventAt)
+        const html = render(cs.state, now(), undefined, { stuckMs })
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
         if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
@@ -471,7 +472,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       return
     }
     const taskNum = taskNumFor(chatState)
-    const html = render(chatState.state, now(), taskNum.total > 1 ? taskNum : undefined)
+    const stuckMs = Math.max(0, now() - chatState.lastEventAt)
+    const html = render(
+      chatState.state,
+      now(),
+      taskNum.total > 1 ? taskNum : undefined,
+      { stuckMs },
+    )
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()

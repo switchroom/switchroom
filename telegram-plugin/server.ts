@@ -254,6 +254,7 @@ import {
   clearActivePins,
 } from './active-pins.js'
 import { sweepActivePins, sweepBotAuthoredPins } from './active-pins-sweep.js'
+import { logPinEvent, classifyPinError, errorMessage } from './pin-event-log.js'
 
 /**
  * One-shot carry-over from the session-end summarizer: a short topic
@@ -1838,6 +1839,21 @@ let progressDriver: ProgressDriver | null = null
  * model's final answer lands — without waiting for turn_end.
  */
 let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
+
+/**
+ * Snapshot of the pin/unpin bookkeeping at the moment of call — wired by the
+ * `streamMode === 'checklist'` block below so the `/pins-status` admin
+ * command can render the current state. Divergence between `sidecar` and
+ * `inMemory` indicates a bug: the two should always agree while a turn is
+ * live, and both should be empty between turns.
+ */
+interface PinsStatusSnapshot {
+  sidecar: Array<{ chatId: string; messageId: number; turnKey: string; ageSec: number }>
+  inMemory: Array<{ turnKey: string; messageId: number }>
+  /** Entries present in one source but not the other. */
+  divergent: Array<{ turnKey: string; messageId: number; missingFrom: 'sidecar' | 'inMemory' }>
+}
+let getPinsStatusSnapshot: (() => PinsStatusSnapshot) | null = null
 if (streamMode === 'checklist') {
   // Failsafe: unpin any progress cards left over from a prior session
   // that crashed or was killed mid-turn. The in-memory pin map is lost
@@ -1850,7 +1866,29 @@ if (streamMode === 'checklist') {
   if (startupAgentDir != null) {
     void sweepActivePins(
       startupAgentDir,
-      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      async (chatId, messageId) => {
+        const started = Date.now()
+        try {
+          await lockedBot.api.unpinChatMessage(chatId, messageId)
+          logPinEvent({
+            event: 'sweep-pin',
+            chatId,
+            messageId,
+            outcome: 'ok',
+            durationMs: Date.now() - started,
+          })
+        } catch (err) {
+          logPinEvent({
+            event: 'sweep-pin',
+            chatId,
+            messageId,
+            outcome: classifyPinError(err),
+            error: errorMessage(err),
+            durationMs: Date.now() - started,
+          })
+          throw err
+        }
+      },
       {
         log: (msg) =>
           process.stderr.write(`telegram channel: startup pin sweep — ${msg}\n`),
@@ -1883,22 +1921,102 @@ if (streamMode === 'checklist') {
     if (unpinnedTurnKeys.has(turnKey)) return
     unpinnedTurnKeys.add(turnKey)
     progressPinnedMsgIds.delete(turnKey)
-    lockedBot.api
-      .unpinChatMessage(chatId, pinnedId)
-      .catch((err: Error) => {
-        process.stderr.write(
-          `telegram channel: progress-card unpin failed: ${err.message}\n`,
-        )
-      })
-      .finally(() => {
-        // Drop the sidecar entry regardless of unpin outcome — if
-        // the API errored the message is likely gone already, and
-        // we don't want to retry forever on startup.
-        const agentDir = resolveAgentDirFromEnv()
-        if (agentDir != null) {
-          removeActivePin(agentDir, chatId, pinnedId)
-        }
-      })
+    const started = Date.now()
+    const attemptUnpin = (attempt: number): Promise<void> =>
+      lockedBot.api
+        .unpinChatMessage(chatId, pinnedId)
+        .then(() => {
+          logPinEvent({
+            event: attempt === 1 ? 'unpin' : 'unpin-retry',
+            chatId,
+            messageId: pinnedId,
+            turnKey,
+            outcome: 'ok',
+            durationMs: Date.now() - started,
+          })
+        })
+        .catch((err: unknown) => {
+          const outcome = classifyPinError(err)
+          const message = errorMessage(err)
+          // Telegram 400 "message to unpin not found" means the pin is
+          // already gone — treat as ok and skip the retry. For other
+          // failures we do a single retry after 1s on the first attempt.
+          const isAlreadyUnpinned =
+            (err as { error_code?: number }).error_code === 400 ||
+            /not found|message_not_modified/i.test(message)
+          if (isAlreadyUnpinned) {
+            logPinEvent({
+              event: attempt === 1 ? 'unpin' : 'unpin-retry',
+              chatId,
+              messageId: pinnedId,
+              turnKey,
+              outcome: 'ok',
+              durationMs: Date.now() - started,
+            })
+            return
+          }
+          logPinEvent({
+            event: attempt === 1 ? 'unpin' : 'unpin-retry',
+            chatId,
+            messageId: pinnedId,
+            turnKey,
+            outcome,
+            error: message,
+            durationMs: Date.now() - started,
+          })
+          process.stderr.write(
+            `telegram channel: progress-card unpin failed (attempt ${attempt}): ${message}\n`,
+          )
+          if (attempt === 1) {
+            return new Promise<void>((resolve) => setTimeout(resolve, 1000)).then(() =>
+              attemptUnpin(2),
+            )
+          }
+        })
+    attemptUnpin(1).finally(() => {
+      // Drop the sidecar entry regardless of unpin outcome — if
+      // the API errored the message is likely gone already, and
+      // we don't want to retry forever on startup.
+      const agentDir = resolveAgentDirFromEnv()
+      if (agentDir != null) {
+        removeActivePin(agentDir, chatId, pinnedId)
+      }
+    })
+  }
+
+  // Expose a read-only snapshot of the pin bookkeeping so the
+  // `/pins-status` admin command can surface divergence between the
+  // sidecar and the in-memory tracker. Called on demand; never mutates.
+  getPinsStatusSnapshot = (): PinsStatusSnapshot => {
+    const agentDir = resolveAgentDirFromEnv()
+    const sidecar = agentDir != null ? readActivePins(agentDir) : []
+    const nowMs = Date.now()
+    const sidecarKeys = new Set(sidecar.map((p) => p.turnKey))
+    const inMemoryKeys = new Set(progressPinnedMsgIds.keys())
+    const divergent: PinsStatusSnapshot['divergent'] = []
+    for (const p of sidecar) {
+      if (!inMemoryKeys.has(p.turnKey)) {
+        divergent.push({ turnKey: p.turnKey, messageId: p.messageId, missingFrom: 'inMemory' })
+      }
+    }
+    for (const [turnKey, messageId] of progressPinnedMsgIds) {
+      if (!sidecarKeys.has(turnKey)) {
+        divergent.push({ turnKey, messageId, missingFrom: 'sidecar' })
+      }
+    }
+    return {
+      sidecar: sidecar.map((p) => ({
+        chatId: p.chatId,
+        messageId: p.messageId,
+        turnKey: p.turnKey,
+        ageSec: Math.max(0, Math.floor((nowMs - p.pinnedAt) / 1000)),
+      })),
+      inMemory: Array.from(progressPinnedMsgIds, ([turnKey, messageId]) => ({
+        turnKey,
+        messageId,
+      })),
+      divergent,
+    }
   }
 
   // Assign to the outer-scope variable so reply() and stream_reply(done=true)
@@ -1969,11 +2087,32 @@ if (streamMode === 'checklist') {
               pinnedAt: Date.now(),
             })
           }
+          const pinStarted = Date.now()
           lockedBot.api
             .pinChatMessage(chatId, pinnedMessageId, { disable_notification: true })
-            .catch((err: Error) => {
+            .then(() => {
+              logPinEvent({
+                event: 'pin',
+                chatId,
+                messageId: pinnedMessageId,
+                turnKey,
+                outcome: 'ok',
+                durationMs: Date.now() - pinStarted,
+              })
+            })
+            .catch((err: unknown) => {
+              const message = errorMessage(err)
+              logPinEvent({
+                event: 'pin',
+                chatId,
+                messageId: pinnedMessageId,
+                turnKey,
+                outcome: classifyPinError(err),
+                error: message,
+                durationMs: Date.now() - pinStarted,
+              })
               process.stderr.write(
-                `telegram channel: progress-card pin failed: ${err.message}\n`,
+                `telegram channel: progress-card pin failed: ${message}\n`,
               )
               if (agentDir != null) {
                 removeActivePin(agentDir, chatId, pinnedMessageId)
@@ -2840,7 +2979,29 @@ async function sweepPinsBeforeSelfRestart(): Promise<void> {
   try {
     await sweepActivePins(
       agentDir,
-      (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+      async (chatId, messageId) => {
+        const started = Date.now()
+        try {
+          await lockedBot.api.unpinChatMessage(chatId, messageId)
+          logPinEvent({
+            event: 'sweep-pin',
+            chatId,
+            messageId,
+            outcome: 'ok',
+            durationMs: Date.now() - started,
+          })
+        } catch (err) {
+          logPinEvent({
+            event: 'sweep-pin',
+            chatId,
+            messageId,
+            outcome: classifyPinError(err),
+            error: errorMessage(err),
+            durationMs: Date.now() - started,
+          })
+          throw err
+        }
+      },
       {
         log: (msg) =>
           process.stderr.write(`telegram channel: pre-restart pin sweep — ${msg}\n`),
@@ -3699,6 +3860,53 @@ bot.command('permissions', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
 })
 
+// /pins-status — diagnostic dump of the progress-card pin bookkeeping.
+//
+// Shows sidecar entries, in-memory tracker entries, and any divergence
+// between the two. Steady-state between turns both should be empty;
+// during a live turn they should agree. Any entry in `divergent` is a
+// bug symptom worth investigating.
+bot.command('pins-status', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  if (getPinsStatusSnapshot == null) {
+    await switchroomReply(ctx, 'Progress-card pin tracking is disabled (stream_mode != checklist).')
+    return
+  }
+  const snap = getPinsStatusSnapshot()
+  const lines: string[] = []
+  lines.push(
+    `<b>Pin bookkeeping</b> — sidecar: ${snap.sidecar.length}, in-memory: ${snap.inMemory.length}, divergent: ${snap.divergent.length}`,
+  )
+  if (snap.sidecar.length > 0) {
+    lines.push('')
+    lines.push('<b>Sidecar</b>')
+    for (const p of snap.sidecar) {
+      lines.push(`• <code>${escapeHtmlForTg(p.turnKey)}</code> msg=${p.messageId} (${p.ageSec}s)`)
+    }
+  }
+  if (snap.inMemory.length > 0) {
+    lines.push('')
+    lines.push('<b>In-memory</b>')
+    for (const p of snap.inMemory) {
+      lines.push(`• <code>${escapeHtmlForTg(p.turnKey)}</code> msg=${p.messageId}`)
+    }
+  }
+  if (snap.divergent.length > 0) {
+    lines.push('')
+    lines.push('<b>⚠️ Divergent</b>')
+    for (const d of snap.divergent) {
+      lines.push(
+        `• <code>${escapeHtmlForTg(d.turnKey)}</code> msg=${d.messageId} — missing from ${d.missingFrom}`,
+      )
+    }
+  }
+  if (snap.sidecar.length === 0 && snap.inMemory.length === 0) {
+    lines.push('')
+    lines.push('<i>(no active pins)</i>')
+  }
+  await switchroomReply(ctx, lines.join('\n'), { html: true })
+})
+
 // /update — git pull, reinstall, reconcile, restart agents.
 //
 // `switchroom update` always restarts agents, including the one running this
@@ -3753,6 +3961,7 @@ bot.command('switchroomhelp', async ctx => {
     '/doctor - Health check (deps, vault, hindsight, services, MCP)',
     '/reconcile [name|all] - Re-apply switchroom.yaml (default: current agent)',
     '/update - Pull latest, reinstall deps, reconcile, restart',
+    '/pins-status - Diagnose progress-card pin bookkeeping (sidecar vs in-memory)',
     '',
     'Permissions (default: current agent)',
     '/permissions [agent] - Show current allow/deny list',
@@ -4462,6 +4671,18 @@ void (async () => {
         for (const gid of Object.keys(bootAccess.groups)) chatSet.add(gid)
         const chatIds = [...chatSet]
         if (chatIds.length > 0) {
+          // Snapshot the sidecar BEFORE the sweep so the audit metric
+          // below can distinguish "orphan pin the sidecar knew about"
+          // (expected — we just swept it) from "orphan pin the sidecar
+          // did NOT know about" (real divergence — alarm-worthy).
+          const sidecarSnapshot = (() => {
+            const agentDir = resolveAgentDirFromEnv()
+            if (agentDir == null) return new Set<string>()
+            return new Set(
+              readActivePins(agentDir).map((p) => `${p.chatId}:${p.messageId}`),
+            )
+          })()
+          const orphanUntracked: Array<{ chatId: string; messageId: number }> = []
           void sweepBotAuthoredPins(
             chatIds,
             me.id,
@@ -4474,16 +4695,70 @@ void (async () => {
                 fromId: pinned.from?.id ?? null,
               }
             },
-            (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+            async (chatId, messageId) => {
+              const started = Date.now()
+              if (!sidecarSnapshot.has(`${chatId}:${messageId}`)) {
+                orphanUntracked.push({ chatId, messageId })
+              }
+              try {
+                await lockedBot.api.unpinChatMessage(chatId, messageId)
+                logPinEvent({
+                  event: 'sweep-auth',
+                  chatId,
+                  messageId,
+                  outcome: 'ok',
+                  durationMs: Date.now() - started,
+                })
+              } catch (err) {
+                logPinEvent({
+                  event: 'sweep-auth',
+                  chatId,
+                  messageId,
+                  outcome: classifyPinError(err),
+                  error: errorMessage(err),
+                  durationMs: Date.now() - started,
+                })
+                throw err
+              }
+            },
             {
               log: (msg) =>
                 process.stderr.write(`telegram channel: bot-authored pin sweep — ${msg}\n`),
             },
-          ).catch((err: Error) =>
-            process.stderr.write(
-              `telegram channel: bot-authored pin sweep failed: ${err.message}\n`,
-            ),
           )
+            .then((result) => {
+              // Audit metric: pins the sweep found that the sidecar never
+              // tracked. Steady-state this should be 0; a non-zero count
+              // on a freshly-restarted bot means a prior pin landed on
+              // Telegram without a matching sidecar entry (pin API
+              // succeeded but sidecar write failed, or sidecar file was
+              // lost). One line per-chat gives ops a grep-friendly alarm.
+              const perChat: Record<string, number> = {}
+              for (const o of orphanUntracked) {
+                perChat[o.chatId] = (perChat[o.chatId] ?? 0) + 1
+              }
+              for (const [chatId, count] of Object.entries(perChat)) {
+                logPinEvent({
+                  event: 'audit-orphan',
+                  chatId,
+                  outcome: 'observed',
+                  durationMs: count,
+                })
+              }
+              if (result.total === 0 && orphanUntracked.length === 0) {
+                logPinEvent({
+                  event: 'audit-orphan',
+                  chatId: '*',
+                  outcome: 'ok',
+                  durationMs: 0,
+                })
+              }
+            })
+            .catch((err: Error) =>
+              process.stderr.write(
+                `telegram channel: bot-authored pin sweep failed: ${err.message}\n`,
+              ),
+            )
         }
       } catch (err) {
         process.stderr.write(
