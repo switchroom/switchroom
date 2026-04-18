@@ -9,6 +9,27 @@ import type {
   ToolCallResult,
 } from "../gateway/ipc-protocol.js";
 
+/** Validate a parsed JSON object looks like a legitimate GatewayToClient
+ *  message. Returns false for malformed or unexpected shapes. Exported so
+ *  the schema can be exercised independently of the socket / connect flow. */
+export function validateGatewayMessage(msg: unknown): msg is GatewayToClient {
+  if (typeof msg !== "object" || msg === null || !("type" in msg)) return false;
+  const m = msg as Record<string, unknown>;
+  switch (m.type) {
+    case "inbound":
+      return typeof m.chatId === "string" && typeof m.text === "string";
+    case "permission":
+      return typeof m.requestId === "string"
+        && (m.behavior === "allow" || m.behavior === "deny");
+    case "status":
+      return typeof m.status === "string";
+    case "tool_call_result":
+      return typeof m.id === "string" && typeof m.success === "boolean";
+    default:
+      return false;
+  }
+}
+
 export interface IpcClientOptions {
   socketPath: string;
   agentName: string;
@@ -117,24 +138,7 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
     }
   }
 
-  /** Validate that a parsed JSON object looks like a legitimate GatewayToClient message. */
-  function validateMessage(msg: unknown): msg is GatewayToClient {
-    if (typeof msg !== "object" || msg === null || !("type" in msg)) return false;
-    const m = msg as Record<string, unknown>;
-    switch (m.type) {
-      case "inbound":
-        return typeof m.chatId === "string" && typeof m.text === "string";
-      case "permission":
-        return typeof m.requestId === "string"
-          && (m.behavior === "allow" || m.behavior === "deny");
-      case "status":
-        return typeof m.status === "string";
-      case "tool_call_result":
-        return typeof m.id === "string" && typeof m.success === "boolean";
-      default:
-        return false;
-    }
-  }
+  const validateMessage = validateGatewayMessage;
 
   function processBuffer(sock: import("bun").Socket<{ buffer: string }>): void {
     const lines = sock.data.buffer.split("\n");
