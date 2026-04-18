@@ -46,6 +46,43 @@ type SocketData = { clientId: string; buffer: string };
  *  data without newline delimiters, which would cause unbounded memory growth. */
 const MAX_BUFFER_SIZE = 1024 * 1024;
 
+/** Validate that a parsed JSON object looks like a legitimate ClientToGateway
+ *  message. Returns false for malformed or unexpected shapes. This prevents
+ *  a rogue process on the same Unix socket from injecting arbitrary payloads.
+ *
+ *  Exported so tests can exercise every field-level rejection independently
+ *  without spinning up a real Unix-socket server. */
+export function validateClientMessage(msg: unknown): msg is ClientToGateway {
+  if (typeof msg !== "object" || msg === null || !("type" in msg)) return false;
+  const m = msg as Record<string, unknown>;
+  switch (m.type) {
+    case "register":
+      return typeof m.agentName === "string"
+        && m.agentName.length > 0
+        && m.agentName.length <= 128
+        && (m.topicId === undefined
+          || (typeof m.topicId === "number"
+            && Number.isInteger(m.topicId)
+            && Number.isFinite(m.topicId)));
+    case "tool_call":
+      return typeof m.id === "string" && m.id.length > 0
+        && typeof m.tool === "string" && m.tool.length > 0
+        && typeof m.args === "object" && m.args !== null;
+    case "session_event":
+      return typeof m.event === "object" && m.event !== null
+        && typeof m.chatId === "string";
+    case "permission_request":
+      return typeof m.requestId === "string" && m.requestId.length > 0
+        && typeof m.toolName === "string"
+        && typeof m.description === "string"
+        && typeof m.inputPreview === "string";
+    case "heartbeat":
+      return typeof m.agentName === "string" && m.agentName.length > 0;
+    default:
+      return false;
+  }
+}
+
 export function createIpcServer(options: IpcServerOptions): IpcServer {
   const {
     socketPath,
@@ -72,39 +109,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     log(`client disconnected: ${client.id} (agent=${client.agentName})`);
   }
 
-  /** Validate that a parsed JSON object looks like a legitimate ClientToGateway
-   *  message. Returns false for malformed or unexpected shapes. This prevents
-   *  a rogue process on the same Unix socket from injecting arbitrary payloads. */
-  function validateMessage(msg: unknown): msg is ClientToGateway {
-    if (typeof msg !== "object" || msg === null || !("type" in msg)) return false;
-    const m = msg as Record<string, unknown>;
-    switch (m.type) {
-      case "register":
-        return typeof m.agentName === "string"
-          && m.agentName.length > 0
-          && m.agentName.length <= 128
-          && (m.topicId === undefined
-            || (typeof m.topicId === "number"
-              && Number.isInteger(m.topicId)
-              && Number.isFinite(m.topicId)));
-      case "tool_call":
-        return typeof m.id === "string" && m.id.length > 0
-          && typeof m.tool === "string" && m.tool.length > 0
-          && typeof m.args === "object" && m.args !== null;
-      case "session_event":
-        return typeof m.event === "object" && m.event !== null
-          && typeof m.chatId === "string";
-      case "permission_request":
-        return typeof m.requestId === "string" && m.requestId.length > 0
-          && typeof m.toolName === "string"
-          && typeof m.description === "string"
-          && typeof m.inputPreview === "string";
-      case "heartbeat":
-        return typeof m.agentName === "string" && m.agentName.length > 0;
-      default:
-        return false;
-    }
-  }
+  // Local alias of the exported validator — kept as a named reference so
+  // the call site below reads the same as before.
+  const validateMessage = validateClientMessage;
 
   function processBuffer(
     socket: import("bun").Socket<SocketData>,

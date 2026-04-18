@@ -28,6 +28,7 @@ import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
+import { createRetryApiCall } from '../retry-api-call.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { type SessionEvent } from '../session-tail.js'
 import { createProgressDriver, type ProgressDriver } from '../progress-card-driver.js'
@@ -448,52 +449,11 @@ function stopTypingLoop(chat_id: string): void {
 }
 
 // ─── Robust API call wrapper ──────────────────────────────────────────────
-async function robustApiCall<T>(fn: () => Promise<T>, opts?: { threadId?: number; chat_id?: string }): Promise<T> {
-  const MAX_RETRIES = 3
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      return await fn()
-    } catch (err) {
-      const isGrammyErr = err instanceof GrammyError
-      const msg = err instanceof Error ? err.message : String(err)
-      const desc = isGrammyErr ? (err as GrammyError).description : msg
-
-      if (isGrammyErr && (err as GrammyError).error_code === 429) {
-        const retryAfter = ((err as any).parameters?.retry_after ?? 5) as number
-        process.stderr.write(`telegram gateway: 429 rate limited, waiting ${retryAfter}s\n`)
-        await new Promise(r => setTimeout(r, retryAfter * 1000))
-        continue
-      }
-      if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('not modified')) {
-        return undefined as unknown as T
-      }
-      // The target message was deleted out from under us (user cleared it,
-      // gateway crashed after edit, etc). Treat as no-op rather than a hard
-      // failure. Callers that need to react to a lost message-id have their
-      // own tracking; for the common edit/delete-in-flight case this just
-      // keeps the retry loop quiet.
-      if (
-        isGrammyErr && (err as GrammyError).error_code === 400 &&
-        (desc.includes('message to edit not found') || desc.includes('message to delete not found'))
-      ) {
-        return undefined as unknown as T
-      }
-      if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('thread not found') && opts?.threadId && opts?.chat_id) {
-        throw Object.assign(new Error('THREAD_NOT_FOUND'), { original: err })
-      }
-      if (!isGrammyErr && (msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('fetch failed') || msg.includes('ENOTFOUND'))) {
-        if (attempt < MAX_RETRIES - 1) {
-          const delay = Math.pow(2, attempt) * 1000
-          process.stderr.write(`telegram gateway: network error, retrying in ${delay / 1000}s: ${msg}\n`)
-          await new Promise(r => setTimeout(r, delay))
-          continue
-        }
-      }
-      throw err
-    }
-  }
-  throw new Error('robustApiCall: max retries exceeded')
-}
+// Extracted to telegram-plugin/retry-api-call.ts so it's unit-testable in
+// isolation; the gateway just composes the pure policy with its own logger.
+const robustApiCall = createRetryApiCall({
+  log: (line) => process.stderr.write(line),
+})
 
 // ─── Structured outbound log ──────────────────────────────────────────────
 function logOutbound(
