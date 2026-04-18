@@ -316,18 +316,17 @@ HOOK_INPUT=""
 if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
 
 # Skip greeting for session recycling: agents without --continue exit after
-# each turn and systemd restarts them. If the gateway socket already existed
-# (age > 300s), the gateway was up well before we booted — this is a session
-# recycle, not a cold boot, so the user doesn't need another greeting.
-# 300s window (vs 60s) accounts for agent startup time after gateway.
-# Explicit /restart has its own "Switchroom restarted — ready" message path.
+# each turn and systemd restarts them. Dedupe by gateway socket inode — send
+# the greeting once per gateway boot, suppress on subsequent session recycles.
 GATEWAY_SOCK="$TELEGRAM_STATE_DIR/gateway.sock"
 NOW=$(date +%s)
 if [ -S "$GATEWAY_SOCK" ]; then
-  SOCK_MTIME=$(stat -c %Y "$GATEWAY_SOCK" 2>/dev/null || echo 0)
-  if [ $((NOW - SOCK_MTIME)) -gt 300 ]; then
+  SOCK_INODE=$(stat -c %i "$GATEWAY_SOCK" 2>/dev/null || echo 0)
+  GREETED_INODE_FILE="$TELEGRAM_STATE_DIR/greeted-sock-inode"
+  if [ -f "$GREETED_INODE_FILE" ] && [ "$(cat "$GREETED_INODE_FILE" 2>/dev/null)" = "$SOCK_INODE" ]; then
     exit 0
   fi
+  printf '%s' "$SOCK_INODE" > "$GREETED_INODE_FILE" 2>/dev/null || true
 fi
 
 # Idempotency guard: Claude Code fires SessionStart multiple times on some
