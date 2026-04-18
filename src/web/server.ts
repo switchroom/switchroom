@@ -1,9 +1,12 @@
 import {
   readFileSync,
-  writeFileSync,
   existsSync,
   realpathSync,
   mkdirSync,
+  openSync,
+  closeSync,
+  writeSync,
+  constants as fsConstants,
 } from "node:fs";
 import { resolve, extname, join, relative, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -66,8 +69,30 @@ function resolveWebToken(): string {
 
   const token = randomBytes(32).toString("hex");
   mkdirSync(dirname(tokenPath), { recursive: true, mode: 0o700 });
-  writeFileSync(tokenPath, token + "\n", { encoding: "utf8", mode: 0o600 });
-  return token;
+  // O_CREAT|O_EXCL: refuse to follow a pre-existing symlink or overwrite a
+  // token someone else created in the same race. If the file already exists
+  // we fall through and use the existing token (above); we only land here
+  // when it truly didn't. If a concurrent dashboard start created the file
+  // between our existsSync and openSync, EEXIST: re-read and use that.
+  try {
+    const fd = openSync(
+      tokenPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      0o600,
+    );
+    try {
+      writeSync(fd, token + "\n");
+    } finally {
+      closeSync(fd);
+    }
+    return token;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      const existing = readFileSync(tokenPath, "utf8").trim();
+      if (existing.length > 0) return existing;
+    }
+    throw err;
+  }
 }
 
 /**

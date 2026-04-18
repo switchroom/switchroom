@@ -2506,28 +2506,15 @@ function handleSessionEvent(ev: SessionEvent): void {
           currentTurnCapturedText = []
 
           void (async () => {
-            // Wait for any in-flight reply handler to complete. If the
-            // handler sets currentTurnReplyCalled during this window,
-            // we skip the backstop entirely. We check a closure-captured
-            // flag since the module-level variable has been reset.
-            let replyCalled = false
-            const originalCheck = currentTurnReplyCalled
-            await new Promise<void>(resolve => {
-              const checkInterval = setInterval(() => {
-                // The reply handler runs in the same event loop; once
-                // the tool completes it resolves. 500ms is generous for
-                // a single Telegram API call.
-              }, 50)
-              setTimeout(() => {
-                clearInterval(checkInterval)
-                resolve()
-              }, 500)
-            })
-            // Re-check: if a reply tool ran during the wait, its handler
-            // recorded the outbound message. Don't duplicate it.
-            // Since we already reset the module-level flag, we check the
-            // history DB directly for a recent outbound message to this
-            // chat in the last 2 seconds.
+            // Wait 500ms for any in-flight reply handler to finish its
+            // Telegram API call before we decide whether to duplicate it.
+            // The pre-reset check above already covers the common case
+            // (tool_use for reply was seen before turn_end); this wait
+            // covers the narrow race where the MCP reply handler is still
+            // mid-`sendMessage` when turn_end fires. History's
+            // `getRecentOutboundCount` is the post-wait signal we use.
+            await new Promise<void>(resolve => setTimeout(resolve, 500))
+
             if (HISTORY_ENABLED) {
               try {
                 const { getRecentOutboundCount } = await import('./history.js')
