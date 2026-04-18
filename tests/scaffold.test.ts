@@ -249,7 +249,7 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain('MONTHLY_BUDGET=""');
   });
 
-  it("session greeting skips session recycling via gateway socket age check", () => {
+  it("session greeting skips session recycling via gateway socket inode dedupe", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("recycle-agent", config, tmpDir, telegramConfig);
     const greeting = readFileSync(
@@ -258,8 +258,33 @@ describe("scaffoldAgent", () => {
     );
 
     expect(greeting).toContain("gateway.sock");
-    expect(greeting).toContain("SOCK_MTIME");
+    expect(greeting).toContain("SOCK_INODE");
+    expect(greeting).toContain("greeted-sock-inode");
     expect(greeting).toContain("session recycling");
+  });
+
+  it("session greeting bypasses inode dedupe when a restart marker is present", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("restart-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    // Restart marker path is resolved relative to TELEGRAM_STATE_DIR so it
+    // lands at <agentDir>/restart-pending.json — the same file written by
+    // the gateway's /restart handler.
+    expect(greeting).toContain("restart-pending.json");
+    expect(greeting).toContain('RESTART_MARKER_FILE="$(dirname "$TELEGRAM_STATE_DIR")/restart-pending.json"');
+    expect(greeting).toContain("RESTART_REQUESTED=1");
+    // The inode early-exit is gated on RESTART_REQUESTED=0 so an explicit
+    // restart fires the greeting even when the socket inode is unchanged.
+    expect(greeting).toMatch(
+      /if \[ "\$RESTART_REQUESTED" = "0" \] && \[ -f "\$GREETED_INODE_FILE" \]/,
+    );
+    // Still records the inode after firing so subsequent session recycles
+    // on the same gateway boot are properly deduped.
+    expect(greeting).toContain('printf \'%s\' "$SOCK_INODE" > "$GREETED_INODE_FILE"');
   });
 
   it("generates telegram .env with bot token", () => {
