@@ -153,8 +153,27 @@ export function markdownToHtml(text: string): string {
   // Strikethrough: ~~text~~
   result = result.replace(/~~(.+?)~~/g, '<s>$1</s>')
 
-  // Links: [text](url)
-  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+  // Links: [text](url). Two safety requirements here:
+  //
+  //  1. URL scheme allowlist. Unrestricted href accepts `javascript:` and
+  //     `data:` URIs; Telegram historically renders tg:// links directly
+  //     (opening another bot) which is a phishing primitive. Anything not
+  //     in the allowlist falls back to `#`.
+  //
+  //  2. Escape the URL before interpolating into the attribute. The HTML
+  //     tag extraction above parks whitelisted tags in \x00HTMLTAG<n>\x00
+  //     placeholders that get restored AFTER this replace. Without escaping
+  //     the href value, an adversarial `[text](x"></a><a href="evil">)` in
+  //     model output produces two <a> tags after placeholder restoration —
+  //     the second hijacks the visible link target. escapeAttr covers both
+  //     the placeholder-restoration attack and plain `"` breakout.
+  const ALLOWED_LINK_SCHEMES = /^(?:https?|mailto|tel|tg):/i
+  const escapeAttr = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, linkText: string, url: string) => {
+    const safe = ALLOWED_LINK_SCHEMES.test(url.trim()) ? url.trim() : '#'
+    return `<a href="${escapeAttr(safe)}">${linkText}</a>`
+  })
 
   // File references: wrap filename.ext patterns in <code> tags.
   // Lookbehind excludes `>` so we don't double-wrap filenames that are
@@ -172,7 +191,13 @@ export function markdownToHtml(text: string): string {
 }
 
 export function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  // Also escape `"` so callers that interpolate into HTML attribute values
+  // don't need a second helper. Safe for tag-content use too.
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
 }
 
 /**

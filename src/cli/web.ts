@@ -22,10 +22,19 @@ export function registerWebCommand(program: Command): void {
         console.log(chalk.gray(`  Agents: ${Object.keys(config.agents).join(", ")}`));
         console.log(chalk.gray(`  Port:   ${port}\n`));
 
-        startWebServer(config, port);
+        const { token } = startWebServer(config, port);
 
         console.log(
           chalk.green(`\n  Dashboard: http://localhost:${port}\n`)
+        );
+        console.log(chalk.gray(`  Token: ${token}`));
+        console.log(
+          chalk.gray(
+            "  Open the dashboard in a browser that can pass the bearer via\n" +
+              "  Authorization header or Sec-WebSocket-Protocol. Override the\n" +
+              "  token with SWITCHROOM_WEB_TOKEN env var; default persists at\n" +
+              "  ~/.switchroom/web-token.\n"
+          )
         );
       })
     );
