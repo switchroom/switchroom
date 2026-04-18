@@ -1,6 +1,16 @@
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { constants as fsConstants } from "node:fs";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { openVault, type VaultEntry } from "./vault.js";
 import { resolvePath } from "../config/loader.js";
@@ -43,6 +53,11 @@ function registerCleanupHook(): void {
       }
     }
     materializedDirs.clear();
+    // Also remove the mkdtemp root so /tmp doesn't accumulate empty dirs.
+    if (cachedRoot) {
+      try { rmSync(cachedRoot, { recursive: true, force: true }); } catch {}
+      cachedRoot = null;
+    }
   };
   process.on("exit", cleanup);
   process.on("SIGINT", () => {
@@ -55,12 +70,48 @@ function registerCleanupHook(): void {
   });
 }
 
+/**
+ * Lazily-initialised per-process materialization root. Using `mkdtempSync`
+ * gives us an unguessable 6-char suffix so a local attacker on a shared
+ * host can't pre-create the path with weaker permissions (which the old
+ * `<uid>-<pid>` scheme permitted). Each invocation of `switchroom` gets
+ * its own root; entries inside are further namespaced per-key.
+ */
+let cachedRoot: string | null = null;
 function materializationRoot(): string {
+  if (cachedRoot) return cachedRoot;
   const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg) return join(xdg, "switchroom", "vault", String(process.pid));
-  const uid =
-    typeof process.getuid === "function" ? String(process.getuid()) : "x";
-  return join(tmpdir(), `switchroom-vault-${uid}-${process.pid}`);
+  if (xdg) {
+    // XDG_RUNTIME_DIR is per-user and 0o700; mkdtemp inside the switchroom
+    // subdir is both unguessable and unreachable by other UIDs.
+    const base = join(xdg, "switchroom", "vault");
+    mkdirSync(base, { recursive: true, mode: 0o700 });
+    cachedRoot = mkdtempSync(join(base, "run-"));
+  } else {
+    cachedRoot = mkdtempSync(join(tmpdir(), "switchroom-vault-"));
+  }
+  chmodSync(cachedRoot, 0o700);
+  return cachedRoot;
+}
+
+function writeFileExclusive(
+  filePath: string,
+  content: Buffer | string,
+): void {
+  // O_CREAT | O_EXCL refuses to follow symlinks or reuse existing files,
+  // closing the TOCTOU gap where an attacker pre-creates `filePath` as a
+  // symlink into their own directory before the vault materialization.
+  const buf = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+  const fd = openSync(
+    filePath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+    0o600,
+  );
+  try {
+    writeSync(fd, buf);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function materializeFilesEntry(
@@ -77,15 +128,21 @@ export function materializeFilesEntry(
     }
   }
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // mkdirSync's mode isn't reliably applied to existing intermediates on
-  // all platforms; force it on the leaf.
   chmodSync(dir, 0o700);
+  // Defense in depth: verify the directory is owned by us and not a symlink
+  // pointing somewhere else. `mkdtemp` above guarantees this for the root,
+  // but the leaf `${root}/${key}` is created with `recursive: true` which
+  // silently succeeds on a pre-existing path.
+  const st = statSync(dir);
+  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
+    throw new Error(`Refusing to materialize vault entry: ${dir} not owned by caller`);
+  }
 
   for (const [filename, { encoding, value }] of Object.entries(files)) {
     const filePath = join(dir, filename);
     const content =
       encoding === "base64" ? Buffer.from(value, "base64") : value;
-    writeFileSync(filePath, content, { mode: 0o600 });
+    writeFileExclusive(filePath, content);
   }
 
   materializedDirs.add(dir);
@@ -102,6 +159,10 @@ export function cleanupMaterializedSecrets(): void {
     }
   }
   materializedDirs.clear();
+  if (cachedRoot) {
+    try { rmSync(cachedRoot, { recursive: true, force: true }); } catch {}
+    cachedRoot = null;
+  }
 }
 
 function resolveSingleReference(

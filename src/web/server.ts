@@ -1,7 +1,14 @@
-import { readFileSync, existsSync, realpathSync } from "node:fs";
-import { resolve, extname, join, relative } from "node:path";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  realpathSync,
+  mkdirSync,
+} from "node:fs";
+import { resolve, extname, join, relative, dirname } from "node:path";
+import { homedir } from "node:os";
 import { spawn } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
+import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   handleGetAgents,
@@ -37,6 +44,51 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
+/**
+ * Resolve the bearer token the dashboard will require for every request.
+ *
+ * Precedence: `SWITCHROOM_WEB_TOKEN` env var wins. Otherwise we generate
+ * a 256-bit random token and persist it at `~/.switchroom/web-token`
+ * (mode 0o600) — subsequent runs reuse it. Auth is NEVER optional:
+ * without a token, any website the user visits could CSRF the localhost
+ * dashboard into starting/stopping agents or streaming journal logs.
+ */
+function resolveWebToken(): string {
+  const fromEnv = process.env.SWITCHROOM_WEB_TOKEN;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+
+  const home = process.env.HOME ?? homedir();
+  const tokenPath = join(home, ".switchroom", "web-token");
+  if (existsSync(tokenPath)) {
+    const existing = readFileSync(tokenPath, "utf8").trim();
+    if (existing.length > 0) return existing;
+  }
+
+  const token = randomBytes(32).toString("hex");
+  mkdirSync(dirname(tokenPath), { recursive: true, mode: 0o700 });
+  writeFileSync(tokenPath, token + "\n", { encoding: "utf8", mode: 0o600 });
+  return token;
+}
+
+/**
+ * Reject requests whose Origin doesn't belong to our own localhost-bound
+ * server. Prevents a malicious page the user happens to load in a browser
+ * from issuing same-site-ish requests to 127.0.0.1:<port> and piggy-backing
+ * on any ambient credentials a browser might attach. We accept requests
+ * with NO Origin header (CLI / curl / same-origin) but block any Origin
+ * that isn't http[s]://localhost[:port] or http[s]://127.0.0.1[:port].
+ */
+function isOriginAllowed(req: Request, port: number): boolean {
+  const origin = req.headers.get("Origin");
+  if (!origin) return true;
+  const allowed = [
+    `http://localhost:${port}`,
+    `http://127.0.0.1:${port}`,
+    `http://[::1]:${port}`,
+  ];
+  return allowed.includes(origin);
+}
+
 function extractBearerToken(req: Request): string | null {
   const authHeader = req.headers.get("Authorization");
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -53,10 +105,7 @@ function extractBearerToken(req: Request): string | null {
   return null;
 }
 
-function checkAuth(req: Request): Response | null {
-  const token = process.env.SWITCHROOM_WEB_TOKEN;
-  if (!token) return null;
-
+function checkAuth(req: Request, token: string): Response | null {
   const presented = extractBearerToken(req);
   if (!presented || !constantTimeEqual(presented, token)) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -67,9 +116,7 @@ function checkAuth(req: Request): Response | null {
   return null;
 }
 
-function checkWsAuth(req: Request): boolean {
-  const token = process.env.SWITCHROOM_WEB_TOKEN;
-  if (!token) return true;
+function checkWsAuth(req: Request, token: string): boolean {
   const presented = extractBearerToken(req);
   return presented !== null && constantTimeEqual(presented, token);
 }
@@ -110,10 +157,11 @@ function parseRoute(
   return null;
 }
 
-export function startWebServer(config: SwitchroomConfig, port: number): void {
+export function startWebServer(config: SwitchroomConfig, port: number): { token: string } {
   const uiDirRaw = resolve(import.meta.dirname, "ui");
   // Resolve symlinks once at startup so the traversal check compares real paths.
   const uiDir = existsSync(uiDirRaw) ? realpathSync(uiDirRaw) : uiDirRaw;
+  const token = resolveWebToken();
 
   const server = Bun.serve({
     port,
@@ -122,6 +170,14 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
       const url = new URL(req.url);
       const { pathname } = url;
 
+      // Cross-origin requests from any page the user happens to load in a
+      // browser must not reach the privileged API. Reject anything whose
+      // Origin isn't our own loopback. Requests with no Origin (CLI, curl,
+      // same-origin fetches) are still allowed.
+      if (!isOriginAllowed(req, port)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
       // Handle CORS preflight — not needed for localhost-only server
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204 });
@@ -129,7 +185,7 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
 
       // WebSocket upgrade
       if (pathname === "/ws") {
-        if (!checkWsAuth(req)) {
+        if (!checkWsAuth(req, token)) {
           return new Response("Unauthorized", { status: 401 });
         }
         // If the client sent a Sec-WebSocket-Protocol header for auth, echo
@@ -149,7 +205,7 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
       // API routes — require auth if SWITCHROOM_WEB_TOKEN is set
       const route = parseRoute(pathname, req.method);
       if (route) {
-        const authError = checkAuth(req);
+        const authError = checkAuth(req, token);
         if (authError) return authError;
 
         switch (route.handler) {
@@ -297,4 +353,5 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
   });
 
   console.log(`Switchroom dashboard running at http://localhost:${server.port}`);
+  return { token };
 }

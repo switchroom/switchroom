@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  chmodSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
@@ -394,27 +403,35 @@ export function startAuthSession(
 
   // When forcing a reauth, use a clean temporary config dir so claude
   // setup-token doesn't see existing credentials and reuse the same
-  // Anthropic account.  This lets the user log in with a different account.
-  const configDir = opts.force
-    ? join(claudeDir(agentDir), `.setup-token-tmp-${Date.now()}`)
-    : claudeDir(agentDir);
-
-  // For a forced reauth we write credentials to a throwaway CLAUDE_CONFIG_DIR
-  // so the user can log in with a different account. Cleanup MUST run even
-  // if `claude setup-token` crashes, is killed, or the tmux session is torn
-  // down — otherwise OAuth artifacts linger on disk readable by anything
-  // with access to the agent dir. A bash EXIT trap gives us that guarantee;
-  // the prior `… ; rm -rf …` form only ran when every prior step succeeded.
+  // Anthropic account. This lets the user log in with a different account.
   //
-  // We route the paths through env-var expansion so the trap body references
-  // a stable variable — avoids nested quoting around shellQuote() output.
+  // Pre-create the dir *from Node* with `mkdtempSync` so the path has an
+  // unguessable random suffix (not just Date.now()) AND the dir exists with
+  // 0o700 before the tmux/bash command runs. That closes two gaps the
+  // prior shape had:
+  //   - a local process watching for `.setup-token-tmp-*` inside agentDir
+  //     could no longer predict the next name and stage a symlink/squat
+  //   - any path where `mkdir -p` silently raced with an attacker-created
+  //     world-readable dir now fails fast (mkdtemp refuses to reuse a path)
+  let configDir: string;
+  if (opts.force) {
+    configDir = mkdtempSync(join(claudeDir(agentDir), ".setup-token-tmp-"));
+    try { chmodSync(configDir, 0o700); } catch {}
+  } else {
+    configDir = claudeDir(agentDir);
+  }
+
+  // For a forced reauth, cleanup MUST still run even if `claude setup-token`
+  // crashes, is killed, or the tmux session is torn down — otherwise OAuth
+  // artifacts linger. A bash EXIT trap gives us that guarantee. We route
+  // paths through env-var expansion so the trap body references a stable
+  // variable — avoids nested quoting around shellQuote() output.
   const commandParts: string[] = []
   commandParts.push(`CLAUDE_CONFIG_DIR=${shellQuote(configDir)}`)
   commandParts.push(`LOG_PATH=${shellQuote(logPath)}`)
   if (opts.force) {
     commandParts.push(`trap 'rm -rf -- "$CLAUDE_CONFIG_DIR"' EXIT`)
   }
-  commandParts.push(`mkdir -p -- "$CLAUDE_CONFIG_DIR"`)
   commandParts.push(`export CLAUDE_CONFIG_DIR`)
   commandParts.push(`claude setup-token | tee -- "$LOG_PATH"`)
   const command = commandParts.join(" && ");
@@ -555,6 +572,11 @@ export function submitAuthCode(
     // best effort
   }
   clearAuthSessionMeta(agentDir);
+  // Belt-and-braces: the bash EXIT trap in startAuthSession removes the
+  // throwaway CLAUDE_CONFIG_DIR when the tmux pane exits, but if the tmux
+  // server was torn down by SIGKILL or the machine lost power, the trap
+  // never fires. Sweep on successful token ingest too.
+  cleanupAuthTempDirs(agentDir);
 
   return {
     completed: true,
