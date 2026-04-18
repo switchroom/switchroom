@@ -641,6 +641,10 @@ const ipcServer: IpcServer = createIpcServer({
     }
     { const ad = resolveAgentDirFromEnv(); if (ad) clearActiveReactions(ad) }
 
+    // Stop the progress-card driver's heartbeat + coalesce timers so it
+    // can't emit into deleted draft streams and spawn duplicate messages.
+    progressDriver?.dispose()
+
     // Finalize any open draft streams so they don't hang mid-edit.
     for (const [key, stream] of activeDraftStreams.entries()) {
       if (!stream.isFinal()) void stream.finalize().catch(() => {})
