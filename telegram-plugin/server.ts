@@ -1914,12 +1914,24 @@ if (streamMode === 'checklist') {
   const unpinnedTurnKeys = new Set<string>()
 
   /**
+   * Tracks deferred pin timers. A pin is only fired after 10 s so fast
+   * turns (quick replies) never pollute the Telegram pin bar. Cancelled if
+   * the turn completes before the timer fires.
+   */
+  const pendingPinTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  /**
    * Unpin the progress card for a specific turnKey. Idempotent — safe to call
    * from multiple paths (turn_end, stream_reply done, reply tool). Only the
    * first call actually fires; subsequent calls for the same turnKey are
    * no-ops via `unpinnedTurnKeys`.
    */
   function unpinProgressCard(turnKey: string, chatId: string, pinnedId: number): void {
+    const pendingTimer = pendingPinTimers.get(turnKey)
+    if (pendingTimer != null) {
+      clearTimeout(pendingTimer)
+      pendingPinTimers.delete(turnKey)
+    }
     if (unpinnedTurnKeys.has(turnKey)) return
     unpinnedTurnKeys.add(turnKey)
     progressPinnedMsgIds.delete(turnKey)
@@ -2025,6 +2037,12 @@ if (streamMode === 'checklist') {
   // can call it without depending on the checklist-mode guard.
   unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {
     const base = threadId != null ? `${chatId}:${threadId}` : chatId
+    for (const [turnKey, timer] of pendingPinTimers) {
+      if (turnKey.startsWith(`${base}:`)) {
+        clearTimeout(timer)
+        pendingPinTimers.delete(turnKey)
+      }
+    }
     for (const [turnKey, pinnedId] of progressPinnedMsgIds) {
       if (turnKey.startsWith(`${base}:`)) {
         unpinProgressCard(turnKey, chatId, pinnedId)
@@ -2069,57 +2087,64 @@ if (streamMode === 'checklist') {
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
         if (!result?.messageId) return
-        // First emit: pin the newly created progress card. Use
-        // disable_notification so the pin doesn't produce an extra push.
-        if (isFirstEmit && !progressPinnedMsgIds.has(turnKey)) {
-          progressPinnedMsgIds.set(turnKey, result.messageId)
+        // First emit: schedule a deferred pin. Only pin after 10 s so
+        // fast turns that reply quickly never clutter the pin bar.
+        // The timer is cancelled if the turn completes first.
+        if (isFirstEmit && !progressPinnedMsgIds.has(turnKey) && !pendingPinTimers.has(turnKey)) {
           const pinnedMessageId = result.messageId
-          // Write the sidecar BEFORE calling pinChatMessage so a
-          // fast-follow self-restart can never leave a pinned card on
-          // Telegram without a matching sidecar entry. The pre-restart
-          // and startup sweeps both key off the sidecar, so a late
-          // write is indistinguishable from a missing pin. If the pin
-          // API then fails, we revert the sidecar entry below.
-          const agentDir = resolveAgentDirFromEnv()
-          if (agentDir != null) {
-            addActivePin(agentDir, {
-              chatId,
-              messageId: pinnedMessageId,
-              turnKey,
-              pinnedAt: Date.now(),
-            })
-          }
-          const pinStarted = Date.now()
-          lockedBot.api
-            .pinChatMessage(chatId, pinnedMessageId, { disable_notification: true })
-            .then(() => {
-              logPinEvent({
-                event: 'pin',
+          const timer = setTimeout(() => {
+            pendingPinTimers.delete(turnKey)
+            // Turn may have completed while we were waiting — bail out.
+            if (unpinnedTurnKeys.has(turnKey)) return
+            progressPinnedMsgIds.set(turnKey, pinnedMessageId)
+            // Write the sidecar BEFORE calling pinChatMessage so a
+            // fast-follow self-restart can never leave a pinned card on
+            // Telegram without a matching sidecar entry. The pre-restart
+            // and startup sweeps both key off the sidecar, so a late
+            // write is indistinguishable from a missing pin. If the pin
+            // API then fails, we revert the sidecar entry below.
+            const agentDir = resolveAgentDirFromEnv()
+            if (agentDir != null) {
+              addActivePin(agentDir, {
                 chatId,
                 messageId: pinnedMessageId,
                 turnKey,
-                outcome: 'ok',
-                durationMs: Date.now() - pinStarted,
+                pinnedAt: Date.now(),
               })
-            })
-            .catch((err: unknown) => {
-              const message = errorMessage(err)
-              logPinEvent({
-                event: 'pin',
-                chatId,
-                messageId: pinnedMessageId,
-                turnKey,
-                outcome: classifyPinError(err),
-                error: message,
-                durationMs: Date.now() - pinStarted,
+            }
+            const pinStarted = Date.now()
+            lockedBot.api
+              .pinChatMessage(chatId, pinnedMessageId, { disable_notification: true })
+              .then(() => {
+                logPinEvent({
+                  event: 'pin',
+                  chatId,
+                  messageId: pinnedMessageId,
+                  turnKey,
+                  outcome: 'ok',
+                  durationMs: Date.now() - pinStarted,
+                })
               })
-              process.stderr.write(
-                `telegram channel: progress-card pin failed: ${message}\n`,
-              )
-              if (agentDir != null) {
-                removeActivePin(agentDir, chatId, pinnedMessageId)
-              }
-            })
+              .catch((err: unknown) => {
+                const message = errorMessage(err)
+                logPinEvent({
+                  event: 'pin',
+                  chatId,
+                  messageId: pinnedMessageId,
+                  turnKey,
+                  outcome: classifyPinError(err),
+                  error: message,
+                  durationMs: Date.now() - pinStarted,
+                })
+                process.stderr.write(
+                  `telegram channel: progress-card pin failed: ${message}\n`,
+                )
+                if (agentDir != null) {
+                  removeActivePin(agentDir, chatId, pinnedMessageId)
+                }
+              })
+          }, 10_000)
+          pendingPinTimers.set(turnKey, timer)
         }
       }).catch((err: Error) => {
         process.stderr.write(
@@ -2136,6 +2161,13 @@ if (streamMode === 'checklist') {
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
     },
     onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
+      // Cancel a pending deferred pin if the turn finished before the 10 s
+      // threshold — no need to pin at all for fast turns.
+      const pendingTimer = pendingPinTimers.get(turnKey)
+      if (pendingTimer != null) {
+        clearTimeout(pendingTimer)
+        pendingPinTimers.delete(turnKey)
+      }
       // Unpin the progress card now that the turn is done. The guard inside
       // unpinProgressCard ensures this is a no-op if reply() or
       // stream_reply(done=true) already unpinned it first.
