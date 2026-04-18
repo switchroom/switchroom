@@ -33,46 +33,13 @@ from lib.content import (
     compose_recall_query,
     format_current_time,
     format_memories,
+    read_transcript_messages,
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
 from lib.state import write_state
 
 LAST_RECALL_STATE = "last_recall.json"
-
-
-def read_transcript_messages(transcript_path: str) -> list:
-    """Read messages from a JSONL transcript file for multi-turn context.
-
-    Claude Code transcript format nests messages:
-      {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
-    Also supports flat format for testing:
-      {role: "user", content: "..."}
-    """
-    if not transcript_path or not os.path.isfile(transcript_path):
-        return []
-    messages = []
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    # Claude Code nested format: {type: "user", message: {role, content}}
-                    if entry.get("type") in ("user", "assistant"):
-                        msg = entry.get("message", {})
-                        if isinstance(msg, dict) and msg.get("role"):
-                            messages.append(msg)
-                    # Flat format (testing / future compatibility)
-                    elif "role" in entry and "content" in entry:
-                        messages.append(entry)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return messages
 
 
 def main():
@@ -135,10 +102,6 @@ def main():
         query = prompt
 
     query = truncate_recall_query(query, prompt, recall_max_query_chars)
-
-    # Final defensive cap (mirrors Openclaw)
-    if len(query) > recall_max_query_chars:
-        query = query[:recall_max_query_chars]
 
     debug_log(config, f"Recalling from bank '{bank_id}', query length: {len(query)}")
 

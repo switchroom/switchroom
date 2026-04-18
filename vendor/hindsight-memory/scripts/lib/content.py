@@ -8,8 +8,47 @@ truncateRecallQuery, sliceLastTurnsByUserBoundary, prepareRetentionTranscript,
 formatMemories.
 """
 
+import json
+import os
 import re
 from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Transcript reading (shared by recall and retain hooks)
+# ---------------------------------------------------------------------------
+
+
+def read_transcript_messages(transcript_path: str) -> list:
+    """Read messages from a JSONL transcript file.
+
+    Claude Code transcript format nests messages:
+      {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
+    Also supports flat format for testing:
+      {role: "user", content: "..."}
+    """
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return []
+    messages = []
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") in ("user", "assistant"):
+                        msg = entry.get("message", {})
+                        if isinstance(msg, dict) and msg.get("role"):
+                            messages.append(msg)
+                    elif "role" in entry and "content" in entry:
+                        messages.append(entry)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return messages
+
 
 # ---------------------------------------------------------------------------
 # Memory tag stripping (anti-feedback-loop)
@@ -397,11 +436,9 @@ _MESSAGE_TEXT_FIELDS = ("text", "body", "message", "content")
 
 # MCP tool name suffixes that are operational, not conversational.
 # Checked against the last segment of the tool name (after the last __).
-import re as _re
-
-_OPERATIONAL_TOOL_PATTERN = _re.compile(
+_OPERATIONAL_TOOL_PATTERN = re.compile(
     r"(?:recall|retain|reflect|search|extract|create_|delete_|update_|get_|list_)",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 
