@@ -646,9 +646,9 @@ describe('progress-card reducer — multi-agent correlation', () => {
   })
 
   it('flag-off renderer ignores subAgents (byte-identical legacy output)', () => {
-    // Force flag off
+    // Force flag off explicitly
     const prev = process.env.PROGRESS_CARD_MULTI_AGENT
-    delete process.env.PROGRESS_CARD_MULTI_AGENT
+    process.env.PROGRESS_CARD_MULTI_AGENT = '0'
     try {
       const st = fold([
         enqueue('go'),
@@ -666,6 +666,7 @@ describe('progress-card reducer — multi-agent correlation', () => {
       expect(html).toContain('Agent')
     } finally {
       if (prev != null) process.env.PROGRESS_CARD_MULTI_AGENT = prev
+      else delete process.env.PROGRESS_CARD_MULTI_AGENT
     }
   })
 

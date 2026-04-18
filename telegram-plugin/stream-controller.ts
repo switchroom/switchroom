@@ -47,6 +47,12 @@ export interface StreamSendOpts {
    * strips this from edit opts internally.
    */
   reply_parameters?: { message_id: number }
+  /**
+   * Inline keyboard markup. Included in both sendMessage and editMessageText
+   * so that inline buttons persist through text edits. Without this,
+   * editMessageText strips any previously attached keyboard.
+   */
+  reply_markup?: unknown
 }
 
 export type RetryPolicy = <T>(
@@ -67,6 +73,12 @@ export interface StreamControllerConfig {
    * don't include it (Telegram rejects reply_parameters on edit).
    */
   replyToMessageId?: number
+  /**
+   * Inline keyboard markup attached to every send and edit. Without this,
+   * editMessageText strips any previously attached keyboard. The progress-
+   * card driver passes the Steer button here so it persists through edits.
+   */
+  replyMarkup?: unknown
   throttleMs?: number
   /** Pre-send idle debounce. See DraftStreamConfig.idleMs. */
   idleMs?: number
@@ -109,6 +121,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     onEdit,
     log,
     replyToMessageId,
+    replyMarkup,
   } = cfg
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
@@ -118,6 +131,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     ...(parseMode ? { parse_mode: parseMode } : {}),
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+    ...(replyMarkup != null ? { reply_markup: replyMarkup } : {}),
   }
   const sendOpts: StreamSendOpts = {
     ...baseOpts,

@@ -665,7 +665,11 @@ const ipcServer: IpcServer = createIpcServer({
 
   onSessionEvent(_client: IpcClient, msg: SessionEventForward) {
     const ev = msg.event as unknown as SessionEvent
-    progressDriver?.ingest(ev, null)
+    // Pass the envelope's chatId so non-enqueue events can route to the
+    // correct card even when the driver's currentChatId is stale.
+    const chatHint = msg.chatId || null
+    const threadHint = msg.threadId != null ? String(msg.threadId) : undefined
+    progressDriver?.ingest(ev, chatHint, threadHint)
     handleSessionEvent(ev)
   },
 
@@ -1198,12 +1202,17 @@ function closeActivityLane(chatId: string, threadId: number | undefined): void {
 }
 
 function closeProgressLane(chatId: string, threadId: number | undefined): void {
-  const key = `${chatId}:${threadId ?? '_'}:progress`
-  const stream = activeDraftStreams.get(key)
-  if (stream == null) return
-  activeDraftStreams.delete(key)
-  activeDraftParseModes.delete(key)
-  void stream.finalize().catch(() => {})
+  // Progress-card streams include a turnKey suffix in their key
+  // (e.g. "chatId:_:progress:chatId:1"). Iterate and match by prefix
+  // so the backstop actually finds the stream.
+  const prefix = `${chatId}:${threadId ?? '_'}:progress`
+  for (const [key, stream] of activeDraftStreams) {
+    if (key.startsWith(prefix)) {
+      activeDraftStreams.delete(key)
+      activeDraftParseModes.delete(key)
+      void stream.finalize().catch(() => {})
+    }
+  }
 }
 
 function handleSessionEvent(ev: SessionEvent): void {
@@ -2516,9 +2525,10 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   await bot.api.setMyCommands(switchroomCommands, { scope: { type: 'all_group_chats' } })
 }
 
-// ─── Inline-button handler (steer + permissions) ─────────────────────────
+// ─── Inline-button handler (steer + stop + permissions) ──────────────────
 // Handles:
 //   - `steer:<chatId>` — "↪️ Steer" button on the progress card
+//   - `stop:<chatId>`  — "🛑 Stop" button — interrupts the agent turn
 //   - `perm:(allow|deny|more):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
@@ -2537,6 +2547,27 @@ bot.on('callback_query:data', async ctx => {
     const chatId = steerM[1]!
     pendingSteerChats.set(chatId, Date.now())
     await ctx.answerCallbackQuery({ text: 'Next message will steer the current task.' }).catch(() => {})
+    return
+  }
+
+  // "🛑 Stop" button: interrupt the current agent turn via switchroom CLI.
+  const stopM = /^stop:(-?\d+)$/.exec(data)
+  if (stopM) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const agentName = getMyAgentName()
+    try {
+      switchroomExec(['agent', 'interrupt', agentName], 5000)
+      await ctx.answerCallbackQuery({ text: `Interrupting ${agentName}…` }).catch(() => {})
+    } catch (err) {
+      const msg = (err as Error).message ?? String(err)
+      process.stderr.write(`telegram gateway: stop button interrupt failed: ${msg}\n`)
+      await ctx.answerCallbackQuery({ text: 'Interrupt failed — see logs.' }).catch(() => {})
+    }
     return
   }
 
@@ -2749,9 +2780,16 @@ if (streamMode === 'checklist') {
 
   progressDriver = createProgressDriver({
     emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
+      // Attach Steer + Stop buttons to every non-final emit so they
+      // persist through text edits (editMessageText strips reply_markup
+      // when omitted). On done, pass an empty keyboard to strip buttons.
+      const steerKeyboard = done
+        ? new InlineKeyboard()
+        : new InlineKeyboard().text('↪️ Steer', `steer:${chatId}`).text('🛑 Stop', `stop:${chatId}`)
       const args = {
         chat_id: chatId, text: html, done, message_thread_id: threadId,
         lane: 'progress', format: 'html', turnKey,
+        reply_markup: steerKeyboard,
       }
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
@@ -2772,14 +2810,11 @@ if (streamMode === 'checklist') {
             process.stderr.write(`telegram gateway: progress-card pin failed: ${err.message}\n`)
             if (agentDir != null) removeActivePin(agentDir, chatId, pinnedMessageId)
           })
-          // Add the "↪️ Steer" inline button to the progress card so the
-          // user can tap it to make their next message a steer.
-          const steerKeyboard = new InlineKeyboard().text('↪️ Steer', `steer:${chatId}`)
-          lockedBot.api.editMessageReplyMarkup(chatId, pinnedMessageId, { reply_markup: steerKeyboard }).catch(() => {})
         }
         if (done) {
-          // Turn complete: remove the Steer button so it can't be tapped
-          // after the card is closed.
+          // reply_markup is baked into baseOpts at stream creation, so the
+          // final text edit still carried the Steer keyboard. Strip it now
+          // that the turn is complete so the button can't be tapped post-card.
           lockedBot.api.editMessageReplyMarkup(chatId, result.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {})
         }
       }).catch((err: Error) => {

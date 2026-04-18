@@ -158,13 +158,13 @@ export function initialState(): ProgressCardState {
 }
 
 /**
- * Single feature flag for the whole multi-agent path. Read once and
- * latched at driver/renderer construction time so toggling mid-process
- * has no half-state risk. Flag OFF = byte-identical legacy behavior; the
- * new state fields stay empty and the renderer ignores them.
+ * Multi-agent sub-section in progress cards. Always enabled — the two-
+ * section [Main]/[Sub-agents] layout activates automatically when sub-
+ * agent events are present, and is invisible otherwise. Can be forced
+ * off with PROGRESS_CARD_MULTI_AGENT=0 for debugging.
  */
 export function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.PROGRESS_CARD_MULTI_AGENT === '1'
+  return env.PROGRESS_CARD_MULTI_AGENT !== '0'
 }
 
 // ─── Reducer ────────────────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ import { join } from 'node:path'
 
 import {
   parseQueuePrefix,
+  parseSteerPrefix,
   formatPriorAssistantPreview,
   buildChannelMetaAttributes,
 } from '../steering.js'
@@ -324,5 +325,518 @@ describe('Race: fake-timer-based timing assertions', () => {
       now: Date.now(),
     })
     expect(r2.secondsSinceTurnStart).toBe(15)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Queue lifecycle harness (models gateway.ts behavior)
+//
+// The gateway introduced a new default: mid-turn messages are queued unless
+// the user explicitly prefixes with `/steer` or `/s`. This harness tracks
+// the full lifecycle: inbound classification → queue notification → enqueue
+// cleanup → meta attributes.
+// ---------------------------------------------------------------------------
+
+interface QueueNotification {
+  chatId: string
+  messageId: number
+  threadId: number | undefined
+  pinned: boolean
+  deleted: boolean
+}
+
+interface GatewayState {
+  activeStatusReactions: Map<string, { chatId: string; threadId?: number }>
+  activeTurnStartedAt: Map<string, number>
+  pendingQueueNotifications: Map<string, QueueNotification>
+  suppressPtyPreview: Set<string>
+  currentSessionChatId: string | null
+  currentTurnStartedAt: number
+  /** Auto-incrementing message id for simulated bot-sent notifications. */
+  _nextBotMsgId: number
+}
+
+function freshGatewayState(): GatewayState {
+  return {
+    activeStatusReactions: new Map(),
+    activeTurnStartedAt: new Map(),
+    pendingQueueNotifications: new Map(),
+    suppressPtyPreview: new Set(),
+    currentSessionChatId: null,
+    currentTurnStartedAt: 0,
+    _nextBotMsgId: 9000,
+  }
+}
+
+/**
+ * Models the gateway.ts inbound handling (lines 1638-1808).
+ *
+ * Key difference from the legacy simulateInbound above: plain mid-turn
+ * messages default to queued (not steering). Only `/steer` or `/s` prefix
+ * opts into steering. `/queue` and `/q` are legacy aliases for the default
+ * queued behavior.
+ */
+function gatewaySimulateInbound(
+  state: GatewayState,
+  opts: {
+    chatId: string
+    threadId?: number
+    rawBody: string
+    priorAssistantText?: string
+    now: number
+  },
+): {
+  body: string
+  reaction: '👀' | '🤝' | null
+  queueNotificationCreated: boolean
+  metaQueued: boolean
+  metaSteering: boolean
+  metaPriorTurnInProgress: boolean
+  secondsSinceTurnStart: number | undefined
+} {
+  const { chatId, threadId, rawBody, now } = opts
+  const key = statusKey(chatId, threadId)
+
+  // Parse prefixes (mirrors gateway.ts lines 1642-1647)
+  const parsedSteer = parseSteerPrefix(rawBody)
+  const isSteerPrefix = parsedSteer.steering
+  const parsedQueue = isSteerPrefix
+    ? { queued: false, body: parsedSteer.body }
+    : parseQueuePrefix(rawBody)
+  const isQueuedPrefix = parsedQueue.queued
+  const body = isSteerPrefix
+    ? parsedSteer.body
+    : isQueuedPrefix
+      ? parsedQueue.body
+      : rawBody
+
+  // Detect prior turn in flight (gateway.ts lines 1654-1661)
+  const priorActive = state.activeStatusReactions.has(key)
+  const isSteering = priorActive && isSteerPrefix
+  let priorTurnStartedAt: number | undefined
+  if (priorActive) {
+    priorTurnStartedAt = state.activeTurnStartedAt.get(key)
+  }
+
+  // Determine reaction and queue notification (gateway.ts lines 1663-1702)
+  let reaction: '👀' | '🤝' | null = null
+  let queueNotificationCreated = false
+
+  if (isSteering) {
+    // Explicit steer: 🤝 on the inbound message, no queue notification
+    reaction = '🤝'
+  } else if (priorActive) {
+    // Queued mid-turn (default): 👀, plus queue notification
+    reaction = '👀'
+    const notifMsgId = state._nextBotMsgId++
+    state.pendingQueueNotifications.set(key, {
+      chatId,
+      messageId: notifMsgId,
+      threadId,
+      pinned: true,
+      deleted: false,
+    })
+    queueNotificationCreated = true
+  } else {
+    // Fresh turn: start tracking
+    state.activeStatusReactions.set(key, { chatId, threadId })
+    state.activeTurnStartedAt.set(key, now)
+    reaction = '👀'
+  }
+
+  // Compute meta attributes (gateway.ts lines 1744-1803)
+  const priorTurnInProgress = isSteering || priorTurnStartedAt != null
+  const isQueuedMidTurn = priorTurnInProgress && !isSteering
+  const secondsSince =
+    priorTurnStartedAt != null && priorTurnStartedAt > 0
+      ? Math.max(0, Math.floor((now - priorTurnStartedAt) / 1000))
+      : undefined
+
+  return {
+    body,
+    reaction,
+    queueNotificationCreated,
+    metaQueued: isQueuedMidTurn || isQueuedPrefix,
+    metaSteering: isSteering,
+    metaPriorTurnInProgress: priorTurnInProgress,
+    secondsSinceTurnStart: secondsSince,
+  }
+}
+
+/**
+ * Models the enqueue session event handler (server.ts lines 2332-2367).
+ * Cleans up the pending queue notification for this chat.
+ */
+function gatewaySimulateEnqueue(
+  state: GatewayState,
+  chatId: string,
+  threadId?: number,
+): { unpinnedMessageId: number | null; deletedMessageId: number | null } {
+  const key = statusKey(chatId, threadId)
+  state.currentSessionChatId = chatId
+  state.currentTurnStartedAt = Date.now()
+
+  const qn = state.pendingQueueNotifications.get(key)
+  if (qn != null) {
+    state.pendingQueueNotifications.delete(key)
+    qn.pinned = false
+    qn.deleted = true
+    return { unpinnedMessageId: qn.messageId, deletedMessageId: qn.messageId }
+  }
+  return { unpinnedMessageId: null, deletedMessageId: null }
+}
+
+/**
+ * Models turn_end for the gateway state.
+ */
+function gatewaySimulateTurnEnd(state: GatewayState, chatId: string, threadId?: number): void {
+  const k = statusKey(chatId, threadId)
+  state.activeStatusReactions.delete(k)
+  state.activeTurnStartedAt.delete(k)
+  state.suppressPtyPreview.delete(streamKey(chatId, threadId))
+  state.currentSessionChatId = null
+  state.currentTurnStartedAt = 0
+}
+
+// ---------------------------------------------------------------------------
+// Queue lifecycle tests
+// ---------------------------------------------------------------------------
+
+describe('Queue lifecycle: mid-turn message defaults to queued', () => {
+  it('plain mid-turn message gets queued="true", NOT steering="true"', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first task', now: 0 })
+
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'second task while first is running',
+      now: 5000,
+    })
+
+    expect(mid.metaQueued).toBe(true)
+    expect(mid.metaSteering).toBe(false)
+    expect(mid.metaPriorTurnInProgress).toBe(true)
+    expect(mid.reaction).toBe('👀')
+  })
+
+  it('/queue prefix mid-turn also yields queued="true" (legacy alias)', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/queue do something else',
+      now: 3000,
+    })
+
+    expect(mid.metaQueued).toBe(true)
+    expect(mid.metaSteering).toBe(false)
+    expect(mid.body).toBe('do something else')
+  })
+
+  it('first inbound (no prior turn) is NOT queued or steering', () => {
+    const s = freshGatewayState()
+    const first = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'hello',
+      now: 0,
+    })
+
+    expect(first.metaQueued).toBe(false)
+    expect(first.metaSteering).toBe(false)
+    expect(first.metaPriorTurnInProgress).toBe(false)
+  })
+})
+
+describe('Queue lifecycle: queue notification created on mid-turn message', () => {
+  it('plain mid-turn message creates a queue notification', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'queued message',
+      now: 5000,
+    })
+
+    expect(mid.queueNotificationCreated).toBe(true)
+    const key = statusKey('c1')
+    const notif = s.pendingQueueNotifications.get(key)
+    expect(notif).toBeDefined()
+    expect(notif!.chatId).toBe('c1')
+    expect(notif!.pinned).toBe(true)
+    expect(notif!.deleted).toBe(false)
+  })
+
+  it('/queue prefix mid-turn also creates a queue notification', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/queue new task',
+      now: 3000,
+    })
+
+    expect(mid.queueNotificationCreated).toBe(true)
+    expect(s.pendingQueueNotifications.size).toBe(1)
+  })
+
+  it('first inbound (no prior turn) does NOT create queue notification', () => {
+    const s = freshGatewayState()
+    const first = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'hello',
+      now: 0,
+    })
+
+    expect(first.queueNotificationCreated).toBe(false)
+    expect(s.pendingQueueNotifications.size).toBe(0)
+  })
+})
+
+describe('Queue lifecycle: enqueue cleans up queue notification', () => {
+  it('enqueue unpins and deletes the pending notification', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'queued', now: 5000 })
+
+    expect(s.pendingQueueNotifications.size).toBe(1)
+    const key = statusKey('c1')
+    const notifBefore = s.pendingQueueNotifications.get(key)
+    const notifMsgId = notifBefore!.messageId
+
+    const result = gatewaySimulateEnqueue(s, 'c1')
+
+    expect(result.unpinnedMessageId).toBe(notifMsgId)
+    expect(result.deletedMessageId).toBe(notifMsgId)
+    expect(s.pendingQueueNotifications.size).toBe(0)
+  })
+
+  it('enqueue with no pending notification is a no-op', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+
+    // No mid-turn message, so no queue notification
+    const result = gatewaySimulateEnqueue(s, 'c1')
+
+    expect(result.unpinnedMessageId).toBeNull()
+    expect(result.deletedMessageId).toBeNull()
+  })
+
+  it('enqueue for a different chat does not touch another chat\'s notification', () => {
+    const s = freshGatewayState()
+    // Chat c1: start a turn, then queue a mid-turn message
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first', now: 0 })
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'mid-turn c1', now: 3000 })
+
+    // Chat c2: start a turn
+    gatewaySimulateInbound(s, { chatId: 'c2', rawBody: 'first c2', now: 1000 })
+
+    expect(s.pendingQueueNotifications.size).toBe(1)
+
+    // Enqueue fires for c2 — should NOT clean up c1's notification
+    gatewaySimulateEnqueue(s, 'c2')
+
+    expect(s.pendingQueueNotifications.size).toBe(1)
+    expect(s.pendingQueueNotifications.has(statusKey('c1'))).toBe(true)
+  })
+})
+
+describe('Queue lifecycle: full turn_end → enqueue → process cycle', () => {
+  it('queued message processes normally after turn_end and enqueue', () => {
+    const s = freshGatewayState()
+
+    // Turn 1: first message
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'task A', now: 0 })
+
+    // Mid-turn: queued message arrives
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'task B',
+      now: 5000,
+    })
+    expect(mid.metaQueued).toBe(true)
+    expect(mid.queueNotificationCreated).toBe(true)
+
+    // Turn 1 ends
+    gatewaySimulateTurnEnd(s, 'c1')
+    expect(s.activeStatusReactions.size).toBe(0)
+    expect(s.activeTurnStartedAt.size).toBe(0)
+
+    // Queue notification is still pending until enqueue fires
+    expect(s.pendingQueueNotifications.size).toBe(1)
+
+    // Enqueue fires for the queued message — notification cleaned up
+    const enqResult = gatewaySimulateEnqueue(s, 'c1')
+    expect(enqResult.unpinnedMessageId).not.toBeNull()
+    expect(enqResult.deletedMessageId).not.toBeNull()
+    expect(s.pendingQueueNotifications.size).toBe(0)
+  })
+
+  it('after turn_end, next fresh inbound is NOT queued or steering', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'task A', now: 0 })
+    gatewaySimulateTurnEnd(s, 'c1')
+
+    const fresh = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'task B (fresh)',
+      now: 20_000,
+    })
+
+    expect(fresh.metaQueued).toBe(false)
+    expect(fresh.metaSteering).toBe(false)
+    expect(fresh.metaPriorTurnInProgress).toBe(false)
+    expect(fresh.queueNotificationCreated).toBe(false)
+  })
+})
+
+describe('Queue lifecycle: steering messages (/steer prefix) get 🤝, no queue notification', () => {
+  it('/steer prefix mid-turn gets steering="true" and 🤝 reaction, NOT queue notification', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'first task', now: 0 })
+
+    const steer = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/steer actually do it this way',
+      now: 3000,
+    })
+
+    expect(steer.metaSteering).toBe(true)
+    expect(steer.metaQueued).toBe(false)
+    expect(steer.metaPriorTurnInProgress).toBe(true)
+    expect(steer.reaction).toBe('🤝')
+    expect(steer.queueNotificationCreated).toBe(false)
+    expect(steer.body).toBe('actually do it this way')
+  })
+
+  it('/s shorthand prefix mid-turn also gets steering + 🤝', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'working on it', now: 0 })
+
+    const steer = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/s use TypeScript instead',
+      now: 2000,
+    })
+
+    expect(steer.metaSteering).toBe(true)
+    expect(steer.metaQueued).toBe(false)
+    expect(steer.reaction).toBe('🤝')
+    expect(steer.queueNotificationCreated).toBe(false)
+    expect(steer.body).toBe('use TypeScript instead')
+  })
+
+  it('/steer prefix when NO prior turn is just a normal message (not steering)', () => {
+    const s = freshGatewayState()
+
+    const first = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/steer do something',
+      now: 0,
+    })
+
+    // No prior turn, so this is treated as a fresh inbound — the /steer prefix
+    // is still parsed but isSteering requires priorActive to be true.
+    expect(first.metaSteering).toBe(false)
+    expect(first.metaQueued).toBe(false)
+    expect(first.metaPriorTurnInProgress).toBe(false)
+    // Body is still stripped of the prefix
+    expect(first.body).toBe('do something')
+  })
+
+  it('contrast: plain mid-turn gets 👀 + queue notification, /steer gets 🤝 + no notification', () => {
+    // Simulate two chats to compare side by side
+    const s = freshGatewayState()
+
+    // Chat c1: start turn, then plain mid-turn
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'start c1', now: 0 })
+    const queued = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'mid-turn plain',
+      now: 3000,
+    })
+
+    // Chat c2: start turn, then /steer mid-turn
+    gatewaySimulateInbound(s, { chatId: 'c2', rawBody: 'start c2', now: 0 })
+    const steered = gatewaySimulateInbound(s, {
+      chatId: 'c2',
+      rawBody: '/steer course correction',
+      now: 3000,
+    })
+
+    // Queued: 👀 + queue notification
+    expect(queued.reaction).toBe('👀')
+    expect(queued.queueNotificationCreated).toBe(true)
+    expect(queued.metaQueued).toBe(true)
+    expect(queued.metaSteering).toBe(false)
+
+    // Steered: 🤝 + NO queue notification
+    expect(steered.reaction).toBe('🤝')
+    expect(steered.queueNotificationCreated).toBe(false)
+    expect(steered.metaSteering).toBe(true)
+    expect(steered.metaQueued).toBe(false)
+
+    // Only c1 has a pending notification
+    expect(s.pendingQueueNotifications.size).toBe(1)
+    expect(s.pendingQueueNotifications.has(statusKey('c1'))).toBe(true)
+    expect(s.pendingQueueNotifications.has(statusKey('c2'))).toBe(false)
+  })
+})
+
+describe('Queue lifecycle: seconds_since_turn_start for queued and steered messages', () => {
+  it('queued mid-turn message reports correct seconds', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'start', now: 1_000_000 })
+
+    const mid = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'follow up',
+      now: 1_000_000 + 7000,
+    })
+
+    expect(mid.secondsSinceTurnStart).toBe(7)
+    expect(mid.metaPriorTurnInProgress).toBe(true)
+  })
+
+  it('/steer mid-turn message reports correct seconds', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'start', now: 1_000_000 })
+
+    const steer = gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: '/steer change direction',
+      now: 1_000_000 + 12000,
+    })
+
+    expect(steer.secondsSinceTurnStart).toBe(12)
+    expect(steer.metaPriorTurnInProgress).toBe(true)
+  })
+})
+
+describe('Queue lifecycle: multiple queued messages overwrite notification', () => {
+  it('second queued mid-turn message overwrites the first notification', () => {
+    const s = freshGatewayState()
+    gatewaySimulateInbound(s, { chatId: 'c1', rawBody: 'turn 1', now: 0 })
+
+    gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'queued A',
+      now: 3000,
+    })
+    const firstNotif = s.pendingQueueNotifications.get(statusKey('c1'))
+    const firstMsgId = firstNotif!.messageId
+
+    gatewaySimulateInbound(s, {
+      chatId: 'c1',
+      rawBody: 'queued B',
+      now: 6000,
+    })
+
+    // The map only holds the latest notification per key
+    expect(s.pendingQueueNotifications.size).toBe(1)
+    const secondNotif = s.pendingQueueNotifications.get(statusKey('c1'))
+    expect(secondNotif!.messageId).not.toBe(firstMsgId)
   })
 })

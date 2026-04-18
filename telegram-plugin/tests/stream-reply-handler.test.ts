@@ -974,4 +974,85 @@ describe('handleStreamReply', () => {
       expect((editOpts as { reply_parameters?: unknown })?.reply_parameters).toBeUndefined()
     })
   })
+
+  describe('reply_markup persistence', () => {
+    it('reply_markup in args is included in sendMessage opts on stream creation', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot)
+      const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'hi', reply_markup: keyboard },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBe(keyboard)
+    })
+
+    it('reply_markup persists through editMessageText on subsequent updates', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot)
+      const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+
+      const p1 = handleStreamReply(
+        { chat_id: '1', text: 'step 1', reply_markup: keyboard },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await p1
+
+      vi.advanceTimersByTime(1000)
+      const p2 = handleStreamReply(
+        { chat_id: '1', text: 'step 2', reply_markup: keyboard },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await p2
+
+      expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+      expect(bot.api.editMessageText.mock.calls[0][3]?.reply_markup).toBe(keyboard)
+    })
+
+    it('reply_markup persists through finalize flush on done=true', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot)
+      const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+
+      const p1 = handleStreamReply(
+        { chat_id: '1', text: 'draft', reply_markup: keyboard },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await p1
+
+      vi.advanceTimersByTime(1000)
+      const p2 = handleStreamReply(
+        { chat_id: '1', text: 'final', done: true, reply_markup: keyboard },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await p2
+
+      expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+      expect(bot.api.editMessageText.mock.calls[0][3]?.reply_markup).toBe(keyboard)
+    })
+
+    it('omits reply_markup when not provided in args', async () => {
+      const state = makeState()
+      const deps = makeDeps(bot)
+
+      const pending = handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBeUndefined()
+    })
+  })
 })

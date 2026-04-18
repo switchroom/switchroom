@@ -2287,12 +2287,17 @@ function closeActivityLane(chatId: string, threadId: number | undefined): void {
  * fresh Telegram message (new messageId) for its progress card.
  */
 function closeProgressLane(chatId: string, threadId: number | undefined): void {
-  const key = `${chatId}:${threadId ?? '_'}:progress`
-  const stream = activeDraftStreams.get(key)
-  if (stream == null) return
-  activeDraftStreams.delete(key)
-  activeDraftParseModes.delete(key)
-  void stream.finalize().catch(() => { /* already logged */ })
+  // Progress-card streams include a turnKey suffix in their key
+  // (e.g. "chatId:_:progress:chatId:1"). Iterate and match by prefix
+  // so the backstop actually finds the stream.
+  const prefix = `${chatId}:${threadId ?? '_'}:progress`
+  for (const [key, stream] of activeDraftStreams) {
+    if (key.startsWith(prefix)) {
+      activeDraftStreams.delete(key)
+      activeDraftParseModes.delete(key)
+      void stream.finalize().catch(() => { /* already logged */ })
+    }
+  }
 }
 
 /**
