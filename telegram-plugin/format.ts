@@ -168,11 +168,9 @@ export function markdownToHtml(text: string): string {
   //     the second hijacks the visible link target. escapeAttr covers both
   //     the placeholder-restoration attack and plain `"` breakout.
   const ALLOWED_LINK_SCHEMES = /^(?:https?|mailto|tel|tg):/i
-  const escapeAttr = (s: string): string =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
   result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, linkText: string, url: string) => {
     const safe = ALLOWED_LINK_SCHEMES.test(url.trim()) ? url.trim() : '#'
-    return `<a href="${escapeAttr(safe)}">${linkText}</a>`
+    return `<a href="${escapeHtml(safe)}">${linkText}</a>`
   })
 
   // File references: wrap filename.ext patterns in <code> tags.

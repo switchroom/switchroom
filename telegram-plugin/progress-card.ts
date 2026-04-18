@@ -264,22 +264,34 @@ export function reduce(
             ? (event.input.subagent_type as string)
             : undefined
         // Reverse-race adoption: scan orphan sub-agents (parentToolUseId
-        // null) for a prompt-text match and adopt the FIRST matching one.
-        // FIFO disambiguates duplicate-prompt bursts (rare).
+        // null) for a prompt-text match. When multiple orphans match the
+        // same prompt (parallel Agent calls with identical `prompt`), we
+        // pair the oldest orphan first — `startedAt` as tiebreaker rather
+        // than JS Map insertion order, which depends on JSONL file-watch
+        // delivery order and can scramble the pairing across concurrent
+        // sub-agent processes.
         let adopted = false
+        let bestAgentId: string | null = null
+        let bestStartedAt = Number.POSITIVE_INFINITY
         for (const [agentId, sa] of subAgents) {
           if (sa.parentToolUseId == null && sa.firstPromptText === promptText) {
-            const next = new Map(subAgents)
-            next.set(agentId, {
-              ...sa,
-              parentToolUseId: event.toolUseId,
-              description,
-              subagentType,
-            })
-            subAgents = next
-            adopted = true
-            break
+            if (sa.startedAt < bestStartedAt) {
+              bestStartedAt = sa.startedAt
+              bestAgentId = agentId
+            }
           }
+        }
+        if (bestAgentId != null) {
+          const sa = subAgents.get(bestAgentId)!
+          const next = new Map(subAgents)
+          next.set(bestAgentId, {
+            ...sa,
+            parentToolUseId: event.toolUseId,
+            description,
+            subagentType,
+          })
+          subAgents = next
+          adopted = true
         }
         if (!adopted) {
           const nextPending = new Map(pendingAgentSpawns)
