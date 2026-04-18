@@ -158,13 +158,13 @@ export function initialState(): ProgressCardState {
 }
 
 /**
- * Single feature flag for the whole multi-agent path. Read once and
- * latched at driver/renderer construction time so toggling mid-process
- * has no half-state risk. Flag OFF = byte-identical legacy behavior; the
- * new state fields stay empty and the renderer ignores them.
+ * Multi-agent sub-section in progress cards. Always enabled — the two-
+ * section [Main]/[Sub-agents] layout activates automatically when sub-
+ * agent events are present, and is invisible otherwise. Can be forced
+ * off with PROGRESS_CARD_MULTI_AGENT=0 for debugging.
  */
 export function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.PROGRESS_CARD_MULTI_AGENT === '1'
+  return env.PROGRESS_CARD_MULTI_AGENT !== '0'
 }
 
 // ─── Reducer ────────────────────────────────────────────────────────────────
@@ -631,7 +631,26 @@ export interface TaskNum {
   total: number
 }
 
-export function render(state: ProgressCardState, now: number, taskNum?: TaskNum): string {
+/**
+ * Extra render hints the driver computes per flush. `stuckMs` is the
+ * gap between the caller's clock and the last real session event that
+ * updated this card. When it crosses STUCK_THRESHOLD_MS (2 min) the
+ * renderer inserts a ⚠️ stuck-warning line under the header. Zombie
+ * closure (driver `maxIdleMs`) still fires at its configured ceiling —
+ * the warning is the earlier, softer signal users see first.
+ */
+export interface RenderOptions {
+  stuckMs?: number
+}
+
+/**
+ * Below this age the renderer treats the card as "fresh" and hides the
+ * stuck-warning entirely. The 120s cutoff matches the spec in
+ * `docs/pinned-progress-card-reliability.md` §5 F10.
+ */
+export const STUCK_THRESHOLD_MS = 2 * 60_000
+
+export function render(state: ProgressCardState, now: number, taskNum?: TaskNum, opts?: RenderOptions): string {
   if (state.turnStartedAt === 0) {
     return `${STEP_PENDING} Waiting…`
   }
@@ -647,6 +666,20 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum)
   const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
+
+  // Stuck-warning: after 2 min of no session events the card is likely
+  // orphaned or the sub-agent is in a long-running silent tool call.
+  // Surface the gap early so users aren't left guessing until the 5-min
+  // zombie ceiling force-closes. Suppressed on 'done' because the warning
+  // becomes misleading once the turn has ended.
+  if (
+    state.stage !== 'done' &&
+    opts?.stuckMs != null &&
+    opts.stuckMs >= STUCK_THRESHOLD_MS
+  ) {
+    const gap = formatDuration(opts.stuckMs)
+    lines.push(`⚠️ <i>No events for ${gap} — likely stuck.</i>`)
+  }
 
   const multiAgentActive =
     isMultiAgentEnabled() &&

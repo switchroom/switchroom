@@ -159,6 +159,56 @@ describe('createStreamController', () => {
     expect(retry.mock.calls[0][1]).toEqual({ threadId: undefined, chat_id: '1' })
   })
 
+  it('replyMarkup is included in sendMessage opts', async () => {
+    const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 1000, replyMarkup: keyboard,
+    })
+    void stream.update('hello')
+    await microtaskFlush()
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBe(keyboard)
+  })
+
+  it('replyMarkup persists through editMessageText calls', async () => {
+    const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 1000, replyMarkup: keyboard,
+    })
+
+    void stream.update('first')
+    await microtaskFlush()
+    vi.advanceTimersByTime(1000)
+    void stream.update('second')
+    await microtaskFlush()
+
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText.mock.calls[0][3]?.reply_markup).toBe(keyboard)
+  })
+
+  it('replyMarkup persists through finalize flush', async () => {
+    const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
+    const stream = createStreamController({
+      bot, chatId: '1', throttleMs: 1000, replyMarkup: keyboard,
+    })
+
+    void stream.update('draft')
+    await microtaskFlush()
+    void stream.update('final')
+    await stream.finalize()
+
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText.mock.calls[0][3]?.reply_markup).toBe(keyboard)
+  })
+
+  it('omits reply_markup when replyMarkup is not provided', async () => {
+    const stream = createStreamController({ bot, chatId: '1', throttleMs: 1000 })
+    void stream.update('hello')
+    await microtaskFlush()
+    expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBeUndefined()
+  })
+
   it('send failure is swallowed by draft-stream loop (pinned behaviour)', async () => {
     bot.api.sendMessage.mockImplementationOnce(async () => {
       throw new Error('network down')

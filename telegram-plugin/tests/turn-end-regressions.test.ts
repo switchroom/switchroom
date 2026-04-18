@@ -82,7 +82,7 @@ function wireServer(order: 'driver-first' | 'handler-first') {
     if (args.done) s.finalize()
   }
 
-  const driver = createProgressDriver({ emit, minIntervalMs: 0, coalesceMs: 0 })
+  const driver = createProgressDriver({ emit, minIntervalMs: 0, coalesceMs: 0, initialDelayMs: 0 })
 
   // Emulate server.ts closeProgressLane: delete + finalize.
   function closeProgressLane(chatId: string, threadId?: string): void {

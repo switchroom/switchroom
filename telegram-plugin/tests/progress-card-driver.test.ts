@@ -16,6 +16,7 @@ function harness(
     captureSummaries?: boolean
     heartbeatMs?: number
     maxIdleMs?: number
+    initialDelayMs?: number
     onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
   },
 ) {
@@ -33,6 +34,7 @@ function harness(
     coalesceMs,
     heartbeatMs: opts?.heartbeatMs,
     maxIdleMs: opts?.maxIdleMs,
+    initialDelayMs: opts?.initialDelayMs ?? 0,
     now: () => now,
     setTimeout: (fn, ms) => {
       const ref = nextRef++
@@ -77,10 +79,11 @@ function harness(
   return { driver, emits, summaries, advance, tick: advance }
 }
 
-const enqueue = (chatId: string, text = 'hi'): SessionEvent => ({
+let nextMsgId = 1
+const enqueue = (chatId: string, text = 'hi', msgId?: string): SessionEvent => ({
   kind: 'enqueue',
   chatId,
-  messageId: '1',
+  messageId: msgId ?? String(nextMsgId++),
   threadId: null,
   rawContent: `<channel chat_id="${chatId}">${text}</channel>`,
 })
@@ -470,6 +473,7 @@ describe('progress-card driver — zombie ceiling (maxIdleMs)', () => {
       onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
       heartbeatMs: 1000,
       maxIdleMs: 5_000,
+      initialDelayMs: 0,
       now: () => now,
       setTimeout: (fn, ms) => {
         const ref = nextRef++
@@ -578,6 +582,7 @@ describe('progress-card driver — multi-agent rate limit', () => {
       minIntervalMs: 100,
       coalesceMs: 100,
       heartbeatMs: 0,
+      initialDelayMs: 0,
       editBudgetThreshold: 3,
       editBudgetCoalesceMs: 2000,
       now: () => now,
@@ -984,7 +989,7 @@ describe('one card per task', () => {
     driver.startTurn({ chatId: 'c', userText: 'hello' })
     advance(0)
     // Session-tail echo arrives (no isSync flag) for the same chat+thread.
-    driver.ingest(enqueue('c', 'hello'), null)
+    driver.ingest(enqueue('c', 'hello', 'echo1'), null)
     advance(0)
     driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c')
     advance(0)
@@ -1015,5 +1020,175 @@ describe('one card per task', () => {
     const firstEmits = emits.filter(e => e.isFirstEmit)
     expect(firstEmits).toHaveLength(1)
     expect(firstEmits[0].turnKey).toBe('c:1')
+  })
+
+  it('late session-tail echo after fast turn_end is dropped (no orphan card)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    // Sync startTurn creates the card.
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    expect(emits.filter(e => e.isFirstEmit)).toHaveLength(1)
+
+    // Turn ends fast (before session-tail fires).
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+    const emitCountAfterEnd = emits.length
+
+    // Late session-tail echo arrives — should be dropped.
+    driver.ingest(enqueue('c', 'hello', 'echo-late'), null)
+    advance(0)
+
+    // No new emits — the echo was consumed.
+    expect(emits.length).toBe(emitCountAfterEnd)
+  })
+
+  it('multiple late echoes after turn_end are all dropped (session restarts)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    expect(emits.filter(e => e.isFirstEmit)).toHaveLength(1)
+
+    // Turn ends fast.
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+    const emitCountAfterEnd = emits.length
+
+    // First echo — Guard 2 catches and consumes pendingSyncEchoes.
+    // Guard 0 records the messageId.
+    driver.ingest(enqueue('c', 'hello', 'msg42'), null)
+    advance(0)
+    expect(emits.length).toBe(emitCountAfterEnd)
+
+    // Second echo (from session restart, same messageId) — Guard 0 catches.
+    driver.ingest(enqueue('c', 'hello', 'msg42'), null)
+    advance(0)
+    expect(emits.length).toBe(emitCountAfterEnd)
+
+    // Third echo — also caught by Guard 0.
+    driver.ingest(enqueue('c', 'hello', 'msg42'), null)
+    advance(0)
+    expect(emits.length).toBe(emitCountAfterEnd)
+  })
+
+  it('messageId dedup allows different messages through', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+    const emitCountAfterEnd = emits.length
+
+    // Echo of the original message — Guard 2 catches.
+    // Guard 0 records the messageId.
+    driver.ingest(enqueue('c', 'hello', 'msg42'), null)
+    advance(0)
+    expect(emits.length).toBe(emitCountAfterEnd)
+
+    // Second echo of same message — Guard 0 catches.
+    driver.ingest(enqueue('c', 'hello', 'msg42'), null)
+    advance(0)
+    expect(emits.length).toBe(emitCountAfterEnd)
+
+    // Different message (different messageId) — should create new card.
+    driver.ingest(enqueue('c', 'new question'), null)
+    advance(0)
+    expect(emits.length).toBeGreaterThan(emitCountAfterEnd)
+    const newFirstEmit = emits.filter(e => e.isFirstEmit)
+    expect(newFirstEmit).toHaveLength(2) // original + new
+  })
+
+  it('enqueue with null chatId is silently dropped (no ghost card)', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    // Simulate a non-channel session-tail enqueue (terminal input has no chat_id).
+    const nullEnqueue: SessionEvent = {
+      kind: 'enqueue',
+      chatId: null,
+      messageId: 'term1',
+      threadId: null,
+      rawContent: 'terminal input without channel wrapper',
+    }
+    driver.ingest(nullEnqueue, null)
+    advance(0)
+    expect(emits).toHaveLength(0)
+    expect(driver.peek('', undefined)).toBeUndefined()
+  })
+
+  it('enqueue with empty string chatId is silently dropped', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    const emptyEnqueue: SessionEvent = {
+      kind: 'enqueue',
+      chatId: '' as string,
+      messageId: 'term2',
+      threadId: null,
+      rawContent: 'no chat_id',
+    }
+    driver.ingest(emptyEnqueue, null)
+    advance(0)
+    expect(emits).toHaveLength(0)
+  })
+
+  it('ghost card (null chatId) is force-closed when a real turn starts', () => {
+    const { driver, emits, advance } = harness(0, 0)
+
+    // Start a real turn.
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    expect(emits.filter(e => e.isFirstEmit)).toHaveLength(1)
+
+    // Subsequent events route correctly.
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'tu1' }, 'c')
+    advance(0)
+    expect(emits.some(e => e.html.includes('Read'))).toBe(true)
+  })
+})
+
+describe('initial delay suppression', () => {
+  it('suppresses the card when turn_end arrives within initialDelayMs', () => {
+    const { driver, emits, advance } = harness(0, 0, { initialDelayMs: 5000 })
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+
+    // No emit yet — deferred by 5s.
+    expect(emits).toHaveLength(0)
+
+    // Turn ends at 2s (within the 5s window).
+    advance(2000)
+    driver.ingest({ kind: 'turn_end', durationMs: 2000 }, 'c')
+    advance(0)
+
+    // Card was never shown — zero emits.
+    expect(emits).toHaveLength(0)
+  })
+
+  it('shows the card after initialDelayMs if the turn is still running', () => {
+    const { driver, emits, advance } = harness(0, 0, { initialDelayMs: 5000 })
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(0)
+    expect(emits).toHaveLength(0)
+
+    // 5s passes — deferred timer fires.
+    advance(5000)
+    expect(emits).toHaveLength(1)
+    expect(emits[0].isFirstEmit).toBe(true)
+  })
+
+  it('subsequent events coalesce normally after the card appears', () => {
+    const { driver, emits, advance } = harness(500, 400, { initialDelayMs: 5000 })
+
+    driver.startTurn({ chatId: 'c', userText: 'hello' })
+    advance(5000)
+    expect(emits).toHaveLength(1)
+
+    // Tool use arrives after the card is shown — normal coalesce.
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't1' }, 'c')
+    advance(500)
+    expect(emits.length).toBeGreaterThan(1)
   })
 })

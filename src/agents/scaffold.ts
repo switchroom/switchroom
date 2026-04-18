@@ -316,17 +316,23 @@ HOOK_INPUT=""
 if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
 
 # Skip greeting for session recycling: agents without --continue exit after
-# each turn and systemd restarts them. If the gateway socket already existed
-# (age > 60s), the gateway was up before we booted — this is a session
-# recycle, not a cold boot, so the user doesn't need another greeting.
-# Explicit /restart has its own "Switchroom restarted — ready" message path.
+# each turn and systemd restarts them. Dedupe by gateway socket inode — send
+# the greeting once per gateway boot, suppress on subsequent session recycles.
+# EXCEPTION: if a restart marker exists (written by /restart, /reconcile
+# --restart, or /update), the user explicitly asked for a restart — fire the
+# greeting even when the gateway socket inode is unchanged.
 GATEWAY_SOCK="$TELEGRAM_STATE_DIR/gateway.sock"
+RESTART_MARKER_FILE="$(dirname "$TELEGRAM_STATE_DIR")/restart-pending.json"
 NOW=$(date +%s)
+RESTART_REQUESTED=0
+[ -f "$RESTART_MARKER_FILE" ] && RESTART_REQUESTED=1
 if [ -S "$GATEWAY_SOCK" ]; then
-  SOCK_MTIME=$(stat -c %Y "$GATEWAY_SOCK" 2>/dev/null || echo 0)
-  if [ $((NOW - SOCK_MTIME)) -gt 60 ]; then
+  SOCK_INODE=$(stat -c %i "$GATEWAY_SOCK" 2>/dev/null || echo 0)
+  GREETED_INODE_FILE="$TELEGRAM_STATE_DIR/greeted-sock-inode"
+  if [ "$RESTART_REQUESTED" = "0" ] && [ -f "$GREETED_INODE_FILE" ] && [ "$(cat "$GREETED_INODE_FILE" 2>/dev/null)" = "$SOCK_INODE" ]; then
     exit 0
   fi
+  printf '%s' "$SOCK_INODE" > "$GREETED_INODE_FILE" 2>/dev/null || true
 fi
 
 # Idempotency guard: Claude Code fires SessionStart multiple times on some

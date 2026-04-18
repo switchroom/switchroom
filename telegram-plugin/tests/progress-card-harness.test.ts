@@ -109,6 +109,7 @@ describe('progress-card integration harness', () => {
       coalesceMs: 20,
       minIntervalMs: 20,
       heartbeatMs: 0, // disable for this test — covered separately below
+      initialDelayMs: 0,
     })
 
     const parent = join(projectsDir, 'parent.jsonl')
@@ -190,6 +191,7 @@ describe('progress-card integration harness', () => {
       coalesceMs: 20,
       minIntervalMs: 20,
       heartbeatMs: 0,
+      initialDelayMs: 0,
     })
 
     const parent = join(projectsDir, 'parent.jsonl')
@@ -263,6 +265,7 @@ describe('progress-card integration harness', () => {
       coalesceMs: 20,
       minIntervalMs: 20,
       heartbeatMs: 0,
+      initialDelayMs: 0,
     })
 
     const parent = join(projectsDir, 'session-A.jsonl')
@@ -318,6 +321,7 @@ describe('progress-card integration harness', () => {
       coalesceMs: 50,
       minIntervalMs: 50,
       heartbeatMs: 5000,
+      initialDelayMs: 0,
       now: () => now,
       setTimeout: (fn, ms) => { const ref = nextRef++; timers.push({ fireAt: now + ms, fn, ref }); return { ref } },
       clearTimeout: (h) => { const i = timers.findIndex((t) => t.ref === (h as { ref: number }).ref); if (i !== -1) timers.splice(i, 1) },
@@ -450,6 +454,7 @@ describe('progress-card multi-agent harness', () => {
         coalesceMs: 20,
         minIntervalMs: 20,
         heartbeatMs: 0,
+        initialDelayMs: 0,
       })
       const sessionStem = 'session-A'
       const parent = join(projectsDir, `${sessionStem}.jsonl`)
@@ -521,7 +526,7 @@ describe('progress-card multi-agent harness', () => {
       const { claudeHome, cwd, projectsDir } = mkProjectsDir()
       const bot = mockBot()
       const driver = createProgressDriver({
-        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0, initialDelayMs: 0,
       })
       const stem = 'session-B'
       const parent = join(projectsDir, `${stem}.jsonl`)
@@ -559,7 +564,7 @@ describe('progress-card multi-agent harness', () => {
       const { claudeHome, cwd, projectsDir } = mkProjectsDir()
       const bot = mockBot()
       const driver = createProgressDriver({
-        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0, initialDelayMs: 0,
       })
       const stem = 'session-C'
       const parent = join(projectsDir, `${stem}.jsonl`)
@@ -594,7 +599,7 @@ describe('progress-card multi-agent harness', () => {
       const { claudeHome, cwd, projectsDir } = mkProjectsDir()
       const bot = mockBot()
       const driver = createProgressDriver({
-        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0, initialDelayMs: 0,
       })
       const stem = 'session-D'
       const parent = join(projectsDir, `${stem}.jsonl`)
@@ -630,7 +635,7 @@ describe('progress-card multi-agent harness', () => {
       const { claudeHome, cwd, projectsDir } = mkProjectsDir()
       const bot = mockBot()
       const driver = createProgressDriver({
-        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0,
+        emit: bot.emit, coalesceMs: 20, minIntervalMs: 20, heartbeatMs: 0, initialDelayMs: 0,
       })
       const stem = 'session-E'
       const parent = join(projectsDir, `${stem}.jsonl`)

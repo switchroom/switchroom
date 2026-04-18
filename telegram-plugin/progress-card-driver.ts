@@ -115,6 +115,15 @@ export interface ProgressDriverConfig {
    * outside tests).
    */
   maxIdleMs?: number
+  /**
+   * Suppress the progress card for fast turns. The first emit is
+   * deferred by this many ms after startTurn. If `turn_end` arrives
+   * before the timer fires (and isFirstEmit is still true), no card
+   * is ever shown — the user only sees the final reply.
+   *
+   * Default 5000 (5 seconds). Set to 0 to disable.
+   */
+  initialDelayMs?: number
 }
 
 /**
@@ -151,6 +160,8 @@ interface PerChatState {
   pendingTimer: unknown
   /** True until the very first flush fires for this turn. Cleared after first emit. */
   isFirstEmit: boolean
+  /** Timer for the deferred first emit (initial-delay suppression). */
+  deferredFirstEmitTimer: unknown
   /**
    * Wall-clock ms of the last real session event routed to this card.
    * Distinct from `lastEmittedAt`: the heartbeat ticks `lastEmittedAt`
@@ -218,6 +229,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const editBudgetThreshold = config.editBudgetThreshold ?? 18
   const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
+  const initialDelayMs = config.initialDelayMs ?? 5000
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
@@ -243,6 +255,19 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   // Each new startTurn increments the counter; the value is the NEXT seq
   // to allocate (so current total = value - 1 once at least one was allocated).
   const baseTurnSeqs = new Map<string, number>()
+  // Tracks base keys of turns started via isSync (startTurn). When the
+  // corresponding non-sync session-tail echo arrives, it's dropped and
+  // the entry is consumed. This prevents orphan cards when a fast turn
+  // completes before the session-tail fires its enqueue echo — Guard 1
+  // misses it because currentTurnKey is already null, but this guard
+  // catches the echo regardless of turn lifecycle state.
+  const pendingSyncEchoes = new Map<string, number>()
+  // MessageId-based dedup: tracks recently seen enqueue messageIds so
+  // that repeated delivery of the same user message (from session
+  // restarts, reconnects, or JSONL rotation) is dropped even after
+  // Guard 2's one-shot marker has been consumed. Keyed by
+  // `base:messageId` → timestamp. Entries expire after 60s.
+  const seenEnqueueMsgIds = new Map<string, number>()
 
   /** Allocate a new turn slot for chatId:threadId. Returns the unique turnKey and 1-based index. */
   function allocateTurnSlot(chatId: string, threadId?: string): { turnKey: string; index: number; total: number } {
@@ -305,6 +330,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         /* never let completion callback break the stream */
       }
     }
+    // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
+    if (cs.deferredFirstEmitTimer != null) {
+      clearT(cs.deferredFirstEmitTimer)
+      cs.deferredFirstEmitTimer = null
+    }
     chats.delete(cs.turnKey)
     lastHeartbeatBucket.delete(cs.turnKey)
     editTimestamps.delete(cs.turnKey)
@@ -334,6 +364,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       const zombies: PerChatState[] = []
       for (const [, cs] of chats) {
         if (cs.state.stage === 'done') continue
+        // Don't heartbeat a card that's still in the initial delay window.
+        if (cs.isFirstEmit && cs.deferredFirstEmitTimer !== DELAY_ELAPSED) continue
         if (maxIdleMs > 0 && now() - cs.lastEventAt > maxIdleMs) {
           zombies.push(cs)
           continue
@@ -343,7 +375,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // those, and an extra heartbeat edit just spends budget. (Design
         // §4.4: "heartbeat respects budget too".)
         if (isBudgetHot(cs.turnKey)) continue
-        const html = render(cs.state, now())
+        const stuckMs = Math.max(0, now() - cs.lastEventAt)
+        const html = render(cs.state, now(), undefined, { stuckMs })
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
         if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
@@ -361,6 +394,15 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         })
       }
       for (const cs of zombies) closeZombie(cs)
+      // Evict stale dedup entries to prevent unbounded map growth.
+      const t60 = now() - 60_000
+      for (const [k, ts] of seenEnqueueMsgIds) {
+        if (ts <= t60) seenEnqueueMsgIds.delete(k)
+      }
+      const t30 = now() - 30_000
+      for (const [k, ts] of pendingSyncEchoes) {
+        if (ts <= t30) pendingSyncEchoes.delete(k)
+      }
       // If every chat has ended, stop the heartbeat to avoid an
       // always-on timer.
       if (chats.size === 0) stopHeartbeat()
@@ -403,9 +445,40 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     return { index: activeIndex, total: activeCount }
   }
 
+  const DELAY_ELAPSED = 'elapsed'
   function flush(chatState: PerChatState, forceDone: boolean): void {
+    // Suppress the card entirely if the turn ends before the initial
+    // delay has elapsed — no point flashing a "Working…" card for a
+    // turn that completed in under initialDelayMs.
+    if (chatState.isFirstEmit && initialDelayMs > 0 && chatState.deferredFirstEmitTimer !== DELAY_ELAPSED) {
+      if (forceDone || chatState.state.stage === 'done') {
+        // Turn ended before the card was ever shown — suppress it.
+        if (chatState.deferredFirstEmitTimer != null) {
+          clearT(chatState.deferredFirstEmitTimer)
+          chatState.deferredFirstEmitTimer = null
+        }
+        return
+      }
+      // Defer the first emit — schedule it for initialDelayMs from now
+      // if not already scheduled.
+      if (chatState.deferredFirstEmitTimer == null) {
+        const capturedTurnKey = chatState.turnKey
+        chatState.deferredFirstEmitTimer = setT(() => {
+          if (!chats.has(capturedTurnKey)) return
+          chatState.deferredFirstEmitTimer = DELAY_ELAPSED
+          flush(chatState, false)
+        }, initialDelayMs)
+      }
+      return
+    }
     const taskNum = taskNumFor(chatState)
-    const html = render(chatState.state, now(), taskNum.total > 1 ? taskNum : undefined)
+    const stuckMs = Math.max(0, now() - chatState.lastEventAt)
+    const html = render(
+      chatState.state,
+      now(),
+      taskNum.total > 1 ? taskNum : undefined,
+      { stuckMs },
+    )
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()
@@ -417,9 +490,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       threadId: chatState.threadId,
       turnKey: chatState.turnKey,
       html,
-      // forceDone=true signals an externally-imposed close (e.g. a new startTurn
-      // interrupting a still-running card). Use it to override the stage check so
-      // the Telegram message is correctly marked done even if turn_end never ran.
       done: forceDone || chatState.state.stage === 'done',
       isFirstEmit: isFirst,
     })
@@ -471,19 +541,56 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         chatId = event.chatId
         threadId = event.threadId ?? undefined
 
+        // Skip enqueue events with no chatId. These come from non-channel
+        // turns (e.g. terminal input) forwarded by the bridge's session-tail.
+        // Creating a card with chatId=null spams "chat null is not allowlisted"
+        // on every emit attempt and produces a ghost card that occupies
+        // currentTurnKey, potentially interfering with real card routing.
+        if (chatId == null || chatId === '') return
+
         // A session-tail enqueue (isSync not set) arriving while a card is
         // already live for the same chat+thread is an echo of a sync
         // startTurn() call — drop it. startTurn owns the turn lifecycle for
         // non-steering messages; if we fell through we'd orphan the pinned
         // card and spawn a second "Working…" message that takes over all
         // the updates while the original stays stuck at 0ms.
-        if (!event.isSync && currentTurnKey != null) {
-          const existing = chats.get(currentTurnKey)
-          if (
-            existing != null &&
-            existing.chatId === chatId &&
-            existing.threadId === threadId
-          ) {
+        if (!event.isSync) {
+          // Guard 0 (messageId dedup): if we've already seen an enqueue
+          // with this messageId for this chat+thread, drop it. Session
+          // restarts can produce multiple echoes of the same user message
+          // (each restart re-processes the queue, writing a fresh enqueue
+          // to a new JSONL). Guard 2 only catches the first; this guard
+          // catches all subsequent duplicates by messageId.
+          if (event.messageId != null) {
+            const base = baseKey(chatId, threadId ?? undefined)
+            const dedupKey = `${base}:${event.messageId}`
+            const seenAt = seenEnqueueMsgIds.get(dedupKey)
+            if (seenAt != null && now() - seenAt < 60_000) {
+              return
+            }
+            seenEnqueueMsgIds.set(dedupKey, now())
+          }
+
+          // Guard 1: active card exists for this chat+thread.
+          if (currentTurnKey != null) {
+            const existing = chats.get(currentTurnKey)
+            if (
+              existing != null &&
+              existing.chatId === chatId &&
+              existing.threadId === threadId
+            ) {
+              return
+            }
+          }
+          // Guard 2: this enqueue is the session-tail echo of a sync
+          // startTurn() call. Drop it and consume the marker. Without
+          // this, fast turns that complete before the echo arrives would
+          // pass Guard 1 (currentTurnKey already null) and spawn an
+          // orphan card.
+          const base = baseKey(chatId, threadId ?? undefined)
+          const syncStart = pendingSyncEchoes.get(base)
+          if (syncStart != null && now() - syncStart < 30_000) {
+            pendingSyncEchoes.delete(base)
             return
           }
         }
@@ -495,12 +602,19 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
         // If an existing card is still active for this chat, force-close it
         // so it gets properly done/unpinned before the new card takes over.
+        // Also close ghost cards (chatId is null/empty) — these come from
+        // non-channel session-tail events that slipped through before the
+        // null guard above was added, or from a race.
         if (currentTurnKey != null) {
           const existing = chats.get(currentTurnKey)
-          if (existing != null && existing.chatId === chatId) {
+          if (existing != null && (existing.chatId === chatId || !existing.chatId)) {
             if (existing.pendingTimer != null) {
               clearT(existing.pendingTimer)
               existing.pendingTimer = null
+            }
+            if (existing.deferredFirstEmitTimer != null) {
+              clearT(existing.deferredFirstEmitTimer)
+              existing.deferredFirstEmitTimer = null
             }
             flush(existing, /*forceDone*/ true)
             const existingTaskNum = taskNumFor(existing)
@@ -517,6 +631,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
                 })
               } catch { /* never let completion callback break the stream */ }
             }
+            // Don't clear pendingSyncEchoes here — the echo may arrive AFTER
+            // this force-close. Guard 2 consumes it on arrival.
             chats.delete(currentTurnKey)
             lastHeartbeatBucket.delete(currentTurnKey)
             editTimestamps.delete(currentTurnKey)
@@ -537,9 +653,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           lastEmittedHtml: null,
           pendingTimer: null,
           isFirstEmit: true,
+          deferredFirstEmitTimer: null,
           lastEventAt: now(),
         }
         chats.set(slot.turnKey, chatState)
+        if (event.isSync) {
+          pendingSyncEchoes.set(baseKey(chatId, threadId), now())
+        }
         startHeartbeatIfNeeded()
         flush(chatState, /*forceDone*/ false)
         return
@@ -606,6 +726,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
             } catch {
               /* never let completion callback break the stream */
             }
+          }
+          // Record turn_end so late enqueue echoes from the session-tail
+          // are dropped (see Guard 2 in the enqueue handler above).
+          // Don't clear pendingSyncEchoes — the echo may arrive after turn_end.
+          // Cancel deferred first-emit timer if the card was never shown.
+          if (chatState.deferredFirstEmitTimer != null) {
+            clearT(chatState.deferredFirstEmitTimer)
+            chatState.deferredFirstEmitTimer = null
           }
           // Drop the chat state so a subsequent turn starts clean.
           chats.delete(chatState.turnKey)
@@ -696,7 +824,17 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           clearT(cs.pendingTimer)
           cs.pendingTimer = null
         }
+        if (cs.deferredFirstEmitTimer != null) {
+          clearT(cs.deferredFirstEmitTimer)
+          cs.deferredFirstEmitTimer = null
+        }
       }
+      chats.clear()
+      currentChatId = null
+      currentThreadId = undefined
+      currentTurnKey = null
+      pendingSyncEchoes.clear()
+      seenEnqueueMsgIds.clear()
     },
   }
 }

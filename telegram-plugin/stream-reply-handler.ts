@@ -64,6 +64,12 @@ export interface StreamReplyArgs {
    * lane callers may leave this undefined to preserve legacy behavior.
    */
   turnKey?: string
+  /**
+   * Inline keyboard markup. When set, every send and edit for this stream
+   * includes it so Telegram doesn't strip an attached keyboard on text
+   * updates. Used by the progress-card driver to persist the Steer button.
+   */
+  reply_markup?: unknown
 }
 
 export interface StreamReplyState {
@@ -348,6 +354,7 @@ export async function handleStreamReply(
       throttleMs: deps.throttleMs ?? 600,
       retry: deps.retry,
       ...(replyToMessageId != null ? { replyToMessageId } : {}),
+      ...(args.reply_markup != null ? { replyMarkup: args.reply_markup } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
       onEdit: (messageId, charCount) =>
