@@ -174,6 +174,61 @@ describe("planImport", () => {
     expect(byName["secrets.env:UNKNOWN_KEY"].action.kind).toBe("warn");
   });
 
+  it("maps previously-unmapped credentials (ziggy, lisa, bank, etc.)", () => {
+    writeFile(tree.dir, "discord-bot-token-ziggy", "ziggy-token\n");
+    writeFile(tree.dir, "microsoft-tokens-ken.json", `{"access":"x"}`);
+    writeFile(tree.dir, "telegram-bot-token-lisa", "lisa-token\n");
+    writeFile(tree.dir, "telegram-lisa-allowFrom.json", `{"ids":[1]}`);
+    writeFile(tree.dir, "telegram-lisa-pairing.json", `{"dm":true}`);
+    writeFile(tree.dir, "bank-agent-private-key", "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n");
+    writeFile(tree.dir, "email-kengpt.json", `{"client_id":"e"}`);
+    writeFile(tree.dir, "pixsoul-ubuntu-key", "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n");
+    writeFile(tree.dir, "synology-kengpt.json", `{"host":"nas"}`);
+
+    const plan = planImport(tree.dir);
+    const byName = Object.fromEntries(plan.map((p) => [p.sourceName, p]));
+
+    expect(byName["discord-bot-token-ziggy"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "discord/ziggy-bot-token",
+    });
+    expect(byName["microsoft-tokens-ken.json"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "microsoft/ken-tokens",
+    });
+    expect(byName["telegram-bot-token-lisa"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "telegram/lisa-bot-token",
+    });
+    expect(byName["telegram-lisa-allowFrom.json"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "telegram/lisa-allowfrom",
+    });
+    expect(byName["telegram-lisa-pairing.json"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "telegram/lisa-pairing",
+    });
+    expect(byName["bank-agent-private-key"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "bank/agent-private-key",
+    });
+    expect(byName["email-kengpt.json"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "email/kengpt-client",
+    });
+    expect(byName["pixsoul-ubuntu-key"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "ssh/pixsoul-ubuntu",
+    });
+    expect(byName["synology-kengpt.json"].action).toMatchObject({
+      kind: "set-string",
+      vaultKey: "synology/kengpt",
+    });
+
+    const warns = plan.filter((p) => p.action.kind === "warn");
+    expect(warns).toHaveLength(0);
+  });
+
   it("warns on unknown files instead of guessing", () => {
     writeFile(tree.dir, "mystery-file", "data");
     const plan = planImport(tree.dir);
