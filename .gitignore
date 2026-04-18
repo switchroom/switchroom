@@ -19,6 +19,9 @@ dist/
 # Personal notes, drafts, and host-specific scratch work
 /private/
 
+# Claude Code local settings (per-user tool allowlist, etc)
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db
