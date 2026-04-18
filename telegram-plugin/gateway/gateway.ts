@@ -30,6 +30,7 @@ import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
+import { createPinManager } from '../progress-card-pin-manager.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { type SessionEvent } from '../session-tail.js'
 import { createProgressDriver, type ProgressDriver } from '../progress-card-driver.js'
@@ -2672,26 +2673,26 @@ if (streamMode === 'checklist') {
     )
   }
 
-  const progressPinnedMsgIds = new Map<string, number>()
-  const unpinnedTurnKeys = new Set<string>()
-
-  function unpinProgressCard(turnKey: string, chatId: string, pinnedId: number): void {
-    if (unpinnedTurnKeys.has(turnKey)) return
-    unpinnedTurnKeys.add(turnKey)
-    progressPinnedMsgIds.delete(turnKey)
-    lockedBot.api.unpinChatMessage(chatId, pinnedId).catch((err: Error) => {
-      process.stderr.write(`telegram gateway: progress-card unpin failed: ${err.message}\n`)
-    }).finally(() => {
+  // Pin lifecycle: extracted to progress-card-pin-manager.ts. The manager
+  // owns the `progressPinnedMsgIds` map, the `unpinnedTurnKeys` dedupe
+  // set, the active-pins sidecar calls, and the pin/unpin API wiring —
+  // previously all inline here.
+  const pinMgr = createPinManager({
+    pin: (chatId, messageId, opts) => lockedBot.api.pinChatMessage(chatId, messageId, opts),
+    unpin: (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+    addPin: (entry) => {
       const agentDir = resolveAgentDirFromEnv()
-      if (agentDir != null) removeActivePin(agentDir, chatId, pinnedId)
-    })
-  }
+      if (agentDir != null) addActivePin(agentDir, entry)
+    },
+    removePin: (chatId, messageId) => {
+      const agentDir = resolveAgentDirFromEnv()
+      if (agentDir != null) removeActivePin(agentDir, chatId, messageId)
+    },
+    log: (line) => process.stderr.write(line),
+  })
 
   unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {
-    const base = threadId != null ? `${chatId}:${threadId}` : chatId
-    for (const [turnKey, pinnedId] of progressPinnedMsgIds) {
-      if (turnKey.startsWith(`${base}:`)) unpinProgressCard(turnKey, chatId, pinnedId)
-    }
+    pinMgr.unpinForChat(chatId, threadId)
   }
 
   progressDriver = createProgressDriver({
@@ -2708,18 +2709,13 @@ if (streamMode === 'checklist') {
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
         if (!result?.messageId) return
-        if (isFirstEmit && !progressPinnedMsgIds.has(turnKey)) {
-          progressPinnedMsgIds.set(turnKey, result.messageId)
-          const pinnedMessageId = result.messageId
-          const agentDir = resolveAgentDirFromEnv()
-          if (agentDir != null) {
-            addActivePin(agentDir, { chatId, messageId: pinnedMessageId, turnKey, pinnedAt: Date.now() })
-          }
-          lockedBot.api.pinChatMessage(chatId, pinnedMessageId, { disable_notification: true }).catch((err: Error) => {
-            process.stderr.write(`telegram gateway: progress-card pin failed: ${err.message}\n`)
-            if (agentDir != null) removeActivePin(agentDir, chatId, pinnedMessageId)
-          })
-        }
+        pinMgr.considerPin({
+          chatId,
+          threadId,
+          turnKey,
+          messageId: result.messageId,
+          isFirstEmit,
+        })
       }).catch((err: Error) => {
         process.stderr.write(`telegram gateway: progress-card emit failed: ${err.message}\n`)
       })
@@ -2729,9 +2725,7 @@ if (streamMode === 'checklist') {
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
     },
     onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
-      const pinnedId = progressPinnedMsgIds.get(turnKey)
-      if (pinnedId != null) unpinProgressCard(turnKey, chatId, pinnedId)
-      unpinnedTurnKeys.delete(turnKey)
+      pinMgr.completeTurn({ chatId, threadId, turnKey })
       if (threadId != null) {
         lockedBot.api.sendMessage(chatId, `✅ Done — ${summary}`).catch((err: Error) => {
           process.stderr.write(`telegram gateway: completion message failed: ${err.message}\n`)
