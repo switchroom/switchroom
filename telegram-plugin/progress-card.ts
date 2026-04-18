@@ -300,9 +300,22 @@ export function reduce(
           narratives = [...narratives.slice(0, -1), { ...last, toolCount: last.toolCount + 1 }]
         }
       }
+      // Cap the raw item history. Only the last MAX_VISIBLE_ITEMS are
+      // rendered (see renderChecklist), and pairing of tool_result to
+      // tool_use happens by toolUseId — not by position — so keeping
+      // thousands of historical entries around only slows rendering and
+      // leaks memory on long turns. We keep ~10× the visible window so
+      // pairings for results arriving after many intervening tool uses
+      // still find their running partner.
+      const ITEM_HISTORY_CAP = MAX_VISIBLE_ITEMS * 10
+      const appended = [...state.items, nextItem]
+      const boundedItems =
+        appended.length > ITEM_HISTORY_CAP
+          ? appended.slice(appended.length - ITEM_HISTORY_CAP)
+          : appended
       return {
         ...state,
-        items: [...state.items, nextItem],
+        items: boundedItems,
         narratives,
         stage: 'run',
         thinking: false,

@@ -1,5 +1,13 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  renameSync,
+  copyFileSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { resolveStatePath } from "../config/paths.js";
 
 export interface TopicEntry {
@@ -32,8 +40,18 @@ export function loadTopicState(statePath?: string): TopicState {
       return parsed as TopicState;
     }
 
+    // Shape is wrong — warn loudly and keep a backup so the operator can
+    // recover the topic → thread id mapping. Silent fallback used to hide
+    // state corruption until the agent couldn't find its topic.
+    console.warn(
+      `switchroom: topics state at ${path} is malformed; keeping a backup at ${path}.corrupt and starting fresh.`,
+    );
+    try { copyFileSync(path, `${path}.corrupt`); } catch {}
     return { topics: {} };
-  } catch {
+  } catch (err) {
+    console.warn(
+      `switchroom: failed to read topics state at ${path} (${(err as Error).message}); starting fresh.`,
+    );
     return { topics: {} };
   }
 }
@@ -46,5 +64,16 @@ export function saveTopicState(state: TopicState, statePath?: string): void {
     mkdirSync(dir, { recursive: true });
   }
 
-  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  // Atomic write: write to a temp file in the same directory, then rename.
+  // A crash mid-write won't leave a truncated/empty topics.json that loses
+  // every topic mapping.
+  const absDir = resolve(dir);
+  const tmp = resolve(absDir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+    renameSync(tmp, path);
+  } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }

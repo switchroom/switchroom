@@ -399,10 +399,25 @@ export function startAuthSession(
     ? join(claudeDir(agentDir), `.setup-token-tmp-${Date.now()}`)
     : claudeDir(agentDir);
 
-  const command = [
-    `mkdir -p ${shellQuote(configDir)}`,
-    `env CLAUDE_CONFIG_DIR=${shellQuote(configDir)} claude setup-token | tee ${shellQuote(logPath)}`,
-  ].join(" && ") + (opts.force ? `; rm -rf ${shellQuote(configDir)}` : "");
+  // For a forced reauth we write credentials to a throwaway CLAUDE_CONFIG_DIR
+  // so the user can log in with a different account. Cleanup MUST run even
+  // if `claude setup-token` crashes, is killed, or the tmux session is torn
+  // down — otherwise OAuth artifacts linger on disk readable by anything
+  // with access to the agent dir. A bash EXIT trap gives us that guarantee;
+  // the prior `… ; rm -rf …` form only ran when every prior step succeeded.
+  //
+  // We route the paths through env-var expansion so the trap body references
+  // a stable variable — avoids nested quoting around shellQuote() output.
+  const commandParts: string[] = []
+  commandParts.push(`CLAUDE_CONFIG_DIR=${shellQuote(configDir)}`)
+  commandParts.push(`LOG_PATH=${shellQuote(logPath)}`)
+  if (opts.force) {
+    commandParts.push(`trap 'rm -rf -- "$CLAUDE_CONFIG_DIR"' EXIT`)
+  }
+  commandParts.push(`mkdir -p -- "$CLAUDE_CONFIG_DIR"`)
+  commandParts.push(`export CLAUDE_CONFIG_DIR`)
+  commandParts.push(`claude setup-token | tee -- "$LOG_PATH"`)
+  const command = commandParts.join(" && ");
 
   tmux(["new-session", "-d", "-s", sessionName, "-c", agentDir, `bash -lc ${shellQuote(command)}`]);
   writeAuthSessionMeta(agentDir, {

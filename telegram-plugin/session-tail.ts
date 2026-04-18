@@ -121,11 +121,20 @@ function parseChannelMeta(content: string): {
 }
 
 /**
+ * Hard cap on a single JSONL line before we parse it. Transcript entries
+ * can embed large tool outputs; a pathological 100 MB line would OOM the
+ * plugin on parse. 2 MB is comfortably above any realistic Claude output
+ * chunk and keeps memory predictable under a corrupted or malicious file.
+ */
+const MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+
+/**
  * Project a single transcript line into a SessionEvent (or null if it's
  * uninteresting noise). Caller is responsible for the JSON parse — if a
  * line is not valid JSON we skip it.
  */
 export function projectTranscriptLine(line: string): SessionEvent[] {
+  if (line.length > MAX_JSONL_LINE_BYTES) return []
   let obj: Record<string, unknown>
   try {
     obj = JSON.parse(line)

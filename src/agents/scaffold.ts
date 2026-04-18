@@ -32,7 +32,9 @@ import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../mem
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
+import { resolvePath } from "../config/loader.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
+import { openVault, VaultError } from "../vault/vault.js";
 import {
   findExistingClaudeJson,
   copyOnboardingState,
@@ -58,12 +60,12 @@ function resolveBotToken(rawToken: string): string | undefined {
     return rawToken;
   }
 
-  // Try vault resolution via passphrase
+  // Try vault resolution via passphrase. Static imports here (rather than
+  // lazy require) so import-time errors surface loudly instead of falling
+  // back silently to env vars and masking a real config problem.
   const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (passphrase) {
     try {
-      const { openVault } = require("../vault/vault.js") as typeof import("../vault/vault.js");
-      const { resolvePath } = require("../config/loader.js") as typeof import("../config/loader.js");
       const vaultPath = resolvePath(process.env.SWITCHROOM_VAULT_PATH ?? "~/.switchroom/vault.enc");
       const secrets = openVault(passphrase, vaultPath);
       const key = parseVaultReference(rawToken);
@@ -71,7 +73,13 @@ function resolveBotToken(rawToken: string): string | undefined {
       if (entry && entry.kind === "string") {
         return entry.value;
       }
-    } catch { /* vault not available */ }
+    } catch (err) {
+      // Known "vault missing / wrong passphrase" outcomes are expected when
+      // callers haven't set one up — fall through to env-var fallback. Any
+      // other error is a real problem and should bubble up so the user sees
+      // it instead of silently using a stale token from the environment.
+      if (!(err instanceof VaultError)) throw err;
+    }
   }
 
   // Fall back to TELEGRAM_BOT_TOKEN env var

@@ -295,35 +295,47 @@ async function closeForumTopic(
   }
 }
 
+// In-process serialization: ensure load → mutate → save runs to completion
+// before a second caller can start. Two concurrent cleanups would otherwise
+// each load a pre-cleanup state and race on save, resurrecting orphans that
+// the first pass deleted.
+let cleanupChain: Promise<unknown> = Promise.resolve();
+
 /**
  * Clean up orphaned topics: close them in Telegram and remove from state.
  */
-export async function cleanupOrphanedTopics(
+export function cleanupOrphanedTopics(
   config: SwitchroomConfig,
   statePath?: string
 ): Promise<{ agent: string; topic_id: number; closed: boolean }[]> {
-  const botToken = resolveBotToken(config.telegram.bot_token);
-  if (!botToken) {
-    throw new TopicSyncError(
-      "Cannot resolve bot token for cleanup."
-    );
-  }
+  const next = cleanupChain.then(async () => {
+    const botToken = resolveBotToken(config.telegram.bot_token);
+    if (!botToken) {
+      throw new TopicSyncError(
+        "Cannot resolve bot token for cleanup."
+      );
+    }
 
-  const chatId = config.telegram.forum_chat_id;
-  const orphans = findOrphanedTopics(config, statePath);
-  const state = loadTopicState(statePath);
-  const results: { agent: string; topic_id: number; closed: boolean }[] = [];
+    const chatId = config.telegram.forum_chat_id;
+    const orphans = findOrphanedTopics(config, statePath);
+    const state = loadTopicState(statePath);
+    const results: { agent: string; topic_id: number; closed: boolean }[] = [];
 
-  for (const orphan of orphans) {
-    const closed = await closeForumTopic(botToken, chatId, orphan.topic_id);
-    delete state.topics[orphan.agent];
-    results.push({
-      agent: orphan.agent,
-      topic_id: orphan.topic_id,
-      closed,
-    });
-  }
+    for (const orphan of orphans) {
+      const closed = await closeForumTopic(botToken, chatId, orphan.topic_id);
+      delete state.topics[orphan.agent];
+      results.push({
+        agent: orphan.agent,
+        topic_id: orphan.topic_id,
+        closed,
+      });
+    }
 
-  saveTopicState(state, statePath);
-  return results;
+    saveTopicState(state, statePath);
+    return results;
+  });
+  // Chain must continue even if one caller rejects, so later callers aren't
+  // poisoned by an earlier failure.
+  cleanupChain = next.catch(() => {});
+  return next;
 }

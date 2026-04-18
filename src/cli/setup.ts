@@ -1031,9 +1031,9 @@ async function stepVerification(
     );
     if (startNow) {
       try {
-        const { execSync } = await import("node:child_process");
+        const { execFileSync } = await import("node:child_process");
         console.log(chalk.gray(`  Starting ${firstName}...`));
-        execSync(`switchroom agent start ${firstName}`, { stdio: "inherit" });
+        execFileSync("switchroom", ["agent", "start", firstName], { stdio: "inherit" });
         console.log(chalk.green(`  ${STEP_DONE} Agent started`));
       } catch {
         console.log(

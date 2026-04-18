@@ -93,7 +93,17 @@ try {
     const m = line.match(/^(\w+)=(.*)$/)
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
-} catch {}
+} catch (err) {
+  // ENOENT is the expected "no .env yet" path and not worth logging.
+  // Anything else (permission denied, truncated, IO error) should surface
+  // so a misconfigured install isn't silently missing env vars.
+  const code = (err as NodeJS.ErrnoException)?.code
+  if (code !== 'ENOENT') {
+    process.stderr.write(
+      `telegram gateway: warning — failed to load ${ENV_FILE}: ${(err as Error).message}\n`,
+    )
+  }
+}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 if (!TOKEN) {
@@ -402,6 +412,8 @@ function escapeMarkdownV2(text: string): string {
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
 const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
+// Track pending backoff-retry timers so shutdown and stop can cancel them.
+const typingRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let typingBackoffMs = 0
 const TYPING_BACKOFF_MAX = 5 * 60 * 1000
 
@@ -415,7 +427,11 @@ function startTypingLoop(chat_id: string): void {
         if (msg.includes('401') || msg.includes('Unauthorized')) {
           typingBackoffMs = Math.min(Math.max(typingBackoffMs * 2 || 1000, 1000), TYPING_BACKOFF_MAX)
           stopTypingLoop(chat_id)
-          setTimeout(() => startTypingLoop(chat_id), typingBackoffMs)
+          const retry = setTimeout(() => {
+            typingRetryTimers.delete(chat_id)
+            startTypingLoop(chat_id)
+          }, typingBackoffMs)
+          typingRetryTimers.set(chat_id, retry)
         }
       },
     )
@@ -427,6 +443,8 @@ function startTypingLoop(chat_id: string): void {
 function stopTypingLoop(chat_id: string): void {
   const iv = typingIntervals.get(chat_id)
   if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
+  const retry = typingRetryTimers.get(chat_id)
+  if (retry) { clearTimeout(retry); typingRetryTimers.delete(chat_id) }
 }
 
 // ─── Robust API call wrapper ──────────────────────────────────────────────
@@ -447,6 +465,17 @@ async function robustApiCall<T>(fn: () => Promise<T>, opts?: { threadId?: number
         continue
       }
       if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('not modified')) {
+        return undefined as unknown as T
+      }
+      // The target message was deleted out from under us (user cleared it,
+      // gateway crashed after edit, etc). Treat as no-op rather than a hard
+      // failure. Callers that need to react to a lost message-id have their
+      // own tracking; for the common edit/delete-in-flight case this just
+      // keeps the retry loop quiet.
+      if (
+        isGrammyErr && (err as GrammyError).error_code === 400 &&
+        (desc.includes('message to edit not found') || desc.includes('message to delete not found'))
+      ) {
         return undefined as unknown as T
       }
       if (isGrammyErr && (err as GrammyError).error_code === 400 && desc.includes('thread not found') && opts?.threadId && opts?.chat_id) {
@@ -481,12 +510,15 @@ function logOutbound(
 
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
+const PERMISSION_TTL_MS = 10 * 60_000
 
 // ─── Pending steer requests (set by "↪️ Steer" button) ───────────────────
 // When a user taps the Steer button on a progress card, the next inbound
 // message from that chat is treated as steering="true" regardless of prefix.
-const pendingSteerChats = new Set<string>()
+// Keyed by chat id → timestamp so the reaper can drop abandoned taps.
+const pendingSteerChats = new Map<string, number>()
+const STEER_TTL_MS = 10 * 60_000
 
 // Reauth flows
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
@@ -500,6 +532,32 @@ type PendingVaultOp =
   | { kind: 'value'; op: 'set'; key: string; passphrase: string; startedAt: number }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
 const pendingVaultOps = new Map<string, PendingVaultOp>()
+
+// ─── TTL reaper ───────────────────────────────────────────────────────────
+// Pending state maps above all grow whenever a flow starts and only shrink
+// when the flow completes. Users abandoning a flow (closing Telegram, losing
+// connection, hitting cancel on client) leaves entries behind. Without a
+// reaper, long-running gateways leak memory across days/weeks. A single
+// 60-second sweep drops anything past its documented TTL.
+const pendingStateReaper = setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of pendingReauthFlows) {
+    if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) pendingReauthFlows.delete(k)
+  }
+  for (const [k, v] of pendingVaultOps) {
+    if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
+  }
+  for (const [k, v] of pendingPermissions) {
+    if (now - v.startedAt > PERMISSION_TTL_MS) pendingPermissions.delete(k)
+  }
+  for (const [k, ts] of pendingSteerChats) {
+    if (now - ts > STEER_TTL_MS) pendingSteerChats.delete(k)
+  }
+  for (const [k, v] of vaultPassphraseCache) {
+    if (now > v.expiresAt) vaultPassphraseCache.delete(k)
+  }
+}, 60_000)
+pendingStateReaper.unref()
 
 function looksLikeAuthCode(text: string): boolean {
   const trimmed = text.trim()
@@ -613,7 +671,7 @@ const ipcServer: IpcServer = createIpcServer({
 
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
-    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview })
+    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     const access = loadAccess()
     const text = `🔐 Permission: ${toolName}`
     const keyboard = new InlineKeyboard()
@@ -2477,7 +2535,7 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     const chatId = steerM[1]!
-    pendingSteerChats.add(chatId)
+    pendingSteerChats.set(chatId, Date.now())
     await ctx.answerCallbackQuery({ text: 'Next message will steer the current task.' }).catch(() => {})
     return
   }
@@ -2599,12 +2657,23 @@ async function shutdown(): Promise<void> {
   shuttingDown = true
   process.stderr.write('telegram gateway: shutting down\n')
 
-  // Clean up all timers and pending state
-  for (const [, iv] of typingIntervals) clearInterval(iv)
+  // Clean up all timers and pending state.
+  // Snapshot timer handles before clearing so a late-firing timer can't
+  // invalidate the iterator by deleting its own entry during cleanup.
+  for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
+  for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
+  typingRetryTimers.clear()
 
-  for (const [, entry] of coalesceBuffer) clearTimeout(entry.timer)
+  for (const t of [...coalesceBuffer.values()].map((e) => e.timer)) clearTimeout(t)
   coalesceBuffer.clear()
+
+  clearInterval(pendingStateReaper)
+  pendingReauthFlows.clear()
+  pendingVaultOps.clear()
+  pendingPermissions.clear()
+  pendingSteerChats.clear()
+  vaultPassphraseCache.clear()
 
   if (orphanedReplyTimeoutId != null) {
     clearTimeout(orphanedReplyTimeoutId)

@@ -1,7 +1,38 @@
 import { randomBytes, scryptSync, createCipheriv, createDecipheriv } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  renameSync,
+  mkdirSync,
+  unlinkSync,
+} from "node:fs";
+import { dirname, basename, resolve } from "node:path";
+
+/**
+ * scrypt cost parameters. N=2^15=32768 (~32 MB, ~100ms on modern hardware)
+ * doubles the historical N=16384 and keeps pace with 2024+ KDF guidance.
+ * `maxmem` must be raised accordingly: default is 32 MB, which refuses
+ * the higher cost.
+ */
+const SCRYPT_N = 32768;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_MAXMEM = 128 * 1024 * 1024; // 128 MB
+
+function atomicWriteFileSync(path: string, data: string, mode: number): void {
+  // Write to a sibling temp file then rename. Rename is atomic on the same
+  // filesystem, which guarantees readers never see a half-written vault.
+  const dir = dirname(resolve(path));
+  const tmp = resolve(dir, `.${basename(path)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmp, data, { encoding: "utf8", mode });
+    renameSync(tmp, path);
+  } catch (err) {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    throw err;
+  }
+}
 
 export class VaultError extends Error {
   constructor(message: string) {
@@ -23,7 +54,12 @@ interface VaultFile {
   iv: string;
   data: string;
   tag: string;
+  /** KDF cost parameters. Older vaults omit these; fall back to N=16384. */
+  kdf?: { N: number; r: number; p: number };
 }
+
+/** Default cost for vaults written before the kdf field existed. */
+const LEGACY_SCRYPT_N = 16384;
 
 type StoredSecrets = Record<string, VaultEntry | string>;
 
@@ -31,8 +67,17 @@ interface VaultData {
   secrets: StoredSecrets;
 }
 
-function deriveKey(passphrase: string, salt: Buffer): Buffer {
-  return scryptSync(passphrase, salt, 32, { N: 16384, r: 8, p: 1 }) as Buffer;
+function deriveKey(
+  passphrase: string,
+  salt: Buffer,
+  params: { N: number; r: number; p: number } = { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P },
+): Buffer {
+  return scryptSync(passphrase, salt, 32, {
+    N: params.N,
+    r: params.r,
+    p: params.p,
+    maxmem: SCRYPT_MAXMEM,
+  }) as Buffer;
 }
 
 function encrypt(key: Buffer, plaintext: string): { iv: string; data: string; tag: string } {
@@ -92,9 +137,10 @@ export function createVault(passphrase: string, vaultPath: string): void {
     iv,
     data,
     tag,
+    kdf: { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P },
   };
 
-  writeFileSync(vaultPath, JSON.stringify(vaultFile, null, 2), { encoding: "utf8", mode: 0o600 });
+  atomicWriteFileSync(vaultPath, JSON.stringify(vaultFile, null, 2), 0o600);
 }
 
 export function openVault(
@@ -113,7 +159,8 @@ export function openVault(
   }
 
   const salt = Buffer.from(vaultFile.salt, "hex");
-  const key = deriveKey(passphrase, salt);
+  const kdfParams = vaultFile.kdf ?? { N: LEGACY_SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P };
+  const key = deriveKey(passphrase, salt, kdfParams);
 
   let plaintext: string;
   try {
@@ -148,8 +195,11 @@ export function saveVault(
     throw new VaultError(`Failed to read vault file: ${vaultPath}`);
   }
 
+  // Always re-encrypt with the current (strong) KDF params on save — legacy
+  // vaults transparently upgrade the first time a secret changes.
   const salt = Buffer.from(vaultFile.salt, "hex");
-  const key = deriveKey(passphrase, salt);
+  const key = deriveKey(passphrase, salt, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P });
+  vaultFile.kdf = { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P };
 
   const vaultData: VaultData = { secrets };
   const { iv, data, tag } = encrypt(key, JSON.stringify(vaultData));
@@ -158,7 +208,7 @@ export function saveVault(
   vaultFile.data = data;
   vaultFile.tag = tag;
 
-  writeFileSync(vaultPath, JSON.stringify(vaultFile, null, 2), { encoding: "utf8", mode: 0o600 });
+  atomicWriteFileSync(vaultPath, JSON.stringify(vaultFile, null, 2), 0o600);
 }
 
 export function setSecret(

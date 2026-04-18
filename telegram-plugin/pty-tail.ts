@@ -467,10 +467,15 @@ export function startPtyTail(config: PtyTailConfig): PtyTailHandle {
   const cols = config.cols ?? 132
   const rows = config.rows ?? 40
 
+  // Bound the in-memory terminal buffer. 1000 lines at 132 cols is ~150 KB
+  // per PTY session; 5000 lines let a 60-minute run of a chatty tool grow
+  // past 300 MB and made extraction O(buffer). Very old scrollback isn't
+  // useful for progress extraction anyway — the extractor only reads from
+  // the current cursor region.
   const term = new Terminal({
     cols,
     rows,
-    scrollback: 5000,
+    scrollback: 1000,
     allowProposedApi: true,
   })
 
