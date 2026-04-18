@@ -40,10 +40,17 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
+/**
+ * Constant-time string comparison to prevent timing attacks on token checks.
+ * When lengths differ, compares against self to consume constant time.
+ */
 function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
-  if (ab.length !== bb.length) return false;
+  if (ab.length !== bb.length) {
+    timingSafeEqual(ab, ab);
+    return false;
+  }
   return timingSafeEqual(ab, bb);
 }
 

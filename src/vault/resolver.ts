@@ -139,6 +139,17 @@ export function materializeFilesEntry(
   }
 
   for (const [filename, { encoding, value }] of Object.entries(files)) {
+    if (
+      filename.includes("/") ||
+      filename.includes("\\") ||
+      filename === ".." ||
+      filename === "." ||
+      filename.includes("\0")
+    ) {
+      throw new Error(
+        `Refusing to materialize vault file with unsafe name: ${filename}`,
+      );
+    }
     const filePath = join(dir, filename);
     const content =
       encoding === "base64" ? Buffer.from(value, "base64") : value;

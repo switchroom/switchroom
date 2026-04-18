@@ -577,6 +577,8 @@ export function submitAuthCode(
   // server was torn down by SIGKILL or the machine lost power, the trap
   // never fires. Sweep on successful token ingest too.
   cleanupAuthTempDirs(agentDir);
+  // Clean up auth log file — it contains the token in plaintext.
+  rmSync(authLogPath(agentDir), { force: true });
 
   return {
     completed: true,

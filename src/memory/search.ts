@@ -2,11 +2,12 @@ import type { SwitchroomConfig } from "../config/schema.js";
 import { getCollectionForAgent, isStrictIsolation } from "./hindsight.js";
 
 /**
- * Shell-quote a value for safe inclusion in a copy-pasteable bash command.
- * Uses single quotes and escapes embedded single quotes via `'\''`.
+ * POSIX-safe single-quote wrapping for embedding a value in a displayed
+ * shell command. Prevents accidental injection if the string is ever
+ * copy-pasted or piped to a shell.
  */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+function shellQuote(s: string): string {
+  return "'" + s.replace(/'/g, "'\"'\"'") + "'";
 }
 
 /**
