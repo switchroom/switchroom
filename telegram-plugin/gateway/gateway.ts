@@ -513,13 +513,6 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
 const PERMISSION_TTL_MS = 10 * 60_000
 
-// ─── Pending steer requests (set by "↪️ Steer" button) ───────────────────
-// When a user taps the Steer button on a progress card, the next inbound
-// message from that chat is treated as steering="true" regardless of prefix.
-// Keyed by chat id → timestamp so the reaper can drop abandoned taps.
-const pendingSteerChats = new Map<string, number>()
-const STEER_TTL_MS = 10 * 60_000
-
 // Reauth flows
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
@@ -549,9 +542,6 @@ const pendingStateReaper = setInterval(() => {
   }
   for (const [k, v] of pendingPermissions) {
     if (now - v.startedAt > PERMISSION_TTL_MS) pendingPermissions.delete(k)
-  }
-  for (const [k, ts] of pendingSteerChats) {
-    if (now - ts > STEER_TTL_MS) pendingSteerChats.delete(k)
   }
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
@@ -1703,11 +1693,8 @@ async function handleInbound(
 
   // Parse explicit prefixes first. `/steer ` / `/s ` opts IN to steering;
   // `/queue ` / `/q ` are legacy aliases that opt in to the new default (queued).
-  // The "↪️ Steer" button sets pendingSteerChats so the next message is treated
-  // as steering even without a prefix — consume and clear that flag here.
-  const buttonSteer = pendingSteerChats.delete(chat_id)
   const parsedSteer = parseSteerPrefix(text)
-  const isSteerPrefix = parsedSteer.steering || buttonSteer
+  const isSteerPrefix = parsedSteer.steering
   const parsedQueue = isSteerPrefix ? { queued: false, body: parsedSteer.body } : parseQueuePrefix(text)
   const isQueuedPrefix = parsedQueue.queued
   const effectiveText = isSteerPrefix ? parsedSteer.body : (isQueuedPrefix ? parsedQueue.body : text)
@@ -2529,51 +2516,10 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   await bot.api.setMyCommands(switchroomCommands, { scope: { type: 'all_group_chats' } })
 }
 
-// ─── Inline-button handler (steer + stop + permissions) ──────────────────
-// Handles:
-//   - `steer:<chatId>` — "↪️ Steer" button on the progress card
-//   - `stop:<chatId>`  — "🛑 Stop" button — interrupts the agent turn
-//   - `perm:(allow|deny|more):<id>` — permission request buttons
+// ─── Inline-button handler (permissions) ──────────────────────────────────
+// Handles `perm:(allow|deny|more):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-
-  // "↪️ Steer" button: mark the next inbound message from this chat as
-  // steering="true" regardless of prefix. Security: same allowFrom gate as
-  // the text-message path.
-  const steerM = /^steer:(-?\d+)$/.exec(data)
-  if (steerM) {
-    const access = loadAccess()
-    const senderId = String(ctx.from.id)
-    if (!access.allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-      return
-    }
-    const chatId = steerM[1]!
-    pendingSteerChats.set(chatId, Date.now())
-    await ctx.answerCallbackQuery({ text: 'Next message will steer the current task.' }).catch(() => {})
-    return
-  }
-
-  // "🛑 Stop" button: interrupt the current agent turn via switchroom CLI.
-  const stopM = /^stop:(-?\d+)$/.exec(data)
-  if (stopM) {
-    const access = loadAccess()
-    const senderId = String(ctx.from.id)
-    if (!access.allowFrom.includes(senderId)) {
-      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-      return
-    }
-    const agentName = getMyAgentName()
-    try {
-      switchroomExec(['agent', 'interrupt', agentName], 5000)
-      await ctx.answerCallbackQuery({ text: `Interrupting ${agentName}…` }).catch(() => {})
-    } catch (err) {
-      const msg = (err as Error).message ?? String(err)
-      process.stderr.write(`telegram gateway: stop button interrupt failed: ${msg}\n`)
-      await ctx.answerCallbackQuery({ text: 'Interrupt failed — see logs.' }).catch(() => {})
-    }
-    return
-  }
 
   // Permission request buttons.
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
@@ -2707,7 +2653,6 @@ async function shutdown(): Promise<void> {
   pendingReauthFlows.clear()
   pendingVaultOps.clear()
   pendingPermissions.clear()
-  pendingSteerChats.clear()
   vaultPassphraseCache.clear()
 
   if (orphanedReplyTimeoutId != null) {
@@ -2784,16 +2729,9 @@ if (streamMode === 'checklist') {
 
   progressDriver = createProgressDriver({
     emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
-      // Attach Steer + Stop buttons to every non-final emit so they
-      // persist through text edits (editMessageText strips reply_markup
-      // when omitted). On done, pass an empty keyboard to strip buttons.
-      const steerKeyboard = done
-        ? new InlineKeyboard()
-        : new InlineKeyboard().text('↪️ Steer', `steer:${chatId}`).text('🛑 Stop', `stop:${chatId}`)
       const args = {
         chat_id: chatId, text: html, done, message_thread_id: threadId,
         lane: 'progress', format: 'html', turnKey,
-        reply_markup: steerKeyboard,
       }
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
@@ -2814,12 +2752,6 @@ if (streamMode === 'checklist') {
             process.stderr.write(`telegram gateway: progress-card pin failed: ${err.message}\n`)
             if (agentDir != null) removeActivePin(agentDir, chatId, pinnedMessageId)
           })
-        }
-        if (done) {
-          // reply_markup is baked into baseOpts at stream creation, so the
-          // final text edit still carried the Steer keyboard. Strip it now
-          // that the turn is complete so the button can't be tapped post-card.
-          lockedBot.api.editMessageReplyMarkup(chatId, result.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {})
         }
       }).catch((err: Error) => {
         process.stderr.write(`telegram gateway: progress-card emit failed: ${err.message}\n`)
