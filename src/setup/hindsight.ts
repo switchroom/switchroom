@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
 
 /**
@@ -85,7 +85,7 @@ export async function pickHindsightPorts(): Promise<{
  */
 export function isDockerAvailable(): boolean {
   try {
-    execSync("docker --version", { stdio: "pipe" });
+    execFileSync("docker", ["--version"], { stdio: "pipe" });
     return true;
   } catch {
     return false;
@@ -97,8 +97,9 @@ export function isDockerAvailable(): boolean {
  */
 export function isHindsightRunning(): boolean {
   try {
-    const output = execSync(
-      'docker ps --filter name=switchroom-hindsight --format "{{.Status}}"',
+    const output = execFileSync(
+      "docker",
+      ["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"],
       { stdio: "pipe", encoding: "utf-8" },
     );
     return output.trim().length > 0;
@@ -112,8 +113,9 @@ export function isHindsightRunning(): boolean {
  */
 export function isHindsightContainerExists(): boolean {
   try {
-    const output = execSync(
-      'docker ps -a --filter name=switchroom-hindsight --format "{{.Names}}"',
+    const output = execFileSync(
+      "docker",
+      ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
       { stdio: "pipe", encoding: "utf-8" },
     );
     return output.trim().length > 0;
@@ -151,7 +153,7 @@ export function startHindsight(
     "ghcr.io/vectorize-io/hindsight:latest",
   ];
 
-  execSync(`docker ${args.join(" ")}`, { stdio: "pipe" });
+  execFileSync("docker", args, { stdio: "pipe" });
 }
 
 /**
@@ -159,10 +161,10 @@ export function startHindsight(
  */
 export function stopHindsight(): void {
   try {
-    execSync("docker stop switchroom-hindsight", { stdio: "pipe" });
+    execFileSync("docker", ["stop", "switchroom-hindsight"], { stdio: "pipe" });
   } catch { /* container may already be stopped */ }
   try {
-    execSync("docker rm switchroom-hindsight", { stdio: "pipe" });
+    execFileSync("docker", ["rm", "switchroom-hindsight"], { stdio: "pipe" });
   } catch { /* container may already be removed */ }
 }
 
@@ -172,8 +174,9 @@ export function stopHindsight(): void {
  */
 export function getHindsightStatus(): string | null {
   try {
-    const output = execSync(
-      'docker ps -a --filter name=switchroom-hindsight --format "{{.Status}}"',
+    const output = execFileSync(
+      "docker",
+      ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"],
       { stdio: "pipe", encoding: "utf-8" },
     );
     const status = output.trim();

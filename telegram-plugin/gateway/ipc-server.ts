@@ -80,7 +80,13 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     const m = msg as Record<string, unknown>;
     switch (m.type) {
       case "register":
-        return typeof m.agentName === "string" && m.agentName.length > 0 && m.agentName.length <= 128;
+        return typeof m.agentName === "string"
+          && m.agentName.length > 0
+          && m.agentName.length <= 128
+          && (m.topicId === undefined
+            || (typeof m.topicId === "number"
+              && Number.isInteger(m.topicId)
+              && Number.isFinite(m.topicId)));
       case "tool_call":
         return typeof m.id === "string" && m.id.length > 0
           && typeof m.tool === "string" && m.tool.length > 0

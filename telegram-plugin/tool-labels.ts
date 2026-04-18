@@ -38,13 +38,17 @@ function basename(p: string): string {
  */
 function shortenGrepPath(p: string): string {
   if (!p) return 'repo'
-  // If path ends with a slash or has no extension, treat as dir and keep
-  // the trailing slash; otherwise basename.
+  const hadTrailingSlash = /\/+$/.test(p)
   const trimmed = p.replace(/\/+$/, '')
   const parts = trimmed.split('/').filter(Boolean)
   if (parts.length === 0) return 'repo'
   const last = parts[parts.length - 1]
-  // Heuristic: no dot in last segment → directory.
+  if (hadTrailingSlash) return `${last}/`
+  // Dotfiles like `.env`, `.gitignore`, `.npmrc` — a leading dot with no
+  // further dot — are files, not directories. The old heuristic ("no dot
+  // → dir") mislabeled them as directories.
+  if (last.startsWith('.') && !last.slice(1).includes('.')) return last
+  // Otherwise: no extension → treat as a directory hint.
   if (!last.includes('.')) return `${last}/`
   return last
 }

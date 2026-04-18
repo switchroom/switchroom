@@ -1,6 +1,7 @@
-import { readFileSync, existsSync } from "node:fs";
-import { resolve, extname, join } from "node:path";
+import { readFileSync, existsSync, realpathSync } from "node:fs";
+import { resolve, extname, join, relative } from "node:path";
 import { spawn } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   handleGetAgents,
@@ -29,16 +30,35 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-/**
- * Check bearer token auth if SWITCHROOM_WEB_TOKEN is set.
- * Returns null if auth passes, or a 401 Response if it fails.
- */
+function constantTimeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function extractBearerToken(req: Request): string | null {
+  const authHeader = req.headers.get("Authorization");
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7);
+  }
+  // Browsers can't set Authorization on WebSocket upgrades, but they CAN set
+  // Sec-WebSocket-Protocol — client does `new WebSocket(url, ["bearer", token])`.
+  const wsProto = req.headers.get("Sec-WebSocket-Protocol");
+  if (wsProto) {
+    const parts = wsProto.split(",").map((s) => s.trim());
+    const idx = parts.indexOf("bearer");
+    if (idx >= 0 && idx + 1 < parts.length) return parts[idx + 1];
+  }
+  return null;
+}
+
 function checkAuth(req: Request): Response | null {
   const token = process.env.SWITCHROOM_WEB_TOKEN;
-  if (!token) return null; // No token configured, allow all
+  if (!token) return null;
 
-  const authHeader = req.headers.get("Authorization");
-  if (!authHeader || authHeader !== `Bearer ${token}`) {
+  const presented = extractBearerToken(req);
+  if (!presented || !constantTimeEqual(presented, token)) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
       status: 401,
       headers: { "Content-Type": "application/json" },
@@ -47,17 +67,11 @@ function checkAuth(req: Request): Response | null {
   return null;
 }
 
-/**
- * Check bearer token for WebSocket upgrade requests.
- * Token can be passed as ?token= query param.
- */
 function checkWsAuth(req: Request): boolean {
   const token = process.env.SWITCHROOM_WEB_TOKEN;
   if (!token) return true;
-
-  const url = new URL(req.url);
-  const paramToken = url.searchParams.get("token");
-  return paramToken === token;
+  const presented = extractBearerToken(req);
+  return presented !== null && constantTimeEqual(presented, token);
 }
 
 function parseRoute(
@@ -97,7 +111,9 @@ function parseRoute(
 }
 
 export function startWebServer(config: SwitchroomConfig, port: number): void {
-  const uiDir = resolve(import.meta.dirname, "ui");
+  const uiDirRaw = resolve(import.meta.dirname, "ui");
+  // Resolve symlinks once at startup so the traversal check compares real paths.
+  const uiDir = existsSync(uiDirRaw) ? realpathSync(uiDirRaw) : uiDirRaw;
 
   const server = Bun.serve({
     port,
@@ -116,7 +132,14 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
         if (!checkWsAuth(req)) {
           return new Response("Unauthorized", { status: 401 });
         }
-        const upgraded = server.upgrade(req);
+        // If the client sent a Sec-WebSocket-Protocol header for auth, echo
+        // back "bearer" so the negotiated subprotocol is valid.
+        const wsProto = req.headers.get("Sec-WebSocket-Protocol");
+        const headers =
+          wsProto && wsProto.split(",").map((s) => s.trim()).includes("bearer")
+            ? { "Sec-WebSocket-Protocol": "bearer" }
+            : undefined;
+        const upgraded = server.upgrade(req, headers ? { headers } : undefined);
         if (!upgraded) {
           return new Response("WebSocket upgrade failed", { status: 400 });
         }
@@ -138,10 +161,11 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
             if (!config.agents[agentName]) {
               return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
             }
-            const rawLines = parseInt(url.searchParams.get("lines") ?? "50", 10);
-            const lines = (!isNaN(rawLines) && rawLines >= 1 && rawLines <= 10000)
-              ? rawLines
-              : 50;
+            const rawLines = Number(url.searchParams.get("lines") ?? "50");
+            const lines =
+              Number.isInteger(rawLines) && rawLines >= 1 && rawLines <= 10000
+                ? rawLines
+                : 50;
             return jsonResponse(handleGetLogs(agentName, lines));
           }
 
@@ -175,21 +199,28 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
       let filePath = pathname === "/" ? "/index.html" : pathname;
       const fullPath = join(uiDir, filePath);
 
-      // Prevent directory traversal
-      if (!fullPath.startsWith(uiDir)) {
+      // Resolve symlinks before comparing so traversal via symlinked uiDir
+      // (or symlinks inside it) can't escape the static root.
+      if (!existsSync(fullPath)) {
+        return new Response("Not Found", { status: 404 });
+      }
+      let realFullPath: string;
+      try {
+        realFullPath = realpathSync(fullPath);
+      } catch {
+        return new Response("Not Found", { status: 404 });
+      }
+      const rel = relative(uiDir, realFullPath);
+      if (rel.startsWith("..") || resolve(uiDir, rel) !== realFullPath) {
         return new Response("Forbidden", { status: 403 });
       }
 
-      if (existsSync(fullPath)) {
-        const ext = extname(fullPath);
-        const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
-        const content = readFileSync(fullPath);
-        return new Response(content, {
-          headers: { "Content-Type": contentType },
-        });
-      }
-
-      return new Response("Not Found", { status: 404 });
+      const ext = extname(realFullPath);
+      const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+      const content = readFileSync(realFullPath);
+      return new Response(content, {
+        headers: { "Content-Type": contentType },
+      });
     },
 
     websocket: {
@@ -209,6 +240,13 @@ export function startWebServer(config: SwitchroomConfig, port: number): void {
           const data = JSON.parse(String(message));
           if (data.type === "subscribe" && data.agent) {
             const agentName = String(data.agent).replace(/[^a-zA-Z0-9_-]/g, "");
+            // Only allow subscribing to agents that actually exist in config.
+            if (!agentName || !config.agents[agentName]) {
+              try {
+                ws.send(JSON.stringify({ type: "error", error: "Unknown agent" }));
+              } catch {}
+              return;
+            }
 
             // Kill any existing log process before subscribing to a new one
             const existing = (ws as any)._logProcess;

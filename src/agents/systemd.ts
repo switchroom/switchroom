@@ -1,9 +1,19 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { usesSwitchroomTelegramPlugin } from "../config/merge.js";
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sanitizeUnitDescription(s: string): string {
+  // systemd unit files disallow newlines in single-line values and treat
+  // `%` as a specifier. Strip both so descriptions can't break unit parsing.
+  return s.replace(/[\r\n]+/g, " ").replace(/%/g, "%%");
+}
 
 const SYSTEMD_USER_DIR = resolve(
   process.env.HOME ?? "/root",
@@ -142,18 +152,19 @@ export function installAllUnits(config: SwitchroomConfig): void {
 
 export function daemonReload(): void {
   try {
-    execSync("systemctl --user daemon-reload", { stdio: "pipe" });
+    execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "pipe" });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const stderr = (err as { stderr?: Buffer }).stderr?.toString().trim();
+    const message = stderr || (err instanceof Error ? err.message : String(err));
     throw new Error(`Failed to reload systemd user daemon: ${message}`);
   }
 }
 
 function enableUnits(unitNames: string[]): void {
   if (unitNames.length === 0) return;
-  const services = unitNames.map((n) => `${n}.service`).join(" ");
+  const services = unitNames.map((n) => `${n}.service`);
   try {
-    execSync(`systemctl --user enable ${services}`, { stdio: "pipe" });
+    execFileSync("systemctl", ["--user", "enable", ...services], { stdio: "pipe" });
   } catch {
     // non-fatal — units are installed but won't auto-start on boot
   }
@@ -163,7 +174,7 @@ function ensureLinger(): void {
   const user = process.env.USER ?? process.env.LOGNAME;
   if (!user) return;
   try {
-    execSync(`loginctl enable-linger ${user}`, { stdio: "pipe" });
+    execFileSync("loginctl", ["enable-linger", user], { stdio: "pipe" });
   } catch {
     // non-fatal — may need sudo; services still work for logged-in sessions
   }
@@ -243,7 +254,8 @@ export function generateTimerUnit(
   prompt: string,
 ): string {
   const onCalendar = cronToOnCalendar(cronExpr);
-  const desc = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
+  const truncated = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
+  const desc = sanitizeUnitDescription(truncated);
   return `[Unit]
 Description=switchroom scheduled: ${agentName} #${index} — ${desc}
 
@@ -310,15 +322,16 @@ export function installScheduleTimers(
 
   // Remove stale timers (indices beyond current schedule length)
   const prefix = `switchroom-${agentName}-cron-`;
+  const staleRegex = new RegExp(`^${escapeRegex(prefix)}(\\d+)\\.(timer|service)$`);
   if (existsSync(SYSTEMD_USER_DIR)) {
     for (const file of readdirSync(SYSTEMD_USER_DIR)) {
       if (!file.startsWith(prefix)) continue;
-      const match = file.match(new RegExp(`^${prefix}(\\d+)\\.(timer|service)$`));
+      const match = file.match(staleRegex);
       if (match && parseInt(match[1], 10) >= schedule.length) {
         const stale = resolve(SYSTEMD_USER_DIR, file);
-        // Stop the timer before removing
+        // Stop the timer before removing — argv array, not shell.
         try {
-          execSync(`systemctl --user stop ${file}`, { stdio: "pipe" });
+          execFileSync("systemctl", ["--user", "stop", file], { stdio: "pipe" });
         } catch { /* may not be running */ }
         unlinkSync(stale);
       }
@@ -333,7 +346,7 @@ export function enableScheduleTimers(agentName: string, count: number): void {
   for (let i = 0; i < count; i++) {
     const timerName = `switchroom-${agentName}-cron-${i}.timer`;
     try {
-      execSync(`systemctl --user enable --now ${timerName}`, { stdio: "pipe" });
+      execFileSync("systemctl", ["--user", "enable", "--now", timerName], { stdio: "pipe" });
     } catch { /* best effort */ }
   }
 }

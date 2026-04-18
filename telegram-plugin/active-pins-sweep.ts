@@ -77,6 +77,10 @@ export async function sweepActivePins(
     ),
   ]);
 
+  // By design: clear the sidecar on timeout even though in-flight unpins
+  // may not have landed. Telegram's unpin is idempotent, so a retried unpin
+  // on the next boot is a cheap no-op, whereas keeping the sidecar entries
+  // around would have the sweep re-fire forever whenever Telegram is slow.
   clearActivePins(agentDir);
   return { swept: pins, timedOut };
 }
