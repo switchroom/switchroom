@@ -104,6 +104,7 @@ import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handle
 import { handleStreamReply } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
 import { logStreamingEvent } from './streaming-metrics.js'
+import { buildAttachmentPath, assertInsideInbox } from './attachment-path.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
 import { createProgressDriver, type ProgressDriver } from './progress-card-driver.js'
 import {
@@ -1597,13 +1598,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const res = await fetch(url)
         if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
         const buf = Buffer.from(await res.arrayBuffer())
-        // file_path is from Telegram (trusted), but strip to safe chars anyway
-        // so nothing downstream can be tricked by an unexpected extension.
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+        const path = buildAttachmentPath({
+          inboxDir: INBOX_DIR,
+          telegramFilePath: file.file_path,
+          fileUniqueId: file.file_unique_id,
+          now: Date.now(),
+        })
         mkdirSync(INBOX_DIR, { recursive: true })
+        assertInsideInbox(INBOX_DIR, path)
         writeFileSync(path, buf)
         return { content: [{ type: 'text', text: path }] }
       }
@@ -3886,9 +3888,14 @@ bot.on('message:photo', async ctx => {
       const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
       const res = await fetch(url)
       const buf = Buffer.from(await res.arrayBuffer())
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+      const path = buildAttachmentPath({
+        inboxDir: INBOX_DIR,
+        telegramFilePath: file.file_path,
+        fileUniqueId: best.file_unique_id,
+        now: Date.now(),
+      })
       mkdirSync(INBOX_DIR, { recursive: true })
+      assertInsideInbox(INBOX_DIR, path)
       writeFileSync(path, buf)
       return path
     } catch (err) {

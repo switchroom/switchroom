@@ -241,9 +241,25 @@ export function createDraftStream(
         })
       } else if (inFlight == null) {
         schedule()
+      } else {
+        // inFlight is set — the current flushLoop is running. Previous
+        // versions of this code relied on flushLoop's while(pendingText
+        // != null) to pick up the new text, but there's a race: if
+        // update() fires AFTER the while's final (null) check but
+        // BEFORE the flushLoop promise settles, the new pendingText
+        // lands in a shell with no one looking at it, and the waiter
+        // hangs forever. Chain a follow-up flush off the current
+        // flushLoop so the new text is guaranteed to be drained.
+        inFlight.then(() => {
+          if (stopped || pendingText == null) return
+          if (inFlight != null) return // a new flushLoop already started
+          if (Date.now() - lastSentAt >= throttleMs) {
+            inFlight = flushLoop().finally(() => { inFlight = null })
+          } else {
+            schedule()
+          }
+        })
       }
-      // (If inFlight != null, the existing flushLoop will pick up
-      // pendingText after its current call resolves.)
       return waitPromise
     },
 

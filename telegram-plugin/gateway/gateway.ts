@@ -29,6 +29,7 @@ import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handl
 import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
 import { createRetryApiCall } from '../retry-api-call.js'
+import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { type SessionEvent } from '../session-tail.js'
 import { createProgressDriver, type ProgressDriver } from '../progress-card-driver.js'
@@ -971,11 +972,14 @@ async function executeDownloadAttachment(args: Record<string, unknown>): Promise
   }
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
   const buf = Buffer.from(await res.arrayBuffer())
-  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-  const dlPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  const dlPath = buildAttachmentPath({
+    inboxDir: INBOX_DIR,
+    telegramFilePath: file.file_path,
+    fileUniqueId: file.file_unique_id,
+    now: Date.now(),
+  })
   mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+  assertInsideInbox(INBOX_DIR, dlPath)
   writeFileSync(dlPath, buf, { mode: 0o600 })
   return { content: [{ type: 'text', text: dlPath }] }
 }
@@ -2556,11 +2560,14 @@ bot.on('message:photo', async ctx => {
         return undefined
       }
       const buf = Buffer.from(await res.arrayBuffer())
-      const rawExt = file.file_path.split('.').pop() ?? 'jpg'
-      const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'jpg'
-      const uniqueId = (best.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'photo'
-      const dlPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+      const dlPath = buildAttachmentPath({
+        inboxDir: INBOX_DIR,
+        telegramFilePath: file.file_path,
+        fileUniqueId: best.file_unique_id,
+        now: Date.now(),
+      })
       mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+      assertInsideInbox(INBOX_DIR, dlPath)
       writeFileSync(dlPath, buf, { mode: 0o600 })
       return dlPath
     } catch (err) {
