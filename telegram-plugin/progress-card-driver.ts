@@ -822,6 +822,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           cs.deferredFirstEmitTimer = null
         }
       }
+      chats.clear()
+      currentChatId = null
+      currentThreadId = undefined
+      currentTurnKey = null
       pendingSyncEchoes.clear()
       seenEnqueueMsgIds.clear()
     },
