@@ -29,44 +29,11 @@ from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.content import (
     prepare_retention_transcript,
+    read_transcript_messages,
     slice_last_turns_by_user_boundary,
 )
 from lib.daemon import get_api_url
 from lib.state import increment_turn_count
-
-
-def read_transcript(transcript_path: str) -> list:
-    """Read a JSONL transcript file and return list of message dicts.
-
-    Claude Code transcript format nests messages:
-      {type: "user", message: {role: "user", content: "..."}, uuid: "...", ...}
-    Also supports flat format for testing:
-      {role: "user", content: "..."}
-    """
-    if not transcript_path or not os.path.isfile(transcript_path):
-        return []
-    messages = []
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    # Claude Code nested format: {type: "user", message: {role, content}}
-                    if entry.get("type") in ("user", "assistant"):
-                        msg = entry.get("message", {})
-                        if isinstance(msg, dict) and msg.get("role"):
-                            messages.append(msg)
-                    # Flat format (testing / future compatibility)
-                    elif "role" in entry and "content" in entry:
-                        messages.append(entry)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return messages
 
 
 def main():
@@ -89,7 +56,7 @@ def main():
     transcript_path = hook_input.get("transcript_path", "")
 
     # Read full transcript
-    all_messages = read_transcript(transcript_path)
+    all_messages = read_transcript_messages(transcript_path)
     if not all_messages:
         debug_log(config, "No messages in transcript, skipping retain")
         return

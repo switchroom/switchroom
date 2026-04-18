@@ -5,6 +5,7 @@ Openclaw HindsightClient (client.js), adapted for Python stdlib.
 """
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,8 +60,6 @@ class HindsightClient:
         Mirrors Openclaw's checkExternalApiHealth: retries up to 3 times
         with 2s delay between attempts.
         """
-        import time
-
         for attempt in range(1, HEALTH_CHECK_RETRIES + 1):
             try:
                 url = f"{self.api_url}/health"
