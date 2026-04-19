@@ -610,6 +610,7 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "IDENTITY.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "TOOLS.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "MEMORY.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "HEARTBEAT.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "memory"))).toBe(true);
 
     // .hbs templates must have been rendered (not copied raw) — the file

@@ -1,0 +1,39 @@
+# HEARTBEAT.md — Proactive Check-Ins
+
+This file is read on every turn (it's a dynamic workspace file). Edit it
+to tell yourself what to look for when someone (or something) prompts you
+with a bare "heartbeat" — a cron firing, a quiet-period nudge, or a
+scheduled check-in.
+
+## When this fires
+
+A heartbeat arrives as a user-role message with no real payload — often
+just "HEARTBEAT" or "heartbeat check". When that happens:
+
+1. Run through the bullets below in order.
+2. If anything needs action, respond normally (and take the action).
+3. If nothing needs action, respond with exactly `HEARTBEAT_OK` on its
+   own line. The plugin suppresses that as a silent reply — no Telegram
+   message gets sent, and the user isn't notified.
+
+## Things to check (customize per-agent)
+
+- **New emails / messages:** is there anything in the inbox or
+  connected channels that looks actionable?
+- **Upcoming calendar events:** anything in the next ~2 hours the user
+  should be reminded of?
+- **Long-running tasks:** any background work you kicked off earlier
+  that might have completed?
+- **Today's plan:** anything in `memory/{{todayDate}}.md` that hasn't
+  been touched?
+
+## Guidelines
+
+- **Respect quiet hours.** If it's late (local time 22:00–08:00),
+  default to `HEARTBEAT_OK` unless something is genuinely urgent.
+- **Don't spam.** If you messaged the user in the last 30 minutes,
+  `HEARTBEAT_OK` unless there's something new to add.
+- **Stay terse.** A heartbeat-initiated message should be one or two
+  lines, not a paragraph.
+
+Edit this file to narrow or broaden the check set for this agent.
