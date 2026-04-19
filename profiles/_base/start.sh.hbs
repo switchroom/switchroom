@@ -98,6 +98,27 @@ fi
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 {{/if}}
 
+# --- Workspace bootstrap (stable) ---
+# Inject AGENTS.md / SOUL.md / IDENTITY.md / USER.md / TOOLS.md /
+# BOOTSTRAP.md from the agent's workspace/ dir into --append-system-prompt.
+# These files are stable across a session, so baking them into the system
+# prompt is cache-friendly. Dynamic files (MEMORY.md, today's daily,
+# HEARTBEAT.md) are injected via the UserPromptSubmit hook, not here.
+if [ -d "{{agentDir}}/workspace" ] && command -v switchroom >/dev/null 2>&1; then
+  _WS_STABLE=$(timeout 5 switchroom workspace render "{{name}}" --stable --warning-mode off 2>/dev/null || true)
+  if [ -n "$_WS_STABLE" ]; then
+    if [ -n "$APPEND_PROMPT" ]; then
+      APPEND_PROMPT="$_WS_STABLE
+
+---
+
+$APPEND_PROMPT"
+    else
+      APPEND_PROMPT="$_WS_STABLE"
+    fi
+  fi
+fi
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
   exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}

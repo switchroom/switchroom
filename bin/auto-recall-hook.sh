@@ -99,4 +99,20 @@ if [ -n "$FORMATTED" ]; then
   printf '%s\n' "$FORMATTED"
 fi
 
+# --- Workspace dynamic bootstrap (MEMORY.md, today/yesterday daily,
+#     HEARTBEAT.md) ---
+# The dynamic workspace block is re-read every turn. Prepend it so the
+# agent sees the latest memory state + heartbeat intentions inline with
+# the user's message. Stable files (AGENTS.md, etc.) are baked into the
+# system prompt at start.sh time and not re-rendered here.
+if [ -n "${SWITCHROOM_AGENT_NAME:-}" ] && command -v switchroom >/dev/null 2>&1; then
+  WS_DYNAMIC=$(timeout 3 switchroom workspace render "$SWITCHROOM_AGENT_NAME" --dynamic --warning-mode once 2>/dev/null || true)
+  if [ -n "$WS_DYNAMIC" ]; then
+    if [ -n "$FORMATTED" ]; then
+      printf '\n'
+    fi
+    printf '%s\n' "$WS_DYNAMIC"
+  fi
+fi
+
 exit 0

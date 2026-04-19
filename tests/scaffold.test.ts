@@ -626,6 +626,20 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "AGENTS.md.hbs"))).toBe(false);
   });
 
+  it("start.sh invokes `switchroom workspace render --stable` to inject bootstrap", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("ws-start-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("switchroom workspace render");
+    expect(startSh).toContain("--stable");
+    // The render call must happen BEFORE the final exec line so APPEND_PROMPT
+    // is updated in time.
+    const renderIdx = startSh.indexOf("switchroom workspace render");
+    const execIdx = startSh.indexOf("exec claude");
+    expect(renderIdx).toBeGreaterThan(0);
+    expect(execIdx).toBeGreaterThan(renderIdx);
+  });
+
   it("preserves user edits in workspace/ across re-scaffold", () => {
     const config = makeAgentConfig();
     const first = scaffoldAgent("edit-agent", config, tmpDir, telegramConfig);

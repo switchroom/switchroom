@@ -14,6 +14,7 @@ import { registerDoctorCommand } from "./doctor.js";
 import { registerUpdateCommand } from "./update.js";
 import { registerHandoffCommand } from "./handoff.js";
 import { registerDepsCommand } from "./deps.js";
+import { registerWorkspaceCommand } from "./workspace.js";
 
 const pkg = JSON.parse(
   readFileSync(resolve(import.meta.dirname, "../../package.json"), "utf-8")
@@ -40,3 +41,4 @@ registerMemoryCommand(program);
 registerWebCommand(program);
 registerHandoffCommand(program);
 registerDepsCommand(program);
+registerWorkspaceCommand(program);
