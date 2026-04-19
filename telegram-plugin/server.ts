@@ -43,7 +43,7 @@ import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { execFileSync, execSync, spawn } from 'child_process'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename, dirname } from 'path'
 import { installPluginLogger } from './plugin-logger.js'
@@ -4025,6 +4025,62 @@ async function handlePermissionSlash(
 
 // /approve [id] — slash-command alternative to tapping ✅ Allow on the
 // inline-button approval card. No id = most recent pending permission.
+/**
+ * Flush the session handoff briefing for the current agent so the next
+ * restart starts without prior-session context. Used by /new and /reset.
+ *
+ * Deletes `.handoff.md` + `.handoff-topic` in the agent's dir if present.
+ * Never touches MEMORY.md, workspace/, or skills — those are durable
+ * state the user curates.
+ *
+ * Returns the number of files actually removed so the caller can report
+ * accurately in the user-visible ack.
+ */
+function flushCurrentAgentHandoff(): number {
+  const agentDir = process.cwd()
+  let removed = 0
+  for (const relPath of ['.handoff.md', '.handoff-topic']) {
+    const full = join(agentDir, relPath)
+    try {
+      if (existsSync(full)) {
+        unlinkSync(full)
+        removed += 1
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[telegram-plugin] flushCurrentAgentHandoff: failed to remove ${full}: ${err instanceof Error ? err.message : String(err)}\n`,
+      )
+    }
+  }
+  return removed
+}
+
+/**
+ * /new [agent] — start a fresh session. Flushes the handoff briefing
+ * (.handoff.md / .handoff-topic) so the restarted claude session isn't
+ * primed with the prior conversation, then triggers a restart via the
+ * switchroom CLI. MEMORY.md, workspace/, skills/ are preserved.
+ *
+ * /reset is a second name for the same operation with slightly stronger
+ * user-facing language; both converge on the same implementation.
+ */
+async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
+  if (!isAuthorizedSender(ctx)) return
+  const name = (ctx.match ?? '').trim() || getMyAgentName()
+  const removed = flushCurrentAgentHandoff()
+  const tail = removed > 0 ? ` \u00b7 flushed ${removed} handoff file(s)` : ''
+  const label = kind === 'new' ? '\u{1F195} New session' : '\u{1F504} Session reset'
+  await switchroomReply(
+    ctx,
+    `${label} for <b>${escapeHtmlForTg(name)}</b>${tail} \u00b7 restarting\u2026`,
+    { html: true },
+  )
+  await runSwitchroomCommand(ctx, ['agent', 'restart', name], `${kind} ${name}`)
+}
+
+bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
+bot.command('reset', async ctx => handleNewOrResetCommand(ctx, 'reset'))
+
 bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
 
 // /deny [id] — slash-command alternative to tapping ❌ Deny on the
