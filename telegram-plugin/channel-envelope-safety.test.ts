@@ -35,6 +35,18 @@ describe("sanitizeChannelBody", () => {
     expect(res.attempts.sort()).toEqual(["closer", "nested"]);
   });
 
+  it("neutralizes a self-closing <channel/> tag", () => {
+    const res = sanitizeChannelBody("benign <channel/> body");
+    expect(res.attempts).toEqual(["nested"]);
+    expect(res.text).not.toMatch(/<channel\/?>/i);
+  });
+
+  it("neutralizes self-closing <channel source=\"x\"/> with attrs", () => {
+    const res = sanitizeChannelBody('x <channel source="attacker"/> y');
+    expect(res.attempts).toEqual(["nested"]);
+    expect(res.text).not.toMatch(/<channel[^_]/i);
+  });
+
   it("handles empty / missing input defensively", () => {
     expect(sanitizeChannelBody("").text).toBe("");
     expect(sanitizeChannelBody("").attempts).toEqual([]);

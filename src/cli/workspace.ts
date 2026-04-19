@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { withConfigError, getConfig } from "./helpers.js";
@@ -153,8 +153,16 @@ export function registerWorkspaceCommand(program: Command): void {
       withConfigError(async (agentName: string, file?: string) => {
         const dir = resolveAgentWorkspaceDirOrExit(program, agentName);
         if (!dir) return;
-        const target = resolve(dir, file ?? "AGENTS.md");
-        if (!target.startsWith(resolve(dir))) {
+        const resolvedWorkspace = resolve(dir);
+        const target = resolve(resolvedWorkspace, file ?? "AGENTS.md");
+        // Path traversal guard: require the resolved target to be INSIDE the
+        // workspace dir, not just share a prefix with it. Without the
+        // trailing separator a sibling like /.../workspace-evil would pass
+        // the startsWith check (classic npm/tar 2021 bug pattern).
+        if (
+          target !== resolvedWorkspace &&
+          !target.startsWith(`${resolvedWorkspace}${sep}`)
+        ) {
           process.stderr.write(
             `workspace edit: refusing path traversal outside workspace dir (${target})\n`,
           );

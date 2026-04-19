@@ -1611,17 +1611,29 @@ export function reconcileAgent(
     );
   }
 
-  // Compute the desired permissions.allow list from current config
+  // Compute the desired permissions.allow list from current config.
+  // IMPORTANT: this must stay in lockstep with scaffoldAgent's permissionAllow
+  // computation — including the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection
+  // when tools.allow is empty and dangerous_mode is off. Without this, the
+  // first `switchroom reconcile` after scaffold wipes the read-only defaults
+  // and every Read/Grep/Glob starts triggering approval cards.
   const tools = agentConfig.tools ?? { allow: [], deny: [] };
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
   const baseAllow = hasAllWildcard
     ? ALL_BUILTIN_TOOLS
     : rawAllow.filter((t) => t !== "all");
+  const reconcileDangerousMode = agentConfig.dangerous_mode === true;
+  const reconcileHadExplicitAllow = rawAllow.length > 0;
+  const reconcileReadOnlyDefaults =
+    !reconcileDangerousMode && !reconcileHadExplicitAllow
+      ? DEFAULT_READ_ONLY_PREAPPROVED_TOOLS
+      : [];
   const memoryBackend = switchroomConfig.memory?.backend;
   const hindsightEnabled = memoryBackend === "hindsight";
   const desiredAllow = dedupe([
     ...baseAllow,
+    ...reconcileReadOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
     ...SWITCHROOM_MCP_TOOLS,
@@ -2018,6 +2030,31 @@ export function reconcileAgent(
       changes.push(mcpJsonPath);
     }
   }
+
+  // --- Re-seed workspace bootstrap files from the profile.
+  //
+  //     writeIfMissing semantics mean user edits survive, but new template
+  //     files added to the profile (e.g. a HEARTBEAT.md shipped in a later
+  //     switchroom release) will be seeded on reconcile — matching scaffold
+  //     behavior. Without this call, agents scaffolded before a template
+  //     addition stay out of date until rescaffolded.
+  const reconcileProfilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
+  const workspaceContext: Record<string, unknown> = {
+    name,
+    agentDir,
+    soul: agentConfig.soul,
+    user: (agentConfig as unknown as { user?: unknown }).user,
+    agentConfig,
+    topicName: agentConfig.topic_name,
+    topicEmoji: agentConfig.topic_emoji,
+  };
+  seedWorkspaceBootstrapFiles({
+    profilePath: reconcileProfilePath,
+    agentDir,
+    context: workspaceContext,
+    created: changes,
+    skipped: [],
+  });
 
   return { agentDir, changes };
 }

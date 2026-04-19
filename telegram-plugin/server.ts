@@ -949,12 +949,21 @@ const mcp = new Server(
  */
 const SILENT_REPLY_MARKERS = new Set(['NO_REPLY', 'HEARTBEAT_OK'])
 
+// Derive the char-length bound from the marker set so adding a new
+// marker doesn't silently desync with a hand-tuned constant.
+const SILENT_REPLY_MAX_LEN = Math.max(
+  ...Array.from(SILENT_REPLY_MARKERS, (m) => m.length),
+) + 2 // small buffer for trailing punctuation callers might add accidentally
+
 function isSilentReplyMarker(text: string | undefined): boolean {
   if (typeof text !== 'string') return false
   const trimmed = text.trim()
   if (trimmed.length === 0) return false
-  if (trimmed.length > 16) return false
-  return SILENT_REPLY_MARKERS.has(trimmed)
+  if (trimmed.length > SILENT_REPLY_MAX_LEN) return false
+  // Case-insensitive match: models occasionally emit `no_reply` or
+  // `NoReply`. Require letters/underscores/digits only so legitimate
+  // prose that happens to contain "NO_REPLY was suggested" still sends.
+  return SILENT_REPLY_MARKERS.has(trimmed.toUpperCase())
 }
 
 // Stores full permission details for "See more" expansion keyed by request_id.
@@ -1239,7 +1248,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Silent-reply short-circuit. If the agent emitted only a NO_REPLY /
         // HEARTBEAT_OK marker, acknowledge the tool call without pushing
         // anything to Telegram. See SILENT_REPLY_MARKERS for rationale.
+        //
+        // Note: assertAllowedChat runs BEFORE the short-circuit so that a
+        // successful silent-reply ack can't be returned for a chat_id the
+        // agent isn't authorized to use. The ack itself would leak
+        // cross-chat context to the LLM (confirming a chat exists + that
+        // the agent reached it) even though no Telegram message is sent.
         if (files.length === 0 && isSilentReplyMarker(text)) {
+          assertAllowedChat(chat_id)
           process.stderr.write(
             `[telegram-plugin] silent-reply acknowledged (${text.trim()}) chat_id=${chat_id}\n`,
           )
@@ -1573,10 +1589,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // silent marker, skip the stream entirely. Mid-stream (done=false)
         // calls fall through to the stream controller normally so partial
         // drafts that happen to contain the marker aren't suppressed.
+        //
+        // assertAllowedChat runs first for the same reason as the reply
+        // handler: the ack itself is a signal to the LLM and must not be
+        // emitted for an unauthorized chat.
         if (
           Boolean(args.done) &&
           isSilentReplyMarker(args.text as string | undefined)
         ) {
+          assertAllowedChat(args.chat_id as string)
           const markerText = (args.text as string).trim()
           process.stderr.write(
             `[telegram-plugin] silent-stream-reply acknowledged (${markerText}) chat_id=${String(args.chat_id)}\n`,

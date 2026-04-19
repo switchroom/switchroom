@@ -174,6 +174,26 @@ describe("projectBootstrapFiles", () => {
   });
 });
 
+describe("projectBootstrapFiles — truncation marker respects cap", () => {
+  it("never produces an injected file longer than the per-file cap even with long file names", () => {
+    const result = projectBootstrapFiles({
+      files: [
+        {
+          name: "BOOTSTRAP.md",
+          path: "/very/long/path/to/BOOTSTRAP.md",
+          content: "y".repeat(10_000_000),
+          missing: false,
+        },
+      ],
+      heading: "Project Context",
+      budget: { bootstrapMaxChars: 1000, bootstrapTotalMaxChars: 10000 },
+    });
+    for (const f of result.injectedFiles) {
+      expect(f.content.length).toBeLessThanOrEqual(1000);
+    }
+  });
+});
+
 describe("buildStableBootstrapPrompt (end-to-end)", () => {
   let dir: string;
   afterEach(async () => {

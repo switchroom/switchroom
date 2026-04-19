@@ -30,25 +30,27 @@ export type ChannelBodySanitizeResult = {
 
 export type ChannelBodyPiAttempt = "closer" | "nested";
 
-const CLOSER_RE = /<\/channel\s*>/gi;
-const NESTED_RE = /<channel(\s+[^>]*)?>/gi;
-
 export function sanitizeChannelBody(body: string): ChannelBodySanitizeResult {
   if (typeof body !== "string" || body.length === 0) {
     return { text: body ?? "", attempts: [] };
   }
+  // Fresh regex instances per call: module-scoped /g regexes carry
+  // lastIndex between .test/.replace which races under any future
+  // concurrent use of this module. Creating fresh is cheap and avoids
+  // the footgun entirely.
+  const closerRe = /<\/channel\s*>/gi;
+  // Allow an optional `/` before `>` so a self-closing <channel/> doesn't
+  // slip past the sanitizer.
+  const nestedRe = /<channel(\s+[^>]*)?\/?>/gi;
   const attempts = new Set<ChannelBodyPiAttempt>();
   let text = body;
-  if (CLOSER_RE.test(text)) {
+  if (closerRe.test(text)) {
     attempts.add("closer");
-    text = text.replace(CLOSER_RE, "<\\/channel>");
+    text = text.replace(/<\/channel\s*>/gi, "<\\/channel>");
   }
-  // Reset regex state for the next call.
-  CLOSER_RE.lastIndex = 0;
-  if (NESTED_RE.test(text)) {
+  if (nestedRe.test(text)) {
     attempts.add("nested");
-    text = text.replace(NESTED_RE, "<_channel$1>");
+    text = text.replace(/<channel(\s+[^>]*)?\/?>/gi, "<_channel$1>");
   }
-  NESTED_RE.lastIndex = 0;
   return { text, attempts: [...attempts] };
 }

@@ -200,16 +200,24 @@ function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
 }
 
+/**
+ * Compute the relative path to the daily memory file for `date` in the
+ * host's LOCAL timezone. A UTC-based computation would roll "today"
+ * over at UTC midnight, which is early-morning for users in UTC+10
+ * and mid-afternoon for users in UTC-8 — both wrong for "today's
+ * notes" semantics. Node's getFullYear/getMonth/getDate already read
+ * the host's local TZ from the system, which is what we want.
+ */
 function dailyMemoryRelativePath(date: Date): string {
-  const y = date.getUTCFullYear();
-  const m = pad2(date.getUTCMonth() + 1);
-  const d = pad2(date.getUTCDate());
+  const y = date.getFullYear();
+  const m = pad2(date.getMonth() + 1);
+  const d = pad2(date.getDate());
   return path.join(DEFAULT_MEMORY_SUBDIR, `${y}-${m}-${d}.md`);
 }
 
 function addDays(date: Date, days: number): Date {
   const out = new Date(date.getTime());
-  out.setUTCDate(out.getUTCDate() + days);
+  out.setDate(out.getDate() + days);
   return out;
 }
 
@@ -225,11 +233,22 @@ function truncateContent(name: string, content: string, maxChars: number): strin
   if (maxChars < 200) {
     return content.slice(0, Math.max(0, maxChars));
   }
-  const headRoom = Math.floor(maxChars * 0.7);
-  const tailRoom = maxChars - headRoom - 64; // 64 for the marker text
+  // Reserve room for the marker text based on actual length, then
+  // shrink head+tail to fit. Previous hard-coded 64-char reservation
+  // underflowed for long file names + large raw sizes, overshooting the
+  // cap by a few chars in pathological cases.
+  const headRoomInitial = Math.floor(maxChars * 0.7);
+  const sampleMarker = `\n…(truncated ${name}: kept ${headRoomInitial}+${Math.max(0, maxChars - headRoomInitial - 96)} chars of ${content.length})…\n`;
+  const markerReserve = Math.max(64, sampleMarker.length + 8); // +8 slack for digit width changes
+  const headRoom = Math.min(headRoomInitial, Math.max(0, maxChars - markerReserve - 8));
+  const tailRoom = Math.max(0, maxChars - headRoom - markerReserve);
   const head = content.slice(0, Math.max(0, headRoom));
   const tail = tailRoom > 0 ? content.slice(content.length - tailRoom) : "";
-  return `${head}\n…(truncated ${name}: kept ${headRoom}+${tailRoom} chars of ${content.length})…\n${tail}`;
+  const result = `${head}\n…(truncated ${name}: kept ${headRoom}+${tailRoom} chars of ${content.length})…\n${tail}`;
+  // Belt-and-braces: if the computed marker ended up longer than
+  // reserved (e.g. multi-byte name with unusual digit widths), trim to
+  // the cap rather than return an over-cap string.
+  return result.length <= maxChars ? result : result.slice(0, maxChars);
 }
 
 /**

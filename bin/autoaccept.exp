@@ -28,9 +28,13 @@ set start_sh [lindex $argv 0]
 spawn /bin/bash -l $start_sh
 
 expect {
-    -re {Yes.{0,10}I.{0,5}accept} {
-        # Bypass permissions warning (dev channels acknowledgement,
-        # shown once per machine). Not a per-tool gate.
+    -re {I.{0,5}accept.{0,80}development.{0,10}channels} {
+        # Dev-channels acknowledgement — shown once per machine when
+        # --dangerously-load-development-channels is first used. Tightly
+        # scoped to the literal "development channels" phrase to avoid
+        # over-matching per-tool confirmations that start with "Yes, I
+        # accept" e.g. "Yes, I accept this file edit." Those must fall
+        # through to the plugin's permission_request flow.
         sleep 0.5
         send "\033\[B\r"
         exp_continue
