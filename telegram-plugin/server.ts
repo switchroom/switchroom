@@ -955,7 +955,7 @@ const SILENT_REPLY_MAX_LEN = Math.max(
   ...Array.from(SILENT_REPLY_MARKERS, (m) => m.length),
 ) + 2 // small buffer for trailing punctuation callers might add accidentally
 
-function isSilentReplyMarker(text: string | undefined): boolean {
+export function isSilentReplyMarker(text: string | undefined): boolean {
   if (typeof text !== 'string') return false
   const trimmed = text.trim()
   if (trimmed.length === 0) return false
@@ -964,6 +964,34 @@ function isSilentReplyMarker(text: string | undefined): boolean {
   // `NoReply`. Require letters/underscores/digits only so legitimate
   // prose that happens to contain "NO_REPLY was suggested" still sends.
   return SILENT_REPLY_MARKERS.has(trimmed.toUpperCase())
+}
+
+/**
+ * Decide whether a `reply`/`stream_reply` invocation should be short-
+ * circuited as a silent-reply ack, enforcing the allowlist FIRST.
+ *
+ * Sprint1 review finding #6: an earlier revision returned the silent ack
+ * before calling `assertAllowedChat`, so unauthorised chats could bypass
+ * the outbound allowlist by having the agent emit `NO_REPLY`. The ack
+ * itself is a cross-chat signal (it confirms to the LLM that the chat
+ * exists and is reachable) even though no Telegram message is sent, so
+ * we must refuse disallowed chats *before* producing it.
+ *
+ * `assertAllowed` throws when `chat_id` is not on the allowlist; callers
+ * let that propagate so the MCP tool call fails loudly.
+ */
+export function guardSilentReply(params: {
+  chat_id: string
+  text: string | undefined
+  hasFiles: boolean
+  assertAllowed: (chat_id: string) => void
+}): { kind: 'silent'; markerText: string } | { kind: 'continue' } {
+  const { chat_id, text, hasFiles, assertAllowed } = params
+  if (hasFiles) return { kind: 'continue' }
+  if (!isSilentReplyMarker(text)) return { kind: 'continue' }
+  // Allowlist check BEFORE returning the ack — see docblock above.
+  assertAllowed(chat_id)
+  return { kind: 'silent', markerText: (text as string).trim() }
 }
 
 // Stores full permission details for "See more" expansion keyed by request_id.
