@@ -53,10 +53,50 @@ done
 {{/if}}
 cd "{{agentDir}}"
 
-# Fresh session every start — avoids context-window blowout after heavy
-# autonomous work. Hindsight auto-recall surfaces relevant past memories
-# on every user message via the UserPromptSubmit hook.
+# Session resume policy. The mode is set at scaffold time from
+# session_continuity.resume_mode (default 'auto'). Effective behaviors:
+#
+#   auto (default): if the latest JSONL transcript under
+#     $CLAUDE_CONFIG_DIR/projects/ is smaller than
+#     SWITCHROOM_RESUME_MAX_BYTES and newer than 7 days, pass
+#     --continue. Otherwise start fresh and let the handoff briefing
+#     (below) inject a summary.
+#   continue: always pass --continue. Flaky for large transcripts;
+#     use only if you know your sessions stay small.
+#   handoff: never pass --continue. Rely entirely on the handoff
+#     briefing for continuity.
+#   none: never resume. Start completely fresh every launch.
+#
+# In every mode, Hindsight auto-recall still surfaces long-term memories
+# on each UserPromptSubmit so recent context isn't lost.
+SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}auto{{/if}}"
+SWITCHROOM_RESUME_MAX_BYTES="{{#if resumeMaxBytes}}{{{resumeMaxBytes}}}{{else}}2000000{{/if}}"
 CONTINUE_FLAG=""
+
+_RESUME_LATEST_JSONL="$(ls -t "$CLAUDE_CONFIG_DIR/projects/"*/*.jsonl 2>/dev/null | head -1)"
+case "$SWITCHROOM_RESUME_MODE" in
+  continue)
+    if [ -n "$_RESUME_LATEST_JSONL" ]; then
+      CONTINUE_FLAG="--continue"
+    fi
+    ;;
+  auto)
+    if [ -n "$_RESUME_LATEST_JSONL" ]; then
+      _RESUME_SIZE="$(stat -c %s "$_RESUME_LATEST_JSONL" 2>/dev/null || echo 0)"
+      _RESUME_MTIME="$(stat -c %Y "$_RESUME_LATEST_JSONL" 2>/dev/null || echo 0)"
+      _RESUME_AGE=$(( $(date +%s) - _RESUME_MTIME ))
+      if [ "$_RESUME_SIZE" -gt 0 ] && [ "$_RESUME_SIZE" -lt "$SWITCHROOM_RESUME_MAX_BYTES" ] && [ "$_RESUME_AGE" -lt 604800 ]; then
+        CONTINUE_FLAG="--continue"
+      fi
+    fi
+    ;;
+  handoff|none)
+    : # CONTINUE_FLAG stays empty
+    ;;
+  *)
+    : # Unknown mode, stay empty
+    ;;
+esac
 
 {{#if handoffEnabled}}
 # --- Session handoff briefing ---

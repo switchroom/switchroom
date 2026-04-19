@@ -246,6 +246,27 @@ export const SessionContinuitySchema = z
       .positive()
       .optional()
       .describe("Cap on recent user/assistant turn pairs fed to the summarizer."),
+    resume_mode: z
+      .enum(["auto", "continue", "handoff", "none"])
+      .optional()
+      .describe(
+        "How to resume the next session. 'auto' (default) uses --continue " +
+        "when the latest JSONL is smaller than resume_max_bytes, else " +
+        "falls back to the summarized handoff briefing. 'continue' always " +
+        "passes --continue. 'handoff' always uses the summarized briefing. " +
+        "'none' starts fresh every time.",
+      ),
+    resume_max_bytes: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Byte threshold above which 'auto' mode falls back to handoff " +
+        "instead of --continue. Default 2_000_000 (~2MB). Large transcripts " +
+        "can blow out the context window even with prefix caching, and " +
+        "--continue replay is known-fragile at scale.",
+      ),
   })
   .optional();
 

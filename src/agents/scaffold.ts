@@ -1131,6 +1131,12 @@ export function scaffoldAgent(
     // SWITCHROOM_HANDOFF_SHOW_LINE env var read by the telegram plugin.
     handoffEnabled: agentConfig.session_continuity?.enabled !== false,
     handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
+    // Session resume policy (see profiles/_base/start.sh.hbs). Defaults
+    // to 'auto' + 2MB threshold so small recent sessions get --continue
+    // and large/old ones fall back to the handoff briefing.
+    resumeMode: agentConfig.session_continuity?.resume_mode ?? "auto",
+    resumeMaxBytes:
+      agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
   };
 
   // --- Create directory structure ---
@@ -1676,6 +1682,9 @@ export function reconcileAgent(
       sessionMaxTurns: agentConfig.session?.max_turns,
       handoffEnabled: agentConfig.session_continuity?.enabled !== false,
       handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
+      resumeMode: agentConfig.session_continuity?.resume_mode ?? "auto",
+      resumeMaxBytes:
+        agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
     };
     const beforeStartSh = readFileSync(startShPath, "utf-8");
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
