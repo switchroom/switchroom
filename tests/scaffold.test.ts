@@ -797,6 +797,37 @@ describe("reconcileAgent", () => {
     expect(settingsAfter.permissions.allow).not.toContain("Write");
   });
 
+  it("keeps read-only defaults when tools.allow=[] and dangerous_mode=off (explicit A3 regression)", () => {
+    // Sprint 2 review finding A3: the existing preserves-defaults test uses
+    // makeAgentConfig() which leaves `tools` and `dangerous_mode` unset, so
+    // it only exercises the "fields missing" branch. If a user explicitly
+    // writes `tools: { allow: [] }` with `dangerous_mode: off`, reconcile
+    // must *still* merge the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS seed into
+    // permissions.allow — an empty user list is not a signal to strip.
+    const agentConfig = makeAgentConfig({
+      tools: { allow: [] },
+      dangerous_mode: "off",
+    } as Partial<AgentConfig>);
+    const scaffolded = scaffoldAgent("a3", agentConfig, tmpDir, telegramConfig);
+    const reconciled = reconcileAgent(
+      "a3",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      buildSwitchroomConfig(agentConfig),
+    );
+    const settings = JSON.parse(
+      readFileSync(join(reconciled.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toEqual(
+      expect.arrayContaining(["Read", "Grep", "Glob"]),
+    );
+    // Risky tools must still NOT be auto-allowed with dangerous_mode=off.
+    expect(settings.permissions.allow).not.toContain("Bash");
+    expect(settings.permissions.allow).not.toContain("Edit");
+    expect(settings.permissions.allow).not.toContain("Write");
+  });
+
   it("re-seeds workspace bootstrap files on reconcile (covers profile template additions)", () => {
     // Regression for Sprint 1 review finding #7: reconcileAgent did not
     // call seedWorkspaceBootstrapFiles, so new profile templates added
