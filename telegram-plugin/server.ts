@@ -4128,15 +4128,64 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
     )
     return
   }
+  // Debounce: /new and /reset are functionally self-restarts. Without the
+  // same 15s marker guard /restart uses, a double-tap (because the ack
+  // hasn't landed yet) would stack systemctl restarts — same respawn-storm
+  // failure mode /restart had before it got debounced.
+  const existing = readRestartMarker()
+  if (existing && Date.now() - existing.ts < 15_000) {
+    await switchroomReply(
+      ctx,
+      `\u23F3 Restart of <b>${escapeHtmlForTg(name)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) \u2014 ignoring duplicate /${kind}.`,
+      { html: true },
+    )
+    return
+  }
+
   const removed = flushCurrentAgentHandoff()
   const tail = removed > 0 ? ` \u00b7 flushed ${removed} handoff file(s)` : ''
   const label = kind === 'new' ? '\u{1F195} New session' : '\u{1F504} Session reset'
-  await switchroomReply(
-    ctx,
-    `${label} for <b>${escapeHtmlForTg(name)}</b>${tail} \u00b7 restarting\u2026`,
-    { html: true },
-  )
-  await runSwitchroomCommand(ctx, ['agent', 'restart', name], `${kind} ${name}`)
+  const ackText = `${label} for <b>${escapeHtmlForTg(name)}</b>${tail} \u00b7 restarting\u2026`
+
+  // Mirror /restart self-target ack path: send via raw API so we can capture
+  // message_id + persist to history before systemd kills us.
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  let ackId: number | null = null
+  try {
+    const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+    })
+    ackId = sent.message_id
+    if (HISTORY_ENABLED) {
+      try {
+        recordOutbound({
+          chat_id: chatId,
+          thread_id: threadId ?? null,
+          message_ids: [sent.message_id],
+          texts: [ackText.replace(/<[^>]+>/g, '')],
+          attachment_kinds: [],
+        })
+      } catch (err) {
+        process.stderr.write(`telegram channel: recordOutbound(${kind} ack) failed: ${err}\n`)
+      }
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: ${kind} ack send failed: ${err}\n`)
+  }
+
+  writeRestartMarker({
+    chat_id: chatId,
+    thread_id: threadId ?? null,
+    ack_message_id: ackId,
+    ts: Date.now(),
+  })
+  await sweepPinsBeforeSelfRestart()
+  // --force: see matching comment in /restart handler. Same reason applies
+  // here — the agent is mid-turn processing this /new or /reset command.
+  spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
 }
 
 bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
