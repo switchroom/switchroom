@@ -53,6 +53,17 @@ done
 {{/if}}
 cd "{{agentDir}}"
 
+# Portable stat wrappers. Switchroom runs on Linux in production (GNU stat)
+# but developers sometimes run `switchroom agent start` ad-hoc on macOS
+# (BSD stat). Detect once and route through helpers.
+if stat -c %s "$0" >/dev/null 2>&1; then
+  _stat_size()  { stat -c %s "$1" 2>/dev/null || echo 0; }
+  _stat_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+else
+  _stat_size()  { stat -f %z "$1" 2>/dev/null || echo 0; }
+  _stat_mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+fi
+
 # Session resume policy. The mode is set at scaffold time from
 # session_continuity.resume_mode (default 'auto'). Effective behaviors:
 #
@@ -82,8 +93,8 @@ case "$SWITCHROOM_RESUME_MODE" in
     ;;
   auto)
     if [ -n "$_RESUME_LATEST_JSONL" ]; then
-      _RESUME_SIZE="$(stat -c %s "$_RESUME_LATEST_JSONL" 2>/dev/null || echo 0)"
-      _RESUME_MTIME="$(stat -c %Y "$_RESUME_LATEST_JSONL" 2>/dev/null || echo 0)"
+      _RESUME_SIZE="$(_stat_size "$_RESUME_LATEST_JSONL")"
+      _RESUME_MTIME="$(_stat_mtime "$_RESUME_LATEST_JSONL")"
       _RESUME_AGE=$(( $(date +%s) - _RESUME_MTIME ))
       if [ "$_RESUME_SIZE" -gt 0 ] && [ "$_RESUME_SIZE" -lt "$SWITCHROOM_RESUME_MAX_BYTES" ] && [ "$_RESUME_AGE" -lt 604800 ]; then
         CONTINUE_FLAG="--continue"
@@ -111,7 +122,7 @@ HANDOFF_FILE="{{agentDir}}/.handoff.md"
 if [ ! -s "$HANDOFF_FILE" ]; then
   _LATEST_JSONL=$(ls -t "$CLAUDE_CONFIG_DIR/projects/"*/*.jsonl 2>/dev/null | head -1)
   if [ -n "$_LATEST_JSONL" ]; then
-    _LAST_MOD=$(stat -c %Y "$_LATEST_JSONL" 2>/dev/null || echo 0)
+    _LAST_MOD=$(_stat_mtime "$_LATEST_JSONL")
     _NOW=$(date +%s)
     if [ $((_NOW - _LAST_MOD)) -lt 600 ]; then
       timeout 2 switchroom handoff "{{name}}" 2>/dev/null || true
