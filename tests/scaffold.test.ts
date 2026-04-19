@@ -874,6 +874,110 @@ describe("reconcileAgent", () => {
     ).toThrow(/Agent directory does not exist/);
   });
 
+  it("seeds NEW workspace templates added to the profile after scaffold (A4a regression)", () => {
+    // Sprint 2 review finding A4a: when a new release ships a new
+    // workspace bootstrap template (e.g. HEARTBEAT.md.hbs added later),
+    // reconcile must pick it up and render it into existing agents'
+    // workspace directories. The earlier smoke test only proved that a
+    // DELETED file gets re-seeded, not that a NEW template in the
+    // profile flows through.
+    const profileWorkspaceDir = resolve(
+      import.meta.dirname,
+      "../profiles/default/workspace",
+    );
+    const newTemplateName = `__A4A_TEST_${Date.now()}.md.hbs`;
+    const newTemplatePath = join(profileWorkspaceDir, newTemplateName);
+    const renderedName = newTemplateName.replace(/\.hbs$/, "");
+    writeFileSync(
+      newTemplatePath,
+      "# Late-arriving template for {{name}}\n",
+      "utf-8",
+    );
+    try {
+      const agentConfig = makeAgentConfig();
+      const scaffolded = scaffoldAgent("a4a", agentConfig, tmpDir, telegramConfig);
+      // Sanity: scaffold already seeded it too… delete so we can prove
+      // reconcile alone puts it back when missing. (Simulates "agent
+      // scaffolded before this template existed in the profile".)
+      const workspaceDir = join(scaffolded.agentDir, "workspace");
+      const renderedPath = join(workspaceDir, renderedName);
+      if (existsSync(renderedPath)) rmSync(renderedPath);
+      expect(existsSync(renderedPath)).toBe(false);
+
+      reconcileAgent(
+        "a4a",
+        agentConfig,
+        tmpDir,
+        telegramConfig,
+        buildSwitchroomConfig(agentConfig),
+      );
+
+      expect(existsSync(renderedPath)).toBe(true);
+      const contents = readFileSync(renderedPath, "utf-8");
+      expect(contents).toBe("# Late-arriving template for a4a\n");
+    } finally {
+      if (existsSync(newTemplatePath)) rmSync(newTemplatePath);
+    }
+  });
+
+  it("scaffold + reconcile render workspace templates IDENTICALLY (A4b contract)", () => {
+    // Sprint 2 review finding A4b: scaffoldAgent and reconcileAgent used
+    // to build separate handlebars contexts for workspace template
+    // rendering (scaffold ~60 keys, reconcile 7 keys). They now share
+    // buildWorkspaceContext() — pin that contract with a template that
+    // references a key from outside the old 7-key subset.
+    const profileWorkspaceDir = resolve(
+      import.meta.dirname,
+      "../profiles/default/workspace",
+    );
+    const templateName = `__A4B_CONTRACT_${Date.now()}.md.hbs`;
+    const templatePath = join(profileWorkspaceDir, templateName);
+    const renderedName = templateName.replace(/\.hbs$/, "");
+    // Reference `{{model}}` — not in the old 7-key reconcile subset,
+    // so this would render as "" on reconcile before the refactor.
+    writeFileSync(
+      templatePath,
+      "name={{name}} soul={{soul.name}} model={{model}}\n",
+      "utf-8",
+    );
+    try {
+      const agentConfig = makeAgentConfig({
+        model: "sonnet",
+        soul: { name: "TestSoul" } as unknown,
+      } as Partial<AgentConfig>);
+
+      // scaffold into dir-A
+      const scaffolded = scaffoldAgent("a4b", agentConfig, tmpDir, telegramConfig);
+      const scaffoldRendered = readFileSync(
+        join(scaffolded.agentDir, "workspace", renderedName),
+        "utf-8",
+      );
+
+      // Second agent: scaffold minimally, delete the file, then
+      // reconcile to exercise the reconcile-path render.
+      const scaffolded2 = scaffoldAgent("a4b", agentConfig, mkdtempSync(join(tmpdir(), "sr-a4b-")), telegramConfig);
+      const workspace2 = join(scaffolded2.agentDir, "workspace");
+      rmSync(join(workspace2, renderedName));
+      reconcileAgent(
+        "a4b",
+        agentConfig,
+        resolve(scaffolded2.agentDir, ".."),
+        telegramConfig,
+        buildSwitchroomConfig(agentConfig),
+      );
+      const reconcileRendered = readFileSync(
+        join(workspace2, renderedName),
+        "utf-8",
+      );
+
+      expect(reconcileRendered).toBe(scaffoldRendered);
+      expect(reconcileRendered).toContain("model=sonnet");
+      expect(reconcileRendered).toContain("soul=TestSoul");
+    } finally {
+      if (existsSync(templatePath)) rmSync(templatePath);
+    }
+  });
+
   it("adds Hindsight MCP entry to settings.json after enabling memory backend", () => {
     // Step 1: scaffold an agent without memory
     const agentConfig = makeAgentConfig();
