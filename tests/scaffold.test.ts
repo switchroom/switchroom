@@ -595,6 +595,49 @@ describe("scaffoldAgent", () => {
 
     expect(settings.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
   });
+
+  it("seeds profile workspace/ files into agent's workspace/ directory", () => {
+    const config = makeAgentConfig({
+      soul: { name: "Test Agent", emoji: "\ud83e\udd16" },
+    });
+    const result = scaffoldAgent("ws-agent", config, tmpDir, telegramConfig);
+
+    // Default profile ships workspace/{AGENTS,USER,IDENTITY,TOOLS,MEMORY}.md.hbs
+    const workspaceDir = join(result.agentDir, "workspace");
+    expect(existsSync(workspaceDir)).toBe(true);
+    expect(existsSync(join(workspaceDir, "AGENTS.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "USER.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "IDENTITY.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "TOOLS.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "MEMORY.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "memory"))).toBe(true);
+
+    // .hbs templates must have been rendered (not copied raw) — the file
+    // must NOT contain handlebars syntax.
+    const agents = readFileSync(join(workspaceDir, "AGENTS.md"), "utf-8");
+    expect(agents).not.toContain("{{");
+    expect(agents).toContain("AGENTS.md");
+
+    // IDENTITY.md should include the agent's soul name (template context).
+    const identity = readFileSync(join(workspaceDir, "IDENTITY.md"), "utf-8");
+    expect(identity).toContain("Test Agent");
+
+    // Source .hbs file must not appear in agent dir.
+    expect(existsSync(join(workspaceDir, "AGENTS.md.hbs"))).toBe(false);
+  });
+
+  it("preserves user edits in workspace/ across re-scaffold", () => {
+    const config = makeAgentConfig();
+    const first = scaffoldAgent("edit-agent", config, tmpDir, telegramConfig);
+    const agentsPath = join(first.agentDir, "workspace", "AGENTS.md");
+    writeFileSync(agentsPath, "# MY CUSTOM AGENTS\nhello", "utf-8");
+
+    // Re-scaffold — existing workspace files must NOT be overwritten.
+    scaffoldAgent("edit-agent", config, tmpDir, telegramConfig);
+
+    const after = readFileSync(agentsPath, "utf-8");
+    expect(after).toBe("# MY CUSTOM AGENTS\nhello");
+  });
 });
 
 describe("reconcileAgent", () => {
