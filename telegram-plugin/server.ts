@@ -3959,6 +3959,95 @@ bot.command('permissions', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
 })
 
+/**
+ * Shared handler for /approve and /deny. Accepts an explicit request_id
+ * argument, or falls back to the most recently created pending permission
+ * if the user didn't specify one (common case: only one approval in
+ * flight).
+ *
+ * Functionally equivalent to tapping the ✅ Allow / ❌ Deny inline
+ * button, but available as a slash command for cases where the button
+ * didn't make it through (e.g. the approval card scrolled off, or the
+ * user prefers keyboard/text). Fires the same MCP notification, so the
+ * plugin's permission_request handler sees a single outcome.
+ */
+async function handlePermissionSlash(
+  ctx: Context,
+  behavior: 'allow' | 'deny',
+): Promise<void> {
+  if (!isAuthorizedSender(ctx)) return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) {
+    await switchroomReply(ctx, 'Not authorized to answer permission prompts.')
+    return
+  }
+  const raw = (ctx.match ?? '').trim()
+  let request_id = raw
+  if (!request_id) {
+    // Default to the most recently created pending permission. Map
+    // preserves insertion order so Array.from(...).at(-1) gives us that.
+    const entries = Array.from(pendingPermissions.keys())
+    request_id = entries[entries.length - 1] ?? ''
+  }
+  if (!request_id) {
+    await switchroomReply(
+      ctx,
+      'No pending permission prompts right now.',
+    )
+    return
+  }
+  if (!pendingPermissions.has(request_id)) {
+    await switchroomReply(
+      ctx,
+      `No pending permission for id <code>${escapeHtmlForTg(request_id)}</code>. It may have already been answered or timed out.`,
+      { html: true },
+    )
+    return
+  }
+  const details = pendingPermissions.get(request_id)
+  void mcp.notification({
+    method: 'notifications/claude/channel/permission',
+    params: { request_id, behavior },
+  })
+  pendingPermissions.delete(request_id)
+  process.stderr.write(
+    `[telegram-plugin] slash-${behavior} request_id=${request_id} tool=${details?.tool_name ?? '?'} by=${senderId}\n`,
+  )
+  const label = behavior === 'allow' ? '\u2705 Allowed' : '\u274c Denied'
+  const suffix = details?.tool_name ? ` (<code>${escapeHtmlForTg(details.tool_name)}</code>)` : ''
+  await switchroomReply(
+    ctx,
+    `${label}${suffix} via /${behavior} <code>${escapeHtmlForTg(request_id)}</code>`,
+    { html: true },
+  )
+}
+
+// /approve [id] — slash-command alternative to tapping ✅ Allow on the
+// inline-button approval card. No id = most recent pending permission.
+bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
+
+// /deny [id] — slash-command alternative to tapping ❌ Deny on the
+// inline-button approval card. No id = most recent pending permission.
+bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
+
+// /pending — list current pending permission prompts with their ids, so
+// a user can target a specific one with /approve <id> or /deny <id>.
+bot.command('pending', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  if (pendingPermissions.size === 0) {
+    await switchroomReply(ctx, 'No pending permission prompts.')
+    return
+  }
+  const lines: string[] = ['<b>Pending permission prompts</b>']
+  for (const [id, details] of pendingPermissions.entries()) {
+    lines.push(
+      `\u2022 <code>${escapeHtmlForTg(id)}</code> \u2014 ${escapeHtmlForTg(details.tool_name)}`,
+    )
+  }
+  await switchroomReply(ctx, lines.join('\n'), { html: true })
+})
+
 // /pins-status — diagnostic dump of the progress-card pin bookkeeping.
 //
 // Shows sidecar entries, in-memory tracker entries, and any divergence
