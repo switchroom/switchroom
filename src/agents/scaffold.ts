@@ -980,6 +980,111 @@ function resolveSwitchroomCliPath(): string {
  * Idempotent: creates missing files and directories but never overwrites
  * existing ones.
  */
+/**
+ * Inputs for {@link buildWorkspaceContext}. Shared shape used by both
+ * `scaffoldAgent` (full-context builder for start.sh / settings.json /
+ * workspace templates) and `reconcileAgent` (workspace re-seed path).
+ *
+ * Keeping one source of truth means a new handlebars key added to any
+ * workspace template automatically resolves identically on both paths —
+ * closing the gap where `reconcileAgent` used to rebuild a 7-key subset
+ * and silently render `""` for anything else.
+ */
+interface BuildWorkspaceContextArgs {
+  name: string;
+  agentDir: string;
+  agentConfig: AgentConfig;
+  telegramConfig: TelegramConfig;
+  switchroomConfig?: SwitchroomConfig;
+  switchroomConfigPath?: string;
+  topicId?: number;
+  tools: { allow?: string[]; deny?: string[] };
+  permissionAllow: string[];
+  hasAllWildcard: boolean;
+  resolvedBotToken?: string;
+  rawBotToken?: string;
+  hindsightAutoRecallEnabled: boolean;
+  hindsightBankId: string;
+  hindsightApiBaseUrl: string;
+}
+
+/**
+ * Build the handlebars render context used for profile templates
+ * (start.sh, settings.json) AND workspace bootstrap templates
+ * (AGENTS.md, SOUL.md, ...). Both scaffold and reconcile call this so
+ * new workspace-template keys stay in lockstep across the two paths.
+ */
+function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, unknown> {
+  const {
+    name,
+    agentDir,
+    agentConfig,
+    telegramConfig,
+    switchroomConfigPath,
+    topicId,
+    tools,
+    permissionAllow,
+    hasAllWildcard,
+    resolvedBotToken,
+    rawBotToken,
+    hindsightAutoRecallEnabled,
+    hindsightBankId,
+    hindsightApiBaseUrl,
+  } = args;
+  return {
+    name,
+    agentDir,
+    topicId,
+    topicName: agentConfig.topic_name,
+    topicEmoji: agentConfig.topic_emoji,
+    soul: agentConfig.soul,
+    user: (agentConfig as unknown as { user?: unknown }).user,
+    agentConfig,
+    tools,
+    toolsDeny: tools.deny ?? [],
+    permissionAllow,
+    defaultModeAcceptEdits: hasAllWildcard,
+    memory: agentConfig.memory,
+    model: agentConfig.model,
+    mcpServers: agentConfig.mcp_servers,
+    schedule: agentConfig.schedule,
+    botToken: resolvedBotToken ?? rawBotToken,
+    forumChatId: telegramConfig.forum_chat_id,
+    dangerousMode: agentConfig.dangerous_mode === true,
+    skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
+    useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+    hindsightEnabled: hindsightAutoRecallEnabled,
+    hindsightBankIdQ: shellSingleQuote(hindsightBankId),
+    hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
+    switchroomConfigPathQ: switchroomConfigPath
+      ? shellSingleQuote(resolve(switchroomConfigPath))
+      : undefined,
+    modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
+    userEnvQuoted: (() => {
+      const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
+      if (Object.keys(combined).length === 0) return undefined;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(combined)) {
+        out[k] = shellSingleQuote(v);
+      }
+      return out;
+    })(),
+    systemPromptAppendShellQuoted: agentConfig.system_prompt_append
+      ? shellSingleQuote(agentConfig.system_prompt_append)
+      : undefined,
+    extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
+      ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
+      : undefined,
+    sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
+    sessionMaxTurns: agentConfig.session?.max_turns,
+    handoffEnabled: agentConfig.session_continuity?.enabled !== false,
+    handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
+    resumeMode: agentConfig.session_continuity?.resume_mode ?? "auto",
+    resumeMaxBytes:
+      agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
+  };
+}
+
 export function scaffoldAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -1067,77 +1172,26 @@ export function scaffoldAgent(
     ? (switchroomConfig!.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
     : "http://127.0.0.1:8888";
 
-  // Build the template rendering context
-  const context: Record<string, unknown> = {
+  // Build the template rendering context via the shared helper so
+  // scaffold and reconcile always produce the same shape for workspace
+  // template rendering (see buildWorkspaceContext).
+  const context = buildWorkspaceContext({
     name,
     agentDir,
+    agentConfig,
+    telegramConfig,
+    switchroomConfig,
+    switchroomConfigPath,
     topicId,
-    topicName: agentConfig.topic_name,
-    topicEmoji: agentConfig.topic_emoji,
-    soul: agentConfig.soul,
     tools,
-    toolsDeny: tools.deny ?? [],
     permissionAllow,
-    defaultModeAcceptEdits: hasAllWildcard,
-    memory: agentConfig.memory,
-    model: agentConfig.model,
-    mcpServers: agentConfig.mcp_servers,
-    schedule: agentConfig.schedule,
-    botToken: resolvedBotToken ?? rawBotToken,
-    forumChatId: telegramConfig.forum_chat_id,
-    dangerousMode: agentConfig.dangerous_mode === true,
-    skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
-    useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
-    hindsightEnabled: hindsightAutoRecallEnabled,
-    // POSIX-single-quote shell-context values as defense-in-depth.
-    // The schema validates these too, but quoting closes the gap for
-    // any future relaxation of the schema validators.
-    hindsightBankIdQ: shellSingleQuote(hindsightBankId),
-    hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
-    switchroomConfigPathQ: switchroomConfigPath
-      ? shellSingleQuote(resolve(switchroomConfigPath))
-      : undefined,
-    modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
-    // Phase 2 + 3 — user env merged with channel-derived env. User
-    // entries win on conflict (explicit beats channel default). Each
-    // value is POSIX-single-quoted at build time so `&`, `$`, backtick,
-    // newline, and embedded quotes all survive shell parsing. The
-    // template emits `export KEY={{{value}}}` with triple braces to
-    // avoid Handlebars HTML-escaping the already-quoted string.
-    userEnvQuoted: (() => {
-      const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
-      if (Object.keys(combined).length === 0) return undefined;
-      const out: Record<string, string> = {};
-      for (const [k, v] of Object.entries(combined)) {
-        out[k] = shellSingleQuote(v);
-      }
-      return out;
-    })(),
-    systemPromptAppendShellQuoted: agentConfig.system_prompt_append
-      ? shellSingleQuote(agentConfig.system_prompt_append)
-      : undefined,
-    // Phase 5 — cli_args escape hatch. Pre-joined here so the template
-    // can dump it verbatim. Each arg is POSIX-single-quoted so arbitrary
-    // user input (including flag values with spaces) reaches claude
-    // intact. Leading space lets the template concat without a gap.
-    extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
-      ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
-      : undefined,
-    // Session freshness check thresholds (shell variables in start.sh)
-    sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
-    sessionMaxTurns: agentConfig.session?.max_turns,
-    // Session-handoff continuity (default on). Thread into start.sh so
-    // the template can gate the handoff merge block and export the
-    // SWITCHROOM_HANDOFF_SHOW_LINE env var read by the telegram plugin.
-    handoffEnabled: agentConfig.session_continuity?.enabled !== false,
-    handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
-    // Session resume policy (see profiles/_base/start.sh.hbs). Defaults
-    // to 'auto' + 2MB threshold so small recent sessions get --continue
-    // and large/old ones fall back to the handoff briefing.
-    resumeMode: agentConfig.session_continuity?.resume_mode ?? "auto",
-    resumeMaxBytes:
-      agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
-  };
+    hasAllWildcard,
+    resolvedBotToken,
+    rawBotToken,
+    hindsightAutoRecallEnabled,
+    hindsightBankId,
+    hindsightApiBaseUrl,
+  });
 
   // --- Create directory structure ---
   const dirs = [
@@ -2039,15 +2093,27 @@ export function reconcileAgent(
   //     behavior. Without this call, agents scaffolded before a template
   //     addition stay out of date until rescaffolded.
   const reconcileProfilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
-  const workspaceContext: Record<string, unknown> = {
+  // Use the same helper scaffoldAgent uses so workspace templates see
+  // an identical context shape on both paths. Without this, any new
+  // handlebars key referenced by a workspace template renders on
+  // scaffold but as "" on reconcile.
+  const workspaceContext = buildWorkspaceContext({
     name,
     agentDir,
-    soul: agentConfig.soul,
-    user: (agentConfig as unknown as { user?: unknown }).user,
     agentConfig,
-    topicName: agentConfig.topic_name,
-    topicEmoji: agentConfig.topic_emoji,
-  };
+    telegramConfig,
+    switchroomConfig,
+    switchroomConfigPath,
+    topicId,
+    tools,
+    permissionAllow: desiredAllow,
+    hasAllWildcard,
+    resolvedBotToken,
+    rawBotToken,
+    hindsightAutoRecallEnabled,
+    hindsightBankId,
+    hindsightApiBaseUrl,
+  });
   seedWorkspaceBootstrapFiles({
     profilePath: reconcileProfilePath,
     agentDir,
