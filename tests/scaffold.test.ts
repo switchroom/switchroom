@@ -763,6 +763,73 @@ describe("reconcileAgent", () => {
     } as SwitchroomConfig;
   }
 
+  it("preserves read-only tool defaults across scaffold → reconcile", () => {
+    // Regression for Sprint 1 review finding #2: reconcileAgent rebuilt
+    // permissions.allow without the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS
+    // seed, so the first reconcile after scaffold stripped Read/Grep/Glob
+    // and every such tool call started popping an approval card. Both
+    // paths must include the defaults when tools.allow is empty AND
+    // dangerous_mode is off.
+    const agentConfig = makeAgentConfig();
+    const scaffolded = scaffoldAgent("rca", agentConfig, tmpDir, telegramConfig);
+    const settingsBefore = JSON.parse(
+      readFileSync(join(scaffolded.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settingsBefore.permissions.allow).toEqual(
+      expect.arrayContaining(["Read", "Grep", "Glob"]),
+    );
+    const reconciled = reconcileAgent(
+      "rca",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      buildSwitchroomConfig(agentConfig),
+    );
+    const settingsAfter = JSON.parse(
+      readFileSync(join(reconciled.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settingsAfter.permissions.allow).toEqual(
+      expect.arrayContaining(["Read", "Grep", "Glob"]),
+    );
+    // Risky tools still must NOT be auto-allowed.
+    expect(settingsAfter.permissions.allow).not.toContain("Bash");
+    expect(settingsAfter.permissions.allow).not.toContain("Edit");
+    expect(settingsAfter.permissions.allow).not.toContain("Write");
+  });
+
+  it("re-seeds workspace bootstrap files on reconcile (covers profile template additions)", () => {
+    // Regression for Sprint 1 review finding #7: reconcileAgent did not
+    // call seedWorkspaceBootstrapFiles, so new profile templates added
+    // after an agent was scaffolded stayed absent until rescaffold.
+    const agentConfig = makeAgentConfig();
+    const scaffolded = scaffoldAgent("wsr", agentConfig, tmpDir, telegramConfig);
+    const workspaceDir = join(scaffolded.agentDir, "workspace");
+    expect(existsSync(join(workspaceDir, "AGENTS.md"))).toBe(true);
+    // Simulate a user having deleted a workspace file — reconcile should
+    // re-seed it from the profile template.
+    const agentsPath = join(workspaceDir, "AGENTS.md");
+    rmSync(agentsPath);
+    expect(existsSync(agentsPath)).toBe(false);
+    reconcileAgent(
+      "wsr",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      buildSwitchroomConfig(agentConfig),
+    );
+    expect(existsSync(agentsPath)).toBe(true);
+    // And user edits to OTHER workspace files must survive reconcile.
+    writeFileSync(join(workspaceDir, "USER.md"), "# MY EDITS", "utf-8");
+    reconcileAgent(
+      "wsr",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      buildSwitchroomConfig(agentConfig),
+    );
+    expect(readFileSync(join(workspaceDir, "USER.md"), "utf-8")).toBe("# MY EDITS");
+  });
+
   it("throws when the agent directory does not exist", () => {
     const agentConfig = makeAgentConfig();
     expect(() =>
