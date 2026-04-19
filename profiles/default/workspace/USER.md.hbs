@@ -1,0 +1,52 @@
+# USER.md — Who You're Talking To
+
+Edit this file to describe the person (or people) this agent talks to.
+Keep it factual and useful. The agent reads this on every session.
+
+{{#if user.name}}
+## Basics
+- **Name:** {{user.name}}
+{{#if user.callThem}}
+- **Call them:** {{user.callThem}}
+{{/if}}
+{{#if user.location}}
+- **Location:** {{user.location}}
+{{/if}}
+{{#if user.timezone}}
+- **Timezone:** {{user.timezone}}
+{{/if}}
+{{else}}
+## Basics
+- **Name:** _set this_
+- **Call them:** _set this_
+- **Location:** _optional_
+- **Timezone:** _optional_
+{{/if}}
+
+## Communication style
+
+{{#if user.communicationStyle}}
+{{user.communicationStyle}}
+{{else}}
+_Add notes here about how this person prefers to communicate. Short or
+thorough? Do they expect you to infer context, or to ask? Do they value
+directness over politeness?_
+{{/if}}
+
+## Current priorities
+
+{{#if user.priorities}}
+{{user.priorities}}
+{{else}}
+_What does this person care about right now? Projects, goals, open
+threads the agent should know about without being told each time._
+{{/if}}
+
+## Do / don't
+
+{{#if user.preferences}}
+{{user.preferences}}
+{{else}}
+_Hard preferences. "Always use X", "never send Y without asking first",
+"they hate Z"._
+{{/if}}

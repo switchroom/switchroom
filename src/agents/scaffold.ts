@@ -799,6 +799,68 @@ function copyDirRecursive(src: string, dest: string): void {
 }
 
 /**
+ * Seed the agent's `workspace/` directory from the profile's `workspace/`
+ * subdirectory (if any). `.hbs` files are rendered with the handlebars
+ * context; everything else is copied verbatim. Existing files are preserved
+ * so user edits survive `switchroom reconcile` runs.
+ *
+ * Profiles should put OpenClaw-style bootstrap files (AGENTS.md, USER.md,
+ * IDENTITY.md, TOOLS.md, MEMORY.md, ...) under their `workspace/` dir. At
+ * runtime, `loadStableBootstrapFiles` / `loadDynamicBootstrapFiles` in
+ * `src/agents/workspace.ts` discover and inject these files into Claude's
+ * system prompt (stable) and per-turn context (dynamic).
+ */
+function seedWorkspaceBootstrapFiles(params: {
+  profilePath: string;
+  agentDir: string;
+  context: Record<string, unknown>;
+  created: string[];
+  skipped: string[];
+}): void {
+  const profileWorkspaceDir = join(params.profilePath, "workspace");
+  if (!existsSync(profileWorkspaceDir)) {
+    return;
+  }
+  const agentWorkspaceDir = join(params.agentDir, "workspace");
+  mkdirSync(agentWorkspaceDir, { recursive: true });
+
+  const walk = (relDir: string): void => {
+    const srcDir = join(profileWorkspaceDir, relDir);
+    if (!existsSync(srcDir)) return;
+    for (const entry of readdirSync(srcDir)) {
+      if (entry.startsWith(".") && entry !== ".gitkeep") continue;
+      const relPath = relDir ? join(relDir, entry) : entry;
+      const srcPath = join(profileWorkspaceDir, relPath);
+      const srcStat = statSync(srcPath);
+      if (srcStat.isDirectory()) {
+        mkdirSync(join(agentWorkspaceDir, relPath), { recursive: true });
+        walk(relPath);
+        continue;
+      }
+      if (entry === ".gitkeep") continue; // presence-only marker, ignore
+      if (entry.endsWith(".hbs")) {
+        const destRel = relPath.replace(/\.hbs$/, "");
+        writeIfMissing(
+          join(agentWorkspaceDir, destRel),
+          () => renderTemplate(srcPath, params.context),
+          params.created,
+          params.skipped,
+        );
+      } else {
+        const destPath = join(agentWorkspaceDir, relPath);
+        if (!existsSync(destPath)) {
+          copyFileSync(srcPath, destPath);
+          params.created.push(destPath);
+        } else {
+          params.skipped.push(destPath);
+        }
+      }
+    }
+  };
+  walk("");
+}
+
+/**
  * Vendored hindsight-memory plugin location inside the switchroom repo.
  * Pinned to the version we ship; updated by `switchroom update`.
  */
@@ -1268,6 +1330,21 @@ export function scaffoldAgent(
       );
     }
   }
+
+  // --- Seed workspace bootstrap files from profile (AGENTS.md, USER.md, etc.)
+  //
+  //     Profiles may ship a `workspace/` subdirectory containing .hbs
+  //     templates and plain files. Each .hbs is rendered into the agent's
+  //     `workspace/` directory; plain files are copied verbatim. These files
+  //     are user-editable afterwards — we only seed on first scaffold (via
+  //     writeIfMissing) so user edits survive re-runs.
+  seedWorkspaceBootstrapFiles({
+    profilePath,
+    agentDir,
+    context,
+    created,
+    skipped,
+  });
 
   // --- Claude Code config (onboarding state) ---
   // Try to copy from existing Claude installation; fall back to minimal config
