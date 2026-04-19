@@ -1,6 +1,5 @@
 import type { Command } from "commander";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -15,6 +14,11 @@ import {
   DEFAULT_DYNAMIC_TOTAL_MAX_CHARS,
 } from "../agents/workspace.js";
 import type { BootstrapPromptWarningMode } from "../agents/bootstrap-budget.js";
+import {
+  DEFAULT_MEMORY_SEARCH_MAX_RESULTS,
+  getWorkspaceMemoryFile,
+  searchWorkspaceMemory,
+} from "../agents/memory-search.js";
 
 /**
  * `switchroom workspace` commands — surface to inspect and edit the
@@ -171,20 +175,74 @@ export function registerWorkspaceCommand(program: Command): void {
       withConfigError(async (agentName: string, file?: string) => {
         const dir = resolveAgentWorkspaceDirOrExit(program, agentName);
         if (!dir) return;
-        const target = resolve(dir, file ?? "AGENTS.md");
-        if (!target.startsWith(resolve(dir))) {
+        try {
+          const res = await getWorkspaceMemoryFile({
+            workspaceDir: dir,
+            relativePath: file ?? "AGENTS.md",
+          });
+          process.stdout.write(res.content);
+          if (res.truncated) {
+            process.stderr.write(
+              `\n[workspace show] truncated at ${res.content.length}/${res.bytes} bytes.\n`,
+            );
+          }
+        } catch (err) {
           process.stderr.write(
-            `workspace show: refusing path traversal outside workspace dir (${target})\n`,
+            `workspace show: ${err instanceof Error ? err.message : String(err)}\n`,
           );
           process.exit(1);
         }
-        if (!existsSync(target)) {
-          process.stderr.write(`workspace show: ${target} does not exist\n`);
-          return;
-        }
-        const content = await readFile(target, "utf8");
-        process.stdout.write(content);
       }),
+    );
+
+  cmd
+    .command("search <agent> <query...>")
+    .description(
+      "BM25-lite search over the agent's workspace markdown files " +
+        "(MEMORY.md, memory/*.md, AGENTS.md, ...). Returns ranked matches with snippets.",
+    )
+    .option(
+      "-n, --max-results <n>",
+      "Maximum results to return",
+      String(DEFAULT_MEMORY_SEARCH_MAX_RESULTS),
+    )
+    .option("--json", "Output raw JSON")
+    .action(
+      withConfigError(
+        async (
+          agentName: string,
+          queryParts: string[],
+          opts: { maxResults: string; json?: boolean },
+        ) => {
+          const dir = resolveAgentWorkspaceDirOrExit(program, agentName);
+          if (!dir) return;
+          const query = queryParts.join(" ").trim();
+          const maxResults = safeParseInt(opts.maxResults, DEFAULT_MEMORY_SEARCH_MAX_RESULTS);
+          const result = await searchWorkspaceMemory({
+            workspaceDir: dir,
+            query,
+            maxResults,
+          });
+          if (opts.json) {
+            process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+            return;
+          }
+          if (result.hits.length === 0) {
+            process.stdout.write(
+              `No matches for "${query}" in ${result.indexedFiles} file(s).\n`,
+            );
+            return;
+          }
+          process.stdout.write(
+            `${result.hits.length} result(s) (of ${result.totalMatches} matches across ${result.indexedFiles} files):\n\n`,
+          );
+          for (const hit of result.hits) {
+            process.stdout.write(
+              `  ${hit.path}:${hit.line}  [score ${hit.score}]\n    ${hit.snippet.replace(/\n/g, " ")}\n\n`,
+            );
+          }
+        },
+      ),
     );
 }
 
