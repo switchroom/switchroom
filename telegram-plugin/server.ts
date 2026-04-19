@@ -995,7 +995,22 @@ export function guardSilentReply(params: {
 }
 
 // Stores full permission details for "See more" expansion keyed by request_id.
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+// Entries expire after PENDING_PERMISSION_TTL_MS to prevent stuck requests
+// (e.g. when the MCP side times out without sending a response) from
+// lingering in /pending forever. Purge is lazy: each read site calls
+// purgeExpiredPermissions() first, so there's no setInterval to leak or
+// complicate tests.
+const PENDING_PERMISSION_TTL_MS = 5 * 60 * 1000
+const pendingPermissions = new Map<
+  string,
+  { tool_name: string; description: string; input_preview: string; expiresAt: number }
+>()
+
+function purgeExpiredPermissions(now: number = Date.now()): void {
+  for (const [id, entry] of pendingPermissions) {
+    if (entry.expiresAt <= now) pendingPermissions.delete(id)
+  }
+}
 
 // Tracks pending reauth flows keyed by chat_id.  When a /reauth or
 // /auth reauth starts successfully, we record the agent name and timestamp.
@@ -1044,7 +1059,12 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
-    pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    pendingPermissions.set(request_id, {
+      tool_name,
+      description,
+      input_preview,
+      expiresAt: Date.now() + PENDING_PERMISSION_TTL_MS,
+    })
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
     const keyboard = new InlineKeyboard()
@@ -4046,6 +4066,7 @@ async function handlePermissionSlash(
   if (!request_id) {
     // Default to the most recently created pending permission. Map
     // preserves insertion order so Array.from(...).at(-1) gives us that.
+    purgeExpiredPermissions()
     const entries = Array.from(pendingPermissions.keys())
     request_id = entries[entries.length - 1] ?? ''
   }
@@ -4068,6 +4089,7 @@ async function handlePermissionSlash(
     )
     return
   }
+  purgeExpiredPermissions()
   if (!pendingPermissions.has(request_id)) {
     await switchroomReply(
       ctx,
@@ -4231,6 +4253,7 @@ bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
 // a user can target a specific one with /approve <id> or /deny <id>.
 bot.command('pending', async ctx => {
   if (!isAuthorizedSender(ctx)) return
+  purgeExpiredPermissions()
   if (pendingPermissions.size === 0) {
     await switchroomReply(ctx, 'No pending permission prompts.')
     return
@@ -4425,6 +4448,7 @@ bot.on('callback_query:data', async ctx => {
   }
   const [, behavior, request_id] = m
 
+  purgeExpiredPermissions()
   if (behavior === 'more') {
     const details = pendingPermissions.get(request_id)
     if (!details) {
