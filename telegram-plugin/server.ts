@@ -3992,6 +3992,16 @@ bot.command('permissions', async ctx => {
  * user prefers keyboard/text). Fires the same MCP notification, so the
  * plugin's permission_request handler sees a single outcome.
  */
+/**
+ * Validate a permission request_id passed via /approve or /deny. Accepts
+ * lowercase alphanumerics and dashes up to 32 chars — a superset of the
+ * inline-button format but still tight enough to reject control chars,
+ * HTML, or runaway strings. Exported for testing.
+ */
+export function isValidPermissionRequestId(id: string): boolean {
+  return typeof id === 'string' && id.length > 0 && id.length <= 32 && /^[a-z0-9-]+$/.test(id)
+}
+
 async function handlePermissionSlash(
   ctx: Context,
   behavior: 'allow' | 'deny',
@@ -4015,6 +4025,18 @@ async function handlePermissionSlash(
     await switchroomReply(
       ctx,
       'No pending permission prompts right now.',
+    )
+    return
+  }
+  // Sanity-check the id shape so we don't look up (or echo back) arbitrary
+  // user input. Claude Code's own request_ids are a short alphanumeric slug;
+  // the inline-button handler enforces /^[a-km-z]{5}$/ (see line ~4318).
+  // The slash path is looser for forward compatibility but still rejects
+  // obvious junk (control chars, overlong strings, HTML, etc.).
+  if (!isValidPermissionRequestId(request_id)) {
+    await switchroomReply(
+      ctx,
+      `Invalid permission id. Expected lowercase alphanumeric / dashes up to 32 chars.`,
     )
     return
   }
@@ -4044,8 +4066,6 @@ async function handlePermissionSlash(
   )
 }
 
-// /approve [id] — slash-command alternative to tapping ✅ Allow on the
-// inline-button approval card. No id = most recent pending permission.
 /**
  * Flush the session handoff briefing for the CURRENT agent (this
  * process) so the next restart starts without prior-session context.
@@ -4122,6 +4142,8 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
 bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
 bot.command('reset', async ctx => handleNewOrResetCommand(ctx, 'reset'))
 
+// /approve [id] — slash-command alternative to tapping ✅ Allow on the
+// inline-button approval card. No id = most recent pending permission.
 bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
 
 // /deny [id] — slash-command alternative to tapping ❌ Deny on the
