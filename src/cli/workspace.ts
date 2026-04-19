@@ -35,6 +35,22 @@ import {
  * dir, etc.) so start.sh and hook scripts never block on workspace
  * config noise.
  */
+
+/**
+ * Returns true iff `target` is the resolved workspace dir itself, or a
+ * path strictly inside it. Both arguments must already be absolute +
+ * normalised (e.g. via `path.resolve`). Uses a trailing separator on the
+ * prefix check so a sibling like `/.../workspace-evil` cannot masquerade
+ * as `/.../workspace` via plain `startsWith`.
+ */
+export function isInsideWorkspace(
+  resolvedWorkspace: string,
+  target: string,
+): boolean {
+  if (target === resolvedWorkspace) return true;
+  return target.startsWith(`${resolvedWorkspace}${sep}`);
+}
+
 export function registerWorkspaceCommand(program: Command): void {
   const cmd = program
     .command("workspace")
@@ -159,10 +175,7 @@ export function registerWorkspaceCommand(program: Command): void {
         // workspace dir, not just share a prefix with it. Without the
         // trailing separator a sibling like /.../workspace-evil would pass
         // the startsWith check (classic npm/tar 2021 bug pattern).
-        if (
-          target !== resolvedWorkspace &&
-          !target.startsWith(`${resolvedWorkspace}${sep}`)
-        ) {
+        if (!isInsideWorkspace(resolvedWorkspace, target)) {
           process.stderr.write(
             `workspace edit: refusing path traversal outside workspace dir (${target})\n`,
           );
