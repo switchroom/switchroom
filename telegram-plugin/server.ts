@@ -4047,15 +4047,21 @@ async function handlePermissionSlash(
 // /approve [id] — slash-command alternative to tapping ✅ Allow on the
 // inline-button approval card. No id = most recent pending permission.
 /**
- * Flush the session handoff briefing for the current agent so the next
- * restart starts without prior-session context. Used by /new and /reset.
+ * Flush the session handoff briefing for the CURRENT agent (this
+ * process) so the next restart starts without prior-session context.
+ * Used by /new and /reset when the target agent is ourselves.
  *
- * Deletes `.handoff.md` + `.handoff-topic` in the agent's dir if present.
- * Never touches MEMORY.md, workspace/, or skills — those are durable
- * state the user curates.
+ * Deletes `.handoff.md` + `.handoff-topic` in `process.cwd()` (the
+ * agent dir per start.sh `cd "{{agentDir}}"`). Never touches MEMORY.md,
+ * workspace/, or skills — those are durable state the user curates.
  *
- * Returns the number of files actually removed so the caller can report
- * accurately in the user-visible ack.
+ * Returns the number of files actually removed so the caller can
+ * report accurately in the user-visible ack.
+ *
+ * NOTE: this plugin is one-process-per-agent. We can only flush our own
+ * handoff files. Cross-agent flushes (e.g. /new other-agent) are refused
+ * upstream so we never silently corrupt the current agent's state while
+ * restarting someone else.
  */
 function flushCurrentAgentHandoff(): number {
   const agentDir = process.cwd()
@@ -4084,10 +4090,24 @@ function flushCurrentAgentHandoff(): number {
  *
  * /reset is a second name for the same operation with slightly stronger
  * user-facing language; both converge on the same implementation.
+ *
+ * Cross-agent /new (e.g. `/new other-agent`) is refused: we can only
+ * flush our OWN handoff, and silently wiping this agent's handoff while
+ * restarting a different agent would be a footgun.
  */
 async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
   if (!isAuthorizedSender(ctx)) return
   const name = (ctx.match ?? '').trim() || getMyAgentName()
+  if (!isSelfTargetingCommand(name)) {
+    await switchroomReply(
+      ctx,
+      `/${kind} only supports the current agent (<b>${escapeHtmlForTg(getMyAgentName())}</b>). ` +
+        `To restart another agent with a fresh session, run /${kind} from its own topic, ` +
+        `or use <code>switchroom agent restart ${escapeHtmlForTg(name)}</code>.`,
+      { html: true },
+    )
+    return
+  }
   const removed = flushCurrentAgentHandoff()
   const tail = removed > 0 ? ` \u00b7 flushed ${removed} handoff file(s)` : ''
   const label = kind === 'new' ? '\u{1F195} New session' : '\u{1F504} Session reset'
