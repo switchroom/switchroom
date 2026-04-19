@@ -166,6 +166,31 @@ const SWITCHROOM_MCP_TOOLS = [
 ];
 
 /**
+ * Read-only built-in tools that are safe to pre-approve for every agent,
+ * regardless of dangerous_mode. Discovering files, searching content, and
+ * reading back data don't mutate host state, so gating them just adds
+ * latency for no safety benefit.
+ *
+ * Risky tools (Bash, Edit, Write, WebFetch, WebSearch, NotebookEdit, and
+ * anything that reaches the network or writes to disk) are deliberately
+ * NOT in this list — they go through the standard permission prompt,
+ * which in switchroom becomes the Telegram inline-button approval flow
+ * via the plugin's permission_request notification handler.
+ *
+ * Used when the agent's tools.allow is empty AND dangerous_mode is
+ * off/unset — otherwise explicit user config wins.
+ */
+const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
+  "Read",
+  "Grep",
+  "Glob",
+  "LS",
+  "Task",
+  "TodoWrite",
+  "ExitPlanMode",
+];
+
+/**
  * Built-in Claude Code tools. When `tools.allow: [all]` is set in
  * switchroom.yaml, every one of these is pre-approved so the agent never
  * blocks on a permission prompt at runtime.
@@ -1014,10 +1039,18 @@ export function scaffoldAgent(
   const baseAllow = hasAllWildcard
     ? ALL_BUILTIN_TOOLS
     : rawAllow.filter((t) => t !== "all");
+  // If the user didn't specify any allowed tools AND dangerous_mode is off,
+  // seed a safe read-only default set so routine tool calls don't spam the
+  // approval UI. Risky tools still prompt and hit the Telegram button flow.
+  const dangerousMode = agentConfig.dangerous_mode === true;
+  const hadExplicitAllow = rawAllow.length > 0;
+  const readOnlyDefaults =
+    !dangerousMode && !hadExplicitAllow ? DEFAULT_READ_ONLY_PREAPPROVED_TOOLS : [];
   const memoryBackend = switchroomConfig?.memory?.backend;
   const hindsightEnabled = memoryBackend === "hindsight";
   const permissionAllow = dedupe([
     ...baseAllow,
+    ...readOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
     ...SWITCHROOM_MCP_TOOLS,

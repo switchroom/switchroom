@@ -626,6 +626,36 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "AGENTS.md.hbs"))).toBe(false);
   });
 
+  it("seeds safe read-only tool defaults when tools.allow is empty and dangerous_mode is off", () => {
+    const config = makeAgentConfig(); // no tools, no dangerous_mode
+    const result = scaffoldAgent("readonly-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const allow: string[] = settings.permissions.allow;
+    expect(allow).toEqual(expect.arrayContaining(["Read", "Grep", "Glob"]));
+    // Risky tools must NOT be auto-allowed.
+    expect(allow).not.toContain("Bash");
+    expect(allow).not.toContain("Edit");
+    expect(allow).not.toContain("Write");
+    expect(allow).not.toContain("WebFetch");
+  });
+
+  it("does not inject read-only defaults when user set explicit tools.allow", () => {
+    const config = makeAgentConfig({
+      tools: { allow: ["Bash"], deny: [] },
+    } as Partial<AgentConfig>);
+    const result = scaffoldAgent("explicit-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const allow: string[] = settings.permissions.allow;
+    expect(allow).toContain("Bash");
+    // Read-only defaults should NOT be injected when user was explicit.
+    expect(allow).not.toContain("Read");
+    expect(allow).not.toContain("Grep");
+  });
+
   it("start.sh invokes `switchroom workspace render --stable` to inject bootstrap", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("ws-start-agent", config, tmpDir, telegramConfig);

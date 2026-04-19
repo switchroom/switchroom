@@ -1,8 +1,17 @@
 #!/usr/bin/expect -f
 #
-# Switchroom autoaccept: automatically respond to Claude Code interactive
-# prompts that appear when launching with
-# `--dangerously-load-development-channels`.
+# Switchroom autoaccept: automatically respond to Claude Code FIRST-RUN
+# TUI prompts that appear when launching a fresh agent (theme picker,
+# provider picker, MCP trust dialog, dev-channels acknowledgement).
+#
+# IMPORTANT: this script deliberately does NOT auto-accept per-tool
+# permission prompts (the "Yes and don't ask again" dialog). Those
+# prompts are the security boundary that lets Ken approve or deny
+# individual tool calls from Telegram via the inline-button flow in
+# server.ts (pendingPermissions + notifications/claude/channel/
+# permission_request). If you auto-accept them here, the approval UX
+# is silently bypassed. Leave that prompt alone so the plugin's
+# permission-request notification can fire.
 #
 # TIOCSTI is disabled by default on Ubuntu 24.04+ (kernel security), so
 # we use expect instead of the old Python PTY approach. expect is
@@ -20,13 +29,8 @@ spawn /bin/bash -l $start_sh
 
 expect {
     -re {Yes.{0,10}I.{0,5}accept} {
-        # Bypass permissions warning — select option 2 (accept)
-        sleep 0.5
-        send "\033\[B\r"
-        exp_continue
-    }
-    -re {Yes.{0,5}and.{0,5}don't.{0,5}ask.{0,5}again} {
-        # Tool permission prompt — always allow
+        # Bypass permissions warning (dev channels acknowledgement,
+        # shown once per machine). Not a per-tool gate.
         sleep 0.5
         send "\033\[B\r"
         exp_continue
