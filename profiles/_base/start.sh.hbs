@@ -84,7 +84,10 @@ SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}auto{{/if}}"
 SWITCHROOM_RESUME_MAX_BYTES="{{#if resumeMaxBytes}}{{{resumeMaxBytes}}}{{else}}2000000{{/if}}"
 CONTINUE_FLAG=""
 
-_RESUME_LATEST_JSONL="$(ls -t "$CLAUDE_CONFIG_DIR/projects/"*/*.jsonl 2>/dev/null | head -1)"
+# Most-recent JSONL transcript. `find -printf` + sort is nullglob-safe
+# (unlike `ls -t *.jsonl`, which passes the literal pattern to ls when
+# the glob doesn't match) and is robust to missing project dirs.
+_RESUME_LATEST_JSONL="$(find "$CLAUDE_CONFIG_DIR/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 case "$SWITCHROOM_RESUME_MODE" in
   continue)
     if [ -n "$_RESUME_LATEST_JSONL" ]; then
@@ -120,7 +123,7 @@ esac
 # and rely on Hindsight's per-turn auto-recall.
 HANDOFF_FILE="{{agentDir}}/.handoff.md"
 if [ ! -s "$HANDOFF_FILE" ]; then
-  _LATEST_JSONL=$(ls -t "$CLAUDE_CONFIG_DIR/projects/"*/*.jsonl 2>/dev/null | head -1)
+  _LATEST_JSONL=$(find "$CLAUDE_CONFIG_DIR/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
   if [ -n "$_LATEST_JSONL" ]; then
     _LAST_MOD=$(_stat_mtime "$_LATEST_JSONL")
     _NOW=$(date +%s)
