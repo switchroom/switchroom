@@ -230,6 +230,18 @@ function shellSingleQuote(s: string): string {
 }
 
 /**
+ * Compose a template-generated file with an optional user sidecar.
+ * Result = <rendered template>\n\n---\n\n<sidecar contents> if sidecar exists,
+ * else just <rendered template>.
+ */
+function composeWithSidecar(renderedBase: string, sidecarPath: string): string {
+  if (!existsSync(sidecarPath)) return renderedBase;
+  const sidecar = readFileSync(sidecarPath, "utf-8").trimEnd();
+  if (sidecar.length === 0) return renderedBase;
+  return `${renderedBase.trimEnd()}\n\n---\n\n${sidecar}\n`;
+}
+
+/**
  * Build a pre-rendered Telegram HTML summary of an agent's effective
  * config. Written to `<agentDir>/telegram/session-greeting.sh` and
  * sent via curl on every SessionStart hook — zero model tokens.
@@ -989,14 +1001,11 @@ function seedWorkspaceBootstrapFiles(params: {
         writeIfMissing(
           join(agentWorkspaceDir, destRel),
           () => {
-            let rendered = renderTemplate(srcPath, params.context);
+            const rendered = renderTemplate(srcPath, params.context);
             // Phase 2: append SOUL.custom.md sidecar if present
             if (destRel === "SOUL.md") {
               const customSoulPath = join(agentWorkspaceDir, "SOUL.custom.md");
-              if (existsSync(customSoulPath)) {
-                const customContent = readFileSync(customSoulPath, "utf-8");
-                rendered = rendered.trimEnd() + "\n\n---\n\n" + customContent;
-              }
+              return composeWithSidecar(rendered, customSoulPath);
             }
             return rendered;
           },
@@ -1850,13 +1859,10 @@ export interface ReconcileResult {
  */
 export interface ReconcileOptions {
   /**
-   * If true, also re-render CLAUDE.md from the template.
-   * Default false (CLAUDE.md is user-protected). Use this when the
-   * template itself has changed and you want to force the new version
-   * onto an existing agent — e.g., after a `switchroom update` that ships
-   * a template fix.
+   * If true, skip regenerating CLAUDE.md. Use this to freeze CLAUDE.md
+   * as-is, ignoring template updates. Default false (regeneration is default).
    */
-  forceClaudeMd?: boolean;
+  preserveClaudeMd?: boolean;
 }
 
 export function reconcileAgent(
@@ -2016,16 +2022,16 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     }
   }
 
-  // --- Force-reconcile CLAUDE.md (only when --force-claude-md given) ---
-  // CLAUDE.md is normally user-protected because users hand-edit it for
-  // persona/behavior tuning. The --force flag lets `switchroom update` push
-  // template fixes through (e.g., the {{memory}} → [object Object] bug
-  // we shipped earlier). Same context as scaffold's CLAUDE.md render.
-  if (options.forceClaudeMd) {
+  // --- Phase 3: regenerate CLAUDE.md by default (unless --preserve-claude-md) ---
+  // CLAUDE.md is regenerated deterministically from the template. CLAUDE.custom.md
+  // sidecar (if present) is appended with a \n\n---\n\n separator.
+  if (!options.preserveClaudeMd) {
     const profilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
     const claudeMdSrc = join(profilePath, "CLAUDE.md.hbs");
     const claudeMdDest = join(agentDir, "CLAUDE.md");
-    if (existsSync(claudeMdSrc) && existsSync(claudeMdDest)) {
+    const claudeCustomPath = join(agentDir, "CLAUDE.custom.md");
+
+    if (existsSync(claudeMdSrc)) {
       const claudeContext: Record<string, unknown> = {
         name,
         agentDir,
@@ -2038,26 +2044,40 @@ Final answers still go through \`stream_reply\` with done=true as usual,
         schedule: agentConfig.schedule,
         useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
       };
-      const beforeMd = readFileSync(claudeMdDest, "utf-8");
-      const afterMd = renderTemplate(claudeMdSrc, claudeContext);
-      if (afterMd !== beforeMd) {
-        writeFileSync(claudeMdDest, afterMd, "utf-8");
-        changes.push(claudeMdDest);
+
+      // Render template + compose with sidecar
+      const rendered = renderTemplate(claudeMdSrc, claudeContext);
+      let composed = composeWithSidecar(rendered, claudeCustomPath);
+
+      // Legacy claude_md_raw still appends after sidecar (one-shot escape hatch)
+      if (agentConfig.claude_md_raw) {
+        composed = composed.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
       }
-    }
-  } else {
-    // --- Phase 2 migration: warn if CLAUDE.md looks like old fat template ---
-    const claudeMdDest = join(agentDir, "CLAUDE.md");
-    if (existsSync(claudeMdDest)) {
-      const content = readFileSync(claudeMdDest, "utf-8");
-      const looksOld = content.length > 5000 && !content.includes("SOUL.md");
-      if (looksOld) {
-        console.warn(
-          chalk.yellow(
-            `CLAUDE.md may be out of date (old template with persona block). ` +
-            `Run \`switchroom agent reconcile ${name} --force-claude-md\` to apply the slimmed template.`
-          )
-        );
+
+      // Migration detection: if on-disk differs and no sidecar exists, warn + abort
+      if (existsSync(claudeMdDest)) {
+        const onDisk = readFileSync(claudeMdDest, "utf-8");
+        if (onDisk !== composed && !existsSync(claudeCustomPath)) {
+          console.error(
+            chalk.red(
+              `CLAUDE.md has hand-edits that will be overwritten by reconcile.\n\n` +
+              `Options:\n` +
+              `  1. Move your custom content to ${claudeCustomPath} and re-run reconcile.\n` +
+              `     The sidecar is appended to the regenerated CLAUDE.md and never overwritten.\n` +
+              `  2. Pass --preserve-claude-md to keep your current CLAUDE.md as-is (no template updates).\n` +
+              `  3. Accept the regeneration and lose hand-edits.\n\n` +
+              `Aborting this reconcile. Re-run with one of the above options.`
+            )
+          );
+          process.exit(1);
+        }
+      }
+
+      // Write if changed
+      const before = existsSync(claudeMdDest) ? readFileSync(claudeMdDest, "utf-8") : "";
+      if (composed !== before) {
+        writeFileSync(claudeMdDest, composed, "utf-8");
+        changes.push(claudeMdDest);
       }
     }
   }
@@ -2418,13 +2438,10 @@ Final answers still go through \`stream_reply\` with done=true as usual,
   const soulMdDest = join(agentDir, "workspace", "SOUL.md");
   if (existsSync(soulMdSrc)) {
     const before = existsSync(soulMdDest) ? readFileSync(soulMdDest, "utf-8") : "";
-    let after = renderTemplate(soulMdSrc, workspaceContext);
+    const rendered = renderTemplate(soulMdSrc, workspaceContext);
     // Append SOUL.custom.md sidecar if present
     const customSoulPath = join(agentDir, "workspace", "SOUL.custom.md");
-    if (existsSync(customSoulPath)) {
-      const customContent = readFileSync(customSoulPath, "utf-8");
-      after = after.trimEnd() + "\n\n---\n\n" + customContent;
-    }
+    const after = composeWithSidecar(rendered, customSoulPath);
     if (after !== before) {
       writeFileSync(soulMdDest, after, "utf-8");
       changes.push(soulMdDest);
