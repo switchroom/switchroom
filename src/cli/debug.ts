@@ -191,7 +191,11 @@ export function registerDebugCommand(program: Command): void {
         }
 
         // Progress updates guidance
-        const resolved = resolveAgentConfig(agentName, config);
+        const resolved = resolveAgentConfig(
+          config.defaults,
+          config.profiles,
+          agentConfig,
+        );
         const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(resolved);
         const progressGuidance = useSwitchroomPlugin
           ? buildProgressUpdateGuidance()
