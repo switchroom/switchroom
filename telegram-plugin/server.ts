@@ -4287,8 +4287,17 @@ bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
 
 // /pending — list current pending permission prompts with their ids, so
 // a user can target a specific one with /approve <id> or /deny <id>.
+// Restricted to access.allowFrom DMs to match /approve and /deny — it
+// wouldn't make sense to let a group member see which permissions are
+// pending when they can't actually answer them.
 bot.command('pending', async ctx => {
   if (!isAuthorizedSender(ctx)) return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) {
+    await switchroomReply(ctx, 'Not authorized to view pending permission prompts.')
+    return
+  }
   purgeExpiredPermissions()
   if (pendingPermissions.size === 0) {
     await switchroomReply(ctx, 'No pending permission prompts.')
