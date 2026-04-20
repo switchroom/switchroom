@@ -15,6 +15,9 @@ import {
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
+
+// Repo root for referencing bin/ scripts in hooks
+const REPO_ROOT = resolve(import.meta.dirname, "../..");
 import { DEFAULT_PROFILE } from "../config/schema.js";
 import {
   resolveAgentConfig,
@@ -1449,12 +1452,33 @@ export function scaffoldAgent(
             },
           ]
         : [];
+      // Switchroom-owned UserPromptSubmit hook: inject dynamic workspace files
+      // (MEMORY.md, today/yesterday daily notes, HEARTBEAT.md) at the start of
+      // every turn. Coexists with Hindsight's own UserPromptSubmit hook (loaded
+      // via the plugin's hooks.json). 5s timeout so a slow render never blocks
+      // the turn; silent failure (no stderr) so missing workspace files don't
+      // spam errors.
+      const switchroomUserPromptSubmit = [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
+              timeout: 5,
+            },
+          ],
+        },
+      ];
       if (userHooks) {
         settings.hooks = {
           ...userHooks,
           SessionStart: [
             ...((userHooks.SessionStart as unknown[]) ?? []),
             ...switchroomSessionStart,
+          ],
+          UserPromptSubmit: [
+            ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
+            ...switchroomUserPromptSubmit,
           ],
           ...(switchroomStop.length > 0
             ? {
@@ -1468,6 +1492,7 @@ export function scaffoldAgent(
       } else {
         settings.hooks = {
           SessionStart: switchroomSessionStart,
+          UserPromptSubmit: switchroomUserPromptSubmit,
           ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
         };
       }
@@ -2084,12 +2109,28 @@ Final answers still go through \`stream_reply\` with done=true as usual,
           },
         ]
       : [];
+    // Switchroom-owned UserPromptSubmit hook (same as scaffoldAgent above)
+    const switchroomUserPromptSubmit = [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
+            timeout: 5,
+          },
+        ],
+      },
+    ];
     if (userHooks) {
       settings.hooks = {
         ...userHooks,
         SessionStart: [
           ...((userHooks.SessionStart as unknown[]) ?? []),
           ...switchroomSessionStart,
+        ],
+        UserPromptSubmit: [
+          ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
+          ...switchroomUserPromptSubmit,
         ],
         ...(switchroomStop.length > 0
           ? {
@@ -2103,6 +2144,7 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     } else {
       settings.hooks = {
         SessionStart: switchroomSessionStart,
+        UserPromptSubmit: switchroomUserPromptSubmit,
         ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
       };
     }

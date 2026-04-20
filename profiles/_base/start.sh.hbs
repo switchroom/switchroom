@@ -170,6 +170,14 @@ APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuo
 # These files are stable across a session, so baking them into the system
 # prompt is cache-friendly. Dynamic files (MEMORY.md, today's daily,
 # HEARTBEAT.md) are injected via the UserPromptSubmit hook, not here.
+#
+# CACHE BOUNDARY ORDERING: The stable workspace render (_WS_STABLE) is
+# prepended BEFORE the handoff briefing in APPEND_PROMPT. This ensures the
+# prefix cache boundary is deterministic: stable parts (workspace + progress
+# guidance) come first and cache hot across sessions, while per-session
+# parts (handoff briefing) come after and only invalidate the cache at
+# session boundaries. If we reversed the order, every new session would
+# invalidate the entire prefix including the stable workspace content.
 if [ -d "{{agentDir}}/workspace" ] && command -v switchroom >/dev/null 2>&1; then
   _WS_STABLE=$(timeout 5 switchroom workspace render "{{name}}" --stable --warning-mode off 2>/dev/null || true)
   if [ -n "$_WS_STABLE" ]; then

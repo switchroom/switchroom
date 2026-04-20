@@ -13,7 +13,7 @@ import {
   DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS,
   DEFAULT_DYNAMIC_TOTAL_MAX_CHARS,
 } from "../agents/workspace.js";
-import type { BootstrapPromptWarningMode } from "../agents/bootstrap-budget.js";
+import { BootstrapBudgetExceededError, type BootstrapPromptWarningMode } from "../agents/bootstrap-budget.js";
 import {
   DEFAULT_MEMORY_SEARCH_MAX_RESULTS,
   getWorkspaceMemoryFile,
@@ -77,7 +77,7 @@ export function registerWorkspaceCommand(program: Command): void {
     .option("--dynamic", "Render only dynamic files (MEMORY + today/yesterday daily + HEARTBEAT)")
     .option(
       "--warning-mode <mode>",
-      "Truncation warning mode: off | once | always (default: off for start.sh use)",
+      "Truncation warning mode: off | once | always | error (default: off for start.sh use)",
       "off",
     )
     .option(
@@ -122,38 +122,46 @@ export function registerWorkspaceCommand(program: Command): void {
             ? safeParseInt(opts.maxTotal, defaultTotal)
             : defaultTotal;
 
-          const result = dynamic
-            ? await buildDynamicBootstrapPrompt({
-                workspaceDir: dir,
-                budget: {
-                  bootstrapMaxChars: maxPerFile,
-                  bootstrapTotalMaxChars: maxTotal,
-                  warningMode,
-                },
-              })
-            : await buildStableBootstrapPrompt({
-                workspaceDir: dir,
-                budget: {
-                  bootstrapMaxChars: maxPerFile,
-                  bootstrapTotalMaxChars: maxTotal,
-                  warningMode,
-                },
-              });
+          try {
+            const result = dynamic
+              ? await buildDynamicBootstrapPrompt({
+                  workspaceDir: dir,
+                  budget: {
+                    bootstrapMaxChars: maxPerFile,
+                    bootstrapTotalMaxChars: maxTotal,
+                    warningMode,
+                  },
+                })
+              : await buildStableBootstrapPrompt({
+                  workspaceDir: dir,
+                  budget: {
+                    bootstrapMaxChars: maxPerFile,
+                    bootstrapTotalMaxChars: maxTotal,
+                    warningMode,
+                  },
+                });
 
-          if (result.concatenated.length > 0) {
-            process.stdout.write(result.concatenated);
-            if (!result.concatenated.endsWith("\n")) {
-              process.stdout.write("\n");
+            if (result.concatenated.length > 0) {
+              process.stdout.write(result.concatenated);
+              if (!result.concatenated.endsWith("\n")) {
+                process.stdout.write("\n");
+              }
             }
-          }
 
-          if (result.warning.warningShown && result.warning.lines.length > 0) {
-            process.stderr.write(
-              `[workspace render] bootstrap truncation (${result.analysis.truncatedFiles.length} file(s)):\n`,
-            );
-            for (const line of result.warning.lines) {
-              process.stderr.write(`  ${line}\n`);
+            if (result.warning.warningShown && result.warning.lines.length > 0) {
+              process.stderr.write(
+                `[workspace render] bootstrap truncation (${result.analysis.truncatedFiles.length} file(s)):\n`,
+              );
+              for (const line of result.warning.lines) {
+                process.stderr.write(`  ${line}\n`);
+              }
             }
+          } catch (err) {
+            if (err instanceof BootstrapBudgetExceededError) {
+              process.stderr.write(`Error: ${err.message}\n`);
+              process.exit(1);
+            }
+            throw err;
           }
         },
       ),
@@ -297,6 +305,8 @@ function normalizeWarningMode(value: string | undefined): BootstrapPromptWarning
       return "off";
     case "always":
       return "always";
+    case "error":
+      return "error";
     case "once":
     default:
       return "once";

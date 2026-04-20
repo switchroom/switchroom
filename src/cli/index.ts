@@ -15,6 +15,7 @@ import { registerUpdateCommand } from "./update.js";
 import { registerHandoffCommand } from "./handoff.js";
 import { registerDepsCommand } from "./deps.js";
 import { registerWorkspaceCommand } from "./workspace.js";
+import { registerDebugCommand } from "./debug.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -53,3 +54,4 @@ registerWebCommand(program);
 registerHandoffCommand(program);
 registerDepsCommand(program);
 registerWorkspaceCommand(program);
+registerDebugCommand(program);

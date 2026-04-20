@@ -17,7 +17,7 @@ export const DEFAULT_BOOTSTRAP_PROMPT_WARNING_MAX_FILES = 3;
 export const DEFAULT_BOOTSTRAP_PROMPT_WARNING_SIGNATURE_HISTORY_MAX = 32;
 
 export type BootstrapTruncationCause = "per-file-limit" | "total-limit";
-export type BootstrapPromptWarningMode = "off" | "once" | "always";
+export type BootstrapPromptWarningMode = "off" | "once" | "always" | "error";
 
 export type BootstrapInjectionStat = {
   name: string;
@@ -65,6 +65,19 @@ export type BootstrapTruncationReportMeta = {
   nearLimitFiles: number;
   totalNearLimit: boolean;
 };
+
+/**
+ * Error thrown when warningMode is 'error' and budget limits are exceeded.
+ */
+export class BootstrapBudgetExceededError extends Error {
+  constructor(
+    public analysis: BootstrapBudgetAnalysis,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BootstrapBudgetExceededError";
+  }
+}
 
 function normalizePositiveLimit(value: number): number {
   if (!Number.isFinite(value) || value <= 0) {

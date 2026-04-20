@@ -19,6 +19,39 @@
  * Both pipelines run through `bootstrap-budget.ts` for per-file and
  * total-size cap enforcement so we don't blow through Claude Code's
  * `--append-system-prompt` limit (~100KB) or the per-turn prompt budget.
+ *
+ * ## Cache Boundary Layering
+ *
+ * Switchroom's context injection is architected to maximize Claude Code's
+ * prompt caching (prefix cache + block cache):
+ *
+ * 1. **STABLE** (cache-hot): Workspace stable render (AGENTS/SOUL/USER/
+ *    IDENTITY/TOOLS/BOOTSTRAP.md) + progress_update guidance + user's
+ *    system_prompt_append. Injected via `--append-system-prompt` at launch.
+ *    Content is stable across a session, so the prefix cache stays warm and
+ *    every turn reuses the cached computation.
+ *
+ * 2. **PER-SESSION** (cache-warm): Handoff briefing from the prior session
+ *    (if present). Also injected via `--append-system-prompt`, but content
+ *    changes when a new session starts (handoff briefing summarizes the
+ *    PREVIOUS session). This invalidates the prefix cache at session
+ *    boundaries, but within a session it stays cached.
+ *
+ *    Rationale: The handoff briefing is per-session, not per-turn, so
+ *    putting it in the system prompt means it caches within a session.
+ *    Moving it to per-turn would work, but would waste per-turn budget on
+ *    content that never changes mid-session.
+ *
+ * 3. **PER-TURN** (never cached): Workspace dynamic render (MEMORY.md,
+ *    today/yesterday daily notes, HEARTBEAT.md) + Hindsight recall results.
+ *    Injected via UserPromptSubmit hooks, which prepend to the user message.
+ *    Content changes every turn (MEMORY.md edits, daily note updates,
+ *    HEARTBEAT intentions), so there's no caching benefit to promoting this
+ *    to the system prompt.
+ *
+ * The ordering (stable → per-session → per-turn) ensures the longest-lived
+ * content is in the prefix where it caches best, and the most volatile
+ * content is in the per-turn layer where cache misses don't matter.
  */
 
 import { readFile, stat } from "node:fs/promises";
@@ -29,6 +62,7 @@ import {
   appendBootstrapPromptWarning,
   buildBootstrapInjectionStats,
   buildBootstrapPromptWarning,
+  BootstrapBudgetExceededError,
   DEFAULT_BOOTSTRAP_NEAR_LIMIT_RATIO,
   DEFAULT_BOOTSTRAP_PROMPT_WARNING_MAX_FILES,
   type BootstrapBudgetAnalysis,
@@ -273,7 +307,7 @@ export function projectBootstrapFiles(params: {
     heading,
     budget,
     seenSignatures,
-    warningMode = "once",
+    warningMode = "error",
     warningMaxFiles = DEFAULT_BOOTSTRAP_PROMPT_WARNING_MAX_FILES,
   } = params;
   const perFileCap = budget.bootstrapMaxChars;
@@ -327,6 +361,32 @@ export function projectBootstrapFiles(params: {
     seenSignatures,
     maxFiles: warningMaxFiles,
   });
+
+  // Error mode: abort if any truncation occurred
+  if (warningMode === "error" && analysis.hasTruncation) {
+    const errorLines: string[] = [
+      "Bootstrap budget exceeded. The following files exceed limits:",
+      "",
+    ];
+    for (const file of analysis.truncatedFiles) {
+      const excessChars = file.rawChars - file.injectedChars;
+      const causes = file.causes.map((c) =>
+        c === "per-file-limit"
+          ? `per-file limit (${analysis.totals.bootstrapMaxChars.toLocaleString()} chars)`
+          : `total limit (${analysis.totals.bootstrapTotalMaxChars.toLocaleString()} chars)`
+      );
+      errorLines.push(
+        `  ${file.name}: ${file.rawChars.toLocaleString()} bytes (exceeds ${causes.join(", ")})`,
+      );
+      errorLines.push(
+        `    Trim ${excessChars.toLocaleString()} bytes, or pass --warning-mode warn to proceed with truncation.`,
+      );
+    }
+    throw new BootstrapBudgetExceededError(
+      analysis,
+      errorLines.join("\n"),
+    );
+  }
 
   return { files, injectedFiles, concatenated, analysis, warning };
 }
