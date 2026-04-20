@@ -367,7 +367,10 @@ _gateway_start_time() {
   if [ ! -S "$GATEWAY_SOCK" ]; then echo 0; return; fi
   local pid
   # ss -xlnp is the cheap path (no /proc walk); falls through to lsof if ss absent.
-  pid=$(ss -xlnp 2>/dev/null | awk -v s="$GATEWAY_SOCK" '$0 ~ s {match($0, /pid=([0-9]+)/, m); if (m[1]) print m[1]}' | head -1)
+  # Uses sed (POSIX-portable) to extract the pid; avoids gawk's
+  # match(regex, arr) three-arg form which fails on plain awk with
+  # "syntax error at or near ," on minimal images (alpine, busybox).
+  pid=$(ss -xlnp 2>/dev/null | grep -F "$GATEWAY_SOCK" | sed -n 's|.*pid=\\([0-9]\\{1,\\}\\).*|\\1|p' | head -1)
   if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
     pid=$(lsof -t "$GATEWAY_SOCK" 2>/dev/null | head -1)
   fi
@@ -502,6 +505,12 @@ MONTHLY_BUDGET="${monthlyBudget}"
 if command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
   WK_COST=""
   MO_COST=""
+  # Belt-and-braces: ccusage scans $CLAUDE_CONFIG_DIR/projects by default.
+  # SessionStart hooks inherit CLAUDE_CONFIG_DIR from the claude process in
+  # theory, but if the env is ever lost (different claude version,
+  # container, manual test) we'd silently query ~/.claude instead of the
+  # agent's own transcripts. Set it explicitly so the hook is deterministic.
+  export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$(dirname \"\$TELEGRAM_STATE_DIR\")/.claude}"
   # --offline avoids a pricing-data fetch; cached data is accurate enough
   # for a status line. Both commands are bounded by a short timeout so a
   # slow ccusage run can never block the greeting hook past a few seconds.
@@ -1363,7 +1372,12 @@ export function scaffoldAgent(
       const greetingHook = {
         type: "command",
         command: `bash "${join(agentDir, "telegram", "session-greeting.sh")}"`,
-        timeout: 5,
+        // 20s budget: ccusage scans local transcripts (3-8s on agents with
+        // hundreds of transcripts) and auth + model resolvers read several
+        // files. 5s was too tight; Ken's assistant (328 transcripts) had
+        // its hook SIGKILL'd before ccusage finished, so the Quota row
+        // silently rendered as "—".
+        timeout: 20,
       };
       const switchroomSessionStart = [{ hooks: [greetingHook] }];
       // Switchroom-owned Stop hook: produce the session-handoff briefing so
@@ -1969,7 +1983,8 @@ export function reconcileAgent(
     const greetingHook = {
       type: "command",
       command: `bash "${join(agentDir, "telegram", "session-greeting.sh")}"`,
-      timeout: 5,
+      // 20s budget, see scaffoldAgent greeting hook for rationale.
+      timeout: 20,
     };
     const switchroomSessionStart = [{ hooks: [greetingHook] }];
     const handoffEnabledReconcile = agentConfig.session_continuity?.enabled !== false;
