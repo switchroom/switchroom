@@ -17,6 +17,7 @@ import { execFileSync, execSync, spawn } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, chmodSync, openSync, closeSync,
+  existsSync, unlinkSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
@@ -2204,6 +2205,183 @@ bot.command('restart', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
 })
 
+// ─── /new and /reset ──────────────────────────────────────────────────────
+// Start a fresh session: flush .handoff.md + .handoff-topic so the restarted
+// claude session isn't primed with the prior conversation, then trigger a
+// restart. MEMORY.md, workspace/, skills/ are preserved. A1/N1/C6 from the
+// OpenClawification review pass all applied.
+function flushAgentHandoff(agentDir: string): number {
+  let removed = 0
+  for (const fname of ['.handoff.md', '.handoff-topic']) {
+    const p = join(agentDir, fname)
+    try {
+      if (existsSync(p)) { unlinkSync(p); removed++ }
+    } catch (err) {
+      process.stderr.write(`telegram gateway: flushAgentHandoff ${fname}: ${(err as Error).message}\n`)
+    }
+  }
+  return removed
+}
+
+async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
+  if (!isAuthorizedSender(ctx)) return
+  const name = (ctx.match ?? '').trim() || getMyAgentName()
+  try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
+  // N1: `all` passes isSelfTargetingCommand (for /restart), but /new and
+  // /reset semantically require flushing each agent's handoff before
+  // restarting it — only that agent's own gateway can do that. If we let
+  // /new all through we'd flush ONLY this agent's handoff and restart every
+  // agent, leaving the others with stale briefings.
+  if (name === 'all') {
+    await switchroomReply(
+      ctx,
+      `/${kind} only supports a single agent — “all” would leave other agents with stale handoff briefings. ` +
+        `Run /${kind} from each agent’s own topic, or use <code>switchroom agent restart all</code> if you just want a plain restart without flushing sessions.`,
+      { html: true },
+    )
+    return
+  }
+  // A1: Cross-agent /new is refused — this gateway can only flush its own
+  // handoff. Silently wiping our handoff while restarting another agent is a
+  // footgun.
+  if (!isSelfTargetingCommand(name)) {
+    await switchroomReply(
+      ctx,
+      `/${kind} only supports the current agent (<b>${escapeHtmlForTg(getMyAgentName())}</b>). ` +
+        `To restart another agent with a fresh session, run /${kind} from its own topic, ` +
+        `or use <code>switchroom agent restart ${escapeHtmlForTg(name)}</code>.`,
+      { html: true },
+    )
+    return
+  }
+  // C6: debounce — /new and /reset are functionally self-restarts. Without
+  // the same 15s marker guard /restart uses, a double-tap (because the ack
+  // hasn't landed yet) would stack systemctl restarts.
+  const existing = readRestartMarker()
+  if (existing && Date.now() - existing.ts < 15_000) {
+    await switchroomReply(
+      ctx,
+      `⏳ Restart of <b>${escapeHtmlForTg(name)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate /${kind}.`,
+      { html: true },
+    )
+    return
+  }
+  // Flush handoff first — if we crash between here and the restart the
+  // worst case is the next boot has no briefing, which is the intent anyway.
+  const agentDir = resolveAgentDirFromEnv()
+  const flushed = agentDir != null ? flushAgentHandoff(agentDir) : 0
+
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  const label = kind === 'new' ? '🆕 Started fresh session' : '🔄 Reset session'
+  const tail = flushed > 0 ? ' · flushed handoff' : ''
+  const ackText = `${label} for <b>${escapeHtmlForTg(name)}</b>${tail} · restarting…`
+  let ackId: number | null = null
+  try {
+    const sent = await lockedBot.api.sendMessage(chatId, ackText, {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+    })
+    ackId = sent.message_id
+    if (HISTORY_ENABLED) {
+      try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [ackText], attachment_kinds: [] }) } catch {}
+    }
+  } catch {}
+  writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
+  await sweepBeforeSelfRestart()
+  spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+}
+
+bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
+bot.command('reset', async ctx => handleNewOrResetCommand(ctx, 'reset'))
+
+// ─── /approve, /deny, /pending ────────────────────────────────────────────
+// Slash-command alternatives to the inline-button approval flow (useful for
+// desktop-only sessions and power-users). Share pendingPermissions state
+// with the button handler; emit the same `permission` IPC broadcast.
+function isValidPermissionRequestId(id: string): boolean {
+  return /^[a-z0-9-]{1,32}$/.test(id)
+}
+
+async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): Promise<void> {
+  if (!isAuthorizedSender(ctx)) return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) {
+    await switchroomReply(ctx, 'Not authorized to answer permission prompts.')
+    return
+  }
+  const raw = (ctx.match ?? '').trim()
+  let request_id = raw
+  if (!request_id) {
+    // Default to most-recently created pending permission. Map preserves
+    // insertion order so Array.from(...).at(-1) gives us that.
+    const entries = Array.from(pendingPermissions.keys())
+    request_id = entries[entries.length - 1] ?? ''
+  }
+  if (!request_id) {
+    await switchroomReply(ctx, 'No pending permission prompts right now.')
+    return
+  }
+  // C2: sanity-check the id shape so we don't look up (or echo back)
+  // arbitrary user input. Claude Code's request_ids are short alphanumeric
+  // slugs; the button handler enforces /^[a-km-z]{5}$/. The slash path is
+  // looser for forward compat but still rejects obvious junk.
+  if (!isValidPermissionRequestId(request_id)) {
+    await switchroomReply(ctx, `Invalid permission id. Expected lowercase alphanumeric / dashes up to 32 chars.`)
+    return
+  }
+  const details = pendingPermissions.get(request_id)
+  if (!details) {
+    await switchroomReply(
+      ctx,
+      `No pending permission for id <code>${escapeHtmlForTg(request_id)}</code>. It may have already been answered or timed out.`,
+      { html: true },
+    )
+    return
+  }
+  // Forward to connected bridges — same IPC the button handler uses.
+  ipcServer.broadcast({ type: 'permission', requestId: request_id, behavior })
+  pendingPermissions.delete(request_id)
+  process.stderr.write(
+    `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
+  )
+  const lbl = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  const suffix = details.tool_name ? ` (<code>${escapeHtmlForTg(details.tool_name)}</code>)` : ''
+  await switchroomReply(
+    ctx,
+    `${lbl}${suffix} via /${behavior} <code>${escapeHtmlForTg(request_id)}</code>`,
+    { html: true },
+  )
+}
+
+bot.command('approve', async ctx => handlePermissionSlash(ctx, 'allow'))
+bot.command('deny', async ctx => handlePermissionSlash(ctx, 'deny'))
+
+// /pending — list current pending permission prompts with their ids, so the
+// user can target a specific one via /approve <id> or /deny <id>.
+// Restricted to access.allowFrom DMs to match /approve and /deny — it
+// wouldn't make sense to let a group member see which permissions are
+// pending when they can't actually answer them.
+bot.command('pending', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const access = loadAccess()
+  const senderId = String(ctx.from?.id ?? '')
+  if (!access.allowFrom.includes(senderId)) {
+    await switchroomReply(ctx, 'Not authorized to view pending permission prompts.')
+    return
+  }
+  if (pendingPermissions.size === 0) {
+    await switchroomReply(ctx, 'No pending permission prompts.')
+    return
+  }
+  const lines: string[] = ['<b>Pending permission prompts</b>']
+  for (const [id, details] of pendingPermissions.entries()) {
+    lines.push(`• <code>${escapeHtmlForTg(id)}</code> — ${escapeHtmlForTg(details.tool_name)}`)
+  }
+  await switchroomReply(ctx, lines.join('\n'), { html: true })
+})
+
 bot.command('interrupt', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
@@ -2462,6 +2640,11 @@ async function registerSwitchroomBotCommands(): Promise<void> {
     { command: 'switchroomstart', description: 'Start an agent' },
     { command: 'stop', description: 'Stop an agent' },
     { command: 'restart', description: 'Restart an agent' },
+    { command: 'new', description: 'Start a fresh session (flush handoff, restart)' },
+    { command: 'reset', description: 'Alias of /new — start a fresh session' },
+    { command: 'approve', description: 'Approve the pending tool permission (or /approve <id>)' },
+    { command: 'deny', description: 'Deny the pending tool permission (or /deny <id>)' },
+    { command: 'pending', description: 'List pending tool permission prompts' },
     { command: 'interrupt', description: 'Interrupt an agent turn' },
     { command: 'doctor', description: 'Health check' },
     { command: 'reconcile', description: 'Re-apply config' },
