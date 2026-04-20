@@ -302,14 +302,15 @@ function buildSessionGreetingScript(
 
   // Telegram HTML — keep it compact for mobile. Omit rows that are
   // null (unset with no interesting default to show).
-  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, and __SWITCHROOM_QUOTA__
-  // are resolved at runtime by the shell script so the greeting always
-  // reflects current state.
+  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, __SWITCHROOM_PLAN__, and
+  // __SWITCHROOM_QUOTA__ are resolved at runtime by the shell script so
+  // the greeting always reflects current state.
   const text = [
     `<b>🎛️ Switchroom · ${escapeHtml(name)} online</b>`,
     ``,
     `<b>Model</b>  __SWITCHROOM_MODEL__`,
     `<b>Auth</b>  __SWITCHROOM_AUTH__`,
+    `<b>Plan</b>  __SWITCHROOM_PLAN__`,
     `<b>Quota</b>  __SWITCHROOM_QUOTA__`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
@@ -532,10 +533,49 @@ if command -v jq >/dev/null 2>&1; then
 fi
 [ -z "$AUTH_STATUS" ] && AUTH_STATUS="—"
 
+# Resolve Pro/Max plan quota utilization by hitting /v1/messages with the
+# CLI's OAuth + user-agent shape — the response headers expose the 5-hour
+# and 7-day rolling-window utilization percentages that the TUI's /usage
+# panel reads. One input token, max_tokens=1, response body discarded.
+#
+# This is the real subscription-quota figure, separate from the
+# ccusage-based monetary "Quota" row below (which reflects dollars spent,
+# not Pro/Max window utilization — orthogonal concerns).
+PLAN_STATUS=""
+if [ -n "$CLAUDE_DIR" ] && [ -f "$CLAUDE_DIR/.oauth-token" ] && command -v curl >/dev/null 2>&1; then
+  OAUTH_TOKEN="$(cat "$CLAUDE_DIR/.oauth-token" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$OAUTH_TOKEN" ]; then
+    PLAN_HEADERS_FILE="$(mktemp 2>/dev/null || echo /tmp/plan-headers.$$)"
+    # -o /dev/null drops body; -D dumps headers; --max-time bounds the call.
+    curl -sS -o /dev/null -D "$PLAN_HEADERS_FILE" --max-time 10 \
+      -X POST "https://api.anthropic.com/v1/messages" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "authorization: Bearer $OAUTH_TOKEN" \
+      -H "x-app: cli" \
+      -H "user-agent: claude-cli/1.0.0 (external, cli)" \
+      -H "content-type: application/json" \
+      --data '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+      >/dev/null 2>&1 || true
+    if [ -s "$PLAN_HEADERS_FILE" ]; then
+      # tr -d '\\r' normalises CRLF so grep matches; awk picks value after ':'.
+      H5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-utilization:' | tail -1 | awk -F': ' '{print $2}')"
+      H7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-utilization:' | tail -1 | awk -F': ' '{print $2}')"
+      if [ -n "$H5" ] || [ -n "$H7" ]; then
+        P5="$(awk -v v="\${H5:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
+        P7="$(awk -v v="\${H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
+        PLAN_STATUS="\${P5}% / 5h · \${P7}% / 7d"
+      fi
+    fi
+    rm -f "$PLAN_HEADERS_FILE" 2>/dev/null || true
+  fi
+fi
+[ -z "$PLAN_STATUS" ] && PLAN_STATUS="—"
+
 # Resolve Claude quota usage (week + month) via ccusage — parses local
-# transcripts, no network call. Anthropic exposes no subscription-quota
-# endpoint, so this is usage-tracked-locally, optionally compared
-# against budgets baked in from switchroom.yaml.
+# transcripts, no network call. This reflects dollars spent (from local
+# JSONL cost estimates), a different signal from the Pro/Max window
+# utilization shown in the Plan row above.
 QUOTA_STATUS=""
 WEEKLY_BUDGET="${weeklyBudget}"
 MONTHLY_BUDGET="${monthlyBudget}"
@@ -581,6 +621,7 @@ fi
 TEXT=${shellSingleQuote(text)}
 TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
 TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
+TEXT="\${TEXT//__SWITCHROOM_PLAN__/$PLAN_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}"
 
 ${curlCalls.join("\n\n")}

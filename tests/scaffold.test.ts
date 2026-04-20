@@ -242,6 +242,36 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain('[ -z "$QUOTA_STATUS" ] && QUOTA_STATUS="—"');
   });
 
+  it("session greeting renders a Plan row that hits /v1/messages for real quota", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("plan-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+
+    // Plan row is a runtime placeholder
+    expect(greeting).toMatch(/<b>Plan<\/b>\s+__SWITCHROOM_PLAN__/);
+    // Uses .oauth-token (not .credentials.json — only .oauth-token carries
+    // the subscription OAuth token that gets the utilization headers back)
+    expect(greeting).toContain('$CLAUDE_DIR/.oauth-token');
+    // Hits the Messages API (the one surface that returns rate-limit
+    // utilization headers for Pro/Max subscription tokens)
+    expect(greeting).toContain("api.anthropic.com/v1/messages");
+    // Needs the CLI's oauth-beta header or the token is rejected with
+    // "OAuth authentication is currently not supported"
+    expect(greeting).toContain("anthropic-beta: oauth-2025-04-20");
+    expect(greeting).toContain("x-app: cli");
+    expect(greeting).toContain("user-agent: claude-cli/");
+    // Reads the two utilization headers off the response
+    expect(greeting).toContain("anthropic-ratelimit-unified-5h-utilization");
+    expect(greeting).toContain("anthropic-ratelimit-unified-7d-utilization");
+    // Placeholder substitution
+    expect(greeting).toContain("${TEXT//__SWITCHROOM_PLAN__/$PLAN_STATUS}");
+    // Graceful fallback when curl/jq is unavailable or the API is down
+    expect(greeting).toContain('[ -z "$PLAN_STATUS" ] && PLAN_STATUS="—"');
+  });
+
   it("session greeting Quota row falls back to raw usage when no budget is set", () => {
     const config = makeAgentConfig();
     // No switchroomConfig passed → no quota section → empty budgets

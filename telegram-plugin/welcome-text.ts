@@ -195,6 +195,7 @@ export const TELEGRAM_MENU_COMMANDS = [
   // Quick diagnostic
   { command: "logs", description: "Show recent agent logs" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
+  { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
   // Auth shortcut (full /auth sub-verbs still typable)
   { command: "reauth", description: "Re-auth Claude for this agent" },
   // Escape hatch — shows the full catalogue including CLI-only commands
@@ -241,6 +242,7 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/dangerous [off]</code> — toggle full tool access`,
     `<code>/vault</code> — manage encrypted secrets`,
     `<code>/doctor</code> — health check (deps, services, MCP)`,
+    `<code>/usage</code> — Pro/Max plan quota (5h + 7d windows)`,
     `<code>/switchroomhelp</code> — this help`,
   ].join("\n");
 }
