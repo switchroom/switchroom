@@ -16,6 +16,27 @@ function serviceName(name: string): string {
   return `switchroom-${name}`;
 }
 
+/**
+ * The agent has TWO systemd units: the agent itself (`switchroom-<name>`),
+ * which spawns the Claude CLI on demand, and the long-running telegram
+ * gateway (`switchroom-<name>-gateway`) which holds the Telegram connection
+ * and IPC server.
+ *
+ * Changes to `telegram-plugin/*` code only take effect when the gateway
+ * unit restarts, because bun loads the source at process start. If the CLI
+ * only cycles the agent unit, telegram-plugin code changes silently stay
+ * stale on a user's machine for hours or days until something else triggers
+ * a gateway restart (crash, reboot, manual intervention).
+ *
+ * Make start/stop/restart always cycle BOTH units so the user never has to
+ * reason about "did the gateway also need a kick." Ordering: stop gateway
+ * last (so it can accept the agent's final heartbeat); start gateway first
+ * (so the agent has someone to talk to on wake).
+ */
+function gatewayServiceName(name: string): string {
+  return `switchroom-${name}-gateway`;
+}
+
 function systemctl(args: string[]): string {
   return execFileSync("systemctl", ["--user", ...args], {
     encoding: "utf-8",
@@ -23,8 +44,30 @@ function systemctl(args: string[]): string {
   }).trim();
 }
 
+/**
+ * Silent-ok wrapper for units that may not exist on this host (e.g. a
+ * reconfigured agent with a different plugin set, or a non-telegram agent).
+ * We want "always cycle both if they exist" semantics, not "fail the whole
+ * restart because one unit is absent."
+ */
+function systemctlIfExists(action: string, unit: string): void {
+  try {
+    // Check existence first. `list-unit-files` exits 0 even when the unit
+    // is missing, so we match the unit name in its output.
+    const listed = systemctl(["list-unit-files", "--no-legend", unit]);
+    if (!listed.includes(unit)) return;
+    systemctl([action, unit]);
+  } catch {
+    // Absent or inactive is fine for start/stop; restart on a non-existent
+    // unit is a no-op. We swallow instead of throwing because the caller
+    // wants "make the right thing happen" not "diagnose per-unit state."
+  }
+}
+
 export function startAgent(name: string): void {
   try {
+    // Gateway first so the agent has someone to IPC to on wake.
+    systemctlIfExists("start", gatewayServiceName(name));
     systemctl(["start", serviceName(name)]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -34,7 +77,9 @@ export function startAgent(name: string): void {
 
 export function stopAgent(name: string): void {
   try {
+    // Agent first so it can flush handoff via gateway IPC before the gateway dies.
     systemctl(["stop", serviceName(name)]);
+    systemctlIfExists("stop", gatewayServiceName(name));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to stop agent "${name}": ${message}`);
@@ -43,6 +88,12 @@ export function stopAgent(name: string): void {
 
 export function restartAgent(name: string): void {
   try {
+    // Gateway owns the long-running Telegram connection and loads
+    // telegram-plugin code at process start. Restart it alongside the agent
+    // so code changes in telegram-plugin/*.ts always propagate on user
+    // action, not silently 6 hours later. Gateway first so the fresh gateway
+    // is ready when the agent wakes.
+    systemctlIfExists("restart", gatewayServiceName(name));
     systemctl(["restart", serviceName(name)]);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

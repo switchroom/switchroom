@@ -363,15 +363,35 @@ function purgeReactionTracking(key: string): void {
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
   }
 
-  // If no more active turns and a restart is pending, perform it now
+  // If no more active turns and a restart is pending, perform it now.
+  //
+  // Cycle BOTH the agent unit and the gateway unit (us). Rationale: users
+  // who ran `switchroom agent restart <name> --graceful-restart` after a
+  // code change expect their telegram-plugin edits to land, and that code
+  // only reloads when this gateway process restarts. Restarting only the
+  // agent unit leaves us running the stale code until something else kicks
+  // us over, which is a foot-gun (as observed on 2026-04-21 when a
+  // klanker gateway ran pre-reorder progress-card code for half a day).
+  //
+  // Use detached spawn for the combined restart so the systemctl job
+  // survives us getting killed by our own restart. Fire-and-forget;
+  // response to the client was already sent when the restart was
+  // scheduled, so nobody is waiting on this.
   if (activeTurnStartedAt.size === 0 && pendingRestarts.size > 0) {
     for (const [agentName, _timestamp] of pendingRestarts.entries()) {
-      process.stderr.write(`telegram gateway: turn completed, restarting ${agentName} now\n`);
+      process.stderr.write(`telegram gateway: turn completed, restarting ${agentName} (agent + gateway) now\n`);
       try {
-        execSync(`systemctl --user restart switchroom-${agentName}.service`, { stdio: 'ignore' });
-        process.stderr.write(`telegram gateway: successfully restarted ${agentName}\n`);
+        spawn(
+          'sh',
+          [
+            '-c',
+            // Sleep briefly so our stderr flush lands before systemd kills us.
+            `sleep 0.3 && systemctl --user restart switchroom-${agentName}.service switchroom-${agentName}-gateway.service`,
+          ],
+          { detached: true, stdio: 'ignore' },
+        ).unref();
       } catch (err) {
-        process.stderr.write(`telegram gateway: restart failed for ${agentName}: ${err}\n`);
+        process.stderr.write(`telegram gateway: restart spawn failed for ${agentName}: ${err}\n`);
       }
       pendingRestarts.delete(agentName);
     }
@@ -689,22 +709,34 @@ const ipcServer: IpcServer = createIpcServer({
     const turnInFlight = activeTurnStartedAt.size > 0;
 
     if (!turnInFlight) {
-      // No active turn, restart immediately
+      // No active turn, restart immediately. Cycle both the agent unit and
+      // the gateway unit (us) so telegram-plugin code changes always
+      // propagate. Send the client response FIRST, then spawn a detached
+      // shell to run the combined systemctl restart after a brief delay.
+      // The delay ensures the IPC response has flushed before systemd
+      // kills us; the detach ensures the systemctl job survives our death.
       try {
-        execSync(`systemctl --user restart switchroom-${agentName}.service`, { stdio: 'ignore' });
         client.send({
           type: 'schedule_restart_result',
           success: true,
           restartedImmediately: true,
         });
-        process.stderr.write(`telegram gateway: restarted ${agentName} immediately (no active turn)\n`);
+        spawn(
+          'sh',
+          [
+            '-c',
+            `sleep 0.3 && systemctl --user restart switchroom-${agentName}.service switchroom-${agentName}-gateway.service`,
+          ],
+          { detached: true, stdio: 'ignore' },
+        ).unref();
+        process.stderr.write(`telegram gateway: scheduled immediate restart of ${agentName} (agent + gateway)\n`);
       } catch (err) {
         client.send({
           type: 'schedule_restart_result',
           success: false,
           error: err instanceof Error ? err.message : String(err),
         });
-        process.stderr.write(`telegram gateway: restart failed for ${agentName}: ${err}\n`);
+        process.stderr.write(`telegram gateway: restart spawn failed for ${agentName}: ${err}\n`);
       }
     } else {
       // Turn is active, schedule restart for when turn completes
