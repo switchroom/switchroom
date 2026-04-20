@@ -223,8 +223,15 @@ describe('progress-card render', () => {
   it('renders a distinctive "Working…" header while in-progress', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
-    expect(out).toContain('⚙️ <b>Working…</b>')
-    expect(out).toContain('<blockquote>')
+    const lines = out.split('\n')
+    // Header should be FIRST, blockquote SECOND
+    const headerLine = lines.find(l => l.includes('⚙️ <b>Working…</b>'))
+    const quoteLine = lines.find(l => l.includes('<blockquote>'))
+    expect(headerLine).toBeDefined()
+    expect(quoteLine).toBeDefined()
+    const headerIdx = lines.indexOf(headerLine!)
+    const quoteIdx = lines.indexOf(quoteLine!)
+    expect(headerIdx).toBeLessThan(quoteIdx)
     expect(out).not.toContain('─ ─ ─')
     expect(out).not.toContain('✅ <b>Done</b> ·')
   })

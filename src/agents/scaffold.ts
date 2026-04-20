@@ -1186,9 +1186,35 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       }
       return out;
     })(),
-    systemPromptAppendShellQuoted: agentConfig.system_prompt_append
-      ? shellSingleQuote(agentConfig.system_prompt_append)
-      : undefined,
+    systemPromptAppendShellQuoted: (() => {
+      const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(agentConfig);
+      const baseAppend = agentConfig.system_prompt_append ?? '';
+      const telegramGuidance = `## Progress updates (human-style check-ins)
+
+You're talking to a human colleague on Telegram. Alongside the emoji status
+ladder, send a short \`progress_update\` at inflection points, the moments a
+senior colleague would ping the person who asked them to do something:
+
+- **Plan formed:** "Got it. Going to do X first, then Y, then Z."
+- **Pivot or blocker:** "First approach didn't work because <reason>. Trying
+  <alternative> instead."
+- **Chunk finished:** "Done with X. Starting Y now."
+
+Keep them short (one or two sentences). Don't narrate every step, the pinned
+progress card shows that for free. Don't send an update on a trivial one-shot
+task. Send them when a colleague would genuinely want to know what's happening.
+
+Final answers still go through \`stream_reply\` with done=true as usual,
+\`progress_update\` is only for mid-turn check-ins.`;
+
+      if (useSwitchroomPlugin) {
+        const combined = baseAppend.length > 0
+          ? `${baseAppend}\n\n---\n\n${telegramGuidance}`
+          : telegramGuidance;
+        return shellSingleQuote(combined);
+      }
+      return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
+    })(),
     extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
       ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
       : undefined,

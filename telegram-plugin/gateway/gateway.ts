@@ -328,6 +328,8 @@ const activeDraftStreams = new Map<string, DraftStreamHandle>()
 const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 const suppressPtyPreview = new Set<string>()
 const lastPtyPreviewByChat = new Map<string, string>()
+const progressUpdateLastSent = new Map<string, number>()
+const progressUpdateTurnCount = new Map<string, number>()
 
 let currentSessionChatId: string | null = null
 let currentTurnStartedAt = 0
@@ -672,7 +674,7 @@ const ipcServer: IpcServer = createIpcServer({
 /** Allowlisted tool names that bridges may invoke via IPC. Prevents a rogue
  *  bridge from calling arbitrary functions by name. */
 const ALLOWED_TOOLS = new Set([
-  'reply', 'stream_reply', 'react', 'download_attachment',
+  'reply', 'stream_reply', 'progress_update', 'react', 'download_attachment',
   'edit_message', 'send_typing', 'pin_message', 'delete_message',
   'forward_message', 'get_recent_messages',
 ])
@@ -686,6 +688,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeReply(args)
     case 'stream_reply':
       return executeStreamReply(args)
+    case 'progress_update':
+      return executeProgressUpdate(args)
     case 'react':
       return executeReact(args)
     case 'download_attachment':
@@ -953,6 +957,95 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     unpinProgressCardForChat?.(srChatId, srThreadId)
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
+}
+
+async function executeProgressUpdate(args: Record<string, unknown>): Promise<unknown> {
+  if (!args.chat_id) throw new Error('progress_update: chat_id is required')
+  if (!args.text) throw new Error('progress_update: text is required')
+
+  const chat_id = args.chat_id as string
+  let text = args.text as string
+  const threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+  const key = statusKey(chat_id, threadId)
+
+  assertAllowedChat(chat_id)
+
+  // Truncate to 300 chars
+  if (text.length > 300) {
+    text = text.slice(0, 299) + '…'
+  }
+
+  const now = Date.now()
+
+  // Rate limit: ≥ 20s between calls
+  const lastSent = progressUpdateLastSent.get(key)
+  if (lastSent != null) {
+    const elapsed = now - lastSent
+    if (elapsed < 20_000) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ ok: false, reason: 'too_soon', retryAfterMs: 20_000 - elapsed }),
+          },
+        ],
+      }
+    }
+  }
+
+  // Turn cap: max 5 calls per turn
+  const turnStart = activeTurnStartedAt.get(key)
+  if (turnStart != null) {
+    const currentCount = progressUpdateTurnCount.get(key) ?? 0
+    if (currentCount >= 5) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
+          },
+        ],
+      }
+    }
+    progressUpdateTurnCount.set(key, currentCount + 1)
+  }
+
+  // Send plain message (no quote-reply)
+  const access = loadAccess()
+  const configParseMode = access.parseMode ?? 'html'
+  const parseMode = configParseMode === 'html' ? 'HTML' : undefined
+  const effectiveText = configParseMode === 'html' ? markdownToHtml(text) : text
+
+  const sendOpts = {
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(threadId != null ? { message_thread_id: threadId } : {}),
+  }
+
+  const sent = await robustApiCall(
+    () => lockedBot.api.sendMessage(chat_id, effectiveText, sendOpts),
+    { verb: 'sendMessage', chat_id, threadId },
+  )
+
+  // Record in sent-message history
+  if (HISTORY_ENABLED) {
+    recordOutbound({
+      chat_id,
+      thread_id: threadId ?? null,
+      message_ids: [sent.message_id],
+      text,
+    })
+  }
+
+  progressUpdateLastSent.set(key, now)
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ ok: true, message_id: sent.message_id }),
+      },
+    ],
+  }
 }
 
 async function executeReact(args: Record<string, unknown>): Promise<unknown> {
@@ -1727,6 +1820,7 @@ async function handleInbound(
         activeStatusReactions.set(key, ctrl)
         activeReactionMsgIds.set(key, { chatId: chat_id, messageId: msgId })
         activeTurnStartedAt.set(key, Date.now())
+        progressUpdateTurnCount.set(key, 0)  // Reset turn counter
         ctrl.setQueued()
         const agentDir = resolveAgentDirFromEnv()
         if (agentDir != null) {

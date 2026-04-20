@@ -190,6 +190,18 @@ const activeTurnStartedAt = new Map<string, number>()
  */
 const pendingQueueNotifications = new Map<string, { chatId: string; messageId: number; threadId: number | undefined }>()
 
+/**
+ * Rate-limit state for progress_update tool: last send timestamp per
+ * (chat_id, thread_id). Keys match statusKey format.
+ */
+const progressUpdateLastSent = new Map<string, number>()
+
+/**
+ * Per-turn call counter for progress_update tool. Reset when a new turn
+ * starts (detected via activeTurnStartedAt change). Keys match statusKey format.
+ */
+const progressUpdateTurnCount = new Map<string, number>()
+
 function statusKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
 }
@@ -1166,6 +1178,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'progress_update',
+      description:
+        'Send a mid-turn check-in message to the user. Use this at inflection points where a colleague would naturally want to know what\'s happening: plan formed, pivot or blocker encountered, chunk of work finished. Does NOT quote-reply, does NOT affect status reactions or progress card. Rate-limited: minimum 20s between calls per chat+thread, max 5 calls per turn. Text capped at 300 chars.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          text: { type: 'string', description: '300-char max, truncated with "…" if longer.' },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.',
+          },
+        },
+        required: ['chat_id', 'text'],
+      },
+    },
+    {
       name: 'react',
       description: 'Add an emoji reaction to a Telegram message. Telegram only accepts a fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc) — non-whitelisted emoji will be rejected.',
       inputSchema: {
@@ -1745,6 +1774,91 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             {
               type: 'text',
               text: `${result.status} (id: ${result.messageId ?? 'pending'})`,
+            },
+          ],
+        }
+      }
+      case 'progress_update': {
+        const chat_id = args.chat_id as string
+        let text = args.text as string
+        const threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+        const key = statusKey(chat_id, threadId)
+
+        assertAllowedChat(chat_id)
+
+        // Truncate to 300 chars
+        if (text.length > 300) {
+          text = text.slice(0, 299) + '…'
+        }
+
+        const now = Date.now()
+
+        // Rate limit: ≥ 20s between calls
+        const lastSent = progressUpdateLastSent.get(key)
+        if (lastSent != null) {
+          const elapsed = now - lastSent
+          if (elapsed < 20_000) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ ok: false, reason: 'too_soon', retryAfterMs: 20_000 - elapsed }),
+                },
+              ],
+            }
+          }
+        }
+
+        // Turn cap: max 5 calls per turn
+        const turnStart = activeTurnStartedAt.get(key)
+        if (turnStart != null) {
+          const currentCount = progressUpdateTurnCount.get(key) ?? 0
+          if (currentCount >= 5) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
+                },
+              ],
+            }
+          }
+          progressUpdateTurnCount.set(key, currentCount + 1)
+        }
+
+        // Send plain message (no quote-reply)
+        const access = loadAccess()
+        const configParseMode = access.parseMode ?? 'html'
+        const parseMode = configParseMode === 'html' ? 'HTML' : undefined
+        const effectiveText = configParseMode === 'html' ? markdownToHtml(text) : text
+
+        const sendOpts = {
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }
+
+        const sent = await robustApiCall(
+          () => lockedBot.api.sendMessage(chat_id, effectiveText, sendOpts),
+          { verb: 'sendMessage', chat_id, threadId },
+        )
+
+        // Record in sent-message history
+        if (HISTORY_ENABLED) {
+          recordOutbound({
+            chat_id,
+            thread_id: threadId ?? null,
+            message_ids: [sent.message_id],
+            text,
+          })
+        }
+
+        progressUpdateLastSent.set(key, now)
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ ok: true, message_id: sent.message_id }),
             },
           ],
         }
@@ -4976,6 +5090,7 @@ async function handleInbound(
         })
         activeStatusReactions.set(key, ctrl)
         activeTurnStartedAt.set(key, Date.now())
+        progressUpdateTurnCount.set(key, 0)  // Reset turn counter
 
         // 👀 immediately
         ctrl.setQueued()

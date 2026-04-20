@@ -657,15 +657,15 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
 
   const lines: string[] = []
 
-  if (state.userRequest) {
-    lines.push(`<blockquote>${escapeHtml(truncate(state.userRequest, 120))}</blockquote>`)
-  }
-
   const elapsed = formatDuration(now - state.turnStartedAt)
   const headerIcon = state.stage === 'done' ? '✅' : '⚙️'
   const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
+
+  if (state.userRequest) {
+    lines.push(`<blockquote>${escapeHtml(truncate(state.userRequest, 120))}</blockquote>`)
+  }
 
   // Stuck-warning: after 2 min of no session events the card is likely
   // orphaned or the sub-agent is in a long-running silent tool call.
