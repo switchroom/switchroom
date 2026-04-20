@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills } from "../src/agents/scaffold.js";
@@ -749,6 +749,25 @@ describe("reconcileAgent", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    // Safety net: A4a/A4b tests write ephemeral __A4*_TEST_* templates
+    // into profiles/default/workspace/ (the repo source tree) and clean
+    // them up in their own try/finally. If a test crashes between
+    // writeFileSync and the finally, the orphan would linger and get
+    // picked up by subsequent test runs. Sweep any leftovers here as
+    // belt-and-braces; no-op in the common case.
+    const profileWorkspaceDir = resolve(
+      import.meta.dirname,
+      "../profiles/default/workspace",
+    );
+    try {
+      for (const entry of readdirSync(profileWorkspaceDir)) {
+        if (/^__A4[AB]_(TEST|CONTRACT)_\d+\.md\.hbs$/.test(entry)) {
+          rmSync(join(profileWorkspaceDir, entry), { force: true });
+        }
+      }
+    } catch {
+      // profile dir missing is fine — nothing to clean
+    }
   });
 
   function buildSwitchroomConfig(
