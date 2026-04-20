@@ -153,7 +153,10 @@ export function registerDebugCommand(program: Command): void {
         const workspaceDir = resolveAgentWorkspaceDir(agentDir);
         const claudeConfigDir = join(agentDir, ".claude");
         const claudeMdPath = join(agentDir, "CLAUDE.md");
+        // Phase 2: SOUL.md lives at workspace/SOUL.md (authoritative), with a
+        // symlink at <agentDir>/SOUL.md for Claude Code auto-discovery.
         const soulMdPath = join(agentDir, "SOUL.md");
+        const workspaceSoulMdPath = join(workspaceDir, "SOUL.md");
         const handoffPath = join(agentDir, ".handoff.md");
 
         const lastN = parseInt(opts.last, 10);
@@ -254,13 +257,17 @@ export function registerDebugCommand(program: Command): void {
           console.log();
         }
 
-        // 4. SOUL.md (auto-loaded by Claude Code if present in agent dir root)
+        // 4. SOUL.md (authoritative persona source from workspace/, symlinked
+        //    to agent root for Claude Code auto-discovery)
         console.log(
-          "=== SOUL.md (auto-loaded by Claude Code if present) ===\n",
+          "=== Persona (SOUL.md) ===\n",
         );
 
+        // Read from symlink path first (agent root), fall back to workspace
         const soulMdContent = existsSync(soulMdPath)
           ? readFileSync(soulMdPath, "utf-8")
+          : existsSync(workspaceSoulMdPath)
+          ? readFileSync(workspaceSoulMdPath, "utf-8")
           : "";
 
         if (soulMdContent.trim().length > 0) {

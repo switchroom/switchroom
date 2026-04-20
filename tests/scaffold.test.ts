@@ -38,7 +38,9 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(result.agentDir, ".claude"))).toBe(true);
     expect(existsSync(join(result.agentDir, ".claude", "settings.json"))).toBe(true);
     expect(existsSync(join(result.agentDir, "CLAUDE.md"))).toBe(true);
+    // Phase 2: SOUL.md is now a symlink to workspace/SOUL.md
     expect(existsSync(join(result.agentDir, "SOUL.md"))).toBe(true);
+    expect(existsSync(join(result.agentDir, "workspace", "SOUL.md"))).toBe(true);
     expect(existsSync(join(result.agentDir, "memory", "MEMORY.md"))).toBe(true);
     expect(existsSync(join(result.agentDir, ".claude", "skills"))).toBe(true);
     expect(existsSync(join(result.agentDir, "telegram", ".env"))).toBe(true);
@@ -46,7 +48,7 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(result.agentDir, "start.sh"))).toBe(true);
   });
 
-  it("renders CLAUDE.md with agent name and soul", () => {
+  it("renders CLAUDE.md with agent name (Phase 2: persona moved to SOUL.md)", () => {
     const config = makeAgentConfig({
       soul: {
         name: "Coach",
@@ -59,9 +61,16 @@ describe("scaffoldAgent", () => {
     const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
 
     expect(claudeMd).toContain("health-coach");
-    expect(claudeMd).toContain("Coach");
-    expect(claudeMd).toContain("motivational");
-    expect(claudeMd).toContain("not a doctor");
+    // Phase 2: persona content moved to SOUL.md
+    expect(claudeMd).toContain("SOUL.md");
+    expect(claudeMd).not.toContain("Coach");
+    expect(claudeMd).not.toContain("motivational");
+
+    // Persona should be in workspace/SOUL.md instead
+    const soulMd = readFileSync(join(result.agentDir, "workspace", "SOUL.md"), "utf-8");
+    expect(soulMd).toContain("Coach");
+    expect(soulMd).toContain("motivational");
+    expect(soulMd).toContain("not a doctor");
   });
 
   it("generates start.sh with correct env vars", () => {
@@ -1229,18 +1238,21 @@ describe("reconcileAgent", () => {
     expect(after.mcpServers.hindsight.url).toBe("http://localhost:18888/mcp/");
   });
 
-  it("does not touch CLAUDE.md, SOUL.md, or telegram user-content files", () => {
+  it("does not touch CLAUDE.md or telegram user-content files (Phase 2: workspace/SOUL.md regenerates)", () => {
     // start.sh is intentionally NOT in this list — it's purely
     // template-driven (no user content) and reconcile re-renders it
     // so config changes (like enabling Hindsight or switching ports)
     // propagate without forcing a full re-scaffold.
+    //
+    // Phase 2: workspace/SOUL.md is also regenerated every reconcile (it's
+    // the authoritative persona source from config). User customizations
+    // belong in SOUL.custom.md sidecar.
     const agentConfig = makeAgentConfig();
     const initialConfig = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, initialConfig);
 
     const userEditedFiles = [
       join(tmpDir, "test-agent", "CLAUDE.md"),
-      join(tmpDir, "test-agent", "SOUL.md"),
       join(tmpDir, "test-agent", "telegram", ".env"),
       join(tmpDir, "test-agent", "telegram", "access.json"),
     ];

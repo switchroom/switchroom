@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, resolve } from "node:path";
+import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
 
 // Repo root for referencing bin/ scripts in hooks
@@ -987,7 +988,18 @@ function seedWorkspaceBootstrapFiles(params: {
         const destRel = relPath.replace(/\.hbs$/, "");
         writeIfMissing(
           join(agentWorkspaceDir, destRel),
-          () => renderTemplate(srcPath, params.context),
+          () => {
+            let rendered = renderTemplate(srcPath, params.context);
+            // Phase 2: append SOUL.custom.md sidecar if present
+            if (destRel === "SOUL.md") {
+              const customSoulPath = join(agentWorkspaceDir, "SOUL.custom.md");
+              if (existsSync(customSoulPath)) {
+                const customContent = readFileSync(customSoulPath, "utf-8");
+                rendered = rendered.trimEnd() + "\n\n---\n\n" + customContent;
+              }
+            }
+            return rendered;
+          },
           params.created,
           params.skipped,
         );
@@ -1570,9 +1582,9 @@ export function scaffoldAgent(
   }
 
   // --- Render template-specific files ---
+  // Phase 2: SOUL.md moved to workspace/SOUL.md (seedWorkspaceBootstrapFiles)
   const templateFiles: Array<{ src: string; dest: string }> = [
     { src: "CLAUDE.md.hbs", dest: "CLAUDE.md" },
-    { src: "SOUL.md.hbs", dest: "SOUL.md" },
   ];
 
   for (const { src, dest } of templateFiles) {
@@ -1771,6 +1783,39 @@ export function scaffoldAgent(
 
   // --- Set up plugin symlinks ---
   setupPlugins(agentDir);
+
+  // --- Phase 2: symlink <agentDir>/SOUL.md → workspace/SOUL.md ---
+  // Claude Code auto-discovers SOUL.md at the project root. Keep parity by
+  // symlinking so both paths see the same authoritative workspace/SOUL.md.
+  const agentSoulPath = join(agentDir, "SOUL.md");
+  const workspaceSoulPath = join(agentDir, "workspace", "SOUL.md");
+  if (existsSync(workspaceSoulPath)) {
+    // Remove old regular file if present (migration)
+    if (existsSync(agentSoulPath)) {
+      const stat = lstatSync(agentSoulPath);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(agentSoulPath);
+        if (target === "workspace/SOUL.md") {
+          // Already correct symlink, skip
+          skipped.push(agentSoulPath);
+        } else {
+          // Wrong symlink, replace
+          rmSync(agentSoulPath);
+          symlinkSync("workspace/SOUL.md", agentSoulPath);
+          created.push(agentSoulPath);
+        }
+      } else {
+        // Regular file, replace with symlink
+        rmSync(agentSoulPath);
+        symlinkSync("workspace/SOUL.md", agentSoulPath);
+        created.push(agentSoulPath);
+      }
+    } else {
+      // No file exists, create symlink
+      symlinkSync("workspace/SOUL.md", agentSoulPath);
+      created.push(agentSoulPath);
+    }
+  }
 
   return { agentDir, created, skipped };
 }
@@ -1998,6 +2043,21 @@ Final answers still go through \`stream_reply\` with done=true as usual,
       if (afterMd !== beforeMd) {
         writeFileSync(claudeMdDest, afterMd, "utf-8");
         changes.push(claudeMdDest);
+      }
+    }
+  } else {
+    // --- Phase 2 migration: warn if CLAUDE.md looks like old fat template ---
+    const claudeMdDest = join(agentDir, "CLAUDE.md");
+    if (existsSync(claudeMdDest)) {
+      const content = readFileSync(claudeMdDest, "utf-8");
+      const looksOld = content.length > 5000 && !content.includes("SOUL.md");
+      if (looksOld) {
+        console.warn(
+          chalk.yellow(
+            `CLAUDE.md may be out of date (old template with persona block). ` +
+            `Run \`switchroom agent reconcile ${name} --force-claude-md\` to apply the slimmed template.`
+          )
+        );
       }
     }
   }
@@ -2349,6 +2409,52 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     created: changes,
     skipped: [],
   });
+
+  // --- Phase 2: regenerate workspace/SOUL.md deterministically every reconcile ---
+  // Unlike other workspace files (user-protected via writeIfMissing), SOUL.md is
+  // the authoritative persona source derived from config. Regenerate on every
+  // reconcile so config changes propagate.
+  const soulMdSrc = join(reconcileProfilePath, "workspace", "SOUL.md.hbs");
+  const soulMdDest = join(agentDir, "workspace", "SOUL.md");
+  if (existsSync(soulMdSrc)) {
+    const before = existsSync(soulMdDest) ? readFileSync(soulMdDest, "utf-8") : "";
+    let after = renderTemplate(soulMdSrc, workspaceContext);
+    // Append SOUL.custom.md sidecar if present
+    const customSoulPath = join(agentDir, "workspace", "SOUL.custom.md");
+    if (existsSync(customSoulPath)) {
+      const customContent = readFileSync(customSoulPath, "utf-8");
+      after = after.trimEnd() + "\n\n---\n\n" + customContent;
+    }
+    if (after !== before) {
+      writeFileSync(soulMdDest, after, "utf-8");
+      changes.push(soulMdDest);
+    }
+  }
+
+  // --- Phase 2: symlink <agentDir>/SOUL.md → workspace/SOUL.md (migration) ---
+  const agentSoulPath = join(agentDir, "SOUL.md");
+  const workspaceSoulPath = join(agentDir, "workspace", "SOUL.md");
+  if (existsSync(workspaceSoulPath)) {
+    if (existsSync(agentSoulPath)) {
+      const stat = lstatSync(agentSoulPath);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(agentSoulPath);
+        if (target !== "workspace/SOUL.md") {
+          rmSync(agentSoulPath);
+          symlinkSync("workspace/SOUL.md", agentSoulPath);
+          changes.push(agentSoulPath);
+        }
+      } else {
+        // Regular file, replace with symlink
+        rmSync(agentSoulPath);
+        symlinkSync("workspace/SOUL.md", agentSoulPath);
+        changes.push(agentSoulPath);
+      }
+    } else {
+      symlinkSync("workspace/SOUL.md", agentSoulPath);
+      changes.push(agentSoulPath);
+    }
+  }
 
   return { agentDir, changes };
 }
