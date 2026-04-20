@@ -163,6 +163,53 @@ export const switchroomHelpCommandNames = [
   "switchroomhelp",
 ] as const;
 
+/**
+ * Trimmed slash-menu registered with Telegram via setMyCommands.
+ *
+ * This is deliberately NOT the full command catalogue — only the
+ * commands a mobile user actually wants one tap away. Everything in
+ * `switchroomHelpCommandNames` remains typable and working; the
+ * autocomplete popup just doesn't clutter with ops primitives like
+ * /vault, /grant, /dangerous, /permissions, /topics, /memory, and
+ * /switchroomstart that are better driven from the terminal.
+ *
+ * Ordering matters — Telegram renders them in array order, so the
+ * most-likely-to-be-used commands come first.
+ */
+export const TELEGRAM_MENU_COMMANDS = [
+  // Pairing / welcome (baseCommands, not switchroom-owned but listed for completeness)
+  { command: "start", description: "Pairing instructions" },
+  { command: "help", description: "What this bot can do" },
+  { command: "status", description: "Agent, model, auth" },
+  // Session control (most-used)
+  { command: "new", description: "Fresh session (flush handoff, restart)" },
+  { command: "reset", description: "Alias of /new" },
+  // Inline approvals
+  { command: "approve", description: "Approve pending tool permission" },
+  { command: "deny", description: "Deny pending tool permission" },
+  { command: "pending", description: "List pending permission prompts" },
+  // Agent lifecycle
+  { command: "restart", description: "Restart the agent" },
+  { command: "reconcile", description: "Re-apply switchroom.yaml" },
+  { command: "update", description: "Pull latest + reconcile + restart" },
+  // Quick diagnostic
+  { command: "logs", description: "Show recent agent logs" },
+  { command: "doctor", description: "Health check (deps, services, MCP)" },
+  // Auth shortcut (full /auth sub-verbs still typable)
+  { command: "reauth", description: "Re-auth Claude for this agent" },
+  // Escape hatch — shows the full catalogue including CLI-only commands
+  { command: "switchroomhelp", description: "Full command list" },
+] as const;
+
+/**
+ * The three baseCommands split out — gateway.ts and server.ts need
+ * to register them under a different scope (private chats only).
+ * Provided here for parity; most callers should use the full
+ * TELEGRAM_MENU_COMMANDS above which already includes these.
+ */
+export const TELEGRAM_BASE_COMMANDS = TELEGRAM_MENU_COMMANDS.slice(0, 3);
+export const TELEGRAM_SWITCHROOM_COMMANDS = TELEGRAM_MENU_COMMANDS.slice(3);
+
 export function switchroomHelpText(agentName: string): string {
   return [
     `<b>Switchroom bot</b> — commands for the <b>${escapeHtml(agentName)}</b> agent.`,
