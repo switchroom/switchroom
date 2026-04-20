@@ -784,7 +784,7 @@ function syncGlobalSkills(
  * directory into <agentDir>/.claude/skills/<name>.
  *
  * This runs unconditionally on every scaffold/reconcile so all agents
- * automatically get the management skills (switchroom-config, switchroom-health,
+ * automatically get the management skills (switchroom-cli, switchroom-health,
  * etc.) without needing to list them in switchroom.yaml.
  *
  * Rules:

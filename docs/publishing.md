@@ -18,9 +18,8 @@ Inside any Claude Code session:
 
 The first command registers this GitHub repo as a marketplace named `switchroom`.
 The second installs the `switchroom` plugin from that marketplace. All 11 skills
-(`switchroom-install`, `switchroom-status`, `switchroom-logs`, `switchroom-config`,
-`switchroom-restart`, `switchroom-reconcile`, `switchroom-schedule`, `switchroom-health`,
-`switchroom-manage`, `switchroom-architecture`, `switchroom-telegram-guide`) become available
+(`switchroom-install`, `switchroom-status`, `switchroom-cli`, `switchroom-health`,
+`switchroom-manage`, `switchroom-architecture`) become available
 under the `switchroom:` namespace.
 
 To pull updates later:
