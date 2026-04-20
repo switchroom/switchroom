@@ -4089,8 +4089,11 @@ async function handlePermissionSlash(
     )
     return
   }
+  // Single .get() avoids a TOCTOU window if any future edit introduces
+  // an `await` between a .has() check and the subsequent .get().
   purgeExpiredPermissions()
-  if (!pendingPermissions.has(request_id)) {
+  const details = pendingPermissions.get(request_id)
+  if (!details) {
     await switchroomReply(
       ctx,
       `No pending permission for id <code>${escapeHtmlForTg(request_id)}</code>. It may have already been answered or timed out.`,
@@ -4098,7 +4101,6 @@ async function handlePermissionSlash(
     )
     return
   }
-  const details = pendingPermissions.get(request_id)
   void mcp.notification({
     method: 'notifications/claude/channel/permission',
     params: { request_id, behavior },
@@ -4168,6 +4170,20 @@ function flushCurrentAgentHandoff(): number {
 async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
   if (!isAuthorizedSender(ctx)) return
   const name = (ctx.match ?? '').trim() || getMyAgentName()
+  // `all` passes isSelfTargetingCommand (by design for /restart), but /new
+  // and /reset semantically require flushing each agent's handoff before
+  // restarting it — something only that agent's own plugin can do. If we
+  // let /new all through we'd flush ONLY this agent's handoff and then
+  // restart every agent, leaving the others with stale briefings.
+  if (name === 'all') {
+    await switchroomReply(
+      ctx,
+      `/${kind} only supports a single agent — “all” would leave other agents with stale handoff briefings. ` +
+        `Run /${kind} from each agent’s own topic, or use <code>switchroom agent restart all</code> if you just want a plain restart without flushing sessions.`,
+      { html: true },
+    )
+    return
+  }
   if (!isSelfTargetingCommand(name)) {
     await switchroomReply(
       ctx,
