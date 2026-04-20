@@ -336,6 +336,30 @@ describe("scaffoldAgent", () => {
     expect(greeting).toMatch(/export CLAUDE_CONFIG_DIR="\$\{CLAUDE_CONFIG_DIR:-\$\(dirname "\$TELEGRAM_STATE_DIR"\)\/\.claude\}"/);
   });
 
+  it("session greeting AUTH_STATUS has a bare-token fallback for .oauth-token-only installs", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("bare-token-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // Klanker-style install: only .oauth-token exists, no metadata sidecar
+    // and no .credentials.json. Script must still render "✓ authed" rather
+    // than the bare "—" fallback (which misleads users into thinking the
+    // agent is unauthenticated).
+    expect(greeting).toContain('AUTH_STATUS="✓ authed"');
+    // Confirm the cascade order: meta.json first, credentials.json second,
+    // bare-token third, "—" fallback last.
+    const idxMeta = greeting.indexOf(".oauth-token.meta.json");
+    const idxCreds = greeting.indexOf(".credentials.json");
+    const idxBare = greeting.indexOf('AUTH_STATUS="✓ authed"');
+    const idxDash = greeting.lastIndexOf('AUTH_STATUS="—"');
+    expect(idxMeta).toBeGreaterThan(0);
+    expect(idxCreds).toBeGreaterThan(0);
+    expect(idxBare).toBeGreaterThan(idxCreds);
+    expect(idxDash).toBeGreaterThan(idxBare);
+  });
+
   it("session greeting uses a 60s idempotency window (widened from the original 30s)", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("idem-agent", config, tmpDir, telegramConfig);

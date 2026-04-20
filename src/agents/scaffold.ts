@@ -506,6 +506,12 @@ if command -v jq >/dev/null 2>&1; then
     else
       AUTH_STATUS="✓ \${SUB:-credentials}"
     fi
+  elif [ -f "$CLAUDE_DIR/.oauth-token" ]; then
+    # Only the token file exists — no metadata sidecar, no .credentials.json.
+    # Klanker hit this because its OAuth was set up without the newer flow
+    # that writes .oauth-token.meta.json. Show the agent is authed even
+    # without expiry/plan details; showing "—" was misleading.
+    AUTH_STATUS="✓ authed"
   fi
 fi
 [ -z "$AUTH_STATUS" ] && AUTH_STATUS="—"
