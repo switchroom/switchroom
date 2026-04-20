@@ -25,7 +25,7 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   } as AgentConfig;
 }
 
-describe("reconcileAgent — persona (Phase 2)", () => {
+describe("reconcileAgent — persona (Phase 3)", () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -87,7 +87,49 @@ describe("reconcileAgent — persona (Phase 2)", () => {
     expect(soulMd).toContain("This is my personal addition");
   });
 
-  it("preserves user-edited CLAUDE.md by default", () => {
+  it("regenerates CLAUDE.md by default when template changes", () => {
+    const config = makeAgentConfig({
+      soul: { name: "Agent", style: "default" },
+    });
+
+    const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    const claudeMdPath = join(result.agentDir, "CLAUDE.md");
+
+    const original = readFileSync(claudeMdPath, "utf-8");
+
+    // Reconcile regenerates CLAUDE.md deterministically
+    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+
+    const afterReconcile = readFileSync(claudeMdPath, "utf-8");
+    expect(afterReconcile).toBe(original); // Idempotent when template is the same
+  });
+
+  it("appends CLAUDE.custom.md sidecar if present", () => {
+    const config = makeAgentConfig({
+      soul: { name: "Agent", style: "default" },
+    });
+
+    const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
+    const claudeMdPath = join(result.agentDir, "CLAUDE.md");
+    const claudeCustomPath = join(result.agentDir, "CLAUDE.custom.md");
+
+    // Add custom sidecar
+    writeFileSync(
+      claudeCustomPath,
+      "## Custom Instructions\n\nThis is my personal addition.",
+      "utf-8"
+    );
+
+    // Reconcile should append the custom content
+    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+
+    const claudeMd = readFileSync(claudeMdPath, "utf-8");
+    expect(claudeMd).toContain("---");
+    expect(claudeMd).toContain("## Custom Instructions");
+    expect(claudeMd).toContain("This is my personal addition");
+  });
+
+  it("preserves CLAUDE.md when --preserve-claude-md is set", () => {
     const config = makeAgentConfig({
       soul: { name: "Agent", style: "default" },
     });
@@ -100,15 +142,17 @@ describe("reconcileAgent — persona (Phase 2)", () => {
     const edited = original + "\n\n## My Custom Section\n\nUser-added content.";
     writeFileSync(claudeMdPath, edited, "utf-8");
 
-    // Reconcile without --force-claude-md
-    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    // Reconcile with --preserve-claude-md
+    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig, undefined, {
+      preserveClaudeMd: true,
+    });
 
     const afterReconcile = readFileSync(claudeMdPath, "utf-8");
     expect(afterReconcile).toContain("## My Custom Section");
     expect(afterReconcile).toContain("User-added content");
   });
 
-  it("regenerates CLAUDE.md when --force-claude-md is set", () => {
+  it("aborts reconcile with warning when CLAUDE.md has hand-edits and no sidecar exists", () => {
     const config = makeAgentConfig({
       soul: { name: "Agent", style: "default" },
     });
@@ -116,18 +160,14 @@ describe("reconcileAgent — persona (Phase 2)", () => {
     const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
     const claudeMdPath = join(result.agentDir, "CLAUDE.md");
 
-    // User edits CLAUDE.md
+    // User edits CLAUDE.md (simulating hand-edits)
     const original = readFileSync(claudeMdPath, "utf-8");
     const edited = original + "\n\n## My Custom Section\n\nUser-added content.";
     writeFileSync(claudeMdPath, edited, "utf-8");
 
-    // Reconcile with --force-claude-md
-    reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig, undefined, {
-      forceClaudeMd: true,
-    });
-
-    const afterReconcile = readFileSync(claudeMdPath, "utf-8");
-    expect(afterReconcile).not.toContain("## My Custom Section");
-    expect(afterReconcile).not.toContain("User-added content");
+    // Reconcile should abort with exit(1)
+    expect(() => {
+      reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    }).toThrow(); // process.exit(1) will throw in test environment
   });
 });
