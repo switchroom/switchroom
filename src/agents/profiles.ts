@@ -51,13 +51,23 @@ export function getBaseProfilePath(): string {
   return resolve(PROFILES_ROOT, "_base");
 }
 
-/** Read a .hbs file and render it with the given context. */
+/**
+ * Read a .hbs file and render it with the given context.
+ *
+ * noEscape: our templates are markdown (*.md.hbs), shell (start.sh.hbs),
+ * and JSON (settings.json.hbs). None are HTML. Handlebars' default HTML
+ * escaping turns apostrophes into `&#x27;` and quotes into `&quot;`,
+ * which is wrong everywhere it fires: markdown gets literal entity refs
+ * in prompts the model sees (`Ken&#x27;s` instead of `Ken's`), and JSON
+ * output breaks JSON-literal expectations. Disable escaping globally;
+ * author templates defensively (no raw user HTML in contexts).
+ */
 export function renderTemplate(
   templatePath: string,
   context: Record<string, unknown>,
 ): string {
   const source = readFileSync(templatePath, "utf-8");
-  const template = Handlebars.compile(source);
+  const template = Handlebars.compile(source, { noEscape: true });
   return template(context);
 }
 
