@@ -1,0 +1,219 @@
+import { describe, it, expect } from "vitest";
+import {
+  escapeHtml,
+  formatAuthLine,
+  formatAgentLine,
+  startText,
+  helpText,
+  statusPairedText,
+  statusPendingText,
+  statusUnpairedText,
+  switchroomHelpText,
+  switchroomHelpCommandNames,
+  restartAckText,
+  newSessionAckText,
+  resetSessionAckText,
+  type AgentMetadata,
+  type AuthSummary,
+} from "../welcome-text";
+
+const baseMeta: AgentMetadata = {
+  agentName: "assistant",
+  model: "sonnet",
+  extendsProfile: "default",
+  topicName: null,
+  topicEmoji: null,
+  uptime: null,
+  status: null,
+  auth: null,
+};
+
+describe("escapeHtml", () => {
+  it("escapes &, <, >, \"", () => {
+    expect(escapeHtml('<foo bar="baz">&')).toBe("&lt;foo bar=&quot;baz&quot;&gt;&amp;");
+  });
+  it("leaves safe text alone", () => {
+    expect(escapeHtml("hello world")).toBe("hello world");
+  });
+});
+
+describe("formatAuthLine", () => {
+  it("null auth → unknown", () => {
+    expect(formatAuthLine(null)).toBe("— auth state unknown");
+  });
+  it("unauth, no pending", () => {
+    expect(formatAuthLine({ authenticated: false, subscription_type: null, expires_in: null, auth_source: null }))
+      .toBe("✗ not authenticated");
+  });
+  it("pending auth", () => {
+    expect(formatAuthLine({ authenticated: false, subscription_type: null, expires_in: null, auth_source: "pending" }))
+      .toBe("… pending auth");
+  });
+  it("authed Max with expiry", () => {
+    expect(formatAuthLine({ authenticated: true, subscription_type: "Max", expires_in: "29 days", auth_source: "oauth" }))
+      .toBe("✓ Max · expires 29 days");
+  });
+  it("authed Pro no expiry", () => {
+    expect(formatAuthLine({ authenticated: true, subscription_type: "Pro", expires_in: null, auth_source: "oauth" }))
+      .toBe("✓ Pro");
+  });
+  it("fallback label when subscription_type is null", () => {
+    expect(formatAuthLine({ authenticated: true, subscription_type: null, expires_in: null, auth_source: "oauth" }))
+      .toBe("✓ subscription");
+  });
+  it("HTML-escapes subscription type", () => {
+    expect(formatAuthLine({ authenticated: true, subscription_type: "<injected>", expires_in: null, auth_source: "oauth" }))
+      .toContain("&lt;injected&gt;");
+  });
+});
+
+describe("formatAgentLine", () => {
+  it("includes model inline", () => {
+    expect(formatAgentLine(baseMeta)).toContain("<code>sonnet</code>");
+  });
+  it("falls back to 'default' when model is null/empty", () => {
+    expect(formatAgentLine({ ...baseMeta, model: null })).toContain("<code>default</code>");
+    expect(formatAgentLine({ ...baseMeta, model: "" })).toContain("<code>default</code>");
+  });
+  it("appends topic when present", () => {
+    const out = formatAgentLine({ ...baseMeta, topicName: "Planning", topicEmoji: "🗓" });
+    expect(out).toContain("topic: 🗓 Planning");
+  });
+  it("omits topic when only emoji is set", () => {
+    // topicName null → no topic chunk. Keeps the line clean.
+    expect(formatAgentLine({ ...baseMeta, topicEmoji: "🗓" })).not.toContain("topic");
+  });
+  it("HTML-escapes agent name", () => {
+    expect(formatAgentLine({ ...baseMeta, agentName: "<script>" }))
+      .toContain("&lt;script&gt;");
+  });
+});
+
+describe("startText", () => {
+  it("dmDisabled path", () => {
+    expect(startText("assistant", true)).toBe("This bot isn't accepting new connections.");
+  });
+  it("names the agent, not 'Claude Code session'", () => {
+    const out = startText("assistant", false);
+    expect(out).toContain("<b>assistant</b>");
+    expect(out).not.toMatch(/Claude Code session/);
+  });
+  it("mentions pairing code flow", () => {
+    const out = startText("assistant", false);
+    expect(out).toContain("/telegram:access pair");
+    expect(out).toContain("6-char code");
+  });
+  it("points at /status and /switchroomhelp", () => {
+    const out = startText("assistant", false);
+    expect(out).toContain("/status");
+    expect(out).toContain("/switchroomhelp");
+  });
+  it("HTML-escapes agent name", () => {
+    expect(startText("<x>", false)).toContain("&lt;x&gt;");
+  });
+});
+
+describe("helpText", () => {
+  it("names the agent", () => {
+    expect(helpText("klanker")).toContain("<b>klanker</b>");
+  });
+  it("mentions the new Sprint 2/3 commands", () => {
+    const out = helpText("assistant");
+    expect(out).toContain("/approve");
+    expect(out).toContain("/deny");
+    expect(out).toContain("/pending");
+    expect(out).toContain("/new");
+    expect(out).toContain("/reset");
+  });
+  it("points at the richer /switchroomhelp", () => {
+    expect(helpText("assistant")).toContain("/switchroomhelp");
+  });
+  it("drops the old 'Claude Code session' phrasing", () => {
+    expect(helpText("assistant")).not.toMatch(/Claude Code session/);
+  });
+});
+
+describe("statusPairedText", () => {
+  const meta: AgentMetadata = {
+    ...baseMeta,
+    agentName: "assistant",
+    model: "sonnet",
+    auth: { authenticated: true, subscription_type: "Max", expires_in: "29 days", auth_source: "oauth" },
+  };
+
+  it("includes the paired-user tag", () => {
+    expect(statusPairedText({ user: "@ken", meta })).toContain("Paired as @ken.");
+  });
+  it("shows agent + model + auth lines", () => {
+    const out = statusPairedText({ user: "@ken", meta });
+    expect(out).toContain("Agent:");
+    expect(out).toContain("Auth: ✓ Max · expires 29 days");
+    expect(out).toContain("<code>sonnet</code>");
+  });
+  it("omits status/uptime when absent", () => {
+    expect(statusPairedText({ user: "@ken", meta })).not.toContain("Status:");
+  });
+  it("includes status/uptime when present", () => {
+    const withStatus: AgentMetadata = { ...meta, status: "running", uptime: "3h 12m" };
+    const out = statusPairedText({ user: "@ken", meta: withStatus });
+    expect(out).toContain("Status: <code>running</code> · up 3h 12m");
+  });
+});
+
+describe("statusPendingText / statusUnpairedText", () => {
+  it("pending includes the code verbatim", () => {
+    expect(statusPendingText("abc-123")).toContain("/telegram:access pair abc-123");
+  });
+  it("unpaired prompts the user to DM", () => {
+    expect(statusUnpairedText()).toMatch(/Send me a message/);
+  });
+  it("pending escapes HTML in the code value", () => {
+    expect(statusPendingText("<x>")).toContain("&lt;x&gt;");
+  });
+});
+
+describe("switchroomHelpText + switchroomHelpCommandNames", () => {
+  it("agent name appears in header", () => {
+    expect(switchroomHelpText("klanker")).toContain("<b>klanker</b>");
+  });
+  it("every command in the autocomplete array is documented here", () => {
+    const out = switchroomHelpText("assistant");
+    for (const cmd of switchroomHelpCommandNames) {
+      expect(out, `missing /${cmd} in switchroomHelpText`).toContain(`/${cmd}`);
+    }
+  });
+  it("groups commands into sections", () => {
+    const out = switchroomHelpText("assistant");
+    expect(out).toContain("<b>Session &amp; approvals</b>");
+    expect(out).toContain("<b>Agents</b>");
+    expect(out).toContain("<b>Auth &amp; config</b>");
+  });
+  it("the name array contains the Sprint 2/3 additions", () => {
+    for (const needed of ["new", "reset", "approve", "deny", "pending"]) {
+      expect(switchroomHelpCommandNames).toContain(needed);
+    }
+  });
+});
+
+describe("restart / new / reset ack text", () => {
+  it("restartAckText is consistent", () => {
+    expect(restartAckText("assistant")).toBe("🔄 Restarting <b>assistant</b>…");
+  });
+  it("newSessionAckText with flush", () => {
+    expect(newSessionAckText("assistant", true))
+      .toBe("🆕 Started fresh session for <b>assistant</b> · flushed handoff · restarting…");
+  });
+  it("newSessionAckText without flush", () => {
+    expect(newSessionAckText("assistant", false))
+      .toBe("🆕 Started fresh session for <b>assistant</b> · restarting…");
+  });
+  it("resetSessionAckText with flush", () => {
+    expect(resetSessionAckText("assistant", true))
+      .toBe("🔄 Reset session for <b>assistant</b> · flushed handoff · restarting…");
+  });
+  it("HTML-escapes agent name in all three", () => {
+    expect(restartAckText("<x>")).toContain("&lt;x&gt;");
+    expect(newSessionAckText("<x>", true)).toContain("&lt;x&gt;");
+    expect(resetSessionAckText("<x>", true)).toContain("&lt;x&gt;");
+  });
+});

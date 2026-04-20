@@ -1,0 +1,217 @@
+/**
+ * Pure text generators for the bot's welcome / help / status surfaces.
+ *
+ * Extracted from gateway.ts and server.ts so the wording is:
+ *   1. single-sourced (no drift between gateway mode and monolith mode)
+ *   2. unit-testable without needing a grammy Context
+ *
+ * All functions return HTML-safe strings with <b>/<i>/<code> markup ready
+ * for Telegram's parse_mode=HTML. The <code>…</code> wrapper is deliberate
+ * for things like command names and agent identifiers, which render as
+ * monospace inline and avoid Telegram treating them as markdown.
+ */
+
+export type AuthSummary = {
+  authenticated: boolean;
+  subscription_type: string | null;
+  expires_in: string | null;
+  auth_source: string | null;
+};
+
+export type AgentMetadata = {
+  agentName: string;
+  model: string | null;
+  extendsProfile: string | null;
+  topicName: string | null;
+  topicEmoji: string | null;
+  uptime: string | null;
+  status: string | null;
+  auth: AuthSummary | null;
+};
+
+// Tiny escaper — duplicates the one in gateway.ts / server.ts so this
+// module stays dependency-free and easy to test.
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * Compact one-line auth status suitable for the `/status` reply.
+ * Examples:
+ *   "✓ Max · expires in 29 days"
+ *   "✓ Pro · oauth"
+ *   "… pending auth"
+ *   "✗ not authenticated"
+ */
+export function formatAuthLine(auth: AuthSummary | null): string {
+  if (!auth) return "— auth state unknown";
+  if (!auth.authenticated) {
+    if (auth.auth_source === "pending") return "… pending auth";
+    return "✗ not authenticated";
+  }
+  const sub = auth.subscription_type ?? "subscription";
+  const expires = auth.expires_in ? ` · expires ${escapeHtml(auth.expires_in)}` : "";
+  return `✓ ${escapeHtml(sub)}${expires}`;
+}
+
+/**
+ * Agent / model one-liner. Model falls back to "inherited" when the
+ * agent config doesn't pin one — Claude Code will pick the system
+ * default.
+ */
+export function formatAgentLine(meta: AgentMetadata): string {
+  const m = meta.model && meta.model.length > 0 ? meta.model : "default";
+  const topic = meta.topicName
+    ? ` · topic: ${escapeHtml([meta.topicEmoji, meta.topicName].filter(Boolean).join(" "))}`
+    : "";
+  return `<b>${escapeHtml(meta.agentName)}</b> · model: <code>${escapeHtml(m)}</code>${topic}`;
+}
+
+/**
+ * Welcome text for `/start`. Called when the user DMs a fresh bot.
+ * We deliberately name Switchroom (not "Claude Code") to match product
+ * reality — the bot is one persona out of a fleet on your subscription.
+ */
+export function startText(agentName: string, dmDisabled: boolean): string {
+  if (dmDisabled) return "This bot isn't accepting new connections.";
+  return [
+    `<b>Switchroom</b> — Telegram on your Claude Pro or Max subscription.`,
+    ``,
+    `This bot is the <b>${escapeHtml(agentName)}</b> agent. Pair first, then send messages here and they reach the agent; replies and reactions come back.`,
+    ``,
+    `<b>To pair:</b>`,
+    `1. DM me anything — you'll get a 6-char code`,
+    `2. In Claude Code: <code>/telegram:access pair &lt;code&gt;</code>`,
+    ``,
+    `After pairing, try <code>/status</code> or <code>/switchroomhelp</code>.`,
+  ].join("\n");
+}
+
+/**
+ * Concise help — points at /switchroomhelp for the full catalogue.
+ * Deliberately short because Telegram truncates /help popovers.
+ */
+export function helpText(agentName: string): string {
+  return [
+    `<b>Switchroom</b> — your Pro/Max subscription, wired to Telegram.`,
+    ``,
+    `This bot is the <b>${escapeHtml(agentName)}</b> agent. Text and photos route through to it; replies, reactions and progress cards come back.`,
+    ``,
+    `Tool approvals surface as inline buttons (✅ / ❌) or via <code>/approve</code>, <code>/deny</code>, <code>/pending</code>. Start a fresh session with <code>/new</code> or <code>/reset</code>.`,
+    ``,
+    `<code>/start</code> — pairing instructions`,
+    `<code>/status</code> — agent, model, auth`,
+    `<code>/switchroomhelp</code> — full command list`,
+  ].join("\n");
+}
+
+/**
+ * Rich `/status` output for a paired user. Includes agent, model,
+ * auth state, and optional uptime / topic info.
+ */
+export function statusPairedText(params: {
+  user: string;
+  meta: AgentMetadata;
+}): string {
+  const { user, meta } = params;
+  const lines = [
+    `Paired as ${escapeHtml(user)}.`,
+    ``,
+    `Agent: ${formatAgentLine(meta)}`,
+    `Auth: ${formatAuthLine(meta.auth)}`,
+  ];
+  if (meta.status) lines.push(`Status: <code>${escapeHtml(meta.status)}</code>${meta.uptime ? ` · up ${escapeHtml(meta.uptime)}` : ""}`);
+  return lines.join("\n");
+}
+
+/**
+ * `/status` when the sender isn't paired yet but has a pending code.
+ */
+export function statusPendingText(code: string): string {
+  return `Pending pairing — run in Claude Code:\n\n<code>/telegram:access pair ${escapeHtml(code)}</code>`;
+}
+
+/**
+ * `/status` when the sender is completely new.
+ */
+export function statusUnpairedText(): string {
+  return "Not paired. Send me a message to get a pairing code.";
+}
+
+/**
+ * The grouped /switchroomhelp command catalogue. Groups the commands
+ * so the list is scannable rather than one flat 25-item dump.
+ *
+ * When this file changes, the switchroomCommands array in
+ * registerSwitchroomBotCommands() (in both gateway.ts and server.ts)
+ * must be kept in sync — the autocomplete menu is registered from
+ * that array, not from this text. The `switchroomHelpCommandNames`
+ * export lets a test pin the two together.
+ */
+export const switchroomHelpCommandNames = [
+  // Session & approvals
+  "new", "reset", "approve", "deny", "pending", "interrupt",
+  // Agents
+  "agents", "switchroomstart", "stop", "restart", "logs", "memory",
+  // Auth & config
+  "auth", "reauth", "topics", "reconcile", "update",
+  "permissions", "grant", "dangerous", "vault", "doctor",
+  "switchroomhelp",
+] as const;
+
+export function switchroomHelpText(agentName: string): string {
+  return [
+    `<b>Switchroom bot</b> — commands for the <b>${escapeHtml(agentName)}</b> agent.`,
+    ``,
+    `<b>Session &amp; approvals</b>`,
+    `<code>/new</code> — fresh session (flush handoff, restart)`,
+    `<code>/reset</code> — alias of /new`,
+    `<code>/approve [id]</code> — approve pending tool permission`,
+    `<code>/deny [id]</code> — deny pending tool permission`,
+    `<code>/pending</code> — list pending permission prompts`,
+    `<code>/interrupt [name]</code> — interrupt an agent turn`,
+    ``,
+    `<b>Agents</b>`,
+    `<code>/agents</code> — list all agents`,
+    `<code>/switchroomstart [name]</code> — start an agent`,
+    `<code>/stop [name]</code> — stop an agent`,
+    `<code>/restart [name|all]</code> — restart an agent`,
+    `<code>/logs [name] [lines]</code> — show agent logs`,
+    `<code>/memory &lt;query&gt;</code> — search agent memory`,
+    ``,
+    `<b>Auth &amp; config</b>`,
+    `<code>/auth</code> — auth status or actions`,
+    `<code>/reauth [agent]</code> — start Claude browser auth`,
+    `<code>/topics</code> — topic-to-agent mappings`,
+    `<code>/reconcile [name|all]</code> — re-apply switchroom.yaml`,
+    `<code>/update</code> — git pull, reinstall, reconcile, restart`,
+    `<code>/permissions [agent]</code> — show agent permissions`,
+    `<code>/grant &lt;tool&gt;</code> — grant a tool permission`,
+    `<code>/dangerous [off]</code> — toggle full tool access`,
+    `<code>/vault</code> — manage encrypted secrets`,
+    `<code>/doctor</code> — health check (deps, services, MCP)`,
+    `<code>/switchroomhelp</code> — this help`,
+  ].join("\n");
+}
+
+/**
+ * Ack shown when a self-targeting /restart (or /new, /reset) kicks off.
+ * Centralized so gateway and monolith agree on wording.
+ */
+export function restartAckText(agentName: string): string {
+  return `🔄 Restarting <b>${escapeHtml(agentName)}</b>…`;
+}
+
+export function newSessionAckText(agentName: string, flushedHandoff: boolean): string {
+  const tail = flushedHandoff ? " · flushed handoff" : "";
+  return `🆕 Started fresh session for <b>${escapeHtml(agentName)}</b>${tail} · restarting…`;
+}
+
+export function resetSessionAckText(agentName: string, flushedHandoff: boolean): string {
+  const tail = flushedHandoff ? " · flushed handoff" : "";
+  return `🔄 Reset session for <b>${escapeHtml(agentName)}</b>${tail} · restarting…`;
+}

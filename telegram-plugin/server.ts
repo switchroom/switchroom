@@ -39,6 +39,15 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import {
+  startText as buildStartText,
+  helpText as buildHelpText,
+  statusPairedText as buildStatusPairedText,
+  statusPendingText as buildStatusPendingText,
+  statusUnpairedText as buildStatusUnpairedText,
+  switchroomHelpText as buildSwitchroomHelpText,
+  restartAckText as buildRestartAckText,
+} from './welcome-text.js'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
@@ -2997,27 +3006,13 @@ process.on('SIGINT', shutdown)
 bot.command('start', async ctx => {
   if (ctx.chat?.type !== 'private') return
   const access = loadAccess()
-  if (access.dmPolicy === 'disabled') {
-    await ctx.reply(`This bot isn't accepting new connections.`)
-    return
-  }
-  await ctx.reply(
-    `This bot bridges Telegram to a Claude Code session.\n\n` +
-    `To pair:\n` +
-    `1. DM me anything — you'll get a 6-char code\n` +
-    `2. In Claude Code: /telegram:access pair <code>\n\n` +
-    `After that, DMs here reach that session.`
-  )
+  const disabled = access.dmPolicy === 'disabled'
+  await ctx.reply(buildStartText(getMyAgentName(), disabled), { parse_mode: 'HTML' })
 })
 
 bot.command('help', async ctx => {
   if (ctx.chat?.type !== 'private') return
-  await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n` +
-    `/status — check your pairing state`
-  )
+  await ctx.reply(buildHelpText(getMyAgentName()), { parse_mode: 'HTML' })
 })
 
 bot.command('status', async ctx => {
@@ -3028,21 +3023,27 @@ bot.command('status', async ctx => {
   const access = loadAccess()
 
   if (access.allowFrom.includes(senderId)) {
-    const name = from.username ? `@${from.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+    const userTag = from.username ? `@${from.username}` : senderId
+    // Monolith-mode best-effort metadata: we don't have the same
+    // switchroomExecJson helper available here; ship a thin snapshot and
+    // let the template render what it can.
+    const meta = {
+      agentName: getMyAgentName(),
+      model: null, extendsProfile: null, topicName: null, topicEmoji: null,
+      uptime: null, status: null, auth: null,
+    }
+    await ctx.reply(buildStatusPairedText({ user: userTag, meta }), { parse_mode: 'HTML' })
     return
   }
 
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
-      await ctx.reply(
-        `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
-      )
+      await ctx.reply(buildStatusPendingText(code), { parse_mode: 'HTML' })
       return
     }
   }
 
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+  await ctx.reply(buildStatusUnpairedText())
 })
 
 // ---------------------------------------------------------------------------
@@ -3548,7 +3549,7 @@ bot.command('restart', async ctx => {
     // record outbound, so the ack disappeared from history after restart.
     const chatId = String(ctx.chat!.id)
     const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const ackText = `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>… back in a few seconds.`
+    const ackText = buildRestartAckText(name)
     let ackId: number | null = null
     try {
       const sent = await lockedBot.api.sendMessage(chatId, ackText, {
@@ -4381,8 +4382,20 @@ bot.command('update', async ctx => {
 // /switchroomhelp — show all available bot commands
 bot.command('switchroomhelp', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const me = getMyAgentName()
-  const helpText = [
+  await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
+})
+
+/* Former flat monolith-only help text retained below as a dead const so the
+   change shows as a pure delete in diff tools. Kept commented for the
+   avoidance of ambiguity during review — the live implementation above
+   shares the ken-voice-approved text with gateway.ts via welcome-text.ts.
+const _legacySwitchroomHelp = (me: string): string => [
+  'Switchroom Bot Commands',
+  '',
+  `This bot is bound to the ${me} agent. Commands default to ${me};`,
+  'pass an agent name to override.',
+  '',
+  'Status & lifecycle',
     'Switchroom Bot Commands',
     '',
     `This bot is bound to the ${me} agent. Commands default to ${me};`,
@@ -4429,9 +4442,8 @@ bot.command('switchroomhelp', async ctx => {
     '/switchroomhelp - Show this help message',
     '',
     'These commands run the switchroom CLI directly — no AI tokens used.',
-  ].join('\n')
-  await switchroomReply(ctx, helpText)
-})
+].join('\n')
+*/
 
 // Register switchroom commands with BotFather (called during startup alongside existing commands).
 async function registerSwitchroomBotCommands(): Promise<void> {
