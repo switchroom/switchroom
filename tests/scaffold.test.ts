@@ -336,6 +336,34 @@ describe("scaffoldAgent", () => {
     expect(greeting).toMatch(/export CLAUDE_CONFIG_DIR="\$\{CLAUDE_CONFIG_DIR:-\$\(dirname "\$TELEGRAM_STATE_DIR"\)\/\.claude\}"/);
   });
 
+  it("session greeting caps Skills row at 6 with '…+N more' suffix for long lists", () => {
+    const many = [
+      "a","b","c","d","e","f","g","h","i",
+    ];
+    const config = makeAgentConfig({ skills: many });
+    const result = scaffoldAgent("skills-many", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // First 6 skills appear; the rest are collapsed into a "+N more" tail.
+    expect(greeting).toContain("a, b, c, d, e, f, …+3 more");
+    // Subsequent skills (g, h, i) do NOT appear by name on the Skills row.
+    expect(greeting).not.toMatch(/<b>Skills<\/b>\s+[a-z, ]*g,/);
+  });
+
+  it("session greeting Skills row renders all skills inline when list ≤ 6", () => {
+    const few = ["a", "b", "c"];
+    const config = makeAgentConfig({ skills: few });
+    const result = scaffoldAgent("skills-few", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    expect(greeting).toContain("<b>Skills</b>  a, b, c");
+    expect(greeting).not.toContain("more");
+  });
+
   it("session greeting gateway-pid extraction uses POSIX sed, not gawk", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("pidparse-agent", config, tmpDir, telegramConfig);
