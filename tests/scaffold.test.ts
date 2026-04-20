@@ -40,7 +40,7 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(result.agentDir, "CLAUDE.md"))).toBe(true);
     expect(existsSync(join(result.agentDir, "SOUL.md"))).toBe(true);
     expect(existsSync(join(result.agentDir, "memory", "MEMORY.md"))).toBe(true);
-    expect(existsSync(join(result.agentDir, "skills"))).toBe(true);
+    expect(existsSync(join(result.agentDir, ".claude", "skills"))).toBe(true);
     expect(existsSync(join(result.agentDir, "telegram", ".env"))).toBe(true);
     expect(existsSync(join(result.agentDir, "telegram", "access.json"))).toBe(true);
     expect(existsSync(join(result.agentDir, "start.sh"))).toBe(true);
@@ -1905,8 +1905,8 @@ describe("scaffoldAgent global skills pool", () => {
       switchroomConfig,
     );
 
-    const checkinPath = join(result.agentDir, "skills", "checkin");
-    const retainPath = join(result.agentDir, "skills", "retain");
+    const checkinPath = join(result.agentDir, ".claude", "skills", "checkin");
+    const retainPath = join(result.agentDir, ".claude", "skills", "retain");
     expect(existsSync(checkinPath)).toBe(true);
     expect(existsSync(retainPath)).toBe(true);
     // Verify they're symlinks pointing into the pool
@@ -1932,7 +1932,7 @@ describe("scaffoldAgent global skills pool", () => {
     );
 
     for (const name of ["checkin", "retain", "weekly-review"]) {
-      expect(existsSync(join(result.agentDir, "skills", name))).toBe(true);
+      expect(existsSync(join(result.agentDir, ".claude", "skills", name))).toBe(true);
     }
   });
 
@@ -1950,8 +1950,8 @@ describe("scaffoldAgent global skills pool", () => {
     );
     warnSpy.mockRestore();
 
-    expect(existsSync(join(result.agentDir, "skills", "checkin"))).toBe(true);
-    expect(existsSync(join(result.agentDir, "skills", "does-not-exist"))).toBe(false);
+    expect(existsSync(join(result.agentDir, ".claude", "skills", "checkin"))).toBe(true);
+    expect(existsSync(join(result.agentDir, ".claude", "skills", "does-not-exist"))).toBe(false);
   });
 
   it("reconcile removes stale symlinks when a skill is dropped from switchroom.yaml", () => {
@@ -1964,7 +1964,7 @@ describe("scaffoldAgent global skills pool", () => {
       telegramConfig,
       initial,
     );
-    expect(existsSync(join(result.agentDir, "skills", "retain"))).toBe(true);
+    expect(existsSync(join(result.agentDir, ".claude", "skills", "retain"))).toBe(true);
 
     const after = makeAgentConfig({ skills: ["checkin"] });
     const updated = buildConfig(after);
@@ -1976,9 +1976,9 @@ describe("scaffoldAgent global skills pool", () => {
       updated,
     );
 
-    expect(existsSync(join(result.agentDir, "skills", "checkin"))).toBe(true);
+    expect(existsSync(join(result.agentDir, ".claude", "skills", "checkin"))).toBe(true);
     // retain's symlink was removed
-    expect(existsSync(join(result.agentDir, "skills", "retain"))).toBe(false);
+    expect(existsSync(join(result.agentDir, ".claude", "skills", "retain"))).toBe(false);
   });
 
   it("does not touch template-copied skill files during stale cleanup", () => {
@@ -1996,7 +1996,7 @@ describe("scaffoldAgent global skills pool", () => {
       switchroomConfig,
     );
 
-    const templateSkill = join(result.agentDir, "skills", "template-skill");
+    const templateSkill = join(result.agentDir, ".claude", "skills", "template-skill");
     mkdirSync(templateSkill, { recursive: true });
     writeFileSync(join(templateSkill, "SKILL.md"), "# template\n", "utf-8");
 

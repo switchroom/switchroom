@@ -583,8 +583,39 @@ function resolveSkillsPoolDir(override: string | undefined): string {
 }
 
 /**
- * Sync the set of global-skill symlinks in an agent's skills/ directory
- * against the user's declared `skills:` list (already merged with
+ * Remove symlinks from the legacy <agentDir>/skills/ directory that point
+ * into the global skills pool. Claude Code never discovered them there, so
+ * they were dead weight — we clear them on reconcile after migration so a
+ * user's agent dir ends up clean. Real files (profile-bundled skills copied
+ * before migration) are left in place.
+ */
+function migrateLegacySkillsDir(agentDir: string, skillsPool: string): void {
+  const legacyDir = join(agentDir, "skills");
+  let entries: string[];
+  try {
+    entries = readdirSync(legacyDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const entryPath = join(legacyDir, entry);
+    let target: string | null = null;
+    try {
+      target = readlinkSync(entryPath);
+    } catch {
+      continue; // not a symlink — leave it
+    }
+    if (target && target.startsWith(skillsPool)) {
+      try {
+        rmSync(entryPath, { force: true });
+      } catch { /* best effort */ }
+    }
+  }
+}
+
+/**
+ * Sync the set of global-skill symlinks in an agent's .claude/skills/
+ * directory against the user's declared `skills:` list (already merged with
  * defaults). Idempotent and safe to call on reconcile:
  *
  *   - Missing links for declared skills are created.
@@ -601,8 +632,15 @@ function syncGlobalSkills(
   skillsDirOverride: string | undefined,
 ): void {
   const skillsPool = resolveSkillsPoolDir(skillsDirOverride);
-  const agentSkillsDir = join(agentDir, "skills");
+  // Claude Code only discovers skills under $CLAUDE_CONFIG_DIR/.claude/skills/.
+  // Symlink there so declared skills actually surface in available-skills.
+  const agentSkillsDir = join(agentDir, ".claude", "skills");
   mkdirSync(agentSkillsDir, { recursive: true });
+
+  // Migrate any pre-existing symlinks from the legacy <agentDir>/skills/
+  // location (pre-.claude/skills migration) so reconcile cleanly relocates
+  // them instead of leaving orphaned links behind.
+  migrateLegacySkillsDir(agentDir, skillsPool);
 
   // Create symlinks for each declared skill. Skip entries that are
   // already correct; replace ones pointing at the wrong target.
@@ -720,13 +758,29 @@ export function installSwitchroomSkills(agentDir: string): void {
     if (!existsSync(join(src, "SKILL.md"))) continue;
 
     const dest = join(targetDir, name);
-    // Skip if destination already exists (idempotent — don't replace
-    // real dirs or correctly-pointing symlinks)
+    // Idempotent: leave correctly-pointing symlinks and real dirs alone.
+    // But refresh stale symlinks whose target is a different switchroom-
+    // lookalike path (e.g. old clerk/skills/ after the clerk→switchroom
+    // rename). Otherwise reconcile can't heal a botched cross-repo state.
+    let existing;
     try {
-      lstatSync(dest);
-      continue; // exists — leave it alone
+      existing = lstatSync(dest);
     } catch {
-      // does not exist — fall through to symlink
+      existing = null;
+    }
+    if (existing) {
+      if (existing.isSymbolicLink()) {
+        let currentTarget: string | null = null;
+        try {
+          currentTarget = readlinkSync(dest);
+        } catch { /* unreadable */ }
+        if (currentTarget === src) continue; // already correct
+        try {
+          rmSync(dest, { force: true });
+        } catch { /* best effort; symlinkSync below will error cleanly */ }
+      } else {
+        continue; // real file/dir — don't touch
+      }
     }
     try {
       symlinkSync(src, dest);
@@ -1197,8 +1251,8 @@ export function scaffoldAgent(
   const dirs = [
     agentDir,
     join(agentDir, ".claude"),
+    join(agentDir, ".claude", "skills"),
     join(agentDir, "memory"),
-    join(agentDir, "skills"),
     join(agentDir, "telegram"),
   ];
   for (const dir of dirs) {
@@ -1575,7 +1629,9 @@ export function scaffoldAgent(
   }
 
   // --- Copy skill files from profile ---
-  copyProfileSkills(profilePath, join(agentDir, "skills"));
+  // Profile-bundled skills land in .claude/skills/ so Claude Code discovers
+  // them alongside user-declared global skills.
+  copyProfileSkills(profilePath, join(agentDir, ".claude", "skills"));
 
   // --- Symlink global skills from switchroom.skills_dir ---
   //
