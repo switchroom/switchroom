@@ -1293,27 +1293,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = repairEscapedWhitespace(args.text as string)
         const files = (args.files as string[] | undefined) ?? []
 
-        // Silent-reply short-circuit. If the agent emitted only a NO_REPLY /
-        // HEARTBEAT_OK marker, acknowledge the tool call without pushing
-        // anything to Telegram. See SILENT_REPLY_MARKERS for rationale.
-        //
-        // Note: assertAllowedChat runs BEFORE the short-circuit so that a
-        // successful silent-reply ack can't be returned for a chat_id the
-        // agent isn't authorized to use. The ack itself would leak
-        // cross-chat context to the LLM (confirming a chat exists + that
-        // the agent reached it) even though no Telegram message is sent.
-        if (files.length === 0 && isSilentReplyMarker(text)) {
-          assertAllowedChat(chat_id)
-          process.stderr.write(
-            `[telegram-plugin] silent-reply acknowledged (${text.trim()}) chat_id=${chat_id}\n`,
-          )
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `silent-reply acknowledged (${text.trim()}); no Telegram message sent`,
-              },
-            ],
+        // Silent-reply short-circuit. Shared helper keeps reply and
+        // stream_reply in lock-step on marker detection and the
+        // allowlist-before-ack ordering (regression-guarded by the
+        // guard-silent-reply test suite).
+        {
+          const guard = guardSilentReply({
+            chat_id,
+            text,
+            hasFiles: files.length > 0,
+            assertAllowed: assertAllowedChat,
+          })
+          if (guard.kind === 'silent') {
+            process.stderr.write(
+              `[telegram-plugin] silent-reply acknowledged (${guard.markerText}) chat_id=${chat_id}\n`,
+            )
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `silent-reply acknowledged (${guard.markerText}); no Telegram message sent`,
+                },
+              ],
+            }
           }
         }
         // Quote-reply default: if the caller didn't pass reply_to (and didn't
@@ -1632,31 +1634,49 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: result }] }
       }
       case 'stream_reply': {
-        // Silent-reply short-circuit for stream_reply: if the first (and
-        // typically only) call is `done=true` with the entire body being a
-        // silent marker, skip the stream entirely. Mid-stream (done=false)
-        // calls fall through to the stream controller normally so partial
-        // drafts that happen to contain the marker aren't suppressed.
-        //
-        // assertAllowedChat runs first for the same reason as the reply
-        // handler: the ack itself is a signal to the LLM and must not be
-        // emitted for an unauthorized chat.
-        if (
-          Boolean(args.done) &&
-          isSilentReplyMarker(args.text as string | undefined)
-        ) {
-          assertAllowedChat(args.chat_id as string)
-          const markerText = (args.text as string).trim()
-          process.stderr.write(
-            `[telegram-plugin] silent-stream-reply acknowledged (${markerText}) chat_id=${String(args.chat_id)}\n`,
-          )
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `silent-reply acknowledged (${markerText}); no Telegram message sent`,
-              },
-            ],
+        // Silent-reply short-circuit for stream_reply. Only applies to a
+        // terminal `done=true` call whose entire body is a silent marker;
+        // mid-stream (done=false) calls fall through to handleStreamReply
+        // normally so partial drafts containing the marker aren't
+        // suppressed. Uses the shared guardSilentReply so the allowlist
+        // check and marker detection stay in lock-step with reply.
+        if (Boolean(args.done)) {
+          const streamChatId = args.chat_id as string
+          const guard = guardSilentReply({
+            chat_id: streamChatId,
+            text: args.text as string | undefined,
+            hasFiles: false,
+            assertAllowed: assertAllowedChat,
+          })
+          if (guard.kind === 'silent') {
+            // If a prior done=false flushed partial content for this
+            // stream, the controller's state (draft handle, parse-mode,
+            // PTY-preview lock) is still live. Tear it down here so the
+            // silent-ack doesn't leak the in-flight stream into the next
+            // turn. Best-effort — if nothing was open this is a no-op.
+            const threadIdForStream = resolveThreadId(
+              streamChatId,
+              args.message_thread_id as string | undefined,
+            )
+            const streamKey_ = `${streamChatId}:${threadIdForStream ?? '_'}`
+            const open = activeDraftStreams.get(streamKey_)
+            if (open != null) {
+              void open.finalize().catch(() => { /* best effort */ })
+              activeDraftStreams.delete(streamKey_)
+              activeDraftParseModes.delete(streamKey_)
+            }
+            suppressPtyPreview.delete(streamKey_)
+            process.stderr.write(
+              `[telegram-plugin] silent-stream-reply acknowledged (${guard.markerText}) chat_id=${String(args.chat_id)}\n`,
+            )
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `silent-reply acknowledged (${guard.markerText}); no Telegram message sent`,
+                },
+              ],
+            }
           }
         }
         const access = loadAccess()
