@@ -3015,6 +3015,53 @@ bot.command('help', async ctx => {
   await ctx.reply(buildHelpText(getMyAgentName()), { parse_mode: 'HTML' })
 })
 
+// Build an AgentMetadata snapshot for the current agent by shelling out
+// to `switchroom agent list --json` and `switchroom auth status --json`.
+// Mirrors gateway.ts's buildAgentMetadata so the /status reply is
+// identical in both runtime modes.
+function buildAgentMetadata(agentName: string): {
+  agentName: string; model: string | null; extendsProfile: string | null;
+  topicName: string | null; topicEmoji: string | null; uptime: string | null;
+  status: string | null; auth: null | {
+    authenticated: boolean; subscription_type: string | null;
+    expires_in: string | null; auth_source: string | null;
+  };
+} {
+  type AgentListResp = {
+    agents: Array<{
+      name: string; status: string; uptime: string;
+      extends?: string | null; template?: string | null;
+      topic_name?: string | null; topic_emoji?: string | null;
+      model?: string | null;
+    }>
+  }
+  type AuthStatusResp = {
+    agents: Array<{
+      name: string; authenticated: boolean; auth_source: string | null;
+      subscription_type: string | null; expires_in: string | null;
+    }>
+  }
+  const list = switchroomExecJson<AgentListResp>(['agent', 'list'])
+  const auth = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
+  const a = list?.agents?.find(x => x.name === agentName) ?? null
+  const au = auth?.agents?.find(x => x.name === agentName) ?? null
+  return {
+    agentName,
+    model: a?.model ?? null,
+    extendsProfile: (a?.extends ?? a?.template) ?? null,
+    topicName: a?.topic_name ?? null,
+    topicEmoji: a?.topic_emoji ?? null,
+    uptime: a?.uptime ?? null,
+    status: a?.status ?? null,
+    auth: au ? {
+      authenticated: au.authenticated,
+      subscription_type: au.subscription_type,
+      expires_in: au.expires_in,
+      auth_source: au.auth_source,
+    } : null,
+  }
+}
+
 bot.command('status', async ctx => {
   if (ctx.chat?.type !== 'private') return
   const from = ctx.from
@@ -3024,14 +3071,7 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const userTag = from.username ? `@${from.username}` : senderId
-    // Monolith-mode best-effort metadata: we don't have the same
-    // switchroomExecJson helper available here; ship a thin snapshot and
-    // let the template render what it can.
-    const meta = {
-      agentName: getMyAgentName(),
-      model: null, extendsProfile: null, topicName: null, topicEmoji: null,
-      uptime: null, status: null, auth: null,
-    }
+    const meta = buildAgentMetadata(getMyAgentName())
     await ctx.reply(buildStatusPairedText({ user: userTag, meta }), { parse_mode: 'HTML' })
     return
   }
