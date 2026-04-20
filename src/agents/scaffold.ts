@@ -561,10 +561,36 @@ if [ -n "$CLAUDE_DIR" ] && [ -f "$CLAUDE_DIR/.oauth-token" ] && command -v curl 
       # tr -d '\\r' normalises CRLF so grep matches; awk picks value after ':'.
       H5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-utilization:' | tail -1 | awk -F': ' '{print $2}')"
       H7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-utilization:' | tail -1 | awk -F': ' '{print $2}')"
+      # Reset epochs (Unix seconds) — tell the user when each window clears.
+      R5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-reset:' | tail -1 | awk -F': ' '{print $2}')"
+      R7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-reset:' | tail -1 | awk -F': ' '{print $2}')"
       if [ -n "$H5" ] || [ -n "$H7" ]; then
         P5="$(awk -v v="\${H5:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
         P7="$(awk -v v="\${H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
-        PLAN_STATUS="\${P5}% / 5h · \${P7}% / 7d"
+        # Format a reset-in countdown from epoch. Output like "2h 14m",
+        # "3d 4h", "17m", or "now" if the window has already elapsed.
+        # Pure POSIX shell+awk so it works without bash-only features.
+        _fmt_reset() {
+          _epoch="$1"
+          [ -z "$_epoch" ] && { echo "—"; return; }
+          _now=$(date +%s)
+          _delta=$((_epoch - _now))
+          [ "$_delta" -le 0 ] && { echo "now"; return; }
+          _hours=$((_delta / 3600))
+          _mins=$(( (_delta % 3600) / 60 ))
+          if [ "$_hours" -lt 1 ]; then
+            echo "\${_mins}m"
+          elif [ "$_hours" -lt 24 ]; then
+            if [ "$_mins" -gt 0 ]; then echo "\${_hours}h \${_mins}m"; else echo "\${_hours}h"; fi
+          else
+            _days=$((_hours / 24))
+            _rh=$((_hours % 24))
+            if [ "$_rh" -gt 0 ]; then echo "\${_days}d \${_rh}h"; else echo "\${_days}d"; fi
+          fi
+        }
+        R5_FMT="$(_fmt_reset "$R5")"
+        R7_FMT="$(_fmt_reset "$R7")"
+        PLAN_STATUS="\${P5}% / 5h (resets in \${R5_FMT}) · \${P7}% / 7d (resets in \${R7_FMT})"
       fi
     fi
     rm -f "$PLAN_HEADERS_FILE" 2>/dev/null || true
