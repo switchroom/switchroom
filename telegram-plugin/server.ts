@@ -47,6 +47,8 @@ import {
   statusUnpairedText as buildStatusUnpairedText,
   switchroomHelpText as buildSwitchroomHelpText,
   restartAckText as buildRestartAckText,
+  TELEGRAM_BASE_COMMANDS,
+  TELEGRAM_SWITCHROOM_COMMANDS,
 } from './welcome-text.js'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
@@ -4485,50 +4487,18 @@ const _legacySwitchroomHelp = (me: string): string => [
 ].join('\n')
 */
 
-// Register switchroom commands with BotFather (called during startup alongside existing commands).
+// Register switchroom commands with BotFather. Slash-menu is intentionally
+// trimmed from the full catalogue — see welcome-text.ts TELEGRAM_MENU_COMMANDS
+// for rationale. All non-menu commands remain typable (handlers still
+// registered below), just not in the autocomplete popover.
 async function registerSwitchroomBotCommands(): Promise<void> {
-  // Register in all_private_chats scope (extends existing commands)
-  const switchroomCommands = [
-    { command: 'agents', description: 'List all agents and their status' },
-    { command: 'auth', description: 'Show auth/token status or auth actions' },
-    { command: 'reauth', description: 'Start Claude browser auth (default: this agent)' },
-    { command: 'topics', description: 'Show topic-to-agent mappings' },
-    { command: 'logs', description: 'Show agent logs (default: this agent)' },
-    { command: 'memory', description: 'Search agent memory' },
-    { command: 'switchroomstart', description: 'Start an agent (default: this agent)' },
-    { command: 'stop', description: 'Stop an agent (default: this agent)' },
-    { command: 'restart', description: 'Restart an agent (default: this agent)' },
-    { command: 'new', description: 'Start a fresh session (flush handoff, restart)' },
-    { command: 'reset', description: 'Alias of /new — start a fresh session' },
-    { command: 'approve', description: 'Approve the pending tool permission (or /approve <id>)' },
-    { command: 'deny', description: 'Deny the pending tool permission (or /deny <id>)' },
-    { command: 'pending', description: 'List pending tool permission prompts' },
-    { command: 'doctor', description: 'Health check (deps, vault, services, MCP)' },
-    { command: 'reconcile', description: 'Re-apply switchroom.yaml (default: this agent)' },
-    { command: 'update', description: 'Pull latest, reinstall, reconcile, restart' },
-    { command: 'permissions', description: 'Show agent permissions (default: this agent)' },
-    { command: 'grant', description: 'Grant a tool permission (default: this agent)' },
-    { command: 'dangerous', description: 'Toggle full tool access (default: this agent)' },
-    { command: 'vault', description: 'Manage encrypted secrets vault' },
-    { command: 'pins-status', description: 'Diagnostic: pin bookkeeping snapshot' },
-    { command: 'switchroomhelp', description: 'Show all switchroom bot commands' },
-  ]
-
-  // Combine with existing base commands
-  const baseCommands = [
-    { command: 'start', description: 'Welcome and setup guide' },
-    { command: 'help', description: 'What this bot can do' },
-    { command: 'status', description: 'Check your pairing status' },
-  ]
-
   await bot.api.setMyCommands(
-    [...baseCommands, ...switchroomCommands],
+    [...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS],
     { scope: { type: 'all_private_chats' } },
   )
-
-  // Also register in group chats where switchroom commands are most useful
+  // Group chats don't support /start pairing, so only switchroom commands.
   await bot.api.setMyCommands(
-    switchroomCommands,
+    TELEGRAM_SWITCHROOM_COMMANDS,
     { scope: { type: 'all_group_chats' } },
   )
 }

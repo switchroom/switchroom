@@ -13,6 +13,9 @@ import {
   restartAckText,
   newSessionAckText,
   resetSessionAckText,
+  TELEGRAM_BASE_COMMANDS,
+  TELEGRAM_SWITCHROOM_COMMANDS,
+  TELEGRAM_MENU_COMMANDS,
   type AgentMetadata,
   type AuthSummary,
 } from "../welcome-text";
@@ -191,6 +194,54 @@ describe("switchroomHelpText + switchroomHelpCommandNames", () => {
   it("the name array contains the Sprint 2/3 additions", () => {
     for (const needed of ["new", "reset", "approve", "deny", "pending"]) {
       expect(switchroomHelpCommandNames).toContain(needed);
+    }
+  });
+});
+
+describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
+  it("base commands are exactly /start /help /status in that order", () => {
+    expect(TELEGRAM_BASE_COMMANDS.map(c => c.command)).toEqual(["start", "help", "status"]);
+  });
+
+  it("menu + base split is non-overlapping and recomposes to the full list", () => {
+    // Invariant: TELEGRAM_MENU_COMMANDS is base followed by switchroom; no dupes.
+    expect([...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS]).toEqual(
+      [...TELEGRAM_MENU_COMMANDS],
+    );
+    const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it("menu includes the session-control commands (the most-used trio)", () => {
+    const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    // These MUST be in the menu — they're the primary mobile UX flows
+    for (const must of ["new", "reset", "approve", "deny", "pending", "restart", "logs", "switchroomhelp"]) {
+      expect(names, `missing /${must} from Telegram menu`).toContain(must);
+    }
+  });
+
+  it("menu drops the ops primitives that cluttered the old catalogue", () => {
+    const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    // These used to be in the menu and are now handler-only (still
+    // typable, but not in autocomplete). If they sneak back in, the
+    // menu has regressed to pre-trim length.
+    for (const droppedFromMenu of ["vault", "grant", "dangerous", "permissions", "switchroomstart", "topics", "memory", "pins-status", "interrupt"]) {
+      expect(names, `/${droppedFromMenu} should NOT be in the trimmed Telegram menu`).not.toContain(droppedFromMenu);
+    }
+  });
+
+  it("menu is short enough for a mobile keyboard (<= 20 entries)", () => {
+    // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
+    // without scrolling. 20 is a generous upper bound.
+    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(20);
+  });
+
+  it("every menu command is documented in switchroomHelpText", () => {
+    const helpDoc = switchroomHelpText("assistant");
+    for (const { command } of TELEGRAM_SWITCHROOM_COMMANDS) {
+      // Special case: /switchroomhelp describes itself; the check still passes
+      // because the list item literally reads '/switchroomhelp — this help'.
+      expect(helpDoc, `menu command /${command} missing from /switchroomhelp text`).toContain(`/${command}`);
     }
   });
 });

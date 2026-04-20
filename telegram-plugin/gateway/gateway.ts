@@ -54,6 +54,8 @@ import {
   restartAckText as buildRestartAckText,
   newSessionAckText as buildNewSessionAckText,
   resetSessionAckText as buildResetSessionAckText,
+  TELEGRAM_BASE_COMMANDS,
+  TELEGRAM_SWITCHROOM_COMMANDS,
   type AgentMetadata, type AuthSummary,
 } from '../welcome-text.js'
 import {
@@ -2655,38 +2657,20 @@ bot.command('switchroomhelp', async ctx => {
 })
 
 async function registerSwitchroomBotCommands(): Promise<void> {
-  const switchroomCommands = [
-    { command: 'agents', description: 'List all agents' },
-    { command: 'auth', description: 'Auth status or actions' },
-    { command: 'reauth', description: 'Start Claude auth' },
-    { command: 'topics', description: 'Show topic mappings' },
-    { command: 'logs', description: 'Show agent logs' },
-    { command: 'memory', description: 'Search agent memory' },
-    { command: 'switchroomstart', description: 'Start an agent' },
-    { command: 'stop', description: 'Stop an agent' },
-    { command: 'restart', description: 'Restart an agent' },
-    { command: 'new', description: 'Start a fresh session (flush handoff, restart)' },
-    { command: 'reset', description: 'Alias of /new — start a fresh session' },
-    { command: 'approve', description: 'Approve the pending tool permission (or /approve <id>)' },
-    { command: 'deny', description: 'Deny the pending tool permission (or /deny <id>)' },
-    { command: 'pending', description: 'List pending tool permission prompts' },
-    { command: 'interrupt', description: 'Interrupt an agent turn' },
-    { command: 'doctor', description: 'Health check' },
-    { command: 'reconcile', description: 'Re-apply config' },
-    { command: 'update', description: 'Pull + install + restart' },
-    { command: 'permissions', description: 'Show permissions' },
-    { command: 'grant', description: 'Grant a tool permission' },
-    { command: 'dangerous', description: 'Toggle full tool access' },
-    { command: 'vault', description: 'Manage vault secrets' },
-    { command: 'switchroomhelp', description: 'Show all commands' },
-  ]
-  const baseCommands = [
-    { command: 'start', description: 'Welcome and setup' },
-    { command: 'help', description: 'What this bot can do' },
-    { command: 'status', description: 'Check pairing status' },
-  ]
-  await bot.api.setMyCommands([...baseCommands, ...switchroomCommands], { scope: { type: 'all_private_chats' } })
-  await bot.api.setMyCommands(switchroomCommands, { scope: { type: 'all_group_chats' } })
+  // Slash-menu is deliberately trimmed from the full command catalogue.
+  // See telegram-plugin/welcome-text.ts TELEGRAM_MENU_COMMANDS for the
+  // rationale (mobile UX focus; ops primitives stay typable but out of
+  // the autocomplete clutter). /switchroomhelp surfaces the full list.
+  await bot.api.setMyCommands(
+    [...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS],
+    { scope: { type: 'all_private_chats' } },
+  )
+  // Group chats don't support /start pairing, so only the switchroom
+  // commands are registered there.
+  await bot.api.setMyCommands(
+    TELEGRAM_SWITCHROOM_COMMANDS,
+    { scope: { type: 'all_group_chats' } },
+  )
 }
 
 // ─── Inline-button handler (permissions) ──────────────────────────────────
