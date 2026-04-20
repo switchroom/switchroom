@@ -4446,6 +4446,11 @@ async function registerSwitchroomBotCommands(): Promise<void> {
     { command: 'switchroomstart', description: 'Start an agent (default: this agent)' },
     { command: 'stop', description: 'Stop an agent (default: this agent)' },
     { command: 'restart', description: 'Restart an agent (default: this agent)' },
+    { command: 'new', description: 'Start a fresh session (flush handoff, restart)' },
+    { command: 'reset', description: 'Alias of /new — start a fresh session' },
+    { command: 'approve', description: 'Approve the pending tool permission (or /approve <id>)' },
+    { command: 'deny', description: 'Deny the pending tool permission (or /deny <id>)' },
+    { command: 'pending', description: 'List pending tool permission prompts' },
     { command: 'doctor', description: 'Health check (deps, vault, services, MCP)' },
     { command: 'reconcile', description: 'Re-apply switchroom.yaml (default: this agent)' },
     { command: 'update', description: 'Pull latest, reinstall, reconcile, restart' },
@@ -4453,6 +4458,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
     { command: 'grant', description: 'Grant a tool permission (default: this agent)' },
     { command: 'dangerous', description: 'Toggle full tool access (default: this agent)' },
     { command: 'vault', description: 'Manage encrypted secrets vault' },
+    { command: 'pins-status', description: 'Diagnostic: pin bookkeeping snapshot' },
     { command: 'switchroomhelp', description: 'Show all switchroom bot commands' },
   ]
 
