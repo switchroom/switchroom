@@ -681,7 +681,7 @@ const ipcServer: IpcServer = createIpcServer({
     // Heartbeat received — no action needed, the server tracks lastHeartbeat
   },
 
-  onScheduleRestart(_client: IpcClient, msg: ScheduleRestartMessage) {
+  onScheduleRestart(client: IpcClient, msg: ScheduleRestartMessage) {
     const { agentName } = msg;
 
     // Check if any turn is currently in flight
@@ -691,14 +691,14 @@ const ipcServer: IpcServer = createIpcServer({
       // No active turn, restart immediately
       try {
         execSync(`systemctl --user restart switchroom-${agentName}.service`, { stdio: 'ignore' });
-        _client.send({
+        client.send({
           type: 'schedule_restart_result',
           success: true,
           restartedImmediately: true,
         });
         process.stderr.write(`telegram gateway: restarted ${agentName} immediately (no active turn)\n`);
       } catch (err) {
-        _client.send({
+        client.send({
           type: 'schedule_restart_result',
           success: false,
           error: err instanceof Error ? err.message : String(err),
@@ -712,7 +712,7 @@ const ipcServer: IpcServer = createIpcServer({
       // Set a flag that will be checked when turns complete
       pendingRestarts.set(agentName, Date.now());
 
-      _client.send({
+      client.send({
         type: 'schedule_restart_result',
         success: true,
         waitingForTurn: true,

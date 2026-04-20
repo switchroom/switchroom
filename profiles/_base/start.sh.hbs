@@ -164,12 +164,16 @@ fi
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 {{/if}}
 
+{{#unless useHotReloadStable}}
 # --- Workspace bootstrap (stable) ---
 # Inject AGENTS.md / SOUL.md / IDENTITY.md / USER.md / TOOLS.md /
 # BOOTSTRAP.md from the agent's workspace/ dir into --append-system-prompt.
 # These files are stable across a session, so baking them into the system
 # prompt is cache-friendly. Dynamic files (MEMORY.md, today's daily,
 # HEARTBEAT.md) are injected via the UserPromptSubmit hook, not here.
+#
+# When channels.telegram.hotReloadStable is true, this injection moves to
+# a UserPromptSubmit hook instead (see workspace-stable-hook.sh).
 #
 # CACHE BOUNDARY ORDERING: The stable workspace render (_WS_STABLE) is
 # prepended BEFORE the handoff briefing in APPEND_PROMPT. This ensures the
@@ -192,6 +196,7 @@ $APPEND_PROMPT"
     fi
   fi
 fi
+{{/unless}}
 
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then

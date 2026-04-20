@@ -56,15 +56,18 @@ export function restartAgent(name: string): void {
  */
 export function gracefulRestartAgent(name: string): Promise<{ restartedImmediately: boolean; waitingForTurn: boolean }> {
   return new Promise((resolve, reject) => {
-    const stateDir = process.env.SWITCHROOM_STATE_DIR ?? resolveStatePath("");
-    const socketPath = join(stateDir, "gateway.sock");
+    // Gateway socket is in the agent's telegram directory
+    // (set via TELEGRAM_STATE_DIR in the gateway service unit)
+    const agentsDir = process.env.SWITCHROOM_AGENTS_DIR ?? resolveStatePath("agents");
+    const agentDir = resolve(agentsDir, name);
+    const socketPath = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(agentDir, "telegram", "gateway.sock");
 
     if (!existsSync(socketPath)) {
       reject(new Error("Gateway socket not found. Is the gateway running?"));
       return;
     }
 
-    const client = connect(socketPath);
+    const client = connect({ path: socketPath });
     let buffer = "";
     let responseReceived = false;
 
@@ -87,7 +90,7 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
           const response = JSON.parse(line);
           if (response.type === "schedule_restart_result") {
             responseReceived = true;
-            client.end();
+            client.destroy();
 
             if (response.success) {
               resolve({
@@ -97,6 +100,7 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
             } else {
               reject(new Error(response.error || "Graceful restart failed"));
             }
+            return;
           }
         } catch (err) {
           // Ignore JSON parse errors, wait for more data
@@ -105,7 +109,9 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
     });
 
     client.on("error", (err) => {
-      reject(new Error(`Failed to connect to gateway: ${err.message}`));
+      if (!responseReceived) {
+        reject(new Error(`Failed to connect to gateway: ${err.message}`));
+      }
     });
 
     client.on("close", () => {
@@ -115,12 +121,18 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
     });
 
     // Timeout after 5 seconds
-    setTimeout(() => {
+    const timeout = setTimeout(() => {
       if (!responseReceived) {
-        client.end();
+        responseReceived = true;
+        client.destroy();
         reject(new Error("Graceful restart request timed out"));
       }
     }, 5000);
+
+    // Clean up timeout if we get a response
+    client.once("data", () => {
+      if (timeout) clearTimeout(timeout);
+    });
   });
 }
 

@@ -1257,6 +1257,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     dangerousMode: agentConfig.dangerous_mode === true,
     skipPermissionPrompt: agentConfig.skip_permission_prompt === true,
     useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+    useHotReloadStable: agentConfig.channels?.telegram?.hotReloadStable === true,
     hindsightEnabled: hindsightAutoRecallEnabled,
     hindsightBankIdQ: shellSingleQuote(hindsightBankId),
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
@@ -1536,13 +1537,30 @@ export function scaffoldAgent(
             },
           ]
         : [];
-      // Switchroom-owned UserPromptSubmit hook: inject dynamic workspace files
-      // (MEMORY.md, today/yesterday daily notes, HEARTBEAT.md) at the start of
-      // every turn. Coexists with Hindsight's own UserPromptSubmit hook (loaded
-      // via the plugin's hooks.json). 5s timeout so a slow render never blocks
-      // the turn; silent failure (no stderr) so missing workspace files don't
-      // spam errors.
+      // Switchroom-owned UserPromptSubmit hooks: inject workspace content at
+      // the start of every turn. When hotReloadStable is true, the stable
+      // workspace files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOOLS.md,
+      // HEARTBEAT.md) are injected here instead of baked into start.sh's
+      // --append-system-prompt. Dynamic files (MEMORY.md, daily notes) are
+      // always injected per-turn. Coexists with Hindsight's own
+      // UserPromptSubmit hook (loaded via the plugin's hooks.json). 5-6s
+      // timeouts so slow renders never block the turn; silent failure (no
+      // stderr) so missing workspace files don't spam errors.
+      const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
       const switchroomUserPromptSubmit = [
+        ...(useHotReloadStable
+          ? [
+              {
+                hooks: [
+                  {
+                    type: "command",
+                    command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
+                    timeout: 6,
+                  },
+                ],
+              },
+            ]
+          : []),
         {
           hooks: [
             {
@@ -2313,8 +2331,22 @@ Final answers still go through \`stream_reply\` with done=true as usual,
           },
         ]
       : [];
-    // Switchroom-owned UserPromptSubmit hook (same as scaffoldAgent above)
+    // Switchroom-owned UserPromptSubmit hooks (same as scaffoldAgent above)
+    const useHotReloadStableReconcile = agentConfig.channels?.telegram?.hotReloadStable === true;
     const switchroomUserPromptSubmit = [
+      ...(useHotReloadStableReconcile
+        ? [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
+                  timeout: 6,
+                },
+              ],
+            },
+          ]
+        : []),
       {
         hooks: [
           {

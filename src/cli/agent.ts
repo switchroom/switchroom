@@ -10,6 +10,7 @@ import {
   startAgent,
   stopAgent,
   restartAgent,
+  gracefulRestartAgent,
   interruptAgent,
   getAgentStatus,
   getAllAgentStatuses,
@@ -514,7 +515,6 @@ export function registerAgentCommand(program: Command): void {
 
             try {
               if (opts.gracefulRestart) {
-                const { gracefulRestartAgent } = await import("../agents/lifecycle.js");
                 const result = await gracefulRestartAgent(n);
                 if (result.restartedImmediately) {
                   console.log(chalk.green(`Restarted ${n} immediately (no active turn)`));
@@ -667,11 +667,10 @@ export function registerAgentCommand(program: Command): void {
             if ((opts.restart || opts.gracefulRestart) && result.changes.length > 0) {
               try {
                 if (opts.gracefulRestart) {
-                  const { gracefulRestartAgent } = await import("../agents/lifecycle.js");
-                  const result = await gracefulRestartAgent(n);
-                  if (result.restartedImmediately) {
+                  const restartResult = await gracefulRestartAgent(n);
+                  if (restartResult.restartedImmediately) {
                     console.log(chalk.green(`  ${n}: restarted immediately (no active turn)`));
-                  } else if (result.waitingForTurn) {
+                  } else if (restartResult.waitingForTurn) {
                     console.log(chalk.yellow(`  ${n}: restart scheduled (waiting for current turn to complete)`));
                   }
                 } else {

@@ -177,12 +177,24 @@ export function registerDebugCommand(program: Command): void {
         // 1. Stable system prompt content
         console.log("=== Append System Prompt (stable) ===\n");
 
+        const resolved = resolveAgentConfig(
+          config.defaults,
+          config.profiles,
+          agentConfig,
+        );
+        const useHotReloadStable = resolved.channels?.telegram?.hotReloadStable === true;
+
         const stableResult = await buildStableBootstrapPrompt({
           workspaceDir,
           budget: { warningMode: "off" },
         });
 
-        if (stableResult.concatenated.trim().length > 0) {
+        if (useHotReloadStable) {
+          console.log(
+            `-- Workspace Stable Render (not used — stable content is in per-turn hook) --`,
+          );
+          console.log();
+        } else if (stableResult.concatenated.trim().length > 0) {
           console.log(
             `-- Workspace Stable Render (${formatBytes(stableResult.concatenated.length)}) --`,
           );
@@ -194,11 +206,6 @@ export function registerDebugCommand(program: Command): void {
         }
 
         // Progress updates guidance
-        const resolved = resolveAgentConfig(
-          config.defaults,
-          config.profiles,
-          agentConfig,
-        );
         const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(resolved);
         const progressGuidance = useSwitchroomPlugin
           ? buildProgressUpdateGuidance()
@@ -283,6 +290,22 @@ export function registerDebugCommand(program: Command): void {
 
         // 5. Per-turn injections (UserPromptSubmit hooks)
         console.log("=== Per-Turn Injections (UserPromptSubmit) ===\n");
+
+        // Stable workspace render (when hot-reload mode is enabled)
+        if (useHotReloadStable) {
+          if (stableResult.concatenated.trim().length > 0) {
+            console.log(
+              `-- Workspace Stable (hot-reload hook): ${formatBytes(stableResult.concatenated.length)} --`,
+            );
+            console.log(stableResult.concatenated);
+            console.log();
+          } else {
+            console.log(
+              "-- Workspace Stable (hot-reload hook): 0 bytes, not set up --",
+            );
+            console.log();
+          }
+        }
 
         // Dynamic workspace render
         const dynamicResult = await buildDynamicBootstrapPrompt({
