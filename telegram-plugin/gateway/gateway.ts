@@ -45,6 +45,18 @@ import {
 import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview } from '../steering.js'
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace } from '../format.js'
 import {
+  startText as buildStartText,
+  helpText as buildHelpText,
+  statusPairedText as buildStatusPairedText,
+  statusPendingText as buildStatusPendingText,
+  statusUnpairedText as buildStatusUnpairedText,
+  switchroomHelpText as buildSwitchroomHelpText,
+  restartAckText as buildRestartAckText,
+  newSessionAckText as buildNewSessionAckText,
+  resetSessionAckText as buildResetSessionAckText,
+  type AgentMetadata, type AuthSummary,
+} from '../welcome-text.js'
+import {
   isContextExhaustionText,
   shouldArmOrphanedReplyTimeout,
   ORPHANED_REPLY_TIMEOUT_MS,
@@ -2105,24 +2117,59 @@ async function runSwitchroomCommandFormatted(ctx: Context, args: string[], label
 
 // ─── Bot commands ─────────────────────────────────────────────────────────
 
+// Build an AgentMetadata snapshot for the current agent by shelling out
+// to `switchroom agent list --json` and `switchroom auth status --json`.
+// Best-effort — any missing piece renders as a placeholder in the text
+// templates rather than blocking the reply.
+function buildAgentMetadata(agentName: string): AgentMetadata {
+  type AgentListResp = {
+    agents: Array<{
+      name: string; status: string; uptime: string;
+      extends?: string | null; template?: string | null;
+      topic_name?: string | null; topic_emoji?: string | null;
+      model?: string | null;
+    }>
+  }
+  type AuthStatusResp = {
+    agents: Array<{
+      name: string; authenticated: boolean; auth_source: string | null;
+      subscription_type: string | null; expires_in: string | null;
+    }>
+  }
+  const list = switchroomExecJson<AgentListResp>(['agent', 'list'])
+  const auth = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
+  const a = list?.agents?.find(x => x.name === agentName) ?? null
+  const au = auth?.agents?.find(x => x.name === agentName) ?? null
+  const authSummary: AuthSummary | null = au
+    ? {
+        authenticated: au.authenticated,
+        subscription_type: au.subscription_type,
+        expires_in: au.expires_in,
+        auth_source: au.auth_source,
+      }
+    : null
+  return {
+    agentName,
+    model: a?.model ?? null,
+    extendsProfile: (a?.extends ?? a?.template) ?? null,
+    topicName: a?.topic_name ?? null,
+    topicEmoji: a?.topic_emoji ?? null,
+    uptime: a?.uptime ?? null,
+    status: a?.status ?? null,
+    auth: authSummary,
+  }
+}
+
 bot.command('start', async ctx => {
   if (ctx.chat?.type !== 'private') return
   const access = loadAccess()
-  if (access.dmPolicy === 'disabled') { await ctx.reply(`This bot isn't accepting new connections.`); return }
-  await ctx.reply(
-    `This bot bridges Telegram to a Claude Code session.\n\n` +
-    `To pair:\n1. DM me anything — you'll get a 6-char code\n` +
-    `2. In Claude Code: /telegram:access pair <code>\n\nAfter that, DMs here reach that session.`,
-  )
+  const disabled = access.dmPolicy === 'disabled'
+  await ctx.reply(buildStartText(getMyAgentName(), disabled), { parse_mode: 'HTML' })
 })
 
 bot.command('help', async ctx => {
   if (ctx.chat?.type !== 'private') return
-  await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n/status — check your pairing state`,
-  )
+  await ctx.reply(buildHelpText(getMyAgentName()), { parse_mode: 'HTML' })
 })
 
 bot.command('status', async ctx => {
@@ -2131,16 +2178,18 @@ bot.command('status', async ctx => {
   const senderId = String(from.id)
   const access = loadAccess()
   if (access.allowFrom.includes(senderId)) {
-    await ctx.reply(`Paired as ${from.username ? `@${from.username}` : senderId}.`)
+    const userTag = from.username ? `@${from.username}` : senderId
+    const meta = buildAgentMetadata(getMyAgentName())
+    await ctx.reply(buildStatusPairedText({ user: userTag, meta }), { parse_mode: 'HTML' })
     return
   }
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
-      await ctx.reply(`Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`)
+      await ctx.reply(buildStatusPendingText(code), { parse_mode: 'HTML' })
       return
     }
   }
-  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+  await ctx.reply(buildStatusUnpairedText())
 })
 
 bot.command('agents', async ctx => {
@@ -2185,7 +2234,7 @@ bot.command('restart', async ctx => {
     }
     const chatId = String(ctx.chat!.id)
     const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const ackText = `🔄 Restarting <b>${escapeHtmlForTg(name)}</b>…`
+    const ackText = buildRestartAckText(name)
     let ackId: number | null = null
     try {
       const sent = await lockedBot.api.sendMessage(chatId, ackText, {
@@ -2273,9 +2322,9 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
 
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  const label = kind === 'new' ? '🆕 Started fresh session' : '🔄 Reset session'
-  const tail = flushed > 0 ? ' · flushed handoff' : ''
-  const ackText = `${label} for <b>${escapeHtmlForTg(name)}</b>${tail} · restarting…`
+  const ackText = kind === 'new'
+    ? buildNewSessionAckText(name, flushed > 0)
+    : buildResetSessionAckText(name, flushed > 0)
   let ackId: number | null = null
   try {
     const sent = await lockedBot.api.sendMessage(chatId, ackText, {
@@ -2602,31 +2651,7 @@ bot.command('update', async ctx => {
 
 bot.command('switchroomhelp', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const me = getMyAgentName()
-  await switchroomReply(ctx, [
-    'Switchroom Bot Commands',
-    '',
-    `This bot is bound to the ${me} agent.`,
-    '',
-    '/agents - List all agents',
-    '/auth - Auth status or actions',
-    '/reauth [agent] - Start Claude auth',
-    '/topics - Show topic-to-agent mappings',
-    '/logs [name] [lines] - Show agent logs',
-    '/memory <query> - Search agent memory',
-    '/switchroomstart [name] - Start an agent',
-    '/stop [name] - Stop an agent',
-    '/restart [name|all] - Restart an agent',
-    '/interrupt [name] - Interrupt an agent turn',
-    '/doctor - Health check',
-    '/reconcile [name|all] - Re-apply config',
-    '/update - Pull + reinstall + restart',
-    '/permissions [agent] - Show permissions',
-    '/grant <tool> - Grant a tool permission',
-    '/dangerous [off] - Toggle full tool access',
-    '/vault - Manage encrypted secrets',
-    '/switchroomhelp - This help',
-  ].join('\n'))
+  await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
 })
 
 async function registerSwitchroomBotCommands(): Promise<void> {
