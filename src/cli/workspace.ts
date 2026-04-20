@@ -273,6 +273,108 @@ export function registerWorkspaceCommand(program: Command): void {
         },
       ),
     );
+
+  cmd
+    .command("commit <agent>")
+    .description("Commit current workspace state as a git checkpoint")
+    .option("-m, --message <message>", "Commit message (defaults to timestamp)")
+    .action(
+      withConfigError(async (agentName: string, opts: { message?: string }) => {
+        const dir = resolveAgentWorkspaceDirOrExit(program, agentName);
+        if (!dir) return;
+
+        // Check if workspace is a git repo
+        const gitDir = resolve(dir, ".git");
+        if (!existsSync(gitDir)) {
+          process.stdout.write(
+            `Workspace is not a git repository. Re-run \`switchroom agent create ${agentName}\` ` +
+            `or manually \`git init\` in ${dir} to enable versioning.\n`,
+          );
+          return;
+        }
+
+        // Check for changes
+        const statusResult = spawnSync("git", ["status", "--short"], {
+          cwd: dir,
+          encoding: "utf-8",
+        });
+        if (statusResult.status !== 0) {
+          process.stderr.write(
+            `git status failed: ${statusResult.stderr || statusResult.stdout}\n`,
+          );
+          process.exit(1);
+        }
+
+        if (!statusResult.stdout.trim()) {
+          process.stdout.write("No changes to commit.\n");
+          return;
+        }
+
+        // Generate commit message
+        const message = opts.message || `checkpoint: ${new Date().toISOString()}`;
+
+        // Stage and commit
+        const addResult = spawnSync("git", ["add", "-A"], {
+          cwd: dir,
+          encoding: "utf-8",
+        });
+        if (addResult.status !== 0) {
+          process.stderr.write(
+            `git add failed: ${addResult.stderr || addResult.stdout}\n`,
+          );
+          process.exit(1);
+        }
+
+        const commitResult = spawnSync("git", ["commit", "-m", message], {
+          cwd: dir,
+          encoding: "utf-8",
+        });
+        if (commitResult.status !== 0) {
+          process.stderr.write(
+            `git commit failed: ${commitResult.stderr || commitResult.stdout}\n`,
+          );
+          process.exit(1);
+        }
+
+        // Get commit SHA
+        const shaResult = spawnSync("git", ["rev-parse", "--short", "HEAD"], {
+          cwd: dir,
+          encoding: "utf-8",
+        });
+        const sha = shaResult.stdout.trim();
+
+        process.stdout.write(`Committed workspace changes: ${sha}\n`);
+        if (commitResult.stdout) {
+          process.stdout.write(commitResult.stdout);
+        }
+      }),
+    );
+
+  cmd
+    .command("status <agent>")
+    .description("Show git status of the workspace")
+    .action(
+      withConfigError(async (agentName: string) => {
+        const dir = resolveAgentWorkspaceDirOrExit(program, agentName);
+        if (!dir) return;
+
+        const gitDir = resolve(dir, ".git");
+        if (!existsSync(gitDir)) {
+          process.stdout.write(
+            `Workspace is not a git repository.\n`,
+          );
+          return;
+        }
+
+        const child = spawnSync("git", ["status", "--short"], {
+          cwd: dir,
+          stdio: "inherit",
+        });
+        if (child.status !== 0 && child.status !== null) {
+          process.exit(child.status);
+        }
+      }),
+    );
 }
 
 function resolveAgentWorkspaceDirOrExit(

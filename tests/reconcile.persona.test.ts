@@ -111,7 +111,7 @@ describe("reconcileAgent — persona (Phase 3)", () => {
 
     const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig);
     const claudeMdPath = join(result.agentDir, "CLAUDE.md");
-    const claudeCustomPath = join(result.agentDir, "CLAUDE.custom.md");
+    const claudeCustomPath = join(result.agentDir, "workspace", "CLAUDE.custom.md");
 
     // Add custom sidecar
     writeFileSync(

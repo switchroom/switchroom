@@ -1027,6 +1027,69 @@ function seedWorkspaceBootstrapFiles(params: {
 }
 
 /**
+ * Initialize the workspace directory as a git repository (if git is available).
+ * Creates .gitignore to exclude regenerables (SOUL.md) and ephemeral state (*.log),
+ * then makes an initial commit capturing the seeded template content.
+ *
+ * Degrades gracefully if git is not on PATH. Returns true if init succeeded.
+ */
+function initWorkspaceGitRepo(
+  workspaceDir: string,
+  agentName: string,
+): boolean {
+  // Check git availability
+  try {
+    execSync("command -v git", { stdio: "ignore" });
+  } catch {
+    console.log(chalk.dim("  git not available, workspace versioning disabled"));
+    return false;
+  }
+
+  // Skip if already a git repo
+  const gitDir = join(workspaceDir, ".git");
+  if (existsSync(gitDir)) {
+    return true;
+  }
+
+  // Write .gitignore before git init
+  const gitignore = `# Regenerated from switchroom.yaml on every reconcile
+SOUL.md
+
+# Ephemeral runtime state
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+`;
+  writeFileSync(join(workspaceDir, ".gitignore"), gitignore, "utf-8");
+
+  // Initialize repo
+  try {
+    execSync("git init --quiet", { cwd: workspaceDir, stdio: "pipe" });
+    execSync("git add -A", { cwd: workspaceDir, stdio: "pipe" });
+
+    // Use switchroom's git identity if available from env, else fall back to generic
+    const userEmail = process.env.GIT_AUTHOR_EMAIL || "switchroom@localhost";
+    const userName = process.env.GIT_AUTHOR_NAME || "Switchroom Agent";
+
+    execSync(
+      `git -c user.email="${userEmail}" -c user.name="${userName}" commit -m "chore: seed workspace from switchroom scaffold"`,
+      { cwd: workspaceDir, stdio: "pipe" }
+    );
+
+    console.log(chalk.green(`  initialized workspace git repo (${agentName})`));
+    return true;
+  } catch (err) {
+    // Non-fatal: workspace still usable without git
+    console.log(chalk.dim(`  workspace git init failed: ${err instanceof Error ? err.message : String(err)}`));
+    return false;
+  }
+}
+
+/**
  * Vendored hindsight-memory plugin location inside the switchroom repo.
  * Pinned to the version we ship; updated by `switchroom update`.
  */
@@ -1633,6 +1696,10 @@ export function scaffoldAgent(
     skipped,
   });
 
+  // --- Initialize workspace as git repo (Phase 4) ---
+  const workspaceDir = join(agentDir, "workspace");
+  initWorkspaceGitRepo(workspaceDir, name);
+
   // --- Claude Code config (onboarding state) ---
   // Try to copy from existing Claude installation; fall back to minimal config
   const existingClaudeJson = findExistingClaudeJson();
@@ -1891,6 +1958,18 @@ export function reconcileAgent(
     );
   }
 
+  // --- Phase 4: migrate CLAUDE.custom.md to workspace/ (one-time) ---
+  const legacyCustomPath = join(agentDir, "CLAUDE.custom.md");
+  const workspaceDir = join(agentDir, "workspace");
+  const newCustomPath = join(workspaceDir, "CLAUDE.custom.md");
+  if (existsSync(legacyCustomPath) && !existsSync(newCustomPath)) {
+    mkdirSync(workspaceDir, { recursive: true });
+    const legacyContent = readFileSync(legacyCustomPath, "utf-8");
+    writeFileSync(newCustomPath, legacyContent, "utf-8");
+    rmSync(legacyCustomPath);
+    console.log(chalk.green(`  moved CLAUDE.custom.md → workspace/CLAUDE.custom.md`));
+  }
+
   // Compute the desired permissions.allow list from current config.
   // IMPORTANT: this must stay in lockstep with scaffoldAgent's permissionAllow
   // computation — including the DEFAULT_READ_ONLY_PREAPPROVED_TOOLS injection
@@ -2029,7 +2108,7 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     const profilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
     const claudeMdSrc = join(profilePath, "CLAUDE.md.hbs");
     const claudeMdDest = join(agentDir, "CLAUDE.md");
-    const claudeCustomPath = join(agentDir, "CLAUDE.custom.md");
+    const claudeCustomPath = join(agentDir, "workspace", "CLAUDE.custom.md");
 
     if (existsSync(claudeMdSrc)) {
       const claudeContext: Record<string, unknown> = {
@@ -2429,6 +2508,12 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     created: changes,
     skipped: [],
   });
+
+  // --- Phase 4: idempotent workspace git init (for existing agents) ---
+  const reconcileWorkspaceDir = join(agentDir, "workspace");
+  if (existsSync(reconcileWorkspaceDir)) {
+    initWorkspaceGitRepo(reconcileWorkspaceDir, name);
+  }
 
   // --- Phase 2: regenerate workspace/SOUL.md deterministically every reconcile ---
   // Unlike other workspace files (user-protected via writeIfMissing), SOUL.md is
