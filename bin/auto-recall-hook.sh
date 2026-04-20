@@ -86,11 +86,16 @@ fi
 
 # Format the recall results into a context block. Each memory has
 # .text and .timestamp; we render them as bullet points with the date.
-FORMATTED=$(printf '%s' "$RESPONSE" | jq -r '
+# $bank is passed as a jq --arg so the shell never interpolates the raw
+# value into the filter body. Today bank names are agent names
+# ([a-zA-Z0-9_-]) so it doesn't matter, but matching how $q is already
+# handled above keeps the hook auditable — nothing inside the jq filter
+# is shell-expanded.
+FORMATTED=$(printf '%s' "$RESPONSE" | jq -r --arg bank "$BANK" '
   if .results == null or (.results | length) == 0 then
     empty
   else
-    "## Recalled context (Hindsight, bank: '"${BANK}"')\n\n" +
+    "## Recalled context (Hindsight, bank: " + $bank + ")\n\n" +
     (.results | map("- " + (.text // "(no text)") + (if .timestamp then " (" + .timestamp + ")" else "" end)) | join("\n"))
   end
 ' 2>/dev/null)

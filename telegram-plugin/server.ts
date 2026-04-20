@@ -4631,9 +4631,12 @@ bot.on('message:sticker', async ctx => {
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
 // notification — delimiter chars would let the uploader break out of the tag
-// or forge a second meta entry.
+// or forge a second meta entry. Strips the XML structural chars (<>[];),
+// line terminators (\r\n), AND attribute delimiters (" \) so a filename like
+// `foo" pi_attempt="none` can't terminate an envelope attribute and inject
+// a fake metadata field if the renderer ever serializes meta as XML attrs.
 function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+  return s?.replace(/[<>\[\]\r\n;"\\]/g, '_')
 }
 
 /**

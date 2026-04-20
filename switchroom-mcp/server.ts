@@ -154,12 +154,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "workspace_memory_search": {
-      const {
-        query,
-        max_results,
-        agent,
-      } = args as { query: string; max_results?: number; agent?: string };
-      const effectiveAgent = agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "";
+      // Runtime type check before passing args to execFileSync. Without
+      // this, an LLM-emitted { query: null } or { query: ['foo'] } hits
+      // the spawn layer and surfaces a cryptic ERR_INVALID_ARG_TYPE
+      // stack trace. Return a clean error string instead.
+      const rawQuery = (args as Record<string, unknown>).query;
+      if (typeof rawQuery !== "string" || rawQuery.length === 0) {
+        return textResult("Error: 'query' must be a non-empty string.");
+      }
+      const rawMax = (args as Record<string, unknown>).max_results;
+      const rawAgent = (args as Record<string, unknown>).agent;
+      if (rawMax != null && typeof rawMax !== "number") {
+        return textResult("Error: 'max_results' must be a number when provided.");
+      }
+      if (rawAgent != null && typeof rawAgent !== "string") {
+        return textResult("Error: 'agent' must be a string when provided.");
+      }
+      const effectiveAgent = rawAgent ?? process.env.SWITCHROOM_AGENT_NAME ?? "";
       if (!effectiveAgent) {
         return textResult(
           "Error: no agent specified and SWITCHROOM_AGENT_NAME env var is not set.",
@@ -169,25 +180,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         "workspace",
         "search",
         effectiveAgent,
-        query,
+        rawQuery,
         "--json",
       ];
-      if (typeof max_results === "number" && Number.isFinite(max_results) && max_results > 0) {
-        searchArgs.push("--max-results", String(Math.floor(max_results)));
+      if (typeof rawMax === "number" && Number.isFinite(rawMax) && rawMax > 0) {
+        searchArgs.push("--max-results", String(Math.floor(rawMax)));
       }
       const output = switchroom(searchArgs);
       return textResult(output);
     }
 
     case "workspace_memory_get": {
-      const { path: filePath, agent } = args as { path: string; agent?: string };
-      const effectiveAgent = agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "";
+      const rawPath = (args as Record<string, unknown>).path;
+      if (typeof rawPath !== "string" || rawPath.length === 0) {
+        return textResult("Error: 'path' must be a non-empty string.");
+      }
+      const rawAgent = (args as Record<string, unknown>).agent;
+      if (rawAgent != null && typeof rawAgent !== "string") {
+        return textResult("Error: 'agent' must be a string when provided.");
+      }
+      const effectiveAgent = rawAgent ?? process.env.SWITCHROOM_AGENT_NAME ?? "";
       if (!effectiveAgent) {
         return textResult(
           "Error: no agent specified and SWITCHROOM_AGENT_NAME env var is not set.",
         );
       }
-      const output = switchroom(["workspace", "show", effectiveAgent, filePath]);
+      const output = switchroom(["workspace", "show", effectiveAgent, rawPath]);
       return textResult(output);
     }
 

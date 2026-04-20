@@ -11,7 +11,8 @@
  * the auto-recall hook or direct MCP calls. This is the file-system tier.
  */
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
 export const DEFAULT_MEMORY_SEARCH_MAX_RESULTS = 6;
@@ -56,25 +57,32 @@ async function listMarkdownFiles(workspaceDir: string, maxDepth = 3): Promise<st
   const queue: Array<{ dir: string; depth: number }> = [{ dir: workspaceDir, depth: 0 }];
   while (queue.length > 0) {
     const { dir, depth } = queue.shift()!;
-    let entries: string[] = [];
+    let entries: Dirent[];
     try {
-      entries = await readdir(dir);
+      // withFileTypes + isSymbolicLink() lets us skip symlinks without
+      // following them. Reading the .md target of a symlinked dir (e.g.
+      // memory -> /etc) would otherwise let the index surface content
+      // from outside the workspace via workspace_memory_search.
+      entries = (await readdir(dir, { withFileTypes: true })) as Dirent[];
     } catch {
       continue;
     }
-    for (const entry of entries) {
-      if (entry.startsWith(".")) continue;
-      const full = path.join(dir, entry);
-      let info;
-      try {
-        info = await stat(full);
-      } catch {
-        continue;
-      }
-      if (info.isDirectory() && depth < maxDepth) {
+    for (const dirent of entries) {
+      if (dirent.name.startsWith(".")) continue;
+      if (dirent.isSymbolicLink()) continue;
+      const full = path.join(dir, dirent.name);
+      if (dirent.isDirectory() && depth < maxDepth) {
         queue.push({ dir: full, depth: depth + 1 });
-      } else if (info.isFile() && /\.mdx?$/i.test(entry) && info.size <= MEMORY_SEARCH_MAX_FILE_SIZE) {
-        results.push(full);
+      } else if (dirent.isFile() && /\.mdx?$/i.test(dirent.name)) {
+        // File size is still checked here because withFileTypes doesn't
+        // surface size; cheap stat when we know the file is regular.
+        let info;
+        try {
+          info = await stat(full);
+        } catch {
+          continue;
+        }
+        if (info.size <= MEMORY_SEARCH_MAX_FILE_SIZE) results.push(full);
       }
     }
   }
@@ -250,8 +258,19 @@ export async function getWorkspaceMemoryFile(params: {
   maxBytes?: number;
 }): Promise<{ path: string; content: string; truncated: boolean; bytes: number }> {
   const maxBytes = params.maxBytes ?? MEMORY_SEARCH_MAX_FILE_SIZE;
-  const resolvedWorkspace = path.resolve(params.workspaceDir);
-  const resolvedTarget = path.resolve(resolvedWorkspace, params.relativePath);
+  const resolvedWorkspace = await realpath(path.resolve(params.workspaceDir));
+  const lexicalTarget = path.resolve(resolvedWorkspace, params.relativePath);
+  // path.resolve() does NOT follow symlinks, so a symlink inside the
+  // workspace could point at /etc/passwd and pass the prefix check.
+  // realpath() the target and re-check so containment survives links.
+  let resolvedTarget: string;
+  try {
+    resolvedTarget = await realpath(lexicalTarget);
+  } catch {
+    // ENOENT or similar — fall back to the lexical path so the
+    // subsequent stat() produces the idiomatic error message.
+    resolvedTarget = lexicalTarget;
+  }
   if (!resolvedTarget.startsWith(`${resolvedWorkspace}${path.sep}`) && resolvedTarget !== resolvedWorkspace) {
     throw new Error(
       `path traversal refused: "${params.relativePath}" resolves outside the workspace`,
