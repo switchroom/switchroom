@@ -8,6 +8,7 @@ import {
 } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent } from "../memory/hindsight.js";
+import { captureEvent, captureException } from "../analytics/posthog.js";
 
 export interface AgentInfo {
   name: string;
@@ -60,8 +61,10 @@ export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
 export function handleStartAgent(name: string): { ok: boolean; error?: string } {
   try {
     startAgent(name);
+    void captureEvent("agent_started", { agent: name, source: "web_api" });
     return { ok: true };
   } catch (err) {
+    void captureException(err, { action: "start_agent", agent: name });
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -69,8 +72,10 @@ export function handleStartAgent(name: string): { ok: boolean; error?: string } 
 export function handleStopAgent(name: string): { ok: boolean; error?: string } {
   try {
     stopAgent(name);
+    void captureEvent("agent_stopped", { agent: name, source: "web_api" });
     return { ok: true };
   } catch (err) {
+    void captureException(err, { action: "stop_agent", agent: name });
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -78,8 +83,10 @@ export function handleStopAgent(name: string): { ok: boolean; error?: string } {
 export function handleRestartAgent(name: string): { ok: boolean; error?: string } {
   try {
     restartAgent(name);
+    void captureEvent("agent_restarted", { agent: name, source: "web_api" });
     return { ok: true };
   } catch (err) {
+    void captureException(err, { action: "restart_agent", agent: name });
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }

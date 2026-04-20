@@ -202,6 +202,19 @@ switchroom web                                # Web dashboard
 | **[OpenClaw alternative](docs/vs-openclaw.md)** | Switchroom vs OpenClaw |
 | **[NanoClaw alternative](docs/vs-nanoclaw.md)** | Switchroom vs NanoClaw |
 | **[Compliance](docs/compliance-attestation.md)** | Anthropic compliance analysis |
+| **[Telemetry](docs/posthog.md)** | What Switchroom reports to PostHog and how to opt out |
+
+## Telemetry
+
+Switchroom reports anonymous usage events and errors to PostHog so we can spot regressions and understand which commands are used. **No personal data, code, or message content leaves your machine.** The anonymous ID lives at `~/.switchroom/analytics-id` and is a random UUID — not tied to your username, email, IP, or machine identifier (we pass `disableGeoip: true` on every event).
+
+To opt out, set this in your shell profile:
+
+```bash
+export SWITCHROOM_TELEMETRY_DISABLED=1
+```
+
+Full event catalogue, dashboard links, and the source module at [docs/posthog.md](docs/posthog.md).
 
 ## FAQ
 

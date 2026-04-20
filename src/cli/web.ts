@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { startWebServer } from "../web/server.js";
 import { withConfigError, getConfig } from "./helpers.js";
+import { captureEvent } from "../analytics/posthog.js";
 
 export function registerWebCommand(program: Command): void {
   program
@@ -23,6 +24,12 @@ export function registerWebCommand(program: Command): void {
         console.log(chalk.gray(`  Port:   ${port}\n`));
 
         const { token } = startWebServer(config, port);
+
+        void captureEvent("web_server_started", {
+          port,
+          agent_count: Object.keys(config.agents).length,
+          auth_configured: Boolean(process.env.SWITCHROOM_WEB_TOKEN),
+        });
 
         console.log(
           chalk.green(`\n  Dashboard: http://localhost:${port}\n`)

@@ -43,6 +43,7 @@ import {
   spinner,
   isInteractive,
 } from "../setup/prompt.js";
+import { captureEvent, captureException } from "../analytics/posthog.js";
 
 const STEP_PENDING = chalk.gray("○");
 const STEP_ACTIVE = chalk.blue("->");
@@ -134,11 +135,17 @@ export function registerSetupCommand(program: Command): void {
         // ── Step 10: Verification ────────────────────────────────
         await stepVerification(config, nonInteractive);
 
+        await captureEvent("setup_completed", {
+          agent_count: Object.keys(config.agents).length,
+          interactive: !nonInteractive,
+        });
+
         console.log(
           chalk.bold.green("\n  Setup complete!") +
             chalk.gray(" Your agents are ready.\n"),
         );
       } catch (err) {
+        await captureException(err, { action: "setup" });
         if (err instanceof ConfigError) {
           console.error(chalk.red(`\nConfig error: ${err.message}`));
           if (err.details) {

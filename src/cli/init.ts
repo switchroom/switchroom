@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { loadConfig, resolveAgentsDir, findConfigFile, ConfigError } from "../config/loader.js";
 import { scaffoldAgent } from "../agents/scaffold.js";
 import { installAllUnits } from "../agents/systemd.js";
+import { captureEvent, captureException } from "../analytics/posthog.js";
 
 export function registerInitCommand(program: Command): void {
   program
@@ -111,7 +112,14 @@ export function registerInitCommand(program: Command): void {
         console.log(
           chalk.gray(`  Start all:  switchroom agent start all\n`)
         );
+
+        await captureEvent("init_completed", {
+          agents_total: agentNames.length,
+          agents_scaffolded: scaffolded,
+          example: opts.example ?? null,
+        });
       } catch (err) {
+        await captureException(err, { action: "init" });
         if (err instanceof ConfigError) {
           console.error(chalk.red(`Config error: ${err.message}`));
           if (err.details) {

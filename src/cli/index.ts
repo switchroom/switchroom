@@ -15,6 +15,9 @@ import { registerUpdateCommand } from "./update.js";
 import { registerHandoffCommand } from "./handoff.js";
 import { registerDepsCommand } from "./deps.js";
 import { registerWorkspaceCommand } from "./workspace.js";
+import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
+
+installGlobalErrorHandlers();
 
 const pkg = JSON.parse(
   readFileSync(resolve(import.meta.dirname, "../../package.json"), "utf-8")
@@ -26,7 +29,15 @@ export const program = new Command()
     "Multi-agent orchestrator for Claude Code. One Telegram group, many specialized agents."
   )
   .version(pkg.version)
-  .option("-c, --config <path>", "Path to switchroom.yaml config file");
+  .option("-c, --config <path>", "Path to switchroom.yaml config file")
+  .hook("preAction", async (_thisCommand, actionCommand) => {
+    await captureEvent("cli_command_invoked", {
+      command: actionCommand.name(),
+      version: pkg.version,
+      node_version: process.version,
+      platform: process.platform,
+    });
+  });
 
 registerSetupCommand(program);
 registerDoctorCommand(program);
