@@ -1936,7 +1936,11 @@ type ReloadSemantics =
   | "restart-required";   // File changes MUST restart (MCP/settings/binary/template);
                           // agent won't pick up changes without a restart
 
-function classifyChange(path: string, agentDir: string): ReloadSemantics {
+function classifyChange(
+  path: string,
+  agentDir: string,
+  useHotReloadStable: boolean,
+): ReloadSemantics {
   // Get the path relative to agentDir
   const relPath = path.startsWith(agentDir)
     ? path.slice(agentDir.length).replace(/^\//, "")
@@ -1947,13 +1951,21 @@ function classifyChange(path: string, agentDir: string): ReloadSemantics {
   if (relPath.startsWith("workspace/memory/") && relPath.endsWith(".md")) return "hot";
   if (relPath === "workspace/HEARTBEAT.md") return "hot";
 
-  // Stale until restart — baked into --append-system-prompt at session start
-  // or auto-loaded by Claude Code at session start
-  if (relPath === "workspace/SOUL.md") return "stale-till-restart";
-  if (relPath === "workspace/AGENTS.md") return "stale-till-restart";
-  if (relPath === "workspace/USER.md") return "stale-till-restart";
-  if (relPath === "workspace/IDENTITY.md") return "stale-till-restart";
-  if (relPath === "workspace/TOOLS.md") return "stale-till-restart";
+  // Stable workspace files — classification depends on hotReloadStable flag
+  // When hotReloadStable is true, these are re-injected on every turn via hook
+  // When hotReloadStable is false (default), they're baked into --append-system-prompt at start
+  const stableWorkspaceFiles = [
+    "workspace/SOUL.md",
+    "workspace/AGENTS.md",
+    "workspace/USER.md",
+    "workspace/IDENTITY.md",
+    "workspace/TOOLS.md",
+  ];
+  if (stableWorkspaceFiles.includes(relPath)) {
+    return useHotReloadStable ? "hot" : "stale-till-restart";
+  }
+
+  // CLAUDE.md stays stale-till-restart regardless (Claude Code's own file-load convention)
   if (relPath === "CLAUDE.md") return "stale-till-restart";
   if (relPath === "workspace/CLAUDE.custom.md") return "stale-till-restart";
   if (relPath === "workspace/SOUL.custom.md") return "stale-till-restart";
@@ -2640,8 +2652,9 @@ Final answers still go through \`stream_reply\` with done=true as usual,
   const staleTillRestart: string[] = [];
   const restartRequired: string[] = [];
 
+  const useHotReloadStableClassify = agentConfig.channels?.telegram?.hotReloadStable === true;
   for (const change of changes) {
-    const semantics = classifyChange(change, agentDir);
+    const semantics = classifyChange(change, agentDir, useHotReloadStableClassify);
     if (semantics === "hot") {
       hot.push(change);
     } else if (semantics === "stale-till-restart") {
