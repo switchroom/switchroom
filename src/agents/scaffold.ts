@@ -266,8 +266,17 @@ function buildSessionGreetingScript(
   const hooks = agentConfig.hooks
     ? Object.keys(agentConfig.hooks).join(", ")
     : null;
+  // Cap visible skill names at 6 to stop the row from wrapping 4+ lines on
+  // Telegram mobile. The agent's own self-knowledge is the authoritative
+  // source for what skills it has; this is a status glance, not an
+  // inventory.
   const skills = agentConfig.skills?.length
-    ? agentConfig.skills.join(", ")
+    ? (() => {
+        const list = agentConfig.skills;
+        const max = 6;
+        if (list.length <= max) return list.join(", ");
+        return `${list.slice(0, max).join(", ")}, …+${list.length - max} more`;
+      })()
     : null;
   const session = [];
   if (agentConfig.session?.max_idle) session.push(`idle ${agentConfig.session.max_idle}`);
