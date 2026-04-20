@@ -132,10 +132,39 @@ esac
 # picks up the just-closed JSONL and the SessionStart hook never fires,
 # which means no session-greeting panel and no feeling of "fresh start"
 # from the user side. Consume the marker so it only applies to one boot.
+_FORCE_FRESH=0
 if [ -f "{{agentDir}}/.force-fresh-session" ]; then
   CONTINUE_FLAG=""
   rm -f "{{agentDir}}/.force-fresh-session"
+  _FORCE_FRESH=1
 fi
+
+# --- Session-mode signal for the session-greeting panel ---
+#
+# Tells the SessionStart hook (session-greeting.sh) what kind of session
+# this is so it can render an appropriate "Session" row in the panel:
+#   continue  — resumed an in-flight JSONL via --continue (tool state kept)
+#   handoff   — fresh claude session BUT a prior handoff briefing exists
+#   fresh     — fresh by /reset or /new (force-fresh marker consumed)
+#   cold      — first boot or no prior state at all
+# Epoch of most recent prior session (from JSONL mtime) is exported too so
+# the greeting can show a "2h ago" time-ago hint.
+if [ "$_FORCE_FRESH" = "1" ]; then
+  SWITCHROOM_SESSION_MODE="fresh"
+elif [ -n "$CONTINUE_FLAG" ]; then
+  SWITCHROOM_SESSION_MODE="continue"
+elif [ -s "{{agentDir}}/.handoff.md" ]; then
+  SWITCHROOM_SESSION_MODE="handoff"
+else
+  SWITCHROOM_SESSION_MODE="cold"
+fi
+export SWITCHROOM_SESSION_MODE
+
+SWITCHROOM_PRIOR_SESSION_EPOCH=""
+if [ -n "$_RESUME_LATEST_JSONL" ]; then
+  SWITCHROOM_PRIOR_SESSION_EPOCH="$(_stat_mtime "$_RESUME_LATEST_JSONL")"
+fi
+export SWITCHROOM_PRIOR_SESSION_EPOCH
 
 {{#if handoffEnabled}}
 # --- Session handoff briefing ---

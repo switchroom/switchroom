@@ -302,9 +302,11 @@ function buildSessionGreetingScript(
 
   // Telegram HTML — keep it compact for mobile. Omit rows that are
   // null (unset with no interesting default to show).
-  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, __SWITCHROOM_PLAN__, and
-  // __SWITCHROOM_QUOTA__ are resolved at runtime by the shell script so
-  // the greeting always reflects current state.
+  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, __SWITCHROOM_PLAN__,
+  // __SWITCHROOM_QUOTA__, and __SWITCHROOM_SESSION__ are resolved at
+  // runtime by the shell script so the greeting always reflects current
+  // state (Session row picks a continuity signal: resumed mid-turn,
+  // handoff-briefed fresh, reset-by-user fresh, or cold start).
   const text = [
     `<b>🎛️ Switchroom · ${escapeHtml(name)} online</b>`,
     ``,
@@ -312,13 +314,14 @@ function buildSessionGreetingScript(
     `<b>Auth</b>  __SWITCHROOM_AUTH__`,
     `<b>Plan</b>  __SWITCHROOM_PLAN__`,
     `<b>Quota</b>  __SWITCHROOM_QUOTA__`,
+    `<b>Session</b>  __SWITCHROOM_SESSION__`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
     deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
     `<b>Memory</b>  ${escapeHtml(memory)}`,
     hooks ? `<b>Hooks</b>  ${escapeHtml(hooks)}` : null,
     skills ? `<b>Skills</b>  ${escapeHtml(skills)}` : null,
-    `<b>Session</b>  ${escapeHtml(sessionStr)}`,
+    `<b>Limits</b>  ${escapeHtml(sessionStr)}`,
     `<b>Channel</b>  ${escapeHtml(plugin)}`,
   ].filter(Boolean).join("\n");
 
@@ -644,11 +647,81 @@ if command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
 fi
 [ -z "$QUOTA_STATUS" ] && QUOTA_STATUS="—"
 
+# Session continuity signal — tell the user whether this boot picked up
+# from a prior session or started fresh, and why. Inputs come from
+# start.sh which sets SWITCHROOM_SESSION_MODE (continue|handoff|fresh|cold)
+# and SWITCHROOM_PRIOR_SESSION_EPOCH (mtime of latest JSONL if any).
+#
+# Output examples:
+#   Session  ↩️ Picked up mid-turn (2h ago)
+#   Session  ↩️ Resumed: <first line of handoff> (2h ago)
+#   Session  🆕 Fresh start (last: <first line>)
+#   Session  ❄️ Cold start
+SESSION_STATUS="—"
+_fmt_ago() {
+  _epoch="$1"
+  [ -z "$_epoch" ] && { echo ""; return; }
+  _now=$(date +%s)
+  _delta=$((_now - _epoch))
+  [ "$_delta" -lt 0 ] && { echo ""; return; }
+  _h=$((_delta / 3600))
+  _m=$(( (_delta % 3600) / 60 ))
+  if [ "$_h" -lt 1 ]; then
+    echo "\${_m}m ago"
+  elif [ "$_h" -lt 24 ]; then
+    echo "\${_h}h ago"
+  else
+    _d=$((_h / 24))
+    echo "\${_d}d ago"
+  fi
+}
+_first_line_of_handoff() {
+  # TELEGRAM_STATE_DIR is <agentDir>/telegram. Its parent is the agent dir
+  # where .handoff.md lives (written by the Stop hook).
+  _file="$(dirname "$TELEGRAM_STATE_DIR")/.handoff.md"
+  [ ! -s "$_file" ] && { echo ""; return; }
+  # Strip leading hashes/whitespace/bullets. Cap to ~80 chars.
+  head -1 "$_file" 2>/dev/null | sed -E 's/^[# \t*-]+//' | cut -c1-80
+}
+SESSION_AGO="$(_fmt_ago "\${SWITCHROOM_PRIOR_SESSION_EPOCH:-}")"
+SESSION_SUMMARY="$(_first_line_of_handoff)"
+case "\${SWITCHROOM_SESSION_MODE:-cold}" in
+  continue)
+    if [ -n "$SESSION_AGO" ]; then
+      SESSION_STATUS="↩️ Picked up mid-turn ($SESSION_AGO)"
+    else
+      SESSION_STATUS="↩️ Picked up mid-turn"
+    fi
+    ;;
+  handoff)
+    if [ -n "$SESSION_SUMMARY" ] && [ -n "$SESSION_AGO" ]; then
+      SESSION_STATUS="↩️ Resumed: $SESSION_SUMMARY ($SESSION_AGO)"
+    elif [ -n "$SESSION_SUMMARY" ]; then
+      SESSION_STATUS="↩️ Resumed: $SESSION_SUMMARY"
+    elif [ -n "$SESSION_AGO" ]; then
+      SESSION_STATUS="↩️ Resumed ($SESSION_AGO)"
+    else
+      SESSION_STATUS="↩️ Resumed"
+    fi
+    ;;
+  fresh)
+    if [ -n "$SESSION_SUMMARY" ]; then
+      SESSION_STATUS="🆕 Fresh start (last: $SESSION_SUMMARY)"
+    else
+      SESSION_STATUS="🆕 Fresh start"
+    fi
+    ;;
+  cold|*)
+    SESSION_STATUS="❄️ Cold start"
+    ;;
+esac
+
 TEXT=${shellSingleQuote(text)}
 TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
 TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_PLAN__/$PLAN_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}"
+TEXT="\${TEXT//__SWITCHROOM_SESSION__/$SESSION_STATUS}"
 
 ${curlCalls.join("\n\n")}
 `;
