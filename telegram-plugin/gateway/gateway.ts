@@ -324,6 +324,7 @@ const chatThreadMap = new Map<string, number>()
 const activeStatusReactions = new Map<string, StatusReactionController>()
 const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>()
 const activeTurnStartedAt = new Map<string, number>()
+const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
 const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 const suppressPtyPreview = new Set<string>()
@@ -359,6 +360,20 @@ function purgeReactionTracking(key: string): void {
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
+  }
+
+  // If no more active turns and a restart is pending, perform it now
+  if (activeTurnStartedAt.size === 0 && pendingRestarts.size > 0) {
+    for (const [agentName, _timestamp] of pendingRestarts.entries()) {
+      process.stderr.write(`telegram gateway: turn completed, restarting ${agentName} now\n`);
+      try {
+        execSync(`systemctl --user restart switchroom-${agentName}.service`, { stdio: 'ignore' });
+        process.stderr.write(`telegram gateway: successfully restarted ${agentName}\n`);
+      } catch (err) {
+        process.stderr.write(`telegram gateway: restart failed for ${agentName}: ${err}\n`);
+      }
+      pendingRestarts.delete(agentName);
+    }
   }
 }
 
@@ -664,6 +679,45 @@ const ipcServer: IpcServer = createIpcServer({
 
   onHeartbeat(_client: IpcClient, _msg: HeartbeatMessage) {
     // Heartbeat received — no action needed, the server tracks lastHeartbeat
+  },
+
+  onScheduleRestart(_client: IpcClient, msg: ScheduleRestartMessage) {
+    const { agentName } = msg;
+
+    // Check if any turn is currently in flight
+    const turnInFlight = activeTurnStartedAt.size > 0;
+
+    if (!turnInFlight) {
+      // No active turn, restart immediately
+      try {
+        execSync(`systemctl --user restart switchroom-${agentName}.service`, { stdio: 'ignore' });
+        _client.send({
+          type: 'schedule_restart_result',
+          success: true,
+          restartedImmediately: true,
+        });
+        process.stderr.write(`telegram gateway: restarted ${agentName} immediately (no active turn)\n`);
+      } catch (err) {
+        _client.send({
+          type: 'schedule_restart_result',
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        process.stderr.write(`telegram gateway: restart failed for ${agentName}: ${err}\n`);
+      }
+    } else {
+      // Turn is active, schedule restart for when turn completes
+      process.stderr.write(`telegram gateway: scheduling restart for ${agentName} after current turn\n`);
+
+      // Set a flag that will be checked when turns complete
+      pendingRestarts.set(agentName, Date.now());
+
+      _client.send({
+        type: 'schedule_restart_result',
+        success: true,
+        waitingForTurn: true,
+      });
+    }
   },
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),

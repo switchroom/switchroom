@@ -1902,6 +1902,51 @@ export function scaffoldAgent(
 export interface ReconcileResult {
   agentDir: string;
   changes: string[];
+  changesBySemantics?: {
+    hot: string[];
+    staleTillRestart: string[];
+    restartRequired: string[];
+  };
+}
+
+/**
+ * Categorize a file change by its reload semantics.
+ */
+type ReloadSemantics =
+  | "hot"             // Active next turn, no restart needed (hook re-reads)
+  | "stale-till-restart"  // File is part of session-start bake; edits ignored until restart
+  | "restart-required";   // File changes MUST restart (MCP/settings/binary/template);
+                          // agent won't pick up changes without a restart
+
+function classifyChange(path: string, agentDir: string): ReloadSemantics {
+  // Get the path relative to agentDir
+  const relPath = path.startsWith(agentDir)
+    ? path.slice(agentDir.length).replace(/^\//, "")
+    : path;
+
+  // Hot — per-turn hook re-reads
+  if (relPath === "workspace/MEMORY.md") return "hot";
+  if (relPath.startsWith("workspace/memory/") && relPath.endsWith(".md")) return "hot";
+  if (relPath === "workspace/HEARTBEAT.md") return "hot";
+
+  // Stale until restart — baked into --append-system-prompt at session start
+  // or auto-loaded by Claude Code at session start
+  if (relPath === "workspace/SOUL.md") return "stale-till-restart";
+  if (relPath === "workspace/AGENTS.md") return "stale-till-restart";
+  if (relPath === "workspace/USER.md") return "stale-till-restart";
+  if (relPath === "workspace/IDENTITY.md") return "stale-till-restart";
+  if (relPath === "workspace/TOOLS.md") return "stale-till-restart";
+  if (relPath === "CLAUDE.md") return "stale-till-restart";
+  if (relPath === "workspace/CLAUDE.custom.md") return "stale-till-restart";
+  if (relPath === "workspace/SOUL.custom.md") return "stale-till-restart";
+
+  // Restart required — claude-code / MCP / subsystem lifecycle
+  if (relPath === ".mcp.json") return "restart-required";
+  if (relPath === ".claude/settings.json") return "restart-required";
+  if (relPath === "start.sh") return "restart-required";
+
+  // Unknown → treat as stale-till-restart (safe default)
+  return "stale-till-restart";
 }
 
 /**
@@ -2558,7 +2603,27 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     }
   }
 
-  return { agentDir, changes };
+  // Categorize changes by reload semantics
+  const hot: string[] = [];
+  const staleTillRestart: string[] = [];
+  const restartRequired: string[] = [];
+
+  for (const change of changes) {
+    const semantics = classifyChange(change, agentDir);
+    if (semantics === "hot") {
+      hot.push(change);
+    } else if (semantics === "stale-till-restart") {
+      staleTillRestart.push(change);
+    } else {
+      restartRequired.push(change);
+    }
+  }
+
+  return {
+    agentDir,
+    changes,
+    changesBySemantics: { hot, staleTillRestart, restartRequired },
+  };
 }
 
 /**

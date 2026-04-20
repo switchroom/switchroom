@@ -5,6 +5,7 @@ import type {
   HeartbeatMessage,
   PermissionRequestForward,
   RegisterMessage,
+  ScheduleRestartMessage,
   SessionEventForward,
   ToolCallMessage,
   ToolCallResult,
@@ -18,6 +19,7 @@ export interface IpcServerOptions {
   onSessionEvent: (client: IpcClient, msg: SessionEventForward) => void;
   onPermissionRequest: (client: IpcClient, msg: PermissionRequestForward) => void;
   onHeartbeat: (client: IpcClient, msg: HeartbeatMessage) => void;
+  onScheduleRestart: (client: IpcClient, msg: ScheduleRestartMessage) => void;
   log?: (msg: string) => void;
 }
 
@@ -78,6 +80,8 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof m.inputPreview === "string";
     case "heartbeat":
       return typeof m.agentName === "string" && m.agentName.length > 0;
+    case "schedule_restart":
+      return typeof m.agentName === "string" && m.agentName.length > 0;
     default:
       return false;
   }
@@ -92,6 +96,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onSessionEvent,
     onPermissionRequest,
     onHeartbeat,
+    onScheduleRestart,
     log = () => {},
   } = options;
 
@@ -152,6 +157,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       case "heartbeat":
         client.lastHeartbeat = Date.now();
         onHeartbeat(client, msg);
+        break;
+      case "schedule_restart":
+        onScheduleRestart(client, msg);
         break;
       default:
         log(`unknown IPC message type from client ${client.id}: ${(msg as any).type}`);

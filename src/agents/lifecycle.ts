@@ -1,6 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { connect } from "node:net";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveStatePath } from "../config/paths.js";
 
@@ -47,6 +48,80 @@ export function restartAgent(name: string): void {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to restart agent "${name}": ${message}`);
   }
+}
+
+/**
+ * Schedule a graceful restart via the gateway IPC. If the agent is idle,
+ * restart immediately. If a turn is in flight, wait for completion then restart.
+ */
+export function gracefulRestartAgent(name: string): Promise<{ restartedImmediately: boolean; waitingForTurn: boolean }> {
+  return new Promise((resolve, reject) => {
+    const stateDir = process.env.SWITCHROOM_STATE_DIR ?? resolveStatePath("");
+    const socketPath = join(stateDir, "gateway.sock");
+
+    if (!existsSync(socketPath)) {
+      reject(new Error("Gateway socket not found. Is the gateway running?"));
+      return;
+    }
+
+    const client = connect(socketPath);
+    let buffer = "";
+    let responseReceived = false;
+
+    client.on("connect", () => {
+      const msg = {
+        type: "schedule_restart",
+        agentName: name,
+      };
+      client.write(JSON.stringify(msg) + "\n");
+    });
+
+    client.on("data", (data) => {
+      buffer += data.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const response = JSON.parse(line);
+          if (response.type === "schedule_restart_result") {
+            responseReceived = true;
+            client.end();
+
+            if (response.success) {
+              resolve({
+                restartedImmediately: response.restartedImmediately ?? false,
+                waitingForTurn: response.waitingForTurn ?? false,
+              });
+            } else {
+              reject(new Error(response.error || "Graceful restart failed"));
+            }
+          }
+        } catch (err) {
+          // Ignore JSON parse errors, wait for more data
+        }
+      }
+    });
+
+    client.on("error", (err) => {
+      reject(new Error(`Failed to connect to gateway: ${err.message}`));
+    });
+
+    client.on("close", () => {
+      if (!responseReceived) {
+        reject(new Error("Gateway closed connection without responding"));
+      }
+    });
+
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      if (!responseReceived) {
+        client.end();
+        reject(new Error("Graceful restart request timed out"));
+      }
+    }, 5000);
+  });
 }
 
 export function enableAgent(name: string): void {

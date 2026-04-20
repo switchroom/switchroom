@@ -33,11 +33,20 @@ export interface ToolCallResult {
   error?: string;
 }
 
+export interface ScheduleRestartResult {
+  type: "schedule_restart_result";
+  success: boolean;
+  restartedImmediately?: boolean;
+  waitingForTurn?: boolean;
+  error?: string;
+}
+
 export type GatewayToClient =
   | InboundMessage
   | PermissionEvent
   | StatusEvent
-  | ToolCallResult;
+  | ToolCallResult
+  | ScheduleRestartResult;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -74,9 +83,15 @@ export interface HeartbeatMessage {
   agentName: string;
 }
 
+export interface ScheduleRestartMessage {
+  type: "schedule_restart";
+  agentName: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
   | SessionEventForward
   | PermissionRequestForward
-  | HeartbeatMessage;
+  | HeartbeatMessage
+  | ScheduleRestartMessage;

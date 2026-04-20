@@ -25,6 +25,8 @@ export function validateGatewayMessage(msg: unknown): msg is GatewayToClient {
       return typeof m.status === "string";
     case "tool_call_result":
       return typeof m.id === "string" && typeof m.success === "boolean";
+    case "schedule_restart_result":
+      return typeof m.success === "boolean";
     default:
       return false;
   }

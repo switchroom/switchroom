@@ -400,11 +400,12 @@ export function registerAgentCommand(program: Command): void {
       "--wait-timeout <ms>",
       "Override --wait timeout in milliseconds (default 300000)"
     )
+    .option("--graceful-restart", "Wait for active turn to complete before restarting (via gateway IPC)")
     .action(
       withConfigError(
         async (
           name: string,
-          opts: { force?: boolean; wait?: boolean; waitTimeout?: string }
+          opts: { force?: boolean; wait?: boolean; waitTimeout?: string; gracefulRestart?: boolean }
         ) => {
           const config = getConfig(program);
           const agentsDir = resolveAgentsDir(config);
@@ -512,8 +513,18 @@ export function registerAgentCommand(program: Command): void {
             }
 
             try {
-              restartAgent(n);
-              console.log(chalk.green(`Restarted ${n}`));
+              if (opts.gracefulRestart) {
+                const { gracefulRestartAgent } = await import("../agents/lifecycle.js");
+                const result = await gracefulRestartAgent(n);
+                if (result.restartedImmediately) {
+                  console.log(chalk.green(`Restarted ${n} immediately (no active turn)`));
+                } else if (result.waitingForTurn) {
+                  console.log(chalk.yellow(`Restart scheduled for ${n} (waiting for current turn to complete)`));
+                }
+              } else {
+                restartAgent(n);
+                console.log(chalk.green(`Restarted ${n}`));
+              }
             } catch (err) {
               console.error(
                 chalk.red(`Failed to restart ${n}: ${(err as Error).message}`)
@@ -571,12 +582,13 @@ export function registerAgentCommand(program: Command): void {
       "Re-apply switchroom.yaml to an existing agent (rewrites .mcp.json + settings.json + start.sh + CLAUDE.md)"
     )
     .option("--restart", "Restart the agent after reconciling")
+    .option("--graceful-restart", "Wait for active turn to complete before restarting")
     .option(
       "--preserve-claude-md",
       "Opt out of regenerating CLAUDE.md — use if you have hand-edits you don't want to migrate to CLAUDE.custom.md yet"
     )
     .action(
-      withConfigError(async (name: string, opts: { restart?: boolean; preserveClaudeMd?: boolean }) => {
+      withConfigError(async (name: string, opts: { restart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean }) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
         const configPath = getConfigPath(program);
@@ -608,16 +620,64 @@ export function registerAgentCommand(program: Command): void {
             } else {
               agentsTouched++;
               totalChanges += result.changes.length;
-              console.log(chalk.green(`  ${n}: updated`));
-              for (const f of result.changes) {
-                console.log(chalk.gray(`    - ${f}`));
+              console.log(chalk.green(`  ${n}: reconciled (${result.changes.length} file${result.changes.length === 1 ? "" : "s"})`));
+
+              // Categorize and display changes by reload semantics
+              const { changesBySemantics } = result;
+              if (changesBySemantics) {
+                const { hot, staleTillRestart, restartRequired } = changesBySemantics;
+
+                if (restartRequired.length > 0) {
+                  console.log(chalk.yellow("\n  Changed (restart REQUIRED, MCP/settings/launch):"));
+                  for (const f of restartRequired) {
+                    console.log(chalk.yellow(`    - ${f}`));
+                  }
+                }
+
+                if (staleTillRestart.length > 0) {
+                  console.log(chalk.yellow("\n  Changed (STALE until restart, stable prefix):"));
+                  for (const f of staleTillRestart) {
+                    console.log(chalk.yellow(`    - ${f}`));
+                  }
+                }
+
+                if (hot.length > 0) {
+                  console.log(chalk.green("\n  Changed (HOT, active next turn, no restart needed):"));
+                  for (const f of hot) {
+                    console.log(chalk.green(`    - ${f}`));
+                  }
+                }
+
+                // If only hot changes, suppress restart suggestion
+                const needsRestart = restartRequired.length > 0 || staleTillRestart.length > 0;
+                if (!needsRestart && hot.length > 0) {
+                  console.log(chalk.green("\n  (no restart needed, changes active next turn)"));
+                } else if (needsRestart && !opts.restart && !opts.gracefulRestart) {
+                  console.log(chalk.gray(`\nRestart: switchroom agent restart ${n}`));
+                  console.log(chalk.gray(`  (Or add --restart / --graceful-restart to this reconcile)`));
+                }
+              } else {
+                // Fallback if changesBySemantics not available (shouldn't happen)
+                for (const f of result.changes) {
+                  console.log(chalk.gray(`    - ${f}`));
+                }
               }
             }
 
-            if (opts.restart && result.changes.length > 0) {
+            if ((opts.restart || opts.gracefulRestart) && result.changes.length > 0) {
               try {
-                restartAgent(n);
-                console.log(chalk.green(`  ${n}: restarted`));
+                if (opts.gracefulRestart) {
+                  const { gracefulRestartAgent } = await import("../agents/lifecycle.js");
+                  const result = await gracefulRestartAgent(n);
+                  if (result.restartedImmediately) {
+                    console.log(chalk.green(`  ${n}: restarted immediately (no active turn)`));
+                  } else if (result.waitingForTurn) {
+                    console.log(chalk.yellow(`  ${n}: restart scheduled (waiting for current turn to complete)`));
+                  }
+                } else {
+                  restartAgent(n);
+                  console.log(chalk.green(`  ${n}: restarted`));
+                }
               } catch (err) {
                 console.error(
                   chalk.red(`  ${n}: restart failed: ${(err as Error).message}`)
