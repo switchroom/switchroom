@@ -1864,8 +1864,12 @@ export function reconcileAgent(
     : "http://127.0.0.1:8888";
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
+  // No existsSync guard: start.sh is a pure function of config+template.
+  // If it's missing (user nuked it, bad manual edit, partial disk copy),
+  // regenerate it. Previously we bailed on missing file which left the
+  // agent permanently unable to launch until a full `agent create` rebuild.
   const startShPath = join(agentDir, "start.sh");
-  if (existsSync(startShPath)) {
+  {
     const basePath = getBaseProfilePath();
     const startShContext: Record<string, unknown> = {
       name,
@@ -1888,9 +1892,38 @@ export function reconcileAgent(
         return out;
       })(),
       model: agentConfig.model,
-      systemPromptAppendShellQuoted: agentConfig.system_prompt_append
-        ? shellSingleQuote(agentConfig.system_prompt_append)
-        : undefined,
+      // Keep in lockstep with buildScaffoldContext's systemPromptAppendShellQuoted:
+      // when the agent uses the switchroom telegram plugin, append the
+      // human-voice progress_update guidance block so agents know to send
+      // natural-language check-ins alongside the emoji reaction ladder.
+      systemPromptAppendShellQuoted: (() => {
+        const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(agentConfig);
+        const baseAppend = agentConfig.system_prompt_append ?? '';
+        const telegramGuidance = `## Progress updates (human-style check-ins)
+
+You're talking to a human colleague on Telegram. Alongside the emoji status
+ladder, send a short \`progress_update\` at inflection points, the moments a
+senior colleague would ping the person who asked them to do something:
+
+- **Plan formed:** "Got it. Going to do X first, then Y, then Z."
+- **Pivot or blocker:** "First approach didn't work because <reason>. Trying
+  <alternative> instead."
+- **Chunk finished:** "Done with X. Starting Y now."
+
+Keep them short (one or two sentences). Don't narrate every step, the pinned
+progress card shows that for free. Don't send an update on a trivial one-shot
+task. Send them when a colleague would genuinely want to know what's happening.
+
+Final answers still go through \`stream_reply\` with done=true as usual,
+\`progress_update\` is only for mid-turn check-ins.`;
+        if (useSwitchroomPlugin) {
+          const combined = baseAppend.length > 0
+            ? `${baseAppend}\n\n---\n\n${telegramGuidance}`
+            : telegramGuidance;
+          return shellSingleQuote(combined);
+        }
+        return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
+      })(),
       extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
         ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
         : undefined,
@@ -1902,7 +1935,9 @@ export function reconcileAgent(
       resumeMaxBytes:
         agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
     };
-    const beforeStartSh = readFileSync(startShPath, "utf-8");
+    const beforeStartSh = existsSync(startShPath)
+      ? readFileSync(startShPath, "utf-8")
+      : "";
     const afterStartSh = renderTemplate(join(basePath, "start.sh.hbs"), startShContext);
     if (afterStartSh !== beforeStartSh) {
       writeFileSync(startShPath, afterStartSh, "utf-8");
