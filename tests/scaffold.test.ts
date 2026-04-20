@@ -249,7 +249,7 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain('MONTHLY_BUDGET=""');
   });
 
-  it("session greeting skips session recycling via gateway socket inode dedupe", () => {
+  it("session greeting dedupes on gateway process start time (not socket inode)", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("recycle-agent", config, tmpDir, telegramConfig);
     const greeting = readFileSync(
@@ -257,13 +257,50 @@ describe("scaffoldAgent", () => {
       "utf-8",
     );
 
-    expect(greeting).toContain("gateway.sock");
-    expect(greeting).toContain("SOCK_INODE");
-    expect(greeting).toContain("greeted-sock-inode");
+    // The gateway.sock Unix socket file is reused across systemctl
+    // restart, so its inode is stable. Using inode as the dedupe key
+    // silently suppressed the greeting whenever we deployed via
+    // systemctl restart (Ken hit this during OpenClawification deploys).
+    // Current dedupe reads /proc/<pid> start time of the process
+    // listening on the socket instead.
+    expect(greeting).toContain("_gateway_start_time");
+    expect(greeting).toContain("greeted-gateway-start");
+    expect(greeting).toContain("GATEWAY_STARTED_AT");
+    expect(greeting).toContain("GREETED_AT");
+    // session-recycling comment still explains the intent
     expect(greeting).toContain("session recycling");
+    // The old inode-only dedupe must be gone (would regress).
+    expect(greeting).not.toContain("greeted-sock-inode");
   });
 
-  it("session greeting bypasses inode dedupe when a restart marker is present", () => {
+  it("session greeting finds gateway PID via ss with lsof fallback", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("pidfind-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // Prefers `ss -xlnp` (cheap, no /proc walk); falls back to lsof when
+    // ss is unavailable (minimal images).
+    expect(greeting).toContain("ss -xlnp");
+    expect(greeting).toContain("lsof -t");
+    expect(greeting).toContain("/proc/$pid");
+  });
+
+  it("session greeting treats corrupt marker as 0 (re-fires instead of silently skipping)", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("corrupt-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // Non-numeric markers coerce to 0 so we don't suppress forever on a
+    // corrupt file (which would be worse UX than a duplicate greeting).
+    expect(greeting).toMatch(/case "\$GREETED_AT" in ''\|\*\[!0-9\]\*\) GREETED_AT=0 ;; esac/);
+    expect(greeting).toMatch(/case "\$GATEWAY_STARTED_AT" in ''\|\*\[!0-9\]\*\) GATEWAY_STARTED_AT=0 ;; esac/);
+  });
+
+  it("session greeting bypasses dedupe when a restart marker is present", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("restart-agent", config, tmpDir, telegramConfig);
     const greeting = readFileSync(
@@ -277,14 +314,12 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain("restart-pending.json");
     expect(greeting).toContain('RESTART_MARKER_FILE="$(dirname "$TELEGRAM_STATE_DIR")/restart-pending.json"');
     expect(greeting).toContain("RESTART_REQUESTED=1");
-    // The inode early-exit is gated on RESTART_REQUESTED=0 so an explicit
-    // restart fires the greeting even when the socket inode is unchanged.
-    expect(greeting).toMatch(
-      /if \[ "\$RESTART_REQUESTED" = "0" \] && \[ -f "\$GREETED_INODE_FILE" \]/,
-    );
-    // Still records the inode after firing so subsequent session recycles
-    // on the same gateway boot are properly deduped.
-    expect(greeting).toContain('printf \'%s\' "$SOCK_INODE" > "$GREETED_INODE_FILE"');
+    // The dedupe early-exit is gated on RESTART_REQUESTED=0 so an
+    // explicit restart fires the greeting regardless of gateway lifetime.
+    expect(greeting).toMatch(/if \[ "\$RESTART_REQUESTED" = "0" \][\s\\]+&& \[ "\$GATEWAY_STARTED_AT" -gt 0 \]/);
+    // Still records the firing timestamp so subsequent session recycles
+    // on the same gateway lifetime are properly deduped.
+    expect(greeting).toContain('printf \'%s\' "$NOW" > "$GREETED_MARKER_FILE"');
   });
 
   it("generates telegram .env with bot token", () => {

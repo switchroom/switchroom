@@ -341,23 +341,56 @@ HOOK_INPUT=""
 if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
 
 # Skip greeting for session recycling: agents without --continue exit after
-# each turn and systemd restarts them. Dedupe by gateway socket inode — send
-# the greeting once per gateway boot, suppress on subsequent session recycles.
+# each turn and systemd restarts them. Dedupe by comparing the gateway's
+# current process start time against the last time we fired the greeting:
+# if our marker is older than the running gateway, the gateway has
+# restarted since we last greeted — send a fresh greeting.
+#
+# Why not socket inode? systemctl restart reuses the Unix socket file, so
+# its inode is stable across restarts. An inode-based dedupe silently
+# suppresses the greeting whenever we deploy via systemctl restart.
+# Ken hit this repeatedly during the OpenClawification deploys.
+#
 # EXCEPTION: if a restart marker exists (written by /restart, /reconcile
-# --restart, or /update), the user explicitly asked for a restart — fire the
-# greeting even when the gateway socket inode is unchanged.
+# --restart, or /update), the user explicitly asked for a restart — fire
+# the greeting regardless.
 GATEWAY_SOCK="$TELEGRAM_STATE_DIR/gateway.sock"
 RESTART_MARKER_FILE="$(dirname "$TELEGRAM_STATE_DIR")/restart-pending.json"
 NOW=$(date +%s)
 RESTART_REQUESTED=0
 [ -f "$RESTART_MARKER_FILE" ] && RESTART_REQUESTED=1
+
+# Resolve gateway process start time (epoch seconds) by finding the PID
+# listening on the Unix socket and reading /proc/<pid>. Returns 0 if we
+# can't find it, which disables the optimisation and always fires.
+_gateway_start_time() {
+  if [ ! -S "$GATEWAY_SOCK" ]; then echo 0; return; fi
+  local pid
+  # ss -xlnp is the cheap path (no /proc walk); falls through to lsof if ss absent.
+  pid=$(ss -xlnp 2>/dev/null | awk -v s="$GATEWAY_SOCK" '$0 ~ s {match($0, /pid=([0-9]+)/, m); if (m[1]) print m[1]}' | head -1)
+  if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -t "$GATEWAY_SOCK" 2>/dev/null | head -1)
+  fi
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then echo 0; return; fi
+  stat -c %Y "/proc/$pid" 2>/dev/null || echo 0
+}
+
 if [ -S "$GATEWAY_SOCK" ]; then
-  SOCK_INODE=$(stat -c %i "$GATEWAY_SOCK" 2>/dev/null || echo 0)
-  GREETED_INODE_FILE="$TELEGRAM_STATE_DIR/greeted-sock-inode"
-  if [ "$RESTART_REQUESTED" = "0" ] && [ -f "$GREETED_INODE_FILE" ] && [ "$(cat "$GREETED_INODE_FILE" 2>/dev/null)" = "$SOCK_INODE" ]; then
+  GATEWAY_STARTED_AT=$(_gateway_start_time)
+  GREETED_MARKER_FILE="$TELEGRAM_STATE_DIR/greeted-gateway-start"
+  GREETED_AT=0
+  [ -f "$GREETED_MARKER_FILE" ] && GREETED_AT=$(cat "$GREETED_MARKER_FILE" 2>/dev/null || echo 0)
+  # Treat non-numeric reads as 0 so a corrupt marker re-fires rather than silently suppressing forever.
+  case "$GREETED_AT" in ''|*[!0-9]*) GREETED_AT=0 ;; esac
+  case "$GATEWAY_STARTED_AT" in ''|*[!0-9]*) GATEWAY_STARTED_AT=0 ;; esac
+  # Skip only if: no explicit restart request AND we have a usable gateway
+  # start time AND we've already greeted *for this gateway process lifetime*.
+  if [ "$RESTART_REQUESTED" = "0" ] \
+     && [ "$GATEWAY_STARTED_AT" -gt 0 ] \
+     && [ "$GREETED_AT" -ge "$GATEWAY_STARTED_AT" ]; then
     exit 0
   fi
-  printf '%s' "$SOCK_INODE" > "$GREETED_INODE_FILE" 2>/dev/null || true
+  printf '%s' "$NOW" > "$GREETED_MARKER_FILE" 2>/dev/null || true
 fi
 
 # Idempotency guard: Claude Code fires SessionStart multiple times on some
