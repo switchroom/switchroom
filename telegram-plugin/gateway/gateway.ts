@@ -84,6 +84,7 @@ import {
   clearActiveReactions,
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
+import { fetchQuota, formatQuotaBlock } from '../quota-check.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import type {
@@ -2717,6 +2718,21 @@ bot.command('memory', async ctx => {
   const query = ctx.match?.trim()
   if (!query) { await switchroomReply(ctx, 'Usage: /memory <search query>'); return }
   await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search')
+})
+
+bot.command('usage', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) {
+    await switchroomReply(ctx, '<b>/usage:</b> cannot resolve agent dir.', { html: true })
+    return
+  }
+  const result = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
+  if (!result.ok) {
+    await switchroomReply(ctx, `<b>/usage:</b> ${escapeHtmlForTg(result.reason)}`, { html: true })
+    return
+  }
+  await switchroomReply(ctx, formatQuotaBlock(result.data), { html: true })
 })
 
 bot.command('doctor', async ctx => {
