@@ -406,12 +406,18 @@ if [ -S "$GATEWAY_SOCK" ]; then
 fi
 
 # Idempotency guard: Claude Code fires SessionStart multiple times on some
-# restart paths. Use a 30s time-window marker instead of per-session-id dedup.
+# restart paths. Use a 60s time-window marker instead of per-session-id dedup.
+# The 30s window that shipped originally was occasionally short enough that
+# the second fire slipped through when the greeting itself took >20s (large
+# transcript archives, cold npx cache). 60s gives enough margin for the
+# full greeting latency plus a buffer. If two legitimate restarts happen
+# within 60s we just skip the second greeting — a small UX cost for
+# deterministic no-dupe behaviour.
 # Atomic via mkdir so concurrent invocations race cleanly.
 GREETING_MARKER="$TELEGRAM_STATE_DIR/greeting-lock"
 if [ -d "$GREETING_MARKER" ]; then
   LAST=$(stat -c %Y "$GREETING_MARKER" 2>/dev/null || echo 0)
-  if [ $((NOW - LAST)) -lt 30 ]; then
+  if [ $((NOW - LAST)) -lt 60 ]; then
     exit 0
   fi
   rmdir "$GREETING_MARKER" 2>/dev/null || true

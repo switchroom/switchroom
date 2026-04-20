@@ -336,6 +336,20 @@ describe("scaffoldAgent", () => {
     expect(greeting).toMatch(/export CLAUDE_CONFIG_DIR="\$\{CLAUDE_CONFIG_DIR:-\$\(dirname "\$TELEGRAM_STATE_DIR"\)\/\.claude\}"/);
   });
 
+  it("session greeting uses a 60s idempotency window (widened from the original 30s)", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("idem-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // Guards against regression to the stingy original window. The second
+    // SessionStart fire from Claude Code can arrive >30s after the first
+    // when the first took >20s (ccusage on large transcript archives).
+    expect(greeting).toMatch(/if \[ \$\(\(NOW - LAST\)\) -lt 60 \]/);
+    expect(greeting).not.toMatch(/if \[ \$\(\(NOW - LAST\)\) -lt 30 \]/);
+  });
+
   it("session greeting caps Skills row at 6 with '…+N more' suffix for long lists", () => {
     const many = [
       "a","b","c","d","e","f","g","h","i",
