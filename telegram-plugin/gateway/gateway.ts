@@ -2520,6 +2520,22 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
     }
   } catch {}
   writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
+
+  // Force-fresh-session marker: tell start.sh to skip --continue on next
+  // boot so the user actually gets a new Claude session (and therefore a
+  // SessionStart greeting). Flushing .handoff.md alone is not enough,
+  // because start.sh auto-mode picks --continue whenever the JSONL
+  // session file still exists under ~/.claude/projects/<slug>/. The
+  // marker is consumed (removed) by start.sh on that one boot, so normal
+  // resume behavior returns immediately after.
+  if (agentDir != null) {
+    try {
+      writeFileSync(join(agentDir, '.force-fresh-session'), `${kind} at ${new Date().toISOString()}\n`, 'utf8')
+    } catch (err) {
+      process.stderr.write(`telegram gateway: failed to write force-fresh marker: ${err}\n`)
+    }
+  }
+
   await sweepBeforeSelfRestart()
   spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
 }

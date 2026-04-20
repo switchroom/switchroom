@@ -124,6 +124,19 @@ case "$SWITCHROOM_RESUME_MODE" in
     ;;
 esac
 
+# --- /reset and /new override: force fresh session ---
+#
+# When the user runs /reset or /new in Telegram the gateway writes a
+# marker file here to signal "this boot must start a fresh Claude session
+# even if --continue would otherwise resume." Without this, auto-resume
+# picks up the just-closed JSONL and the SessionStart hook never fires,
+# which means no session-greeting panel and no feeling of "fresh start"
+# from the user side. Consume the marker so it only applies to one boot.
+if [ -f "{{agentDir}}/.force-fresh-session" ]; then
+  CONTINUE_FLAG=""
+  rm -f "{{agentDir}}/.force-fresh-session"
+fi
+
 {{#if handoffEnabled}}
 # --- Session handoff briefing ---
 # On a normal shutdown the Stop hook writes .handoff.md (compact
