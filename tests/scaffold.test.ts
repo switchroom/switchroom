@@ -300,6 +300,57 @@ describe("scaffoldAgent", () => {
     expect(greeting).toMatch(/case "\$GATEWAY_STARTED_AT" in ''\|\*\[!0-9\]\*\) GATEWAY_STARTED_AT=0 ;; esac/);
   });
 
+  it("session greeting hook has a generous timeout (not the stingy default)", () => {
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "timeout-agent": config },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent("timeout-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    // SessionStart hook. The original 5s budget was too tight — ccusage
+    // alone takes 3-8s on agents with 300+ local transcripts, so the hook
+    // got SIGKILL'd and the Quota/Auth rows silently rendered as "—".
+    const sessionStart = settings.hooks?.SessionStart ?? [];
+    const greetingHook = sessionStart
+      .flatMap((s: { hooks?: Array<{ command?: string; timeout?: number }> }) => s.hooks ?? [])
+      .find((h: { command?: string }) => h.command?.includes("session-greeting.sh"));
+    expect(greetingHook).toBeDefined();
+    expect(greetingHook.timeout).toBeGreaterThanOrEqual(15);
+  });
+
+  it("session greeting exports CLAUDE_CONFIG_DIR for ccusage", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("ccusage-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // ccusage scans $CLAUDE_CONFIG_DIR/projects by default. Without this
+    // export, a hook that loses the env silently queries ~/.claude
+    // instead of the agent's own transcripts (Ken's assistant was
+    // showing the wrong quota because of this).
+    expect(greeting).toMatch(/export CLAUDE_CONFIG_DIR="\$\{CLAUDE_CONFIG_DIR:-\$\(dirname "\$TELEGRAM_STATE_DIR"\)\/\.claude\}"/);
+  });
+
+  it("session greeting gateway-pid extraction uses POSIX sed, not gawk", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("pidparse-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // gawk's `match(regex, arr)` three-arg form failed loudly on plain
+    // awk with "syntax error at or near ,". Use POSIX sed so the script
+    // works on minimal images (alpine, busybox).
+    expect(greeting).toContain("sed -n 's|.*pid=\\([0-9]\\{1,\\}\\).*|\\1|p'");
+    // Confirm the old gawk syntax is gone.
+    expect(greeting).not.toMatch(/match\(\$0,.*?,\s*m\)/);
+  });
+
   it("session greeting bypasses dedupe when a restart marker is present", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("restart-agent", config, tmpDir, telegramConfig);
