@@ -102,8 +102,8 @@ import {
   nextLockout,
   type LockoutRecord,
 } from '../auto-fallback.js'
-import { currentActiveSlot, markSlotQuotaExhausted } from '../../src/auth/accounts.js'
-import { fallbackToNextSlot } from '../../src/auth/manager.js'
+import { markSlotQuotaExhausted } from '../../src/auth/accounts.js'
+import { fallbackToNextSlot, currentActiveSlot } from '../../src/auth/manager.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import type {
