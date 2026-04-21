@@ -329,6 +329,99 @@ export async function buildAgentStatusReport(
 }
 
 /**
+ * Poll `buildAgentStatusReport` until every component relevant to readiness
+ * is `ok`, or until the timeout elapses. This backs the B1 readiness gate
+ * on `switchroom agent start|restart`: instead of returning success the
+ * moment a process is spawned, callers can wait for the agent to be
+ * actually serveable.
+ *
+ * "Ready" here means the same thing `formatStatusText` calls green:
+ *   - claude systemd unit active with a pid
+ *   - gateway systemd unit active with a pid
+ *   - Hindsight reachable AND its bank exists (when configured for this agent)
+ *   - Telegram gateway has logged `polling as @<bot>` without a later failure
+ *
+ * The `messages` check is intentionally excluded — a fresh agent with an
+ * empty history.db should still be considered ready.
+ *
+ * Returns once ready (`ready: true`) or the deadline passes
+ * (`ready: false`, with `notReady` naming which components are still not ok
+ * and `report` holding the final status for formatting). Errors from the
+ * underlying probes are surfaced via the report itself; they do not throw.
+ */
+export interface WaitForAgentReadyResult {
+  ready: boolean;
+  elapsedMs: number;
+  report: AgentStatusReport;
+  /** Components that are still not ok at the moment of return. */
+  notReady: string[];
+}
+
+export interface WaitForAgentReadyOptions {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  /**
+   * Injectable sleep so tests can advance a fake clock instead of waiting
+   * in real time.
+   */
+  sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injectable clock for the same reason. Defaults to `Date.now`.
+   */
+  now?: () => number;
+}
+
+export async function waitForAgentReady(
+  inputs: StatusInputs,
+  options: WaitForAgentReadyOptions = {},
+): Promise<WaitForAgentReadyResult> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 750;
+  const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = options.now ?? Date.now;
+
+  const startedAt = now();
+  const deadline = startedAt + timeoutMs;
+
+  let report = await buildAgentStatusReport(inputs);
+  let notReady = readinessGaps(report);
+
+  while (notReady.length > 0) {
+    if (now() >= deadline) {
+      return {
+        ready: false,
+        elapsedMs: now() - startedAt,
+        report,
+        notReady,
+      };
+    }
+    await sleep(pollIntervalMs);
+    report = await buildAgentStatusReport(inputs);
+    notReady = readinessGaps(report);
+  }
+
+  return {
+    ready: true,
+    elapsedMs: now() - startedAt,
+    report,
+    notReady: [],
+  };
+}
+
+/**
+ * Return the list of component names that are not ok for readiness
+ * purposes. `messages` is excluded deliberately (see waitForAgentReady).
+ */
+export function readinessGaps(report: AgentStatusReport): string[] {
+  const gaps: string[] = [];
+  if (report.claude.state !== "ok") gaps.push("claude");
+  if (report.gateway.state !== "ok") gaps.push("gateway");
+  if (report.hindsight.state !== "ok") gaps.push("hindsight");
+  if (report.polling.state !== "ok") gaps.push("polling");
+  return gaps;
+}
+
+/**
  * Grep-stable text formatter. Each line is `key: value`, where `key` is
  * a stable short identifier (no colors, no box drawing) so shell scripts
  * can `| grep ^claude:` reliably.
