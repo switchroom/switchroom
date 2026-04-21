@@ -12,7 +12,9 @@ import {
   checkDepsCacheWritable,
   checkSkillsPrerequisites,
   checkConfig,
+  checkGatewayUnit,
 } from "../src/cli/doctor.js";
+import { generateGatewayUnit } from "../src/agents/systemd.js";
 import { findConfigFile } from "../src/config/loader.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
 
@@ -436,6 +438,67 @@ describe("checkSkillsPrerequisites", () => {
     for (const r of results) {
       expect(["ok", "warn", "fail"]).toContain(r.status);
     }
+  });
+});
+
+describe("checkGatewayUnit", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = resolve(tmpdir(), `switchroom-doctor-gw-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("reports ok when the unit pins SWITCHROOM_AGENT_NAME", () => {
+    const unitPath = join(tempDir, "switchroom-clerk-gateway.service");
+    writeFileSync(
+      unitPath,
+      generateGatewayUnit("/home/user/.switchroom/agents/clerk/telegram", "clerk"),
+    );
+    const result = checkGatewayUnit("clerk", unitPath);
+    expect(result.status).toBe("ok");
+    expect(result.detail).toContain("SWITCHROOM_AGENT_NAME=clerk");
+  });
+
+  it("reports fail when the unit is missing SWITCHROOM_AGENT_NAME", () => {
+    const unitPath = join(tempDir, "switchroom-clerk-gateway.service");
+    // Hand-craft a stale unit without the env var — matches the buggy
+    // unit shape that produced the "/restart silently fails" production
+    // regression.
+    writeFileSync(
+      unitPath,
+      [
+        "[Service]",
+        "ExecStart=/bin/true",
+        "Environment=TELEGRAM_STATE_DIR=/tmp/clerk/telegram",
+        "",
+      ].join("\n"),
+    );
+    const result = checkGatewayUnit("clerk", unitPath);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toContain("SWITCHROOM_AGENT_NAME");
+    expect(result.fix).toContain("reconcile");
+  });
+
+  it("reports warn when the unit file doesn't exist", () => {
+    const result = checkGatewayUnit("clerk", join(tempDir, "missing.service"));
+    expect(result.status).toBe("warn");
+    expect(result.detail).toContain("not installed");
+  });
+
+  it("requires the agent name in the env value to match exactly", () => {
+    const unitPath = join(tempDir, "switchroom-clerk-gateway.service");
+    // Wrong name — a stale unit from a different agent must not pass.
+    writeFileSync(
+      unitPath,
+      generateGatewayUnit("/tmp/lawgpt/telegram", "lawgpt"),
+    );
+    const result = checkGatewayUnit("clerk", unitPath);
+    expect(result.status).toBe("fail");
   });
 });
 

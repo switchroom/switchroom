@@ -664,6 +664,71 @@ export async function checkTelegram(config: SwitchroomConfig): Promise<CheckResu
   return results;
 }
 
+/**
+ * Verify that an agent's generated gateway systemd unit pins
+ * `Environment=SWITCHROOM_AGENT_NAME=<agent>` into the gateway process's
+ * environment.
+ *
+ * Without that env var the gateway falls back to `basename(process.cwd())`,
+ * which is literally the string "telegram" because `WorkingDirectory` is
+ * `.../<agent>/telegram`. That makes every self-targeting command
+ * (`/restart`, `/reconcile --restart`, `/update`, etc.) resolve the agent
+ * as "telegram" — a name that doesn't exist in switchroom.yaml — so the
+ * detached `switchroom agent <verb>` child exits non-zero and the user
+ * sees nothing happen. See `generateGatewayUnit()` in
+ * `src/agents/systemd.ts` for the matching producer-side fix.
+ *
+ * Overridable via `unitPath` for tests.
+ * @internal exported for testing
+ */
+export function checkGatewayUnit(
+  agentName: string,
+  unitPath: string = resolve(
+    process.env.HOME ?? "/root",
+    ".config/systemd/user",
+    `switchroom-${agentName}-gateway.service`,
+  ),
+): CheckResult {
+  const label = `${agentName}: gateway unit`;
+  if (!existsSync(unitPath)) {
+    return {
+      name: label,
+      status: "warn",
+      detail: `${unitPath} not installed`,
+      fix: `Run \`switchroom reconcile --restart\` to install the gateway unit`,
+    };
+  }
+
+  let content: string;
+  try {
+    content = readFileSync(unitPath, "utf-8");
+  } catch (err) {
+    return {
+      name: label,
+      status: "fail",
+      detail: `unreadable: ${(err as Error).message}`,
+      fix: `Run \`switchroom reconcile --restart\``,
+    };
+  }
+
+  const expected = `Environment=SWITCHROOM_AGENT_NAME=${agentName}`;
+  if (!content.includes(expected)) {
+    return {
+      name: label,
+      status: "fail",
+      detail:
+        `missing \`${expected}\` — self-targeting commands (/restart, /reconcile) will silently fail`,
+      fix: `Run \`switchroom reconcile --restart\` to regenerate the gateway unit and bounce the gateway`,
+    };
+  }
+
+  return {
+    name: label,
+    status: "ok",
+    detail: `SWITCHROOM_AGENT_NAME=${agentName} set`,
+  };
+}
+
 function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
   const agentsDir = resolveAgentsDir(config);
@@ -780,6 +845,12 @@ function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[
 
     // 4. MCP wireup drift detection (switchroom-telegram plugin agents)
     if (agentConfig.channels?.telegram?.plugin === "switchroom") {
+      // 4a. Gateway unit health — ensures the generated systemd unit
+      // pins the agent name into the gateway process's environment so
+      // self-targeting commands (/restart, /reconcile, /update) resolve
+      // correctly instead of falling back to basename(cwd) == "telegram".
+      results.push(checkGatewayUnit(name));
+
       const mcpJsonPath = join(agentDir, ".mcp.json");
       if (!existsSync(mcpJsonPath)) {
         results.push({
