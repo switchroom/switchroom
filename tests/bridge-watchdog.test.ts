@@ -54,9 +54,20 @@ describe("bridge-watchdog.sh — dynamic agent discovery (regression guard)", ()
     expect(script).toMatch(/exit 0/);
   });
 
-  it("skips agents whose agent service is inactive (PartOf handles the inverse)", () => {
+  it("heals agents whose agent service is inactive (start them, don't silently skip)", () => {
+    // Regression: 2026-04-22 incident #2. clerk's start.sh exited with
+    // status=0/SUCCESS (clean exit, not a crash). Restart=on-failure
+    // doesn't restart on clean exits. Previous watchdog skipped
+    // inactive services entirely. Result: agent dead indefinitely
+    // while the gateway stayed up.
     expect(script).toMatch(/systemctl --user is-active --quiet.*\$agent_svc/);
-    expect(script).toMatch(/continue/);
+    expect(script).toMatch(/systemctl --user start "\$agent_svc"/);
+    expect(script).toMatch(/agent service is inactive/);
+  });
+
+  it("does NOT restart an agent in 'failed' state (needs operator reset-failed)", () => {
+    expect(script).toMatch(/\[\[ "\$state" == "failed" \]\]/);
+    expect(script).toMatch(/needs operator reset-failed/);
   });
 
   it("uses strings(1) to bypass PTY control codes in the gateway log", () => {
