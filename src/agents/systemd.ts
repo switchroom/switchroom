@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
@@ -123,6 +123,60 @@ export function resolveGatewayUnitName(
  * exits non-zero — silently, since the command is spawned detached. This
  * was the production bug that prompted this function's signature change.
  */
+/**
+ * Decide which `switchroom` CLI binary the gateway should invoke when
+ * it shells out for slash-command actions (/restart, /auth reauth,
+ * /reconcile, etc.).
+ *
+ * Historically we pointed at `~/.bun/bin/switchroom` (installed by
+ * `bun install -g switchroom-ai`). That file has `#!/usr/bin/env node`
+ * as its shebang, so on bun-only hosts without node on PATH the binary
+ * ENOENTs silently and every gateway CLI invocation fails with no
+ * Telegram-facing signal (see reference/restart-and-know-what-im-running.md
+ * "silent respawn" anti-pattern).
+ *
+ * Resolution order:
+ *   1. `node` is on PATH → packaged CLI at `<bunBinDir>/switchroom`.
+ *      No wrapper needed; preserves behaviour for hosts that ship node.
+ *   2. `node` missing AND the repo-local wrapper exists at
+ *      `scripts/switchroom-cli-wrapper.sh` → the wrapper (which invokes
+ *      the CLI through bun). This is the bun-only host path.
+ *   3. Otherwise → packaged CLI as before, and trust the operator to
+ *      install node. We never silently omit the env var.
+ *
+ * The detection runs at unit-generation time (scaffold / reconcile).
+ * Reconciling on a host that has since installed node flips back to
+ * the packaged path.
+ */
+export interface ResolveCliOpts {
+  /** Override for `hasNodeOnPath()` — tests inject a fixed value. */
+  nodeAvailable?: boolean;
+  /** Override for existsSync(wrapper) — tests inject a fixed value. */
+  wrapperExists?: boolean;
+}
+
+export function resolveSwitchroomCliPath(bunBinDir: string, opts: ResolveCliOpts = {}): string {
+  const packagedCli = resolve(bunBinDir, "switchroom");
+  const wrapper = resolve(import.meta.dirname, "../../scripts/switchroom-cli-wrapper.sh");
+  const nodeAvailable = opts.nodeAvailable ?? hasNodeOnPath();
+  if (nodeAvailable) return packagedCli;
+  const wrapperExists = opts.wrapperExists ?? existsSync(wrapper);
+  if (wrapperExists) return wrapper;
+  return packagedCli;
+}
+
+function hasNodeOnPath(): boolean {
+  try {
+    // `command -v node` is POSIX-portable and doesn't execute node; it
+    // just checks PATH. execSync throws non-zero, which maps to
+    // "node not found".
+    execSync("command -v node", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function generateGatewayUnit(stateDir: string, agentName: string): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
@@ -131,7 +185,7 @@ export function generateGatewayUnit(stateDir: string, agentName: string): string
   const bunBin = resolve(homeDir, ".bun/bin/bun");
   const bunBinDir = dirname(bunBin);
   const nodeBinDir = dirname(process.execPath);
-  const switchroomCli = resolve(bunBinDir, "switchroom");
+  const switchroomCli = resolveSwitchroomCliPath(bunBinDir);
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
   const desc = agentName ? `switchroom telegram gateway (${agentName})` : "switchroom telegram gateway";
 
