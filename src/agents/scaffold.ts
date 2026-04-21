@@ -250,6 +250,18 @@ function composeWithSidecar(renderedBase: string, sidecarPath: string): string {
  * The script sources the bot token from `.env` at runtime (not baked
  * in) so secrets never land in a script file.
  */
+
+/**
+ * Human-readable label for an agent + its Hindsight bank in log output.
+ * When they match (default case): just the agent name ("clerk").
+ * When they differ (custom memory.collection in yaml, e.g. legacy bank_id):
+ * "clerk (bank: assistant)" to avoid confusing the bank ID with the agent name.
+ */
+function formatAgentBankLabel(agentName: string, bankId: string): string {
+  if (agentName === bankId) return agentName;
+  return `${agentName} (bank: ${bankId})`;
+}
+
 function buildSessionGreetingScript(
   name: string,
   agentConfig: AgentConfig,
@@ -2178,13 +2190,13 @@ export function scaffoldAgent(
     updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} Bank missions updated for ${hindsightBankId}`);
+          console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
         } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions: ${result.reason}`);
+          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
         }
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
       });
   }
 
@@ -2194,13 +2206,13 @@ export function scaffoldAgent(
     ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${hindsightBankId}`);
+          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
         } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM: ${result.reason}`);
+          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
         }
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
       });
   }
 
@@ -2994,13 +3006,13 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} Bank missions updated for ${hindsightBankId}`);
+          console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
         } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions: ${result.reason}`);
+          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
         }
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
       });
   }
 
@@ -3010,13 +3022,13 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${hindsightBankId}`);
+          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
         } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM: ${result.reason}`);
+          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
         }
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
       });
   }
 
