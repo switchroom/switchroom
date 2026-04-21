@@ -3283,7 +3283,24 @@ function clearRestartMarker(): void {
  * Returns immediately. The caller should acknowledge to the user
  * BEFORE calling this so they see something before the bot dies.
  */
-function spawnSwitchroomDetached(args: string[]): void {
+/**
+ * Fire-and-forget a detached `switchroom` CLI invocation.
+ *
+ * If `onFailure` is supplied, we hook the child's `exit` event and call
+ * back when the child exits non-zero within ~5 seconds — the window in
+ * which we haven't yet been SIGTERM'd by a successful restart. A
+ * successful restart cascades into killing this process before we'd
+ * ever observe the exit, so any exit we DO see is almost certainly a
+ * fail-fast CLI error (bad agent name, bad args, missing config). That
+ * matters because the production bug — gateway unit not exporting
+ * SWITCHROOM_AGENT_NAME — makes `/restart`, `/reconcile`, `/update`
+ * resolve the agent as "telegram", which fails validation in the CLI
+ * and used to disappear silently into detached-spawn.log.
+ */
+function spawnSwitchroomDetached(
+  args: string[],
+  onFailure?: (info: { code: number; tail: string }) => void,
+): void {
   const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
   const logPath = join(STATE_DIR, 'detached-spawn.log')
   let outFd: number | null = null
@@ -3303,7 +3320,58 @@ function spawnSwitchroomDetached(args: string[]): void {
   if (outFd != null) {
     try { closeSync(outFd) } catch { /* fd already dup'd into child */ }
   }
+
+  if (onFailure) {
+    const started = Date.now()
+    child.on('exit', (code) => {
+      if (code == null || code === 0) return
+      if (Date.now() - started > 5000) return
+      let tail = ''
+      try {
+        const full = readFileSync(logPath, 'utf8')
+        tail = full.split('\n').slice(-30).join('\n').trim()
+      } catch { /* best effort */ }
+      try { onFailure({ code, tail }) } catch (err) {
+        process.stderr.write(`telegram channel: spawn onFailure handler threw: ${err}\n`)
+      }
+    })
+    child.on('error', (err) => {
+      try { onFailure({ code: -1, tail: String(err) }) } catch { /* ignore */ }
+    })
+  }
+
   child.unref()
+}
+
+/**
+ * Build an `onFailure` handler that posts a user-facing error reply back
+ * to the Telegram chat when a detached `switchroom` child fails fast.
+ * Also clears the restart marker so the "🎛️ restarted — ready" follow-up
+ * doesn't get stuck forever.
+ */
+function notifyDetachedFailure(
+  chatId: string,
+  threadId: number | null,
+  label: string,
+): (info: { code: number; tail: string }) => void {
+  return ({ code, tail }) => {
+    clearRestartMarker()
+    const snippet = tail ? tail.slice(-800) : '(no output captured)'
+    const text =
+      `❌ <b>${escapeHtmlForTg(label)} failed</b> (exit ${code}):\n` +
+      preBlock(snippet)
+    lockedBot.api
+      .sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      .catch((err: unknown) => {
+        process.stderr.write(
+          `telegram channel: notifyDetachedFailure send failed: ${err}\n`,
+        )
+      })
+  }
 }
 
 /**
@@ -3747,7 +3815,10 @@ bot.command('restart', async ctx => {
     // askYesNo prompt on a detached stdin, gets EOF, returns false, and aborts
     // silently — leaving the ack message + orphaned restart-pending.json but
     // no actual systemctl restart.
-    spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+    spawnSwitchroomDetached(
+      ['agent', 'restart', name, '--force'],
+      notifyDetachedFailure(chatId, threadId ?? null, `restart ${name}`),
+    )
     return
   }
   await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
@@ -4136,7 +4207,10 @@ bot.command('reconcile', async ctx => {
       ts: Date.now(),
     })
     await sweepPinsBeforeSelfRestart()
-    spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
+    spawnSwitchroomDetached(
+      ['agent', 'reconcile', arg, '--restart'],
+      notifyDetachedFailure(chatId, threadId ?? null, `reconcile ${arg}`),
+    )
     return
   }
   await runSwitchroomCommand(
@@ -4428,7 +4502,10 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
   await sweepPinsBeforeSelfRestart()
   // --force: see matching comment in /restart handler. Same reason applies
   // here — the agent is mid-turn processing this /new or /reset command.
-  spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+  spawnSwitchroomDetached(
+    ['agent', 'restart', name, '--force'],
+    notifyDetachedFailure(chatId, threadId ?? null, `${kind} ${name}`),
+  )
 }
 
 bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
@@ -4532,7 +4609,12 @@ bot.command('update', async ctx => {
     { html: true },
   )
   await sweepPinsBeforeSelfRestart()
-  spawnSwitchroomDetached(['update'])
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  spawnSwitchroomDetached(
+    ['update'],
+    notifyDetachedFailure(chatId, threadId ?? null, 'update'),
+  )
 })
 
 // /switchroomhelp — show all available bot commands

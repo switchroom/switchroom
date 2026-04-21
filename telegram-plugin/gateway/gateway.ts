@@ -2173,7 +2173,21 @@ function clearRestartMarker(): void {
   try { rmSync(p, { force: true }) } catch {}
 }
 
-function spawnSwitchroomDetached(args: string[]): void {
+/**
+ * Fire-and-forget a detached `switchroom` CLI invocation.
+ *
+ * `onFailure`, if provided, is called with the child's exit code and the
+ * tail of `detached-spawn.log` when the child exits non-zero BEFORE
+ * ~5 seconds have passed (the rough window during which the gateway is
+ * still alive and hasn't yet been SIGTERM'd by its own restart). This
+ * lets us surface "agent not found in switchroom.yaml" and other
+ * fail-fast CLI errors to the Telegram user instead of silently
+ * swallowing them into detached-spawn.log.
+ */
+function spawnSwitchroomDetached(
+  args: string[],
+  onFailure?: (info: { code: number; tail: string }) => void,
+): void {
   const fullArgs = SWITCHROOM_CONFIG ? ['--config', SWITCHROOM_CONFIG, ...args] : args
   const logPath = join(STATE_DIR, 'detached-spawn.log')
   let outFd: number | null = null
@@ -2188,7 +2202,64 @@ function spawnSwitchroomDetached(args: string[]): void {
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
   })
   if (outFd != null) { try { closeSync(outFd) } catch {} }
+
+  if (onFailure) {
+    const started = Date.now()
+    child.on('exit', (code) => {
+      // Only surface "obvious-fail" exits — non-zero within 5 seconds.
+      // A successful restart kills us before we'd ever see the exit
+      // event, so any exit we DO observe here is almost certainly
+      // fail-fast (bad agent name, bad args, missing config).
+      if (code == null || code === 0) return
+      if (Date.now() - started > 5000) return
+      let tail = ''
+      try {
+        const full = readFileSync(logPath, 'utf8')
+        tail = full.split('\n').slice(-30).join('\n').trim()
+      } catch { /* best effort */ }
+      try { onFailure({ code, tail }) } catch (err) {
+        process.stderr.write(`telegram gateway: spawn onFailure handler threw: ${err}\n`)
+      }
+    })
+    child.on('error', (err) => {
+      try { onFailure({ code: -1, tail: String(err) }) } catch { /* ignore */ }
+    })
+  }
+
   child.unref()
+}
+
+/**
+ * Build an `onFailure` handler that posts a user-facing error reply back
+ * to the Telegram chat when a detached `switchroom` child fails fast.
+ * Also clears the restart marker so the "🎛️ restarted — ready" follow-up
+ * doesn't get stuck forever.
+ */
+function notifyDetachedFailure(
+  chatId: string,
+  threadId: number | null,
+  label: string,
+): (info: { code: number; tail: string }) => void {
+  return ({ code, tail }) => {
+    clearRestartMarker()
+    const snippet = tail ? tail.slice(-800) : '(no output captured)'
+    const text =
+      `❌ <b>${escapeHtmlForTg(label)} failed</b> (exit ${code}):\n` +
+      preBlock(snippet)
+    // Fire-and-forget — we're off the command-handler context and don't
+    // have an await to block on anyway.
+    lockedBot.api
+      .sendMessage(chatId, text, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      .catch((err: unknown) => {
+        process.stderr.write(
+          `telegram gateway: notifyDetachedFailure send failed: ${err}\n`,
+        )
+      })
+  }
 }
 
 async function sweepBeforeSelfRestart(): Promise<void> {
@@ -2460,7 +2531,10 @@ bot.command('restart', async ctx => {
     } catch {}
     writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: ackId, ts: Date.now() })
     await sweepBeforeSelfRestart()
-    spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+    spawnSwitchroomDetached(
+      ['agent', 'restart', name, '--force'],
+      notifyDetachedFailure(chatId, threadId ?? null, `restart ${name}`),
+    )
     return
   }
   await runSwitchroomCommand(ctx, ['agent', 'restart', name], `restart ${name}`)
@@ -2566,7 +2640,10 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
   }
 
   await sweepBeforeSelfRestart()
-  spawnSwitchroomDetached(['agent', 'restart', name, '--force'])
+  spawnSwitchroomDetached(
+    ['agent', 'restart', name, '--force'],
+    notifyDetachedFailure(chatId, threadId ?? null, `${kind} ${name}`),
+  )
 }
 
 bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
@@ -2960,7 +3037,10 @@ bot.command('reconcile', async ctx => {
     } catch {}
     writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: null, ts: Date.now() })
     await sweepBeforeSelfRestart()
-    spawnSwitchroomDetached(['agent', 'reconcile', arg, '--restart'])
+    spawnSwitchroomDetached(
+      ['agent', 'reconcile', arg, '--restart'],
+      notifyDetachedFailure(chatId, threadId ?? null, `reconcile ${arg}`),
+    )
     return
   }
   await runSwitchroomCommand(ctx, ['agent', 'reconcile', arg, '--restart'], `reconcile ${arg}`)
@@ -3000,7 +3080,12 @@ bot.command('update', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, '🔄 Running <b>switchroom update</b>… back in ~30 seconds.', { html: true })
   await sweepBeforeSelfRestart()
-  spawnSwitchroomDetached(['update'])
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  spawnSwitchroomDetached(
+    ['update'],
+    notifyDetachedFailure(chatId, threadId ?? null, 'update'),
+  )
 })
 
 bot.command('switchroomhelp', async ctx => {

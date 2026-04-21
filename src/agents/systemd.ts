@@ -107,7 +107,23 @@ export function resolveGatewayUnitName(
   return first ? `${first}-gateway` : GATEWAY_UNIT_NAME;
 }
 
-export function generateGatewayUnit(stateDir: string, descSuffix?: string): string {
+/**
+ * Generate the systemd unit for an agent's telegram gateway.
+ *
+ * `agentName` is required and used for two things:
+ *   1. the unit description (so `systemctl status` says which agent it's for),
+ *   2. the `SWITCHROOM_AGENT_NAME` env var, which the gateway reads via
+ *      getMyAgentName() to decide whether `/restart`, `/reconcile`, etc.
+ *      target the agent the bot is bound to.
+ *
+ * Without SWITCHROOM_AGENT_NAME, the gateway falls back to basename(cwd),
+ * which is literally the string "telegram" (because WorkingDirectory is
+ * `.../<agent>/telegram`). Every self-targeting command then resolves to
+ * an agent named "telegram", which doesn't exist, and the switchroom CLI
+ * exits non-zero — silently, since the command is spawned detached. This
+ * was the production bug that prompted this function's signature change.
+ */
+export function generateGatewayUnit(stateDir: string, agentName: string): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
   const logFile = resolve(stateDir, "gateway.log");
@@ -117,7 +133,7 @@ export function generateGatewayUnit(stateDir: string, descSuffix?: string): stri
   const nodeBinDir = dirname(process.execPath);
   const switchroomCli = resolve(bunBinDir, "switchroom");
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
-  const desc = descSuffix ? `switchroom telegram gateway (${descSuffix})` : "switchroom telegram gateway";
+  const desc = agentName ? `switchroom telegram gateway (${agentName})` : "switchroom telegram gateway";
 
   return `[Unit]
 Description=${desc}
@@ -137,6 +153,7 @@ WorkingDirectory=${stateDir}
 Environment=PATH=${unitPath}
 Environment=SWITCHROOM_CLI_PATH=${switchroomCli}
 Environment=TELEGRAM_STATE_DIR=${stateDir}
+Environment=SWITCHROOM_AGENT_NAME=${agentName}
 
 [Install]
 WantedBy=default.target

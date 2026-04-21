@@ -182,7 +182,7 @@ describe("generateTimerServiceUnit", () => {
 
 describe("generateGatewayUnit", () => {
   it("generates valid systemd unit for gateway", () => {
-    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram");
+    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram", "assistant");
     expect(unit).toContain("[Unit]");
     expect(unit).toContain("[Service]");
     expect(unit).toContain("[Install]");
@@ -190,35 +190,57 @@ describe("generateGatewayUnit", () => {
   });
 
   it("uses Restart=always with fast restart interval", () => {
-    const unit = generateGatewayUnit("/tmp/telegram");
+    const unit = generateGatewayUnit("/tmp/telegram", "assistant");
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("RestartSec=3");
   });
 
   it("sets TELEGRAM_STATE_DIR environment", () => {
-    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram");
+    const unit = generateGatewayUnit("/home/user/.claude/channels/telegram", "assistant");
     expect(unit).toContain("Environment=TELEGRAM_STATE_DIR=/home/user/.claude/channels/telegram");
   });
 
   it("references gateway entry point", () => {
-    const unit = generateGatewayUnit("/tmp/telegram");
+    const unit = generateGatewayUnit("/tmp/telegram", "assistant");
     expect(unit).toContain("gateway/gateway.ts");
   });
 
   it("includes rate limiting", () => {
-    const unit = generateGatewayUnit("/tmp/telegram");
+    const unit = generateGatewayUnit("/tmp/telegram", "assistant");
     expect(unit).toContain("StartLimitBurst=10");
     expect(unit).toContain("StartLimitIntervalSec=60");
   });
 
   it("places StartLimitBurst and StartLimitIntervalSec in [Unit] section, not [Service]", () => {
-    const unit = generateGatewayUnit("/tmp/telegram");
+    const unit = generateGatewayUnit("/tmp/telegram", "assistant");
     const unitSection = unit.split("[Service]")[0];
     const serviceSection = unit.split("[Service]")[1].split("[Install]")[0];
     expect(unitSection).toContain("StartLimitBurst=10");
     expect(unitSection).toContain("StartLimitIntervalSec=60");
     expect(serviceSection).not.toContain("StartLimitBurst");
     expect(serviceSection).not.toContain("StartLimitIntervalSec");
+  });
+
+  // Regression test for the "/restart silently does nothing" bug.
+  //
+  // The gateway's getMyAgentName() prefers process.env.SWITCHROOM_AGENT_NAME
+  // and falls back to basename(cwd). Systemd sets WorkingDirectory to
+  // `.../<agent>/telegram`, so without the env var every self-restart,
+  // /reconcile, /update etc. resolves the agent as "telegram" and the
+  // switchroom CLI exits non-zero — no agent named "telegram" exists
+  // in switchroom.yaml — with no user-facing error (spawnDetached).
+  it("sets SWITCHROOM_AGENT_NAME so gateway self-targeting works", () => {
+    const unit = generateGatewayUnit("/tmp/telegram", "clerk");
+    expect(unit).toContain("Environment=SWITCHROOM_AGENT_NAME=clerk");
+  });
+
+  it("each agent's gateway unit carries its own SWITCHROOM_AGENT_NAME", () => {
+    const clerkUnit = generateGatewayUnit("/tmp/clerk/telegram", "clerk");
+    const lawgptUnit = generateGatewayUnit("/tmp/lawgpt/telegram", "lawgpt");
+    expect(clerkUnit).toContain("Environment=SWITCHROOM_AGENT_NAME=clerk");
+    expect(lawgptUnit).toContain("Environment=SWITCHROOM_AGENT_NAME=lawgpt");
+    expect(clerkUnit).not.toContain("SWITCHROOM_AGENT_NAME=lawgpt");
+    expect(lawgptUnit).not.toContain("SWITCHROOM_AGENT_NAME=clerk");
   });
 });
 
