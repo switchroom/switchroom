@@ -77,6 +77,25 @@ interface AuthSessionMeta {
    * it. Missing value is treated as "can't verify, recreate to be safe".
    */
   initialCodeChallenge?: string;
+  /**
+   * The CLAUDE_CONFIG_DIR that claude setup-token was invoked with.
+   * For forced reauth this is a throwaway `.setup-token-tmp-XXX` dir
+   * (so the new account doesn't see existing credentials). For a
+   * first-time login it's the agent's normal `.claude/` dir.
+   *
+   * Why we store it: claude CLI 2.1+ never prints the OAuth token to
+   * stdout after setup-token succeeds. It writes the token to
+   * `<configDir>/.credentials.json` and shows only a "Login successful"
+   * banner. Switchroom's old log-scan for `sk-ant-oat\d+-...` found
+   * nothing and timed out with "no token was found after 20s" even
+   * when the exchange had succeeded. To detect silent success we must
+   * poll the credentials file directly. See 2026-04-22 bundle-strings
+   * investigation — the setup-token success branch explicitly returns
+   * `null` for the on-screen view when a token exists.
+   *
+   * Optional for the same legacy reason as initialCodeChallenge.
+   */
+  configDir?: string;
 }
 
 /**
@@ -345,6 +364,41 @@ export function parseSetupTokenValue(output: string): string | null {
   return match?.[0] ?? null;
 }
 
+/**
+ * Read the OAuth access token from a `.credentials.json` file written
+ * by `claude setup-token`. The file shape (as of claude CLI 2.1.x):
+ *
+ *   { "claudeAiOauth": { "accessToken": "sk-ant-oat01-...", ... } }
+ *
+ * Returns null if the file is missing, unreadable, malformed, or has
+ * no accessToken. Also validates the token format so we don't hand a
+ * random string downstream. The valid token shape is the same regex
+ * parseSetupTokenValue uses for backwards compatibility.
+ *
+ * Why this exists: claude CLI 2.1+ does not print the OAuth token to
+ * stdout. The old path of log-scanning for `sk-ant-oat...` in tmux
+ * output stopped working silently. This reader is the new primary
+ * success-detection channel; log-scanning is kept as a fallback for
+ * older CLI versions. 2026-04-22 incident.
+ */
+export function readTokenFromCredentialsFile(
+  credentialsFilePath: string,
+): string | null {
+  try {
+    if (!existsSync(credentialsFilePath)) return null;
+    const raw = readFileSync(credentialsFilePath, "utf-8");
+    const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown } };
+    const token = parsed?.claudeAiOauth?.accessToken;
+    if (typeof token !== "string") return null;
+    // Validate format. Protects against half-written files and
+    // unexpected shape drift in future claude CLI versions.
+    if (!/^sk-ant-oat\d+-[A-Za-z0-9._-]+$/.test(token)) return null;
+    return token;
+  } catch {
+    return null;
+  }
+}
+
 function hasPendingAuthSession(name: string, agentDir: string): boolean {
   const meta = readJsonFile<AuthSessionMeta>(authSessionMetaPath(agentDir));
   if (meta?.sessionName && tmuxSessionExists(meta.sessionName)) {
@@ -514,10 +568,20 @@ export function startAuthSession(
   const commandParts: string[] = []
   commandParts.push(`CLAUDE_CONFIG_DIR=${shellQuote(configDir)}`)
   commandParts.push(`LOG_PATH=${shellQuote(logPath)}`)
+  // BROWSER=/bin/true suppresses claude setup-token's attempt to
+  // auto-launch a browser on the host. On a server that has Firefox
+  // installed but no active graphical user session, the launched
+  // browser lands on Claude's login page without any cookies —
+  // useless — and leaves a zombie Firefox + loopback listener behind.
+  // Forcing a no-op browser keeps the manual-paste flow as the only
+  // path and makes the process tree cleaner. Doesn't affect the URL
+  // shown to the user (still uses the platform.claude.com redirect).
+  // Proven via 2026-04-22 experiments (stt-exp1, stt-exp2).
+  commandParts.push(`BROWSER=/bin/true`)
   if (opts.force) {
     commandParts.push(`trap 'rm -rf -- "$CLAUDE_CONFIG_DIR"' EXIT`)
   }
-  commandParts.push(`export CLAUDE_CONFIG_DIR`)
+  commandParts.push(`export CLAUDE_CONFIG_DIR BROWSER`)
   commandParts.push(`claude setup-token | tee -- "$LOG_PATH"`)
   const command = commandParts.join(" && ");
 
@@ -541,6 +605,7 @@ export function startAuthSession(
     startedAt: Date.now(),
     slot: slotArg,
     initialCodeChallenge,
+    configDir,
   });
 
   return {
@@ -626,22 +691,39 @@ export function submitAuthCode(
 
   tmux(["send-keys", "-t", sessionName, code.trim(), "Enter"]);
 
-  // Poll the log file for the token rather than relying on a single tmux
-  // pane capture. The auth session was started with `| tee <logPath>` so the
-  // full output accumulates in the log file even as the terminal scrolls.
-  // This is more reliable than a fixed 1.5s sleep + pane capture, which races
-  // against claude setup-token's processing time and tmux scroll limits.
+  // Read the configDir that `claude setup-token` was launched with so
+  // we can watch its .credentials.json for the success-written token.
+  // Fallback to the agent's regular .claude dir for first-time logins
+  // (non-force flow) where configDir == claudeDir(agentDir) anyway.
+  const meta = readJsonFile<AuthSessionMeta>(authSessionMetaPath(agentDir));
+  const credFileToWatch = meta?.configDir
+    ? join(meta.configDir, ".credentials.json")
+    : credentialsPath(agentDir);
+
+  // Two-channel success detection:
+  //   1. <configDir>/.credentials.json written by claude CLI itself.
+  //      This is the PRIMARY channel as of claude CLI 2.1+ because the
+  //      token is no longer printed to stdout on setup-token success.
+  //   2. Log file scan for a raw `sk-ant-oat...` string. Covers older
+  //      claude CLI versions that DID print it, and any future code
+  //      path that logs the token (e.g. debug mode).
+  //
+  // Both channels produce the same token string on success; we return
+  // whichever wins the race. Polling both each tick means a silent
+  // success is detected on the same interval as a printed success.
   const logPath = authLogPath(agentDir);
   let token: string | null = null;
   const deadline = Date.now() + pollTimeoutMs;
   while (Date.now() < deadline) {
     sleepMs(pollIntervalMs);
+    token = readTokenFromCredentialsFile(credFileToWatch);
+    if (token) break;
     token = readTokenFromLogFile(logPath);
     if (token) break;
   }
 
-  // Fallback: pane capture handles edge cases where the log file isn't
-  // available (e.g. configDir isolation for force-reauth flows).
+  // Last-ditch pane capture. If both channels are empty but the UI
+  // happens to have the token rendered (unlikely but cheap), catch it.
   if (!token) {
     const paneOutput = captureTmuxPane(sessionName);
     token = parseSetupTokenValue(paneOutput);
