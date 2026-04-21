@@ -19,6 +19,7 @@ import {
 } from "../agents/lifecycle.js";
 import {
   generateUnit,
+  generateGatewayUnit,
   installUnit,
   uninstallUnit,
   installScheduleTimers,
@@ -275,9 +276,20 @@ export function registerAgentCommand(program: Command): void {
         // Effective switchroom-plugin flag is driven by channels.telegram.plugin.
         // This mirrors usesSwitchroomTelegramPlugin() in src/config/merge.ts.
         const useAutoaccept = agentConfig.channels?.telegram?.plugin === "switchroom";
-        const gwName = resolveGatewayUnitName(config);
+        const gwName = resolveGatewayUnitName(config, name);
         const unitContent = generateUnit(name, agentDir, useAutoaccept, gwName);
         installUnit(name, unitContent);
+
+        // Install this agent's dedicated gateway unit. Each telegram-using
+        // agent has its own bot token in its own state dir, so each gets
+        // its own gateway process. Without this, only `switchroom systemd
+        // install` would install the gateway — running `switchroom agent
+        // create` on its own would leave the new bot silent.
+        if (useAutoaccept && gwName) {
+          const stateDir = resolve(agentDir, "telegram");
+          const gatewayContent = generateGatewayUnit(stateDir, name);
+          installUnit(gwName, gatewayContent);
+        }
 
         // Install schedule timers if the agent has any
         const schedule = agentConfig.schedule ?? [];

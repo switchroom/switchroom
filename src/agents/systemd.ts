@@ -74,7 +74,33 @@ export function uninstallUnit(name: string): void {
 
 const GATEWAY_UNIT_NAME = "gateway";
 
-export function resolveGatewayUnitName(config: SwitchroomConfig): string {
+/**
+ * Resolve the gateway unit name for a specific agent.
+ *
+ * Each telegram-using agent gets its own dedicated gateway unit
+ * (`switchroom-<agent>-gateway.service`) pointing at its own state dir
+ * with its own bot token. Agents that don't use the switchroom-telegram
+ * plugin return undefined — they have no gateway dependency.
+ *
+ * Earlier implementations returned a single shared gateway name (the
+ * first telegram-using agent's), which silently broke every agent
+ * after the first: their bot token was in a state dir no gateway
+ * was watching, so Telegram polling never started. The multi-agent
+ * case is exactly what switchroom is for, so the one-gateway-per-agent
+ * model is the correct default.
+ */
+export function resolveGatewayUnitName(
+  config: SwitchroomConfig,
+  agentName?: string,
+): string | undefined {
+  if (agentName !== undefined) {
+    const agent = config.agents[agentName];
+    if (!agent) return undefined;
+    if (!usesSwitchroomTelegramPlugin(agent)) return undefined;
+    return `${agentName}-gateway`;
+  }
+  // Legacy no-arg form — preserved for callers that still want the
+  // historical "first telegram agent's gateway" default.
   const first = Object.keys(config.agents).find(
     (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
   );
@@ -121,28 +147,26 @@ export function installAllUnits(config: SwitchroomConfig): void {
   const agentsDir = resolveAgentsDir(config);
   const installedAgents: string[] = [];
 
-  // Determine the gateway unit name before generating agent units, since
-  // agents that use the switchroom Telegram plugin depend on it via After=.
-  const firstTelegramAgent = Object.keys(config.agents).find(
-    (name) => usesSwitchroomTelegramPlugin(config.agents[name]),
-  );
-  const gwName = firstTelegramAgent
-    ? `${firstTelegramAgent}-gateway`
-    : GATEWAY_UNIT_NAME;
-
+  // Every telegram-using agent gets its OWN gateway unit. The gateway
+  // process needs its own state dir (for the per-agent bot token in
+  // .env and per-agent IPC socket), so one shared gateway cannot cover
+  // multiple agents. See resolveGatewayUnitName() for rationale.
   for (const agentName of Object.keys(config.agents)) {
+    const agent = config.agents[agentName];
     const agentDir = resolve(agentsDir, agentName);
-    const useAutoaccept = usesSwitchroomTelegramPlugin(config.agents[agentName]);
+    const useAutoaccept = usesSwitchroomTelegramPlugin(agent);
+    const gwName = useAutoaccept ? `${agentName}-gateway` : undefined;
+
     const content = generateUnit(agentName, agentDir, useAutoaccept, gwName);
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
-  }
 
-  if (firstTelegramAgent) {
-    const stateDir = resolve(agentsDir, firstTelegramAgent, "telegram");
-    const gatewayContent = generateGatewayUnit(stateDir, firstTelegramAgent);
-    installUnit(gwName, gatewayContent);
-    installedAgents.push(unitName(gwName));
+    if (useAutoaccept && gwName) {
+      const stateDir = resolve(agentDir, "telegram");
+      const gatewayContent = generateGatewayUnit(stateDir, agentName);
+      installUnit(gwName, gatewayContent);
+      installedAgents.push(unitName(gwName));
+    }
   }
 
   daemonReload();
