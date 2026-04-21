@@ -474,6 +474,8 @@ function checkHindsight(config: SwitchroomConfig): CheckResult[] {
   const url = (config.memory?.config?.url as string | undefined)
     ?? "http://localhost:8888/mcp/";
 
+  const results: CheckResult[] = [];
+
   // Parse host and port out of the URL
   const match = url.match(/^https?:\/\/([^:/]+):?(\d+)?/);
   if (!match) {
@@ -502,13 +504,36 @@ function checkHindsight(config: SwitchroomConfig): CheckResult[] {
     ];
   }
 
-  return [
-    {
-      name: "hindsight reachable",
-      status: "ok",
-      detail: `${host}:${port}`,
-    },
-  ];
+  results.push({
+    name: "hindsight reachable",
+    status: "ok",
+    detail: `${host}:${port}`,
+  });
+
+  // Per-agent bank health checks
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    const bankId = agentConfig.memory?.collection ?? agentName;
+
+    // Check if missions are set
+    const hasBankMission = !!agentConfig.memory?.bank_mission;
+    const hasRetainMission = !!agentConfig.memory?.retain_mission;
+    if (!hasBankMission || !hasRetainMission) {
+      results.push({
+        name: `${agentName} missions`,
+        status: "warn",
+        detail: `bank_mission: ${hasBankMission ? "set" : "unset"}, retain_mission: ${hasRetainMission ? "set" : "unset"}`,
+        fix: `Add bank_mission and retain_mission to agents.${agentName}.memory in switchroom.yaml`,
+      });
+    } else {
+      results.push({
+        name: `${agentName} missions`,
+        status: "ok",
+        detail: "bank_mission and retain_mission configured",
+      });
+    }
+  }
+
+  return results;
 }
 
 /**

@@ -316,10 +316,10 @@ function buildSessionGreetingScript(
     `<b>Plan</b>  __SWITCHROOM_PLAN__`,
     `<b>Quota</b>  __SWITCHROOM_QUOTA__`,
     `<b>Session</b>  __SWITCHROOM_SESSION__`,
+    `<b>Memory</b>  __SWITCHROOM_MEMORY__`,
     `<b>Profile</b>  ${escapeHtml(profile)}`,
     `<b>Tools</b>  ${escapeHtml(tools)}`,
     deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
-    `<b>Memory</b>  ${escapeHtml(memory)}`,
     hooks ? `<b>Hooks</b>  ${escapeHtml(hooks)}` : null,
     skills ? `<b>Skills</b>  ${escapeHtml(skills)}` : null,
     `<b>Limits</b>  ${escapeHtml(sessionStr)}`,
@@ -717,12 +717,69 @@ case "\${SWITCHROOM_SESSION_MODE:-cold}" in
     ;;
 esac
 
+# Resolve Memory row: query Hindsight for bank stats (memory count, last retain)
+# Timeout bounded at 3s; fallback to "—" on timeout or error.
+MEMORY_STATUS="${escapeHtml(memory)}"
+if [ -n "\${HINDSIGHT_BANK_ID:-}" ] && [ -n "\${HINDSIGHT_API_URL:-}" ]; then
+  _bank_stats() {
+    _api_url="\${HINDSIGHT_API_URL}/mcp/"
+    _bank_id="\${HINDSIGHT_BANK_ID}"
+    # JSON-RPC flow: initialize → tools/call get_bank_stats
+    _SESSION=$(curl -sS -X POST "\$_api_url" \\
+      -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
+      -H "X-Bank-Id: \$_bank_id" -D /tmp/bank-stats-$$.headers \\
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bank-stats","version":"0.1"}}}' \\
+      -m 2 -o /dev/null 2>/dev/null && grep -i mcp-session-id /tmp/bank-stats-$$.headers | cut -d' ' -f2 | tr -d '\\r\\n')
+    if [ -n "\$_SESSION" ]; then
+      _STATS=$(curl -sS -X POST "\$_api_url" \\
+        -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
+        -H "X-Bank-Id: \$_bank_id" -H "mcp-session-id: \$_SESSION" \\
+        -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_bank_stats","arguments":{}}}' \\
+        -m 2 2>/dev/null)
+      rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
+      # Extract memory_count and last_retain from JSON response
+      # Assume response is: {"result":{"content":[{"text":"...memory_count: N...last_retain: <ts>..."}]}}
+      # Naive parse since full jq may not be available
+      _COUNT=$(echo "\$_STATS" | sed -n 's|.*"memory_count":[[:space:]]*\\([0-9]\\{1,\\}\\).*|\\1|p' | head -1)
+      _LAST_RETAIN_TS=$(echo "\$_STATS" | sed -n 's|.*"last_retain":[[:space:]]*"\\([^"]*\\)".*|\\1|p' | head -1)
+      if [ -n "\$_COUNT" ]; then
+        _AGO=""
+        if [ -n "\$_LAST_RETAIN_TS" ]; then
+          _LAST_RETAIN_EPOCH=$(date -d "\$_LAST_RETAIN_TS" +%s 2>/dev/null || echo 0)
+          _NOW=$(date +%s)
+          _DIFF=$((_NOW - _LAST_RETAIN_EPOCH))
+          if [ "\$_DIFF" -lt 60 ]; then
+            _AGO="\${_DIFF}s ago"
+          elif [ "\$_DIFF" -lt 3600 ]; then
+            _AGO="$((_DIFF / 60))m ago"
+          elif [ "\$_DIFF" -lt 86400 ]; then
+            _AGO="$((_DIFF / 3600))h ago"
+          else
+            _AGO="$((_DIFF / 86400))d ago"
+          fi
+        fi
+        if [ -n "\$_AGO" ]; then
+          echo "✓ \$_COUNT memories · last retain \$_AGO"
+        else
+          echo "✓ \$_COUNT memories"
+        fi
+        return 0
+      fi
+    fi
+    rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
+    echo "⚠ Hindsight unreachable, recall disabled this session"
+    return 1
+  }
+  MEMORY_STATUS=$(_bank_stats 2>/dev/null || echo "—")
+fi
+
 TEXT=${shellSingleQuote(text)}
 TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
 TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_PLAN__/$PLAN_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}"
 TEXT="\${TEXT//__SWITCHROOM_SESSION__/$SESSION_STATUS}"
+TEXT="\${TEXT//__SWITCHROOM_MEMORY__/$MEMORY_STATUS}"
 
 ${curlCalls.join("\n\n")}
 `;
