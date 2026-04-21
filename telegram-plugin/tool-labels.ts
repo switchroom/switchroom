@@ -88,18 +88,44 @@ function firstLine(s: string): string {
  * Return a display suffix for `tool` given its `input`, without the tool
  * name itself. Caller renders `${tool} ${suffix}` (space-separated; no
  * colon) — the checklist format the progress card uses.
+ *
+ * The optional `preamble` is the most recent short `text` content block
+ * the model emitted just before this `tool_use` in the same assistant
+ * message — the model's natural "I'll check foo.ts" narration. For the
+ * file/search tools (Read/Write/Edit/Grep/Glob/NotebookEdit) we prefer
+ * that prose over the filename/pattern fallback when it's short enough
+ * to fit on one mobile line (single-line, ≤160 chars). Multi-line or
+ * longer text is treated as a narrative step, not a per-tool preamble,
+ * and the fallback label wins. Bash/BashOutput/Task/Agent already carry
+ * `input.description` and intentionally ignore preamble.
  */
-export function toolLabel(tool: string, input?: Record<string, unknown>): string {
+export function toolLabel(
+  tool: string,
+  input?: Record<string, unknown>,
+  preamble?: string,
+): string {
   if (!input || typeof input !== 'object') return ''
   const str = (k: string): string | undefined =>
     typeof input[k] === 'string' ? (input[k] as string) : undefined
+
+  const preambleLabel = (): string | null => {
+    if (!preamble) return null
+    if (preamble.includes('\n')) return null
+    const trimmed = preamble.trim()
+    if (!trimmed) return null
+    if (trimmed.length > MAX_DESCRIPTION_CHARS) return null
+    return trimmed
+  }
 
   switch (tool) {
     case 'Read':
     case 'Write':
     case 'NotebookEdit':
-    case 'Edit':
+    case 'Edit': {
+      const pre = preambleLabel()
+      if (pre) return pre
       return truncate(basename(str('file_path') ?? ''))
+    }
 
     case 'Bash':
     case 'BashOutput': {
@@ -112,10 +138,15 @@ export function toolLabel(tool: string, input?: Record<string, unknown>): string
     case 'KillShell':
       return truncate(str('shell_id') ?? '')
 
-    case 'Glob':
+    case 'Glob': {
+      const pre = preambleLabel()
+      if (pre) return pre
       return truncate(str('pattern') ?? '')
+    }
 
     case 'Grep': {
+      const pre = preambleLabel()
+      if (pre) return pre
       const pat = str('pattern') ?? ''
       if (!pat) return ''
       const path = str('path')

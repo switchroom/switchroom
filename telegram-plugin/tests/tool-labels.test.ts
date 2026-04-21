@@ -98,4 +98,75 @@ describe('toolLabel', () => {
     expect(toolLabel('Read', { file_path: '' })).toBe('')
     expect(toolLabel('Read', { file_path: 42 as unknown as string })).toBe('')
   })
+
+  describe('preamble pairing (file/search tools)', () => {
+    it('Read: preamble wins over filename fallback when short single-line', () => {
+      expect(
+        toolLabel(
+          'Read',
+          { file_path: '/x/switchroom/foo.ts' },
+          'Checking the progress card reducer',
+        ),
+      ).toBe('Checking the progress card reducer')
+    })
+
+    it('Read: no preamble → basename fallback preserved', () => {
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' })).toBe('foo.ts')
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' }, undefined)).toBe('foo.ts')
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' }, '')).toBe('foo.ts')
+    })
+
+    it('Read: multi-line preamble is a narrative, not a label → basename fallback', () => {
+      expect(
+        toolLabel(
+          'Read',
+          { file_path: '/x/switchroom/foo.ts' },
+          "Here's my plan:\n1. check the file\n2. fix the bug",
+        ),
+      ).toBe('foo.ts')
+    })
+
+    it('Read: preamble over 160 chars falls back to basename', () => {
+      const long = 'a'.repeat(161)
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' }, long)).toBe('foo.ts')
+      // exactly 160 chars still counts as preamble
+      const atCap = 'b'.repeat(160)
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' }, atCap)).toBe(atCap)
+    })
+
+    it('Read: whitespace-only preamble falls back to basename', () => {
+      expect(toolLabel('Read', { file_path: '/x/switchroom/foo.ts' }, '   ')).toBe('foo.ts')
+    })
+
+    it('Write / Edit / Grep / Glob all prefer preamble', () => {
+      expect(
+        toolLabel('Write', { file_path: '/x/new.ts' }, 'Creating the new helper'),
+      ).toBe('Creating the new helper')
+      expect(
+        toolLabel('Edit', { file_path: '/x/existing.ts' }, 'Patching the reducer'),
+      ).toBe('Patching the reducer')
+      expect(
+        toolLabel('Grep', { pattern: 'TODO' }, 'Searching for leftover TODOs'),
+      ).toBe('Searching for leftover TODOs')
+      expect(
+        toolLabel('Glob', { pattern: '**/*.ts' }, 'Listing all TypeScript sources'),
+      ).toBe('Listing all TypeScript sources')
+    })
+
+    it('Bash / Task / Agent ignore preamble (they already use input.description)', () => {
+      expect(
+        toolLabel(
+          'Bash',
+          { command: 'git status', description: 'Check git status' },
+          'Running git status real quick',
+        ),
+      ).toBe('Check git status')
+      expect(
+        toolLabel('Task', { description: 'Research bug' }, 'Kicking off the research agent'),
+      ).toBe('Research bug')
+      expect(
+        toolLabel('Agent', { subagent_type: 'Explore' }, 'Spawning an explorer'),
+      ).toBe('Explore')
+    })
+  })
 })

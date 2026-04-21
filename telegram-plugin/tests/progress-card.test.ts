@@ -177,6 +177,55 @@ describe('progress-card reducer', () => {
     expect(s.narratives[0].state).toBe('done')
   })
 
+  it('text event stashes pendingPreamble for the next tool_use', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: "Let me check the reducer" },
+    ])
+    expect(s.pendingPreamble).toBe('Let me check the reducer')
+  })
+
+  it('tool_use consumes pendingPreamble and uses it as the Read label', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: 'Reading the reducer implementation' },
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/progress-card.ts' } },
+    ])
+    expect(s.items[0].label).toBe('Reading the reducer implementation')
+    expect(s.pendingPreamble).toBeFalsy()
+  })
+
+  it('sibling tool_use in the same batch does NOT reuse the preamble', () => {
+    // Simulating the "parallel tool_use" case: one text block followed
+    // by two tool_use blocks in the same assistant message. Only the
+    // first should adopt the preamble; the second falls back.
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: 'Checking a couple files' },
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/a.ts' } },
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/b.ts' } },
+    ])
+    expect(s.items[0].label).toBe('Checking a couple files')
+    expect(s.items[1].label).toBe('b.ts')
+  })
+
+  it('tool_use without a preceding preamble keeps the filename fallback', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/a.ts' } },
+    ])
+    expect(s.items[0].label).toBe('a.ts')
+  })
+
+  it('multi-line text becomes a narrative, not a preamble → filename fallback', () => {
+    const s = fold([
+      enqueue('test'),
+      { kind: 'text', text: "Here's my plan:\n1. foo\n2. bar" },
+      { kind: 'tool_use', toolName: 'Read', input: { file_path: '/x/a.ts' } },
+    ])
+    expect(s.items[0].label).toBe('a.ts')
+  })
+
   it('events outside the turn lifecycle are no-ops', () => {
     const s1 = reduce(initialState(), { kind: 'thinking' }, 1000)
     expect(s1).toEqual(initialState())
