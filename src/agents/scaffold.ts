@@ -872,7 +872,7 @@ except Exception:
       fi
     fi
     if [ -n "\$_AGO" ]; then
-      echo "✓ Hindsight · \$_COUNT memories · last \$_AGO"
+      echo "✓ Hindsight · \$_COUNT memories · last consolidated \$_AGO"
     else
       echo "✓ Hindsight · \$_COUNT memories"
     fi
