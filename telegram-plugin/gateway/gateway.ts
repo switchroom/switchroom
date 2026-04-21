@@ -2113,10 +2113,14 @@ function preBlock(text: string): string {
   return '<pre>' + escapeHtmlForTg(text) + '</pre>'
 }
 
+type SwitchroomReplyMarkup =
+  | InlineKeyboard
+  | { force_reply: true; input_field_placeholder?: string; selective?: boolean }
+
 async function switchroomReply(
   ctx: Context,
   text: string,
-  options: { html?: boolean; reply_markup?: InlineKeyboard } = {},
+  options: { html?: boolean; reply_markup?: SwitchroomReplyMarkup } = {},
 ): Promise<void> {
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
@@ -2306,14 +2310,35 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
   const url = trimmed.match(/https:\/\/\S+/)?.[0] ?? null
   const lines = trimmed.split(/\n+/).map(l => l.trim()).filter(Boolean)
   if (!url) return { text: preBlock(formatSwitchroomOutput(trimmed)), url: null }
-  const body = lines.filter(line => line !== url)
+  // Drop the `switchroom auth code ...` and `switchroom auth cancel ...`
+  // CLI hints. In Telegram the user never types those — they just reply
+  // with the code (intercepted by the pendingReauthFlows flow above) or
+  // tap the inline button. Surfacing shell syntax is confusing noise on
+  // a phone.
+  const body = lines.filter(line => {
+    if (line === url) return false
+    if (line.startsWith('switchroom auth code')) return false
+    if (line.startsWith('switchroom auth cancel')) return false
+    if (line.startsWith("Use 'tmux attach")) return false
+    if (line.startsWith('After Claude shows you a browser code')) return false
+    if (line.startsWith('Then finish with:')) return false
+    if (line.startsWith('Cancel with:')) return false
+    return true
+  })
   const rendered = body.map(line => {
     if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) return `<b>${escapeHtmlForTg(line)}</b>`
-    if (line.startsWith('Then finish with:') || line.startsWith('Cancel with:')) return escapeHtmlForTg(line)
-    if (line.startsWith('switchroom auth ')) return `<code>${escapeHtmlForTg(line)}</code>`
+    if (line.startsWith('Open this URL')) return `<i>${escapeHtmlForTg(line)}</i>`
     return escapeHtmlForTg(line)
   })
-  rendered.push('', `<a href="${escapeHtmlForTg(url)}">Open Claude login</a>`, escapeHtmlForTg(url))
+  // Mobile-native post-script: tap the inline button below, then reply
+  // to this chat with the browser code. No command prefix needed.
+  rendered.push(
+    '',
+    '👇 Tap the button below to open Claude auth.',
+    'Then <b>reply here with the browser code</b> (just paste it).',
+    '',
+    `<a href="${escapeHtmlForTg(url)}">${escapeHtmlForTg(url)}</a>`,
+  )
   return { text: rendered.join('\n'), url }
 }
 
@@ -2334,6 +2359,21 @@ async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: str
     const formatted = formatAuthOutputForTelegram(output)
     const keyboard = formatted.url ? buildAuthUrlKeyboard(formatted.url) : undefined
     await switchroomReply(ctx, formatted.text, { html: true, reply_markup: keyboard })
+    // If this flow produced an OAuth URL, follow up with a ForceReply
+    // prompt so Telegram's text-input bar shows a "Paste browser code"
+    // placeholder. The user's next message (whether they 'reply' to
+    // this explicitly or just type) is auto-captured by the existing
+    // pendingReauthFlows intercept in the inbound-message handler.
+    if (formatted.url) {
+      try {
+        await switchroomReply(ctx, '📋 Paste the browser code here ↓', {
+          reply_markup: { force_reply: true, input_field_placeholder: 'Paste browser code', selective: true },
+        })
+      } catch {
+        // ForceReply is UX garnish — if it fails the flow still works
+        // via the pending-intercept. Don't escalate.
+      }
+    }
   } catch (err: unknown) {
     const error = err as { status?: number; stderr?: string; message?: string }
     if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
