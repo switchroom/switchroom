@@ -39,6 +39,12 @@ import {
   shouldSuppressToolActivity,
 } from '../pty-tail.js'
 import {
+  parseAuthSubCommand,
+  checkRemoveSafety,
+  formatSlotList,
+  type SlotListingFromCli,
+} from '../auth-slot-parser.js'
+import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
 } from '../history.js'
@@ -2654,38 +2660,70 @@ bot.command('interrupt', async ctx => {
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
-  const sub = (parts[0] ?? 'status').toLowerCase()
   const currentAgent = getMyAgentName()
+  const intent = parseAuthSubCommand(parts, currentAgent)
 
-  if (sub === 'login' || sub === 'reauth' || sub === 'link') {
-    const name = parts[1] ?? currentAgent
-    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-    await runSwitchroomAuthCommand(ctx, ['auth', sub, name], `auth ${sub} ${name}`)
-    if (sub === 'reauth' || sub === 'login') pendingReauthFlows.set(String(ctx.chat!.id), { agent: name, startedAt: Date.now() })
+  if (intent.kind === 'error' || intent.kind === 'usage') {
+    await switchroomReply(ctx, intent.message)
     return
   }
-  if (sub === 'code') {
-    let name = currentAgent; let code = ''
-    if (parts.length >= 3) { name = parts[1]; code = parts.slice(2).join(' ') }
-    else if (parts.length === 2) { code = parts[1] }
-    if (!code) { await switchroomReply(ctx, 'Usage: /auth code [agent] <browser-code>'); return }
-    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-    await runSwitchroomCommand(ctx, ['auth', 'code', name, code], `auth code ${name}`)
+
+  if (intent.kind === 'login' || intent.kind === 'reauth' || intent.kind === 'link') {
+    await runSwitchroomAuthCommand(ctx, intent.cliArgs, intent.label)
+    if (intent.registerReauth) pendingReauthFlows.set(String(ctx.chat!.id), { agent: intent.agent, startedAt: Date.now() })
+    return
+  }
+  if (intent.kind === 'code') {
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
     pendingReauthFlows.delete(String(ctx.chat!.id))
     return
   }
-  if (sub === 'cancel') {
-    const name = parts[1] ?? currentAgent
-    try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-    await runSwitchroomCommand(ctx, ['auth', 'cancel', name], `auth cancel ${name}`)
+  if (intent.kind === 'cancel') {
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
     pendingReauthFlows.delete(String(ctx.chat!.id))
     return
   }
-  if (sub !== 'status') {
-    await switchroomReply(ctx, `Usage:\n/auth\n/auth login [agent]\n/auth reauth [agent]\n/auth code [agent] <browser-code>\n/auth cancel [agent]`)
+
+  // --- Slot management verbs ---
+
+  if (intent.kind === 'add') {
+    await runSwitchroomAuthCommand(ctx, intent.cliArgs, intent.label)
+    pendingReauthFlows.set(String(ctx.chat!.id), { agent: intent.agent, startedAt: Date.now() })
     return
   }
-  await runSwitchroomCommandFormatted(ctx, ['auth', 'status'], 'auth status', () => {
+
+  if (intent.kind === 'use') {
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    // Restart the agent so the new OAuth token is picked up.
+    try { assertSafeAgentName(intent.agent) } catch { return }
+    await runSwitchroomCommand(ctx, ['agent', 'restart', intent.agent], `restart ${intent.agent}`)
+    return
+  }
+
+  if (intent.kind === 'list') {
+    await runSwitchroomCommandFormatted(ctx, intent.cliArgs, intent.label, () => {
+      const data = switchroomExecJson<SlotListingFromCli>(intent.cliArgs)
+      if (!data) return null
+      return formatSlotList({ ...data, agent: data.agent ?? intent.agent })
+    })
+    return
+  }
+
+  if (intent.kind === 'rm') {
+    // Safety check against current slot listing unless --force.
+    if (!intent.force) {
+      const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', intent.agent, '--json'])
+      if (listing) {
+        const err = checkRemoveSafety({ ...listing, agent: listing.agent ?? intent.agent }, intent.slot, intent.force)
+        if (err) { await switchroomReply(ctx, err); return }
+      }
+    }
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
+  // intent.kind === 'status' — fall through to formatted status below.
+  await runSwitchroomCommandFormatted(ctx, intent.cliArgs, intent.label, () => {
     type AuthStatusResp = { agents: Array<{ name: string; authenticated: boolean; auth_source: string | null; pending_auth: boolean; subscription_type: string | null; expires_in: string | null }> }
     const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
     if (!data) return null
