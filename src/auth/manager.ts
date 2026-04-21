@@ -260,8 +260,16 @@ export function formatTimeUntilExpiry(expiresAt: number): string {
 
 export function parseSetupTokenUrl(output: string): string | null {
   const clean = stripAnsi(output);
+  // Anthropic has served the OAuth authorize URL under two shapes over
+  // time: the legacy `https://claude.ai/oauth/authorize?...` form and
+  // (as of ~2026-04) the newer `https://claude.com/cai/oauth/authorize?...`
+  // form. Match either — claude.ai/oauth OR claude.com/cai/oauth — so
+  // the URL-surfacing path in startAuthSession keeps working across the
+  // flip. Regressing this regex means `switchroom auth reauth` falls
+  // back to "use tmux attach" and the Telegram /auth reauth handler
+  // never delivers a tappable link to the user.
   const match = clean.match(
-    /https:\/\/claude\.ai\/oauth\/authorize\?[\s\S]*?(?=\n\s*\n|\n\s*Paste code here|$)/,
+    /https:\/\/claude\.(?:ai\/|com\/cai\/)oauth\/authorize\?[\s\S]*?(?=\n\s*\n|\n\s*Paste code here|$)/,
   );
   if (!match) return null;
   return match[0].replace(/\s+/g, "");

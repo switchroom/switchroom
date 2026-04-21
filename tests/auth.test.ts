@@ -305,11 +305,34 @@ describe("reauth uses clean config dir", () => {
 });
 
 describe("setup-token parsing", () => {
-  it("extracts and unwraps the Claude browser auth URL", () => {
+  it("extracts and unwraps the legacy claude.ai browser auth URL", () => {
     const sample = `Browser didn't open? Use the url below to sign in\n\nhttps://claude.ai/oauth/authorize?code=true&client_id=abc\n123&response_type=code\n\nPaste code here if prompted >`;
     expect(parseSetupTokenUrl(sample)).toBe(
       "https://claude.ai/oauth/authorize?code=true&client_id=abc123&response_type=code"
     );
+  });
+
+  it("extracts the current claude.com/cai URL shape (Apr 2026 flip)", () => {
+    // This is the URL shape claude setup-token actually emits now.
+    // Regression sample: /auth reauth from Telegram on 2026-04-21
+    // silently fell back to the tmux-attach instruction because the
+    // URL regex didn't match this shape, so the URL never made it to
+    // the caller.
+    const sample =
+      `Browser didn't open? Use the url below to sign in\n\n` +
+      `https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e\n` +
+      `&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback\n\n` +
+      `Paste code here if prompted >`;
+    expect(parseSetupTokenUrl(sample)).toBe(
+      "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+    );
+  });
+
+  it("returns null when no URL is present", () => {
+    expect(parseSetupTokenUrl("")).toBeNull();
+    expect(parseSetupTokenUrl("no urls here")).toBeNull();
+    // A bare https:// without the right path should not match.
+    expect(parseSetupTokenUrl("https://claude.ai/other/path?x=1")).toBeNull();
   });
 
   it("extracts a setup-token oauth token from output", () => {
