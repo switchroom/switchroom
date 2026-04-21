@@ -95,6 +95,15 @@ import {
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
 import { fetchQuota, formatQuotaBlock } from '../quota-check.js'
+import {
+  evaluateFallbackTrigger,
+  performAutoFallback,
+  emptyLockout,
+  nextLockout,
+  type LockoutRecord,
+} from '../auto-fallback.js'
+import { currentActiveSlot, markSlotQuotaExhausted } from '../../src/auth/accounts.js'
+import { fallbackToNextSlot } from '../../src/auth/manager.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import type {
@@ -2657,6 +2666,85 @@ bot.command('interrupt', async ctx => {
   await runSwitchroomCommand(ctx, ['agent', 'interrupt', name], `interrupt ${name}`)
 })
 
+// Shared auto-fallback state. `lockout` is a per-process in-memory
+// guard against rapid re-fire between the scheduled poll and a
+// manual /authfallback trigger (see telegram-plugin/auto-fallback.ts).
+let autoFallbackLockout: LockoutRecord = emptyLockout()
+
+type AutoFallbackCheckResult =
+  | { kind: 'no-action'; reason: string; decision: 'noop' | 'fallback-skipped' }
+  | { kind: 'executed'; previousSlot: string; newSlot: string }
+  | { kind: 'exhausted-all'; activeSlot: string }
+  | { kind: 'error'; message: string }
+
+async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): Promise<AutoFallbackCheckResult> {
+  try {
+    const agentDir = resolveAgentDirFromEnv()
+    const agentName = getMyAgentName()
+    const active = currentActiveSlot(agentDir)
+    const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
+    const decision = evaluateFallbackTrigger({
+      quota,
+      activeSlot: active,
+      now: Date.now(),
+      lockout: autoFallbackLockout,
+    })
+    if (decision.action !== 'fallback') {
+      return { kind: 'no-action', reason: decision.reason, decision: 'noop' }
+    }
+    const plan = performAutoFallback({
+      agentDir,
+      agentName,
+      decision,
+      deps: { currentActiveSlot, markSlotQuotaExhausted, fallbackToNextSlot },
+    })
+    const ownerChatId = loadAccess().allowFrom[0]
+    if (ownerChatId) {
+      try {
+        await bot.api.sendMessage(ownerChatId, plan.notificationHtml, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: auto-fallback notify failed (${opts.trigger}): ${err}\n`)
+      }
+    }
+    if (plan.kind === 'executed') {
+      try { assertSafeAgentName(plan.agentName) }
+      catch {
+        return { kind: 'error', message: `invalid agent name: ${plan.agentName}` }
+      }
+      try {
+        switchroomExec(['agent', 'restart', plan.agentName])
+      } catch (err) {
+        process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
+      }
+      autoFallbackLockout = nextLockout(plan.previousSlot, Date.now())
+      return { kind: 'executed', previousSlot: plan.previousSlot, newSlot: plan.newSlot }
+    }
+    autoFallbackLockout = nextLockout(plan.activeSlot, Date.now())
+    return { kind: 'exhausted-all', activeSlot: plan.activeSlot }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: auto-fallback ${opts.trigger} poll error: ${err}\n`)
+    return { kind: 'error', message: String((err as Error).message ?? err) }
+  }
+}
+
+bot.command('authfallback', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const result = await runAutoFallbackCheck({ trigger: 'manual' })
+  if (result.kind === 'executed') {
+    await switchroomReply(ctx, `✅ Switched slot <code>${escapeHtmlForTg(result.previousSlot)}</code> → <code>${escapeHtmlForTg(result.newSlot)}</code>. Agent restarted.`, { html: true })
+    return
+  }
+  if (result.kind === 'exhausted-all') {
+    await switchroomReply(ctx, `🚨 All slots quota-exhausted. Run <code>/auth add</code> to attach another subscription.`, { html: true })
+    return
+  }
+  if (result.kind === 'error') {
+    await switchroomReply(ctx, `❌ /authfallback error: ${escapeHtmlForTg(result.message)}`, { html: true })
+    return
+  }
+  await switchroomReply(ctx, `No action: ${escapeHtmlForTg(result.reason)}`, { html: true })
+})
+
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
@@ -3292,6 +3380,21 @@ void (async () => {
           }
         }
       } catch {}
+
+      // Auto-fallback on quota exhaustion. Periodically polls
+      // the active slot's rate-limit headers; when utilization >= 99.5%
+      // or a 429 is observed, marks the slot exhausted, swaps to the
+      // next healthy slot via src/auth, restarts the agent, and posts
+      // a notification to the owner chat. See telegram-plugin/auto-fallback.ts
+      // for the pure decision logic + notification builder.
+      //
+      // Default poll cadence: every 60 minutes. Set
+      // SWITCHROOM_AUTO_FALLBACK_POLL_MS=0 to disable the background
+      // poller (users can still trigger a check via /authfallback).
+      const AUTO_FALLBACK_POLL_MS = Number(process.env.SWITCHROOM_AUTO_FALLBACK_POLL_MS ?? 60 * 60_000)
+      if (AUTO_FALLBACK_POLL_MS > 0) {
+        setInterval(() => { void runAutoFallbackCheck({ trigger: 'scheduled' }) }, AUTO_FALLBACK_POLL_MS).unref()
+      }
 
       runnerHandle = run(bot)
       await runnerHandle.task()
