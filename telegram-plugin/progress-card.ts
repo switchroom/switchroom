@@ -92,6 +92,17 @@ export interface SubAgentState {
     readonly toolUseId: string
     readonly startedAt: number
   }
+  /**
+   * Per-sub-agent analogue of ProgressCardState.pendingPreamble: the most
+   * recent single-line `text` block THIS sub-agent emitted that hasn't
+   * yet been paired to a `sub_agent_tool_use`. Set on every
+   * `sub_agent_text` event; consumed and cleared by the NEXT
+   * `sub_agent_tool_use` for the same agent (sibling tool_uses in the
+   * same batch get the filename fallback). Cleared on
+   * `sub_agent_turn_end` / `turn_end`. Lives per-agent — a preamble from
+   * sub-agent A must not leak onto sub-agent B's tool_use.
+   */
+  readonly pendingPreamble?: string | null
   /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
   readonly nestedSpawnCount: number
 }
@@ -455,9 +466,28 @@ export function reduce(
       return { ...state, subAgents, pendingAgentSpawns, items }
     }
 
+    case 'sub_agent_text': {
+      // Per-sub-agent analogue of the parent `text` case: stash the raw
+      // text as a candidate preamble for THIS sub-agent's next
+      // sub_agent_tool_use. toolLabel() applies the single-line + length
+      // gate so we pass the full text through unfiltered. No-op if the
+      // sub-agent isn't known yet (defensive: sub_agent_started should
+      // always precede sub_agent_text in the same JSONL).
+      const sa = state.subAgents.get(event.agentId)
+      if (!sa) return state
+      const next = new Map(state.subAgents)
+      next.set(event.agentId, { ...sa, pendingPreamble: event.text })
+      return { ...state, subAgents: next }
+    }
+
     case 'sub_agent_tool_use': {
       const sa = state.subAgents.get(event.agentId)
       if (!sa) return state
+      // Consume pendingPreamble exactly once — same one-shot semantic as
+      // the parent path (3ad8436): the first sub_agent_tool_use after a
+      // sub_agent_text pairs with it; sibling tool_uses in the same
+      // assistant message fall back to filename/pattern.
+      const preamble = sa.pendingPreamble ?? undefined
       const next = new Map(state.subAgents)
       next.set(event.agentId, {
         ...sa,
@@ -465,11 +495,12 @@ export function reduce(
         currentTool: event.toolUseId
           ? {
               tool: event.toolName,
-              label: toolLabel(event.toolName, event.input),
+              label: toolLabel(event.toolName, event.input, preamble),
               toolUseId: event.toolUseId,
               startedAt: now,
             }
           : sa.currentTool,
+        pendingPreamble: null,
       })
       return { ...state, subAgents: next }
     }
@@ -493,9 +524,10 @@ export function reduce(
       if (!sa) return state
       // Tentative close: parent's tool_result is still authoritative.
       // If it later arrives with isError=true, the tool_result case
-      // overrides this 'done' with 'failed'.
+      // overrides this 'done' with 'failed'. Clear any lingering
+      // pendingPreamble defensively — mirrors the parent turn_end path.
       const next = new Map(state.subAgents)
-      next.set(event.agentId, { ...sa, state: 'done', finishedAt: now })
+      next.set(event.agentId, { ...sa, state: 'done', finishedAt: now, pendingPreamble: null })
       return { ...state, subAgents: next }
     }
 
@@ -514,7 +546,10 @@ export function reduce(
       )
       const subAgents = new Map<string, SubAgentState>()
       for (const [k, sa] of state.subAgents) {
-        subAgents.set(k, sa.state === 'running' ? { ...sa, state: 'done', finishedAt: now } : sa)
+        // Clear any lingering pendingPreamble on turn_end — mirrors the
+        // parent pendingPreamble: null reset below.
+        const closed = sa.state === 'running' ? { ...sa, state: 'done' as const, finishedAt: now } : sa
+        subAgents.set(k, { ...closed, pendingPreamble: null })
       }
       const narratives = state.narratives.map(n =>
         n.state === 'active' ? { ...n, state: 'done' as const } : n,
@@ -527,6 +562,7 @@ export function reduce(
         pendingAgentSpawns: new Map(),
         stage: 'done',
         thinking: false,
+        pendingPreamble: null,
       }
     }
 
