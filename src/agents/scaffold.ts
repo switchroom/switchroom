@@ -34,7 +34,7 @@ import {
 } from "./profiles.js";
 import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -2282,44 +2282,82 @@ export function scaffoldAgent(
     }
   }
 
-  // Update bank missions if configured
-  if (hindsightEnabled && (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission)) {
-    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
-    const missions: { bank_mission?: string; retain_mission?: string } = {};
-    if (agentConfig.memory?.bank_mission) {
-      missions.bank_mission = agentConfig.memory.bank_mission;
-    }
-    if (agentConfig.memory?.retain_mission) {
-      missions.retain_mission = agentConfig.memory.retain_mission;
-    }
-
-    updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
-      .then((result) => {
-        if (result.ok) {
-          console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
-        } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-        }
-      })
-      .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-      });
-  }
-
-  // Ensure user-profile Mental Model exists when Hindsight is enabled
+  // Create the Hindsight bank idempotently. Without this, the first
+  // `retain` call against the newly scaffolded agent blows up with a raw
+  // foreign-key constraint violation because the bank doesn't exist yet
+  // (see reference/onboarding-gap-analysis.md §1). create_bank is a no-op
+  // if the bank already exists. We intentionally await this BEFORE the
+  // downstream bank-mission and mental-model ops — those depend on the
+  // bank existing and would fail the same way. If Hindsight itself is
+  // unreachable we warn to stderr and carry on — agent scaffolding must
+  // still succeed so the operator can start Hindsight and re-run
+  // `switchroom agent reconcile <name>` to retry.
   if (hindsightEnabled) {
     const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
-    ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+    const bankOpsChain = createBank(apiUrl, hindsightBankId, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
-        } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+          console.log(`  ${chalk.green("✓")} Hindsight bank ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+          return true;
         }
+        if (result.reason === "Unreachable") {
+          console.warn(
+            `  ${chalk.yellow("⚠")} Hindsight unreachable — skipping bank creation for ${formatAgentBankLabel(name, hindsightBankId)}.`,
+          );
+          console.warn(
+            `     Agent is still usable, but start Hindsight and run: switchroom agent reconcile ${name}`,
+          );
+        } else {
+          console.warn(
+            `  ${chalk.yellow("⚠")} Failed to create Hindsight bank for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`,
+          );
+        }
+        return false;
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} Hindsight bank create error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        return false;
       });
+
+    // Update bank missions and ensure user-profile MM — both gated on the
+    // bank actually existing.
+    bankOpsChain.then((bankReady) => {
+      if (!bankReady) return;
+
+      if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission) {
+        const missions: { bank_mission?: string; retain_mission?: string } = {};
+        if (agentConfig.memory?.bank_mission) {
+          missions.bank_mission = agentConfig.memory.bank_mission;
+        }
+        if (agentConfig.memory?.retain_mission) {
+          missions.retain_mission = agentConfig.memory.retain_mission;
+        }
+
+        updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+          .then((result) => {
+            if (result.ok) {
+              console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+            }
+          })
+          .catch((err) => {
+            console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+          });
+      }
+
+      ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+        .then((result) => {
+          if (result.ok) {
+            console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+          } else {
+            console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
+    });
   }
 
   return { agentDir, created, skipped };
@@ -3098,44 +3136,73 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     }
   }
 
-  // Update bank missions if configured (same as scaffoldAgent)
-  if (hindsightEnabled && (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission)) {
-    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
-    const missions: { bank_mission?: string; retain_mission?: string } = {};
-    if (agentConfig.memory?.bank_mission) {
-      missions.bank_mission = agentConfig.memory.bank_mission;
-    }
-    if (agentConfig.memory?.retain_mission) {
-      missions.retain_mission = agentConfig.memory.retain_mission;
-    }
-
-    updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
-      .then((result) => {
-        if (result.ok) {
-          console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
-        } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-        }
-      })
-      .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-      });
-  }
-
-  // Ensure user-profile Mental Model exists when Hindsight is enabled (same as scaffoldAgent)
+  // Ensure bank exists before any mission/MM ops — same rationale as
+  // scaffoldAgent. reconcile is also the operator's retry path when
+  // Hindsight was down during `agent create`.
   if (hindsightEnabled) {
     const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
-    ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+    const bankOpsChain = createBank(apiUrl, hindsightBankId, { timeoutMs: 5000 })
       .then((result) => {
         if (result.ok) {
-          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
-        } else {
-          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+          console.log(`  ${chalk.green("✓")} Hindsight bank ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+          return true;
         }
+        if (result.reason === "Unreachable") {
+          console.warn(
+            `  ${chalk.yellow("⚠")} Hindsight unreachable — skipping bank creation for ${formatAgentBankLabel(name, hindsightBankId)}.`,
+          );
+          console.warn(
+            `     Start Hindsight, then re-run: switchroom agent reconcile ${name}`,
+          );
+        } else {
+          console.warn(
+            `  ${chalk.yellow("⚠")} Failed to create Hindsight bank for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`,
+          );
+        }
+        return false;
       })
       .catch((err) => {
-        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        console.warn(`  ${chalk.yellow("⚠")} Hindsight bank create error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        return false;
       });
+
+    bankOpsChain.then((bankReady) => {
+      if (!bankReady) return;
+
+      if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission) {
+        const missions: { bank_mission?: string; retain_mission?: string } = {};
+        if (agentConfig.memory?.bank_mission) {
+          missions.bank_mission = agentConfig.memory.bank_mission;
+        }
+        if (agentConfig.memory?.retain_mission) {
+          missions.retain_mission = agentConfig.memory.retain_mission;
+        }
+
+        updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+          .then((result) => {
+            if (result.ok) {
+              console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
+            } else {
+              console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+            }
+          })
+          .catch((err) => {
+            console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+          });
+      }
+
+      ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+        .then((result) => {
+          if (result.ok) {
+            console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
+          } else {
+            console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
+    });
   }
 
   return {
