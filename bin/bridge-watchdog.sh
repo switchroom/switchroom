@@ -129,23 +129,34 @@ for gateway_svc in "${gateway_services[@]}"; do
     fi
   fi
 
-  # Check the gateway log for the last bridge event.
-  # "bridge registered"   = healthy
-  # "bridge disconnected" = dead
-  # (no events yet)       = dead (treat as bridge never connected)
+  # Check the IPC socket for an actual ESTAB connection from the
+  # agent's bridge. This is authoritative — if there's a live unix
+  # socket, the bridge is connected right now. If not, it isn't.
   #
-  # strings(1) strips the PTY control codes the gateway emits through
-  # `script -qfc`; grep alone would miss lines wrapped in escape
-  # sequences.
-  last_bridge_event=$(
-    strings "$gateway_log" 2>/dev/null \
-      | grep -E 'bridge (registered|disconnected)' \
-      | tail -1 || true
+  # Why not just grep the gateway log: log grep used to be the check,
+  # but it had a subtle bug. After a gateway restart, the log persists
+  # across the restart (the gateway's `tee $LOG_PATH` appends). The
+  # last "bridge registered" event might be from BEFORE the restart,
+  # so `tail -1` reports it as healthy even though the agent hasn't
+  # reconnected yet. Production incident 2026-04-22 ~07:20: clerk was
+  # stuck with 0 IPC connections but watchdog said healthy because
+  # the pre-restart "bridge registered" was the latest in the log.
+  #
+  # ss -x reads kernel-level socket state so it's immune to log
+  # staleness. Unix sockets are visible without sudo for the owner.
+  gateway_sock="${gateway_state_dir}/gateway.sock"
+  if [[ ! -S "$gateway_sock" ]]; then
+    # Socket file doesn't exist — gateway hasn't fully started or is
+    # shutting down. Skip this tick; try again in 60s.
+    continue
+  fi
+
+  ipc_estab_count=$(
+    ss -x 2>/dev/null \
+      | awk -v sock="$gateway_sock" '$1 == "u_str" && $2 == "ESTAB" && index($0, sock) { n++ } END { print n+0 }'
   )
 
-  if [[ -z "$last_bridge_event" ]]; then
-    bridge_healthy=false
-  elif [[ "$last_bridge_event" == *"bridge registered"* ]]; then
+  if (( ipc_estab_count > 0 )); then
     bridge_healthy=true
   else
     bridge_healthy=false
