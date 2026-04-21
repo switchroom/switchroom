@@ -5,9 +5,19 @@ import {
   cronToOnCalendar,
   generateTimerUnit,
   generateTimerServiceUnit,
+  resolveGatewayUnitName,
 } from "../src/agents/systemd.js";
 import { usesSwitchroomTelegramPlugin } from "../src/config/merge.js";
-import type { AgentConfig } from "../src/config/schema.js";
+import type { AgentConfig, SwitchroomConfig } from "../src/config/schema.js";
+
+function makeConfig(agents: Record<string, AgentConfig>): SwitchroomConfig {
+  return {
+    switchroom: { version: 1, agents_dir: "~/.switchroom/agents", skills_dir: "~/.switchroom/skills" },
+    telegram: { bot_token: "vault:telegram-bot-token" },
+    defaults: {},
+    agents,
+  } as unknown as SwitchroomConfig;
+}
 
 describe("generateUnit", () => {
   it("generates valid unit file content", () => {
@@ -222,6 +232,72 @@ describe("generateUnit with gateway dependency", () => {
     const unit = generateUnit("agent", "/tmp/agent", false);
     expect(unit).toContain("After=network-online.target");
     expect(unit).not.toContain("switchroom-gateway.service");
+  });
+
+  it("points After= at the agent's own gateway when given an explicit name", () => {
+    const unit = generateUnit("lawgpt", "/tmp/lawgpt", true, "lawgpt-gateway");
+    expect(unit).toContain("After=network-online.target switchroom-lawgpt-gateway.service");
+  });
+});
+
+describe("multi-agent gateway support", () => {
+  // Regression test for: installAllUnits used to pick the first
+  // telegram-using agent and install exactly one gateway for the whole
+  // deployment. Every subsequent telegram agent ended up with its own
+  // bot token in a state dir no gateway was watching, so Telegram
+  // polling silently never started. switchroom is meant to run many
+  // agents side-by-side — each with its own bot — so every telegram-
+  // using agent must get its own dedicated gateway unit.
+
+  it("resolveGatewayUnitName returns per-agent gateway names", () => {
+    const config = makeConfig({
+      clerk: { profile: "default" } as AgentConfig,
+      lawgpt: { profile: "default" } as AgentConfig,
+    });
+    expect(resolveGatewayUnitName(config, "clerk")).toBe("clerk-gateway");
+    expect(resolveGatewayUnitName(config, "lawgpt")).toBe("lawgpt-gateway");
+  });
+
+  it("resolveGatewayUnitName returns undefined for agents that don't use the switchroom telegram plugin", () => {
+    const config = makeConfig({
+      official: {
+        profile: "default",
+        channels: { telegram: { plugin: "official" } },
+      } as AgentConfig,
+    });
+    expect(resolveGatewayUnitName(config, "official")).toBeUndefined();
+  });
+
+  it("resolveGatewayUnitName returns undefined for an unknown agent", () => {
+    const config = makeConfig({
+      clerk: { profile: "default" } as AgentConfig,
+    });
+    expect(resolveGatewayUnitName(config, "ghost")).toBeUndefined();
+  });
+
+  it("distinct telegram agents produce distinct gateway unit bodies", () => {
+    const clerkUnit = generateGatewayUnit("/home/user/.switchroom/agents/clerk/telegram", "clerk");
+    const lawgptUnit = generateGatewayUnit("/home/user/.switchroom/agents/lawgpt/telegram", "lawgpt");
+
+    expect(clerkUnit).toContain("Description=switchroom telegram gateway (clerk)");
+    expect(lawgptUnit).toContain("Description=switchroom telegram gateway (lawgpt)");
+
+    expect(clerkUnit).toContain("TELEGRAM_STATE_DIR=/home/user/.switchroom/agents/clerk/telegram");
+    expect(lawgptUnit).toContain("TELEGRAM_STATE_DIR=/home/user/.switchroom/agents/lawgpt/telegram");
+
+    expect(clerkUnit).not.toContain("lawgpt");
+    expect(lawgptUnit).not.toContain("clerk");
+  });
+
+  it("each agent unit After= references its own gateway, not a shared one", () => {
+    const clerkUnit = generateUnit("clerk", "/tmp/clerk", true, "clerk-gateway");
+    const lawgptUnit = generateUnit("lawgpt", "/tmp/lawgpt", true, "lawgpt-gateway");
+
+    expect(clerkUnit).toContain("After=network-online.target switchroom-clerk-gateway.service");
+    expect(lawgptUnit).toContain("After=network-online.target switchroom-lawgpt-gateway.service");
+
+    expect(clerkUnit).not.toContain("switchroom-lawgpt-gateway.service");
+    expect(lawgptUnit).not.toContain("switchroom-clerk-gateway.service");
   });
 });
 
