@@ -64,6 +64,10 @@ import {
   ORPHANED_REPLY_TIMEOUT_MS,
 } from '../context-exhaustion.js'
 import {
+  decideTurnFlush,
+  isTurnFlushSafetyEnabled,
+} from '../turn-flush-safety.js'
+import {
   resolveAgentDirFromEnv,
   consumeHandoffTopic,
   shouldShowHandoffLine,
@@ -598,6 +602,7 @@ function coalesceKey(chatId: string, userId: string): string {
 
 // ─── Progress card + session/PTY tail state ───────────────────────────────
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
+const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 let progressDriver: ProgressDriver | null = null
 let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
 
@@ -1452,70 +1457,79 @@ function handleSessionEvent(ev: SessionEvent): void {
       const threadId = currentSessionThreadId
       const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
 
-      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0 && progressDriver == null) {
-        const capturedText = currentTurnCapturedText.join('\n').trim()
-        if (capturedText) {
-          const backstopChatId = chatId
-          const backstopThreadId = threadId
-          const backstopCtrl = ctrl
+      const flushDecision = decideTurnFlush({
+        chatId: currentSessionChatId,
+        replyCalled: currentTurnReplyCalled,
+        capturedText: currentTurnCapturedText,
+        flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
+      })
+      if (flushDecision.kind === 'skip' && flushDecision.reason !== 'reply-called') {
+        process.stderr.write(
+          `telegram gateway: turn-flush skipped — reason=${flushDecision.reason}\n`,
+        )
+      }
+      if (flushDecision.kind === 'flush') {
+        const capturedText = flushDecision.text
+        const backstopChatId = chatId
+        const backstopThreadId = threadId
+        const backstopCtrl = ctrl
 
-          currentSessionChatId = null
-          currentSessionThreadId = undefined
-          currentTurnReplyCalled = false
-          currentTurnCapturedText = []
+        currentSessionChatId = null
+        currentSessionThreadId = undefined
+        currentTurnReplyCalled = false
+        currentTurnCapturedText = []
 
-          void (async () => {
-            await new Promise<void>(resolve => setTimeout(resolve, 500))
-            if (HISTORY_ENABLED) {
+        void (async () => {
+          await new Promise<void>(resolve => setTimeout(resolve, 500))
+          if (HISTORY_ENABLED) {
+            try {
+              const { getRecentOutboundCount } = await import('../history.js')
+              const recentCount = getRecentOutboundCount(backstopChatId, 2)
+              if (recentCount > 0) {
+                process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
+                if (backstopCtrl) backstopCtrl.setDone()
+                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
+                return
+              }
+            } catch {}
+          }
+
+          process.stderr.write(
+            `telegram gateway: turn-flush firing — ${capturedText.length} chars without reply tool (chat=${backstopChatId})\n`,
+          )
+          const sendOpts = {
+            parse_mode: 'HTML' as const,
+            ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
+            link_preview_options: { is_disabled: true },
+          }
+          const renderedText = markdownToHtml(capturedText)
+          const limit = 4000
+          const htmlChunks = splitHtmlChunks(renderedText, limit)
+          const sentIds: number[] = []
+          try {
+            for (const c of htmlChunks) {
+              const sent = await bot.api.sendMessage(backstopChatId, c, sendOpts)
+              sentIds.push(sent.message_id)
+            }
+            if (HISTORY_ENABLED && sentIds.length > 0) {
               try {
-                const { getRecentOutboundCount } = await import('../history.js')
-                const recentCount = getRecentOutboundCount(backstopChatId, 2)
-                if (recentCount > 0) {
-                  process.stderr.write(`telegram gateway: backstop suppressed — reply tool sent ${recentCount} message(s)\n`)
-                  if (backstopCtrl) backstopCtrl.setDone()
-                  purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
-                  return
-                }
+                recordOutbound({
+                  chat_id: backstopChatId,
+                  thread_id: backstopThreadId ?? null,
+                  message_ids: sentIds,
+                  texts: htmlChunks,
+                })
               } catch {}
             }
-
-            process.stderr.write(
-              `telegram gateway: orphaned-reply backstop firing — ${capturedText.length} chars without reply tool\n`,
-            )
-            const sendOpts = {
-              parse_mode: 'HTML' as const,
-              ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
-              link_preview_options: { is_disabled: true },
-            }
-            const renderedText = markdownToHtml(capturedText)
-            const limit = 4000
-            const htmlChunks = splitHtmlChunks(renderedText, limit)
-            const sentIds: number[] = []
-            try {
-              for (const c of htmlChunks) {
-                const sent = await bot.api.sendMessage(backstopChatId, c, sendOpts)
-                sentIds.push(sent.message_id)
-              }
-              if (HISTORY_ENABLED && sentIds.length > 0) {
-                try {
-                  recordOutbound({
-                    chat_id: backstopChatId,
-                    thread_id: backstopThreadId ?? null,
-                    message_ids: sentIds,
-                    texts: htmlChunks,
-                  })
-                } catch {}
-              }
-              if (backstopCtrl) backstopCtrl.setDone()
-            } catch (err) {
-              process.stderr.write(`telegram gateway: orphaned-reply backstop failed: ${(err as Error).message}\n`)
-              if (backstopCtrl) backstopCtrl.setError()
-            } finally {
-              purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
-            }
-          })()
-          return
-        }
+            if (backstopCtrl) backstopCtrl.setDone()
+          } catch (err) {
+            process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
+            if (backstopCtrl) backstopCtrl.setError()
+          } finally {
+            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
+          }
+        })()
+        return
       }
 
       if (ctrl) ctrl.setDone()
