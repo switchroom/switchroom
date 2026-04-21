@@ -453,6 +453,15 @@ export const AgentSchema = z.object({
     .string()
     .optional()
     .describe("Per-agent Telegram bot token or vault reference (overrides global telegram.bot_token)"),
+  auth_label: z
+    .string()
+    .optional()
+    .describe(
+      "Human-readable identity for the session-start greeting (e.g. 'pixsoul@gmail.com'). " +
+      "Anthropic does not expose a public user-profile endpoint for OAuth tokens, so the " +
+      "email/account cannot be read locally; the user declares it here. Appears in the Auth " +
+      "row as '✓ max · <label> · expires ...'."
+    ),
   topic_name: z.string().describe("Telegram forum topic display name"),
   topic_emoji: z
     .string()
