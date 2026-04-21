@@ -360,7 +360,7 @@ export function checkSkillsPrerequisites(): CheckResult[] {
   ];
 }
 
-function checkConfig(config: SwitchroomConfig, configPath: string): CheckResult[] {
+export function checkConfig(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
 
   results.push({
@@ -387,6 +387,23 @@ function checkConfig(config: SwitchroomConfig, configPath: string): CheckResult[
     fix: forumChatId
       ? undefined
       : "Add a Telegram forum group chat ID under telegram.forum_chat_id",
+  });
+
+  const knownSubagents = ["worker", "researcher", "reviewer"] as const;
+  const foundSubagents = knownSubagents.filter(
+    (k) => config.defaults?.subagents?.[k] !== undefined,
+  );
+  results.push({
+    name: "default subagents configured",
+    status: foundSubagents.length > 0 ? "ok" : "warn",
+    detail:
+      foundSubagents.length > 0
+        ? foundSubagents.join(", ")
+        : "no default subagents — main agent handles all work inline",
+    fix:
+      foundSubagents.length > 0
+        ? undefined
+        : "Add defaults.subagents to switchroom.yaml to enable Sonnet/Haiku delegation. See docs/sub-agents.md for the worker/researcher/reviewer pattern.",
   });
 
   return results;

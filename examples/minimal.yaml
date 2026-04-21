@@ -16,6 +16,38 @@ defaults:
   model: claude-sonnet-4-6
   tools:
     allow: [all]
+  subagents:
+    worker:
+      description: "Handles implementation tasks: writing, editing, building, testing. Use for any task that takes more than a few seconds."
+      model: sonnet
+      background: true
+      isolation: worktree
+      maxTurns: 50
+      color: blue
+      prompt: |
+        You are a worker sub-agent. Implement the task described in your
+        prompt precisely and completely. Commit your work when done.
+        If requirements are ambiguous, state your assumptions rather
+        than guessing. Return a concise summary of what you did.
+    researcher:
+      description: "Explores codebases, reads documentation, searches for information. Use for any research or investigation task."
+      model: haiku
+      background: true
+      color: green
+      prompt: |
+        You are a research sub-agent. Investigate the topic described
+        in your prompt thoroughly. Return structured findings — not
+        raw file contents. Keep your report under 500 words unless
+        the parent explicitly asks for more detail.
+    reviewer:
+      description: "Reviews code, plans, documents for quality, correctness, and completeness. Use after a worker finishes or before shipping."
+      model: sonnet
+      color: purple
+      prompt: |
+        You are a review sub-agent. Examine the work described in
+        your prompt for correctness, completeness, security, and
+        quality. Report findings as a punch list: what's good, what
+        needs fixing, what's missing. Be rigorous but concise.
 
 agents:
   assistant:
