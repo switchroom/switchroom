@@ -24,6 +24,14 @@ a specific UI.
 
 - The user gets an ambient signal that the agent heard them, effectively
   instantly. No silent gap between "I sent it" and "something's happening."
+- The ambient signal distinguishes phases at a glance — acknowledged,
+  thinking/working, actively editing code. A glance is enough to know
+  which phase; the user never has to open a structured surface just to
+  answer "what kind of work is happening right now."
+- Fast replies don't pay structured-progress overhead. If the agent can
+  answer before the user would reasonably start wondering, the answer
+  itself is the signal — no progress card, no pinned status, just the
+  reply with the ambient reaction carrying the "I'm on it" beat.
 - The user can tell running from stuck at a glance. A stuck agent visibly
   escalates, it doesn't just sit there.
 - A user who scrolls back after the fact can reconstruct roughly what the
@@ -49,6 +57,14 @@ a specific UI.
   them and you lose signal on all three.
 - Narrating every tool call as a new chat message. A wall of bot receipts
   buries the actual conversation.
+- Spinning up a structured progress surface for a reply that finishes in
+  a couple of seconds. A card that appears and disappears before the
+  user's eyes settle on it is pure noise — worse than nothing. Structured
+  progress is for turns that actually earn it.
+- Collapsing "acknowledged," "thinking/working," and "actively editing"
+  into a single undifferentiated ambient signal. If the glance looks the
+  same across phases, the glance carries no information and the user is
+  forced to open a structured surface to learn what's happening.
 - Hiding progress behind a command or a button. If the user has to ask
   what their agent is doing, the product has already failed. A user
   typing "status?" mid-turn is a fail state, not a feature to support.
@@ -71,8 +87,11 @@ experience, not just the reply.
 - **Long, multi-step work.** Ask for something that will take many tool
   calls over 30+ seconds. The user should never wonder if it's alive or
   what stage it's at.
-- **Short one-shot.** Ask a trivial question. The overhead of "showing
-  progress" should not dominate a small answer.
+- **Short one-shot.** Ask a trivial question. The reply arrives as a
+  plain answer — no structured progress surface appears at all. The
+  ambient reaction alone carries the "I'm on it" beat until the answer
+  lands. A progress card flashing up and vanishing on a fast reply is a
+  failure, not a feature.
 - **Delegated work.** Ask for something that should route to a sub-agent.
   The user should see sub-agent progress in the same place as the parent,
   not have to go find it.

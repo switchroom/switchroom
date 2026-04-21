@@ -8,6 +8,9 @@ import {
   buildMessageStatus,
   formatStatusText,
   parseSystemdTimestamp,
+  readinessGaps,
+  waitForAgentReady,
+  type AgentStatusReport,
   type StatusInputs,
 } from "../src/agents/status.js";
 
@@ -379,5 +382,121 @@ describe("formatStatusText", () => {
     const text = formatStatusText(report);
     expect(text).toContain("overall: fail");
     expect(text).toContain("claude: fail");
+  });
+});
+
+describe("readinessGaps", () => {
+  function reportWith(overrides: Partial<AgentStatusReport> = {}): AgentStatusReport {
+    const base: AgentStatusReport = {
+      name: "test-agent",
+      claude: { state: "ok", pid: 1, uptimeSeconds: 10, detail: "ok" },
+      gateway: { state: "ok", pid: 2, detail: "ok" },
+      hindsight: { state: "ok", detail: "ok" },
+      polling: { state: "ok", botHandle: "b", detail: "@b" },
+      messages: { state: "ok", lastInboundTs: 1, lastOutboundTs: 1, detail: "ok" },
+      overallState: "ok",
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("returns empty list when all components are ok", () => {
+    expect(readinessGaps(reportWith())).toEqual([]);
+  });
+
+  it("names each failing component", () => {
+    const gaps = readinessGaps(
+      reportWith({
+        claude: { state: "fail", pid: null, uptimeSeconds: null, detail: "x" },
+        gateway: { state: "fail", pid: null, detail: "x" },
+        hindsight: { state: "fail", detail: "x" },
+        polling: { state: "fail", botHandle: null, detail: "x" },
+      }),
+    );
+    expect(gaps).toEqual(["claude", "gateway", "hindsight", "polling"]);
+  });
+
+  it("excludes messages from readiness gaps even when warn/fail", () => {
+    const gaps = readinessGaps(
+      reportWith({
+        messages: {
+          state: "warn",
+          lastInboundTs: null,
+          lastOutboundTs: null,
+          detail: "empty db",
+        },
+      }),
+    );
+    expect(gaps).toEqual([]);
+  });
+
+  it("treats hindsight 'ok — not configured' as ready (no gap)", () => {
+    // When hindsight is not configured for the agent, state is ok by
+    // construction. Confirm the gap list stays empty.
+    expect(readinessGaps(reportWith({ hindsight: { state: "ok", detail: "not configured" } }))).toEqual([]);
+  });
+});
+
+describe("waitForAgentReady", () => {
+  it("returns ready: true on first poll when every component is ok", async () => {
+    const sleep = vi.fn(async () => {});
+    const result = await waitForAgentReady(makeInputs(), {
+      timeoutMs: 5_000,
+      pollIntervalMs: 100,
+      sleep,
+    });
+    expect(result.ready).toBe(true);
+    expect(result.notReady).toEqual([]);
+    // Never needed to sleep — fast-path. Guarantees start/restart return
+    // immediately when the agent is already serveable.
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("returns ready: false with notReady list when the deadline elapses", async () => {
+    // Simulate the gateway log never getting its "polling as @bot" line.
+    // Advance a virtual clock by returning fixed values from `now`.
+    const times = [0, 100, 800, 1600, 2400, 3200, 4000, 4800, 5600];
+    let i = 0;
+    const now = () => times[Math.min(i++, times.length - 1)];
+    const sleep = vi.fn(async () => {});
+
+    const inputs = makeInputs({
+      readGatewayLog: () => "", // no polling line → polling state = fail
+    });
+
+    const result = await waitForAgentReady(inputs, {
+      timeoutMs: 1_000,
+      pollIntervalMs: 500,
+      sleep,
+      now,
+    });
+
+    expect(result.ready).toBe(false);
+    expect(result.notReady).toContain("polling");
+    // sleep was called at least once before giving up (we did poll, not
+    // just bail on the first probe).
+    expect(sleep).toHaveBeenCalled();
+  });
+
+  it("polls until the failing probe recovers", async () => {
+    // First call fails (no polling line), subsequent calls succeed.
+    let calls = 0;
+    const readGatewayLog = () => {
+      calls += 1;
+      return calls === 1 ? "" : "telegram gateway: polling as @bot\n";
+    };
+
+    const sleep = vi.fn(async () => {});
+    const result = await waitForAgentReady(
+      makeInputs({ readGatewayLog }),
+      { timeoutMs: 5_000, pollIntervalMs: 50, sleep },
+    );
+
+    expect(result.ready).toBe(true);
+    expect(result.notReady).toEqual([]);
+    // We slept exactly once between the failing first probe and the
+    // succeeding second probe. Guards against a regression where the
+    // loop either busy-spins or doesn't re-probe at all.
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(calls).toBeGreaterThanOrEqual(2);
   });
 });

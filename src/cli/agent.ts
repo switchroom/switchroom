@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import YAML from "yaml";
 import { resolveAgentsDir, loadConfig } from "../config/loader.js";
+import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent } from "../agents/scaffold.js";
 import {
@@ -33,6 +34,8 @@ import {
   buildAgentStatusReport,
   defaultStatusInputs,
   formatStatusText,
+  waitForAgentReady,
+  type StatusInputs,
 } from "../agents/status.js";
 
 /**
@@ -121,6 +124,65 @@ function preflightCheck(
   }
 
   return errors;
+}
+
+/**
+ * Resolve the StatusInputs for a given agent — same Hindsight-URL resolution
+ * the `status` command uses inline. Extracted so `start` and `restart` can
+ * share the B1 readiness wait without duplicating the config branch.
+ */
+function buildStatusInputs(
+  name: string,
+  config: SwitchroomConfig,
+  agentsDir: string,
+): StatusInputs {
+  const agentDir = resolve(agentsDir, name);
+  const agentConfig = config.agents[name];
+
+  let hindsightApiUrl: string | null = null;
+  let hindsightBankId = name;
+  if (config.memory?.backend === "hindsight") {
+    const baseUrl =
+      (config.memory.config?.url as string | undefined) ??
+      "http://localhost:8888/mcp/";
+    hindsightApiUrl = baseUrl.endsWith("/mcp/")
+      ? baseUrl
+      : baseUrl.replace(/\/$/, "") + "/mcp/";
+    hindsightBankId = agentConfig?.memory?.collection ?? name;
+  }
+
+  return defaultStatusInputs({
+    agentName: name,
+    agentDir,
+    hindsightApiUrl,
+    hindsightBankId,
+  });
+}
+
+/**
+ * Wait for the agent to become serveable after a start/restart and print a
+ * human-readable line summarising the outcome. Keeps the CLI exit-clean —
+ * an agent that never reaches ready still returns control, we just paint
+ * the line yellow and list which components are still not ok.
+ */
+async function printReadyOutcome(
+  name: string,
+  config: SwitchroomConfig,
+  agentsDir: string,
+  verb: "Started" | "Restarted",
+): Promise<void> {
+  const inputs = buildStatusInputs(name, config, agentsDir);
+  const result = await waitForAgentReady(inputs);
+  const secs = (result.elapsedMs / 1000).toFixed(1);
+  if (result.ready) {
+    console.log(chalk.green(`${verb} ${name} (ready in ${secs}s)`));
+  } else {
+    console.log(
+      chalk.yellow(
+        `${verb} ${name} but not fully ready after ${secs}s — not ready: ${result.notReady.join(", ")}`,
+      ),
+    );
+  }
 }
 
 function formatUptime(timestamp: string | null): string {
@@ -409,7 +471,7 @@ export function registerAgentCommand(program: Command): void {
 
           try {
             startAgent(n);
-            console.log(chalk.green(`Started ${n}`));
+            await printReadyOutcome(n, config, agentsDir, "Started");
           } catch (err) {
             console.error(
               chalk.red(`Failed to start ${n}: ${(err as Error).message}`)
@@ -595,13 +657,13 @@ export function registerAgentCommand(program: Command): void {
               if (opts.gracefulRestart) {
                 const result = await gracefulRestartAgent(n);
                 if (result.restartedImmediately) {
-                  console.log(chalk.green(`Restarted ${n} immediately (no active turn)`));
+                  await printReadyOutcome(n, config, agentsDir, "Restarted");
                 } else if (result.waitingForTurn) {
                   console.log(chalk.yellow(`Restart scheduled for ${n} (waiting for current turn to complete)`));
                 }
               } else {
                 restartAgent(n);
-                console.log(chalk.green(`Restarted ${n}`));
+                await printReadyOutcome(n, config, agentsDir, "Restarted");
               }
             } catch (err) {
               console.error(
