@@ -20,7 +20,7 @@ bun run test
 
 ## Project Structure
 
-See [PRD.md](PRD.md) for architecture details.
+See [reference/PRD.md](reference/PRD.md) for architecture details.
 
 ## Profiles
 

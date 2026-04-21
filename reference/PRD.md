@@ -11,12 +11,12 @@
 > memory model (file-based `MEMORY.md` auto-memory is disabled in favour of
 > Hindsight). For current behaviour, treat the canonical sources as:
 >
-> - [`README.md`](README.md) — what switchroom is and how to use it
-> - [`docs/configuration.md`](docs/configuration.md) — config schema & cascade
-> - [`docs/telegram-plugin.md`](docs/telegram-plugin.md) — Telegram plugin
-> - [`docs/sub-agents.md`](docs/sub-agents.md) — sub-agent delegation
-> - [`docs/scheduling.md`](docs/scheduling.md) — scheduled tasks
-> - [`docs/compliance-attestation.md`](docs/compliance-attestation.md) — compliance
+> - [`README.md`](../README.md) — what switchroom is and how to use it
+> - [`docs/configuration.md`](../docs/configuration.md) — config schema & cascade
+> - [`docs/telegram-plugin.md`](../docs/telegram-plugin.md) — Telegram plugin
+> - [`docs/sub-agents.md`](../docs/sub-agents.md) — sub-agent delegation
+> - [`docs/scheduling.md`](../docs/scheduling.md) — scheduled tasks
+> - [`docs/compliance-attestation.md`](../docs/compliance-attestation.md) — compliance
 >
 > The "Phased Delivery" roadmap below is largely complete; phases are kept
 > here as a record of the project's evolution rather than a forward plan.

@@ -13,8 +13,10 @@ Pro/Max subscription via OAuth (no API keys, no Docker, no custom
 runtime). The headline feature is a live **progress card** that pins into
 each Telegram topic while an agent works.
 
-See `README.md` for the user-facing description and `PRD.md` for the
-(partially dated) product intent.
+See `README.md` for the user-facing description. Deeper design notes
+live in `reference/`: outcome-focused JTBDs (`reference/*.md`) describe
+what the product is *for*, and `reference/PRD.md` is the (partially
+dated) original product-intent doc kept for architectural rationale.
 
 ## Repo layout
 
@@ -42,7 +44,8 @@ telegram-plugin/        The enhanced MCP Telegram plugin (own Bun tests)
 profiles/               Built-in agent profiles (CLAUDE.md.hbs + SOUL.md.hbs)
 skills/                 Bundled Claude Code skills (symlinked into agents)
 docs/                   User-facing docs
-reference/              Internal reference notes (JTBDs, design notes)
+reference/              Internal reference notes — outcome-focused JTBDs
+                        (*.md) + PRD.md (original product-intent doc)
 scripts/                Build + release helpers
 tests/                  Vitest suite for src/
 ```
