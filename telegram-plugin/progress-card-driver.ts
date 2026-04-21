@@ -696,6 +696,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // turn finishes. The user sees the final card the instant turn_end
       // lands.
       if (event.kind === 'turn_end' || event.kind === 'enqueue' || stageChanged) {
+        if (event.kind === 'turn_end') {
+          process.stderr.write(`telegram gateway: progress-card: turn_end flush chatId=${chatState.chatId} threadId=${chatState.threadId ?? '-'} turnKey=${chatState.turnKey}\n`)
+        }
         flush(chatState, /*forceDone*/ event.kind === 'turn_end')
         if (event.kind === 'turn_end') {
           // Emit a one-line summary for the handoff sidecar (see
@@ -714,6 +717,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           // message). Must fire BEFORE chats.delete() so taskNumFor() can
           // still see this chat when computing the total.
           if (config.onTurnComplete) {
+            process.stderr.write(`telegram gateway: progress-card: onTurnComplete firing turnKey=${chatState.turnKey}\n`)
             try {
               config.onTurnComplete({
                 chatId: chatState.chatId,

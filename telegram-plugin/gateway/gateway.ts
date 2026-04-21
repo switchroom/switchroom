@@ -1570,6 +1570,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               } catch {}
             }
             if (backstopCtrl) backstopCtrl.setDone()
+            unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
           } catch (err) {
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
             if (backstopCtrl) backstopCtrl.setError()
@@ -3653,6 +3654,7 @@ if (streamMode === 'checklist') {
       if (agentDir != null) writeLastTurnSummary(agentDir, summary)
     },
     onTurnComplete: ({ chatId, threadId, turnKey, summary }) => {
+      process.stderr.write(`telegram gateway: progress-card: onTurnComplete callback turnKey=${turnKey}\n`)
       pinMgr.completeTurn({ chatId, threadId, turnKey })
       if (threadId != null) {
         lockedBot.api.sendMessage(chatId, `✅ Done — ${summary}`).catch((err: Error) => {

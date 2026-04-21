@@ -153,6 +153,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   function doUnpin(turnKey: string, chatId: string, pinnedId: number): void {
     if (unpinned.has(turnKey)) return
     unpinned.add(turnKey)
+    log(`telegram gateway: progress-card: unpin turnKey=${turnKey} msgId=${pinnedId}\n`)
     pinned.delete(turnKey)
     const key = serviceKey(chatId, pinnedId)
     const svcId = serviceMessages.get(key)
@@ -184,6 +185,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // between these writes and the pin call still leaves a recovery
       // record for the startup sweep.
       pinned.set(c.turnKey, c.messageId)
+      log(`telegram gateway: progress-card: pinned turnKey=${c.turnKey} msgId=${c.messageId}\n`)
       if (deps.addPin) {
         deps.addPin({
           chatId: c.chatId,
