@@ -499,6 +499,13 @@ printf '%s' "$MODEL" > "$MODEL_CACHE" 2>/dev/null || true
 # Prefer .oauth-token (the authoritative token after switchroom auth code)
 # but merge in subscriptionType + rateLimitTier from .credentials.json when
 # both files exist — the oauth-token flow alone does not carry plan metadata.
+#
+# AUTH_LABEL is a user-declared identity (e.g. pixsoul@gmail.com) for the
+# greeting row. Anthropic does not expose a public endpoint to read the
+# OAuth account's email from the token, so we rely on the user declaring it
+# in switchroom.yaml (agents.<name>.auth_label). Empty string means no
+# label — the row falls back to the old 'plan · expires' shape.
+AUTH_LABEL=${shellSingleQuote(agentConfig.auth_label ?? "")}
 AUTH_STATUS=""
 CLAUDE_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 if command -v jq >/dev/null 2>&1; then
@@ -508,6 +515,9 @@ if command -v jq >/dev/null 2>&1; then
     SUB="$(jq -r '.claudeAiOauth.subscriptionType // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
     TIER="$(jq -r '.claudeAiOauth.rateLimitTier // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
   fi
+  # Export so the Quota block can decide between 'within plan' (Pro/Max
+  # user) and raw ccusage dollar display (API-only user).
+  export _QUOTA_SUB="$SUB"
   if [ -f "$CLAUDE_DIR/.oauth-token" ] && [ -f "$CLAUDE_DIR/.oauth-token.meta.json" ]; then
     EXP_AT="$(jq -r '.expiresAt // empty' "$CLAUDE_DIR/.oauth-token.meta.json" 2>/dev/null)"
     PLAN="\${SUB:-oauth}"
@@ -517,7 +527,11 @@ if command -v jq >/dev/null 2>&1; then
       if [ "$REM_MS" -gt 0 ]; then
         REM_H=$((REM_MS / 3600000))
         REM_M=$(((REM_MS % 3600000) / 60000))
-        AUTH_STATUS="✓ \${PLAN} · expires \${REM_H}h \${REM_M}m"
+        if [ -n "$AUTH_LABEL" ]; then
+          AUTH_STATUS="✓ \${PLAN} · $AUTH_LABEL · expires \${REM_H}h \${REM_M}m"
+        else
+          AUTH_STATUS="✓ \${PLAN} · expires \${REM_H}h \${REM_M}m"
+        fi
       else
         AUTH_STATUS="⚠️ \${PLAN} token expired"
       fi
@@ -532,7 +546,11 @@ if command -v jq >/dev/null 2>&1; then
       if [ "$REM_MS" -gt 0 ]; then
         REM_H=$((REM_MS / 3600000))
         REM_M=$(((REM_MS % 3600000) / 60000))
-        AUTH_STATUS="✓ \${SUB:-credentials} · expires \${REM_H}h \${REM_M}m"
+        if [ -n "$AUTH_LABEL" ]; then
+          AUTH_STATUS="✓ \${SUB:-credentials} · $AUTH_LABEL · expires \${REM_H}h \${REM_M}m"
+        else
+          AUTH_STATUS="✓ \${SUB:-credentials} · expires \${REM_H}h \${REM_M}m"
+        fi
       else
         AUTH_STATUS="⚠️ credentials expired"
       fi
@@ -580,6 +598,13 @@ if [ -n "$CLAUDE_DIR" ] && [ -f "$CLAUDE_DIR/.oauth-token" ] && command -v curl 
       # Reset epochs (Unix seconds) — tell the user when each window clears.
       R5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-reset:' | tail -1 | awk -F': ' '{print $2}')"
       R7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-reset:' | tail -1 | awk -F': ' '{print $2}')"
+      # Overage status — used by the Quota row below to decide between
+      # 'within plan' and a dollar estimate. 'allowed' means Anthropic lets
+      # you exceed the plan and bill; 'disabled' means hard cap.
+      OVERAGE_STATUS="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-overage-status:' | tail -1 | awk -F': ' '{print $2}')"
+      # Export both utilization and overage status so Quota block can read them.
+      export _QUOTA_H7="$H7"
+      export _QUOTA_OVERAGE="$OVERAGE_STATUS"
       if [ -n "$H5" ] || [ -n "$H7" ]; then
         P5="$(awk -v v="\${H5:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
         P7="$(awk -v v="\${H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
@@ -614,14 +639,54 @@ if [ -n "$CLAUDE_DIR" ] && [ -f "$CLAUDE_DIR/.oauth-token" ] && command -v curl 
 fi
 [ -z "$PLAN_STATUS" ] && PLAN_STATUS="—"
 
-# Resolve Claude quota usage (week + month) via ccusage — parses local
-# transcripts, no network call. This reflects dollars spent (from local
-# JSONL cost estimates), a different signal from the Pro/Max window
-# utilization shown in the Plan row above.
+# Resolve Claude quota usage.
+#
+# Two different stories depending on how the account is billed:
+#
+#   Pro/Max subscriber (flat monthly fee, usage included up to plan cap):
+#     The ccusage dollar figures are what usage WOULD cost on API pricing
+#     and are misleading — the user pays a flat subscription regardless.
+#     So for these accounts, show plan-coverage state instead of $$$:
+#       - H7 < 1.0, overage allowed  -> 'within plan' (green)
+#       - H7 < 1.0, overage disabled -> 'within plan'
+#       - H7 >= 1.0, overage allowed -> 'overage active' (user is billed extra)
+#       - H7 >= 1.0, overage disabled -> 'plan cap reached' (hard block)
+#
+#   API-only account (pay per token):
+#     ccusage dollars ARE real spend. Show wk / mo as before, with optional
+#     budget comparison from switchroom.yaml.
+#
+# Plan membership is detected via _QUOTA_SUB (exported by the Auth block
+# from .credentials.json's subscriptionType). H7 (7d utilization) and
+# OVERAGE_STATUS come from the Plan block's response headers.
 QUOTA_STATUS=""
 WEEKLY_BUDGET="${weeklyBudget}"
 MONTHLY_BUDGET="${monthlyBudget}"
-if command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+
+# Pro/Max fast path: skip ccusage entirely. The subscription flat fee is
+# the real cost; utilization tells the rest of the story.
+if [ -n "\${_QUOTA_SUB:-}" ] && [ "\${_QUOTA_SUB}" != "api" ] && [ "\${_QUOTA_SUB}" != "none" ]; then
+  _PLAN_LABEL="\${_QUOTA_SUB}"
+  # Capitalize first letter (pro -> Pro, max -> Max)
+  _PLAN_LABEL_CAP="$(printf '%s' "\$_PLAN_LABEL" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  # Parse H7 (0.0-1.0) into percent.
+  _H7_PCT="$(awk -v v="\${_QUOTA_H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
+  if [ "\${_H7_PCT}" -lt 100 ]; then
+    QUOTA_STATUS="within \${_PLAN_LABEL_CAP} plan"
+  else
+    case "\${_QUOTA_OVERAGE:-}" in
+      allowed)
+        QUOTA_STATUS="⚠ overage active (over plan cap)"
+        ;;
+      disabled|*)
+        QUOTA_STATUS="⚠ plan cap reached"
+        ;;
+    esac
+  fi
+fi
+
+# API-only fallback: ccusage dollar display, same as before.
+if [ -z "$QUOTA_STATUS" ] && command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
   WK_COST=""
   MO_COST=""
   # Belt-and-braces: ccusage scans $CLAUDE_CONFIG_DIR/projects by default.
@@ -790,7 +855,7 @@ except Exception:
     _COUNT="\${_PARSED%%|*}"
     _LAST_TS="\${_PARSED#*|}"
     if [ -z "\$_COUNT" ] || [ "\$_COUNT" = "0" ]; then
-      echo "✓ 0 memories (empty bank)"
+      echo "✓ Hindsight · 0 memories (empty bank)"
       return 0
     fi
     _AGO=""
@@ -807,9 +872,9 @@ except Exception:
       fi
     fi
     if [ -n "\$_AGO" ]; then
-      echo "✓ \$_COUNT memories · last consolidated \$_AGO"
+      echo "✓ Hindsight · \$_COUNT memories · last \$_AGO"
     else
-      echo "✓ \$_COUNT memories"
+      echo "✓ Hindsight · \$_COUNT memories"
     fi
     return 0
   }
