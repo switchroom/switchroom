@@ -137,7 +137,7 @@ memory:
   backend: hindsight
 
 defaults:
-  model: claude-opus-4-6
+  model: claude-opus-4-6   # or claude-sonnet-4-6, claude-haiku-4-5
   tools: { allow: [all] }
   subagents:
     worker:
@@ -181,13 +181,64 @@ switchroom agent logs <name> [-f]             # View logs
 switchroom agent grant <name> <tool>          # Grant a tool permission
 switchroom agent permissions <name>           # Show allow/deny list
 switchroom agent dangerous <name> [off]       # Toggle full tool access
+```
 
-switchroom auth login|status|refresh          # Per-agent OAuth
-switchroom memory setup|search|stats|reflect  # Hindsight memory
-switchroom topics sync|list|cleanup           # Telegram forum topics
-switchroom vault init|set|get|list|remove     # Encrypted secrets
-switchroom handoff <agent>                    # Cross-session handoff summarizer
-switchroom web                                # Web dashboard
+### Authentication (multi-account slot pool)
+
+Each agent has a pool of Claude OAuth slots. The **active** slot is what
+the agent uses; other slots are automatic fallbacks when the active slot
+hits its quota window. Every `<slot>` option defaults to the active slot
+if omitted.
+
+```bash
+switchroom auth status                            # All agents, one table
+switchroom auth login <agent>                     # First-time OAuth into the active slot
+switchroom auth code <agent> <browser-code>       # Paste the code back from the browser
+switchroom auth cancel <agent>                    # Abandon a pending login
+switchroom auth reauth <agent> [--slot <s>]       # Fresh OAuth, replace existing token
+switchroom auth refresh <agent>                   # Alias for reauth (back-compat)
+
+switchroom auth add <agent> [--slot <name>]       # Add another account to the fallback pool
+switchroom auth use <agent> <slot>                # Switch the active slot
+switchroom auth list <agent> [--json]             # Show slots: health, quota status, expiry
+switchroom auth rm <agent> <slot> [--force]       # Remove a slot (refuses active/last slot)
+```
+
+The fallback pool also works from Telegram — the switchroom MCP plugin
+exposes the same verbs as `/auth add|use|list|rm` inside the chat.
+
+### Workspace (agent bootstrap layer)
+
+Each agent has a workspace directory (`~/.switchroom/agents/<name>/workspace/`)
+with editable stable files (`AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`,
+`TOOLS.md`) and dynamic files (`MEMORY.md`, `memory/YYYY-MM-DD.md`,
+`HEARTBEAT.md`) that are injected into the model's context at turn time.
+
+```bash
+switchroom workspace path <agent>                 # Print the workspace dir
+switchroom workspace show <agent> [file]          # Print one workspace file (default AGENTS.md)
+switchroom workspace edit <agent> [file]          # Open in $EDITOR (default AGENTS.md)
+switchroom workspace render <agent> --stable      # Dump the stable bootstrap block (for start.sh)
+switchroom workspace render <agent> --dynamic     # Dump the dynamic block (for UserPromptSubmit)
+switchroom workspace search <agent> <query...>    # BM25-lite search over workspace markdown
+switchroom workspace commit <agent> [-m <msg>]    # Git checkpoint of workspace state
+switchroom workspace status <agent>               # git status on the workspace
+```
+
+### Observability
+
+```bash
+switchroom debug turn <agent>                     # Dump the exact prompt layering from the last turn
+switchroom memory setup|search|stats|reflect      # Hindsight memory
+```
+
+### Other
+
+```bash
+switchroom topics sync|list|cleanup               # Telegram forum topics
+switchroom vault init|set|get|list|remove         # Encrypted secrets
+switchroom handoff <agent>                        # Cross-session handoff summarizer
+switchroom web                                    # Web dashboard
 ```
 
 ## Documentation

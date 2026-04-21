@@ -52,6 +52,39 @@ Per-agent `access.json` defines:
 - **Group policy**: per-group settings (requireMention, allowFrom)
 - **Topic filtering**: agents can be scoped to specific forum topics
 
+### `/auth` router
+
+The plugin exposes the multi-account slot-pool verbs inside Telegram, so
+you can add, switch, and prune subscriptions without SSHing into the
+host. The agent argument is optional — if omitted, it defaults to the
+agent receiving the message.
+
+| Command | Equivalent CLI |
+|---|---|
+| `/auth` | (help listing) |
+| `/auth login [agent]` | `switchroom auth login <agent>` |
+| `/auth reauth [agent]` | `switchroom auth reauth <agent>` |
+| `/auth code [agent] <browser-code>` | `switchroom auth code <agent> <code>` |
+| `/auth cancel [agent]` | `switchroom auth cancel <agent>` |
+| `/auth add [agent] [--slot <name>]` | `switchroom auth add <agent>` |
+| `/auth use [agent] <slot>` | `switchroom auth use <agent> <slot>` |
+| `/auth list [agent]` | `switchroom auth list <agent>` |
+| `/auth rm [agent] <slot> [--force]` | `switchroom auth rm <agent> <slot>` |
+
+`/auth rm` refuses to remove the only remaining slot or the currently
+active slot unless you pass `--force`. `/auth list` renders the slot
+table as a short HTML block with health + quota status per slot.
+
+### Auto-fallback on quota exhaustion
+
+When the active slot's quota window is exhausted, the plugin's
+`auto-fallback` poller marks the slot as `quota-exhausted`, swaps to the
+next healthy slot in the pool, restarts the agent process, and posts a
+short notice into the chat. If no fallback slot is available, it prompts
+you to `/auth add <agent>` another subscription. See
+`telegram-plugin/auto-fallback.ts` and `src/auth/accounts.ts` for the
+storage layout.
+
 ### Forum topic support
 
 Messages from Telegram forum topics carry `message_thread_id`. The plugin:

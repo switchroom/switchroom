@@ -24,7 +24,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 
 | Field | Cascade | Description |
 |-------|---------|-------------|
-| `model` | override | Claude model (`claude-opus-4-6`, `claude-sonnet-4-6`) |
+| `model` | override | Claude model (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Haiku is the default for the handoff summarizer; agents typically use opus or sonnet. |
 | `extends` | — | Named profile to inherit from |
 | `tools.allow` / `tools.deny` | union | Tool permissions |
 | `soul` | per-field | Agent persona (name, style, boundaries) |
@@ -121,6 +121,46 @@ Manual recovery: `switchroom deps rebuild <skill>` force-rebuilds one skill's ca
 Host prerequisites:
 - Python venvs need `python3-venv` (on Debian/Ubuntu: `apt install python3.12-venv`). `switchroom health` reports missing deps.
 - Node envs use `bun` by default. `npm` is available as an alternate installer.
+
+## Multi-Account OAuth (Slot Pool)
+
+Each agent owns a **pool** of Claude OAuth account slots. One slot is
+active at a time; the others sit in the pool as automatic fallbacks when
+the active slot hits a quota window. Nothing in `switchroom.yaml`
+describes the pool — it's managed at runtime via `switchroom auth` (or
+`/auth` inside Telegram).
+
+On-disk layout per agent:
+
+```
+<agentDir>/.claude/
+  accounts/
+    <slot>/
+      .oauth-token             # token value
+      .oauth-token.meta.json   # { createdAt, expiresAt, quotaExhaustedUntil?, source }
+  active                       # text file: name of the active slot
+  .oauth-token                 # LEGACY path, mirrored from the active slot
+  .oauth-token.meta.json       # LEGACY path, mirrored from the active slot
+```
+
+Slot names must match `[A-Za-z0-9._-]+` (max 64 chars). The legacy
+top-level token paths are always kept in sync with the active slot so
+`start.sh` and the `claude` CLI see no layout change.
+
+### Auto-fallback on quota exhaustion
+
+The switchroom telegram plugin polls each agent's quota. When the active
+slot crosses the exhaustion threshold (~99.5% utilisation) the plugin:
+
+1. Marks the slot `quota-exhausted` (writes `quotaExhaustedUntil` into
+   the slot's meta file).
+2. Picks the next healthy slot in the pool and switches to it.
+3. Restarts the agent so the new token is picked up.
+4. Posts a short notice into the chat; if no fallback slot is available,
+   prompts you to `/auth add <agent>` another subscription.
+
+A per-slot cooldown prevents fallback-loop storms if two polls race.
+Source: `telegram-plugin/auto-fallback.ts`, `src/auth/accounts.ts`.
 
 ## Escape Hatches
 
