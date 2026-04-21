@@ -199,8 +199,8 @@ describe("reflectAcrossAgents", () => {
     expect(result.excluded[0].collection).toBe("journal-private");
 
     expect(result.commands).toHaveLength(2);
-    expect(result.commands[0]).toBe("hindsight reflect --collection coach-data");
-    expect(result.commands[1]).toBe("hindsight reflect --collection planner");
+    expect(result.commands[0]).toBe("hindsight reflect --collection 'coach-data'");
+    expect(result.commands[1]).toBe("hindsight reflect --collection 'planner'");
   });
 
   it("returns empty eligible when all agents are strict", () => {

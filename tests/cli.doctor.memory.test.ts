@@ -73,8 +73,8 @@ describe("greeting memory row", () => {
     const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
 
     expect(scaffoldSource).toContain("memories");
-    expect(scaffoldSource).toContain("last retain");
+    expect(scaffoldSource).toContain("last consolidated");
     expect(scaffoldSource).toContain("_COUNT");
-    expect(scaffoldSource).toContain("_LAST_RETAIN");
+    expect(scaffoldSource).toContain("_LAST_TS");
   });
 });

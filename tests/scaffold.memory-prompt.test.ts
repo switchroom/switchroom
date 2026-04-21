@@ -130,9 +130,12 @@ describe("Memory prompt guidance", () => {
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
     const reconcileStartSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
 
-    // Extract the APPEND_PROMPT sections
+    // Extract the APPEND_PROMPT sections. Bash single-quoted strings embed
+    // literal `'` as the `'"'"'` sequence; match those along with normal
+    // non-quote chars so the Memory block (which contains apostrophes)
+    // survives the extract.
     const extractAppend = (content: string) => {
-      const match = content.match(/APPEND_PROMPT='([^']+)'/s);
+      const match = content.match(/APPEND_PROMPT='((?:[^']|'"'"')*)'/s);
       return match ? match[1] : "";
     };
 

@@ -43,10 +43,12 @@ describe("ensureUserProfileMentalModel", () => {
         ok: true,
         headers: new Map([["mcp-session-id", "test-session"]]),
         json: async () => ({}),
+        text: async () => JSON.stringify({}),
       } as any)
       .mockResolvedValueOnce({
         ok: true,
         json: async () => ({ result: { content: [{ text: "user-profile\nother-model" }] } }),
+        text: async () => JSON.stringify({ result: { content: [{ text: "user-profile\nother-model" }] } }),
       } as any);
 
     const result = await ensureUserProfileMentalModel(
@@ -76,9 +78,19 @@ describe("ensureUserProfileMentalModel", () => {
   });
 
   it("returns error on timeout", async () => {
-    const mockFetch = vi.fn().mockImplementation(() => {
-      return new Promise((resolve) => {
-        setTimeout(() => resolve({ ok: true, headers: new Map() } as any), 10000);
+    const mockFetch = vi.fn().mockImplementation((_url: any, init: any) => {
+      return new Promise((resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        const timer = setTimeout(
+          () => resolve({ ok: true, headers: new Map() } as any),
+          10000
+        );
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
       });
     });
 

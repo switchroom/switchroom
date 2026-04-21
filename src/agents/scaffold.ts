@@ -2213,10 +2213,10 @@ export function scaffoldAgent(
   // The corresponding systemd timer+service units are installed by
   // `switchroom agent create` / `switchroom systemd install` (in cli/agent.ts),
   // not here — scaffold writes the scripts, CLI wires the timers.
-  if (agentConfig.schedule.length > 0) {
+  if ((agentConfig.schedule?.length ?? 0) > 0) {
     const cronChatId = userId ?? telegramConfig.forum_chat_id;
-    for (let i = 0; i < agentConfig.schedule.length; i++) {
-      const entry = agentConfig.schedule[i];
+    for (let i = 0; i < agentConfig.schedule!.length; i++) {
+      const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
       const script = buildCronScript(agentDir, entry.prompt, model, telegramConfig.forum_chat_id, userId);
       const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
@@ -2920,7 +2920,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
   }
 
   // --- Reconcile scheduled task cron scripts ---
-  if (agentConfig.schedule.length > 0) {
+  if ((agentConfig.schedule?.length ?? 0) > 0) {
     let cronUserId: string | undefined;
     const cronAccessPath = join(agentDir, "telegram", "access.json");
     if (existsSync(cronAccessPath)) {
@@ -2929,8 +2929,8 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
         cronUserId = cronAccess.allowFrom?.[0];
       } catch { /* best effort */ }
     }
-    for (let i = 0; i < agentConfig.schedule.length; i++) {
-      const entry = agentConfig.schedule[i];
+    for (let i = 0; i < agentConfig.schedule!.length; i++) {
+      const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
       const script = buildCronScript(
         agentDir, entry.prompt, model,
