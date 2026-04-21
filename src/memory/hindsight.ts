@@ -245,6 +245,127 @@ export async function ensureUserProfileMentalModel(
 }
 
 /**
+ * Idempotently create a Hindsight bank via MCP.
+ *
+ * Calls Hindsight's create_bank tool. Hindsight's create_bank is documented
+ * as "Create a new memory bank or get an existing one" — so calling this on
+ * an already-existing bank is a no-op and returns success. Best-effort with
+ * timeout; never throws.
+ *
+ * Used by `switchroom agent create` to make sure an agent's bank exists
+ * BEFORE its first `retain` call — without this, the first retain against a
+ * missing bank blows up with a raw foreign-key constraint violation because
+ * Hindsight's `get_bank_stats` silently returns empty on a missing bank.
+ *
+ * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
+ * @param bankId The bank ID to create (typically the agent name)
+ * @param opts Optional fetch implementation, timeout, and optional name/mission
+ * @returns {ok: true} on success, {ok: false, reason} on error. reason will be
+ *   "Unreachable" when the Hindsight daemon is not running (connection refused
+ *   / network error) so callers can render a specific operator-facing message.
+ */
+export async function createBank(
+  apiUrl: string,
+  bankId: string,
+  opts?: {
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    name?: string;
+    mission?: string;
+  }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Step 1: Initialize MCP session
+    const initResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "switchroom", version: "0.1" },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!initResponse.ok) {
+      return { ok: false, reason: `HTTP ${initResponse.status}` };
+    }
+
+    const sessionId = initResponse.headers.get("mcp-session-id");
+    if (!sessionId) {
+      return { ok: false, reason: "No session ID returned" };
+    }
+
+    // Step 2: Call create_bank tool
+    const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
+    const args: Record<string, unknown> = { bank_id: bankId };
+    if (opts?.name) args.name = opts.name;
+    if (opts?.mission) args.mission = opts.mission;
+
+    const toolResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "create_bank",
+          arguments: args,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout2);
+
+    if (!toolResponse.ok) {
+      return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return { ok: false, reason: "Timeout" };
+    }
+    // ECONNREFUSED / fetch failed → daemon not running. Normalize to
+    // "Unreachable" so the CLI can surface a specific operator message.
+    const msg = String(err);
+    if (
+      msg.includes("ECONNREFUSED") ||
+      msg.includes("fetch failed") ||
+      msg.includes("Failed to fetch") ||
+      msg.includes("ENOTFOUND")
+    ) {
+      return { ok: false, reason: "Unreachable" };
+    }
+    return { ok: false, reason: msg };
+  }
+}
+
+/**
  * Update bank mission statements via MCP.
  *
  * Calls Hindsight's update_bank tool to set bank_mission and/or retain_mission.
