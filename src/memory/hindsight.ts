@@ -89,6 +89,134 @@ export function isStrictIsolation(
 }
 
 /**
+ * Ensure the user-profile Mental Model exists for a bank.
+ *
+ * Creates the Mental Model if it doesn't exist, idempotent on subsequent calls.
+ * The MM is pre-computed via reflection and answers "what do we know about the user?"
+ *
+ * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
+ * @param bankId The bank ID to create the MM in
+ * @param opts Optional fetch implementation and timeout
+ * @returns {ok: true} on success, {ok: false, reason} on error
+ */
+export async function ensureUserProfileMentalModel(
+  apiUrl: string,
+  bankId: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Step 1: Initialize MCP session
+    const initResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "switchroom", version: "0.1" },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!initResponse.ok) {
+      return { ok: false, reason: `HTTP ${initResponse.status}` };
+    }
+
+    const sessionId = initResponse.headers.get("mcp-session-id");
+    if (!sessionId) {
+      return { ok: false, reason: "No session ID returned" };
+    }
+
+    // Step 2: Check if MM already exists
+    const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
+    const listResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "list_mental_models",
+          arguments: {},
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout2);
+
+    if (listResponse.ok) {
+      const listData = await listResponse.json();
+      const models = listData.result?.content?.[0]?.text;
+      if (models && typeof models === "string" && models.includes("user-profile")) {
+        return { ok: true }; // Already exists
+      }
+    }
+
+    // Step 3: Create the MM
+    const timeout3 = setTimeout(() => controller.abort(), timeoutMs);
+    const createResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "create_mental_model",
+          arguments: {
+            name: "user-profile",
+            query: "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
+            types: ["world", "experience"],
+          },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout3);
+
+    if (!createResponse.ok) {
+      return { ok: false, reason: `Create MM HTTP ${createResponse.status}` };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return { ok: false, reason: "Timeout" };
+    }
+    return { ok: false, reason: String(err) };
+  }
+}
+
+/**
  * Update bank mission statements via MCP.
  *
  * Calls Hindsight's update_bank tool to set bank_mission and/or retain_mission.
