@@ -73,22 +73,38 @@ describe("auth code ForceReply prompt", () => {
 });
 
 describe("looksLikeAuthCode — regression", () => {
-  // Mirror gateway.ts's looksLikeAuthCode to pin the intercept
-  // heuristic we rely on for auto-capture.
+  // Mirror gateway.ts's looksLikeAuthCode EXACTLY to pin the intercept
+  // heuristic we rely on for auto-capture. If the two diverge, users
+  // paste codes and the bot ignores them.
   function looksLikeAuthCode(text: string): boolean {
     const trimmed = text.trim();
     if (!trimmed || /\s/.test(trimmed)) return false;
     if (trimmed.startsWith("session_")) return true;
     if (trimmed.startsWith("sk-ant-")) return true;
-    if (/^[A-Za-z0-9_-]{6,200}$/.test(trimmed)) return true;
+    if (/^[A-Za-z0-9_.#-]{6,500}$/.test(trimmed)) return true;
     return false;
   }
 
   it("accepts typical Claude setup-token browser codes", () => {
-    // Real-world samples from manual reauth flows.
     expect(looksLikeAuthCode("abc123_def456")).toBe(true);
     expect(looksLikeAuthCode("session_xyz789")).toBe(true);
     expect(looksLikeAuthCode("JKL-mno-456")).toBe(true);
+  });
+
+  it("accepts the claude.com/cai browser code format (2026-04-22 regression)", () => {
+    // The exact code Ken pasted on 2026-04-22 at 3:51 AM AEST from the
+    // lawgpt reauth flow. Bot silently ignored it because the old
+    // regex [A-Za-z0-9_-] didn't include '#'. Pinning this exact
+    // shape so the heuristic never regresses against the new URL
+    // format parseSetupTokenUrl now accepts (see PR #16).
+    const kensCode =
+      "tle0rmLfXTjWJAfE0GRJ2BHnlvPQ7fka6zizkJ7Y6gZfEAV8#00EySjRL37" +
+      "-yPK0OGJAKueV5yVQHDvkHYtvMsQ4f7Dc";
+    expect(looksLikeAuthCode(kensCode)).toBe(true);
+
+    // Generic shape: <code>#<state>
+    expect(looksLikeAuthCode("abc123#def456")).toBe(true);
+    expect(looksLikeAuthCode("AABB-CCDD.EEFF_GGHH#XXYY")).toBe(true);
   });
 
   it("rejects plain text that isn't a code", () => {
@@ -96,15 +112,33 @@ describe("looksLikeAuthCode — regression", () => {
     expect(looksLikeAuthCode("what now?")).toBe(false);
     expect(looksLikeAuthCode("")).toBe(false);
     expect(looksLikeAuthCode("   ")).toBe(false);
+    // Hashtag-only messages still reject (too short).
+    expect(looksLikeAuthCode("#swag")).toBe(false);
   });
 
   it("rejects short strings (too low signal to intercept)", () => {
     expect(looksLikeAuthCode("abc")).toBe(false);
     expect(looksLikeAuthCode("xy")).toBe(false);
+    expect(looksLikeAuthCode("a#b")).toBe(false);
   });
 
   it("accepts long alphanumeric strings (common in OAuth)", () => {
     const longCode = "a".repeat(150);
     expect(looksLikeAuthCode(longCode)).toBe(true);
+    // Accepts strings up to new 500-char cap for future token-shape
+    // growth.
+    expect(looksLikeAuthCode("a".repeat(500))).toBe(true);
+    // But rejects over-long strings (prevents accidental intercept
+    // of a whole paragraph with no whitespace).
+    expect(looksLikeAuthCode("a".repeat(501))).toBe(false);
+  });
+
+  it("rejects strings containing shell metacharacters outside the allowed set", () => {
+    expect(looksLikeAuthCode("abc;ls")).toBe(false);
+    expect(looksLikeAuthCode("abc|nc")).toBe(false);
+    expect(looksLikeAuthCode("abc$(id)")).toBe(false);
+    expect(looksLikeAuthCode("abc'quote")).toBe(false);
+    expect(looksLikeAuthCode("abc\"quote")).toBe(false);
+    expect(looksLikeAuthCode("abc&rm")).toBe(false);
   });
 });

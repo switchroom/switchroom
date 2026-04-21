@@ -44,9 +44,19 @@ if [ ! -f "$entry" ]; then
   exit 127
 fi
 
-if ! command -v bun >/dev/null 2>&1; then
-  echo "switchroom-cli-wrapper: bun not found on PATH" >&2
+# Locate bun. Gateway systemd unit sets PATH with ~/.bun/bin, but
+# manual invocations from SSH or a cron without the export fall back
+# to an empty PATH and fail. Check PATH first, then common install
+# locations in order of likelihood.
+if command -v bun >/dev/null 2>&1; then
+  bun_bin="bun"
+elif [ -x "${HOME:-/root}/.bun/bin/bun" ]; then
+  bun_bin="${HOME:-/root}/.bun/bin/bun"
+elif [ -x "/usr/local/bin/bun" ]; then
+  bun_bin="/usr/local/bin/bun"
+else
+  echo "switchroom-cli-wrapper: bun not found on PATH, in \$HOME/.bun/bin, or /usr/local/bin" >&2
   exit 127
 fi
 
-exec bun "$entry" "$@"
+exec "$bun_bin" "$entry" "$@"
