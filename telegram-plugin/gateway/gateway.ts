@@ -38,6 +38,7 @@ import { createProgressDriver, type ProgressDriver } from '../progress-card-driv
 import {
   shouldSuppressToolActivity,
 } from '../pty-tail.js'
+import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import {
   parseAuthSubCommand,
   checkRemoveSafety,
@@ -3394,6 +3395,11 @@ let runnerHandle: RunnerHandle | null = null
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
+      // Clear any orphan long-poll from a previous gateway process
+      // before we start our own. See clearStaleTelegramPollingState
+      // docstring for the production incident that motivates this.
+      await clearStaleTelegramPollingState(bot.api)
+
       const me = await bot.api.getMe()
       botUsername = me.username
       process.stderr.write(`telegram gateway: polling as @${me.username}\n`)
