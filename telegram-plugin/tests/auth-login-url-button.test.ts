@@ -14,23 +14,46 @@ import { InlineKeyboard } from "grammy";
  */
 
 function buildAuthUrlKeyboardForTest(authorizeUrl: string): InlineKeyboard {
-  return new InlineKeyboard().url("🔐 Open Claude auth", authorizeUrl);
+  // Mirrors the production builder in gateway.ts: url button + raw
+  // copy_text button in the same row. copy_text is Bot API 7.7+ and
+  // not exposed by grammy's InlineKeyboard helpers, so the raw object
+  // is pushed into the row array.
+  const kb = new InlineKeyboard().url("🔐 Open Claude auth", authorizeUrl);
+  kb.inline_keyboard[0].push({
+    text: "📋 Copy URL",
+    copy_text: { text: authorizeUrl },
+  } as unknown as typeof kb.inline_keyboard[0][number]);
+  return kb;
 }
 
 describe("auth URL button keyboard", () => {
-  it("wraps the OAuth URL in a single inline-keyboard button", () => {
+  it("has a single row with Open + Copy URL buttons", () => {
     const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc";
     const kb = buildAuthUrlKeyboardForTest(url);
 
-    // grammy's InlineKeyboard stores buttons in inline_keyboard[row][col]
     const json = kb.inline_keyboard;
     expect(json.length).toBe(1);
-    expect(json[0].length).toBe(1);
+    // One row with two buttons: [Open Claude auth] + [Copy URL]
+    expect(json[0].length).toBe(2);
 
-    const btn = json[0][0];
-    expect(btn.text).toContain("Open Claude auth");
-    expect("url" in btn).toBe(true);
-    if ("url" in btn) expect(btn.url).toBe(url);
+    const openBtn = json[0][0];
+    expect(openBtn.text).toContain("Open Claude auth");
+    expect("url" in openBtn).toBe(true);
+    if ("url" in openBtn) expect(openBtn.url).toBe(url);
+  });
+
+  it("[Copy URL] button uses Bot API 7.7+ copy_text shape", () => {
+    // This is the escape hatch for the 2026-04-22 in-app-browser
+    // incident: when the OAuth URL opens in Telegram's WebView (with
+    // different cookies than the user's main browser), wrong account
+    // gets authorized. Copy URL lets the user paste into their main
+    // browser where they know which account is signed in.
+    const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc";
+    const kb = buildAuthUrlKeyboardForTest(url);
+    const copyBtn = kb.inline_keyboard[0][1] as unknown as { text: string; copy_text: { text: string } };
+    expect(copyBtn.text).toContain("Copy URL");
+    expect(copyBtn.copy_text).toBeDefined();
+    expect(copyBtn.copy_text.text).toBe(url);
   });
 
   it("accepts long URLs with query params without truncation", () => {

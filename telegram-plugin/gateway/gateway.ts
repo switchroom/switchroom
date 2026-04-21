@@ -2365,10 +2365,19 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
   })
   // Mobile-native post-script: tap the inline button below, then reply
   // to this chat with the browser code. No command prefix needed.
+  //
+  // 2026-04-22 note: include an in-app-browser warning — when you tap
+  // the `🔐 Open Claude auth` button, many Telegram clients open the
+  // URL in their built-in WebView which has SEPARATE cookies from
+  // your main browser. If you signed into the wrong Anthropic account
+  // there (or into no account), the OAuth approve happens under that
+  // WebView's session — not whatever account your main browser is
+  // logged into.
   rendered.push(
     '',
-    '👇 Tap the button below to open Claude auth.',
-    'Then <b>reply here with the browser code</b> (just paste it).',
+    '👇 Tap <b>🔐 Open Claude auth</b> below, then <b>reply with the browser code</b>.',
+    '',
+    '<i>Tip: if the wrong Anthropic account keeps getting authorized, tap <b>📋 Copy URL</b> instead and paste the URL into your main browser where the right account is signed in.</i>',
     '',
     `<a href="${escapeHtmlForTg(url)}">${escapeHtmlForTg(url)}</a>`,
   )
@@ -2377,13 +2386,38 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
 
 /**
  * Build the inline keyboard shown under an auth-flow response that has
- * an OAuth URL. The button gives users a direct tap-to-browser action
- * without having to select the inline text link— the native pattern on
- * mobile per the keep-my-subscription-honest JTBD ("user can state in
- * one sentence what they're paying for" → one-tap auth action).
+ * an OAuth URL. Two buttons:
+ *
+ *   [🔐 Open Claude auth]   — `url` button. On mobile Telegram clients
+ *                             this typically opens in the app's in-app
+ *                             browser (WebView). Fine when the WebView
+ *                             shares cookies with where the user
+ *                             recently signed into Claude.
+ *
+ *   [📋 Copy URL]           — `copy_text` button (Bot API 7.7+).
+ *                             Copies the authorize URL to the clipboard
+ *                             so the user can paste it into their main
+ *                             browser — the one they actually checked
+ *                             which Anthropic account is signed in.
+ *                             This is the escape hatch for the
+ *                             in-app-browser-vs-main-browser cookie
+ *                             mismatch surfaced in the 2026-04-22 incident
+ *                             where Ken saw pixsoul@gmail.com in his main
+ *                             browser but Telegram's WebView authorized
+ *                             under a different account.
+ *
+ * grammy's InlineKeyboard builder doesn't expose a helper for
+ * `copy_text`, so we push the raw button object into the row directly.
  */
 function buildAuthUrlKeyboard(authorizeUrl: string): InlineKeyboard {
-  return new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
+  const kb = new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
+  // Push raw copy_text button into the same row. Casting because
+  // grammy's TS types don't include copy_text yet (it's Bot API 7.7+).
+  kb.inline_keyboard[0].push({
+    text: '📋 Copy URL',
+    copy_text: { text: authorizeUrl },
+  } as unknown as typeof kb.inline_keyboard[0][number])
+  return kb
 }
 
 async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
@@ -3055,14 +3089,19 @@ function fetchDashboardState(agent: string): DashboardState | null {
     return null
   }
 
-  // Plan + bank come from switchroom auth status for THIS agent.
+  // Plan + bank + rateLimitTier come from switchroom auth status for
+  // THIS agent. rateLimitTier is the signal users need to verify the
+  // correct Anthropic account got authorized during reauth (e.g.
+  // max_5x vs max_20x). See 2026-04-22 account-mismatch discussion.
   let plan: string | null = null
+  let rateLimitTier: string | null = null
   const bankId = agent
   try {
     type AuthStatusResp = { agents: Array<{ name: string; subscription_type: string | null; rate_limit_tier?: string | null }> }
     const statusData = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
     const thisAgent = statusData?.agents?.find((a) => a.name === agent)
     if (thisAgent?.subscription_type) plan = thisAgent.subscription_type
+    if (thisAgent?.rate_limit_tier) rateLimitTier = thisAgent.rate_limit_tier
   } catch {
     /* best-effort */
   }
@@ -3077,6 +3116,7 @@ function fetchDashboardState(agent: string): DashboardState | null {
     agent,
     bankId,
     plan,
+    rateLimitTier,
     slots,
     quotaHot: isQuotaHot(slots),
     generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
