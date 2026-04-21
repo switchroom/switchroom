@@ -54,6 +54,15 @@ export interface DashboardState {
   agent: string;
   bankId: string;
   plan?: string | null;
+  /**
+   * Anthropic's `rateLimitTier` from the active slot's credentials
+   * — e.g. `default_claude_max_5x` vs `default_claude_max_20x`. The
+   * tier is the easiest human-visible signal that "the account I
+   * meant to authorize with got authorized". Without this, the
+   * dashboard just shows `Plan: max` for both tiers and an account
+   * mismatch is silent until the agent hits quota.
+   */
+  rateLimitTier?: string | null;
   slots: DashboardSlot[];
   /** True when at least one slot shows >= 90% utilization on either
    *  window. Toggles the [Fall back now] button's visibility. */
@@ -195,8 +204,17 @@ export function buildDashboard(state: DashboardState): {
 export function buildDashboardText(state: DashboardState): string {
   const lines: string[] = [];
   lines.push(`━━━ <b>Auth • ${escapeHtml(state.agent)}</b> ━━━`);
-  const planLine = state.plan
-    ? `Bank: <code>${escapeHtml(state.bankId)}</code> · Plan: <b>${escapeHtml(state.plan)}</b>`
+  // Show the full rate-limit tier when we have it — e.g. 'max_5x' vs
+  // 'max_20x' lets the user tell at a glance whether the correct
+  // Anthropic account got authorized during reauth. Otherwise fall
+  // back to the plain plan name.
+  const tierLabel = state.rateLimitTier
+    ? formatRateLimitTier(state.rateLimitTier)
+    : state.plan
+    ? state.plan
+    : null;
+  const planLine = tierLabel
+    ? `Bank: <code>${escapeHtml(state.bankId)}</code> · Plan: <b>${escapeHtml(tierLabel)}</b>`
     : `Bank: <code>${escapeHtml(state.bankId)}</code>`;
   lines.push(planLine);
   lines.push("");
@@ -333,6 +351,21 @@ export function isQuotaHot(slots: DashboardSlot[]): boolean {
     if ((s.sevenDayPct ?? 0) >= QUOTA_HOT_THRESHOLD_PCT) return true;
   }
   return false;
+}
+
+/**
+ * Shorten Anthropic's verbose tier strings into something readable in a
+ * one-line dashboard header.
+ *
+ *   default_claude_max_5x   → max_5x
+ *   default_claude_max_20x  → max_20x
+ *   default_claude_pro      → pro
+ *   anything else           → passthrough (we don't pretend to
+ *                             understand every future tier string)
+ */
+export function formatRateLimitTier(tier: string): string {
+  if (!tier) return tier;
+  return tier.replace(/^default_claude_/, "");
 }
 
 /** Tiny HTML escaper — same shape as welcome-text.ts's escapeHtml so
