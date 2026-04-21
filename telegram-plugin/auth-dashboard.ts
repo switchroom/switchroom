@@ -60,6 +60,20 @@ export interface DashboardState {
   quotaHot: boolean;
   /** ISO timestamp of the snapshot, shown in the header. */
   generatedAt?: string;
+  /**
+   * Slot name of the currently-pending auth session, if any.
+   *
+   * Populated by the gateway from the agent's
+   * `.claude/.setup-token.session.json` when present. When non-null,
+   * the dashboard renders a `[♻️ Restart flow]` button so the user
+   * can explicitly kill + restart the flow if it's gone sideways
+   * (browser took too long, claude setup-token crashed, etc.).
+   *
+   * Complements the automatic stale-session detection in
+   * startAuthSession — catches the cases where the user wants to
+   * start over BEFORE the challenge actually drifts.
+   */
+  pendingSessionSlot?: string | null;
 }
 
 /**
@@ -82,6 +96,7 @@ export type CallbackAction =
   | { kind: "confirm-rm"; agent: string; slot: string }
   | { kind: "fallback"; agent: string }
   | { kind: "usage"; agent: string }
+  | { kind: "restart-flow"; agent: string; slot: string }
   | { kind: "noop" };
 
 const CALLBACK_PREFIX = "auth:";
@@ -109,6 +124,8 @@ export function encodeCallbackData(action: CallbackAction): string {
       return `${CALLBACK_PREFIX}fallback:${action.agent}`;
     case "usage":
       return `${CALLBACK_PREFIX}usage:${action.agent}`;
+    case "restart-flow":
+      return `${CALLBACK_PREFIX}restart-flow:${action.agent}:${action.slot}`;
     case "noop":
       return `${CALLBACK_PREFIX}noop`;
   }
@@ -145,6 +162,9 @@ export function parseCallbackData(data: string): CallbackAction {
       return { kind: "fallback", agent };
     case "usage":
       return { kind: "usage", agent };
+    case "restart-flow":
+      if (!slot || !isSafeSlotName(slot)) return { kind: "noop" };
+      return { kind: "restart-flow", agent, slot };
     default:
       return { kind: "noop" };
   }
@@ -198,6 +218,11 @@ export function buildDashboardText(state: DashboardState): string {
   }
 
   lines.push("");
+  if (state.pendingSessionSlot) {
+    lines.push(
+      `<i>⏳ Auth flow pending for slot <code>${escapeHtml(state.pendingSessionSlot)}</code>. If it's stuck, tap ♻️ below to restart.</i>`,
+    );
+  }
   lines.push("━━━━━━━━━━━━━━━━━━━");
   if (state.generatedAt) {
     lines.push(`<i>Updated ${escapeHtml(state.generatedAt)}</i>`);
@@ -271,7 +296,21 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   }
   if (removableSlots.length > 0) kb.row();
 
-  // Row 4: quota actions. [Fall back now] only when the dashboard
+  // Row 4: pending-flow recovery. Shown ONLY when an auth flow is
+  // pending (session meta file on disk). Lets the user explicitly
+  // kill + restart the flow. Pairs with the automatic stale-session
+  // detection in startAuthSession — catches the case where the user
+  // wants to start over BEFORE the PKCE challenge actually drifts
+  // (e.g. they closed the browser tab before pasting).
+  if (state.pendingSessionSlot) {
+    kb.text(
+      `♻️ Restart ${state.pendingSessionSlot} flow`,
+      encodeCallbackData({ kind: "restart-flow", agent: state.agent, slot: state.pendingSessionSlot }),
+    );
+    kb.row();
+  }
+
+  // Row 5: quota actions. [Fall back now] only when the dashboard
   // flagged quotaHot; always show [Full quota] as the escape hatch.
   if (state.quotaHot) {
     kb.text("⚠️ Fall back now", encodeCallbackData({ kind: "fallback", agent: state.agent }));
@@ -279,7 +318,7 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   kb.text("📊 Full quota", encodeCallbackData({ kind: "usage", agent: state.agent }));
   kb.row();
 
-  // Row 5: refresh
+  // Row 6: refresh
   kb.text("🔁 Refresh", encodeCallbackData({ kind: "refresh", agent: state.agent }));
 
   return kb;
