@@ -2363,21 +2363,30 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
     if (line.startsWith('Open this URL')) return `<i>${escapeHtmlForTg(line)}</i>`
     return escapeHtmlForTg(line)
   })
-  // Mobile-native post-script: tap the inline button below, then reply
-  // to this chat with the browser code. No command prefix needed.
+  // Mobile-native post-script. Two paths depending on which Anthropic
+  // account the user wants to authorize:
   //
-  // 2026-04-22 note: include an in-app-browser warning — when you tap
-  // the `🔐 Open Claude auth` button, many Telegram clients open the
-  // URL in their built-in WebView which has SEPARATE cookies from
-  // your main browser. If you signed into the wrong Anthropic account
-  // there (or into no account), the OAuth approve happens under that
-  // WebView's session — not whatever account your main browser is
-  // logged into.
+  //   (a) Button: 🔐 Open Claude auth — opens in Telegram's in-app
+  //       browser (WebView) on most mobile clients. WebView has its
+  //       own cookie jar, separate from the user's main browser. Fine
+  //       when the WebView is already signed into the intended Claude
+  //       account; wrong when it's signed into a different one.
+  //
+  //   (b) Long-press the URL text at the bottom of this message — every
+  //       mobile Telegram client exposes "Copy Link" / "Open in
+  //       Browser" / "Open in Chrome" on long-press. That's the
+  //       escape hatch when you need to land in your main browser
+  //       where you control which account is signed in.
+  //
+  // Why not a copy_text button? We tried. Telegram's CopyTextButton.text
+  // field caps at 256 chars and OAuth URLs run ~320–340 chars. Result
+  // was BUTTON_COPY_TEXT_INVALID. The long-press-the-URL path achieves
+  // the same outcome with no API constraint. See PR #30.
   rendered.push(
     '',
     '👇 Tap <b>🔐 Open Claude auth</b> below, then <b>reply with the browser code</b>.',
     '',
-    '<i>Tip: if the wrong Anthropic account keeps getting authorized, tap <b>📋 Copy URL</b> instead and paste the URL into your main browser where the right account is signed in.</i>',
+    '<i>Wrong Anthropic account getting authorized? Long-press the URL below and choose "Copy Link" or "Open in Browser" — lands in your main browser where the right account is signed in, bypassing Telegram\'s in-app browser cookies.</i>',
     '',
     `<a href="${escapeHtmlForTg(url)}">${escapeHtmlForTg(url)}</a>`,
   )
@@ -2386,38 +2395,27 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
 
 /**
  * Build the inline keyboard shown under an auth-flow response that has
- * an OAuth URL. Two buttons:
+ * an OAuth URL. Single button:
  *
  *   [🔐 Open Claude auth]   — `url` button. On mobile Telegram clients
  *                             this typically opens in the app's in-app
- *                             browser (WebView). Fine when the WebView
- *                             shares cookies with where the user
- *                             recently signed into Claude.
+ *                             browser (WebView).
  *
- *   [📋 Copy URL]           — `copy_text` button (Bot API 7.7+).
- *                             Copies the authorize URL to the clipboard
- *                             so the user can paste it into their main
- *                             browser — the one they actually checked
- *                             which Anthropic account is signed in.
- *                             This is the escape hatch for the
- *                             in-app-browser-vs-main-browser cookie
- *                             mismatch surfaced in the 2026-04-22 incident
- *                             where Ken saw pixsoul@gmail.com in his main
- *                             browser but Telegram's WebView authorized
- *                             under a different account.
+ * We previously tried adding a `[📋 Copy URL]` button using Telegram's
+ * Bot API 7.7 `copy_text` type but it capped at 256 chars for the
+ * copyable text. OAuth URLs (~320–340 chars) exceed that and produce
+ * `BUTTON_COPY_TEXT_INVALID`. Instead, the message body renders the
+ * URL as a tappable link; users long-press the URL text to get native
+ * "Copy Link" / "Open in Browser" actions, bypassing the WebView.
  *
- * grammy's InlineKeyboard builder doesn't expose a helper for
- * `copy_text`, so we push the raw button object into the row directly.
+ * Defense in depth: this function's output is validated against
+ * Telegram's real field-length constraints in
+ * `telegram-plugin/tests/auth-url-keyboard-constraints.test.ts` so
+ * future changes that breach a limit fail loudly at CI time rather
+ * than silently in production.
  */
 function buildAuthUrlKeyboard(authorizeUrl: string): InlineKeyboard {
-  const kb = new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
-  // Push raw copy_text button into the same row. Casting because
-  // grammy's TS types don't include copy_text yet (it's Bot API 7.7+).
-  kb.inline_keyboard[0].push({
-    text: '📋 Copy URL',
-    copy_text: { text: authorizeUrl },
-  } as unknown as typeof kb.inline_keyboard[0][number])
-  return kb
+  return new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
 }
 
 async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
