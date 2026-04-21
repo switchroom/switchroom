@@ -56,10 +56,31 @@ for gateway_svc in "${gateway_services[@]}"; do
     continue
   fi
 
-  # Skip if agent service isn't running. PartOf= on the gateway handles
-  # the cascade case (agent killed → gateway restarted); we only heal
-  # the inverse direction (agent stuck, gateway fine).
+  # If the agent service itself is inactive but the gateway is up,
+  # treat that as a stale-bridge scenario too and restart it.
+  #
+  # Why: the agent service has `Restart=on-failure` in its unit (not
+  # `Restart=always`) so a clean 0-exit of start.sh leaves it inactive.
+  # That happens when Claude Code exits normally mid-session for any
+  # reason (including external kill that start.sh handles gracefully).
+  # Without this heal path the watchdog's earlier skip-if-inactive
+  # guard left agents dead indefinitely.
+  #
+  # Production incident: 2026-04-22 ~03:44 AEST clerk's start.sh
+  # exited with status=0/SUCCESS and the service went inactive. The
+  # gateway stayed up; bridge was disconnected; systemd did nothing.
   if ! systemctl --user is-active --quiet "$agent_svc" 2>/dev/null; then
+    # Also skip if the service is marked failed (start-limit-hit etc.)
+    # — that needs operator intervention, not a restart loop.
+    state="$(systemctl --user show "$agent_svc" -p ActiveState --value 2>/dev/null)"
+    if [[ "$state" == "failed" ]]; then
+      echo "$(date -Iseconds) watchdog: ${agent_svc} is failed state; skipping (needs operator reset-failed)"
+      continue
+    fi
+    echo "$(date -Iseconds) watchdog: ${agent} agent service is inactive (${state}); starting ${agent_svc}"
+    systemctl --user start "$agent_svc" || {
+      echo "$(date -Iseconds) watchdog: ${agent_svc} start failed"
+    }
     continue
   fi
 
