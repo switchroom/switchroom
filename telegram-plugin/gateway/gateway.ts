@@ -3057,7 +3057,7 @@ function fetchDashboardState(agent: string): DashboardState | null {
 
   // Plan + bank come from switchroom auth status for THIS agent.
   let plan: string | null = null
-  let bankId = agent
+  const bankId = agent
   try {
     type AuthStatusResp = { agents: Array<{ name: string; subscription_type: string | null; rate_limit_tier?: string | null }> }
     const statusData = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
@@ -3067,6 +3067,12 @@ function fetchDashboardState(agent: string): DashboardState | null {
     /* best-effort */
   }
 
+  // Check for a pending auth session on disk. When present, surface it
+  // on the dashboard so the user can tap [♻️ Restart flow] without
+  // waiting for the automatic stale-session detection to fire (which
+  // only fires on actual PKCE challenge drift).
+  const pendingSessionSlot = readPendingSessionSlot(agent)
+
   return {
     agent,
     bankId,
@@ -3074,7 +3080,50 @@ function fetchDashboardState(agent: string): DashboardState | null {
     slots,
     quotaHot: isQuotaHot(slots),
     generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    pendingSessionSlot,
   }
+}
+
+/**
+ * Read the pending auth session's target slot from the agent's
+ * `.setup-token.session.json` meta file. Returns null when no session
+ * is pending.
+ */
+function readPendingSessionSlot(agent: string): string | null {
+  try {
+    const agentDir = resolveAgentDirForName(agent)
+    if (!agentDir) return null
+    const metaPath = join(agentDir, '.claude', '.setup-token.session.json')
+    const raw = readFileSync(metaPath, 'utf-8')
+    const meta = JSON.parse(raw) as { slot?: string }
+    return meta.slot ?? 'default'
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve the agent directory for a given name. Tries the local
+ * SWITCHROOM_CONFIG-driven lookup first, falls back to scanning
+ * known agent-root paths. Used by dashboard path probing without
+ * blowing up when configs are split across roots (klanker setup).
+ */
+function resolveAgentDirForName(agent: string): string | null {
+  try {
+    // If this gateway is scoped to a specific agent, prefer that.
+    if (agent === getMyAgentName()) {
+      return resolveAgentDirFromEnv()
+    }
+  } catch { /* ignore */ }
+  // Common split-root layout for klanker.
+  const candidates = [
+    join(process.env.HOME ?? '/root', `.switchroom-${agent}/agents/${agent}`),
+    join(process.env.HOME ?? '/root', `.switchroom/agents/${agent}`),
+  ]
+  for (const c of candidates) {
+    try { readFileSync(join(c, '.claude', 'settings.json'), 'utf-8'); return c } catch { /* try next */ }
+  }
+  return null
 }
 
 /**
@@ -3159,6 +3208,27 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         await switchroomReply(ctx, `No action: ${escapeHtmlForTg(result.reason)}`, { html: true })
       }
       await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'restart-flow': {
+      // Kill any pending session + restart the same flow (reauth or
+      // add-slot) fresh. Exists for the case where the user wants to
+      // start over BEFORE the automatic stale-session detection fires
+      // (e.g. closed the browser tab, 2FA failed, waited too long).
+      await ctx.answerCallbackQuery({ text: `Restarting ${action.slot} flow…` }).catch(() => {})
+      // Step 1: cancel any pending session for this agent.
+      try {
+        await runSwitchroomCommand(ctx, ['auth', 'cancel', action.agent], `auth cancel ${action.agent}`)
+      } catch { /* cancel is best-effort */ }
+      // Step 2: re-initiate. Slot == 'default' → reauth; else → add-slot.
+      // Both paths print the fresh URL + button + ForceReply prompt via
+      // runSwitchroomAuthCommand.
+      if (action.slot === 'default') {
+        await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', action.agent], `auth reauth ${action.agent}`)
+      } else {
+        await runSwitchroomAuthCommand(ctx, ['auth', 'add', action.agent, '--slot', action.slot], `auth add ${action.agent} --slot ${action.slot}`)
+      }
+      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
       return
     }
     case 'usage': {
