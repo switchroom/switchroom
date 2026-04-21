@@ -34,7 +34,7 @@ import {
 } from "./profiles.js";
 import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { updateBankMissions } from "../memory/hindsight.js";
+import { updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -1681,19 +1681,26 @@ export function scaffoldAgent(
       const handoffConfigArg = switchroomConfigPath
         ? ` --config ${shellSingleQuote(resolve(switchroomConfigPath))}`
         : "";
-      const switchroomStop = handoffEnabled
-        ? [
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `switchroom${handoffConfigArg} handoff ${name}`,
-                  timeout: 35,
-                  async: true,
-                },
-              ],
-            },
-          ]
+      const switchroomStopHooks: Array<{ type: string; command: string; timeout: number; async: boolean }> = [];
+      if (handoffEnabled) {
+        switchroomStopHooks.push({
+          type: "command",
+          command: `switchroom${handoffConfigArg} handoff ${name}`,
+          timeout: 35,
+          async: true,
+        });
+      }
+      // User-profile Mental Model refresh hook (when Hindsight is enabled)
+      if (hindsightEnabled) {
+        switchroomStopHooks.push({
+          type: "command",
+          command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
+          timeout: 10,
+          async: true,
+        });
+      }
+      const switchroomStop = switchroomStopHooks.length > 0
+        ? [{ hooks: switchroomStopHooks }]
         : [];
       // Switchroom-owned UserPromptSubmit hooks: inject workspace content at
       // the start of every turn. When hotReloadStable is true, the stable
@@ -2090,6 +2097,22 @@ export function scaffoldAgent(
       })
       .catch((err) => {
         console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+      });
+  }
+
+  // Ensure user-profile Mental Model exists when Hindsight is enabled
+  if (hindsightEnabled) {
+    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
+    ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+      .then((result) => {
+        if (result.ok) {
+          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${hindsightBankId}`);
+        } else {
+          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM: ${result.reason}`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error: ${err}`);
       });
   }
 
@@ -2527,19 +2550,26 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     };
     const switchroomSessionStart = [{ hooks: [greetingHook] }];
     const handoffEnabledReconcile = agentConfig.session_continuity?.enabled !== false;
-    const switchroomStop = handoffEnabledReconcile
-      ? [
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `switchroom handoff ${name}`,
-                timeout: 35,
-                async: true,
-              },
-            ],
-          },
-        ]
+    const switchroomStopHooksReconcile: Array<{ type: string; command: string; timeout: number; async: boolean }> = [];
+    if (handoffEnabledReconcile) {
+      switchroomStopHooksReconcile.push({
+        type: "command",
+        command: `switchroom handoff ${name}`,
+        timeout: 35,
+        async: true,
+      });
+    }
+    // User-profile Mental Model refresh hook (when Hindsight is enabled)
+    if (hindsightEnabled) {
+      switchroomStopHooksReconcile.push({
+        type: "command",
+        command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
+        timeout: 10,
+        async: true,
+      });
+    }
+    const switchroomStop = switchroomStopHooksReconcile.length > 0
+      ? [{ hooks: switchroomStopHooksReconcile }]
       : [];
     // Switchroom-owned UserPromptSubmit hooks (same as scaffoldAgent above)
     const useHotReloadStableReconcile = agentConfig.channels?.telegram?.hotReloadStable === true;
@@ -2883,6 +2913,22 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       })
       .catch((err) => {
         console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+      });
+  }
+
+  // Ensure user-profile Mental Model exists when Hindsight is enabled (same as scaffoldAgent)
+  if (hindsightEnabled) {
+    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
+    ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
+      .then((result) => {
+        if (result.ok) {
+          console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${hindsightBankId}`);
+        } else {
+          console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM: ${result.reason}`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`  ${chalk.yellow("⚠")} User-profile MM error: ${err}`);
       });
   }
 
