@@ -49,6 +49,14 @@ export const AgentMemorySchema = z
       .describe(
         "strict = never shared cross-agent, default = eligible for reflect"
       ),
+    bank_mission: z
+      .string()
+      .optional()
+      .describe("Bank-level mission statement used during recall to contextualize results"),
+    retain_mission: z
+      .string()
+      .optional()
+      .describe("Instructions for the fact extraction LLM during retain"),
   })
   .optional();
 

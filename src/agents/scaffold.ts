@@ -34,6 +34,7 @@ import {
 } from "./profiles.js";
 import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
+import { updateBankMissions } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -2051,6 +2052,30 @@ export function scaffoldAgent(
     }
   }
 
+  // Update bank missions if configured
+  if (hindsightEnabled && (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission)) {
+    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
+    const missions: { bank_mission?: string; retain_mission?: string } = {};
+    if (agentConfig.memory?.bank_mission) {
+      missions.bank_mission = agentConfig.memory.bank_mission;
+    }
+    if (agentConfig.memory?.retain_mission) {
+      missions.retain_mission = agentConfig.memory.retain_mission;
+    }
+
+    updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+      .then((result) => {
+        if (result.ok) {
+          console.log(`  ${chalk.green("✓")} Bank missions updated for ${hindsightBankId}`);
+        } else {
+          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions: ${result.reason}`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+      });
+  }
+
   return { agentDir, created, skipped };
 }
 
@@ -2802,6 +2827,30 @@ Final answers still go through \`stream_reply\` with done=true as usual,
     } else {
       restartRequired.push(change);
     }
+  }
+
+  // Update bank missions if configured (same as scaffoldAgent)
+  if (hindsightEnabled && (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission)) {
+    const apiUrl = `${hindsightApiBaseUrl}/mcp/`;
+    const missions: { bank_mission?: string; retain_mission?: string } = {};
+    if (agentConfig.memory?.bank_mission) {
+      missions.bank_mission = agentConfig.memory.bank_mission;
+    }
+    if (agentConfig.memory?.retain_mission) {
+      missions.retain_mission = agentConfig.memory.retain_mission;
+    }
+
+    updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+      .then((result) => {
+        if (result.ok) {
+          console.log(`  ${chalk.green("✓")} Bank missions updated for ${hindsightBankId}`);
+        } else {
+          console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions: ${result.reason}`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`  ${chalk.yellow("⚠")} Bank mission update error: ${err}`);
+      });
   }
 
   return {

@@ -87,3 +87,101 @@ export function isStrictIsolation(
   const agentConfig = config.agents[agentName];
   return agentConfig?.memory?.isolation === "strict";
 }
+
+/**
+ * Update bank mission statements via MCP.
+ *
+ * Calls Hindsight's update_bank tool to set bank_mission and/or retain_mission.
+ * Best-effort with timeout; never throws.
+ *
+ * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
+ * @param bankId The bank ID to update
+ * @param missions Object with optional bank_mission and/or retain_mission
+ * @param opts Optional fetch implementation and timeout
+ * @returns {ok: true} on success, {ok: false, reason} on error
+ */
+export async function updateBankMissions(
+  apiUrl: string,
+  bankId: string,
+  missions: { bank_mission?: string; retain_mission?: string },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Step 1: Initialize MCP session
+    const initResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "switchroom", version: "0.1" },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!initResponse.ok) {
+      return { ok: false, reason: `HTTP ${initResponse.status}` };
+    }
+
+    const sessionId = initResponse.headers.get("mcp-session-id");
+    if (!sessionId) {
+      return { ok: false, reason: "No session ID returned" };
+    }
+
+    // Step 2: Call update_bank tool
+    const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
+    const toolResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "update_bank",
+          arguments: {
+            bank_id: bankId,
+            mission: missions.bank_mission,
+            retain_mission: missions.retain_mission,
+          },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout2);
+
+    if (!toolResponse.ok) {
+      return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return { ok: false, reason: "Timeout" };
+    }
+    return { ok: false, reason: String(err) };
+  }
+}
