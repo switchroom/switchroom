@@ -59,6 +59,12 @@ export interface PinManagerDeps {
   addPin?: (entry: ActivePinEntry) => void
   /** Optional: remove from the sidecar. Skipped when not wired. */
   removePin?: (chatId: string, messageId: number) => void
+  /**
+   * Optional: `bot.api.deleteMessage` wrapper. When wired, the manager
+   * deletes the "Clerk pinned ..." service message that Telegram posts
+   * automatically after each pin. Skipped when not wired.
+   */
+  deleteMessage?: (chatId: string, messageId: number) => Promise<unknown>
   /** Logger for pin/unpin failures. Receives lines with trailing newline. */
   log?: (line: string) => void
   /** Clock injection for test determinism. Defaults to `Date.now`. */
@@ -76,6 +82,18 @@ export interface PinManager {
    * cancellation paths that need to clear all active pins for a chat.
    */
   unpinForChat(chatId: string, threadId: number | undefined): void
+  /**
+   * Hook for the grammY `message:pinned_message` update. When Telegram
+   * auto-posts the "Clerk pinned ..." service message after a pin we
+   * made, the gateway calls this with the service message id and the id
+   * of the pinned message it wraps. The manager deletes the service
+   * message immediately if it matches one of our tracked pins.
+   */
+  captureServiceMessage(args: {
+    chatId: string
+    pinnedMessageId: number
+    serviceMessageId: number
+  }): void
   /** Test-only: snapshot the currently-pinned turnKeys. */
   pinnedTurnKeys(): ReadonlyArray<string>
   /** Test-only: look up the pinned message id for a turnKey. */
@@ -100,8 +118,26 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   // onTurnComplete exactly once today, but the reducer's zombie path
   // can also land on the same turnKey).
   const unpinned = new Set<string>()
+  // `${chatId}:${pinnedMessageId}` -> service-message id. Populated when
+  // the grammY `pinned_message` update handler forwards the wrapper
+  // message to us. We delete on capture; this map exists only so a late
+  // unpin path can also scrub the service message if the capture-delete
+  // somehow failed.
+  const serviceMessages = new Map<string, number>()
   // Fire-and-forget promises we want tests to be able to drain.
   const inFlight = new Set<Promise<unknown>>()
+
+  function serviceKey(chatId: string, pinnedMessageId: number): string {
+    return `${chatId}:${pinnedMessageId}`
+  }
+
+  function deleteServiceMessage(chatId: string, serviceMessageId: number): void {
+    if (!deps.deleteMessage) return
+    const p = deps.deleteMessage(chatId, serviceMessageId).catch((err: Error) => {
+      log(`telegram gateway: progress-card pin service-msg delete failed: ${err?.message ?? err}\n`)
+    })
+    track(p)
+  }
 
   function track(p: Promise<unknown>): void {
     inFlight.add(p)
@@ -118,6 +154,12 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     if (unpinned.has(turnKey)) return
     unpinned.add(turnKey)
     pinned.delete(turnKey)
+    const key = serviceKey(chatId, pinnedId)
+    const svcId = serviceMessages.get(key)
+    if (svcId != null) {
+      serviceMessages.delete(key)
+      deleteServiceMessage(chatId, svcId)
+    }
     const p = deps.unpin(chatId, pinnedId)
       .catch((err: Error) => {
         log(`telegram gateway: progress-card unpin failed: ${err?.message ?? err}\n`)
@@ -181,6 +223,25 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
         if (turnKey.startsWith(`${base}:`)) matching.push([turnKey, pinnedId])
       }
       for (const [turnKey, pinnedId] of matching) doUnpin(turnKey, chatId, pinnedId)
+    },
+
+    captureServiceMessage({ chatId, pinnedMessageId, serviceMessageId }) {
+      // Only act on service messages that wrap one of our tracked pins —
+      // otherwise we'd be deleting arbitrary pin-service messages in the
+      // chat, which could include user-initiated pins.
+      let matched = false
+      for (const [, msgId] of pinned) {
+        if (msgId === pinnedMessageId) { matched = true; break }
+      }
+      if (!matched) return
+      const key = serviceKey(chatId, pinnedMessageId)
+      serviceMessages.set(key, serviceMessageId)
+      deleteServiceMessage(chatId, serviceMessageId)
+      // Also drop the tracked id — if the delete succeeded there's
+      // nothing left to scrub on unpin. If it failed the catch logged it
+      // and a retry on unpin wouldn't help (Telegram pin-service messages
+      // don't age back into existence).
+      serviceMessages.delete(key)
     },
 
     pinnedTurnKeys() {

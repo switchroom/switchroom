@@ -3084,6 +3084,7 @@ if (streamMode === 'checklist') {
   const pinMgr = createPinManager({
     pin: (chatId, messageId, opts) => lockedBot.api.pinChatMessage(chatId, messageId, opts),
     unpin: (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+    deleteMessage: (chatId, messageId) => lockedBot.api.deleteMessage(chatId, messageId),
     addPin: (entry) => {
       const agentDir = resolveAgentDirFromEnv()
       if (agentDir != null) addActivePin(agentDir, entry)
@@ -3093,6 +3094,18 @@ if (streamMode === 'checklist') {
       if (agentDir != null) removeActivePin(agentDir, chatId, messageId)
     },
     log: (line) => process.stderr.write(line),
+  })
+
+  bot.on('message:pinned_message', async ctx => {
+    const chatId = String(ctx.chat.id)
+    const serviceMessageId = ctx.message.message_id
+    const pinned = ctx.message.pinned_message
+    if (!pinned) return
+    pinMgr.captureServiceMessage({
+      chatId,
+      pinnedMessageId: pinned.message_id,
+      serviceMessageId,
+    })
   })
 
   unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {

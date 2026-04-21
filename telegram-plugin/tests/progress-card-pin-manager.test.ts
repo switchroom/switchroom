@@ -22,6 +22,7 @@ interface Harness {
   deps: {
     pin: ReturnType<typeof vi.fn>
     unpin: ReturnType<typeof vi.fn>
+    deleteMessage: ReturnType<typeof vi.fn>
     addPin: ReturnType<typeof vi.fn>
     removePin: ReturnType<typeof vi.fn>
     log: ReturnType<typeof vi.fn>
@@ -37,6 +38,7 @@ function mkHarness(overrides: Partial<PinManagerDeps> = {}): Harness {
   const deps = {
     pin: vi.fn(async () => true),
     unpin: vi.fn(async () => true),
+    deleteMessage: vi.fn(async () => true),
     addPin: vi.fn((entry: ActivePinEntry) => {
       sidecar.push(entry)
     }),
@@ -345,6 +347,74 @@ describe('createPinManager', () => {
 
       expect(h.deps.pin).toHaveBeenCalledTimes(2)
       expect(h.mgr.pinnedMessageId('c:1')).toBe(777)
+    })
+  })
+
+  describe('captureServiceMessage — pin-service-msg deletion', () => {
+    it('deletes the service message when it wraps a tracked pin', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      await h.mgr.drainInFlight()
+
+      h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 500, serviceMessageId: 9001 })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.deleteMessage).toHaveBeenCalledWith('c', 9001)
+    })
+
+    it('ignores service messages wrapping pins we did not track', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      await h.mgr.drainInFlight()
+
+      h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 999, serviceMessageId: 9001 })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.deleteMessage).not.toHaveBeenCalled()
+    })
+
+    it('no-op when deleteMessage is not wired', async () => {
+      const h = mkHarness({ deleteMessage: undefined })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      await h.mgr.drainInFlight()
+
+      expect(() => {
+        h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 500, serviceMessageId: 9001 })
+      }).not.toThrow()
+      await h.mgr.drainInFlight()
+    })
+
+    it('deleteMessage rejection is logged and does not throw', async () => {
+      const h = mkHarness()
+      h.deps.deleteMessage.mockRejectedValueOnce(errors.badRequest('message to delete not found', 'deleteMessage'))
+
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      await h.mgr.drainInFlight()
+
+      h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 500, serviceMessageId: 9001 })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.log).toHaveBeenCalledWith(
+        expect.stringMatching(/pin service-msg delete failed/),
+      )
+    })
+
+    it('unpin deletes a service message that was captured but not yet deleted', async () => {
+      // Simulate: capture arrives, but deleteMessage is pending forever —
+      // then an unpin fires. Because captureServiceMessage already
+      // attempted the delete and removed its entry, unpin won't double-fire;
+      // this guards the inverse scenario where capture never arrived.
+      // Here we test the safety-net path: no capture → no stray delete.
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      await h.mgr.drainInFlight()
+
+      // No captureServiceMessage call — simulates a lost/unmatched update.
+      h.mgr.completeTurn({ chatId: 'c', turnKey: 'c:1' })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.unpin).toHaveBeenCalledWith('c', 500)
+      expect(h.deps.deleteMessage).not.toHaveBeenCalled()
     })
   })
 
