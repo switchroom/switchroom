@@ -29,6 +29,11 @@ import {
 } from "../agents/systemd.js";
 import { detectInFlight, waitUntilIdle } from "../agents/in-flight.js";
 import { askYesNo } from "../setup/prompt.js";
+import {
+  buildAgentStatusReport,
+  defaultStatusInputs,
+  formatStatusText,
+} from "../agents/status.js";
 
 /**
  * Pre-restart preflight check. Verifies the agent's runtime
@@ -232,6 +237,67 @@ export function registerAgentCommand(program: Command): void {
         printTable(headers, rows, widths);
         console.log();
       })
+    );
+
+  // switchroom agent status <name>
+  //
+  // Single-command answer to "is my agent alive and healthy?" — rolls up
+  // Claude PID + uptime, gateway PID, Hindsight reachability + bank
+  // presence, Telegram polling state, and last inbound/outbound message
+  // timestamps. Exit code 0 iff every check passes; 1 if any check
+  // fails. Stable `key: value` output so shell scripts can grep it.
+  agent
+    .command("status <name>")
+    .description("Show health status for a single agent (PID, polling, Hindsight, last messages)")
+    .option("--json", "Output as JSON")
+    .action(
+      withConfigError(async (name: string, opts: { json?: boolean }) => {
+        const config = getConfig(program);
+        const agentsDir = resolveAgentsDir(config);
+        const agentConfig = config.agents[name];
+        if (!agentConfig) {
+          console.error(
+            chalk.red(`Agent "${name}" is not defined in switchroom.yaml`),
+          );
+          process.exit(1);
+        }
+
+        const agentDir = resolve(agentsDir, name);
+
+        // Hindsight MCP URL is only relevant if the agent actually uses
+        // Hindsight. When memory.backend !== "hindsight" we pass null so
+        // the probe is skipped and the check reports "not configured".
+        let hindsightApiUrl: string | null = null;
+        let hindsightBankId = name;
+        if (config.memory?.backend === "hindsight") {
+          const baseUrl = (config.memory.config?.url as string | undefined)
+            ?? "http://localhost:8888/mcp/";
+          // Normalize to end in /mcp/
+          hindsightApiUrl = baseUrl.endsWith("/mcp/")
+            ? baseUrl
+            : baseUrl.replace(/\/$/, "") + "/mcp/";
+          hindsightBankId = agentConfig.memory?.collection ?? name;
+        }
+
+        const inputs = defaultStatusInputs({
+          agentName: name,
+          agentDir,
+          hindsightApiUrl,
+          hindsightBankId,
+        });
+
+        const report = await buildAgentStatusReport(inputs);
+
+        if (opts.json) {
+          console.log(JSON.stringify(report, null, 2));
+        } else {
+          console.log(formatStatusText(report));
+        }
+
+        if (report.overallState === "fail") {
+          process.exit(1);
+        }
+      }),
     );
 
   // switchroom agent create <name>
