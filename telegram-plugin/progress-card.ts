@@ -130,6 +130,16 @@ export interface ProgressCardState {
   readonly thinking: boolean
   /** Latest short `text` content from the assistant (for the thought line). */
   readonly latestText?: string
+  /**
+   * The most recent single-line `text` block the model emitted that
+   * hasn't yet been paired to a `tool_use`. Used by the file/search
+   * tools (Read/Write/Edit/Grep/Glob) to show the model's natural
+   * preamble ("I'll check foo.ts") instead of the filename fallback
+   * in the checklist. Set on every `text` event; consumed and cleared
+   * by the NEXT `tool_use` (so sibling tool_uses in the same batch do
+   * NOT reuse it). Cleared unconditionally on `turn_end` / `enqueue`.
+   */
+  readonly pendingPreamble?: string | null
   /** Narrative steps derived from assistant text blocks. */
   readonly narratives: ReadonlyArray<NarrativeStep>
   /**
@@ -204,9 +214,16 @@ export function reduce(
 
     case 'text': {
       if (state.turnStartedAt === 0) return state
+      // Stash the raw text as a candidate preamble for the next
+      // tool_use. toolLabel() applies its own single-line + length
+      // gate, so we pass the full text through here and let the label
+      // layer decide. Multi-line narrative text will be rejected there
+      // and the filename/pattern fallback wins — which is what we
+      // want for "here's my plan: <long paragraph>" style narration.
+      const pendingPreamble = event.text
       const label = extractNarrativeLabel(event.text)
       if (!label) {
-        return { ...state, latestText: event.text, thinking: false }
+        return { ...state, latestText: event.text, thinking: false, pendingPreamble }
       }
       const prevNarratives = state.narratives.map(n =>
         n.state === 'active' ? { ...n, state: 'done' as const } : n,
@@ -223,6 +240,7 @@ export function reduce(
         narratives: [...prevNarratives, newNarrative],
         latestText: event.text,
         thinking: false,
+        pendingPreamble,
       }
     }
 
@@ -237,11 +255,17 @@ export function reduce(
       // land on the WRONG item (by FIFO fallback) because its
       // toolUseId-matched item had already been force-done. Pairing is
       // now entirely up to tool_result (by toolUseId when available).
+      // Consume pendingPreamble exactly once — the first tool_use after
+      // the text block pairs with it; any sibling tool_uses in the same
+      // assistant message fall back to the filename/pattern label. This
+      // is why we capture before building the item and clear it in the
+      // returned state below.
+      const preamble = state.pendingPreamble ?? undefined
       const nextItem: ChecklistItem = {
         id: state.items.length,
         toolUseId: event.toolUseId ?? null,
         tool: event.toolName,
-        label: toolLabel(event.toolName, event.input),
+        label: toolLabel(event.toolName, event.input, preamble),
         state: 'running',
         startedAt: now,
       }
@@ -333,6 +357,7 @@ export function reduce(
         thinking: false,
         pendingAgentSpawns,
         subAgents,
+        pendingPreamble: null,
       }
     }
 
