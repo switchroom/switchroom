@@ -594,12 +594,34 @@ const pendingStateReaper = setInterval(() => {
 }, 60_000)
 pendingStateReaper.unref()
 
+/**
+ * Does a message look like a Claude setup-token browser code?
+ *
+ * The intercept path in the inbound-message handler uses this to decide
+ * whether to treat a pending-reauth chat's next message as `/auth code`.
+ * Return value drives whether the gateway hijacks the message or lets
+ * it through to the agent bridge — false negatives are user-visible as
+ * 'I pasted my code and nothing happened'.
+ *
+ * Format evolution:
+ *   - Legacy:  opaque 20+ char alphanum+underscore+hyphen token
+ *   - 2025+:   `sk-ant-...` API tokens emitted by setup-token
+ *   - 2026+:   `<code>#<state>` format from the claude.com/cai
+ *              authorize URL (see parseSetupTokenUrl regex). The `#`
+ *              in the middle was the breakage surfaced 2026-04-22 —
+ *              user's code starting with `tle0rm...#00EySj...` fell
+ *              through because the character class missed `#`.
+ *
+ * Character class now includes `#` and `.` for future-proofing (dot
+ * is common in JWT-style tokens). Length cap raised to 500 because
+ * the new dual-section format is ~90+ chars and will likely grow.
+ */
 function looksLikeAuthCode(text: string): boolean {
   const trimmed = text.trim()
   if (!trimmed || /\s/.test(trimmed)) return false
   if (trimmed.startsWith('session_')) return true
   if (trimmed.startsWith('sk-ant-')) return true
-  if (/^[A-Za-z0-9_-]{6,200}$/.test(trimmed)) return true
+  if (/^[A-Za-z0-9_.#-]{6,500}$/.test(trimmed)) return true
   return false
 }
 
