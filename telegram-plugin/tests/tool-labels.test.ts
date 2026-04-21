@@ -31,6 +31,20 @@ describe('toolLabel', () => {
     expect(out).toMatch(/…$/)
   })
 
+  it('Bash: prefers description over raw command when present', () => {
+    expect(
+      toolLabel('Bash', {
+        command: 'find /home -name "*.tmp" -mtime +30 -exec rm {} \\;',
+        description: 'Delete old temp files',
+      }),
+    ).toBe('Delete old temp files')
+  })
+
+  it('Bash: description gets a higher cap than raw command', () => {
+    const longDesc = 'Run the migration script and verify schema integrity across all shards'
+    expect(toolLabel('Bash', { command: 'x', description: longDesc })).toBe(longDesc)
+  })
+
   it('Grep: quotes pattern and shows "(in <path>)" always', () => {
     // No path given → "(in repo)"
     expect(toolLabel('Grep', { pattern: 'TODO' })).toBe('"TODO" (in repo)')

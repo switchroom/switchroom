@@ -18,6 +18,13 @@
 
 const MAX_LABEL_CHARS = 60
 const MAX_BASH_CHARS = 40
+/**
+ * Cap for human-readable `description` fields (Bash, fallback). Set
+ * larger than MAX_BASH_CHARS because descriptions are agent-authored
+ * English prose intended for humans — letting them wrap a couple of
+ * mobile lines is fine; aggressive truncation hides intent.
+ */
+const MAX_DESCRIPTION_CHARS = 160
 
 /**
  * Basename of a path — just the trailing segment. `/a/b/c.ts` → `c.ts`.
@@ -96,6 +103,8 @@ export function toolLabel(tool: string, input?: Record<string, unknown>): string
 
     case 'Bash':
     case 'BashOutput': {
+      const description = str('description')
+      if (description) return truncate(firstLine(description), MAX_DESCRIPTION_CHARS)
       const cmd = str('command') ?? str('bash_id') ?? ''
       return truncate(firstLine(cmd), MAX_BASH_CHARS)
     }
@@ -144,12 +153,15 @@ export function toolLabel(tool: string, input?: Record<string, unknown>): string
       return truncate(str('command') ?? '')
 
     default:
-      // Unknown tool — try common keys in priority order.
-      for (const k of ['file_path', 'path', 'url', 'query', 'pattern', 'command', 'description']) {
+      // Unknown tool — try common keys in priority order. `description`
+      // is checked first because it's the agent's human-readable summary
+      // (when present) and beats raw command/path strings.
+      for (const k of ['description', 'file_path', 'path', 'url', 'query', 'pattern', 'command']) {
         const v = str(k)
         if (v != null && v.length > 0) {
           if (k === 'file_path' || k === 'path') return truncate(basename(v))
           if (k === 'url') return truncate(hostFromUrl(v))
+          if (k === 'description') return truncate(firstLine(v), MAX_DESCRIPTION_CHARS)
           return truncate(firstLine(v))
         }
       }

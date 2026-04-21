@@ -173,7 +173,7 @@ function extractNarrativeLabel(text: string): string {
   const trimmed = text.trim()
   if (!trimmed) return ''
   const line = trimmed.split('\n')[0]
-  return line.length > 80 ? line.slice(0, 79) + '…' : line
+  return line.length > 200 ? line.slice(0, 199) + '…' : line
 }
 
 /**
