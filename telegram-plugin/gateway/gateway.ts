@@ -1835,7 +1835,7 @@ async function handleInbound(
       try {
         const output = stripAnsi(switchroomExecCombined(['auth', 'code', pendingReauth.agent, text.trim()], 30000))
         const formatted = formatAuthOutputForTelegram(output)
-        await switchroomReply(ctx, formatted, { html: true })
+        await switchroomReply(ctx, formatted.text, { html: true })
       } catch (err: unknown) {
         const error = err as { stderr?: string; message?: string }
         const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
@@ -2113,12 +2113,17 @@ function preBlock(text: string): string {
   return '<pre>' + escapeHtmlForTg(text) + '</pre>'
 }
 
-async function switchroomReply(ctx: Context, text: string, options: { html?: boolean } = {}): Promise<void> {
+async function switchroomReply(
+  ctx: Context,
+  text: string,
+  options: { html?: boolean; reply_markup?: InlineKeyboard } = {},
+): Promise<void> {
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
   await ctx.reply(text, {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
+    ...(options.reply_markup ? { reply_markup: options.reply_markup } : {}),
   })
 }
 
@@ -2286,11 +2291,21 @@ async function sweepBeforeSelfRestart(): Promise<void> {
   }
 }
 
-function formatAuthOutputForTelegram(output: string): string {
+/**
+ * Shape the `switchroom auth ...` CLI stdout into a Telegram-friendly
+ * HTML block. Returns the body text AND the OAuth authorize URL (if
+ * one was present in the output) so the caller can wire a tappable
+ * InlineKeyboardButton in addition to the inline link.
+ *
+ * The URL-in-text is kept on its own line at the bottom as a fallback:
+ * if the inline button ever fails to render (old client, unusual scope)
+ * the user still has a copy-paste-able URL.
+ */
+function formatAuthOutputForTelegram(output: string): { text: string; url: string | null } {
   const trimmed = stripAnsi(output).trim()
   const url = trimmed.match(/https:\/\/\S+/)?.[0] ?? null
   const lines = trimmed.split(/\n+/).map(l => l.trim()).filter(Boolean)
-  if (!url) return preBlock(formatSwitchroomOutput(trimmed))
+  if (!url) return { text: preBlock(formatSwitchroomOutput(trimmed)), url: null }
   const body = lines.filter(line => line !== url)
   const rendered = body.map(line => {
     if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) return `<b>${escapeHtmlForTg(line)}</b>`
@@ -2299,13 +2314,26 @@ function formatAuthOutputForTelegram(output: string): string {
     return escapeHtmlForTg(line)
   })
   rendered.push('', `<a href="${escapeHtmlForTg(url)}">Open Claude login</a>`, escapeHtmlForTg(url))
-  return rendered.join('\n')
+  return { text: rendered.join('\n'), url }
+}
+
+/**
+ * Build the inline keyboard shown under an auth-flow response that has
+ * an OAuth URL. The button gives users a direct tap-to-browser action
+ * without having to select the inline text link— the native pattern on
+ * mobile per the keep-my-subscription-honest JTBD ("user can state in
+ * one sentence what they're paying for" → one-tap auth action).
+ */
+function buildAuthUrlKeyboard(authorizeUrl: string): InlineKeyboard {
+  return new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
 }
 
 async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
   try {
     const output = switchroomExecCombined(args, 30000)
-    await switchroomReply(ctx, formatAuthOutputForTelegram(output), { html: true })
+    const formatted = formatAuthOutputForTelegram(output)
+    const keyboard = formatted.url ? buildAuthUrlKeyboard(formatted.url) : undefined
+    await switchroomReply(ctx, formatted.text, { html: true, reply_markup: keyboard })
   } catch (err: unknown) {
     const error = err as { status?: number; stderr?: string; message?: string }
     if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
