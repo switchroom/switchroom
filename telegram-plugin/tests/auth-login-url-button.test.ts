@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { InlineKeyboard } from "grammy";
+import { validateInlineKeyboard } from "../telegram-button-constraints";
 
 /**
  * These tests exercise the helper contracts that back the login-URL
@@ -13,28 +14,30 @@ import { InlineKeyboard } from "grammy";
  * pin the contract the real gateway is supposed to honour.
  */
 
+/**
+ * MUST MATCH gateway.ts::buildAuthUrlKeyboard. Single url button.
+ * We deliberately do NOT add a copy_text button: OAuth URLs exceed
+ * the 256-char CopyTextButton.text limit (2026-04-22
+ * BUTTON_COPY_TEXT_INVALID incident).
+ */
 function buildAuthUrlKeyboardForTest(authorizeUrl: string): InlineKeyboard {
-  // Mirrors the production builder in gateway.ts: url button + raw
-  // copy_text button in the same row. copy_text is Bot API 7.7+ and
-  // not exposed by grammy's InlineKeyboard helpers, so the raw object
-  // is pushed into the row array.
-  const kb = new InlineKeyboard().url("🔐 Open Claude auth", authorizeUrl);
-  kb.inline_keyboard[0].push({
-    text: "📋 Copy URL",
-    copy_text: { text: authorizeUrl },
-  } as unknown as typeof kb.inline_keyboard[0][number]);
-  return kb;
+  return new InlineKeyboard().url("🔐 Open Claude auth", authorizeUrl);
 }
 
+// Realistic URL samples reproducing Anthropic's actual OAuth flow.
+const REALISTIC_OAUTH_URLS = [
+  "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=GoNa9QB-OawV-fm2qWcfQEzCPN2SZRBKUS-nUbyFimU&state=YDMyyej1234567890abcdefghijklmnop",
+  "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=aB7xK9L2mN4pQ8rS6tU3vW5yZ1cD0eF2gH4jK6mN8pQ&state=zxcvbnm987654321qwertyuiopasdfghjkl",
+];
+
 describe("auth URL button keyboard", () => {
-  it("has a single row with Open + Copy URL buttons", () => {
+  it("has a single row with ONE url button", () => {
     const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc";
     const kb = buildAuthUrlKeyboardForTest(url);
 
     const json = kb.inline_keyboard;
     expect(json.length).toBe(1);
-    // One row with two buttons: [Open Claude auth] + [Copy URL]
-    expect(json[0].length).toBe(2);
+    expect(json[0].length).toBe(1);
 
     const openBtn = json[0][0];
     expect(openBtn.text).toContain("Open Claude auth");
@@ -42,18 +45,35 @@ describe("auth URL button keyboard", () => {
     if ("url" in openBtn) expect(openBtn.url).toBe(url);
   });
 
-  it("[Copy URL] button uses Bot API 7.7+ copy_text shape", () => {
-    // This is the escape hatch for the 2026-04-22 in-app-browser
-    // incident: when the OAuth URL opens in Telegram's WebView (with
-    // different cookies than the user's main browser), wrong account
-    // gets authorized. Copy URL lets the user paste into their main
-    // browser where they know which account is signed in.
-    const url = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc";
-    const kb = buildAuthUrlKeyboardForTest(url);
-    const copyBtn = kb.inline_keyboard[0][1] as unknown as { text: string; copy_text: { text: string } };
-    expect(copyBtn.text).toContain("Copy URL");
-    expect(copyBtn.copy_text).toBeDefined();
-    expect(copyBtn.copy_text.text).toBe(url);
+  it("REGRESSION: does NOT emit a copy_text button (PR #29 bug)", () => {
+    // PR #29 added a copy_text button holding the OAuth URL. Telegram
+    // rejected with BUTTON_COPY_TEXT_INVALID because copy_text.text
+    // caps at 256 chars and OAuth URLs run ~320+. This test locks the
+    // fix in: any reintroduction of copy_text here will fail.
+    const kb = buildAuthUrlKeyboardForTest(REALISTIC_OAUTH_URLS[0]);
+    const allBtns = kb.inline_keyboard.flat() as Array<Record<string, unknown>>;
+    expect(allBtns.some((b) => "copy_text" in b)).toBe(false);
+  });
+
+  it.each(REALISTIC_OAUTH_URLS)(
+    "keyboard passes ALL Telegram field constraints for %s",
+    (url) => {
+      const kb = buildAuthUrlKeyboardForTest(url);
+      const errors = validateInlineKeyboard(
+        kb.inline_keyboard as unknown as Record<string, unknown>[][],
+      );
+      expect(errors).toEqual([]);
+    },
+  );
+
+  it("sanity-check: realistic OAuth URL samples exceed 256 chars", () => {
+    // If this ever fails, Anthropic changed the OAuth URL shape;
+    // update the samples. Otherwise this is the check that keeps the
+    // regression test above honest — it must exercise a URL long
+    // enough to have broken copy_text.
+    for (const url of REALISTIC_OAUTH_URLS) {
+      expect(url.length).toBeGreaterThan(256);
+    }
   });
 
   it("accepts long URLs with query params without truncation", () => {
