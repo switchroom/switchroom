@@ -12,6 +12,7 @@ import {
   copyOnboardingState,
   copyExistingCredentials,
 } from "../src/setup/onboarding.js";
+import { stripOfficialTelegramPlugin } from "../src/agents/scaffold.js";
 import {
   isPortFree,
   findFreePort,
@@ -184,6 +185,101 @@ describe("findExistingClaudeJson", () => {
   it("should return null when nothing exists", () => {
     const result = findExistingClaudeJson();
     expect(result).toBeNull();
+  });
+
+  it("should find ~/.claude.json (modern Claude Code 2.x canonical path)", () => {
+    // Claude Code 2.x writes onboarding state to ~/.claude.json directly.
+    // The ~/.claude/ directory holds credentials/projects but NOT the
+    // onboarding config. Without this candidate, fresh installs fall
+    // through to the "no config" warning and skip auto-onboarding.
+    writeFileSync(
+      join(tempDir, ".claude.json"),
+      JSON.stringify({ hasCompletedOnboarding: true, source: "home" }),
+    );
+
+    const result = findExistingClaudeJson();
+    expect(result).toBe(join(tempDir, ".claude.json"));
+  });
+
+  it("should prefer ~/.claude.json over legacy .claude-home/.claude.json", () => {
+    // Modern path wins when both exist — upgraded installations shouldn't
+    // accidentally re-read stale onboarding state from the legacy location.
+    const claudeHomeDir = join(tempDir, ".claude-home");
+    mkdirSync(claudeHomeDir, { recursive: true });
+    writeFileSync(
+      join(tempDir, ".claude.json"),
+      JSON.stringify({ source: "modern" }),
+    );
+    writeFileSync(
+      join(claudeHomeDir, ".claude.json"),
+      JSON.stringify({ source: "legacy" }),
+    );
+
+    const result = findExistingClaudeJson();
+    expect(result).toBe(join(tempDir, ".claude.json"));
+  });
+});
+
+// ─── stripOfficialTelegramPlugin ─────────────────────────────────────────────
+
+describe("stripOfficialTelegramPlugin", () => {
+  it("removes telegram@claude-plugins-official from the plugins map", () => {
+    const input = JSON.stringify(
+      {
+        plugins: {
+          "telegram@claude-plugins-official": { enabled: true },
+          "other@vendor": { enabled: true },
+        },
+      },
+      null,
+      2,
+    );
+    const out = stripOfficialTelegramPlugin(input);
+    const parsed = JSON.parse(out);
+    expect(parsed.plugins).not.toHaveProperty(
+      "telegram@claude-plugins-official",
+    );
+    expect(parsed.plugins).toHaveProperty("other@vendor");
+  });
+
+  it("returns input unchanged when plugin entry is absent", () => {
+    const input = JSON.stringify({ plugins: { "other@vendor": {} } }, null, 2);
+    expect(stripOfficialTelegramPlugin(input)).toBe(input);
+  });
+
+  it("returns input unchanged when payload is malformed JSON", () => {
+    const garbage = "{ not json ";
+    expect(stripOfficialTelegramPlugin(garbage)).toBe(garbage);
+  });
+
+  it("returns input unchanged when payload has no plugins key", () => {
+    const input = JSON.stringify({ other: "data" });
+    expect(stripOfficialTelegramPlugin(input)).toBe(input);
+  });
+
+  it("returns input unchanged when plugins is not an object", () => {
+    const input = JSON.stringify({ plugins: "not-an-object" });
+    expect(stripOfficialTelegramPlugin(input)).toBe(input);
+  });
+
+  it("preserves other plugin entries unchanged", () => {
+    const input = JSON.stringify(
+      {
+        plugins: {
+          "telegram@claude-plugins-official": { bot_token: "xxx" },
+          "memory@vendor": { configured: true, detail: { nested: "value" } },
+        },
+        version: 1,
+      },
+      null,
+      2,
+    );
+    const parsed = JSON.parse(stripOfficialTelegramPlugin(input));
+    expect(parsed.plugins["memory@vendor"]).toEqual({
+      configured: true,
+      detail: { nested: "value" },
+    });
+    expect(parsed.version).toBe(1);
   });
 });
 

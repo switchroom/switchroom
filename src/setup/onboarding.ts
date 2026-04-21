@@ -10,7 +10,14 @@ import { resolveStatePath } from "../config/paths.js";
 export function findExistingClaudeJson(): string | null {
   const home = process.env.HOME ?? "/root";
 
+  // Modern Claude Code (2.x) writes onboarding state to ~/.claude.json
+  // directly — the `~/.claude/` directory holds credentials and projects
+  // but not the onboarding config. Earlier candidates (~/.claude-home/,
+  // ~/.claude/.claude.json) are kept for users upgrading from older
+  // layouts or using CLAUDE_HOME overrides. Ordered modern-first so the
+  // canonical path wins when multiple exist.
   const candidates = [
+    resolve(home, ".claude.json"),
     resolve(home, ".claude-home", ".claude.json"),
     resolve(home, ".claude", ".claude.json"),
     resolve(home, ".claude-home", "config.json"),

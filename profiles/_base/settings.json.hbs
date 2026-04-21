@@ -5,7 +5,7 @@
     "defaultMode": "acceptEdits"{{/if}}
   },
   "enabledPlugins": {
-    "telegram@claude-plugins-official": true
+    "telegram@claude-plugins-official": {{#if useSwitchroomPlugin}}false{{else}}true{{/if}}
   }{{#if hindsightEnabled}},
   "autoMemoryEnabled": false{{/if}}{{#if mcpServers}},
   "mcpServers": {{{json mcpServers}}}

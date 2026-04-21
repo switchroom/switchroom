@@ -96,12 +96,48 @@ function resolveBotToken(rawToken: string): string | undefined {
 }
 
 /**
+ * Strip any `telegram@claude-plugins-official` entry from an
+ * installed_plugins.json payload. Exported for unit testing.
+ *
+ * Background: Claude Code auto-installs the official Telegram plugin
+ * from the marketplace whenever it's available. For switchroom agents
+ * that use the switchroom-telegram fork (the default), having both
+ * plugins alive polls the same bot token from two processes, so
+ * Telegram returns "Conflict: terminated by other getUpdates" and
+ * every inbound message is missed. Scrubbing the copied inventory
+ * keeps the fork as the sole Telegram owner for this agent.
+ *
+ * Users who opted into the official plugin (`channels.telegram.plugin:
+ * official`) keep the entry — this only runs when useSwitchroomPlugin
+ * is true.
+ */
+export function stripOfficialTelegramPlugin(payload: string): string {
+  let data: unknown;
+  try {
+    data = JSON.parse(payload);
+  } catch {
+    return payload; // malformed — don't touch it
+  }
+  if (!data || typeof data !== "object") return payload;
+  const obj = data as Record<string, unknown>;
+  const plugins = obj.plugins;
+  if (!plugins || typeof plugins !== "object") return payload;
+  const pluginsObj = plugins as Record<string, unknown>;
+  if (!("telegram@claude-plugins-official" in pluginsObj)) return payload;
+  delete pluginsObj["telegram@claude-plugins-official"];
+  return JSON.stringify(obj, null, 2) + "\n";
+}
+
+/**
  * Set up plugin symlinks and config files in the agent's CLAUDE_CONFIG_DIR.
  *
  * Symlinks the official Telegram plugin marketplace from the user's global
- * ~/.claude/plugins/ and copies plugin config files if they exist.
+ * ~/.claude/plugins/ and copies plugin config files if they exist. When
+ * `useSwitchroomPlugin` is true, the copied installed_plugins.json is
+ * scrubbed of the official Telegram plugin so it doesn't race the
+ * switchroom fork for the same bot token.
  */
-export function setupPlugins(agentDir: string): void {
+export function setupPlugins(agentDir: string, useSwitchroomPlugin = false): void {
   const home = process.env.HOME ?? "/root";
   const globalPluginsDir = join(home, ".claude", "plugins");
   const agentPluginsDir = join(agentDir, ".claude", "plugins");
@@ -127,7 +163,12 @@ export function setupPlugins(agentDir: string): void {
     const agentFile = join(agentPluginsDir, file);
     if (existsSync(globalFile) && !existsSync(agentFile)) {
       try {
-        copyFileSync(globalFile, agentFile);
+        if (useSwitchroomPlugin && file === "installed_plugins.json") {
+          const scrubbed = stripOfficialTelegramPlugin(readFileSync(globalFile, "utf8"));
+          writeFileSync(agentFile, scrubbed);
+        } else {
+          copyFileSync(globalFile, agentFile);
+        }
       } catch { /* ignore copy failures */ }
     }
   }
@@ -2206,7 +2247,7 @@ export function scaffoldAgent(
   installSwitchroomSkills(agentDir);
 
   // --- Set up plugin symlinks ---
-  setupPlugins(agentDir);
+  setupPlugins(agentDir, usesSwitchroomTelegramPlugin(agentConfig));
 
   // --- Phase 2: symlink <agentDir>/SOUL.md → workspace/SOUL.md ---
   // Claude Code auto-discovers SOUL.md at the project root. Keep parity by
