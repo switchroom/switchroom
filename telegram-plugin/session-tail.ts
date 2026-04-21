@@ -94,6 +94,7 @@ export type SessionEvent =
   // as parent events; the reducer fans them out to per-sub-agent state.
   | { kind: 'sub_agent_started'; agentId: string; firstPromptText: string; subagentType?: string }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown> }
+  | { kind: 'sub_agent_text'; agentId: string; text: string }
   | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean }
   | { kind: 'sub_agent_turn_end'; agentId: string }
   | { kind: 'sub_agent_nested_spawn'; agentId: string }
@@ -320,6 +321,16 @@ export function projectSubagentLine(
             input: (c.input as Record<string, unknown> | undefined) ?? undefined,
           })
         }
+      } else if (ct === 'text') {
+        // Surface the sub-agent's natural preamble text so the
+        // progress-card reducer can pair it with the next
+        // sub_agent_tool_use — same UX as the parent's preamble→tool_use
+        // pairing (see 3ad8436). Order matters: text and tool_use blocks
+        // in the SAME assistant message must be emitted in source order
+        // so the reducer consumes the preamble on the immediately-next
+        // tool_use and sibling tool_uses fall back to filename/pattern.
+        const text = (c.text as string | undefined) ?? ''
+        events.push({ kind: 'sub_agent_text', agentId, text })
       }
     }
     return events

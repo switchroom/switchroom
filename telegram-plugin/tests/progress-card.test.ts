@@ -728,6 +728,103 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.subAgents.get('X')!.currentTool).toBeUndefined()
   })
 
+  it('sub_agent_text stashes pendingPreamble on the target sub-agent only', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'dA', prompt: 'PA' } },
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'dB', prompt: 'PB' } },
+      { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'PA' },
+      { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'PB' },
+    ])
+    st = reduce(st, { kind: 'sub_agent_text', agentId: 'A', text: 'Checking the reducer' }, 6000)
+    expect(st.subAgents.get('A')?.pendingPreamble).toBe('Checking the reducer')
+    // B must not receive A's preamble — per-sub-agent isolation.
+    expect(st.subAgents.get('B')?.pendingPreamble ?? null).toBeNull()
+  })
+
+  it('sub_agent_tool_use consumes + clears pendingPreamble and uses it as the Read label', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Reading the reducer implementation' },
+    ])
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x1', toolName: 'Read', input: { file_path: '/x/progress-card.ts' } },
+      6000,
+    )
+    const sa = st.subAgents.get('X')!
+    expect(sa.currentTool?.label).toBe('Reading the reducer implementation')
+    expect(sa.pendingPreamble ?? null).toBeNull()
+  })
+
+  it('sibling sub_agent_tool_use (no new text between) falls back to basename', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Checking a couple files' },
+    ])
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x1', toolName: 'Read', input: { file_path: '/x/a.ts' } },
+      6000,
+    )
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x2', toolName: 'Read', input: { file_path: '/x/b.ts' } },
+      6100,
+    )
+    // The sub-agent's currentTool reflects the latest tool_use; second
+    // tool_use in the same batch should NOT inherit the preamble — falls
+    // back to filename.
+    expect(st.subAgents.get('X')?.currentTool?.label).toBe('b.ts')
+  })
+
+  it('multi-line sub_agent_text is a narrative, not a preamble → basename fallback', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_text', agentId: 'X', text: "Here's my plan:\n1. foo\n2. bar" },
+    ])
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x1', toolName: 'Read', input: { file_path: '/x/a.ts' } },
+      6000,
+    )
+    expect(st.subAgents.get('X')?.currentTool?.label).toBe('a.ts')
+  })
+
+  it("sub_agent_text for agent A does NOT leak onto sub-agent B's tool_use", () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'dA', prompt: 'PA' } },
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'dB', prompt: 'PB' } },
+      { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'PA' },
+      { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'PB' },
+      { kind: 'sub_agent_text', agentId: 'A', text: 'A is checking the reducer' },
+    ])
+    st = reduce(
+      st,
+      { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'toolu_b1', toolName: 'Read', input: { file_path: '/x/b.ts' } },
+      6000,
+    )
+    // B uses its own (empty) preamble → filename fallback.
+    expect(st.subAgents.get('B')?.currentTool?.label).toBe('b.ts')
+    // A's preamble is still waiting for A's tool_use.
+    expect(st.subAgents.get('A')?.pendingPreamble).toBe('A is checking the reducer')
+  })
+
+  it('sub_agent_text for an unknown agent is a no-op', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_text', agentId: 'ghost', text: 'nobody home' },
+    ])
+    expect(st.subAgents.has('ghost')).toBe(false)
+  })
+
   it("parent's tool_result is authoritative: overrides early sub_agent_turn_end on isError", () => {
     let st = fold([
       enqueue('go'),

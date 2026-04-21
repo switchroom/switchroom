@@ -390,6 +390,34 @@ describe('projectSubagentLine', () => {
     expect(events[1]).toEqual({ kind: 'sub_agent_nested_spawn', agentId: 'X' })
   })
 
+  it('emits sub_agent_text + sub_agent_tool_use in source order for [text, tool_use]', () => {
+    // Sub-agent assistant messages can interleave text (preamble) and
+    // tool_use blocks in a single `content` array. The projector MUST
+    // emit them in source order so the progress-card reducer can pair
+    // the preamble to the immediately-next tool_use on the same agent.
+    const st = { hasEmittedStart: true }
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'Reading the reducer' },
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } },
+        ],
+      },
+    })
+    const events = projectSubagentLine(line, 'X', st)
+    expect(events).toEqual([
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Reading the reducer' },
+      {
+        kind: 'sub_agent_tool_use',
+        agentId: 'X',
+        toolUseId: 'toolu_a',
+        toolName: 'Read',
+        input: { file_path: '/a' },
+      },
+    ])
+  })
+
   it('emits sub_agent_turn_end on system turn_duration', () => {
     const st = { hasEmittedStart: true }
     const events = projectSubagentLine(
