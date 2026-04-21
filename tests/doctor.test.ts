@@ -11,6 +11,7 @@ import {
   findChromium,
   checkDepsCacheWritable,
   checkSkillsPrerequisites,
+  checkConfig,
 } from "../src/cli/doctor.js";
 import { findConfigFile } from "../src/config/loader.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -435,5 +436,56 @@ describe("checkSkillsPrerequisites", () => {
     for (const r of results) {
       expect(["ok", "warn", "fail"]).toContain(r.status);
     }
+  });
+});
+
+describe("checkConfig — default subagents check", () => {
+  function makeMinimalConfig(subagents?: Record<string, unknown>): SwitchroomConfig {
+    const cfg: Record<string, unknown> = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "-100" },
+      agents: { assistant: {} },
+    };
+    if (subagents !== undefined) {
+      cfg.defaults = { subagents };
+    }
+    return cfg as unknown as SwitchroomConfig;
+  }
+
+  it("reports ok when worker, researcher, and reviewer are all present", () => {
+    const config = makeMinimalConfig({
+      worker: { description: "w", model: "sonnet", prompt: "x" },
+      researcher: { description: "r", model: "haiku", prompt: "x" },
+      reviewer: { description: "rv", model: "sonnet", prompt: "x" },
+    });
+    const results = checkConfig(config, "/fake/switchroom.yaml");
+    const check = results.find((r) => r.name === "default subagents configured");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("ok");
+    expect(check!.detail).toContain("worker");
+    expect(check!.detail).toContain("researcher");
+    expect(check!.detail).toContain("reviewer");
+    expect(check!.fix).toBeUndefined();
+  });
+
+  it("reports ok when at least one known subagent is present", () => {
+    const config = makeMinimalConfig({
+      worker: { description: "w", model: "sonnet", prompt: "x" },
+    });
+    const results = checkConfig(config, "/fake/switchroom.yaml");
+    const check = results.find((r) => r.name === "default subagents configured");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("ok");
+    expect(check!.detail).toBe("worker");
+  });
+
+  it("reports warn when defaults.subagents is absent", () => {
+    const config = makeMinimalConfig(undefined);
+    const results = checkConfig(config, "/fake/switchroom.yaml");
+    const check = results.find((r) => r.name === "default subagents configured");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warn");
+    expect(check!.detail).toContain("no default subagents");
+    expect(check!.fix).toContain("docs/sub-agents.md");
   });
 });
