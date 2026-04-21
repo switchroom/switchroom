@@ -25,7 +25,18 @@
 
 import { InlineKeyboard } from "grammy";
 
-export type SlotHealth = "healthy" | "expired" | "quota-exhausted" | "missing";
+/**
+ * Slot-health values emitted by `switchroom auth list --json`.
+ *
+ * The CLI distinguishes 'active' (the currently-active slot, which is
+ * also healthy) from 'healthy' (a non-active slot with a valid token).
+ * Dashboard treats both as healthy for the badge — 'active' is already
+ * surfaced via the ● marker and the '(active)' label; duplicating it
+ * in the health badge would be noisy.
+ *
+ * Source: src/auth/accounts.ts SlotHealth enum.
+ */
+export type SlotHealth = "active" | "healthy" | "expired" | "quota-exhausted" | "missing";
 
 export interface DashboardSlot {
   slot: string;
@@ -178,8 +189,9 @@ export function buildDashboardText(state: DashboardState): string {
   for (const slot of state.slots) {
     const marker = slot.active ? "●" : "○";
     const badge = healthBadge(slot.health);
+    const label = healthLabel(slot.health);
     lines.push(
-      `${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${slot.health}`,
+      `${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
     );
     const detail = slotDetailLine(slot);
     if (detail) lines.push(`  └ ${detail}`);
@@ -209,6 +221,7 @@ function slotDetailLine(slot: DashboardSlot): string | null {
 
 function healthBadge(health: SlotHealth): string {
   switch (health) {
+    case "active":
     case "healthy":
       return "✓";
     case "quota-exhausted":
@@ -218,6 +231,15 @@ function healthBadge(health: SlotHealth): string {
     case "missing":
       return "✗";
   }
+}
+
+/**
+ * Human-readable label for a slot's health. 'active' collapses to
+ * 'healthy' — the ● + '(active)' markers already carry the active-slot
+ * signal; rendering 'active active' is redundant.
+ */
+function healthLabel(health: SlotHealth): string {
+  return health === "active" ? "healthy" : health;
 }
 
 export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
