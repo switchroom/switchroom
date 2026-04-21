@@ -5345,6 +5345,16 @@ initHandoffContinuity()
 // itself doesn't retry on 409 by default).
 let runnerHandle: RunnerHandle | null = null
 
+// One-shot startup guard. The outer for-loop below re-enters its try block
+// on 409 Conflict retries — those are transient polling conflicts, not
+// process restarts. Anything that should fire exactly once per bot process
+// (restart-marker send, crash-recovery banner, boot-time pin sweep,
+// bot-command registration) must be gated by this flag. Otherwise every
+// 409 retry re-runs them, producing spurious "⚡ Recovered from
+// unexpected restart" banners while the PID stays constant (observed on
+// 2026-04-22 — same bug in the gateway).
+let didOneTimeSetup = false
+
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -5356,7 +5366,10 @@ void (async () => {
       if (TOPIC_ID != null) {
         process.stderr.write(`telegram channel: topic filter active — only thread_id=${TOPIC_ID}\n`)
       }
-      void registerSwitchroomBotCommands().catch(() => {})
+
+      if (!didOneTimeSetup) {
+        didOneTimeSetup = true
+        void registerSwitchroomBotCommands().catch(() => {})
 
       // Boot-time stale-pin sweep. Complements the sidecar-driven
       // `sweepActivePins` above: walks every allowlisted chat and
@@ -5555,6 +5568,7 @@ void (async () => {
       } catch (err) {
         process.stderr.write(`telegram channel: crash recovery notification failed: ${err}\n`)
       }
+      } // end if (!didOneTimeSetup)
 
       // run() returns a RunnerHandle. Call .task() to await background completion.
       runnerHandle = run(bot)

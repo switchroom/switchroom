@@ -3679,99 +3679,116 @@ process.on('uncaughtException', err => {
 
 let runnerHandle: RunnerHandle | null = null
 
+// One-shot startup guard. The outer for-loop below re-enters its try block
+// on 409 Conflict retries — those are transient polling conflicts, not
+// process restarts. Anything that should fire exactly once per gateway
+// process (restart-marker send, crash-recovery banner, boot-time pin sweep,
+// auto-fallback setInterval, bot-command registration) must be gated by
+// this flag. Otherwise every 409 retry re-runs them, producing the
+// spurious "⚡ Recovered from unexpected restart" banners observed on
+// 2026-04-22 (user received 4+ banners in 2 minutes while PID was constant
+// and systemd logged zero lifecycle events — the only signal was the
+// grammY 409 retry loop).
+let didOneTimeSetup = false
+
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       // Clear any orphan long-poll from a previous gateway process
       // before we start our own. See clearStaleTelegramPollingState
       // docstring for the production incident that motivates this.
+      // Safe to re-run on retries: it's idempotent.
       await clearStaleTelegramPollingState(bot.api)
 
       const me = await bot.api.getMe()
       botUsername = me.username
       process.stderr.write(`telegram gateway: polling as @${me.username}\n`)
       if (TOPIC_ID != null) process.stderr.write(`telegram gateway: topic filter active — thread_id=${TOPIC_ID}\n`)
-      void registerSwitchroomBotCommands().catch(() => {})
 
-      // Boot-time pin sweep
-      try {
-        const bootAccess = loadAccess()
-        const chatSet = new Set<string>(bootAccess.allowFrom)
-        for (const gid of Object.keys(bootAccess.groups)) chatSet.add(gid)
-        const chatIds = [...chatSet]
-        if (chatIds.length > 0) {
-          void sweepBotAuthoredPins(
-            chatIds, me.id,
-            async (chatId) => {
-              const chat = await lockedBot.api.getChat(chatId)
-              const pinned = (chat as { pinned_message?: { message_id: number; from?: { id: number } } }).pinned_message
-              if (!pinned) return null
-              return { messageId: pinned.message_id, fromId: pinned.from?.id ?? null }
-            },
-            (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
-            { log: (msg) => process.stderr.write(`telegram gateway: bot-authored pin sweep — ${msg}\n`) },
-          ).catch(() => {})
-        }
-      } catch {}
+      if (!didOneTimeSetup) {
+        didOneTimeSetup = true
+        void registerSwitchroomBotCommands().catch(() => {})
 
-      // Restart follow-up
-      try {
-        const marker = readRestartMarker()
-        if (marker) {
-          clearRestartMarker()
-          const ageMs = Date.now() - marker.ts
-          if (ageMs < 5 * 60_000) {
-            const ageSec = Math.max(1, Math.round(ageMs / 1000))
-            const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
-            try {
-              const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
-                parse_mode: 'HTML', link_preview_options: { is_disabled: true },
-                ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
-                ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
-              })
-              if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
-            } catch {}
-          }
-        }
-      } catch {}
-
-      // Crash recovery
-      try {
-        const marker = readRestartMarker()
-        if (!marker) {
+        // Boot-time pin sweep
+        try {
           const bootAccess = loadAccess()
-          const ownerChatId = bootAccess.allowFrom[0]
-          if (ownerChatId && HISTORY_ENABLED) {
-            try {
-              const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
-              if (recent.length > 0) {
-                const lastTs = recent[0].ts * 1000
-                const downtime = Date.now() - lastTs
-                if (downtime < 30 * 60_000) {
-                  const downSec = Math.max(1, Math.round(downtime / 1000))
-                  const text = `⚡ Recovered from unexpected restart. (down ~${downSec}s)`
-                  const sent = await lockedBot.api.sendMessage(ownerChatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
-                  if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: ownerChatId, thread_id: null, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
-                }
-              }
-            } catch {}
+          const chatSet = new Set<string>(bootAccess.allowFrom)
+          for (const gid of Object.keys(bootAccess.groups)) chatSet.add(gid)
+          const chatIds = [...chatSet]
+          if (chatIds.length > 0) {
+            void sweepBotAuthoredPins(
+              chatIds, me.id,
+              async (chatId) => {
+                const chat = await lockedBot.api.getChat(chatId)
+                const pinned = (chat as { pinned_message?: { message_id: number; from?: { id: number } } }).pinned_message
+                if (!pinned) return null
+                return { messageId: pinned.message_id, fromId: pinned.from?.id ?? null }
+              },
+              (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
+              { log: (msg) => process.stderr.write(`telegram gateway: bot-authored pin sweep — ${msg}\n`) },
+            ).catch(() => {})
           }
-        }
-      } catch {}
+        } catch {}
 
-      // Auto-fallback on quota exhaustion. Periodically polls
-      // the active slot's rate-limit headers; when utilization >= 99.5%
-      // or a 429 is observed, marks the slot exhausted, swaps to the
-      // next healthy slot via src/auth, restarts the agent, and posts
-      // a notification to the owner chat. See telegram-plugin/auto-fallback.ts
-      // for the pure decision logic + notification builder.
-      //
-      // Default poll cadence: every 60 minutes. Set
-      // SWITCHROOM_AUTO_FALLBACK_POLL_MS=0 to disable the background
-      // poller (users can still trigger a check via /authfallback).
-      const AUTO_FALLBACK_POLL_MS = Number(process.env.SWITCHROOM_AUTO_FALLBACK_POLL_MS ?? 60 * 60_000)
-      if (AUTO_FALLBACK_POLL_MS > 0) {
-        setInterval(() => { void runAutoFallbackCheck({ trigger: 'scheduled' }) }, AUTO_FALLBACK_POLL_MS).unref()
+        // Restart follow-up
+        try {
+          const marker = readRestartMarker()
+          if (marker) {
+            clearRestartMarker()
+            const ageMs = Date.now() - marker.ts
+            if (ageMs < 5 * 60_000) {
+              const ageSec = Math.max(1, Math.round(ageMs / 1000))
+              const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
+              try {
+                const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
+                  parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+                  ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
+                  ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
+                })
+                if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+              } catch {}
+            }
+          }
+        } catch {}
+
+        // Crash recovery
+        try {
+          const marker = readRestartMarker()
+          if (!marker) {
+            const bootAccess = loadAccess()
+            const ownerChatId = bootAccess.allowFrom[0]
+            if (ownerChatId && HISTORY_ENABLED) {
+              try {
+                const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
+                if (recent.length > 0) {
+                  const lastTs = recent[0].ts * 1000
+                  const downtime = Date.now() - lastTs
+                  if (downtime < 30 * 60_000) {
+                    const downSec = Math.max(1, Math.round(downtime / 1000))
+                    const text = `⚡ Recovered from unexpected restart. (down ~${downSec}s)`
+                    const sent = await lockedBot.api.sendMessage(ownerChatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+                    if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: ownerChatId, thread_id: null, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+                  }
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+
+        // Auto-fallback on quota exhaustion. Periodically polls
+        // the active slot's rate-limit headers; when utilization >= 99.5%
+        // or a 429 is observed, marks the slot exhausted, swaps to the
+        // next healthy slot via src/auth, restarts the agent, and posts
+        // a notification to the owner chat. See telegram-plugin/auto-fallback.ts
+        // for the pure decision logic + notification builder.
+        //
+        // Default poll cadence: every 60 minutes. Set
+        // SWITCHROOM_AUTO_FALLBACK_POLL_MS=0 to disable the background
+        // poller (users can still trigger a check via /authfallback).
+        const AUTO_FALLBACK_POLL_MS = Number(process.env.SWITCHROOM_AUTO_FALLBACK_POLL_MS ?? 60 * 60_000)
+        if (AUTO_FALLBACK_POLL_MS > 0) {
+          setInterval(() => { void runAutoFallbackCheck({ trigger: 'scheduled' }) }, AUTO_FALLBACK_POLL_MS).unref()
+        }
       }
 
       runnerHandle = run(bot)
