@@ -63,6 +63,30 @@ interface AuthSessionMeta {
   startedAt: number;
   /** Target slot for the pending auth flow (undefined = active/default). */
   slot?: string;
+  /**
+   * The OAuth PKCE `code_challenge` parameter from the authorize URL
+   * that `claude setup-token` emitted when the session was first
+   * started. Used to detect stale sessions on retry: if claude
+   * setup-token has internally restarted (idle timeout, crash) while
+   * the user was completing the browser flow, the tmux pane will show
+   * a DIFFERENT challenge than this saved value. In that case the user's
+   * code matches the OLD challenge but we'd hand them the NEW URL —
+   * silent auth failure. See 2026-04-22 incident.
+   *
+   * Optional because legacy sessions (pre-stale-detection) don't have
+   * it. Missing value is treated as "can't verify, recreate to be safe".
+   */
+  initialCodeChallenge?: string;
+}
+
+/**
+ * Extract the PKCE `code_challenge` query param from a setup-token
+ * authorize URL. Returns `null` if not present. Single place for this
+ * shape so tests and the stale-detection branch use identical parsing.
+ */
+export function extractCodeChallenge(url: string): string | null {
+  const match = url.match(/[?&]code_challenge=([A-Za-z0-9_-]+)/);
+  return match ? match[1] : null;
 }
 
 export interface AuthSessionResult {
@@ -231,6 +255,46 @@ function clearAuthSessionMeta(agentDir: string): void {
   rmSync(authSessionMetaPath(agentDir), { force: true });
 }
 
+/**
+ * Is the running tmux auth session stale?
+ *
+ * "Stale" means the `code_challenge` currently visible in the tmux
+ * pane's authorize URL doesn't match the `initialCodeChallenge` saved
+ * when the session was first started. This happens when claude
+ * setup-token internally idle-times-out and relaunches with a new
+ * PKCE pair while the user is still completing the browser flow
+ * against the original URL.
+ *
+ * Return value semantics:
+ *   - true  → caller MUST kill + recreate. Session is unusable; user's
+ *             eventual code won't match the new challenge.
+ *   - false → session is live AND the challenge matches the one we
+ *             emitted the URL for. Safe to return the existing URL.
+ *
+ * Edge cases (all treated as "stale" for safety):
+ *   - Legacy meta file with no `initialCodeChallenge` field — we
+ *     have nothing to compare to, can't guarantee coherence.
+ *   - Current pane has no parseable URL — setup-token hasn't
+ *     rendered yet OR has crashed; recreate is safer than returning
+ *     a non-URL.
+ *   - Meta file missing entirely — race condition, recreate.
+ */
+export function isSessionStale(
+  agentDir: string,
+  sessionName: string,
+): boolean {
+  const meta = readJsonFile<AuthSessionMeta>(authSessionMetaPath(agentDir));
+  if (!meta) return true;
+  if (meta.sessionName !== sessionName) return true;
+  if (!meta.initialCodeChallenge) return true;
+  const pane = captureTmuxPane(sessionName);
+  const currentUrl = parseSetupTokenUrl(pane);
+  if (!currentUrl) return true;
+  const currentChallenge = extractCodeChallenge(currentUrl);
+  if (!currentChallenge) return true;
+  return currentChallenge !== meta.initialCodeChallenge;
+}
+
 /** Remove any leftover .setup-token-tmp-* dirs from interrupted reauth flows. */
 function cleanupAuthTempDirs(agentDir: string): void {
   const dir = claudeDir(agentDir);
@@ -388,6 +452,19 @@ export function startAuthSession(
     if (opts.force) {
       tmux(["kill-session", "-t", sessionName]);
       clearAuthSessionMeta(agentDir);
+    } else if (isSessionStale(agentDir, sessionName)) {
+      // Stale-session detection (2026-04-22 incident fix): claude
+      // setup-token can idle-restart internally while the user is
+      // completing the browser flow. The tmux pane then shows a NEW
+      // OAuth URL (with a new code_challenge) that differs from the
+      // one the user already authorized. Handing them that new URL
+      // and asking them to paste a code matching the OLD challenge
+      // silently fails. Detect via saved `initialCodeChallenge` in
+      // the session meta; on mismatch, kill + recreate so the user
+      // gets a coherent fresh session.
+      tmux(["kill-session", "-t", sessionName]);
+      clearAuthSessionMeta(agentDir);
+      // Fall through to the fresh-session-creation code below.
     } else {
       const output = captureTmuxPane(sessionName);
       const loginUrl = parseSetupTokenUrl(output) ?? undefined;
@@ -445,16 +522,26 @@ export function startAuthSession(
   const command = commandParts.join(" && ");
 
   tmux(["new-session", "-d", "-s", sessionName, "-c", agentDir, `bash -lc ${shellQuote(command)}`]);
+
+  sleepMs(8000);
+  const output = captureTmuxPane(sessionName);
+  const loginUrl = parseSetupTokenUrl(output) ?? undefined;
+
+  // Save the INITIAL code_challenge so a subsequent call to
+  // startAuthSession can detect if claude setup-token has since
+  // restarted internally (new challenge ≠ saved challenge → stale
+  // session). See 2026-04-22 incident. Written only after the URL is
+  // available; if we couldn't parse a challenge (e.g. claude failed
+  // to render), we save the meta without it — legacy treats missing
+  // as "kill + recreate on retry" which is the safe default.
+  const initialCodeChallenge = loginUrl ? extractCodeChallenge(loginUrl) ?? undefined : undefined;
   writeAuthSessionMeta(agentDir, {
     sessionName,
     logPath,
     startedAt: Date.now(),
     slot: slotArg,
+    initialCodeChallenge,
   });
-
-  sleepMs(8000);
-  const output = captureTmuxPane(sessionName);
-  const loginUrl = parseSetupTokenUrl(output) ?? undefined;
 
   return {
     sessionName,
