@@ -717,58 +717,89 @@ case "\${SWITCHROOM_SESSION_MODE:-cold}" in
     ;;
 esac
 
-# Resolve Memory row: query Hindsight for bank stats (memory count, last retain)
-# Timeout bounded at 3s; fallback to "—" on timeout or error.
-MEMORY_STATUS="${escapeHtml(memory)}"
-if [ -n "\${HINDSIGHT_BANK_ID:-}" ] && [ -n "\${HINDSIGHT_API_URL:-}" ]; then
+# Resolve Memory row: query Hindsight for bank stats.
+#
+# Hindsight's MCP server returns text/event-stream with a nested shape:
+# first an SSE envelope ("event: message / data: {...}"), inside that a
+# JSON-RPC result whose content[0].text field is itself a JSON-stringified
+# stats blob. Real field names are total_documents, node_counts
+# (experience/world/observation), and last_consolidated_at (ISO timestamp).
+# Older versions of this code hunted for memory_count / last_retain which
+# don't exist, and produced a spurious Hindsight-unreachable banner even
+# when Hindsight was healthy.
+#
+# Use python3 for robust parsing. Bounded by curl -m 2 and python -u.
+# Fallback to "—" on any failure.
+MEMORY_STATUS="—"
+if [ -n "\${HINDSIGHT_BANK_ID:-}" ] && [ -n "\${HINDSIGHT_API_URL:-}" ] && command -v python3 >/dev/null 2>&1; then
   _bank_stats() {
     _api_url="\${HINDSIGHT_API_URL}/mcp/"
     _bank_id="\${HINDSIGHT_BANK_ID}"
-    # JSON-RPC flow: initialize → tools/call get_bank_stats
     _SESSION=$(curl -sS -X POST "\$_api_url" \\
       -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
       -H "X-Bank-Id: \$_bank_id" -D /tmp/bank-stats-$$.headers \\
       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bank-stats","version":"0.1"}}}' \\
       -m 2 -o /dev/null 2>/dev/null && grep -i mcp-session-id /tmp/bank-stats-$$.headers | cut -d' ' -f2 | tr -d '\\r\\n')
-    if [ -n "\$_SESSION" ]; then
-      _STATS=$(curl -sS -X POST "\$_api_url" \\
-        -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
-        -H "X-Bank-Id: \$_bank_id" -H "mcp-session-id: \$_SESSION" \\
-        -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_bank_stats","arguments":{}}}' \\
-        -m 2 2>/dev/null)
-      rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
-      # Extract memory_count and last_retain from JSON response
-      # Assume response is: {"result":{"content":[{"text":"...memory_count: N...last_retain: <ts>..."}]}}
-      # Naive parse since full jq may not be available
-      _COUNT=$(echo "\$_STATS" | sed -n 's|.*"memory_count":[[:space:]]*\\([0-9]\\{1,\\}\\).*|\\1|p' | head -1)
-      _LAST_RETAIN_TS=$(echo "\$_STATS" | sed -n 's|.*"last_retain":[[:space:]]*"\\([^"]*\\)".*|\\1|p' | head -1)
-      if [ -n "\$_COUNT" ]; then
-        _AGO=""
-        if [ -n "\$_LAST_RETAIN_TS" ]; then
-          _LAST_RETAIN_EPOCH=$(date -d "\$_LAST_RETAIN_TS" +%s 2>/dev/null || echo 0)
-          _NOW=$(date +%s)
-          _DIFF=$((_NOW - _LAST_RETAIN_EPOCH))
-          if [ "\$_DIFF" -lt 60 ]; then
-            _AGO="\${_DIFF}s ago"
-          elif [ "\$_DIFF" -lt 3600 ]; then
-            _AGO="$((_DIFF / 60))m ago"
-          elif [ "\$_DIFF" -lt 86400 ]; then
-            _AGO="$((_DIFF / 3600))h ago"
-          else
-            _AGO="$((_DIFF / 86400))d ago"
-          fi
+    rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
+    if [ -z "\$_SESSION" ]; then
+      echo "⚠ Hindsight unreachable, recall disabled this session"
+      return 1
+    fi
+    _STATS=$(curl -sS -X POST "\$_api_url" \\
+      -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
+      -H "X-Bank-Id: \$_bank_id" -H "mcp-session-id: \$_SESSION" \\
+      -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_bank_stats","arguments":{}}}' \\
+      -m 2 2>/dev/null)
+    if [ -z "\$_STATS" ]; then
+      echo "⚠ Hindsight stats unavailable"
+      return 1
+    fi
+    # Parse: SSE envelope -> MCP result -> inner JSON text -> actual stats.
+    # Emit "<count>|<iso-timestamp-or-empty>" on success, empty line on error.
+    _PARSED=$(printf '%s' "\$_STATS" | python3 -u -c 'import sys, json, re
+try:
+    raw = sys.stdin.read()
+    m = re.search(r"^data: (.*)$", raw, re.M)
+    if not m: sys.exit(0)
+    env = json.loads(m.group(1))
+    text = env["result"]["content"][0]["text"]
+    stats = json.loads(text)
+    nc = stats.get("node_counts", {}) or {}
+    count = (nc.get("experience", 0) or 0) + (nc.get("world", 0) or 0)
+    last = stats.get("last_consolidated_at", "") or ""
+    print(f"{count}|{last}")
+except Exception:
+    pass
+' 2>/dev/null)
+    if [ -z "\$_PARSED" ]; then
+      echo "⚠ Hindsight stats unparseable"
+      return 1
+    fi
+    _COUNT="\${_PARSED%%|*}"
+    _LAST_TS="\${_PARSED#*|}"
+    if [ -z "\$_COUNT" ] || [ "\$_COUNT" = "0" ]; then
+      echo "✓ 0 memories (empty bank)"
+      return 0
+    fi
+    _AGO=""
+    if [ -n "\$_LAST_TS" ]; then
+      _LAST_EPOCH=$(date -d "\$_LAST_TS" +%s 2>/dev/null || echo 0)
+      if [ "\$_LAST_EPOCH" -gt 0 ]; then
+        _NOW=$(date +%s)
+        _DIFF=$((_NOW - _LAST_EPOCH))
+        if [ "\$_DIFF" -lt 60 ]; then _AGO="\${_DIFF}s ago"
+        elif [ "\$_DIFF" -lt 3600 ]; then _AGO="$((_DIFF / 60))m ago"
+        elif [ "\$_DIFF" -lt 86400 ]; then _AGO="$((_DIFF / 3600))h ago"
+        else _AGO="$((_DIFF / 86400))d ago"
         fi
-        if [ -n "\$_AGO" ]; then
-          echo "✓ \$_COUNT memories · last retain \$_AGO"
-        else
-          echo "✓ \$_COUNT memories"
-        fi
-        return 0
       fi
     fi
-    rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
-    echo "⚠ Hindsight unreachable, recall disabled this session"
-    return 1
+    if [ -n "\$_AGO" ]; then
+      echo "✓ \$_COUNT memories · last consolidated \$_AGO"
+    else
+      echo "✓ \$_COUNT memories"
+    fi
+    return 0
   }
   MEMORY_STATUS=$(_bank_stats 2>/dev/null || echo "—")
 fi
