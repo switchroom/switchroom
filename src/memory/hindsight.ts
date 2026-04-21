@@ -89,6 +89,26 @@ export function isStrictIsolation(
 }
 
 /**
+ * Parse a Hindsight MCP response body.
+ *
+ * Hindsight's MCP server returns text/event-stream responses of the form:
+ *
+ *   event: message
+ *   data: {"jsonrpc":"2.0","id":1,"result":{...}}
+ *
+ * `await resp.json()` throws on that because it is not raw JSON. Strip the
+ * SSE preamble and parse the JSON payload manually. Falls back to raw text
+ * parsing if no `data:` line is present, so a server that responds with
+ * plain JSON still works.
+ */
+async function parseSseOrJson<T>(resp: Response): Promise<T> {
+  const text = await resp.text();
+  const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
+  const payload = dataLine ? dataLine.slice("data: ".length) : text;
+  return JSON.parse(payload) as T;
+}
+
+/**
  * Ensure the user-profile Mental Model exists for a bank.
  *
  * Creates the Mental Model if it doesn't exist, idempotent on subsequent calls.
@@ -168,10 +188,18 @@ export async function ensureUserProfileMentalModel(
     clearTimeout(timeout2);
 
     if (listResponse.ok) {
-      const listData = await listResponse.json();
-      const models = listData.result?.content?.[0]?.text;
-      if (models && typeof models === "string" && models.includes("user-profile")) {
-        return { ok: true }; // Already exists
+      try {
+        const listData = await parseSseOrJson<{
+          result?: { content?: Array<{ text?: string }> };
+        }>(listResponse);
+        const models = listData.result?.content?.[0]?.text;
+        if (models && typeof models === "string" && models.includes("user-profile")) {
+          return { ok: true }; // Already exists
+        }
+      } catch {
+        // Parse failed (not SSE and not JSON). Fall through to create attempt;
+        // if the MM already exists, create will return an idempotent error
+        // we also swallow below.
       }
     }
 

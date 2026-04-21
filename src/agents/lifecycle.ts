@@ -49,13 +49,21 @@ function systemctl(args: string[]): string {
  * reconfigured agent with a different plugin set, or a non-telegram agent).
  * We want "always cycle both if they exist" semantics, not "fail the whole
  * restart because one unit is absent."
+ *
+ * Earlier implementation used `list-unit-files --no-legend <unit>` to gate
+ * the action, but the unit-name match required `.service` suffix to appear
+ * in the output. Passing `switchroom-clerk-gateway` returned empty and the
+ * gated restart silently no-op'd. Observed on Pixsoul 2026-04-21: gateway
+ * services never actually restarted via `switchroom agent restart`.
+ *
+ * Simpler fix: just try the action and swallow failures. systemctl exits
+ * non-zero with a clear stderr message for missing units; we catch and
+ * continue. Safer for the "always cycle both" intent.
  */
 function systemctlIfExists(action: string, unit: string): void {
   try {
-    // Check existence first. `list-unit-files` exits 0 even when the unit
-    // is missing, so we match the unit name in its output.
-    const listed = systemctl(["list-unit-files", "--no-legend", unit]);
-    if (!listed.includes(unit)) return;
+    // systemctl accepts both `switchroom-x` and `switchroom-x.service` forms.
+    // No explicit existence probe; just fire. Missing unit -> throws -> swallow.
     systemctl([action, unit]);
   } catch {
     // Absent or inactive is fine for start/stop; restart on a non-existent
