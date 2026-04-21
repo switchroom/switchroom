@@ -46,6 +46,16 @@ import {
   type SlotListingFromCli,
 } from '../auth-slot-parser.js'
 import {
+  buildDashboard,
+  buildRemoveConfirmKeyboard,
+  parseCallbackData,
+  encodeCallbackData,
+  isQuotaHot,
+  type DashboardState,
+  type DashboardSlot,
+  type SlotHealth,
+} from '../auth-dashboard.js'
+import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
 } from '../history.js'
@@ -2956,23 +2966,200 @@ bot.command('auth', async ctx => {
     return
   }
 
-  // intent.kind === 'status' — fall through to formatted status below.
-  await runSwitchroomCommandFormatted(ctx, intent.cliArgs, intent.label, () => {
-    type AuthStatusResp = { agents: Array<{ name: string; authenticated: boolean; auth_source: string | null; pending_auth: boolean; subscription_type: string | null; expires_in: string | null }> }
-    const data = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
-    if (!data) return null
-    if (data.agents.length === 0) return '<i>No agents defined</i>'
-    const lines = ['<b>Auth status</b>']
-    for (const a of data.agents) {
-      const icon = a.authenticated ? '✓' : (a.pending_auth ? '…' : '✗')
-      const source = a.auth_source ?? (a.pending_auth ? 'pending' : '—')
-      const subLabel = a.subscription_type ?? '—'
-      const expires = a.expires_in ?? '—'
-      lines.push(`${icon} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(source)} · ${escapeHtmlForTg(subLabel)} · expires ${escapeHtmlForTg(expires)}`)
-    }
-    return lines.join('\n')
-  })
+  // intent.kind === 'status' — render the inline-keyboard dashboard.
+  // For the dashboard we're the bot-bound agent: we don't list every
+  // agent in the switchroom config; we show THIS bot's agent with its
+  // slots and actions.
+  await sendAuthDashboard(ctx, intent.agent ?? currentAgent)
 })
+
+/**
+ * Gather DashboardState for an agent and send the dashboard as a fresh
+ * message (on `/auth` command) or editMessageText (on callback refresh).
+ *
+ * Implementation note: we could poll fetchQuota here to populate the
+ * fiveHour/sevenDay utilization per slot. Skipping for the initial
+ * landing — quota-check is expensive (one Anthropic API call per poll)
+ * and the background auto-fallback already surfaces quota-exhausted
+ * state. Dashboard renders the CLI-side health badges and omits
+ * utilization numbers when they're absent; a future PR can wire
+ * quota-check in.
+ */
+async function sendAuthDashboard(
+  ctx: Context,
+  agent: string,
+  opts: { edit?: boolean } = {},
+): Promise<void> {
+  const state = fetchDashboardState(agent)
+  if (!state) {
+    await switchroomReply(
+      ctx,
+      `<b>/auth</b> — no data (agent "${escapeHtmlForTg(agent)}" missing from switchroom.yaml or CLI unreachable)`,
+      { html: true },
+    )
+    return
+  }
+  const { text, keyboard } = buildDashboard(state)
+  if (opts.edit && ctx.callbackQuery) {
+    try {
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard, link_preview_options: { is_disabled: true } })
+      return
+    } catch {
+      // Message may have been deleted or identical content
+      // (editMessageText throws MESSAGE_NOT_MODIFIED) — fall through
+      // to sending a new one.
+    }
+  }
+  await switchroomReply(ctx, text, { html: true, reply_markup: keyboard })
+}
+
+function fetchDashboardState(agent: string): DashboardState | null {
+  // Slots come from switchroom auth list --json.
+  let slots: DashboardSlot[] = []
+  try {
+    const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', agent, '--json'])
+    if (listing && Array.isArray(listing.slots)) {
+      slots = listing.slots.map((s) => ({
+        slot: s.slot,
+        active: s.active,
+        health: (s.health as SlotHealth) ?? 'missing',
+        quotaExhaustedUntil: s.quota_exhausted_until ?? null,
+        fiveHourPct: null,
+        sevenDayPct: null,
+      }))
+    }
+  } catch {
+    return null
+  }
+
+  // Plan + bank come from switchroom auth status for THIS agent.
+  let plan: string | null = null
+  let bankId = agent
+  try {
+    type AuthStatusResp = { agents: Array<{ name: string; subscription_type: string | null; rate_limit_tier?: string | null }> }
+    const statusData = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
+    const thisAgent = statusData?.agents?.find((a) => a.name === agent)
+    if (thisAgent?.subscription_type) plan = thisAgent.subscription_type
+  } catch {
+    /* best-effort */
+  }
+
+  return {
+    agent,
+    bankId,
+    plan,
+    slots,
+    quotaHot: isQuotaHot(slots),
+    generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+  }
+}
+
+/**
+ * Handle a callback_query from an auth dashboard button. Parses the
+ * callback_data, runs the matching action, acknowledges the tap with a
+ * toast, and refreshes the dashboard in-place via editMessageText.
+ */
+async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data ?? ''
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const action = parseCallbackData(data)
+
+  switch (action.kind) {
+    case 'refresh': {
+      await ctx.answerCallbackQuery({ text: 'Refreshed' }).catch(() => {})
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'reauth': {
+      await ctx.answerCallbackQuery({ text: 'Starting reauth…' }).catch(() => {})
+      await runSwitchroomAuthCommand(
+        ctx,
+        action.slot ? ['auth', 'reauth', action.agent, '--slot', action.slot] : ['auth', 'reauth', action.agent],
+        `auth reauth ${action.agent}`,
+      )
+      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
+      return
+    }
+    case 'add': {
+      await ctx.answerCallbackQuery({ text: 'Adding slot…' }).catch(() => {})
+      await runSwitchroomAuthCommand(ctx, ['auth', 'add', action.agent], `auth add ${action.agent}`)
+      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
+      return
+    }
+    case 'use': {
+      await ctx.answerCallbackQuery({ text: `Switching to ${action.slot}…` }).catch(() => {})
+      await runSwitchroomCommand(ctx, ['auth', 'use', action.agent, action.slot], `auth use ${action.agent} ${action.slot}`)
+      try { assertSafeAgentName(action.agent) } catch { return }
+      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'rm': {
+      // Two-step confirm — swap the dashboard keyboard for a
+      // confirmation keyboard before doing anything destructive.
+      await ctx.answerCallbackQuery({ text: `Confirm remove ${action.slot}?` }).catch(() => {})
+      try {
+        await ctx.editMessageReplyMarkup({ reply_markup: buildRemoveConfirmKeyboard(action.agent, action.slot) })
+      } catch { /* ignore */ }
+      return
+    }
+    case 'confirm-rm': {
+      await ctx.answerCallbackQuery({ text: `Removing ${action.slot}…` }).catch(() => {})
+      const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', action.agent, '--json'])
+      if (listing) {
+        const err = checkRemoveSafety({ ...listing, agent: listing.agent ?? action.agent }, action.slot, false)
+        if (err) {
+          await switchroomReply(ctx, err)
+          await sendAuthDashboard(ctx, action.agent, { edit: true })
+          return
+        }
+      }
+      await runSwitchroomCommand(ctx, ['auth', 'rm', action.agent, action.slot], `auth rm ${action.agent} ${action.slot}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'fallback': {
+      await ctx.answerCallbackQuery({ text: 'Triggering fallback…' }).catch(() => {})
+      const result = await runAutoFallbackCheck({ trigger: 'manual' })
+      if (result.kind === 'executed') {
+        await switchroomReply(ctx, `✅ Switched <code>${escapeHtmlForTg(result.previousSlot)}</code> → <code>${escapeHtmlForTg(result.newSlot)}</code>.`, { html: true })
+      } else if (result.kind === 'exhausted-all') {
+        await switchroomReply(ctx, `🚨 All slots quota-exhausted. Tap ➕ Add slot.`, { html: true })
+      } else if (result.kind === 'error') {
+        await switchroomReply(ctx, `❌ Fallback error: ${escapeHtmlForTg(result.message)}`, { html: true })
+      } else {
+        await switchroomReply(ctx, `No action: ${escapeHtmlForTg(result.reason)}`, { html: true })
+      }
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'usage': {
+      await ctx.answerCallbackQuery({ text: 'Fetching quota…' }).catch(() => {})
+      const agentDir = resolveAgentDirFromEnv()
+      try {
+        const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
+        if (!quota.ok) {
+          await switchroomReply(ctx, `<b>Quota:</b> ${escapeHtmlForTg(quota.reason)}`, { html: true })
+        } else {
+          await switchroomReply(ctx, formatQuotaBlock(quota.data), { html: true })
+        }
+      } catch (err) {
+        await switchroomReply(ctx, `Quota fetch failed: ${escapeHtmlForTg(String(err))}`, { html: true })
+      }
+      return
+    }
+    case 'noop':
+    default: {
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+  }
+}
 
 bot.command('reauth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
@@ -3183,6 +3370,14 @@ async function registerSwitchroomBotCommands(): Promise<void> {
 // Handles `perm:(allow|deny|more):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // Auth dashboard buttons (`auth:<verb>:<agent>[:<slot>]`). Route
+  // through a dedicated handler that maps each action onto the
+  // existing CLI invocations plus dashboard refresh.
+  if (data.startsWith('auth:')) {
+    await handleAuthDashboardCallback(ctx)
+    return
+  }
 
   // Permission request buttons.
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
