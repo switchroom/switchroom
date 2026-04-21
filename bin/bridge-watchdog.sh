@@ -13,8 +13,24 @@
 # (since renamed to "clerk") and silently skipped the new "lawgpt" agent
 # entirely, leaving both in a stale-bridge state for hours while klanker
 # (still on the list) kept getting healed.
+#
+# False-restart fix (2026-04-22): the bridge IPC flaps `registered ↔
+# disconnected` rapidly across Claude Code turn boundaries. The old
+# `tail -1` heuristic caught transient disconnect states and restarted
+# otherwise-healthy agents. On 2026-04-21 20:12–20:26 AEST this produced
+# 3 spurious restarts of klanker mid-CPU-heavy-work. The watchdog now
+# requires SUSTAINED disconnection (>= DISCONNECT_GRACE_SECS across
+# consecutive ticks) and an uptime grace (>= UPTIME_GRACE_SECS since
+# the agent service started) before acting.
 
 set -euo pipefail
+
+# Tunables. Expressed as env-overridable so the test harness can drive
+# edge cases without mutating the script.
+: "${UPTIME_GRACE_SECS:=90}"       # skip the bridge check for this long after agent (re)start
+: "${DISCONNECT_GRACE_SECS:=120}"  # require disconnection to persist this long before restarting
+
+now_epoch() { date +%s; }
 
 # Discover active gateway units. systemd's list-units output includes only
 # currently-loaded units; we filter to the switchroom-*-gateway.service
@@ -49,6 +65,11 @@ for gateway_svc in "${gateway_services[@]}"; do
     continue
   fi
   gateway_log="${gateway_state_dir}/gateway.log"
+  # Sidecar file where we remember when the disconnected state started,
+  # so we can detect SUSTAINED disconnection across ticks. Lives in the
+  # same per-agent state dir so it's self-cleaning when an agent is
+  # removed.
+  disconnect_marker="${gateway_state_dir}/.watchdog-disconnect-since"
 
   if [[ ! -f "$gateway_log" ]]; then
     # Log file missing — gateway probably hasn't written a full turn yet.
@@ -84,6 +105,30 @@ for gateway_svc in "${gateway_services[@]}"; do
     continue
   fi
 
+  # Uptime grace: freshly-started agents haven't had time to register
+  # their bridge yet. systemctl emits ActiveEnterTimestamp in a format
+  # like "Tue 2026-04-21 20:23:38 AEST"; ActiveEnterTimestampMonotonic
+  # is easier to parse (microseconds since boot) but comparing to
+  # wall-clock uptime is cross-platform-icky. We use the wall-clock
+  # field and parse it with `date -d`, which systemd's format supports.
+  active_enter_ts="$(
+    systemctl --user show "$agent_svc" -p ActiveEnterTimestamp --value 2>/dev/null
+  )"
+  if [[ -n "$active_enter_ts" ]]; then
+    # `date -d ""` fails; guard the empty case.
+    active_enter_epoch="$(date -d "$active_enter_ts" +%s 2>/dev/null || echo 0)"
+    if [[ "$active_enter_epoch" -gt 0 ]]; then
+      uptime_secs=$(( $(now_epoch) - active_enter_epoch ))
+      if [[ "$uptime_secs" -lt "$UPTIME_GRACE_SECS" ]]; then
+        # Agent just started — give it time to come up. Clear any
+        # stale disconnect marker from a previous cycle too, so the
+        # grace window really is a clean slate.
+        rm -f "$disconnect_marker" 2>/dev/null || true
+        continue
+      fi
+    fi
+  fi
+
   # Check the gateway log for the last bridge event.
   # "bridge registered"   = healthy
   # "bridge disconnected" = dead
@@ -106,10 +151,41 @@ for gateway_svc in "${gateway_services[@]}"; do
     bridge_healthy=false
   fi
 
-  if [[ "$bridge_healthy" == false ]]; then
-    echo "$(date -Iseconds) watchdog: ${agent} bridge is disconnected, restarting ${agent_svc}"
-    systemctl --user restart "$agent_svc" || {
-      echo "$(date -Iseconds) watchdog: ${agent_svc} restart failed"
-    }
+  if [[ "$bridge_healthy" == true ]]; then
+    # Healthy — wipe the disconnect marker so the next disconnect
+    # starts a fresh grace window.
+    rm -f "$disconnect_marker" 2>/dev/null || true
+    continue
   fi
+
+  # Disconnected. Has it been sustained long enough to act?
+  now="$(now_epoch)"
+  if [[ -f "$disconnect_marker" ]]; then
+    disc_since="$(cat "$disconnect_marker" 2>/dev/null || echo "$now")"
+    # Paranoia: if the file got corrupted (non-numeric), treat as now.
+    if ! [[ "$disc_since" =~ ^[0-9]+$ ]]; then
+      disc_since="$now"
+      echo "$now" > "$disconnect_marker"
+    fi
+  else
+    # First observation of disconnect on this tick. Record it and wait.
+    echo "$now" > "$disconnect_marker"
+    disc_since="$now"
+  fi
+
+  disc_duration=$(( now - disc_since ))
+  if [[ "$disc_duration" -lt "$DISCONNECT_GRACE_SECS" ]]; then
+    # Transient flap — the bridge IPC disconnects across Claude Code
+    # turn boundaries. Don't restart yet; give it another tick or two.
+    continue
+  fi
+
+  echo "$(date -Iseconds) watchdog: ${agent} bridge has been disconnected for ${disc_duration}s (>= ${DISCONNECT_GRACE_SECS}s), restarting ${agent_svc}"
+  # Clear the marker so post-restart we don't immediately re-trip on
+  # the still-old tail. The uptime grace will cover the startup window
+  # anyway, but removing the marker keeps state clean.
+  rm -f "$disconnect_marker" 2>/dev/null || true
+  systemctl --user restart "$agent_svc" || {
+    echo "$(date -Iseconds) watchdog: ${agent_svc} restart failed"
+  }
 done
