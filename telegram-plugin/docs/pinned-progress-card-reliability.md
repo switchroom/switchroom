@@ -62,7 +62,7 @@ All must be tested (see §7). `I*` numbers are referenced elsewhere in this spec
 | **I3** | `unpinProgressCard(turnKey, …)` is idempotent — first call fires the API, all subsequent calls for the same `turnKey` are no-ops. |
 | **I4** | On process start, any sidecar entry from a prior session is consumed (attempt unpin, then clear) before new traffic is accepted. |
 | **I5** | The final render of the card (before unpin) shows `stage === 'done'` → `✅ Done` header. |
-| **I6** | Turns that complete faster than `initialDelayMs` (default 5s) produce **no** pin and **no** card — suppressed, not deferred-then-cancelled. |
+| **I6** | Turns that complete faster than `initialDelayMs` (default 30s) produce **no** pin and **no** card — suppressed, not deferred-then-cancelled. |
 | **I7** | Parallel active turns on the same `(chatId, threadId)` each have independent `turnKey`, `pin`, `unpin`, and `sidecar` entries. The second `enqueue` force-closes the first (including its unpin) before creating the new pin. |
 | **I8** | `sweepBotAuthoredPins` stops at the first non-bot pinned message for a chat — never unpins a user's pin. |
 | **I9** | Zombie ceiling: a card whose `lastEventAt` is older than `maxIdleMs` (5 min) is force-closed via the same path as `turn_end` — unpin + `onTurnComplete` + state delete. |

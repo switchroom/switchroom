@@ -74,9 +74,10 @@ export interface PinManagerDeps {
   /** Clock injection for test determinism. Defaults to `Date.now`. */
   now?: () => number
   /**
-   * How long to wait after the first emit before actually pinning. Short
-   * turns that complete before this delay never produce a pinned card —
-   * cuts the Telegram noise for quick back-and-forths. Defaults to 30s.
+   * How long to wait after the first emit before actually pinning. The
+   * driver's `initialDelayMs` already suppresses the card entirely for
+   * fast turns, so by the time first-emit fires the turn is already
+   * considered slow and the pin can follow immediately. Defaults to 0.
    */
   pinDelayMs?: number
   /**
@@ -125,7 +126,7 @@ export interface PinManager {
 export function createPinManager(deps: PinManagerDeps): PinManager {
   const now = deps.now ?? Date.now
   const log = deps.log ?? (() => {})
-  const pinDelayMs = deps.pinDelayMs ?? 30_000
+  const pinDelayMs = deps.pinDelayMs ?? 0
   const scheduleTimer: (fn: () => void, ms: number) => TimerHandle =
     deps.scheduleTimer ??
     ((fn, ms) => {
@@ -241,10 +242,12 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       if (!c.isFirstEmit) return
       if (pinned.has(c.turnKey)) return
       if (pendingPins.has(c.turnKey)) return
-      // Defer the actual pin until pinDelayMs has elapsed. Fast turns
-      // that complete before the timer fires never produce a pin — cuts
-      // Telegram noise on quick back-and-forths. Only slow turns get a
-      // pinned "Working..." card.
+      // Schedule the pin via the injected timer. Fast-turn suppression is
+      // owned upstream by the driver's `initialDelayMs` — by the time
+      // considerPin sees isFirstEmit=true the card has already been
+      // published, so pinDelayMs defaults to 0 (fire on next tick).
+      // The indirection remains so tests and callers can still override
+      // with a positive value if they want a pre-pin visual buffer.
       const timer = scheduleTimer(() => {
         firePin(c.turnKey, c.chatId, c.messageId)
       }, pinDelayMs)

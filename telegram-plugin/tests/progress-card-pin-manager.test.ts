@@ -509,9 +509,12 @@ describe('createPinManager', () => {
       h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
       await h.mgr.drainInFlight()
 
-      // Timer scheduled, but not fired → no pin yet.
+      // Timer scheduled, but not fired → no pin yet. Default pinDelayMs
+      // is now 0 (fast-turn suppression is owned upstream by the
+      // driver's initialDelayMs); the setTimeout indirection remains so
+      // completeTurn can still cancel a pin that hasn't landed yet.
       expect(h.timers).toHaveLength(1)
-      expect(h.timers[0].ms).toBe(30_000)
+      expect(h.timers[0].ms).toBe(0)
       expect(h.deps.pin).not.toHaveBeenCalled()
       expect(h.deps.addPin).not.toHaveBeenCalled()
       expect(h.mgr.pinnedTurnKeys()).toEqual([])

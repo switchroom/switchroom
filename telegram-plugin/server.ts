@@ -2366,9 +2366,12 @@ if (streamMode === 'checklist') {
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
         if (!result?.messageId) return
-        // First emit: schedule a deferred pin. Only pin after 10 s so
-        // fast turns that reply quickly never clutter the pin bar.
-        // The timer is cancelled if the turn completes first.
+        // First emit: schedule the pin. Fast-turn suppression is owned
+        // upstream by the driver's initialDelayMs (default 30s), so by
+        // the time isFirstEmit fires the turn is already considered slow
+        // and the pin can land on the next tick. The setTimeout(…, 0)
+        // indirection is kept so the cancel path below still works if
+        // the turn ends in the same tick as the first emit.
         if (isFirstEmit && !progressPinnedMsgIds.has(turnKey) && !pendingPinTimers.has(turnKey)) {
           const pinnedMessageId = result.messageId
           const timer = setTimeout(() => {
@@ -2422,7 +2425,7 @@ if (streamMode === 'checklist') {
                   removeActivePin(agentDir, chatId, pinnedMessageId)
                 }
               })
-          }, 10_000)
+          }, 0)
           pendingPinTimers.set(turnKey, timer)
         }
       }).catch((err: Error) => {

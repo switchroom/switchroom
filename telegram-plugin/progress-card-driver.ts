@@ -121,7 +121,7 @@ export interface ProgressDriverConfig {
    * before the timer fires (and isFirstEmit is still true), no card
    * is ever shown — the user only sees the final reply.
    *
-   * Default 5000 (5 seconds). Set to 0 to disable.
+   * Default 30000 (30 seconds). Set to 0 to disable.
    */
   initialDelayMs?: number
 }
@@ -184,9 +184,10 @@ export interface ProgressDriver {
   /**
    * Begin a new turn synchronously — called from the inbound-message
    * handler the instant a user's message clears the gate, BEFORE any
-   * session-tail event arrives. Creates a fresh progress card and fires
-   * an immediate render of the "⚙️ Working…" skeleton so the user sees
-   * it within ~1s of their message.
+   * session-tail event arrives. Creates a fresh progress card state; the
+   * first visible render is gated by `initialDelayMs` (default 30s) so
+   * turns that finish before the delay produce no card at all and the
+   * user only sees the final reply.
    *
    * If a card is already active for this chat, it is force-closed (done=true,
    * onTurnComplete fired) before the new card is created. Each call always
@@ -229,7 +230,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const editBudgetThreshold = config.editBudgetThreshold ?? 18
   const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
-  const initialDelayMs = config.initialDelayMs ?? 5000
+  const initialDelayMs = config.initialDelayMs ?? 30_000
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
