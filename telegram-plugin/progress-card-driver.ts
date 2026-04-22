@@ -17,6 +17,7 @@
 
 import type { SessionEvent } from './session-tail.js'
 import {
+  hasInFlightSubAgents,
   initialState,
   reduce,
   render,
@@ -174,6 +175,24 @@ interface PerChatState {
    * so it can't tick forever.
    */
   lastEventAt: number
+  /**
+   * True once the parent turn has ended (via `turn_end` or
+   * `forceCompleteTurn`) BUT one or more sub-agents were still running
+   * at that moment. The card stays alive and keeps ticking so the
+   * running sub-agents remain visible. When the last running sub-agent
+   * transitions to done (via `sub_agent_turn_end` or parent's Agent
+   * `tool_result`), completion callbacks finally fire and the card is
+   * closed. Guards against duplicate completion firing (both turn_end
+   * and forceCompleteTurn can legitimately arrive).
+   */
+  pendingCompletion: boolean
+  /**
+   * Set to true the moment completion callbacks have fired, whether
+   * immediately (no in-flight sub-agents at turn_end) or deferred
+   * (after last sub-agent finished). Guards against double-firing if
+   * multiple completion signals race.
+   */
+  completionFired: boolean
 }
 
 export interface ProgressDriver {
@@ -312,21 +331,19 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const lastHeartbeatBucket = new Map<string, number>()
 
   /**
-   * Force-close a card from outside its normal turn_end path. Used by
-   * the heartbeat zombie ceiling when a card has idled past `maxIdleMs`
-   * with no real events landing. Synthesizes a `turn_end` through the
-   * reducer so the final render shows the proper 'done' stage, fires
-   * the same callbacks an ordinary turn_end would, and fully clears
-   * chats / heartbeat bookkeeping. Must not re-enter ingest.
+   * Fire completion callbacks + delete chatState + tidy bookkeeping.
+   * Idempotent via `completionFired`. Does not touch the reducer or
+   * flush — the caller is responsible for putting the state into its
+   * final shape before invoking this.
+   *
+   * Shared by three completion paths:
+   *   - Normal turn_end with no in-flight sub-agents
+   *   - Deferred completion (last sub-agent finishes after parent turn_end)
+   *   - Abandonment (closeZombie for maxIdle / enqueue-force-close)
    */
-  function closeZombie(cs: PerChatState): void {
-    if (cs.pendingTimer != null) {
-      clearT(cs.pendingTimer)
-      cs.pendingTimer = null
-    }
-    const durationMs = Math.max(0, now() - cs.state.turnStartedAt)
-    cs.state = reduce(cs.state, { kind: 'turn_end', durationMs }, now())
-    flush(cs, /*forceDone*/ true)
+  function completeTurnFully(cs: PerChatState): void {
+    if (cs.completionFired) return
+    cs.completionFired = true
     const taskNum = taskNumFor(cs)
     const summary = summariseTurn(cs.state, now())
     if (config.onTurnEnd) {
@@ -337,6 +354,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }
     }
     if (config.onTurnComplete) {
+      process.stderr.write(`telegram gateway: progress-card: onTurnComplete firing turnKey=${cs.turnKey}\n`)
       try {
         config.onTurnComplete({
           chatId: cs.chatId,
@@ -350,7 +368,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         /* never let completion callback break the stream */
       }
     }
-    // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
+    if (cs.pendingTimer != null) {
+      clearT(cs.pendingTimer)
+      cs.pendingTimer = null
+    }
     if (cs.deferredFirstEmitTimer != null) {
       clearT(cs.deferredFirstEmitTimer)
       cs.deferredFirstEmitTimer = null
@@ -363,6 +384,57 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       currentThreadId = undefined
       currentTurnKey = null
     }
+    if (chats.size === 0) stopHeartbeat()
+  }
+
+  /**
+   * Post-ingest check: if the turn is in `pendingCompletion` state and
+   * no sub-agents are still in-flight, fire completion. Called after
+   * every reducer dispatch that could transition a sub-agent to done
+   * (sub_agent_turn_end, parent Agent tool_result, etc.).
+   */
+  function maybeCompleteDeferredTurn(cs: PerChatState): void {
+    if (!cs.pendingCompletion) return
+    if (hasInFlightSubAgents(cs.state)) return
+    process.stderr.write(`telegram gateway: progress-card: deferred completion firing turnKey=${cs.turnKey} (last sub-agent finished)\n`)
+    flush(cs, /*forceDone*/ true)
+    completeTurnFully(cs)
+  }
+
+  /**
+   * Force-close a card regardless of sub-agent state. Used by the
+   * heartbeat zombie ceiling (idle > maxIdleMs) and by the enqueue
+   * force-close path when a new turn arrives while the old card is
+   * still alive. Synthesizes a `turn_end` through the reducer, then
+   * explicitly abandons any still-running sub-agents (they won't
+   * receive their own sub_agent_turn_end because we're giving up on
+   * them) so the final render shows them as done, then runs the
+   * shared completion path. Must not re-enter ingest.
+   */
+  function closeZombie(cs: PerChatState): void {
+    if (cs.pendingTimer != null) {
+      clearT(cs.pendingTimer)
+      cs.pendingTimer = null
+    }
+    const durationMs = Math.max(0, now() - cs.state.turnStartedAt)
+    cs.state = reduce(cs.state, { kind: 'turn_end', durationMs }, now())
+    // turn_end no longer force-closes running sub-agents (background
+    // agents may legitimately outlive parent turn_end). But closeZombie
+    // IS the abandonment path — we ARE giving up on them here. Close
+    // them explicitly so the final render shows all work accounted for.
+    if (hasInFlightSubAgents(cs.state)) {
+      const closed = new Map(cs.state.subAgents)
+      const nowMs = now()
+      for (const [k, sa] of closed) {
+        if (sa.state === 'running') {
+          closed.set(k, { ...sa, state: 'done', finishedAt: nowMs, pendingPreamble: null })
+        }
+      }
+      cs.state = { ...cs.state, subAgents: closed }
+    }
+    flush(cs, /*forceDone*/ true)
+    completeTurnFully(cs)
+    // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
   }
 
   function startHeartbeatIfNeeded(): void {
@@ -628,37 +700,17 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // Also close ghost cards (chatId is null/empty) — these come from
         // non-channel session-tail events that slipped through before the
         // null guard above was added, or from a race.
+        //
+        // Route through closeZombie so any still-running sub-agents on
+        // the old card are explicitly marked done (abandoned) and the
+        // shared completion sequence fires exactly once. This is the
+        // correct path for "new turn replacing old" even when the old
+        // turn was in pendingCompletion state (background sub-agent
+        // hadn't reported done yet).
         if (currentTurnKey != null) {
           const existing = chats.get(currentTurnKey)
           if (existing != null && (existing.chatId === chatId || !existing.chatId)) {
-            if (existing.pendingTimer != null) {
-              clearT(existing.pendingTimer)
-              existing.pendingTimer = null
-            }
-            if (existing.deferredFirstEmitTimer != null) {
-              clearT(existing.deferredFirstEmitTimer)
-              existing.deferredFirstEmitTimer = null
-            }
-            flush(existing, /*forceDone*/ true)
-            const existingTaskNum = taskNumFor(existing)
-            const existingSummary = summariseTurn(existing.state, now())
-            if (config.onTurnComplete) {
-              try {
-                config.onTurnComplete({
-                  chatId: existing.chatId,
-                  threadId: existing.threadId,
-                  turnKey: existing.turnKey,
-                  summary: existingSummary,
-                  taskIndex: existingTaskNum.index,
-                  taskTotal: existingTaskNum.total,
-                })
-              } catch { /* never let completion callback break the stream */ }
-            }
-            // Don't clear pendingSyncEchoes here — the echo may arrive AFTER
-            // this force-close. Guard 2 consumes it on arrival.
-            chats.delete(currentTurnKey)
-            lastHeartbeatBucket.delete(currentTurnKey)
-            editTimestamps.delete(currentTurnKey)
+            closeZombie(existing)
           }
         }
         currentChatId = chatId
@@ -678,6 +730,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           isFirstEmit: true,
           deferredFirstEmitTimer: null,
           lastEventAt: now(),
+          pendingCompletion: false,
+          completionFired: false,
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -724,58 +778,32 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         }
         flush(chatState, /*forceDone*/ event.kind === 'turn_end')
         if (event.kind === 'turn_end') {
-          // Emit a one-line summary for the handoff sidecar (see
-          // writeLastTurnSummary in handoff-continuity.ts). Best-effort:
-          // the outer callback swallows IO errors.
-          const summary = summariseTurn(chatState.state, now())
-          const taskNum = taskNumFor(chatState)
-          if (config.onTurnEnd) {
-            try {
-              config.onTurnEnd(summary)
-            } catch {
-              /* never let a summary write break the stream */
+          if (hasInFlightSubAgents(chatState.state)) {
+            // Parent turn ended but sub-agents are still running (common
+            // for background Agent calls). Keep the card alive so the
+            // sub-agent work stays visible; defer completion until the
+            // last running sub-agent reports done via its own
+            // sub_agent_turn_end (or the parent Agent tool_result for
+            // the foreground case). The heartbeat keeps ticking so the
+            // card visibly tracks the in-flight sub-agents.
+            chatState.pendingCompletion = true
+            const running: string[] = []
+            for (const [k, sa] of chatState.state.subAgents) {
+              if (sa.state === 'running') running.push(k)
             }
+            process.stderr.write(`telegram gateway: progress-card: turn_end deferred turnKey=${chatState.turnKey} reason=in-flight-sub-agents n=${running.length} agentIds=[${running.join(',')}]\n`)
+            return
           }
-          // Fire per-chat completion callback (for pin/unpin + completion
-          // message). Must fire BEFORE chats.delete() so taskNumFor() can
-          // still see this chat when computing the total.
-          if (config.onTurnComplete) {
-            process.stderr.write(`telegram gateway: progress-card: onTurnComplete firing turnKey=${chatState.turnKey}\n`)
-            try {
-              config.onTurnComplete({
-                chatId: chatState.chatId,
-                threadId: chatState.threadId,
-                turnKey: chatState.turnKey,
-                summary,
-                taskIndex: taskNum.index,
-                taskTotal: taskNum.total,
-              })
-            } catch {
-              /* never let completion callback break the stream */
-            }
-          }
-          // Record turn_end so late enqueue echoes from the session-tail
-          // are dropped (see Guard 2 in the enqueue handler above).
-          // Don't clear pendingSyncEchoes — the echo may arrive after turn_end.
-          // Cancel deferred first-emit timer if the card was never shown.
-          if (chatState.deferredFirstEmitTimer != null) {
-            clearT(chatState.deferredFirstEmitTimer)
-            chatState.deferredFirstEmitTimer = null
-          }
-          // Drop the chat state so a subsequent turn starts clean.
-          chats.delete(chatState.turnKey)
-          lastHeartbeatBucket.delete(chatState.turnKey)
-          editTimestamps.delete(chatState.turnKey)
-          if (currentTurnKey === chatState.turnKey) {
-            currentChatId = null
-            currentThreadId = undefined
-            currentTurnKey = null
-          }
-          // Stop heartbeat when no chats remain active.
-          if (chats.size === 0) stopHeartbeat()
+          // No in-flight sub-agents: complete the turn the normal way.
+          completeTurnFully(chatState)
         }
         return
       }
+
+      // Post-reduce deferred-completion check: if this event transitioned
+      // the last in-flight sub-agent to done (sub_agent_turn_end, parent
+      // Agent tool_result), fire completion now.
+      maybeCompleteDeferredTurn(chatState)
 
       // If this event didn't change anything user-visible (e.g. a
       // `thinking` flag toggle that isn't rendered), don't schedule a
@@ -853,8 +881,28 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // no-op.
         return
       }
+      // Simulate the normal turn_end path so in-flight sub-agents keep
+      // their card surface. If sub-agents are running, this sets
+      // pendingCompletion and defers; if not, it closes immediately.
+      // stream_reply(done=true) signals "user's answer landed", not
+      // "all background work finished" — we must not abandon still-
+      // running sub-agents just because the final reply was sent.
+      if (target.completionFired) return
       process.stderr.write(`telegram gateway: progress-card: forceCompleteTurn turnKey=${target.turnKey} (external completion signal, e.g. stream_reply done=true)\n`)
-      closeZombie(target)
+      const durationMs = Math.max(0, now() - target.state.turnStartedAt)
+      target.state = reduce(target.state, { kind: 'turn_end', durationMs }, now())
+      target.lastEventAt = now()
+      flush(target, /*forceDone*/ true)
+      if (hasInFlightSubAgents(target.state)) {
+        target.pendingCompletion = true
+        const running: string[] = []
+        for (const [k, sa] of target.state.subAgents) {
+          if (sa.state === 'running') running.push(k)
+        }
+        process.stderr.write(`telegram gateway: progress-card: forceCompleteTurn deferred turnKey=${target.turnKey} reason=in-flight-sub-agents n=${running.length} agentIds=[${running.join(',')}]\n`)
+        return
+      }
+      completeTurnFully(target)
     },
 
     peek(chatId, threadId) {

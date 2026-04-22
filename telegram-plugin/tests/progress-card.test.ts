@@ -998,7 +998,13 @@ describe('progress-card reducer — multi-agent correlation', () => {
     }
   })
 
-  it('turn_end closes running sub-agents and clears pending spawns', () => {
+  it('turn_end leaves running sub-agents alive and clears pending spawns', () => {
+    // Parent turn_end no longer force-closes running sub-agents —
+    // background Agent calls may legitimately outlive the parent turn.
+    // The driver's pendingCompletion gate keeps the card alive until
+    // each sub-agent reports its own sub_agent_turn_end. pendingSpawns
+    // are still cleared on turn_end (they're pre-correlation state
+    // with no sub-agent yet to represent them).
     const st = fold([
       enqueue('go'),
       {
@@ -1017,9 +1023,164 @@ describe('progress-card reducer — multi-agent correlation', () => {
       // P2's sub-agent JSONL never appears
       { kind: 'turn_end', durationMs: 1 },
     ])
-    expect(st.subAgents.get('X')?.state).toBe('done')
+    expect(st.subAgents.get('X')?.state).toBe('running')
     expect(st.pendingAgentSpawns.size).toBe(0)
     expect(st.stage).toBe('done')
+  })
+
+  it('turn_end followed by sub_agent_turn_end closes the sub-agent', () => {
+    // End-to-end: background sub-agent outlives parent, then reports
+    // its own turn_end via its JSONL. Card is now closeable.
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'bg', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'turn_end', durationMs: 1 },
+      // Parent turn done, sub-agent still running.
+      { kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 5 },
+    ])
+    expect(st.subAgents.get('X')?.state).toBe('done')
+    expect(st.stage).toBe('done')
+  })
+})
+
+describe('sub-agent description fallback chain', () => {
+  it('correlated sub-agent: uses description', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'analyse logs', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P', subagentType: 'researcher' },
+    ])
+    const html = render(st, 2000)
+    expect(html).toContain('analyse logs')
+    expect(html).not.toContain('(uncorrelated)')
+  })
+
+  it('orphan sub-agent with subagentType: uses subagentType', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'unknown prompt', subagentType: 'reviewer' },
+    ])
+    const html = render(st, 2000)
+    expect(html).toContain('reviewer')
+    expect(html).not.toContain('(uncorrelated)')
+  })
+
+  it('orphan sub-agent with narrative text: uses first line', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'unknown' },
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Looking at the config files\nsecond line' },
+    ])
+    const html = render(st, 2000)
+    expect(html).toContain('Looking at the config files')
+    expect(html).not.toContain('(uncorrelated)')
+    expect(html).not.toContain('second line')
+  })
+
+  it('orphan sub-agent with nothing: falls back to generic "sub-agent"', () => {
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'unknown' },
+    ])
+    const html = render(st, 2000)
+    expect(html).toContain('sub-agent')
+    expect(html).not.toContain('(uncorrelated)')
+  })
+
+  it('render NEVER surfaces "(uncorrelated)" to users', () => {
+    // Check across several orphan states.
+    const states: ProgressCardState[] = [
+      fold([enqueue('g'), { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'x' }]),
+      fold([enqueue('g'), { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'x', subagentType: 'worker' }]),
+      fold([
+        enqueue('g'),
+        { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'x' },
+        { kind: 'sub_agent_tool_use', agentId: 'A', toolName: 'Read', toolUseId: 't1', input: { file_path: '/tmp/f' } },
+      ]),
+    ]
+    for (const st of states) {
+      expect(render(st, 2000)).not.toContain('(uncorrelated)')
+    }
+  })
+})
+
+describe('sub-agent activity-line fallback (never "(idle)")', () => {
+  it('currently running tool: shows tool label', () => {
+    const st = fold([
+      enqueue('g'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolName: 'Read', toolUseId: 't1', input: { file_path: '/foo.ts' } },
+    ])
+    const html = render(st, 3000)
+    expect(html).toContain('foo.ts')
+    expect(html).not.toContain('(idle)')
+  })
+
+  it('between tools with pendingPreamble: shows narrative', () => {
+    const st = fold([
+      enqueue('g'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolName: 'Read', toolUseId: 't1', input: { file_path: '/foo.ts' } },
+      { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 't1', isError: false },
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Now checking tests' },
+    ])
+    const html = render(st, 3000)
+    expect(html).toContain('Now checking tests')
+    expect(html).not.toContain('(idle)')
+  })
+
+  it('between tools with no preamble: shows last completed tool', () => {
+    const st = fold([
+      enqueue('g'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolName: 'Read', toolUseId: 't1', input: { file_path: '/foo.ts' } },
+      { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 't1', isError: false },
+    ])
+    const html = render(st, 3000)
+    expect(html).toContain('just finished')
+    expect(html).toContain('foo.ts')
+    expect(html).not.toContain('(idle)')
+  })
+
+  it('running with no tools yet: shows "thinking..."', () => {
+    const st = fold([
+      enqueue('g'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    const html = render(st, 3000)
+    expect(html).toContain('thinking')
+    expect(html).not.toContain('(idle)')
+  })
+
+  it('render NEVER surfaces "(idle)" regardless of sub-agent phase', () => {
+    // Exhaustive sanity: iterate through phases, check each render.
+    const events: SessionEvent[] = [
+      enqueue('g'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolName: 'Read', toolUseId: 't1', input: { file_path: '/a' } },
+      { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 't1', isError: false },
+      { kind: 'sub_agent_tool_use', agentId: 'X', toolName: 'Bash', toolUseId: 't2', input: { command: 'ls' } },
+      { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 't2', isError: false },
+    ]
+    let state = initialState()
+    let t = 1000
+    for (const e of events) {
+      state = reduce(state, e, t)
+      t += 100
+      // Render at every step — should never show "(idle)".
+      expect(render(state, t)).not.toContain('(idle)')
+    }
   })
 })
 

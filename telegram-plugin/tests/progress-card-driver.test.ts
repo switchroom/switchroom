@@ -1304,6 +1304,186 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emits).toHaveLength(0)
   })
 
+  it('pendingCompletion: turn_end with running sub-agent defers', () => {
+    // Parent turn_end fires while a sub-agent is still running.
+    // Completion callbacks must NOT fire yet — card stays alive so the
+    // user sees the sub-agent progressing.
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+
+    // Parent turn_end landed but sub-agent X is still running → no completion.
+    expect(emitted).toHaveLength(0)
+  })
+
+  it('deferred completion fires when last sub-agent finishes', () => {
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(0)
+
+    // Sub-agent reports its own turn_end → completion fires.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 5000 }, 'c')
+    advance(0)
+
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('two sub-agents running: completion waits for the last one', () => {
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'a', prompt: 'P1' } },
+      'c',
+    )
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p2', input: { description: 'b', prompt: 'P2' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P1' }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'Y', firstPromptText: 'P2' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+
+    // Parent turn_end → X and Y still running, no completion.
+    expect(emitted).toHaveLength(0)
+
+    // X finishes → Y still running, still no completion.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 2000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(0)
+
+    // Y finishes → last one done, completion fires.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'Y', durationMs: 3000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('forceCompleteTurn with running sub-agent defers (stream_reply done semantic)', () => {
+    // stream_reply(done=true) = user's answer landed, NOT all work done.
+    // Must not abandon still-running sub-agents.
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+
+    // stream_reply(done=true) fires before any turn_end.
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+    expect(emitted).toHaveLength(0)
+
+    // Sub-agent eventually finishes.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 5000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('completion fires exactly once even if turn_end + forceCompleteTurn both arrive', () => {
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+
+    // Both completion signals arrive.
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+    expect(emitted).toHaveLength(0) // still deferred (sub-agent running)
+
+    // Sub-agent finishes → completion fires EXACTLY ONCE.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 5000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('new enqueue during waiting-for-sub-agents: force-closes old card, abandons sub-agent', () => {
+    // Simulates a new user message arriving while an old turn's background
+    // sub-agent is still running. The old card must be force-closed with
+    // the sub-agent marked done (abandoned). startTurn synthesizes an
+    // isSync:true enqueue which bypasses Guard 1's echo-drop and reaches
+    // the force-close path.
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c', 'first'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(0)
+
+    // New user message arrives via startTurn (the production path) — old
+    // card must force-close now, sub-agent abandoned.
+    driver.startTurn({ chatId: 'c', userText: 'second message' })
+    advance(0)
+    expect(emitted).toHaveLength(1) // old card closed via closeZombie
+  })
+
+  it('normal fast turn (no sub-agents): completes immediately on turn_end', () => {
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/f' } }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+
+    // No sub-agents → normal immediate completion.
+    expect(emitted).toHaveLength(1)
+  })
+
   it('threadId scoping: completes the matching chat+thread only', () => {
     const emitted: Array<{ chatId: string; threadId?: string }> = []
     const { driver, advance } = harness(0, 0, {

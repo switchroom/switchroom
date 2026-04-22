@@ -616,7 +616,12 @@ describe('progress-card multi-agent harness', () => {
         appendFileSync(sub, subAgentUserLine('PROMPT-Y'))
         await wait(200)
         const orphanHtml = bot.edits[bot.edits.length - 1].html
-        expect(orphanHtml).toContain('(uncorrelated)')
+        // Before adoption, the orphan sub-agent renders with a fallback
+        // description (never the debug-only '(uncorrelated)' string).
+        // With no subagentType or narrative text available, the generic
+        // 'sub-agent' fallback applies.
+        expect(orphanHtml).toContain('sub-agent')
+        expect(orphanHtml).not.toContain('(uncorrelated)')
         // Now parent emits the Agent tool_use → adoption
         appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'reverse race target', 'PROMPT-Y'))
         await wait(200)

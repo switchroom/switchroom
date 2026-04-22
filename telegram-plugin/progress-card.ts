@@ -103,6 +103,25 @@ export interface SubAgentState {
    * sub-agent A must not leak onto sub-agent B's tool_use.
    */
   readonly pendingPreamble?: string | null
+  /**
+   * The sub-agent's first narrative/text line, captured on the first
+   * `sub_agent_text` event for this agent. Used as a description fallback
+   * when correlation fails (orphan sub-agents) so the user still sees
+   * something meaningful instead of "(uncorrelated)". Never cleared.
+   */
+  readonly firstNarrativeText?: string
+  /**
+   * The tool most recently completed by this sub-agent. Captured on
+   * `sub_agent_tool_result` (before the toolUseId match clears
+   * `currentTool`). Used by the render fallback chain when the sub-agent
+   * is running-but-between-tools so we show the last thing it did rather
+   * than the bare "(idle)" string.
+   */
+  readonly lastCompletedTool?: {
+    readonly tool: string
+    readonly label: string
+    readonly finishedAt: number
+  }
   /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
   readonly nestedSpawnCount: number
 }
@@ -164,6 +183,20 @@ export interface ProgressCardState {
    * to correlate with. Keyed by the parent's `toolUseId`.
    */
   readonly pendingAgentSpawns: ReadonlyMap<string, PendingAgentSpawn>
+}
+
+/**
+ * True when any sub-agent in the state is still running. Parent turn_end
+ * no longer closes running sub-agents (they may outlive the parent turn
+ * for background Agent calls), so the driver uses this gate to decide
+ * whether to close the card now or defer until the last sub-agent lands
+ * its own `sub_agent_turn_end`.
+ */
+export function hasInFlightSubAgents(state: ProgressCardState): boolean {
+  for (const sa of state.subAgents.values()) {
+    if (sa.state === 'running') return true
+  }
+  return false
 }
 
 export function initialState(): ProgressCardState {
@@ -479,7 +512,14 @@ export function reduce(
       const sa = state.subAgents.get(event.agentId)
       if (!sa) return state
       const next = new Map(state.subAgents)
-      next.set(event.agentId, { ...sa, pendingPreamble: event.text })
+      next.set(event.agentId, {
+        ...sa,
+        pendingPreamble: event.text,
+        // Capture the first narrative line for the description-fallback
+        // chain. Once set, never overwrite — we want the sub-agent's
+        // initial framing, not its latest chatter.
+        firstNarrativeText: sa.firstNarrativeText ?? event.text,
+      })
       return { ...state, subAgents: next }
     }
 
@@ -512,11 +552,22 @@ export function reduce(
       const sa = state.subAgents.get(event.agentId)
       if (!sa) return state
       // Per design §3.3: per-tool errors don't fail the agent; only the
-      // parent's tool_result does. We just clear currentTool if it
-      // matches.
+      // parent's tool_result does. We clear currentTool if it matches,
+      // AND stash it as lastCompletedTool so the render fallback chain
+      // can surface "just finished X" instead of a bare "(idle)" line
+      // while the sub-agent thinks between tools.
       if (sa.currentTool && sa.currentTool.toolUseId === event.toolUseId) {
+        const justFinished = {
+          tool: sa.currentTool.tool,
+          label: sa.currentTool.label,
+          finishedAt: now,
+        }
         const next = new Map(state.subAgents)
-        next.set(event.agentId, { ...sa, currentTool: undefined })
+        next.set(event.agentId, {
+          ...sa,
+          currentTool: undefined,
+          lastCompletedTool: justFinished,
+        })
         return { ...state, subAgents: next }
       }
       return state
@@ -547,12 +598,20 @@ export function reduce(
       const items = state.items.map((it) =>
         it.state === 'running' ? { ...it, state: 'done' as const, finishedAt: now } : it,
       )
+      // Running sub-agents may outlive parent turn_end (common for background
+      // `Agent(run_in_background=true)` calls — parent returns immediately
+      // but the sub-agent keeps working). Leave them in `state: 'running'`
+      // so their card surface stays informative, and let them close via
+      // their own `sub_agent_turn_end` event (or via the driver's
+      // abandonment path on maxIdle / enqueue-force-close). For sub-agents
+      // already done, clear pendingPreamble defensively.
       const subAgents = new Map<string, SubAgentState>()
       for (const [k, sa] of state.subAgents) {
-        // Clear any lingering pendingPreamble on turn_end — mirrors the
-        // parent pendingPreamble: null reset below.
-        const closed = sa.state === 'running' ? { ...sa, state: 'done' as const, finishedAt: now } : sa
-        subAgents.set(k, { ...closed, pendingPreamble: null })
+        if (sa.state === 'running') {
+          subAgents.set(k, sa)
+        } else {
+          subAgents.set(k, { ...sa, pendingPreamble: null })
+        }
       }
       const narratives = state.narratives.map(n =>
         n.state === 'active' ? { ...n, state: 'done' as const } : n,
@@ -912,13 +971,41 @@ function formatSubAgentCounts(c: SubAgentCounts): string {
  * The `forceCollapse` arg is set on `turn_end` (Ken locked-in #5) so the
  * archived card never carries the running two-line shape.
  */
+/**
+ * Description fallback chain for a sub-agent, in priority order:
+ *   1. correlated description (from parent Agent/Task tool_use input)
+ *   2. subagentType (when correlation failed but the sub-agent type is known)
+ *   3. first narrative text the sub-agent emitted
+ *   4. generic 'sub-agent'
+ * "(uncorrelated)" is a debug-log string and never appears in this chain —
+ * surfacing that to the user was the original UX bug.
+ */
+function subAgentDisplayDescription(sa: SubAgentState): string {
+  if (sa.description && sa.description.length > 0 && sa.description !== '(uncorrelated)') {
+    return sa.description
+  }
+  if (sa.subagentType && sa.subagentType.length > 0) {
+    return sa.subagentType
+  }
+  if (sa.firstNarrativeText && sa.firstNarrativeText.length > 0) {
+    // Extract first line, cap length — same shape as toolLabel preambles.
+    const line = sa.firstNarrativeText.split('\n')[0].trim()
+    if (line.length > 0) return line
+  }
+  return 'sub-agent'
+}
+
 function renderSubAgent(
   sa: SubAgentState,
   now: number,
   forceCollapse: boolean,
 ): string[] {
-  const desc = sa.description || '(uncorrelated)'
-  const typeSuffix = sa.subagentType ? ` · ${escapeHtml(sa.subagentType)}` : ''
+  const desc = subAgentDisplayDescription(sa)
+  // Show subagent type as a suffix only if it's NOT already the display
+  // description (i.e. only when we have a real description + a type).
+  const typeSuffix = sa.subagentType && sa.subagentType !== desc
+    ? ` · ${escapeHtml(sa.subagentType)}`
+    : ''
   const spawnedSuffix = sa.nestedSpawnCount > 0
     ? ` <i>(spawned ${sa.nestedSpawnCount})</i>`
     : ''
@@ -935,6 +1022,10 @@ function renderSubAgent(
   // Running: two-line block.
   const elapsed = formatDuration(now - sa.startedAt)
   const headerLine = `  🤖 <b>${escapeHtml(truncate(desc, 50))}</b>${typeSuffix} · ⏱ ${elapsed}${spawnedSuffix}`
+
+  // Activity-line fallback chain — never render the literal "(idle)" string.
+  // Priority: currently-executing tool > pending narrative text > last
+  // completed tool > generic "thinking..." filler.
   if (sa.currentTool) {
     const cur = sa.currentTool
     const curDur = formatDuration(now - cur.startedAt)
@@ -943,7 +1034,23 @@ function renderSubAgent(
       `     └ ${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
     ]
   }
-  return [headerLine, `     └ <i>(idle)</i> · ${sa.toolCount} tools`]
+  if (sa.pendingPreamble && sa.pendingPreamble.length > 0) {
+    const preambleLine = sa.pendingPreamble.split('\n')[0].trim()
+    if (preambleLine.length > 0) {
+      return [
+        headerLine,
+        `     └ 🤔 <i>${escapeHtml(truncate(preambleLine, 60))}</i> · ${sa.toolCount} tools`,
+      ]
+    }
+  }
+  if (sa.lastCompletedTool) {
+    const last = sa.lastCompletedTool
+    return [
+      headerLine,
+      `     └ ✓ <i>just finished</i> ${renderItemCore(last.tool, last.label)} · ${sa.toolCount} tools`,
+    ]
+  }
+  return [headerLine, `     └ 💭 <i>thinking…</i> · ${sa.toolCount} tools`]
 }
 
 /**
