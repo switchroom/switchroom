@@ -194,6 +194,25 @@ export interface ProgressDriver {
    * produces an independent card with its own pin lifecycle.
    */
   startTurn(args: { chatId: string; threadId?: string; userText: string }): void
+  /**
+   * External completion hook — authoritative turn-finished signal from
+   * outside the session-tail path. Intended for `stream_reply(done=true)`
+   * so the final-answer arrival acts with equal authority to a session-tail
+   * `turn_end` event. Idempotent: first caller wins, subsequent callers
+   * on the same chat+thread find no active card and no-op.
+   *
+   * Closes any active card for (chatId, threadId):
+   *   - cancels the deferred-first-emit timer (fast-turn suppression)
+   *   - synthesizes a `turn_end` through the reducer
+   *   - fires onTurnEnd + onTurnComplete
+   *   - clears chats map + bookkeeping
+   *
+   * If the deferred first emit hasn't landed yet (fast turn), `flush` sees
+   * `forceDone=true` on a still-`isFirstEmit=true` state and suppresses
+   * the emit entirely — no ghost card. If the card already emitted, the
+   * normal flush+unpin path runs via onTurnComplete.
+   */
+  forceCompleteTurn(args: { chatId: string; threadId?: string }): void
   /** Current state for a chat (for tests / inspection). */
   peek(chatId: string, threadId?: string): ProgressCardState | undefined
 }
@@ -808,6 +827,34 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         chatId,
         threadId,
       )
+    },
+
+    forceCompleteTurn({ chatId, threadId }) {
+      // Find active chatState for this chat:thread. Prefer the one pointed
+      // at by currentTurnKey; fall back to any state matching the chat key.
+      let target: PerChatState | undefined
+      if (currentTurnKey != null) {
+        const cs = chats.get(currentTurnKey)
+        if (cs != null && cs.chatId === chatId && cs.threadId === threadId) {
+          target = cs
+        }
+      }
+      if (target == null) {
+        for (const cs of chats.values()) {
+          if (cs.chatId === chatId && cs.threadId === threadId) {
+            target = cs
+            break
+          }
+        }
+      }
+      if (target == null) {
+        // No active card for this chat+thread — either the turn already
+        // completed via another path, or no turn is in flight. Idempotent
+        // no-op.
+        return
+      }
+      process.stderr.write(`telegram gateway: progress-card: forceCompleteTurn turnKey=${target.turnKey} (external completion signal, e.g. stream_reply done=true)\n`)
+      closeZombie(target)
     },
 
     peek(chatId, threadId) {

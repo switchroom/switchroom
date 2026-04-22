@@ -154,6 +154,16 @@ export interface StreamReplyDeps {
   }) => void
   /** Called on done=true to transition the status reaction controller. */
   endStatusReaction: (chatId: string, threadId: number | undefined, verdict: 'done') => void
+  /**
+   * Optional: progress-card driver completion hook. Wired by the gateway
+   * to `progressDriver.forceCompleteTurn(...)`. Invoked after a
+   * `stream_reply(done=true)` on the default (unnamed) lane finalizes,
+   * so the final-answer delivery acts as an authoritative turn-complete
+   * signal equal to session-tail `turn_end`. Skipped when args.lane is
+   * 'progress' (that's the driver's own emit — calling this would cause
+   * re-entry). Safe to leave unset for callers that don't use the driver.
+   */
+  forceCompleteTurn?: (chatId: string, threadId: number | undefined) => void
   /** Whether to persist outbound history. */
   historyEnabled: boolean
   /** History row writer. Only called when historyEnabled && done && messageId != null. */
@@ -434,6 +444,19 @@ export async function handleStreamReply(
   const finalMessageId = stream.getMessageId()
   if (done) {
     process.stderr.write(`telegram channel: stream_reply: finalized done=true chatId=${chat_id} lane=${args.lane ?? 'default'} messageId=${finalMessageId ?? 'null'}\n`)
+    // Fire the authoritative turn-complete signal to the progress-card
+    // driver so any in-flight card for this chat is closed out alongside
+    // the final answer landing. Only for the default (unnamed) lane —
+    // the progress lane is the driver's own emit path and routing
+    // completion through it would re-enter the driver from within its
+    // own flush. Idempotent on the driver side: first caller wins.
+    if (deps.forceCompleteTurn != null && (args.lane == null || args.lane.length === 0)) {
+      try {
+        deps.forceCompleteTurn(chat_id, threadId)
+      } catch (err) {
+        deps.writeError(`telegram channel: stream_reply: forceCompleteTurn hook threw: ${err}\n`)
+      }
+    }
   }
   return {
     messageId: finalMessageId,

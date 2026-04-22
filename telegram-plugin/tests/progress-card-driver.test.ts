@@ -1192,3 +1192,137 @@ describe('initial delay suppression', () => {
     expect(emits.length).toBeGreaterThan(1)
   })
 })
+
+describe('forceCompleteTurn — external completion signal', () => {
+  it('cusp race: stream_reply completes at +28s, no card ever emits', () => {
+    // Reproduces the turn-:15 bug. The turn completes fast (before
+    // initialDelayMs=30s elapses), and stream_reply(done=true) fires
+    // forceCompleteTurn. The deferred first-emit timer must be cancelled
+    // so it can't fire at +30s with a ghost card.
+    const { driver, emits, advance } = harness(0, 0, { initialDelayMs: 30_000 })
+
+    driver.startTurn({ chatId: 'c', userText: 'quick question' })
+    advance(0)
+    expect(emits).toHaveLength(0) // deferred
+
+    // Turn has some tool activity at +10s.
+    advance(10_000)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1' }, 'c')
+    advance(0)
+    expect(emits).toHaveLength(0) // still deferred (timer hasn't fired)
+
+    // At +28s stream_reply(done=true) arrives; gateway forwards to driver.
+    advance(18_000)
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+
+    // Zero emits — card was suppressed before the deferred timer could fire.
+    expect(emits).toHaveLength(0)
+
+    // Advance past the would-be timer firing moment.
+    advance(10_000) // +38s total, past the 30s timer
+    expect(emits).toHaveLength(0) // still nothing — timer was cancelled
+  })
+
+  it('card already emitted: forceCompleteTurn finalises + unpins', () => {
+    // Slow turn: card emitted at +30s, then stream_reply done=true arrives
+    // at +45s. Driver should fire turn_end render, onTurnComplete, and
+    // clean up — same as a session-tail turn_end would.
+    const emitted: Array<{ turnKey: string; summary: string; taskIndex: number; taskTotal: number }> = []
+    const { driver, emits, advance } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.startTurn({ chatId: 'c', userText: 'slow one' })
+    advance(30_000) // timer fires, card emits
+    expect(emits.length).toBeGreaterThan(0)
+    const firstEmitCount = emits.length
+
+    // Stream_reply done=true at +45s.
+    advance(15_000)
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+
+    // onTurnComplete fired exactly once with the turn summary.
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0].summary).toContain('no tools')
+    // A final done-render landed after the forceCompleteTurn call.
+    expect(emits.length).toBeGreaterThan(firstEmitCount)
+    expect(emits[emits.length - 1].done).toBe(true)
+  })
+
+  it('idempotent: second forceCompleteTurn is a no-op', () => {
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.startTurn({ chatId: 'c', userText: 'q' })
+    advance(0)
+    driver.forceCompleteTurn({ chatId: 'c' })
+    driver.forceCompleteTurn({ chatId: 'c' })
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+
+    // Only one completion fired even with three external signals.
+    expect(emitted).toHaveLength(1)
+  })
+
+  it('no active turn: forceCompleteTurn is a silent no-op', () => {
+    const emitted: Array<unknown> = []
+    const { driver } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    // No startTurn, no enqueue — nothing is active.
+    expect(() => driver.forceCompleteTurn({ chatId: 'c' })).not.toThrow()
+    expect(emitted).toHaveLength(0)
+  })
+
+  it('forceCompleteTurn then turn_end: turn_end is a no-op (first-wins)', () => {
+    const emitted: Array<unknown> = []
+    const { driver, emits, advance } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.startTurn({ chatId: 'c', userText: 'q' })
+    advance(10_000)
+    driver.forceCompleteTurn({ chatId: 'c' })
+    advance(0)
+    expect(emitted).toHaveLength(1)
+
+    // Session-tail turn_end arrives late — must not re-trigger completion.
+    driver.ingest({ kind: 'turn_end', durationMs: 10_000 }, 'c')
+    advance(0)
+
+    expect(emitted).toHaveLength(1) // still 1
+    // The card never emitted (fast-turn suppression held).
+    expect(emits).toHaveLength(0)
+  })
+
+  it('threadId scoping: completes the matching chat+thread only', () => {
+    const emitted: Array<{ chatId: string; threadId?: string }> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      onTurnComplete: (args) => emitted.push({ chatId: args.chatId, threadId: args.threadId }),
+    })
+
+    driver.startTurn({ chatId: 'c', threadId: 't1', userText: 'q' })
+    advance(0)
+
+    // Wrong thread — should be a no-op.
+    driver.forceCompleteTurn({ chatId: 'c', threadId: 't2' })
+    advance(0)
+    expect(emitted).toHaveLength(0)
+
+    // Matching thread — completes.
+    driver.forceCompleteTurn({ chatId: 'c', threadId: 't1' })
+    advance(0)
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0]).toEqual({ chatId: 'c', threadId: 't1' })
+  })
+})

@@ -1089,6 +1089,12 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       defaultFormat: access.parseMode ?? 'html',
       logStreamingEvent,
       endStatusReaction,
+      forceCompleteTurn: (chatId, threadId) => {
+        progressDriver?.forceCompleteTurn({
+          chatId,
+          threadId: threadId != null ? String(threadId) : undefined,
+        })
+      },
       historyEnabled: HISTORY_ENABLED,
       recordOutbound,
       ...(HISTORY_ENABLED ? { getLatestInboundMessageId } : {}),

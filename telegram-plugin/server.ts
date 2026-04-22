@@ -1754,6 +1754,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             defaultFormat: access.parseMode ?? 'html',
             logStreamingEvent,
             endStatusReaction,
+            forceCompleteTurn: (chatId, threadId) => {
+              progressDriver?.forceCompleteTurn({
+                chatId,
+                threadId: threadId != null ? String(threadId) : undefined,
+              })
+            },
             historyEnabled: HISTORY_ENABLED,
             recordOutbound,
             // Wire the quote-reply default only when history is enabled —
