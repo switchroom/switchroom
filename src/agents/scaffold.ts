@@ -499,18 +499,29 @@ fi
 mkdir "$GREETING_MARKER" 2>/dev/null || exit 0
 
 # Resolve the active model from SessionStart hook stdin.
-# Fallback chain: hook .model → current transcript → newest transcript
-# across this project's JSONLs → user default from ~/.claude.json → cache.
+# Fallback chain: hook .model → agent settings.json .model → current
+# transcript → newest transcript across this project's JSONLs → user
+# default from ~/.claude.json → cache.
+#
+# settings.json sits at position 2 because it's the configured ground
+# truth: switchroom.yaml → reconcile → settings.json, and start.sh
+# passes the same value to \`claude --model\`. Transcript-based lookups
+# are unreliable on --continue resumes — the transcript's last "model"
+# entry is from the previous session, which then pollutes the cache
+# and makes every subsequent greeting display the stale value.
 MODEL=""
 CWD=""
 if command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
   MODEL="$(printf '%s' "$HOOK_INPUT" | jq -r '.model // empty' 2>/dev/null)"
   CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
-  if [ -z "$MODEL" ]; then
-    TRANSCRIPT="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
-    if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-      MODEL="$(grep -o '"model":"[^"]*"' "$TRANSCRIPT" | tail -1 | cut -d'"' -f4)"
-    fi
+fi
+if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -f "\$CLAUDE_CONFIG_DIR/settings.json" ]; then
+  MODEL="$(jq -r '.model // empty' "\$CLAUDE_CONFIG_DIR/settings.json" 2>/dev/null)"
+fi
+if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
+  TRANSCRIPT="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    MODEL="$(grep -o '"model":"[^"]*"' "$TRANSCRIPT" | tail -1 | cut -d'"' -f4)"
   fi
 fi
 [ -z "$CWD" ] && CWD="$PWD"
