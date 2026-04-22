@@ -1,4 +1,4 @@
-# Switchroom vs NanoClaw — a NanoClaw alternative for Claude Code subscribers
+# Switchroom vs NanoClaw: a NanoClaw alternative for Claude Code subscribers
 
 NanoClaw is built on the Anthropic Agents SDK and runs agents in containers. Switchroom takes a different approach: use the actual `claude` CLI, authenticate with your Claude Pro/Max subscription, and manage lifecycle with systemd.
 
@@ -21,11 +21,11 @@ NanoClaw is built on the Anthropic Agents SDK and runs agents in containers. Swi
 | Scheduling | systemd timers | Built-in scheduler |
 | Sub-agents | Native Claude Code sub-agents | N/A |
 | Config | YAML with cascade | ENV vars |
-| License | MIT | — |
+| License | MIT | n/a |
 
-## CLI vs SDK — why it matters
+## CLI vs SDK: why it matters
 
-The Agents SDK is a great primitive for building new agent products from scratch. But if you want to run Claude Code itself — the thing you use in your terminal and IDE — the SDK is a reconstruction, not the real thing.
+The Agents SDK is a fine primitive for building new agent products from scratch. But if you want to run Claude Code itself, the thing you use in your terminal and IDE, the SDK is a reconstruction, not the real thing.
 
 Using the unmodified `claude` binary means Switchroom agents behave exactly like your local Claude Code sessions:
 - Same sub-agents (Plan, Explore, general-purpose).
@@ -35,7 +35,7 @@ Using the unmodified `claude` binary means Switchroom agents behave exactly like
 - Same hooks (PreToolUse, PostToolUse, Stop, UserPromptSubmit).
 - Same keyboard-bound workflows (`/commands`, `@mentions`).
 
-If you've already invested in Claude Code conventions — skills, CLAUDE.md files, slash commands — Switchroom inherits all of them. NanoClaw agents are their own ecosystem.
+If you've already invested in Claude Code conventions (skills, CLAUDE.md files, slash commands), Switchroom inherits all of them. NanoClaw agents are their own ecosystem.
 
 ## Subscription auth vs API key
 
@@ -45,12 +45,12 @@ OAuth also unifies your account: the same auth your desktop app uses, the same a
 
 ## Config cascade vs ENV vars
 
-NanoClaw configures agents through environment variables. That's fine for one or two agents but breaks down at fleet scale — you end up copy-pasting envs, and there's no inheritance.
+NanoClaw configures agents through environment variables. That's fine for one or two agents but breaks down at fleet scale. You end up copy-pasting envs, and there's no inheritance.
 
 Switchroom's `switchroom.yaml` has three layers:
-1. **defaults** — applied to every agent unless overridden.
-2. **profiles** — named bundles (e.g., `advisor`) that agents can extend.
-3. **per-agent** — the only place you write what makes each agent unique.
+1. **defaults**: applied to every agent unless overridden.
+2. **profiles**: named bundles (e.g. `advisor`) that agents can extend.
+3. **per-agent**: the only place you write what makes each agent unique.
 
 Change the default model once, every agent inherits it. Create an `advisor` profile that denies `Bash`/`Edit`/`Write`, and every advisor-style agent gets the same guardrails.
 
@@ -62,8 +62,8 @@ Change the default model once, every agent inherits it. Create an `advisor` prof
 
 ## Migrating from NanoClaw
 
-1. Install Switchroom: `git clone https://github.com/mekenthompson/switchroom.git ~/code/switchroom && cd ~/code/switchroom && bun install && bun link`
-2. `switchroom setup` — OAuth login with your Claude Pro/Max account, register Telegram bot, scaffold first agent.
+1. Install Switchroom: `git clone https://github.com/switchroom/switchroom.git ~/code/switchroom && cd ~/code/switchroom && bun install && bun link`
+2. `switchroom setup`. OAuth login with your Claude Pro/Max account, register Telegram bot, scaffold first agent.
 3. Translate each NanoClaw agent's ENV-based config into a block under `agents:` in `switchroom.yaml`. See [configuration.md](configuration.md).
 4. `switchroom agent start <name>` for each agent.
 

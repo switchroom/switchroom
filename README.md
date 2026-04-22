@@ -9,7 +9,7 @@
 [![Trigger evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-trigger-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 [![Quality evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-quality-evals.json)](https://buildkite.com/ken-thompson/switchroom)
 
-**Your Claude Code agents. On Telegram. Your subscription. No black box.**
+**Your Claude Pro or Max, as a fleet of always-on agents in Telegram.**
 
 ## Right, so what's this about
 
@@ -93,35 +93,45 @@ Switchroom is **not a harness**. Each agent runs the unmodified `claude` binary,
 
 ## Install
 
+Ubuntu 24.04 LTS, 4GB RAM. Linux only.
+
+### One-liner (fresh box)
+
 ```bash
-# Node 20.11+ required
-npm install -g switchroom-ai
+curl -fsSL https://get.switchroom.ai | bash
+```
 
-switchroom --version
+Bootstraps bun, node 22, the claude CLI, and switchroom-ai. Idempotent. Safe to re-run. Source is [`install.sh`](install.sh) in this repo.
 
-# Interactive wizard. Installs deps, scaffolds config, links Telegram.
+Then:
+
+```bash
+switchroom setup                                        # interactive Telegram wiring
+switchroom agent create coach --profile health-coach    # scaffold your first agent
+switchroom auth login coach                             # link your Pro or Max session
+switchroom agent start coach                            # go
+```
+
+After the last command you talk to the agent from Telegram. You don't touch the server again.
+
+### Already have node?
+
+```bash
+npm install -g @anthropic-ai/claude-code switchroom-ai
 switchroom setup
 ```
 
-## Quick Start (manual)
+Node 20.11+. `switchroom setup` is the interactive first-time wizard — scaffolds config, handles Telegram wiring, sets up the vault.
+
+### One-shot happy path (no wizard)
+
+If you already have Telegram credentials in `~/.switchroom/switchroom.yaml`, skip `switchroom setup`. `agent create --profile` writes a minimal entry for you, and auth is scoped per-agent:
 
 ```bash
-# Prerequisites: Ubuntu 24.04 LTS, 4GB RAM
-sudo apt update && sudo apt install -y tmux expect
-curl -fsSL https://bun.sh/install | bash
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && \
-  source ~/.bashrc && nvm install 22
-npm install -g @anthropic-ai/claude-code
-
-# Install Switchroom
-git clone https://github.com/switchroom/switchroom.git ~/code/switchroom
-cd ~/code/switchroom && bun install && bun link
-
-# Setup
-switchroom setup
+switchroom agent create coach --profile health-coach
+switchroom auth login coach
+switchroom agent start coach
 ```
-
-After setup, you talk to your agent from Telegram. You don't touch the server again.
 
 ## Example Configuration
 
@@ -173,7 +183,7 @@ switchroom doctor                             # Health check
 switchroom update                             # Pull + reconcile + restart
 
 switchroom agent list                         # Status of all agents
-switchroom agent create <name>                # Scaffold + install timers
+switchroom agent create <name> [--profile <p>] # Scaffold + install timers; --profile writes yaml entry
 switchroom agent reconcile <name|all>         # Re-apply switchroom.yaml
 switchroom agent start|stop|restart <name>    # Lifecycle (with preflight)
 switchroom agent attach <name>                # Interactive tmux session
@@ -182,6 +192,17 @@ switchroom agent grant <name> <tool>          # Grant a tool permission
 switchroom agent permissions <name>           # Show allow/deny list
 switchroom agent dangerous <name> [off]       # Toggle full tool access
 ```
+
+Profiles live in `profiles/` at the repo root. Bundled ones for `--profile`: `coding`, `default`, `executive-assistant`, `health-coach` (the `_base/` dir is framework-internal render templates and is not a user-selectable profile).
+
+`switchroom agent create <name> --profile <profile>` does two things in one step:
+
+1. Adds an entry to `switchroom.yaml` under `agents:` with `extends: <profile>` and a derived `topic_name` (capitalized agent name). Edit the yaml afterwards to change the topic name, emoji, tools, etc.
+2. Scaffolds the agent directory and installs the systemd unit (same as running `agent create` on an entry that already exists in yaml).
+
+If the agent is already in yaml, `--profile` must match the existing `extends:` value or it errors. If the yaml entry has no `extends:` and you pass `--profile`, the flag is written in additively with a warning. Running `agent create` with no `--profile` on a missing entry keeps the old "Agent not defined in switchroom.yaml" error, now with a hint to use `--profile`.
+
+Model aliases: the bare names `opus`, `sonnet`, `haiku` are accepted alongside the full IDs (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Use whichever reads cleaner in your config.
 
 ### Authentication (multi-account slot pool)
 
@@ -204,7 +225,7 @@ switchroom auth list <agent> [--json]             # Show slots: health, quota st
 switchroom auth rm <agent> <slot> [--force]       # Remove a slot (refuses active/last slot)
 ```
 
-The fallback pool also works from Telegram — the switchroom MCP plugin
+The fallback pool also works from Telegram. The switchroom MCP plugin
 exposes the same verbs as `/auth add|use|list|rm` inside the chat.
 
 ### Workspace (agent bootstrap layer)
@@ -257,7 +278,7 @@ switchroom web                                    # Web dashboard
 
 ## Telemetry
 
-Switchroom reports anonymous usage events and errors to PostHog so we can spot regressions and understand which commands are used. **No personal data, code, or message content leaves your machine.** The anonymous ID lives at `~/.switchroom/analytics-id` and is a random UUID — not tied to your username, email, IP, or machine identifier (we pass `disableGeoip: true` on every event).
+Switchroom reports anonymous usage events and errors to PostHog so we can spot regressions and understand which commands are used. **No personal data, code, or message content leaves your machine.** The anonymous ID lives at `~/.switchroom/analytics-id` and is a random UUID. Not tied to your username, email, IP, or machine identifier (we pass `disableGeoip: true` on every event).
 
 To opt out, set this in your shell profile:
 

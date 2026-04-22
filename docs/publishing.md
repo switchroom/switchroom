@@ -12,12 +12,12 @@ to move.
 Inside any Claude Code session:
 
 ```
-/plugin marketplace add mekenthompson/switchroom
+/plugin marketplace add switchroom/switchroom
 /plugin install switchroom@switchroom
 ```
 
 The first command registers this GitHub repo as a marketplace named `switchroom`.
-The second installs the `switchroom` plugin from that marketplace. All 11 skills
+The second installs the `switchroom` plugin from that marketplace. Six skills
 (`switchroom-install`, `switchroom-status`, `switchroom-cli`, `switchroom-health`,
 `switchroom-manage`, `switchroom-architecture`) become available
 under the `switchroom:` namespace.
@@ -31,8 +31,8 @@ To pull updates later:
 ## For maintainers: cutting a release
 
 1. Update the version in both manifests so they stay in sync:
-   - `package.json` — `version`
-   - `.claude-plugin/plugin.json` — `version`
+   - `package.json`: `version`
+   - `.claude-plugin/plugin.json`: `version`
 2. Commit the bump:
    ```bash
    git add package.json .claude-plugin/plugin.json
@@ -44,7 +44,7 @@ To pull updates later:
    git push origin main --tags
    ```
 4. Users running `/plugin marketplace update switchroom` will see the new version on
-   their next refresh. There is no separate publish step — GitHub is the
+   their next refresh. There is no separate publish step. GitHub is the
    distribution channel.
 
 ### Versioning
@@ -71,7 +71,7 @@ update switchroom` to pick up the changes (or remove and re-add the marketplace)
 
 Claude Code's plugin convention puts skills under `<plugin-root>/skills/`.
 Because switchroom already kept its skills at `<repo-root>/skills/`, the marketplace
-entry uses `"source": "./"` — the repo root *is* the plugin root. No skill files
+entry uses `"source": "./"`. The repo root *is* the plugin root. No skill files
 were moved. The only new artifacts are:
 
 - `.claude-plugin/marketplace.json`

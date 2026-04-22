@@ -1,6 +1,6 @@
 # Switchroom's Telegram Plugin
 
-Switchroom ships an enhanced Telegram MCP plugin (`switchroom-telegram`) that replaces the official `telegram@claude-plugins-official` marketplace plugin. It is the **default** for all agents — you don't need to configure anything to use it.
+Switchroom ships an enhanced Telegram MCP plugin (`switchroom-telegram`) that replaces the official `telegram@claude-plugins-official` marketplace plugin. It is the **default** for all agents. You don't need to configure anything to use it.
 
 ## Why a fork?
 
@@ -56,7 +56,7 @@ Per-agent `access.json` defines:
 
 The plugin exposes the multi-account slot-pool verbs inside Telegram, so
 you can add, switch, and prune subscriptions without SSHing into the
-host. The agent argument is optional — if omitted, it defaults to the
+host. The agent argument is optional. If omitted, it defaults to the
 agent receiving the message.
 
 | Command | Equivalent CLI |
@@ -110,7 +110,7 @@ agents:
 How live progress is surfaced while a turn is in flight. Configure via
 `channels.telegram.stream_mode` in `switchroom.yaml`:
 
-- **`checklist`** (default) — event-driven progress card. Reads canonical
+- **`checklist`** (default): event-driven progress card. Reads canonical
   `tool_use` / `tool_result` / `turn_end` events from the session JSONL
   and renders a stable, fixed-order checklist with per-item state emojis
   (⏸ pending · ⚡ running · ✅ done · ❌ failed) and a short label per
@@ -120,8 +120,8 @@ How live progress is surfaced while a turn is in flight. Configure via
   only on semantic transitions with a 500ms min-edit floor and a 400ms
   coalesce window, so bursts of quick tools render as a single edit.
   No flicker.
-- **`pty`** — tails Claude Code's TUI output and re-renders a snapshot
-  on each frame. Legacy fallback — can visibly flicker as Ink does
+- **`pty`**: tails Claude Code's TUI output and re-renders a snapshot
+  on each frame. Legacy fallback. Can visibly flicker as Ink does
   differential re-renders during quick tool calls. Keep this mode only
   if you've customised agent hooks or prompts in a way that breaks the
   session-tail projection.
@@ -147,7 +147,7 @@ The switchroom fork reads additional env vars from `start.sh`:
 |---------|--------|---------|
 | `SWITCHROOM_TG_FORMAT` | `channels.telegram.format` | Default reply format (`html`, `markdownv2`, `text`) |
 | `SWITCHROOM_TG_RATE_LIMIT_MS` | `channels.telegram.rate_limit_ms` | Min delay between outgoing messages |
-| `SWITCHROOM_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty` — see "Streaming modes" above |
+| `SWITCHROOM_TG_STREAM_MODE` | `channels.telegram.stream_mode` | `checklist` (default) or `pty`. See "Streaming modes" above |
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |

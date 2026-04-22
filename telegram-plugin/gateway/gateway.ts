@@ -25,6 +25,7 @@ import { join, extname, sep, basename } from 'path'
 import { installPluginLogger } from '../plugin-logger.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
+import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
@@ -126,6 +127,13 @@ import type {
   HeartbeatMessage,
   InboundMessage,
 } from './ipc-protocol.js'
+import { writePidFile, clearPidFile } from './pid-file.js'
+import {
+  writeSessionMarker,
+  readSessionMarker,
+  shouldFireRestartBanner,
+  type SessionMarker,
+} from './session-marker.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -534,6 +542,12 @@ function stopTypingLoop(chat_id: string): void {
   if (retry) { clearTimeout(retry); typingRetryTimers.delete(chat_id) }
 }
 
+const typingWrapper = createTypingWrapper({
+  startTypingLoop,
+  stopTypingLoop,
+  isSurfaceTool: isTelegramSurfaceTool,
+})
+
 // ─── Robust API call wrapper ──────────────────────────────────────────────
 // Extracted to telegram-plugin/retry-api-call.ts so it's unit-testable in
 // isolation; the gateway just composes the pure policy with its own logger.
@@ -659,6 +673,22 @@ let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) =>
 const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
 // Ensure the directory for the socket exists
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+
+// PID file + session marker. See pid-file.ts and session-marker.ts for
+// the 2026-04-22 incident that motivates these. The PID file lets the
+// in-agent plugin distinguish "gateway gone" from "socket blinked on a
+// live gateway"; the session marker lets the crash-recovery banner
+// distinguish a real process restart from a grammY poll-restart.
+const GATEWAY_PID_PATH = process.env.SWITCHROOM_GATEWAY_PID_FILE ?? join(STATE_DIR, 'gateway.pid.json')
+const GATEWAY_SESSION_MARKER_PATH = process.env.SWITCHROOM_GATEWAY_SESSION_MARKER ?? join(STATE_DIR, 'gateway-session.json')
+const GATEWAY_STARTED_AT_MS = Date.now()
+
+try {
+  writePidFile(GATEWAY_PID_PATH, { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS })
+  process.stderr.write(`telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS}\n`)
+} catch (err) {
+  process.stderr.write(`telegram gateway: writePidFile failed: ${err}\n`)
+}
 
 const ipcServer: IpcServer = createIpcServer({
   socketPath: SOCKET_PATH,
@@ -1432,6 +1462,9 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
 function handleSessionEvent(ev: SessionEvent): void {
   switch (ev.kind) {
     case 'enqueue': {
+      // Drain any orphaned typing-wrap entries left over from a crashed
+      // prior turn before resetting focus.
+      typingWrapper.drainAll()
       if (ev.chatId) {
         currentSessionChatId = ev.chatId
         currentSessionThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
@@ -1467,6 +1500,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (!ctrl) return
       if (isTelegramSurfaceTool(name)) return
       ctrl.setTool(name)
+      if (ev.toolUseId) {
+        typingWrapper.onToolUse(ev.toolUseId, currentSessionChatId, name)
+      }
       return
     }
     case 'text': {
@@ -1501,8 +1537,24 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       return
     }
-    case 'tool_result': return
+    case 'tool_result': {
+      if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
+      return
+    }
+    case 'sub_agent_tool_use': {
+      if (currentSessionChatId == null) return
+      if (!ev.toolUseId) return
+      typingWrapper.onToolUse(ev.toolUseId, currentSessionChatId, ev.toolName)
+      return
+    }
+    case 'sub_agent_tool_result': {
+      if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
+      return
+    }
     case 'turn_end': {
+      // Drain any still-pending tool dispatch typing entries — covers
+      // transcript truncation or a Claude Code crash mid-tool.
+      typingWrapper.drainAll()
       if (orphanedReplyTimeoutId != null) {
         clearTimeout(orphanedReplyTimeoutId)
         orphanedReplyTimeoutId = null
@@ -3669,6 +3721,12 @@ async function shutdown(): Promise<void> {
   ipcServer.broadcast({ type: 'status', status: 'gateway_shutting_down' })
   await ipcServer.close()
 
+  // Clear PID file so the next bridge spawn sees "no PID file" = gateway
+  // truly gone, rather than racing a stale file against an already-dead
+  // process. Session marker is left on disk intentionally — it's read
+  // by the NEXT gateway process's banner-gate.
+  clearPidFile(GATEWAY_PID_PATH)
+
   // Safety net: force exit after 3 seconds if graceful stop hangs
   const forceExitTimer = setTimeout(() => process.exit(0), 3000)
   forceExitTimer.unref()
@@ -3906,10 +3964,19 @@ void (async () => {
           }
         } catch {}
 
-        // Crash recovery
+        // Crash recovery. Gated on the session marker so a grammY
+        // poll-restart (which re-enters the outer retry loop) does NOT
+        // fire the banner — only an actual new process does. See
+        // session-marker.ts for the 2026-04-22 incident this closes.
         try {
           const marker = readRestartMarker()
-          if (!marker) {
+          const currentSession: SessionMarker = { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS }
+          const storedSession = readSessionMarker(GATEWAY_SESSION_MARKER_PATH)
+          const bannerOK = shouldFireRestartBanner({ stored: storedSession, current: currentSession })
+          if (!marker && !bannerOK) {
+            process.stderr.write(`telegram gateway: boot: suppressed 'recovered' banner — session marker matches current process (pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS})\n`)
+          }
+          if (!marker && bannerOK) {
             const bootAccess = loadAccess()
             const ownerChatId = bootAccess.allowFrom[0]
             if (ownerChatId && HISTORY_ENABLED) {
@@ -3930,6 +3997,13 @@ void (async () => {
                 }
               } catch {}
             }
+          }
+          // Always update the marker to the current process on this
+          // boot pass so subsequent banner-gates see "stored === current".
+          try {
+            writeSessionMarker(GATEWAY_SESSION_MARKER_PATH, currentSession)
+          } catch (err) {
+            process.stderr.write(`telegram gateway: writeSessionMarker failed: ${err}\n`)
           }
         } catch {}
 

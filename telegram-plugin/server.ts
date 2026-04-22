@@ -61,6 +61,18 @@ import { installPluginLogger } from './plugin-logger.js'
 import { sanitizeChannelBody } from './channel-envelope-safety.js'
 import { StatusReactionController } from './status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from './tool-names.js'
+import { createTypingWrapper } from './typing-wrap.js'
+import {
+  readPidFile,
+  isPidAlive,
+  shouldFallBackToLegacy,
+} from './gateway/pid-file.js'
+import {
+  readSessionMarker,
+  writeSessionMarker,
+  shouldFireRestartBanner,
+  type SessionMarker,
+} from './gateway/session-marker.js'
 
 // Route all process.stderr.write calls (including downstream "telegram channel:",
 // "[streaming-metrics] ...", and draft-stream edit-error lines) to a rotating
@@ -91,13 +103,12 @@ installPluginLogger()
 {
   const _stateDir = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
   const _gatewaySocket = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(_stateDir, 'gateway.sock')
+  const _gatewayPidPath = process.env.SWITCHROOM_GATEWAY_PID_FILE ?? join(_stateDir, 'gateway.pid.json')
+
   let _gatewayLive = false
-  if (existsSync(_gatewaySocket)) {
-    // Probe the socket: attempt a TCP-level connect then immediately close.
-    // If the gateway is alive, connect succeeds; if the listener is gone
-    // (ECONNREFUSED) or the probe fails transiently, we fall through to
-    // legacy mode WITHOUT deleting the socket — see banner-incident note
-    // above.
+
+  async function probeSocketOnce(): Promise<void> {
+    if (!existsSync(_gatewaySocket)) return
     try {
       await Bun.connect({
         unix: _gatewaySocket,
@@ -110,18 +121,64 @@ installPluginLogger()
         },
       })
       _gatewayLive = true
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(
-        `telegram channel: socket ${_gatewaySocket} exists but probe failed (${msg}) — ` +
-        `falling through to legacy monolith. Socket left intact; gateway owns lifecycle.\n`,
-      )
+    } catch {
+      /* swallow — caller inspects _gatewayLive */
     }
   }
+
+  // Retry-before-fallback: if the socket is momentarily unreachable
+  // but the gateway PID file exists AND the PID is alive, the gateway
+  // is just briefly not listening (accept-backlog, handshake race, or
+  // a sub-ms window during gateway's own restart). Retry with backoff
+  // rather than spawning a second grammY poller. See pid-file.ts for
+  // the 2026-04-22 incident this closes.
+  await probeSocketOnce()
+  if (!_gatewayLive) {
+    const BACKOFFS_MS = [200, 500, 1000, 2000, 4000]
+    for (const delay of BACKOFFS_MS) {
+      const rec = readPidFile(_gatewayPidPath)
+      const pidFileExists = rec !== null
+      const pidAlive = rec != null && isPidAlive(rec.pid)
+      const decision = shouldFallBackToLegacy({
+        socketReachable: false,
+        pidFileExists,
+        pidAlive,
+      })
+      if (decision) break
+      process.stderr.write(
+        `telegram channel: socket ${_gatewaySocket} unreachable but gateway PID ${rec?.pid} alive — retrying in ${delay}ms\n`,
+      )
+      await new Promise((r) => setTimeout(r, delay))
+      await probeSocketOnce()
+      if (_gatewayLive) break
+    }
+  }
+
   if (_gatewayLive) {
     process.stderr.write(`telegram channel: gateway detected at ${_gatewaySocket}, running as bridge\n`)
     await import('./bridge/bridge.js')
     await new Promise(() => {})
+  }
+
+  // Final fallback-or-not decision after retries exhausted. We reach
+  // here only if the socket is still not reachable; log which branch
+  // of the decision tree we took.
+  const _finalRec = readPidFile(_gatewayPidPath)
+  const _finalPidFileExists = _finalRec !== null
+  const _finalPidAlive = _finalRec != null && isPidAlive(_finalRec.pid)
+  if (!shouldFallBackToLegacy({
+    socketReachable: false,
+    pidFileExists: _finalPidFileExists,
+    pidAlive: _finalPidAlive,
+  })) {
+    // The PID is alive but the socket stayed unreachable across all
+    // retries. Something is genuinely wrong with the gateway — don't
+    // make it worse by spawning a second poller. Abort this sidecar.
+    process.stderr.write(
+      `telegram channel: gateway PID ${_finalRec?.pid} alive but socket ${_gatewaySocket} unreachable after retries — ` +
+      `refusing to fall back to legacy monolith (would 409-conflict against live gateway). Exiting sidecar.\n`,
+    )
+    process.exit(0)
   }
   process.stderr.write('telegram channel: no gateway socket found, running legacy monolith\n')
 }
@@ -151,6 +208,7 @@ const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', '
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
+const LEGACY_STARTED_AT_MS = Date.now()
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -887,6 +945,12 @@ function stopTypingLoop(chat_id: string): void {
     typingIntervals.delete(chat_id)
   }
 }
+
+const typingWrapper = createTypingWrapper({
+  startTypingLoop,
+  stopTypingLoop,
+  isSurfaceTool: isTelegramSurfaceTool,
+})
 
 // ---------------------------------------------------------------------------
 // Robust API call wrapper — handles 429, 400 edge cases, network retries
@@ -2791,6 +2855,9 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
 function handleSessionEvent(ev: SessionEvent): void {
   switch (ev.kind) {
     case 'enqueue': {
+      // Drain any orphaned typing-wrap entries left over from a crashed
+      // prior turn before resetting focus.
+      typingWrapper.drainAll()
       // The model is about to process this chat. Reset turn tracking and
       // capture the focus so subsequent events route correctly.
       if (ev.chatId) {
@@ -2862,6 +2929,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       // Everything else is the model doing real work — drive a tool reaction.
       ctrl.setTool(name)
+      if (ev.toolUseId) {
+        typingWrapper.onToolUse(ev.toolUseId, currentSessionChatId, name)
+      }
       return
     }
     case 'text': {
@@ -2933,9 +3003,23 @@ function handleSessionEvent(ev: SessionEvent): void {
       return
     }
     case 'tool_result': {
+      if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
+      return
+    }
+    case 'sub_agent_tool_use': {
+      if (currentSessionChatId == null) return
+      if (!ev.toolUseId) return
+      typingWrapper.onToolUse(ev.toolUseId, currentSessionChatId, ev.toolName)
+      return
+    }
+    case 'sub_agent_tool_result': {
+      if (ev.toolUseId) typingWrapper.onToolResult(ev.toolUseId)
       return
     }
     case 'turn_end': {
+      // Drain any still-pending tool dispatch typing entries — covers
+      // transcript truncation or a Claude Code crash mid-tool.
+      typingWrapper.drainAll()
       // Cancel orphaned-reply timeout — turn_end arrived normally
       if (orphanedReplyTimeoutId != null) {
         clearTimeout(orphanedReplyTimeoutId)
@@ -5537,9 +5621,20 @@ void (async () => {
       // previously running (we have history and an allowlisted DM chat),
       // notify the owner that we recovered from an unexpected crash/kill.
       // This covers SIGKILL, OOM, systemd auto-restart after exit-on-failure.
+      //
+      // Gated on a session marker (pid + startedAt) so a grammY
+      // poll-restart within one process lifetime does NOT refire the
+      // banner. See session-marker.ts for the 2026-04-22 incident.
       try {
         const marker = readRestartMarker()
-        if (!marker) {
+        const _sessionMarkerPath = process.env.SWITCHROOM_LEGACY_SESSION_MARKER ?? join(STATE_DIR, 'legacy-session.json')
+        const currentSession: SessionMarker = { pid: process.pid, startedAtMs: LEGACY_STARTED_AT_MS }
+        const storedSession = readSessionMarker(_sessionMarkerPath)
+        const bannerOK = shouldFireRestartBanner({ stored: storedSession, current: currentSession })
+        if (!marker && !bannerOK) {
+          process.stderr.write(`telegram channel: boot: suppressed 'recovered' banner — session marker matches current process (pid=${process.pid})\n`)
+        }
+        if (!marker && bannerOK) {
           const bootAccess = loadAccess()
           const ownerChatId = bootAccess.allowFrom[0]
           if (ownerChatId && HISTORY_ENABLED) {
@@ -5573,6 +5668,14 @@ void (async () => {
               process.stderr.write(`telegram channel: crash recovery history check failed: ${histErr}\n`)
             }
           }
+        }
+        // Always record this process in the session marker — subsequent
+        // banner-gates within this process lifetime see "stored === current"
+        // and stay silent on poll-restarts.
+        try {
+          writeSessionMarker(_sessionMarkerPath, currentSession)
+        } catch (err) {
+          process.stderr.write(`telegram channel: writeSessionMarker failed: ${err}\n`)
         }
       } catch (err) {
         process.stderr.write(`telegram channel: crash recovery notification failed: ${err}\n`)

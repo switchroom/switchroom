@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Switchroom Dashboard</title>
+  <title>Switchroom Fleet</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -209,8 +209,8 @@
 </head>
 <body>
   <header>
-    <h1>Switchroom <span>Dashboard</span></h1>
-    <div class="refresh-info">Auto-refresh: 10s</div>
+    <h1>Switchroom <span>Fleet</span></h1>
+    <div class="refresh-info">Refreshes every 10s</div>
   </header>
   <main>
     <div id="error"></div>
@@ -285,7 +285,7 @@
     function render() {
       const container = document.getElementById('agents');
       if (agents.length === 0) {
-        container.innerHTML = '<div class="loading">No agents configured</div>';
+        container.innerHTML = '<div class="loading">No agents yet. Run <code>switchroom agent create &lt;name&gt; --profile &lt;profile&gt;</code> to add one.</div>';
         return;
       }
 

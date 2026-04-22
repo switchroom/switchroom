@@ -1,6 +1,6 @@
 # Sub-Agent Delegation
 
-Switchroom generates Claude Code custom sub-agent files (`.claude/agents/<name>.md`) from your switchroom.yaml config. This enables the "Opus plans, Sonnet implements" pattern — the main agent delegates to cheaper models running in the background.
+Switchroom generates Claude Code custom sub-agent files (`.claude/agents/<name>.md`) from your switchroom.yaml config. This enables the "Opus plans, Sonnet implements" pattern. The main agent delegates to cheaper models running in the background.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ After `switchroom agent create` or `switchroom agent reconcile`, these become `.
 ## How Delegation Works
 
 1. The main agent (e.g. Opus) receives your request
-2. It dispatches to `@worker` — a Sonnet sub-agent running in the background
+2. It dispatches to `@worker`, a Sonnet sub-agent running in the background
 3. The main agent responds immediately ("working on it") and stays available
 4. The worker implements in its own git worktree
 5. When done, the main agent reviews the result
@@ -89,7 +89,7 @@ The dev agent's `worker` completely replaces the default `worker`.
 
 ## Design Principles
 
-- **Generic, not domain-specific.** Default sub-agents are `worker`, `researcher`, `reviewer` — domain-agnostic names that work for any agent type.
+- **Generic, not domain-specific.** Default sub-agents are `worker`, `researcher`, `reviewer`. Domain-agnostic names that work for any agent type.
 - **Smart defaults.** Ship with useful sub-agents out of the box. Override per-profile or per-agent when needed.
 - **Don't fight Claude Code.** Sub-agent files use Claude Code's native spec. No wrapper, no custom runtime.
 - **No `CLAUDE_CODE_SUBAGENT_MODEL`.** That env var overrides ALL sub-agents including built-in Explore (Haiku). Per-file model control is the right granularity.

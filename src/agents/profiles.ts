@@ -42,6 +42,31 @@ function hasProfileFiles(dir: string): boolean {
 }
 
 /**
+ * List the filesystem profiles under PROFILES_ROOT that a user can
+ * pass to `switchroom agent create --profile <name>`. Skips the
+ * framework-internal `_base/` profile (underscore-prefixed by
+ * convention — users aren't meant to pick it) and any entry that
+ * doesn't look like a real profile directory.
+ */
+export function listAvailableProfiles(): string[] {
+  try {
+    return readdirSync(PROFILES_ROOT)
+      .filter((name) => !name.startsWith("_"))
+      .filter((name) => {
+        const p = resolve(PROFILES_ROOT, name);
+        try {
+          return statSync(p).isDirectory() && hasProfileFiles(p);
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Path to the `_base/` profile directory. Contains framework-level
  * render templates (start.sh.hbs, settings.json.hbs) that every
  * agent uses regardless of their `extends:` choice. Hardcoded name,

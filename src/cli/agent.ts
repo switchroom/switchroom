@@ -7,6 +7,7 @@ import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent } from "../agents/scaffold.js";
+import { listAvailableProfiles } from "../agents/profiles.js";
 import {
   startAgent,
   stopAgent,
@@ -231,6 +232,90 @@ function printTable(
   }
 }
 
+/**
+ * Synthesize a human-readable topic name fallback from an agent's
+ * CLI name. `health-coach` → `Health Coach`. The schema requires
+ * `topic_name` on every agent; when `--profile` is used to create a
+ * yaml entry from scratch there's no place for the user to provide
+ * one, so we derive a reasonable default. Users can edit later.
+ *
+ * Exported for tests.
+ */
+export function synthesizeTopicName(name: string): string {
+  return name
+    .split(/[-_]+/)
+    .filter((s) => s.length > 0)
+    .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+    .join(" ");
+}
+
+/**
+ * Write a new agent entry into switchroom.yaml. Preserves surrounding
+ * comments + formatting via yaml's Document API. Creates the
+ * `agents:` map if missing (it shouldn't be, but defensive). Throws
+ * if the agent already exists — caller should guard with its own
+ * existence check.
+ *
+ * Exported for tests.
+ */
+export function writeAgentEntryToConfig(
+  configPath: string,
+  name: string,
+  profile: string,
+): void {
+  if (!existsSync(configPath)) {
+    throw new Error(`switchroom.yaml not found at ${configPath}`);
+  }
+  const raw = readFileSync(configPath, "utf-8");
+  const doc = YAML.parseDocument(raw);
+
+  let agents = doc.get("agents") as YAML.YAMLMap | null;
+  if (!agents) {
+    agents = new YAML.YAMLMap();
+    doc.set("agents", agents);
+  }
+  if (agents.has(name)) {
+    throw new Error(
+      `Agent "${name}" already exists in ${configPath}. Use updateAgentExtendsInConfig to change its profile.`,
+    );
+  }
+
+  const entry = new YAML.YAMLMap();
+  entry.set("extends", profile);
+  entry.set("topic_name", synthesizeTopicName(name));
+  agents.set(name, entry);
+
+  writeFileSync(configPath, doc.toString(), "utf-8");
+}
+
+/**
+ * Add or overwrite an `extends:` field on an existing agent entry in
+ * switchroom.yaml. Only used when the yaml entry exists but has no
+ * extends field and the user passed --profile — we write it in rather
+ * than refusing the explicit CLI intent. Caller is responsible for
+ * confirming the agent exists and does not already have a different
+ * extends value.
+ *
+ * Exported for tests.
+ */
+export function updateAgentExtendsInConfig(
+  configPath: string,
+  name: string,
+  profile: string,
+): void {
+  const raw = readFileSync(configPath, "utf-8");
+  const doc = YAML.parseDocument(raw);
+  const agents = doc.get("agents") as YAML.YAMLMap | null;
+  if (!agents || !agents.has(name)) {
+    throw new Error(
+      `Agent "${name}" not found in ${configPath}; cannot update extends.`,
+    );
+  }
+  const agentNode = agents.get(name) as YAML.YAMLMap;
+  agentNode.set("extends", profile);
+  writeFileSync(configPath, doc.toString(), "utf-8");
+}
+
 export function registerAgentCommand(program: Command): void {
   const agent = program
     .command("agent")
@@ -362,31 +447,124 @@ export function registerAgentCommand(program: Command): void {
       }),
     );
 
-  // switchroom agent create <name>
+  // switchroom agent create <name> [--profile <profile>]
   //
-  // The profile an agent extends is declared in switchroom.yaml via
-  // `extends: <profile>`, not on the CLI — there's only one source of
-  // truth. This command just materializes the directory/files.
+  // Two entry points into the same scaffold step:
+  //
+  //   1. YAML-first — the user edits switchroom.yaml to add an agent
+  //      with `extends: <profile>`, then runs `agent create` with no
+  //      --profile flag. The existing "not defined in yaml" error fires
+  //      with a hint about --profile if the entry is missing.
+  //
+  //   2. CLI-first (one-shot) — the user runs
+  //      `agent create <name> --profile <profile>` for a fresh agent.
+  //      We validate the profile against the filesystem, write a new
+  //      entry into switchroom.yaml (`extends: <profile>`, plus the
+  //      required topic_name fallback), reload the config, and scaffold.
+  //
+  //   If the name already exists in yaml AND --profile is passed:
+  //     - matching extends → proceed silently
+  //     - differing extends → error (don't silently mutate)
+  //     - no extends in yaml → warn, then add the extends line
+  //       (additive-only — safer than refusing the explicit CLI intent)
   agent
     .command("create <name>")
-    .description("Scaffold a new agent directory")
+    .description("Scaffold a new agent directory (optionally from a profile)")
+    .option(
+      "--profile <profile>",
+      "Profile to extend from (e.g. 'health-coach', 'coding'). " +
+      "Writes the entry into switchroom.yaml if it doesn't exist yet."
+    )
     .action(
-      withConfigError(async (name: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        const agentConfig = config.agents[name];
+      withConfigError(async (name: string, opts: { profile?: string }) => {
+        const configPath = getConfigPath(program);
+        let config = getConfig(program);
+        let agentConfig = config.agents[name];
+
+        // If the user passed --profile, validate it against the
+        // filesystem profiles/ directory before we touch yaml.
+        if (opts.profile) {
+          const available = listAvailableProfiles();
+          if (!available.includes(opts.profile)) {
+            console.error(
+              chalk.red(`Unknown profile: "${opts.profile}"`)
+            );
+            console.error(
+              chalk.gray(`  Valid profiles: ${available.join(", ")}`)
+            );
+            process.exit(1);
+          }
+        }
 
         if (!agentConfig) {
-          console.error(
-            chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
-          );
-          console.error(
-            chalk.gray(
-              `  Add it to the agents section first, or use one of: ${Object.keys(config.agents).join(", ")}`
+          if (!opts.profile) {
+            console.error(
+              chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
+            );
+            console.error(
+              chalk.gray(
+                `  Hint: pass --profile <profile> to scaffold a new agent ` +
+                `in one shot (or add the entry to switchroom.yaml manually).`
+              )
+            );
+            const existing = Object.keys(config.agents);
+            if (existing.length > 0) {
+              console.error(
+                chalk.gray(`  Existing agents: ${existing.join(", ")}`)
+              );
+            }
+            process.exit(1);
+          }
+
+          // Fresh agent, --profile supplied — write the entry to yaml.
+          writeAgentEntryToConfig(configPath, name, opts.profile!);
+          console.log(
+            chalk.green(
+              `  Added agent "${name}" to ${configPath} with extends: ${opts.profile}`
             )
           );
-          process.exit(1);
+
+          // Reload config after writing so scaffoldAgent sees the new entry.
+          config = loadConfig(configPath);
+          agentConfig = config.agents[name];
+          if (!agentConfig) {
+            // Shouldn't happen — if it does, surface loudly rather than
+            // silently scaffold against stale in-memory config.
+            console.error(
+              chalk.red(
+                `Internal error: wrote agent "${name}" to yaml but config ` +
+                `reload did not pick it up. Inspect ${configPath} and retry.`
+              )
+            );
+            process.exit(1);
+          }
+        } else if (opts.profile) {
+          // Agent already exists in yaml; reconcile --profile against
+          // the existing extends: value.
+          const existingExtends = agentConfig.extends;
+          if (!existingExtends) {
+            console.log(
+              chalk.yellow(
+                `  Agent "${name}" exists in switchroom.yaml without an extends: ` +
+                `field. Writing extends: ${opts.profile}.`
+              )
+            );
+            updateAgentExtendsInConfig(configPath, name, opts.profile);
+            config = loadConfig(configPath);
+            agentConfig = config.agents[name];
+          } else if (existingExtends !== opts.profile) {
+            console.error(
+              chalk.red(
+                `Agent "${name}" is already configured with profile ` +
+                `"${existingExtends}". Edit switchroom.yaml or drop --profile.`
+              )
+            );
+            process.exit(1);
+          }
+          // existingExtends === opts.profile → proceed silently.
         }
+
+        const agentsDir = resolveAgentsDir(config);
 
         console.log(chalk.bold(`\nScaffolding agent: ${name}\n`));
         scaffoldAgent(
