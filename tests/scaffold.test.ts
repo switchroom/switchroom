@@ -3409,3 +3409,116 @@ describe("installSwitchroomSkills", () => {
     expect(switchroomEntries.length).toBeGreaterThan(0);
   });
 });
+
+describe("CLAUDE.md-first workspace template (Phase 5)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-claudemd-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("scaffolds workspace/CLAUDE.md as a regular file with expected content", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("claudemd-fresh", config, tmpDir, telegramConfig);
+
+    const claudeMd = join(result.agentDir, "workspace", "CLAUDE.md");
+    expect(existsSync(claudeMd)).toBe(true);
+    expect(lstatSync(claudeMd).isFile()).toBe(true);
+    expect(lstatSync(claudeMd).isSymbolicLink()).toBe(false);
+
+    const content = readFileSync(claudeMd, "utf-8");
+    expect(content).toContain("CLAUDE.md — Agent Operating Protocol");
+    expect(content).toContain("AGENTS.md");
+    expect(content).toContain("AGENT.md");
+    expect(content).toContain("Working on code repositories");
+  });
+
+  it("creates workspace/AGENTS.md and workspace/AGENT.md as symlinks to CLAUDE.md", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("claudemd-symlinks", config, tmpDir, telegramConfig);
+
+    const agentsMd = join(result.agentDir, "workspace", "AGENTS.md");
+    const agentMd = join(result.agentDir, "workspace", "AGENT.md");
+
+    expect(lstatSync(agentsMd).isSymbolicLink()).toBe(true);
+    expect(lstatSync(agentMd).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentsMd)).toBe("CLAUDE.md");
+    expect(readlinkSync(agentMd)).toBe("CLAUDE.md");
+  });
+
+  it("content read via AGENTS.md, AGENT.md, and CLAUDE.md is identical", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("claudemd-identity", config, tmpDir, telegramConfig);
+
+    const viaClaude = readFileSync(join(result.agentDir, "workspace", "CLAUDE.md"), "utf-8");
+    const viaAgents = readFileSync(join(result.agentDir, "workspace", "AGENTS.md"), "utf-8");
+    const viaAgent = readFileSync(join(result.agentDir, "workspace", "AGENT.md"), "utf-8");
+    expect(viaAgents).toBe(viaClaude);
+    expect(viaAgent).toBe(viaClaude);
+  });
+
+  it("migrates a legacy regular-file workspace/AGENTS.md into CLAUDE.md on reconcile", () => {
+    // Simulate a pre-Phase-5 agent: scaffold first, then replace the
+    // post-Phase-5 layout with the legacy shape (regular-file AGENTS.md,
+    // no CLAUDE.md, no AGENT.md symlink). Then reconcile and verify the
+    // migration preserved the legacy content under the new filename.
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "legacy-agent": config },
+    } as SwitchroomConfig;
+
+    const result = scaffoldAgent("legacy-agent", config, tmpDir, telegramConfig, switchroomConfig);
+    const workspaceDir = join(result.agentDir, "workspace");
+
+    // Unwind Phase-5 layout → legacy state
+    rmSync(join(workspaceDir, "AGENT.md"), { force: true });
+    rmSync(join(workspaceDir, "AGENTS.md"), { force: true });
+    const legacyContent = "# Pre-Phase-5 AGENTS.md\n\nAgent-specific customization that must survive.\n";
+    writeFileSync(join(workspaceDir, "AGENTS.md"), legacyContent, "utf-8");
+    rmSync(join(workspaceDir, "CLAUDE.md"), { force: true });
+
+    reconcileAgent("legacy-agent", config, tmpDir, telegramConfig, switchroomConfig);
+
+    const claudeMd = join(workspaceDir, "CLAUDE.md");
+    const agentsMd = join(workspaceDir, "AGENTS.md");
+    const agentMd = join(workspaceDir, "AGENT.md");
+
+    expect(existsSync(claudeMd)).toBe(true);
+    expect(lstatSync(claudeMd).isFile()).toBe(true);
+    expect(lstatSync(claudeMd).isSymbolicLink()).toBe(false);
+    // Migrated content preserved (writeIfMissing skipped CLAUDE.md since the
+    // migration already created it).
+    expect(readFileSync(claudeMd, "utf-8")).toBe(legacyContent);
+
+    expect(lstatSync(agentsMd).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentsMd)).toBe("CLAUDE.md");
+    expect(lstatSync(agentMd).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentMd)).toBe("CLAUDE.md");
+  });
+
+  it("is idempotent — reconcile twice leaves symlinks unchanged", () => {
+    const config = makeAgentConfig();
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "idem-claudemd": config },
+    } as SwitchroomConfig;
+
+    scaffoldAgent("idem-claudemd", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("idem-claudemd", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("idem-claudemd", config, tmpDir, telegramConfig, switchroomConfig);
+
+    const agentsMd = join(tmpDir, "idem-claudemd", "workspace", "AGENTS.md");
+    const agentMd = join(tmpDir, "idem-claudemd", "workspace", "AGENT.md");
+    expect(lstatSync(agentsMd).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentsMd)).toBe("CLAUDE.md");
+    expect(lstatSync(agentMd).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(agentMd)).toBe("CLAUDE.md");
+  });
+});

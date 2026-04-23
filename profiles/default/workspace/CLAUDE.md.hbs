@@ -1,7 +1,9 @@
-# AGENTS.md — Agent Operating Protocol
+# CLAUDE.md — Agent Operating Protocol
 
 This file is loaded on every session (and injected into the system prompt)
 so you, the agent, know how to operate in this workspace.
+`AGENTS.md` and `AGENT.md` are symlinks to this file — edit here, not
+there.
 
 ## Every session
 
@@ -55,6 +57,37 @@ Failed edits burn your own context and the user's patience. Verify first.
   blocking.
 - `memory_search` and `memory_get` (when available) are your primary
   interface to workspace knowledge; use them before asking the user.
+
+## Working on code repositories
+
+When you start work on any code repository outside this workspace — your
+own or someone else's — **check for repo-level agent guidance before you
+touch code**. The repo's authors may have documented conventions, build
+steps, testing requirements, or "do not do X" rules that aren't obvious
+from the files alone.
+
+First time you operate in a repo this session, look for (in order):
+
+1. `CLAUDE.md` — Claude Code's convention
+2. `AGENTS.md` — cross-tool convention (often a symlink to `CLAUDE.md`)
+3. `AGENT.md` — older alias
+
+Each may exist in the repo root or in subdirectories for
+repo-subsection-specific rules. Also check a `.github/` directory for
+`CONTRIBUTING.md` which covers human-contributor conventions that
+usually apply to you too.
+
+If none exist, fall back to `README.md` + recent commit history
+(`git log --oneline -20`) for implicit conventions.
+
+**Why this matters:** Claude Code only auto-loads `CLAUDE.md` from the
+directory it was started in and its parents. When you navigate into a
+different repo mid-session (or dispatch a sub-agent to work there),
+that repo's agent guidance is NOT in your context unless you `Read` it.
+Missing this is how you commit against someone's style, skip their
+tests, or bypass their release flow.
+
+One `Read` at the start of repo work costs ~1s and saves rework.
 
 ## Signals
 
