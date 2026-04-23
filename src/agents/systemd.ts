@@ -3,7 +3,8 @@ import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "n
 import { resolve, join, dirname } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
-import { usesSwitchroomTelegramPlugin } from "../config/merge.js";
+import { usesSwitchroomTelegramPlugin, resolveAgentConfig } from "../config/merge.js";
+import { resolveTimezone } from "../config/timezone.js";
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -28,7 +29,13 @@ function unitFilePath(name: string): string {
   return resolve(SYSTEMD_USER_DIR, `${unitName(name)}.service`);
 }
 
-export function generateUnit(name: string, agentDir: string, useAutoaccept = false, gatewayUnitName?: string): string {
+export function generateUnit(
+  name: string,
+  agentDir: string,
+  useAutoaccept = false,
+  gatewayUnitName?: string,
+  timezone?: string,
+): string {
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
 
@@ -38,6 +45,14 @@ export function generateUnit(name: string, agentDir: string, useAutoaccept = fal
 
   const afterDeps = ["network-online.target"];
   if (useAutoaccept) afterDeps.push(`${unitName(gatewayUnitName ?? GATEWAY_UNIT_NAME)}.service`);
+
+  // TZ= makes subprocess `date`, `Date.now()`-formatted strings, and
+  // anything else that reads the env see the right zone — cheap insurance
+  // beyond the UserPromptSubmit hint. SWITCHROOM_TIMEZONE is the canonical
+  // source that bin/timezone-hook.sh reads to emit the per-turn context line.
+  const tzEnv = timezone
+    ? `Environment=TZ=${timezone}\nEnvironment=SWITCHROOM_TIMEZONE=${timezone}\n`
+    : "";
 
   return `[Unit]
 Description=switchroom agent: ${name}
@@ -54,7 +69,7 @@ StandardError=journal
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=${agentDir}
-
+${tzEnv}
 [Install]
 WantedBy=default.target
 `;
@@ -228,7 +243,14 @@ export function installAllUnits(config: SwitchroomConfig): void {
     const useAutoaccept = usesSwitchroomTelegramPlugin(agent);
     const gwName = useAutoaccept ? `${agentName}-gateway` : undefined;
 
-    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName);
+    // Resolve the full cascade so profile/defaults-provided timezones flow
+    // through to the unit's TZ= env. Without this, `generateUnit` would only
+    // see the raw per-agent entry and miss the common case of
+    // `defaults.timezone` being set once for the fleet.
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
+    const timezone = resolveTimezone(config, resolved);
+
+    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone);
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
 

@@ -367,9 +367,55 @@ export const ChannelsSchema = z
  * excluded from defaults — defaulting a topic name across multiple
  * agents would collapse them onto the same Telegram thread.
  */
+/**
+ * Rough IANA timezone validator. Accepts canonical Region/City (and
+ * Region/Sub/City, e.g. America/Argentina/Buenos_Aires) plus the bare
+ * "UTC" string. Explicitly rejects three-letter aliases (EST, PST),
+ * bare offsets (UTC+10, +10:00), and empty strings — those are exactly
+ * the values that mislead the `date` CLI and Claude Code's clocks in
+ * subtle ways on edge-case hosts (Windows-style aliases, containers
+ * inheriting a broken $TZ).
+ *
+ * The pattern is:
+ *   - exactly "UTC", OR
+ *   - at least one "/"-separated segment group, each segment starting
+ *     with a capital and containing [A-Za-z0-9_+-] thereafter.
+ *
+ * The inner class includes `+-` and `0-9` so real IANA zones like
+ * `Etc/GMT+1`, `Etc/GMT-10`, and `America/Port-au-Prince` are accepted.
+ * Bare offsets like `UTC+10` and `+10:00` are still rejected because
+ * the first (anchored) alternative requires exactly "UTC" and the
+ * second requires a capital-letter prefix followed by at least one "/".
+ *
+ * The "/" requirement is what excludes EST / PST / MST — they have no
+ * slash, they aren't "UTC", so they're out. Any real IANA zone carries
+ * at least a Region/City pair.
+ *
+ * Not exhaustive: we don't ship the IANA database itself. If `date -u`
+ * accepts a name we reject, add it to the pattern. Cheap validator here
+ * beats a 600KB zone bundle we'd never refresh.
+ */
+const TIMEZONE_REGEX = /^UTC$|^[A-Z][A-Za-z0-9_+-]+(\/[A-Z][A-Za-z0-9_+-]+){1,2}$/;
+
 const profileFields = {
   extends: z.string().optional(),
   bot_token: z.string().optional(),
+  timezone: z
+    .string()
+    .regex(
+      TIMEZONE_REGEX,
+      "timezone must be an IANA zone name like 'Australia/Melbourne' or 'UTC' " +
+      "(three-letter aliases like EST/PST and bare offsets like UTC+10 are not accepted)",
+    )
+    .optional()
+    .describe(
+      "IANA timezone name (e.g. 'Australia/Melbourne', 'America/New_York', " +
+      "'UTC'). Used to generate the per-turn local-time hint the agent's " +
+      "UserPromptSubmit timezone hook emits, and baked into the systemd " +
+      "unit as TZ= so subprocess `date`/`Date.now()` are correct. If unset " +
+      "at every cascade layer, switchroom auto-detects from /etc/timezone " +
+      "and warns on `reconcile` when the detected zone is UTC.",
+    ),
   soul: z
     .object({
       name: z.string().optional(),
@@ -453,6 +499,20 @@ export const AgentSchema = z.object({
     .string()
     .optional()
     .describe("Per-agent Telegram bot token or vault reference (overrides global telegram.bot_token)"),
+  timezone: z
+    .string()
+    .regex(
+      TIMEZONE_REGEX,
+      "timezone must be an IANA zone name like 'Australia/Melbourne' or 'UTC' " +
+      "(three-letter aliases like EST/PST and bare offsets like UTC+10 are not accepted)",
+    )
+    .optional()
+    .describe(
+      "Per-agent IANA timezone override. Wins over any profile/defaults " +
+      "value and over the top-level switchroom.timezone global. Controls " +
+      "the UserPromptSubmit timezone hook's emitted local time and the " +
+      "systemd unit's TZ= env.",
+    ),
   auth_label: z
     .string()
     .optional()
@@ -665,6 +725,18 @@ export const SwitchroomConfigSchema = z.object({
         "Shared skills pool. Each subdirectory is a named skill " +
         "(matching a switchroom.yaml `skills:` entry). Scaffold symlinks " +
         "selected skills into each agent's skills/ directory."
+      ),
+    timezone: z
+      .string()
+      .regex(
+        TIMEZONE_REGEX,
+        "timezone must be an IANA zone name like 'Australia/Melbourne' or 'UTC'",
+      )
+      .optional()
+      .describe(
+        "Global default IANA timezone applied to every agent unless the " +
+        "agent (or its profile) declares its own. See the per-agent " +
+        "timezone field for the full cascade and auto-detection fallback.",
       ),
   }),
   telegram: TelegramConfigSchema,

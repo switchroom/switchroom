@@ -206,6 +206,9 @@ export function mergeAgentConfig(
   if (defaults.bot_token !== undefined && merged.bot_token === undefined) {
     merged.bot_token = defaults.bot_token;
   }
+  if (defaults.timezone !== undefined && merged.timezone === undefined) {
+    merged.timezone = defaults.timezone;
+  }
   if (defaults.model !== undefined && merged.model === undefined) {
     merged.model = defaults.model;
   }

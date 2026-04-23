@@ -26,6 +26,7 @@ import {
   usesSwitchroomTelegramPlugin,
   deepMergeJson,
 } from "../config/merge.js";
+import { resolveTimezone, classifyTimezoneSource } from "../config/timezone.js";
 import {
   getProfilePath,
   getBaseProfilePath,
@@ -1952,6 +1953,20 @@ export function scaffoldAgent(
             },
           ],
         },
+        // Timezone hook — fast (one `date` call), emits a one-line
+        // additionalContext string so the LLM sees fresh local time on every
+        // turn. Placed last so the time-of-turn line renders near the bottom
+        // of the hook-injected preamble. 3s timeout is generous headroom for
+        // a call that should finish in <20ms.
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
+              timeout: 3,
+            },
+          ],
+        },
       ];
       if (userHooks) {
         settings.hooks = {
@@ -2487,6 +2502,24 @@ export function reconcileAgent(
   const agentDir = resolve(agentsDir, name);
   const changes: string[] = [];
 
+  // Timezone sanity check — warn when we fell back to server detection
+  // AND the detected zone is UTC. That combination almost always means
+  // the host is a container inheriting the platform default, not a real
+  // expression of the user's locale, and the per-turn time hint will be
+  // useless. Silent when an explicit value is present at any layer.
+  {
+    const resolvedTz = resolveTimezone(switchroomConfig, agentConfig);
+    const source = classifyTimezoneSource(switchroomConfig, agentConfig);
+    if (source === "detected" && resolvedTz === "UTC") {
+      console.warn(
+        `  ${chalk.yellow("⚠")} Timezone auto-detected as UTC from server. This is often a container default.`,
+      );
+      console.warn(
+        `     Set \`timezone: "Region/City"\` in switchroom.yaml to silence this warning.`,
+      );
+    }
+  }
+
   if (!existsSync(agentDir)) {
     throw new Error(
       `Agent directory does not exist: ${agentDir}. Run \`switchroom agent create ${name}\` first.`,
@@ -2848,6 +2881,16 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
             type: "command",
             command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
             timeout: 5,
+          },
+        ],
+      },
+      // Timezone hook — see matching comment in scaffoldAgent for rationale.
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
+            timeout: 3,
           },
         ],
       },

@@ -6,6 +6,7 @@ import { dirname, resolve, join } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
 import { reconcileAgent } from "../agents/scaffold.js";
 import { restartAgent } from "../agents/lifecycle.js";
+import { installAllUnits } from "../agents/systemd.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { getConfigPath } from "./helpers.js";
 
@@ -188,6 +189,26 @@ export function registerUpdateCommand(program: Command): void {
         if (agentNames.length === 0) {
           console.log(chalk.yellow("\n  No agents defined in switchroom.yaml — nothing to reconcile.\n"));
           return;
+        }
+
+        // 6a. Regenerate systemd units BEFORE reconcile+restart so restarted
+        //     agents pick up any env-var changes (e.g. SWITCHROOM_TIMEZONE,
+        //     TZ) baked into the unit file. Without this, upgraded installs
+        //     keep their stale units and new env-based features silently
+        //     no-op until `switchroom systemd install` is run manually.
+        //
+        //     installAllUnits is idempotent: it rewrites every per-agent
+        //     unit + gateway unit from the current config, runs
+        //     `systemctl --user daemon-reload`, and re-enables the units.
+        //     Safe to call every `switchroom update`.
+        console.log(chalk.bold("\n  Regenerating systemd units..."));
+        try {
+          installAllUnits(config);
+          console.log(chalk.green(`    ${agentNames.length} unit(s) rewritten`));
+        } catch (err) {
+          console.error(
+            chalk.red(`    Failed to regenerate units: ${(err as Error).message}`)
+          );
         }
 
         console.log(chalk.bold(`\n  Reconciling ${agentNames.length} agent(s)...`));
