@@ -52,11 +52,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mekenthompson/switchroom.git"
+    "url": "https://github.com/switchroom/switchroom.git"
   },
-  "homepage": "https://github.com/mekenthompson/switchroom#readme",
+  "homepage": "https://github.com/switchroom/switchroom#readme",
   "bugs": {
-    "url": "https://github.com/mekenthompson/switchroom/issues"
+    "url": "https://github.com/switchroom/switchroom/issues"
   },
   "publishConfig": {
     "access": "public"

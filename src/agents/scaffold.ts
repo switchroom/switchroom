@@ -1491,6 +1491,96 @@ function seedWorkspaceBootstrapFiles(params: {
 }
 
 /**
+ * Pre-seed migration: if the agent has a legacy `workspace/AGENTS.md`
+ * regular file (pre-Phase 5 scaffold) and no `workspace/CLAUDE.md` yet,
+ * rename AGENTS.md → CLAUDE.md so any agent-specific edits survive.
+ * The subsequent seed pass is `writeIfMissing`, so it will skip CLAUDE.md
+ * and preserve the migrated content. A later step replaces AGENTS.md with
+ * a symlink into CLAUDE.md.
+ *
+ * Safe to call multiple times — does nothing if AGENTS.md is already a
+ * symlink or if CLAUDE.md already exists.
+ */
+function migrateLegacyAgentsMdIfPresent(
+  agentWorkspaceDir: string,
+  created: string[],
+): void {
+  const agentsMd = join(agentWorkspaceDir, "AGENTS.md");
+  const claudeMd = join(agentWorkspaceDir, "CLAUDE.md");
+  if (!existsSync(agentsMd)) return;
+  const stat = lstatSync(agentsMd);
+  if (stat.isSymbolicLink()) return; // already migrated
+  if (existsSync(claudeMd)) {
+    // CLAUDE.md already present — legacy AGENTS.md will be removed by
+    // ensureClaudeMdSymlinks so the symlink can take its place.
+    return;
+  }
+  // Preserve agent-specific customizations by renaming.
+  const content = readFileSync(agentsMd, "utf-8");
+  writeFileSync(claudeMd, content, "utf-8");
+  rmSync(agentsMd);
+  created.push(claudeMd);
+  console.log(
+    chalk.dim(
+      `  migrated legacy workspace/AGENTS.md → workspace/CLAUDE.md (content preserved)`,
+    ),
+  );
+}
+
+/**
+ * Ensure `workspace/AGENTS.md` and `workspace/AGENT.md` are symlinks
+ * pointing at `CLAUDE.md`. Mirrors the pattern used in the switchroom
+ * repo's own root where AGENTS.md/AGENT.md are symlinks to CLAUDE.md so
+ * every tooling convention resolves to the same file.
+ *
+ * Migration-safe: removes any pre-existing regular file or wrong-target
+ * symlink at those paths before re-linking. Idempotent across reconcile
+ * runs.
+ *
+ * No-op if workspace/CLAUDE.md doesn't exist (edge case — template wasn't
+ * rendered, nothing to link to).
+ */
+function ensureClaudeMdSymlinks(
+  agentWorkspaceDir: string,
+  changes: string[],
+): void {
+  const claudeMd = join(agentWorkspaceDir, "CLAUDE.md");
+  if (!existsSync(claudeMd)) return;
+
+  for (const name of ["AGENTS.md", "AGENT.md"] as const) {
+    const linkPath = join(agentWorkspaceDir, name);
+    if (existsSync(linkPath) || lstatExists(linkPath)) {
+      const stat = lstatSync(linkPath);
+      if (stat.isSymbolicLink()) {
+        const target = readlinkSync(linkPath);
+        if (target === "CLAUDE.md") continue; // already correct
+        rmSync(linkPath);
+      } else {
+        // Regular file from a previous scaffold — remove so the symlink
+        // can take its place. Content has already been migrated into
+        // CLAUDE.md by migrateLegacyAgentsMdIfPresent when applicable.
+        rmSync(linkPath);
+      }
+    }
+    symlinkSync("CLAUDE.md", linkPath);
+    changes.push(linkPath);
+  }
+}
+
+/**
+ * `existsSync` follows symlinks, so a broken symlink reads as "doesn't
+ * exist". Use lstat to detect link entries regardless of target health.
+ */
+function lstatExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Initialize the workspace directory as a git repository (if git is available).
  * Creates .gitignore to exclude regenerables (SOUL.md) and ephemeral state (*.log),
  * then makes an initial commit capturing the seeded template content.
@@ -2241,13 +2331,21 @@ export function scaffoldAgent(
     }
   }
 
-  // --- Seed workspace bootstrap files from profile (AGENTS.md, USER.md, etc.)
+  // --- Seed workspace bootstrap files from profile (CLAUDE.md, USER.md, etc.)
   //
   //     Profiles may ship a `workspace/` subdirectory containing .hbs
   //     templates and plain files. Each .hbs is rendered into the agent's
   //     `workspace/` directory; plain files are copied verbatim. These files
   //     are user-editable afterwards — we only seed on first scaffold (via
   //     writeIfMissing) so user edits survive re-runs.
+  //
+  //     Phase 5: CLAUDE.md is the primary agent-protocol file; AGENTS.md
+  //     and AGENT.md are symlinks to it. Run the legacy-AGENTS.md
+  //     migration before seeding so any pre-Phase-5 customizations are
+  //     preserved into CLAUDE.md before the seed pass runs.
+  const phase5WorkspaceDir = join(agentDir, "workspace");
+  mkdirSync(phase5WorkspaceDir, { recursive: true });
+  migrateLegacyAgentsMdIfPresent(phase5WorkspaceDir, created);
   seedWorkspaceBootstrapFiles({
     profilePath,
     agentDir,
@@ -2255,6 +2353,7 @@ export function scaffoldAgent(
     created,
     skipped,
   });
+  ensureClaudeMdSymlinks(phase5WorkspaceDir, created);
 
   // --- Initialize workspace as git repo (Phase 4) ---
   const workspaceDir = join(agentDir, "workspace");
@@ -2576,7 +2675,9 @@ function classifyChange(
   // When hotReloadStable is false (default), they're baked into --append-system-prompt at start
   const stableWorkspaceFiles = [
     "workspace/SOUL.md",
+    "workspace/CLAUDE.md",
     "workspace/AGENTS.md",
+    "workspace/AGENT.md",
     "workspace/USER.md",
     "workspace/IDENTITY.md",
     "workspace/TOOLS.md",
@@ -3300,6 +3401,13 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     hindsightBankId,
     hindsightApiBaseUrl,
   });
+  // Phase 5 migration: preserve any agent-specific edits to the legacy
+  // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before
+  // the seed pass runs. seedWorkspaceBootstrapFiles is writeIfMissing,
+  // so it will then skip CLAUDE.md and preserve the migrated content.
+  const reconcileWorkspaceDir = join(agentDir, "workspace");
+  mkdirSync(reconcileWorkspaceDir, { recursive: true });
+  migrateLegacyAgentsMdIfPresent(reconcileWorkspaceDir, changes);
   seedWorkspaceBootstrapFiles({
     profilePath: reconcileProfilePath,
     agentDir,
@@ -3307,9 +3415,9 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     created: changes,
     skipped: [],
   });
+  ensureClaudeMdSymlinks(reconcileWorkspaceDir, changes);
 
   // --- Phase 4: idempotent workspace git init (for existing agents) ---
-  const reconcileWorkspaceDir = join(agentDir, "workspace");
   if (existsSync(reconcileWorkspaceDir)) {
     initWorkspaceGitRepo(reconcileWorkspaceDir, name);
   }

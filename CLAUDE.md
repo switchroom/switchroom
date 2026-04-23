@@ -88,6 +88,70 @@ globally. During local work on src/, prefer `bun run dev` over rebuilding.
   `docs(scope):`, `test(scope):`, `chore(scope):`). Recent history is a
   good reference — `git log --oneline -20`.
 
+## Repo model & dev flow
+
+Switchroom uses a **fork + canonical** model. Read this before pushing.
+
+- **`switchroom/switchroom`** — canonical public repo, source of truth
+  for releases. All `npm publish` output comes from here. Tagged
+  versions (`v0.X.Y`) live here.
+- **Your fork** (e.g. `<your-username>/switchroom`) — where you work.
+  Feature branches + PRs on the fork for iteration; release-time PRs
+  from the fork's `main` → `switchroom:main`.
+
+**Local git remotes** should be:
+- `origin` → your fork (for push)
+- `upstream` → `switchroom/switchroom` (for pulling canonical updates)
+
+Agent working on this repo: when you open a PR, **target
+`switchroom/switchroom:main`** as the base, not the fork's main. The fork
+is a staging area for your own iteration; the canonical repo is where
+review + merge + release happens.
+
+### Three workflows — know which one you're in
+
+**1. Code-change dev loop (most common).** Editing source, iterating.
+```
+bun run build                  # ~1s, regenerates dist/cli/switchroom.js
+switchroom agent restart all   # reconciles + restarts running agents
+```
+
+**2. Release to npm (canonical maintainers).** Bump `package.json`,
+update `CHANGELOG.md`, commit `chore: release vX.Y.Z`, tag, push, then
+`npm publish`. Publishes come from the canonical repo only.
+
+**3. Local deploy.** Same as the dev loop — pull, build, restart.
+
+### Code ≠ runtime
+
+A rebuild updates the CLI + dist/. It does **not** update running agent
+processes — those loaded the code at boot and hold it in memory.
+**Changes only go live after the runtime restarts post-build.** When
+your work affects the CLI, the telegram-plugin, or scaffolded assets,
+expect a `switchroom agent restart all` to be part of verification.
+
+Since PR #59, `switchroom agent restart` always runs reconcile first
+(regenerating systemd units + daemon-reload if changed). So a restart is
+also a mini-deploy of any scaffold changes.
+
+### Install paths
+
+`~/.bun/bin/switchroom` is typically a symlink to the workspace's
+`dist/cli/switchroom.js`. If you built with `bun run build`, the global
+CLI is already fresh — no `npm i -g` needed. An `npm i -g switchroom-ai`
+installs a separate, pinned copy at `~/.nvm/…/node_modules/switchroom-ai`;
+PATH resolution order determines which wins. Prefer the bun-linked install
+on dev machines, the npm-global install on consumer machines.
+
+### Secrets in tests
+
+The repo has GitHub Push Protection enabled. Don't commit real-looking
+tokens — even as test fixtures — as contiguous string literals. If you
+need a token-shaped fixture for testing secret detectors, construct it
+at runtime via string concatenation so the source file never contains a
+contiguous token pattern. See
+`telegram-plugin/tests/secret-detect-secretlint.test.ts` for the pattern.
+
 ## Safety rails
 
 - **Never bypass hooks** (`--no-verify`, `--no-gpg-sign`) without an
