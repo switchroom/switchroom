@@ -120,3 +120,64 @@ export function shouldSuppressRecoveryBanner(
   if (age < 0) return false; // clock skew defence — treat as stale
   return age < maxAgeMs;
 }
+
+/** Maximum age for a pre-stamped reason to be considered "fresh" and
+ *  worth preserving across a SIGTERM-triggered marker rewrite. Matches
+ *  the cooperative-race window in `writeRestartReasonMarker`
+ *  (src/agents/lifecycle.ts): CLI/user/watchdog initiators stamp the
+ *  marker immediately before issuing the systemctl restart, so the
+ *  SIGTERM handler runs well within 30s. */
+export const REASON_PRESERVE_MAX_AGE_MS = 30_000;
+
+/** Fallback reason stamped when the gateway receives SIGTERM/SIGINT and
+ *  no other initiator (CLI, watchdog, user slash) pre-stamped a reason.
+ *  Covers the "bare `systemctl restart switchroom-<name>-gateway`" path
+ *  that PR #58 did not thread through. Without this, those restarts
+ *  produced a reasonless marker and the greeting's Restarted row was
+ *  silently omitted — which is exactly what Ken hit on 2026-04-24
+ *  when applying an EnvironmentFile change via systemctl. */
+export const EXTERNAL_RESTART_FALLBACK_REASON = "systemctl: external restart";
+
+/**
+ * Pure decision: compute the marker the SIGTERM/SIGINT handler should
+ * write, given any prior marker already on disk (e.g. stamped by a CLI
+ * restart, watchdog, or user slash BEFORE systemd sent the signal).
+ *
+ * Three outcomes:
+ *
+ *   1. Prior marker exists AND carries a reason AND is fresh (<30s):
+ *      preserve the reason, refresh `ts` to now and set `signal` to the
+ *      incoming signal. This is the cooperative-race case — every CLI
+ *      path writes its reason microseconds before issuing the
+ *      `systemctl restart` that delivers SIGTERM, and we must not clobber
+ *      that attribution.
+ *
+ *   2. Prior marker exists but is stale, has no reason, or is missing
+ *      a required field: write a fresh marker with the fallback reason
+ *      `"systemctl: external restart"`. This is the bare-`systemctl
+ *      restart` path (no CLI wrapping, no watchdog, no slash command)
+ *      which otherwise leaves the greeting silent about WHY the
+ *      restart happened.
+ *
+ *   3. No prior marker at all: same as case 2 — fresh marker with the
+ *      fallback reason. Staying silent would regress the user-visible
+ *      contract that every planned shutdown produces a Restarted row.
+ *
+ * Pure so we can unit-test the sequencing without racing a real gateway
+ * shutdown. Keeping `now` and `prior` as arguments removes the hidden
+ * time + fs dependency.
+ */
+export function resolveShutdownMarker(
+  prior: CleanShutdownMarker | null,
+  signal: string,
+  now: number,
+  maxPreserveAgeMs: number = REASON_PRESERVE_MAX_AGE_MS,
+): CleanShutdownMarker {
+  if (prior && typeof prior.reason === "string" && prior.reason.length > 0) {
+    const age = now - prior.ts;
+    if (age >= 0 && age < maxPreserveAgeMs) {
+      return { ts: now, signal, reason: prior.reason };
+    }
+  }
+  return { ts: now, signal, reason: EXTERNAL_RESTART_FALLBACK_REASON };
+}

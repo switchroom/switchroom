@@ -144,6 +144,7 @@ import {
   // it renders the "Restarted <reason>" row. See the boot path comment
   // around the reason-rendering block for the lifecycle rationale.
   shouldSuppressRecoveryBanner,
+  resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS as CLEAN_SHUTDOWN_MAX_AGE_MS,
 } from './clean-shutdown-marker.js'
 import { runPipeline } from '../secret-detect/pipeline.js'
@@ -4004,14 +4005,23 @@ async function shutdown(signal: string): Promise<void> {
   // startup mutex (PR #53 nit fix), but those are real crashes — writing
   // the marker on a crash would suppress its own recovery banner at the
   // next boot, defeating the entire feature.
+  //
+  // Preserve any reason an initiator stamped microseconds before SIGTERM.
+  // CLI/watchdog/user-slash paths call writeRestartReasonMarker(…reason)
+  // right before issuing `systemctl restart`; without this readback the
+  // shutdown handler would clobber their reason with a signal-only
+  // marker, and the next greeting card would render no Restarted row.
+  // Falls back to `"systemctl: external restart"` when no initiator
+  // stamped a reason (bare `systemctl restart switchroom-<name>-gateway`
+  // from an admin terminal) so the greeting always surfaces WHY we
+  // bounced. See resolveShutdownMarker() for the full decision table.
   const isOsSignal = signal === 'SIGTERM' || signal === 'SIGINT'
   if (isOsSignal) {
     try {
-      writeCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH, {
-        ts: Date.now(),
-        signal,
-      })
-      process.stderr.write(`telegram gateway: shutdown.clean_marker_written signal=${signal} path=${GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH}\n`)
+      const prior = readCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
+      const next = resolveShutdownMarker(prior, signal, Date.now())
+      writeCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH, next)
+      process.stderr.write(`telegram gateway: shutdown.clean_marker_written signal=${signal} reason=${JSON.stringify(next.reason ?? '')} preserved=${prior?.reason === next.reason && prior != null} path=${GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH}\n`)
     } catch (err) {
       process.stderr.write(`telegram gateway: shutdown.clean_marker_write_failed err=${(err as Error).message}\n`)
     }

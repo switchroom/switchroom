@@ -35,7 +35,10 @@ import {
   readCleanShutdownMarker,
   clearCleanShutdownMarker,
   shouldSuppressRecoveryBanner,
+  resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS,
+  EXTERNAL_RESTART_FALLBACK_REASON,
+  REASON_PRESERVE_MAX_AGE_MS,
   type CleanShutdownMarker,
 } from "../gateway/clean-shutdown-marker.js";
 
@@ -217,6 +220,162 @@ describe("shouldSuppressRecoveryBanner", () => {
     expect(shouldSuppressRecoveryBanner({ ts: now, signal: "SIGTERM" }, now)).toBe(true);
     expect(shouldSuppressRecoveryBanner({ ts: now, signal: "SIGINT" }, now)).toBe(true);
     expect(shouldSuppressRecoveryBanner({ ts: now, signal: "SIGUSR1" }, now)).toBe(true);
+  });
+});
+
+describe("resolveShutdownMarker (SIGTERM-handler sequencing)", () => {
+  // These tests pin the fix for the 2026-04-24 bug where bare
+  // `systemctl restart switchroom-<name>-gateway` produced a reasonless
+  // marker AND the shutdown handler clobbered any reason stamped by a
+  // preceding CLI/watchdog/user-slash initiator. The resolver preserves
+  // fresh reasons and falls back to "systemctl: external restart" so
+  // the next greeting card always has a non-empty Restarted row for
+  // planned shutdowns.
+
+  it("preserves a fresh prior reason (cooperative race with a CLI/user stamp)", () => {
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = {
+      ts: now - 500, // 500ms old — CLI just stamped
+      signal: "SIGTERM",
+      reason: "cli: deploying abc1234",
+    };
+    const next = resolveShutdownMarker(prior, "SIGTERM", now);
+    expect(next.reason).toBe("cli: deploying abc1234");
+    expect(next.signal).toBe("SIGTERM");
+    expect(next.ts).toBe(now);
+  });
+
+  it("preserves user-slash attribution when the gateway stamps before spawning the CLI", () => {
+    // /restart, /reconcile, /new, /reset paths in gateway.ts call
+    // stampUserRestartReason() which writes the marker, then spawn the
+    // detached CLI which stamps its own. By the time SIGTERM arrives,
+    // the most recent marker should already carry "user: /restart from
+    // chat" (preserved by preserveExisting in writeRestartReasonMarker).
+    // The SIGTERM handler must then preserve it a second time.
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = {
+      ts: now - 2_000,
+      signal: "SIGTERM",
+      reason: "user: /restart from chat",
+    };
+    const next = resolveShutdownMarker(prior, "SIGTERM", now);
+    expect(next.reason).toBe("user: /restart from chat");
+  });
+
+  it("falls back to 'systemctl: external restart' when no prior marker exists", () => {
+    // Bare `systemctl restart switchroom-<name>-gateway` from an admin
+    // terminal — no CLI, no watchdog, no slash command stamped anything.
+    // Before this fix the marker was `{ts, signal}` with no reason and
+    // the greeting silently omitted the Restarted row. This is the
+    // 04:57 2026-04-24 bug Ken hit when applying an EnvironmentFile
+    // change.
+    const now = 1_700_000_000_000;
+    const next = resolveShutdownMarker(null, "SIGTERM", now);
+    expect(next.reason).toBe(EXTERNAL_RESTART_FALLBACK_REASON);
+    expect(next.signal).toBe("SIGTERM");
+    expect(next.ts).toBe(now);
+  });
+
+  it("falls back when a prior marker is missing its reason field", () => {
+    // A reasonless prior marker means an earlier SIGTERM-only path
+    // wrote it (pre-fix gateway) or an initiator stamped ts+signal
+    // without a reason. Either way, we have no attribution to preserve
+    // — use the fallback so the greeting is never silent.
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = { ts: now - 1_000, signal: "SIGTERM" };
+    const next = resolveShutdownMarker(prior, "SIGTERM", now);
+    expect(next.reason).toBe(EXTERNAL_RESTART_FALLBACK_REASON);
+  });
+
+  it("falls back when the prior reason is stale (>30s)", () => {
+    // A stale prior reason almost certainly belongs to an earlier
+    // shutdown cycle, not the current one. Using it would mis-attribute
+    // today's restart to yesterday's initiator. The 30s window matches
+    // writeRestartReasonMarker's preserveExisting guard in
+    // src/agents/lifecycle.ts.
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = {
+      ts: now - 60_000,
+      signal: "SIGTERM",
+      reason: "cli: deploying 0badc0de",
+    };
+    const next = resolveShutdownMarker(prior, "SIGTERM", now);
+    expect(next.reason).toBe(EXTERNAL_RESTART_FALLBACK_REASON);
+  });
+
+  it("falls back when the prior reason is in the future (clock skew)", () => {
+    // A negative age indicates clock skew; don't trust it.
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = {
+      ts: now + 5_000,
+      signal: "SIGTERM",
+      reason: "cli: restart",
+    };
+    const next = resolveShutdownMarker(prior, "SIGTERM", now);
+    expect(next.reason).toBe(EXTERNAL_RESTART_FALLBACK_REASON);
+  });
+
+  it("respects a custom maxPreserveAgeMs", () => {
+    const now = 1_700_000_000_000;
+    const prior: CleanShutdownMarker = {
+      ts: now - 10_000,
+      signal: "SIGTERM",
+      reason: "watchdog: bridge disconnected for 145s",
+    };
+    // Fresh under the default 30s guard, stale under a 5s guard.
+    expect(resolveShutdownMarker(prior, "SIGTERM", now).reason).toBe(
+      "watchdog: bridge disconnected for 145s",
+    );
+    expect(resolveShutdownMarker(prior, "SIGTERM", now, 5_000).reason).toBe(
+      EXTERNAL_RESTART_FALLBACK_REASON,
+    );
+  });
+
+  it("copies the incoming signal onto the resolved marker (SIGTERM vs SIGINT)", () => {
+    const now = 1_700_000_000_000;
+    expect(resolveShutdownMarker(null, "SIGTERM", now).signal).toBe("SIGTERM");
+    expect(resolveShutdownMarker(null, "SIGINT", now).signal).toBe("SIGINT");
+  });
+
+  it("REASON_PRESERVE_MAX_AGE_MS matches the lifecycle.ts cooperative window", () => {
+    // Load-bearing constant — if the two windows drift out of sync, the
+    // CLI-stamps-then-SIGTERM race gets harder to reason about. Pin it.
+    expect(REASON_PRESERVE_MAX_AGE_MS).toBe(30_000);
+  });
+});
+
+describe("gateway.ts shutdown-handler wiring (source-level)", () => {
+  // Source-grep pins so a future refactor can't silently drop the
+  // reason-preserving + fallback-writing behaviour the 2026-04-24 fix
+  // added to the SIGTERM handler.
+  const gatewaySource = readFileSync(
+    join(import.meta.dir, "..", "gateway", "gateway.ts"),
+    "utf8",
+  );
+
+  it("reads any prior marker before writing the new one", () => {
+    // The handler MUST readCleanShutdownMarker first — writing without
+    // the readback clobbers reasons stamped by CLI/watchdog/user-slash
+    // initiators that ran microseconds before SIGTERM.
+    expect(gatewaySource).toMatch(
+      /const prior = readCleanShutdownMarker\(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH\)/,
+    );
+  });
+
+  it("routes the marker computation through resolveShutdownMarker", () => {
+    expect(gatewaySource).toMatch(
+      /const next = resolveShutdownMarker\(prior, signal, Date\.now\(\)\)/,
+    );
+    expect(gatewaySource).toMatch(
+      /writeCleanShutdownMarker\(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH, next\)/,
+    );
+  });
+
+  it("logs the resolved reason + preserved flag so journals are diagnosable", () => {
+    // The journal line is what operators grep when "why did the greeting
+    // say X?" questions come up. Keep it present.
+    expect(gatewaySource).toContain("shutdown.clean_marker_written");
+    expect(gatewaySource).toContain("reason=${JSON.stringify(next.reason ?? '')}");
   });
 });
 
