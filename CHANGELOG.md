@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2 — 2026-04-24
+
+### Fixed
+- Removed absolute source paths baked into bundled output (build hygiene). The bundler was inlining `__filename` as a developer-machine absolute path inside `dist/cli/switchroom.js`. Switched `src/memory/scaffold-integration.ts` to `import.meta.dirname` so the resolved `switchroom-mcp/server.ts` anchor is computed at runtime from the bundle's own location. No published behaviour change, no new code paths.
+
 ## v0.2.1 — 2026-04-24
 
 ### Added

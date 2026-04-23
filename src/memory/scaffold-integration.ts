@@ -1,4 +1,4 @@
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   generateHindsightMcpConfig,
@@ -40,11 +40,20 @@ export function getHindsightSettingsEntry(
 export function getSwitchroomMcpSettingsEntry(
   configPath?: string,
 ): { key: string; value: McpServerConfig } {
-  // Resolve the path to switchroom-mcp/server.ts relative to this source file.
-  // At runtime this file lives at src/memory/scaffold-integration.ts (or .js),
-  // and switchroom-mcp/ is at the project root alongside src/.
+  // Resolve the path to switchroom-mcp/server.ts relative to this module.
+  // At dev time this file lives at src/memory/scaffold-integration.ts; after
+  // bundling it lives at dist/cli/switchroom.js. In both cases the project
+  // root is two levels up from `import.meta.dirname`, and switchroom-mcp/
+  // sits alongside src/ and dist/ at the project root.
+  //
+  // NOTE: we deliberately avoid `__filename` here — Bun's bundler replaces it
+  // with the absolute source path at build time, which both leaks developer
+  // home-dir paths into shipped artifacts and points at a file that does not
+  // exist inside the npm tarball.
   const serverPath = resolve(
-    dirname(dirname(dirname(import.meta.path ?? __filename))),
+    import.meta.dirname,
+    "..",
+    "..",
     "switchroom-mcp",
     "server.ts",
   );
