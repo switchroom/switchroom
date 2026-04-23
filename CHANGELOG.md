@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.3 — 2026-04-24
+
+### Fixed
+- gateway SIGTERM handler was clobbering stamped restart reasons, so greetings showed "clean shutdown" with no "why". Handler now preserves fresh reasons from any initiator and falls back to "systemctl: external restart" otherwise.
+
 ## v0.2.2 — 2026-04-24
 
 ### Fixed

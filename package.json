@@ -1,6 +1,6 @@
 {
   "name": "switchroom-ai",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys, no Docker.",
   "type": "module",
   "bin": {
