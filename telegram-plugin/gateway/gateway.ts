@@ -136,6 +136,13 @@ import {
   shouldFireRestartBanner,
   type SessionMarker,
 } from './session-marker.js'
+import {
+  writeCleanShutdownMarker,
+  readCleanShutdownMarker,
+  clearCleanShutdownMarker,
+  shouldSuppressRecoveryBanner,
+  DEFAULT_MAX_AGE_MS as CLEAN_SHUTDOWN_MAX_AGE_MS,
+} from './clean-shutdown-marker.js'
 import { runPipeline } from '../secret-detect/pipeline.js'
 import { StagingMap } from '../secret-detect/staging.js'
 import { maskToken } from '../secret-detect/mask.js'
@@ -704,6 +711,12 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 // distinguish a real process restart from a grammY poll-restart.
 const GATEWAY_PID_PATH = process.env.SWITCHROOM_GATEWAY_PID_FILE ?? join(STATE_DIR, 'gateway.pid.json')
 const GATEWAY_SESSION_MARKER_PATH = process.env.SWITCHROOM_GATEWAY_SESSION_MARKER ?? join(STATE_DIR, 'gateway-session.json')
+// Separate from gateway-session.json (which fires the recovery banner on a
+// real process restart) and from restart-pending.json (the user-initiated
+// /restart marker carrying chat_id + ack_message_id). This one is written
+// by the SIGTERM/SIGINT handler so the next boot can suppress the
+// "recovered from unexpected restart" banner for planned shutdowns.
+const GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH = process.env.SWITCHROOM_GATEWAY_CLEAN_SHUTDOWN_MARKER ?? join(STATE_DIR, 'clean-shutdown.json')
 const GATEWAY_STARTED_AT_MS = Date.now()
 
 // Startup mutex. Atomic single-writer claim on the PID file so two
@@ -3942,6 +3955,34 @@ async function shutdown(signal: string): Promise<void> {
   const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
   process.stderr.write('telegram gateway: shutting down\n')
 
+  // Write the clean-shutdown sentinel BEFORE any drain work begins so
+  // even if the drain hangs and the +5s force-exit kills us, the marker
+  // is already on disk for the next boot to find. This is what tells
+  // the next gateway "this restart was planned (systemd/CLI/Coolify),
+  // don't post the 'recovered from unexpected restart' banner". Distinct
+  // from restart-pending.json, which is the user-initiated /restart
+  // marker (chat_id + ack_message_id, posts a quote-reply ack).
+  //
+  // ONLY write the marker for genuine OS-signal shutdowns. uncaughtException
+  // and unhandledRejection ALSO route through shutdown() to release the
+  // startup mutex (PR #53 nit fix), but those are real crashes — writing
+  // the marker on a crash would suppress its own recovery banner at the
+  // next boot, defeating the entire feature.
+  const isOsSignal = signal === 'SIGTERM' || signal === 'SIGINT'
+  if (isOsSignal) {
+    try {
+      writeCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH, {
+        ts: Date.now(),
+        signal,
+      })
+      process.stderr.write(`telegram gateway: shutdown.clean_marker_written signal=${signal} path=${GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH}\n`)
+    } catch (err) {
+      process.stderr.write(`telegram gateway: shutdown.clean_marker_write_failed err=${(err as Error).message}\n`)
+    }
+  } else {
+    process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
+  }
+
   // Clean up all timers and pending state.
   // Snapshot timer handles before clearing so a late-firing timer can't
   // invalidate the iterator by deleting its own entry during cleanup.
@@ -4258,15 +4299,37 @@ void (async () => {
         // poll-restart (which re-enters the outer retry loop) does NOT
         // fire the banner — only an actual new process does. See
         // session-marker.ts for the 2026-04-22 incident this closes.
+        //
+        // ALSO gated on the clean-shutdown marker: SIGTERM/SIGINT writes
+        // a sentinel before draining, so deliberate restarts (systemctl,
+        // `switchroom agent restart`, Coolify, etc.) suppress the
+        // banner. See clean-shutdown-marker.ts for the 2026-04-23 UX gap
+        // this closes.
         try {
           const marker = readRestartMarker()
+          const cleanMarker = readCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
+          const nowMs = Date.now()
+          const cleanFresh = shouldSuppressRecoveryBanner(cleanMarker, nowMs, CLEAN_SHUTDOWN_MAX_AGE_MS)
+          if (cleanMarker) {
+            const ageSec = Math.max(0, Math.round((nowMs - cleanMarker.ts) / 1000))
+            if (cleanFresh) {
+              process.stderr.write(`telegram gateway: boot.clean_shutdown_detected age=${ageSec}s signal=${cleanMarker.signal} — suppressing 'recovered from unexpected restart' banner\n`)
+            } else {
+              // Marker present but stale: shutdown was initiated cleanly
+              // but never finished within the age window. Almost
+              // certainly a crash mid-drain; clear the stale marker and
+              // fall through so the operator gets the banner anyway.
+              process.stderr.write(`telegram gateway: boot.clean_shutdown_marker_stale age=${ageSec}s signal=${cleanMarker.signal} — clearing + posting banner anyway\n`)
+            }
+            clearCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
+          }
           const currentSession: SessionMarker = { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS }
           const storedSession = readSessionMarker(GATEWAY_SESSION_MARKER_PATH)
           const bannerOK = shouldFireRestartBanner({ stored: storedSession, current: currentSession })
           if (!marker && !bannerOK) {
             process.stderr.write(`telegram gateway: boot: suppressed 'recovered' banner — session marker matches current process (pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS})\n`)
           }
-          if (!marker && bannerOK) {
+          if (!marker && bannerOK && !cleanFresh) {
             const bootAccess = loadAccess()
             const ownerChatId = bootAccess.allowFrom[0]
             if (ownerChatId && HISTORY_ENABLED) {

@@ -17,9 +17,9 @@
   "scripts": {
     "dev": "bun bin/switchroom.ts",
     "build": "node scripts/build.mjs",
-    "test": "vitest run && bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts",
+    "test": "vitest run && bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",
     "test:vitest": "vitest run",
-    "test:bun": "bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts",
+    "test:bun": "bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run lint && npm test"
