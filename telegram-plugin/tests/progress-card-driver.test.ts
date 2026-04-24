@@ -1817,6 +1817,8 @@ describe('forceCompleteTurn — external completion signal', () => {
     driver.ingest({ kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'a-t1', toolName: 'Read' }, 'c')
 
     // Step 5: B fires tool_use + tool_result (B has ≥1 completed tool cycle)
+    // B completing a cycle before parent turn_end ensures the deferred-completion logic sees
+    // heterogeneous sub-agent states (one mid-tool, one with completed cycles).
     driver.ingest({ kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'b-t1', toolName: 'Bash' }, 'c')
     driver.ingest({ kind: 'sub_agent_tool_result', agentId: 'B', toolUseId: 'b-t1' }, 'c')
 
@@ -1853,6 +1855,7 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emits.length).toBeGreaterThan(baselineCount) // flushes did happen
 
     // Step 8a: first sub-agent finishes — A done, B still running
+    // One sub-agent finishing must NOT close the card — other sub-agent still running.
     driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'A' }, 'c')
     advance(0)
 
@@ -1869,14 +1872,14 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emits[emits.length - 1].done).toBe(true)
   })
 
-  it('late sub-agent event after card close: logs debug and returns cleanly', () => {
+  it('late sub-agent event after card close: logs to stderr and returns cleanly', () => {
     // Regression test for issue #6 item 2.
     //
     // After completeTurnFully nulls currentTurnKey, any sub_agent_* event
     // that arrives (from a stale session-tail tail) should:
-    //   1. Emit a console.debug diagnostic log (not warn — expected-but-noteworthy).
+    //   1. Emit a process.stderr.write diagnostic log (matches file's observability pattern).
     //   2. Return cleanly without corrupting any state.
-    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
 
     try {
       const { driver, emits, advance } = harness(0, 0, { initialDelayMs: 0 })
@@ -1895,19 +1898,19 @@ describe('forceCompleteTurn — external completion signal', () => {
       driver.ingest({ kind: 'sub_agent_tool_result', agentId: 'Z', toolUseId: 'z-t1' }, 'c')
       advance(0)
 
-      // Assert 1: console.debug was called with the diagnostic event.
-      expect(debugSpy).toHaveBeenCalledOnce()
-      const [firstArg] = debugSpy.mock.calls[0]
-      expect(firstArg).toMatchObject({
-        event: 'progress-card.late-sub-agent-event-dropped',
-        kind: 'sub_agent_tool_result',
-      })
+      // Assert 1: process.stderr.write was called with the diagnostic log.
+      expect(stderrSpy).toHaveBeenCalled()
+      const lateEventLog = stderrSpy.mock.calls
+        .map((c) => c[0] as string)
+        .find((s) => typeof s === 'string' && s.includes('late-sub-agent-event-dropped'))
+      expect(lateEventLog).toBeDefined()
+      expect(lateEventLog).toContain('sub_agent_tool_result')
 
       // Assert 2: no state corruption — no new emits, card still closed.
       expect(emits).toHaveLength(emitCountBeforeLate)
       expect(driver.hasActiveCard('c')).toBe(false)
     } finally {
-      debugSpy.mockRestore()
+      stderrSpy.mockRestore()
     }
   })
 })

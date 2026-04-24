@@ -792,12 +792,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       const k = currentTurnKey
       if (k == null) {
         if (event.kind.startsWith('sub_agent_')) {
-          console.debug({
-            event: 'progress-card.late-sub-agent-event-dropped',
-            kind: event.kind,
-            agentId: 'agentId' in event ? (event as { agentId: string }).agentId : null,
-            chatId,
-          }, 'sub_agent event arrived after card close')
+          process.stderr.write(
+            `telegram gateway: progress-card: late-sub-agent-event-dropped kind=${event.kind} agentId=${'agentId' in event ? (event as { agentId: string }).agentId : 'n/a'} chatId=${chatId}\n`,
+          )
         }
         return
       }
