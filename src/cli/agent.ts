@@ -44,6 +44,7 @@ import {
   waitForAgentReady,
   type StatusInputs,
 } from "../agents/status.js";
+import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
 
 /**
  * Pre-restart preflight check. Verifies the agent's runtime
@@ -1467,6 +1468,127 @@ export function registerAgentCommand(program: Command): void {
         }
 
         console.log(chalk.green(`\nAgent "${name}" destroyed.`));
+      })
+    );
+
+  // switchroom agent bootstrap <name>
+  //
+  // One-shot: scaffold + OAuth + start. For Phase 2 testing the OAuth URL is
+  // printed to stdout and the code is pasted from stdin. Phase 3 replaces this
+  // terminal stub with the foreman bot relay.
+  agent
+    .command("bootstrap <name>")
+    .description(
+      "Scaffold, authenticate, and start an agent in one flow. " +
+      "Prints the OAuth URL to stdout and reads the code from stdin."
+    )
+    .requiredOption("--profile <profile>", "Profile to extend (e.g. health-coach)")
+    .requiredOption("--bot-token <token>", "BotFather token for the agent's Telegram bot")
+    .option("--rollback-on-fail", "Remove scaffold dir if auth fails (default: keep for retry)")
+    .action(
+      withConfigError(async (
+        name: string,
+        opts: { profile: string; botToken: string; rollbackOnFail?: boolean },
+      ) => {
+        const configPath = getConfigPath(program);
+
+        console.log(chalk.bold(`\nBootstrapping agent: ${name}\n`));
+        console.log(chalk.gray(`  Profile:   ${opts.profile}`));
+        console.log(chalk.gray(`  Config:    ${configPath}`));
+        console.log();
+
+        // ── Step 1: createAgent ───────────────────────────────────────────
+        let creationResult: Awaited<ReturnType<typeof createAgent>>;
+        try {
+          creationResult = await createAgent({
+            name,
+            profile: opts.profile,
+            telegramBotToken: opts.botToken,
+            configPath,
+            rollbackOnFail: opts.rollbackOnFail ?? false,
+          });
+        } catch (err) {
+          console.error(chalk.red(`Bootstrap failed: ${(err as Error).message}`));
+          process.exit(1);
+        }
+
+        const { loginUrl, sessionName, agentDir } = creationResult;
+        console.log(chalk.green(`  Agent scaffolded at ${agentDir}`));
+        console.log(chalk.green(`  Auth session: ${sessionName}`));
+
+        if (loginUrl) {
+          console.log(chalk.bold(`\n  Open this URL in your browser to authenticate:\n`));
+          console.log(chalk.cyan(`  ${loginUrl}\n`));
+        } else {
+          console.log(
+            chalk.yellow(
+              `\n  Auth session started but no URL yet. ` +
+              `Check: tmux attach -t ${sessionName}\n`
+            )
+          );
+        }
+
+        // ── Step 2: Read code from stdin (Phase 2 terminal stub) ──────────
+        process.stdout.write(chalk.bold("  Paste the browser code here: "));
+        const code = await new Promise<string>((resolve) => {
+          process.stdin.setEncoding("utf-8");
+          let buf = "";
+          process.stdin.on("data", (chunk) => {
+            buf += chunk.toString();
+            const newlineIdx = buf.indexOf("\n");
+            if (newlineIdx !== -1) {
+              process.stdin.removeAllListeners("data");
+              resolve(buf.slice(0, newlineIdx).trim());
+            }
+          });
+        });
+
+        if (!code) {
+          console.error(chalk.red("No code entered. Aborting."));
+          console.log(
+            chalk.gray(
+              `  Retry auth later with: switchroom auth code ${name} <code>`
+            )
+          );
+          process.exit(1);
+        }
+
+        // ── Step 3: completeCreation ──────────────────────────────────────
+        console.log(chalk.gray(`\n  Submitting code…`));
+        let completionResult: Awaited<ReturnType<typeof completeCreation>>;
+        try {
+          completionResult = await completeCreation(name, code, { configPath });
+        } catch (err) {
+          console.error(chalk.red(`Completion failed: ${(err as Error).message}`));
+          process.exit(1);
+        }
+
+        const { outcome, started } = completionResult;
+
+        if (outcome.kind !== "success") {
+          console.error(chalk.red(`\n  Auth failed (${outcome.kind}).`));
+          if (outcome.paneTailText) {
+            console.error(chalk.gray(`  Pane output: ${outcome.paneTailText}`));
+          }
+          console.log(
+            chalk.yellow(
+              `\n  Retry with: switchroom auth code ${name} <code>\n` +
+              `  Or restart the auth flow: switchroom auth reauth ${name}\n`
+            )
+          );
+          process.exit(1);
+        }
+
+        if (started) {
+          console.log(chalk.bold.green(`\n  Agent "${name}" is online!\n`));
+        } else {
+          console.log(
+            chalk.yellow(
+              `\n  OAuth saved, but agent start failed. ` +
+              `Start with: switchroom agent start ${name}\n`
+            )
+          );
+        }
       })
     );
 }

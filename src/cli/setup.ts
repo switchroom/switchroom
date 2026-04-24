@@ -19,14 +19,9 @@ import {
 } from "../setup/telegram-api.js";
 import {
   findExistingClaudeJson,
-  copyOnboardingState,
-  copyExistingCredentials,
   writeAccessJson,
   writeAgentEnv,
   saveUserConfig,
-  loadUserConfig,
-  preTrustWorkspace,
-  createMinimalClaudeConfig,
 } from "../setup/onboarding.js";
 import {
   isDockerAvailable,

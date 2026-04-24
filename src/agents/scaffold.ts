@@ -51,7 +51,6 @@ import { openVault, VaultError } from "../vault/vault.js";
 import {
   findExistingClaudeJson,
   copyOnboardingState,
-  copyExistingCredentials,
   preTrustWorkspace,
   createMinimalClaudeConfig,
   loadUserConfig,
@@ -2423,11 +2422,23 @@ export function scaffoldAgent(
   initWorkspaceGitRepo(workspaceDir, name);
 
   // --- Claude Code config (onboarding state) ---
-  // Try to copy from existing Claude installation; fall back to minimal config
+  // Copy onboarding state (.claude.json) from the host's Claude installation
+  // so the agent skips the first-run wizard, but intentionally do NOT copy
+  // .credentials.json. Each agent must go through its own fresh OAuth flow
+  // (Phase 2 policy: copyExistingCredentials removed from scaffold path).
+  // Existing credential blobs can be stale and cause silent 401s.
+  // Operators are directed to `switchroom auth login <agent>` or
+  // `switchroom agent bootstrap <agent>` for a guided OAuth flow.
+  //
+  // UPGRADE WARN: if ~/.claude-home/.credentials.json (or ~/.claude/.credentials.json)
+  // exists at scaffold time, we deliberately skip copying it. Agents that were
+  // previously scaffolded with the old policy and already have their own
+  // .credentials.json are unaffected — we never remove existing credential files.
   const existingClaudeJson = findExistingClaudeJson();
   if (existingClaudeJson) {
     copyOnboardingState(existingClaudeJson, agentDir);
-    copyExistingCredentials(agentDir);
+    // NOTE: copyExistingCredentials() intentionally NOT called here (Phase 2).
+    // Each agent gets its own fresh OAuth. See CHANGELOG.
     if (!existsSync(join(agentDir, ".claude", "config.json"))) {
       // copyOnboardingState didn't write (file existed), write default
       writeIfMissing(

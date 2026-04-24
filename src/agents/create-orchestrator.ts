@@ -1,0 +1,309 @@
+/**
+ * Phase 2 — Creation orchestrator.
+ *
+ * Sequences scaffold → systemd install → auth-session start in one call.
+ * Does NOT block waiting for the OAuth browser dance; the caller relays
+ * the loginUrl to the user (via Telegram or terminal stub) and then
+ * calls completeCreation() with the code the user pastes back.
+ *
+ * Public surface:
+ *   createAgent(opts)          → Promise<CreationResult>
+ *   completeCreation(name, code) → Promise<CompletionResult>
+ */
+
+import { resolve } from "node:path";
+import { existsSync, rmSync } from "node:fs";
+import { resolveAgentsDir, loadConfig } from "../config/loader.js";
+import { scaffoldAgent } from "./scaffold.js";
+import { listAvailableProfiles } from "./profiles.js";
+import { startAgent } from "./lifecycle.js";
+import { startAuthSession, submitAuthCode } from "../auth/manager.js";
+import type { AuthCodeOutcome } from "../auth/manager.js";
+import {
+  generateUnit,
+  generateGatewayUnit,
+  installUnit,
+  installScheduleTimers,
+  enableScheduleTimers,
+  daemonReload,
+  resolveGatewayUnitName,
+} from "./systemd.js";
+import {
+  writeAgentEntryToConfig,
+  updateAgentExtendsInConfig,
+  synthesizeTopicName,
+} from "../cli/agent.js";
+import { validateBotToken } from "../setup/telegram-api.js";
+import { writeAgentEnv } from "../setup/onboarding.js";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export interface CreateAgentOpts {
+  /** Agent name (slug, e.g. "gymbro"). */
+  name: string;
+  /** Profile to extend (e.g. "health-coach"). Must exist in profiles/ dir. */
+  profile: string;
+  /** BotFather token for the new agent's Telegram bot. */
+  telegramBotToken: string;
+  /**
+   * Admin chat ID to relay OAuth URL to (reserved for Phase 3 foreman bot).
+   * Not used in Phase 2 — included for forward-compatibility.
+   */
+  adminChatId?: string;
+  /** Handle of the admin bot (reserved for Phase 3). */
+  adminBotHandle?: string;
+  /**
+   * Path to switchroom.yaml. Defaults to cwd/switchroom.yaml.
+   * Override in tests.
+   */
+  configPath?: string;
+  /**
+   * If true and any step after disk writes fails, remove the scaffold dir.
+   * Default: false (leave artefacts for retry).
+   */
+  rollbackOnFail?: boolean;
+}
+
+export interface CreationResult {
+  /** OAuth URL to open in a browser. */
+  loginUrl?: string;
+  /** tmux session name — pass to completeCreation for retry/cancel. */
+  sessionName: string;
+  /** Absolute path to the scaffolded agent directory. */
+  agentDir: string;
+}
+
+export interface CompletionResult {
+  /** Structured outcome from submitAuthCode. */
+  outcome: AuthCodeOutcome;
+  /** True if the agent was successfully started after auth. */
+  started: boolean;
+  /** Instructions for the caller to display. */
+  instructions: string[];
+}
+
+// ─── createAgent ─────────────────────────────────────────────────────────────
+
+/**
+ * Scaffold, systemd-install, and start an OAuth session for a new agent.
+ *
+ * Steps (in order):
+ *   1. Validate profile against filesystem.
+ *   2. Validate bot token via Telegram getMe — FAIL FAST before any disk writes.
+ *   3. Write agent entry to switchroom.yaml if missing.
+ *   4. scaffoldAgent().
+ *   5. Install systemd units.
+ *   6. Write telegram/.env with the bot token.
+ *   7. startAuthSession() — returns loginUrl + sessionName.
+ *
+ * On failure at step 7 with rollbackOnFail=true, the scaffold dir is removed.
+ */
+export async function createAgent(
+  opts: CreateAgentOpts,
+): Promise<CreationResult> {
+  const {
+    name,
+    profile,
+    telegramBotToken,
+    configPath: configPathOpt,
+    rollbackOnFail = false,
+  } = opts;
+
+  // ── Step 1: Validate profile ──────────────────────────────────────────────
+  const available = listAvailableProfiles();
+  if (!available.includes(profile)) {
+    throw new Error(
+      `Unknown profile: "${profile}". Valid profiles: ${available.join(", ")}`,
+    );
+  }
+
+  // ── Step 2: Validate bot token (BEFORE any disk writes) ──────────────────
+  await validateBotToken(telegramBotToken).catch((err: Error) => {
+    throw new Error(
+      `Bot token rejected by Telegram — check the token and try again. ` +
+        `(${err.message})`,
+    );
+  });
+
+  // ── Step 3: Determine configPath and ensure agent in yaml ─────────────────
+  const configPath =
+    configPathOpt ??
+    (() => {
+      // Fallback: try cwd/switchroom.yaml
+      const cwd = process.cwd();
+      const candidates = [
+        resolve(cwd, "switchroom.yaml"),
+        resolve(cwd, "switchroom.yml"),
+      ];
+      for (const c of candidates) {
+        if (existsSync(c)) return c;
+      }
+      throw new Error(
+        "switchroom.yaml not found. Pass configPath or run from the project root.",
+      );
+    })();
+
+  let config = loadConfig(configPath);
+  const existingEntry = config.agents[name];
+
+  if (!existingEntry) {
+    // Fresh agent: write entry to yaml.
+    writeAgentEntryToConfig(configPath, name, profile);
+    config = loadConfig(configPath);
+  } else {
+    // Agent already in yaml — reconcile extends.
+    const existingExtends = existingEntry.extends;
+    if (!existingExtends) {
+      updateAgentExtendsInConfig(configPath, name, profile);
+      config = loadConfig(configPath);
+    } else if (existingExtends !== profile) {
+      throw new Error(
+        `Agent "${name}" is already configured with profile "${existingExtends}". ` +
+          `Remove the existing entry from switchroom.yaml or drop --profile.`,
+      );
+    }
+  }
+
+  const agentConfig = config.agents[name];
+  if (!agentConfig) {
+    throw new Error(
+      `Internal: wrote agent "${name}" to yaml but reload didn't pick it up.`,
+    );
+  }
+
+  const agentsDir = resolveAgentsDir(config);
+  const agentDir = resolve(agentsDir, name);
+
+  // ── Step 4: Scaffold ──────────────────────────────────────────────────────
+  scaffoldAgent(name, agentConfig, agentsDir, config.telegram, config, undefined, configPath);
+
+  // ── Step 5: Install systemd units ─────────────────────────────────────────
+  const useAutoaccept = agentConfig.channels?.telegram?.plugin === "switchroom";
+  const gwName = resolveGatewayUnitName(config, name);
+  const unitContent = generateUnit(name, agentDir, useAutoaccept, gwName);
+  installUnit(name, unitContent);
+
+  if (useAutoaccept && gwName) {
+    const stateDir = resolve(agentDir, "telegram");
+    const gatewayContent = generateGatewayUnit(stateDir, name);
+    installUnit(gwName, gatewayContent);
+  }
+
+  // Install schedule timers if any.
+  const schedule = agentConfig.schedule ?? [];
+  if (schedule.length > 0) {
+    installScheduleTimers(name, agentDir, schedule);
+    daemonReload();
+    enableScheduleTimers(name, schedule.length);
+  }
+
+  // ── Step 6: Write bot token to telegram/.env ──────────────────────────────
+  writeAgentEnv(agentDir, telegramBotToken);
+
+  // ── Step 7: Start OAuth session ───────────────────────────────────────────
+  let authResult: ReturnType<typeof startAuthSession>;
+  try {
+    authResult = startAuthSession(name, agentDir, { force: false });
+  } catch (err) {
+    if (rollbackOnFail) {
+      try {
+        rmSync(agentDir, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+    throw err;
+  }
+
+  return {
+    loginUrl: authResult.loginUrl,
+    sessionName: authResult.sessionName,
+    agentDir,
+  };
+}
+
+// ─── completeCreation ─────────────────────────────────────────────────────────
+
+/**
+ * Complete agent creation after the user has obtained the OAuth code from their
+ * browser. Wraps Phase 1's submitAuthCode + agent start.
+ *
+ * Returns a CompletionResult with the structured outcome. If outcome.kind ===
+ * 'success', the agent is started and `started` will be true. For any other
+ * outcome, started is false and the caller should surface the error and offer
+ * a retry (call createAgent again to restart the auth session).
+ */
+export async function completeCreation(
+  name: string,
+  code: string,
+  opts: {
+    configPath?: string;
+    /** Poll timeout override (ms). Defaults to submitAuthCode's own default. */
+    pollTimeoutMs?: number;
+  } = {},
+): Promise<CompletionResult> {
+  const configPath =
+    opts.configPath ??
+    (() => {
+      const cwd = process.cwd();
+      const candidates = [resolve(cwd, "switchroom.yaml"), resolve(cwd, "switchroom.yml")];
+      for (const c of candidates) if (existsSync(c)) return c;
+      throw new Error("switchroom.yaml not found. Pass configPath option.");
+    })();
+
+  const config = loadConfig(configPath);
+  const agentsDir = resolveAgentsDir(config);
+  const agentDir = resolve(agentsDir, name);
+
+  if (!existsSync(agentDir)) {
+    throw new Error(
+      `Agent dir not found: ${agentDir}. Run createAgent first.`,
+    );
+  }
+
+  // Submit the OAuth code using Phase 1's submitAuthCode.
+  const authCodeResult = submitAuthCode(
+    name,
+    agentDir,
+    code,
+    undefined, // slot
+    opts.pollTimeoutMs ? { pollTimeoutMs: opts.pollTimeoutMs } : {},
+  );
+
+  const outcome = authCodeResult.outcome ?? { kind: "timeout" as const };
+
+  if (outcome.kind !== "success") {
+    return {
+      outcome,
+      started: false,
+      instructions: authCodeResult.instructions,
+    };
+  }
+
+  // Auth succeeded — start the agent.
+  let started = false;
+  try {
+    startAgent(name);
+    started = true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      outcome,
+      started: false,
+      instructions: [
+        ...authCodeResult.instructions,
+        `Warning: Could not start agent "${name}" automatically: ${message}`,
+        `Start manually with: switchroom agent start ${name}`,
+      ],
+    };
+  }
+
+  return {
+    outcome,
+    started,
+    instructions: [
+      ...authCodeResult.instructions,
+      `Agent "${name}" started successfully.`,
+    ],
+  };
+}

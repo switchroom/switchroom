@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased (Phase 2 — creation orchestrator + bootstrap verb)
+
+### Added
+- `src/agents/create-orchestrator.ts` — new module with `createAgent()` and
+  `completeCreation()` that sequences scaffold → systemd install → OAuth start
+  → agent start in a single coherent flow. Used by the new `bootstrap` command
+  and ready for the Phase 3 foreman bot.
+- `switchroom agent bootstrap <name> --profile <p> --bot-token <t>` — one-shot
+  CLI verb: scaffolds the agent, validates the BotFather token, starts an OAuth
+  session, prints the URL to stdout, reads the code from stdin, and starts the
+  agent. Passes `--rollback-on-fail` to remove the scaffold dir on auth failure
+  (default: keep artefacts for retry).
+
+### Changed
+- **BREAKING (upgrade note):** `scaffoldAgent()` no longer copies
+  `~/.claude-home/.credentials.json` (or `~/.claude/.credentials.json`) into
+  a new agent's `.claude/` directory. Each agent now gets its own fresh OAuth
+  via `switchroom auth login <agent>` or `switchroom agent bootstrap <agent>`.
+  Existing agents with their own `.oauth-token` or `.credentials.json` are
+  unaffected — only the copy-on-scaffold step is removed.
+
 ## v0.2.5 — 2026-04-24
 
 ### Fixed
