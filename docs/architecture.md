@@ -13,13 +13,13 @@ One Claude Code REPL per agent, dressed up with systemd and a Telegram bot. Each
 Runs the Claude Code CLI session. The unit's `ExecStart` is:
 
 ```
-/usr/bin/script -qfc "/bin/bash -l ~/.switchroom/agents/<agent>/start.sh" <logFile>
+/usr/bin/script -qfc "/usr/bin/expect -f bin/autoaccept.exp ~/.switchroom/agents/<agent>/start.sh" <logFile>
 ```
 
 The layers:
 
 - **`script`** — allocates a PTY and writes a full-fidelity terminal log. Required because `claude` expects an interactive terminal; also enables log-based token-detection during auth.
-- **`bash -l`** — login shell so `~/.profile` and `PATH` resolve correctly on a headless systemd unit.
+- **`expect`** (via `bin/autoaccept.exp`) — handles the one-time TUI dialogs Claude Code shows on first run (theme picker, trust-folder prompt, `--dangerously-load-development-channels` acknowledgement) so headless systemd launches don't block on keyboard input. It does NOT auto-accept per-tool permission prompts — those still route through the Telegram inline-button approval flow when the agent hits one mid-turn. `expect` then launches `/bin/bash -l start.sh` internally.
 - **`start.sh`** — thin wrapper that sets environment variables, then `exec`s the `claude` binary.
 
 `start.sh` invokes claude with flags like:
@@ -35,7 +35,7 @@ exec claude \
 
 Key flags:
 
-- `--continue` — resumes the agent's existing transcript on every restart. The agent picks up where it left off rather than starting cold.
+- `--continue` — passed conditionally. Under `session_continuity.resume_mode: auto` (default), it's set only when the transcript exists, is under the configured size cap (default 2 MB), and is under 7 days old — so long-running agents pick up where they left off, but stale or oversized transcripts start fresh. Under `resume_mode: continue` it's always set; under `handoff` or `none` it's never set (the agent starts cold, optionally with a handoff briefing). See `profiles/_base/start.sh.hbs` for the exact logic.
 - `--dangerously-load-development-channels server:switchroom-telegram` — loads the switchroom Telegram MCP as a development channel. Operators can swap this for `--channels plugin:telegram@claude-plugins-official` per-agent.
 - `--plugin-dir` — points at the agent's local plugin directory.
 - `--append-system-prompt` — injects the stable workspace bootstrap block (SOUL.md, AGENTS.md, TOOLS.md, etc.) at session start.
@@ -45,7 +45,7 @@ Environment variables set before exec:
 - `CLAUDE_CONFIG_DIR` — pinned to `~/.switchroom/agents/<agent>/.claude/`. Fully isolates each agent's auth, settings, transcripts, and MCP config from every other agent and from the user's personal Claude setup.
 - `CLAUDE_CODE_OAUTH_TOKEN` — populated from the active slot file (`accounts/<slot>/.oauth-token`) for multi-account rotation. Claude Code reads this env var and uses it in place of the credentials file when set.
 
-This is an **interactive REPL**, not `claude -p`. The session is persistent and long-lived, resumed across restarts via `--continue`.
+This is an **interactive REPL**, not `claude -p`. The session is persistent and long-lived, conditionally resumed across restarts via `--continue` (see flag description above).
 
 ### `switchroom-<agent>-gateway.service` — the mouth
 
@@ -108,7 +108,7 @@ Neither use case is affected by any rumored deprecation of `-p` in a meaningful 
 
 ## Other moving parts
 
-**Hindsight** — a separate persistent process (`switchroom-hindsight.service`) providing semantic memory, knowledge graph, entity resolution, and directives. Runs on `localhost:18888`. MCP'd into every claude agent via the shared MCP config, so all agents share the same memory bank by default (each agent can be scoped to its own collection).
+**Hindsight** — runs as a Docker container (`ghcr.io/vectorize-io/hindsight:latest`) exposing its API on `localhost:18888` (port mapping `127.0.0.1:18888 → 8888/tcp`; also exposes `127.0.0.1:19999 → 9999/tcp`). It's mounted into each agent's `claude` process as an MCP plugin (`--plugin-dir .claude/plugins/hindsight-memory`), so every agent shares the same long-term memory backend while keeping its own bank. Deployment mechanism (Docker) is independent of switchroom itself — switchroom only wires the MCP plugin into each agent's `claude` invocation. Provides semantic memory, knowledge graph, entity resolution, and directives.
 
 **Foreman** — an optional always-on admin bot (`telegram-plugin/foreman/foreman.ts`) that provides fleet-wide visibility and lifecycle control over a separate Telegram bot token. Does not run Claude inference. Talks to the `switchroom` CLI directly for status, logs, restart, and create operations. Gated by `access.json` sender allowlists.
 
