@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.5 — 2026-04-24
+
+### Fixed
+- Progress card no longer closes prematurely while background sub-agents are still running; deferred-completion visibility now waits for all active sub-agents before dismissing (#4).
+
+### Changed
+- MCP tool labels polished in the progress card for cleaner display.
+- Preamble nudge added to scaffold to guide agent context on startup.
+
 ## v0.2.4 — 2026-04-24
 
 ### Fixed
