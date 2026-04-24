@@ -298,7 +298,9 @@ describe('progress-card integration harness', () => {
 
       // The subdir tool_use MUST NOT have been surfaced (it's noise the
       // tailer shouldn't see). Only parent events should make it through.
-      expect(bot.edits.some((e) => e.html.includes('Task'))).toBe(true)
+      // Task with human-authored description renders without the "Task" prefix;
+      // check the description text instead.
+      expect(bot.edits.some((e) => e.html.includes('delegated work'))).toBe(true)
       expect(bot.edits.some((e) => e.html.includes('"X"'))).toBe(false)
       const doneEdits = bot.edits.filter((e) => e.done)
       expect(doneEdits.length).toBe(1)

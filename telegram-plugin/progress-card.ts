@@ -15,7 +15,7 @@
  */
 
 import type { SessionEvent } from './session-tail.js'
-import { toolLabel } from './tool-labels.js'
+import { toolLabel, isHumanDescription } from './tool-labels.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +39,13 @@ export interface ChecklistItem {
    *  command, query, etc.). Empty string when the tool has no natural
    *  label (e.g. TodoWrite) or input was missing. */
   readonly label: string
+  /**
+   * True when the label came from a human-authored `description` field
+   * (Bash/BashOutput/Task/Agent with a non-empty description). The
+   * renderer uses this to suppress the tool-name prefix so the card reads
+   * "Check commit state" instead of "Bash Check commit state".
+   */
+  readonly humanAuthored: boolean
   /** Current state. */
   readonly state: ItemState
   /** Unix ms when tool_use fired. */
@@ -89,6 +96,7 @@ export interface SubAgentState {
   readonly currentTool?: {
     readonly tool: string
     readonly label: string
+    readonly humanAuthored: boolean
     readonly toolUseId: string
     readonly startedAt: number
   }
@@ -120,6 +128,7 @@ export interface SubAgentState {
   readonly lastCompletedTool?: {
     readonly tool: string
     readonly label: string
+    readonly humanAuthored: boolean
     readonly finishedAt: number
   }
   /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
@@ -310,6 +319,7 @@ export function reduce(
         toolUseId: event.toolUseId ?? null,
         tool: event.toolName,
         label: toolLabel(event.toolName, event.input, preamble),
+        humanAuthored: isHumanDescription(event.toolName, event.input),
         state: 'running',
         startedAt: now,
       }
@@ -539,6 +549,7 @@ export function reduce(
           ? {
               tool: event.toolName,
               label: toolLabel(event.toolName, event.input, preamble),
+              humanAuthored: isHumanDescription(event.toolName, event.input),
               toolUseId: event.toolUseId,
               startedAt: now,
             }
@@ -560,6 +571,7 @@ export function reduce(
         const justFinished = {
           tool: sa.currentTool.tool,
           label: sa.currentTool.label,
+          humanAuthored: sa.currentTool.humanAuthored,
           finishedAt: now,
         }
         const next = new Map(state.subAgents)
@@ -697,14 +709,24 @@ function extractUserText(raw: string): string {
  * `running` items bold the tool name so the eye jumps to the line that's
  * currently in flight.
  */
-function renderItemCore(tool: string, label: string, bold = false): string {
+function renderItemCore(
+  tool: string,
+  label: string,
+  bold = false,
+  humanAuthored = false,
+): string {
   // MCP tools: the label from toolLabel() already begins with a
   // prettified "Server: action" form (from mcpBaseLabel), so echoing
   // the raw `mcp__server__action` tool name as a prefix just duplicates
   // the friendly name. Render the label alone. If label is empty
   // (malformed mcp__ name, no input keys to preview), fall through so
   // the raw tool name still appears rather than rendering nothing.
-  if (tool.startsWith('mcp__') && label) {
+  //
+  // humanAuthored: Bash/BashOutput/Task/Agent tool_use items whose label
+  // came from input.description (a human-written phrase) rather than a
+  // raw command / fallback. Suppress the tool-name prefix for the same
+  // reason as MCP tools — the description is already self-explanatory.
+  if ((tool.startsWith('mcp__') || humanAuthored) && label) {
     return bold ? `<b>${escapeHtml(label)}</b>` : escapeHtml(label)
   }
   const toolHtml = bold ? `<b>${escapeHtml(tool)}</b>` : escapeHtml(tool)
@@ -926,17 +948,19 @@ function renderMainItem(
   const isAgent = item.tool === 'Agent' || item.tool === 'Task'
   const indent = multiAgentActive ? '  ' : ''
 
+  const humanAuthored = item.humanAuthored ?? false
+
   if (isAgent && item.state === 'running' && multiAgentActive) {
     // Hold the 🤖 emoji while the sub-agent (if correlated) is alive.
     // Show elapsed since the parent's tool_use fired.
     const dur = formatDuration(now - item.startedAt)
-    return `${indent}🤖 ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
+    return `${indent}🤖 ${renderItemCore(item.tool, item.label, /*bold*/ true, humanAuthored)} <i>(${dur})</i>`
   }
 
   const symbol = TOOL_SYMBOL[item.state]
   if (item.state === 'running') {
     const dur = formatDuration(now - item.startedAt)
-    return `${indent}${symbol} ${renderItemCore(item.tool, item.label, /*bold*/ true)} <i>(${dur})</i>`
+    return `${indent}${symbol} ${renderItemCore(item.tool, item.label, /*bold*/ true, humanAuthored)} <i>(${dur})</i>`
   }
   if ((item.state === 'done' || item.state === 'failed') && item.finishedAt != null) {
     if (item.kind === 'rollup') {
@@ -945,10 +969,10 @@ function renderMainItem(
     }
     const dur = formatDuration(item.finishedAt - item.startedAt)
     const needsDuration = item.finishedAt - item.startedAt >= 1000
-    return `${indent}${symbol} ${renderItemCore(item.tool, item.label)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
+    return `${indent}${symbol} ${renderItemCore(item.tool, item.label, false, humanAuthored)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
   }
   void subAgents
-  return `${indent}${symbol} ${renderItemCore(item.tool, item.label)}`
+  return `${indent}${symbol} ${renderItemCore(item.tool, item.label, false, humanAuthored)}`
 }
 
 /**
@@ -1066,7 +1090,7 @@ function renderSubAgent(
     const curDur = formatDuration(now - cur.startedAt)
     return [
       headerLine,
-      `     └ ${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
+      `     └ ${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label, false, cur.humanAuthored)} <i>(${curDur})</i> · ${sa.toolCount} tools`,
     ]
   }
   if (sa.pendingPreamble && sa.pendingPreamble.length > 0) {
@@ -1082,7 +1106,7 @@ function renderSubAgent(
     const last = sa.lastCompletedTool
     return [
       headerLine,
-      `     └ ✓ <i>just finished</i> ${renderItemCore(last.tool, last.label)} · ${sa.toolCount} tools`,
+      `     └ ✓ <i>just finished</i> ${renderItemCore(last.tool, last.label, false, last.humanAuthored)} · ${sa.toolCount} tools`,
     ]
   }
   return [headerLine, `     └ 💭 <i>thinking…</i> · ${sa.toolCount} tools`]
@@ -1133,6 +1157,7 @@ export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] 
         toolUseId: null,
         tool: first.tool,
         label: first.label,
+        humanAuthored: first.humanAuthored,
         state: 'done',
         startedAt: first.startedAt,
         finishedAt: last.finishedAt,
@@ -1146,6 +1171,7 @@ export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] 
         toolUseId: null,
         tool: first.tool,
         label: '',
+        humanAuthored: false,
         state: 'done',
         startedAt: first.startedAt,
         finishedAt: last.finishedAt,

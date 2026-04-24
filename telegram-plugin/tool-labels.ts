@@ -101,6 +101,40 @@ function firstLine(s: string): string {
 }
 
 /**
+ * Return true when the label produced by `toolLabel(tool, input)` came
+ * from a human-authored `description` field rather than a raw fallback
+ * (filename, command string, hostname, etc.). The progress card uses this
+ * flag to suppress the tool-name prefix — "Check commit state" reads
+ * better than "Bash Check commit state".
+ *
+ * Rules:
+ *   - Bash / BashOutput → true when `input.description` is a non-empty string
+ *   - Task / Agent     → true when `input.description` is a non-empty string
+ *   - All other tools  → false (keep the "ToolName label" concat)
+ *
+ * WebFetch and WebSearch are intentionally left as false because the
+ * tool name provides important context ("WebFetch example.com" makes more
+ * sense than just "example.com").
+ */
+export function isHumanDescription(
+  tool: string,
+  input?: Record<string, unknown>,
+): boolean {
+  if (!input || typeof input !== 'object') return false
+  const description =
+    typeof input['description'] === 'string' ? input['description'] : undefined
+  switch (tool) {
+    case 'Bash':
+    case 'BashOutput':
+    case 'Task':
+    case 'Agent':
+      return typeof description === 'string' && description.trim().length > 0
+    default:
+      return false
+  }
+}
+
+/**
  * Return a display suffix for `tool` given its `input`, without the tool
  * name itself. Caller renders `${tool} ${suffix}` (space-separated; no
  * colon) — the checklist format the progress card uses.

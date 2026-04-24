@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { toolLabel } from '../tool-labels.js'
+import { toolLabel, isHumanDescription } from '../tool-labels.js'
 
 describe('toolLabel', () => {
   it('Read: uses basename of file_path', () => {
@@ -292,5 +292,60 @@ describe('toolLabel', () => {
     it('unknown non-mcp tool still uses generic sweep', () => {
       expect(toolLabel('SomeRandomTool', { description: 'doing a thing' })).toBe('doing a thing')
     })
+  })
+})
+
+describe('isHumanDescription', () => {
+  it('Bash with non-empty description → true', () => {
+    expect(isHumanDescription('Bash', { description: 'Check commit state' })).toBe(true)
+    expect(isHumanDescription('Bash', { command: 'git status', description: 'Check git status' })).toBe(true)
+  })
+
+  it('BashOutput with non-empty description → true', () => {
+    expect(isHumanDescription('BashOutput', { description: 'Stream output' })).toBe(true)
+  })
+
+  it('Bash with no description, command only → false', () => {
+    expect(isHumanDescription('Bash', { command: 'git status' })).toBe(false)
+    expect(isHumanDescription('Bash', {})).toBe(false)
+    expect(isHumanDescription('Bash', { description: '' })).toBe(false)
+    expect(isHumanDescription('Bash', { description: '   ' })).toBe(false)
+  })
+
+  it('Task with non-empty description → true', () => {
+    expect(isHumanDescription('Task', { description: 'Research the bug' })).toBe(true)
+  })
+
+  it('Agent with non-empty description → true', () => {
+    expect(isHumanDescription('Agent', { description: 'Deploy the service', subagent_type: 'worker' })).toBe(true)
+  })
+
+  it('Task / Agent without description → false', () => {
+    expect(isHumanDescription('Task', { subagent_type: 'general-purpose' })).toBe(false)
+    expect(isHumanDescription('Agent', {})).toBe(false)
+  })
+
+  it('WebFetch → false (tool name provides context)', () => {
+    expect(isHumanDescription('WebFetch', { url: 'https://example.com', description: 'Check docs' })).toBe(false)
+  })
+
+  it('WebSearch → false', () => {
+    expect(isHumanDescription('WebSearch', { query: 'foo', description: 'Search for foo' })).toBe(false)
+  })
+
+  it('Read / Edit / Grep → false', () => {
+    expect(isHumanDescription('Read', { file_path: '/x/foo.ts' })).toBe(false)
+    expect(isHumanDescription('Edit', { file_path: '/x/foo.ts', description: 'Fix the bug' })).toBe(false)
+    expect(isHumanDescription('Grep', { pattern: 'TODO' })).toBe(false)
+  })
+
+  it('MCP tools → false (handled separately by tool.startsWith("mcp__"))', () => {
+    expect(isHumanDescription('mcp__hindsight__recall', { query: 'foo' })).toBe(false)
+    expect(isHumanDescription('mcp__hindsight__retain', { description: 'Store user pref' })).toBe(false)
+  })
+
+  it('missing or non-object input → false', () => {
+    expect(isHumanDescription('Bash', undefined)).toBe(false)
+    expect(isHumanDescription('Bash')).toBe(false)
   })
 })

@@ -976,14 +976,17 @@ describe('progress-card reducer — multi-agent correlation', () => {
           kind: 'tool_use',
           toolName: 'Agent',
           toolUseId: 'toolu_p1',
-          input: { description: 'd', prompt: 'P' },
+          input: { description: 'Deploy the service', prompt: 'P' },
         },
         { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
       ])
       const html = render(st, 5000)
       expect(html).not.toContain('[Main')
       expect(html).not.toContain('[Sub-agents')
-      expect(html).toContain('Agent')
+      // Agent with human-authored description renders without the "Agent:" prefix.
+      // Check the description text appears (not the raw tool name as a prefix).
+      expect(html).toContain('Deploy the service')
+      expect(html).not.toContain('Agent: Deploy')
     } finally {
       if (prev != null) process.env.PROGRESS_CARD_MULTI_AGENT = prev
       else delete process.env.PROGRESS_CARD_MULTI_AGENT
@@ -1296,12 +1299,14 @@ function makeItem(
   tool: string,
   label: string,
   state: 'done' | 'running' | 'failed' = 'done',
+  humanAuthored = false,
 ): ChecklistItem {
   return {
     id,
     toolUseId: null,
     tool,
     label,
+    humanAuthored,
     state,
     startedAt: 1000 + id * 100,
     finishedAt: state === 'done' ? 1050 + id * 100 : undefined,
@@ -1365,8 +1370,8 @@ describe('compactItems', () => {
 
   it('rollup preserves first.startedAt and last.finishedAt', () => {
     const items: ChecklistItem[] = [
-      { id: 0, toolUseId: null, tool: 'Read', label: 'x', state: 'done', startedAt: 100, finishedAt: 200 },
-      { id: 1, toolUseId: null, tool: 'Read', label: 'x', state: 'done', startedAt: 300, finishedAt: 500 },
+      { id: 0, toolUseId: null, tool: 'Read', label: 'x', humanAuthored: false, state: 'done', startedAt: 100, finishedAt: 200 },
+      { id: 1, toolUseId: null, tool: 'Read', label: 'x', humanAuthored: false, state: 'done', startedAt: 300, finishedAt: 500 },
     ]
     const out = compactItems(items)
     expect(out[0].startedAt).toBe(100)
@@ -1399,5 +1404,111 @@ describe('compactItems', () => {
 
   it('empty input returns empty output', () => {
     expect(compactItems([])).toEqual([])
+  })
+})
+
+// ─── human-authored label rendering (issue #6 item 5) ────────────────────────
+
+describe('renderItemCore: human-authored label prefix suppression', () => {
+  it('Bash with description renders without "Bash " prefix', () => {
+    const s = fold([
+      enqueue('check stuff'),
+      {
+        kind: 'tool_use',
+        toolName: 'Bash',
+        toolUseId: 'b1',
+        input: { command: 'git log --oneline', description: 'Check commit state' },
+      },
+      { kind: 'tool_result', toolUseId: 'b1', toolName: 'Bash' },
+    ])
+    const html = render(s, 5000)
+    // description should appear; raw "Bash " prefix must not
+    expect(html).toContain('Check commit state')
+    expect(html).not.toMatch(/Bash Check commit state/)
+    expect(html).not.toMatch(/Bash: Check commit state/)
+  })
+
+  it('Bash with no description still renders "Bash <cmd>"', () => {
+    const s = fold([
+      enqueue('check stuff'),
+      {
+        kind: 'tool_use',
+        toolName: 'Bash',
+        toolUseId: 'b2',
+        input: { command: 'git status' },
+      },
+      { kind: 'tool_result', toolUseId: 'b2', toolName: 'Bash' },
+    ])
+    const html = render(s, 5000)
+    expect(html).toContain('Bash')
+    expect(html).toContain('git status')
+    // prefix is preserved when no description
+    expect(html).toMatch(/Bash.*git status/)
+  })
+
+  it('Task with description renders without "Task: " prefix', () => {
+    const s = fold([
+      enqueue('delegate'),
+      {
+        kind: 'tool_use',
+        toolName: 'Task',
+        toolUseId: 't1',
+        input: { description: 'Research the bug', prompt: 'look into it' },
+      },
+      { kind: 'tool_result', toolUseId: 't1', toolName: 'Task' },
+    ])
+    const html = render(s, 5000)
+    expect(html).toContain('Research the bug')
+    expect(html).not.toMatch(/Task: Research/)
+    expect(html).not.toMatch(/Task Research/)
+  })
+
+  it('Agent with description renders without "Agent: " prefix', () => {
+    const s = fold([
+      enqueue('delegate'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'a1',
+        input: { description: 'Deploy the service', prompt: 'deploy it' },
+      },
+      { kind: 'tool_result', toolUseId: 'a1', toolName: 'Agent' },
+    ])
+    const html = render(s, 5000)
+    expect(html).toContain('Deploy the service')
+    expect(html).not.toMatch(/Agent: Deploy/)
+    expect(html).not.toMatch(/Agent Deploy/)
+  })
+
+  it('MCP tool still renders label-only (regression guard)', () => {
+    const s = fold([
+      enqueue('remember'),
+      {
+        kind: 'tool_use',
+        toolName: 'mcp__hindsight__retain',
+        toolUseId: 'mcp1',
+        input: { description: 'Remember user prefers TypeScript' },
+      },
+      { kind: 'tool_result', toolUseId: 'mcp1', toolName: 'mcp__hindsight__retain' },
+    ])
+    const html = render(s, 5000)
+    expect(html).toContain('Remember user prefers TypeScript')
+    expect(html).not.toContain('mcp__hindsight__retain')
+  })
+
+  it('WebFetch still renders "WebFetch <host>" (regression guard)', () => {
+    const s = fold([
+      enqueue('fetch docs'),
+      {
+        kind: 'tool_use',
+        toolName: 'WebFetch',
+        toolUseId: 'w1',
+        input: { url: 'https://docs.example.com/api' },
+      },
+      { kind: 'tool_result', toolUseId: 'w1', toolName: 'WebFetch' },
+    ])
+    const html = render(s, 5000)
+    expect(html).toContain('WebFetch')
+    expect(html).toContain('docs.example.com')
   })
 })
