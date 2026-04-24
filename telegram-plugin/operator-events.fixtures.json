@@ -1,0 +1,161 @@
+{
+  "_comment": "Captured error shapes per OperatorEventKind. Real API keys/IDs have been scrubbed.",
+
+  "credentials-expired": [
+    {
+      "_source": "Anthropic API — 401 with authentication_error + expired hint",
+      "status": 401,
+      "error": {
+        "type": "authentication_error",
+        "message": "Your API key has expired. Please refresh your credentials."
+      }
+    },
+    {
+      "_source": "Anthropic API — authentication_error at top level with expired token message",
+      "type": "authentication_error",
+      "message": "OAuth token expired, please re-authenticate to continue"
+    }
+  ],
+
+  "credentials-invalid": [
+    {
+      "_source": "Anthropic API — 401 with invalid_api_key",
+      "status": 401,
+      "error": {
+        "type": "invalid_api_key",
+        "message": "Invalid API key provided. Check your API key and try again."
+      }
+    },
+    {
+      "_source": "Anthropic API — authentication_error without expired hint",
+      "status": 401,
+      "error": {
+        "type": "authentication_error",
+        "message": "Your API key is not valid. Please check your API key."
+      }
+    },
+    {
+      "_source": "Top-level invalid_api_key",
+      "type": "invalid_api_key",
+      "message": "Invalid API key"
+    }
+  ],
+
+  "credit-exhausted": [
+    {
+      "_source": "Anthropic API — 402 credit_balance_too_low",
+      "status": 402,
+      "error": {
+        "type": "credit_balance_too_low",
+        "message": "Your credit balance is too low to complete this request. Please add credits at console.anthropic.com."
+      }
+    },
+    {
+      "_source": "Top-level credit_balance_too_low",
+      "type": "credit_balance_too_low",
+      "message": "credit balance insufficient"
+    }
+  ],
+
+  "quota-exhausted": [
+    {
+      "_source": "Anthropic API — 529 overloaded_error (Claude Code converts to quota-exhausted)",
+      "status": 529,
+      "error": {
+        "type": "overloaded_error",
+        "message": "Overloaded"
+      }
+    },
+    {
+      "_source": "Synthetic — set by session-tail after repeated 429 + slot exhaustion",
+      "type": "overloaded_error",
+      "message": "Service overloaded, usage limits reached"
+    }
+  ],
+
+  "rate-limited": [
+    {
+      "_source": "Anthropic API — 429 rate_limit_error",
+      "status": 429,
+      "error": {
+        "type": "rate_limit_error",
+        "message": "Rate limit exceeded. Please retry after 60 seconds."
+      }
+    },
+    {
+      "_source": "Top-level rate_limit_error",
+      "type": "rate_limit_error",
+      "message": "rate limit exceeded"
+    }
+  ],
+
+  "agent-crashed": [
+    {
+      "_source": "Synthetic — emitted by IPC bridge when Claude child exits nonzero",
+      "type": "agent-crashed",
+      "message": "Claude process exited with code 1"
+    },
+    {
+      "_source": "Synthetic — emitted by session-tail on socket disconnect",
+      "code": "agent-crashed",
+      "message": "IPC socket disconnected unexpectedly"
+    }
+  ],
+
+  "agent-restarted-unexpectedly": [
+    {
+      "_source": "Synthetic — emitted by gateway boot-banner diff when uptime drops unexpectedly",
+      "type": "agent-restarted-unexpectedly",
+      "message": "Agent restarted while user session was active"
+    },
+    {
+      "_source": "Synthetic — systemd watchdog detects unexpected restart",
+      "code": "agent-restarted-unexpectedly",
+      "message": "systemd unit restarted outside of operator request"
+    }
+  ],
+
+  "unknown-4xx": [
+    {
+      "_source": "Novel 4xx not matching any known Anthropic error type",
+      "status": 422,
+      "error": {
+        "type": "invalid_request_error",
+        "message": "Unrecognised field in request body"
+      }
+    },
+    {
+      "_source": "Bare 403 with no recognised type",
+      "status": 403,
+      "message": "Forbidden"
+    },
+    {
+      "_source": "null input — always unknown-4xx",
+      "_value": null
+    },
+    {
+      "_source": "Completely empty object",
+      "_value": {}
+    },
+    {
+      "_source": "Non-object string",
+      "_value": "something went wrong"
+    }
+  ],
+
+  "unknown-5xx": [
+    {
+      "_source": "500 with no recognised type",
+      "status": 500,
+      "message": "Internal Server Error"
+    },
+    {
+      "_source": "503 service unavailable",
+      "status": 503,
+      "error": {
+        "type": "service_unavailable",
+        "message": "Service temporarily unavailable"
+      }
+    }
+  ]
+}
