@@ -420,7 +420,8 @@ export function regenerateSystemdUnitsForAgent(
 
   if (useAutoaccept && gwName) {
     const stateDir = resolve(agentDir, "telegram");
-    const desiredGw = generateGatewayUnit(stateDir, name);
+    const adminEnabled = resolved.admin === true;
+    const desiredGw = generateGatewayUnit(stateDir, name, adminEnabled);
     const gwUnitPath = unitFilePath(gwName);
     const currentGw = existsSync(gwUnitPath) ? readFileSync(gwUnitPath, "utf-8") : "";
     if (currentGw !== desiredGw) {
@@ -781,7 +782,9 @@ export function registerAgentCommand(program: Command): void {
         // create` on its own would leave the new bot silent.
         if (useAutoaccept && gwName) {
           const stateDir = resolve(agentDir, "telegram");
-          const gatewayContent = generateGatewayUnit(stateDir, name);
+          const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+          const adminEnabled = resolved.admin === true;
+          const gatewayContent = generateGatewayUnit(stateDir, name, adminEnabled);
           installUnit(gwName, gatewayContent);
         }
 

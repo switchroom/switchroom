@@ -599,6 +599,16 @@ export const AgentSchema = z.object({
     .boolean()
     .optional()
     .describe("If true, add skipDangerousModePermissionPrompt to settings.json"),
+  admin: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, the agent's Telegram gateway intercepts admin slash commands " +
+      "(/agents, /logs, /restart, /delete, /update, /auth, /reconcile, etc.) " +
+      "locally before forwarding to Claude. Commands are handled silently — " +
+      "Claude never sees them. Requires the agent to use the switchroom-telegram " +
+      "plugin. When false or absent, all messages pass through to Claude unchanged.",
+    ),
   settings_raw: z
     .record(z.string(), z.unknown())
     .optional()

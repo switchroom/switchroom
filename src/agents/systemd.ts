@@ -197,7 +197,7 @@ function hasNodeOnPath(): boolean {
   }
 }
 
-export function generateGatewayUnit(stateDir: string, agentName: string): string {
+export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
   const logFile = resolve(stateDir, "gateway.log");
@@ -239,7 +239,7 @@ Environment=PATH=${unitPath}
 Environment=SWITCHROOM_CLI_PATH=${switchroomCli}
 Environment=TELEGRAM_STATE_DIR=${stateDir}
 Environment=SWITCHROOM_AGENT_NAME=${agentName}
-
+${adminEnabled ? `Environment=SWITCHROOM_AGENT_ADMIN=true\n` : ''}
 [Install]
 WantedBy=default.target
 `;
@@ -335,7 +335,11 @@ export function installAllUnits(config: SwitchroomConfig): void {
 
     if (useAutoaccept && gwName) {
       const stateDir = resolve(agentDir, "telegram");
-      const gatewayContent = generateGatewayUnit(stateDir, agentName);
+      // Pass admin flag so the gateway unit includes SWITCHROOM_AGENT_ADMIN=true
+      // when the agent is configured with admin:true. The gateway reads this env
+      // var to decide whether to intercept slash commands before forwarding to Claude.
+      const adminEnabled = resolveAgentConfig(config.defaults, config.profiles, agent).admin === true;
+      const gatewayContent = generateGatewayUnit(stateDir, agentName, adminEnabled);
       installUnit(gwName, gatewayContent);
       installedAgents.push(unitName(gwName));
     }
