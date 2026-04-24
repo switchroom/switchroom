@@ -60,7 +60,6 @@ export const ADMIN_COMMAND_NAMES = new Set<string>([
   'deny',
   'pending',
   'interrupt',
-  'pins-status',
 ])
 
 /**

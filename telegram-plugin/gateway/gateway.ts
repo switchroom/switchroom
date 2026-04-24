@@ -152,7 +152,7 @@ import { StagingMap } from '../secret-detect/staging.js'
 import { maskToken } from '../secret-detect/mask.js'
 import { defaultVaultWrite, defaultVaultList } from '../secret-detect/vault-write.js'
 import { detectSecrets } from '../secret-detect/index.js'
-import { dispatchAdminCommand, ADMIN_COMMAND_NAMES, parseCommandName } from '../admin-commands/index.js'
+import { ADMIN_COMMAND_NAMES, parseCommandName } from '../admin-commands/index.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()

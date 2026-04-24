@@ -26,7 +26,7 @@ describe('parseCommandName', () => {
     expect(parseCommandName('agents')).toBeNull()
   })
 
-  it('returns null for an empty slash', () => {
+  it('returns an empty string for a bare slash', () => {
     expect(parseCommandName('/ ')).toBe('')
   })
 })
