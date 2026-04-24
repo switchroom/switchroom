@@ -402,15 +402,23 @@ function buildSessionGreetingScript(
 
   // Build curl calls for each destination. TEXT is a shell variable resolved
   // at runtime (after placeholder substitution), so we use $TEXT not a quoted literal.
+  // Each call logs the HTTP response code so the session-greeting.log captures
+  // whether Telegram accepted the message (useful when diagnosing why a card
+  // didn't appear — 400 (bad markup), 401 (bad token), 403 (blocked), etc.).
   const curlTemplate = (destChatId: string, threadId?: number) => {
     const threadLine = threadId != null
       ? `\n  -d message_thread_id="${threadId}" \\`
       : "";
-    return `curl -s "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \\
+    const label = threadId != null
+      ? `chat=${destChatId} thread=${threadId}`
+      : `chat=${destChatId}`;
+    return `_log "SEND calling Telegram sendMessage (${label}, text_len=\${#TEXT})"
+_SEND_HTTP=$(curl -s -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \\
   -d chat_id="${destChatId}" \\${threadLine}
   -d parse_mode="HTML" \\
   -d disable_web_page_preview=true \\
-  --data-urlencode text="$TEXT" > /dev/null 2>&1 || true`;
+  --data-urlencode text="$TEXT" 2>/dev/null || echo "curl-failed")
+_log "SEND completed (${label}) http=$_SEND_HTTP"`;
   };
 
   const curlCalls: string[] = [];
@@ -428,16 +436,36 @@ function buildSessionGreetingScript(
 # Telegram on SessionStart. Zero model tokens — pure curl.
 # Regenerated on every reconcile so config changes are reflected.
 
+# --- DIAGNOSTIC LOGGING ---
+# Every invocation appends a line to $TELEGRAM_STATE_DIR/session-greeting.log
+# so we can reconstruct why the greeting fired (or was suppressed) on any
+# given SessionStart. Pure ops-observability: zero model tokens, no user-
+# visible behaviour change. Rotate/trash the file manually when it gets big.
+_GLOG="\${TELEGRAM_STATE_DIR:-/tmp}/session-greeting.log"
+_log() { printf '[%s pid=%d ppid=%d] %s\\n' "$(date -Iseconds)" "$$" "$PPID" "$*" >> "$_GLOG" 2>/dev/null || true; }
+_log "INVOKED cwd=$PWD telegram_state_dir=\${TELEGRAM_STATE_DIR:-UNSET} switchroom_agent=\${SWITCHROOM_AGENT_NAME:-UNSET} eval_mode=\${SWITCHROOM_EVAL_MODE:-unset}"
+
 # Skip greeting for eval runs and one-shot claude -p calls.
-[ "$SWITCHROOM_EVAL_MODE" = "1" ] && exit 0
+if [ "$SWITCHROOM_EVAL_MODE" = "1" ]; then _log "EXIT early: SWITCHROOM_EVAL_MODE=1"; exit 0; fi
 
 # Source bot token at runtime (never baked into scripts).
 source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
-[ -z "$TELEGRAM_BOT_TOKEN" ] && exit 0
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then _log "EXIT early: no TELEGRAM_BOT_TOKEN (state_dir=\${TELEGRAM_STATE_DIR:-UNSET})"; exit 0; fi
 
 # Capture hook stdin once — used for dedupe (session_id) and model resolution.
 HOOK_INPUT=""
 if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
+# Log hook input metadata (trimmed, no tokens in normal hook payload).
+if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
+  _HOOK_EVENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
+  _HOOK_SOURCE=$(printf '%s' "$HOOK_INPUT" | jq -r '.source // empty' 2>/dev/null)
+  _HOOK_SESSION=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+  _HOOK_PARENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.parent_session_id // empty' 2>/dev/null)
+  _HOOK_TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
+  _log "HOOK event=$_HOOK_EVENT source=$_HOOK_SOURCE session=\${_HOOK_SESSION:0:16} parent=\${_HOOK_PARENT:0:16} transcript=$(basename "\${_HOOK_TRANSCRIPT:-none}")"
+else
+  _log "HOOK empty or no-jq (hook_input_len=\${#HOOK_INPUT})"
+fi
 
 # Skip greeting for session recycling: agents without --continue exit after
 # each turn and systemd restarts them. Dedupe by comparing the gateway's
@@ -462,8 +490,15 @@ RESTART_REQUESTED=0
 # Resolve gateway process start time (epoch seconds) by finding the PID
 # listening on the Unix socket and reading /proc/<pid>. Returns 0 if we
 # can't find it, which disables the optimisation and always fires.
+#
+# IMPORTANT: no filesystem short-circuit on [ -S "$GATEWAY_SOCK" ]. If the
+# socket's directory entry was unlinked (orphaned socket — inode still
+# alive, path gone) the filesystem check returns false but the gateway
+# process is still running and listening. \`ss -xlnp\` reports the listener
+# by path even in that case, so we go straight to ss and let it speak
+# truth. A bare -S check here is what caused the greeting to re-fire on
+# every SessionStart when gateway.sock was unlinked.
 _gateway_start_time() {
-  if [ ! -S "$GATEWAY_SOCK" ]; then echo 0; return; fi
   local pid
   # ss -xlnp is the cheap path (no /proc walk); falls through to lsof if ss absent.
   # Uses sed (POSIX-portable) to extract the pid; avoids gawk's
@@ -477,22 +512,32 @@ _gateway_start_time() {
   stat -c %Y "/proc/$pid" 2>/dev/null || echo 0
 }
 
-if [ -S "$GATEWAY_SOCK" ]; then
-  GATEWAY_STARTED_AT=$(_gateway_start_time)
+# Proceed with dedupe whenever the gateway process is actually running
+# (as reported by ss), regardless of whether the filesystem entry for
+# the Unix socket is present. Orphaned-socket deploys must not bypass
+# dedupe.
+GATEWAY_STARTED_AT=$(_gateway_start_time)
+case "$GATEWAY_STARTED_AT" in ''|*[!0-9]*) GATEWAY_STARTED_AT=0 ;; esac
+if [ "$GATEWAY_STARTED_AT" -gt 0 ]; then
   GREETED_MARKER_FILE="$TELEGRAM_STATE_DIR/greeted-gateway-start"
   GREETED_AT=0
   [ -f "$GREETED_MARKER_FILE" ] && GREETED_AT=$(cat "$GREETED_MARKER_FILE" 2>/dev/null || echo 0)
   # Treat non-numeric reads as 0 so a corrupt marker re-fires rather than silently suppressing forever.
   case "$GREETED_AT" in ''|*[!0-9]*) GREETED_AT=0 ;; esac
-  case "$GATEWAY_STARTED_AT" in ''|*[!0-9]*) GATEWAY_STARTED_AT=0 ;; esac
-  # Skip only if: no explicit restart request AND we have a usable gateway
-  # start time AND we've already greeted *for this gateway process lifetime*.
-  if [ "$RESTART_REQUESTED" = "0" ] \
-     && [ "$GATEWAY_STARTED_AT" -gt 0 ] \
+  _skip_eligible=no
+  if [ "$RESTART_REQUESTED" = "0" ] && [ "$GREETED_AT" -ge "$GATEWAY_STARTED_AT" ]; then _skip_eligible=yes; fi
+  _log "DEDUPE gateway_sock_file=$([ -S "$GATEWAY_SOCK" ] && echo present || echo MISSING) restart_requested=$RESTART_REQUESTED gateway_started_at=$GATEWAY_STARTED_AT greeted_at=$GREETED_AT skip_eligible=$_skip_eligible"
+  # Skip only if: no explicit restart request AND we've already greeted
+  # *for this gateway process lifetime*.
+  if [ "$RESTART_REQUESTED" = "0" ] \\
      && [ "$GREETED_AT" -ge "$GATEWAY_STARTED_AT" ]; then
+    _log "EXIT dedupe-skip: already greeted for this gateway lifetime (greeted_at=$GREETED_AT >= gateway_started_at=$GATEWAY_STARTED_AT)"
     exit 0
   fi
+  _log "DEDUPE falling through to greet; updating marker to NOW=$NOW"
   printf '%s' "$NOW" > "$GREETED_MARKER_FILE" 2>/dev/null || true
+else
+  _log "DEDUPE gateway_started_at=0 (no listener found via ss/lsof); skipping dedupe, will attempt greet"
 fi
 
 # Idempotency guard: Claude Code fires SessionStart multiple times on some
@@ -507,12 +552,18 @@ fi
 GREETING_MARKER="$TELEGRAM_STATE_DIR/greeting-lock"
 if [ -d "$GREETING_MARKER" ]; then
   LAST=$(stat -c %Y "$GREETING_MARKER" 2>/dev/null || echo 0)
+  _log "LOCK exists since $LAST (age $((NOW - LAST))s)"
   if [ $((NOW - LAST)) -lt 60 ]; then
+    _log "EXIT lock-skip: greeting-lock acquired <60s ago (age=$((NOW - LAST))s)"
     exit 0
   fi
   rmdir "$GREETING_MARKER" 2>/dev/null || true
 fi
-mkdir "$GREETING_MARKER" 2>/dev/null || exit 0
+if ! mkdir "$GREETING_MARKER" 2>/dev/null; then
+  _log "EXIT mkdir-race: another invocation won the greeting-lock"
+  exit 0
+fi
+_log "LOCK acquired; proceeding with greeting"
 
 # Resolve the active model from SessionStart hook stdin.
 # Fallback chain: hook .model → agent settings.json .model → current
