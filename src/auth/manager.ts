@@ -12,6 +12,7 @@ import {
 import { join, resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import { probeForCodePrompt } from "./pane-ready-probe.js";
 import {
   getSlotInfos,
   listSlots,
@@ -119,7 +120,26 @@ export interface AuthCodeResult {
   tokenSaved: boolean;
   tokenPath?: string;
   instructions: string[];
+  /** Structured outcome for callers that need to switch on the result kind. */
+  outcome?: AuthCodeOutcome;
 }
+
+/**
+ * Structured outcome from `submitAuthCode`. Callers such as the Telegram
+ * gateway switch on `kind` to render an appropriate user-facing message
+ * rather than parsing the free-text `instructions` array.
+ *
+ * - `success`       — token found and saved.
+ * - `invalid-code`  — pane tail contains a known "invalid code" message.
+ * - `expired-code`  — pane tail contains a known "expired code" message.
+ * - `pane-not-ready` — the auth pane didn't show "Paste code here" within
+ *                      the probe window; code was not injected.
+ * - `timeout`       — polling exhausted `pollTimeoutMs` without a token.
+ */
+export type AuthCodeOutcome = {
+  kind: "success" | "invalid-code" | "expired-code" | "pane-not-ready" | "timeout";
+  paneTailText?: string;
+};
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -669,7 +689,14 @@ export function submitAuthCode(
   _opts: { pollIntervalMs?: number; pollTimeoutMs?: number } = {},
 ): AuthCodeResult {
   const pollIntervalMs = _opts.pollIntervalMs ?? 500;
-  const pollTimeoutMs = _opts.pollTimeoutMs ?? 20_000;
+  // Default raised from 20 s → 120 s (2 min). The old default was below
+  // p99 round-trip for `claude setup-token` to write `.credentials.json`.
+  // Override via SWITCHROOM_AUTH_CODE_TIMEOUT_MS env var.
+  const envTimeout = process.env.SWITCHROOM_AUTH_CODE_TIMEOUT_MS
+    ? parseInt(process.env.SWITCHROOM_AUTH_CODE_TIMEOUT_MS, 10)
+    : NaN;
+  const pollTimeoutMs =
+    _opts.pollTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 120_000);
 
   // If slot is omitted, try to read pending session meta to discover it.
   let targetSlot = slot;
@@ -689,7 +716,34 @@ export function submitAuthCode(
     };
   }
 
-  tmux(["send-keys", "-t", sessionName, code.trim(), "Enter"]);
+  // --- Pane-ready probe --------------------------------------------------
+  // Before injecting the code, poll the pane for the "Paste code here"
+  // prompt (up to ~5 s). This catches the race between session start and
+  // the URL/prompt rendering. If the prompt isn't visible yet, don't inject
+  // the code — return a structured `pane-not-ready` outcome so the caller
+  // can prompt the user to retry.
+  const paneReadyResult = probeForCodePrompt(sessionName);
+  if (!paneReadyResult.ready) {
+    clearAuthSessionMeta(agentDir);
+    const outcome: AuthCodeOutcome = { kind: "pane-not-ready" };
+    return {
+      completed: false,
+      tokenSaved: false,
+      outcome,
+      instructions: [
+        `Auth pane for agent "${name}" is not ready (prompt not visible yet).`,
+        paneReadyResult.reason === "session-gone"
+          ? `The tmux session disappeared — start a new auth with: switchroom auth reauth ${name}`
+          : `Retry in a moment with: switchroom auth code ${name} <browser-code>`,
+      ],
+    };
+  }
+
+  // --- Two separate send-keys calls ----------------------------------------
+  // The combined `code<space>Enter` form is fragile across terminfo
+  // variants. Send the literal code first, then Enter separately.
+  tmux(["send-keys", "-l", "-t", sessionName, code.trim()]);
+  tmux(["send-keys", "-t", sessionName, "Enter"]);
 
   // Read the configDir that `claude setup-token` was launched with so
   // we can watch its .credentials.json for the success-written token.
@@ -730,11 +784,39 @@ export function submitAuthCode(
   }
 
   if (!token) {
+    // Capture the pane tail to surface the real error (e.g. "Invalid or
+    // expired code") to the caller rather than a generic timeout message.
+    let paneTailText: string | undefined;
+    try {
+      const paneText = captureTmuxPane(sessionName);
+      const lastNonEmpty = paneText
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .at(-1);
+      if (lastNonEmpty) paneTailText = lastNonEmpty;
+    } catch {
+      // best effort
+    }
+
+    // Map known OAuth-error pane strings to typed outcome kinds.
+    const tailLower = paneTailText?.toLowerCase() ?? "";
+    let outcomeKind: AuthCodeOutcome["kind"] = "timeout";
+    if (/invalid.*code|code.*invalid/i.test(tailLower)) {
+      outcomeKind = "invalid-code";
+    } else if (/expired.*code|code.*expired/i.test(tailLower)) {
+      outcomeKind = "expired-code";
+    }
+
+    clearAuthSessionMeta(agentDir);
+    const outcome: AuthCodeOutcome = { kind: outcomeKind, paneTailText };
     return {
       completed: false,
       tokenSaved: false,
+      outcome,
       instructions: [
         `Submitted code to Claude for agent "${name}", but no token was found after ${Math.round(pollTimeoutMs / 1000)}s.`,
+        ...(paneTailText ? [`Pane output: ${paneTailText}`] : []),
         `If the code was invalid, Claude will say so in the auth session.`,
         `Inspect with: tmux attach -t ${sessionName}`,
         `Retry with:   switchroom auth code ${name} <browser-code>`,
@@ -757,10 +839,12 @@ export function submitAuthCode(
   // Clean up auth log file — it contains the token in plaintext.
   rmSync(authLogPath(agentDir), { force: true });
 
+  const outcome: AuthCodeOutcome = { kind: "success" };
   return {
     completed: true,
     tokenSaved: true,
     tokenPath,
+    outcome,
     instructions: [
       `Saved Claude OAuth token for agent "${name}".`,
       `  Token file: ${tokenPath}`,
