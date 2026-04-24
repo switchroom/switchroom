@@ -545,6 +545,108 @@ describe('progress-card render', () => {
     const out = render(st, 1500)
     expect(out).toContain('◉ <i>Thinking…</i>')
   })
+
+  it('suppresses raw mcp__ tool name prefix when label is present', () => {
+    // The checklist used to render:
+    //   "mcp__switchroom-telegram__stream_reply Telegram: stream_reply (…)"
+    // after the MCP polish it should render the friendly label alone.
+    let st = reduce(initialState(), enqueue('polish test'), 1000)
+    st = reduce(
+      st,
+      {
+        kind: 'tool_use',
+        toolName: 'mcp__switchroom-telegram__stream_reply',
+        toolUseId: 'toolu_x',
+        input: { text: 'Hello world' },
+      },
+      1100,
+    )
+    const out = render(st, 1500)
+    expect(out).not.toContain('mcp__switchroom-telegram__stream_reply')
+    expect(out).toContain('Telegram: stream_reply')
+  })
+
+  it('strips HTML tags from MCP preview so <b> does not leak as literal text', () => {
+    let st = reduce(initialState(), enqueue('html leak test'), 1000)
+    st = reduce(
+      st,
+      {
+        kind: 'tool_use',
+        toolName: 'mcp__switchroom-telegram__stream_reply',
+        toolUseId: 'toolu_y',
+        input: { text: '<b>Recommendation, priority-ordered:</b> 1a' },
+      },
+      1100,
+    )
+    const out = render(st, 1500)
+    // escapeHtml would turn a surviving '<b>' into '&lt;b&gt;' in the
+    // final string. Assert neither form appears.
+    expect(out).not.toContain('<b>Recommendation')
+    expect(out).not.toContain('&lt;b&gt;Recommendation')
+    expect(out).toContain('Recommendation')
+  })
+
+  // ─── Deferred-completion header: "Working…" while sub-agents outlive turn_end ───
+  //
+  // Root cause covered by these tests: after parent turn_end the reducer
+  // sets stage='done' unconditionally, but background Agent sub-agents
+  // can still be running. Pre-fix the header rendered "✅ Done" and the
+  // heartbeat stopped re-rendering — users saw a frozen ✅ card while
+  // the sub-agent ground away. Post-fix "truly done" means
+  // stage==='done' AND no in-flight sub-agents.
+
+  it('shows "Working…" header while sub-agent outlives parent turn_end', () => {
+    let st = reduce(initialState(), enqueue('deferred test'), 1000)
+    st = reduce(st, {
+      kind: 'tool_use',
+      toolName: 'Agent',
+      toolUseId: 'toolu_a',
+      input: { description: 'run review', subagent_type: 'reviewer' },
+    }, 1100)
+    st = reduce(st, {
+      kind: 'sub_agent_started',
+      agentId: 'agent-x',
+      firstPromptText: 'run review',
+      subagentType: 'reviewer',
+    }, 1200)
+    st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1500)
+
+    // Sanity: reducer still flips stage='done' internally, but the
+    // sub-agent is still running — so the header should reflect
+    // "still working" to the user.
+    expect(st.stage).toBe('done')
+    const out = render(st, 2000)
+    expect(out).toContain('⚙️')
+    expect(out).toContain('Working')
+    expect(out).not.toContain('✅')
+  })
+
+  it('flips header to "✅ Done" once last sub-agent finishes', () => {
+    let st = reduce(initialState(), enqueue('deferred completion'), 1000)
+    st = reduce(st, {
+      kind: 'tool_use',
+      toolName: 'Agent',
+      toolUseId: 'toolu_b',
+      input: { description: 'run review', subagent_type: 'reviewer' },
+    }, 1100)
+    st = reduce(st, {
+      kind: 'sub_agent_started',
+      agentId: 'agent-y',
+      firstPromptText: 'run review',
+      subagentType: 'reviewer',
+    }, 1200)
+    st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1500)
+    // Sub-agent finishes after parent turn_end.
+    st = reduce(st, {
+      kind: 'sub_agent_turn_end',
+      agentId: 'agent-y',
+      durationMs: 2000,
+    }, 3500)
+
+    const out = render(st, 3600)
+    expect(out).toContain('✅')
+    expect(out).toContain('Done')
+  })
 })
 
 // ─── Multi-agent correlation reducer tests ───────────────────────────────

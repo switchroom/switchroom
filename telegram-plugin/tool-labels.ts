@@ -79,6 +79,22 @@ function truncate(s: string, n = MAX_LABEL_CHARS): string {
   return s.slice(0, n - 1) + '…'
 }
 
+/**
+ * Strip HTML tags from a preview string. MCP tools like `stream_reply`
+ * accept Telegram-HTML text as input; when we use that text as a label
+ * preview, the raw `<b>`/`<i>`/etc. markers would pass through
+ * `escapeHtml` in the renderer and show up as visible `<b>` on screen.
+ * Dropping tags here keeps the preview human-readable.
+ *
+ * Requires an ASCII letter (or `/`) immediately after `<` so comparison
+ * operators in plain-text queries (`"find x < 5 and y > 3"`) survive
+ * unmolested. A naive `/<[^>]+>/g` would otherwise eat everything
+ * between the two brackets.
+ */
+function stripHtml(s: string): string {
+  return s.replace(/<\/?[a-zA-Z][^>]*>/g, '')
+}
+
 function firstLine(s: string): string {
   const idx = s.indexOf('\n')
   return idx === -1 ? s : s.slice(0, idx)
@@ -208,14 +224,14 @@ export function toolLabel(
       // key-sweep fallback, which would otherwise echo raw query strings.
       if (tool.startsWith('mcp__')) {
         const description = str('description')
-        if (description) return truncate(firstLine(description), MAX_DESCRIPTION_CHARS)
+        if (description) return truncate(firstLine(stripHtml(description)), MAX_DESCRIPTION_CHARS)
         const label = mcpBaseLabel(tool)
         const query = str('query') ?? str('text') ?? str('name')
         if (label && query) {
           // Reserve room for the " (…)" wrapping so the total label stays
           // under MAX_LABEL_CHARS. 4 chars of framing: " (" + "…" + ")".
           const budget = Math.max(8, MAX_LABEL_CHARS - label.length - 4)
-          const preview = truncate(firstLine(query), budget)
+          const preview = truncate(firstLine(stripHtml(query)), budget)
           return `${label} (${preview})`
         }
         if (label) return truncate(label)

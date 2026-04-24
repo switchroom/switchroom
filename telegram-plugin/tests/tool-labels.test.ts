@@ -254,6 +254,34 @@ describe('toolLabel', () => {
       // Only one `__` segment after prefix — no action half.
       expect(toolLabel('mcp__broken', { query: 'foo' })).toBe('foo')
     })
+
+    it('strips HTML tags from preview text', () => {
+      // stream_reply accepts Telegram-HTML text; raw tags in the preview
+      // would survive escapeHtml() in the renderer and render as literal
+      // `<b>` on screen. The label must come back as plain prose.
+      const out = toolLabel('mcp__switchroom-telegram__stream_reply', {
+        text: '<b>Recommendation, priority-ordered:</b> 1a — scaffold',
+      })
+      expect(out).not.toContain('<b>')
+      expect(out).not.toContain('</b>')
+      expect(out).toContain('Recommendation')
+    })
+
+    it('strips HTML from description fallback', () => {
+      const out = toolLabel('mcp__hindsight__retain', {
+        description: 'Remember <i>Ken</i> prefers TypeScript',
+      })
+      expect(out).toBe('Remember Ken prefers TypeScript')
+    })
+
+    it('preserves comparison operators in non-HTML queries', () => {
+      // stripHtml's regex requires a letter/slash after `<` so plain-text
+      // comparisons like "x < 5 and y > 3" don't get their middle eaten.
+      const out = toolLabel('mcp__hindsight__recall', {
+        query: 'x < 5 and y > 3',
+      })
+      expect(out).toBe('Hindsight: recall (x < 5 and y > 3)')
+    })
   })
 
   describe('regression: existing cases still pass with new defaults', () => {

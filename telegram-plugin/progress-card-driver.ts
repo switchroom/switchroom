@@ -466,7 +466,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // the cleanup.
       const zombies: PerChatState[] = []
       for (const [, cs] of chats) {
-        if (cs.state.stage === 'done') continue
+        // Skip only when TRULY done. During the deferred-completion
+        // window (parent turn_end fired but background sub-agents are
+        // still running), reducer stage is 'done' but the card is
+        // still alive and `hasInFlightSubAgents` is true. We want the
+        // heartbeat to keep ticking so elapsed time + sub-agent
+        // durations visibly advance — a frozen "✅ Done" card was the
+        // "card went dead" bug.
+        if (cs.state.stage === 'done' && !hasInFlightSubAgents(cs.state)) continue
         // Don't heartbeat a card that's still in the initial delay window.
         if (cs.isFirstEmit && cs.deferredFirstEmitTimer !== DELAY_ELAPSED) continue
         if (maxIdleMs > 0 && now() - cs.lastEventAt > maxIdleMs) {

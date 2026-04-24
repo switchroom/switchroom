@@ -698,6 +698,15 @@ function extractUserText(raw: string): string {
  * currently in flight.
  */
 function renderItemCore(tool: string, label: string, bold = false): string {
+  // MCP tools: the label from toolLabel() already begins with a
+  // prettified "Server: action" form (from mcpBaseLabel), so echoing
+  // the raw `mcp__server__action` tool name as a prefix just duplicates
+  // the friendly name. Render the label alone. If label is empty
+  // (malformed mcp__ name, no input keys to preview), fall through so
+  // the raw tool name still appears rather than rendering nothing.
+  if (tool.startsWith('mcp__') && label) {
+    return bold ? `<b>${escapeHtml(label)}</b>` : escapeHtml(label)
+  }
   const toolHtml = bold ? `<b>${escapeHtml(tool)}</b>` : escapeHtml(tool)
   if (!label) return toolHtml
   const separator = tool === 'Agent' || tool === 'Task' ? ': ' : ' '
@@ -781,8 +790,15 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
   const lines: string[] = []
 
   const elapsed = formatDuration(now - state.turnStartedAt)
-  const headerIcon = state.stage === 'done' ? '✅' : '⚙️'
-  const headerLabel = state.stage === 'done' ? 'Done' : 'Working…'
+  // "Truly done" = parent turn_end fired AND no sub-agents still in
+  // flight. While the driver's `pendingCompletion` state is active
+  // (background Agent calls outliving parent turn_end), the reducer
+  // has already flipped `state.stage` to 'done' but the work isn't
+  // actually finished. Show "Working…" + ticking elapsed in that
+  // window so users aren't looking at a frozen ✅ card.
+  const trulyDone = state.stage === 'done' && !hasInFlightSubAgents(state)
+  const headerIcon = trulyDone ? '✅' : '⚙️'
+  const headerLabel = trulyDone ? 'Done' : 'Working…'
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
 
@@ -793,10 +809,11 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
   // Stuck-warning: after 2 min of no session events the card is likely
   // orphaned or the sub-agent is in a long-running silent tool call.
   // Surface the gap early so users aren't left guessing until the 5-min
-  // zombie ceiling force-closes. Suppressed on 'done' because the warning
-  // becomes misleading once the turn has ended.
+  // zombie ceiling force-closes. Suppressed only on TRUE done — during
+  // the deferred-completion window (parent done, sub-agents still
+  // running silently) the warning is still the correct signal.
   if (
-    state.stage !== 'done' &&
+    !trulyDone &&
     opts?.stuckMs != null &&
     opts.stuckMs >= STUCK_THRESHOLD_MS
   ) {
@@ -833,7 +850,13 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     const counts = countSubAgentStates(state.subAgents)
     lines.push(`[Sub-agents · ${formatSubAgentCounts(counts)}]`)
     for (const sa of sortSubAgentsChrono(state.subAgents)) {
-      for (const l of renderSubAgent(sa, now, state.stage === 'done')) {
+      // forceCollapse only when TRULY done — during deferred-completion
+      // (parent ended but sub-agents still running), keep running
+      // sub-agents in the two-line running block so their ticking
+      // elapsed-time stays visible. When trulyDone is reached the
+      // reducer has already marked every sub-agent as done/failed, so
+      // this arg is effectively moot in that branch.
+      for (const l of renderSubAgent(sa, now, trulyDone)) {
         lines.push(l)
       }
     }
@@ -864,8 +887,20 @@ function renderNarrativeChecklist(
   const visible = narratives.slice(-MAX_VISIBLE_ITEMS)
   for (const step of visible) {
     if (step.state === 'active') {
-      const dur = formatDuration(now - step.startedAt)
-      lines.push(`${STEP_ACTIVE} <b>${escapeHtml(step.text)}</b> <i>(${dur})</i>`)
+      const age = now - step.startedAt
+      const dur = formatDuration(age)
+      // When an active narrative is older than the stuck threshold, the
+      // "No events for X" banner will already be rendered above. A
+      // confidently-bolded narrative with a ticking age next to it sends
+      // mixed signals ("stuck" vs "actively working on X"). De-emphasise
+      // the narrative to italic with a `stale` marker so the signals
+      // agree: the last announced step, not necessarily what's running
+      // right now.
+      if (age > STUCK_THRESHOLD_MS) {
+        lines.push(`${STEP_ACTIVE} <i>${escapeHtml(step.text)} · stale (${dur})</i>`)
+      } else {
+        lines.push(`${STEP_ACTIVE} <b>${escapeHtml(step.text)}</b> <i>(${dur})</i>`)
+      }
     } else {
       lines.push(`${STEP_DONE} ${escapeHtml(step.text)}`)
     }

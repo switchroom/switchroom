@@ -1898,7 +1898,19 @@ progress card shows that for free. Don't send an update on a trivial one-shot
 task. Send them when a colleague would genuinely want to know what's happening.
 
 Final answers still go through \`stream_reply\` with done=true as usual,
-\`progress_update\` is only for mid-turn check-ins.`;
+\`progress_update\` is only for mid-turn check-ins.
+
+## Think out loud before tool calls
+
+When you're about to call a tool — especially on the second and later
+tool calls in a turn — lead the assistant message with one short
+sentence naming what you're doing: "Reading the config.", "Running the
+migration.", "Searching for X." The progress card pairs that sentence
+with the tool as a natural-language step, so the user can tell what's
+happening without decoding raw tool names. Without a preamble the card
+goes quiet during long tool chains and feels stuck. Keep it to one
+line; don't repeat the preamble before every call in a fast sequence,
+but do refresh it when you switch to a genuinely different step.`;
 
       const memoryGuidance = `## Memory — proactive, conversational
 
@@ -2939,7 +2951,19 @@ progress card shows that for free. Don't send an update on a trivial one-shot
 task. Send them when a colleague would genuinely want to know what's happening.
 
 Final answers still go through \`stream_reply\` with done=true as usual,
-\`progress_update\` is only for mid-turn check-ins.`;
+\`progress_update\` is only for mid-turn check-ins.
+
+## Think out loud before tool calls
+
+When you're about to call a tool — especially on the second and later
+tool calls in a turn — lead the assistant message with one short
+sentence naming what you're doing: "Reading the config.", "Running the
+migration.", "Searching for X." The progress card pairs that sentence
+with the tool as a natural-language step, so the user can tell what's
+happening without decoding raw tool names. Without a preamble the card
+goes quiet during long tool chains and feels stuck. Keep it to one
+line; don't repeat the preamble before every call in a fast sequence,
+but do refresh it when you switch to a genuinely different step.`;
         const memoryGuidance = `## Memory — proactive, conversational
 
 You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_memory\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.

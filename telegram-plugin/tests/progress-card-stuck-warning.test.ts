@@ -65,6 +65,44 @@ describe("render — stuck-warning", () => {
     const html = render(s, START + STUCK_THRESHOLD_MS + 10_000);
     expect(html).not.toContain("No events for");
   });
+
+  it("demotes active narrative to italic+stale when age > threshold", () => {
+    // When the stuck banner appears, a still-bolded narrative with a
+    // confidently ticking age sends mixed signals. The narrative should
+    // render in italics with a "· stale" marker so the two signals agree.
+    let s = reduce(initialState(), enqueue(), START);
+    s = reduce(s, { kind: "text", text: "Reading config" }, START + 100);
+    const html = render(s, START + STUCK_THRESHOLD_MS + 30_000, undefined, {
+      stuckMs: STUCK_THRESHOLD_MS + 30_000,
+    });
+    expect(html).toContain("stale");
+    expect(html).not.toContain("<b>Reading config</b>");
+  });
+
+  it("keeps active narrative bold while fresh (below threshold)", () => {
+    let s = reduce(initialState(), enqueue(), START);
+    s = reduce(s, { kind: "text", text: "Reading config" }, START + 100);
+    const html = render(s, START + 30_000, undefined, {
+      stuckMs: 30_000,
+    });
+    expect(html).toContain("<b>Reading config</b>");
+    expect(html).not.toContain("stale");
+  });
+
+  it("narrative at exact STUCK_THRESHOLD_MS stays bold (deliberate `>` asymmetry)", () => {
+    // Banner condition is `>=`; narrative demotion uses `>`. At the
+    // exact-equality tick the banner appears but the narrative is still
+    // bold. In production stuckMs ticks in ~5s increments so the window
+    // never reaches exact-equality — pin this as intentional so a
+    // future refactor doesn't accidentally change both to `>=`.
+    let s = reduce(initialState(), enqueue(), START);
+    s = reduce(s, { kind: "text", text: "Reading config" }, START);
+    const html = render(s, START + STUCK_THRESHOLD_MS, undefined, {
+      stuckMs: STUCK_THRESHOLD_MS,
+    });
+    expect(html).toContain("<b>Reading config</b>");
+    expect(html).toContain("No events for");
+  });
 });
 
 describe("progress-card driver — stuck warning propagation via heartbeat", () => {
@@ -163,6 +201,53 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     const post = emits.slice(beforeReset);
     const postHasWarning = post.some((e) => e.html.includes("No events for"));
     expect(postHasWarning).toBe(false);
+  });
+
+  it("heartbeat keeps ticking while sub-agent outlives parent turn_end", () => {
+    // Regression: pre-fix, the heartbeat skipped any card with
+    // `state.stage === 'done'` — which the reducer sets the moment
+    // turn_end fires, even when sub-agents are still running. Result:
+    // user saw a frozen "✅ Done" card with stopped elapsed time while
+    // a background Agent sub-agent ground away. Post-fix the heartbeat
+    // only skips when BOTH stage='done' AND !hasInFlightSubAgents.
+    const { driver, emits, advance } = harness({ heartbeatMs: 5_000 });
+    driver.ingest(enqueue("c1"), null);
+    // Start a background Agent sub-agent.
+    driver.ingest(
+      {
+        kind: "tool_use",
+        toolName: "Agent",
+        toolUseId: "toolu_agent",
+        input: { description: "run review", subagent_type: "reviewer" },
+      },
+      "c1",
+    );
+    driver.ingest(
+      {
+        kind: "sub_agent_started",
+        agentId: "agent-bg",
+        firstPromptText: "run review",
+        subagentType: "reviewer",
+      },
+      "c1",
+    );
+    // Parent turn ends while sub-agent still running.
+    driver.ingest({ kind: "turn_end", durationMs: 500 }, "c1");
+    const emitsAtTurnEnd = emits.length;
+    // Tick a few heartbeats forward. Since hasInFlightSubAgents is true,
+    // the heartbeat should keep re-rendering and emitting as the
+    // elapsed-time bucket advances.
+    advance(20_000);
+    const postHeartbeatEmits = emits.length;
+    expect(postHeartbeatEmits).toBeGreaterThan(emitsAtTurnEnd);
+    // None of those heartbeat emits should carry done=true — the card
+    // is still waiting on the sub-agent.
+    const heartbeatEmits = emits.slice(emitsAtTurnEnd);
+    expect(heartbeatEmits.every((e) => e.done === false)).toBe(true);
+    // And the header should still say "Working…" (⚙️), not "✅ Done".
+    const lastHeartbeat = heartbeatEmits[heartbeatEmits.length - 1];
+    expect(lastHeartbeat.html).toContain("⚙️");
+    expect(lastHeartbeat.html).not.toContain("✅");
   });
 
   it("zombie ceiling force-closes a card whose lastEventAt is older than maxIdleMs", () => {
