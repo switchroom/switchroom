@@ -107,8 +107,14 @@ export interface CompletionResult {
  * This prevents a failed bootstrap from leaving the user in a "stuck" state
  * where a second run hits the "already configured" guard.
  */
-/** Regex that agent names must match — mirrors the yaml schema constraint. */
-const AGENT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+/**
+ * Regex that agent names must match — mirrors the yaml schema constraint.
+ * Max length 51 chars. Telegram callback_data is capped at 64 BYTES; the
+ * longest operator-event prefix is `op:swap-slot:` (13 bytes), leaving 51
+ * for the agent name. Agents with longer names would have broken buttons
+ * in Phase 4a/4b. See operator-events.ts callback_data contract.
+ */
+const AGENT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,50}$/;
 
 export async function createAgent(
   opts: CreateAgentOpts,
@@ -125,7 +131,7 @@ export async function createAgent(
   if (!AGENT_NAME_RE.test(name)) {
     throw new Error(
       `Invalid agent name: "${name}". ` +
-        `Names must match ^[a-z0-9][a-z0-9_-]{0,62}$ (lowercase alphanumeric, hyphens, underscores; max 63 chars).`,
+        `Names must match ^[a-z0-9][a-z0-9_-]{0,50}$ (lowercase alphanumeric, hyphens, underscores; max 51 chars for Telegram callback_data compatibility).`,
     );
   }
 
@@ -296,7 +302,7 @@ export async function completeCreation(
   if (!AGENT_NAME_RE.test(name)) {
     throw new Error(
       `Invalid agent name: "${name}". ` +
-        `Names must match ^[a-z0-9][a-z0-9_-]{0,62}$ (lowercase alphanumeric, hyphens, underscores; max 63 chars).`,
+        `Names must match ^[a-z0-9][a-z0-9_-]{0,50}$ (lowercase alphanumeric, hyphens, underscores; max 51 chars for Telegram callback_data compatibility).`,
     );
   }
 

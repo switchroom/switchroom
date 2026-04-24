@@ -43,16 +43,20 @@ describe('foreman-handlers: assertSafeAgentName', () => {
     expect(() => assertSafeAgentName('my_agent')).not.toThrow()
   })
 
-  it('accepts names with uppercase and digits', () => {
-    expect(() => assertSafeAgentName('Agent1')).not.toThrow()
+  it('accepts lowercase names with digits', () => {
+    expect(() => assertSafeAgentName('agent1')).not.toThrow()
   })
 
-  it('accepts 64-char name', () => {
-    expect(() => assertSafeAgentName('a'.repeat(64))).not.toThrow()
+  it('rejects uppercase names', () => {
+    expect(() => assertSafeAgentName('Agent1')).toThrow('invalid agent name')
   })
 
-  it('rejects names over 64 chars', () => {
-    expect(() => assertSafeAgentName('a'.repeat(65))).toThrow('invalid agent name')
+  it('accepts 51-char name (Telegram callback_data max)', () => {
+    expect(() => assertSafeAgentName('a'.repeat(51))).not.toThrow()
+  })
+
+  it('rejects 52-char name (exceeds callback_data budget)', () => {
+    expect(() => assertSafeAgentName('a'.repeat(52))).toThrow('invalid agent name')
   })
 
   it('rejects empty name', () => {

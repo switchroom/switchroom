@@ -25,10 +25,12 @@ export type SwitchroomExecJsonFn = <T = unknown>(args: string[]) => T | null
 
 /**
  * Throw if the agent name is not safe for use in journalctl unit names.
- * Accepts [a-zA-Z0-9_-]{1,64}.
+ * Mirrors AGENT_NAME_RE in src/agents/create-orchestrator.ts and the yaml
+ * schema in src/config/schema.ts — all three MUST stay in sync. Max 51
+ * chars (see operator-events.ts callback_data contract).
  */
 export function assertSafeAgentName(name: string): void {
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+  if (!/^[a-z0-9][a-z0-9_-]{0,50}$/.test(name)) {
     throw new Error(`invalid agent name: ${name}`)
   }
 }
