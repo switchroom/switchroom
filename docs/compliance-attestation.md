@@ -39,17 +39,13 @@ Switchroom does **not**:
 
 ### 1. Switchroom Is Not a Third-Party Harness
 
-**Anthropic's policy:** Anthropic's Consumer Terms of Service explicitly prohibit using OAuth tokens obtained through Claude Free, Pro, or Max accounts in any other product, tool, or service, including the Agent SDK. Anthropic clarified this position publicly on February 20, 2026, and formalised the consumer-terms language on April 4, 2026. A small-scale test beginning around April 21–22, 2026 removed Claude Code from the Pro plan for approximately 2% of new prosumer signups (existing subscribers unaffected); this is a pricing/packaging change, not a technical restriction on supported usage.
+**Anthropic's policy:** Anthropic's Consumer Terms of Service explicitly prohibit using OAuth tokens obtained through Claude Free, Pro, or Max accounts in any other product, tool, or service. Anthropic clarified this position publicly on February 20, 2026 (explicitly naming the Agent SDK among the prohibited uses), and formalised the consumer-terms language on April 4, 2026. In April 2026, Anthropic removed Claude Code from the Pro plan's pricing page and began restricting new Pro signups from accessing Claude Code — affecting an initial cohort of approximately 2% of new prosumer signups, with existing subscribers unaffected. This is a packaging policy signal, not a technical restriction on the supported usage patterns described in this document.
 
-**Source:** [Legal and compliance - Claude Code Docs](https://code.claude.com/docs/en/legal-and-compliance); [Anthropic clarifies ban on third-party tool access to Claude — The Register, 2026-02-20](https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/); [Anthropic tests removing Claude Code from Pro — The Register, 2026-04-22](https://www.theregister.com/2026/04/22/anthropic_removes_claude_code_pro/)
+**Source:** [Legal and compliance - Claude Code Docs](https://code.claude.com/docs/en/legal-and-compliance) (OAuth prohibition); [Anthropic clarifies ban on third-party tool access to Claude — The Register, 2026-02-20](https://www.theregister.com/2026/02/20/anthropic_clarifies_ban_third_party_claude_access/) (Agent SDK and third-party tools clarification); [Anthropic tests removing Claude Code from Pro — The Register, 2026-04-22](https://www.theregister.com/2026/04/22/anthropic_removes_claude_code_pro/) (pricing-page packaging change)
 
-**Switchroom's compliance:** Switchroom does not route requests through subscription credentials. Each Claude Code agent session:
-- Runs the official `claude` CLI binary directly
-- Authenticates via Claude Code's own OAuth flow (the user completes this in the terminal via tmux pane automation)
-- Maintains its own `.credentials.json` managed entirely by Claude Code
-- Makes inference requests directly to Anthropic's servers via Claude Code's built-in client
+**Switchroom's compliance:** Switchroom leverages Claude Code natively — no Agent SDK, no direct API usage, no custom runtime. Each agent is an unmodified `claude` CLI process started the same way a user would start one, authenticated via Claude Code's own OAuth flow completed in the terminal. Switchroom reads the OAuth token from the agent's local `.credentials.json` solely to manage multi-account slot rotation on the same machine (writing a companion slot file, `accounts/<slot>/.oauth-token`). The token is never transmitted off-device, never forwarded to a third party, and never used by switchroom to make inference calls on the user's behalf. All inference happens between the user's Claude Code session and Anthropic's servers directly, via Claude Code's built-in client.
 
-Switchroom never touches, reads, or proxies the access token, refresh token, or any authentication credential used for inference. The authentication relationship is directly between the user's Claude Code session and Anthropic. Switchroom's auth flow Phase 1 (`src/auth/pane-ready-probe.ts`) automates only keystroke entry into the terminal during the OAuth flow; it does not intercept tokens.
+Switchroom's auth flow Phase 1 (`src/auth/pane-ready-probe.ts`) automates only keystroke entry into the terminal during the OAuth flow. The authentication relationship is directly between the user's Claude Code session and Anthropic.
 
 ### 2. Telegram Plugin: Switchroom Fork by Default, Official Available as Opt-Out
 
@@ -132,11 +128,10 @@ The gateway stays alive across Claude Code session restarts (via systemd), allow
 **What it is:** Terminal automation (`src/auth/pane-ready-probe.ts` + `src/cli/auth.ts`) that waits for the OAuth browser login to complete, then pastes the OAuth code into the terminal.
 
 **Compliance take:** This is **compliant** because:
-1. Switchroom does NOT intercept or cache the OAuth token
-2. Switchroom does NOT route the token through its own infrastructure
-3. It only automates manual keystroke entry (pasting the code shown in the browser)
-4. The token is written directly by `claude setup-token` into `.credentials.json` in the agent's local Claude directory
-5. Anthropic's documentation explicitly acknowledges OAuth flow automation as valid ("users complete this in the terminal")
+1. It only automates manual keystroke entry (pasting the code shown in the browser)
+2. The token is written directly by `claude setup-token` into `.credentials.json` in the agent's local Claude directory
+3. Switchroom reads the token locally from `.credentials.json` solely to write the companion slot file (`accounts/<slot>/.oauth-token`) for multi-account rotation — it does not route the token through any external infrastructure
+4. The token never leaves the machine
 
 ---
 
