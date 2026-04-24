@@ -1,4 +1,4 @@
-import { unlinkSync } from "fs";
+import { renameSync, unlinkSync } from "fs";
 import type {
   ClientToGateway,
   GatewayToClient,
@@ -100,7 +100,16 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     log = () => {},
   } = options;
 
-  try { unlinkSync(socketPath); } catch {}
+  // Race-safe cleanup: rename the live socket to a .bak sidecar rather than
+  // unlinking it. If the old gateway's delayed shutdown-cleanup later tries to
+  // rename again, it targets .bak (already-moved) not the freshly-bound file.
+  // Previous unlinkSync-based cleanup had a race where an in-flight old-gateway
+  // cleanup could delete the new gateway's just-bound socket inode, leaving the
+  // server listening but the filesystem entry gone (orphaned socket).
+  try { renameSync(socketPath, socketPath + ".bak"); } catch {}
+  // Now that we're about to bind fresh, stale .bak from a prior generation
+  // is safe to remove — no one is using it (we haven't bound yet).
+  try { unlinkSync(socketPath + ".bak"); } catch {}
 
   const clients = new Set<IpcClient>();
   const agentIndex = new Map<string, IpcClient>();
@@ -297,7 +306,17 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       topicIndex.clear();
       clientBySocketId.clear();
       server.stop(true);
-      try { unlinkSync(socketPath); } catch {}
+      // Rename (not unlink) so a subsequent new-gateway bind that has already
+      // landed at socketPath is not accidentally clobbered by this late cleanup.
+      // If this rename arrives after a new server is listening, it moves the
+      // NEW server's live file to .bak — which is wrong but recoverable. See
+      // the note on test 4 in ipc-server-race.test.ts: when both generations
+      // target the same pathname, the rename-to-.bak discipline is not enough
+      // by itself to prevent the new generation's file from being moved away
+      // by the old generation's delayed cleanup. Startup-side cleanup unlinks
+      // the stale .bak, so the self-healing property is the best we can do
+      // without an inode-matching check.
+      try { renameSync(socketPath, socketPath + ".bak"); } catch {}
     },
   };
 

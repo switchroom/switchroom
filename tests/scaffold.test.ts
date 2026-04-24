@@ -456,6 +456,59 @@ describe("scaffoldAgent", () => {
     expect(greeting).not.toMatch(/match\(\$0,.*?,\s*m\)/);
   });
 
+  it("session greeting _gateway_start_time has no bare -S short-circuit (orphaned-socket fix)", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("orphan-sock-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // The original _gateway_start_time short-circuited on
+    //   [ ! -S "$GATEWAY_SOCK" ] && echo 0
+    // If the Unix socket's path was unlinked but the process kept
+    // listening (orphaned socket — inode alive, dir entry gone), the
+    // short-circuit returned 0, the dedupe block became a no-op, and
+    // the greeting fired on every SessionStart. Go straight to ss.
+    const fnMatch = greeting.match(/_gateway_start_time\(\)\s*\{([\s\S]*?)\n\}/);
+    expect(fnMatch).not.toBeNull();
+    const fnBody = fnMatch?.[1] ?? "";
+    expect(fnBody).not.toMatch(/\[\s*!\s*-S\s*"\$GATEWAY_SOCK"\s*\]/);
+    expect(fnBody).toContain("ss -xlnp");
+    // Outer dedupe gate should be the numeric start-time, not a
+    // filesystem-existence check on the socket path.
+    expect(greeting).toMatch(/if \[ "\$GATEWAY_STARTED_AT" -gt 0 \]; then/);
+    expect(greeting).not.toMatch(/if \[ -S "\$GATEWAY_SOCK" \]; then/);
+  });
+
+  it("session greeting writes diagnostic logging to session-greeting.log", () => {
+    // topic_id triggers a curl call to the forum group, which exercises the
+    // SEND log lines. Without a destination (no topic, no user id) curlCalls
+    // is empty and the SEND log path wouldn't be emitted.
+    const config = makeAgentConfig({ topic_id: 42 });
+    const result = scaffoldAgent("log-agent", config, tmpDir, telegramConfig);
+    const greeting = readFileSync(
+      join(result.agentDir, "telegram", "session-greeting.sh"),
+      "utf-8",
+    );
+    // _log helper writes to $TELEGRAM_STATE_DIR/session-greeting.log with
+    // a timestamp, pid, and ppid prefix. Pure ops-observability: zero
+    // model tokens, no user-visible behaviour change.
+    expect(greeting).toContain('_GLOG="${TELEGRAM_STATE_DIR:-/tmp}/session-greeting.log"');
+    expect(greeting).toMatch(/_log\(\) \{ printf '\[%s pid=%d ppid=%d\]/);
+    // At least one INVOKED line at the top of execution.
+    expect(greeting).toMatch(/_log "INVOKED /);
+    // Hook metadata line: event/source/session/parent/transcript.
+    expect(greeting).toMatch(/_log "HOOK event=/);
+    // Dedupe decision line.
+    expect(greeting).toMatch(/_log "DEDUPE /);
+    // Lock state lines.
+    expect(greeting).toMatch(/_log "LOCK /);
+    // Send result line capturing the HTTP code.
+    expect(greeting).toMatch(/_log "SEND /);
+    expect(greeting).toContain("_SEND_HTTP=$(curl");
+    expect(greeting).toContain("-w '%{http_code}'");
+  });
+
   it("session greeting bypasses dedupe when a restart marker is present", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("restart-agent", config, tmpDir, telegramConfig);
@@ -472,7 +525,10 @@ describe("scaffoldAgent", () => {
     expect(greeting).toContain("RESTART_REQUESTED=1");
     // The dedupe early-exit is gated on RESTART_REQUESTED=0 so an
     // explicit restart fires the greeting regardless of gateway lifetime.
-    expect(greeting).toMatch(/if \[ "\$RESTART_REQUESTED" = "0" \][\s\\]+&& \[ "\$GATEWAY_STARTED_AT" -gt 0 \]/);
+    // (GATEWAY_STARTED_AT>0 is now the outer gate rather than an inner
+    // && — see orphaned-socket fix.)
+    expect(greeting).toMatch(/if \[ "\$GATEWAY_STARTED_AT" -gt 0 \]; then/);
+    expect(greeting).toMatch(/if \[ "\$RESTART_REQUESTED" = "0" \][\s\\]+&& \[ "\$GREETED_AT" -ge "\$GATEWAY_STARTED_AT" \]/);
     // Still records the firing timestamp so subsequent session recycles
     // on the same gateway lifetime are properly deduped.
     expect(greeting).toContain('printf \'%s\' "$NOW" > "$GREETED_MARKER_FILE"');

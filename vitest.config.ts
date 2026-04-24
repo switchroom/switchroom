@@ -26,6 +26,7 @@ export default defineConfig({
       "**/dist/**",
       "**/telegram-plugin/tests/history.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",
+      "**/telegram-plugin/tests/ipc-server-race.test.ts",
       "**/telegram-plugin/tests/gateway-bridge.test.ts",
       "**/telegram-plugin/tests/gateway-startup-mutex.test.ts",
       "**/telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",
