@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   rmSync,
   chmodSync,
+  statSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
@@ -90,12 +91,30 @@ interface AuthSessionMeta {
    * nothing and timed out with "no token was found after 20s" even
    * when the exchange had succeeded. To detect silent success we must
    * poll the credentials file directly. See 2026-04-22 bundle-strings
-   * investigation — the setup-token success branch explicitly returns
+   * investigation — the setup-tool success branch explicitly returns
    * `null` for the on-screen view when a token exists.
    *
    * Optional for the same legacy reason as initialCodeChallenge.
    */
   configDir?: string;
+  /**
+   * The mtime (ms since epoch) of `<configDir>/.credentials.json` at the
+   * moment the auth session was started, or 0 if the file didn't exist.
+   *
+   * Used in the poll loop inside `submitAuthCode` to reject pre-existing
+   * stale tokens: we only accept a credentials.json read if its mtime is
+   * strictly greater than this snapshot. That way a leftover credentials.json
+   * from a prior auth (e.g. gymbro's expired 2026-04-20 token) can never be
+   * mistaken for fresh output from the new `claude setup-token` run.
+   *
+   * Edge case: snapshot == 0 (file absent at session start) → any positive
+   * mtime passes, so first-time logins still work correctly.
+   *
+   * Optional for legacy session files written before this field was added;
+   * missing value is treated as 0 (accept any mtime) to avoid breaking
+   * already-in-flight sessions after an upgrade.
+   */
+  credentialsMtimeAtStart?: number;
 }
 
 /**
@@ -261,6 +280,19 @@ export function resolveSlotForAdd(
     return requested;
   }
   return suggestSlotName(agentDir);
+}
+
+/**
+ * Return the mtime (ms since epoch) of a file, or 0 if it doesn't exist
+ * or can't be stat'd. Used to snapshot .credentials.json before an auth
+ * session starts so the poll loop can reject pre-existing stale tokens.
+ */
+function fileMtimeMs(filePath: string): number {
+  try {
+    return statSync(filePath).mtimeMs;
+  } catch {
+    return 0;
+  }
 }
 
 function writeAuthSessionMeta(agentDir: string, meta: AuthSessionMeta): void {
@@ -560,6 +592,14 @@ export function startAuthSession(
     configDir = claudeDir(agentDir);
   }
 
+  // Snapshot the mtime of the credentials file BEFORE we launch claude
+  // setup-token. The poll loop in submitAuthCode uses this to reject any
+  // token read from a .credentials.json that hasn't changed since session
+  // start — i.e. a stale file from a prior auth. For the force path the
+  // configDir is a fresh temp dir, so the file never existed (mtime == 0)
+  // and the snapshot is effectively a no-op guard.
+  const credentialsMtimeAtStart = fileMtimeMs(join(configDir, ".credentials.json"));
+
   // For a forced reauth, cleanup MUST still run even if `claude setup-token`
   // crashes, is killed, or the tmux session is torn down — otherwise OAuth
   // artifacts linger. A bash EXIT trap gives us that guarantee. We route
@@ -606,6 +646,7 @@ export function startAuthSession(
     slot: slotArg,
     initialCodeChallenge,
     configDir,
+    credentialsMtimeAtStart,
   });
 
   return {
@@ -700,13 +741,24 @@ export function submitAuthCode(
     ? join(meta.configDir, ".credentials.json")
     : credentialsPath(agentDir);
 
+  // Stale-token guard (Fix 1, 2026-04-25 gymbro incident):
+  // We only accept a credentials.json read if the file was written AFTER
+  // the auth session started. snapshot == 0 means the file didn't exist at
+  // session start, so any positive mtime passes (first-time login case).
+  // Legacy session meta without this field → treat as 0 (accept any mtime)
+  // to avoid breaking already-in-flight sessions after an upgrade.
+  const credsMtimeSnapshot = meta?.credentialsMtimeAtStart ?? 0;
+
   // Two-channel success detection:
   //   1. <configDir>/.credentials.json written by claude CLI itself.
   //      This is the PRIMARY channel as of claude CLI 2.1+ because the
   //      token is no longer printed to stdout on setup-token success.
+  //      GATED: only accepted if the file's mtime is strictly newer than
+  //      the snapshot taken at session start (stale-token fix).
   //   2. Log file scan for a raw `sk-ant-oat...` string. Covers older
   //      claude CLI versions that DID print it, and any future code
-  //      path that logs the token (e.g. debug mode).
+  //      path that logs the token (e.g. debug mode). Not mtime-gated
+  //      because the log file is created fresh at session start.
   //
   // Both channels produce the same token string on success; we return
   // whichever wins the race. Polling both each tick means a silent
@@ -716,8 +768,12 @@ export function submitAuthCode(
   const deadline = Date.now() + pollTimeoutMs;
   while (Date.now() < deadline) {
     sleepMs(pollIntervalMs);
-    token = readTokenFromCredentialsFile(credFileToWatch);
-    if (token) break;
+    // Only read credentials.json if it's newer than the snapshot.
+    const credsMtime = fileMtimeMs(credFileToWatch);
+    if (credsMtime > credsMtimeSnapshot) {
+      token = readTokenFromCredentialsFile(credFileToWatch);
+      if (token) break;
+    }
     token = readTokenFromLogFile(logPath);
     if (token) break;
   }
@@ -756,6 +812,14 @@ export function submitAuthCode(
   cleanupAuthTempDirs(agentDir);
   // Clean up auth log file — it contains the token in plaintext.
   rmSync(authLogPath(agentDir), { force: true });
+  // Fix 2 (2026-04-25 gymbro incident): remove the agent's .credentials.json
+  // so the running claude CLI doesn't shadow the new .oauth-token with a
+  // stale (possibly expired) credentials file. The env-var path
+  // (CLAUDE_CODE_OAUTH_TOKEN exported from start.sh) is the single source
+  // of truth at runtime. For the force path, credentials.json lives in the
+  // throwaway temp dir which cleanupAuthTempDirs just wiped; this call is
+  // a no-op there (force: true makes it safe).
+  rmSync(credentialsPath(agentDir), { force: true });
 
   return {
     completed: true,
