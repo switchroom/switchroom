@@ -384,6 +384,16 @@ async function handleCreateAgentCommand(ctx: Context, match: string): Promise<vo
 // ─── Create-agent: callback_query for profile selection ───────────────────
 
 bot.on('callback_query:data', async ctx => {
+  // Defense-in-depth: the global bot.use middleware already fires a
+  // `ctx.chat?.type !== 'private'` check, but callback_query updates from
+  // inline messages can arrive without a ctx.chat (callback_query.message
+  // is populated but ctx.chat may be undefined in edge cases). The global
+  // guard does `undefined !== 'private'` = true = ALLOW, so re-check here
+  // explicitly. If this isn't a private chat, silently drop.
+  if (ctx.chat?.type !== 'private') {
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
   const data = ctx.callbackQuery.data
   const chatId = String(ctx.chat?.id ?? ctx.callbackQuery.from.id)
 
@@ -502,7 +512,14 @@ async function handleCreateFlowText(
 
       await switchroomReply(ctx, `Token OK. Creating agent <b>${escapeHtmlForTg(name)}</b>…`, { html: true })
       try {
-        const result = await createAgent({ name, profile, telegramBotToken: botToken })
+        const result = await createAgent({
+          name,
+          profile,
+          telegramBotToken: botToken,
+          // Clean up scaffold/systemd/yaml on mid-flow failure so the user
+          // can retry /create-agent with the same name without conflicts.
+          rollbackOnFail: true,
+        })
         const newState = advanceState(flowState, {
           step: 'asked-oauth-code',
           name,

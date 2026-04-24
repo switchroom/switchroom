@@ -21,7 +21,7 @@
  */
 
 import { Database } from 'bun:sqlite'
-import { mkdirSync } from 'fs'
+import { chmodSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -56,10 +56,18 @@ function getDb(): Database {
   const foremanDir =
     process.env.SWITCHROOM_FOREMAN_DIR ?? join(homedir(), '.switchroom', 'foreman')
 
-  mkdirSync(foremanDir, { recursive: true })
+  // 0o700 on the directory + 0o600 on the DB: this file stores in-flight
+  // BotFather tokens during /create-agent flows. On a multi-user host,
+  // default umask (0o022) would leave tokens world-readable otherwise.
+  mkdirSync(foremanDir, { recursive: true, mode: 0o700 })
 
   const dbPath = join(foremanDir, 'state.sqlite')
   _db = new Database(dbPath)
+  try {
+    chmodSync(dbPath, 0o600)
+  } catch {
+    // best-effort — fall through if chmod isn't supported
+  }
 
   _db.exec(`
     CREATE TABLE IF NOT EXISTS create_flow (
