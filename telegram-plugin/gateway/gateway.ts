@@ -152,6 +152,7 @@ import { StagingMap } from '../secret-detect/staging.js'
 import { maskToken } from '../secret-detect/mask.js'
 import { defaultVaultWrite, defaultVaultList } from '../secret-detect/vault-write.js'
 import { detectSecrets } from '../secret-detect/index.js'
+import { dispatchAdminCommand, ADMIN_COMMAND_NAMES, parseCommandName } from '../admin-commands/index.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -193,6 +194,11 @@ if (!TOKEN) {
 
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID ? Number(process.env.TELEGRAM_TOPIC_ID) : undefined
+
+// When SWITCHROOM_AGENT_ADMIN=true (set by generateGatewayUnit when admin:true
+// is configured), the gateway intercepts admin slash commands locally and never
+// forwards them to Claude. When false (default), every message goes to Claude.
+const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 
 // ─── Bot + chat lock ──────────────────────────────────────────────────────
 const bot = new Bot(TOKEN)
@@ -2861,6 +2867,35 @@ async function runSwitchroomCommandFormatted(ctx: Context, args: string[], label
     await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
+
+// ─── Admin-command gating middleware ─────────────────────────────────────
+// When AGENT_ADMIN=false (default), admin slash commands like /agents, /logs,
+// /restart etc. should fall through to Claude rather than being executed
+// locally. Grammy's bot.command() handlers fire BEFORE bot.on('message:text'),
+// so without this middleware the commands would silently execute (or no-op
+// due to isAuthorizedSender) and never reach handleInboundCoalesced.
+//
+// Middleware registered BEFORE bot.command() calls intercepts text messages
+// first. If admin gating is off and the command is in ADMIN_COMMAND_NAMES, we
+// redirect to handleInboundCoalesced so Claude sees the message.
+//
+// Invariant: when AGENT_ADMIN=true, this middleware is a no-op — bot.command()
+// handlers run normally and Claude never sees admin commands.
+bot.use(async (ctx, next) => {
+  if (!AGENT_ADMIN && ctx.message?.text) {
+    const cmd = parseCommandName(ctx.message.text)
+    if (cmd !== null && ADMIN_COMMAND_NAMES.has(cmd)) {
+      // Redirect admin command text to Claude via the normal inbound path.
+      // We intentionally do NOT call next() so bot.command() never fires.
+      process.stderr.write(
+        `telegram gateway: admin-gate redirect cmd=/${cmd} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} (AGENT_ADMIN=false)\n`,
+      )
+      await handleInboundCoalesced(ctx, ctx.message.text, undefined)
+      return
+    }
+  }
+  await next()
+})
 
 // ─── Bot commands ─────────────────────────────────────────────────────────
 
