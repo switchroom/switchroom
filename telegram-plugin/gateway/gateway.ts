@@ -36,7 +36,11 @@ import { createPinManager } from '../progress-card-pin-manager.js'
 import { createPinWatchdog } from '../progress-card-pin-watchdog.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { type SessionEvent } from '../session-tail.js'
-import { createProgressDriver, type ProgressDriver } from '../progress-card-driver.js'
+import {
+  createProgressDriver,
+  type ApiFailureInfo,
+  type ProgressDriver,
+} from '../progress-card-driver.js'
 import {
   shouldSuppressToolActivity,
 } from '../pty-tail.js'
@@ -4191,6 +4195,35 @@ if (streamMode === 'checklist') {
     pinMgr.unpinForChat(chatId, threadId)
   }
 
+  /**
+   * Classify a Telegram API error for the progress-card failure-escalation
+   * mechanism. Returns an ApiFailureInfo for reportApiFailure(), or a
+   * transient classification for unknown errors.
+   */
+  function classifyProgressCardApiError(err: unknown): ApiFailureInfo {
+    if (err instanceof GrammyError) {
+      const code = err.error_code
+      const desc = err.description ?? ''
+      if (code === 400 && /\bmessage is not modified\b/i.test(desc)) {
+        return { code, description: desc, kind: 'benign' }
+      }
+      if (code >= 400 && code < 500) {
+        return { code, description: desc, kind: 'permanent_4xx' }
+      }
+      return { code, description: desc, kind: 'transient' }
+    }
+    const msg = err instanceof Error ? err.message : String(err)
+    if (
+      msg.includes('ECONNRESET') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('fetch failed') ||
+      msg.includes('ENOTFOUND')
+    ) {
+      return { code: 0, description: msg, kind: 'transient' }
+    }
+    return { code: 0, description: msg, kind: 'transient' }
+  }
+
   progressDriver = createProgressDriver({
     emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
       const args = {
@@ -4204,6 +4237,8 @@ if (streamMode === 'checklist') {
         historyEnabled: false, recordOutbound: () => {},
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
+        // Successful API call — reset the consecutive-4xx counter.
+        progressDriver?.reportApiSuccess(turnKey)
         if (!result?.messageId) return
         pinMgr.considerPin({
           chatId,
@@ -4221,8 +4256,10 @@ if (streamMode === 'checklist') {
             void pinWatchdog.verify({ chatId, turnKey, expectedMessageId: expectedId })
           }
         }
-      }).catch((err: Error) => {
-        process.stderr.write(`telegram gateway: progress-card emit failed: ${err.message}\n`)
+      }).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        process.stderr.write(`telegram gateway: progress-card emit failed: ${msg}\n`)
+        progressDriver?.reportApiFailure(turnKey, classifyProgressCardApiError(err))
       })
     },
     onTurnEnd: (summary) => {

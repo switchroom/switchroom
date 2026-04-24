@@ -1775,3 +1775,291 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emits.length).toBe(afterFirst)
   })
 })
+
+// ─── API failure escalation (permanent-4xx terminal state) ───────────────────
+// Locks the contract for the failure-escalation mechanism introduced in
+// fix/progress-card-api-failure-escalation. After K=3 consecutive permanent
+// 4xx errors the card is marked terminal; all further flushes and heartbeat
+// ticks are no-ops for that card. A single success resets the counter.
+// Transient (5xx/network) and benign ("message is not modified") errors never
+// advance the counter.
+
+describe('progress-card driver — API failure escalation', () => {
+  // Build a harness that exposes the turnKey for the current active card so
+  // tests can call reportApiFailure / reportApiSuccess directly.
+  function failureHarness(opts?: { maxConsecutive4xx?: number; heartbeatMs?: number }) {
+    let now = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const emits: Array<{ chatId: string; turnKey: string; html: string; done: boolean; isFirstEmit: boolean }> = []
+
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ chatId: a.chatId, turnKey: a.turnKey, html: a.html, done: a.done, isFirstEmit: a.isFirstEmit }),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: opts?.heartbeatMs ?? 0,
+      initialDelayMs: 0,
+      maxConsecutive4xx: opts?.maxConsecutive4xx ?? 3,
+      now: () => now,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+    })
+
+    const advance = (ms: number): void => {
+      now += ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers[0]
+        if (!next || next.fireAt > now) break
+        if (next.repeat != null) {
+          next.fireAt += next.repeat
+          next.fn()
+        } else {
+          timers.shift()
+          next.fn()
+        }
+      }
+    }
+
+    // Return the current active turnKey (chatId:seq).
+    const currentTurnKey = (chatId: string): string => `${chatId}:1`
+
+    return { driver, emits, advance, currentTurnKey }
+  }
+
+  it('3 consecutive permanent_4xx → terminal=true, 4th flush is a no-op', () => {
+    const { driver, emits, advance, currentTurnKey } = failureHarness()
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    // Fire a tool_use to give the card some content, note current emit count.
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1' }, 'c')
+    advance(0)
+    const emitCountBefore4xx = emits.length
+
+    // 3 consecutive permanent_4xx failures.
+    const perm4xx = { code: 403, description: 'Forbidden: bot was blocked by the user', kind: 'permanent_4xx' as const }
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+
+    // Now the card is terminal — further events must NOT produce emits.
+    driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' }, 'c')
+    advance(100)
+    expect(emits.length).toBe(emitCountBefore4xx)
+
+    // turn_end flush is also suppressed.
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+    expect(emits.length).toBe(emitCountBefore4xx)
+  })
+
+  it('2 consecutive permanent_4xx then a successful emit → counter resets to 0', () => {
+    const { driver, emits, advance, currentTurnKey } = failureHarness()
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    const perm4xx = { code: 404, description: 'Bad Request: message to edit not found', kind: 'permanent_4xx' as const }
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+
+    // Success: counter resets.
+    driver.reportApiSuccess(turnKey)
+
+    // One more 4xx — with counter at 0 this is only the 1st, not the 3rd.
+    driver.reportApiFailure(turnKey, perm4xx)
+
+    // Card is NOT yet terminal (only 1 out of 3 needed).
+    // A new event should still cause an emit.
+    const countBefore = emits.length
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'b1' }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(countBefore)
+  })
+
+  it('transient failures do NOT increment the counter — can loop indefinitely', () => {
+    const { driver, emits, advance, currentTurnKey } = failureHarness()
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    const transient = { code: 500, description: 'Internal Server Error', kind: 'transient' as const }
+
+    // Report 100 transient errors — the card must remain non-terminal.
+    for (let i = 0; i < 100; i++) {
+      driver.reportApiFailure(turnKey, transient)
+    }
+
+    // Events must still produce emits.
+    const countBefore = emits.length
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'tr1' }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(countBefore)
+  })
+
+  it('benign ("message is not modified") does not count as a failure', () => {
+    const { driver, emits, advance, currentTurnKey } = failureHarness()
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    const benign = { code: 400, description: 'Bad Request: message is not modified', kind: 'benign' as const }
+
+    // 50 benign errors — counter must stay at 0.
+    for (let i = 0; i < 50; i++) {
+      driver.reportApiFailure(turnKey, benign)
+    }
+
+    // Card is still live — next event produces an emit.
+    const countBefore = emits.length
+    driver.ingest({ kind: 'tool_use', toolName: 'Grep', toolUseId: 'g1' }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(countBefore)
+  })
+
+  it('new turn_start on same chat resets terminal state and counter', () => {
+    const { driver, emits, advance } = failureHarness()
+
+    // Turn 1: drive to terminal.
+    driver.startTurn({ chatId: 'c', userText: 'first' })
+    advance(0)
+    const turn1Key = 'c:1'
+
+    const perm4xx = { code: 403, description: 'Forbidden: bot was blocked by the user', kind: 'permanent_4xx' as const }
+    driver.reportApiFailure(turn1Key, perm4xx)
+    driver.reportApiFailure(turn1Key, perm4xx)
+    driver.reportApiFailure(turn1Key, perm4xx)
+
+    // Turn 1 is now terminal.
+    const emitCountAfterTerminal = emits.length
+
+    // Simulate turn_end that the session fires between turns — clears turn 1
+    // so startTurn can create a fresh card.
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+    advance(0)
+
+    // Turn 2: fresh card with clean apiFailures state.
+    driver.startTurn({ chatId: 'c', userText: 'second' })
+    advance(0)
+
+    // The new turn must produce at least one emit (isFirstEmit=true).
+    const firstEmitOfTurn2 = emits.find(e => e.turnKey === 'c:2' && e.isFirstEmit)
+    expect(firstEmitOfTurn2).toBeDefined()
+
+    // And continued events on the new turn are not suppressed.
+    const countBefore = emits.length
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'b2' }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(countBefore)
+  })
+
+  it('when terminal=true, heartbeatTick does not call the emit function', () => {
+    // Use heartbeatMs=1000 so we can observe heartbeat ticks.
+    const { driver, emits, advance, currentTurnKey } = failureHarness({ heartbeatMs: 1000 })
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'a1' }, 'c')
+    advance(0)
+
+    const turnKey = currentTurnKey('c')
+
+    // Advance so heartbeat fires once, confirm a heartbeat-driven emit lands.
+    advance(1000)
+    const emitCountBeforeTerminal = emits.length
+    expect(emitCountBeforeTerminal).toBeGreaterThan(1) // at least one heartbeat emit
+
+    // Drive to terminal.
+    const perm4xx = { code: 400, description: 'Bad Request: message to edit not found', kind: 'permanent_4xx' as const }
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+
+    const emitCountAfterTerminal = emits.length
+
+    // Advance through multiple heartbeat ticks — no further emits.
+    advance(5000) // 5 heartbeat ticks
+    expect(emits.length).toBe(emitCountAfterTerminal)
+  })
+
+  it('reportApiFailure is idempotent after terminal=true', () => {
+    // Calling reportApiFailure many more times after terminal must not
+    // throw, must not cause emits, and must not somehow flip terminal back.
+    const { driver, emits, advance, currentTurnKey } = failureHarness()
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    const perm4xx = { code: 403, description: 'Forbidden', kind: 'permanent_4xx' as const }
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+    driver.reportApiFailure(turnKey, perm4xx)
+
+    const emitCountAfterTerminal = emits.length
+
+    // 10 more after terminal — must all be no-ops.
+    for (let i = 0; i < 10; i++) {
+      driver.reportApiFailure(turnKey, perm4xx)
+    }
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 'r1' }, 'c')
+    advance(0)
+
+    expect(emits.length).toBe(emitCountAfterTerminal)
+  })
+
+  it('maxConsecutive4xx=0 disables the escalation mechanism entirely', () => {
+    // When maxConsecutive4xx=0 the feature is off — any number of 4xx
+    // errors must not produce a terminal card.
+    const { driver, emits, advance, currentTurnKey } = failureHarness({ maxConsecutive4xx: 0 })
+
+    driver.startTurn({ chatId: 'c', userText: 'task' })
+    advance(0)
+    const turnKey = currentTurnKey('c')
+
+    const perm4xx = { code: 404, description: 'Bad Request: message to edit not found', kind: 'permanent_4xx' as const }
+    for (let i = 0; i < 20; i++) {
+      driver.reportApiFailure(turnKey, perm4xx)
+    }
+
+    // Card must still be live.
+    const countBefore = emits.length
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'b1' }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(countBefore)
+  })
+
+  it('reportApiFailure and reportApiSuccess are no-ops for unknown turnKeys', () => {
+    // If the turn has already completed (chat purged from map), calls with
+    // a stale turnKey must not throw.
+    const { driver } = failureHarness()
+
+    const perm4xx = { code: 403, description: 'Forbidden', kind: 'permanent_4xx' as const }
+    expect(() => driver.reportApiFailure('nonexistent:99', perm4xx)).not.toThrow()
+    expect(() => driver.reportApiSuccess('nonexistent:99')).not.toThrow()
+  })
+})

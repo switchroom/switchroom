@@ -191,7 +191,11 @@ import { createChatLock } from './chat-lock.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { buildAttachmentPath, assertInsideInbox } from './attachment-path.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
-import { createProgressDriver, type ProgressDriver } from './progress-card-driver.js'
+import {
+  createProgressDriver,
+  type ApiFailureInfo,
+  type ProgressDriver,
+} from './progress-card-driver.js'
 import {
   startPtyTail,
   V1ToolActivityExtractor,
@@ -2399,12 +2403,49 @@ if (streamMode === 'checklist') {
     }
   }
 
+  /**
+   * Classify a Telegram API error for the progress-card failure-escalation
+   * mechanism. Returns an ApiFailureInfo for reportApiFailure(), or null
+   * for errors that don't originate from a card edit (e.g. assertAllowedChat
+   * throws before any API call is made).
+   */
+  function classifyProgressCardApiError(err: unknown): ApiFailureInfo | null {
+    const isGrammy = err instanceof GrammyError
+    if (isGrammy) {
+      const code = (err as GrammyError).error_code
+      const desc = (err as GrammyError).description ?? ''
+      // "message is not modified" — benign; the content was already identical.
+      if (code === 400 && /\bmessage is not modified\b/i.test(desc)) {
+        return { code, description: desc, kind: 'benign' }
+      }
+      // 4xx permanent failures: message gone, bot blocked, etc.
+      if (code >= 400 && code < 500) {
+        return { code, description: desc, kind: 'permanent_4xx' }
+      }
+      // 5xx server errors — transient.
+      return { code, description: desc, kind: 'transient' }
+    }
+    // Network errors — transient.
+    const msg = err instanceof Error ? err.message : String(err)
+    if (
+      msg.includes('ECONNRESET') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('fetch failed') ||
+      msg.includes('ENOTFOUND')
+    ) {
+      return { code: 0, description: msg, kind: 'transient' }
+    }
+    // Unknown errors — treat as transient (don't escalate on mystery errors).
+    return { code: 0, description: msg, kind: 'transient' }
+  }
+
   progressDriver = createProgressDriver({
     emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
       // Fire-and-forget — handleStreamReply is async but we don't await
       // (the driver owns cadence; the call just posts/edits). Errors
       // are logged and swallowed so a dropped edit never kills the
-      // session.
+      // session. On 4xx failures, we report back to the driver so it can
+      // track consecutive failures and mark the card terminal after K hits.
       const args = {
         chat_id: chatId,
         text: html,
@@ -2435,6 +2476,9 @@ if (streamMode === 'checklist') {
         recordOutbound: () => {},
         writeError: (line) => process.stderr.write(line),
       }).then((result) => {
+        // Successful API call — reset the consecutive-4xx counter so a
+        // single success clears any prior failure state.
+        progressDriver?.reportApiSuccess(turnKey)
         if (!result?.messageId) return
         // First emit: schedule the pin. Fast-turn suppression is owned
         // upstream by the driver's initialDelayMs (default 30s), so by
@@ -2498,10 +2542,15 @@ if (streamMode === 'checklist') {
           }, 0)
           pendingPinTimers.set(turnKey, timer)
         }
-      }).catch((err: Error) => {
+      }).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err)
         process.stderr.write(
-          `telegram channel: progress-card emit failed: ${err.message}\n`,
+          `telegram channel: progress-card emit failed: ${msg}\n`,
         )
+        const failure = classifyProgressCardApiError(err)
+        if (failure != null) {
+          progressDriver?.reportApiFailure(turnKey, failure)
+        }
       })
     },
     onTurnEnd: (summary) => {

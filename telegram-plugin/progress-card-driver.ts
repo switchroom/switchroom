@@ -25,6 +25,32 @@ import {
   type TaskNum,
 } from './progress-card.js'
 
+/**
+ * Classification of a Telegram API error for failure-escalation purposes.
+ *
+ * - `permanent_4xx`: 4xx error that won't resolve itself (message deleted,
+ *   bot blocked, etc.). After K consecutive such failures the card is marked
+ *   terminal and all further edits are suppressed.
+ * - `transient`: network/5xx error — retryable; does NOT count toward the
+ *   permanent-failure threshold.
+ * - `benign`: "message is not modified" — the edit had no effect because the
+ *   text was already identical. Not a failure at all; counter must not advance.
+ */
+export type ApiFailureKind = 'permanent_4xx' | 'transient' | 'benign'
+
+/**
+ * Failure descriptor reported back to the driver after an async emit fails.
+ * The outer layer (server.ts) inspects the raw Telegram error and classifies
+ * it before calling `reportApiFailure`.
+ */
+export interface ApiFailureInfo {
+  /** HTTP-level error code from Telegram (400, 403, 404, 500, …). */
+  code: number
+  /** Telegram's `description` field, e.g. "Forbidden: bot was blocked by the user". */
+  description: string
+  kind: ApiFailureKind
+}
+
 export interface ProgressDriverConfig {
   /**
    * Emit rendered HTML for the given chat+thread. Caller owns the send.
@@ -125,6 +151,15 @@ export interface ProgressDriverConfig {
    * Default 30000 (30 seconds). Set to 0 to disable.
    */
   initialDelayMs?: number
+  /**
+   * Number of consecutive 4xx Telegram API failures on card edits before
+   * the card is marked terminal and all further edits are suppressed for
+   * this turn. Transient (5xx/network) errors and "message is not modified"
+   * do NOT count toward this threshold. A single success resets the counter.
+   *
+   * Default 3. Set to 0 to disable the escalation mechanism entirely.
+   */
+  maxConsecutive4xx?: number
 }
 
 /**
@@ -193,6 +228,18 @@ interface PerChatState {
    * multiple completion signals race.
    */
   completionFired: boolean
+  /**
+   * Tracks consecutive Telegram 4xx failures on card edits. Once
+   * `terminal` is true, flush() and the heartbeat tick skip all edits
+   * for this card (message deleted / bot blocked / stale message_id).
+   *
+   * Resets automatically when a fresh turn starts (new PerChatState).
+   */
+  apiFailures: {
+    consecutive4xx: number
+    lastError: { code: number; description: string; timestamp: number } | null
+    terminal: boolean
+  }
 }
 
 export interface ProgressDriver {
@@ -245,6 +292,27 @@ export interface ProgressDriver {
    * notification) instead of editing the pinned card.
    */
   hasActiveCard(chatId: string, threadId?: string): boolean
+  /**
+   * Report a Telegram API failure back to the driver after an async emit
+   * fails. The outer layer (server.ts catch handler) classifies the raw
+   * error and calls this so the driver can track consecutive 4xx failures
+   * and mark the card terminal when the threshold is reached.
+   *
+   * Rules:
+   *   - `benign` (message is not modified) — ignored; counter unchanged.
+   *   - `transient` (5xx, network) — logged at debug; counter unchanged.
+   *   - `permanent_4xx` — counter incremented; terminal=true after K hits.
+   *
+   * Idempotent after terminal=true.
+   */
+  reportApiFailure(turnKey: string, failure: ApiFailureInfo): void
+  /**
+   * Report a successful Telegram API call for a card. Resets the
+   * consecutive-4xx counter so a single success after a transient failure
+   * doesn't leave the counter elevated. Call from the `.then()` handler
+   * of the async emit in server.ts.
+   */
+  reportApiSuccess(turnKey: string): void
 }
 
 export function createProgressDriver(config: ProgressDriverConfig): ProgressDriver {
@@ -280,6 +348,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
   const initialDelayMs = config.initialDelayMs ?? 30_000
+  const maxConsecutive4xx = config.maxConsecutive4xx ?? 3
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
@@ -474,6 +543,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // durations visibly advance — a frozen "✅ Done" card was the
         // "card went dead" bug.
         if (cs.state.stage === 'done' && !hasInFlightSubAgents(cs.state)) continue
+        // Skip heartbeat for terminal cards — the Telegram message is gone
+        // (deleted / bot blocked). No edits should be attempted.
+        if (cs.apiFailures.terminal) continue
         // Don't heartbeat a card that's still in the initial delay window.
         if (cs.isFirstEmit && cs.deferredFirstEmitTimer !== DELAY_ELAPSED) continue
         if (maxIdleMs > 0 && now() - cs.lastEventAt > maxIdleMs) {
@@ -557,6 +629,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
   const DELAY_ELAPSED = 'elapsed'
   function flush(chatState: PerChatState, forceDone: boolean): void {
+    // If this card has hit the permanent-failure threshold, don't attempt
+    // any more edits. Avoids log spam and pointless retries for deleted
+    // messages / blocked bots.
+    if (chatState.apiFailures.terminal) return
     // Suppress the card entirely if the turn ends before the initial
     // delay has elapsed — no point flashing a "Working…" card for a
     // turn that completed in under initialDelayMs.
@@ -770,6 +846,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           lastEventAt: now(),
           pendingCompletion: false,
           completionFired: false,
+          apiFailures: { consecutive4xx: 0, lastError: null, terminal: false },
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -969,6 +1046,53 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         }
       }
       return false
+    },
+
+    reportApiFailure(turnKey, failure) {
+      const cs = chats.get(turnKey)
+      if (cs == null) return // turn already completed — ignore
+      if (cs.apiFailures.terminal) return // already terminal — no-op
+
+      if (failure.kind === 'benign') {
+        // "message is not modified" — not a real failure; don't touch counter.
+        return
+      }
+      if (failure.kind === 'transient') {
+        // Network/5xx — retryable by the outer layer; don't escalate.
+        process.stderr.write(
+          `telegram gateway: progress-card: transient API error turnKey=${turnKey} code=${failure.code} (${failure.description}) — will retry\n`,
+        )
+        return
+      }
+
+      // permanent_4xx
+      cs.apiFailures.consecutive4xx++
+      cs.apiFailures.lastError = {
+        code: failure.code,
+        description: failure.description,
+        timestamp: now(),
+      }
+
+      if (maxConsecutive4xx > 0 && cs.apiFailures.consecutive4xx >= maxConsecutive4xx) {
+        cs.apiFailures.terminal = true
+        process.stderr.write(
+          `telegram gateway: progress-card: card edit giving 4xx, abandoning locally` +
+          ` (chat=${cs.chatId}, turnKey=${turnKey}, code=${failure.code}, desc="${failure.description}")\n`,
+        )
+      } else {
+        process.stderr.write(
+          `telegram gateway: progress-card: card edit 4xx (${cs.apiFailures.consecutive4xx}/${maxConsecutive4xx})` +
+          ` turnKey=${turnKey} code=${failure.code} (${failure.description})\n`,
+        )
+      }
+    },
+
+    reportApiSuccess(turnKey) {
+      const cs = chats.get(turnKey)
+      if (cs == null) return
+      if (cs.apiFailures.consecutive4xx > 0) {
+        cs.apiFailures.consecutive4xx = 0
+      }
     },
 
     dispose() {
