@@ -192,6 +192,13 @@ export interface RenderResult {
  * message text, superseding the strings that were previously in
  * auto-fallback.ts. The decision logic (slot switching, mark-exhausted)
  * stays in auto-fallback.ts; only the rendered text lives here.
+ *
+ * callback_data encoding: agent names are URL-encoded in all callback_data
+ * strings (e.g. `op:reauth:<encoded-agent>`). The Phase 4b callback_query
+ * handler MUST decodeURIComponent() the third segment when parsing. This is
+ * defense-in-depth alongside the slug validation in createAgent — together
+ * they ensure neither side can fail independently even if names ever contain
+ * `:` or other delimiter characters.
  */
 export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
   const agent = escHtml(ev.agent)
@@ -210,8 +217,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔐 Reauth now', callback_data: `op:reauth:${ev.agent}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${ev.agent}` },
+              { text: '🔐 Reauth now', callback_data: `op:reauth:${encodeURIComponent(ev.agent)}` },
+              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
             ],
           ],
         },
@@ -229,8 +236,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔐 Reauth now', callback_data: `op:reauth:${ev.agent}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${ev.agent}` },
+              { text: '🔐 Reauth now', callback_data: `op:reauth:${encodeURIComponent(ev.agent)}` },
+              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
             ],
           ],
         },
@@ -248,10 +255,10 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${ev.agent}` },
-              { text: '➕ Add slot', callback_data: `op:add-slot:${ev.agent}` },
+              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${encodeURIComponent(ev.agent)}` },
+              { text: '➕ Add slot', callback_data: `op:add-slot:${encodeURIComponent(ev.agent)}` },
             ],
-            [{ text: '⏳ Wait', callback_data: `op:dismiss:${ev.agent}` }],
+            [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }
@@ -271,10 +278,10 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${ev.agent}` },
-              { text: '➕ Add slot', callback_data: `op:add-slot:${ev.agent}` },
+              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${encodeURIComponent(ev.agent)}` },
+              { text: '➕ Add slot', callback_data: `op:add-slot:${encodeURIComponent(ev.agent)}` },
             ],
-            [{ text: '⏳ Wait', callback_data: `op:dismiss:${ev.agent}` }],
+            [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }
@@ -290,7 +297,7 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           .join('\n'),
         keyboard: {
           inline_keyboard: [
-            [{ text: '⏳ Wait', callback_data: `op:dismiss:${ev.agent}` }],
+            [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }
@@ -306,8 +313,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔄 Restart', callback_data: `op:restart:${ev.agent}` },
-              { text: '📋 Show logs', callback_data: `op:logs:${ev.agent}` },
+              { text: '🔄 Restart', callback_data: `op:restart:${encodeURIComponent(ev.agent)}` },
+              { text: '📋 Show logs', callback_data: `op:logs:${encodeURIComponent(ev.agent)}` },
             ],
           ],
         },
@@ -325,8 +332,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '📋 Show logs', callback_data: `op:logs:${ev.agent}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${ev.agent}` },
+              { text: '📋 Show logs', callback_data: `op:logs:${encodeURIComponent(ev.agent)}` },
+              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
             ],
           ],
         },
@@ -343,8 +350,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         keyboard: {
           inline_keyboard: [
             [
-              { text: '🔐 Reauth', callback_data: `op:reauth:${ev.agent}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${ev.agent}` },
+              { text: '🔐 Reauth', callback_data: `op:reauth:${encodeURIComponent(ev.agent)}` },
+              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
             ],
           ],
         },
@@ -361,7 +368,7 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           .join('\n'),
         keyboard: {
           inline_keyboard: [
-            [{ text: '⏳ Wait', callback_data: `op:dismiss:${ev.agent}` }],
+            [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }
