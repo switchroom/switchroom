@@ -13,6 +13,8 @@
 
 > *I loved OpenClaw + Telegram. I wanted my Claude subscription. And the UX done properly. So I built this.*
 
+**Compliance-by-design.** Switchroom leverages Claude Code natively — unmodified `claude` CLI, no Agent SDK, no direct API. It sets up the CLI the way you would, then gets out of the way. See the [Compliance Attestation](docs/compliance-attestation.md) for detail.
+
 ## Right, so what's this about
 
 So you had the bright idea. Run Claude Code agents 24/7 on a cheap Linux box, talk to them from Telegram, use the Claude Pro or Max subscription you're already paying for. Sensible. Obvious, even.
@@ -52,6 +54,8 @@ When the agent finishes, the card flips to Done and unpins. Two agents working a
 - No silent gaps. No ghosts.
 
 ## Architecture
+
+One Claude Code REPL per agent, dressed up with systemd and a Telegram bot. Two systemd units per agent: the Claude process (`switchroom-<agent>.service`) and its Telegram gateway (`switchroom-<agent>-gateway.service`). See [`docs/architecture.md`](docs/architecture.md) for the process model, IPC layout, and how each layer maps to the `claude` CLI.
 
 ```
 You (Telegram)
