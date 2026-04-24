@@ -631,6 +631,14 @@ function deferredKey(chat_id: string, message_id: number): string {
   return `${chat_id}:${message_id}`
 }
 
+// Channel B context rule — tracks when the gateway has emitted the
+// "Paste the browser code here" prompt so that the next inbound message
+// in the same chat is treated as auth-flow-sensitive regardless of whether
+// the pattern rule fires (belt-and-braces: pattern covers the known shape,
+// context rule covers future shape changes).
+const awaitingAuthCodeAt = new Map<string, number>()
+const AUTH_CODE_CONTEXT_TTL_MS = 5 * 60_000 // 5 min — OAuth code lifetime
+
 // ─── TTL reaper ───────────────────────────────────────────────────────────
 // Pending state maps above all grow whenever a flow starts and only shrink
 // when the flow completes. Users abandoning a flow (closing Telegram, losing
@@ -650,6 +658,9 @@ const pendingStateReaper = setInterval(() => {
   }
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
+  }
+  for (const [k, v] of awaitingAuthCodeAt) {
+    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
   }
 }, 60_000)
 pendingStateReaper.unref()
@@ -2146,6 +2157,19 @@ async function handleInbound(
   // — never fall through to recordInbound/broadcast with raw bytes. See
   // gateway-secret-detect.test.ts and secret-detect-fail-closed.test.ts.
   try {
+    // Channel B context rule: if we emitted "Paste the browser code here"
+    // recently in this chat, treat the inbound as auth-flow-sensitive —
+    // high-confidence secret detection regardless of pattern match. This
+    // survives Anthropic changing their token format because it tracks the
+    // gateway's own prompt, not the token shape.
+    const authCodeSentAt = awaitingAuthCodeAt.get(chat_id)
+    const isAuthFlowContext =
+      authCodeSentAt !== undefined && Date.now() - authCodeSentAt < AUTH_CODE_CONTEXT_TTL_MS
+    if (isAuthFlowContext) {
+      awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
+      process.stderr.write(`[secret-detect] auth-flow context rule active for chat ${chat_id}\n`)
+    }
+
     const cachedPp = vaultPassphraseCache.get(chat_id)
     const passphrase = cachedPp && cachedPp.expiresAt > Date.now() ? cachedPp.passphrase : null
     if (passphrase) {
@@ -2182,6 +2206,25 @@ async function handleInbound(
             staged_at: Date.now(),
           })
         }
+      } else if (isAuthFlowContext && pipeRes.stored.length === 0) {
+        // Channel B fallback: pattern didn't fire (Anthropic may have changed
+        // the token format) but we know this is an auth code paste because we
+        // prompted for it. Delete + stage + warn so no raw bytes leak.
+        if (msgId != null) {
+          try { await bot.api.deleteMessage(chat_id, msgId) } catch {}
+        }
+        await switchroomReply(
+          ctx,
+          '⚠️ auth-flow secret detected (context rule). the message was deleted for safety. run <code>/vault list</code> to unlock and re-paste if you need to store it.',
+          { html: true },
+        )
+        deferredSecrets.set(deferredKey(chat_id, msgId ?? 0), {
+          chat_id,
+          original_message_id: msgId ?? 0,
+          text: effectiveText,
+          staged_at: Date.now(),
+        })
+        return
       } else if (pipeRes.ambiguous.length > 0) {
         for (const d of pipeRes.ambiguous) {
           secretStaging.set({ chat_id, message_id: msgId ?? 0, detection: d, staged_at: Date.now() })
@@ -2199,7 +2242,7 @@ async function handleInbound(
       // No passphrase cached — detect, but defer. Tell the user once per
       // message so they can /vault unlock and re-paste.
       const detections = detectSecrets(effectiveText)
-      const hasHigh = detections.some((d) => d.confidence === 'high' && !d.suppressed)
+      const hasHigh = detections.some((d) => d.confidence === 'high' && !d.suppressed) || isAuthFlowContext
       if (hasHigh) {
         deferredSecrets.set(deferredKey(chat_id, msgId ?? 0), {
           chat_id,
@@ -2780,6 +2823,11 @@ async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: str
         await switchroomReply(ctx, '📋 Paste the browser code here ↓', {
           reply_markup: { force_reply: true, input_field_placeholder: 'Paste browser code', selective: true },
         })
+        // Channel B context rule: record that this chat is awaiting an auth
+        // code paste so the inbound handler can treat the next message as
+        // auth-flow-sensitive even if the pattern rule misses it.
+        const authChatId = String(ctx.chat!.id)
+        awaitingAuthCodeAt.set(authChatId, Date.now())
       } catch {
         // ForceReply is UX garnish — if it fails the flow still works
         // via the pending-intercept. Don't escalate.

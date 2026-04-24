@@ -31,6 +31,15 @@ export interface PatternDef {
  */
 export const ANCHORED_PATTERNS: PatternDef[] = [
   { rule_id: 'anthropic_api_key', regex: /\b(sk-ant-[A-Za-z0-9_-]{8,})\b/g, captureIndex: 1, slugHint: 'anthropic_api_key' },
+  // Anthropic OAuth browser code — emitted by the claude.com/cai authorize
+  // flow as two URL-safe base64 segments joined by `#`. Listed before the
+  // generic anthropic_api_key rule so it wins on ties.
+  // Shape: <20+ url-safe-b64>#<20+ url-safe-b64>
+  // The 20-char minimum on each segment reliably excludes ordinary URL
+  // fragment anchors (which are always short identifiers like `#section`).
+  // The \b boundaries prevent matching inside a URL where the preceding
+  // path component would be part of a longer word.
+  { rule_id: 'anthropic_oauth_code', regex: /\b([A-Za-z0-9_-]{20,}#[A-Za-z0-9_-]{20,})\b/g, captureIndex: 1, slugHint: 'anthropic_oauth_code' },
   { rule_id: 'openai_api_key', regex: /\b(sk-[A-Za-z0-9_-]{20,})\b/g, captureIndex: 1, slugHint: 'openai_api_key' },
   { rule_id: 'github_pat_classic', regex: /\b(ghp_[A-Za-z0-9]{20,})\b/g, captureIndex: 1, slugHint: 'github_pat' },
   { rule_id: 'github_pat_fine_grained', regex: /\b(github_pat_[A-Za-z0-9_]{20,})\b/g, captureIndex: 1, slugHint: 'github_pat' },
