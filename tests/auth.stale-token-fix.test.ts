@@ -28,15 +28,26 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
   existsSync,
   utimesSync,
   statSync,
 } from "node:fs";
+import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { submitAuthCode, readTokenFromCredentialsFile } from "../src/auth/manager";
+
+function tmuxAvailable(): boolean {
+  try {
+    execSync("command -v tmux", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // A syntactically valid token for use in fixtures. Not a real credential.
 const STALE_TOKEN =
@@ -204,21 +215,12 @@ describe("Fix 2 — submitAuthCode clears credentials.json on success", () => {
     rmSync(agentDir, { recursive: true, force: true });
   });
 
-  it("credentials.json is absent after a successful submitAuthCode (no-tmux baseline)", () => {
-    // We can't drive a real successful auth without tmux + claude CLI.
-    // What we CAN verify: when the function exits (even on no-session failure)
-    // the cleanup path is not corrupted. Specifically, if credentials.json was
-    // present BEFORE, a successful auth call must remove it.
-    //
-    // For a more targeted test of Fix 2: we verify directly that rmSync is
-    // called on credentialsPath(agentDir) by checking the file is gone if we
-    // manually simulate the success branch's side-effects. The actual end-to-end
-    // success path requires mocking tmux — see the next test which exercises
-    // Fix 2 via the log-file channel using a crafted log with a fresh token.
-
-    // The no-tmux path returns before writing anything — credentials.json
-    // is not touched. This test ensures the function doesn't accidentally
-    // DELETE credentials.json on a non-success path.
+  it("credentials.json is preserved when submitAuthCode early-exits with no tmux session", () => {
+    // Negative invariant for Fix 2: the unlink must NOT fire on the no-session
+    // failure path. Otherwise a stale stranded session would silently nuke a
+    // user's credentials file the next time they typed /auth code. The full
+    // success-branch behavior is exercised in the tmux-gated describe block
+    // below.
     writeCredentials(claudeDir, STALE_TOKEN);
 
     writeSessionMeta(claudeDir, {
@@ -242,35 +244,81 @@ describe("Fix 2 — submitAuthCode clears credentials.json on success", () => {
     expect(existsSync(join(claudeDir, ".credentials.json"))).toBe(true);
   });
 
-  it("credentials.json is removed when the log-file channel delivers a fresh token", () => {
-    // This exercises the full success branch of submitAuthCode using the log-file
-    // fallback channel, which is NOT mtime-gated. We:
-    //   1. Write a stale credentials.json with an old token.
-    //   2. Write a session meta that snapshots the current mtime (so the
-    //      credentials.json channel will be blocked).
-    //   3. Write a .setup-token.log containing a fresh token — the log-file
-    //      channel is always open.
-    //   4. However, submitAuthCode still needs a live tmux session to send the
-    //      code to — without one it exits early before polling.
-    //
-    // Since mocking tmux is not feasible in unit tests, we verify the next-best
-    // thing: that the `rmSync(credentialsPath(agentDir), { force: true })` call
-    // is reachable by reading the implementation directly and confirming it
-    // appears after `writeOAuthToken` in the success branch. The behavioral
-    // invariant is captured by the no-tmux early-exit test above (no deletion
-    // on failure), and the full integration is covered by Fix 2's description.
-    //
-    // What we test here: if credentials.json exists and we write a fresh
-    // .oauth-token manually (simulating the success branch), then call
-    // rmSync on credentialsPath — that the file disappears. This is essentially
-    // a smoke test that the file path functions resolve correctly.
+});
+
+// Behavioral end-to-end test for Fix 2. Drives submitAuthCode through its
+// success branch using a real tmux session and the log-file detection
+// channel, then asserts the credentials.json was unlinked by the function
+// itself (not by the test). Mirrors the tmux-gating pattern from
+// auth.stale-session.test.ts.
+describe.runIf(tmuxAvailable())("Fix 2 — submitAuthCode unlinks credentials.json on success (tmux required)", () => {
+  let agentDir: string;
+  let claudeDir: string;
+  let agentName: string;
+  let sessionName: string;
+
+  beforeEach(() => {
+    agentDir = mkdtempSync(join(tmpdir(), "sw-stale-fix2-real-"));
+    claudeDir = join(agentDir, ".claude");
+    mkdirSync(claudeDir, { recursive: true });
+    // Unique agent name → unique tmux session per test (no parallel collisions).
+    agentName = `fix2real-${process.pid}-${Date.now()}`;
+    sessionName = `switchroom-auth-${agentName}`;
+  });
+
+  afterEach(() => {
+    try {
+      execSync(`tmux kill-session -t ${sessionName}`, { stdio: "ignore" });
+    } catch {
+      // already gone — submitAuthCode kills its own session on success
+    }
+    rmSync(agentDir, { recursive: true, force: true });
+  });
+
+  it("removes a stale credentials.json after a successful auth via log-file channel", () => {
+    // 1. Stale credentials.json on disk before the auth started — Fix 2 must
+    //    delete this on success even though it wasn't the source of the token.
     writeCredentials(claudeDir, STALE_TOKEN);
-    expect(existsSync(join(claudeDir, ".credentials.json"))).toBe(true);
+    const staleMtime = statSync(join(claudeDir, ".credentials.json")).mtimeMs;
 
-    // Simulate what submitAuthCode's success branch does for Fix 2.
-    rmSync(join(claudeDir, ".credentials.json"), { force: true });
+    // 2. Pre-populate the auth log with a fresh token. The log-file channel
+    //    is NOT mtime-gated, so it'll be the one that wins the poll race —
+    //    while the credentials.json channel correctly stays blocked because
+    //    the snapshot mtime equals the file's mtime (no claude write happened).
+    const logPath = join(claudeDir, ".setup-token.log");
+    writeFileSync(logPath, `boot output\nLogin successful\n${FRESH_TOKEN}\n`);
 
+    // 3. Session meta that submitAuthCode will read.
+    writeSessionMeta(claudeDir, {
+      sessionName,
+      logPath,
+      startedAt: Date.now(),
+      configDir: claudeDir,
+      credentialsMtimeAtStart: staleMtime, // gate blocks the stale file
+    });
+
+    // 4. Live, harmless tmux session so tmuxSessionExists returns true and
+    //    `tmux send-keys` has somewhere to deliver the code. Detached, no-op.
+    execSync(`tmux new-session -d -s ${sessionName} "sleep 30"`);
+
+    const result = submitAuthCode(agentName, agentDir, "BROWSERCODE", undefined, {
+      pollIntervalMs: 10,
+      pollTimeoutMs: 2000,
+    });
+
+    // Fix 2 invariant: submitAuthCode itself removed credentials.json.
+    expect(result.completed).toBe(true);
+    expect(result.tokenSaved).toBe(true);
     expect(existsSync(join(claudeDir, ".credentials.json"))).toBe(false);
+
+    // Fix 1 invariant: the stale token did NOT win — the fresh token from
+    // the log-file channel was captured and persisted.
+    const oauthTokenPath = join(claudeDir, ".oauth-token");
+    expect(existsSync(oauthTokenPath)).toBe(true);
+    expect(readFileSync(oauthTokenPath, "utf-8").trim()).toBe(FRESH_TOKEN);
+
+    // Auth log file is also cleaned up on success (it contained the token).
+    expect(existsSync(logPath)).toBe(false);
   });
 });
 
