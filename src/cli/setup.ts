@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { loadConfig, resolveAgentsDir, resolvePath, ConfigError } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { scaffoldAgent } from "../agents/scaffold.js";
-import { installAllUnits, installForemanUnit, generateForemanUnit } from "../agents/systemd.js";
+import { installAllUnits, installForemanUnit } from "../agents/systemd.js";
 import { syncTopics } from "../telegram/topic-manager.js";
 import { loadTopicState } from "../telegram/state.js";
 import { createVault, setStringSecret } from "../vault/vault.js";
@@ -1143,9 +1143,36 @@ async function runForemanSetup(opts: { nonInteractive?: boolean; userId?: string
 
   // ── Write config files ─────────────────────────────────────────────────
   const envFile = join(foremanDir, ".env");
-  writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${botToken}\n`, { mode: 0o600 });
-  chmodSync(envFile, 0o600);
-  console.log(chalk.green(`  ${STEP_DONE} Wrote ${envFile}`));
+  const force = process.env.SWITCHROOM_FOREMAN_FORCE === "1";
+
+  if (existsSync(envFile) && !force) {
+    if (nonInteractive) {
+      console.error(
+        chalk.red(`  ${envFile} already exists.`) +
+          chalk.gray(
+            "\n  Re-running setup rotates the bot token. To confirm, set SWITCHROOM_FOREMAN_FORCE=1.\n  To only update the allowlist, delete and recreate access.json directly.",
+          ),
+      );
+      process.exit(1);
+    }
+    const confirm = await askYesNo(
+      `\n  ${envFile} already exists. Overwrite bot token?`,
+      false,
+    );
+    if (!confirm) {
+      console.log(
+        chalk.gray("  Keeping existing token. (Access list will still be updated.)"),
+      );
+    } else {
+      writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${botToken}\n`, { mode: 0o600 });
+      chmodSync(envFile, 0o600);
+      console.log(chalk.green(`  ${STEP_DONE} Rewrote ${envFile}`));
+    }
+  } else {
+    writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${botToken}\n`, { mode: 0o600 });
+    chmodSync(envFile, 0o600);
+    console.log(chalk.green(`  ${STEP_DONE} Wrote ${envFile}`));
+  }
 
   const accessFile = join(foremanDir, "access.json");
   writeFileSync(

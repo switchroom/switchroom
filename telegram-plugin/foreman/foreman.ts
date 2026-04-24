@@ -17,10 +17,8 @@
  *   /auth [agent]   — fleet auth dashboard (per-agent, agent-name-parametric)
  */
 
-import { Bot, GrammyError } from 'grammy'
-import {
-  readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync,
-} from 'fs'
+import { Bot } from 'grammy'
+import { readFileSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { execSync } from 'child_process'
@@ -45,7 +43,6 @@ import {
   type SlotHealth,
 } from '../auth-dashboard.js'
 import { parseAuthSubCommand } from '../auth-slot-parser.js'
-import { clearStaleTelegramPollingState } from '../startup-reset.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
