@@ -133,19 +133,43 @@ export function registerAuthCommand(program: Command): void {
       })
     );
 
-  // switchroom auth code <name> <code> [--slot <slot>]
+  // switchroom auth code <name> <code> [--slot <slot>] [--json]
   auth
     .command("code <name> <code>")
     .description("Finish a pending Claude OAuth token flow by pasting the browser code")
     .option("--slot <slot>", "Target slot for the pending flow (defaults to pending)")
+    .option("--json", "Output structured JSON result (includes AuthCodeOutcome)")
     .action(
-      withConfigError(async (name: string, code: string, opts: { slot?: string }) => {
+      withConfigError(async (name: string, code: string, opts: { slot?: string; json?: boolean }) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
 
         requireKnownAgent(config, name);
         const agentDir = resolve(agentsDir, name);
         const result = submitAuthCode(name, agentDir, code, opts.slot);
+
+        if (opts.json) {
+          console.log(JSON.stringify({
+            completed: result.completed,
+            tokenSaved: result.tokenSaved,
+            tokenPath: result.tokenPath ?? null,
+            outcome: result.outcome ?? null,
+            instructions: result.instructions,
+          }));
+          // Still attempt restart even in JSON mode so callers get the
+          // full effect, but don't surface restart output to stdout.
+          if (result.completed && result.tokenSaved) {
+            try {
+              const status = getAgentStatus(name);
+              if (status.active === "active" || status.active === "running") {
+                restartAgent(name);
+              }
+            } catch {
+              // swallow — caller reads the JSON, not this
+            }
+          }
+          return;
+        }
 
         console.log();
         for (const line of result.instructions) {
