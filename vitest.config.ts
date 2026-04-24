@@ -30,6 +30,7 @@ export default defineConfig({
       "**/telegram-plugin/tests/gateway-bridge.test.ts",
       "**/telegram-plugin/tests/gateway-startup-mutex.test.ts",
       "**/telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",
+      "**/telegram-plugin/tests/foreman-state.test.ts",
     ],
     coverage: {
       provider: "v8",

@@ -2,6 +2,7 @@ import type {
   ClientToGateway,
   GatewayToClient,
   InboundMessage,
+  OperatorEventForward,
   PermissionEvent,
   PermissionRequestForward,
   SessionEventForward,
@@ -49,6 +50,7 @@ export interface IpcClientHandle {
   callTool(tool: string, args: Record<string, unknown>, timeoutMs?: number): Promise<ToolCallResult>;
   sendSessionEvent(event: SessionEventForward): void;
   sendPermissionRequest(msg: PermissionRequestForward): void;
+  sendOperatorEvent(msg: OperatorEventForward): void;
   isConnected(): boolean;
   close(): void;
 }

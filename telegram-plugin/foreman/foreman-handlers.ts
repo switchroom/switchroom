@@ -9,6 +9,9 @@
  */
 
 import { execFileSync } from 'child_process'
+import { renameSync, existsSync } from 'fs'
+import { homedir } from 'os'
+import { join, resolve } from 'path'
 import {
   escapeHtmlForTg,
   preBlock,
@@ -183,6 +186,252 @@ export function handleLogsCommand(
         },
       ],
     }
+  }
+
+  if (Buffer.byteLength(trimmed, 'utf8') > LOG_PAGE_BYTES) {
+    const chunks = chunkText(trimmed, 3800)
+    return {
+      replies: chunks.map((chunk, i) => {
+        const label = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ''
+        return {
+          text: preBlock(chunk) + (label ? `\n<i>${label}</i>` : ''),
+          html: true,
+        }
+      }),
+    }
+  }
+
+  return { replies: [{ text: preBlock(trimmed), html: true }] }
+}
+
+// ─── /restart handler impl ────────────────────────────────────────────────
+
+export interface RestartResult {
+  ok: boolean
+  text: string
+  html: boolean
+}
+
+/**
+ * Core /restart implementation.
+ *
+ * Shells out to `systemctl --user restart switchroom-<agent>` via execFileSync
+ * (no shell, so agent name is safely passed as an arg — no injection risk).
+ *
+ * @param match      Text after "/restart " from ctx.match
+ * @param execFile   Injected execFileSync for testability
+ */
+export function handleRestartCommand(
+  match: string,
+  execFile: typeof execFileSync = execFileSync,
+): RestartResult {
+  const agentName = match.trim().split(/\s+/)[0] ?? ''
+
+  if (!agentName) {
+    return {
+      ok: false,
+      text: 'Usage: /restart &lt;agent&gt;',
+      html: true,
+    }
+  }
+
+  try {
+    assertSafeAgentName(agentName)
+  } catch {
+    return { ok: false, text: 'Invalid agent name.', html: true }
+  }
+
+  try {
+    execFile(
+      'systemctl',
+      ['--user', 'restart', `switchroom-${agentName}`],
+      {
+        encoding: 'utf-8',
+        timeout: 15000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    return {
+      ok: true,
+      text: `Restarted <code>switchroom-${escapeHtmlForTg(agentName)}</code>.`,
+      html: true,
+    }
+  } catch (err) {
+    const msg = err as { stderr?: string; stdout?: string; message?: string }
+    const detail = stripAnsi(msg.stderr || msg.stdout || msg.message || 'unknown error').trim()
+    return {
+      ok: false,
+      text: `<b>restart failed for ${escapeHtmlForTg(agentName)}:</b>\n${preBlock(formatSwitchroomOutput(detail))}`,
+      html: true,
+    }
+  }
+}
+
+// ─── /delete (destroy) handler impl ──────────────────────────────────────
+
+export interface DeleteResult {
+  replies: Array<{ text: string; html: boolean }>
+  /** When true, foreman.ts should also send an inline keyboard for confirmation. */
+  needsConfirm?: boolean
+  /** Agent name (for the confirmation prompt). */
+  agentForConfirm?: string
+}
+
+/**
+ * Resolve the agents directory from environment or default location.
+ * Exposed for testability.
+ */
+export function resolveAgentsDirForDelete(): string {
+  const switchroomDir = process.env.SWITCHROOM_AGENTS_DIR
+    ?? join(homedir(), '.switchroom', 'agents')
+  return switchroomDir
+}
+
+/**
+ * Core /delete first-step implementation — returns a confirmation prompt.
+ *
+ * The actual deletion is performed by executeDeleteAgent() once the user
+ * confirms via callback_query or "YES" text.
+ */
+export function handleDeleteCommand(match: string): DeleteResult {
+  const agentName = match.trim().split(/\s+/)[0] ?? ''
+
+  if (!agentName) {
+    return {
+      replies: [{ text: 'Usage: /delete &lt;agent&gt;', html: true }],
+    }
+  }
+
+  try {
+    assertSafeAgentName(agentName)
+  } catch {
+    return { replies: [{ text: 'Invalid agent name.', html: true }] }
+  }
+
+  return {
+    replies: [
+      {
+        text: `Are you sure you want to delete agent <b>${escapeHtmlForTg(agentName)}</b>?\n\nThis will stop and remove the systemd unit and archive the agent directory. Reply <b>YES</b> to confirm.`,
+        html: true,
+      },
+    ],
+    needsConfirm: true,
+    agentForConfirm: agentName,
+  }
+}
+
+/**
+ * Execute agent deletion after confirmation.
+ *
+ * Archives the agent dir to `agents/_archived_<name>_<timestamp>/` before
+ * running `switchroom agent destroy --yes <name>` so data is recoverable.
+ *
+ * @param agentName   Validated agent name
+ * @param switchroomExec  Injected CLI exec for testability
+ * @param execFile    Injected execFileSync for testability (systemctl)
+ * @param agentsDir   Override agents dir (for tests)
+ */
+export function executeDeleteAgent(
+  agentName: string,
+  switchroomExec: SwitchroomExecFn,
+  execFile: typeof execFileSync = execFileSync,
+  agentsDir: string = resolveAgentsDirForDelete(),
+): DeleteResult {
+  try {
+    assertSafeAgentName(agentName)
+  } catch {
+    return { replies: [{ text: 'Invalid agent name.', html: true }] }
+  }
+
+  const agentDir = resolve(agentsDir, agentName)
+  let archivePath: string | null = null
+
+  // Step 1: Archive the dir if it exists
+  if (existsSync(agentDir)) {
+    const timestamp = Date.now()
+    archivePath = resolve(agentsDir, `_archived_${agentName}_${timestamp}`)
+    try {
+      renameSync(agentDir, archivePath)
+    } catch (err) {
+      return {
+        replies: [
+          {
+            text: `<b>Archive failed for ${escapeHtmlForTg(agentName)}:</b>\n${preBlock(formatSwitchroomOutput((err as Error).message))}`,
+            html: true,
+          },
+        ],
+      }
+    }
+  }
+
+  // Step 2: Stop + remove systemd unit via CLI (--yes skips the interactive prompt)
+  let cliOutput = ''
+  let cliOk = true
+  try {
+    cliOutput = switchroomExec(['agent', 'destroy', '--yes', agentName])
+  } catch (err) {
+    cliOk = false
+    const msg = err as { stderr?: string; stdout?: string; message?: string }
+    cliOutput = stripAnsi(msg.stderr || msg.stdout || msg.message || 'unknown error').trim()
+  }
+
+  const lines: string[] = []
+
+  if (archivePath) {
+    lines.push(`Archived <code>${escapeHtmlForTg(agentName)}</code> to:`)
+    lines.push(`<code>${escapeHtmlForTg(archivePath)}</code>`)
+    lines.push('')
+  }
+
+  if (cliOk) {
+    lines.push(`Agent <b>${escapeHtmlForTg(agentName)}</b> deleted.`)
+    if (cliOutput.trim()) {
+      lines.push(preBlock(formatSwitchroomOutput(stripAnsi(cliOutput))))
+    }
+  } else {
+    lines.push(`<b>CLI destroy failed</b> (agent dir was archived; systemd unit may still exist):`)
+    lines.push(preBlock(formatSwitchroomOutput(cliOutput)))
+  }
+
+  return { replies: [{ text: lines.join('\n'), html: true }] }
+}
+
+// ─── /update handler impl ─────────────────────────────────────────────────
+
+export interface UpdateResult {
+  replies: Array<{ text: string; html: boolean }>
+}
+
+/**
+ * Core /update implementation.
+ *
+ * Shells out to `switchroom update` via the CLI exec helper. Output is
+ * paginated when > 3 KB.
+ *
+ * @param switchroomExec  Injected CLI exec (combined stdout+stderr) for testability
+ */
+export function handleUpdateCommand(
+  switchroomExec: SwitchroomExecFn,
+): UpdateResult {
+  let output: string
+  try {
+    output = switchroomExec(['update'])
+  } catch (err) {
+    const msg = err as { stderr?: string; stdout?: string; message?: string }
+    const detail = stripAnsi(msg.stderr || msg.stdout || msg.message || 'unknown error').trim()
+    return {
+      replies: [
+        {
+          text: `<b>update failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`,
+          html: true,
+        },
+      ],
+    }
+  }
+
+  const trimmed = stripAnsi(output).trim()
+  if (!trimmed) {
+    return { replies: [{ text: 'Update complete (no output).', html: false }] }
   }
 
   if (Buffer.byteLength(trimmed, 'utf8') > LOG_PAGE_BYTES) {
