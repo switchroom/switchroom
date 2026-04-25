@@ -5,6 +5,7 @@ import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { usesSwitchroomTelegramPlugin, resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
+import { COMMIT_SHA } from "../build-info.js";
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -54,6 +55,14 @@ export function generateUnit(
     ? `Environment=TZ=${timezone}\nEnvironment=SWITCHROOM_TIMEZONE=${timezone}\n`
     : "";
 
+  // Stamp the current binary's commit SHA so per-agent "started on X"
+  // reporting can show what code the agent launched under, even if the
+  // binary has since been updated. `getAgentStartSha` in lifecycle.ts
+  // reads this env var back from the running unit via `systemctl show`.
+  const shaEnv = COMMIT_SHA
+    ? `Environment=SWITCHROOM_AGENT_START_SHA=${COMMIT_SHA}\n`
+    : "";
+
   return `[Unit]
 Description=switchroom agent: ${name}
 After=${afterDeps.join(" ")}
@@ -74,7 +83,7 @@ WorkingDirectory=${agentDir}
 # agents that don't use the vault). %h resolves to the invoking user's
 # home under "systemd --user", so this works without hardcoding paths.
 EnvironmentFile=-%h/.switchroom/.env.vault
-${tzEnv}
+${tzEnv}${shaEnv}
 [Install]
 WantedBy=default.target
 `;

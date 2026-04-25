@@ -4,7 +4,7 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
-import { getAllAgentStatuses } from "../agents/lifecycle.js";
+import { getAllAgentStatuses, getAgentStartSha } from "../agents/lifecycle.js";
 import { COMMIT_SHA, VERSION } from "../build-info.js";
 
 /**
@@ -120,13 +120,12 @@ export function printHealthSummary(config: ReturnType<typeof getConfig>): void {
       const s = statuses[name];
       const isUp = s.active === "active" || s.active === "running";
       const uptime = formatUptime(s.uptime);
-      // The SHA the process was started with is not trivially available
-      // from systemd alone. We use the COMMIT_SHA of the current binary
-      // as a proxy (since switchroom update rebuilds + restarts everything).
-      // A future iteration can embed the SHA into the systemd Environment=
-      // at install time for per-process accuracy.
       if (isUp) {
-        lines.push(chalk.green(`✓ ${name} → up ${uptime}, on ${sha}`));
+        // Read the SHA the agent was started under from its systemd unit's
+        // Environment= block (baked in at install time via SWITCHROOM_AGENT_START_SHA).
+        // Falls back to "?" if the unit pre-dates #66 or systemctl is unavailable.
+        const agentSha = getAgentStartSha(name) ?? "?";
+        lines.push(chalk.green(`✓ ${name} → up ${uptime}, on ${agentSha}`));
       } else {
         lines.push(chalk.red(`✗ ${name} → ${s.active}`));
       }

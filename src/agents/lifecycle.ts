@@ -345,6 +345,37 @@ export function interruptAgent(name: string): { pid: number } {
   return { pid: status.pid };
 }
 
+/**
+ * Read the SWITCHROOM_AGENT_START_SHA from the running unit's environment.
+ *
+ * systemd stores the unit's baked-in Environment= lines and can return them
+ * via `systemctl --user show --property=Environment`. We parse the output for
+ * `SWITCHROOM_AGENT_START_SHA=<sha>`.
+ *
+ * Returns null if the unit isn't running, the env var isn't set (pre-#66
+ * units), or parsing fails.
+ */
+export function getAgentStartSha(name: string): string | null {
+  const service = serviceName(name);
+  try {
+    const output = systemctl(["show", service, "--property=Environment"]);
+    // The output looks like:
+    //   Environment=VAR1=val1 VAR2=val2 SWITCHROOM_AGENT_START_SHA=abc1234 TZ=UTC
+    // Each word may itself contain = so we need to split carefully.
+    for (const line of output.split("\n")) {
+      if (!line.startsWith("Environment=")) continue;
+      const envBlock = line.slice("Environment=".length);
+      // Split on whitespace boundaries between KEY= tokens. We look for
+      // the specific key anywhere in the block.
+      const match = envBlock.match(/(?:^|\s)SWITCHROOM_AGENT_START_SHA=(\S+)/);
+      if (match) return match[1];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function getAgentStatus(name: string): AgentStatus {
   const service = serviceName(name);
 
