@@ -34,6 +34,7 @@ import {
   copyProfileSkills,
 } from "./profiles.js";
 import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
+import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
@@ -2517,7 +2518,11 @@ export function scaffoldAgent(
           return `${k}: ${v}`;
         })
         .join("\n");
-      const body = saDef.prompt ?? `You are the ${saName} sub-agent.`;
+      const rawBody = saDef.prompt ?? `You are the ${saName} sub-agent.`;
+      const body = applyTelegramProgressGuidance(rawBody, {
+        telegramEnabled: true,
+        defaultChatId: userId,
+      });
       const content = `---\n${fmLines}\n---\n\n${body}\n`;
       writeFileSync(mdPath, content, "utf-8");
     }
@@ -3283,6 +3288,17 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       };
     }
 
+    // Read userId from access.json (written during scaffold) — used by
+    // both the sub-agent prompt addendum and the greeting script below.
+    let greetingUserId: string | undefined;
+    const accessPath = join(agentDir, "telegram", "access.json");
+    if (existsSync(accessPath)) {
+      try {
+        const access = JSON.parse(readFileSync(accessPath, "utf-8"));
+        greetingUserId = access.allowFrom?.[0];
+      } catch { /* best effort */ }
+    }
+
     // --- Reconcile sub-agent definitions (.claude/agents/<name>.md) ---
     //
     // Same generation as scaffold — overwrites on every reconcile so
@@ -3315,7 +3331,11 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
             return `${k}: ${v}`;
           })
           .join("\n");
-        const body = saDef.prompt ?? `You are the ${saName} sub-agent.`;
+        const rawBody = saDef.prompt ?? `You are the ${saName} sub-agent.`;
+        const body = applyTelegramProgressGuidance(rawBody, {
+          telegramEnabled: true,
+          defaultChatId: greetingUserId,
+        });
         const content = `---\n${fmLines}\n---\n\n${body}\n`;
         const before = existsSync(mdPath) ? readFileSync(mdPath, "utf-8") : "";
         if (content !== before) {
@@ -3328,15 +3348,6 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     // Regenerate the session-greeting script so config changes are
     // reflected in the greeting message.
     const greetingPath = join(agentDir, "telegram", "session-greeting.sh");
-    // Read userId from access.json (written during scaffold)
-    let greetingUserId: string | undefined;
-    const accessPath = join(agentDir, "telegram", "access.json");
-    if (existsSync(accessPath)) {
-      try {
-        const access = JSON.parse(readFileSync(accessPath, "utf-8"));
-        greetingUserId = access.allowFrom?.[0];
-      } catch { /* best effort */ }
-    }
     const greetingScript = buildSessionGreetingScript(
       name,
       agentConfig,
