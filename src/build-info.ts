@@ -2,8 +2,8 @@
 // Tracked in git so `tsc --noEmit` works on a fresh clone before `npm run build`.
 // Values are refreshed every time `npm run build` runs.
 
-export const VERSION: string = "0.2.5";
-export const COMMIT_SHA: string | null = "635e492";
-export const COMMIT_DATE: string | null = "2026-04-25T00:31:38+10:00";
-export const LATEST_PR: number | null = null;
-export const COMMITS_AHEAD_OF_TAG: number | null = 13;
+export const VERSION: string = "0.3.0";
+export const COMMIT_SHA: string | null = "8a4039f";
+export const COMMIT_DATE: string | null = "2026-04-26T07:58:40+10:00";
+export const LATEST_PR: number | null = 79;
+export const COMMITS_AHEAD_OF_TAG: number | null = 10;

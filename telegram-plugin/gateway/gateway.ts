@@ -5002,7 +5002,14 @@ void (async () => {
         // and surfaces live activity to Telegram via a pinned card +
         // inline notifications. Only started when a valid agentDir is known
         // (gate on streamMode=checklist for progress-card parity).
-        if (streamMode === 'checklist') {
+        //
+        // OPT-IN: gated on SWITCHROOM_SUBAGENT_WATCHER=1 because the
+        // current implementation re-fires "Worker dispatched" notifications
+        // for pre-existing JSONL files at startup (issue: watcher treats
+        // historical sessions as new dispatches). Default OFF until the
+        // skip-pre-existing-files fix lands. See switchroom#82.
+        const subagentWatcherEnabled = process.env.SWITCHROOM_SUBAGENT_WATCHER === '1'
+        if (subagentWatcherEnabled && streamMode === 'checklist') {
           const watcherAgentDir = resolveAgentDirFromEnv()
           if (watcherAgentDir != null) {
             // Pinned worker card: one message per watcher session,
