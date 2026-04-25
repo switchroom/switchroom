@@ -23,6 +23,17 @@ export interface IpcServerOptions {
   onScheduleRestart: (client: IpcClient, msg: ScheduleRestartMessage) => void;
   onOperatorEvent?: (client: IpcClient, msg: OperatorEventForward) => void;
   log?: (msg: string) => void;
+  /**
+   * How long (in ms) to wait without a heartbeat before force-closing the
+   * client connection. The bridge sends heartbeats every 5s by default, so
+   * a safe threshold is 3–5× that (15–30s). Set to 0 to disable the watchdog.
+   * Defaults to 30 000 ms (30 s).
+   *
+   * Issue #71: without this, a bridge that crashes or hangs silently stays in
+   * the agentIndex and new inbound Telegram messages are never delivered to the
+   * new claude process that reconnects after a restart.
+   */
+  heartbeatTimeoutMs?: number;
 }
 
 export interface IpcClient {
@@ -106,6 +117,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onScheduleRestart,
     onOperatorEvent,
     log = () => {},
+    heartbeatTimeoutMs = 30_000,
   } = options;
 
   // Race-safe cleanup: rename the live socket to a .bak sidecar rather than
@@ -279,6 +291,46 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
 
   log(`listening on ${socketPath}`);
 
+  // ─── Heartbeat watchdog (issue #71) ─────────────────────────────────────
+  // The IPC client sends a heartbeat every `heartbeatIntervalMs` (default 5s).
+  // If a client's `lastHeartbeat` is older than `heartbeatTimeoutMs` (default
+  // 30s), the TCP socket is likely wedged (process crashed but the socket fd
+  // was never cleanly closed, or the OS hasn't yet delivered the FIN). Force-
+  // close those connections so:
+  //   1. The gateway clears the stale agentIndex entry immediately.
+  //   2. Inbound Telegram messages are not silently dropped into a black hole.
+  //   3. The real bridge process (which may already be reconnecting) gets its
+  //      fresh register() handled rather than silently shadowed by the stale
+  //      entry (handleRegister does replace-not-reject, so this is belt-and-
+  //      suspenders — but eviction is cleaner).
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  if (heartbeatTimeoutMs > 0) {
+    // Poll at half the timeout so we catch a wedged client within one interval.
+    const watchdogInterval = Math.max(1000, Math.floor(heartbeatTimeoutMs / 2));
+    watchdogTimer = setInterval(() => {
+      const now = Date.now();
+      for (const client of clients) {
+        if (!client.isAlive()) continue;
+        // Only evict clients that have registered (agentName set). Unregistered
+        // connections that just opened are excluded — they haven't had a chance
+        // to send their first heartbeat yet.
+        if (client.agentName === null) continue;
+        const age = now - client.lastHeartbeat;
+        if (age > heartbeatTimeoutMs) {
+          log(
+            `heartbeat watchdog: evicting stale client agent=${client.agentName} id=${client.id} ` +
+            `lastHeartbeat=${age}ms ago (threshold=${heartbeatTimeoutMs}ms)`,
+          );
+          client.close();
+        }
+      }
+    }, watchdogInterval);
+    // Unref so the watchdog doesn't prevent clean process exit.
+    if (typeof (watchdogTimer as any)?.unref === "function") {
+      (watchdogTimer as any).unref();
+    }
+  }
+
   const ipcServer: IpcServer = {
     sendToAgent(agentName: string, msg: GatewayToClient): boolean {
       const client = agentIndex.get(agentName);
@@ -309,6 +361,12 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     },
 
     async close(): Promise<void> {
+      // Stop the heartbeat watchdog before closing clients so it doesn't
+      // log spurious evictions during planned shutdown.
+      if (watchdogTimer !== null) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
       for (const client of clients) {
         client.close();
       }
