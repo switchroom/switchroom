@@ -2519,6 +2519,10 @@ export function scaffoldAgent(
         })
         .join("\n");
       const rawBody = saDef.prompt ?? `You are the ${saName} sub-agent.`;
+      // `telegramEnabled: true` reflects this scaffold path being inside
+      // a switchroom-scaffolded agent (which always has a Telegram surface).
+      // The actual gate is `defaultChatId` — when there's no userId we skip
+      // the addendum cleanly inside `applyTelegramProgressGuidance`.
       const body = applyTelegramProgressGuidance(rawBody, {
         telegramEnabled: true,
         defaultChatId: userId,

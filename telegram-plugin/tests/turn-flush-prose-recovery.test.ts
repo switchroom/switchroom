@@ -33,6 +33,12 @@ describe('recoverProseFromProgressCard', () => {
     expect(recoverProseFromProgressCard(stateWith([]))).toBe('')
   })
 
+  it('returns empty string when the narratives field is missing', () => {
+    // Defensive: partial state (e.g. older persisted shape) must not throw.
+    const partial = { turnStartedAt: 0, items: [], stage: 'idle', thinking: false } as unknown as ProgressCardState
+    expect(recoverProseFromProgressCard(partial)).toBe('')
+  })
+
   it('joins narrative text in order, newline-separated', () => {
     const state = stateWith([
       narrative(1, 'Reading the file.'),

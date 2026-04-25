@@ -29,6 +29,9 @@ export function recoverProseFromProgressCard(
   state: ProgressCardState | undefined,
 ): string {
   if (state == null) return ''
+  // Defensive: older state shapes (e.g. partial persisted state, mocks
+  // in tests) may lack the `narratives` field. Don't throw.
+  if (!Array.isArray(state.narratives)) return ''
   const parts: string[] = []
   for (const n of state.narratives) {
     if (typeof n.text === 'string' && n.text.length > 0) parts.push(n.text)
