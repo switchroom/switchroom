@@ -27,10 +27,10 @@ describe('sanitizeCwdToProjectName', () => {
   })
 
   it('matches the openclaw research example', () => {
-    // From the streaming research: cwd /mnt/c/Users/kenth/SynologyDrive
-    // sanitizes to -mnt-c-Users-kenth-SynologyDrive
-    expect(sanitizeCwdToProjectName('/mnt/c/Users/kenth/SynologyDrive')).toBe(
-      '-mnt-c-Users-kenth-SynologyDrive',
+    // From the streaming research: cwd /mnt/c/Users/example/Documents
+    // sanitizes to -mnt-c-Users-example-Documents
+    expect(sanitizeCwdToProjectName('/mnt/c/Users/example/Documents')).toBe(
+      '-mnt-c-Users-example-Documents',
     )
   })
 })

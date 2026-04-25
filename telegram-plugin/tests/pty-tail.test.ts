@@ -232,7 +232,7 @@ describe('V1Extractor', () => {
   it('does not include subsequent param names when text is mid-call', async () => {
     // This is the exact scenario that produced the bug screenshot.
     const tui =
-      '● switchroom-telegram - reply (MCP)(chat_id: "8248703757", text: "Short answer coming once I\\"ve looked.", reply_to: "86")\r\n'
+      '● switchroom-telegram - reply (MCP)(chat_id: "100000001", text: "Short answer coming once I\\"ve looked.", reply_to: "86")\r\n'
     const term = await feedToTerm(tui)
     const result = extractor.extract(term)
     expect(result).toBe('Short answer coming once I"ve looked.')

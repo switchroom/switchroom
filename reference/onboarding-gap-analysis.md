@@ -3,7 +3,7 @@
 ## Problem
 
 Bringing up a new switchroom agent with a real corpus is still a babysitting
-job. Setting up `lawgpt` (~100MB Goodfellow Estate export) surfaced six
+job. Setting up `lawgpt` (~100MB <redacted-corpus> export) surfaced six
 distinct gaps where the happy path relies on operator knowledge that isn't in
 the code or the docs. Most of these are silent-failure shaped: the CLI
 reports success, something is actually broken, and the only way to find out
