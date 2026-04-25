@@ -164,7 +164,7 @@ export function renderWorkerCard(
 
   const lines: string[] = [`\u{1F6E0} <b>Background workers (${active.length})</b>`]
   for (const w of active) {
-    const ago = formatDuration(now - w.lastActivityAt)
+    const ago = escapeHtml(formatDuration(now - w.lastActivityAt))
     const desc = escapeHtml(truncate(w.description || 'sub-agent', 60))
     lines.push(`\u{1F527} ${desc} · running · last activity ${ago} ago · ${w.toolCount} tools`)
   }

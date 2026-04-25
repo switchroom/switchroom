@@ -113,6 +113,20 @@ describe('renderWorkerCard', () => {
     const html = renderWorkerCard(registry, 31_000)
     expect(html).toContain('30s ago')
   })
+
+  it('escapes HTML in sub-second age (<1s)', () => {
+    // formatDuration returns the literal string "<1s" when ms < 1000.
+    // If left unescaped, Telegram parses the leading "<" as the start
+    // of an HTML tag and rejects the message with
+    // "can't parse entities: Unsupported start tag '1s'". Ensure the
+    // rendered card escapes the angle bracket so the card actually sends.
+    const registry = new Map<string, WorkerEntry>([
+      ['a', makeEntry({ description: 'sub-agent', lastActivityAt: 999 })],
+    ])
+    const html = renderWorkerCard(registry, 1000) // 1ms idle → "<1s"
+    expect(html).not.toContain('<1s')
+    expect(html).toContain('&lt;1s')
+  })
 })
 
 // ─── startSubagentWatcher harness ────────────────────────────────────────────
