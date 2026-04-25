@@ -162,6 +162,18 @@ interface WatcherHarness {
   watcher: ReturnType<typeof startSubagentWatcher>
   // Current mocked time
   now: () => number
+  // Mutable fs object — tests can override .readSync, .statSync etc.
+  // for per-test customization (the watcher reads each method on every call,
+  // so reassigning is picked up immediately).
+  mockFs: {
+    existsSync: typeof fs.existsSync
+    readdirSync: typeof fs.readdirSync
+    statSync: typeof fs.statSync
+    openSync: typeof fs.openSync
+    closeSync: typeof fs.closeSync
+    readSync: typeof fs.readSync
+    watch: typeof fs.watch
+  }
 }
 
 function makeHarness(opts: {
@@ -193,73 +205,53 @@ function makeHarness(opts: {
     fileContents.set(path, Buffer.from(content, 'utf-8'))
   }
 
-  // Mock fs.existsSync
-  vi.spyOn(fs, 'existsSync').mockImplementation((p: fs.PathLike) => {
-    const ps = String(p)
-    // Check dirs
-    if (existingDirs.includes(ps)) return true
-    if (dirs[ps] !== undefined) return true
-    // Check files
-    if (fileContents.has(ps)) return true
-    // Check parent paths of files
-    for (const fp of fileContents.keys()) {
-      if (fp.startsWith(ps + '/')) return true
-    }
-    return false
-  })
-
-  // Mock fs.readdirSync
-  vi.spyOn(fs, 'readdirSync').mockImplementation((p: fs.PathLike) => {
-    const ps = String(p)
-    if (dirs[ps]) return dirs[ps] as unknown as fs.Dirent[]
-    // Derive from files
-    const children = new Set<string>()
-    for (const fp of fileContents.keys()) {
-      if (fp.startsWith(ps + '/')) {
-        const rest = fp.slice(ps.length + 1)
-        const part = rest.split('/')[0]
-        if (part) children.add(part)
-      }
-    }
-    return Array.from(children) as unknown as fs.Dirent[]
-  })
-
-  // Mock fs.statSync
-  vi.spyOn(fs, 'statSync').mockImplementation((p: fs.PathLike) => {
-    const ps = String(p)
-    const content = fileContents.get(ps)
-    if (content !== undefined) {
-      return { size: content.length } as fs.Stats
-    }
-    return { size: 0 } as fs.Stats
-  })
-
-  // Mock fs.openSync, readSync, closeSync
-  vi.spyOn(fs, 'openSync').mockReturnValue(42 as ReturnType<typeof fs.openSync>)
-  vi.spyOn(fs, 'closeSync').mockImplementation(() => {})
-  vi.spyOn(fs, 'readSync').mockImplementation((
-    _fd: number,
-    buf: NodeJS.ArrayBufferView,
-    offset: number,
-    length: number,
-    position: number | null,
-  ): number => {
-    // We don't know which file was opened in this mock, so we need a stateful
-    // approach. Since openSync is a no-op (returns 42), we track the last
-    // opened file via a side-channel. This requires us to intercept openSync.
-    // For simplicity: return zeros (the watcher will see 0-length reads and
-    // correctly no-op). The file content is delivered via explicit setContent.
-    void _fd; void buf; void offset; void length; void position
-    return 0
-  })
-
-  // Mock fs.watch
+  // Build a mock fs object — injected via watcher config (ESM namespace
+  // exports are not configurable so vi.spyOn(fs, ...) doesn't work).
   const fakeWatchers: Array<{ close: () => void }> = []
-  vi.spyOn(fs, 'watch').mockImplementation(() => {
-    const w = { close: vi.fn() }
-    fakeWatchers.push(w)
-    return w as unknown as fs.FSWatcher
-  })
+  const mockFs = {
+    existsSync: ((p: fs.PathLike) => {
+      const ps = String(p)
+      if (existingDirs.includes(ps)) return true
+      if (dirs[ps] !== undefined) return true
+      if (fileContents.has(ps)) return true
+      for (const fp of fileContents.keys()) {
+        if (fp.startsWith(ps + '/')) return true
+      }
+      return false
+    }) as typeof fs.existsSync,
+    readdirSync: ((p: fs.PathLike) => {
+      const ps = String(p)
+      if (dirs[ps]) return dirs[ps]
+      const children = new Set<string>()
+      for (const fp of fileContents.keys()) {
+        if (fp.startsWith(ps + '/')) {
+          const rest = fp.slice(ps.length + 1)
+          const part = rest.split('/')[0]
+          if (part) children.add(part)
+        }
+      }
+      return Array.from(children)
+    }) as unknown as typeof fs.readdirSync,
+    statSync: ((p: fs.PathLike) => {
+      const ps = String(p)
+      const content = fileContents.get(ps)
+      return { size: content?.length ?? 0 } as fs.Stats
+    }) as typeof fs.statSync,
+    openSync: (() => 42) as unknown as typeof fs.openSync,
+    closeSync: (() => {}) as typeof fs.closeSync,
+    readSync: ((
+      _fd: number,
+      _buf: NodeJS.ArrayBufferView,
+      _offset: number,
+      _length: number,
+      _position: number | null,
+    ): number => 0) as unknown as typeof fs.readSync,
+    watch: (() => {
+      const w = { close: vi.fn() }
+      fakeWatchers.push(w)
+      return w as unknown as fs.FSWatcher
+    }) as unknown as typeof fs.watch,
+  }
 
   // Injected timers
   const intervals: Array<{ fn: () => void; ms: number; ref: number; fireAt: number }> = []
@@ -283,6 +275,7 @@ function makeHarness(opts: {
       const idx = intervals.findIndex((i) => i.ref === ref)
       if (idx !== -1) intervals.splice(idx, 1)
     },
+    fs: mockFs,
     log: (_msg: string) => {}, // silence in tests
   })
 
@@ -310,6 +303,7 @@ function makeHarness(opts: {
     poll,
     watcher,
     now: () => currentTime,
+    mockFs,
   }
 }
 
@@ -383,7 +377,7 @@ describe('startSubagentWatcher', () => {
 
     // Override readSync to actually return file content
     let fileData = Buffer.from(content)
-    vi.spyOn(fs, 'readSync').mockImplementation((
+    h.mockFs.readSync = ((
       _fd, buf, offset, length, position,
     ) => {
       const pos = position ?? 0
@@ -392,7 +386,7 @@ describe('startSubagentWatcher', () => {
       fileData.copy(buf as Buffer, offset, pos, pos + available)
       return available
     })
-    vi.spyOn(fs, 'statSync').mockImplementation((p) => {
+    h.mockFs.statSync = ((p) => {
       const ps = String(p)
       if (ps === jsonlPath) return { size: fileData.length } as fs.Stats
       return { size: 0 } as fs.Stats
@@ -437,14 +431,14 @@ describe('startSubagentWatcher', () => {
     })
 
     const buf = Buffer.from(content)
-    vi.spyOn(fs, 'readSync').mockImplementation((_fd, b, offset, length, position) => {
+    h.mockFs.readSync = ((_fd, b, offset, length, position) => {
       const pos = position ?? 0
       const available = Math.min(length, buf.length - pos)
       if (available <= 0) return 0
       buf.copy(b as Buffer, offset, pos, pos + available)
       return available
     })
-    vi.spyOn(fs, 'statSync').mockImplementation((p) => {
+    h.mockFs.statSync = ((p) => {
       const ps = String(p)
       if (ps === jsonlPath) return { size: buf.length } as fs.Stats
       return { size: 0 } as fs.Stats
@@ -486,14 +480,14 @@ describe('startSubagentWatcher', () => {
     })
 
     const buf = Buffer.from(content)
-    vi.spyOn(fs, 'readSync').mockImplementation((_fd, b, offset, length, position) => {
+    h.mockFs.readSync = ((_fd, b, offset, length, position) => {
       const pos = position ?? 0
       const available = Math.min(length, buf.length - pos)
       if (available <= 0) return 0
       buf.copy(b as Buffer, offset, pos, pos + available)
       return available
     })
-    vi.spyOn(fs, 'statSync').mockImplementation((p) => {
+    h.mockFs.statSync = ((p) => {
       const ps = String(p)
       if (ps === jsonlPath) return { size: buf.length } as fs.Stats
       return { size: 0 } as fs.Stats

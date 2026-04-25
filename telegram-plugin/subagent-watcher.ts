@@ -99,6 +99,20 @@ export interface SubagentWatcherConfig {
   /** `setTimeout` override for tests. */
   setTimeout?: (fn: () => void, ms: number) => { ref: unknown }
   clearTimeout?: (ref: unknown) => void
+  /**
+   * `fs` overrides for tests. ESM namespace exports are not configurable so
+   * `vi.spyOn(fs, ...)` doesn't work — tests inject a mock object here
+   * instead. Defaults to the real `node:fs` functions.
+   */
+  fs?: {
+    existsSync: typeof existsSync
+    readdirSync: typeof readdirSync
+    statSync: typeof statSync
+    openSync: typeof openSync
+    closeSync: typeof closeSync
+    readSync: typeof readSync
+    watch: typeof watch
+  }
 }
 
 export interface SubagentWatcherHandle {
@@ -166,15 +180,26 @@ interface SubTail {
   watcher: FSWatcher | null
 }
 
+interface FsLike {
+  existsSync: typeof existsSync
+  readdirSync: typeof readdirSync
+  statSync: typeof statSync
+  openSync: typeof openSync
+  closeSync: typeof closeSync
+  readSync: typeof readSync
+  watch: typeof watch
+}
+
 function readSubTail(
   entry: WorkerEntry,
   tail: SubTail,
   now: number,
   onDescriptionUpdate: (desc: string) => void,
+  fs: FsLike,
   log?: (msg: string) => void,
 ): void {
   try {
-    const stat = statSync(entry.filePath)
+    const stat = fs.statSync(entry.filePath)
     if (stat.size < tail.cursor) {
       tail.cursor = 0
       tail.pendingPartial = ''
@@ -182,11 +207,11 @@ function readSubTail(
     if (stat.size === tail.cursor) return
 
     const buf = Buffer.alloc(stat.size - tail.cursor)
-    const fd = openSync(entry.filePath, 'r')
+    const fd = fs.openSync(entry.filePath, 'r')
     try {
-      readSync(fd, buf, 0, buf.length, tail.cursor)
+      fs.readSync(fd, buf, 0, buf.length, tail.cursor)
     } finally {
-      closeSync(fd)
+      fs.closeSync(fd)
     }
     tail.cursor = stat.size
 
@@ -242,6 +267,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const clearI = config.clearInterval ?? ((ref) => {
     clearInterval((ref as { ref: ReturnType<typeof setInterval> }).ref)
   })
+
+  // fs DI: tests pass a mock; production uses the real node:fs functions.
+  const fs = config.fs ?? {
+    existsSync,
+    readdirSync,
+    statSync,
+    openSync,
+    closeSync,
+    readSync,
+    watch,
+  }
 
   // Registry: agentId → WorkerEntry
   const registry = new Map<string, WorkerEntry>()
@@ -309,11 +345,11 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     readSubTail(entry, tail, n, (desc) => {
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
       maybeSendCardUpdate()
-    }, log)
+    }, fs, log)
 
     // Set up FSWatcher
     try {
-      tail.watcher = watch(filePath, () => {
+      tail.watcher = fs.watch(filePath, () => {
         if (stopped) return
         const entry = registry.get(agentId)
         const t = tails.get(agentId)
@@ -321,7 +357,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
           maybeSendCardUpdate()
-        }, log)
+        }, fs, log)
         maybySendStateTransition(agentId)
         maybeSendCardUpdate()
       })
@@ -396,32 +432,32 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     if (stopped) return
     const claudeHome = join(agentDir, '.claude')
     const projectsRoot = join(claudeHome, 'projects')
-    if (!existsSync(projectsRoot)) return
+    if (!fs.existsSync(projectsRoot)) return
 
     let projectDirs: string[]
     try {
-      projectDirs = readdirSync(projectsRoot)
+      projectDirs = fs.readdirSync(projectsRoot) as string[]
     } catch { return }
 
     for (const pDir of projectDirs) {
       const projectPath = join(projectsRoot, pDir)
       let sessionDirs: string[]
       try {
-        sessionDirs = readdirSync(projectPath)
+        sessionDirs = fs.readdirSync(projectPath) as string[]
       } catch { continue }
 
       for (const sDir of sessionDirs) {
         // Session dirs are UUID-like; skip known non-session entries
         if (sDir.endsWith('.jsonl')) continue
         const subagentsPath = join(projectPath, sDir, 'subagents')
-        if (!existsSync(subagentsPath)) continue
+        if (!fs.existsSync(subagentsPath)) continue
 
         // Watch the subagents dir for new files if not already watching
         if (!dirWatchers.has(subagentsPath)) {
           try {
-            const w = watch(subagentsPath, (_event, filename) => {
-              if (!filename || !filename.startsWith('agent-') || !filename.endsWith('.jsonl')) return
-              const filePath = join(subagentsPath, filename)
+            const w = fs.watch(subagentsPath, (_event, filename) => {
+              if (!filename || !filename.toString().startsWith('agent-') || !filename.toString().endsWith('.jsonl')) return
+              const filePath = join(subagentsPath, filename.toString())
               if (!knownFiles.has(filePath)) {
                 scanSubagentsDir(subagentsPath)
               }
@@ -442,7 +478,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   function scanSubagentsDir(subagentsPath: string): void {
     let entries: string[]
     try {
-      entries = readdirSync(subagentsPath)
+      entries = fs.readdirSync(subagentsPath) as string[]
     } catch { return }
 
     for (const e of entries) {
