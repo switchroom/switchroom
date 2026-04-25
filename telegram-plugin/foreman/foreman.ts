@@ -26,6 +26,7 @@ import { Bot, InlineKeyboard, type Context } from 'grammy'
 import { readFileSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { listWorktrees } from '../../src/worktree/list.js'
 import { installPluginLogger } from '../plugin-logger.js'
 import {
   escapeHtmlForTg,
@@ -340,6 +341,29 @@ bot.command('version', async ctx => {
   }
 })
 
+// ─── /worktrees ───────────────────────────────────────────────────────────
+bot.command('worktrees', async ctx => {
+  try {
+    const { worktrees } = listWorktrees()
+    if (worktrees.length === 0) {
+      await switchroomReply(ctx, 'No active worktrees.', { html: false })
+      return
+    }
+    const lines = ['<b>Active worktrees</b>', '']
+    for (const w of worktrees) {
+      const ageMin = Math.floor(w.ageSeconds / 60)
+      const hbMin = Math.floor(w.heartbeatAgeSeconds / 60)
+      const owner = w.ownerAgent ? ` (${escapeHtmlForTg(w.ownerAgent)})` : ''
+      lines.push(
+        `• <code>${escapeHtmlForTg(w.repoName)}</code>${owner} — branch <code>${escapeHtmlForTg(w.branch)}</code>, age ${ageMin}m, hb ${hbMin}m`,
+      )
+    }
+    await switchroomReply(ctx, lines.join('\n'), { html: true })
+  } catch (err) {
+    await switchroomReply(ctx, `<b>worktrees failed:</b> ${escapeHtmlForTg((err as Error).message)}`, { html: true })
+  }
+})
+
 // ─── /create-agent ────────────────────────────────────────────────────────
 
 bot.command('create_agent', async ctx => {
@@ -621,6 +645,7 @@ void runPollingLoop(bot, {
         { command: 'delete', description: 'Delete agent (with confirm): /delete <agent>' },
         { command: 'update', description: 'Update switchroom' },
         { command: 'version', description: 'Show versions + running agent health' },
+        { command: 'worktrees', description: 'List active git worktrees claimed by sub-agents' },
         { command: 'create_agent', description: 'Create new agent: /create-agent [name]' },
       ])
     } catch (err) {

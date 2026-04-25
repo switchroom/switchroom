@@ -1,0 +1,13 @@
+{
+  "name": "switchroom-worktree-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing git worktree isolation tools to Claude Code sub-agents",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun install --no-summary && bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

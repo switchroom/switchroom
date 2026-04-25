@@ -19,6 +19,7 @@ import { registerHandoffCommand } from "./handoff.js";
 import { registerDepsCommand } from "./deps.js";
 import { registerWorkspaceCommand } from "./workspace.js";
 import { registerDebugCommand } from "./debug.js";
+import { registerWorktreeCommand } from "./worktree.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -60,6 +61,7 @@ registerHandoffCommand(program);
 registerDepsCommand(program);
 registerWorkspaceCommand(program);
 registerDebugCommand(program);
+registerWorktreeCommand(program);
 
 // Deprecated aliases — kept for one release, will be removed after.
 // Invoking these prints a clear deprecation warning and delegates to `update`.

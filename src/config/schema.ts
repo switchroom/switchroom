@@ -1,5 +1,23 @@
 import { z } from "zod";
 
+/**
+ * A single entry in an agent's code_repos list.
+ * Declares a git repo the agent is allowed to claim worktrees from,
+ * with an optional short alias and per-repo concurrency cap.
+ */
+export const CodeRepoEntrySchema = z.object({
+  name: z.string().describe("Short alias used when claiming (e.g. 'switchroom')"),
+  source: z
+    .string()
+    .describe("Absolute or home-relative path to the repo (e.g. ~/code/switchroom)"),
+  concurrency: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Max simultaneous worktrees for this repo (default 5)"),
+});
+
 export const ScheduleEntrySchema = z.object({
   cron: z.string().describe("Cron expression (e.g., '0 8 * * *')"),
   prompt: z.string().describe("Prompt to send at the scheduled time"),
@@ -636,6 +654,16 @@ export const AgentSchema = z.object({
       "doesn't expose directly (e.g. --effort high, " +
       "--exclude-dynamic-system-prompt-sections)."
     ),
+  code_repos: z
+    .array(CodeRepoEntrySchema)
+    .optional()
+    .describe(
+      "Git repositories this agent is allowed to claim worktrees from. " +
+      "Each entry provides a short name alias, a source path, and an " +
+      "optional concurrency cap (default 5). When code_repos is set, " +
+      "claim_worktree accepts the alias as the repo argument. " +
+      "Absolute paths may always be passed regardless of this list.",
+    ),
 });
 
 export const TelegramConfigSchema = z.object({
@@ -796,3 +824,4 @@ export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
+export type CodeRepoEntry = z.infer<typeof CodeRepoEntrySchema>;
