@@ -86,6 +86,7 @@ import {
   decideTurnFlush,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
+import { recoverProseFromProgressCard } from '../turn-flush-prose-recovery.js'
 import {
   resolveAgentDirFromEnv,
   consumeHandoffTopic,
@@ -1656,6 +1657,28 @@ function handleSessionEvent(ev: SessionEvent): void {
       const chatId = currentSessionChatId
       const threadId = currentSessionThreadId
       const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
+
+      // ── #51: prose-as-step recovery ──────────────────────────────────
+      // The capturedText accumulator gates push on currentSessionChatId,
+      // while progressDriver.ingest uses the IPC envelope's chatHint. When
+      // those views disagree, prose can land in the progress card's
+      // narrative steps while capturedText stays empty — `decideTurnFlush`
+      // then returns `empty-text` and the user sees nothing. Recover from
+      // the card state so the flush path can send what the user already
+      // sees in the step list.
+      if (currentTurnCapturedText.length === 0 && progressDriver != null) {
+        const peek = progressDriver.peek(
+          chatId,
+          threadId != null ? String(threadId) : undefined,
+        )
+        const recovered = recoverProseFromProgressCard(peek)
+        if (recovered.length > 0) {
+          process.stderr.write(
+            `telegram gateway: turn-flush prose-recovery — recovered ${recovered.length} chars from progress-card narratives chat=${chatId} turnKey=${currentTurnStartedAt}\n`,
+          )
+          currentTurnCapturedText.push(recovered)
+        }
+      }
 
       const flushDecision = decideTurnFlush({
         chatId: currentSessionChatId,
