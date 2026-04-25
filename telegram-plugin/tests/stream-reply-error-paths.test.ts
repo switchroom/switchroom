@@ -59,10 +59,24 @@ function makeDeps(
  * Pump vi fake timers + microtasks until all pending work settles.
  * The draft-stream's `flushLoop` has setTimeout(0) schedules that need
  * explicit advancement even at throttleMs=0, plus intermediate awaits.
+ *
+ * vi.advanceTimersByTimeAsync isn't implemented under bun's test runner.
+ * Polyfill via the sync advance + explicit microtask flush so this file
+ * runs cleanly under both vitest and `bun test`.
  */
+async function advanceFakeClock(ms: number): Promise<void> {
+  const viAny = vi as { advanceTimersByTimeAsync?: (ms: number) => Promise<void> }
+  if (typeof viAny.advanceTimersByTimeAsync === 'function') {
+    await viAny.advanceTimersByTimeAsync(ms)
+    return
+  }
+  vi.advanceTimersByTime(ms)
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+}
+
 async function settle(ms = 0): Promise<void> {
   for (let i = 0; i < 20; i++) {
-    await vi.advanceTimersByTimeAsync(ms)
+    await advanceFakeClock(ms)
     await Promise.resolve()
   }
 }

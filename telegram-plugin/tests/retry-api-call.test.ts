@@ -13,6 +13,20 @@ import { GrammyError } from 'grammy'
 import { createRetryApiCall, type RetryObserver } from '../retry-api-call.js'
 import { errors, makeGrammyError } from './fake-bot-api.js'
 
+// vitest's vi.advanceTimersByTimeAsync isn't implemented by Bun's test runner.
+// This polyfill keeps the same semantics (advance fake clock + flush microtasks)
+// and lets the file run cleanly under both vitest and `bun test`.
+async function advanceTimers(ms: number): Promise<void> {
+  const viAny = vi as { advanceTimersByTimeAsync?: (ms: number) => Promise<void> }
+  if (typeof viAny.advanceTimersByTimeAsync === 'function') {
+    await viAny.advanceTimersByTimeAsync(ms)
+    return
+  }
+  vi.advanceTimersByTime(ms)
+  // Flush a few microtask turns so awaits chained off the timer callback resolve.
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+}
+
 describe('retryApiCall', () => {
   beforeEach(() => {
     vi.useFakeTimers()
@@ -35,7 +49,7 @@ describe('retryApiCall', () => {
       // Haven't advanced time yet — call is parked on the sleep.
       await Promise.resolve()
       expect(fn).toHaveBeenCalledTimes(1)
-      await vi.advanceTimersByTimeAsync(3000)
+      await advanceTimers(3000)
       const result = await pending
       expect(result).toBe('ok')
       expect(fn).toHaveBeenCalledTimes(2)
@@ -60,7 +74,7 @@ describe('retryApiCall', () => {
       const retry = createRetryApiCall()
       const pending = retry(fn)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(5000)
+      await advanceTimers(5000)
       await pending
       expect(fn).toHaveBeenCalledTimes(2)
     })
@@ -75,9 +89,9 @@ describe('retryApiCall', () => {
       const retry = createRetryApiCall()
       const pending = retry(fn)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000)
+      await advanceTimers(1000)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(2000)
+      await advanceTimers(2000)
       expect(await pending).toBe('ok')
       expect(fn).toHaveBeenCalledTimes(3)
     })
@@ -146,9 +160,9 @@ describe('retryApiCall', () => {
       const pending = retry(fn)
 
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000) // 2^0 * 1000
+      await advanceTimers(1000) // 2^0 * 1000
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(2000) // 2^1 * 1000
+      await advanceTimers(2000) // 2^1 * 1000
       expect(await pending).toBe('ok')
       expect(observer.onRetry).toHaveBeenCalledTimes(2)
       expect((observer.onRetry as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
@@ -173,9 +187,9 @@ describe('retryApiCall', () => {
       const caught = pending.catch((e) => e)
 
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000)
+      await advanceTimers(1000)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(2000)
+      await advanceTimers(2000)
       const err = await caught
       expect((err as Error).message).toBe('fetch failed')
       expect(fn).toHaveBeenCalledTimes(3)
@@ -221,9 +235,9 @@ describe('retryApiCall', () => {
       const retry = createRetryApiCall({ observer: { onRetry } })
       const pending = retry(fn)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000)
+      await advanceTimers(1000)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000)
+      await advanceTimers(1000)
       await pending
       expect(onRetry).toHaveBeenCalledTimes(2)
       expect(onRetry.mock.calls[0][0]).toMatchObject({ attempt: 0, reason: 'flood_wait' })
@@ -251,7 +265,7 @@ describe('retryApiCall', () => {
       const retry = createRetryApiCall({ log })
       const pending = retry(fn)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(2000)
+      await advanceTimers(2000)
       await pending
       expect(log).toHaveBeenCalledWith(expect.stringMatching(/429 rate limited.*2s/))
     })
@@ -265,7 +279,7 @@ describe('retryApiCall', () => {
       const retry = createRetryApiCall({ log })
       const pending = retry(fn)
       await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(1000)
+      await advanceTimers(1000)
       await pending
       expect(log).toHaveBeenCalledWith(expect.stringMatching(/network error.*1s/))
     })

@@ -115,7 +115,9 @@ steps:
         # the assigned file list in place of {{testExamples}}.
         export BUILDKITE_TEST_ENGINE_TEST_CMD="bunx vitest run {{testExamples}}"
         # Match all test files that vitest.config.ts would include.
-        export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="{tests,test,experimental,src}/**/*.test.ts,telegram-plugin/tests/*.test.ts"
+        # Brace expansion ({a,b,c}) is not honored by bktec's glob library —
+        # it produces "no files found" silently. List each root dir explicitly.
+        export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="tests/**/*.test.ts,test/**/*.test.ts,experimental/**/*.test.ts,src/**/*.test.ts,telegram-plugin/tests/*.test.ts"
         export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/history.test.ts"
         bktec run
       else
