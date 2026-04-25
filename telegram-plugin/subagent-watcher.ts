@@ -507,7 +507,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (!tail) continue
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      }, log)
+      }, fs, log)
       maybySendStateTransition(agentId)
     }
 
