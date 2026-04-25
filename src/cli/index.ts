@@ -72,7 +72,11 @@ for (const oldVerb of ["upgrade", "rebuild", "reconcile"] as const) {
       console.warn(
         `\n  ⚠  '${oldVerb}' is deprecated — use 'switchroom update' instead.\n`
       );
-      // Delegate by re-invoking with the canonical verb
+      // Delegate by re-invoking with the canonical verb. argv layout for
+      // a CLI invocation is [node, /path/to/switchroom, <verb>, ...rest],
+      // so slice(3) drops the deprecated verb and keeps the rest of the
+      // user's flags. Test harnesses that mock argv differently must
+      // construct the array themselves.
       try {
         const self = process.argv[1];
         execFileSync(process.execPath, [self, "update", ...process.argv.slice(3)], {

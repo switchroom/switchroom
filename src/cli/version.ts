@@ -37,6 +37,7 @@ function getTreeStatus(installDir: string | null): "clean" | "dirty" | null {
       cwd: installDir,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
     }).trim();
     return out ? "dirty" : "clean";
   } catch {

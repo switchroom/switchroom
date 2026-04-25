@@ -14,9 +14,16 @@ import { printHealthSummary } from "./version.js";
  *
  * Drain semantics: by default we use the graceful-restart path which
  * waits for an in-flight claude turn to complete before cycling the
- * process (same as `agent restart --graceful-restart`).
+ * process (same as `agent restart --graceful-restart`). When a turn is
+ * in flight, the restart is *scheduled* — the CLI prints "restart
+ * scheduled (waiting for turn to complete)" and exits 0. The actual
+ * bounce happens asynchronously when the gateway observes the turn
+ * complete (or hits the 60s drain cap and forces). Automation that
+ * needs a synchronous wait should poll `switchroom version` until the
+ * uptime resets, or use `--force`.
  *
- * --force: skip drain, SIGTERM immediately (same as omitting graceful).
+ * --force: skip drain, SIGTERM immediately. Synchronous from the CLI's
+ * perspective — exits when the systemctl restart returns.
  *
  * Prints the one-line health summary when done.
  */

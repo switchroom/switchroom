@@ -62,10 +62,12 @@ function locateSwitchroomInstallDir(): string | null {
 
 /**
  * Run a shell command, streaming output. Returns true on success.
+ * Pass an explicit timeoutMs — git/network/install commands MUST cap, or
+ * a stalled SSH key prompt or unreachable origin hangs `update` forever.
  */
-function runStreamed(cmd: string, cwd: string): boolean {
+function runStreamed(cmd: string, cwd: string, timeoutMs: number): boolean {
   try {
-    execSync(cmd, { cwd, stdio: "inherit" });
+    execSync(cmd, { cwd, stdio: "inherit", timeout: timeoutMs });
     return true;
   } catch {
     return false;
@@ -74,13 +76,16 @@ function runStreamed(cmd: string, cwd: string): boolean {
 
 /**
  * Run a shell command and capture stdout. Returns the output or null on error.
+ * timeoutMs defaults to 10s — fine for local git metadata reads (rev-parse,
+ * status, log). Override for anything that touches the network.
  */
-function runCaptured(cmd: string, cwd: string): string | null {
+function runCaptured(cmd: string, cwd: string, timeoutMs = 10_000): string | null {
   try {
     return execSync(cmd, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf-8",
+      timeout: timeoutMs,
     }).toString();
   } catch {
     return null;
@@ -144,7 +149,7 @@ export function registerUpdateCommand(program: Command): void {
 
         // 2. Fetch from origin
         console.log(chalk.gray("\n  Fetching from origin..."));
-        if (!runStreamed("git fetch --quiet origin", installDir)) {
+        if (!runStreamed("git fetch --quiet origin", installDir, 30_000)) {
           console.error(chalk.red("  git fetch failed"));
           process.exit(1);
         }
@@ -176,7 +181,7 @@ export function registerUpdateCommand(program: Command): void {
         // 4. Pull
         if (log) {
           console.log(chalk.gray("\n  Pulling..."));
-          if (!runStreamed(`git pull --ff-only --quiet origin ${branch}`, installDir)) {
+          if (!runStreamed(`git pull --ff-only --quiet origin ${branch}`, installDir, 60_000)) {
             console.error(
               chalk.red(
                 "  git pull failed (not a fast-forward?). " +
@@ -193,7 +198,7 @@ export function registerUpdateCommand(program: Command): void {
           )?.trim() ?? "";
           if (changed.includes("package.json") || changed.includes("bun.lock")) {
             console.log(chalk.gray("\n  Reinstalling dependencies (package.json changed)..."));
-            if (!runStreamed("bun install --quiet", installDir)) {
+            if (!runStreamed("bun install --quiet", installDir, 120_000)) {
               console.error(chalk.yellow("  bun install reported a non-zero exit"));
             }
           }
@@ -202,7 +207,7 @@ export function registerUpdateCommand(program: Command): void {
           const pluginPkg = join(installDir, "telegram-plugin", "package.json");
           if (existsSync(pluginPkg) && changed.includes("telegram-plugin/package.json")) {
             console.log(chalk.gray("  Reinstalling telegram-plugin dependencies..."));
-            runStreamed("bun install --quiet", join(installDir, "telegram-plugin"));
+            runStreamed("bun install --quiet", join(installDir, "telegram-plugin"), 120_000);
           }
         }
 
