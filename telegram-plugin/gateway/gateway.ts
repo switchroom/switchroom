@@ -164,6 +164,10 @@ import {
   startSubagentWatcher,
   type SubagentWatcherHandle,
 } from '../subagent-watcher.js'
+import {
+  startBootCard,
+  type BootCardHandle,
+} from './boot-card.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -751,6 +755,30 @@ function coalesceKey(chatId: string, userId: string): string {
   return `${chatId}:${userId}`
 }
 
+/**
+ * Legacy "restarted — ready" banner, used when BOOT_CARD_ENABLED=false.
+ * Kept as a safe fallback so reverting to the old behavior is one env var flip.
+ */
+function postLegacyBanner(
+  chatId: string,
+  threadId: number | undefined,
+  ackMessageId: number | undefined,
+  ageSec: number,
+  site: string,
+): void {
+  const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
+  process.stderr.write(`telegram gateway: ${site}: posting legacy banner chat_id=${chatId}\n`)
+  lockedBot.api.sendMessage(chatId, text, {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+    ...(threadId != null ? { message_thread_id: threadId } : {}),
+    ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
+  }).then(sent => {
+    if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
+  }).catch((err: Error) => {
+    process.stderr.write(`telegram gateway: ${site}: legacy banner send failed: ${err.message}\n`)
+  })
+}
+
 // ─── Progress card + session/PTY tail state ───────────────────────────────
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
@@ -777,6 +805,10 @@ const GATEWAY_SESSION_MARKER_PATH = process.env.SWITCHROOM_GATEWAY_SESSION_MARKE
 // "recovered from unexpected restart" banner for planned shutdowns.
 const GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH = process.env.SWITCHROOM_GATEWAY_CLEAN_SHUTDOWN_MARKER ?? join(STATE_DIR, 'clean-shutdown.json')
 const GATEWAY_STARTED_AT_MS = Date.now()
+
+// Boot card: feature flag (default on) + handle for unpinning on first turn
+const BOOT_CARD_ENABLED = process.env.SWITCHROOM_BOOT_CARD !== 'false'
+let activeBootCard: BootCardHandle | null = null
 
 // Startup mutex. Atomic single-writer claim on the PID file so two
 // gateway processes can't race on Telegram's getUpdates long-poll.
@@ -854,17 +886,31 @@ const ipcServer: IpcServer = createIpcServer({
       process.stderr.write(`telegram gateway: bridge-reconnect: restart-marker present, chat_id=${marker.chat_id} age=${ageSec}s within5min=${ageMs < 5 * 60_000} agent=${client.agentName}\n`)
       clearRestartMarker()
       if (ageMs < 5 * 60_000) {
-        const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
-        process.stderr.write(`telegram gateway: bridge-reconnect: posting 'restarted — ready' banner chat_id=${marker.chat_id} thread_id=${marker.thread_id ?? '-'} ackReply=${marker.ack_message_id ?? '-'}\n`)
-        lockedBot.api.sendMessage(marker.chat_id, text, {
-          parse_mode: 'HTML', link_preview_options: { is_disabled: true },
-          ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
-          ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
-        }).then(sent => {
-          if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
-        }).catch((err: Error) => {
-          process.stderr.write(`telegram gateway: bridge-reconnect: 'restarted — ready' banner send failed: ${err.message}\n`)
-        })
+        const chatId = marker.chat_id
+        const threadId = marker.thread_id ?? undefined
+        const ackMsgId = marker.ack_message_id ?? undefined
+        process.stderr.write(`telegram gateway: bridge-reconnect: posting boot card chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
+        if (BOOT_CARD_ENABLED) {
+          const agentDir = resolveAgentDirFromEnv()
+          const agentName = process.env.SWITCHROOM_AGENT_NAME ?? client.agentName ?? '-'
+          const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
+            sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
+            editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
+            pinChatMessage: (cid, mid, opts) => lockedBot.api.pinChatMessage(cid, mid, opts as Parameters<typeof lockedBot.api.pinChatMessage>[2]),
+            unpinChatMessage: (cid, mid) => lockedBot.api.unpinChatMessage(cid, mid),
+          }
+          startBootCard(chatId, threadId, botApiForCard, {
+            agentName,
+            agentDir: agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp'),
+            gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
+          }, ackMsgId).then(handle => {
+            activeBootCard = handle
+          }).catch((err: Error) => {
+            process.stderr.write(`telegram gateway: bridge-reconnect: boot card error: ${err.message}\n`)
+          })
+        } else {
+          postLegacyBanner(chatId, threadId, ackMsgId, ageSec, 'bridge-reconnect')
+        }
       }
     }
   },
@@ -4882,17 +4928,31 @@ void (async () => {
             process.stderr.write(`telegram gateway: boot: restart-marker present, chat_id=${marker.chat_id} age=${ageSec}s within5min=${ageMs < 5 * 60_000}\n`)
             clearRestartMarker()
             if (ageMs < 5 * 60_000) {
-              const text = `🎛️ Switchroom restarted — ready. (took ~${ageSec}s)`
-              process.stderr.write(`telegram gateway: boot: posting 'restarted — ready' banner chat_id=${marker.chat_id} thread_id=${marker.thread_id ?? '-'} ackReply=${marker.ack_message_id ?? '-'}\n`)
-              try {
-                const sent = await lockedBot.api.sendMessage(marker.chat_id, text, {
-                  parse_mode: 'HTML', link_preview_options: { is_disabled: true },
-                  ...(marker.thread_id != null ? { message_thread_id: marker.thread_id } : {}),
-                  ...(marker.ack_message_id != null ? { reply_parameters: { message_id: marker.ack_message_id } } : {}),
-                })
-                if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: marker.chat_id, thread_id: marker.thread_id, message_ids: [sent.message_id], texts: [text], attachment_kinds: [] }) } catch {} }
-              } catch (err) {
-                process.stderr.write(`telegram gateway: boot: 'restarted — ready' banner send failed: ${err}\n`)
+              const chatId = marker.chat_id
+              const threadId = marker.thread_id ?? undefined
+              const ackMsgId = marker.ack_message_id ?? undefined
+              process.stderr.write(`telegram gateway: boot: posting boot card chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
+              if (BOOT_CARD_ENABLED) {
+                const agentDir = resolveAgentDirFromEnv()
+                const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+                const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
+                  sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
+                  editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
+                  pinChatMessage: (cid, mid, opts) => lockedBot.api.pinChatMessage(cid, mid, opts as Parameters<typeof lockedBot.api.pinChatMessage>[2]),
+                  unpinChatMessage: (cid, mid) => lockedBot.api.unpinChatMessage(cid, mid),
+                }
+                try {
+                  const handle = await startBootCard(chatId, threadId, botApiForCard, {
+                    agentName,
+                    agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentName),
+                    gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
+                  }, ackMsgId)
+                  activeBootCard = handle
+                } catch (err) {
+                  process.stderr.write(`telegram gateway: boot: boot card error: ${err}\n`)
+                }
+              } else {
+                postLegacyBanner(chatId, threadId, ackMsgId, ageSec, 'boot')
               }
             }
           } else {
