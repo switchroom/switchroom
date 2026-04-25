@@ -2054,6 +2054,7 @@ async function handleInbound(
         }
       }
       if (msgId != null) {
+        void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
         void bot.api.setMessageReaction(chat_id, msgId, [
           { type: 'emoji', emoji: '🔑' as ReactionTypeEmoji['emoji'] },
         ]).catch(() => {})
@@ -2166,7 +2167,6 @@ async function handleInbound(
     const isAuthFlowContext =
       authCodeSentAt !== undefined && Date.now() - authCodeSentAt < AUTH_CODE_CONTEXT_TTL_MS
     if (isAuthFlowContext) {
-      awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
       process.stderr.write(`[secret-detect] auth-flow context rule active for chat ${chat_id}\n`)
     }
 
@@ -2183,6 +2183,9 @@ async function handleInbound(
       })
       if (pipeRes.stored.length > 0) {
         effectiveText = pipeRes.rewritten_text
+        if (isAuthFlowContext) {
+          awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
+        }
         if (msgId != null) {
           try {
             await bot.api.deleteMessage(chat_id, msgId)
@@ -2210,6 +2213,7 @@ async function handleInbound(
         // Channel B fallback: pattern didn't fire (Anthropic may have changed
         // the token format) but we know this is an auth code paste because we
         // prompted for it. Delete + stage + warn so no raw bytes leak.
+        awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
         if (msgId != null) {
           try { await bot.api.deleteMessage(chat_id, msgId) } catch {}
         }
@@ -2244,6 +2248,9 @@ async function handleInbound(
       const detections = detectSecrets(effectiveText)
       const hasHigh = detections.some((d) => d.confidence === 'high' && !d.suppressed) || isAuthFlowContext
       if (hasHigh) {
+        if (isAuthFlowContext) {
+          awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
+        }
         deferredSecrets.set(deferredKey(chat_id, msgId ?? 0), {
           chat_id,
           original_message_id: msgId ?? 0,
@@ -2819,15 +2826,17 @@ async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: str
     // this explicitly or just type) is auto-captured by the existing
     // pendingReauthFlows intercept in the inbound-message handler.
     if (formatted.url) {
+      // Channel B context rule: arm unconditionally — record that this chat
+      // is awaiting an auth code paste so the inbound handler can treat the
+      // next message as auth-flow-sensitive even if the pattern rule misses
+      // it. Set BEFORE the ForceReply attempt so a switchroomReply throw
+      // doesn't leave Channel B unarmed.
+      const authChatId = String(ctx.chat!.id)
+      awaitingAuthCodeAt.set(authChatId, Date.now())
       try {
         await switchroomReply(ctx, '📋 Paste the browser code here ↓', {
           reply_markup: { force_reply: true, input_field_placeholder: 'Paste browser code', selective: true },
         })
-        // Channel B context rule: record that this chat is awaiting an auth
-        // code paste so the inbound handler can treat the next message as
-        // auth-flow-sensitive even if the pattern rule misses it.
-        const authChatId = String(ctx.chat!.id)
-        awaitingAuthCodeAt.set(authChatId, Date.now())
       } catch {
         // ForceReply is UX garnish — if it fails the flow still works
         // via the pending-intercept. Don't escalate.
