@@ -125,6 +125,7 @@ import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
+import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
   ToolCallMessage,
   ToolCallResult,
@@ -4453,6 +4454,10 @@ async function shutdown(signal: string): Promise<void> {
     process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
   }
 
+  // Stop the long-poll health check before draining so it doesn't trigger
+  // a stall-recovery restart while we're already in shutdown.
+  pollHealthCheck?.stop()
+
   // Clean up all timers and pending state.
   // Snapshot timer handles before clearing so a late-firing timer can't
   // invalidate the iterator by deleting its own entry during cleanup.
@@ -4727,6 +4732,62 @@ process.on('uncaughtException', err => {
 
 let runnerHandle: RunnerHandle | null = null
 
+// Long-poll health-check handle (issue #56). Created once per process, started
+// after the runner comes up, stopped on clean shutdown. The `onStall` callback
+// stops the runner so the outer retry loop can restart it.
+//
+// Interval and threshold are configurable via env for ops/testing flexibility:
+//   SWITCHROOM_POLL_HEALTH_INTERVAL_MS — default 5 min
+//   SWITCHROOM_POLL_HEALTH_THRESHOLD   — default 3
+const POLL_HEALTH_INTERVAL_MS = Number(
+  process.env.SWITCHROOM_POLL_HEALTH_INTERVAL_MS ?? 5 * 60_000,
+)
+const POLL_HEALTH_THRESHOLD = Number(
+  process.env.SWITCHROOM_POLL_HEALTH_THRESHOLD ?? 3,
+)
+
+/** Sentinel error thrown by onStall so the outer for-loop retries rather
+ *  than exiting. The catch block recognises this specific message. */
+class PollStallError extends Error {
+  constructor() {
+    super('poll_stall_restart')
+    this.name = 'PollStallError'
+  }
+}
+
+let pollHealthCheck: PollHealthCheckHandle | null = null
+if (POLL_HEALTH_INTERVAL_MS > 0) {
+  pollHealthCheck = createPollHealthCheck({
+    ping: () => bot.api.getMe(),
+    onStall: async () => {
+      const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+      process.stderr.write(
+        `telegram gateway: poll.health_check.stall_recovery stopping runner agent=${agentName}\n`,
+      )
+      if (runnerHandle != null && runnerHandle.isRunning()) {
+        try {
+          await runnerHandle.stop()
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: poll.health_check.stall_recovery runner.stop error: ${(err as Error).message}\n`,
+          )
+        }
+      }
+      // runnerHandle.stop() causes task() to resolve. That would normally
+      // hit the `return` below and exit the startup IIFE. Instead we throw
+      // PollStallError from inside task()'s continuation by surfacing it
+      // through the outer catch block — but task() itself doesn't throw here.
+      //
+      // The simpler fix: set runnerHandle to a sentinel that the code below
+      // `await runnerHandle.task()` checks to decide continue vs return.
+      runnerHandle = null
+    },
+    intervalMs: POLL_HEALTH_INTERVAL_MS,
+    failureThreshold: POLL_HEALTH_THRESHOLD,
+    log: (msg) => process.stderr.write(msg.endsWith('\n') ? msg : msg + '\n'),
+  })
+}
+
 // One-shot startup guard. The outer for-loop below re-enters its try block
 // on 409 Conflict retries — those are transient polling conflicts, not
 // process restarts. Anything that should fire exactly once per gateway
@@ -4931,7 +4992,25 @@ void (async () => {
 
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot)
+      // Start the long-poll health-check now that the runner is up.
+      // Stop first in case we're re-entering the loop after a stall recovery.
+      pollHealthCheck?.stop()
+      pollHealthCheck?.start()
       await runnerHandle.task()
+      // If onStall fired, it called runnerHandle.stop() which resolved task()
+      // above, then set runnerHandle = null. Detect that here and continue the
+      // loop to restart the runner. A normal clean exit leaves runnerHandle non-
+      // null (the stopped handle is still non-null at this point), so we can
+      // distinguish: null means stall-triggered, non-null means clean exit.
+      if (runnerHandle === null) {
+        const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+        process.stderr.write(
+          `telegram gateway: poll.health_check.stall_recovery restarting runner agent=${agentName}\n`,
+        )
+        // Brief pause so the Telegram API can close the stalled connection.
+        await new Promise(r => setTimeout(r, 2000))
+        continue
+      }
       return
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 409) {
