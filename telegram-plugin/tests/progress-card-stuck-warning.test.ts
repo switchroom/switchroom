@@ -208,17 +208,25 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     // `state.stage === 'done'` — which the reducer sets the moment
     // turn_end fires, even when sub-agents are still running. Result:
     // user saw a frozen "✅ Done" card with stopped elapsed time while
-    // a background Agent sub-agent ground away. Post-fix the heartbeat
-    // only skips when BOTH stage='done' AND !hasInFlightSubAgents.
+    // a sub-agent ground away. Post-fix the heartbeat only skips when
+    // BOTH stage='done' AND !hasAnyRunningSubAgent (display gate).
+    //
+    // Note: this scenario exercises a CORRELATED sub-agent — the parent
+    // tool_use's `prompt` matches sub_agent_started's `firstPromptText`
+    // so the reducer establishes parentToolUseId. After the #31/#43 fix,
+    // orphan sub-agents (parentToolUseId == null) no longer gate the
+    // defer at turn_end — the card closes immediately for those.
+    // Correlated sub-agents like this one DO keep the card alive.
     const { driver, emits, advance } = harness({ heartbeatMs: 5_000 });
     driver.ingest(enqueue("c1"), null);
-    // Start a background Agent sub-agent.
+    // Start a background Agent sub-agent. `prompt` matches firstPromptText
+    // below so correlation succeeds and parentToolUseId is set.
     driver.ingest(
       {
         kind: "tool_use",
         toolName: "Agent",
         toolUseId: "toolu_agent",
-        input: { description: "run review", subagent_type: "reviewer" },
+        input: { description: "run review", subagent_type: "reviewer", prompt: "run review" },
       },
       "c1",
     );
@@ -234,9 +242,9 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     // Parent turn ends while sub-agent still running.
     driver.ingest({ kind: "turn_end", durationMs: 500 }, "c1");
     const emitsAtTurnEnd = emits.length;
-    // Tick a few heartbeats forward. Since hasInFlightSubAgents is true,
-    // the heartbeat should keep re-rendering and emitting as the
-    // elapsed-time bucket advances.
+    // Tick a few heartbeats forward. Since hasInFlightSubAgents is true
+    // (correlated sub-agent still running), the card stays alive and the
+    // heartbeat re-renders as the elapsed-time bucket advances.
     advance(20_000);
     const postHeartbeatEmits = emits.length;
     expect(postHeartbeatEmits).toBeGreaterThan(emitsAtTurnEnd);
