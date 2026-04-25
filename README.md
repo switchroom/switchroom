@@ -268,6 +268,28 @@ switchroom handoff <agent>                        # Cross-session handoff summar
 switchroom web                                    # Web dashboard
 ```
 
+### Migrating credentials from OpenClaw
+
+`scripts/import-openclaw-credentials.ts` is a one-shot migration script that lifts `/data/openclaw-config/credentials/` into the Switchroom vault. It ships with a small set of default mappings for filenames OpenClaw documents out of the box.
+
+User-specific credential filenames (your custom bot tokens, SSH keys, and so on) belong in a local overlay file — not in the source repository. Create `~/.switchroom/import-openclaw.yaml`:
+
+```yaml
+# ~/.switchroom/import-openclaw.yaml
+files:
+  telegram-bot-token-mybot: telegram/mybot-bot-token
+  discord-bot-token-mybot: discord/mybot-bot-token
+  my-server-ssh-key: ssh/my-server
+skip:
+  compass-mac-cookies.json: "auto-managed by compass skill (8h TTL cache)"
+secrets_env:
+  X_BEARER_TOKEN: x-api/bearer-token
+directories:
+  garmin-tokens: garmin/tokens
+```
+
+Overlay entries win on collision with built-in defaults. Unknown files that appear in neither defaults nor the overlay surface as `warn` entries so nothing is silently dropped. Run `bun scripts/import-openclaw-credentials.ts --help` for flags including `--mapping <path>` to override the default overlay location.
+
 ## Documentation
 
 | Guide | Description |

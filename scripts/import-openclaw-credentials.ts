@@ -10,7 +10,10 @@ import {
   statSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
+import { z } from "zod";
 import {
   openVault,
   saveVault,
@@ -20,6 +23,7 @@ import {
 import { loadConfig, resolvePath } from "../src/config/loader.js";
 
 const DEFAULT_SOURCE = "/data/openclaw-config/credentials";
+const DEFAULT_OVERLAY_PATH = resolve(homedir(), ".switchroom/import-openclaw.yaml");
 
 export type ImportAction =
   | { kind: "set-string"; vaultKey: string; value: string }
@@ -37,16 +41,20 @@ export interface ImportPlanEntry {
   action: ImportAction;
 }
 
+// ---------------------------------------------------------------------------
+// Default maps — generic OpenClaw credential filenames only.
+// User-specific filenames belong in ~/.switchroom/import-openclaw.yaml
+// (or another path passed via --mapping). See printHelp() for the schema.
+// ---------------------------------------------------------------------------
+
 // Mapping from OpenClaw source filename → Switchroom vault key. Every
 // entry here is stored as a `kind:"string"` entry (plaintext or JSON
 // blob preserved as-is). Multi-file and skipped entries are handled
 // outside this table. Covers the credential file names OpenClaw ships
 // by default; anything not listed here surfaces as a `warn` entry so
 // the operator can extend the mapping for their own deployment.
-const FILE_TO_VAULT_KEY: Record<string, string> = {
-  "anthropic-buildkite-token": "anthropic/buildkite-api-key",
+export const DEFAULT_FILE_MAP: Record<string, string> = {
   "anthropic-personal-api-key": "anthropic/personal-api-key",
-  "bank-agent-private-key": "bank/agent-private-key",
   "buildkite-api-token": "buildkite/api-token",
   "calendar-admin-api-key": "calendar/admin-api-key",
   "calendar-jwt-secret": "calendar/jwt-secret",
@@ -54,59 +62,81 @@ const FILE_TO_VAULT_KEY: Record<string, string> = {
   "claude-code-token.json": "anthropic/claude-code-token",
   "claude-code-token.txt": "anthropic/claude-code-token-txt",
   "cloudflare-api-token.json": "cloudflare/api-token",
-  "cluedin-agent-key.json": "cluedin/agent-key",
-  "cluedin-agent-keys.json": "cluedin/agent-keys",
-  "compass-mac.json": "compass/credentials",
   "coolify-api-token": "coolify/api-token",
-  "discord-bot-token-ziggy": "discord/ziggy-bot-token",
   "discord-pairing.json": "discord/pairing",
   "elevenlabs-api-key": "elevenlabs/api-key",
-  "email-kengpt.json": "email/kengpt-client",
-  "google-buildkite.json": "google/buildkite-client",
-  "google-photos.json": "google/photos-client",
-  "google-tokens-buildkite.json": "google/buildkite-tokens",
-  "google-tokens-photos.json": "google/photos-tokens",
   "ha-access-token": "ha/access-token",
   "ha-ssh-key": "ha/ssh-key",
-  "hotdoc.json": "hotdoc/credentials",
   "linear-api-key": "linear/api-key",
-  "linear-personal-api-key": "linear/personal-api-key",
-  "microsoft-azure.json": "microsoft/azure-app",
-  "microsoft-tokens-ken.json": "microsoft/ken-tokens",
-  "nas-ssh-key": "nas/ssh-key",
   "notion-api-key": "notion/api-key",
   "notion-token": "notion/token",
   "perplexity-api-key": "perplexity/api-key",
-  "pixsoul-ubuntu-key": "ssh/pixsoul-ubuntu",
-  "synology-kengpt.json": "synology/kengpt",
   "telegram-allowFrom.json": "telegram/main-allowfrom",
   "telegram-bot-token": "telegram/main-bot-token",
-  "telegram-bot-token-lisa": "telegram/lisa-bot-token",
   "telegram-default-allowFrom.json": "telegram/default-allowfrom",
-  "telegram-lisa-allowFrom.json": "telegram/lisa-allowfrom",
-  "telegram-lisa-pairing.json": "telegram/lisa-pairing",
   "telegram-pairing.json": "telegram/main-pairing",
-  "wsl-ssh-key": "wsl/ssh-key",
 };
 
-const EXPLICIT_SKIP: Record<string, string> = {
-  "compass-mac-cookies.json": "auto-managed by compass skill (8h TTL cache)",
+export const DEFAULT_SKIP: Record<string, string> = {
   "garmin-session.json": "legacy, superseded by garmin-tokens directory",
   "garmin.json": "legacy, superseded by garmin-tokens directory",
 };
 
 // `secrets.env` catch-all: known key → vault key. Anything not in this
 // map falls through to a warning so the operator can add a mapping.
-const SECRETS_ENV_MAP: Record<string, string> = {
-  X_BEARER_TOKEN: "x-api/bearer-token",
-  OPENROUTER_API_KEY: "openrouter/api-key",
-};
+export const DEFAULT_SECRETS_ENV: Record<string, string> = {};
 
 // Directory names that should be lifted as `kind:"files"` multi-file
 // secrets. Every file inside is read as utf8.
-const DIRECTORY_TO_VAULT_KEY: Record<string, string> = {
+export const DEFAULT_DIRECTORY_MAP: Record<string, string> = {
   "garmin-tokens": "garmin/tokens",
 };
+
+// ---------------------------------------------------------------------------
+// Overlay schema (validated with Zod)
+// ---------------------------------------------------------------------------
+
+const OverlaySchema = z.object({
+  files: z.record(z.string()).optional().default({}),
+  skip: z.record(z.string()).optional().default({}),
+  secrets_env: z.record(z.string()).optional().default({}),
+  directories: z.record(z.string()).optional().default({}),
+});
+
+export type Overlay = z.infer<typeof OverlaySchema>;
+
+export function loadOverlay(overlayPath: string | undefined): Overlay {
+  const path = overlayPath ?? (existsSync(DEFAULT_OVERLAY_PATH) ? DEFAULT_OVERLAY_PATH : undefined);
+  if (!path) {
+    return { files: {}, skip: {}, secrets_env: {}, directories: {} };
+  }
+  if (!existsSync(path)) {
+    throw new Error(`overlay file not found: ${path}`);
+  }
+  let raw: unknown;
+  try {
+    raw = parseYaml(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `overlay file is not valid YAML (${path}): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const result = OverlaySchema.safeParse(raw ?? {});
+  if (!result.success) {
+    const details = result.error.errors
+      .map((e) => `  ${e.path.join(".")}: ${e.message}`)
+      .join("\n");
+    throw new Error(`overlay file schema error (${path}):\n${details}`);
+  }
+  return result.data;
+}
+
+export function mergeMaps<T>(
+  defaults: Record<string, T>,
+  overlay: Record<string, T>
+): Record<string, T> {
+  return { ...defaults, ...overlay };
+}
 
 export function parseSecretsEnv(content: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -140,10 +170,27 @@ function readDirectoryAsFiles(
   return out;
 }
 
-export function planImport(credentialsDir: string): ImportPlanEntry[] {
+export function planImport(
+  credentialsDir: string,
+  opts?: { overlayPath?: string }
+): ImportPlanEntry[] {
   if (!existsSync(credentialsDir)) {
     throw new Error(`credentials directory not found: ${credentialsDir}`);
   }
+
+  const overlay = loadOverlay(opts?.overlayPath);
+  const resolvedOverlayPath =
+    opts?.overlayPath ??
+    (existsSync(DEFAULT_OVERLAY_PATH) ? DEFAULT_OVERLAY_PATH : undefined);
+
+  const FILE_TO_VAULT_KEY = mergeMaps(DEFAULT_FILE_MAP, overlay.files);
+  const EXPLICIT_SKIP = mergeMaps(DEFAULT_SKIP, overlay.skip);
+  const SECRETS_ENV_MAP = mergeMaps(DEFAULT_SECRETS_ENV, overlay.secrets_env);
+  const DIRECTORY_TO_VAULT_KEY = mergeMaps(DEFAULT_DIRECTORY_MAP, overlay.directories);
+
+  const warnHint = resolvedOverlayPath
+    ? ` — extend mapping in ${resolvedOverlayPath}`
+    : ` — create ${DEFAULT_OVERLAY_PATH} to extend the mapping`;
 
   const plan: ImportPlanEntry[] = [];
   const entries = readdirSync(credentialsDir).sort();
@@ -170,7 +217,7 @@ export function planImport(credentialsDir: string): ImportPlanEntry[] {
           sourceName: name,
           action: {
             kind: "warn",
-            reason: `unknown directory (no mapping) — add to DIRECTORY_TO_VAULT_KEY or skip`,
+            reason: `unknown directory (no mapping)${warnHint}`,
           },
         });
       }
@@ -211,7 +258,7 @@ export function planImport(credentialsDir: string): ImportPlanEntry[] {
             sourceName: `secrets.env:${envKey}`,
             action: {
               kind: "warn",
-              reason: `unknown env key — add to SECRETS_ENV_MAP or ignore`,
+              reason: `unknown env key${warnHint}`,
             },
           });
         }
@@ -236,7 +283,7 @@ export function planImport(credentialsDir: string): ImportPlanEntry[] {
         sourceName: name,
         action: {
           kind: "warn",
-          reason: "unknown file (no mapping) — add to FILE_TO_VAULT_KEY or skip",
+          reason: `unknown file (no mapping)${warnHint}`,
         },
       });
     }
@@ -347,6 +394,7 @@ interface CliOptions {
   apply: boolean;
   overwrite: boolean;
   vault?: string;
+  mapping?: string;
   help: boolean;
 }
 
@@ -363,6 +411,7 @@ function parseArgs(argv: string[]): CliOptions {
     else if (a === "--apply") opts.apply = true;
     else if (a === "--overwrite") opts.overwrite = true;
     else if (a === "--vault") opts.vault = argv[++i];
+    else if (a === "--mapping") opts.mapping = argv[++i];
     else if (a === "-h" || a === "--help") opts.help = true;
   }
   return opts;
@@ -373,14 +422,34 @@ function printHelp(): void {
     `import-openclaw-credentials — one-shot migration script (Phase 9.1.7)
 
 USAGE
-  bun scripts/import-openclaw-credentials.ts [--source DIR] [--apply] [--overwrite] [--vault PATH]
+  bun scripts/import-openclaw-credentials.ts [--source DIR] [--apply] [--overwrite] [--vault PATH] [--mapping PATH]
 
 OPTIONS
-  --source DIR    Source credentials directory (default: ${DEFAULT_SOURCE})
-  --apply         Actually write to the vault (default: dry-run)
-  --overwrite     Overwrite existing vault keys (default: skip conflicts)
-  --vault PATH    Override vault path (default: from switchroom config)
-  -h, --help      Show this help
+  --source DIR      Source credentials directory (default: ${DEFAULT_SOURCE})
+  --apply           Actually write to the vault (default: dry-run)
+  --overwrite       Overwrite existing vault keys (default: skip conflicts)
+  --vault PATH      Override vault path (default: from switchroom config)
+  --mapping PATH    Override the user-overlay YAML path (default: ${DEFAULT_OVERLAY_PATH})
+  -h, --help        Show this help
+
+OVERLAY FILE
+  User-specific credential mappings live outside source, in an overlay YAML file.
+  Lookup precedence: --mapping flag > ${DEFAULT_OVERLAY_PATH} (if it exists) > built-in defaults only.
+
+  Overlay schema (${DEFAULT_OVERLAY_PATH}):
+
+    files:
+      telegram-bot-token-mybot: telegram/mybot-bot-token
+      my-custom-key: custom/vault-key
+    skip:
+      legacy-foo.json: "deprecated, use legacy-bar instead"
+    secrets_env:
+      MY_API_TOKEN: myservice/api-token
+    directories:
+      my-token-dir: myservice/tokens
+
+  Overlay entries win on collision with built-in defaults. Unknown files
+  that match neither defaults nor the overlay surface as warn entries.
 
 The script is dry-run by default. Review the plan, then re-run with --apply.
 Requires SWITCHROOM_VAULT_PASSPHRASE in the environment when --apply is set.`
@@ -401,7 +470,13 @@ async function main(): Promise<number> {
   }
 
   console.log(`source: ${sourceDir}`);
-  const plan = planImport(sourceDir);
+  let plan: ImportPlanEntry[];
+  try {
+    plan = planImport(sourceDir, { overlayPath: opts.mapping });
+  } catch (err) {
+    console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
   console.log("");
   console.log(formatPlan(plan));
   console.log("");
