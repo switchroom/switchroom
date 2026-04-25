@@ -159,9 +159,12 @@ export const switchroomHelpCommandNames = [
   "agents", "switchroomstart", "stop", "restart", "logs", "memory",
   // Auth & config
   "auth", "reauth", "authfallback",
-  "topics", "reconcile", "update",
+  "topics", "update", "version",
   "permissions", "grant", "dangerous", "vault", "doctor",
   "switchroomhelp",
+  // Note: "reconcile" is a deprecated alias still handled as a bot command
+  // but intentionally omitted from this autocomplete/help array so it
+  // doesn't appear in /switchroomhelp or the Telegram command palette.
 ] as const;
 
 /**
@@ -189,10 +192,10 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "approve", description: "Approve pending tool permission" },
   { command: "deny", description: "Deny pending tool permission" },
   { command: "pending", description: "List pending permission prompts" },
-  // Agent lifecycle
-  { command: "restart", description: "Restart the agent" },
-  { command: "reconcile", description: "Re-apply switchroom.yaml" },
-  { command: "update", description: "Pull latest + reconcile + restart" },
+  // Agent lifecycle — three verbs only
+  { command: "update", description: "Pull latest code + reconcile + restart" },
+  { command: "restart", description: "Restart the agent (drain by default)" },
+  { command: "version", description: "Show versions + running agent health" },
   // Quick diagnostic
   { command: "logs", description: "Show recent agent logs" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
@@ -235,9 +238,13 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/agents</code> — list all agents`,
     `<code>/switchroomstart [name]</code> — start an agent`,
     `<code>/stop [name]</code> — stop an agent`,
-    `<code>/restart [name|all]</code> — restart an agent`,
     `<code>/logs [name] [lines]</code> — show agent logs`,
     `<code>/memory &lt;query&gt;</code> — search agent memory`,
+    ``,
+    `<b>Fleet management</b>`,
+    `<code>/update</code> — pull latest code, reconcile, restart everything`,
+    `<code>/restart [name|all]</code> — bounce agent (drains in-flight turn by default)`,
+    `<code>/version</code> — show versions + running agent health summary`,
     ``,
     `<b>Auth &amp; config</b>`,
     `<code>/auth</code> — auth status or actions`,
@@ -248,8 +255,6 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/reauth [agent]</code> — start Claude browser auth`,
     `<code>/authfallback</code> — manual quota check + fall back to next slot`,
     `<code>/topics</code> — topic-to-agent mappings`,
-    `<code>/reconcile [name|all]</code> — re-apply switchroom.yaml`,
-    `<code>/update</code> — git pull, reinstall, reconcile, restart`,
     `<code>/permissions [agent]</code> — show agent permissions`,
     `<code>/grant &lt;tool&gt;</code> — grant a tool permission`,
     `<code>/dangerous [off]</code> — toggle full tool access`,
@@ -257,6 +262,8 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/doctor</code> — health check (deps, services, MCP)`,
     `<code>/usage</code> — Pro/Max plan quota (5h + 7d windows)`,
     `<code>/switchroomhelp</code> — this help`,
+    ``,
+    `<i>Tip: <code>/update</code> picks up new code; <code>/restart</code> bounces a stuck agent; <code>/version</code> checks what's running.</i>`,
   ].join("\n");
 }
 

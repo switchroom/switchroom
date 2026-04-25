@@ -4301,70 +4301,20 @@ bot.command('doctor', async ctx => {
   }
 })
 
-// /reconcile [name|all] — re-apply switchroom.yaml to an agent.
-// Defaults to the current agent; pass "all" to reconcile every agent.
+// Deprecated: /reconcile → /update. Kept for one release with a deprecation notice.
 bot.command('reconcile', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const arg = (ctx.match ?? '').trim() || getMyAgentName()
-  // Reconcile + --restart kills our own systemd unit when arg targets us.
-  // Same self-kill problem as /restart — fire-and-forget the detached
-  // child after acknowledging. Uses the same debounce + restart-marker
-  // pattern as /restart so the new bot posts a "🎛️ restarted" follow-up.
-  if (isSelfTargetingCommand(arg)) {
-    // Debounce: guard against double-tap storm (same 15s window as /restart).
-    const existing = readRestartMarker()
-    if (existing && Date.now() - existing.ts < 15_000) {
-      await switchroomReply(
-        ctx,
-        `⏳ Reconcile of <b>${escapeHtmlForTg(arg)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate.`,
-        { html: true },
-      )
-      return
-    }
-    const chatId = String(ctx.chat!.id)
-    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const ackText = `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting… back in a few seconds.`
-    let ackId: number | null = null
-    try {
-      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        ...(threadId != null ? { message_thread_id: threadId } : {}),
-      })
-      ackId = sent.message_id
-      if (HISTORY_ENABLED) {
-        try {
-          recordOutbound({
-            chat_id: chatId,
-            thread_id: threadId ?? null,
-            message_ids: [sent.message_id],
-            texts: [`🔁 Reconciling ${arg} and restarting… back in a few seconds.`],
-            attachment_kinds: [],
-          })
-        } catch (err) {
-          process.stderr.write(`telegram channel: recordOutbound(reconcile ack) failed: ${err}\n`)
-        }
-      }
-    } catch (err) {
-      process.stderr.write(`telegram channel: reconcile ack send failed: ${err}\n`)
-    }
-    writeRestartMarker({
-      chat_id: chatId,
-      thread_id: threadId ?? null,
-      ack_message_id: ackId,
-      ts: Date.now(),
-    })
-    await sweepPinsBeforeSelfRestart()
-    spawnSwitchroomDetached(
-      ['agent', 'reconcile', arg, '--restart'],
-      notifyDetachedFailure(chatId, threadId ?? null, `reconcile ${arg}`),
-    )
-    return
-  }
-  await runSwitchroomCommand(
+  await switchroomReply(
     ctx,
-    ['agent', 'reconcile', arg, '--restart'],
-    `reconcile ${arg}`,
+    `⚠️ <b>/reconcile is deprecated</b> — use <code>/update</code> instead.\n\nRunning <b>switchroom update</b> now…`,
+    { html: true },
+  )
+  await sweepPinsBeforeSelfRestart()
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  spawnSwitchroomDetached(
+    ['update'],
+    notifyDetachedFailure(chatId, threadId ?? null, 'update (via deprecated /reconcile)'),
   )
 })
 
@@ -4763,6 +4713,20 @@ bot.command('update', async ctx => {
     ['update'],
     notifyDetachedFailure(chatId, threadId ?? null, 'update'),
   )
+})
+
+bot.command('version', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  try {
+    let output: string
+    try { output = switchroomExecCombined(['version'], 10000) }
+    catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'version failed' }
+    const trimmed = stripAnsi(output).trim()
+    if (!trimmed) { await switchroomReply(ctx, 'version: no output'); return }
+    await switchroomReply(ctx, preBlock(formatSwitchroomOutput(trimmed)), { html: true })
+  } catch (err: unknown) {
+    await switchroomReply(ctx, `<b>version failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+  }
 })
 
 // /switchroomhelp — show all available bot commands

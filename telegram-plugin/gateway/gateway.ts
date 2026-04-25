@@ -645,6 +645,10 @@ const AUTH_CODE_CONTEXT_TTL_MS = 5 * 60_000 // 5 min — OAuth code lifetime
 // when the flow completes. Users abandoning a flow (closing Telegram, losing
 // connection, hitting cancel on client) leaves entries behind. Without a
 // reaper, long-running gateways leak memory across days/weeks. A single
+// Maximum time to wait for an in-flight turn before forcing a pending
+// restart (the `--force` SIGKILL fallback documented in the spec).
+const PENDING_RESTART_DRAIN_CAP_MS = 60_000
+
 // 60-second sweep drops anything past its documented TTL.
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
@@ -662,6 +666,28 @@ const pendingStateReaper = setInterval(() => {
   }
   for (const [k, v] of awaitingAuthCodeAt) {
     if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
+  }
+  // Drain cap: if a scheduled restart has been waiting >60s for a turn
+  // to complete, force it through anyway (spec: 60s cap → SIGKILL fallback).
+  for (const [agentName, requestedAt] of pendingRestarts.entries()) {
+    if (now - requestedAt > PENDING_RESTART_DRAIN_CAP_MS) {
+      process.stderr.write(`telegram gateway: pending restart drain cap exceeded for ${agentName} (waited ${Math.round((now - requestedAt) / 1000)}s) — forcing restart\n`)
+      pendingRestarts.delete(agentName)
+      try {
+        spawn(
+          'sh',
+          [
+            '-c',
+            // The systemctl restart will SIGTERM then SIGKILL after TimeoutStopSec.
+            // The currently-running claude process will get SIGKILL via the unit stop.
+            `sleep 0.1 && systemctl --user restart switchroom-${agentName}.service switchroom-${agentName}-gateway.service`,
+          ],
+          { detached: true, stdio: 'ignore' },
+        ).unref()
+      } catch (err) {
+        process.stderr.write(`telegram gateway: forced restart spawn failed for ${agentName}: ${err}\n`)
+      }
+    }
   }
 }, 60_000)
 pendingStateReaper.unref()
@@ -4129,36 +4155,21 @@ bot.command('doctor', async ctx => {
   }
 })
 
+// Deprecated: /reconcile is now /update. Kept for one release with a warning.
 bot.command('reconcile', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const arg = (ctx.match ?? '').trim() || getMyAgentName()
-  try { assertSafeAgentName(arg) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  if (isSelfTargetingCommand(arg)) {
-    const existing = readRestartMarker()
-    if (existing && Date.now() - existing.ts < 15_000) {
-      await switchroomReply(ctx, `⏳ Reconcile already in progress — ignoring duplicate.`, { html: true })
-      return
-    }
-    const chatId = String(ctx.chat!.id)
-    const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    const ackText = `🔁 Reconciling <b>${escapeHtmlForTg(arg)}</b> and restarting…`
-    try {
-      const sent = await lockedBot.api.sendMessage(chatId, ackText, {
-        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
-        ...(threadId != null ? { message_thread_id: threadId } : {}),
-      })
-      if (HISTORY_ENABLED) { try { recordOutbound({ chat_id: chatId, thread_id: threadId ?? null, message_ids: [sent.message_id], texts: [ackText], attachment_kinds: [] }) } catch {} }
-    } catch {}
-    writeRestartMarker({ chat_id: chatId, thread_id: threadId ?? null, ack_message_id: null, ts: Date.now() })
-    stampUserRestartReason('user: /reconcile from chat')
-    await sweepBeforeSelfRestart()
-    spawnSwitchroomDetached(
-      ['agent', 'reconcile', arg, '--restart'],
-      notifyDetachedFailure(chatId, threadId ?? null, `reconcile ${arg}`),
-    )
-    return
-  }
-  await runSwitchroomCommand(ctx, ['agent', 'reconcile', arg, '--restart'], `reconcile ${arg}`)
+  await switchroomReply(
+    ctx,
+    `⚠️ <b>/reconcile is deprecated</b> — use <code>/update</code> instead.\n\nRunning <b>switchroom update</b> now…`,
+    { html: true },
+  )
+  await sweepBeforeSelfRestart()
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  spawnSwitchroomDetached(
+    ['update'],
+    notifyDetachedFailure(chatId, threadId ?? null, 'update (via deprecated /reconcile)'),
+  )
 })
 
 bot.command('grant', async ctx => {
@@ -4202,6 +4213,21 @@ bot.command('update', async ctx => {
     notifyDetachedFailure(chatId, threadId ?? null, 'update'),
   )
 })
+
+bot.command('version', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  try {
+    let output: string
+    try { output = switchroomExecCombined(['version'], 10000) }
+    catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'version failed' }
+    const trimmed = stripAnsi(output).trim()
+    if (!trimmed) { await switchroomReply(ctx, 'version: no output'); return }
+    await switchroomReply(ctx, preBlock(formatSwitchroomOutput(trimmed)), { html: true })
+  } catch (err: unknown) {
+    await switchroomReply(ctx, `<b>version failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+  }
+})
+
 
 bot.command('switchroomhelp', async ctx => {
   if (!isAuthorizedSender(ctx)) return
