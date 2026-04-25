@@ -347,6 +347,12 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       maybeSendCardUpdate()
     }, fs, log)
 
+    // If the JSONL already contained a turn_end at registration time
+    // (file written-then-watched), fire the state-transition + completion
+    // notification now. Otherwise the FSWatcher callback handles it on
+    // subsequent writes.
+    maybySendStateTransition(agentId)
+
     // Set up FSWatcher
     try {
       tail.watcher = fs.watch(filePath, () => {

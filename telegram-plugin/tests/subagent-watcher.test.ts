@@ -11,8 +11,11 @@
  *   - Card lifecycle (created on first worker, updated on changes, removed when all done)
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as fs from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { renderWorkerCard, startSubagentWatcher, type WorkerEntry } from '../subagent-watcher.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -351,160 +354,118 @@ describe('startSubagentWatcher', () => {
     h.watcher.stop()
   })
 
-  it('updates description from sub_agent_text event', () => {
-    const agentDir = '/home/user/.switchroom/agents/myagent'
-    const projectsRoot = `${agentDir}/.claude/projects`
-    const projectDir = `${projectsRoot}/myproject`
-    const sessionDir = `${projectDir}/session-abc123`
-    const subagentsDir = `${sessionDir}/subagents`
-    const jsonlPath = `${subagentsDir}/agent-deadbeef.jsonl`
+  // The next three tests use a real tmp dir + real files + real fs (no
+  // injection). The over-mocked harness can't reproduce the read-sequence
+  // statefully — real fs is simpler and more accurate.
+  describe('with real tmp filesystem', () => {
+    let tmpRoot = ''
+    const startedWatchers: Array<{ stop(): void }> = []
 
-    const content = buildJSONL(
-      subAgentUserMsg('Do the thing'),
-      subAgentAssistantText('I will implement the feature now'),
-    )
-
-    const h = makeHarness({
-      agentDir,
-      existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
-      dirs: {
-        [projectsRoot]: ['myproject'],
-        [projectDir]: ['session-abc123'],
-        [subagentsDir]: ['agent-deadbeef.jsonl'],
-      },
-      files: { [jsonlPath]: content },
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), 'switchroom-watcher-test-'))
     })
 
-    // Override readSync to actually return file content
-    let fileData = Buffer.from(content)
-    h.mockFs.readSync = ((
-      _fd, buf, offset, length, position,
-    ) => {
-      const pos = position ?? 0
-      const available = Math.min(length, fileData.length - pos)
-      if (available <= 0) return 0
-      fileData.copy(buf as Buffer, offset, pos, pos + available)
-      return available
-    })
-    h.mockFs.statSync = ((p) => {
-      const ps = String(p)
-      if (ps === jsonlPath) return { size: fileData.length } as fs.Stats
-      return { size: 0 } as fs.Stats
+    afterEach(() => {
+      while (startedWatchers.length) {
+        try { startedWatchers.pop()?.stop() } catch { /* ignore */ }
+      }
+      try { rmSync(tmpRoot, { recursive: true, force: true }) } catch { /* ignore */ }
     })
 
-    h.poll()
-
-    const registry = h.watcher.getRegistry()
-    const entry = registry.get('deadbeef')
-    // Description should be updated from first text line
-    if (entry) {
-      expect(entry.description).not.toBe('sub-agent')
+    function setupRealFs(jsonlContent: string, agentId: string): {
+      agentDir: string
+      jsonlPath: string
+    } {
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, `agent-${agentId}.jsonl`)
+      writeFileSync(jsonlPath, jsonlContent)
+      return { agentDir, jsonlPath }
     }
 
-    h.watcher.stop()
-  })
-
-  it('counts tools from sub_agent_tool_use events', () => {
-    const agentDir = '/home/user/.switchroom/agents/myagent'
-    const projectsRoot = `${agentDir}/.claude/projects`
-    const projectDir = `${projectsRoot}/myproject`
-    const sessionDir = `${projectDir}/session-abc123`
-    const subagentsDir = `${sessionDir}/subagents`
-    const jsonlPath = `${subagentsDir}/agent-deadbeef.jsonl`
-
-    const content = buildJSONL(
-      subAgentUserMsg('Fix things'),
-      subAgentToolUse('Read', 'id1'),
-      subAgentToolUse('Bash', 'id2'),
-      subAgentToolUse('Edit', 'id3'),
-    )
-
-    const h = makeHarness({
-      agentDir,
-      existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
-      dirs: {
-        [projectsRoot]: ['myproject'],
-        [projectDir]: ['session-abc123'],
-        [subagentsDir]: ['agent-deadbeef.jsonl'],
-      },
-      files: { [jsonlPath]: content },
-    })
-
-    const buf = Buffer.from(content)
-    h.mockFs.readSync = ((_fd, b, offset, length, position) => {
-      const pos = position ?? 0
-      const available = Math.min(length, buf.length - pos)
-      if (available <= 0) return 0
-      buf.copy(b as Buffer, offset, pos, pos + available)
-      return available
-    })
-    h.mockFs.statSync = ((p) => {
-      const ps = String(p)
-      if (ps === jsonlPath) return { size: buf.length } as fs.Stats
-      return { size: 0 } as fs.Stats
-    })
-
-    h.poll()
-
-    const registry = h.watcher.getRegistry()
-    const entry = registry.get('deadbeef')
-    if (entry) {
-      expect(entry.toolCount).toBe(3)
+    function startWatcherSync(opts: { agentDir: string }): {
+      notifications: string[]
+      cardUpdates: Array<string | null>
+      poll: () => void
+      watcher: ReturnType<typeof startSubagentWatcher>
+    } {
+      const notifications: string[] = []
+      const cardUpdates: Array<string | null> = []
+      const intervals: Array<{ fn: () => void; ref: number }> = []
+      let nextRef = 1
+      const watcher = startSubagentWatcher({
+        agentDir: opts.agentDir,
+        sendNotification: (text) => notifications.push(text),
+        updatePinnedCard: (html) => cardUpdates.push(html),
+        stallThresholdMs: 60_000,
+        cardUpdateIntervalMs: 100,
+        rescanMs: 500,
+        now: () => Date.now(),
+        setInterval: (fn) => {
+          const ref = nextRef++
+          intervals.push({ fn, ref })
+          return { ref }
+        },
+        clearInterval: (handle) => {
+          const { ref } = handle as { ref: number }
+          const idx = intervals.findIndex((i) => i.ref === ref)
+          if (idx !== -1) intervals.splice(idx, 1)
+        },
+        log: () => {},
+      })
+      startedWatchers.push(watcher)
+      return {
+        notifications,
+        cardUpdates,
+        poll: () => intervals[0]?.fn(),
+        watcher,
+      }
     }
 
-    h.watcher.stop()
-  })
-
-  it('emits completion notification when turn_end arrives', () => {
-    const agentDir = '/home/user/.switchroom/agents/myagent'
-    const projectsRoot = `${agentDir}/.claude/projects`
-    const projectDir = `${projectsRoot}/myproject`
-    const sessionDir = `${projectDir}/session-abc123`
-    const subagentsDir = `${sessionDir}/subagents`
-    const jsonlPath = `${subagentsDir}/agent-deadbeef.jsonl`
-
-    const content = buildJSONL(
-      subAgentUserMsg('Do the task'),
-      subAgentTurnDuration(),
-    )
-
-    const h = makeHarness({
-      agentDir,
-      existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
-      dirs: {
-        [projectsRoot]: ['myproject'],
-        [projectDir]: ['session-abc123'],
-        [subagentsDir]: ['agent-deadbeef.jsonl'],
-      },
-      files: { [jsonlPath]: content },
+    it('updates description from sub_agent_text event', () => {
+      const content = buildJSONL(
+        subAgentUserMsg('Do the thing'),
+        subAgentAssistantText('I will implement the feature now'),
+      )
+      const { agentDir } = setupRealFs(content, 'deadbeef')
+      const h = startWatcherSync({ agentDir })
+      h.poll()
+      const entry = h.watcher.getRegistry().get('deadbeef')
+      expect(entry).toBeDefined()
+      expect(entry?.description).not.toBe('sub-agent')
+      expect(entry?.description).toMatch(/I will implement/)
     })
 
-    const buf = Buffer.from(content)
-    h.mockFs.readSync = ((_fd, b, offset, length, position) => {
-      const pos = position ?? 0
-      const available = Math.min(length, buf.length - pos)
-      if (available <= 0) return 0
-      buf.copy(b as Buffer, offset, pos, pos + available)
-      return available
+    it('counts tools from sub_agent_tool_use events', () => {
+      const content = buildJSONL(
+        subAgentUserMsg('Fix things'),
+        subAgentToolUse('Read', 'id1'),
+        subAgentToolUse('Bash', 'id2'),
+        subAgentToolUse('Edit', 'id3'),
+      )
+      const { agentDir } = setupRealFs(content, 'deadbeef')
+      const h = startWatcherSync({ agentDir })
+      h.poll()
+      const entry = h.watcher.getRegistry().get('deadbeef')
+      expect(entry).toBeDefined()
+      expect(entry?.toolCount).toBe(3)
     })
-    h.mockFs.statSync = ((p) => {
-      const ps = String(p)
-      if (ps === jsonlPath) return { size: buf.length } as fs.Stats
-      return { size: 0 } as fs.Stats
+
+    it('emits completion notification when turn_end arrives', () => {
+      const content = buildJSONL(
+        subAgentUserMsg('Do the task'),
+        subAgentTurnDuration(),
+      )
+      const { agentDir } = setupRealFs(content, 'deadbeef')
+      const h = startWatcherSync({ agentDir })
+      h.poll()
+      const entry = h.watcher.getRegistry().get('deadbeef')
+      expect(entry).toBeDefined()
+      expect(entry?.state).toBe('done')
+      const completionNotifs = h.notifications.filter((n) => n.includes('Worker done'))
+      expect(completionNotifs.length).toBeGreaterThanOrEqual(1)
     })
-
-    h.poll()
-
-    const completionNotifs = h.notifications.filter((n) => n.includes('Worker done'))
-    expect(completionNotifs.length).toBeGreaterThanOrEqual(1)
-
-    const registry = h.watcher.getRegistry()
-    const entry = registry.get('deadbeef')
-    if (entry) {
-      expect(entry.state).toBe('done')
-    }
-
-    h.watcher.stop()
   })
 
   it('emits stall notification after stallThresholdMs idle', () => {
