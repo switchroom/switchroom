@@ -57,6 +57,13 @@ export interface WorkerEntry {
   completionNotified: boolean
   /** Short summary from last completed tool / narrative, for completion message. */
   lastSummaryLine: string
+  /**
+   * True if the underlying JSONL file existed before the watcher started.
+   * Historical entries are tracked for late state transitions but are
+   * excluded from the active-workers card — the sub-agent process is long
+   * dead, the file is just left over from a prior session.
+   */
+  historical: boolean
 }
 
 export interface SubagentWatcherConfig {
@@ -158,7 +165,7 @@ export function renderWorkerCard(
   now: number,
 ): string | null {
   const active = Array.from(registry.values()).filter(
-    (w) => w.state === 'running',
+    (w) => w.state === 'running' && !w.historical,
   )
   if (active.length === 0) return null
 
@@ -343,6 +350,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       stallNotified: false,
       completionNotified: false,
       lastSummaryLine: '',
+      historical: isHistorical,
     }
     registry.set(agentId, entry)
 
@@ -436,6 +444,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     const n = nowFn()
     for (const entry of registry.values()) {
       if (entry.state !== 'running') continue
+      if (entry.historical) continue
       if (entry.stallNotified) continue
       const idleMs = n - entry.lastActivityAt
       if (idleMs >= stallThresholdMs) {
