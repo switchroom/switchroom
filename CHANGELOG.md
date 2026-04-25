@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (Phase 2 — creation orchestrator + bootstrap verb)
+## v0.3.0 — 2026-04-25
 
 ### Added
 - `src/agents/create-orchestrator.ts` — new module with `createAgent()` and
@@ -12,6 +12,14 @@
   session, prints the URL to stdout, reads the code from stdin, and starts the
   agent. Passes `--rollback-on-fail` to remove the scaffold dir on auth failure
   (default: keep artefacts for retry).
+- Phase 3a foreman bot skeleton with read-only fleet commands (status, list,
+  logs) accessible over Telegram (#22).
+- Phase 3b `/create-agent` multi-turn flow and destructive fleet commands
+  (restart, stop, delete) with confirmation prompts (#27).
+- Phase 4b operator-events: callback handler, IPC server/client, and history
+  store for durable event tracking (#29).
+- Telegram admin commands in gateway phase 1 — privileged bot commands routed
+  directly through the gateway IPC (#33).
 
 ### Changed
 - **BREAKING (upgrade note):** `scaffoldAgent()` no longer copies
@@ -20,6 +28,30 @@
   via `switchroom auth login <agent>` or `switchroom agent bootstrap <agent>`.
   Existing agents with their own `.oauth-token` or `.credentials.json` are
   unaffected — only the copy-on-scaffold step is removed.
+- Scaffold and fixtures no longer embed personal implementation details;
+  import overlay added for cleaner separation (#55, closes #48).
+- Architecture doc added and README updated with compliance callout (#42).
+- README hero image refreshed with Telegram highlight; compliance attestation
+  updated for 2026-04-25 (#39).
+
+### Fixed
+- Progress-card orphan-defer race, label noise, and ghost replies resolved;
+  multi-sub-agent invariant locked with regression tests (#49, closes #31 #41
+  #43 #45).
+- Progress-card retries bounded on Telegram 4xx errors (#10).
+- Progress-card tool-name prefix stripped for human-authored labels (#9).
+- Progress-card multi-sub-agent invariant test added (#12).
+- CI unblocked: bktec brace-expansion + `advanceTimersByTimeAsync` polyfill
+  (#54).
+- CI unblocked: bktec parallelism fix + `TELEGRAM_BOT_TOKEN` stub (#38).
+- Secret-detect: Anthropic OAuth browser code redaction added (#46).
+- Auth: stale-token capture and `credentials.json` shadowing fixed (#40).
+- Bootstrap: rollback scope widened, env-var token supported, missing outcome
+  tests added (#20).
+- Hardening: slug validation tightened, foreman state guards added,
+  `callback_data` safety enforced (#25).
+- Auth Phase 1: pane-ready probe, structured outcomes, and boot-sweep filter
+  (#17).
 
 ## v0.2.5 — 2026-04-24
 
