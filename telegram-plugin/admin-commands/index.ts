@@ -39,6 +39,7 @@ export const ADMIN_COMMAND_NAMES = new Set<string>([
   'logs',
   'restart',
   'update',
+  'version',
   'auth',
   'reauth',
   'reconcile',

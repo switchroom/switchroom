@@ -44,6 +44,7 @@ import {
   handleDeleteCommand,
   executeDeleteAgent,
   handleUpdateCommand,
+  handleVersionCommand,
 } from './foreman-handlers.js'
 import {
   buildDashboard,
@@ -204,6 +205,7 @@ bot.command('start', async ctx => {
     '  /status, /list — fleet summary',
     '  /logs &lt;agent&gt; [--tail N] — last N log lines (default 50)',
     '  /auth [agent] — auth dashboard',
+    '  /version — show versions + running agent health',
     '',
     'Write commands:',
     '  /restart &lt;agent&gt; — restart an agent',
@@ -325,6 +327,14 @@ bot.command('delete', async ctx => {
 bot.command('update', async ctx => {
   await switchroomReply(ctx, 'Running <code>switchroom update</code>…', { html: true })
   const result = handleUpdateCommand(switchroomExecCombined)
+  for (const reply of result.replies) {
+    await switchroomReply(ctx, reply.text, { html: reply.html })
+  }
+})
+
+// ─── /version ─────────────────────────────────────────────────────────────
+bot.command('version', async ctx => {
+  const result = handleVersionCommand(switchroomExecCombined)
   for (const reply of result.replies) {
     await switchroomReply(ctx, reply.text, { html: reply.html })
   }
@@ -610,6 +620,7 @@ void runPollingLoop(bot, {
         { command: 'restart', description: 'Restart agent: /restart <agent>' },
         { command: 'delete', description: 'Delete agent (with confirm): /delete <agent>' },
         { command: 'update', description: 'Update switchroom' },
+        { command: 'version', description: 'Show versions + running agent health' },
         { command: 'create_agent', description: 'Create new agent: /create-agent [name]' },
       ])
     } catch (err) {

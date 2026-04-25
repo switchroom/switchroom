@@ -35,14 +35,23 @@ describe('parseCommandName', () => {
 
 describe('ADMIN_COMMAND_NAMES', () => {
   it('contains the core admin commands', () => {
-    const required = ['agents', 'logs', 'restart', 'update', 'auth', 'reconcile']
+    const required = ['agents', 'logs', 'restart', 'update', 'version', 'auth', 'reconcile']
     for (const cmd of required) {
       expect(ADMIN_COMMAND_NAMES.has(cmd)).toBe(true)
     }
   })
 
+  it('contains version (fleet management verb)', () => {
+    expect(ADMIN_COMMAND_NAMES.has('version')).toBe(true)
+  })
+
   it('does not contain create-agent (out of scope for phase 1)', () => {
     expect(ADMIN_COMMAND_NAMES.has('create-agent')).toBe(false)
+  })
+
+  it('does not contain legacy verbs upgrade or rebuild', () => {
+    expect(ADMIN_COMMAND_NAMES.has('upgrade')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('rebuild')).toBe(false)
   })
 })
 
@@ -55,6 +64,7 @@ describe('dispatchAdminCommand', () => {
       expect(dispatchAdminCommand('/logs', true)).toEqual({ handled: true })
       expect(dispatchAdminCommand('/restart', true)).toEqual({ handled: true })
       expect(dispatchAdminCommand('/update', true)).toEqual({ handled: true })
+      expect(dispatchAdminCommand('/version', true)).toEqual({ handled: true })
       expect(dispatchAdminCommand('/auth', true)).toEqual({ handled: true })
     })
 

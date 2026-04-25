@@ -396,6 +396,48 @@ export function executeDeleteAgent(
   return { replies: [{ text: lines.join('\n'), html: true }] }
 }
 
+// ─── /version handler impl ────────────────────────────────────────────────
+
+export interface VersionResult {
+  replies: Array<{ text: string; html: boolean }>
+}
+
+/**
+ * Core /version implementation.
+ *
+ * Shells out to `switchroom version` and posts the output. Mirrors the
+ * /version handler in server.ts and gateway.ts — kept as a pure function
+ * here so tests can exercise it without a live bot.
+ *
+ * @param switchroomExec  Injected CLI exec (combined stdout+stderr) for testability
+ */
+export function handleVersionCommand(
+  switchroomExec: SwitchroomExecFn,
+): VersionResult {
+  let output: string
+  try {
+    output = switchroomExec(['version'])
+  } catch (err) {
+    const msg = err as { stderr?: string; stdout?: string; message?: string }
+    const detail = stripAnsi(msg.stderr || msg.stdout || msg.message || 'unknown error').trim()
+    return {
+      replies: [
+        {
+          text: `<b>version failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`,
+          html: true,
+        },
+      ],
+    }
+  }
+
+  const trimmed = stripAnsi(output).trim()
+  if (!trimmed) {
+    return { replies: [{ text: 'version: no output.', html: false }] }
+  }
+
+  return { replies: [{ text: preBlock(trimmed), html: true }] }
+}
+
 // ─── /update handler impl ─────────────────────────────────────────────────
 
 export interface UpdateResult {
