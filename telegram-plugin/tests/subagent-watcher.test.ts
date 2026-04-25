@@ -32,6 +32,7 @@ function makeEntry(overrides: Partial<WorkerEntry> = {}): WorkerEntry {
     stallNotified: false,
     completionNotified: false,
     lastSummaryLine: '',
+    historical: false,
     ...overrides,
   }
 }
@@ -126,6 +127,33 @@ describe('renderWorkerCard', () => {
     const html = renderWorkerCard(registry, 1000) // 1ms idle → "<1s"
     expect(html).not.toContain('<1s')
     expect(html).toContain('&lt;1s')
+  })
+
+  it('excludes historical entries from the active-workers card', () => {
+    // Historical = JSONL existed before the watcher started. The sub-agent
+    // process is long dead; the file is just left over from a prior session.
+    // Even if state was last written as 'running' (no turn_end event in
+    // the file), the entry must not appear in the card. With many
+    // historical entries (e.g. months of session history) the card text
+    // overflows Telegram's 4096-char message limit and sendMessage fails.
+    const registry = new Map<string, WorkerEntry>([
+      ['live', makeEntry({ agentId: 'live', description: 'real worker', historical: false })],
+      ['hist1', makeEntry({ agentId: 'hist1', description: 'old session 1', historical: true })],
+      ['hist2', makeEntry({ agentId: 'hist2', description: 'old session 2', historical: true })],
+    ])
+    const html = renderWorkerCard(registry, 2000)
+    expect(html).toContain('Background workers (1)')
+    expect(html).toContain('real worker')
+    expect(html).not.toContain('old session 1')
+    expect(html).not.toContain('old session 2')
+  })
+
+  it('returns null when only historical entries are present', () => {
+    const registry = new Map<string, WorkerEntry>([
+      ['hist1', makeEntry({ agentId: 'hist1', historical: true })],
+      ['hist2', makeEntry({ agentId: 'hist2', historical: true })],
+    ])
+    expect(renderWorkerCard(registry, 2000)).toBeNull()
   })
 })
 
@@ -580,8 +608,12 @@ describe('startSubagentWatcher', () => {
       rescanMs: 500,
     })
 
-    // Initial poll — registers the agent
+    // Initial poll — registers the agent (as historical, since the file
+    // already exists at boot). Flip historical=false to simulate an entry
+    // that was discovered post-boot, which is the only case stalls fire.
     h.poll()
+    const entry = h.watcher.getRegistry().get('deadbeef')
+    if (entry) entry.historical = false
 
     // Advance past stall threshold without any new JSONL activity
     h.advance(65_000)
@@ -589,6 +621,40 @@ describe('startSubagentWatcher', () => {
     const stallNotifs = h.notifications.filter((n) => n.includes('Worker idle'))
     expect(stallNotifs.length).toBeGreaterThanOrEqual(1)
     expect(stallNotifs[0]).toContain('Worker idle')
+
+    h.watcher.stop()
+  })
+
+  it('suppresses stall notifications for historical entries', () => {
+    // Historical entries (file existed at watcher boot) must NOT fire
+    // stall notifications. The sub-agent process is long dead; the file
+    // is just left over from a prior session. With many historicals
+    // present at restart, firing stalls for each would flood the chat.
+    const agentDir = '/home/user/.switchroom/agents/myagent'
+    const projectsRoot = `${agentDir}/.claude/projects`
+    const projectDir = `${projectsRoot}/myproject`
+    const sessionDir = `${projectDir}/session-abc123`
+    const subagentsDir = `${sessionDir}/subagents`
+    const jsonlPath = `${subagentsDir}/agent-deadbeef.jsonl`
+    const content = buildJSONL(subAgentUserMsg('Old task'))
+
+    const h = makeHarness({
+      agentDir,
+      existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
+      dirs: {
+        [projectsRoot]: ['myproject'],
+        [projectDir]: ['session-abc123'],
+        [subagentsDir]: ['agent-deadbeef.jsonl'],
+      },
+      files: { [jsonlPath]: content },
+      stallThresholdMs: 60_000,
+    })
+
+    h.poll()
+    h.advance(65_000) // past stall threshold
+
+    const stallNotifs = h.notifications.filter((n) => n.includes('Worker idle'))
+    expect(stallNotifs).toHaveLength(0)
 
     h.watcher.stop()
   })
@@ -616,6 +682,9 @@ describe('startSubagentWatcher', () => {
     })
 
     h.poll()
+    const entry = h.watcher.getRegistry().get('deadbeef')
+    if (entry) entry.historical = false
+
     h.advance(65_000)
     h.advance(65_000) // advance past threshold AGAIN
 
