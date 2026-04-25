@@ -492,13 +492,29 @@ export async function reconcileAndRestartAgent(
   }
 
   if (opts.graceful) {
-    const r = await deps.gracefulRestartAgent(name);
-    return {
-      reconciled: true,
-      restarted: r.restartedImmediately,
-      waitingForTurn: r.waitingForTurn,
-      changes: allChanges,
-    };
+    try {
+      const r = await deps.gracefulRestartAgent(name);
+      return {
+        reconciled: true,
+        restarted: r.restartedImmediately,
+        waitingForTurn: r.waitingForTurn,
+        changes: allChanges,
+      };
+    } catch (err) {
+      // Gateway IPC is the path graceful restart depends on. If the socket
+      // is missing or unresponsive, the gateway itself is wedged — exactly
+      // the case where the user most needs `restart` to work. Fall back to
+      // a direct systemctl bounce, which restartAgent does for both the
+      // gateway and the agent service together. See switchroom#71.
+      const msg = err instanceof Error ? err.message : String(err);
+      log(
+        chalk.yellow(
+          `  ${name}: graceful path unavailable (${msg}) — falling back to direct restart`,
+        ),
+      );
+      deps.restartAgent(name);
+      return { reconciled: true, restarted: true, changes: allChanges };
+    }
   }
 
   deps.restartAgent(name);
