@@ -195,8 +195,10 @@ const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
   "mcp__switchroom-telegram__edit_message",
   "mcp__switchroom-telegram__send_typing",
   "mcp__switchroom-telegram__pin_message",
+  "mcp__switchroom-telegram__delete_message",
   "mcp__switchroom-telegram__forward_message",
   "mcp__switchroom-telegram__download_attachment",
+  "mcp__switchroom-telegram__get_recent_messages",
 ];
 
 /**
