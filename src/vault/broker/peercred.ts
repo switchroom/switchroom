@@ -73,7 +73,9 @@ function parseSsRows(output: string): SsRow[] {
   for (const line of lines) {
     if (!line.trim() || line.startsWith("Netid")) continue;
     // Tokenize on whitespace runs. Columns are:
-    //   netid state recv-q send-q local-addr local-port peer-addr peer-port [users:(...)]
+    //   netid state recv-q send-q local-addr local-inode peer-addr peer-inode [users:(...)]
+    // (`ss` reuses the TCP "port" header label even for unix sockets, where
+    //  the trailing slot actually holds an inode number.)
     const tokens = line.split(/\s+/).filter((t) => t.length > 0);
     if (tokens.length < 8) continue;
     const localAddr = tokens[4];
@@ -190,6 +192,71 @@ export function readSystemdUnit(pid: number): string | null {
 }
 
 /**
+ * Verify with systemd-user that a unit name read from /proc/<pid>/cgroup
+ * actually corresponds to a unit systemd has loaded.
+ *
+ * Background: under cgroup v2 user delegation, a regular user owns their
+ * own user@<uid>.service subtree and can `mkdir` arbitrary cgroup
+ * directories within it (including paths shaped like
+ * `switchroom-<agent>-cron-<i>.service`) and move their own processes in
+ * via `cgroup.procs`. /proc/<pid>/cgroup then reports the spoofed name.
+ * The cgroup file by itself is therefore attacker-controlled input for
+ * any same-UID caller — the broker can't trust it without cross-checking
+ * against systemd's authoritative view.
+ *
+ * `systemctl --user show <unit>` returns LoadState=not-found for any
+ * name systemd-user has not loaded as a real unit. Real cron units (and
+ * `systemd-run --user --unit=...` transient units) report
+ * LoadState=loaded with an ActiveState we accept.
+ *
+ * Returns true only when the unit is loaded and currently running.
+ */
+export function verifySystemdUnit(
+  unitName: string,
+  runner: (
+    file: string,
+    args: readonly string[],
+    opts: ExecFileSyncOptions,
+  ) => Buffer | string,
+): boolean {
+  let raw: string;
+  try {
+    const out = runner(
+      "systemctl",
+      [
+        "--user",
+        "show",
+        unitName,
+        "--property=LoadState,ActiveState",
+      ],
+      { timeout: 500, encoding: "utf8" },
+    );
+    raw = typeof out === "string" ? out : out.toString("utf8");
+  } catch {
+    // systemctl not available, timeout, or returned non-zero — fail closed
+    return false;
+  }
+
+  const props: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^([A-Za-z]+)=(.*)$/);
+    if (m) props[m[1]] = m[2];
+  }
+
+  // not-found: spoofed cgroup with no corresponding registered unit.
+  if (props.LoadState !== "loaded") return false;
+
+  // Real cron units cycle through `activating` (Type=oneshot ExecStart
+  // running) and `active`. Any other state means the unit isn't currently
+  // executing the caller's script — reject.
+  if (props.ActiveState !== "active" && props.ActiveState !== "activating") {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Identify the peer on the other end of a Unix domain socket connection.
  *
  * @param socketPath - Absolute path to the listening socket.
@@ -264,7 +331,20 @@ export function identify(
     return null;
   }
 
-  const systemdUnit = readSystemdUnit(pid);
+  // Read the alleged unit from cgroup, then cross-check with systemd.
+  // /proc/<pid>/cgroup is attacker-controlled under user delegation; only
+  // a unit systemd-user actually has loaded counts.
+  const cgroupClaim = readSystemdUnit(pid);
+  let systemdUnit: string | null = null;
+  if (cgroupClaim !== null) {
+    if (verifySystemdUnit(cgroupClaim, runner)) {
+      systemdUnit = cgroupClaim;
+    } else {
+      process.stderr.write(
+        `[vault-broker] peercred: cgroup claims unit=${cgroupClaim} but systemd-user does not report it as loaded+running; treating caller as unidentified\n`,
+      );
+    }
+  }
 
   return { uid, pid, exe, systemdUnit };
 }

@@ -145,18 +145,17 @@ export function checkAcl(
 
   // ── Allow interactive: the installed switchroom CLI ────────────────────
   // Only reached when systemdUnit is null (caller is not a cron unit).
+  // /proc/<pid>/exe always resolves to a bare binary path with no args.
   const allowInteractive = config.vault?.broker?.allow_interactive ?? false;
   if (allowInteractive) {
     const switchroomCli = join(bunBinDir, "switchroom");
-    if (peer.exe === switchroomCli || peer.exe.startsWith(switchroomCli + " ")) {
+    if (peer.exe === switchroomCli) {
       return { allow: true };
     }
   }
 
   return {
     allow: false,
-    reason: peer.systemdUnit === null
-      ? `caller is not a switchroom cron unit (no cgroup match) and allow_interactive is disabled`
-      : `DENIED`,
+    reason: `caller is not a switchroom cron unit (no cgroup match) and allow_interactive is disabled`,
   };
 }

@@ -9,10 +9,19 @@
   exe is `/bin/bash` and the path pattern never matched in production.
   Replaced with cgroup-based identity: peercred reads
   `/proc/<pid>/cgroup` to find the systemd unit name
-  (`switchroom-<agent>-cron-<i>.service`), which systemd writes as root
-  and processes cannot tamper with from userspace. Unit-test fixtures
-  now exercise the full `ss -xpn` inode-pair lookup that production
-  needs to map a connecting client back to its PID.
+  (`switchroom-<agent>-cron-<i>.service`).
+- **Hardened against cgroup spoofing under user delegation.** `/proc/<pid>/cgroup`
+  is attacker-controlled when the broker and caller share UID — under
+  cgroup v2 user delegation, a regular process can `mkdir` arbitrary
+  directories under their `user@<uid>.service` subtree (including paths
+  shaped like `switchroom-<agent>-cron-<i>.service`) and move their own
+  PID into one. Peercred now cross-checks the cgroup-derived unit name
+  against `systemctl --user show`; only units systemd-user reports as
+  `LoadState=loaded` and `ActiveState ∈ {active, activating}` are
+  accepted. Spoofed cgroups have no corresponding registered unit and
+  fail the check.
+- Unit-test fixtures now exercise the full `ss -xpn` inode-pair lookup
+  that production needs to map a connecting client back to its PID.
 - **Peercred `ss` query was returning the broker's own PID.** The
   `src <socket>` filter selects the server-side row of a unix
   connection, whose `users:()` column is the listening process. The

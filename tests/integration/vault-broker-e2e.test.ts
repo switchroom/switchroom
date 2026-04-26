@@ -50,7 +50,9 @@ const SKIP_REASON = !INTEGRATION
   ? "Linux only"
   : !systemdAvailable()
   ? "no user-level systemd detected"
-  : "systemd-run not available";
+  : !systemdRunAvailable()
+  ? "systemd-run not available"
+  : "";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
