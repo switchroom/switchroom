@@ -210,8 +210,11 @@ export async function postInitialBootCard(
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
   })
-  // Pin it — fire and forget; failure is non-fatal
-  bot.pinChatMessage(chatId, sent.message_id, { disable_notification: true }).catch(() => {})
+  // Boot card is no longer pinned — it scrolls past with the rest of the
+  // chat. Pinning was perceived as visual clutter (chat-header banner +
+  // a "<bot> pinned …" service message on every restart). The defensive
+  // unpin in BootCardHandle.complete() below is kept so any leftover
+  // pinned cards from older deploys still get cleared on first turn.
   return sent.message_id
 }
 
