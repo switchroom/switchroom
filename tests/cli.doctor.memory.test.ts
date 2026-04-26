@@ -42,39 +42,11 @@ describe("doctor memory section", () => {
   });
 });
 
-describe("greeting memory row", () => {
-  it("includes SWITCHROOM_MEMORY placeholder in greeting template", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("__SWITCHROOM_MEMORY__");
-    expect(scaffoldSource).toContain("<b>Memory</b>  __SWITCHROOM_MEMORY__");
-  });
-
-  it("includes bank_stats query logic in greeting script", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("_bank_stats");
-    expect(scaffoldSource).toContain("get_bank_stats");
-    expect(scaffoldSource).toContain("HINDSIGHT_BANK_ID");
-  });
-
-  it("gracefully handles Hindsight unreachable state", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("Hindsight unreachable");
-    expect(scaffoldSource).toContain("recall disabled this session");
-  });
-
-  it("formats memory count and last retain time", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("memories");
-    expect(scaffoldSource).toContain("last consolidated");
-    expect(scaffoldSource).toContain("_COUNT");
-    expect(scaffoldSource).toContain("_LAST_TS");
-  });
-});
+// "greeting memory row" describe block removed: the SessionStart greeting
+// script that used to render the Memory row was disabled — the boot card
+// (gateway-side) is now the single source of restart-status visibility.
+// The placeholders, bank_stats query logic, and Hindsight unreachable
+// fallback all lived in `buildSessionGreetingScript`'s template, which
+// has been replaced with a no-op stub. The doctor-side memory checks
+// (above) still cover the runtime backend; this block was only testing
+// stale template substrings.

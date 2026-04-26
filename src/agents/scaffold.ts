@@ -169,14 +169,25 @@ export function setupPlugins(agentDir: string, useSwitchroomPlugin = false): voi
   for (const file of configFiles) {
     const globalFile = join(globalPluginsDir, file);
     const agentFile = join(agentPluginsDir, file);
-    if (existsSync(globalFile) && !existsSync(agentFile)) {
-      try {
-        if (useSwitchroomPlugin && file === "installed_plugins.json") {
-          const scrubbed = stripOfficialTelegramPlugin(readFileSync(globalFile, "utf8"));
+    if (file === "installed_plugins.json" && useSwitchroomPlugin) {
+      // Always re-scrub on every reconcile — a Claude Code update can re-add
+      // the official Telegram entry, which races the switchroom fork for the
+      // same bot token. Scrub from the global file if present, otherwise from
+      // the already-written agent file.
+      const sourceFile = existsSync(globalFile)
+        ? globalFile
+        : existsSync(agentFile)
+          ? agentFile
+          : null;
+      if (sourceFile) {
+        try {
+          const scrubbed = stripOfficialTelegramPlugin(readFileSync(sourceFile, "utf8"));
           writeFileSync(agentFile, scrubbed);
-        } else {
-          copyFileSync(globalFile, agentFile);
-        }
+        } catch { /* ignore write failures */ }
+      }
+    } else if (existsSync(globalFile) && !existsSync(agentFile)) {
+      try {
+        copyFileSync(globalFile, agentFile);
       } catch { /* ignore copy failures */ }
     }
   }
@@ -312,753 +323,34 @@ function formatAgentBankLabel(agentName: string, bankId: string): string {
 }
 
 function buildSessionGreetingScript(
-  name: string,
-  agentConfig: AgentConfig,
-  telegramConfig: TelegramConfig,
-  topicId: number | undefined,
-  userId: string | undefined,
-  quotaConfig: QuotaConfig | undefined,
+  _name: string,
+  _agentConfig: AgentConfig,
+  _telegramConfig: TelegramConfig,
+  _topicId: number | undefined,
+  _userId: string | undefined,
+  _quotaConfig: QuotaConfig | undefined,
 ): string {
-  // Send to DM users AND the forum group (if topic is configured).
-  // The DM is the primary channel for personal agents; the forum
-  // topic is for multi-agent setups where each agent has its own topic.
-  const dmChatIds = userId ? [userId] : [];
-  const forumChatId = telegramConfig.forum_chat_id;
-
-  const model = agentConfig.model
-    ? agentConfig.model
-    : "inherited from CLI";
-  const profile = agentConfig.extends
-    ? agentConfig.extends
-    : "default";
-  const tools = agentConfig.tools?.allow?.includes("all")
-    ? "all"
-    : (agentConfig.tools?.allow?.slice(0, 5).join(", ") ?? "none (default)")
-      + ((agentConfig.tools?.allow?.length ?? 0) > 5
-        ? ` +${(agentConfig.tools?.allow?.length ?? 0) - 5} more`
-        : "");
-  const deny = agentConfig.tools?.deny?.length
-    ? agentConfig.tools.deny.join(", ")
-    : null;
-  const memory = agentConfig.memory?.collection ?? `${name} (default)`;
-  const hooks = agentConfig.hooks
-    ? Object.keys(agentConfig.hooks).join(", ")
-    : null;
-  // Cap visible skill names at 6 to stop the row from wrapping 4+ lines on
-  // Telegram mobile. The agent's own self-knowledge is the authoritative
-  // source for what skills it has; this is a status glance, not an
-  // inventory.
-  const skills = agentConfig.skills?.length
-    ? (() => {
-        const list = agentConfig.skills;
-        const max = 6;
-        if (list.length <= max) return list.join(", ");
-        return `${list.slice(0, max).join(", ")}, …+${list.length - max} more`;
-      })()
-    : null;
-  const session = [];
-  if (agentConfig.session?.max_idle) session.push(`idle ${agentConfig.session.max_idle}`);
-  if (agentConfig.session?.max_turns) session.push(`${agentConfig.session.max_turns} turns`);
-  const sessionStr = session.length ? session.join(", ") : "unlimited (default)";
-  const plugin = agentConfig.channels?.telegram?.plugin ?? "switchroom (default)";
-
-  // Telegram HTML — keep it compact for mobile. Omit rows that are
-  // null (unset with no interesting default to show).
-  // __SWITCHROOM_MODEL__, __SWITCHROOM_AUTH__, __SWITCHROOM_PLAN__,
-  // __SWITCHROOM_QUOTA__, and __SWITCHROOM_SESSION__ are resolved at
-  // runtime by the shell script so the greeting always reflects current
-  // state (Session row picks a continuity signal: resumed mid-turn,
-  // handoff-briefed fresh, reset-by-user fresh, or cold start).
-  // __SWITCHROOM_RESTARTED__ is resolved at runtime from the gateway's
-  // clean-shutdown marker (written by whichever actor initiated the
-  // restart — CLI, /restart, /reconcile, watchdog, update). The row is
-  // RENDERED ONLY IF the marker exists and carries a `reason`; cold
-  // starts and admin-systemctl restarts leave no marker → no row. See
-  // the RESTARTED_STATUS block below for the resolution logic.
-  const text = [
-    `<b>🎛️ Switchroom · ${escapeHtml(name)} online</b>`,
-    ``,
-    `<b>Model</b>  __SWITCHROOM_MODEL__`,
-    `<b>Auth</b>  __SWITCHROOM_AUTH__`,
-    `<b>Plan</b>  __SWITCHROOM_PLAN__`,
-    `<b>Quota</b>  __SWITCHROOM_QUOTA__`,
-    `<b>Session</b>  __SWITCHROOM_SESSION__`,
-    `__SWITCHROOM_RESTARTED_ROW__`,
-    `<b>Memory</b>  __SWITCHROOM_MEMORY__`,
-    `<b>Version</b>  ${escapeHtml(formatVersionRow())}`,
-    `<b>Profile</b>  ${escapeHtml(profile)}`,
-    `<b>Tools</b>  ${escapeHtml(tools)}`,
-    deny ? `<b>Deny</b>  ${escapeHtml(deny)}` : null,
-    hooks ? `<b>Hooks</b>  ${escapeHtml(hooks)}` : null,
-    skills ? `<b>Skills</b>  ${escapeHtml(skills)}` : null,
-    `<b>Limits</b>  ${escapeHtml(sessionStr)}`,
-    `<b>Channel</b>  ${escapeHtml(plugin)}`,
-  ].filter(Boolean).join("\n");
-
-  // Budget values baked into the script so the shell doesn't have to
-  // re-read switchroom.yaml. Empty string = unset (raw usage shown).
-  const weeklyBudget = quotaConfig?.weekly_budget_usd?.toString() ?? "";
-  const monthlyBudget = quotaConfig?.monthly_budget_usd?.toString() ?? "";
-
-  // Build curl calls for each destination. TEXT is a shell variable resolved
-  // at runtime (after placeholder substitution), so we use $TEXT not a quoted literal.
-  // Each call logs the HTTP response code so the session-greeting.log captures
-  // whether Telegram accepted the message (useful when diagnosing why a card
-  // didn't appear — 400 (bad markup), 401 (bad token), 403 (blocked), etc.).
-  const curlTemplate = (destChatId: string, threadId?: number) => {
-    const threadLine = threadId != null
-      ? `\n  -d message_thread_id="${threadId}" \\`
-      : "";
-    const label = threadId != null
-      ? `chat=${destChatId} thread=${threadId}`
-      : `chat=${destChatId}`;
-    return `_log "SEND calling Telegram sendMessage (${label}, text_len=\${#TEXT})"
-_SEND_HTTP=$(curl -s -o /dev/null -w '%{http_code}' "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \\
-  -d chat_id="${destChatId}" \\${threadLine}
-  -d parse_mode="HTML" \\
-  -d disable_web_page_preview=true \\
-  --data-urlencode text="$TEXT" 2>/dev/null || echo "curl-failed")
-_log "SEND completed (${label}) http=$_SEND_HTTP"`;
-  };
-
-  const curlCalls: string[] = [];
-  // DM to each allowed user
-  for (const uid of dmChatIds) {
-    curlCalls.push(curlTemplate(uid));
-  }
-  // Forum group (with topic thread if configured)
-  if (topicId != null) {
-    curlCalls.push(curlTemplate(forumChatId, topicId));
-  }
-
+  // The boot card (posted by the Telegram gateway on every gateway start)
+  // is now the single source of restart-status visibility. The
+  // SessionStart greeting that this function used to render is
+  // disabled — it sent a separate "Switchroom · <agent> online" message
+  // on every Claude Code session that duplicated the boot card's
+  // information. We keep the function + the file write + the hook
+  // registration intact so existing scaffold expectations and the hook
+  // budget tests stay green; the script body is now a no-op that just
+  // logs the invocation for diagnostics.
   return `#!/bin/bash
-# Auto-generated by switchroom scaffold/reconcile. Sends config summary to
-# Telegram on SessionStart. Zero model tokens — pure curl.
-# Regenerated on every reconcile so config changes are reflected.
+# Auto-generated by switchroom scaffold/reconcile.
+# SessionStart greeting is disabled — the boot card (gateway) is now the
+# single source of restart-status visibility on every restart. This
+# script is intentionally a no-op so the hook registration stays intact
+# without sending a duplicate Telegram message. See PR that introduced
+# this stub for the rationale.
 
-# --- DIAGNOSTIC LOGGING ---
-# Every invocation appends a line to $TELEGRAM_STATE_DIR/session-greeting.log
-# so we can reconstruct why the greeting fired (or was suppressed) on any
-# given SessionStart. Pure ops-observability: zero model tokens, no user-
-# visible behaviour change. Rotate/trash the file manually when it gets big.
 _GLOG="\${TELEGRAM_STATE_DIR:-/tmp}/session-greeting.log"
 _log() { printf '[%s pid=%d ppid=%d] %s\\n' "$(date -Iseconds)" "$$" "$PPID" "$*" >> "$_GLOG" 2>/dev/null || true; }
-_log "INVOKED cwd=$PWD telegram_state_dir=\${TELEGRAM_STATE_DIR:-UNSET} switchroom_agent=\${SWITCHROOM_AGENT_NAME:-UNSET} eval_mode=\${SWITCHROOM_EVAL_MODE:-unset}"
-
-# Skip greeting for eval runs and one-shot claude -p calls.
-if [ "$SWITCHROOM_EVAL_MODE" = "1" ]; then _log "EXIT early: SWITCHROOM_EVAL_MODE=1"; exit 0; fi
-
-# Source bot token at runtime (never baked into scripts).
-source "$TELEGRAM_STATE_DIR/.env" 2>/dev/null
-if [ -z "$TELEGRAM_BOT_TOKEN" ]; then _log "EXIT early: no TELEGRAM_BOT_TOKEN (state_dir=\${TELEGRAM_STATE_DIR:-UNSET})"; exit 0; fi
-
-# Capture hook stdin once — used for dedupe (session_id) and model resolution.
-HOOK_INPUT=""
-if [ ! -t 0 ]; then HOOK_INPUT="$(cat 2>/dev/null || true)"; fi
-# Log hook input metadata (trimmed, no tokens in normal hook payload).
-if [ -n "$HOOK_INPUT" ] && command -v jq >/dev/null 2>&1; then
-  _HOOK_EVENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
-  _HOOK_SOURCE=$(printf '%s' "$HOOK_INPUT" | jq -r '.source // empty' 2>/dev/null)
-  _HOOK_SESSION=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)
-  _HOOK_PARENT=$(printf '%s' "$HOOK_INPUT" | jq -r '.parent_session_id // empty' 2>/dev/null)
-  _HOOK_TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
-  _log "HOOK event=$_HOOK_EVENT source=$_HOOK_SOURCE session=\${_HOOK_SESSION:0:16} parent=\${_HOOK_PARENT:0:16} transcript=$(basename "\${_HOOK_TRANSCRIPT:-none}")"
-else
-  _log "HOOK empty or no-jq (hook_input_len=\${#HOOK_INPUT})"
-fi
-
-# Skip greeting for session recycling: agents without --continue exit after
-# each turn and systemd restarts them. Dedupe by comparing the gateway's
-# current process start time against the last time we fired the greeting:
-# if our marker is older than the running gateway, the gateway has
-# restarted since we last greeted — send a fresh greeting.
-#
-# Why not socket inode? systemctl restart reuses the Unix socket file, so
-# its inode is stable across restarts. An inode-based dedupe silently
-# suppresses the greeting whenever we deploy via systemctl restart.
-# Ken hit this repeatedly during the OpenClawification deploys.
-#
-# EXCEPTION: if a restart marker exists (written by /restart, /reconcile
-# --restart, or /update), the user explicitly asked for a restart — fire
-# the greeting regardless.
-GATEWAY_SOCK="$TELEGRAM_STATE_DIR/gateway.sock"
-RESTART_MARKER_FILE="$(dirname "$TELEGRAM_STATE_DIR")/restart-pending.json"
-NOW=$(date +%s)
-RESTART_REQUESTED=0
-[ -f "$RESTART_MARKER_FILE" ] && RESTART_REQUESTED=1
-
-# Resolve gateway process start time (epoch seconds) by finding the PID
-# listening on the Unix socket and reading /proc/<pid>. Returns 0 if we
-# can't find it, which disables the optimisation and always fires.
-#
-# IMPORTANT: no filesystem short-circuit on [ -S "$GATEWAY_SOCK" ]. If the
-# socket's directory entry was unlinked (orphaned socket — inode still
-# alive, path gone) the filesystem check returns false but the gateway
-# process is still running and listening. \`ss -xlnp\` reports the listener
-# by path even in that case, so we go straight to ss and let it speak
-# truth. A bare -S check here is what caused the greeting to re-fire on
-# every SessionStart when gateway.sock was unlinked.
-_gateway_start_time() {
-  local pid
-  # ss -xlnp is the cheap path (no /proc walk); falls through to lsof if ss absent.
-  # Uses sed (POSIX-portable) to extract the pid; avoids gawk's
-  # match(regex, arr) three-arg form which fails on plain awk with
-  # "syntax error at or near ," on minimal images (alpine, busybox).
-  pid=$(ss -xlnp 2>/dev/null | grep -F "$GATEWAY_SOCK" | sed -n 's|.*pid=\\([0-9]\\{1,\\}\\).*|\\1|p' | head -1)
-  if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
-    pid=$(lsof -t "$GATEWAY_SOCK" 2>/dev/null | head -1)
-  fi
-  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then echo 0; return; fi
-  stat -c %Y "/proc/$pid" 2>/dev/null || echo 0
-}
-
-# Proceed with dedupe whenever the gateway process is actually running
-# (as reported by ss), regardless of whether the filesystem entry for
-# the Unix socket is present. Orphaned-socket deploys must not bypass
-# dedupe.
-GATEWAY_STARTED_AT=$(_gateway_start_time)
-case "$GATEWAY_STARTED_AT" in ''|*[!0-9]*) GATEWAY_STARTED_AT=0 ;; esac
-if [ "$GATEWAY_STARTED_AT" -gt 0 ]; then
-  GREETED_MARKER_FILE="$TELEGRAM_STATE_DIR/greeted-gateway-start"
-  GREETED_AT=0
-  [ -f "$GREETED_MARKER_FILE" ] && GREETED_AT=$(cat "$GREETED_MARKER_FILE" 2>/dev/null || echo 0)
-  # Treat non-numeric reads as 0 so a corrupt marker re-fires rather than silently suppressing forever.
-  case "$GREETED_AT" in ''|*[!0-9]*) GREETED_AT=0 ;; esac
-  _skip_eligible=no
-  if [ "$RESTART_REQUESTED" = "0" ] && [ "$GREETED_AT" -ge "$GATEWAY_STARTED_AT" ]; then _skip_eligible=yes; fi
-  _log "DEDUPE gateway_sock_file=$([ -S "$GATEWAY_SOCK" ] && echo present || echo MISSING) restart_requested=$RESTART_REQUESTED gateway_started_at=$GATEWAY_STARTED_AT greeted_at=$GREETED_AT skip_eligible=$_skip_eligible"
-  # Skip only if: no explicit restart request AND we've already greeted
-  # *for this gateway process lifetime*.
-  if [ "$RESTART_REQUESTED" = "0" ] \\
-     && [ "$GREETED_AT" -ge "$GATEWAY_STARTED_AT" ]; then
-    _log "EXIT dedupe-skip: already greeted for this gateway lifetime (greeted_at=$GREETED_AT >= gateway_started_at=$GATEWAY_STARTED_AT)"
-    exit 0
-  fi
-  _log "DEDUPE falling through to greet; updating marker to NOW=$NOW"
-  printf '%s' "$NOW" > "$GREETED_MARKER_FILE" 2>/dev/null || true
-else
-  _log "DEDUPE gateway_started_at=0 (no listener found via ss/lsof); skipping dedupe, will attempt greet"
-fi
-
-# Idempotency guard: Claude Code fires SessionStart multiple times on some
-# restart paths. Use a 60s time-window marker instead of per-session-id dedup.
-# The 30s window that shipped originally was occasionally short enough that
-# the second fire slipped through when the greeting itself took >20s (large
-# transcript archives, cold npx cache). 60s gives enough margin for the
-# full greeting latency plus a buffer. If two legitimate restarts happen
-# within 60s we just skip the second greeting — a small UX cost for
-# deterministic no-dupe behaviour.
-# Atomic via mkdir so concurrent invocations race cleanly.
-GREETING_MARKER="$TELEGRAM_STATE_DIR/greeting-lock"
-if [ -d "$GREETING_MARKER" ]; then
-  LAST=$(stat -c %Y "$GREETING_MARKER" 2>/dev/null || echo 0)
-  _log "LOCK exists since $LAST (age $((NOW - LAST))s)"
-  if [ $((NOW - LAST)) -lt 60 ]; then
-    _log "EXIT lock-skip: greeting-lock acquired <60s ago (age=$((NOW - LAST))s)"
-    exit 0
-  fi
-  rmdir "$GREETING_MARKER" 2>/dev/null || true
-fi
-if ! mkdir "$GREETING_MARKER" 2>/dev/null; then
-  _log "EXIT mkdir-race: another invocation won the greeting-lock"
-  exit 0
-fi
-_log "LOCK acquired; proceeding with greeting"
-
-# Resolve the active model from SessionStart hook stdin.
-# Fallback chain: hook .model → agent settings.json .model → current
-# transcript → newest transcript across this project's JSONLs → user
-# default from ~/.claude.json → cache.
-#
-# settings.json sits at position 2 because it's the configured ground
-# truth: switchroom.yaml → reconcile → settings.json, and start.sh
-# passes the same value to \`claude --model\`. Transcript-based lookups
-# are unreliable on --continue resumes — the transcript's last "model"
-# entry is from the previous session, which then pollutes the cache
-# and makes every subsequent greeting display the stale value.
-MODEL=""
-CWD=""
-if command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
-  MODEL="$(printf '%s' "$HOOK_INPUT" | jq -r '.model // empty' 2>/dev/null)"
-  CWD="$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
-fi
-if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -f "\$CLAUDE_CONFIG_DIR/settings.json" ]; then
-  MODEL="$(jq -r '.model // empty' "\$CLAUDE_CONFIG_DIR/settings.json" 2>/dev/null)"
-fi
-if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
-  TRANSCRIPT="$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
-  if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
-    MODEL="$(grep -o '"model":"[^"]*"' "$TRANSCRIPT" | tail -1 | cut -d'"' -f4)"
-  fi
-fi
-[ -z "$CWD" ] && CWD="$PWD"
-if [ -z "$MODEL" ]; then
-  CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-  ENCODED="$(printf '%s' "$CWD" | sed 's|/|-|g')"
-  PROJECT_DIR="$CONFIG_DIR/projects/$ENCODED"
-  if [ -d "$PROJECT_DIR" ]; then
-    while IFS= read -r f; do
-      [ -z "$f" ] && continue
-      CANDIDATE="$(grep -o '"model":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4)"
-      if [ -n "$CANDIDATE" ]; then MODEL="$CANDIDATE"; break; fi
-    done <<< "$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null)"
-  fi
-fi
-if [ -z "$MODEL" ] && command -v jq >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ]; then
-  MODEL="$(jq -r '.model // empty' "$HOME/.claude.json" 2>/dev/null)"
-fi
-MODEL_CACHE="$TELEGRAM_STATE_DIR/last-model"
-if [ -z "$MODEL" ] && [ -f "$MODEL_CACHE" ]; then
-  MODEL="$(cat "$MODEL_CACHE" 2>/dev/null)"
-fi
-[ -z "$MODEL" ] && MODEL="default"
-printf '%s' "$MODEL" > "$MODEL_CACHE" 2>/dev/null || true
-
-# Resolve auth status from token files at runtime.
-# Prefer .oauth-token (the authoritative token after switchroom auth code)
-# but merge in subscriptionType + rateLimitTier from .credentials.json when
-# both files exist — the oauth-token flow alone does not carry plan metadata.
-#
-# AUTH_LABEL is a user-declared identity (e.g. user@example.com) for the
-# greeting row. Anthropic does not expose a public endpoint to read the
-# OAuth account's email from the token, so we rely on the user declaring it
-# in switchroom.yaml (agents.<name>.auth_label). Empty string means no
-# label — the row falls back to the old 'plan · expires' shape.
-AUTH_LABEL=${shellSingleQuote(agentConfig.auth_label ?? "")}
-AUTH_STATUS=""
-CLAUDE_DIR="\${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-if command -v jq >/dev/null 2>&1; then
-  SUB=""
-  TIER=""
-  if [ -f "$CLAUDE_DIR/.credentials.json" ]; then
-    SUB="$(jq -r '.claudeAiOauth.subscriptionType // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
-    TIER="$(jq -r '.claudeAiOauth.rateLimitTier // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
-  fi
-  # Export so the Quota block can decide between 'within plan' (Pro/Max
-  # user) and raw ccusage dollar display (API-only user).
-  export _QUOTA_SUB="$SUB"
-  if [ -f "$CLAUDE_DIR/.oauth-token" ] && [ -f "$CLAUDE_DIR/.oauth-token.meta.json" ]; then
-    EXP_AT="$(jq -r '.expiresAt // empty' "$CLAUDE_DIR/.oauth-token.meta.json" 2>/dev/null)"
-    PLAN="\${SUB:-oauth}"
-    if [ -n "$EXP_AT" ]; then
-      NOW_MS=$(($(date +%s) * 1000))
-      REM_MS=$((EXP_AT - NOW_MS))
-      if [ "$REM_MS" -gt 0 ]; then
-        REM_H=$((REM_MS / 3600000))
-        REM_M=$(((REM_MS % 3600000) / 60000))
-        if [ -n "$AUTH_LABEL" ]; then
-          AUTH_STATUS="✓ \${PLAN} · $AUTH_LABEL · expires \${REM_H}h \${REM_M}m"
-        else
-          AUTH_STATUS="✓ \${PLAN} · expires \${REM_H}h \${REM_M}m"
-        fi
-      else
-        AUTH_STATUS="⚠️ \${PLAN} token expired"
-      fi
-    else
-      AUTH_STATUS="✓ \${PLAN}"
-    fi
-  elif [ -f "$CLAUDE_DIR/.credentials.json" ]; then
-    EXP_AT="$(jq -r '.claudeAiOauth.expiresAt // empty' "$CLAUDE_DIR/.credentials.json" 2>/dev/null)"
-    if [ -n "$EXP_AT" ]; then
-      NOW_MS=$(($(date +%s) * 1000))
-      REM_MS=$((EXP_AT - NOW_MS))
-      if [ "$REM_MS" -gt 0 ]; then
-        REM_H=$((REM_MS / 3600000))
-        REM_M=$(((REM_MS % 3600000) / 60000))
-        if [ -n "$AUTH_LABEL" ]; then
-          AUTH_STATUS="✓ \${SUB:-credentials} · $AUTH_LABEL · expires \${REM_H}h \${REM_M}m"
-        else
-          AUTH_STATUS="✓ \${SUB:-credentials} · expires \${REM_H}h \${REM_M}m"
-        fi
-      else
-        AUTH_STATUS="⚠️ credentials expired"
-      fi
-    else
-      AUTH_STATUS="✓ \${SUB:-credentials}"
-    fi
-  elif [ -f "$CLAUDE_DIR/.oauth-token" ]; then
-    # Only the token file exists — no metadata sidecar, no .credentials.json.
-    # Klanker hit this because its OAuth was set up without the newer flow
-    # that writes .oauth-token.meta.json. Show the agent is authed even
-    # without expiry/plan details; showing "—" was misleading.
-    AUTH_STATUS="✓ authed"
-  fi
-fi
-[ -z "$AUTH_STATUS" ] && AUTH_STATUS="—"
-
-# Resolve Pro/Max plan quota utilization by hitting /v1/messages with the
-# CLI's OAuth + user-agent shape — the response headers expose the 5-hour
-# and 7-day rolling-window utilization percentages that the TUI's /usage
-# panel reads. One input token, max_tokens=1, response body discarded.
-#
-# This is the real subscription-quota figure, separate from the
-# ccusage-based monetary "Quota" row below (which reflects dollars spent,
-# not Pro/Max window utilization — orthogonal concerns).
-PLAN_STATUS=""
-if [ -n "$CLAUDE_DIR" ] && [ -f "$CLAUDE_DIR/.oauth-token" ] && command -v curl >/dev/null 2>&1; then
-  OAUTH_TOKEN="$(cat "$CLAUDE_DIR/.oauth-token" 2>/dev/null | tr -d '[:space:]')"
-  if [ -n "$OAUTH_TOKEN" ]; then
-    PLAN_HEADERS_FILE="$(mktemp 2>/dev/null || echo /tmp/plan-headers.$$)"
-    # -o /dev/null drops body; -D dumps headers; --max-time bounds the call.
-    curl -sS -o /dev/null -D "$PLAN_HEADERS_FILE" --max-time 10 \
-      -X POST "https://api.anthropic.com/v1/messages" \
-      -H "anthropic-version: 2023-06-01" \
-      -H "anthropic-beta: oauth-2025-04-20" \
-      -H "authorization: Bearer $OAUTH_TOKEN" \
-      -H "x-app: cli" \
-      -H "user-agent: claude-cli/1.0.0 (external, cli)" \
-      -H "content-type: application/json" \
-      --data '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
-      >/dev/null 2>&1 || true
-    if [ -s "$PLAN_HEADERS_FILE" ]; then
-      # tr -d '\\r' normalises CRLF so grep matches; awk picks value after ':'.
-      H5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-utilization:' | tail -1 | awk -F': ' '{print $2}')"
-      H7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-utilization:' | tail -1 | awk -F': ' '{print $2}')"
-      # Reset epochs (Unix seconds) — tell the user when each window clears.
-      R5="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-5h-reset:' | tail -1 | awk -F': ' '{print $2}')"
-      R7="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-7d-reset:' | tail -1 | awk -F': ' '{print $2}')"
-      # Overage status — used by the Quota row below to decide between
-      # 'within plan' and a dollar estimate. 'allowed' means Anthropic lets
-      # you exceed the plan and bill; 'disabled' means hard cap.
-      OVERAGE_STATUS="$(tr -d '\\r' < "$PLAN_HEADERS_FILE" | grep -i '^anthropic-ratelimit-unified-overage-status:' | tail -1 | awk -F': ' '{print $2}')"
-      # Export both utilization and overage status so Quota block can read them.
-      export _QUOTA_H7="$H7"
-      export _QUOTA_OVERAGE="$OVERAGE_STATUS"
-      if [ -n "$H5" ] || [ -n "$H7" ]; then
-        P5="$(awk -v v="\${H5:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
-        P7="$(awk -v v="\${H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
-        # Format a reset-in countdown from epoch. Output like "2h 14m",
-        # "3d 4h", "17m", or "now" if the window has already elapsed.
-        # Pure POSIX shell+awk so it works without bash-only features.
-        _fmt_reset() {
-          _epoch="$1"
-          [ -z "$_epoch" ] && { echo "—"; return; }
-          _now=$(date +%s)
-          _delta=$((_epoch - _now))
-          [ "$_delta" -le 0 ] && { echo "now"; return; }
-          _hours=$((_delta / 3600))
-          _mins=$(( (_delta % 3600) / 60 ))
-          if [ "$_hours" -lt 1 ]; then
-            echo "\${_mins}m"
-          elif [ "$_hours" -lt 24 ]; then
-            if [ "$_mins" -gt 0 ]; then echo "\${_hours}h \${_mins}m"; else echo "\${_hours}h"; fi
-          else
-            _days=$((_hours / 24))
-            _rh=$((_hours % 24))
-            if [ "$_rh" -gt 0 ]; then echo "\${_days}d \${_rh}h"; else echo "\${_days}d"; fi
-          fi
-        }
-        R5_FMT="$(_fmt_reset "$R5")"
-        R7_FMT="$(_fmt_reset "$R7")"
-        PLAN_STATUS="\${P5}% / 5h (resets in \${R5_FMT}) · \${P7}% / 7d (resets in \${R7_FMT})"
-      fi
-    fi
-    rm -f "$PLAN_HEADERS_FILE" 2>/dev/null || true
-  fi
-fi
-[ -z "$PLAN_STATUS" ] && PLAN_STATUS="—"
-
-# Resolve Claude quota usage.
-#
-# Two different stories depending on how the account is billed:
-#
-#   Pro/Max subscriber (flat monthly fee, usage included up to plan cap):
-#     The ccusage dollar figures are what usage WOULD cost on API pricing
-#     and are misleading — the user pays a flat subscription regardless.
-#     So for these accounts, show plan-coverage state instead of $$$:
-#       - H7 < 1.0, overage allowed  -> 'within plan' (green)
-#       - H7 < 1.0, overage disabled -> 'within plan'
-#       - H7 >= 1.0, overage allowed -> 'overage active' (user is billed extra)
-#       - H7 >= 1.0, overage disabled -> 'plan cap reached' (hard block)
-#
-#   API-only account (pay per token):
-#     ccusage dollars ARE real spend. Show wk / mo as before, with optional
-#     budget comparison from switchroom.yaml.
-#
-# Plan membership is detected via _QUOTA_SUB (exported by the Auth block
-# from .credentials.json's subscriptionType). H7 (7d utilization) and
-# OVERAGE_STATUS come from the Plan block's response headers.
-QUOTA_STATUS=""
-WEEKLY_BUDGET="${weeklyBudget}"
-MONTHLY_BUDGET="${monthlyBudget}"
-
-# Pro/Max fast path: skip ccusage entirely. The subscription flat fee is
-# the real cost; utilization tells the rest of the story.
-if [ -n "\${_QUOTA_SUB:-}" ] && [ "\${_QUOTA_SUB}" != "api" ] && [ "\${_QUOTA_SUB}" != "none" ]; then
-  _PLAN_LABEL="\${_QUOTA_SUB}"
-  # Capitalize first letter (pro -> Pro, max -> Max)
-  _PLAN_LABEL_CAP="$(printf '%s' "\$_PLAN_LABEL" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
-  # Parse H7 (0.0-1.0) into percent.
-  _H7_PCT="$(awk -v v="\${_QUOTA_H7:-0}" 'BEGIN { printf "%.0f", v * 100 }')"
-  if [ "\${_H7_PCT}" -lt 100 ]; then
-    QUOTA_STATUS="within \${_PLAN_LABEL_CAP} plan"
-  else
-    case "\${_QUOTA_OVERAGE:-}" in
-      allowed)
-        QUOTA_STATUS="⚠ overage active (over plan cap)"
-        ;;
-      disabled|*)
-        QUOTA_STATUS="⚠ plan cap reached"
-        ;;
-    esac
-  fi
-fi
-
-# API-only fallback: ccusage dollar display, same as before.
-if [ -z "$QUOTA_STATUS" ] && command -v jq >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
-  WK_COST=""
-  MO_COST=""
-  # Belt-and-braces: ccusage scans $CLAUDE_CONFIG_DIR/projects by default.
-  # SessionStart hooks inherit CLAUDE_CONFIG_DIR from the claude process in
-  # theory, but if the env is ever lost (different claude version,
-  # container, manual test) we'd silently query ~/.claude instead of the
-  # agent's own transcripts. Set it explicitly so the hook is deterministic.
-  export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$(dirname \"\$TELEGRAM_STATE_DIR\")/.claude}"
-  # --offline avoids a pricing-data fetch; cached data is accurate enough
-  # for a status line. Both commands are bounded by a short timeout so a
-  # slow ccusage run can never block the greeting hook past a few seconds.
-  WK_JSON="$(timeout 8 npx --yes ccusage@latest weekly --json --offline 2>/dev/null || true)"
-  if [ -n "$WK_JSON" ]; then
-    WK_COST="$(printf '%s' "$WK_JSON" | jq -r '.weekly[-1].totalCost // empty' 2>/dev/null)"
-  fi
-  MO_JSON="$(timeout 8 npx --yes ccusage@latest monthly --json --offline 2>/dev/null || true)"
-  if [ -n "$MO_JSON" ]; then
-    MO_COST="$(printf '%s' "$MO_JSON" | jq -r '.monthly[-1].totalCost // empty' 2>/dev/null)"
-  fi
-  fmt_usage() {
-    local cost="$1" budget="$2" label="$3"
-    [ -z "$cost" ] && cost="0"
-    if [ -n "$budget" ]; then
-      local pct
-      pct="$(awk -v c="$cost" -v b="$budget" 'BEGIN { if (b > 0) printf "%.0f", (c / b) * 100; else printf "0" }')"
-      printf '%s $%.2f / $%s (%s%%)' "$label" "$cost" "$budget" "$pct"
-    else
-      printf '%s $%.2f' "$label" "$cost"
-    fi
-  }
-  if [ -n "$WK_COST" ] || [ -n "$MO_COST" ]; then
-    WK_PART="$(fmt_usage "$WK_COST" "$WEEKLY_BUDGET" "wk")"
-    MO_PART="$(fmt_usage "$MO_COST" "$MONTHLY_BUDGET" "mo")"
-    QUOTA_STATUS="$WK_PART · $MO_PART"
-  fi
-fi
-[ -z "$QUOTA_STATUS" ] && QUOTA_STATUS="—"
-
-# Session continuity signal — tell the user whether this boot picked up
-# from a prior session or started fresh, and why. Inputs come from
-# start.sh which sets SWITCHROOM_SESSION_MODE (continue|handoff|fresh|cold)
-# and SWITCHROOM_PRIOR_SESSION_EPOCH (mtime of latest JSONL if any).
-#
-# Output examples:
-#   Session  ↩️ Picked up mid-turn (2h ago)
-#   Session  ↩️ Resumed: <first line of handoff> (2h ago)
-#   Session  🆕 Fresh start (last: <first line>)
-#   Session  ❄️ Cold start
-SESSION_STATUS="—"
-_fmt_ago() {
-  _epoch="$1"
-  [ -z "$_epoch" ] && { echo ""; return; }
-  _now=$(date +%s)
-  _delta=$((_now - _epoch))
-  [ "$_delta" -lt 0 ] && { echo ""; return; }
-  _h=$((_delta / 3600))
-  _m=$(( (_delta % 3600) / 60 ))
-  if [ "$_h" -lt 1 ]; then
-    echo "\${_m}m ago"
-  elif [ "$_h" -lt 24 ]; then
-    echo "\${_h}h ago"
-  else
-    _d=$((_h / 24))
-    echo "\${_d}d ago"
-  fi
-}
-_first_line_of_handoff() {
-  # TELEGRAM_STATE_DIR is <agentDir>/telegram. Its parent is the agent dir
-  # where .handoff.md lives (written by the Stop hook).
-  _file="$(dirname "$TELEGRAM_STATE_DIR")/.handoff.md"
-  [ ! -s "$_file" ] && { echo ""; return; }
-  # Strip leading hashes/whitespace/bullets. Cap to ~80 chars.
-  head -1 "$_file" 2>/dev/null | sed -E 's/^[# \t*-]+//' | cut -c1-80
-}
-SESSION_AGO="$(_fmt_ago "\${SWITCHROOM_PRIOR_SESSION_EPOCH:-}")"
-SESSION_SUMMARY="$(_first_line_of_handoff)"
-case "\${SWITCHROOM_SESSION_MODE:-cold}" in
-  continue)
-    if [ -n "$SESSION_AGO" ]; then
-      SESSION_STATUS="↩️ Picked up mid-turn ($SESSION_AGO)"
-    else
-      SESSION_STATUS="↩️ Picked up mid-turn"
-    fi
-    ;;
-  handoff)
-    if [ -n "$SESSION_SUMMARY" ] && [ -n "$SESSION_AGO" ]; then
-      SESSION_STATUS="↩️ Resumed: $SESSION_SUMMARY ($SESSION_AGO)"
-    elif [ -n "$SESSION_SUMMARY" ]; then
-      SESSION_STATUS="↩️ Resumed: $SESSION_SUMMARY"
-    elif [ -n "$SESSION_AGO" ]; then
-      SESSION_STATUS="↩️ Resumed ($SESSION_AGO)"
-    else
-      SESSION_STATUS="↩️ Resumed"
-    fi
-    ;;
-  fresh)
-    if [ -n "$SESSION_SUMMARY" ]; then
-      SESSION_STATUS="🆕 Fresh start (last: $SESSION_SUMMARY)"
-    else
-      SESSION_STATUS="🆕 Fresh start"
-    fi
-    ;;
-  cold|*)
-    SESSION_STATUS="❄️ Cold start"
-    ;;
-esac
-
-# Resolve Memory row: query Hindsight for bank stats.
-#
-# Hindsight's MCP server returns text/event-stream with a nested shape:
-# first an SSE envelope ("event: message / data: {...}"), inside that a
-# JSON-RPC result whose content[0].text field is itself a JSON-stringified
-# stats blob. Real field names are total_documents, node_counts
-# (experience/world/observation), and last_consolidated_at (ISO timestamp).
-# Older versions of this code hunted for memory_count / last_retain which
-# don't exist, and produced a spurious Hindsight-unreachable banner even
-# when Hindsight was healthy.
-#
-# Use python3 for robust parsing. Bounded by curl -m 2 and python -u.
-# Fallback to "—" on any failure.
-MEMORY_STATUS="—"
-if [ -n "\${HINDSIGHT_BANK_ID:-}" ] && [ -n "\${HINDSIGHT_API_URL:-}" ] && command -v python3 >/dev/null 2>&1; then
-  _bank_stats() {
-    _api_url="\${HINDSIGHT_API_URL}/mcp/"
-    _bank_id="\${HINDSIGHT_BANK_ID}"
-    _SESSION=$(curl -sS -X POST "\$_api_url" \\
-      -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
-      -H "X-Bank-Id: \$_bank_id" -D /tmp/bank-stats-$$.headers \\
-      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"bank-stats","version":"0.1"}}}' \\
-      -m 2 -o /dev/null 2>/dev/null && grep -i mcp-session-id /tmp/bank-stats-$$.headers | cut -d' ' -f2 | tr -d '\\r\\n')
-    rm -f /tmp/bank-stats-$$.headers 2>/dev/null || true
-    if [ -z "\$_SESSION" ]; then
-      echo "⚠ Hindsight unreachable, recall disabled this session"
-      return 1
-    fi
-    _STATS=$(curl -sS -X POST "\$_api_url" \\
-      -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \\
-      -H "X-Bank-Id: \$_bank_id" -H "mcp-session-id: \$_SESSION" \\
-      -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_bank_stats","arguments":{}}}' \\
-      -m 2 2>/dev/null)
-    if [ -z "\$_STATS" ]; then
-      echo "⚠ Hindsight stats unavailable"
-      return 1
-    fi
-    # Parse: SSE envelope -> MCP result -> inner JSON text -> actual stats.
-    # Emit "<count>|<iso-timestamp-or-empty>" on success, empty line on error.
-    _PARSED=$(printf '%s' "\$_STATS" | python3 -u -c 'import sys, json, re
-try:
-    raw = sys.stdin.read()
-    m = re.search(r"^data: (.*)$", raw, re.M)
-    if not m: sys.exit(0)
-    env = json.loads(m.group(1))
-    text = env["result"]["content"][0]["text"]
-    stats = json.loads(text)
-    nc = stats.get("node_counts", {}) or {}
-    count = (nc.get("experience", 0) or 0) + (nc.get("world", 0) or 0)
-    last = stats.get("last_consolidated_at", "") or ""
-    print(f"{count}|{last}")
-except Exception:
-    pass
-' 2>/dev/null)
-    if [ -z "\$_PARSED" ]; then
-      echo "⚠ Hindsight stats unparseable"
-      return 1
-    fi
-    _COUNT="\${_PARSED%%|*}"
-    _LAST_TS="\${_PARSED#*|}"
-    if [ -z "\$_COUNT" ] || [ "\$_COUNT" = "0" ]; then
-      echo "✓ Hindsight · 0 memories (empty bank)"
-      return 0
-    fi
-    _AGO=""
-    if [ -n "\$_LAST_TS" ]; then
-      _LAST_EPOCH=$(date -d "\$_LAST_TS" +%s 2>/dev/null || echo 0)
-      if [ "\$_LAST_EPOCH" -gt 0 ]; then
-        _NOW=$(date +%s)
-        _DIFF=$((_NOW - _LAST_EPOCH))
-        if [ "\$_DIFF" -lt 60 ]; then _AGO="\${_DIFF}s ago"
-        elif [ "\$_DIFF" -lt 3600 ]; then _AGO="$((_DIFF / 60))m ago"
-        elif [ "\$_DIFF" -lt 86400 ]; then _AGO="$((_DIFF / 3600))h ago"
-        else _AGO="$((_DIFF / 86400))d ago"
-        fi
-      fi
-    fi
-    if [ -n "\$_AGO" ]; then
-      echo "✓ Hindsight · \$_COUNT memories · last consolidated \$_AGO"
-    else
-      echo "✓ Hindsight · \$_COUNT memories"
-    fi
-    return 0
-  }
-  MEMORY_STATUS=$(_bank_stats 2>/dev/null || echo "—")
-fi
-
-# Resolve the Restarted row from the gateway's clean-shutdown marker.
-#
-# WHY: every restart initiator (switchroom agent restart, watchdog,
-# /restart, /reconcile, update) stamps $TELEGRAM_STATE_DIR/clean-shutdown.json
-# with a human-readable reason BEFORE issuing systemctl restart. On the
-# next boot we read that file, render the reason as a row, and DELETE
-# the file so the next greeting doesn't show stale data.
-#
-# If there's no marker (cold start, or an admin-systemctl bounce with
-# no initiator), OMIT the row entirely — cold starts stay quiet rather
-# than showing "unknown".
-#
-# CAVEAT: the gateway's own boot path also reads this file to decide
-# banner suppression but no longer deletes it (see
-# telegram-plugin/gateway/clean-shutdown-marker.ts) — cleanup is owned
-# here because the gateway and agent boot in parallel and we want the
-# agent-side greeting to be the authoritative consumer.
-RESTARTED_ROW=""
-_clean_marker="$TELEGRAM_STATE_DIR/clean-shutdown.json"
-if [ -f "$_clean_marker" ]; then
-  _restart_reason=""
-  if command -v jq >/dev/null 2>&1; then
-    _restart_reason="$(jq -r '.reason // empty' "$_clean_marker" 2>/dev/null || true)"
-  else
-    # jq-less fallback: crude grep for "reason":"..." — good enough for
-    # a single-line JSON literal written by our own writers. If it fails
-    # we leave the row empty, which is the conservative choice.
-    _restart_reason="$(sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$_clean_marker" 2>/dev/null | head -1)"
-  fi
-  # HTML-escape minimally: the reason is operator-supplied but not
-  # user-untrusted. & < > cover Telegram HTML parse-mode safety.
-  if [ -n "$_restart_reason" ]; then
-    _restart_reason_esc="$(printf '%s' "$_restart_reason" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g')"
-    RESTARTED_ROW="<b>Restarted</b>  $_restart_reason_esc"
-  fi
-  # Consume the marker. Leaving it would make the NEXT greeting show the
-  # same stale reason. rm is best-effort — a readonly fs just means the
-  # next greeting repeats the row, which is annoying but not broken.
-  rm -f "$_clean_marker" 2>/dev/null || true
-fi
-
-TEXT=${shellSingleQuote(text)}
-TEXT="\${TEXT//__SWITCHROOM_MODEL__/$MODEL}"
-TEXT="\${TEXT//__SWITCHROOM_AUTH__/$AUTH_STATUS}"
-TEXT="\${TEXT//__SWITCHROOM_PLAN__/$PLAN_STATUS}"
-TEXT="\${TEXT//__SWITCHROOM_QUOTA__/$QUOTA_STATUS}"
-TEXT="\${TEXT//__SWITCHROOM_SESSION__/$SESSION_STATUS}"
-TEXT="\${TEXT//__SWITCHROOM_MEMORY__/$MEMORY_STATUS}"
-# Conditional row: when RESTARTED_ROW is empty we want the whole line
-# (including the newline that followed the placeholder) to disappear
-# so the rendered card doesn't have a blank gap.
-if [ -n "$RESTARTED_ROW" ]; then
-  TEXT="\${TEXT//__SWITCHROOM_RESTARTED_ROW__/$RESTARTED_ROW}"
-else
-  # Strip the placeholder line along with its trailing newline.
-  TEXT="$(printf '%s' "$TEXT" | awk '!/__SWITCHROOM_RESTARTED_ROW__/ { print }')"
-fi
-
-${curlCalls.join("\n\n")}
+_log "INVOKED (no-op: boot-card replaces session greeting) cwd=$PWD agent=\${SWITCHROOM_AGENT_NAME:-UNSET}"
+exit 0
 `;
 }
 
@@ -1758,13 +1050,31 @@ export function installHindsightPlugin(
   }
 
   // Copy the vendored plugin into the agent's .claude/plugins dir.
-  // Force overwrite on every reconcile so plugin updates from
-  // `switchroom update` propagate.
+  // Skip the copy when the installed plugin.json version matches the vendor
+  // version to avoid unnecessary I/O on every `switchroom update`.
   const destPath = join(agentDir, ".claude", "plugins", "hindsight-memory");
-  if (existsSync(destPath)) {
-    rmSync(destPath, { recursive: true, force: true });
+  const vendorManifestPath = join(sourcePath, ".claude-plugin", "plugin.json");
+  const installedManifestPath = join(destPath, ".claude-plugin", "plugin.json");
+
+  let vendorVersion: string | null = null;
+  let installedVersion: string | null = null;
+  try {
+    const m = JSON.parse(readFileSync(vendorManifestPath, "utf8")) as { version?: string };
+    vendorVersion = m.version ?? null;
+  } catch { /* unreadable or missing */ }
+  if (vendorVersion !== null && existsSync(installedManifestPath)) {
+    try {
+      const m = JSON.parse(readFileSync(installedManifestPath, "utf8")) as { version?: string };
+      installedVersion = m.version ?? null;
+    } catch { /* unreadable */ }
   }
-  copyDirRecursive(sourcePath, destPath);
+
+  if (vendorVersion === null || vendorVersion !== installedVersion || !existsSync(destPath)) {
+    if (existsSync(destPath)) {
+      rmSync(destPath, { recursive: true, force: true });
+    }
+    copyDirRecursive(sourcePath, destPath);
+  }
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
   // The plugin's hooks expect HINDSIGHT_API_URL (the REST base), not the
