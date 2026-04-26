@@ -129,6 +129,29 @@ class HindsightClient:
         }
         return self._request("POST", path, body, timeout=timeout)
 
+    def list_directives(
+        self,
+        bank_id: str,
+        active_only: bool = True,
+        timeout: int = 5,
+    ) -> dict:
+        """List directives for a bank.
+
+        Returns the raw API response dict with 'items' list. Each item has:
+        id, bank_id, name, content, priority, is_active, tags, created_at,
+        updated_at.
+
+        We intentionally do NOT pass tags or isolation_mode arguments — the
+        upstream `reflect` tool has a known bug (vectorize-io/hindsight#1269)
+        where tagged directives are dropped by isolation_mode filtering.
+        `list_directives` itself works correctly with no filters, so we keep
+        the call surface minimal.
+        """
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/directives"
+        if active_only:
+            path = f"{path}?active_only=true"
+        return self._request("GET", path, body=None, timeout=timeout)
+
     def set_bank_mission(
         self, bank_id: str, mission: str, retain_mission: Optional[str] = None, timeout: int = 15
     ) -> dict:

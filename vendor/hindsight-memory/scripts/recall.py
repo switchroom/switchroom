@@ -37,6 +37,7 @@ from lib.content import (
     truncate_recall_query,
 )
 from lib.daemon import get_api_url
+from lib.directives import fetch_active_directives, format_active_directives_block
 from lib.state import write_state
 
 LAST_RECALL_STATE = "last_recall.json"
@@ -105,7 +106,18 @@ def main():
 
     debug_log(config, f"Recalling from bank '{bank_id}', query length: {len(query)}")
 
+    # Fetch active directives FIRST (independent of recall — even if recall
+    # finds no memories, an agent with active directives still needs them
+    # surfaced every turn). fetch_active_directives is failure-safe and
+    # returns [] on any error.
+    directives = fetch_active_directives(client, bank_id)
+    directives_block = format_active_directives_block(directives) if directives else None
+    if directives_block:
+        debug_log(config, f"Injecting {len(directives)} active directives")
+
     # Call Hindsight recall API
+    memories_block = None
+    result_count = 0
     try:
         response = client.recall(
             bank_id=bank_id,
@@ -115,29 +127,41 @@ def main():
             types=config.get("recallTypes"),
             timeout=10,
         )
+        results = response.get("results", [])
+        result_count = len(results)
+        if results:
+            debug_log(config, f"Injecting {result_count} memories")
+            memories_formatted = format_memories(results)
+            preamble = config.get("recallPromptPreamble", "")
+            current_time = format_current_time()
+            memories_block = (
+                f"<hindsight_memories>\n"
+                f"{preamble}\n"
+                f"Current time - {current_time}\n\n"
+                f"{memories_formatted}\n"
+                f"</hindsight_memories>"
+            )
+        else:
+            debug_log(config, "No memories found")
     except Exception as e:
         print(f"[Hindsight] Recall failed: {e}", file=sys.stderr)
+        # Fall through — we still want to emit the directives block if we
+        # have one, so a recall API failure doesn't blind the agent to
+        # its own active directives.
+
+    # If neither block has content, there's nothing to inject — exit
+    # silently to avoid emitting an empty hookSpecificOutput.
+    if not directives_block and not memories_block:
         return
 
-    results = response.get("results", [])
-    if not results:
-        debug_log(config, "No memories found")
-        return
-
-    debug_log(config, f"Injecting {len(results)} memories")
-
-    # Format context message — exact match of Openclaw's format
-    memories_formatted = format_memories(results)
-    preamble = config.get("recallPromptPreamble", "")
-    current_time = format_current_time()
-
-    context_message = (
-        f"<hindsight_memories>\n"
-        f"{preamble}\n"
-        f"Current time - {current_time}\n\n"
-        f"{memories_formatted}\n"
-        f"</hindsight_memories>"
-    )
+    # Compose final context. Directives block goes ABOVE memories so the
+    # agent reads HARD RULES before low-signal recall traces.
+    parts = []
+    if directives_block:
+        parts.append(directives_block)
+    if memories_block:
+        parts.append(memories_block)
+    context_message = "\n\n".join(parts)
 
     # Save last recall to state for diagnostics
     write_state(
@@ -146,7 +170,8 @@ def main():
             "context": context_message,
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "bank_id": bank_id,
-            "result_count": len(results),
+            "result_count": result_count,
+            "directive_count": len(directives),
         },
     )
 
