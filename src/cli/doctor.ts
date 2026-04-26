@@ -18,6 +18,7 @@ import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { isPlaceholderOnlyFile } from "../agents/workspace.js";
 
 /**
  * Result of a single doctor check.
@@ -729,6 +730,33 @@ export function checkGatewayUnit(
   };
 }
 
+const WORKSPACE_TEMPLATE_FILES = ["SOUL.md", "USER.md", "TOOLS.md", "MEMORY.md", "IDENTITY.md"];
+
+function checkWorkspacePlaceholders(config: SwitchroomConfig): CheckResult[] {
+  const results: CheckResult[] = [];
+  const agentsDir = resolveAgentsDir(config);
+  for (const name of Object.keys(config.agents)) {
+    const workspaceDir = resolve(agentsDir, name, "workspace");
+    for (const filename of WORKSPACE_TEMPLATE_FILES) {
+      const filePath = join(workspaceDir, filename);
+      if (!existsSync(filePath)) continue;
+      let content: string;
+      try {
+        content = readFileSync(filePath, "utf-8");
+      } catch { continue; }
+      if (isPlaceholderOnlyFile(content)) {
+        results.push({
+          name: `${name}: workspace/${filename}`,
+          status: "warn",
+          detail: "contains unfilled template placeholders — loaded into context every turn",
+          fix: `Edit ${filePath} to replace placeholder text with real content`,
+        });
+      }
+    }
+  }
+  return results;
+}
+
 function checkAgents(config: SwitchroomConfig, configPath: string): CheckResult[] {
   const results: CheckResult[] = [];
   const agentsDir = resolveAgentsDir(config);
@@ -943,6 +971,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Memory (Hindsight)", results: checkHindsight(config) },
           { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
+          { title: "Workspace", results: checkWorkspacePlaceholders(config) },
         ];
 
         if (opts.json) {

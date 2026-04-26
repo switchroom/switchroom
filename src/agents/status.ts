@@ -716,10 +716,21 @@ export async function probeHindsight(
       return { reachable: true, bankExists: false, reason: "unparseable list_banks response" };
     }
     // Hindsight returns { result: { content: [{ text: "bank1\nbank2" }] } }
-    // or sometimes JSON objects — just check the flattened text.
-    const flat = JSON.stringify(parsed);
-    const bankExists = flat.includes(`"${bankId}"`)
-      || new RegExp(`\\b${escapeRegex(bankId)}\\b`).test(flat);
+    // Parse the structured response to check for an exact bank name match.
+    // Falling back to line-by-line text search avoids false positives where
+    // the bank ID is a substring of another field value.
+    let bankExists = false;
+    const result = (parsed as Record<string, unknown>)?.result;
+    const content = (result as Record<string, unknown>)?.content;
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        const text = (item as Record<string, unknown>)?.text;
+        if (typeof text === "string") {
+          bankExists = text.split("\n").map((l) => l.trim()).includes(bankId);
+          if (bankExists) break;
+        }
+      }
+    }
     return { reachable: true, bankExists };
   } catch (err) {
     if ((err as Error).name === "AbortError") {

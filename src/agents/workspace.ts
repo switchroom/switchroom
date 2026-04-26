@@ -179,6 +179,9 @@ async function loadNamedFile(
   if (content === undefined) {
     return { name, path: filePath, missing: true };
   }
+  if (isPlaceholderOnlyFile(content)) {
+    return { name, path: filePath, missing: true };
+  }
   return { name, path: filePath, content, missing: false };
 }
 
@@ -461,4 +464,45 @@ export function decorateTurnWithWarning(
     return turnPrompt;
   }
   return appendBootstrapPromptWarning(turnPrompt, warning.lines);
+}
+
+/**
+ * Return true when a workspace file consists almost entirely of unfilled
+ * template placeholder text. These files are skipped by the workspace loader
+ * so fresh agents don't burn context on boilerplate like `_set this_`.
+ *
+ * A file is considered placeholder-only when >80% of its meaningful lines
+ * (non-blank, non-heading, non-blockquote) match placeholder patterns.
+ * Files with fewer than 3 meaningful lines are never skipped.
+ *
+ * Exported for unit testing.
+ */
+export function isPlaceholderOnlyFile(content: string): boolean {
+  const lines = content.split("\n");
+  const meaningful = lines.filter((line) => {
+    const t = line.trim();
+    if (t.length === 0) return false;
+    if (t.startsWith("#")) return false;
+    if (t.startsWith(">")) return false;
+    return true;
+  });
+  if (meaningful.length < 3) return false;
+  const placeholderPhrases = [
+    /set this/i,
+    /edit this file/i,
+    /add as you go/i,
+    /describe the machine/i,
+    /fill this in/i,
+    /\[your /i,
+    /\(your /i,
+  ];
+  let placeholderCount = 0;
+  for (const line of meaningful) {
+    const t = line.trim();
+    const isShortItalic =
+      t.startsWith("_") && t.endsWith("_") && !t.slice(1, -1).includes("_") && t.length < 80;
+    if (isShortItalic) { placeholderCount++; continue; }
+    if (placeholderPhrases.some((re) => re.test(t))) placeholderCount++;
+  }
+  return meaningful.length > 0 && placeholderCount / meaningful.length > 0.8;
 }

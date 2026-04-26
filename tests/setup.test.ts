@@ -12,7 +12,7 @@ import {
   copyOnboardingState,
   copyExistingCredentials,
 } from "../src/setup/onboarding.js";
-import { stripOfficialTelegramPlugin } from "../src/agents/scaffold.js";
+import { stripOfficialTelegramPlugin, setupPlugins } from "../src/agents/scaffold.js";
 import {
   isPortFree,
   findFreePort,
@@ -502,6 +502,74 @@ describe("pickHindsightPorts", () => {
       expect(ports.apiPort).toBeGreaterThanOrEqual(18888);
     } finally {
       blocker.close();
+    }
+  });
+});
+
+// ─── setupPlugins ─────────────────────────────────────────────────────────────
+
+describe("setupPlugins", () => {
+  let tmpDir: string;
+  let agentDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-setup-plugins-"));
+    agentDir = join(tmpDir, "agent");
+    mkdirSync(join(agentDir, ".claude", "plugins"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("re-scrubs installed_plugins.json on reconcile when useSwitchroomPlugin is true", () => {
+    // Use an isolated HOME so we don't read the real ~/.claude/plugins
+    const fakeHome = join(tmpDir, "fake-home");
+    mkdirSync(join(fakeHome, ".claude", "plugins"), { recursive: true });
+
+    const agentPluginsDir = join(agentDir, ".claude", "plugins");
+    const installedPluginsPath = join(agentPluginsDir, "installed_plugins.json");
+    writeFileSync(installedPluginsPath, JSON.stringify({
+      plugins: {
+        "telegram@claude-plugins-official": { enabled: true },
+        "other@vendor": { enabled: true },
+      },
+    }));
+
+    const origHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      setupPlugins(agentDir, true);
+    } finally {
+      process.env.HOME = origHome;
+    }
+
+    const after = JSON.parse(readFileSync(installedPluginsPath, "utf-8"));
+    expect(after.plugins).not.toHaveProperty("telegram@claude-plugins-official");
+    expect(after.plugins).toHaveProperty("other@vendor");
+  });
+
+  it("does not scrub installed_plugins.json when useSwitchroomPlugin is false", () => {
+    // Use an isolated HOME with a global installed_plugins.json containing the official entry
+    const fakeHome = join(tmpDir, "fake-home");
+    const globalPluginsDir = join(fakeHome, ".claude", "plugins");
+    mkdirSync(globalPluginsDir, { recursive: true });
+    writeFileSync(join(globalPluginsDir, "installed_plugins.json"), JSON.stringify({
+      plugins: { "telegram@claude-plugins-official": { enabled: true } },
+    }));
+
+    const origHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      setupPlugins(agentDir, false);
+    } finally {
+      process.env.HOME = origHome;
+    }
+
+    const installedPath = join(agentDir, ".claude", "plugins", "installed_plugins.json");
+    if (existsSync(installedPath)) {
+      const after = JSON.parse(readFileSync(installedPath, "utf-8"));
+      expect(after.plugins).toHaveProperty("telegram@claude-plugins-official");
     }
   });
 });

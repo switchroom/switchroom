@@ -1292,6 +1292,48 @@ describe("installHindsightPlugin", () => {
     expect(result).not.toBeNull();
     expect(result!.apiBaseUrl).toBe("http://localhost:18888");
   });
+
+  it("skips copy when installed plugin.json version matches vendor", () => {
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      memory: { backend: "hindsight", shared_collection: "shared" },
+      agents: { agent: { extends: "default", topic_name: "x", schedule: [] } },
+    } as SwitchroomConfig;
+
+    const result1 = installHindsightPlugin("agent", agentDir, config);
+    expect(result1).not.toBeNull();
+
+    // Add a sentinel file — it must survive when version matches
+    const sentinelPath = join(result1!.pluginDir, "sentinel.txt");
+    writeFileSync(sentinelPath, "version-match-skip-test");
+
+    installHindsightPlugin("agent", agentDir, config);
+    expect(existsSync(sentinelPath)).toBe(true);
+  });
+
+  it("re-copies when installed plugin.json version differs from vendor", () => {
+    const config: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      memory: { backend: "hindsight", shared_collection: "shared" },
+      agents: { agent: { extends: "default", topic_name: "x", schedule: [] } },
+    } as SwitchroomConfig;
+
+    const result1 = installHindsightPlugin("agent", agentDir, config);
+    expect(result1).not.toBeNull();
+
+    // Overwrite the installed manifest with a stale version
+    const installedManifest = join(result1!.pluginDir, ".claude-plugin", "plugin.json");
+    const manifest = JSON.parse(readFileSync(installedManifest, "utf-8"));
+    writeFileSync(installedManifest, JSON.stringify({ ...manifest, version: "0.0.1" }));
+
+    const sentinelPath = join(result1!.pluginDir, "sentinel.txt");
+    writeFileSync(sentinelPath, "should-be-removed");
+
+    installHindsightPlugin("agent", agentDir, config);
+    expect(existsSync(sentinelPath)).toBe(false);
+  });
 });
 
 describe("scaffoldAgent with global defaults cascade", () => {
