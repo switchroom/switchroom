@@ -115,10 +115,20 @@ steps:
         # the assigned file list in place of {{testExamples}}.
         export BUILDKITE_TEST_ENGINE_TEST_CMD="bunx vitest run {{testExamples}}"
         # Match all test files that vitest.config.ts would include.
-        # Brace expansion ({a,b,c}) is not honored by bktec's glob library —
-        # it produces "no files found" silently. List each root dir explicitly.
-        export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="tests/**/*.test.ts,test/**/*.test.ts,experimental/**/*.test.ts,src/**/*.test.ts,telegram-plugin/tests/*.test.ts"
-        export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/history.test.ts"
+        #
+        # Root cause of issue #111: bktec v2.3.2 uses drjosh.dev/zzglob which
+        # does NOT treat commas as pattern separators at the top level — commas
+        # are only significant inside {a,b,c} alternation groups. A
+        # comma-separated list like "tests/**,src/**" is parsed as a single
+        # literal glob containing commas, which matches no real paths, so bktec
+        # exits with "no files found". Fix: use a single brace-alternation
+        # pattern instead.
+        #
+        # Exclude pattern mirrors vitest.config.ts excludes — these files use
+        # Bun-only APIs (bun:sqlite, bun:test timers, Bun.spawn) that vitest
+        # running under Node cannot resolve.
+        export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="{tests,test,experimental,src,telegram-plugin}/**/*.test.ts"
+        export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/{history,ipc-server-client,ipc-server-race,gateway-bridge,gateway-startup-mutex,gateway-clean-shutdown-marker,foreman-state,boot-card-dedupe,boot-card-reason,progress-update,quota-cache,silent-reply-guard,unhandled-rejection-policy}.test.ts"
         bktec run
       else
         echo "bktec token unavailable — falling back to plain vitest"
