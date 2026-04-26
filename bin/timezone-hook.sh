@@ -34,7 +34,16 @@ else
   TZ_UNSET=0
 fi
 
-NOW=$(TZ="$TZ_VAL" date '+%Y-%m-%d %H:%M %Z (UTC%:z)')
+# Round the emitted timestamp down to the nearest 15-minute bucket. This
+# matters for prompt caching: the timestamp lands in additionalContext on
+# every UserPromptSubmit, and Anthropic's cache is content-addressed, so
+# a fresh per-second value would invalidate the cache key on every turn.
+# 15 minutes is short enough that "current local time" stays useful and
+# long enough to coalesce ~15× more cache hits than per-minute. GNU date's
+# `-d "@<unix>"` is required (Linux-only, fine for switchroom production).
+NOW_UNIX=$(date +%s)
+ROUNDED=$(( NOW_UNIX - (NOW_UNIX % 900) ))
+NOW=$(TZ="$TZ_VAL" date -d "@$ROUNDED" '+%Y-%m-%d %H:%M %Z (UTC%:z)')
 
 if [ "$TZ_UNSET" = "1" ]; then
   MSG="Current local time: $NOW ($TZ_VAL — WARNING: SWITCHROOM_TIMEZONE unset; systemd unit may be stale, run \`switchroom systemd install\` to refresh)"

@@ -19,6 +19,8 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import { findLatestSessionJsonl } from "./handoff-summarizer.js";
+import { readTurnUsages, summarizeCache } from "./perf.js";
 
 export type CheckState = "ok" | "fail" | "warn";
 
@@ -61,6 +63,27 @@ export interface LastMessageStatus {
   detail: string;
 }
 
+/**
+ * Optional cache-hit telemetry derived from the agent's most recent
+ * session JSONL. Omitted entirely when the JSONL is missing or has no
+ * assistant lines — status must not regress just because telemetry is
+ * unavailable. See src/agents/perf.ts for the parser.
+ */
+export interface CacheTelemetry {
+  /** sum(cache_read) / (sum(cache_read) + sum(cache_creation)). 0..1 */
+  hitRate: number;
+  /** Average cache_creation_input_tokens per analyzed turn. */
+  avgCreate: number;
+  /** ephemeral_1h share of cache_creation total. 0..1 */
+  ttl1hShare: number;
+  /** Number of assistant turns whose usage was aggregated. */
+  turnsAnalyzed: number;
+  /** ISO 8601 of the first analyzed turn, or null. */
+  firstTurnIso: string | null;
+  /** ISO 8601 of the last analyzed turn, or null. */
+  lastTurnIso: string | null;
+}
+
 export interface AgentStatusReport {
   name: string;
   claude: ClaudeProcessStatus;
@@ -68,6 +91,13 @@ export interface AgentStatusReport {
   hindsight: HindsightStatus;
   polling: PollingStatus;
   messages: LastMessageStatus;
+  /**
+   * Cache-hit telemetry. Optional — present when the agent has a
+   * session JSONL with at least one analyzable assistant turn,
+   * absent otherwise. Status check exit-code is unaffected by this
+   * block.
+   */
+  cache?: CacheTelemetry;
   /** Roll-up: ok if every check is ok or warn; fail if any check is fail. */
   overallState: CheckState;
 }
@@ -97,6 +127,13 @@ export interface StatusInputs {
   getLastMessages: (historyDbPath: string) => LastMessagesResult;
   /** Read N lines of gateway.log (or equivalent) to extract polling state. */
   readGatewayLog: (logPath: string) => string | null;
+  /**
+   * Optional cache-telemetry provider. When omitted (or it returns
+   * null), the cache block is dropped from the report. Production wires
+   * this up in `defaultStatusInputs` to the JSONL parser; tests can
+   * stub or omit it.
+   */
+  getCacheTelemetry?: () => CacheTelemetry | null;
 }
 
 export interface HindsightProbeResult {
@@ -317,6 +354,20 @@ export async function buildAgentStatusReport(
   ];
   const overallState: CheckState = checks.includes("fail") ? "fail" : "ok";
 
+  // Cache telemetry is optional — only attached when the provider is
+  // wired and finds a parseable JSONL. Failures are silent (provider
+  // returns null) so status itself never regresses on a missing
+  // telemetry source.
+  let cache: CacheTelemetry | undefined;
+  if (inputs.getCacheTelemetry) {
+    try {
+      const t = inputs.getCacheTelemetry();
+      if (t) cache = t;
+    } catch {
+      // swallow — telemetry is best-effort.
+    }
+  }
+
   return {
     name: inputs.agentName,
     claude,
@@ -324,6 +375,7 @@ export async function buildAgentStatusReport(
     hindsight,
     polling,
     messages,
+    ...(cache ? { cache } : {}),
     overallState,
   };
 }
@@ -437,7 +489,22 @@ export function formatStatusText(report: AgentStatusReport): string {
   lines.push(`hindsight: ${report.hindsight.state} ${report.hindsight.detail}`);
   lines.push(`polling: ${report.polling.state} ${report.polling.detail}`);
   lines.push(`messages: ${report.messages.state} ${report.messages.detail}`);
+  // Cache telemetry — only when the JSONL existed and yielded turns.
+  // Three short lines: hit rate, average bytes written per turn, and
+  // the analyzed window. Keeps the status output greppable.
+  if (report.cache) {
+    lines.push(`cache_hit: ${report.cache.hitRate.toFixed(3)} (n=${report.cache.turnsAnalyzed})`);
+    lines.push(`cache_create_avg: ${Math.round(report.cache.avgCreate)}`);
+    const w = formatWindowFromIso(report.cache.firstTurnIso, report.cache.lastTurnIso);
+    lines.push(`cache_window: ${w}`);
+  }
   return lines.join("\n");
+}
+
+function formatWindowFromIso(first: string | null, last: string | null): string {
+  const f = first ?? "—";
+  const l = last ?? "—";
+  return `${f} .. ${l}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +832,47 @@ export function defaultStatusInputs(params: {
     probeHindsight: (url, id) => probeHindsight(url, id),
     readGatewayLog: (path) => readLogFile(path),
     getLastMessages: (path) => readLastMessages(path),
+    getCacheTelemetry: () => readCacheTelemetry(params.agentDir),
   };
+}
+
+/**
+ * Production cache-telemetry provider. Locates the agent's most recent
+ * session JSONL, reads the last 20 assistant turns' usage blocks, and
+ * returns the rolled-up CacheTelemetry. Returns null when no JSONL is
+ * found, parsing yields no turns, or any I/O step throws — the caller
+ * treats null as "no telemetry available, omit the block."
+ *
+ * Defaulting to the last 20 turns matches `switchroom agent perf`'s
+ * default. 20 turns is a couple of hours of activity for a busy agent
+ * — recent enough to reflect the current cache regime, long enough to
+ * smooth out single-turn noise.
+ */
+export function readCacheTelemetry(agentDir: string): CacheTelemetry | null {
+  try {
+    const claudeConfigDir = join(agentDir, ".claude");
+    const jsonl = findLatestSessionJsonl(claudeConfigDir);
+    if (!jsonl) return null;
+    const turns = readTurnUsages(jsonl, 20);
+    if (turns.length === 0) return null;
+    const stats = summarizeCache(turns);
+    return {
+      hitRate: stats.hitRate,
+      avgCreate: stats.avgCreatePerTurn,
+      ttl1hShare: stats.ttl1hShare,
+      turnsAnalyzed: stats.turnsAnalyzed,
+      firstTurnIso:
+        stats.firstTurnTs !== null
+          ? new Date(stats.firstTurnTs).toISOString().replace(/\.\d+Z$/, "Z")
+          : null,
+      lastTurnIso:
+        stats.lastTurnTs !== null
+          ? new Date(stats.lastTurnTs).toISOString().replace(/\.\d+Z$/, "Z")
+          : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // Keep `resolve` used — sanity import guard so we don't break bundling if

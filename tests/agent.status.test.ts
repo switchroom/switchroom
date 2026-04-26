@@ -383,6 +383,48 @@ describe("formatStatusText", () => {
     expect(text).toContain("overall: fail");
     expect(text).toContain("claude: fail");
   });
+
+  // Cache telemetry block is optional — must be absent when the
+  // provider returns null (e.g. no JSONL exists yet) and present when
+  // it returns a real CacheTelemetry. This guards against status
+  // regressing on freshly-installed agents.
+  it("omits the cache_* lines when getCacheTelemetry is unset", async () => {
+    const report = await buildAgentStatusReport(makeInputs());
+    expect(report.cache).toBeUndefined();
+    const text = formatStatusText(report);
+    expect(text).not.toMatch(/^cache_hit:/m);
+    expect(text).not.toMatch(/^cache_create_avg:/m);
+    expect(text).not.toMatch(/^cache_window:/m);
+  });
+
+  it("omits the cache_* lines when getCacheTelemetry returns null", async () => {
+    const report = await buildAgentStatusReport(
+      makeInputs({ getCacheTelemetry: () => null }),
+    );
+    expect(report.cache).toBeUndefined();
+    const text = formatStatusText(report);
+    expect(text).not.toMatch(/^cache_hit:/m);
+  });
+
+  it("includes cache_* lines when getCacheTelemetry returns telemetry", async () => {
+    const report = await buildAgentStatusReport(
+      makeInputs({
+        getCacheTelemetry: () => ({
+          hitRate: 0.974,
+          avgCreate: 1842.3,
+          ttl1hShare: 0.91,
+          turnsAnalyzed: 20,
+          firstTurnIso: "2026-04-26T08:12:00Z",
+          lastTurnIso: "2026-04-26T11:34:00Z",
+        }),
+      }),
+    );
+    expect(report.cache?.turnsAnalyzed).toBe(20);
+    const text = formatStatusText(report);
+    expect(text).toMatch(/^cache_hit: 0\.974 \(n=20\)$/m);
+    expect(text).toMatch(/^cache_create_avg: 1842$/m);
+    expect(text).toMatch(/^cache_window: 2026-04-26T08:12:00Z \.\. 2026-04-26T11:34:00Z$/m);
+  });
 });
 
 describe("readinessGaps", () => {

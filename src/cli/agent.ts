@@ -45,6 +45,7 @@ import {
   type StatusInputs,
 } from "../agents/status.js";
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
+import { registerAgentPerfCommand } from "./perf.js";
 
 /**
  * Pre-restart preflight check. Verifies the agent's runtime
@@ -525,6 +526,11 @@ export function registerAgentCommand(program: Command): void {
   const agent = program
     .command("agent")
     .description("Manage individual agents");
+
+  // switchroom agent perf <name> — cache-hit telemetry surfaced from the
+  // agent's session JSONL. Registered first so the command appears near
+  // the top of `--help`. See src/cli/perf.ts for the implementation.
+  registerAgentPerfCommand(agent);
 
   // switchroom agent list
   agent

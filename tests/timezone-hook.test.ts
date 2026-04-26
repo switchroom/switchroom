@@ -64,4 +64,27 @@ describe("timezone-hook.sh", () => {
     expect(() => runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" })).not.toThrow();
     expect(() => runHook({ SWITCHROOM_TIMEZONE: undefined })).not.toThrow();
   });
+
+  // The hook must round to a 15-minute bucket so the additionalContext
+  // is byte-stable across closely-spaced turns. Without this, every
+  // UserPromptSubmit invalidates the prompt cache via the embedded
+  // wall-clock minute. We can't easily fake $(date) inside the hook,
+  // but two back-to-back invocations should always land in the same
+  // bucket (the 15-min window is far longer than the test runtime).
+  it("emits byte-identical stdout for back-to-back invocations (15-min bucket)", () => {
+    const a = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
+    const b = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
+    expect(b.stdout).toBe(a.stdout);
+  });
+
+  it("the embedded HH:MM minute is a multiple of 15", () => {
+    const { json } = runHook({ SWITCHROOM_TIMEZONE: "UTC" });
+    const ctx = (json as { hookSpecificOutput: { additionalContext: string } })
+      .hookSpecificOutput.additionalContext;
+    // Match "YYYY-MM-DD HH:MM " — the literal minute token after the colon.
+    const m = ctx.match(/\d{4}-\d{2}-\d{2} \d{2}:(\d{2}) /);
+    expect(m).not.toBeNull();
+    const mins = parseInt(m![1], 10);
+    expect(mins % 15).toBe(0);
+  });
 });
