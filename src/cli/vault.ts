@@ -13,6 +13,13 @@ import {
   VaultError,
 } from "../vault/vault.js";
 import { registerVaultSweep } from "./vault-sweep.js";
+import {
+  getViaBroker,
+  statusViaBroker,
+  unlockViaBroker,
+  resolveBrokerSocketPath,
+} from "../vault/broker/client.js";
+import { registerVaultBrokerCommand } from "./vault-broker.js";
 
 function getVaultPath(configPath?: string): string {
   try {
@@ -196,10 +203,105 @@ export function registerVaultCommand(program: Command): void {
 
   vault
     .command("get <key>")
-    .description("Get a secret from the vault")
-    .action(async (key: string) => {
+    .description("Get a secret from the vault (tries broker first)")
+    .option("--no-broker", "Bypass the broker and read directly from the vault file")
+    .action(async (key: string, opts: { broker?: boolean }) => {
+      const useBroker = opts.broker !== false;
+      const parentOpts = program.opts();
+
+      // ── Broker routing ──────────────────────────────────────────────────
+      if (useBroker) {
+        let brokerSocket: string | undefined;
+        try {
+          const config = loadConfig(parentOpts.config);
+          brokerSocket = resolvePath(config.vault?.broker?.socket ?? "~/.switchroom/vault-broker.sock");
+        } catch {
+          brokerSocket = resolvePath("~/.switchroom/vault-broker.sock");
+        }
+
+        const brokerOpts = { socket: brokerSocket };
+        const status = await statusViaBroker(brokerOpts);
+
+        if (status !== null) {
+          // Broker is reachable
+          if (!status.unlocked) {
+            // Broker locked
+            if (process.stdin.isTTY) {
+              // Prompt locally and offer to push to broker
+              try {
+                const passphrase = await getPassphrase();
+                const vaultPath = getVaultPath(parentOpts.config);
+                const entry = getSecret(passphrase, vaultPath, key);
+                if (entry === null) {
+                  console.error(chalk.yellow(`Secret '${key}' not found`));
+                  process.exit(1);
+                }
+                if (entry.kind === "string" || entry.kind === "binary") {
+                  console.log(entry.value);
+                } else {
+                  console.error(chalk.yellow(`Secret '${key}' is kind="${entry.kind}"`));
+                  process.exit(1);
+                }
+                // Offer to unlock broker
+                const push = await promptLine("\nPush passphrase to broker for future requests? [Y/n]: ");
+                if (!push.trim() || push.trim().toLowerCase() === "y") {
+                  const result = await unlockViaBroker(passphrase, brokerOpts);
+                  if (result.ok) {
+                    console.log(chalk.green("broker unlocked"));
+                  } else {
+                    console.error(chalk.yellow(`Could not unlock broker: ${result.msg}`));
+                  }
+                }
+                return;
+              } catch (err) {
+                if (err instanceof VaultError || err instanceof Error) {
+                  console.error(chalk.red(`Error: ${err.message}`));
+                  process.exit(1);
+                }
+                throw err;
+              }
+            } else {
+              console.error("broker locked and stdin is not a TTY");
+              process.exit(3);
+            }
+          }
+
+          // Broker is unlocked — request the key
+          const entry = await getViaBroker(key, brokerOpts);
+          if (entry === null) {
+            // Null from broker = DENIED or UNKNOWN_KEY
+            // Re-check with a status+error response by trying again and looking at response
+            if (process.stdin.isTTY) {
+              console.error(
+                chalk.yellow(
+                  `Key '${key}' not in ACL or not found. Use --no-broker to read directly.`,
+                ),
+              );
+              process.exit(2);
+            } else {
+              console.error(`key '${key}' not in ACL`);
+              process.exit(2);
+            }
+          }
+          if (entry.kind === "string" || entry.kind === "binary") {
+            console.log(entry.value);
+          } else {
+            console.error(chalk.yellow(`Secret '${key}' is kind="${entry.kind}"`));
+            process.exit(1);
+          }
+          return;
+        }
+
+        // Broker not reachable
+        if (!process.stdin.isTTY && !process.env.SWITCHROOM_VAULT_PASSPHRASE) {
+          console.error("broker not running and stdin is not a TTY");
+          process.exit(1);
+        }
+        // Fall through to direct vault access with passphrase prompt (or env var)
+      }
+
+      // ── Direct vault access (--no-broker or broker unreachable + TTY) ──
       try {
-        const parentOpts = program.opts();
         const vaultPath = getVaultPath(parentOpts.config);
         const passphrase = await getPassphrase();
 
@@ -277,4 +379,7 @@ export function registerVaultCommand(program: Command): void {
   // `vault sweep` — retroactively scrub stored vault values from Telegram
   // SQLite history + Claude Code session transcripts. See vault-sweep.ts.
   registerVaultSweep(vault, program);
+
+  // `vault broker` — manage the vault-broker daemon.
+  registerVaultBrokerCommand(vault, program);
 }

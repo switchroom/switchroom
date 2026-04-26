@@ -14,6 +14,11 @@ import { constants as fsConstants } from "node:fs";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { openVault, type VaultEntry } from "./vault.js";
 import { resolvePath } from "../config/loader.js";
+import {
+  getViaBroker,
+  resolveBrokerSocketPath,
+  type BrokerClientOpts,
+} from "./broker/client.js";
 
 export function isVaultReference(value: string): boolean {
   return value.startsWith("vault:");
@@ -239,4 +244,89 @@ export function resolveVaultReferences(
   const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
   const secrets = openVault(passphrase, vaultPath);
   return resolveValue(config, secrets) as SwitchroomConfig;
+}
+
+/**
+ * Resolve vault references in a config using the broker daemon.
+ *
+ * For each `vault:<key>` reference found in the config, fetches the value
+ * from the running broker rather than decrypting the vault file directly.
+ * Falls back to passphrase-based `resolveVaultReferences` when the broker
+ * is unreachable (ENOENT / ECONNREFUSED / timeout) and `passphrase` is
+ * provided.
+ *
+ * @param config    The parsed SwitchroomConfig.
+ * @param passphrase Optional fallback passphrase for direct vault access.
+ * @param brokerOpts  Optional broker client options (socket path, timeout).
+ */
+export async function resolveVaultReferencesViaBroker(
+  config: SwitchroomConfig,
+  passphrase?: string,
+  brokerOpts?: BrokerClientOpts,
+): Promise<SwitchroomConfig> {
+  const socketPath = resolveBrokerSocketPath({
+    ...brokerOpts,
+    vaultBrokerSocket: config.vault?.broker?.socket
+      ? resolvePath(config.vault.broker.socket)
+      : undefined,
+  });
+  const opts: BrokerClientOpts = { ...brokerOpts, socket: socketPath };
+
+  // Collect all vault keys referenced in the config
+  const refs = collectVaultRefs(config as unknown as Record<string, unknown>);
+
+  if (refs.size === 0) {
+    // No vault references — return config unchanged
+    return config;
+  }
+
+  // Try broker first
+  const brokerSecrets: Record<string, VaultEntry> = {};
+  let brokerReachable = false;
+
+  for (const key of refs) {
+    const entry = await getViaBroker(key, opts);
+    if (entry !== null) {
+      brokerSecrets[key] = entry;
+      brokerReachable = true;
+    } else if (!brokerReachable) {
+      // First key attempt failed — broker unreachable
+      break;
+    }
+  }
+
+  if (brokerReachable && Object.keys(brokerSecrets).length === refs.size) {
+    // All refs resolved via broker
+    return resolveValue(config, brokerSecrets) as SwitchroomConfig;
+  }
+
+  // Broker unreachable or partial — fall back to direct decrypt
+  if (passphrase) {
+    return resolveVaultReferences(config, passphrase);
+  }
+
+  // No fallback available — return config unchanged (caller handles missing refs)
+  return config;
+}
+
+/**
+ * Collect all vault key names referenced in an arbitrary value tree.
+ * Returns a Set of key names (without the "vault:" prefix or "#filename" suffix).
+ */
+function collectVaultRefs(value: unknown): Set<string> {
+  const keys = new Set<string>();
+
+  function walk(v: unknown): void {
+    if (typeof v === "string" && isVaultReference(v)) {
+      const ref = parseVaultReferenceDetailed(v);
+      keys.add(ref.key);
+    } else if (Array.isArray(v)) {
+      for (const item of v) walk(item);
+    } else if (v !== null && typeof v === "object") {
+      for (const val of Object.values(v as Record<string, unknown>)) walk(val);
+    }
+  }
+
+  walk(value);
+  return keys;
 }

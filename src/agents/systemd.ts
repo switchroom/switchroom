@@ -317,9 +317,34 @@ export function installForemanUnit(): void {
   ensureLinger();
 }
 
+/**
+ * Returns true if any agent in the config has at least one schedule entry
+ * with a non-empty secrets array, OR if vault.broker.enabled is explicitly
+ * true. Used to decide whether the broker unit should be installed.
+ */
+export function shouldInstallBrokerUnit(config: SwitchroomConfig): boolean {
+  if (config.vault?.broker?.enabled === true) return true;
+  for (const agent of Object.values(config.agents)) {
+    const schedule = agent.schedule ?? [];
+    if (schedule.some((e) => (e.secrets?.length ?? 0) > 0)) return true;
+  }
+  return false;
+}
+
 export function installAllUnits(config: SwitchroomConfig): void {
   const agentsDir = resolveAgentsDir(config);
   const installedAgents: string[] = [];
+
+  // Install the vault-broker unit when any agent uses secrets or
+  // vault.broker.enabled is set.
+  if (shouldInstallBrokerUnit(config)) {
+    const homeDir = process.env.HOME ?? "/root";
+    const bunBinDir = resolve(homeDir, ".bun", "bin");
+    const brokerContent = generateBrokerUnit({ homeDir, bunBinDir });
+    const brokerUnitName = "switchroom-vault-broker";
+    installUnit(brokerUnitName, brokerContent);
+    installedAgents.push(brokerUnitName);
+  }
 
   // Every telegram-using agent gets its OWN gateway unit. The gateway
   // process needs its own state dir (for the per-agent bot token in
@@ -480,6 +505,10 @@ WantedBy=timers.target
 
 /**
  * Generate a systemd .service unit for a scheduled task (oneshot).
+ *
+ * Declares a soft dependency on the vault-broker so the broker has a
+ * chance to start before the cron fires. Wants+After rather than Requires
+ * so a locked (or absent) broker does not hard-fail the timer.
  */
 export function generateTimerServiceUnit(
   agentName: string,
@@ -489,11 +518,58 @@ export function generateTimerServiceUnit(
   const scriptPath = join(agentDir, "telegram", `cron-${index}.sh`);
   return `[Unit]
 Description=switchroom scheduled task: ${agentName} #${index}
+After=switchroom-vault-broker.service
+Wants=switchroom-vault-broker.service
 
 [Service]
 Type=oneshot
 ExecStart=/bin/bash ${scriptPath}
 WorkingDirectory=${agentDir}
+`;
+}
+
+// ─── Vault broker unit ─────────────────────────────────────────────────────
+
+export interface BrokerUnitOpts {
+  homeDir: string;
+  bunBinDir: string;
+}
+
+/**
+ * Generate the systemd user unit for the vault-broker daemon.
+ *
+ * Type=notify: the broker calls sd_notify("READY=1\n") via NOTIFY_SOCKET
+ * once both sockets are listening, so systemd knows the unit is actually up
+ * before starting dependents.
+ *
+ * No EnvironmentFile: the vault passphrase never touches disk — it is pushed
+ * to the unlock socket interactively after the daemon starts.
+ */
+export function generateBrokerUnit(opts: BrokerUnitOpts): string {
+  const { homeDir, bunBinDir } = opts;
+  const switchroomCli = resolve(bunBinDir, "switchroom");
+  const nodeBinDir = dirname(process.execPath);
+  const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
+
+  return `[Unit]
+Description=switchroom vault broker daemon
+Documentation=https://github.com/switchroom/switchroom
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=${switchroomCli} vault broker start --foreground
+Restart=on-failure
+RestartSec=2
+# NOTIFY_SOCKET is set automatically by systemd for Type=notify.
+# The broker writes READY=1 after both sockets are listening.
+# No EnvironmentFile — the vault passphrase never touches disk.
+# Push the passphrase via: switchroom vault broker unlock
+Environment=PATH=${unitPath}
+Environment=HOME=${homeDir}
+
+[Install]
+WantedBy=default.target
 `;
 }
 

@@ -1,0 +1,492 @@
+/**
+ * vault-broker server — Unix socket daemon that holds the decrypted vault
+ * in memory and serves secrets to authorized cron scripts.
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ SECURITY DESIGN                                                         │
+ * │                                                                         │
+ * │ Data socket   ~/.switchroom/vault-broker.sock     mode 0600             │
+ * │   Serves get / list / status / lock requests.                           │
+ * │   Caller is identified via peercred (Linux: ss + /proc).               │
+ * │   Each get request goes through ACL before returning any secret.        │
+ * │                                                                         │
+ * │ Unlock socket ~/.switchroom/vault-broker.unlock.sock  mode 0600         │
+ * │   Accepts ONE plaintext line per connection: the vault passphrase.      │
+ * │   This is NOT JSON-framed and NOT part of the data protocol.            │
+ * │   Only the same UID may connect (enforced by socket file mode 0600 and  │
+ * │   confirmed by peercred when available).                                │
+ * │   Responds with "OK\n" on success, "ERR <message>\n" on failure.        │
+ * │   The passphrase NEVER crosses the data socket.                         │
+ * │                                                                         │
+ * │ sd_notify     NOTIFY_SOCKET env var (abstract unix socket)              │
+ * │   When set, sends "READY=1\n" after both sockets are listening.         │
+ * │   No external dependency — implemented inline.                          │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ */
+
+import * as net from "node:net";
+import { mkdirSync, chmodSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve, join } from "node:path";
+import type { SwitchroomConfig } from "../../config/schema.js";
+import { openVault, type VaultEntry } from "../vault.js";
+import { resolvePath } from "../../config/loader.js";
+import { identify } from "./peercred.js";
+import { checkAcl } from "./acl.js";
+import {
+  decodeRequest,
+  encodeResponse,
+  errorResponse,
+  entryResponse,
+  MAX_FRAME_BYTES,
+  type BrokerStatus,
+} from "./protocol.js";
+
+const PID_FILE_DEFAULT = "~/.switchroom/vault-broker.pid";
+
+/** Options accepted by the test-only constructor path. */
+export interface BrokerTestOpts {
+  /**
+   * If provided, the broker starts with these pre-loaded secrets instead of
+   * reading from a vault file. Bypasses the passphrase/KDF entirely.
+   * DO NOT use outside tests.
+   */
+  _testSecrets?: Record<string, VaultEntry>;
+  /**
+   * If provided, use this config instead of loading from configPath.
+   */
+  _testConfig?: SwitchroomConfig;
+}
+
+export class VaultBroker {
+  private secrets: Record<string, VaultEntry> | null = null;
+  private config: SwitchroomConfig | null = null;
+  private startedAt: number = Date.now();
+  private server: net.Server | null = null;
+  private unlockServer: net.Server | null = null;
+  private socketPath: string = "";
+  private unlockSocketPath: string = "";
+  private vaultPath: string = "";
+
+  constructor(private readonly testOpts: BrokerTestOpts = {}) {}
+
+  /**
+   * Start the broker — bind both sockets, write PID file, notify systemd.
+   *
+   * @param socketPath   Path for the data socket. Created mode 0600.
+   * @param configPath   Path to switchroom.yaml (or undefined to auto-detect).
+   * @param vaultPath    Path to the encrypted vault file.
+   */
+  async start(
+    socketPath: string,
+    configPath: string | undefined,
+    vaultPath?: string,
+  ): Promise<void> {
+    this.socketPath = resolve(socketPath);
+    this.unlockSocketPath = this.socketPath.replace(/\.sock$/, ".unlock.sock");
+    this.startedAt = Date.now();
+
+    // Load config
+    if (this.testOpts._testConfig) {
+      this.config = this.testOpts._testConfig;
+    } else {
+      const { loadConfig } = await import("../../config/loader.js");
+      this.config = loadConfig(configPath);
+    }
+
+    // Resolve vault path from config or override
+    if (vaultPath) {
+      this.vaultPath = resolve(vaultPath);
+    } else {
+      this.vaultPath = resolvePath(this.config.vault?.path ?? "~/.switchroom/vault.enc");
+    }
+
+    // Pre-load secrets if test opts provided
+    if (this.testOpts._testSecrets !== undefined) {
+      this.secrets = { ...this.testOpts._testSecrets };
+    }
+
+    // Ensure parent directory exists and is mode 0700
+    const parentDir = dirname(this.socketPath);
+    mkdirSync(parentDir, { recursive: true });
+    try {
+      chmodSync(parentDir, 0o700);
+    } catch {
+      // May fail if directory already has correct perms from another process
+    }
+
+    // Remove stale sockets
+    for (const p of [this.socketPath, this.unlockSocketPath]) {
+      if (existsSync(p)) {
+        try { unlinkSync(p); } catch { /* ignore */ }
+      }
+    }
+
+    // Bind data socket
+    await this._bindDataSocket();
+
+    // Bind unlock socket
+    await this._bindUnlockSocket();
+
+    // Write PID file
+    this._writePidFile();
+
+    // Notify systemd if NOTIFY_SOCKET is set
+    this._sdNotify("READY=1\n");
+
+    if (process.platform !== "linux") {
+      process.stderr.write(
+        `[vault-broker] WARNING: running on ${process.platform} — peercred ACL is disabled. ` +
+        `Access control relies solely on socket file mode 0600.\n`,
+      );
+    }
+  }
+
+  /**
+   * Unlock the vault using the given passphrase.
+   * Throws VaultError on bad passphrase or unreadable vault.
+   */
+  unlockFromPassphrase(passphrase: string): void {
+    const secrets = openVault(passphrase, this.vaultPath);
+    this.secrets = secrets;
+    // Overwrite the passphrase string in place (best-effort; JS strings are
+    // immutable but we ensure the reference is dropped immediately).
+    // The caller should also zero their copy.
+  }
+
+  /**
+   * Lock the broker — wipe in-memory secrets and null the reference.
+   */
+  lock(): void {
+    if (this.secrets !== null) {
+      // Best-effort overwrite of string values before GC
+      for (const [, entry] of Object.entries(this.secrets)) {
+        try {
+          if (entry.kind === "string" || entry.kind === "binary") {
+            // Strings are immutable in JS — we can't zero the underlying bytes.
+            // We drop the reference and rely on GC. This is a known limitation
+            // documented in the security design notes.
+            (entry as { value: string }).value = "";
+          }
+        } catch { /* best-effort */ }
+      }
+      this.secrets = null;
+    }
+  }
+
+  /**
+   * Stop the broker — lock, close both sockets, exit.
+   */
+  stop(): void {
+    this.lock();
+    if (this.server) {
+      this.server.close();
+      this.server = null;
+    }
+    if (this.unlockServer) {
+      this.unlockServer.close();
+      this.unlockServer = null;
+    }
+    // Clean up socket files
+    for (const p of [this.socketPath, this.unlockSocketPath]) {
+      if (p && existsSync(p)) {
+        try { unlinkSync(p); } catch { /* ignore */ }
+      }
+    }
+    // Remove PID file
+    try {
+      const pidPath = resolvePath(PID_FILE_DEFAULT);
+      if (existsSync(pidPath)) unlinkSync(pidPath);
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * Get the current status (for testing / status RPC).
+   */
+  getStatus(): BrokerStatus {
+    return {
+      unlocked: this.secrets !== null,
+      keyCount: this.secrets !== null ? Object.keys(this.secrets).length : 0,
+      uptimeSec: (Date.now() - this.startedAt) / 1000,
+    };
+  }
+
+  /**
+   * Test-only: return direct reference to the internal secrets map.
+   * Used by server tests to verify lock() zeroes state.
+   */
+  _getSecretsRef(): Record<string, VaultEntry> | null {
+    return this.secrets;
+  }
+
+  // ─── Private helpers ──────────────────────────────────────────────────────
+
+  private _bindDataSocket(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        this._handleDataConnection(socket);
+      });
+
+      server.on("error", (err) => {
+        reject(err);
+      });
+
+      server.listen(this.socketPath, () => {
+        try {
+          chmodSync(this.socketPath, 0o600);
+        } catch { /* ignore */ }
+        this.server = server;
+        resolve();
+      });
+    });
+  }
+
+  private _bindUnlockSocket(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        this._handleUnlockConnection(socket);
+      });
+
+      server.on("error", (err) => {
+        reject(err);
+      });
+
+      server.listen(this.unlockSocketPath, () => {
+        try {
+          chmodSync(this.unlockSocketPath, 0o600);
+        } catch { /* ignore */ }
+        this.unlockServer = server;
+        resolve();
+      });
+    });
+  }
+
+  private _handleDataConnection(socket: net.Socket): void {
+    // Identify peer immediately on accept (Linux only)
+    let peer: import("./peercred.js").PeerInfo | null = null;
+    if (process.platform === "linux") {
+      peer = identify(this.socketPath);
+    }
+
+    let buffer = "";
+
+    socket.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+
+      // Guard against oversized buffers (>64 KiB without a newline)
+      if (Buffer.byteLength(buffer, "utf8") > MAX_FRAME_BYTES) {
+        const resp = encodeResponse(
+          errorResponse("BAD_REQUEST", "Frame exceeds 64 KiB limit"),
+        );
+        socket.write(resp);
+        socket.destroy();
+        return;
+      }
+
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIdx).trimEnd();
+        buffer = buffer.slice(newlineIdx + 1);
+
+        if (!line) continue;
+
+        this._handleRequest(socket, peer, line);
+      }
+    });
+
+    socket.on("error", () => {
+      socket.destroy();
+    });
+  }
+
+  private _handleRequest(
+    socket: net.Socket,
+    peer: import("./peercred.js").PeerInfo | null,
+    line: string,
+  ): void {
+    let req: ReturnType<typeof import("./protocol.js").decodeRequest>;
+    try {
+      req = decodeRequest(line);
+    } catch (err) {
+      const resp = encodeResponse(
+        errorResponse(
+          "BAD_REQUEST",
+          err instanceof Error ? err.message : "Malformed request",
+        ),
+      );
+      socket.write(resp);
+      return;
+    }
+
+    // Handle each op
+    if (req.op === "status") {
+      const status = this.getStatus();
+      socket.write(
+        encodeResponse({ ok: true, status }),
+      );
+      return;
+    }
+
+    if (req.op === "lock") {
+      this.lock();
+      socket.write(encodeResponse({ ok: true, locked: true }));
+      return;
+    }
+
+    if (req.op === "list") {
+      if (this.secrets === null) {
+        socket.write(encodeResponse(errorResponse("LOCKED", "Vault is locked")));
+        return;
+      }
+      socket.write(encodeResponse({ ok: true, keys: Object.keys(this.secrets) }));
+      return;
+    }
+
+    if (req.op === "get") {
+      if (this.secrets === null) {
+        socket.write(encodeResponse(errorResponse("LOCKED", "Vault is locked")));
+        return;
+      }
+
+      // ACL check
+      if (peer !== null && this.config !== null) {
+        const aclResult = checkAcl(peer, this.config, req.key);
+        if (!aclResult.allow) {
+          socket.write(
+            encodeResponse(
+              errorResponse("DENIED", aclResult.reason),
+            ),
+          );
+          return;
+        }
+      } else if (process.platform === "linux" && peer === null) {
+        // On Linux, peercred unavailable → fail-closed
+        socket.write(
+          encodeResponse(
+            errorResponse(
+              "DENIED",
+              "Unable to identify caller (peercred unavailable); denying on Linux",
+            ),
+          ),
+        );
+        return;
+      }
+      // On non-Linux: ACL is skipped (socket file mode 0600 is the guard)
+
+      const entry = this.secrets[req.key];
+      if (entry === undefined) {
+        socket.write(
+          encodeResponse(errorResponse("UNKNOWN_KEY", `Key not found: ${req.key}`)),
+        );
+        return;
+      }
+
+      socket.write(encodeResponse(entryResponse(entry)));
+      return;
+    }
+
+    // Exhaustive check — should not reach here
+    socket.write(
+      encodeResponse(
+        errorResponse("BAD_REQUEST", `Unknown op: ${(req as { op: string }).op}`),
+      ),
+    );
+  }
+
+  private _handleUnlockConnection(socket: net.Socket): void {
+    // Same UID check for unlock socket. On Linux: verify via peercred.
+    // On other OSes: rely on socket file mode 0600.
+    if (process.platform === "linux") {
+      const peer = identify(this.unlockSocketPath);
+      if (peer === null) {
+        socket.write("ERR unable to verify caller identity\n");
+        socket.destroy();
+        return;
+      }
+    }
+
+    let buffer = "";
+    socket.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const newlineIdx = buffer.indexOf("\n");
+      if (newlineIdx === -1) {
+        // Guard against massive input
+        if (Buffer.byteLength(buffer, "utf8") > 4096) {
+          socket.write("ERR passphrase too long\n");
+          socket.destroy();
+          buffer = "";
+        }
+        return;
+      }
+
+      // Take exactly the first line as the passphrase
+      const passphrase = buffer.slice(0, newlineIdx).trimEnd();
+      // Immediately drop the rest (don't process further input)
+      buffer = "";
+
+      if (!passphrase) {
+        socket.write("ERR passphrase cannot be empty\n");
+        socket.destroy();
+        return;
+      }
+
+      try {
+        this.unlockFromPassphrase(passphrase);
+        socket.write("OK\n");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        socket.write(`ERR ${msg}\n`);
+      } finally {
+        socket.destroy();
+      }
+    });
+
+    socket.on("error", () => {
+      socket.destroy();
+    });
+  }
+
+  private _writePidFile(): void {
+    try {
+      const pidPath = resolvePath(PID_FILE_DEFAULT);
+      writeFileSync(pidPath, String(process.pid) + "\n", { mode: 0o600 });
+    } catch { /* non-fatal */ }
+  }
+
+  private _sdNotify(message: string): void {
+    const notifySocket = process.env.NOTIFY_SOCKET;
+    if (!notifySocket) return;
+
+    // The NOTIFY_SOCKET may be an abstract socket (starts with "@") or a
+    // path socket. We implement sd_notify inline without dependencies.
+    try {
+      const socketPath = notifySocket.startsWith("@")
+        ? "\0" + notifySocket.slice(1)
+        : notifySocket;
+      const client = net.createConnection({ path: socketPath });
+      client.on("connect", () => {
+        client.write(message);
+        client.destroy();
+      });
+      client.on("error", () => {
+        // Non-fatal — sd_notify failure doesn't block startup
+      });
+    } catch { /* non-fatal */ }
+  }
+}
+
+// ─── Top-level graceful shutdown ─────────────────────────────────────────────
+
+let _globalBroker: VaultBroker | null = null;
+
+export function registerShutdownHandlers(broker: VaultBroker): void {
+  _globalBroker = broker;
+  const shutdown = (): void => {
+    if (_globalBroker) {
+      _globalBroker.stop();
+      _globalBroker = null;
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}

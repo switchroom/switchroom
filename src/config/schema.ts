@@ -736,6 +736,15 @@ export const VaultConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Whether to start the vault-broker daemon on agent launch"),
+      allow_interactive: z
+        .boolean()
+        .default(false)
+        .describe(
+          "If true, the installed switchroom CLI binary may read any vault key " +
+          "via the broker without being declared in a cron ACL. Off by default — " +
+          "enable only for interactive developer workflows where the operator " +
+          "understands the trust model.",
+        ),
     })
     .default({})
     .describe(

@@ -82,6 +82,7 @@ describe("VaultConfigSchema.broker", () => {
     expect(result.broker).toEqual({
       socket: "~/.switchroom/vault-broker.sock",
       enabled: true,
+      allow_interactive: false,
     });
   });
 
