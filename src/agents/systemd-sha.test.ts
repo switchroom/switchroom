@@ -6,15 +6,23 @@
  * from `systemctl show --property=Environment` output.
  */
 
-import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import { generateUnit } from "./systemd.js";
 import { getAgentStartSha, parseAgentStartShaFromSystemctl } from "./lifecycle.js";
 
 // ─── generateUnit SHA injection ──────────────────────────────────────────────
 
 describe("generateUnit: SWITCHROOM_AGENT_START_SHA injection", () => {
+  // Reset the module registry between tests so each `vi.doMock` of
+  // build-info.js takes effect on the next dynamic import. Earlier the file
+  // used query-string cache-busters (./systemd.js?sha-test-foo) which Bun
+  // honors at runtime but tsc rejects with TS2307. resetModules + plain
+  // dynamic import is the vitest-blessed way and types cleanly.
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
   it("includes SWITCHROOM_AGENT_START_SHA when COMMIT_SHA is set", async () => {
-    // We mock the build-info module to control COMMIT_SHA
     vi.doMock("../build-info.js", () => ({
       COMMIT_SHA: "abc1234",
       VERSION: "0.3.0",
@@ -23,8 +31,7 @@ describe("generateUnit: SWITCHROOM_AGENT_START_SHA injection", () => {
       COMMITS_AHEAD_OF_TAG: null,
     }));
 
-    // Re-import after mock
-    const { generateUnit: gen } = await import("./systemd.js?sha-test-inject");
+    const { generateUnit: gen } = await import("./systemd.js");
     const unit = gen("myagent", "/agents/myagent");
     expect(unit).toContain("Environment=SWITCHROOM_AGENT_START_SHA=abc1234");
   });
@@ -38,7 +45,7 @@ describe("generateUnit: SWITCHROOM_AGENT_START_SHA injection", () => {
       COMMITS_AHEAD_OF_TAG: null,
     }));
 
-    const { generateUnit: gen } = await import("./systemd.js?sha-test-null");
+    const { generateUnit: gen } = await import("./systemd.js");
     const unit = gen("myagent", "/agents/myagent");
     expect(unit).not.toContain("SWITCHROOM_AGENT_START_SHA");
   });
@@ -52,7 +59,7 @@ describe("generateUnit: SWITCHROOM_AGENT_START_SHA injection", () => {
       COMMITS_AHEAD_OF_TAG: null,
     }));
 
-    const { generateUnit: gen } = await import("./systemd.js?sha-test-tz");
+    const { generateUnit: gen } = await import("./systemd.js");
     const unit = gen("myagent", "/agents/myagent", false, undefined, "Australia/Brisbane");
     expect(unit).toContain("Environment=SWITCHROOM_AGENT_START_SHA=def5678");
     expect(unit).toContain("Environment=TZ=Australia/Brisbane");

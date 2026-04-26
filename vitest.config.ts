@@ -31,6 +31,12 @@ export default defineConfig({
       "**/telegram-plugin/tests/gateway-startup-mutex.test.ts",
       "**/telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts",
       "**/telegram-plugin/tests/foreman-state.test.ts",
+      "**/telegram-plugin/tests/boot-card-dedupe.test.ts",
+      "**/telegram-plugin/tests/boot-card-reason.test.ts",
+      "**/telegram-plugin/tests/progress-update.test.ts",
+      "**/telegram-plugin/tests/quota-cache.test.ts",
+      "**/telegram-plugin/tests/silent-reply-guard.test.ts",
+      "**/telegram-plugin/tests/unhandled-rejection-policy.test.ts",
     ],
     coverage: {
       provider: "v8",
