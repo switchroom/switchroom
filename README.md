@@ -181,6 +181,51 @@ agents:
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
 
+## Vault broker (cron secrets)
+
+Scheduled tasks run headless via `systemd --user` timers, so they cannot prompt
+for the vault passphrase. The vault broker is a long-running user-level systemd
+unit that holds the vault decrypted in memory after a one-time interactive
+unlock. Cron tasks fetch the specific keys they declare via a unix socket; the
+passphrase never sits on disk.
+
+**Declare per-cron secrets in `switchroom.yaml`:**
+
+```yaml
+agents:
+  scout:
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "Morning brief."
+        secrets: [openai_api_key, polygon_api_key]   # only these may be read
+```
+
+`secrets: []` (the default) means the cron has no vault access.
+
+**Bootstrap once per host:**
+
+```bash
+switchroom update                       # installs the broker systemd unit
+switchroom vault broker unlock          # prompt for passphrase, primes broker
+```
+
+Or just run `switchroom vault get <key>` from a TTY — the broker offers to
+take the unlocked state with `[Y/n]` so you don't have to remember a separate
+unlock command.
+
+**Identity model.** On Linux, the broker reads `/proc/<pid>/cgroup` to find
+the connecting cron's systemd unit (`switchroom-<agent>-cron-<i>.service`).
+Cgroup membership is set by systemd as root and is unspoofable from
+userspace, so a compromised agent cannot pose as another agent's cron and
+read its keys. macOS and other platforms degrade to UID-only via the socket
+file mode 0600 — fine for desktop use, not recommended for production cron.
+
+The broker locks on `SIGTERM` (so a `restart` zeros the in-memory state)
+and on demand via `switchroom vault broker lock`. Use
+`switchroom vault get <key> --no-broker` to bypass and prompt locally.
+
+Unit installed at `~/.config/systemd/user/switchroom-vault-broker.service`.
+
 ## CLI Reference
 
 ```bash

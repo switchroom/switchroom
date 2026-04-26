@@ -1,24 +1,28 @@
 /**
  * vault-broker ACL — per-cron access control for vault key requests.
  *
+ * Identity is established via cgroup membership, not the exe path. When
+ * systemd starts a cron unit (`switchroom-<agent>-cron-<i>.service`), it
+ * places the process in a dedicated cgroup that it writes as root. Processes
+ * cannot move themselves between cgroups from userspace, making the unit name
+ * unspoofable.
+ *
  * Logic (fail-closed on any error):
  *
  *   1. UID must equal the broker's own UID. (Enforced by peercred before
  *      ACL is consulted; documented here for clarity.)
  *
- *   2. The caller's exe is matched against the cron script convention:
- *        ~/.switchroom/agents/<agent>/telegram/cron-<i>.sh
- *      `<agent>` and `<i>` are parsed from the path.
- *
- *   3. `config.agents[<agent>].schedule[<i>].secrets` (added by PR 1) is
+ *   2. If `peer.systemdUnit` matches `switchroom-<agent>-cron-<i>.service`:
+ *      `<agent>` and `<i>` are parsed from the unit name. Then
+ *      `config.agents[<agent>].schedule[<i>].secrets` (added by PR 1) is
  *      looked up. If the requested key appears in that array, access is
- *      granted.
+ *      granted. Otherwise: deny.
  *
- *   4. Interactive fallback: if `config.vault.broker.allow_interactive` is
- *      true AND the exe matches the installed `switchroom` CLI binary
+ *   3. Interactive fallback: if `config.vault.broker.allow_interactive` is
+ *      true AND `peer.exe` matches the installed `switchroom` CLI binary
  *      (<bunBinDir>/switchroom), access is granted. Default: false.
  *
- *   5. Otherwise: deny.
+ *   4. Otherwise: deny.
  *
  * allow_interactive is gated off by default so ordinary users can't use
  * `switchroom vault get <key>` to read any key without being in an explicit
@@ -27,7 +31,6 @@
 
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import type { PeerInfo } from "./peercred.js";
 
@@ -53,37 +56,35 @@ export interface AclOpts {
 }
 
 /**
- * Resolve the agents base directory from config or default.
- */
-function agentsDir(config: SwitchroomConfig, homeDir: string): string {
-  const raw = config.switchroom?.agents_dir ?? "~/.switchroom/agents";
-  return raw.startsWith("~/") ? join(homeDir, raw.slice(2)) : resolve(raw);
-}
-
-/**
- * Parse an exe path as a cron script under the agents dir.
- * Returns { agentName, index } or null if not a recognized cron script.
+ * Parse a systemd unit name as a switchroom cron unit.
+ * Returns { agentName, index } or null if not a recognized cron unit.
  *
- * Expected convention (from scaffold.ts buildCronScript):
- *   <agentsDir>/<agentName>/telegram/cron-<index>.sh
+ * Expected format: switchroom-<agent>-cron-<index>.service
+ * where <agent> consists of [a-zA-Z0-9_-]+ characters.
+ *
+ * Note: agent names may themselves contain hyphens, so we match greedily
+ * from the left up to the last `-cron-<digits>.service` suffix.
  */
-function parseCronExe(
-  exe: string,
-  baseAgentsDir: string,
+export function parseCronUnit(
+  unitName: string,
 ): { agentName: string; index: number } | null {
-  // Normalize both paths to eliminate trailing slashes and relative segments
-  const normalizedAgentsDir = resolve(baseAgentsDir);
-  const normalizedExe = resolve(exe);
-
-  // exe must be under <agentsDir>/
-  if (!normalizedExe.startsWith(normalizedAgentsDir + "/")) return null;
-
-  // Relative portion: <agentName>/telegram/cron-<index>.sh
-  const rel = normalizedExe.slice(normalizedAgentsDir.length + 1);
-  const m = rel.match(/^([^/]+)\/telegram\/cron-(\d+)\.sh$/);
+  // Match: switchroom-<agent>-cron-<N>.service
+  // The agent name can contain hyphens, so use a greedy match up to the
+  // last occurrence of -cron-<digits>.service
+  const m = unitName.match(/^switchroom-([a-zA-Z0-9_-]+)-cron-(\d+)\.service$/);
   if (!m) return null;
 
-  return { agentName: m[1], index: parseInt(m[2], 10) };
+  // The above regex is greedy, so m[1] will consume the agent name including
+  // any hyphens. We need to strip the trailing "-cron-<N>" that may have been
+  // captured as part of the agent name if the agent itself contains "cron".
+  // Since the regex anchors at -cron-<digits>.service at the end, m[1] is
+  // everything between "switchroom-" and "-cron-<N>.service".
+  const agentName = m[1];
+  const index = parseInt(m[2], 10);
+
+  if (!agentName) return null;
+
+  return { agentName, index };
 }
 
 /**
@@ -103,7 +104,47 @@ export function checkAcl(
   const homeDir = opts.homeDir ?? homedir();
   const bunBinDir = opts.bunBinDir ?? join(homeDir, ".bun", "bin");
 
+  // ── Cgroup-based cron identity ─────────────────────────────────────────
+  if (peer.systemdUnit !== null) {
+    const parsed = parseCronUnit(peer.systemdUnit);
+
+    if (parsed === null) {
+      return {
+        allow: false,
+        reason: `systemd unit '${peer.systemdUnit}' does not match switchroom cron unit naming convention`,
+      };
+    }
+
+    const { agentName, index } = parsed;
+
+    const agentConfig = config.agents?.[agentName];
+    if (!agentConfig) {
+      return { allow: false, reason: `agent '${agentName}' not found in config` };
+    }
+
+    const schedule = agentConfig.schedule ?? [];
+    if (index >= schedule.length || index < 0) {
+      return {
+        allow: false,
+        reason: `schedule index ${index} out of range for agent '${agentName}' (${schedule.length} entries)`,
+      };
+    }
+
+    const entry = schedule[index];
+    const allowedKeys: string[] = entry.secrets ?? [];
+
+    if (!allowedKeys.includes(key)) {
+      return {
+        allow: false,
+        reason: `key '${key}' not in ACL for ${agentName}/schedule[${index}] (allowed: [${allowedKeys.join(", ")}])`,
+      };
+    }
+
+    return { allow: true };
+  }
+
   // ── Allow interactive: the installed switchroom CLI ────────────────────
+  // Only reached when systemdUnit is null (caller is not a cron unit).
   const allowInteractive = config.vault?.broker?.allow_interactive ?? false;
   if (allowInteractive) {
     const switchroomCli = join(bunBinDir, "switchroom");
@@ -112,41 +153,10 @@ export function checkAcl(
     }
   }
 
-  // ── Cron script path matching ──────────────────────────────────────────
-  const base = agentsDir(config, homeDir);
-  const parsed = parseCronExe(peer.exe, base);
-
-  if (parsed === null) {
-    return {
-      allow: false,
-      reason: `exe '${peer.exe}' is not a recognized switchroom cron script`,
-    };
-  }
-
-  const { agentName, index } = parsed;
-
-  const agentConfig = config.agents?.[agentName];
-  if (!agentConfig) {
-    return { allow: false, reason: `agent '${agentName}' not found in config` };
-  }
-
-  const schedule = agentConfig.schedule ?? [];
-  if (index >= schedule.length || index < 0) {
-    return {
-      allow: false,
-      reason: `schedule index ${index} out of range for agent '${agentName}' (${schedule.length} entries)`,
-    };
-  }
-
-  const entry = schedule[index];
-  const allowedKeys: string[] = entry.secrets ?? [];
-
-  if (!allowedKeys.includes(key)) {
-    return {
-      allow: false,
-      reason: `key '${key}' not in ACL for ${agentName}/schedule[${index}] (allowed: [${allowedKeys.join(", ")}])`,
-    };
-  }
-
-  return { allow: true };
+  return {
+    allow: false,
+    reason: peer.systemdUnit === null
+      ? `caller is not a switchroom cron unit (no cgroup match) and allow_interactive is disabled`
+      : `DENIED`,
+  };
 }

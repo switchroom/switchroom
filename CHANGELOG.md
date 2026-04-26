@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Vault broker ACL was unconditionally denying every cron** in #113. The
+  ACL matched `/proc/<pid>/exe` against the cron script path, but the
+  generated systemd unit invokes `/bin/bash <script>`, so the kernel-set
+  exe is `/bin/bash` and the path pattern never matched in production.
+  Replaced with cgroup-based identity: peercred reads
+  `/proc/<pid>/cgroup` to find the systemd unit name
+  (`switchroom-<agent>-cron-<i>.service`), which systemd writes as root
+  and processes cannot tamper with from userspace. Unit-test fixtures
+  now exercise the full `ss -xpn` inode-pair lookup that production
+  needs to map a connecting client back to its PID.
+- **Peercred `ss` query was returning the broker's own PID.** The
+  `src <socket>` filter selects the server-side row of a unix
+  connection, whose `users:()` column is the listening process. The
+  caller is the *client side*, identifiable by walking the inode pair
+  in the same `ss -xpn` output. Fix lands the two-step lookup.
+
+### Added
+- `tests/integration/vault-broker-e2e.test.ts` — gated systemd e2e
+  harness (set `INTEGRATION=1`). Spawns a real broker, places the cron
+  in a transient `switchroom-<agent>-cron-0.service` via
+  `systemd-run --user`, and proves end-to-end:
+  - allowed-key happy path returns the value through the broker
+  - disallowed-key path is denied with `ACL DENIED`, no value leaks
+  - broker-stopped path fails loud (no silent fallback to interactive
+    passphrase prompt in headless mode)
+
 ## v0.3.0 — 2026-04-25
 
 ### Added
