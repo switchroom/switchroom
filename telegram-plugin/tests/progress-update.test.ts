@@ -1,7 +1,13 @@
 /**
  * Unit tests for progress_update tool: rate limiting, turn cap, text truncation.
+ *
+ * Note on time mocking: this file used to import `vi` from `vitest` and rely
+ * on `vi.useFakeTimers()` + `vi.setSystemTime()`. Bun's vitest shim does NOT
+ * implement `vi.setSystemTime`, so the suite was failing in CI. Rewritten to
+ * use `bun:test` and manual `Date.now` mocking via `spyOn`. See CI build #48
+ * (failed 9/1931) for the original symptom.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test'
 
 // Mock state shared across tests (simulates the module-level state in server.ts / gateway.ts)
 const progressUpdateLastSent = new Map<string, number>()
@@ -63,13 +69,25 @@ function executeProgressUpdate(args: {
   return { ok: true, message_id: Math.floor(Math.random() * 100000) }
 }
 
+// Manual time mocking — bun:test compatible (bun lacks vi.setSystemTime).
+let mockNow = 1000
+let dateSpy: Mock<typeof Date.now> | null = null
+function advance(ms: number): void {
+  mockNow += ms
+}
+
 describe('progress_update tool', () => {
   beforeEach(() => {
     progressUpdateLastSent.clear()
     progressUpdateTurnCount.clear()
     activeTurnStartedAt.clear()
-    vi.useFakeTimers()
-    vi.setSystemTime(1000)
+    mockNow = 1000
+    dateSpy = spyOn(Date, 'now').mockImplementation(() => mockNow)
+  })
+
+  afterEach(() => {
+    dateSpy?.mockRestore()
+    dateSpy = null
   })
 
   it('happy path: single update sends and returns ok', () => {
@@ -98,7 +116,7 @@ describe('progress_update tool', () => {
     expect(r1.ok).toBe(true)
 
     // Advance 10s (not enough)
-    vi.advanceTimersByTime(10_000)
+    advance(10_000)
 
     const r2 = executeProgressUpdate({ chat_id: '123', text: 'Second' })
     expect(r2.ok).toBe(false)
@@ -117,7 +135,7 @@ describe('progress_update tool', () => {
     expect(r1.ok).toBe(true)
 
     // Advance 20s
-    vi.advanceTimersByTime(20_000)
+    advance(20_000)
 
     const r2 = executeProgressUpdate({ chat_id: '123', text: 'Second' })
     expect(r2.ok).toBe(true)
@@ -130,13 +148,13 @@ describe('progress_update tool', () => {
     progressUpdateTurnCount.set(key, 0)
 
     for (let i = 1; i <= 5; i++) {
-      vi.advanceTimersByTime(20_000)
+      advance(20_000)
       const r = executeProgressUpdate({ chat_id: '123', text: `Update ${i}` })
       expect(r.ok).toBe(true)
     }
 
     // 6th call
-    vi.advanceTimersByTime(20_000)
+    advance(20_000)
     const r6 = executeProgressUpdate({ chat_id: '123', text: 'Update 6' })
     expect(r6.ok).toBe(false)
     if (!r6.ok) {
@@ -167,7 +185,7 @@ describe('progress_update tool', () => {
 
     // Send 5 updates
     for (let i = 1; i <= 5; i++) {
-      vi.advanceTimersByTime(20_000)
+      advance(20_000)
       executeProgressUpdate({ chat_id: '123', text: `Update ${i}` })
     }
     expect(progressUpdateTurnCount.get(key)).toBe(5)
@@ -177,7 +195,7 @@ describe('progress_update tool', () => {
     activeTurnStartedAt.set(key, Date.now())
 
     // Should be able to send again
-    vi.advanceTimersByTime(20_000)
+    advance(20_000)
     const r = executeProgressUpdate({ chat_id: '123', text: 'New turn update' })
     expect(r.ok).toBe(true)
     expect(progressUpdateTurnCount.get(key)).toBe(1)
@@ -207,7 +225,7 @@ describe('progress_update tool', () => {
     const r1 = executeProgressUpdate({ chat_id: '999', text: 'First' })
     expect(r1.ok).toBe(true)
 
-    vi.advanceTimersByTime(10_000)
+    advance(10_000)
     const r2 = executeProgressUpdate({ chat_id: '999', text: 'Second' })
     expect(r2.ok).toBe(false)
 
