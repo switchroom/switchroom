@@ -1,3 +1,4 @@
+import { utimesSync, closeSync, openSync } from "node:fs";
 import type {
   ClientToGateway,
   GatewayToClient,
@@ -44,6 +45,12 @@ export interface IpcClientOptions {
   reconnectDelayMs?: number;
   maxReconnectDelayMs?: number;
   heartbeatIntervalMs?: number;
+  /** Optional path to a liveness file. When set, the heartbeat tick
+   *  updates the file's mtime on every tick so an external watchdog can
+   *  distinguish "bridge alive but socket temporarily disconnected" from
+   *  "bridge process actually dead". Only touches mtime — no content
+   *  change — so the file stays zero bytes after initial creation. */
+  livenessFilePath?: string;
 }
 
 export interface IpcClientHandle {
@@ -73,6 +80,7 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
     reconnectDelayMs = 2000,
     maxReconnectDelayMs = 30000,
     heartbeatIntervalMs = 5000,
+    livenessFilePath,
   } = options;
 
   /** Max buffer size (1MB). Protects against the gateway flooding data
@@ -97,10 +105,26 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
     sendRaw(msg);
   }
 
+  function touchLivenessFile(): void {
+    if (!livenessFilePath) return;
+    try {
+      const now = new Date();
+      // Best-effort: create the file if it doesn't exist, then update mtime.
+      try { closeSync(openSync(livenessFilePath, "a")); } catch {}
+      utimesSync(livenessFilePath, now, now);
+    } catch (err) {
+      log(`liveness file update failed: ${err}`);
+    }
+  }
+
   function startHeartbeat(): void {
     stopHeartbeat();
+    // Touch on the first tick immediately so the file is fresh as soon as
+    // the bridge connects, rather than waiting one full interval.
+    touchLivenessFile();
     heartbeatTimer = setInterval(() => {
       sendRaw({ type: "heartbeat", agentName });
+      touchLivenessFile();
     }, heartbeatIntervalMs);
   }
 

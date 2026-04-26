@@ -95,11 +95,21 @@ describe("bridge-watchdog.sh — static regression guards", () => {
     expect(stat.mode & 0o100).toBeTruthy();
   });
 
-  it("exposes UPTIME_GRACE_SECS and DISCONNECT_GRACE_SECS as env-overridable tunables", () => {
+  it("exposes UPTIME_GRACE_SECS, DISCONNECT_GRACE_SECS and LIVENESS_GRACE_SECS as env-overridable tunables", () => {
     // The tests below drive edge cases by overriding these — don't
     // accidentally hardcode them back into raw literals.
     expect(script).toMatch(/UPTIME_GRACE_SECS:=/);
     expect(script).toMatch(/DISCONNECT_GRACE_SECS:=/);
+    expect(script).toMatch(/LIVENESS_GRACE_SECS:=/);
+  });
+
+  it("checks the liveness file mtime when ESTAB == 0 (bridge-alive false-positive fix)", () => {
+    // The proper fix for the ~12 false restarts/day: before declaring the
+    // bridge dead on ESTAB==0, consult the mtime of .bridge-alive — a file
+    // the bridge touches on every heartbeat tick.
+    expect(script).toMatch(/\.bridge-alive/);
+    expect(script).toMatch(/LIVENESS_GRACE_SECS/);
+    expect(script).toMatch(/liveness file is fresh/);
   });
 
   it("requires SUSTAINED disconnection before restarting (not tail -1 alone)", () => {
@@ -472,5 +482,55 @@ describe("bridge-watchdog.sh — behavioural integration", () => {
     expect(r.code).toBe(0);
     expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(false);
     expect(existsSync(join(h.stateDir, ".watchdog-disconnect-since"))).toBe(false);
+  });
+
+  it("bridge alive but disconnected (liveness file fresh) → no restart", () => {
+    // Core liveness-file test: ESTAB == 0 but the bridge touched the
+    // liveness file very recently, so it's alive and just reconnecting.
+    // Should NOT restart — that would kill an in-flight Claude turn.
+    setEstabCount(h, 0);
+    writeGatewayLog(h, ["telegram gateway: bridge registered"]);
+    // Write a fresh liveness file (mtime = now).
+    const livenessFile = join(h.stateDir, ".bridge-alive");
+    writeFileSync(livenessFile, "");
+    const r = runWatchdog(h, { LIVENESS_GRACE_SECS: "30" });
+    expect(r.code).toBe(0);
+    expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(false);
+    expect(r.stdout).toMatch(/liveness file is fresh/);
+  });
+
+  it("bridge dead (liveness file stale) → restart after grace", () => {
+    // The bridge process has died: ESTAB == 0 AND the liveness file
+    // hasn't been touched in a long time. After the disconnect grace
+    // window, the watchdog should restart the agent.
+    setEstabCount(h, 0);
+    writeGatewayLog(h, ["telegram gateway: bridge registered"]);
+    // Write a stale liveness file (mtime = 2 minutes ago).
+    const livenessFile = join(h.stateDir, ".bridge-alive");
+    writeFileSync(livenessFile, "");
+    const staleTime = new Date(Date.now() - 120_000);
+    const { utimesSync: touch } = require("node:fs");
+    touch(livenessFile, staleTime, staleTime);
+    // Also pre-seed the disconnect marker so the grace window is already
+    // exhausted.
+    const longAgo = Math.floor(Date.now() / 1000) - 200;
+    writeFileSync(join(h.stateDir, ".watchdog-disconnect-since"), String(longAgo));
+    const r = runWatchdog(h, { DISCONNECT_GRACE_SECS: "120", LIVENESS_GRACE_SECS: "30" });
+    expect(r.code).toBe(0);
+    expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(true);
+  });
+
+  it("bridge dead (no liveness file at all) → restart after grace (backwards compat)", () => {
+    // Old bridges don't write the liveness file at all. The watchdog
+    // must still restart them when ESTAB == 0 for long enough — no
+    // regression in the existing behaviour.
+    setEstabCount(h, 0);
+    writeGatewayLog(h, ["telegram gateway: bridge registered"]);
+    // No liveness file written — backwards compat scenario.
+    const longAgo = Math.floor(Date.now() / 1000) - 200;
+    writeFileSync(join(h.stateDir, ".watchdog-disconnect-since"), String(longAgo));
+    const r = runWatchdog(h, { DISCONNECT_GRACE_SECS: "120", LIVENESS_GRACE_SECS: "30" });
+    expect(r.code).toBe(0);
+    expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(true);
   });
 });

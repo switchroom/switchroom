@@ -439,6 +439,7 @@ async function main(): Promise<void> {
     onPermission,
     onStatus,
     log: (msg) => process.stderr.write(`telegram bridge: ipc: ${msg}\n`),
+    livenessFilePath: join(STATE_DIR, ".bridge-alive"),
   })
   if (ipc.isConnected()) {
     process.stderr.write(`telegram bridge: connected to gateway at ${SOCKET_PATH}\n`)
