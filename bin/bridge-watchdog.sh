@@ -28,7 +28,7 @@ set -euo pipefail
 # Tunables. Expressed as env-overridable so the test harness can drive
 # edge cases without mutating the script.
 : "${UPTIME_GRACE_SECS:=90}"       # skip the bridge check for this long after agent (re)start
-: "${DISCONNECT_GRACE_SECS:=120}"  # require disconnection to persist this long before restarting
+: "${DISCONNECT_GRACE_SECS:=600}"  # require disconnection to persist this long before restarting
 
 now_epoch() { date +%s; }
 
