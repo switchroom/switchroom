@@ -29,6 +29,7 @@ set -euo pipefail
 # edge cases without mutating the script.
 : "${UPTIME_GRACE_SECS:=90}"       # skip the bridge check for this long after agent (re)start
 : "${DISCONNECT_GRACE_SECS:=600}"  # require disconnection to persist this long before restarting
+: "${LIVENESS_GRACE_SECS:=30}"     # liveness file mtime must be older than this before we treat bridge as dead
 
 now_epoch() { date +%s; }
 
@@ -159,7 +160,21 @@ for gateway_svc in "${gateway_services[@]}"; do
   if (( ipc_estab_count > 0 )); then
     bridge_healthy=true
   else
+    # ESTAB == 0: socket is disconnected. Before declaring the bridge dead,
+    # check the liveness file the bridge writes on every heartbeat tick (~5s).
+    # A recent mtime means the bridge process is alive but temporarily
+    # reconnecting (e.g. after a gateway restart) — restarting the agent
+    # here would be wasteful and would kill any in-flight Claude turn.
+    liveness_file="${gateway_state_dir}/.bridge-alive"
     bridge_healthy=false
+    if [[ -f "$liveness_file" ]]; then
+      liveness_mtime=$(stat -c %Y "$liveness_file" 2>/dev/null || echo 0)
+      liveness_age=$(( $(now_epoch) - liveness_mtime ))
+      if (( liveness_age < LIVENESS_GRACE_SECS )); then
+        bridge_healthy=true
+        echo "$(date -Iseconds) watchdog: ${agent} bridge socket disconnected but liveness file is fresh (${liveness_age}s ago); bridge process alive, skipping restart"
+      fi
+    fi
   fi
 
   if [[ "$bridge_healthy" == true ]]; then
