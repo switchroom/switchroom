@@ -169,7 +169,8 @@ import {
   type BootCardHandle,
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
-import type { RestartReason } from './boot-card.js'
+import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
+import { classifyRejection } from './unhandled-rejection-policy.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -882,7 +883,16 @@ const ipcServer: IpcServer = createIpcServer({
     // If the agent reconnected after a /restart (or any restart), post a boot
     // card. The restart-marker carries the ack chat; if absent we fall back to
     // resolveBootChatId so crash-recovery reconnects also get a card.
-    {
+    //
+    // Skip if the boot path already posted a card this lifetime — the boot
+    // path runs first (in the IIFE at end of file) and `activeBootCard` is
+    // set as soon as it succeeds. Without this guard, both paths fire on a
+    // single gateway start (observed: msgId 2245 + 2248 within 5s for klanker
+    // at 11:19:47 on 2026-04-26). See `shouldSkipDuplicateBootCard`.
+    const dedupeDecision = shouldSkipDuplicateBootCard({ activeBootCard }, 'bridge-reconnect')
+    if (dedupeDecision.skip) {
+      process.stderr.write(`telegram gateway: bridge-reconnect: skipping boot card (${dedupeDecision.reason})\n`)
+    } else {
       const nowMs = Date.now()
       const marker = readRestartMarker()
       const cleanMarker = readCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
@@ -4832,9 +4842,20 @@ initHandoffContinuity()
 // held until the next boot's stale-PID auto-recovery — workable, but noisy.
 // The `shuttingDown` guard inside shutdown() prevents double-invocation if
 // SIGTERM races with one of these handlers.
+//
+// `unhandledRejection` is discriminated through `classifyRejection` so that
+// benign Telegram 400s ("message is not modified", "message to edit not
+// found") are logged but NOT crashed-on. These leaked through restart loops
+// for klanker (#99) and lawgpt's mid-day crash family — see the unit tests
+// in `tests/unhandled-rejection-policy.test.ts`.
 process.on('unhandledRejection', err => {
-  process.stderr.write(`telegram gateway: unhandled rejection: ${err}\n`)
-  void shutdown('unhandledRejection')
+  const action = classifyRejection(err)
+  process.stderr.write(
+    `telegram gateway: unhandled rejection (${action}): ${err}\n`,
+  )
+  if (action === 'shutdown') {
+    void shutdown('unhandledRejection')
+  }
 })
 process.on('uncaughtException', err => {
   process.stderr.write(`telegram gateway: uncaught exception: ${err}\n`)

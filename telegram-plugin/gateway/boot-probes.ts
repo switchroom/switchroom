@@ -16,6 +16,8 @@ import { join } from 'path'
 import { execFile as execFileCb } from 'child_process'
 import { promisify } from 'util'
 
+import { readQuotaCache, writeQuotaCache } from './quota-cache.js'
+
 const execFile = promisify(execFileCb)
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -231,6 +233,13 @@ const QUOTA_DEBUG_FILE = 'quota-debug.json'
  * Attempt to read quota info via the /api/oauth/usage endpoint.
  * The response schema is undocumented — we probe defensively and
  * save the raw response to a debug file on first 2xx hit.
+ *
+ * Result is cached for 5 min in `~/.switchroom/quota-cache.json` and
+ * shared across all agents. Without the cache, every gateway boot +
+ * bridge-reconnect across 4 agents hits the endpoint, triggering 429s
+ * that surface as 🟡 "rate limited" in the boot card. See `quota-cache.ts`.
+ *
+ * Tests can override the cache path via SWITCHROOM_QUOTA_CACHE_PATH.
  */
 export async function probeQuota(
   claudeConfigDir: string,
@@ -238,6 +247,12 @@ export async function probeQuota(
   fetchImpl: typeof fetch = fetch,
 ): Promise<ProbeResult> {
   return withTimeout('Quota', (async (): Promise<ProbeResult> => {
+    // Cache hit → return early (avoids the rate-limit cascade)
+    const cached = readQuotaCache()
+    if (cached) {
+      return cached
+    }
+
     // Read token
     let token: string | null = null
     for (const candidate of [
@@ -332,7 +347,9 @@ export async function probeQuota(
     if (parts.length === 0) {
       return { status: 'degraded', label: 'Quota', detail: 'schema unknown — saving raw response' }
     }
-    return { status: 'ok', label: 'Quota', detail: parts.join(' · ') }
+    const result: ProbeResult = { status: 'ok', label: 'Quota', detail: parts.join(' · ') }
+    writeQuotaCache(result)
+    return result
   })())
 }
 

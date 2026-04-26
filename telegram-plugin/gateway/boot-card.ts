@@ -59,6 +59,48 @@ export interface BootCardHandle {
   complete(): void
 }
 
+export type BootCardSite = 'boot' | 'bridge-reconnect'
+
+export interface BootCardGate {
+  /**
+   * Set after the boot path successfully posts a card. The bridge-reconnect
+   * path checks this to avoid posting a second card on the same gateway
+   * lifetime — observed in the wild as klanker msgId 2245 + 2248 within 5s
+   * (2026-04-26 11:19:47).
+   */
+  activeBootCard: { messageId: number } | null
+}
+
+export interface BootCardSkipDecision {
+  skip: boolean
+  /** Human-readable reason (only present when skip=true). */
+  reason?: string
+}
+
+/**
+ * Decide whether to skip posting the boot card based on gateway state.
+ *
+ * The boot path runs first (in the gateway IIFE) and sets activeBootCard
+ * on success. The bridge-reconnect path runs later when the agent
+ * registers; without this guard it posts a duplicate card.
+ *
+ * Boot path: never skip — it's the primary post site.
+ * Bridge-reconnect: skip if a card was already posted this lifetime.
+ */
+export function shouldSkipDuplicateBootCard(
+  gate: BootCardGate,
+  site: BootCardSite,
+): BootCardSkipDecision {
+  if (site === 'boot') return { skip: false }
+  if (gate.activeBootCard != null) {
+    return {
+      skip: true,
+      reason: `already-posted-msgId=${gate.activeBootCard.messageId}`,
+    }
+  }
+  return { skip: false }
+}
+
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
 const REASON_EMOJI: Record<RestartReason, string> = {
