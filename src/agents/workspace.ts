@@ -72,6 +72,7 @@ import {
 import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_BOOTSTRAP_FILENAME,
+  DEFAULT_BRIEF_FILENAME,
   DEFAULT_HEARTBEAT_FILENAME,
   DEFAULT_IDENTITY_FILENAME,
   DEFAULT_MEMORY_FILENAME,
@@ -101,12 +102,20 @@ export const STABLE_BOOTSTRAP_FILENAMES: WorkspaceBootstrapFileName[] = [
 
 /**
  * Files that change mid-session and belong in the UserPromptSubmit hook
- * (re-read every turn). MEMORY.md and HEARTBEAT.md are read from the
- * workspace root; daily files are read from `workspace/memory/YYYY-MM-DD.md`.
+ * (re-read every turn). MEMORY.md, HEARTBEAT.md, and BRIEF.md are read from
+ * the workspace root; daily files are read from
+ * `workspace/memory/YYYY-MM-DD.md`. Files that don't exist for a given agent
+ * are silently skipped by the loader.
+ *
+ * BRIEF.md is included so agents that maintain a canonical case-state file
+ * (e.g. lawgpt) get it injected on every turn rather than relying on the
+ * agent to actively `Read()` it on session start. The bootstrap-budget
+ * pipeline truncates oversized content if needed.
  */
 export const DYNAMIC_BOOTSTRAP_FILENAMES: WorkspaceBootstrapFileName[] = [
   DEFAULT_MEMORY_FILENAME,
   DEFAULT_HEARTBEAT_FILENAME,
+  DEFAULT_BRIEF_FILENAME,
 ];
 
 export const DEFAULT_BOOTSTRAP_MAX_CHARS = 12_000;

@@ -20,6 +20,7 @@ export const DEFAULT_USER_FILENAME = "USER.md";
 export const DEFAULT_HEARTBEAT_FILENAME = "HEARTBEAT.md";
 export const DEFAULT_BOOTSTRAP_FILENAME = "BOOTSTRAP.md";
 export const DEFAULT_MEMORY_FILENAME = "MEMORY.md";
+export const DEFAULT_BRIEF_FILENAME = "BRIEF.md";
 
 export type WorkspaceBootstrapFileName =
   | typeof DEFAULT_AGENTS_FILENAME
@@ -29,7 +30,8 @@ export type WorkspaceBootstrapFileName =
   | typeof DEFAULT_USER_FILENAME
   | typeof DEFAULT_HEARTBEAT_FILENAME
   | typeof DEFAULT_BOOTSTRAP_FILENAME
-  | typeof DEFAULT_MEMORY_FILENAME;
+  | typeof DEFAULT_MEMORY_FILENAME
+  | typeof DEFAULT_BRIEF_FILENAME;
 
 /**
  * A file discovered in the workspace bootstrap pipeline. `content` is the raw
