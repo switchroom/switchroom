@@ -369,6 +369,7 @@ import {
 } from './active-pins.js'
 import { sweepActivePins, sweepBotAuthoredPins } from './active-pins-sweep.js'
 import { logPinEvent, classifyPinError, errorMessage } from './pin-event-log.js'
+import { validateStringArray } from './gateway/access-validator.js'
 
 /**
  * One-shot carry-over from the session-end summarizer: a short topic
@@ -610,10 +611,18 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
+    const allowFrom = validateStringArray('allowFrom', parsed.allowFrom ?? [], 'channel')
+    const groups: Record<string, GroupPolicy> = {}
+    for (const [chatId, policy] of Object.entries(parsed.groups ?? {})) {
+      groups[chatId] = {
+        ...policy,
+        allowFrom: validateStringArray(`groups.${chatId}.allowFrom`, policy.allowFrom ?? [], 'channel'),
+      }
+    }
     return {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
+      allowFrom,
+      groups,
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,

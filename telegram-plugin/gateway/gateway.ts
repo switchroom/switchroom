@@ -74,6 +74,7 @@ import {
 } from '../operator-events.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
+import { validateStringArray } from './access-validator.js'
 
 /**
  * Truncation cap for the `reply_to_text` channel-meta attribute (issue #119).
@@ -370,10 +371,18 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
+    const allowFrom = validateStringArray('allowFrom', parsed.allowFrom ?? [])
+    const groups: Record<string, GroupPolicy> = {}
+    for (const [chatId, policy] of Object.entries(parsed.groups ?? {})) {
+      groups[chatId] = {
+        ...policy,
+        allowFrom: validateStringArray(`groups.${chatId}.allowFrom`, policy.allowFrom ?? []),
+      }
+    }
     return {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
+      allowFrom,
+      groups,
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
