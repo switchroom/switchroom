@@ -121,6 +121,49 @@ describe('recordInbound + query', () => {
     expect(query({ chat_id: '-100' }).map(r => r.text)).toEqual(['A'])
     expect(query({ chat_id: '-200' }).map(r => r.text)).toEqual(['B'])
   })
+
+  // Issue #119: Telegram-native reply context.
+  it('round-trips reply_to_message_id and reply_to_text', () => {
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 42,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: 'how do we fix this?',
+      reply_to_message_id: 17,
+      reply_to_text: 'Morning briefing: cron job failed at 06:00',
+    })
+    const rows = query({ chat_id: '-100' })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.reply_to_message_id).toBe(17)
+    expect(rows[0]?.reply_to_text).toBe('Morning briefing: cron job failed at 06:00')
+  })
+
+  it('stores null when no reply context is provided', () => {
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 5,
+      user: 'a',
+      user_id: '1',
+      ts: 100,
+      text: 'plain message',
+    })
+    const rows = query({ chat_id: '-100' })
+    expect(rows[0]?.reply_to_message_id).toBeNull()
+    expect(rows[0]?.reply_to_text).toBeNull()
+  })
+
+  it('stores reply context independently across messages in the same chat', () => {
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 1, user: 'a', user_id: '1', ts: 100, text: 'first', reply_to_message_id: null, reply_to_text: null })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 2, user: 'a', user_id: '1', ts: 200, text: 'reply', reply_to_message_id: 1, reply_to_text: 'first' })
+    recordInbound({ chat_id: '-100', thread_id: null, message_id: 3, user: 'a', user_id: '1', ts: 300, text: 'unrelated' })
+    const rows = query({ chat_id: '-100' })
+    expect(rows.map(r => r.reply_to_message_id)).toEqual([null, 1, null])
+    expect(rows.map(r => r.reply_to_text)).toEqual([null, 'first', null])
+  })
 })
 
 describe('getLatestInboundMessageId', () => {

@@ -93,6 +93,13 @@ export interface RecordedMessage {
   text: string
   attachment_kind: string | null
   group_id: number | null
+  /**
+   * Set when the inbound user message was a Telegram-native reply to a
+   * prior message. Lets get_recent_messages surface the reply context
+   * the agent saw at delivery time.
+   */
+  reply_to_message_id: number | null
+  reply_to_text: string | null
 }
 
 export interface QueryOptions {
@@ -135,6 +142,8 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
       text           TEXT    NOT NULL,
       attachment_kind TEXT,
       group_id       INTEGER,
+      reply_to_message_id INTEGER,
+      reply_to_text  TEXT,
       PRIMARY KEY (chat_id, thread_id, message_id)
     )
   `)
@@ -142,6 +151,17 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     CREATE INDEX IF NOT EXISTS idx_messages_recent
       ON messages (chat_id, thread_id, ts DESC)
   `)
+  // Migration: add reply_to columns to existing DBs that pre-date issue #119.
+  // SQLite has no IF NOT EXISTS for ALTER TABLE ADD COLUMN, so we tolerate
+  // "duplicate column name" errors and re-throw anything else.
+  for (const column of ["reply_to_message_id INTEGER", "reply_to_text TEXT"]) {
+    try {
+      db.exec(`ALTER TABLE messages ADD COLUMN ${column}`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!/duplicate column name/i.test(msg)) throw err
+    }
+  }
 
   // Lock the file to owner-only. Same pattern the plugin uses for .env at
   // server.ts:52. No-op on Windows (would need ACLs).
@@ -184,6 +204,14 @@ interface RecordInboundArgs {
   ts: number
   text: string
   attachment_kind?: string | null | undefined
+  /**
+   * If the user replied to a prior message via Telegram's native reply
+   * feature, the original message_id and a (truncated) preview of its
+   * text. Populated from `ctx.message.reply_to_message` in the gateway
+   * handler. See issue #119.
+   */
+  reply_to_message_id?: number | null | undefined
+  reply_to_text?: string | null | undefined
 }
 
 /**
@@ -199,8 +227,8 @@ export function recordInbound(args: RecordInboundArgs): void {
   if (args.message_id == null) return
   const stmt = requireDb().prepare(`
     INSERT OR REPLACE INTO messages
-      (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id)
-    VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL)
+      (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text)
+    VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL, ?, ?)
   `)
   stmt.run(
     args.chat_id,
@@ -211,6 +239,8 @@ export function recordInbound(args: RecordInboundArgs): void {
     args.ts,
     args.text,
     args.attachment_kind ?? null,
+    args.reply_to_message_id ?? null,
+    args.reply_to_text ?? null,
   )
 }
 
