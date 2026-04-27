@@ -105,7 +105,7 @@ describe("hot-reload stable feature", () => {
       expect(hasDynamicHook).toBe(true);
     });
 
-    it("classifies stable workspace files as stale-till-restart", () => {
+    it("classifies SOUL.md as restart-required (soul changes need restart to take effect)", () => {
       const config = makeAgentConfig({
         soul: { name: "Bot", style: "helpful" },
         channels: {
@@ -126,8 +126,10 @@ describe("hot-reload stable feature", () => {
       // Reconcile
       const reconcileResult = reconcileAgent("test-agent", config, tmpDir, telegramConfig, switchroomConfig);
 
-      // SOUL.md should be in staleTillRestart, not hot
-      expect(reconcileResult.changesBySemantics?.staleTillRestart).toContain(soulMdPath);
+      // SOUL.md should be in restartRequired (not stale-till-restart, not hot) —
+      // soul fields are frozen at session launch and invisible until restart.
+      expect(reconcileResult.changesBySemantics?.restartRequired).toContain(soulMdPath);
+      expect(reconcileResult.changesBySemantics?.staleTillRestart).not.toContain(soulMdPath);
       expect(reconcileResult.changesBySemantics?.hot).not.toContain(soulMdPath);
     });
   });

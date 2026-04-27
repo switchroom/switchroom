@@ -1963,11 +1963,20 @@ function classifyChange(
   if (relPath.startsWith("workspace/memory/") && relPath.endsWith(".md")) return "hot";
   if (relPath === "workspace/HEARTBEAT.md") return "hot";
 
+  // Soul files — persona identity (name, vibe, creature) is baked into
+  // --append-system-prompt at session start. When hotReloadStable is true the
+  // per-turn hook re-injects SOUL.md so changes go live next turn (hot).
+  // When hotReloadStable is false (default), the file is frozen at launch and
+  // any edit is invisible until the agent restarts — so we promote it to
+  // restart-required so the reconciler auto-restarts immediately.
+  if (relPath === "workspace/SOUL.md" || relPath === "workspace/SOUL.custom.md") {
+    return useHotReloadStable ? "hot" : "restart-required";
+  }
+
   // Stable workspace files — classification depends on hotReloadStable flag
   // When hotReloadStable is true, these are re-injected on every turn via hook
   // When hotReloadStable is false (default), they're baked into --append-system-prompt at start
   const stableWorkspaceFiles = [
-    "workspace/SOUL.md",
     "workspace/CLAUDE.md",
     "workspace/AGENTS.md",
     "workspace/AGENT.md",
@@ -1982,7 +1991,6 @@ function classifyChange(
   // CLAUDE.md stays stale-till-restart regardless (Claude Code's own file-load convention)
   if (relPath === "CLAUDE.md") return "stale-till-restart";
   if (relPath === "workspace/CLAUDE.custom.md") return "stale-till-restart";
-  if (relPath === "workspace/SOUL.custom.md") return "stale-till-restart";
 
   // Restart required — claude-code / MCP / subsystem lifecycle
   if (relPath === ".mcp.json") return "restart-required";

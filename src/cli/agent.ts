@@ -1161,14 +1161,15 @@ export function registerAgentCommand(program: Command): void {
     .description(
       "Re-apply switchroom.yaml to an existing agent (rewrites .mcp.json + settings.json + start.sh + CLAUDE.md)"
     )
-    .option("--restart", "Restart the agent after reconciling")
+    .option("--restart", "Restart the agent after reconciling (no-op when auto-restart fires)")
+    .option("--no-restart", "Suppress the automatic restart even when soul/config changes require it")
     .option("--graceful-restart", "Wait for active turn to complete before restarting")
     .option(
       "--preserve-claude-md",
       "Opt out of regenerating CLAUDE.md — use if you have hand-edits you don't want to migrate to CLAUDE.custom.md yet"
     )
     .action(
-      withConfigError(async (name: string, opts: { restart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean }) => {
+      withConfigError(async (name: string, opts: { restart?: boolean; noRestart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean }) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
         const configPath = getConfigPath(program);
@@ -1203,12 +1204,12 @@ export function registerAgentCommand(program: Command): void {
               console.log(chalk.green(`  ${n}: reconciled (${result.changes.length} file${result.changes.length === 1 ? "" : "s"})`));
 
               // Categorize and display changes by reload semantics
-              const { changesBySemantics } = result;
-              if (changesBySemantics) {
-                const { hot, staleTillRestart, restartRequired } = changesBySemantics;
+              const semantics = result.changesBySemantics;
+              if (semantics) {
+                const { hot, staleTillRestart, restartRequired } = semantics;
 
                 if (restartRequired.length > 0) {
-                  console.log(chalk.yellow("\n  Changed (restart REQUIRED, MCP/settings/launch):"));
+                  console.log(chalk.yellow("\n  Changed (restart required — soul/MCP/settings/launch):"));
                   for (const f of restartRequired) {
                     console.log(chalk.yellow(`    - ${f}`));
                   }
@@ -1230,11 +1231,17 @@ export function registerAgentCommand(program: Command): void {
 
                 // If only hot changes, suppress restart suggestion
                 const needsRestart = restartRequired.length > 0 || staleTillRestart.length > 0;
+                // Auto-restart when restart-required changes present (e.g. soul fields),
+                // unless the user explicitly opted out with --no-restart.
+                const autoRestart = restartRequired.length > 0 && !opts.noRestart;
                 if (!needsRestart && hot.length > 0) {
                   console.log(chalk.green("\n  (no restart needed, changes active next turn)"));
-                } else if (needsRestart && !opts.restart && !opts.gracefulRestart) {
+                } else if (needsRestart && !opts.restart && !opts.gracefulRestart && !autoRestart) {
                   console.log(chalk.gray(`\nRestart: switchroom agent restart ${n}`));
                   console.log(chalk.gray(`  (Or add --restart / --graceful-restart to this reconcile)`));
+                } else if (autoRestart) {
+                  console.log(chalk.cyan(`\n  Soul/config fields changed — restarting ${n} now.`));
+                  console.log(chalk.gray(`  (Pass --no-restart to skip.)`));
                 }
               } else {
                 // Fallback if changesBySemantics not available (shouldn't happen)
@@ -1244,7 +1251,16 @@ export function registerAgentCommand(program: Command): void {
               }
             }
 
-            if ((opts.restart || opts.gracefulRestart) && result.changes.length > 0) {
+            // Determine whether to restart: explicit flag, graceful flag, or auto-restart
+            // triggered by restart-required changes (soul fields, MCP, settings, etc.)
+            const changesBySemantics = result.changesBySemantics;
+            const autoRestartNeeded =
+              !opts.noRestart &&
+              changesBySemantics !== undefined &&
+              changesBySemantics.restartRequired.length > 0;
+            const shouldRestart = (opts.restart || opts.gracefulRestart || autoRestartNeeded) && result.changes.length > 0;
+
+            if (shouldRestart) {
               try {
                 // Summarise the files that changed (at most 3) so the
                 // greeting's Restarted row is meaningful rather than
@@ -1288,10 +1304,10 @@ export function registerAgentCommand(program: Command): void {
               `\nReconciled ${agentsTouched} agent(s), ${totalChanges} file(s) changed.`
             )
           );
-          if (!opts.restart) {
+          if (!opts.restart && !opts.gracefulRestart) {
             console.log(
               chalk.gray(
-                "  Tip: pass --restart to apply changes immediately, or run `switchroom agent restart <name>`."
+                "  Tip: soul/MCP/settings changes trigger an auto-restart. Pass --no-restart to defer, or --graceful-restart to wait for idle."
               )
             );
           }
