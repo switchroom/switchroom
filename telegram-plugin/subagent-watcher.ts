@@ -33,6 +33,7 @@ import {
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
+import { formatDuration, escapeHtml, truncate } from './card-format.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -136,29 +137,26 @@ const DEFAULT_CARD_UPDATE_INTERVAL_MS = 3000
 
 // ─── Card rendering ──────────────────────────────────────────────────────────
 
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return '<1s'
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  const r = s % 60
-  return `${m}m${r > 0 ? `${r}s` : ''}`
-}
+// formatDuration / escapeHtml / truncate now come from `./card-format.js`
+// — see issue #94. The previous local copy of `formatDuration` returned
+// the literal string `<1s` for sub-second values, which had to be
+// escaped at every call site or it crashed Telegram's HTML parser
+// (issue #86 / #89 / #101). The shared formatter returns `<n>ms`
+// instead, so the worker card no longer needs the per-call escapeHtml
+// dance for the elapsed-time component.
 
 /**
  * Render the pinned worker card from the current registry.
  * Returns null when no active workers are present.
  *
- * Format (one line per worker):
- *   🛠 <description> · <state> · last activity Xs ago · <tool count> tools
+ * Format (issue #94 — aligned with the main progress card):
+ *   🔧 <b>Background workers (N)</b> · ⏱ <elapsed-since-oldest>
+ *     🤖 <description> · ⏱ <last-activity-age> · <toolCount> tools
+ *
+ * The header mirrors the main card's `⚙️ Working… · ⏱ MM:SS` layout
+ * with a different icon (🔧 vs ⚙️) for visual distinction. Worker rows
+ * use the same `⏱` glyph + duration format as sub-agent rows in the
+ * main card.
  */
 export function renderWorkerCard(
   registry: ReadonlyMap<string, WorkerEntry>,
@@ -169,11 +167,20 @@ export function renderWorkerCard(
   )
   if (active.length === 0) return null
 
-  const lines: string[] = [`\u{1F6E0} <b>Background workers (${active.length})</b>`]
+  // Header elapsed = age of the oldest still-running worker. This gives
+  // the user a single "how long has the background fleet been busy"
+  // signal at a glance, matching the main card's "this turn has been
+  // running for X" framing.
+  const oldestDispatchedAt = Math.min(...active.map((w) => w.dispatchedAt))
+  const headerElapsed = formatDuration(now - oldestDispatchedAt)
+
+  const lines: string[] = [
+    `🔧 <b>Background workers (${active.length})</b> · ⏱ ${headerElapsed}`,
+  ]
   for (const w of active) {
-    const ago = escapeHtml(formatDuration(now - w.lastActivityAt))
+    const ago = formatDuration(now - w.lastActivityAt)
     const desc = escapeHtml(truncate(w.description || 'sub-agent', 60))
-    lines.push(`\u{1F527} ${desc} · running · last activity ${ago} ago · ${w.toolCount} tools`)
+    lines.push(`  🤖 ${desc} · ⏱ ${ago} · ${w.toolCount} tools`)
   }
   return lines.join('\n')
 }

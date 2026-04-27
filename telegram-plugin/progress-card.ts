@@ -16,6 +16,11 @@
 
 import type { SessionEvent } from './session-tail.js'
 import { toolLabel, isHumanDescription } from './tool-labels.js'
+import {
+  formatDuration as sharedFormatDuration,
+  escapeHtml as sharedEscapeHtml,
+  truncate as sharedTruncate,
+} from './card-format.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -700,23 +705,12 @@ const TOOL_SYMBOL: Record<ItemState, string> = {
  */
 const MAX_VISIBLE_ITEMS = 5
 
-/** @internal exported for unit testing */
-export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `00:${s.toString().padStart(2, '0')}`
-  const m = Math.floor(s / 60)
-  const r = s % 60
-  return `${m.toString().padStart(2, '0')}:${r.toString().padStart(2, '0')}`
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
-}
-
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + '…' : s
-}
+// Re-export the shared formatters so existing callers (and the test
+// file `tests/progress-card.test.ts`) keep working. The implementation
+// lives in `./card-format.js` — see issue #94.
+export const formatDuration = sharedFormatDuration
+const escapeHtml = sharedEscapeHtml
+const truncate = sharedTruncate
 
 /**
  * Strip the `<channel …>` XML wrapper (if present) from the enqueue raw

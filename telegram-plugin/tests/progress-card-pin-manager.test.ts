@@ -427,6 +427,36 @@ describe('createPinManager', () => {
       expect(h.deps.deleteMessage).not.toHaveBeenCalled()
     })
 
+    it('issue #94: deletes service messages for externally-tracked pins (worker card)', async () => {
+      // Worker / sub-agent cards are pinned via the gateway directly,
+      // not through `considerPin`. They register with `trackExternalPin`
+      // so `captureServiceMessage` recognises their service messages and
+      // suppresses the "Clerk pinned …" system noise (matching the main
+      // card's behaviour). Without this branch the worker card's pin
+      // event would slip through unmatched.
+      const h = mkHarness()
+      h.mgr.trackExternalPin('c', 777)
+
+      h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 777, serviceMessageId: 9002 })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.deleteMessage).toHaveBeenCalledWith('c', 9002)
+    })
+
+    it('issue #94: untrackExternalPin stops further captures', async () => {
+      const h = mkHarness()
+      h.mgr.trackExternalPin('c', 777)
+      h.mgr.untrackExternalPin('c', 777)
+
+      h.mgr.captureServiceMessage({ chatId: 'c', pinnedMessageId: 777, serviceMessageId: 9002 })
+      await h.mgr.drainInFlight()
+
+      // Once untracked, the manager treats the pin as unknown again and
+      // declines to delete — same shape as the "ignores untracked pins"
+      // test above.
+      expect(h.deps.deleteMessage).not.toHaveBeenCalled()
+    })
+
     it('no-op when deleteMessage is not wired', async () => {
       const h = mkHarness({ deleteMessage: undefined })
       h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })

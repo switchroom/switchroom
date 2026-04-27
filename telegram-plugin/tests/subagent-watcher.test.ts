@@ -62,7 +62,12 @@ describe('renderWorkerCard', () => {
     expect(html).toContain('Background workers (1)')
     expect(html).toContain('Fix the tests')
     expect(html).toContain('3 tools')
-    expect(html).toContain('running')
+    // Issue #94: rows now use the same `🤖` glyph + `⏱ MM:SS` format as
+    // sub-agent rows in the main progress card. The literal word
+    // "running" no longer appears — the active state is implied by the
+    // worker showing up in the card at all (done/failed are filtered).
+    expect(html).toContain('🤖')
+    expect(html).toContain('⏱')
   })
 
   it('renders multiple running workers', () => {
@@ -106,27 +111,33 @@ describe('renderWorkerCard', () => {
     expect(html).toContain('…')
   })
 
-  it('formats last-activity age', () => {
+  it('formats last-activity age (issue #94: shared MM:SS format)', () => {
     const registry = new Map<string, WorkerEntry>([
       ['a', makeEntry({ lastActivityAt: 1000 })],
     ])
-    // 30s ago
+    // 30s ago — shared formatter emits "00:30", not the legacy "30s".
     const html = renderWorkerCard(registry, 31_000)
-    expect(html).toContain('30s ago')
+    expect(html).toContain('00:30')
+    expect(html).not.toContain('30s ago')
   })
 
-  it('escapes HTML in sub-second age (<1s)', () => {
-    // formatDuration returns the literal string "<1s" when ms < 1000.
-    // If left unescaped, Telegram parses the leading "<" as the start
-    // of an HTML tag and rejects the message with
-    // "can't parse entities: Unsupported start tag '1s'". Ensure the
-    // rendered card escapes the angle bracket so the card actually sends.
+  it('issue #94: sub-second age renders HTML-safe (no `<1s` literal)', () => {
+    // Pre-#94 the watcher's own formatDuration returned the literal
+    // string "<1s" when ms < 1000. That broke Telegram's HTML parser
+    // unless escaped at every call site (see #86 / #89 / #101). The
+    // shared formatter (`./card-format.ts`) returns "<n>ms" instead,
+    // so no `<` ever appears in the rendered output and no per-call
+    // escapeHtml is required.
     const registry = new Map<string, WorkerEntry>([
       ['a', makeEntry({ description: 'sub-agent', lastActivityAt: 999 })],
     ])
-    const html = renderWorkerCard(registry, 1000) // 1ms idle → "<1s"
+    const html = renderWorkerCard(registry, 1000) // 1ms idle
     expect(html).not.toContain('<1s')
-    expect(html).toContain('&lt;1s')
+    expect(html).not.toContain('&lt;1s')
+    // The HTML-safe form: "1ms" — a literal sub-second duration as
+    // numeric ms. No HTML special chars; ready to interpolate without
+    // escaping.
+    expect(html).toContain('1ms')
   })
 
   it('excludes historical entries from the active-workers card', () => {

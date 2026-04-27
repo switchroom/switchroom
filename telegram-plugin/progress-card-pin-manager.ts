@@ -111,6 +111,21 @@ export interface PinManager {
     pinnedMessageId: number
     serviceMessageId: number
   }): void
+  /**
+   * Register a pin made outside the per-turn `considerPin()` path so
+   * `captureServiceMessage()` will recognise its service message and
+   * delete it. Used by the worker / sub-agent card (issue #94), which
+   * pins through the gateway directly rather than the progress-card
+   * pin candidate flow. Idempotent — calling twice with the same
+   * (chatId, messageId) is a no-op.
+   */
+  trackExternalPin(chatId: string, messageId: number): void
+  /**
+   * Drop an external pin from tracking. Call when the corresponding
+   * pinned message is unpinned/deleted by its owner so the manager
+   * doesn't keep a stale reference. Idempotent.
+   */
+  untrackExternalPin(chatId: string, messageId: number): void
   /** Test-only: snapshot the currently-pinned turnKeys. */
   pinnedTurnKeys(): ReadonlyArray<string>
   /** Test-only: look up the pinned message id for a turnKey. */
@@ -157,6 +172,13 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   // unpin path can also scrub the service message if the capture-delete
   // somehow failed.
   const serviceMessages = new Map<string, number>()
+  // Pins that the manager DIDN'T make through `considerPin()` but should
+  // still recognise so their "Clerk pinned …" service message gets
+  // deleted. Issue #94: the worker / sub-agent card pins via the gateway
+  // directly; without this set, captureServiceMessage would skip its
+  // service message and the user sees the system-message noise that the
+  // main card already suppresses. Keyed by `${chatId}:${messageId}`.
+  const externalPins = new Set<string>()
   // Fire-and-forget promises we want tests to be able to drain.
   const inFlight = new Set<Promise<unknown>>()
 
@@ -315,9 +337,17 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // Only act on service messages that wrap one of our tracked pins —
       // otherwise we'd be deleting arbitrary pin-service messages in the
       // chat, which could include user-initiated pins.
+      //
+      // We match against two sets: per-turn progress-card pins (managed
+      // through `considerPin`) AND externally-registered pins (the
+      // worker / sub-agent card, registered via `trackExternalPin` —
+      // see issue #94).
       let matched = false
       for (const [, msgId] of pinned) {
         if (msgId === pinnedMessageId) { matched = true; break }
+      }
+      if (!matched && externalPins.has(serviceKey(chatId, pinnedMessageId))) {
+        matched = true
       }
       if (!matched) return
       const key = serviceKey(chatId, pinnedMessageId)
@@ -328,6 +358,14 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // and a retry on unpin wouldn't help (Telegram pin-service messages
       // don't age back into existence).
       serviceMessages.delete(key)
+    },
+
+    trackExternalPin(chatId, messageId) {
+      externalPins.add(serviceKey(chatId, messageId))
+    },
+
+    untrackExternalPin(chatId, messageId) {
+      externalPins.delete(serviceKey(chatId, messageId))
     },
 
     pinnedTurnKeys() {

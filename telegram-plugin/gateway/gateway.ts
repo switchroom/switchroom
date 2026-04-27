@@ -5217,6 +5217,10 @@ void (async () => {
                   if (workerCardMsgId != null) {
                     const msgId = workerCardMsgId
                     workerCardMsgId = null
+                    // Drop external-pin tracking before issuing the unpin so
+                    // a race with a concurrent service-message capture can't
+                    // re-resurrect the entry. Issue #94.
+                    pinMgr.untrackExternalPin(String(ownerChatId), msgId)
                     void lockedBot.api.unpinChatMessage(ownerChatId, msgId).catch(() => {})
                     void lockedBot.api.deleteMessage(ownerChatId, msgId).catch(() => {})
                   }
@@ -5230,6 +5234,12 @@ void (async () => {
                     ...(TOPIC_ID != null ? { message_thread_id: TOPIC_ID } : {}),
                   }).then((sent) => {
                     workerCardMsgId = sent.message_id
+                    // Register the worker card with pinMgr BEFORE pinning so
+                    // its `captureServiceMessage` callback recognises the
+                    // service message Telegram emits in response and deletes
+                    // it (matching the existing main-card behaviour).
+                    // Issue #94.
+                    pinMgr.trackExternalPin(String(ownerChatId), sent.message_id)
                     void lockedBot.api.pinChatMessage(ownerChatId, sent.message_id, {
                       disable_notification: true,
                     }).catch(() => {})
