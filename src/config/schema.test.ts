@@ -82,6 +82,8 @@ describe("VaultConfigSchema.broker", () => {
     expect(result.broker).toEqual({
       socket: "~/.switchroom/vault-broker.sock",
       enabled: true,
+      autoUnlock: false,
+      autoUnlockCredentialPath: "~/.config/credstore.encrypted/vault-passphrase",
     });
   });
 
@@ -107,5 +109,27 @@ describe("VaultConfigSchema.broker", () => {
     });
     expect(result.path).toBe("/custom/vault.enc");
     expect(result.broker.enabled).toBe(true);
+  });
+
+  it("defaults autoUnlock to false", () => {
+    const result = VaultConfigSchema.parse({});
+    expect(result.broker.autoUnlock).toBe(false);
+  });
+
+  it("accepts autoUnlock: true", () => {
+    const result = VaultConfigSchema.parse({
+      broker: { autoUnlock: true },
+    });
+    expect(result.broker.autoUnlock).toBe(true);
+    expect(result.broker.enabled).toBe(true);
+  });
+
+  it("accepts a custom autoUnlockCredentialPath", () => {
+    const result = VaultConfigSchema.parse({
+      broker: { autoUnlockCredentialPath: "/etc/credstore.encrypted/vault-passphrase" },
+    });
+    expect(result.broker.autoUnlockCredentialPath).toBe(
+      "/etc/credstore.encrypted/vault-passphrase"
+    );
   });
 });
