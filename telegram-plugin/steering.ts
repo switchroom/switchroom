@@ -93,6 +93,27 @@ export function formatPriorAssistantPreview(text: string, maxChars = 200): strin
   return escapeXmlAttribute(truncated)
 }
 
+/**
+ * Format the `reply_to_text` channel-meta attribute (issue #119) — used by
+ * both `server.ts` and `gateway/gateway.ts` so the two paths can't drift.
+ *
+ * Difference from `formatPriorAssistantPreview`: we do NOT strip HTML or
+ * collapse whitespace. The original Telegram message text is plain text
+ * already, and preserving its shape (line breaks excluded by truncation,
+ * special chars escaped at the boundary) helps the agent see what the
+ * user was looking at when they hit "Reply".
+ *
+ * Returns undefined when `text` is null/undefined so the call site can
+ * conditionally include the attribute via spread without an extra guard.
+ */
+export function formatReplyToText(text: string | null | undefined, maxChars: number): string | undefined {
+  if (text == null) return undefined
+  const truncated = text.length > maxChars
+    ? text.slice(0, maxChars - 1) + '…'
+    : text
+  return escapeXmlAttribute(truncated)
+}
+
 export interface ChannelMetaAttributeOptions {
   queued?: boolean
   steering?: boolean

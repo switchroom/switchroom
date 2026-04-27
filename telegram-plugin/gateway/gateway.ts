@@ -65,7 +65,14 @@ import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
 } from '../history.js'
-import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview } from '../steering.js'
+import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview, formatReplyToText } from '../steering.js'
+
+/**
+ * Truncation cap for the `reply_to_text` channel-meta attribute (issue #119).
+ * Same value as in server.ts — kept in sync because the two paths produce
+ * identical envelope shapes.
+ */
+const REPLY_TO_TEXT_MAX = 200
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace } from '../format.js'
 import {
   startText as buildStartText,
@@ -2562,13 +2569,11 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
-  // If the user replied to a prior message via Telegram's native "long-press
-  // → Reply" affordance, capture the original message_id and a truncated
-  // preview so the agent can resolve "this" / "that" anaphora without
-  // an extra get_recent_messages call. See issue #119.
+  // Telegram-native reply context (issue #119). Same pattern as server.ts:
+  // `replyToText` is raw (for SQLite); `replyToTextEscaped` is XML-escaped
+  // (for channel meta).
   const replyToMsg = ctx.message?.reply_to_message
   const replyToMessageId = replyToMsg?.message_id
-  const REPLY_TO_TEXT_MAX = 200
   const replyToTextRaw = replyToMsg
     ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
     : undefined
@@ -2577,6 +2582,7 @@ async function handleInbound(
         ? replyToTextRaw.slice(0, REPLY_TO_TEXT_MAX - 1) + '…'
         : replyToTextRaw)
     : undefined
+  const replyToTextEscaped = formatReplyToText(replyToTextRaw, REPLY_TO_TEXT_MAX)
 
   if (HISTORY_ENABLED) {
     try {
@@ -2654,7 +2660,9 @@ async function handleInbound(
       // treat this as the antecedent for "this" / "that" / pronoun
       // references in the body, instead of asking the user what they meant.
       ...(replyToMessageId != null ? { reply_to_message_id: String(replyToMessageId) } : {}),
-      ...(replyToText != null && replyToText.length > 0 ? { reply_to_text: replyToText } : {}),
+      // Use the XML-escaped form for the meta — the raw form is in the
+      // SQLite buffer for verbatim retrieval via get_recent_messages.
+      ...(replyToTextEscaped != null && replyToTextEscaped.length > 0 ? { reply_to_text: replyToTextEscaped } : {}),
       // queued="true" when mid-turn with no steer prefix (new default), or
       // with explicit /queue or /q prefix (legacy alias).
       ...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),
