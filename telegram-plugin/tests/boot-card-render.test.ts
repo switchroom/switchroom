@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { renderBootCard } from '../gateway/boot-card.js'
+import { renderBootCard, resolvePersonaName } from '../gateway/boot-card.js'
 
 describe('renderBootCard — quiet by default', () => {
   it('returns one-line ack with default ✅ when no probes and no restart reason', () => {
@@ -170,5 +170,50 @@ describe('renderBootCard — HTML escaping', () => {
     })
     expect(out).toContain('rate &lt;limited&gt;')
     expect(out).not.toContain('rate <limited>')
+  })
+})
+
+describe('resolvePersonaName — persona name over slug (#169)', () => {
+  it('returns soul.name when set in config', () => {
+    const fakeCfg = () => ({
+      agents: { finn: { soul: { name: 'Finn', style: 'warm' } } },
+    })
+    expect(resolvePersonaName('finn', fakeCfg)).toBe('Finn')
+  })
+
+  it('falls back to slug when soul.name is absent', () => {
+    const fakeCfg = () => ({
+      agents: { finn: { soul: null } },
+    })
+    expect(resolvePersonaName('finn', fakeCfg)).toBe('finn')
+  })
+
+  it('falls back to slug when soul.name is empty string', () => {
+    const fakeCfg = () => ({
+      agents: { finn: { soul: { name: '', style: 'warm' } } },
+    })
+    expect(resolvePersonaName('finn', fakeCfg)).toBe('finn')
+  })
+
+  it('falls back to slug when agent key is not in config', () => {
+    const fakeCfg = () => ({ agents: {} })
+    expect(resolvePersonaName('finn', fakeCfg)).toBe('finn')
+  })
+
+  it('falls back to slug when config loader throws', () => {
+    const throwing = () => { throw new Error('no config file') }
+    expect(resolvePersonaName('finn', throwing)).toBe('finn')
+  })
+
+  it('boot card rendered with soul.name not slug — acceptance criterion for #169', () => {
+    // Simulate: slug is "finn", soul.name is "Finn"
+    const fakeCfg = () => ({
+      agents: { finn: { soul: { name: 'Finn', style: 'warm' } } },
+    })
+    const displayName = resolvePersonaName('finn', fakeCfg)
+    const out = renderBootCard({ agentName: displayName, version: 'v0.3.0+50' })
+    // User sees "Finn", not the slug "finn"
+    expect(out).toBe('✅ <b>Finn</b> back up · v0.3.0+50')
+    expect(out).not.toContain('<b>finn</b>')
   })
 })

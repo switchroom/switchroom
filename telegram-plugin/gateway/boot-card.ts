@@ -43,6 +43,42 @@ import {
 } from './boot-probes.js'
 import { escapeHtml } from '../card-format.js'
 import { join } from 'path'
+import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
+
+// ─── Persona name resolution ─────────────────────────────────────────────────
+
+/**
+ * Resolve the display name for an agent from its config's soul.name field.
+ *
+ * The slug (e.g. "finn") is an operator-facing identifier: agent directory,
+ * systemd unit name, vault key prefix. It should never appear in
+ * user-facing Telegram output. soul.name (e.g. "Finn") is the persona
+ * the user knows through the bot username, topic emoji, and conversation.
+ *
+ * Falls back to the slug when:
+ *   - soul is not set in the agent config
+ *   - the agent key is not found in switchroom.yaml
+ *   - the config cannot be loaded (gateway running outside a switchroom env)
+ *
+ * The optional `loadConfig` override exists purely for unit-test injection.
+ * Production callers pass no second argument and get the live config.
+ *
+ * Closes #169.
+ */
+export function resolvePersonaName(
+  slug: string,
+  loadConfig?: () => { agents?: Record<string, { soul?: { name?: string } | null }> } | null,
+): string {
+  try {
+    const config = loadConfig ? loadConfig() : _loadSwitchroomConfig()
+    const name = config?.agents?.[slug]?.soul?.name
+    return name && name.trim().length > 0 ? name : slug
+  } catch {
+    // Config unreadable (gateway running in a test env or outside a
+    // switchroom workspace). Degrade gracefully to the slug.
+    return slug
+  }
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 

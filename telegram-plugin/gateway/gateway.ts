@@ -187,6 +187,7 @@ import {
 } from '../subagent-watcher.js'
 import {
   startBootCard,
+  resolvePersonaName,
   type BootCardHandle,
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
@@ -1069,13 +1070,14 @@ const ipcServer: IpcServer = createIpcServer({
         process.stderr.write(`telegram gateway: bridge-reconnect: posting boot card reason=${reason} chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
         if (BOOT_CARD_ENABLED) {
           const agentDir = resolveAgentDirFromEnv()
-          const agentName = process.env.SWITCHROOM_AGENT_NAME ?? client.agentName ?? '-'
+          const agentSlug = process.env.SWITCHROOM_AGENT_NAME ?? client.agentName ?? '-'
+          const agentDisplayName = resolvePersonaName(agentSlug)
           const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
             sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
             editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
           }
           startBootCard(chatId, threadId, botApiForCard, {
-            agentName,
+            agentName: agentDisplayName,
             version: formatBootVersion(),
             agentDir: agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp'),
             gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
@@ -5707,16 +5709,17 @@ void (async () => {
               process.stderr.write(`telegram gateway: boot: posting boot card reason=${reason} chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
               if (BOOT_CARD_ENABLED) {
                 const agentDir = resolveAgentDirFromEnv()
-                const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+                const agentSlug = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+                const agentDisplayName = resolvePersonaName(agentSlug)
                 const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
                   sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
                   editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
                 }
                 try {
                   const handle = await startBootCard(chatId, threadId, botApiForCard, {
-                    agentName,
+                    agentName: agentDisplayName,
                     version: formatBootVersion(),
-                    agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentName),
+                    agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentSlug),
                     gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
                     restartReason: reason,
                     restartAgeMs: markerAgeMs,
