@@ -2835,6 +2835,7 @@ async function handleInbound(
         chatId: chat_id,
         threadId: messageThreadId != null ? String(messageThreadId) : undefined,
         userText: effectiveText,
+        replyToMessageId: msgId != null ? msgId : undefined,
       })
     } catch (err) {
       process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
@@ -5407,10 +5408,23 @@ if (streamMode === 'checklist') {
   }
 
   progressDriver = createProgressDriver({
-    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit }) => {
+    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit, replyToMessageId }) => {
       const args = {
         chat_id: chatId, text: html, done, message_thread_id: threadId,
         lane: 'progress', format: 'html', turnKey,
+        // Pass the source message_id as reply_to on the initial send only
+        // (isFirstEmit=true). handleStreamReply only applies reply_to on
+        // stream creation (first call for a given sKey), so subsequent
+        // edits — which reuse the existing DraftStream — naturally ignore
+        // this. Passing it unconditionally would be harmless, but being
+        // explicit here documents the "first send only" contract.
+        // We also opt out of auto-quote (quote:false) so that if
+        // replyToMessageId is absent the progress card sends bare — it
+        // doesn't want a random "latest inbound" quote attached.
+        quote: false as const,
+        ...(isFirstEmit && replyToMessageId != null
+          ? { reply_to: String(replyToMessageId) }
+          : {}),
       }
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,

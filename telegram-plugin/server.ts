@@ -5383,6 +5383,7 @@ async function handleInbound(
         chatId: chat_id,
         threadId: messageThreadId != null ? String(messageThreadId) : undefined,
         userText: effectiveText,
+        replyToMessageId: msgId != null ? msgId : undefined,
       })
     } catch (err) {
       process.stderr.write(

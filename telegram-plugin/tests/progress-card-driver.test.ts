@@ -95,7 +95,8 @@ describe('progress-card driver', () => {
     expect(emits).toHaveLength(1)
     expect(emits[0].chatId).toBe('c1')
     expect(emits[0].done).toBe(false)
-    expect(emits[0].html).toContain('<blockquote>hi</blockquote>')
+    // User request is no longer in the HTML — shown via Telegram reply banner.
+    expect(emits[0].html).not.toContain('<blockquote>')
   })
 
   it('startTurn fires an initial "Working…" render BEFORE any tool_use event', () => {
@@ -112,9 +113,9 @@ describe('progress-card driver', () => {
     expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
     // No tool_use has been fed in yet — there must be no checklist items.
     expect(emits[0].html).not.toContain('◉ <b>')
-    // And the echoed user request shows up so the card ties back to the
-    // user's message.
-    expect(emits[0].html).toContain('please investigate')
+    // The user request is no longer in the HTML — it is shown via Telegram's
+    // native reply banner (reply_parameters on the initial sendMessage).
+    expect(emits[0].html).not.toContain('<blockquote>')
   })
 
   it('startTurn passes threadId through for forum-topic chats', () => {
@@ -280,9 +281,11 @@ describe('progress-card driver', () => {
     const { driver, emits } = harness()
     driver.ingest(enqueue('c1', 'request-one'), null)
     driver.ingest(enqueue('c2', 'request-two'), null)
+    // Each chat produces its own emit; user request text is no longer
+    // rendered in the card body (#156 — shown via Telegram reply banner).
     expect(emits.map((e) => e.chatId)).toEqual(['c1', 'c2'])
-    expect(emits[0].html).toContain('request-one')
-    expect(emits[1].html).toContain('request-two')
+    expect(emits[0].html).not.toContain('<blockquote>')
+    expect(emits[1].html).not.toContain('<blockquote>')
   })
 
   it('turn_end drops state so next turn starts fresh', () => {
@@ -296,7 +299,8 @@ describe('progress-card driver', () => {
     // New turn
     driver.ingest(enqueue('c1', 'second'), null)
     expect(emits).toHaveLength(1)
-    expect(emits[0].html).toContain('<blockquote>second</blockquote>')
+    // User request is no longer in the HTML — shown via Telegram reply banner.
+    expect(emits[0].html).not.toContain('<blockquote>')
     // No leaked items from the prior turn
     expect(emits[0].html).not.toContain('Read')
   })

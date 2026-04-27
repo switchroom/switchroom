@@ -60,6 +60,14 @@ export interface ProgressDriverConfig {
    * that creates the Telegram message. The caller can use this signal to
    * pin the new message: after this call resolves, the message_id will be
    * available in the caller's draft-stream handle.
+   *
+   * `replyToMessageId` is set only on the first emit (when `isFirstEmit`
+   * is true) and only when the turn was started with a source message_id
+   * (via `startTurn({ replyToMessageId })`). The caller should pass this
+   * as `reply_parameters` on the initial `sendMessage` so the progress
+   * card is a tappable reply to the user's original message. Edits
+   * (subsequent emits) must NOT carry reply_parameters — Telegram rejects
+   * it on editMessageText.
    */
   emit: (args: {
     chatId: string
@@ -70,6 +78,12 @@ export interface ProgressDriverConfig {
     done: boolean
     /** True only on the first flush for this turn (message creation). */
     isFirstEmit: boolean
+    /**
+     * Set on the first emit only (isFirstEmit=true) when the turn was
+     * started via startTurn({ replyToMessageId }). Pass as
+     * reply_parameters.message_id on the initial sendMessage.
+     */
+    replyToMessageId?: number
   }) => void
   /**
    * Optional callback fired once per turn immediately after the final
@@ -200,6 +214,13 @@ interface PerChatState {
   /** Timer for the deferred first emit (initial-delay suppression). */
   deferredFirstEmitTimer: unknown
   /**
+   * The Telegram message_id of the user's original inbound message that
+   * triggered this turn. Set via startTurn({ replyToMessageId }). Passed
+   * as reply_parameters on the FIRST sendMessage only — edits must not
+   * carry it (Telegram rejects reply_parameters on editMessageText).
+   */
+  replyToMessageId?: number
+  /**
    * Wall-clock ms of the last real session event routed to this card.
    * Distinct from `lastEmittedAt`: the heartbeat ticks `lastEmittedAt`
    * every cycle, but `lastEventAt` only advances when an actual event
@@ -286,7 +307,7 @@ export interface ProgressDriver {
    * onTurnComplete fired) before the new card is created. Each call always
    * produces an independent card with its own pin lifecycle.
    */
-  startTurn(args: { chatId: string; threadId?: string; userText: string }): void
+  startTurn(args: { chatId: string; threadId?: string; userText: string; replyToMessageId?: number }): void
   /**
    * External completion hook — authoritative turn-finished signal from
    * outside the session-tail path. Intended for `stream_reply(done=true)`
@@ -779,6 +800,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       html,
       done: terminal,
       isFirstEmit: isFirst,
+      // Thread the source message_id through on the first emit only so
+      // the caller can pass it as reply_parameters on the initial
+      // sendMessage. Edits (isFirstEmit=false) must NOT carry it.
+      ...(isFirst && chatState.replyToMessageId != null
+        ? { replyToMessageId: chatState.replyToMessageId }
+        : {}),
     })
   }
 
@@ -1080,7 +1107,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }, delay)
     },
 
-    startTurn({ chatId, threadId, userText }) {
+    startTurn({ chatId, threadId, userText, replyToMessageId }) {
       // Synthesize an enqueue event and run it through the normal ingest
       // path. This guarantees we share all the flush/cadence/teardown
       // semantics with session-tail-driven enqueues.
@@ -1100,6 +1127,15 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         chatId,
         threadId,
       )
+      // Stash the source message_id on the newly-created PerChatState so
+      // flush() can pass it to the emit callback on the first send only.
+      // Do this AFTER ingest() so the new PerChatState entry is in chats.
+      if (replyToMessageId != null && currentTurnKey != null) {
+        const cs = chats.get(currentTurnKey)
+        if (cs != null && cs.chatId === chatId) {
+          cs.replyToMessageId = replyToMessageId
+        }
+      }
     },
 
     forceCompleteTurn({ chatId, threadId }) {

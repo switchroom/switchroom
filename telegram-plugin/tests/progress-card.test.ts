@@ -266,7 +266,9 @@ describe('progress-card render', () => {
   it('renders plan stage with no items', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
-    expect(out).toContain('<blockquote>fix tests</blockquote>')
+    // User request is no longer rendered as a blockquote — it is shown via
+    // Telegram's native reply banner (reply_parameters on sendMessage).
+    expect(out).not.toContain('<blockquote>')
     expect(out).not.toContain('🤔 Plan')
   })
 
@@ -274,14 +276,10 @@ describe('progress-card render', () => {
     const s = fold([enqueue('fix tests')])
     const out = render(s, 5000)
     const lines = out.split('\n')
-    // Header should be FIRST, blockquote SECOND
     const headerLine = lines.find(l => l.includes('⚙️ <b>Working…</b>'))
-    const quoteLine = lines.find(l => l.includes('<blockquote>'))
     expect(headerLine).toBeDefined()
-    expect(quoteLine).toBeDefined()
-    const headerIdx = lines.indexOf(headerLine!)
-    const quoteIdx = lines.indexOf(quoteLine!)
-    expect(headerIdx).toBeLessThan(quoteIdx)
+    // No blockquote — user request shown via Telegram native reply banner.
+    expect(out).not.toContain('<blockquote>')
     expect(out).not.toContain('─ ─ ─')
     expect(out).not.toContain('✅ <b>Done</b> ·')
   })
@@ -444,24 +442,28 @@ describe('progress-card render', () => {
     expect(out).not.toContain('b.ts')
   })
 
-  it('truncates long user requests', () => {
+  it('does not render the user request as a blockquote (shown via Telegram reply banner)', () => {
     const long = 'a'.repeat(300)
     const s = fold([enqueue(long)])
     const out = render(s, 2000)
-    expect(out).toContain('aaa…')
-    const bqLine = out.split('\n').find(l => l.includes('<blockquote>'))!
-    expect(bqLine.length).toBeLessThan(160)
+    // The user request is no longer in the HTML — it appears as a Telegram
+    // native reply banner (reply_parameters) which is outside the HTML body.
+    expect(out).not.toContain('<blockquote>')
+    expect(out).not.toContain('aaa')
   })
 
-  it('escapes HTML in user text and latestText', () => {
+  it('escapes HTML in latestText', () => {
     const s = fold([
       enqueue('fix <script>alert(1)</script>'),
       { kind: 'text', text: 'my plan: <img>' },
     ])
     const out = render(s, 2000)
-    expect(out).toContain('&lt;script&gt;')
+    // User request is no longer in the HTML (shown via Telegram reply banner),
+    // so the script tag does not appear in the rendered card HTML at all.
+    expect(out).not.toContain('script')
+    // latestText IS still rendered, and its HTML must be escaped.
     expect(out).toContain('&lt;img&gt;')
-    expect(out).not.toContain('<script>')
+    expect(out).not.toContain('<img>')
   })
 
   it('header banner reflects the active stage', () => {

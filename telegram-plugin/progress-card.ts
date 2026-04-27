@@ -880,9 +880,11 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
   lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
 
-  if (state.userRequest) {
-    lines.push(`<blockquote>${escapeHtml(truncate(state.userRequest, 120))}</blockquote>`)
-  }
+  // (#156) The user's request used to render here as an inline
+  // <blockquote>. That was a styled element only — Telegram clients
+  // don't deep-link inline HTML quotes. The progress card now sets
+  // reply_parameters.message_id on the initial sendMessage so Telegram
+  // shows its native, tappable reply banner above the card instead.
 
   if (silentEnd) {
     // Diagnostic hint shown only on silent-end turns. Distinct from the

@@ -103,7 +103,9 @@ describe('progress-card golden turn', () => {
 
     // Structural assertions — don't brittle-pin the whole string, but
     // lock in the key visual elements and their ordering.
-    expect(html).toContain('<blockquote>fix the failing tests and push</blockquote>')
+    // User request is no longer rendered as a blockquote — it is shown via
+    // Telegram's native reply banner (reply_parameters on sendMessage).
+    expect(html).not.toContain('<blockquote>')
     expect(html).toContain('✅ <b>Done</b>')
 
     // Text events create narrative steps; the final text block becomes a narrative
