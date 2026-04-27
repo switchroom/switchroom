@@ -56,7 +56,7 @@ describe("ScheduleEntrySchema.secrets", () => {
   });
 
   it("rejects key names containing shell-special characters", () => {
-    const badNames = ["foo$bar", "foo;bar", "foo/bar", "foo.bar", "foo@bar"];
+    const badNames = ["foo$bar", "foo;bar", "foo.bar", "foo@bar"];
     for (const name of badNames) {
       expect(() =>
         ScheduleEntrySchema.parse({
@@ -67,6 +67,15 @@ describe("ScheduleEntrySchema.secrets", () => {
         `expected "${name}" to be rejected`,
       ).toThrow();
     }
+  });
+
+  it("accepts namespaced key names with forward slashes", () => {
+    const result = ScheduleEntrySchema.parse({
+      cron: "0 8 * * *",
+      prompt: "Send a brief.",
+      secrets: ["microsoft/ken-tokens", "openai/api-key"],
+    });
+    expect(result.secrets).toEqual(["microsoft/ken-tokens", "openai/api-key"]);
   });
 });
 

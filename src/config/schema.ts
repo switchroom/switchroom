@@ -29,7 +29,7 @@ export const ScheduleEntrySchema = z.object({
       "Use claude-opus-4-6 for tasks needing complex reasoning.",
     ),
   secrets: z
-    .array(z.string().regex(/^[a-zA-Z0-9_-]+$/, "Secret key names must contain only alphanumeric characters, underscores, and hyphens"))
+    .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))
     .default([])
     .describe(
       "Vault key names this cron task may read via the vault-broker daemon. " +
