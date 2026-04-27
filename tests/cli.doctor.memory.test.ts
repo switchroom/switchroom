@@ -42,39 +42,12 @@ describe("doctor memory section", () => {
   });
 });
 
-describe("greeting memory row", () => {
-  it("includes SWITCHROOM_MEMORY placeholder in greeting template", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("__SWITCHROOM_MEMORY__");
-    expect(scaffoldSource).toContain("<b>Memory</b>  __SWITCHROOM_MEMORY__");
-  });
-
-  it("includes bank_stats query logic in greeting script", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("_bank_stats");
-    expect(scaffoldSource).toContain("get_bank_stats");
-    expect(scaffoldSource).toContain("HINDSIGHT_BANK_ID");
-  });
-
-  it("gracefully handles Hindsight unreachable state", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("Hindsight unreachable");
-    expect(scaffoldSource).toContain("recall disabled this session");
-  });
-
-  it("formats memory count and last retain time", () => {
-    const fs = require("fs");
-    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
-
-    expect(scaffoldSource).toContain("memories");
-    expect(scaffoldSource).toContain("last consolidated");
-    expect(scaffoldSource).toContain("_COUNT");
-    expect(scaffoldSource).toContain("_LAST_TS");
-  });
-});
+// `describe('greeting memory row', ...)` block deleted in #142 PR 1.
+// The session greeting card (a curl + heredoc bash script written to
+// `<agentDir>/telegram/session-greeting.sh` on every SessionStart) was
+// removed wholesale — its Memory row, bank_stats query, "recall
+// disabled this session" fallback, and `_COUNT` / `_LAST_TS`
+// placeholder substitution all went with it. The greeting's content
+// will be reincarnated as a `/status` slash command in #142 PR 3,
+// where it runs server-side on demand instead of agent-side on every
+// SessionStart. New tests will land alongside that PR.
