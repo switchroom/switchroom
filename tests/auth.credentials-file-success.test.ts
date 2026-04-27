@@ -32,8 +32,18 @@ import {
  *     recognises (no drift between the two channels)
  */
 
-const VALID_TOKEN =
-  "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";
+// Assembled at runtime so the source file never contains a contiguous
+// `sk-ant-oat\d+-...` pattern that GitHub Push Protection (or Anthropic's
+// secret-scanning peers) would treat as a leaked OAuth token. The shape
+// still passes the regex `parseSetupTokenValue` and `readTokenFromCreden-
+// tialsFile` use, so the test exercises the real success contract.
+// See CLAUDE.md "Secrets in tests" + telegram-plugin/tests/secret-detect-
+// secretlint.test.ts for the established pattern.
+const VALID_TOKEN = [
+  "sk-ant-oat01-",
+  "FIXTURE0NOTAREALTOKEN",
+  "_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+].join("");
 
 describe("readTokenFromCredentialsFile", () => {
   let tempDir: string;

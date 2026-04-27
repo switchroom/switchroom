@@ -169,7 +169,8 @@ describe('detectSecrets — end-to-end', () => {
     expect(d[0]!.suppressed).toBe(false)
   })
   it('finds a GitHub PAT', () => {
-    const text = 'token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 expires tomorrow'
+    // Token assembled at runtime — see CLAUDE.md "Secrets in tests".
+    const text = 'token: ghp' + '_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 expires tomorrow'
     const d = detectSecrets(text)
     expect(d.some((h) => h.rule_id === 'github_pat_classic')).toBe(true)
   })
