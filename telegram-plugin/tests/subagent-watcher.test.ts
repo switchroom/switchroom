@@ -1,14 +1,18 @@
 /**
  * Unit tests for the subagent-watcher module.
  *
- * Covers:
- *   - renderWorkerCard output format
+ * Covers (post-#142):
  *   - Registry transitions (register, tool_use, turn_end)
  *   - JSONL tail parsing (description from sub_agent_text, toolCount from sub_agent_tool_use)
  *   - Stall detection (stall notification after stallThresholdMs idle)
  *   - Completion notification (sent once on state=done)
- *   - Dispatch notification (sent on registration)
- *   - Card lifecycle (created on first worker, updated on changes, removed when all done)
+ *
+ * #142 deleted the per-dispatch "Worker dispatched" reply and the pinned
+ * "🔧 Background workers" card — those duplicated information already
+ * shown in the main progress card's in-card `[Sub-agents · N running]`
+ * block, which now stays alive past parent turn-end via the driver's
+ * pendingCompletion gate (see progress-card-driver.test.ts:1347+ for the
+ * locked contract).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -16,157 +20,7 @@ import * as fs from 'fs'
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { renderWorkerCard, startSubagentWatcher, type WorkerEntry } from '../subagent-watcher.js'
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function makeEntry(overrides: Partial<WorkerEntry> = {}): WorkerEntry {
-  return {
-    agentId: 'test-agent-01',
-    filePath: '/tmp/agent-test-agent-01.jsonl',
-    description: 'Build the feature',
-    state: 'running',
-    dispatchedAt: 1000,
-    lastActivityAt: 1000,
-    toolCount: 0,
-    stallNotified: false,
-    completionNotified: false,
-    lastSummaryLine: '',
-    historical: false,
-    ...overrides,
-  }
-}
-
-// ─── renderWorkerCard ────────────────────────────────────────────────────────
-
-describe('renderWorkerCard', () => {
-  it('returns null when registry is empty', () => {
-    const registry = new Map<string, WorkerEntry>()
-    expect(renderWorkerCard(registry, 2000)).toBeNull()
-  })
-
-  it('returns null when all workers are done', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ state: 'done' })],
-      ['b', makeEntry({ agentId: 'b', state: 'failed' })],
-    ])
-    expect(renderWorkerCard(registry, 2000)).toBeNull()
-  })
-
-  it('renders a single running worker', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: 'Fix the tests', toolCount: 3, lastActivityAt: 1000 })],
-    ])
-    const html = renderWorkerCard(registry, 61_000)
-    expect(html).not.toBeNull()
-    expect(html).toContain('Background workers (1)')
-    expect(html).toContain('Fix the tests')
-    expect(html).toContain('3 tools')
-    // Issue #94: rows now use the same `🤖` glyph + `⏱ MM:SS` format as
-    // sub-agent rows in the main progress card. The literal word
-    // "running" no longer appears — the active state is implied by the
-    // worker showing up in the card at all (done/failed are filtered).
-    expect(html).toContain('🤖')
-    expect(html).toContain('⏱')
-  })
-
-  it('renders multiple running workers', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: 'Worker A', toolCount: 2 })],
-      ['b', makeEntry({ agentId: 'b', description: 'Worker B', toolCount: 5 })],
-    ])
-    const html = renderWorkerCard(registry, 2000)
-    expect(html).toContain('Background workers (2)')
-    expect(html).toContain('Worker A')
-    expect(html).toContain('Worker B')
-  })
-
-  it('shows only running workers in the card', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: 'Still running', state: 'running' })],
-      ['b', makeEntry({ agentId: 'b', description: 'Already done', state: 'done' })],
-    ])
-    const html = renderWorkerCard(registry, 2000)
-    expect(html).toContain('Background workers (1)')
-    expect(html).toContain('Still running')
-    expect(html).not.toContain('Already done')
-  })
-
-  it('escapes HTML special characters in description', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: '<script>alert("xss")</script>' })],
-    ])
-    const html = renderWorkerCard(registry, 2000)
-    expect(html).not.toContain('<script>')
-    expect(html).toContain('&lt;script&gt;')
-  })
-
-  it('truncates long descriptions', () => {
-    const long = 'a'.repeat(100)
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: long })],
-    ])
-    const html = renderWorkerCard(registry, 2000)
-    expect(html?.length).toBeLessThan(400)
-    expect(html).toContain('…')
-  })
-
-  it('formats last-activity age (issue #94: shared MM:SS format)', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ lastActivityAt: 1000 })],
-    ])
-    // 30s ago — shared formatter emits "00:30", not the legacy "30s".
-    const html = renderWorkerCard(registry, 31_000)
-    expect(html).toContain('00:30')
-    expect(html).not.toContain('30s ago')
-  })
-
-  it('issue #94: sub-second age renders HTML-safe (no `<1s` literal)', () => {
-    // Pre-#94 the watcher's own formatDuration returned the literal
-    // string "<1s" when ms < 1000. That broke Telegram's HTML parser
-    // unless escaped at every call site (see #86 / #89 / #101). The
-    // shared formatter (`./card-format.ts`) returns "<n>ms" instead,
-    // so no `<` ever appears in the rendered output and no per-call
-    // escapeHtml is required.
-    const registry = new Map<string, WorkerEntry>([
-      ['a', makeEntry({ description: 'sub-agent', lastActivityAt: 999 })],
-    ])
-    const html = renderWorkerCard(registry, 1000) // 1ms idle
-    expect(html).not.toContain('<1s')
-    expect(html).not.toContain('&lt;1s')
-    // The HTML-safe form: "1ms" — a literal sub-second duration as
-    // numeric ms. No HTML special chars; ready to interpolate without
-    // escaping.
-    expect(html).toContain('1ms')
-  })
-
-  it('excludes historical entries from the active-workers card', () => {
-    // Historical = JSONL existed before the watcher started. The sub-agent
-    // process is long dead; the file is just left over from a prior session.
-    // Even if state was last written as 'running' (no turn_end event in
-    // the file), the entry must not appear in the card. With many
-    // historical entries (e.g. months of session history) the card text
-    // overflows Telegram's 4096-char message limit and sendMessage fails.
-    const registry = new Map<string, WorkerEntry>([
-      ['live', makeEntry({ agentId: 'live', description: 'real worker', historical: false })],
-      ['hist1', makeEntry({ agentId: 'hist1', description: 'old session 1', historical: true })],
-      ['hist2', makeEntry({ agentId: 'hist2', description: 'old session 2', historical: true })],
-    ])
-    const html = renderWorkerCard(registry, 2000)
-    expect(html).toContain('Background workers (1)')
-    expect(html).toContain('real worker')
-    expect(html).not.toContain('old session 1')
-    expect(html).not.toContain('old session 2')
-  })
-
-  it('returns null when only historical entries are present', () => {
-    const registry = new Map<string, WorkerEntry>([
-      ['hist1', makeEntry({ agentId: 'hist1', historical: true })],
-      ['hist2', makeEntry({ agentId: 'hist2', historical: true })],
-    ])
-    expect(renderWorkerCard(registry, 2000)).toBeNull()
-  })
-})
+import { startSubagentWatcher } from '../subagent-watcher.js'
 
 // ─── startSubagentWatcher harness ────────────────────────────────────────────
 
@@ -210,7 +64,6 @@ function subAgentTurnDuration() {
 
 interface WatcherHarness {
   notifications: string[]
-  cardUpdates: Array<string | null>
   advance: (ms: number) => void
   // Trigger the poll timer manually
   poll: () => void
@@ -238,7 +91,6 @@ function makeHarness(opts: {
   dirs?: Record<string, string[]> // dirPath → list of filenames
   existingDirs?: string[]
   stallThresholdMs?: number
-  cardUpdateIntervalMs?: number
   rescanMs?: number
 }): WatcherHarness {
   const {
@@ -247,13 +99,11 @@ function makeHarness(opts: {
     dirs = {},
     existingDirs = [],
     stallThresholdMs = 60_000,
-    cardUpdateIntervalMs = 100,
     rescanMs = 500,
   } = opts
 
   let currentTime = 1000
   const notifications: string[] = []
-  const cardUpdates: Array<string | null> = []
 
   // Track all JSONL content per path for statSync + read simulation
   const fileContents: Map<string, Buffer> = new Map()
@@ -332,9 +182,7 @@ function makeHarness(opts: {
   const watcher = startSubagentWatcher({
     agentDir,
     sendNotification: (text) => notifications.push(text),
-    updatePinnedCard: (html) => cardUpdates.push(html),
     stallThresholdMs,
-    cardUpdateIntervalMs,
     rescanMs,
     now: () => currentTime,
     setInterval: (fn, ms) => {
@@ -370,7 +218,6 @@ function makeHarness(opts: {
 
   return {
     notifications,
-    cardUpdates,
     advance,
     poll,
     watcher,
@@ -390,12 +237,16 @@ describe('startSubagentWatcher', () => {
     const h = makeHarness({ agentDir: '/nonexistent', existingDirs: [] })
     h.poll()
     expect(h.notifications).toHaveLength(0)
-    expect(h.cardUpdates).toHaveLength(0)
     h.watcher.stop()
   })
 
-  it('detects a new subagent JSONL created after startup and emits dispatch notification', () => {
-    // Watcher starts with an empty subagents dir, then a new file appears.
+  it('registers a new post-startup sub-agent in the registry without firing a Telegram dispatch (#142)', () => {
+    // Pre-#142 the watcher emitted a "🛠️ Worker dispatched" inline reply
+    // every time it discovered a sub-agent JSONL after boot. That surface
+    // duplicated the in-card `[Sub-agents · N running]` block of the main
+    // progress card. #142 deleted it — registry tracking still happens
+    // (we still tail JSONLs for stall + completion transitions), but no
+    // dispatch notification is sent to Telegram.
     const agentDir = '/home/user/.switchroom/agents/myagent'
     const projectsRoot = `${agentDir}/.claude/projects`
     const projectDir = `${projectsRoot}/myproject`
@@ -410,16 +261,13 @@ describe('startSubagentWatcher', () => {
       dirs: {
         [projectsRoot]: ['myproject'],
         [projectDir]: ['session-abc123'],
-        // subagentsDir is empty at startup
         [subagentsDir]: [],
       },
       files: {},
     })
 
-    // No notifications during boot
     expect(h.notifications).toHaveLength(0)
 
-    // Simulate the new file appearing after startup
     h.mockFs.readdirSync = ((p: unknown) => {
       const ps = String(p)
       if (ps === subagentsDir) return ['agent-deadbeef.jsonl']
@@ -439,8 +287,11 @@ describe('startSubagentWatcher', () => {
 
     h.poll()
 
-    expect(h.notifications.length).toBeGreaterThanOrEqual(1)
-    expect(h.notifications[0]).toContain('Worker dispatched')
+    // Registry has the new agent…
+    expect(h.watcher.getRegistry().has('deadbeef')).toBe(true)
+    expect(h.watcher.getRegistry().get('deadbeef')?.historical).toBe(false)
+    // …but no Telegram dispatch notification was sent.
+    expect(h.notifications.filter((n) => n.includes('Worker dispatched'))).toHaveLength(0)
 
     h.watcher.stop()
   })
@@ -477,20 +328,16 @@ describe('startSubagentWatcher', () => {
 
     function startWatcherSync(opts: { agentDir: string }): {
       notifications: string[]
-      cardUpdates: Array<string | null>
       poll: () => void
       watcher: ReturnType<typeof startSubagentWatcher>
     } {
       const notifications: string[] = []
-      const cardUpdates: Array<string | null> = []
       const intervals: Array<{ fn: () => void; ref: number }> = []
       let nextRef = 1
       const watcher = startSubagentWatcher({
         agentDir: opts.agentDir,
         sendNotification: (text) => notifications.push(text),
-        updatePinnedCard: (html) => cardUpdates.push(html),
         stallThresholdMs: 60_000,
-        cardUpdateIntervalMs: 100,
         rescanMs: 500,
         now: () => Date.now(),
         setInterval: (fn) => {
@@ -508,7 +355,6 @@ describe('startSubagentWatcher', () => {
       startedWatchers.push(watcher)
       return {
         notifications,
-        cardUpdates,
         poll: () => intervals[0]?.fn(),
         watcher,
       }
@@ -561,21 +407,23 @@ describe('startSubagentWatcher', () => {
       expect(completionNotifs).toHaveLength(0)
     })
 
-    it('emits completion notification when a NEW subagent finishes', () => {
+    it('emits completion notification when a NEW subagent finishes (no dispatch since #142)', () => {
       // File does NOT exist at startup. Watcher starts, then file appears
       // with an in-flight status. Then turn_end is appended — we should
       // get a completion notification.
+      //
+      // Pre-#142 a "🛠️ Worker dispatched" notification also fired on the
+      // first poll. That surface was deleted (it duplicated the in-card
+      // [Sub-agents · N running] block of the main progress card).
       const agentDir = join(tmpRoot, 'agent')
       const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
       mkdirSync(subagentsDir, { recursive: true })
       const jsonlPath = join(subagentsDir, 'agent-newagent.jsonl')
 
-      // Write just the initial user message (in-flight state)
       const initialContent = buildJSONL(subAgentUserMsg('Do the task'))
 
       const h = startWatcherSync({ agentDir })
 
-      // Write file AFTER watcher starts (post-startup, so not historical)
       writeFileSync(jsonlPath, initialContent)
       h.poll()
 
@@ -583,10 +431,10 @@ describe('startSubagentWatcher', () => {
       expect(entry).toBeDefined()
       expect(entry?.state).toBe('running')
 
-      // Dispatch notification fired (post-startup file)
-      expect(h.notifications.filter((n) => n.includes('Worker dispatched'))).toHaveLength(1)
+      // No dispatch notification — that surface was deleted in #142.
+      expect(h.notifications.filter((n) => n.includes('Worker dispatched'))).toHaveLength(0)
 
-      // Now append turn_end to simulate agent finishing
+      // Append turn_end to simulate agent finishing
       appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
       h.poll()
 
@@ -753,16 +601,25 @@ describe('startSubagentWatcher', () => {
     expect(h.notifications.length).toBe(notifsBefore)
   })
 
-  // ─── Startup-snapshot regression tests (the core bug fix) ─────────────────
+  // ─── Startup-snapshot regression tests ─────────────────────────────────
 
-  describe('startup snapshot: pre-existing JSONL files do not fire dispatch', () => {
+  describe('startup snapshot: registry tracks pre-existing files (no dispatch since #142)', () => {
     /**
-     * These tests directly verify the fix for the bug where pre-existing JSONL
-     * files at watcher boot caused spurious "Worker dispatched" notifications —
-     * one per historical session — on every agent restart.
+     * Pre-#142 history: the watcher emitted a "🛠️ Worker dispatched" inline
+     * reply for every newly-discovered sub-agent. A bug shipped in PR #70
+     * caused that to fire for every pre-existing JSONL file at watcher
+     * boot — flooding the chat on every restart with "Worker dispatched"
+     * for sessions that finished long ago. The historical-files snapshot
+     * was the targeted fix.
+     *
+     * Post-#142 the dispatch surface is gone entirely (it duplicated the
+     * in-card [Sub-agents · N running] block of the main progress card).
+     * Historical tracking still matters because stall detection skips
+     * historical entries (otherwise restarts would fire 60s-stall warnings
+     * for every long-dead session).
      */
 
-    it('pre-existing JSONL files at startup are NOT dispatched', () => {
+    it('pre-existing JSONL files at startup populate the registry (no dispatch ever)', () => {
       // Two JSONL files exist before the watcher starts.
       const agentDir = '/home/user/.switchroom/agents/myagent'
       const projectsRoot = `${agentDir}/.claude/projects`
@@ -774,7 +631,6 @@ describe('startSubagentWatcher', () => {
 
       const content = buildJSONL(subAgentUserMsg('Old task'))
 
-      // Both files exist at harness construction time (i.e. before watcher starts)
       const h = makeHarness({
         agentDir,
         existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
@@ -789,71 +645,21 @@ describe('startSubagentWatcher', () => {
         },
       })
 
-      // Both agents are in the registry (we track them for state transitions)
+      // Both agents are in the registry, both flagged historical.
       const registry = h.watcher.getRegistry()
       expect(registry.size).toBe(2)
+      for (const entry of registry.values()) {
+        expect(entry.historical).toBe(true)
+      }
 
-      // But no dispatch notification was emitted for either
+      // No dispatch notification — surface deleted in #142.
       const dispatchNotifs = h.notifications.filter((n) => n.includes('Worker dispatched'))
       expect(dispatchNotifs).toHaveLength(0)
 
       h.watcher.stop()
     })
 
-    it('JSONL file created after startup DOES fire dispatch', () => {
-      const agentDir = '/home/user/.switchroom/agents/myagent'
-      const projectsRoot = `${agentDir}/.claude/projects`
-      const projectDir = `${projectsRoot}/myproject`
-      const sessionDir = `${projectDir}/session-abc123`
-      const subagentsDir = `${sessionDir}/subagents`
-      const newJsonl = `${subagentsDir}/agent-new-cccc.jsonl`
-
-      const content = buildJSONL(subAgentUserMsg('Fresh task'))
-
-      // Watcher starts with an EMPTY subagents dir
-      const h = makeHarness({
-        agentDir,
-        existingDirs: [projectsRoot, projectDir, sessionDir, subagentsDir],
-        dirs: {
-          [projectsRoot]: ['myproject'],
-          [projectDir]: ['session-abc123'],
-          // subagentsDir is empty at startup — no pre-existing files
-          [subagentsDir]: [],
-        },
-        files: {},
-      })
-
-      // Nothing dispatched yet
-      expect(h.notifications.filter((n) => n.includes('Worker dispatched'))).toHaveLength(0)
-
-      // Simulate a new file appearing AFTER startup by mutating mockFs
-      h.mockFs.readdirSync = ((p: unknown) => {
-        if (String(p) === subagentsDir) return ['agent-new-cccc.jsonl']
-        if (String(p) === projectsRoot) return ['myproject']
-        if (String(p) === projectDir) return ['session-abc123']
-        return []
-      }) as unknown as typeof import('fs').readdirSync
-      h.mockFs.existsSync = ((p: unknown) => {
-        const ps = String(p)
-        return [projectsRoot, projectDir, sessionDir, subagentsDir, newJsonl].includes(ps)
-      }) as typeof import('fs').existsSync
-      h.mockFs.statSync = ((p: unknown) => {
-        const ps = String(p)
-        if (ps === newJsonl) return { size: Buffer.from(content, 'utf-8').length } as import('fs').Stats
-        return { size: 0 } as import('fs').Stats
-      }) as typeof import('fs').statSync
-
-      // Trigger a poll — the new file is now visible
-      h.poll()
-
-      const dispatchNotifs = h.notifications.filter((n) => n.includes('Worker dispatched'))
-      expect(dispatchNotifs).toHaveLength(1)
-      expect(dispatchNotifs[0]).toContain('Worker dispatched')
-
-      h.watcher.stop()
-    })
-
-    it('pre-existing in-flight agent that finishes after restart fires completion but NOT dispatch', () => {
+    it('pre-existing in-flight agent that finishes after restart fires completion (no dispatch ever, #142)', () => {
       // An in-flight subagent existed before restart. At boot it's registered
       // as historical (no dispatch). Then it writes turn_end and we get a
       // completion notification — the state transition fired correctly.

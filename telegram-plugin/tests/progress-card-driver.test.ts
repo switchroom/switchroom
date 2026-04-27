@@ -1508,6 +1508,56 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emitted).toHaveLength(1) // old card closed via closeZombie
   })
 
+  it('pendingCompletion: heartbeat keeps emitting renders during the deferred window (#142)', () => {
+    // Locks the contract that #142 PR 2 depends on: when the parent turn
+    // ends but a sub-agent outlives it, the SAME card must keep ticking
+    // visibly so the user sees activity. Without this guarantee the
+    // separate `🔧 Background workers` pinned card would be the only
+    // surface keeping the user informed — that's the surface PR 2 is
+    // deleting.
+    //
+    // The driver's heartbeat skips chats only when `stage==='done' &&
+    // !hasAnyRunningSubAgent` (driver line ~561). During pendingCompletion,
+    // hasAnyRunningSubAgent stays true, so heartbeats continue.
+    const emitted: Array<unknown> = []
+    const { driver, emits, advance } = harness(0, 0, {
+      heartbeatMs: 5_000,
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest(
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } },
+      'c',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+    const emitsBeforeWait = emits.length
+    expect(emitted).toHaveLength(0) // deferred — no completion yet
+
+    // Cross multiple heartbeat ticks (~30s) while the sub-agent is still
+    // running. The header elapsed-time bumps each second, so renders DO
+    // diverge between ticks — the heartbeat must produce at least one
+    // visible re-emit, otherwise the card is frozen.
+    advance(30_000)
+    const heartbeatEmits = emits.length - emitsBeforeWait
+    expect(heartbeatEmits).toBeGreaterThanOrEqual(1)
+
+    // Every heartbeat-driven emit during the deferred window must carry
+    // done=false so Telegram sees an edit, not a new sendMessage (#101).
+    const deferredEmits = emits.slice(emitsBeforeWait)
+    expect(deferredEmits.every((e) => e.done === false)).toBe(true)
+
+    // Sub-agent finishes → terminal emit lands with done=true and
+    // completion fires exactly once.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 30_000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(1)
+    expect(emits[emits.length - 1].done).toBe(true)
+  })
+
   it('normal fast turn (no sub-agents): completes immediately on turn_end', () => {
     const emitted: Array<unknown> = []
     const { driver, advance } = harness(0, 0, {
