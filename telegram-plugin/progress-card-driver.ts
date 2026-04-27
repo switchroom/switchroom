@@ -675,7 +675,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     // The card prefers `narratives` (human preambles) over `items` (raw
     // tool counts). When prose lands without narratives we want to know
     // why — log the available state at the decision boundary.
-    if (forceDone || chatState.lastEmittedHtml == null /* first emit */) {
+    //
+    // Fires on the first emit AND on any forced-done flush (terminal
+    // state via completeTurnFully / closeZombie / maybeCompleteDeferredTurn)
+    // — both are useful inflection points for understanding what the card
+    // looked like when it transitioned.
+    if (forceDone || chatState.lastEmittedHtml == null /* first emit or terminal flush */) {
       const s = chatState.state
       const branch = s.narratives.length > 0
         ? 'narratives'
@@ -909,7 +914,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // the card's "human-readable preamble" path can't render and the
       // tool-count fallback wins. The log lets us correlate "user typed
       // status?" telemetry with the missing narrative path.
-      if (event.kind === 'text') {
+      //
+      // Gated behind PROGRESS_CARD_DIAG=1 because this fires on every
+      // assistant text event — a long verbose turn could produce dozens
+      // of lines per minute. The render-branch and prose-recovery diags
+      // (~2x and ~1x per turn respectively) stay always-on. Flip the env
+      // var on a one-off agent restart to capture data, then turn it off.
+      if (event.kind === 'text' && process.env.PROGRESS_CARD_DIAG === '1') {
         const before = prev.narratives.length
         const after = chatState.state.narratives.length
         const last = chatState.state.narratives[after - 1]
