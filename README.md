@@ -226,6 +226,38 @@ and on demand via `switchroom vault broker lock`. Use
 
 Unit installed at `~/.config/systemd/user/switchroom-vault-broker.service`.
 
+### Auto-unlock on boot (opt-in)
+
+By default, the broker holds the unlocked state in memory only — every
+restart (host reboot, service crash, reconcile that re-renders the unit)
+wipes it and requires `switchroom vault broker unlock` again. For
+unattended hosts where this is too painful, switchroom supports
+auto-unlock via [systemd `LoadCredentialEncrypted=`](https://systemd.io/CREDENTIALS/):
+
+```bash
+switchroom vault broker enable-auto-unlock   # one-time setup, prompts for passphrase
+# Then in switchroom.yaml:
+#   vault:
+#     broker:
+#       autoUnlock: true
+switchroom reconcile                          # re-render broker unit with LoadCredentialEncrypted=
+systemctl --user restart switchroom-vault-broker.service
+```
+
+After this, the broker auto-unlocks on every start. Disable with
+`switchroom vault broker disable-auto-unlock`.
+
+**Security tradeoff — read this before enabling.** The passphrase is
+encrypted with a per-user key derived by `systemd-creds` and stored at
+`~/.config/credstore.encrypted/vault-passphrase` (configurable via
+`vault.broker.autoUnlockCredentialPath`). Anyone with code execution as
+your user — or root on the host — can call `systemd-creds decrypt` and
+recover the passphrase. This is the same blast radius as today's TTY
+unlock (a process running as you can already attach to the broker and
+exfiltrate secrets), but the convenience-vs-security knob is real:
+auto-unlock means a lost laptop is a lost vault even if the vault file
+itself is encrypted at rest. Use only on hosts you trust.
+
 ## CLI Reference
 
 ```bash
