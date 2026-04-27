@@ -2989,6 +2989,26 @@ function isSelfTargetingCommand(name: string): boolean {
 // ─── Restart marker ───────────────────────────────────────────────────────
 type RestartMarker = { chat_id: string; thread_id: number | null; ack_message_id: number | null; ts: number }
 
+/**
+ * In-memory timestamp of the most recent planned restart written by this
+ * gateway process. The restart-watchdog reads this (with a freshness
+ * window) instead of `readRestartMarker()` to decide whether a NRestarts
+ * uptick is user-initiated.
+ *
+ * The disk marker is unsafe for that purpose because the bridge-reconnect
+ * handler clears it within ~1-2s of agent boot, before the next watchdog
+ * tick (every 30s by default). That race made every \`/restart agent\`
+ * produce a misleading "agent restarted unexpectedly" card. The in-memory
+ * timestamp is set on every \`writeRestartMarker\` and survives bridge-
+ * reconnect clearing, eliminating the false positive.
+ *
+ * 60s window is generous enough to cover systemd kill → restart →
+ * bridge-reconnect (typically 2–5s) plus the next watchdog tick. After
+ * 60s, any further NRestarts increment is genuinely unexpected.
+ */
+let lastPlannedRestartAt: number | null = null
+const PLANNED_RESTART_FRESHNESS_MS = 60_000
+
 function restartMarkerPath(): string | null {
   const agentDir = resolveAgentDirFromEnv()
   if (!agentDir) return null
@@ -2998,10 +3018,22 @@ function writeRestartMarker(marker: RestartMarker): void {
   const p = restartMarkerPath(); if (!p) return
   try {
     writeFileSync(p, JSON.stringify(marker))
+    lastPlannedRestartAt = Date.now()
     process.stderr.write(`telegram gateway: restart-marker: write chat_id=${marker.chat_id} thread_id=${marker.thread_id ?? '-'} ack=${marker.ack_message_id ?? '-'} path=${p}\n`)
   } catch (err) {
     process.stderr.write(`telegram gateway: writeRestartMarker failed: ${err}\n`)
   }
+}
+
+/**
+ * True when this gateway process initiated a planned restart in the last
+ * `PLANNED_RESTART_FRESHNESS_MS`. Used by the restart-watchdog as the
+ * authoritative "was this a /restart" signal — see `lastPlannedRestartAt`
+ * comment for why the disk marker can't carry this responsibility.
+ */
+function isPlannedRestartFresh(now: number = Date.now()): boolean {
+  if (lastPlannedRestartAt == null) return false
+  return now - lastPlannedRestartAt < PLANNED_RESTART_FRESHNESS_MS
 }
 function readRestartMarker(): RestartMarker | null {
   const p = restartMarkerPath(); if (!p) return null
@@ -5594,7 +5626,7 @@ void (async () => {
                 ['--user', 'show', unit, '-p', 'NRestarts,ActiveEnterTimestampMonotonic'],
                 { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] },
               ) as string,
-            isPlannedRestartFresh: () => readRestartMarker() != null,
+            isPlannedRestartFresh: () => isPlannedRestartFresh(),
             emit: (detail) => {
               emitGatewayOperatorEvent({
                 kind: 'agent-restarted-unexpectedly',
