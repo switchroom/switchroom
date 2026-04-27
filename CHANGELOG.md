@@ -37,6 +37,19 @@
   - disallowed-key path is denied with `ACL DENIED`, no value leaks
   - broker-stopped path fails loud (no silent fallback to interactive
     passphrase prompt in headless mode)
+- **Agent watchdog now detects journal-silent hangs.** Three classes of
+  agent hang were observed in production with the unit reporting
+  `active (running)` to systemd while internally frozen — no journal
+  output for many minutes, manual restart was the only recovery.
+  `bin/bridge-watchdog.sh` now also checks journal-output freshness
+  per-agent and restarts via `switchroom agent restart <agent>` when an
+  agent has been silent for `JOURNAL_SILENCE_SECS` (default 600s) and
+  has cleared the existing `UPTIME_GRACE_SECS`. Closes #116.
+
+### Changed
+- Agent service units now declare `MemoryMax=2G` and `MemoryHigh=1536M`,
+  so unbounded memory growth (observed up to 1 GB before hang) hits a
+  ceiling and gets OOM-killed. `Restart=on-failure` then recovers.
 
 ## v0.3.0 — 2026-04-25
 

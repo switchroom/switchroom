@@ -1,10 +1,24 @@
 #!/usr/bin/env bash
 # Watchdog: restarts switchroom agent services whose Telegram bridge has
-# disconnected from the gateway. Designed to run on a systemd timer.
+# disconnected from the gateway, OR whose journal output has been silent
+# for too long (indicating an internally-frozen agent that systemd still
+# reports as "active (running)"). Designed to run on a systemd timer.
 #
 # For each agent, checks whether the gateway is up and has an active bridge.
 # If the gateway is healthy but the bridge is disconnected (or never connected),
 # restarts the agent service so Claude Code gets a fresh MCP server.
+#
+# Journal-silence check (2026-04-26, issue #116): Three klanker hangs in
+# 10 hours exposed a class of failure where the agent process is
+# "active (running)" to systemd but internally frozen — no journal output
+# for many minutes, manual restart the only recovery. Two hangs were on the
+# Stop-hook ladder ("running stop hooks 0/N"); one was mid-task at 1.0 GB
+# RSS. The watchdog now also checks journal-output freshness per-agent and
+# restarts via `switchroom agent restart <agent>` when an agent has been
+# silent for JOURNAL_SILENCE_SECS (default 600s) and has cleared the uptime
+# grace. Sustained suspicion via a state file under
+# /run/user/<uid>/switchroom-watchdog/ prevents transient quiet from
+# triggering.
 #
 # Agent discovery: enumerates ALL active switchroom-*-gateway.service units
 # and derives the agent name + gateway-log path from each. This replaces the
@@ -27,9 +41,19 @@ set -euo pipefail
 
 # Tunables. Expressed as env-overridable so the test harness can drive
 # edge cases without mutating the script.
-: "${UPTIME_GRACE_SECS:=90}"       # skip the bridge check for this long after agent (re)start
-: "${DISCONNECT_GRACE_SECS:=600}"  # require disconnection to persist this long before restarting
-: "${LIVENESS_GRACE_SECS:=30}"     # liveness file mtime must be older than this before we treat bridge as dead
+: "${UPTIME_GRACE_SECS:=90}"              # skip checks for this long after agent (re)start
+: "${DISCONNECT_GRACE_SECS:=600}"         # require disconnection to persist this long before restarting
+: "${LIVENESS_GRACE_SECS:=30}"            # liveness file mtime must be recent before we treat bridge as dead
+: "${JOURNAL_SILENCE_SECS:=600}"          # seconds of journal silence before suspecting a hang
+: "${JOURNAL_SILENCE_HARD_SECS:=600}"     # seconds the silence_since marker must predate before restarting
+
+# Per-agent watchdog state lives under /run/user/$UID/switchroom-watchdog/
+# (tmpfs, cleared on logout — correct: we don't want stale silence markers
+# surviving restarts). mkdir -p is idempotent.
+# WATCHDOG_STATE_DIR is env-overridable for the test harness.
+UID_VAL="${UID:-$(id -u)}"
+: "${WATCHDOG_STATE_DIR:=/run/user/${UID_VAL}/switchroom-watchdog}"
+mkdir -p "$WATCHDOG_STATE_DIR" 2>/dev/null || true
 
 now_epoch() { date +%s; }
 
@@ -236,4 +260,134 @@ for gateway_svc in "${gateway_services[@]}"; do
   systemctl --user restart "$agent_svc" || {
     echo "$(date -Iseconds) watchdog: ${agent_svc} restart failed"
   }
+done
+
+# ─── Journal-silence check ───────────────────────────────────────────────────
+#
+# Independent of the bridge-disconnect check above. For each active
+# switchroom-<agent>.service unit (NOT the gateway), verify that it has
+# emitted at least one journal entry within JOURNAL_SILENCE_SECS. If an
+# agent has been silent longer than that AND uptime has cleared
+# UPTIME_GRACE_SECS, record a silence_since marker in the watchdog state
+# dir. Once the marker is older than JOURNAL_SILENCE_HARD_SECS, restart
+# via `switchroom agent restart <agent>` (the contracted reconcile+restart
+# path; NOT raw systemctl restart, which would bypass switchroom's
+# config reconciliation).
+#
+# Why `switchroom agent restart` rather than `systemctl --user restart`:
+# the project contract is that all lifecycle transitions go through the
+# switchroom CLI so that config reconciliation always runs. Raw systemctl
+# calls skip that step and can leave units with stale unit files.
+
+mapfile -t agent_services < <(
+  systemctl --user list-units --type=service --state=active --no-legend --plain 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -E '^switchroom-.+\.service$' \
+    | grep -v -E '^switchroom-(gateway|vault-broker|foreman)\.service$' \
+    | grep -v -E '^switchroom-.+-gateway\.service$' \
+    | grep -v -E '^switchroom-.+-cron-[0-9]+\.service$' || true
+)
+
+for agent_svc in "${agent_services[@]}"; do
+  # Extract agent name: switchroom-<agent>.service → <agent>
+  agent="${agent_svc#switchroom-}"
+  agent="${agent%.service}"
+
+  silence_marker="${WATCHDOG_STATE_DIR}/${agent}.silence_since"
+
+  # Uptime grace: same logic as the bridge check. Fresh agents haven't
+  # had time to settle into a normal logging cadence.
+  active_enter_ts="$(
+    systemctl --user show "$agent_svc" -p ActiveEnterTimestamp --value 2>/dev/null
+  )"
+  if [[ -n "$active_enter_ts" ]]; then
+    active_enter_epoch="$(date -d "$active_enter_ts" +%s 2>/dev/null || echo 0)"
+    if [[ "$active_enter_epoch" -gt 0 ]]; then
+      uptime_secs=$(( $(now_epoch) - active_enter_epoch ))
+      if [[ "$uptime_secs" -lt "$UPTIME_GRACE_SECS" ]]; then
+        # Clear stale silence marker on fresh start so the grace window
+        # is a clean slate.
+        rm -f "$silence_marker" 2>/dev/null || true
+        continue
+      fi
+    fi
+  fi
+
+  # Read the timestamp of the most recent journal entry from this unit.
+  # --output=short-unix gives "EPOCH.USEC MESSAGE" format; we grab the
+  # leading integer epoch seconds.
+  latest_journal_line="$(
+    journalctl --user -u "$agent_svc" -n 1 --output=short-unix --no-pager 2>/dev/null || true
+  )"
+  latest_journal_epoch=0
+  if [[ -n "$latest_journal_line" ]]; then
+    # short-unix format: "1745632800.123456 hostname unit[pid]: message"
+    # Extract the leading epoch (integer part before the dot or space).
+    candidate="$(echo "$latest_journal_line" | awk '{print $1}' | cut -d. -f1)"
+    if [[ "$candidate" =~ ^[0-9]+$ ]]; then
+      latest_journal_epoch="$candidate"
+    fi
+  fi
+
+  now="$(now_epoch)"
+  if [[ "$latest_journal_epoch" -eq 0 ]]; then
+    # No journal entries at all — possibly a very new unit that hasn't
+    # logged yet. Treat conservatively: skip this tick (uptime grace
+    # should have caught a genuine fresh start above, so this branch
+    # mostly hits units that truly haven't logged due to a bug — still
+    # give them one tick of benefit of the doubt).
+    continue
+  fi
+
+  journal_age=$(( now - latest_journal_epoch ))
+
+  if [[ "$journal_age" -lt "$JOURNAL_SILENCE_SECS" ]]; then
+    # Journal is fresh — clear any stale silence marker and move on.
+    rm -f "$silence_marker" 2>/dev/null || true
+    continue
+  fi
+
+  # Journal has been silent for >= JOURNAL_SILENCE_SECS. Record the
+  # first observation so we can require sustained silence.
+  if [[ -f "$silence_marker" ]]; then
+    silence_since="$(cat "$silence_marker" 2>/dev/null || echo "$now")"
+    if ! [[ "$silence_since" =~ ^[0-9]+$ ]]; then
+      silence_since="$now"
+      echo "$now" > "$silence_marker"
+    fi
+  else
+    echo "$now" > "$silence_marker"
+    silence_since="$now"
+    logger -t switchroom-watchdog "agent ${agent}: journal silent for ${journal_age}s; recording silence marker (will restart after ${JOURNAL_SILENCE_HARD_SECS}s of sustained silence)"
+    continue
+  fi
+
+  silence_duration=$(( now - silence_since ))
+  if [[ "$silence_duration" -lt "$JOURNAL_SILENCE_HARD_SECS" ]]; then
+    # Silence not yet sustained long enough to act.
+    continue
+  fi
+
+  # The agent has been journal-silent for >= JOURNAL_SILENCE_HARD_SECS
+  # AND has cleared the uptime grace. This matches the production hang
+  # pattern (issue #116). Restart via the switchroom CLI.
+  logger -t switchroom-watchdog "agent ${agent}: journal silent for ${journal_age}s (marker age ${silence_duration}s >= ${JOURNAL_SILENCE_HARD_SECS}s); restarting via switchroom agent restart"
+  echo "$(date -Iseconds) watchdog: ${agent} journal silent for ${journal_age}s, restarting"
+  rm -f "$silence_marker" 2>/dev/null || true
+
+  # Use `switchroom agent restart` (not raw systemctl) — the project
+  # contract is that all agent lifecycle transitions go through the CLI
+  # so config reconciliation always runs. The CLI is on PATH when the
+  # watchdog is invoked via its systemd timer unit.
+  if command -v switchroom >/dev/null 2>&1; then
+    switchroom agent restart "$agent" || {
+      logger -t switchroom-watchdog "agent ${agent}: switchroom agent restart failed; falling back to systemctl"
+      systemctl --user restart "$agent_svc" || true
+    }
+  else
+    # Fallback: if the switchroom CLI isn't on PATH (unusual), use systemctl
+    # directly and log the degraded path.
+    logger -t switchroom-watchdog "agent ${agent}: switchroom CLI not on PATH; using systemctl restart as fallback"
+    systemctl --user restart "$agent_svc" || true
+  fi
 done

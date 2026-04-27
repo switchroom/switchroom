@@ -77,6 +77,17 @@ StandardOutput=journal
 StandardError=journal
 Restart=on-failure
 RestartSec=5
+# Memory ceiling: MemoryHigh triggers kernel reclaim at 1.5G so the
+# process is throttled before hitting the hard ceiling. MemoryMax=2G is
+# the hard limit — once hit, the kernel OOM-kills the unit. Combined
+# with Restart=on-failure (already set above), this gives automatic
+# recovery from memory-growth hangs observed in production (issue #116):
+# three klanker hangs in 10h where RSS climbed past 1 GB before the
+# process froze — systemd still reported active (running) with no way to
+# detect or auto-recover. 2G gives ample headroom above the observed
+# 1 GB peak while providing a reliable ceiling.
+MemoryHigh=1536M
+MemoryMax=2G
 WorkingDirectory=${agentDir}
 # Optional vault-decrypted env. The "-" prefix makes systemd silently
 # skip the file when absent (e.g. pre-"switchroom vault init" or
