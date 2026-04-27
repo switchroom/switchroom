@@ -1128,6 +1128,12 @@ function parseDurationToSeconds(d: string | undefined): number | undefined {
  * with the configured model, sends output to Telegram via curl.
  * The script is self-contained — sources nvm, reads bot token from
  * .env at runtime, and uses POSIX quoting for the prompt.
+ *
+ * When `suppressStdout` is true (issue #118), the script discards stdout
+ * instead of forwarding it to Telegram. Use this for cron entries that
+ * post their own message via MCP tools (stream_reply / reply) — the
+ * trailing model summary that the cron prompt produces would otherwise
+ * arrive as a second, redundant Telegram message.
  */
 export function buildCronScript(
   agentDir: string,
@@ -1137,6 +1143,7 @@ export function buildCronScript(
   userId: string | undefined,
   secrets: string[] = [],
   brokerSocket?: string,
+  suppressStdout = false,
 ): string {
   const dest = userId ?? chatId;
   const secretsComment = secrets.length > 0
@@ -1173,7 +1180,15 @@ if [ -f "$CLAUDE_CONFIG_DIR/.oauth-token" ]; then
   export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_CONFIG_DIR/.oauth-token" | tr -d '[:space:]')"
 fi
 
-# Run Claude one-shot (no persistent session, cheap model)
+${suppressStdout
+    ? `# suppress_stdout: true (cron entry posts its own message via MCP tools — see issue #118)
+# Discard stdout so the trailing model summary doesn't arrive as a second message.
+exec claude -p ${shellSingleQuote(prompt)} \\
+  --model ${shellSingleQuote(model)} \\
+  --no-session-persistence \\
+  > /dev/null 2>&1
+`
+    : `# Run Claude one-shot (no persistent session, cheap model)
 OUTPUT=$(claude -p ${shellSingleQuote(prompt)} \\
   --model ${shellSingleQuote(model)} \\
   --no-session-persistence \\
@@ -1190,7 +1205,7 @@ curl -s "https://api.telegram.org/bot\${TELEGRAM_BOT_TOKEN}/sendMessage" \\
   -d parse_mode="HTML" \\
   -d disable_web_page_preview=true \\
   --data-urlencode text="$OUTPUT" > /dev/null 2>&1 || true
-`;
+`}`;
 }
 
 /**
@@ -2600,7 +2615,7 @@ export function scaffoldAgent(
     for (let i = 0; i < agentConfig.schedule!.length; i++) {
       const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
-      const script = buildCronScript(agentDir, entry.prompt, model, telegramConfig.forum_chat_id, userId, entry.secrets ?? [], brokerSocket);
+      const script = buildCronScript(agentDir, entry.prompt, model, telegramConfig.forum_chat_id, userId, entry.secrets ?? [], brokerSocket, entry.suppress_stdout ?? false);
       const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
       writeFileSync(scriptPath, script, { encoding: "utf-8", mode: 0o700 });
     }
@@ -3445,6 +3460,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       const script = buildCronScript(
         agentDir, entry.prompt, model,
         telegramConfig.forum_chat_id, cronUserId, entry.secrets ?? [], reconBrokerSocket,
+        entry.suppress_stdout ?? false,
       );
       const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
       const before = existsSync(scriptPath) ? readFileSync(scriptPath, "utf-8") : "";

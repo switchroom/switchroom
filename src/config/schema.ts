@@ -36,6 +36,16 @@ export const ScheduleEntrySchema = z.object({
       "Declared keys are injected as env vars at runtime (PR 2). " +
       "Empty by default — no vault access unless explicitly listed.",
     ),
+  suppress_stdout: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, the cron script runs `claude -p` and discards stdout " +
+      "instead of forwarding it to Telegram. Use for tasks that send their " +
+      "own message via MCP tools (stream_reply / reply) so the trailing " +
+      "model summary doesn't post as a duplicate. Defaults to false to " +
+      "preserve the legacy stdout-forwarding behavior. See issue #118.",
+    ),
 });
 
 export const AgentSoulSchema = z

@@ -2644,6 +2644,70 @@ describe("scheduled task cron script generation", () => {
     expect(content).not.toContain("claude-sonnet-4-6");
   });
 
+  // Issue #118: cron entries that send their own message via MCP tools
+  // shouldn't also forward stdout to Telegram (would arrive as a duplicate).
+  it("default cron script forwards stdout to Telegram (legacy behavior)", () => {
+    const agentConfig = makeAgentConfig({
+      schedule: [{ cron: "0 8 * * *", prompt: "default-route" }],
+    });
+    const result = scaffoldAgent("default-cron", agentConfig, tmpDir, telegramConfig);
+    const content = readFileSync(
+      join(result.agentDir, "telegram", "cron-0.sh"),
+      "utf-8",
+    );
+    // Default path: capture stdout and curl it.
+    expect(content).toContain("OUTPUT=$(claude -p");
+    expect(content).toContain("api.telegram.org");
+    expect(content).toContain("sendMessage");
+    expect(content).not.toContain("suppress_stdout");
+  });
+
+  it("suppress_stdout=true skips the curl-to-Telegram block", () => {
+    const agentConfig = makeAgentConfig({
+      schedule: [
+        { cron: "0 7 * * *", prompt: "mcp-only", suppress_stdout: true },
+      ],
+    });
+    const result = scaffoldAgent("mcp-cron", agentConfig, tmpDir, telegramConfig);
+    const content = readFileSync(
+      join(result.agentDir, "telegram", "cron-0.sh"),
+      "utf-8",
+    );
+    // Suppress path: exec claude directly, route output to /dev/null, no curl.
+    expect(content).toContain("suppress_stdout: true");
+    expect(content).toContain("exec claude -p");
+    expect(content).toContain("> /dev/null 2>&1");
+    expect(content).not.toContain("api.telegram.org");
+    expect(content).not.toContain("OUTPUT=");
+  });
+
+  it("reconcile flips a cron from default to suppress_stdout", () => {
+    const baseAgent = makeAgentConfig({
+      schedule: [{ cron: "0 6 * * *", prompt: "test" }],
+    });
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "flip-cron": baseAgent },
+    } as SwitchroomConfig;
+    scaffoldAgent("flip-cron", baseAgent, tmpDir, telegramConfig, switchroomConfig);
+    const scriptPath = join(tmpDir, "flip-cron", "telegram", "cron-0.sh");
+    expect(readFileSync(scriptPath, "utf-8")).toContain("api.telegram.org");
+
+    const updated = makeAgentConfig({
+      schedule: [{ cron: "0 6 * * *", prompt: "test", suppress_stdout: true }],
+    });
+    const updatedConfig: SwitchroomConfig = {
+      ...switchroomConfig,
+      agents: { "flip-cron": updated },
+    } as SwitchroomConfig;
+    const result = reconcileAgent("flip-cron", updated, tmpDir, telegramConfig, updatedConfig);
+    expect(result.changes).toContain(scriptPath);
+    const updatedScript = readFileSync(scriptPath, "utf-8");
+    expect(updatedScript).toContain("exec claude -p");
+    expect(updatedScript).not.toContain("api.telegram.org");
+  });
+
   it("reconcile regenerates cron scripts when prompt changes", () => {
     const initial = makeAgentConfig({
       schedule: [{ cron: "0 8 * * *", prompt: "v1 prompt" }],
