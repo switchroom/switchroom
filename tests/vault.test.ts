@@ -15,8 +15,12 @@ import {
   getStringSecret,
   listSecrets,
   removeSecret,
+  validateFormatHint,
+  detectFormat,
+  VAULT_FORMAT_HINTS,
   VaultError,
   type VaultEntry,
+  type VaultFormatHint,
 } from "../src/vault/vault.js";
 import {
   isVaultReference,
@@ -579,5 +583,236 @@ describe("vault resolver", () => {
       expect(existsSync(join(dir2, "stale.txt"))).toBe(false);
       expect(existsSync(join(dir2, "oauth_token.json"))).toBe(true);
     });
+  });
+});
+
+// ─── Issue #172: format hints ────────────────────────────────────────────────
+
+describe("validateFormatHint", () => {
+  it("accepts a valid PEM string", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEA\n-----END PRIVATE KEY-----\n";
+    expect(validateFormatHint(pem, "pem")).toBeNull();
+  });
+
+  it("rejects a non-PEM value for --format pem", () => {
+    expect(validateFormatHint("not pem", "pem")).toMatch(/PEM/);
+  });
+
+  it("accepts a valid 32-byte base64-raw-seed", () => {
+    const seed = Buffer.alloc(32).toString("base64"); // 32 zero bytes
+    expect(validateFormatHint(seed, "base64-raw-seed")).toBeNull();
+  });
+
+  it("rejects a short base64 value for --format base64-raw-seed", () => {
+    const short = Buffer.alloc(16).toString("base64"); // only 16 bytes
+    const result = validateFormatHint(short, "base64-raw-seed");
+    expect(result).toMatch(/32-byte/);
+  });
+
+  it("accepts valid base64 for --format base64", () => {
+    expect(validateFormatHint(Buffer.alloc(20).toString("base64"), "base64")).toBeNull();
+  });
+
+  it("accepts valid JSON for --format json", () => {
+    expect(validateFormatHint('{"key":"value"}', "json")).toBeNull();
+  });
+
+  it("rejects invalid JSON for --format json", () => {
+    expect(validateFormatHint("not json", "json")).toMatch(/JSON/i);
+  });
+
+  it("accepts anything for --format string", () => {
+    expect(validateFormatHint("any text at all", "string")).toBeNull();
+  });
+});
+
+describe("detectFormat", () => {
+  it("detects PEM strings", () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQI=\n-----END PRIVATE KEY-----\n";
+    expect(detectFormat(pem)).toBe("pem");
+  });
+
+  it("detects a 32-byte base64-raw-seed", () => {
+    const seed = Buffer.alloc(32).toString("base64");
+    expect(detectFormat(seed)).toBe("base64-raw-seed");
+  });
+
+  it("returns null for plain text", () => {
+    expect(detectFormat("hello world")).toBeNull();
+  });
+});
+
+describe("format hint roundtrip via setStringSecret / getSecret", () => {
+  let tmpDir: string;
+  let vaultPath: string;
+  const passphrase = "fmt-test-pass";
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-fmt-test-"));
+    vaultPath = join(tmpDir, "vault.enc");
+    createVault(passphrase, vaultPath);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("stores and retrieves the format hint", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQI=\n-----END PRIVATE KEY-----\n";
+    setStringSecret(passphrase, vaultPath, "mykey", pem, "pem");
+
+    const entry = getSecret(passphrase, vaultPath, "mykey");
+    expect(entry).not.toBeNull();
+    expect(entry?.kind).toBe("string");
+    if (entry?.kind === "string") {
+      expect(entry.format).toBe("pem");
+      expect(entry.value).toBe(pem);
+    }
+  });
+
+  it("entries without a format hint have format=undefined", () => {
+    setStringSecret(passphrase, vaultPath, "plain", "hello");
+    const entry = getSecret(passphrase, vaultPath, "plain");
+    expect(entry?.kind).toBe("string");
+    if (entry?.kind === "string") {
+      expect(entry.format).toBeUndefined();
+    }
+  });
+
+  it("all VAULT_FORMAT_HINTS are listed and non-empty", () => {
+    expect(VAULT_FORMAT_HINTS.length).toBeGreaterThan(0);
+    for (const hint of VAULT_FORMAT_HINTS) {
+      expect(hint).toBeTruthy();
+    }
+  });
+});
+
+// ─── Issue #172: vault set CLI --format integration ──────────────────────────
+
+describe("vault set CLI --format integration", () => {
+  const binPath = fileURLToPath(new URL("../bin/switchroom.ts", import.meta.url));
+  const passphrase = "fmt-cli-test-passphrase";
+  let tmpDir: string;
+  let vaultPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-fmt-cli-test-"));
+    vaultPath = join(tmpDir, "vault.enc");
+    createVault(passphrase, vaultPath);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runCli(args: string[], input?: string) {
+    const configPath = join(tmpDir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+    );
+    return spawnSync(
+      "bun",
+      [binPath, "--config", configPath, "vault", ...args],
+      {
+        input,
+        env: { ...process.env, SWITCHROOM_VAULT_PASSPHRASE: passphrase },
+        encoding: "utf8",
+      }
+    );
+  }
+
+  it("stores format hint when --format pem is passed with a valid PEM", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAAS\n-----END PRIVATE KEY-----\n";
+    const result = runCli(["set", "pem-key", "--format", "pem"], pem);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("format: pem");
+
+    const entry = getSecret(passphrase, vaultPath, "pem-key");
+    expect(entry?.kind).toBe("string");
+    if (entry?.kind === "string") {
+      expect(entry.format).toBe("pem");
+    }
+  });
+
+  it("rejects a non-PEM value with --format pem and exits non-zero", () => {
+    const result = runCli(["set", "bad-key", "--format", "pem"], "not a pem value");
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/format validation failed/);
+  });
+
+  it("rejects an unknown --format value", () => {
+    const result = runCli(["set", "x", "--format", "unknown-format"], "value");
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/unknown format/);
+  });
+
+  it("vault get --expect warns to stderr when stored format mismatches", () => {
+    // Store a seed but tell the consumer it's a PEM
+    const seed = Buffer.alloc(32).toString("base64");
+    const setResult = runCli(["set", "seed-key", "--format", "base64-raw-seed"], seed);
+    expect(setResult.status).toBe(0);
+
+    // Get with --expect pem should warn but still print the value (warn-and-proceed)
+    const getResult = runCli(["get", "seed-key", "--expect", "pem", "--no-broker"]);
+    expect(getResult.status).toBe(0);
+    expect(getResult.stderr).toMatch(/VAULT-FORMAT-MISMATCH/);
+  });
+
+  it("vault get --expect --strict-format exits 4 on mismatch", () => {
+    const seed = Buffer.alloc(32).toString("base64");
+    runCli(["set", "seed-key2", "--format", "base64-raw-seed"], seed);
+
+    const getResult = runCli(["get", "seed-key2", "--expect", "pem", "--strict-format", "--no-broker"]);
+    expect(getResult.status).toBe(4);
+    expect(getResult.stderr).toMatch(/VAULT-FORMAT-MISMATCH/);
+  });
+
+  it("vault get --expect passes when formats match", () => {
+    const pem =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAAS\n-----END PRIVATE KEY-----\n";
+    runCli(["set", "ok-pem", "--format", "pem"], pem);
+
+    const getResult = runCli(["get", "ok-pem", "--expect", "pem", "--no-broker"]);
+    expect(getResult.status).toBe(0);
+    expect(getResult.stderr).not.toMatch(/VAULT-FORMAT-MISMATCH/);
+  });
+}, 30_000);
+
+// ─── Issue #173: broker-denied error surface ──────────────────────────────────
+
+describe("broker-denied error message format", () => {
+  it("VAULT-BROKER-DENIED prefix is stable (grep-friendly)", () => {
+    // The prefix is a contract — scripts grep for it. Verify it appears in
+    // the ACL deny path by simulating a non-TTY caller against a running
+    // broker that will deny them.
+    //
+    // Rather than spinning up a real broker (covered by the integration
+    // test), we verify the prefix is used in the cli/vault.ts source via
+    // a string match — the prefix must not be changed without updating the
+    // docs and this test.
+    const src = require("node:fs").readFileSync(
+      require("node:path").join(
+        require("node:url").fileURLToPath(new URL("../src/cli/vault.ts", import.meta.url))
+      ),
+      "utf8"
+    ) as string;
+    expect(src).toContain("VAULT-BROKER-DENIED");
+    // The prefix should appear in both the "locked" and "denied" paths.
+    const count = (src.match(/VAULT-BROKER-DENIED/g) ?? []).length;
+    expect(count).toBeGreaterThanOrEqual(2);
+  });
+
+  it("VAULT-FORMAT-MISMATCH prefix appears in vault CLI source", () => {
+    const src = require("node:fs").readFileSync(
+      require("node:path").join(
+        require("node:url").fileURLToPath(new URL("../src/cli/vault.ts", import.meta.url))
+      ),
+      "utf8"
+    ) as string;
+    expect(src).toContain("VAULT-FORMAT-MISMATCH");
   });
 });

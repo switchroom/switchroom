@@ -41,9 +41,39 @@ export class VaultError extends Error {
   }
 }
 
+/**
+ * Format hints for vault entries (issue #172).
+ *
+ * Stored alongside the value as an opt-in annotation set via
+ * `switchroom vault set --format <kind>`.  Consumers can pass
+ * `--expect <kind>` at get-time to get an early warning when the stored
+ * format does not match what they need.
+ *
+ * Allowed values:
+ *   pem            — PEM-encoded key or certificate (-----BEGIN …-----)
+ *   base64-raw-seed — 32-byte raw seed, base64-encoded (no PEM wrapper)
+ *   base64         — arbitrary base64-encoded binary (no structural meaning)
+ *   json           — UTF-8 JSON text
+ *   string         — plain text (the default; no structural meaning)
+ */
+export type VaultFormatHint =
+  | "pem"
+  | "base64-raw-seed"
+  | "base64"
+  | "json"
+  | "string";
+
+export const VAULT_FORMAT_HINTS: VaultFormatHint[] = [
+  "pem",
+  "base64-raw-seed",
+  "base64",
+  "json",
+  "string",
+];
+
 export type VaultEntry =
-  | { kind: "string"; value: string }
-  | { kind: "binary"; value: string }
+  | { kind: "string"; value: string; format?: VaultFormatHint }
+  | { kind: "binary"; value: string; format?: VaultFormatHint }
   | {
       kind: "files";
       files: Record<string, { encoding: "utf8" | "base64"; value: string }>;
@@ -115,6 +145,94 @@ function normalizeSecrets(raw: StoredSecrets): Record<string, VaultEntry> {
     out[k] = normalizeEntry(v);
   }
   return out;
+}
+
+/**
+ * Validate that a value's content matches the claimed format hint.
+ *
+ * Returns null on success or an error string describing the mismatch.
+ * Only called at `set` time when the caller passes `--format`.
+ */
+export function validateFormatHint(
+  value: string,
+  format: VaultFormatHint,
+): string | null {
+  switch (format) {
+    case "pem": {
+      const trimmed = value.trim();
+      if (
+        !trimmed.startsWith("-----BEGIN ") ||
+        !trimmed.includes("-----END ")
+      ) {
+        return `value does not look like PEM (expected -----BEGIN ...-----)`;
+      }
+      return null;
+    }
+    case "base64-raw-seed": {
+      // Must be valid base64, decoding to 32 bytes (256-bit seed)
+      const trimmed = value.trim();
+      try {
+        const decoded = Buffer.from(trimmed, "base64");
+        if (decoded.length !== 32) {
+          return `expected a 32-byte base64-raw-seed but decoded to ${decoded.length} bytes`;
+        }
+      } catch {
+        return `value is not valid base64`;
+      }
+      return null;
+    }
+    case "base64": {
+      const trimmed = value.trim();
+      try {
+        Buffer.from(trimmed, "base64");
+      } catch {
+        return `value is not valid base64`;
+      }
+      return null;
+    }
+    case "json": {
+      try {
+        JSON.parse(value);
+      } catch {
+        return `value is not valid JSON`;
+      }
+      return null;
+    }
+    case "string":
+      // No structural validation for plain strings
+      return null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Detect the most likely format of a stored value for mismatch-warning
+ * purposes.  This is a best-effort heuristic; it returns the detected
+ * VaultFormatHint or null when uncertain.
+ */
+export function detectFormat(value: string): VaultFormatHint | null {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("-----BEGIN ") && trimmed.includes("-----END ")) {
+    return "pem";
+  }
+  // Try to detect a 32-byte base64 seed (43 or 44 chars with optional = padding)
+  if (/^[A-Za-z0-9+/]{43}={0,1}$/.test(trimmed)) {
+    try {
+      const decoded = Buffer.from(trimmed, "base64");
+      if (decoded.length === 32) return "base64-raw-seed";
+    } catch { /* ignore */ }
+  }
+  // Try generic base64
+  if (/^[A-Za-z0-9+/\n\r]+=*$/.test(trimmed) && trimmed.length > 0) {
+    return "base64";
+  }
+  // Try JSON
+  try {
+    JSON.parse(value);
+    return "json";
+  } catch { /* ignore */ }
+  return null;
 }
 
 export function createVault(passphrase: string, vaultPath: string): void {
@@ -235,9 +353,13 @@ export function setStringSecret(
   passphrase: string,
   vaultPath: string,
   key: string,
-  value: string
+  value: string,
+  format?: VaultFormatHint,
 ): void {
-  setSecret(passphrase, vaultPath, key, { kind: "string", value });
+  const entry: VaultEntry = format
+    ? { kind: "string", value, format }
+    : { kind: "string", value };
+  setSecret(passphrase, vaultPath, key, entry);
 }
 
 export function getStringSecret(

@@ -10,7 +10,11 @@ import {
   getSecret,
   listSecrets,
   removeSecret,
+  validateFormatHint,
+  detectFormat,
+  VAULT_FORMAT_HINTS,
   VaultError,
+  type VaultFormatHint,
 } from "../vault/vault.js";
 import { registerVaultSweep } from "./vault-sweep.js";
 import {
@@ -117,6 +121,24 @@ async function getPassphrase(confirm = false): Promise<string> {
   return passphrase;
 }
 
+/**
+ * Return a human-readable conversion suggestion when a stored format does not
+ * match the expected format.  Returns an empty string when no known conversion
+ * path exists.
+ */
+function conversionHint(stored: VaultFormatHint, expected: VaultFormatHint): string {
+  if (stored === "base64-raw-seed" && expected === "pem") {
+    return (
+      "Convert with: openssl genpkey -algorithm ed25519 " +
+      "(or wrap the raw seed with your key type's PEM encoder)."
+    );
+  }
+  if (stored === "pem" && expected === "base64-raw-seed") {
+    return "Extract the raw seed from the PEM with: openssl pkey -in key.pem -outform DER | tail -c 32 | base64";
+  }
+  return "";
+}
+
 export function registerVaultCommand(program: Command): void {
   const vault = program
     .command("vault")
@@ -149,10 +171,29 @@ export function registerVaultCommand(program: Command): void {
       "-f, --file <path>",
       "Read the secret value from a file (preserves multi-line content)"
     )
-    .action(async (key: string, opts: { file?: string }) => {
+    .option(
+      "--format <kind>",
+      `Annotate the stored value with a format hint (${VAULT_FORMAT_HINTS.join(", ")}). The hint is validated against the value at set time and checked against --expect at get time.`
+    )
+    .action(async (key: string, opts: { file?: string; format?: string }) => {
       try {
         const parentOpts = program.opts();
         const vaultPath = getVaultPath(parentOpts.config);
+
+        // Validate --format value early so we fail before prompting for passphrase.
+        let formatHint: VaultFormatHint | undefined;
+        if (opts.format !== undefined) {
+          if (!(VAULT_FORMAT_HINTS as readonly string[]).includes(opts.format)) {
+            console.error(
+              chalk.red(
+                `Error: unknown format '${opts.format}'. Allowed values: ${VAULT_FORMAT_HINTS.join(", ")}`
+              )
+            );
+            process.exit(1);
+          }
+          formatHint = opts.format as VaultFormatHint;
+        }
+
         // When stdin is piped we need to consume it for the secret value,
         // so the passphrase must come from the env var rather than a prompt.
         if (!process.stdin.isTTY && !process.env.SWITCHROOM_VAULT_PASSPHRASE && !opts.file) {
@@ -190,8 +231,23 @@ export function registerVaultCommand(program: Command): void {
           process.exit(1);
         }
 
-        setStringSecret(passphrase, vaultPath, key, value);
-        console.log(chalk.green(`✓ Secret '${key}' saved`));
+        // Validate the value against the declared format hint.
+        if (formatHint) {
+          const validationError = validateFormatHint(value, formatHint);
+          if (validationError) {
+            console.error(
+              chalk.red(`Error: format validation failed for --format ${formatHint}: ${validationError}`)
+            );
+            process.exit(1);
+          }
+        }
+
+        setStringSecret(passphrase, vaultPath, key, value, formatHint);
+        if (formatHint) {
+          console.log(chalk.green(`✓ Secret '${key}' saved (format: ${formatHint})`));
+        } else {
+          console.log(chalk.green(`✓ Secret '${key}' saved`));
+        }
       } catch (err) {
         if (err instanceof VaultError || err instanceof Error) {
           console.error(chalk.red(`Error: ${err.message}`));
@@ -204,10 +260,75 @@ export function registerVaultCommand(program: Command): void {
   vault
     .command("get <key>")
     .description("Get a secret from the vault (tries broker first)")
-    .option("--no-broker", "Bypass the broker and read directly from the vault file")
-    .action(async (key: string, opts: { broker?: boolean }) => {
+    .option("--no-broker", "Bypass the broker and read directly from the vault file. Required for interactive (non-cron) access — the broker only serves switchroom cron units.")
+    .option(
+      "--expect <format>",
+      `Warn if the stored format hint does not match. Allowed values: ${VAULT_FORMAT_HINTS.join(", ")}. Exits with code 4 on mismatch (warn-and-proceed is the default; use --strict-format to fail-closed).`
+    )
+    .option(
+      "--strict-format",
+      "When combined with --expect, exit with code 4 instead of warning-and-proceeding on a format mismatch."
+    )
+    .action(async (key: string, opts: { broker?: boolean; expect?: string; strictFormat?: boolean }) => {
       const useBroker = opts.broker !== false;
       const parentOpts = program.opts();
+
+      // Validate --expect value early.
+      let expectFormat: VaultFormatHint | undefined;
+      if (opts.expect !== undefined) {
+        if (!(VAULT_FORMAT_HINTS as readonly string[]).includes(opts.expect)) {
+          console.error(
+            chalk.red(
+              `Error: unknown format '${opts.expect}' for --expect. Allowed values: ${VAULT_FORMAT_HINTS.join(", ")}`
+            )
+          );
+          process.exit(1);
+        }
+        expectFormat = opts.expect as VaultFormatHint;
+      }
+
+      /**
+       * Check format hint on a retrieved entry and warn (or fail) on mismatch.
+       * Returns false if the caller should exit (strict-format + mismatch).
+       */
+      function checkFormatExpectation(entry: { kind: string; value?: string; format?: VaultFormatHint }): boolean {
+        if (!expectFormat) return true;
+        if (entry.kind !== "string" && entry.kind !== "binary") return true;
+
+        const storedFormat = (entry as { format?: VaultFormatHint }).format;
+
+        // Primary check: stored format hint vs expected
+        if (storedFormat && storedFormat !== expectFormat) {
+          const hint = conversionHint(storedFormat, expectFormat);
+          const msg =
+            `VAULT-FORMAT-MISMATCH: secret '${key}' was stored as format '${storedFormat}' ` +
+            `but caller expects '${expectFormat}'.` +
+            (hint ? ` ${hint}` : "");
+          process.stderr.write(msg + "\n");
+          if (opts.strictFormat) {
+            process.exit(4);
+          }
+          return true; // warn-and-proceed
+        }
+
+        // Secondary check: no stored hint — detect from value content
+        if (!storedFormat && entry.value !== undefined) {
+          const detected = detectFormat(entry.value);
+          if (detected && detected !== expectFormat) {
+            const hint = conversionHint(detected, expectFormat);
+            const msg =
+              `VAULT-FORMAT-MISMATCH: secret '${key}' has no stored format hint but value ` +
+              `looks like '${detected}', not '${expectFormat}'.` +
+              (hint ? ` ${hint}` : "");
+            process.stderr.write(msg + "\n");
+            if (opts.strictFormat) {
+              process.exit(4);
+            }
+          }
+        }
+
+        return true;
+      }
 
       // ── Broker routing ──────────────────────────────────────────────────
       if (useBroker) {
@@ -237,6 +358,7 @@ export function registerVaultCommand(program: Command): void {
                   process.exit(1);
                 }
                 if (entry.kind === "string" || entry.kind === "binary") {
+                  checkFormatExpectation(entry);
                   console.log(entry.value);
                 } else {
                   console.error(chalk.yellow(`Secret '${key}' is kind="${entry.kind}"`));
@@ -261,7 +383,12 @@ export function registerVaultCommand(program: Command): void {
                 throw err;
               }
             } else {
-              console.error("broker locked and stdin is not a TTY");
+              // Non-TTY + broker locked: write a clearly-prefixed error to
+              // stderr so agents/scripts surfacing captured output can grep it.
+              process.stderr.write(
+                `VAULT-BROKER-DENIED: broker locked and stdin is not a TTY; ` +
+                `use 'switchroom vault get --no-broker' for interactive access\n`
+              );
               process.exit(3);
             }
           }
@@ -272,6 +399,7 @@ export function registerVaultCommand(program: Command): void {
           if (result.kind === "ok") {
             const entry = result.entry;
             if (entry.kind === "string" || entry.kind === "binary") {
+              checkFormatExpectation(entry);
               console.log(entry.value);
               return;
             }
@@ -290,7 +418,8 @@ export function registerVaultCommand(program: Command): void {
             // ACL rejection or vault locked. For interactive callers, fall
             // through to direct vault decrypt with the user's passphrase
             // (--no-broker semantics). For non-interactive callers, fail
-            // with the broker's reason so cron logs explain it.
+            // with a clearly-prefixed error so captured subprocess output
+            // is still actionable (issue #173).
             if (process.stdin.isTTY) {
               console.error(
                 chalk.yellow(
@@ -300,8 +429,12 @@ export function registerVaultCommand(program: Command): void {
               );
               // fall through to direct-decrypt block below
             } else {
-              console.error(
-                `broker denied request for '${key}' (${result.code}): ${result.msg}`,
+              // Write a VAULT-BROKER-DENIED prefix so scripts/agents that
+              // capture stdout/stderr can grep for it even when the full
+              // message isn't surfaced in their UI.
+              process.stderr.write(
+                `VAULT-BROKER-DENIED [${result.code}]: ${result.msg}\n` +
+                `Hint: run 'switchroom vault get --no-broker ${key}' for interactive (non-cron) access.\n`
               );
               process.exit(2);
             }
@@ -322,7 +455,10 @@ export function registerVaultCommand(program: Command): void {
 
         // Broker not reachable
         if (!process.stdin.isTTY && !process.env.SWITCHROOM_VAULT_PASSPHRASE) {
-          console.error("broker not running and stdin is not a TTY");
+          process.stderr.write(
+            `VAULT-BROKER-DENIED: broker not running and stdin is not a TTY; ` +
+            `use 'switchroom vault get --no-broker ${key}' for interactive access\n`
+          );
           process.exit(1);
         }
         // Fall through to direct vault access with passphrase prompt (or env var)
@@ -340,6 +476,7 @@ export function registerVaultCommand(program: Command): void {
         }
 
         if (entry.kind === "string" || entry.kind === "binary") {
+          checkFormatExpectation(entry);
           console.log(entry.value);
         } else {
           console.error(
