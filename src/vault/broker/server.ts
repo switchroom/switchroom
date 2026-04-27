@@ -81,7 +81,24 @@ export class VaultBroker {
   private unlockSocketPath: string = "";
   private vaultPath: string = "";
 
-  constructor(private readonly testOpts: BrokerTestOpts = {}) {}
+  constructor(private readonly testOpts: BrokerTestOpts = {}) {
+    // Defence-in-depth: BrokerTestOpts is exported (so vitest can construct
+    // brokers with seeded state and a stubbed identify()), but each field
+    // bypasses a security boundary — secrets pre-load, config injection,
+    // and forged peer identity. None of the production callers set these
+    // (see src/cli/vault-broker.ts), so we hard-fail outside test runners.
+    // vitest sets NODE_ENV=test by default; production builds do not.
+    const usingTestOpt =
+      testOpts._testSecrets !== undefined ||
+      testOpts._testConfig !== undefined ||
+      testOpts._testIdentify !== undefined;
+    if (usingTestOpt && process.env.NODE_ENV !== "test") {
+      throw new Error(
+        "VaultBroker: BrokerTestOpts (_testSecrets/_testConfig/_testIdentify) " +
+          "must not be set outside tests. Set NODE_ENV=test if you really mean it.",
+      );
+    }
+  }
 
   /**
    * Start the broker — bind both sockets, write PID file, notify systemd.
