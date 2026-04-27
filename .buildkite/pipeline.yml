@@ -92,26 +92,47 @@ steps:
       export BUILDKITE_ANALYTICS_TOKEN="$$(buildkite-agent secret get ANALYTICS_TOKEN_VITEST 2>/dev/null || true)"
       # Run vitest directly. bktec parallel sharding is opt-in via
       # SWITCHROOM_USE_BKTEC=1 — see the bktec block below. Plain vitest is
-      # the default because every recent build of bktec v2.3.2 has exited 16
-      # ("no files found") on this repo's pattern, even after switching from
-      # comma-separated to brace alternation in PR #120. The pattern parses
-      # correctly per drjosh.dev/zzglob docs (brace + ** are both supported
-      # and combinable), so the failure is somewhere else in the pipeline:
-      # discoverTestFiles, the test-plan API call, or vitest argument
-      # construction. Until that's diagnosed with bktec --debug logs, the
-      # parallel-sharding gain isn't worth a red main. See issues #107, #111.
+      # the default because every Core-tests run since #65 has exited bktec
+      # with code 16 (any non-exec error) and the team hasn't had a chance
+      # to capture debug logs to diagnose. The bktec block below is wired
+      # to capture those logs the next time someone flips the env flag —
+      # see CHECKLIST in the comment block immediately below.
       if [[ "$$SWITCHROOM_USE_BKTEC" == "1" ]]; then
+        # ─── bktec re-enable checklist (skills/buildkite-test-engine) ───
+        # 1. SWITCHROOM_TEST_ENGINE_API_TOKEN cluster secret must exist with
+        #    the read_suites scope (Personal Settings > API Access Tokens).
+        # 2. Confirm the `switchroom-vitest` suite has historical timing
+        #    data — without it, bktec falls back to file-count splitting
+        #    instead of timing-balanced. The collector is wired in
+        #    vitest.config.ts via BUILDKITE_ANALYTICS_TOKEN; check the
+        #    Test Engine dashboard.
+        # 3. DEBUG_ENABLED=true is on so the build log will print
+        #    "Discovering test files with include pattern: ..." +
+        #    "Discovered N files" — that confirms the zzglob-based
+        #    discoverTestFiles is finding our suite.
+        # 4. We do NOT download the bktec binary ourselves: hosted
+        #    Buildkite agents have it pre-installed. Downloading v2.3.2
+        #    from GitHub Releases shadows whatever fixed version the
+        #    hosted image already ships.
+        # 5. vitest is not a natively-supported runner, so we use
+        #    `custom` with a TEST_CMD that substitutes {{testExamples}}.
+        #    The custom runner doesn't need RESULT_PATH (per bktec's
+        #    config validation in internal/config/validate.go).
         export BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN="$$(buildkite-agent secret get SWITCHROOM_TEST_ENGINE_API_TOKEN 2>/dev/null || true)"
         if [[ -n "$$BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN" ]]; then
-          BKTEC_VERSION="2.3.2"
-          curl -fsSL "https://github.com/buildkite/test-engine-client/releases/download/v$${BKTEC_VERSION}/bktec_$${BKTEC_VERSION}_linux_amd64" \
-            -o /usr/local/bin/bktec && chmod +x /usr/local/bin/bktec
+          export BUILDKITE_TEST_ENGINE_DEBUG_ENABLED="true"
           export BUILDKITE_TEST_ENGINE_SUITE_SLUG="switchroom-vitest"
           export BUILDKITE_TEST_ENGINE_TEST_RUNNER="custom"
           export BUILDKITE_TEST_ENGINE_TEST_CMD="bunx vitest run {{testExamples}}"
           export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="{tests,test,experimental,src,telegram-plugin}/**/*.test.ts"
           export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/{history,ipc-server-client,ipc-server-race,gateway-bridge,gateway-startup-mutex,gateway-clean-shutdown-marker,foreman-state,boot-card-dedupe,boot-card-reason,progress-update,quota-cache,silent-reply-guard,unhandled-rejection-policy}.test.ts"
-          bktec run
+          if command -v bktec >/dev/null 2>&1; then
+            bktec --version
+            bktec run
+          else
+            echo "SWITCHROOM_USE_BKTEC=1 set but bktec is not pre-installed on this agent. Falling back to plain vitest."
+            bun run test:vitest
+          fi
         else
           echo "SWITCHROOM_USE_BKTEC=1 set but bktec token unavailable — falling back to plain vitest"
           bun run test:vitest
