@@ -97,6 +97,9 @@ steps:
       # to capture debug logs to diagnose. The bktec block below is wired
       # to capture those logs the next time someone flips the env flag —
       # see CHECKLIST in the comment block immediately below.
+      # bktec disabled by default (exit-16 on every Core-tests run since
+      # build #65; tracking issue #107). Re-enable with SWITCHROOM_USE_BKTEC=1
+      # in the cluster env once you're ready to capture --debug logs.
       if [[ "$$SWITCHROOM_USE_BKTEC" == "1" ]]; then
         # ─── bktec re-enable checklist (skills/buildkite-test-engine) ───
         # 1. SWITCHROOM_TEST_ENGINE_API_TOKEN cluster secret must exist with
@@ -118,6 +121,11 @@ steps:
         #    `custom` with a TEST_CMD that substitutes {{testExamples}}.
         #    The custom runner doesn't need RESULT_PATH (per bktec's
         #    config validation in internal/config/validate.go).
+        # 6. **Restore `parallelism: 2` on this step** when re-enabling.
+        #    bktec aborts with "BUILDKITE_PARALLEL_JOB_COUNT was 0" without
+        #    it. The directive was removed in this PR because plain vitest
+        #    runs the suite once, so duplicating jobs would just waste
+        #    compute.
         export BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN="$$(buildkite-agent secret get SWITCHROOM_TEST_ENGINE_API_TOKEN 2>/dev/null || true)"
         if [[ -n "$$BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN" ]]; then
           export BUILDKITE_TEST_ENGINE_DEBUG_ENABLED="true"
@@ -287,9 +295,13 @@ steps:
     # a public badge gist. Neither is load-bearing — every status that
     # matters (build, type-check, tests, evals) already shows on the build
     # page. A red Eval summary should never fail the build, so soft_fail
-    # any exit_status >= 1 (the publish-badges curl PATCH can 404 the gist
-    # on fork PRs that don't have access to the GIST_TOKEN cluster secret).
-    soft_fail: true
+    # the exit codes the scripts can plausibly produce (1 from a script
+    # failure, 2 from buildkite-agent secret/artifact errors). We
+    # deliberately do NOT mask agent loss (-1) or signal kills (143) so
+    # those infrastructure failures still bubble up.
+    soft_fail:
+      - exit_status: 1
+      - exit_status: 2
     command: |
       mkdir -p evals/results
       # Download to "." — buildkite-agent preserves the artifact's original
