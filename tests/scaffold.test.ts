@@ -2673,10 +2673,14 @@ describe("scheduled task cron script generation", () => {
       join(result.agentDir, "telegram", "cron-0.sh"),
       "utf-8",
     );
-    // Suppress path: exec claude directly, route output to /dev/null, no curl.
-    expect(content).toContain("suppress_stdout: true");
+    // Suppress path: `exec` replaces the shell with claude (no captured
+    // OUTPUT, no curl), and stdout goes to /dev/null. We assert on the
+    // structural shape — `exec claude -p ... > /dev/null` followed by the
+    // absence of the forwarding block — rather than the human-readable
+    // comment text, so the test doesn't break when the comment is reworded.
     expect(content).toContain("exec claude -p");
-    expect(content).toContain("> /dev/null 2>&1");
+    expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
+    expect(content).not.toContain("> /dev/null 2>&1"); // PR #125 review: don't swallow stderr
     expect(content).not.toContain("api.telegram.org");
     expect(content).not.toContain("OUTPUT=");
   });

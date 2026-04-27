@@ -1182,11 +1182,14 @@ fi
 
 ${suppressStdout
     ? `# suppress_stdout: true (cron entry posts its own message via MCP tools — see issue #118)
-# Discard stdout so the trailing model summary doesn't arrive as a second message.
+# Discard stdout so the trailing model summary doesn't arrive as a second
+# Telegram message. Stderr is left open so systemd captures auth/network/
+# bad-prompt errors via journalctl — silently swallowing those would make
+# a broken cron job invisible to operators.
 exec claude -p ${shellSingleQuote(prompt)} \\
   --model ${shellSingleQuote(model)} \\
   --no-session-persistence \\
-  > /dev/null 2>&1
+  > /dev/null
 `
     : `# Run Claude one-shot (no persistent session, cheap model)
 OUTPUT=$(claude -p ${shellSingleQuote(prompt)} \\

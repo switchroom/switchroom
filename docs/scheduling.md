@@ -36,6 +36,23 @@ For each schedule entry, switchroom generates:
 | `cron` | Yes | — | Standard 5-field cron expression |
 | `prompt` | Yes | — | The prompt sent to Claude |
 | `model` | No | `claude-sonnet-4-6` | Model for this task |
+| `secrets` | No | `[]` | Vault keys this task may read via the broker. See [configuration.md#vault-broker-linux-only](configuration.md#vault-broker-linux-only). |
+| `suppress_stdout` | No | `false` | When `true`, the cron script discards stdout instead of forwarding it to Telegram. Use for tasks that send their own message via MCP tools (`stream_reply` / `reply`) so the trailing model summary doesn't post as a duplicate. See [issue #118](https://github.com/switchroom/switchroom/issues/118). |
+
+### When to set `suppress_stdout: true`
+
+The default cron flow captures `claude -p`'s stdout and `curl`s it to Telegram, so the agent gets one message per cron run for free. That works for tasks that respond entirely via the model's final text — "morning briefing", "weekly summary", etc.
+
+It backfires for tasks that already post their own message via MCP tools (`mcp__switchroom-telegram__stream_reply`, `mcp__switchroom-telegram__reply`). The MCP tool call posts the formatted message; then the cron script forwards the model's trailing summary as a second message:
+
+```
+[MCP tool call]: 🌅 Morning briefing — 3 items on today's calendar...
+[stdout]:        Morning briefing sent. Key signals flagged: low sleep, gym in 2h.
+```
+
+The user sees both. The `HEARTBEAT_OK` / `NO_REPLY` sentinels can suppress the stdout but only if the model produces them as the exact final tokens — fragile.
+
+`suppress_stdout: true` is the deterministic switch. The cron script `exec`s `claude -p` with stdout routed to `/dev/null`, so only the MCP-tool-posted message reaches Telegram.
 
 ### Cron Expression Examples
 
