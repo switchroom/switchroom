@@ -2083,7 +2083,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const who = r.role === 'user' ? r.user ?? 'user' : 'assistant'
             const time = new Date(r.ts * 1000).toISOString()
             const attach = r.attachment_kind ? ` [${r.attachment_kind}]` : ''
-            return `[${time}] ${who}${attach}: ${r.text}`
+            // Surface Telegram-native reply context inline so the agent
+            // sees what was being replied to without parsing the JSON
+            // payload. See issue #119.
+            const replyCtx = r.reply_to_message_id != null
+              ? ` ↪️#${r.reply_to_message_id}${r.reply_to_text ? `:"${r.reply_to_text.slice(0, 60)}${r.reply_to_text.length > 60 ? '…' : ''}"` : ''}`
+              : ''
+            return `[${time}] ${who}${attach}${replyCtx}: ${r.text}`
           })
           .join('\n')
         const payload = {
@@ -5336,6 +5342,22 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // If the user replied to a prior message via Telegram's native "long-press
+  // → Reply" affordance, capture the original message_id and a truncated
+  // preview so the agent can resolve "this" / "that" anaphora without
+  // an extra get_recent_messages call. See issue #119.
+  const replyToMsg = ctx.message?.reply_to_message
+  const replyToMessageId = replyToMsg?.message_id
+  const REPLY_TO_TEXT_MAX = 200
+  const replyToTextRaw = replyToMsg
+    ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
+    : undefined
+  const replyToText = replyToTextRaw != null
+    ? (replyToTextRaw.length > REPLY_TO_TEXT_MAX
+        ? replyToTextRaw.slice(0, REPLY_TO_TEXT_MAX - 1) + '…'
+        : replyToTextRaw)
+    : undefined
+
   // Persist to history before notifying Claude. We're past the gate, the
   // topic filter, and the permission-reply intercept, so this is exactly
   // the message the agent will see in its prompt — store the same thing.
@@ -5350,6 +5372,8 @@ async function handleInbound(
         ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
         text: effectiveText,
         attachment_kind: attachment?.kind,
+        reply_to_message_id: replyToMessageId ?? null,
+        reply_to_text: replyToText ?? null,
       })
     } catch (err) {
       // Never let history failures break message delivery.
@@ -5423,6 +5447,12 @@ async function handleInbound(
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
+        // Telegram-native reply context (issue #119). When set, the user
+        // long-pressed a prior message and chose "Reply" — the agent should
+        // treat this as the antecedent for "this" / "that" / pronoun
+        // references in the body, instead of asking the user what they meant.
+        ...(replyToMessageId != null ? { reply_to_message_id: String(replyToMessageId) } : {}),
+        ...(replyToText != null && replyToText.length > 0 ? { reply_to_text: replyToText } : {}),
         ...(isQueuedPrefix ? { queued: 'true' } : {}),
         ...(isSteering && !isQueuedPrefix ? { steering: 'true' } : {}),
         ...(priorTurnInProgress ? { prior_turn_in_progress: 'true' } : {}),

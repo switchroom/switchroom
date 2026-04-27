@@ -2562,6 +2562,22 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // If the user replied to a prior message via Telegram's native "long-press
+  // → Reply" affordance, capture the original message_id and a truncated
+  // preview so the agent can resolve "this" / "that" anaphora without
+  // an extra get_recent_messages call. See issue #119.
+  const replyToMsg = ctx.message?.reply_to_message
+  const replyToMessageId = replyToMsg?.message_id
+  const REPLY_TO_TEXT_MAX = 200
+  const replyToTextRaw = replyToMsg
+    ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
+    : undefined
+  const replyToText = replyToTextRaw != null
+    ? (replyToTextRaw.length > REPLY_TO_TEXT_MAX
+        ? replyToTextRaw.slice(0, REPLY_TO_TEXT_MAX - 1) + '…'
+        : replyToTextRaw)
+    : undefined
+
   if (HISTORY_ENABLED) {
     try {
       recordInbound({
@@ -2573,6 +2589,8 @@ async function handleInbound(
         ts: ctx.message?.date ?? Math.floor(Date.now() / 1000),
         text: effectiveText,
         attachment_kind: attachment?.kind,
+        reply_to_message_id: replyToMessageId ?? null,
+        reply_to_text: replyToText ?? null,
       })
     } catch (err) {
       process.stderr.write(`telegram gateway: history recordInbound failed: ${err}\n`)
@@ -2631,6 +2649,12 @@ async function handleInbound(
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
       ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
       ...(imagePath ? { image_path: imagePath } : {}),
+      // Telegram-native reply context (issue #119). When set, the user
+      // long-pressed a prior message and chose "Reply" — the agent should
+      // treat this as the antecedent for "this" / "that" / pronoun
+      // references in the body, instead of asking the user what they meant.
+      ...(replyToMessageId != null ? { reply_to_message_id: String(replyToMessageId) } : {}),
+      ...(replyToText != null && replyToText.length > 0 ? { reply_to_text: replyToText } : {}),
       // queued="true" when mid-turn with no steer prefix (new default), or
       // with explicit /queue or /q prefix (legacy alias).
       ...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),
