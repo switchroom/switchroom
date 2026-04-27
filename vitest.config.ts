@@ -24,6 +24,10 @@ export default defineConfig({
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
+      // `.claude/worktrees/<slug>/` are checkout copies created by sub-agent
+      // sessions. Their tests duplicate the canonical ones and run against
+      // stale code — never discover them from the canonical repo.
+      "**/.claude/worktrees/**",
       "**/telegram-plugin/tests/history.test.ts",
       "**/telegram-plugin/tests/ipc-server-client.test.ts",
       "**/telegram-plugin/tests/ipc-server-race.test.ts",
