@@ -289,10 +289,14 @@ export class VaultBroker {
   }
 
   private _handleDataConnection(socket: net.Socket): void {
-    // Identify peer immediately on accept (Linux only)
+    // Identify peer immediately on accept (Linux only). Pass the accepted
+    // socket so identify() can use SO_PEERCRED via bun:ffi (bun runtime) or
+    // pin its ss-output lookup to the server-side fd's inode (node runtime).
+    // Without the socket, identify() falls back to the legacy first-row-wins
+    // ss lookup which has a documented concurrency hazard. See issue #129.
     let peer: import("./peercred.js").PeerInfo | null = null;
     if (process.platform === "linux") {
-      peer = identify(this.socketPath);
+      peer = identify(this.socketPath, socket);
     }
 
     let buffer = "";
@@ -438,10 +442,11 @@ export class VaultBroker {
   }
 
   private _handleUnlockConnection(socket: net.Socket): void {
-    // Same UID check for unlock socket. On Linux: verify via peercred.
+    // Same UID check for unlock socket. On Linux: verify via peercred,
+    // pinned to this connection's fd (issue #129).
     // On other OSes: rely on socket file mode 0600.
     if (process.platform === "linux") {
-      const peer = identify(this.unlockSocketPath);
+      const peer = identify(this.unlockSocketPath, socket);
       if (peer === null) {
         socket.write("ERR unable to verify caller identity\n");
         socket.destroy();

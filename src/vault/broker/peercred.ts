@@ -1,39 +1,41 @@
 /**
  * peercred — Linux peer-credential identification for Unix socket connections.
  *
- * On Linux, identifies the calling process by:
- *   1. Running `ss -xpn state connected src <socket-path>` to enumerate
- *      connected peers and parse the `users:(("name",pid=NNN,fd=NN))` column.
- *   2. Reading `/proc/<pid>/status` to get the caller's real UID.
- *   3. Reading `/proc/<pid>/exe` (symlink) to get the caller's executable path.
- *   4. Reading `/proc/<pid>/cgroup` to find the systemd unit name, which is
- *      used as the primary identity signal for ACL decisions.
+ * Two paths, picked at runtime:
  *
- * The cgroup identity (`systemdUnit`) is the authoritative identity for cron
- * scripts. systemd writes the cgroup as root when it starts the unit, and
- * processes cannot change their own cgroup from userspace — making it
- * unspoofable. The exe path is retained for the interactive-CLI fallback only.
+ *   1. Bun runtime — `bun:ffi` getsockopt(SO_PEERCRED) on the accepted
+ *      socket fd. The kernel binds peer credentials to the connection
+ *      itself, so this returns the unique caller for *this* socket — no
+ *      shell-out, no inode join, no concurrency ambiguity. ~30 LOC.
+ *      See `peercred-ffi.ts`.
  *
- * Limitation: when multiple clients are simultaneously connected to the same
- * socket, `ss` returns all of them. This implementation picks the first
- * connected entry — the server calls `identify()` immediately on accept,
- * before the next connection can appear, which makes the single-client
- * assumption hold in practice for cron scripts (each is a short-lived
- * one-shot process). If more than one entry appears, a WARN is emitted to
- * stderr.
+ *   2. Node fallback — `ss -xpn` parsing. Same approach as before, but
+ *      issue #129 fixed the concurrency hazard: instead of "first row
+ *      that matches the listening socket path wins", we now match by
+ *      `serverFdInode` — the inode of the accepted server-side socket
+ *      fd, obtained via `fs.fstatSync(socket._handle.fd).ino`. That
+ *      gives us the unique row for this connection regardless of how
+ *      many clients are connected simultaneously.
+ *
+ * Both paths cross-check the resolved PID's UID against the broker's UID
+ * and look up its cgroup-derived systemd unit (validated against
+ * systemctl-user). The cgroup identity is what the ACL gates on.
  *
  * Security model:
  *   - Fail-closed: any parse error, missing /proc entry, or UID mismatch
- *     returns null (the caller should treat null as "unidentified" and deny).
- *   - On non-Linux platforms this module returns null immediately — the
- *     Unix socket's file mode 0600 is the sole access control in that case.
+ *     returns null (caller treats null as "unidentified" and denies).
+ *   - On non-Linux this module returns null immediately. The broker
+ *     refuses to start on non-Linux unless SWITCHROOM_BROKER_ALLOW_NON_LINUX
+ *     is set (see VaultBroker.start), so production never reaches that path.
  *
  * This module is the single seam for OS-specific process identification.
  * Keep it small, pure, and independently testable.
  */
 
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
-import { readFileSync, readlinkSync } from "node:fs";
+import { readFileSync, readlinkSync, fstatSync } from "node:fs";
+import type { Socket } from "node:net";
+import { getPeerCred } from "./peercred-ffi.js";
 
 export interface PeerInfo {
   uid: number;
@@ -113,6 +115,44 @@ function findClientPids(rows: SsRow[], socketPath: string): number[] {
     }
   }
   return pids;
+}
+
+/**
+ * Like `findClientPids`, but pinpoints the row corresponding to the
+ * specific accepted server-side fd whose inode the caller already knows.
+ * Eliminates the "first connected entry wins" concurrency hazard that the
+ * original code documented — when N clients are connected, this returns
+ * the PID of the *Nth* one corresponding to *our* fd, not whichever ss
+ * happened to list first.
+ *
+ * Returns null when:
+ *   - no server row's localInode matches `serverInode` (we may have raced
+ *     with the kernel's socket bookkeeping)
+ *   - the matching server row has a peerInode but no client row has that
+ *     localInode (client may have already disconnected)
+ *
+ * Issue #129.
+ */
+function findClientPidByServerInode(
+  rows: SsRow[],
+  socketPath: string,
+  serverInode: number,
+): number | null {
+  // SsRow.localInode is a string (parsed from ss output as-is). Stringify
+  // the numeric inode from fstat once so the comparison is type-correct.
+  const serverInodeStr = String(serverInode);
+  for (const serverRow of rows) {
+    if (serverRow.localAddr !== socketPath) continue;
+    if (serverRow.localInode !== serverInodeStr) continue;
+    for (const clientRow of rows) {
+      if (clientRow.localAddr !== "*") continue;
+      if (clientRow.localInode !== serverRow.peerInode) continue;
+      if (clientRow.pid === null) continue;
+      return clientRow.pid;
+    }
+    return null;
+  }
+  return null;
 }
 
 /**
@@ -257,14 +297,66 @@ export function verifySystemdUnit(
 }
 
 /**
+ * Read the inode of an open file descriptor. Used to disambiguate ss rows
+ * for our specific accepted connection (issue #129). Returns null on any
+ * error so the caller can fall through to less-precise matching.
+ */
+function readFdInode(fd: number): number | null {
+  try {
+    const stat = fstatSync(fd);
+    // Node's Stats.ino is `number` on 32-bit inodes and falls back to
+    // `bigint` only when bigint:true is requested. We never request bigint,
+    // so this is safely numeric on Linux.
+    return stat.ino as number;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract the file descriptor from a connected `net.Socket`. Uses the
+ * undocumented `_handle.fd` because Node has no public fd accessor (only
+ * a setter via the constructor). The cast is intentional and isolated to
+ * this one helper so the rest of peercred treats fd as a plain number.
+ *
+ * Returns null when the handle is missing (socket already destroyed) or
+ * the fd is unset (Windows / non-fd-backed handle).
+ */
+function fdFromSocket(socket: Socket): number | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handle = (socket as unknown as { _handle?: { fd?: number } })._handle;
+  if (!handle || typeof handle.fd !== "number" || handle.fd < 0) return null;
+  return handle.fd;
+}
+
+/**
  * Identify the peer on the other end of a Unix domain socket connection.
  *
+ * Two-path implementation:
+ *
+ *   1. **Bun fast path** — when `socket` is provided AND we're on Linux
+ *      AND `bun:ffi` is available, call `getsockopt(fd, SOL_SOCKET,
+ *      SO_PEERCRED)` directly. The kernel binds peer creds to the
+ *      connection at accept(2) time, so this gives the unique caller for
+ *      this exact socket. Cleanest, fastest, no shell-out.
+ *
+ *   2. **Node fallback** — `ss -xpn` parsing. When `socket` is provided
+ *      we now also pull the server-side fd's inode via `fstatSync` and
+ *      pass it to `findClientPidByServerInode`, which selects the
+ *      *exactly correct* row instead of "first row that matches
+ *      socketPath". That fixes the concurrency hazard the original code
+ *      documented as a "known limitation" (issue #129).
+ *
  * @param socketPath - Absolute path to the listening socket.
- * @param execFileSync_ - Injectable for testing (default: Node's execFileSync).
+ * @param socket - Optional connected socket from the accept() callback.
+ *                 Strongly preferred — without it we fall back to the
+ *                 first-row-wins lookup, which has the historical race.
+ * @param execFileSyncOverride - Injectable for testing (default: Node's execFileSync).
  * @returns PeerInfo or null (unidentified / non-Linux / error).
  */
 export function identify(
   socketPath: string,
+  socket?: Socket,
   execFileSyncOverride?: (
     file: string,
     args: readonly string[],
@@ -272,43 +364,81 @@ export function identify(
   ) => Buffer | string,
 ): PeerInfo | null {
   if (process.platform !== "linux") {
-    // macOS / other: degrade to UID-only (socket file mode 0600 is the guard)
+    // macOS / other: degrade to UID-only (socket file mode 0600 is the guard).
+    // The broker also refuses to start on non-Linux unless explicitly
+    // overridden, so this branch is reachable only via the dev escape hatch.
     return null;
   }
 
   const runner = execFileSyncOverride ?? execFileSync;
 
-  let ssOutput: string;
-  try {
-    // We need every unix endpoint to do the inode-pair lookup that maps the
-    // server-side row to the client-side row. `ss` only stamps the path on
-    // the server side; the connecting client appears under `Local *
-    // <inode>`. A `src` or `dst` filter narrows the result before we can
-    // match the pair, so we list everything and filter in user space.
-    const raw = runner("ss", ["-xpn"], {
-      timeout: 200,
-      encoding: "utf8",
-    });
-    ssOutput = typeof raw === "string" ? raw : raw.toString("utf8");
-  } catch {
-    // ss not available or timed out — fail closed
-    return null;
+  // ── Path 1: bun:ffi SO_PEERCRED ──────────────────────────────────────────
+  // Returns null under node (bun:ffi unavailable) or if getsockopt errors.
+  // We then fall through to the ss-parsing path below.
+  let pid: number | null = null;
+  if (socket !== undefined) {
+    const fd = fdFromSocket(socket);
+    if (fd !== null) {
+      const cred = getPeerCred(fd);
+      if (cred !== null) {
+        pid = cred.pid;
+        // The UID from SO_PEERCRED is authoritative; record it now so we can
+        // skip the /proc/<pid>/status read below if it agrees with the broker.
+        // (We re-validate below for robustness.)
+      }
+    }
   }
 
-  const rows = parseSsRows(ssOutput);
-  const clientPids = findClientPids(rows, socketPath);
-  if (clientPids.length === 0) return null;
+  // ── Path 2: ss -xpn fallback (concurrency-safe via inode match) ──────────
+  if (pid === null) {
+    let ssOutput: string;
+    try {
+      // We need every unix endpoint to do the inode-pair lookup that maps the
+      // server-side row to the client-side row. `ss` only stamps the path on
+      // the server side; the connecting client appears under `Local *
+      // <inode>`. A `src` or `dst` filter narrows the result before we can
+      // match the pair, so we list everything and filter in user space.
+      const raw = runner("ss", ["-xpn"], {
+        timeout: 200,
+        encoding: "utf8",
+      });
+      ssOutput = typeof raw === "string" ? raw : raw.toString("utf8");
+    } catch {
+      // ss not available or timed out — fail closed
+      return null;
+    }
 
-  if (clientPids.length > 1) {
-    // Multiple simultaneous connections — warn but use the first.
-    // This is documented as a known limitation.
-    process.stderr.write(
-      `[vault-broker] peercred: ${clientPids.length} connected peers found for ${socketPath}; ` +
-        `using pid=${clientPids[0]}. Multiple simultaneous connections reduce identification accuracy.\n`,
-    );
+    const rows = parseSsRows(ssOutput);
+
+    // When we have a connected socket, pin the lookup to its server-side
+    // inode. That eliminates the "first connected client wins" race the
+    // original code warned about (issue #129).
+    let serverInode: number | null = null;
+    if (socket !== undefined) {
+      const fd = fdFromSocket(socket);
+      if (fd !== null) serverInode = readFdInode(fd);
+    }
+
+    if (serverInode !== null) {
+      pid = findClientPidByServerInode(rows, socketPath, serverInode);
+    } else {
+      // Caller didn't pass the socket. Use the legacy "first row wins"
+      // lookup with the same warning the original code emitted.
+      const clientPids = findClientPids(rows, socketPath);
+      if (clientPids.length === 0) return null;
+      if (clientPids.length > 1) {
+        process.stderr.write(
+          `[vault-broker] peercred: ${clientPids.length} connected peers found for ${socketPath}; ` +
+            `using pid=${clientPids[0]}. ` +
+            `Multiple simultaneous connections reduce identification accuracy. ` +
+            `(This warning means identify() was called without a socket arg — likely a stale call site.)\n`,
+        );
+      }
+      pid = clientPids[0];
+    }
   }
 
-  const pid = clientPids[0];
+  if (pid === null) return null;
 
   const uid = readUid(pid);
   if (uid === null) {
