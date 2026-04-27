@@ -153,7 +153,7 @@ describe('toolLabel', () => {
       ).toBe('Listing all TypeScript sources')
     })
 
-    it('Bash / Task / Agent ignore preamble (they already use input.description)', () => {
+    it('Bash: description wins over preamble when both are present', () => {
       expect(
         toolLabel(
           'Bash',
@@ -161,6 +161,38 @@ describe('toolLabel', () => {
           'Running git status real quick',
         ),
       ).toBe('Check git status')
+    })
+
+    it('Bash: falls back to preamble when description is absent', () => {
+      // Issue #50.1 — post-#41 Bash no longer ignores preamble. When the
+      // agent didn't supply a `description`, the preamble (model's preceding
+      // text narration) wins over the raw command string.
+      expect(
+        toolLabel(
+          'Bash',
+          { command: 'find /home -name "*.tmp" -mtime +30 -exec rm {} \\;' },
+          'Sweep stale temp files',
+        ),
+      ).toBe('Sweep stale temp files')
+    })
+
+    it('Bash: raw command fallback when both description and preamble are absent', () => {
+      expect(toolLabel('Bash', { command: 'git status' })).toBe('git status')
+      expect(toolLabel('Bash', { command: 'git status' }, undefined)).toBe('git status')
+      expect(toolLabel('Bash', { command: 'git status' }, '')).toBe('git status')
+    })
+
+    it('Bash: multi-line preamble is narrative, not a label → command fallback', () => {
+      expect(
+        toolLabel(
+          'Bash',
+          { command: 'git status' },
+          "Here's my plan:\n1. check status\n2. commit",
+        ),
+      ).toBe('git status')
+    })
+
+    it('Task / Agent ignore preamble (description / subagent_type is always set)', () => {
       expect(
         toolLabel('Task', { description: 'Research bug' }, 'Kicking off the research agent'),
       ).toBe('Research bug')

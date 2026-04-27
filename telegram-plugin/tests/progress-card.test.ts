@@ -12,6 +12,7 @@ import {
   render,
   compactItems,
   formatDuration,
+  hasInFlightSubAgents,
   type ProgressCardState,
   type ChecklistItem,
 } from '../progress-card.js'
@@ -1155,6 +1156,101 @@ describe('progress-card reducer — multi-agent correlation', () => {
   })
 })
 
+describe('hasInFlightSubAgents (PR #49 orphan-exclusion contract)', () => {
+  // Issue #50.2 — pin the contract directly so a regression flips this red
+  // before any integration test reproduces the ghost-pin bug end-to-end.
+  // The defer gate must:
+  //   1. return TRUE for any running sub-agent with a parentToolUseId
+  //   2. return FALSE when every running sub-agent is an orphan
+  //      (parentToolUseId == null) — orphans don't gate parent turn_end
+  //   3. return FALSE when no sub-agents are running
+  it('returns false on a fresh state with no sub-agents', () => {
+    expect(hasInFlightSubAgents(initialState())).toBe(false)
+  })
+
+  it('returns true when a correlated sub-agent is running', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P' },
+    ])
+    // Sanity: the sub-agent really is correlated + running.
+    expect(st.subAgents.get('A')?.parentToolUseId).toBe('toolu_p1')
+    expect(st.subAgents.get('A')?.state).toBe('running')
+    expect(hasInFlightSubAgents(st)).toBe(true)
+  })
+
+  it('returns false when the only running sub-agent is an orphan', () => {
+    // Orphan = sub_agent_started without a matching parent tool_use.
+    const st = fold([
+      enqueue('go'),
+      { kind: 'sub_agent_started', agentId: 'orphan', firstPromptText: 'unmatched' },
+    ])
+    expect(st.subAgents.get('orphan')?.parentToolUseId).toBeNull()
+    expect(st.subAgents.get('orphan')?.state).toBe('running')
+    // …yet the defer gate stays open: orphan turn_ends may never arrive.
+    expect(hasInFlightSubAgents(st)).toBe(false)
+  })
+
+  it('returns false when a correlated sub-agent has finished', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P' },
+      { kind: 'sub_agent_turn_end', agentId: 'A', durationMs: 5 },
+    ])
+    expect(st.subAgents.get('A')?.state).toBe('done')
+    expect(hasInFlightSubAgents(st)).toBe(false)
+  })
+
+  it('returns true when at least one correlated sub-agent runs alongside orphans', () => {
+    // Mixed fleet: one correlated runner + one orphan. Defer should hold.
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'correlated', firstPromptText: 'P' },
+      { kind: 'sub_agent_started', agentId: 'orphan', firstPromptText: 'unmatched' },
+    ])
+    expect(st.subAgents.get('correlated')?.parentToolUseId).toBe('toolu_p1')
+    expect(st.subAgents.get('orphan')?.parentToolUseId).toBeNull()
+    expect(hasInFlightSubAgents(st)).toBe(true)
+  })
+
+  it('returns false when every correlated sub-agent finishes, leaving only running orphans', () => {
+    const st = fold([
+      enqueue('go'),
+      {
+        kind: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'toolu_p1',
+        input: { description: 'd', prompt: 'P' },
+      },
+      { kind: 'sub_agent_started', agentId: 'correlated', firstPromptText: 'P' },
+      { kind: 'sub_agent_started', agentId: 'orphan', firstPromptText: 'unmatched' },
+      { kind: 'sub_agent_turn_end', agentId: 'correlated', durationMs: 5 },
+    ])
+    expect(st.subAgents.get('correlated')?.state).toBe('done')
+    expect(st.subAgents.get('orphan')?.state).toBe('running')
+    // Only orphan is alive → defer gate releases.
+    expect(hasInFlightSubAgents(st)).toBe(false)
+  })
+})
+
 describe('sub-agent description fallback chain', () => {
   it('correlated sub-agent: uses description', () => {
     const st = fold([
@@ -1405,6 +1501,60 @@ describe('compactItems', () => {
 
   it('empty input returns empty output', () => {
     expect(compactItems([])).toEqual([])
+  })
+
+  // Issue #50.3 — pin the humanAuthored carve-out (#41 fix). When the agent
+  // attached a human-readable description to each Bash, those descriptions
+  // are valuable signal — collapsing into "Bash ×3" would discard them.
+  describe('humanAuthored items are never collapsed (#41)', () => {
+    it('three same-label humanAuthored Bash items render as three singles, not Bash ×3', () => {
+      const items = [
+        makeItem(0, 'Bash', 'Run the migration', 'done', true),
+        makeItem(1, 'Bash', 'Run the migration', 'done', true),
+        makeItem(2, 'Bash', 'Run the migration', 'done', true),
+      ]
+      const out = compactItems(items)
+      expect(out).toHaveLength(3)
+      expect(out.every((x) => x.kind === 'single')).toBe(true)
+      expect(out.every((x) => x.humanAuthored === true)).toBe(true)
+    })
+
+    it('two same-label humanAuthored Bash items render as two singles', () => {
+      const items = [
+        makeItem(0, 'Bash', 'Check commit state', 'done', true),
+        makeItem(1, 'Bash', 'Check commit state', 'done', true),
+      ]
+      const out = compactItems(items)
+      expect(out).toHaveLength(2)
+      expect(out.every((x) => x.kind === 'single')).toBe(true)
+    })
+
+    it('a single humanAuthored item in a same-label run blocks the rollup of the whole run', () => {
+      // Two non-humanAuthored items would normally rollup at ROLLUP_THRESHOLD=2.
+      // Adding one humanAuthored sibling in the same run must keep all three
+      // as singles, otherwise the agent's description gets discarded.
+      const items = [
+        makeItem(0, 'Bash', 'git status', 'done', false),
+        makeItem(1, 'Bash', 'git status', 'done', true),
+        makeItem(2, 'Bash', 'git status', 'done', false),
+      ]
+      const out = compactItems(items)
+      expect(out).toHaveLength(3)
+      expect(out.every((x) => x.kind === 'single')).toBe(true)
+    })
+
+    it('a humanAuthored sibling blocks even the mixed-label rollup', () => {
+      // 3 same-tool, mixed-label, all done normally collapses (C1).
+      // One humanAuthored item in the run prevents that collapse too.
+      const items = [
+        makeItem(0, 'Bash', 'git status', 'done', false),
+        makeItem(1, 'Bash', 'Run the migration', 'done', true),
+        makeItem(2, 'Bash', 'npm test', 'done', false),
+      ]
+      const out = compactItems(items)
+      expect(out).toHaveLength(3)
+      expect(out.every((x) => x.kind === 'single')).toBe(true)
+    })
   })
 })
 

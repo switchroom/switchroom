@@ -146,8 +146,10 @@ export function isHumanDescription(
  * that prose over the filename/pattern fallback when it's short enough
  * to fit on one mobile line (single-line, ≤160 chars). Multi-line or
  * longer text is treated as a narrative step, not a per-tool preamble,
- * and the fallback label wins. Bash/BashOutput/Task/Agent already carry
- * `input.description` and intentionally ignore preamble.
+ * and the fallback label wins. Bash/BashOutput prefer their own
+ * `input.description` first but fall back to preamble when it's absent
+ * (then the raw command). Task/Agent ignore preamble entirely — their
+ * `input.description` / `subagent_type` is always set by the harness.
  */
 export function toolLabel(
   tool: string,
