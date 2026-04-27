@@ -50,15 +50,17 @@ describe('sweepHindsightBank', () => {
   })
 
   it('matches on the context field as well as text', async () => {
+    // Token assembled at runtime — see CLAUDE.md "Secrets in tests".
+    const GH_FIXTURE = 'ghp' + '_' + '16C7e42F292c6912E7710c838347Ae178B4a'
     const memories: HindsightMemory[] = [
       {
         id: 'm1',
         text: 'fine',
-        context: 'ran with ghp_16C7e42F292c6912E7710c838347Ae178B4a',
+        context: 'ran with ' + GH_FIXTURE,
       },
     ]
     const vaultValues = [
-      { key: 'GH_TOKEN', value: 'ghp_16C7e42F292c6912E7710c838347Ae178B4a' },
+      { key: 'GH_TOKEN', value: GH_FIXTURE },
     ]
     const { client, deleted } = makeFakeClient(memories)
     const report = await sweepHindsightBank(client, 'bank-a', vaultValues, {

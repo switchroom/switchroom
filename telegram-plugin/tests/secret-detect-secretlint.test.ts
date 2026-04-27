@@ -4,10 +4,13 @@ import {
   detectSecretsAsync,
 } from '../secret-detect/index.js'
 
-// Assembled at runtime so the source file never contains a contiguous
-// xoxb- pattern. Matches secretlint's Slack regex when evaluated; evades
-// GitHub Push Protection's static-text scan.
+// All three fixtures are assembled at runtime so the source file never
+// contains a contiguous token pattern. Matches the corresponding
+// secretlint regex when evaluated; evades GitHub Push Protection's
+// static-text scan. See CLAUDE.md "Secrets in tests".
 const SLACK_FIXTURE = ['xoxb', '0000000000', '0000000000000', 'FIXTURE0NOTAREALTOKEN000'].join('-')
+const GITHUB_FIXTURE = 'ghp' + '_' + '16C7e42F292c6912E7710c838347Ae178B4a'
+const NPM_FIXTURE = 'npm' + '_' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'
 
 describe('secretlint-source.detectViaSecretlint', () => {
   it('catches a realistic-looking Slack bot token', async () => {
@@ -28,7 +31,7 @@ describe('secretlint-source.detectViaSecretlint', () => {
   })
 
   it('catches a GitHub personal access token', async () => {
-    const text = 'token=ghp_16C7e42F292c6912E7710c838347Ae178B4a rest of message'
+    const text = 'token=' + GITHUB_FIXTURE + ' rest of message'
     const hits = await detectViaSecretlint(text)
     const gh = hits.find((h) => h.rule_id.includes('github'))
     expect(gh).toBeDefined()
@@ -38,7 +41,7 @@ describe('secretlint-source.detectViaSecretlint', () => {
   })
 
   it('catches an NPM access token', async () => {
-    const text = 'NPM_TOKEN=npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'
+    const text = 'NPM_TOKEN=' + NPM_FIXTURE
     const hits = await detectViaSecretlint(text)
     const npm = hits.find((h) => h.rule_id.includes('npm'))
     expect(npm).toBeDefined()
@@ -89,7 +92,7 @@ describe('detectSecretsAsync merge', () => {
 
   it('produces unique slugs across the merged detection list', async () => {
     const text =
-      'tok1=ghp_16C7e42F292c6912E7710c838347Ae178B4a' +
+      'tok1=' + GITHUB_FIXTURE +
       ' and tok2=' + SLACK_FIXTURE
     const hits = await detectSecretsAsync(text)
     const slugs = hits.map((h) => h.suggested_slug)
