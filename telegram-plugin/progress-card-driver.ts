@@ -254,6 +254,20 @@ interface PerChatState {
    * `PerChatState` (one per turn).
    */
   replyToolCalled: boolean
+  /**
+   * Issue #137: how many outbound replies actually landed in the chat
+   * this turn? Bumped by `ProgressDriver.recordOutboundDelivered()` from
+   * the gateway's executeReply / executeStreamReply success paths.
+   *
+   * Combined with `replyToolCalled` at turn-end, this distinguishes:
+   *   - both false              → silent-end (#132, "Ended without reply")
+   *   - replyToolCalled only    → reply attempted but never delivered
+   *                               (#137 — render a degraded variant
+   *                               distinct from silent-end so the user
+   *                               knows the agent TRIED)
+   *   - delivered>0             → real success
+   */
+  outboundDeliveredCount: number
 }
 
 export interface ProgressDriver {
@@ -327,6 +341,15 @@ export interface ProgressDriver {
    * of the async emit in server.ts.
    */
   reportApiSuccess(turnKey: string): void
+  /**
+   * Issue #137: bump the per-turn outbound-delivered counter for the
+   * card matching (chatId, threadId). Called from the gateway's reply
+   * success paths (executeReply, executeStreamReply) AFTER the
+   * `bot.api.sendMessage` resolved. If no card is active for that
+   * chat+thread, the call is a silent no-op (boot banners and other
+   * system messages don't tick the counter).
+   */
+  recordOutboundDelivered(chatId: string, threadId?: string): void
 }
 
 export function createProgressDriver(config: ProgressDriverConfig): ProgressDriver {
@@ -580,7 +603,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // "Working…". The renderer applies the same gate, so passing the
         // unconditional flag here is safe.
         const silentEnd = !cs.replyToolCalled
-        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd })
+        // Issue #137: agent called reply/stream_reply (replyToolCalled=true)
+        // but the actual outbound never landed (recordOutboundDelivered was
+        // never called for this card). Distinct from silentEnd because the
+        // agent TRIED — the failure is in the delivery layer, not the model.
+        const replyNotDelivered = cs.replyToolCalled && cs.outboundDeliveredCount === 0
+        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered })
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
         if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
@@ -685,11 +713,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     const taskNum = taskNumFor(chatState)
     const stuckMs = Math.max(0, now() - chatState.lastEventAt)
     const silentEnd = !chatState.replyToolCalled
+    const replyNotDelivered =
+      chatState.replyToolCalled && chatState.outboundDeliveredCount === 0
     const html = render(
       chatState.state,
       now(),
       taskNum.total > 1 ? taskNum : undefined,
-      { stuckMs, silentEnd },
+      { stuckMs, silentEnd, replyNotDelivered },
     )
     // Issue #81 diagnostic: which checklist branch is the renderer taking?
     // The card prefers `narratives` (human preambles) over `items` (raw
@@ -893,6 +923,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           completionFired: false,
           apiFailures: { consecutive4xx: 0, lastError: null, terminal: false },
           replyToolCalled: false,
+          outboundDeliveredCount: 0,
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1197,6 +1228,22 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (cs.apiFailures.consecutive4xx > 0) {
         cs.apiFailures.consecutive4xx = 0
       }
+    },
+
+    recordOutboundDelivered(chatId, threadId) {
+      // Issue #137: walk the active chats and find the entry matching the
+      // outbound destination. We can't index by chatId alone — multiple
+      // turns may queue against the same chat — so iterate. The map is
+      // small (one entry per active turn) so the linear scan is fine.
+      for (const cs of chats.values()) {
+        if (cs.chatId === chatId && cs.threadId === threadId) {
+          cs.outboundDeliveredCount += 1
+          return
+        }
+      }
+      // No active card → outbound was likely a system message (boot
+      // banner, restart ack, etc.) and isn't part of any agent turn.
+      // Silent no-op.
     },
 
     dispose() {

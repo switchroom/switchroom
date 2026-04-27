@@ -835,6 +835,21 @@ export interface RenderOptions {
    * a rephrase. Has no effect while the turn is still running.
    */
   silentEnd?: boolean
+  /**
+   * Issue #137: the agent DID call `reply` / `stream_reply` this turn
+   * but no outbound message ever actually landed in the chat
+   * (recordOutboundDelivered was never called for the card). Distinct
+   * from silentEnd because the agent tried — the failure is in the
+   * delivery layer (MCP bridge instability, dropped streams, etc.),
+   * not the model going mute.
+   *
+   * Mutually exclusive with silentEnd at the driver layer (replyNot-
+   * Delivered requires replyToolCalled=true; silentEnd requires it
+   * false), but the renderer guards with `!silentEnd` to be safe.
+   * When true and the turn is terminal, the header swaps to
+   * "⚠️ Reply attempted but not delivered".
+   */
+  replyNotDelivered?: boolean
 }
 
 /**
@@ -859,11 +874,15 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
   // for pin-lifecycle purposes (#31/#43 fix).
   const trulyDone = state.stage === 'done' && !hasAnyRunningSubAgent(state)
   const silentEnd = trulyDone && opts?.silentEnd === true
+  const replyNotDelivered = trulyDone && !silentEnd && opts?.replyNotDelivered === true
   let headerIcon: string
   let headerLabel: string
   if (silentEnd) {
     headerIcon = '🙊'
     headerLabel = 'Ended without reply'
+  } else if (replyNotDelivered) {
+    headerIcon = '⚠️'
+    headerLabel = 'Reply attempted but not delivered'
   } else if (trulyDone) {
     headerIcon = '✅'
     headerLabel = 'Done'
@@ -884,6 +903,14 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     // tells the user what happened and what to try next.
     lines.push(
       `<i>⚠️ Agent ran tools but didn't send a reply. Try /restart or rephrase your message.</i>`,
+    )
+  } else if (replyNotDelivered) {
+    // Issue #137: the agent called the reply tool but the actual outbound
+    // never landed — likely an MCP bridge stream tear-down between
+    // tool-acceptance and final flush. Different remediation than
+    // silent-end: a /restart is more likely to recover than a rephrase.
+    lines.push(
+      `<i>⚠️ Reply tool was called but the message never delivered. Try /restart — likely a transient bridge issue.</i>`,
     )
   }
 

@@ -115,7 +115,7 @@ function wireServer(order: 'driver-first' | 'handler-first') {
     }
   }
 
-  return { onEvent, streams, allStreams, events }
+  return { onEvent, streams, allStreams, events, driver }
 }
 
 describe('bug 1 — server.ts wiring uses driver-first order', () => {
@@ -142,7 +142,7 @@ describe('bug 1 — server.ts wiring uses driver-first order', () => {
 
 describe('bug 1 — Done transition reaches the original progress card', () => {
   it('driver-first order: Done render lands in the ORIGINAL stream', () => {
-    const { onEvent, allStreams } = wireServer('driver-first')
+    const { onEvent, allStreams, driver } = wireServer('driver-first')
 
     // Minimal turn: enqueue → one tool_use+result → turn_end
     onEvent({
@@ -160,6 +160,10 @@ describe('bug 1 — Done transition reaches the original progress card', () => {
     // the silent-end UX, so we explicitly opt into the happy path.
     onEvent({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__reply', toolUseId: 't2' })
     onEvent({ kind: 'tool_result', toolUseId: 't2', toolName: 'mcp__switchroom-telegram__reply' })
+    // Issue #137: also simulate a successful outbound delivery so the renderer
+    // doesn't downgrade to "⚠️ Reply attempted but not delivered" — gateway's
+    // executeReply path calls recordOutboundDelivered after the message lands.
+    driver.recordOutboundDelivered('c1')
     onEvent({ kind: 'turn_end', durationMs: 500 })
 
     // With driver-first, only ONE stream is ever created — the original

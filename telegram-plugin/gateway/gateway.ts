@@ -1419,6 +1419,18 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // Issue #137: signal to the progress driver that an actual outbound
+  // landed, so a turn-end with replyToolCalled=true but zero deliveries
+  // can render the "⚠️ Reply attempted but not delivered" variant.
+  if (sentIds.length > 0) {
+    try {
+      progressDriver?.recordOutboundDelivered(
+        chat_id,
+        threadId != null ? String(threadId) : undefined,
+      )
+    } catch { /* best-effort signal */ }
+  }
+
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
   return { content: [{ type: 'text', text: result }] }
 }
@@ -1465,6 +1477,19 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       progressCardActive: streamMode === 'checklist',
     },
   )
+  // Issue #137: bump the per-turn outbound counter on every successful
+  // stream_reply call (partial OR final). Even a single chunk landing
+  // proves the delivery path worked. messageId may be null when the
+  // call only updated the streaming draft and didn't sendMessage on
+  // this invocation — that case still counts as activity.
+  if (result.messageId != null) {
+    try {
+      progressDriver?.recordOutboundDelivered(
+        args.chat_id as string,
+        args.message_thread_id as string | undefined,
+      )
+    } catch { /* best-effort signal */ }
+  }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
 

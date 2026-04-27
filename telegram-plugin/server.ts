@@ -1745,6 +1745,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Issue #137: signal to the progress driver that an actual outbound
+        // landed, so a turn-end with replyToolCalled=true but zero deliveries
+        // can render the "⚠️ Reply attempted but not delivered" variant.
+        if (sentIds.length > 0) {
+          try {
+            progressDriver?.recordOutboundDelivered(
+              chat_id,
+              threadId != null ? String(threadId) : undefined,
+            )
+          } catch { /* best-effort signal */ }
+        }
+
         // Intentionally NOT firing the terminal 👍 here. A single turn
         // can call `reply` multiple times (progress notes, chunks of a
         // long answer, etc.) and also continue doing tool work after a
@@ -1854,6 +1866,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             progressCardActive: streamMode === 'checklist',
           },
         )
+        // Issue #137: tick the per-turn outbound counter on successful
+        // stream_reply send (matches the executeStreamReply wiring in
+        // gateway.ts).
+        if (result.messageId != null) {
+          try {
+            progressDriver?.recordOutboundDelivered(
+              args.chat_id as string,
+              args.message_thread_id as string | undefined,
+            )
+          } catch { /* best-effort signal */ }
+        }
         return {
           content: [
             {

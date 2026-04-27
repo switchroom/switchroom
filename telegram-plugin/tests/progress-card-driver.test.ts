@@ -145,6 +145,11 @@ describe('progress-card driver', () => {
     // This test exercises the happy path. See the silent-end test below
     // for the inverse.
     driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__reply' }, 'c1')
+    // Issue #137: also need at least one delivery — without it the renderer
+    // would land on "⚠️ Reply attempted but not delivered". The gateway's
+    // executeReply path calls recordOutboundDelivered after the message
+    // actually lands; this is the test-side equivalent.
+    driver.recordOutboundDelivered('c1')
     emits.length = 0
     driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
     expect(emits).toHaveLength(1)
@@ -178,10 +183,68 @@ describe('progress-card driver', () => {
     // Different MCP server-key prefix — old "clerk-telegram" still matches
     // because tool-names.ts uses a regex on `mcp__*__telegram__`.
     driver.ingest({ kind: 'tool_use', toolName: 'mcp__clerk-telegram__stream_reply' }, 'c1')
+    // The agent attempted a reply AND a delivery actually happened — this
+    // is the happy-path baseline that distinguishes #132 (no reply tool)
+    // from #137 (reply tool but no delivery).
+    driver.recordOutboundDelivered('c1')
     emits.length = 0
     driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
     expect(emits[0].html).toContain('✅ <b>Done</b>')
     expect(emits[0].html).not.toContain('🙊')
+    expect(emits[0].html).not.toContain('Reply attempted but not delivered')
+  })
+
+  it('issue #137: replyToolCalled but no delivery → ⚠️ "Reply attempted but not delivered"', () => {
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    // Agent calls the reply tool (any registered MCP server-key prefix)…
+    driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__stream_reply' }, 'c1')
+    // …but the gateway never calls recordOutboundDelivered (simulating
+    // an MCP bridge tear-down between tool-acceptance and final flush).
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    expect(emits).toHaveLength(1)
+    expect(emits[0].done).toBe(true)
+    // Distinct from silent-end's 🙊 — the user needs to know the agent
+    // TRIED, just that the message never made it.
+    expect(emits[0].html).toContain('⚠️ <b>Reply attempted but not delivered</b>')
+    expect(emits[0].html).not.toContain('✅ <b>Done</b>')
+    expect(emits[0].html).not.toContain('🙊 <b>Ended without reply</b>')
+    // Diagnostic hint suggests /restart specifically (more likely to
+    // recover from a transient bridge issue than a rephrase).
+    expect(emits[0].html).toContain('Try /restart')
+  })
+
+  it('issue #137: silentEnd takes precedence — no reply tool means it is #132 not #137', () => {
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c1')
+    // No reply tool fired AND no delivery — pure silent-end. The renderer's
+    // mutex (silentEnd checked first) means we get 🙊, not ⚠️.
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    expect(emits[0].html).toContain('🙊 <b>Ended without reply</b>')
+    expect(emits[0].html).not.toContain('⚠️ <b>Reply attempted')
+  })
+
+  it('issue #137: recordOutboundDelivered for unknown chat is a silent no-op', () => {
+    const { driver } = harness()
+    // No active card for "ghost" — this could happen if a system message
+    // (boot banner, restart ack) routes through the same code path.
+    expect(() => driver.recordOutboundDelivered('ghost')).not.toThrow()
+  })
+
+  it('issue #137: multiple deliveries per turn keep the card on ✅ Done', () => {
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__stream_reply' }, 'c1')
+    // Stream of partial chunks — three deliveries.
+    driver.recordOutboundDelivered('c1')
+    driver.recordOutboundDelivered('c1')
+    driver.recordOutboundDelivered('c1')
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    expect(emits[0].html).toContain('✅ <b>Done</b>')
   })
 
   it('coalesces bursts of non-stage-changing events', () => {
@@ -376,6 +439,10 @@ describe('progress-card checklist rendering', () => {
     // Reply tool call is required to render "✅ Done" — see issue #132.
     driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__reply', toolUseId: 't3' }, 'c1')
     driver.ingest({ kind: 'tool_result', toolUseId: 't3', toolName: 'mcp__switchroom-telegram__reply' }, 'c1')
+    // Issue #137: simulate the gateway's executeReply call into the driver
+    // after the actual outbound landed, so the renderer doesn't downgrade
+    // to "⚠️ Reply attempted but not delivered".
+    driver.recordOutboundDelivered('c1')
     driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
     const final = emits.at(-1)!
     expect(final.done).toBe(true)
