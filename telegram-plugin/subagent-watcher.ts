@@ -1,19 +1,20 @@
 /**
- * Background sub-agent visibility — registry + directory watcher + pinned card.
+ * Background sub-agent visibility — registry + directory watcher.
  *
  * Watches the subagents/ directory under each active session dir for new
  * agent-<id>.jsonl files. For each discovered sub-agent it:
  *   1. Registers it in an in-memory registry.
  *   2. Tails the JSONL to count tool calls and detect turn_end.
- *   3. Maintains a pinned "worker card" in Telegram showing live state.
- *   4. Emits inline notifications for dispatch / stall / completion events.
+ *   3. Emits inline notifications for dispatch / stall / completion events.
+ *
+ * Sub-agent state is surfaced to the user via the progress card's
+ * [Sub-agents · N running] block (progress-card.ts), not a separate pinned
+ * card. See issue #142.
  *
  * Architecture notes:
  *   - Option B from the spec: filesystem-driven, no IPC contract.
  *   - The registry is independent of the progress-card driver — it watches
  *     the subagents/ directories directly, not the parent session JSONL.
- *   - The pinned card is a separate Telegram message managed here; it does
- *     NOT interact with the progress-card pin lifecycle.
  *   - Privacy: tool counts + descriptions only — no tool args or file content.
  *
  * Integration: call `startSubagentWatcher(config)` once at gateway startup
@@ -33,7 +34,7 @@ import {
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
-import { formatDuration, escapeHtml, truncate } from './card-format.js'
+import { escapeHtml, truncate } from './card-format.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -79,12 +80,6 @@ export interface SubagentWatcherConfig {
    */
   sendNotification: (text: string) => void
   /**
-   * Send + manage the pinned worker card. Called on every registry change
-   * (throttled internally). Receives null to delete/unpin the card when no
-   * workers are active.
-   */
-  updatePinnedCard: (html: string | null) => void
-  /**
    * How often to re-scan for new subagent dirs (ms). Default 1000.
    */
   rescanMs?: number
@@ -93,10 +88,6 @@ export interface SubagentWatcherConfig {
    * Default 60_000.
    */
   stallThresholdMs?: number
-  /**
-   * Throttle for pinned-card updates (ms). Default 3000.
-   */
-  cardUpdateIntervalMs?: number
   /** Optional logger for debug output. */
   log?: (msg: string) => void
   /** `Date.now` override for tests. */
@@ -133,57 +124,6 @@ export interface SubagentWatcherHandle {
 
 const DEFAULT_RESCAN_MS = 1000
 const DEFAULT_STALL_THRESHOLD_MS = 60_000
-const DEFAULT_CARD_UPDATE_INTERVAL_MS = 3000
-
-// ─── Card rendering ──────────────────────────────────────────────────────────
-
-// formatDuration / escapeHtml / truncate now come from `./card-format.js`
-// — see issue #94. The previous local copy of `formatDuration` returned
-// the literal string `<1s` for sub-second values, which had to be
-// escaped at every call site or it crashed Telegram's HTML parser
-// (issue #86 / #89 / #101). The shared formatter returns `<n>ms`
-// instead, so the worker card no longer needs the per-call escapeHtml
-// dance for the elapsed-time component.
-
-/**
- * Render the pinned worker card from the current registry.
- * Returns null when no active workers are present.
- *
- * Format (issue #94 — aligned with the main progress card):
- *   🔧 <b>Background workers (N)</b> · ⏱ <elapsed-since-oldest>
- *     🤖 <description> · ⏱ <last-activity-age> · <toolCount> tools
- *
- * The header mirrors the main card's `⚙️ Working… · ⏱ MM:SS` layout
- * with a different icon (🔧 vs ⚙️) for visual distinction. Worker rows
- * use the same `⏱` glyph + duration format as sub-agent rows in the
- * main card.
- */
-export function renderWorkerCard(
-  registry: ReadonlyMap<string, WorkerEntry>,
-  now: number,
-): string | null {
-  const active = Array.from(registry.values()).filter(
-    (w) => w.state === 'running' && !w.historical,
-  )
-  if (active.length === 0) return null
-
-  // Header elapsed = age of the oldest still-running worker. This gives
-  // the user a single "how long has the background fleet been busy"
-  // signal at a glance, matching the main card's "this turn has been
-  // running for X" framing.
-  const oldestDispatchedAt = Math.min(...active.map((w) => w.dispatchedAt))
-  const headerElapsed = formatDuration(now - oldestDispatchedAt)
-
-  const lines: string[] = [
-    `🔧 <b>Background workers (${active.length})</b> · ⏱ ${headerElapsed}`,
-  ]
-  for (const w of active) {
-    const ago = formatDuration(now - w.lastActivityAt)
-    const desc = escapeHtml(truncate(w.description || 'sub-agent', 60))
-    lines.push(`  🤖 ${desc} · ⏱ ${ago} · ${w.toolCount} tools`)
-  }
-  return lines.join('\n')
-}
 
 // ─── JSONL tail per sub-agent ─────────────────────────────────────────────
 
@@ -269,7 +209,6 @@ function readSubTail(
 export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWatcherHandle {
   const agentDir = config.agentDir
   const stallThresholdMs = config.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS
-  const cardUpdateIntervalMs = config.cardUpdateIntervalMs ?? DEFAULT_CARD_UPDATE_INTERVAL_MS
   const rescanMs = config.rescanMs ?? DEFAULT_RESCAN_MS
   const log = config.log
   const nowFn = config.now ?? (() => Date.now())
@@ -315,28 +254,6 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   let bootScanInProgress = true
 
   let stopped = false
-  let lastCardUpdate = 0
-  let pendingCardUpdate = false
-
-  // ─── Card management ────────────────────────────────────────────────────
-
-  function maybeSendCardUpdate(force = false): void {
-    const n = nowFn()
-    if (!force && n - lastCardUpdate < cardUpdateIntervalMs) {
-      if (!pendingCardUpdate) {
-        pendingCardUpdate = true
-      }
-      return
-    }
-    lastCardUpdate = n
-    pendingCardUpdate = false
-    const html = renderWorkerCard(registry, n)
-    try {
-      config.updatePinnedCard(html)
-    } catch (err) {
-      log?.(`subagent-watcher: updatePinnedCard error: ${(err as Error).message}`)
-    }
-  }
 
   // ─── Per-agent registration ─────────────────────────────────────────────
 
@@ -372,7 +289,6 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // Initial read
     readSubTail(entry, tail, n, (desc) => {
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      maybeSendCardUpdate()
     }, fs, log)
 
     // If the JSONL already contained a turn_end at registration time
@@ -401,26 +317,12 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         if (!entry || !t) return
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-          maybeSendCardUpdate()
         }, fs, log)
         maybySendStateTransition(agentId)
-        maybeSendCardUpdate()
       })
     } catch (err) {
       log?.(`subagent-watcher: fs.watch failed for ${agentId}: ${(err as Error).message}`)
     }
-
-    // Dispatch notification — suppressed for historical (pre-existing) files.
-    if (!isHistorical) {
-      try {
-        const desc = escapeHtml(truncate(entry.description, 80))
-        config.sendNotification(`\u{1F6E0} Worker dispatched: ${desc}`)
-      } catch (err) {
-        log?.(`subagent-watcher: sendNotification error: ${(err as Error).message}`)
-      }
-    }
-
-    maybeSendCardUpdate(true)
   }
 
   // ─── State-transition notifications ─────────────────────────────────────
@@ -441,7 +343,6 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       } catch (err) {
         log?.(`subagent-watcher: completion notification error: ${(err as Error).message}`)
       }
-      maybeSendCardUpdate(true)
     }
   }
 
@@ -566,11 +467,6 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
     // Stall detection
     checkStalls()
-
-    // Flush pending card update if needed
-    if (pendingCardUpdate) {
-      maybeSendCardUpdate(true)
-    }
   }
 
   // Initial boot scan: discover pre-existing files and mark them historical

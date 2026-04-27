@@ -5192,10 +5192,6 @@ void (async () => {
         if (streamMode === 'checklist') {
           const watcherAgentDir = resolveAgentDirFromEnv()
           if (watcherAgentDir != null) {
-            // Pinned worker card: one message per watcher session,
-            // edited in-place. Managed entirely by the watcher.
-            let workerCardMsgId: number | null = null
-
             subagentWatcher = startSubagentWatcher({
               agentDir: watcherAgentDir,
               sendNotification: (text: string) => {
@@ -5208,55 +5204,6 @@ void (async () => {
                 }).catch((err: Error) => {
                   process.stderr.write(`telegram gateway: subagent-watcher notification failed: ${err.message}\n`)
                 })
-              },
-              updatePinnedCard: (html: string | null) => {
-                const ownerChatId = loadAccess().allowFrom[0]
-                if (!ownerChatId) return
-                if (html === null) {
-                  // No active workers — unpin and delete the card
-                  if (workerCardMsgId != null) {
-                    const msgId = workerCardMsgId
-                    workerCardMsgId = null
-                    // Drop external-pin tracking before issuing the unpin so
-                    // a race with a concurrent service-message capture can't
-                    // re-resurrect the entry. Issue #94.
-                    pinMgr.untrackExternalPin(String(ownerChatId), msgId)
-                    void lockedBot.api.unpinChatMessage(ownerChatId, msgId).catch(() => {})
-                    void lockedBot.api.deleteMessage(ownerChatId, msgId).catch(() => {})
-                  }
-                  return
-                }
-                if (workerCardMsgId == null) {
-                  // Create a new pinned card
-                  void lockedBot.api.sendMessage(ownerChatId, html, {
-                    parse_mode: 'HTML',
-                    link_preview_options: { is_disabled: true },
-                    ...(TOPIC_ID != null ? { message_thread_id: TOPIC_ID } : {}),
-                  }).then((sent) => {
-                    workerCardMsgId = sent.message_id
-                    // Register the worker card with pinMgr BEFORE pinning so
-                    // its `captureServiceMessage` callback recognises the
-                    // service message Telegram emits in response and deletes
-                    // it (matching the existing main-card behaviour).
-                    // Issue #94.
-                    pinMgr.trackExternalPin(String(ownerChatId), sent.message_id)
-                    void lockedBot.api.pinChatMessage(ownerChatId, sent.message_id, {
-                      disable_notification: true,
-                    }).catch(() => {})
-                  }).catch((err: Error) => {
-                    process.stderr.write(`telegram gateway: subagent-watcher card send failed: ${err.message}\n`)
-                  })
-                } else {
-                  // Edit the existing card
-                  void lockedBot.api.editMessageText(ownerChatId, workerCardMsgId, html, {
-                    parse_mode: 'HTML',
-                    link_preview_options: { is_disabled: true },
-                  }).catch((err: Error) => {
-                    const msg = err instanceof GrammyError && err.error_code === 400 &&
-                      /message is not modified/i.test(err.description ?? '') ? '' : err.message
-                    if (msg) process.stderr.write(`telegram gateway: subagent-watcher card edit failed: ${msg}\n`)
-                  })
-                }
               },
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             })
