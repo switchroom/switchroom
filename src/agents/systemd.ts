@@ -596,6 +596,14 @@ WorkingDirectory=${agentDir}
 export interface BrokerUnitOpts {
   homeDir: string;
   bunBinDir: string;
+  /**
+   * When present, appends `LoadCredentialEncrypted=vault-passphrase:<path>`
+   * to the [Service] block so systemd decrypts the credential at start and
+   * injects it via $CREDENTIALS_DIRECTORY. The broker reads the file at
+   * `$CREDENTIALS_DIRECTORY/vault-passphrase` and calls unlockFromPassphrase()
+   * automatically.
+   */
+  autoUnlock?: { credentialPath: string };
 }
 
 /**
@@ -616,10 +624,14 @@ export interface BrokerUnitOpts {
  * to the unlock socket interactively after the daemon starts.
  */
 export function generateBrokerUnit(opts: BrokerUnitOpts): string {
-  const { homeDir, bunBinDir } = opts;
+  const { homeDir, bunBinDir, autoUnlock } = opts;
   const switchroomCli = resolve(bunBinDir, "switchroom");
   const nodeBinDir = dirname(process.execPath);
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
+
+  const credentialLine = autoUnlock
+    ? `LoadCredentialEncrypted=vault-passphrase:${autoUnlock.credentialPath}\n`
+    : "";
 
   return `[Unit]
 Description=switchroom vault broker daemon
@@ -631,7 +643,7 @@ Type=simple
 ExecStart=${switchroomCli} vault broker start --foreground
 Restart=on-failure
 RestartSec=2
-# Type=simple — see generateBrokerUnit() for the sd_notify-stream-vs-datagram
+${credentialLine}# Type=simple — see generateBrokerUnit() for the sd_notify-stream-vs-datagram
 # rationale. The hand-rolled sd_notify in the broker is non-functional;
 # Type=notify caused a restart loop that destroyed unlock state.
 # No EnvironmentFile — the vault passphrase never touches disk.
