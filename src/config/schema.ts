@@ -750,6 +750,17 @@ export const VaultConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Whether to start the vault-broker daemon on agent launch"),
+      autoUnlock: z.boolean().default(false).describe(
+        "Auto-unlock the broker at start via systemd LoadCredentialEncrypted=. " +
+        "Off by default. When enabled, broker reads the passphrase from " +
+        "$CREDENTIALS_DIRECTORY/vault-passphrase. Run `switchroom vault " +
+        "broker enable-auto-unlock` once to set up the encrypted credential."
+      ),
+      autoUnlockCredentialPath: z.string().default("~/.config/credstore.encrypted/vault-passphrase").describe(
+        "Path to the systemd-creds-encrypted passphrase file. Default is " +
+        "the systemd-idiomatic user credential store. Tilde-expansion happens " +
+        "at install time."
+      ),
     })
     .default({})
     .describe(

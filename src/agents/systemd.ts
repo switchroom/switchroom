@@ -2,7 +2,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import type { SwitchroomConfig, ScheduleEntry } from "../config/schema.js";
-import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentsDir, resolvePath } from "../config/loader.js";
 import { usesSwitchroomTelegramPlugin, resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { COMMIT_SHA } from "../build-info.js";
@@ -358,7 +358,24 @@ export function installAllUnits(config: SwitchroomConfig): void {
   if (shouldInstallBrokerUnit(config)) {
     const homeDir = process.env.HOME ?? "/root";
     const bunBinDir = resolve(homeDir, ".bun", "bin");
-    const brokerContent = generateBrokerUnit({ homeDir, bunBinDir });
+    const brokerAutoUnlock = config.vault?.broker?.autoUnlock ?? false;
+    let autoUnlockOpt: { credentialPath: string } | undefined;
+    if (brokerAutoUnlock) {
+      const rawCredPath =
+        config.vault?.broker?.autoUnlockCredentialPath ??
+        "~/.config/credstore.encrypted/vault-passphrase";
+      const credPath = resolvePath(rawCredPath);
+      if (existsSync(credPath)) {
+        autoUnlockOpt = { credentialPath: credPath };
+      } else {
+        process.stderr.write(
+          `[switchroom] note: vault.broker.autoUnlock=true but credential file ` +
+          `is missing at ${credPath}; broker will start in interactive mode. ` +
+          `Run \`switchroom vault broker enable-auto-unlock\` to set up.\n`
+        );
+      }
+    }
+    const brokerContent = generateBrokerUnit({ homeDir, bunBinDir, autoUnlock: autoUnlockOpt });
     installUnit("vault-broker", brokerContent);
     // installedAgents holds the OS unit name (with the `switchroom-` prefix
     // that systemctl needs).
@@ -596,23 +613,42 @@ WorkingDirectory=${agentDir}
 export interface BrokerUnitOpts {
   homeDir: string;
   bunBinDir: string;
+  /**
+   * When present, appends `LoadCredentialEncrypted=vault-passphrase:<path>`
+   * to the [Service] block so systemd decrypts the credential at start and
+   * injects it via $CREDENTIALS_DIRECTORY. The broker reads the file at
+   * `$CREDENTIALS_DIRECTORY/vault-passphrase` and calls unlockFromPassphrase()
+   * automatically.
+   */
+  autoUnlock?: { credentialPath: string };
 }
 
 /**
  * Generate the systemd user unit for the vault-broker daemon.
  *
- * Type=notify: the broker calls sd_notify("READY=1\n") via NOTIFY_SOCKET
- * once both sockets are listening, so systemd knows the unit is actually up
- * before starting dependents.
+ * Type=simple: the in-process sd_notify implementation in
+ * `src/vault/broker/server.ts` uses `net.createConnection` (a STREAM
+ * socket), but systemd's $NOTIFY_SOCKET is a datagram socket — so the
+ * READY=1 message never reaches systemd. Under Type=notify the unit
+ * times out and enters a restart loop, killing any held vault unlock
+ * state. Until sd_notify is rewritten to use UNIX datagrams, Type=simple
+ * is the working configuration: systemd considers the unit started as
+ * soon as the ExecStart process is alive. The broker binds both sockets
+ * synchronously early in start(), so dependents racing the daemon is a
+ * non-issue in practice.
  *
  * No EnvironmentFile: the vault passphrase never touches disk — it is pushed
  * to the unlock socket interactively after the daemon starts.
  */
 export function generateBrokerUnit(opts: BrokerUnitOpts): string {
-  const { homeDir, bunBinDir } = opts;
+  const { homeDir, bunBinDir, autoUnlock } = opts;
   const switchroomCli = resolve(bunBinDir, "switchroom");
   const nodeBinDir = dirname(process.execPath);
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
+
+  const credentialLine = autoUnlock
+    ? `LoadCredentialEncrypted=vault-passphrase:${autoUnlock.credentialPath}\n`
+    : "";
 
   return `[Unit]
 Description=switchroom vault broker daemon
@@ -620,12 +656,13 @@ Documentation=https://github.com/switchroom/switchroom
 After=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=${switchroomCli} vault broker start --foreground
 Restart=on-failure
 RestartSec=2
-# NOTIFY_SOCKET is set automatically by systemd for Type=notify.
-# The broker writes READY=1 after both sockets are listening.
+${credentialLine}# Type=simple — see generateBrokerUnit() for the sd_notify-stream-vs-datagram
+# rationale. The hand-rolled sd_notify in the broker is non-functional;
+# Type=notify caused a restart loop that destroyed unlock state.
 # No EnvironmentFile — the vault passphrase never touches disk.
 # Push the passphrase via: switchroom vault broker unlock
 Environment=PATH=${unitPath}

@@ -15,10 +15,10 @@
  */
 
 import type { Command } from "commander";
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync } from "node:fs";
+import { resolve, dirname } from "node:path";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { loadConfig } from "../config/loader.js";
 import { resolvePath } from "../config/loader.js";
 import {
@@ -28,6 +28,7 @@ import {
   resolveBrokerSocketPath,
 } from "../vault/broker/client.js";
 import { VaultBroker, registerShutdownHandlers } from "../vault/broker/server.js";
+import { openVault } from "../vault/vault.js";
 
 const DEFAULT_PID_FILE = "~/.switchroom/vault-broker.pid";
 const DEFAULT_SOCKET_PATH = "~/.switchroom/vault-broker.sock";
@@ -51,6 +52,16 @@ function getVaultPath(configPath?: string): string {
     return resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
   } catch {
     return resolvePath("~/.switchroom/vault.enc");
+  }
+}
+
+function getAutoUnlockCredPath(configPath?: string): string {
+  const fallback = "~/.config/credstore.encrypted/vault-passphrase";
+  try {
+    const config = loadConfig(configPath);
+    return resolvePath(config.vault?.broker?.autoUnlockCredentialPath ?? fallback);
+  } catch {
+    return resolvePath(fallback);
   }
 }
 
@@ -239,6 +250,117 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
         console.log("locked");
       } else {
         console.error("lock failed — is the broker running?");
+        process.exit(1);
+      }
+    });
+
+  // ── enable-auto-unlock ───────────────────────────────────────────────────
+  // Encrypt the vault passphrase via systemd-creds and write it to the
+  // configured credential path. After this, the broker unit (re-rendered
+  // with vault.broker.autoUnlock=true) can declare LoadCredentialEncrypted=
+  // and systemd will inject the passphrase at start time without further
+  // user interaction. See issue #152 and README "Auto-unlock on boot".
+  broker
+    .command("enable-auto-unlock")
+    .description(
+      "Encrypt vault passphrase via systemd-creds and write to the credential path. " +
+      "After this, set vault.broker.autoUnlock=true and reconcile to take effect.",
+    )
+    .action(async () => {
+      const parentOpts = program.opts();
+
+      if (process.platform !== "linux") {
+        console.error("enable-auto-unlock requires Linux (systemd-creds is Linux-only).");
+        process.exit(1);
+      }
+
+      // Verify systemd-creds is on PATH.
+      try {
+        execFileSync("systemd-creds", ["--version"], { stdio: "ignore" });
+      } catch {
+        console.error(
+          "systemd-creds not found on PATH. Requires systemd >= 250. " +
+          "Try: sudo apt install systemd",
+        );
+        process.exit(1);
+      }
+
+      const credPath = getAutoUnlockCredPath(parentOpts.config);
+      const vaultPath = getVaultPath(parentOpts.config);
+
+      // Prompt + verify BEFORE writing anything. We must not encrypt a typo.
+      let passphrase: string;
+      try {
+        passphrase = await promptPassphrase();
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+
+      try {
+        openVault(passphrase, vaultPath);
+      } catch (err) {
+        console.error(`Passphrase verification failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+
+      mkdirSync(dirname(credPath), { recursive: true, mode: 0o700 });
+
+      // systemd-creds encrypt --name=vault-passphrase --user --quiet - <credPath>
+      // Stdin: passphrase. Output: encrypted credential at credPath.
+      // The --name=vault-passphrase binding is required — systemd validates the
+      // embedded name matches the LoadCredentialEncrypted= id at decrypt time.
+      try {
+        execFileSync(
+          "systemd-creds",
+          ["encrypt", "--name=vault-passphrase", "--user", "--quiet", "-", credPath],
+          { input: passphrase, stdio: ["pipe", "inherit", "inherit"] },
+        );
+      } catch (err) {
+        console.error(`systemd-creds encrypt failed: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      } finally {
+        passphrase = "";
+      }
+
+      try {
+        chmodSync(credPath, 0o600);
+      } catch {
+        /* non-fatal — systemd-creds already restricts mode */
+      }
+
+      console.log(`Auto-unlock credential written to ${credPath}`);
+      console.log("");
+      console.log("Next steps:");
+      console.log("  1. Set vault.broker.autoUnlock: true in switchroom.yaml");
+      console.log("  2. switchroom reconcile        # re-renders the broker unit");
+      console.log("  3. systemctl --user restart switchroom-vault-broker.service");
+      console.log("");
+      console.log("Verify with: switchroom vault broker status (after restart)");
+    });
+
+  // ── disable-auto-unlock ──────────────────────────────────────────────────
+  broker
+    .command("disable-auto-unlock")
+    .description("Remove the auto-unlock credential file. Reconcile + restart broker after.")
+    .action(() => {
+      const parentOpts = program.opts();
+      const credPath = getAutoUnlockCredPath(parentOpts.config);
+
+      if (!existsSync(credPath)) {
+        console.log(`No credential file at ${credPath} — nothing to do.`);
+        return;
+      }
+      try {
+        unlinkSync(credPath);
+        console.log(`Removed ${credPath}`);
+        console.log("");
+        console.log("Next steps:");
+        console.log("  1. Set vault.broker.autoUnlock: false in switchroom.yaml (or remove)");
+        console.log("  2. switchroom reconcile");
+        console.log("  3. systemctl --user restart switchroom-vault-broker.service");
+      } catch (err) {
+        console.error(`Failed to remove credential file: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
       }
     });
