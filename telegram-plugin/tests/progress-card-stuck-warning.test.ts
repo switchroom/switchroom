@@ -113,13 +113,18 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     repeat?: number;
   }
 
-  function harness(opts: { heartbeatMs?: number; maxIdleMs?: number } = {}) {
+  function harness(opts: {
+    heartbeatMs?: number;
+    maxIdleMs?: number;
+    onTurnComplete?: (args: { chatId: string; threadId?: string; turnKey: string; summary: string; taskIndex: number; taskTotal: number }) => void;
+  } = {}) {
     let now = 1000;
     const timers: FakeTimer[] = [];
     let nextRef = 0;
     const emits: Array<{ html: string; done: boolean; isFirstEmit: boolean }> = [];
     const driver = createProgressDriver({
       emit: ({ html, done, isFirstEmit }) => emits.push({ html, done, isFirstEmit }),
+      onTurnComplete: opts.onTurnComplete,
       heartbeatMs: opts.heartbeatMs ?? 5000,
       // Distinct from the renderer's STUCK_THRESHOLD_MS: the driver zombie
       // ceiling fires later (5 min in production); use a large value here
@@ -277,6 +282,41 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     // terminal-state contract: SOME terminal header lands, and we record
     // which one. (Either ✅ Done or 🙊 silent end is acceptable here; the
     // important property is `done: true` was emitted by the zombie path.)
+    expect(terminal!.html).toMatch(/✅ <b>Done<\/b>|🙊 <b>Ended without reply<\/b>/);
+  });
+
+  // T6 (spec §7): combined scenario — 2 min silence → stuck-warning in
+  // header; continue to 5 min → zombie ceiling fires, onTurnComplete
+  // callback invoked (this is the signal server.ts uses to unpin the card).
+  it("T6: 2-min silence shows stuck-warning, 5-min zombie ceiling fires onTurnComplete (unpin signal)", () => {
+    const completions: Array<{ chatId: string; turnKey: string }> = [];
+    const { driver, emits, advance } = harness({
+      heartbeatMs: 30_000,
+      maxIdleMs: 5 * 60_000,
+      onTurnComplete: ({ chatId, turnKey }) => completions.push({ chatId, turnKey }),
+    });
+    driver.ingest(enqueue("c1"), null);
+    // No further events — the turn goes silent from this point.
+
+    // ── Phase 1: advance to just past the 2-min stuck threshold ──────────
+    advance(STUCK_THRESHOLD_MS + 30_000); // 2.5 min elapsed
+    const stuckEmits = emits.filter((e) => e.html.includes("No events for"));
+    expect(stuckEmits.length).toBeGreaterThan(0);
+    // The card should still be alive (not yet zombie-closed).
+    expect(completions).toHaveLength(0);
+
+    // ── Phase 2: advance to past the 5-min zombie ceiling ────────────────
+    // Total elapsed from turn start: 2.5 min + 3 min = 5.5 min > maxIdleMs.
+    advance(3 * 60_000);
+    // onTurnComplete is the driver-layer signal that the card is being torn
+    // down — in production server.ts wires this to unpinProgressCard(). The
+    // zombie path MUST have fired it exactly once.
+    expect(completions).toHaveLength(1);
+    expect(completions[0].chatId).toBe("c1");
+    // A terminal emit with done=true must also have been produced so the
+    // Telegram message is marked done before the unpin.
+    const terminal = emits.find((e) => e.done === true);
+    expect(terminal).toBeDefined();
     expect(terminal!.html).toMatch(/✅ <b>Done<\/b>|🙊 <b>Ended without reply<\/b>/);
   });
 });
