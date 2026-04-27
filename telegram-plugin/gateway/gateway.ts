@@ -66,6 +66,13 @@ import {
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
 } from '../history.js'
 import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview, formatReplyToText } from '../steering.js'
+import {
+  renderOperatorEvent,
+  shouldEmitOperatorEvent,
+  type OperatorEvent,
+  type OperatorEventKind,
+} from '../operator-events.js'
+import { recordOperatorEvent } from '../operator-events-history.js'
 
 /**
  * Truncation cap for the `reply_to_text` channel-meta attribute (issue #119).
@@ -139,6 +146,8 @@ import type {
   SessionEventForward,
   PermissionRequestForward,
   HeartbeatMessage,
+  ScheduleRestartMessage,
+  OperatorEventForward,
   InboundMessage,
 } from './ipc-protocol.js'
 import { writePidFile, clearPidFile } from './pid-file.js'
@@ -1093,6 +1102,75 @@ const ipcServer: IpcServer = createIpcServer({
         success: true,
         waitingForTurn: true,
       });
+    }
+  },
+
+  onOperatorEvent(_client: IpcClient, msg: OperatorEventForward) {
+    // Phase 4c: bridge has detected an Anthropic API error (or synthetic
+    // gateway-side event). Render the operator card + post to every chat
+    // on the access allowlist, deduped by per-agent per-kind cooldown.
+    //
+    // chatId on the wire is currently always empty — the bridge doesn't
+    // know which user-chat the error should attribute to (errors aren't
+    // tied to a specific inbound message). We broadcast to the same set
+    // of chats that receive permission requests so the right operator
+    // sees it.
+    const kind = msg.kind as OperatorEventKind
+    const agent = msg.agent
+
+    if (!shouldEmitOperatorEvent(agent, kind)) {
+      process.stderr.write(
+        `telegram gateway: operator-event suppressed (cooldown) agent=${agent} kind=${kind}\n`,
+      )
+      return
+    }
+
+    const event: OperatorEvent = {
+      kind,
+      agent,
+      detail: msg.detail,
+      suggestedActions: [],
+      firstSeenAt: new Date(),
+    }
+
+    try {
+      recordOperatorEvent(event)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: recordOperatorEvent failed agent=${agent} kind=${kind}: ${(err as Error).message}\n`,
+      )
+    }
+
+    let rendered: ReturnType<typeof renderOperatorEvent>
+    try {
+      rendered = renderOperatorEvent(event)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: renderOperatorEvent failed agent=${agent} kind=${kind}: ${(err as Error).message}\n`,
+      )
+      return
+    }
+
+    const access = loadAccess()
+    if (access.allowFrom.length === 0) {
+      process.stderr.write(
+        `telegram gateway: operator-event no-allowlist agent=${agent} kind=${kind} (recorded only)\n`,
+      )
+      return
+    }
+
+    process.stderr.write(
+      `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)\n`,
+    )
+    for (const chat_id of access.allowFrom) {
+      void bot.api.sendMessage(chat_id, rendered.text, {
+        parse_mode: 'HTML',
+        reply_markup: rendered.keyboard,
+      }).catch(e => {
+        process.stderr.write(
+          `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
+        )
+      })
     }
   },
 

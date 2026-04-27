@@ -353,6 +353,27 @@ if (sessionTailEnabled) {
       cwd: sessionCwd,
       log: (msg) => process.stderr.write(`telegram bridge: ${msg}\n`),
       onEvent: forwardSessionEvent,
+      onOperatorEvent: (ev) => {
+        // Phase 4c: forward Anthropic API errors to the gateway so it can
+        // post the operator card + record into the /status history. The
+        // gateway resolves the destination chat from its access allowlist
+        // (operator events are agent-level, not tied to a specific user
+        // message), so chatId is left empty here.
+        if (!ipc || !ipc.isConnected()) return
+        try {
+          ipc.sendOperatorEvent({
+            type: 'operator_event',
+            kind: ev.kind,
+            agent: AGENT_NAME,
+            detail: ev.detail.slice(0, 1000),
+            chatId: '',
+          })
+        } catch (err) {
+          process.stderr.write(
+            `telegram bridge: sendOperatorEvent failed kind=${ev.kind}: ${(err as Error).message}\n`,
+          )
+        }
+      },
     })
     process.stderr.write(
       `telegram bridge: session tail watching ${sessionTailHandle.getActiveFile() ?? '(no active file yet)'}\n`,

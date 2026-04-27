@@ -61,6 +61,32 @@ type SocketData = { clientId: string; buffer: string };
  *  data without newline delimiters, which would cause unbounded memory growth. */
 const MAX_BUFFER_SIZE = 1024 * 1024;
 
+/** Allowlist of OperatorEventKind values that can arrive over IPC. Mirrors
+ *  the union in `telegram-plugin/operator-events.ts` — kept as a literal Set
+ *  here so the validator has zero cross-package type dependencies. If the
+ *  taxonomy grows, update both places. */
+const VALID_OPERATOR_KINDS = new Set([
+  "credentials-expired",
+  "credentials-invalid",
+  "credit-exhausted",
+  "quota-exhausted",
+  "rate-limited",
+  "agent-crashed",
+  "agent-restarted-unexpectedly",
+  "unknown-4xx",
+  "unknown-5xx",
+]);
+
+/** Same regex as `assertSafeAgentName` and the op:* callback handler in
+ *  gateway.ts — keeps every entry-point that touches an agent name on the
+ *  same shape. */
+const AGENT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,50}$/;
+
+/** Cap for the `detail` field on an operator_event message. Long enough to
+ *  carry a typical Anthropic error body, short enough that a misbehaving
+ *  bridge can't fill the gateway log. */
+const OPERATOR_EVENT_DETAIL_MAX = 1000;
+
 /** Validate that a parsed JSON object looks like a legitimate ClientToGateway
  *  message. Returns false for malformed or unexpected shapes. This prevents
  *  a rogue process on the same Unix socket from injecting arbitrary payloads.
@@ -96,9 +122,12 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
     case "schedule_restart":
       return typeof m.agentName === "string" && m.agentName.length > 0;
     case "operator_event":
-      return typeof m.kind === "string" && m.kind.length > 0
-        && typeof m.agent === "string" && m.agent.length > 0
+      return typeof m.kind === "string"
+        && VALID_OPERATOR_KINDS.has(m.kind as string)
+        && typeof m.agent === "string"
+        && AGENT_NAME_RE.test(m.agent as string)
         && typeof m.detail === "string"
+        && (m.detail as string).length <= OPERATOR_EVENT_DETAIL_MAX
         && typeof m.chatId === "string";
     default:
       return false;
