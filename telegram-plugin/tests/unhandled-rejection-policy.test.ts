@@ -52,6 +52,22 @@ describe('classifyRejection — benign Telegram 400s', () => {
     expect(classifyRejection(err)).toBe('log_only')
   })
 
+  it('returns "log_only" for "can\'t parse entities" (issue #101 — formatDuration HTML parse error)', () => {
+    const err = grammyError(
+      400,
+      "Bad Request: can't parse entities: Unsupported start tag \"1s\" at byte offset 42",
+    )
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for "unsupported start tag" variant', () => {
+    const err = grammyError(
+      400,
+      'Bad Request: unsupported start tag "b" at byte offset 10',
+    )
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
   it('case-insensitive description match', () => {
     const err = grammyError(400, 'Bad Request: MESSAGE IS NOT MODIFIED: blah')
     expect(classifyRejection(err)).toBe('log_only')

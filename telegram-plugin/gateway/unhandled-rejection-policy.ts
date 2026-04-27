@@ -51,7 +51,13 @@ export function classifyRejection(
   if (
     desc.includes('message is not modified') ||
     desc.includes('message to edit not found') ||
-    desc.includes('message to delete not found')
+    desc.includes('message to delete not found') ||
+    // HTML parse errors (e.g. formatDuration sub-second output like "<1s"
+    // interpreted as a tag). These are transient render bugs — log the
+    // failure so we can fix the root cause, but don't crash the gateway
+    // into a restart loop (issue #101).
+    desc.includes("can't parse entities") ||
+    desc.includes('unsupported start tag')
   ) {
     return 'log_only'
   }

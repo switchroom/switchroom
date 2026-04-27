@@ -700,7 +700,8 @@ const TOOL_SYMBOL: Record<ItemState, string> = {
  */
 const MAX_VISIBLE_ITEMS = 5
 
-function formatDuration(ms: number): string {
+/** @internal exported for unit testing */
+export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   const s = Math.floor(ms / 1000)
   if (s < 60) return `00:${s.toString().padStart(2, '0')}`

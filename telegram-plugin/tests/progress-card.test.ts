@@ -11,6 +11,7 @@ import {
   reduce,
   render,
   compactItems,
+  formatDuration,
   type ProgressCardState,
   type ChecklistItem,
 } from '../progress-card.js'
@@ -1510,5 +1511,83 @@ describe('renderItemCore: human-authored label prefix suppression', () => {
     const html = render(s, 5000)
     expect(html).toContain('WebFetch')
     expect(html).toContain('docs.example.com')
+  })
+})
+
+// ── formatDuration unit tests (issue #101) ──────────────────────────────────
+//
+// Every value returned by formatDuration must be safe for direct embedding
+// inside Telegram HTML — no unescaped '<', '>', or '&' characters.
+
+describe('formatDuration — HTML-safe output', () => {
+  function isHtmlSafe(s: string): boolean {
+    return !/</.test(s)
+  }
+
+  it('formatDuration(0) is HTML-safe', () => {
+    const out = formatDuration(0)
+    expect(isHtmlSafe(out)).toBe(true)
+    expect(out).toBe('0ms')
+  })
+
+  it('formatDuration(999) is HTML-safe (sub-second boundary)', () => {
+    const out = formatDuration(999)
+    expect(isHtmlSafe(out)).toBe(true)
+    expect(out).toBe('999ms')
+  })
+
+  it('formatDuration(1000) renders as seconds format', () => {
+    const out = formatDuration(1000)
+    expect(isHtmlSafe(out)).toBe(true)
+    expect(out).toBe('00:01')
+  })
+
+  it('formatDuration(60_000) renders as 1-minute format', () => {
+    const out = formatDuration(60_000)
+    expect(isHtmlSafe(out)).toBe(true)
+    expect(out).toBe('01:00')
+  })
+
+  it('formatDuration(3_600_000) renders as 60-minute format', () => {
+    const out = formatDuration(3_600_000)
+    expect(isHtmlSafe(out)).toBe(true)
+    expect(out).toBe('60:00')
+  })
+
+  it('no value contains an unescaped "<" character (regression guard for issue #101)', () => {
+    const samples = [0, 1, 500, 999, 1000, 5000, 30_000, 60_000, 90_000, 3_600_000]
+    for (const ms of samples) {
+      expect(formatDuration(ms)).not.toMatch(/</)
+    }
+  })
+})
+
+// ── Render-path regression: sub-second elapsed time (issue #101) ─────────────
+//
+// When a turn's elapsed time is sub-second the card header must not contain
+// an unescaped '<' that would fail Telegram's HTML parser.
+
+describe('render — sub-second elapsed time is HTML-safe', () => {
+  it('card rendered at t=turnStart+500ms contains no bare "<" outside tags', () => {
+    const state = reduce(initialState(), enqueue('quick task'), 1000)
+    const html = render(state, 1500) // 500 ms elapsed
+    // All '<' should be the start of known HTML tags, not bare numeric comparisons.
+    // A simple heuristic: no '<' followed by a digit (e.g. "<1s").
+    expect(html).not.toMatch(/<\d/)
+  })
+
+  it('card rendered at t=turnStart+0ms contains no bare "<" outside tags', () => {
+    const state = reduce(initialState(), enqueue('instant task'), 1000)
+    const html = render(state, 1000) // 0 ms elapsed
+    expect(html).not.toMatch(/<\d/)
+  })
+
+  it('header elapsed duration is safe for HTML embedding when sub-second', () => {
+    const state = reduce(initialState(), enqueue('test'), 1000)
+    const html = render(state, 1999) // 999 ms
+    // Must NOT contain a bare "<1s" pattern
+    expect(html).not.toContain('<1s')
+    // Must contain the safe ms representation
+    expect(html).toContain('999ms')
   })
 })
