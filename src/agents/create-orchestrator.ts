@@ -35,7 +35,7 @@ import {
   removeAgentFromConfig,
   synthesizeTopicName,
 } from "../cli/agent.js";
-import { validateBotToken } from "../setup/telegram-api.js";
+import { validateBotToken, validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { writeAgentEnv } from "../setup/onboarding.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -143,10 +143,13 @@ export async function createAgent(
     );
   }
 
-  // ── Step 2: Validate bot token (BEFORE any disk writes) ──────────────────
-  await validateBotToken(telegramBotToken).catch((err: Error) => {
+  // ── Step 2: Validate bot token and assert username matches agent slug ────
+  // Uses getMe to verify the token is valid AND that the returned username
+  // contains the agent slug — catches copy-paste mistakes like writing
+  // clerk's token into finn's .env before any disk writes occur.
+  await validateBotTokenMatchesAgent(telegramBotToken, name).catch((err: Error) => {
     throw new Error(
-      `Bot token rejected by Telegram — check the token and try again. ` +
+      `Bot token validation failed — check the token and try again. ` +
         `(${err.message})`,
     );
   });

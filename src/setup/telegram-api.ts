@@ -66,6 +66,52 @@ export async function validateBotToken(token: string): Promise<BotInfo> {
 }
 
 /**
+ * Assert that a bot's username contains the expected agent slug.
+ *
+ * Telegram bot usernames follow no single naming convention — Switchroom
+ * agents use both `@<slug>_meken_bot` and `@meken_<slug>_bot` depending on
+ * BotFather history. The minimal convention we enforce is that the slug
+ * appears somewhere in the username (case-insensitive).
+ *
+ * Throws with a human-readable message when the username does not contain
+ * the slug, so the caller can surface it as a loud error.
+ *
+ * @param username - The bot username returned by getMe (without leading @).
+ * @param agentSlug - The agent name / slug (e.g. "finn", "gymbro").
+ */
+export function assertBotUsernameMatchesAgent(
+  username: string,
+  agentSlug: string,
+): void {
+  const lowerUsername = username.toLowerCase();
+  const lowerSlug = agentSlug.toLowerCase();
+  if (!lowerUsername.includes(lowerSlug)) {
+    throw new Error(
+      `agent "${agentSlug}" bot_token resolves to @${username} — expected username to contain "${agentSlug}". ` +
+        `Check switchroom.yaml or the vault entry (bot_token key may point to the wrong bot).`,
+    );
+  }
+}
+
+/**
+ * Validate a bot token by calling getMe, then assert the returned username
+ * matches the expected agent slug. Throws on network error, invalid token,
+ * or username mismatch.
+ *
+ * This is the combined validation that should be called at scaffold/reconcile
+ * time so mismatched tokens (e.g. clerk's token written to finn's .env) are
+ * caught immediately with a clear error.
+ */
+export async function validateBotTokenMatchesAgent(
+  token: string,
+  agentSlug: string,
+): Promise<BotInfo> {
+  const botInfo = await validateBotToken(token);
+  assertBotUsernameMatchesAgent(botInfo.username, agentSlug);
+  return botInfo;
+}
+
+/**
  * Poll getUpdates looking for a /start message from a private chat.
  * Returns the sender's info once found.
  */

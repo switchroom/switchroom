@@ -45,6 +45,7 @@ import {
   type StatusInputs,
 } from "../agents/status.js";
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
+import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { registerAgentPerfCommand } from "./perf.js";
 
 /**
@@ -489,6 +490,32 @@ export async function reconcileAndRestartAgent(
     log(chalk.green(`  ${name}: reconciled (${allChanges.length} file${allChanges.length === 1 ? "" : "s"})`));
     for (const f of allChanges) {
       log(chalk.gray(`    - ${f}`));
+    }
+  }
+
+  // ── Bot-token username validation ─────────────────────────────────────────
+  // Read the resolved token from telegram/.env and verify via getMe that the
+  // bot username contains the agent slug. This catches copy-paste mistakes
+  // (e.g. clerk's token in finn's .env) before the agent restarts and starts
+  // spamming 409 conflicts. Fails loudly — refuse to restart on mismatch.
+  {
+    const envPath = resolve(agentsDir, name, "telegram", ".env");
+    if (existsSync(envPath)) {
+      const envContent = readFileSync(envPath, "utf-8");
+      const match = envContent.match(/^TELEGRAM_BOT_TOKEN=(.+)$/m);
+      if (match) {
+        const token = match[1].trim();
+        try {
+          await validateBotTokenMatchesAgent(token, name);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Fail loudly — do not restart with a wrong token.
+          throw new Error(
+            `Bot token mismatch for agent "${name}": ${msg}\n` +
+              `Fix telegram/.env or the vault entry, then re-run the command.`,
+          );
+        }
+      }
     }
   }
 

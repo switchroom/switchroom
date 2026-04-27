@@ -27,6 +27,7 @@ import { join } from "node:path";
 
 vi.mock("../setup/telegram-api.js", () => ({
   validateBotToken: vi.fn(),
+  validateBotTokenMatchesAgent: vi.fn(),
 }));
 
 vi.mock("./scaffold.js", () => ({
@@ -76,7 +77,7 @@ vi.mock("../setup/onboarding.js", () => ({
 // ─── Imports (after mocks) ───────────────────────────────────────────────────
 
 import { createAgent, completeCreation } from "./create-orchestrator.js";
-import { validateBotToken } from "../setup/telegram-api.js";
+import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { scaffoldAgent } from "./scaffold.js";
 import {
   generateUnit,
@@ -127,7 +128,7 @@ describe("createAgent", () => {
   beforeEach(() => {
     agentsDir = makeAgentDir();
     vi.mocked(listAvailableProfiles).mockReturnValue(["health-coach", "coding"]);
-    vi.mocked(validateBotToken).mockResolvedValue({
+    vi.mocked(validateBotTokenMatchesAgent).mockResolvedValue({
       id: 111111111,
       is_bot: true,
       first_name: "Gymbro",
@@ -156,12 +157,12 @@ describe("createAgent", () => {
         configPath: join(agentsDir, "switchroom.yaml"),
       }),
     ).rejects.toThrow(/Unknown profile/);
-    // validateBotToken must NOT have been called (no disk write, no network call)
-    expect(validateBotToken).not.toHaveBeenCalled();
+    // validateBotTokenMatchesAgent must NOT have been called (no disk write, no network call)
+    expect(validateBotTokenMatchesAgent).not.toHaveBeenCalled();
   });
 
   it("rejects a bad bot token before any disk writes", async () => {
-    vi.mocked(validateBotToken).mockRejectedValue(
+    vi.mocked(validateBotTokenMatchesAgent).mockRejectedValue(
       new Error("Invalid bot token: Unauthorized"),
     );
     await expect(
@@ -171,7 +172,7 @@ describe("createAgent", () => {
         telegramBotToken: "bad-token",
         configPath: join(agentsDir, "switchroom.yaml"),
       }),
-    ).rejects.toThrow(/Bot token rejected/);
+    ).rejects.toThrow(/Bot token validation failed/);
     // scaffold must NOT have been called
     expect(scaffoldAgent).not.toHaveBeenCalled();
   });
@@ -612,7 +613,7 @@ describe("createAgent + completeCreation end-to-end", () => {
   beforeEach(() => {
     agentsDir = makeAgentDir();
     vi.mocked(listAvailableProfiles).mockReturnValue(["health-coach"]);
-    vi.mocked(validateBotToken).mockResolvedValue({
+    vi.mocked(validateBotTokenMatchesAgent).mockResolvedValue({
       id: 111111111,
       is_bot: true,
       first_name: "Gymbro",
