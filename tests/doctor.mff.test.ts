@@ -14,6 +14,7 @@ import {
   checkMff,
 } from "../src/cli/doctor.js";
 import { generateKeyPairSync } from "node:crypto";
+import { createVault, setStringSecret } from "../src/vault/vault.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,9 +33,6 @@ function writeVaultWithKey(
   key: string,
   value: string,
 ): void {
-  // Use vault module directly to create a real vault
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { createVault, setStringSecret } = require("../src/vault/vault.js");
   createVault(passphrase, vaultPath);
   setStringSecret(passphrase, vaultPath, key, value);
 }
@@ -142,8 +140,6 @@ describe("checkMffVaultKeyPresent", () => {
 
   it("returns fail when key is absent from vault", () => {
     const vaultPath = join(tempDir, "vault.enc");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createVault } = require("../src/vault/vault.js");
     createVault(passphrase, vaultPath);
     const result = checkMffVaultKeyPresent(passphrase, vaultPath);
     expect(result.status).toBe("fail");
@@ -183,8 +179,6 @@ describe("checkMffVaultKeyFormat", () => {
 
   it("returns warn when key is not in vault", () => {
     const vaultPath = join(tempDir, "vault.enc");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createVault } = require("../src/vault/vault.js");
     createVault(passphrase, vaultPath);
     const result = checkMffVaultKeyFormat(passphrase, vaultPath);
     expect(result.status).toBe("warn");

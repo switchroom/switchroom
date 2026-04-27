@@ -11,7 +11,8 @@ import {
   statSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
-import { createPublicKey } from "node:crypto";
+import { createPublicKey, createPrivateKey } from "node:crypto";
+import { listSecrets, getStringSecret } from "../vault/vault.js";
 import { resolveAgentsDir, resolvePath } from "../config/loader.js";
 import { resolveStatePath } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
@@ -444,8 +445,6 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
   }
 
   try {
-    // Lazy import so we don't pull vault crypto when not needed
-    const { listSecrets } = require("../vault/vault.js") as typeof import("../vault/vault.js");
     const keys = listSecrets(passphrase, vaultPath);
     return [
       {
@@ -973,7 +972,6 @@ export function checkMffVaultKeyPresent(
     };
   }
   try {
-    const { listSecrets } = require("../vault/vault.js") as typeof import("../vault/vault.js");
     const keys = listSecrets(passphrase, vaultPath);
     if (!keys.includes(MFF_VAULT_KEY)) {
       return {
@@ -1007,10 +1005,7 @@ export function deriveEd25519PublicKeyBytes(keyMaterial: string): Buffer | null 
   // Try PEM first
   if (trimmed.includes("-----BEGIN")) {
     try {
-      const privKey = require("node:crypto").createPrivateKey({
-        key: trimmed,
-        format: "pem",
-      });
+      const privKey = createPrivateKey({ key: trimmed, format: "pem" });
       const pubKey = createPublicKey(privKey);
       return pubKey.export({ type: "spki", format: "der" }) as Buffer;
     } catch {
@@ -1028,11 +1023,7 @@ export function deriveEd25519PublicKeyBytes(keyMaterial: string): Buffer | null 
       "hex",
     );
     const der = Buffer.concat([oidPkcs8Ed25519, rawSeed]);
-    const privKey = require("node:crypto").createPrivateKey({
-      key: der,
-      format: "der",
-      type: "pkcs8",
-    });
+    const privKey = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
     const pubKey = createPublicKey(privKey);
     return pubKey.export({ type: "spki", format: "der" }) as Buffer;
   } catch {
@@ -1057,7 +1048,6 @@ export function checkMffVaultKeyFormat(
     };
   }
   try {
-    const { getStringSecret } = require("../vault/vault.js") as typeof import("../vault/vault.js");
     const keyMaterial = getStringSecret(passphrase, vaultPath, MFF_VAULT_KEY);
     if (keyMaterial === null) {
       return {
