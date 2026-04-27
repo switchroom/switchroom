@@ -1,16 +1,19 @@
 /**
  * Tests for vault-broker ACL enforcement.
  *
- * Identity is established via cgroup-based systemdUnit (not exe path).
- * Covers:
+ * Identity is established via cgroup-based systemdUnit. Covers:
  *   - Valid cron unit + key in schedule secrets → allowed
  *   - Valid cron unit + key NOT in secrets → denied
  *   - Cross-agent: unit for agentA can't read agentB's secrets → denied
- *   - systemdUnit=null + allow_interactive=true + exe is switchroom CLI → allowed
- *   - systemdUnit=null + allow_interactive=false (default) → denied
+ *   - systemdUnit=null (interactive caller, broker not for them) → denied
  *   - Malformed/unrecognized unit name → denied
  *   - Unknown agent name in unit → denied
  *   - Out-of-range schedule index → denied
+ *
+ * Note: there is no "interactive fallback" path. The broker is for cron-driven
+ * access only. Interactive `switchroom vault get` reads the vault file directly
+ * with the user's passphrase via --no-broker (or auto-fallback when broker
+ * denies / is unreachable). See issue #129.
  */
 
 import { describe, expect, it } from "vitest";
@@ -18,16 +21,12 @@ import { checkAcl } from "./acl.js";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import type { PeerInfo } from "./peercred.js";
 
-const HOME_DIR = "/home/testuser";
-const BUN_BIN_DIR = `${HOME_DIR}/.bun/bin`;
-
 /** Minimal valid SwitchroomConfig stub */
 function makeConfig(
   agentSchedules: Record<
     string,
     Array<{ cron: string; prompt: string; secrets?: string[] }>
   >,
-  allowInteractive = false,
 ): SwitchroomConfig {
   const agents: SwitchroomConfig["agents"] = {};
   for (const [name, schedule] of Object.entries(agentSchedules)) {
@@ -37,6 +36,7 @@ function makeConfig(
         cron: s.cron,
         prompt: s.prompt,
         secrets: s.secrets ?? [],
+        suppress_stdout: false,
       })),
     };
   }
@@ -48,7 +48,6 @@ function makeConfig(
       broker: {
         socket: "~/.switchroom/vault-broker.sock",
         enabled: true,
-        allow_interactive: allowInteractive,
       },
     },
     agents,
@@ -64,8 +63,6 @@ function peer(
   return { uid, pid, exe, systemdUnit };
 }
 
-const OPTS = { homeDir: HOME_DIR, bunBinDir: BUN_BIN_DIR };
-
 describe("ACL: cgroup-based cron identity", () => {
   it("allows a key that is in the declared secrets", () => {
     const config = makeConfig({
@@ -75,7 +72,6 @@ describe("ACL: cgroup-based cron identity", () => {
       peer("switchroom-myagent-cron-0.service"),
       config,
       "api_key",
-      OPTS,
     );
     expect(result.allow).toBe(true);
   });
@@ -88,7 +84,6 @@ describe("ACL: cgroup-based cron identity", () => {
       peer("switchroom-myagent-cron-0.service"),
       config,
       "other_secret",
-      OPTS,
     );
     expect(result.allow).toBe(false);
     if (!result.allow) {
@@ -104,9 +99,30 @@ describe("ACL: cgroup-based cron identity", () => {
       peer("switchroom-myagent-cron-0.service"),
       config,
       "any_key",
-      OPTS,
     );
     expect(result.allow).toBe(false);
+  });
+
+  it("does not leak the allowed-keys list in the deny reason", () => {
+    // Defense-in-depth: the per-cron deny message should not enumerate the
+    // allowed key set — same-UID callers can already read the config file,
+    // but the protocol should not echo the allowlist back.
+    const config = makeConfig({
+      myagent: [
+        { cron: "0 8 * * *", prompt: "hi", secrets: ["secret_a", "secret_b", "secret_c"] },
+      ],
+    });
+    const result = checkAcl(
+      peer("switchroom-myagent-cron-0.service"),
+      config,
+      "not_in_acl",
+    );
+    expect(result.allow).toBe(false);
+    if (!result.allow) {
+      expect(result.reason).not.toContain("secret_a");
+      expect(result.reason).not.toContain("secret_b");
+      expect(result.reason).not.toContain("secret_c");
+    }
   });
 
   it("prevents cross-agent key leakage (unit for otheragent can't read myagent secrets)", () => {
@@ -119,7 +135,6 @@ describe("ACL: cgroup-based cron identity", () => {
       peer("switchroom-otheragent-cron-0.service"),
       config,
       "api_key",
-      OPTS,
     );
     expect(result.allow).toBe(false);
   });
@@ -132,12 +147,12 @@ describe("ACL: cgroup-based cron identity", () => {
       ],
     });
     // cron-0 may read key_a but not key_b
-    expect(checkAcl(peer("switchroom-myagent-cron-0.service"), config, "key_a", OPTS).allow).toBe(true);
-    expect(checkAcl(peer("switchroom-myagent-cron-0.service"), config, "key_b", OPTS).allow).toBe(false);
+    expect(checkAcl(peer("switchroom-myagent-cron-0.service"), config, "key_a").allow).toBe(true);
+    expect(checkAcl(peer("switchroom-myagent-cron-0.service"), config, "key_b").allow).toBe(false);
 
     // cron-1 may read key_b but not key_a
-    expect(checkAcl(peer("switchroom-myagent-cron-1.service"), config, "key_b", OPTS).allow).toBe(true);
-    expect(checkAcl(peer("switchroom-myagent-cron-1.service"), config, "key_a", OPTS).allow).toBe(false);
+    expect(checkAcl(peer("switchroom-myagent-cron-1.service"), config, "key_b").allow).toBe(true);
+    expect(checkAcl(peer("switchroom-myagent-cron-1.service"), config, "key_a").allow).toBe(false);
   });
 });
 
@@ -150,7 +165,6 @@ describe("ACL: unknown agent → denied", () => {
       peer("switchroom-unknownagent-cron-0.service"),
       config,
       "key",
-      OPTS,
     );
     expect(result.allow).toBe(false);
     if (!result.allow) {
@@ -169,7 +183,6 @@ describe("ACL: out-of-range schedule index → denied", () => {
       peer("switchroom-myagent-cron-5.service"),
       config,
       "key",
-      OPTS,
     );
     expect(result.allow).toBe(false);
     if (!result.allow) {
@@ -188,9 +201,7 @@ describe("ACL: malformed unit name → denied", () => {
       peer("switchroom-myagent-cron-.service"),
       config,
       "key",
-      OPTS,
     );
-    // systemdUnit is not null, but parseCronUnit will reject it
     expect(result.allow).toBe(false);
   });
 
@@ -202,57 +213,21 @@ describe("ACL: malformed unit name → denied", () => {
       peer("some-random.service"),
       config,
       "key",
-      OPTS,
     );
     expect(result.allow).toBe(false);
   });
 });
 
-describe("ACL: allow_interactive", () => {
-  it("grants access when allow_interactive=true and exe is switchroom CLI (systemdUnit=null)", () => {
-    const config = makeConfig({}, true);
-    const switchroomExe = `${BUN_BIN_DIR}/switchroom`;
-    const result = checkAcl(
-      peer(null, switchroomExe),
-      config,
-      "any_key",
-      OPTS,
-    );
-    expect(result.allow).toBe(true);
-  });
-
-  it("denies when allow_interactive=false (default) even for switchroom CLI", () => {
-    const config = makeConfig({}, false);
-    const switchroomExe = `${BUN_BIN_DIR}/switchroom`;
-    const result = checkAcl(
-      peer(null, switchroomExe),
-      config,
-      "any_key",
-      OPTS,
-    );
-    expect(result.allow).toBe(false);
-  });
-
-  it("denies when allow_interactive absent (defaults to false)", () => {
+describe("ACL: non-cron callers (systemdUnit=null) → denied", () => {
+  it("denies any key for a caller without a switchroom cron systemd unit", () => {
+    // Replaces the prior "allow_interactive" tests. The broker no longer
+    // serves interactive callers — they read the vault file directly with
+    // the user's passphrase via `switchroom vault get --no-broker`.
     const config = makeConfig({});
-    const switchroomExe = `${BUN_BIN_DIR}/switchroom`;
-    const result = checkAcl(
-      peer(null, switchroomExe),
-      config,
-      "any_key",
-      OPTS,
-    );
+    const result = checkAcl(peer(null, "/some/path/switchroom"), config, "any_key");
     expect(result.allow).toBe(false);
-  });
-
-  it("denies interactive even with allow_interactive=true when exe is not switchroom CLI", () => {
-    const config = makeConfig({}, true);
-    const result = checkAcl(
-      peer(null, "/usr/bin/bash"),
-      config,
-      "any_key",
-      OPTS,
-    );
-    expect(result.allow).toBe(false);
+    if (!result.allow) {
+      expect(result.reason).toContain("not a switchroom cron unit");
+    }
   });
 });

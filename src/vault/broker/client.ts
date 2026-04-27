@@ -22,6 +22,7 @@ import {
   decodeResponse,
   type BrokerResponse,
   type BrokerStatus,
+  type ErrorCode,
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
 
@@ -43,6 +44,33 @@ export interface UnlockResult {
 }
 
 /**
+ * Structured result from a broker `get` request.
+ *
+ * `kind` discriminator surfaces the four cases callers actually need to
+ * distinguish, instead of collapsing all failures into `null` (issue #129).
+ *
+ *   - `ok`           — entry was returned; use `.entry`.
+ *   - `unreachable`  — broker is not running, timed out, or refused the
+ *                     connection. Caller may want to fall back to direct
+ *                     vault decrypt with the user's passphrase.
+ *   - `denied`       — broker rejected the caller (cron unit not in ACL,
+ *                     allow_interactive disabled, vault locked, etc).
+ *                     Falling back to direct decrypt is the right move
+ *                     for the CLI; for cron scripts it's a config bug.
+ *   - `not_found`    — broker is running and the caller is allowed, but
+ *                     the key doesn't exist in the vault. Don't fall back.
+ *
+ * `code` is the wire error code from `protocol.ts` (LOCKED, DENIED,
+ * UNKNOWN_KEY, BAD_REQUEST, INTERNAL) for `denied` and `not_found` cases.
+ * `msg` is the broker's human-readable reason.
+ */
+export type GetResult =
+  | { kind: "ok"; entry: VaultEntry }
+  | { kind: "unreachable"; msg: string }
+  | { kind: "denied"; code: ErrorCode; msg: string }
+  | { kind: "not_found"; code: ErrorCode; msg: string };
+
+/**
  * Resolve the data socket path from options.
  */
 export function resolveBrokerSocketPath(opts?: BrokerClientOpts): string {
@@ -54,20 +82,28 @@ export function resolveBrokerSocketPath(opts?: BrokerClientOpts): string {
 }
 
 /**
+ * Result of a single RPC: either a parsed broker response, or an
+ * "unreachable" status with a human-readable reason. Internal helper
+ * — public API on top distinguishes denied vs not-found vs unreachable.
+ */
+type RpcResult =
+  | { kind: "response"; resp: BrokerResponse }
+  | { kind: "unreachable"; msg: string };
+
+/**
  * Send a single request to the broker and get a response.
- * Returns null on connection failure (unreachable broker).
- * Throws on protocol errors (bad response).
+ * Returns { kind: "unreachable", msg } on any connection / protocol failure.
  */
 async function rpc(
   req: Parameters<typeof encodeRequest>[0],
   opts?: BrokerClientOpts,
-): Promise<BrokerResponse | null> {
+): Promise<RpcResult> {
   const socketPath = resolveBrokerSocketPath(opts);
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  return new Promise<BrokerResponse | null>((resolve) => {
+  return new Promise<RpcResult>((resolve) => {
     let settled = false;
-    const settle = (val: BrokerResponse | null): void => {
+    const settle = (val: RpcResult): void => {
       if (settled) return;
       settled = true;
       resolve(val);
@@ -75,23 +111,20 @@ async function rpc(
 
     const timer = setTimeout(() => {
       client.destroy();
-      settle(null);
+      settle({ kind: "unreachable", msg: `broker did not respond within ${timeoutMs}ms` });
     }, timeoutMs);
 
     const client = net.createConnection({ path: socketPath });
 
     client.on("error", (err: NodeJS.ErrnoException) => {
       clearTimeout(timer);
-      // Unreachable broker — return null (not an error for the caller)
-      if (
-        err.code === "ENOENT" ||
-        err.code === "ECONNREFUSED" ||
-        err.code === "EACCES"
-      ) {
-        settle(null);
-      } else {
-        settle(null); // treat all connection errors as unreachable
-      }
+      const code = err.code ?? "ERR";
+      let msg: string;
+      if (code === "ENOENT") msg = "broker socket not found (is the daemon running?)";
+      else if (code === "ECONNREFUSED") msg = "broker socket exists but refused connection";
+      else if (code === "EACCES") msg = "broker socket access denied (wrong UID?)";
+      else msg = `broker connection failed: ${err.message}`;
+      settle({ kind: "unreachable", msg });
     });
 
     let buffer = "";
@@ -104,9 +137,12 @@ async function rpc(
         client.destroy();
         try {
           const resp = decodeResponse(line);
-          settle(resp);
-        } catch {
-          settle(null);
+          settle({ kind: "response", resp });
+        } catch (err) {
+          settle({
+            kind: "unreachable",
+            msg: `unparseable broker response: ${err instanceof Error ? err.message : String(err)}`,
+          });
         }
       }
     });
@@ -114,10 +150,13 @@ async function rpc(
     client.on("connect", () => {
       try {
         client.write(encodeRequest(req));
-      } catch {
+      } catch (err) {
         clearTimeout(timer);
         client.destroy();
-        settle(null);
+        settle({
+          kind: "unreachable",
+          msg: `failed to send request: ${err instanceof Error ? err.message : String(err)}`,
+        });
       }
     });
   });
@@ -125,16 +164,49 @@ async function rpc(
 
 /**
  * Get a vault entry via the broker.
- * Returns null if broker is unreachable or key is not found.
+ *
+ * Returns a structured `GetResult` distinguishing the four cases callers
+ * actually need to act on. See the `GetResult` type for semantics.
+ *
+ * For ergonomic callers that only care about success vs anything-else,
+ * use `getEntryOrNull()` below — it preserves the old null-on-failure shape.
+ */
+export async function getViaBrokerStructured(
+  key: string,
+  opts?: BrokerClientOpts,
+): Promise<GetResult> {
+  const result = await rpc({ v: 1, op: "get", key }, opts);
+  if (result.kind === "unreachable") {
+    return { kind: "unreachable", msg: result.msg };
+  }
+  const resp = result.resp;
+  if (resp.ok && "entry" in resp) {
+    return { kind: "ok", entry: resp.entry as VaultEntry };
+  }
+  if (!resp.ok) {
+    // UNKNOWN_KEY is "broker is healthy and willing, but the key isn't there"
+    // — meaningfully different from DENIED for the CLI's UX. LOCKED, DENIED,
+    // BAD_REQUEST, INTERNAL all roll up into "denied" from the caller's
+    // perspective: the broker said no and it isn't a missing-key issue.
+    if (resp.code === "UNKNOWN_KEY") {
+      return { kind: "not_found", code: resp.code, msg: resp.msg };
+    }
+    return { kind: "denied", code: resp.code, msg: resp.msg };
+  }
+  return { kind: "unreachable", msg: "unexpected broker response shape" };
+}
+
+/**
+ * Get a vault entry via the broker. Legacy shape: returns the entry on
+ * success or `null` on any failure. Prefer `getViaBrokerStructured()` in
+ * new code so the caller can tell unreachable from denied from not-found.
  */
 export async function getViaBroker(
   key: string,
   opts?: BrokerClientOpts,
 ): Promise<VaultEntry | null> {
-  const resp = await rpc({ v: 1, op: "get", key }, opts);
-  if (resp === null) return null;
-  if (resp.ok && "entry" in resp) return resp.entry as VaultEntry;
-  return null;
+  const result = await getViaBrokerStructured(key, opts);
+  return result.kind === "ok" ? result.entry : null;
 }
 
 /**
@@ -144,9 +216,11 @@ export async function getViaBroker(
 export async function listViaBroker(
   opts?: BrokerClientOpts,
 ): Promise<string[] | null> {
-  const resp = await rpc({ v: 1, op: "list" }, opts);
-  if (resp === null) return null;
-  if (resp.ok && "keys" in resp) return resp.keys as string[];
+  const result = await rpc({ v: 1, op: "list" }, opts);
+  if (result.kind === "unreachable") return null;
+  if (result.resp.ok && "keys" in result.resp) {
+    return result.resp.keys as string[];
+  }
   return null;
 }
 
@@ -157,9 +231,11 @@ export async function listViaBroker(
 export async function statusViaBroker(
   opts?: BrokerClientOpts,
 ): Promise<BrokerStatus | null> {
-  const resp = await rpc({ v: 1, op: "status" }, opts);
-  if (resp === null) return null;
-  if (resp.ok && "status" in resp) return resp.status as BrokerStatus;
+  const result = await rpc({ v: 1, op: "status" }, opts);
+  if (result.kind === "unreachable") return null;
+  if (result.resp.ok && "status" in result.resp) {
+    return result.resp.status as BrokerStatus;
+  }
   return null;
 }
 
@@ -168,9 +244,9 @@ export async function statusViaBroker(
  * Returns true on success, false if broker is unreachable.
  */
 export async function lockViaBroker(opts?: BrokerClientOpts): Promise<boolean> {
-  const resp = await rpc({ v: 1, op: "lock" }, opts);
-  if (resp === null) return false;
-  return resp.ok;
+  const result = await rpc({ v: 1, op: "lock" }, opts);
+  if (result.kind === "unreachable") return false;
+  return result.resp.ok;
 }
 
 /**

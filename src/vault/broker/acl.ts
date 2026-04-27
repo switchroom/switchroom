@@ -1,10 +1,18 @@
 /**
  * vault-broker ACL — per-cron access control for vault key requests.
  *
- * Identity is established via cgroup membership, not the exe path. When
- * systemd starts a cron unit (`switchroom-<agent>-cron-<i>.service`), it
- * places the process in a dedicated cgroup that it writes as root. Processes
- * cannot move themselves between cgroups from userspace, making the unit name
+ * The broker is for cron-driven access. Interactive `switchroom vault get`
+ * runs against the vault file directly with the user's passphrase — it
+ * does not need (and never had a real reason to use) the broker. Issue #129
+ * dropped the broker's interactive fallback for this reason: the symlink-
+ * fragile `peer.exe == bunBinDir/switchroom` check it relied on was both
+ * easy to bypass (npx, wrappers, $PATH) and easy to break (rename, move,
+ * different package manager).
+ *
+ * Identity is established via cgroup membership. When systemd starts a
+ * cron unit (`switchroom-<agent>-cron-<i>.service`), it places the process
+ * in a dedicated cgroup that it writes as root. Processes cannot move
+ * themselves between cgroups from userspace, making the unit name
  * unspoofable.
  *
  * Logic (fail-closed on any error):
@@ -14,23 +22,20 @@
  *
  *   2. If `peer.systemdUnit` matches `switchroom-<agent>-cron-<i>.service`:
  *      `<agent>` and `<i>` are parsed from the unit name. Then
- *      `config.agents[<agent>].schedule[<i>].secrets` (added by PR 1) is
- *      looked up. If the requested key appears in that array, access is
- *      granted. Otherwise: deny.
+ *      `config.agents[<agent>].schedule[<i>].secrets` is looked up.
+ *      If the requested key appears in that array, access is granted.
+ *      Otherwise: deny.
  *
- *   3. Interactive fallback: if `config.vault.broker.allow_interactive` is
- *      true AND `peer.exe` matches the installed `switchroom` CLI binary
- *      (<bunBinDir>/switchroom), access is granted. Default: false.
+ *   3. Otherwise: deny. Use `switchroom vault get --no-broker` to read
+ *      directly from the vault file with your passphrase.
  *
- *   4. Otherwise: deny.
- *
- * allow_interactive is gated off by default so ordinary users can't use
- * `switchroom vault get <key>` to read any key without being in an explicit
- * ACL. Operators who want an interactive shell workflow enable it explicitly.
+ * Note on threat model: the per-cron `secrets[]` allowlist is
+ * misconfiguration protection (a typo lets cron-A read cron-B's keys),
+ * not a security boundary. Anyone who can edit cron scripts can also edit
+ * the config to grant any key. See [docs/architecture.md] for the full
+ * framing.
  */
 
-import { resolve, join } from "node:path";
-import { homedir } from "node:os";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import type { PeerInfo } from "./peercred.js";
 
@@ -44,16 +49,6 @@ export interface AclDeny {
 }
 
 export type AclResult = AclAllow | AclDeny;
-
-/**
- * Options for ACL checking, injectable for tests.
- */
-export interface AclOpts {
-  /** Override for the home directory (default: os.homedir()) */
-  homeDir?: string;
-  /** Override for the bun bin directory (default: ~/.bun/bin) */
-  bunBinDir?: string;
-}
 
 /**
  * Parse a systemd unit name as a switchroom cron unit.
@@ -93,17 +88,12 @@ export function parseCronUnit(
  * @param peer    Caller identity from peercred.identify()
  * @param config  The loaded SwitchroomConfig
  * @param key     The vault key being requested
- * @param opts    Overrides for home/bunBinDir (for tests)
  */
 export function checkAcl(
   peer: PeerInfo,
   config: SwitchroomConfig,
   key: string,
-  opts: AclOpts = {},
 ): AclResult {
-  const homeDir = opts.homeDir ?? homedir();
-  const bunBinDir = opts.bunBinDir ?? join(homeDir, ".bun", "bin");
-
   // ── Cgroup-based cron identity ─────────────────────────────────────────
   if (peer.systemdUnit !== null) {
     const parsed = parseCronUnit(peer.systemdUnit);
@@ -136,26 +126,17 @@ export function checkAcl(
     if (!allowedKeys.includes(key)) {
       return {
         allow: false,
-        reason: `key '${key}' not in ACL for ${agentName}/schedule[${index}] (allowed: [${allowedKeys.join(", ")}])`,
+        reason: `key '${key}' not in ACL for ${agentName}/schedule[${index}]`,
       };
     }
 
     return { allow: true };
   }
 
-  // ── Allow interactive: the installed switchroom CLI ────────────────────
-  // Only reached when systemdUnit is null (caller is not a cron unit).
-  // /proc/<pid>/exe always resolves to a bare binary path with no args.
-  const allowInteractive = config.vault?.broker?.allow_interactive ?? false;
-  if (allowInteractive) {
-    const switchroomCli = join(bunBinDir, "switchroom");
-    if (peer.exe === switchroomCli) {
-      return { allow: true };
-    }
-  }
-
+  // ── Non-cron callers are not served by the broker ──────────────────────
+  // Use `switchroom vault get --no-broker` for interactive access.
   return {
     allow: false,
-    reason: `caller is not a switchroom cron unit (no cgroup match) and allow_interactive is disabled`,
+    reason: "caller is not a switchroom cron unit; use 'switchroom vault get --no-broker' for interactive access",
   };
 }

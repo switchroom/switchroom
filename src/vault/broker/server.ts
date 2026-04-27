@@ -81,6 +81,29 @@ export class VaultBroker {
     configPath: string | undefined,
     vaultPath?: string,
   ): Promise<void> {
+    // Linux-only by design (issue #129). The broker's ACL is a cgroup-based
+    // identity check on the calling cron systemd unit; that primitive only
+    // exists on Linux. On macOS / WSL the only access control would be the
+    // socket's file mode (0600), which we don't consider sufficient for
+    // multi-cron secret routing. Fail-fast with an actionable message
+    // instead of silently degrading.
+    //
+    // Opt-out for dev / tests: SWITCHROOM_BROKER_ALLOW_NON_LINUX=1.
+    if (
+      process.platform !== "linux" &&
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX !== "1"
+    ) {
+      throw new Error(
+        `vault-broker is Linux-only (running on ${process.platform}). ` +
+        `The broker's ACL relies on cgroup-based systemd unit identification, ` +
+        `which is not available on this platform. ` +
+        `Use 'switchroom vault get --no-broker' for direct vault access. ` +
+        `If you need to run the broker for development on this platform, ` +
+        `set SWITCHROOM_BROKER_ALLOW_NON_LINUX=1 — but understand that the ` +
+        `broker will accept any same-user caller without per-cron ACL enforcement.`,
+      );
+    }
+
     this.socketPath = resolve(socketPath);
     this.unlockSocketPath = this.socketPath.replace(/\.sock$/, ".unlock.sock");
     this.startedAt = Date.now();
@@ -134,9 +157,14 @@ export class VaultBroker {
     this._sdNotify("READY=1\n");
 
     if (process.platform !== "linux") {
+      // Reachable only when SWITCHROOM_BROKER_ALLOW_NON_LINUX=1 was set
+      // (the start() guard above would have thrown otherwise). Log a loud
+      // warning so dev runs can't be confused with production semantics.
       process.stderr.write(
-        `[vault-broker] WARNING: running on ${process.platform} — peercred ACL is disabled. ` +
-        `Access control relies solely on socket file mode 0600.\n`,
+        `[vault-broker] WARNING: running on ${process.platform} with ` +
+        `SWITCHROOM_BROKER_ALLOW_NON_LINUX=1 — peercred ACL is disabled. ` +
+        `Access control is socket file mode 0600 ONLY. Do not use this ` +
+        `configuration for production secrets.\n`,
       );
     }
   }

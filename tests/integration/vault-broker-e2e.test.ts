@@ -76,7 +76,6 @@ function makeConfig(
       broker: {
         socket: join(tmpDir, "vault-broker.sock"),
         enabled: true,
-        allow_interactive: false,
       },
     },
     agents: {

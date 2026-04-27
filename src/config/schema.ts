@@ -32,9 +32,13 @@ export const ScheduleEntrySchema = z.object({
     .array(z.string().regex(/^[a-zA-Z0-9_-]+$/, "Secret key names must contain only alphanumeric characters, underscores, and hyphens"))
     .default([])
     .describe(
-      "Vault key names this cron task is allowed to access via the vault-broker daemon. " +
-      "Declared keys are injected as env vars at runtime (PR 2). " +
-      "Empty by default — no vault access unless explicitly listed.",
+      "Vault key names this cron task may read via the vault-broker daemon. " +
+      "Empty by default — broker requests for unlisted keys are denied. " +
+      "Note: this is misconfiguration protection (a typo in cron-A doesn't " +
+      "accidentally read cron-B's keys) rather than a security boundary — " +
+      "anyone who can edit cron scripts can also edit switchroom.yaml, and " +
+      "anyone with the vault passphrase can read the vault file directly. " +
+      "See docs/configuration.md for the full framing.",
     ),
 });
 
@@ -736,15 +740,6 @@ export const VaultConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Whether to start the vault-broker daemon on agent launch"),
-      allow_interactive: z
-        .boolean()
-        .default(false)
-        .describe(
-          "If true, the installed switchroom CLI binary may read any vault key " +
-          "via the broker without being declared in a cron ACL. Off by default — " +
-          "enable only for interactive developer workflows where the operator " +
-          "understands the trust model.",
-        ),
     })
     .default({})
     .describe(

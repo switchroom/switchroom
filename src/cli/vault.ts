@@ -14,7 +14,7 @@ import {
 } from "../vault/vault.js";
 import { registerVaultSweep } from "./vault-sweep.js";
 import {
-  getViaBroker,
+  getViaBrokerStructured,
   statusViaBroker,
   unlockViaBroker,
   resolveBrokerSocketPath,
@@ -267,29 +267,57 @@ export function registerVaultCommand(program: Command): void {
           }
 
           // Broker is unlocked — request the key
-          const entry = await getViaBroker(key, brokerOpts);
-          if (entry === null) {
-            // Null from broker = DENIED or UNKNOWN_KEY
-            // Re-check with a status+error response by trying again and looking at response
-            if (process.stdin.isTTY) {
-              console.error(
-                chalk.yellow(
-                  `Key '${key}' not in ACL or not found. Use --no-broker to read directly.`,
-                ),
-              );
-              process.exit(2);
-            } else {
-              console.error(`key '${key}' not in ACL`);
-              process.exit(2);
+          const result = await getViaBrokerStructured(key, brokerOpts);
+
+          if (result.kind === "ok") {
+            const entry = result.entry;
+            if (entry.kind === "string" || entry.kind === "binary") {
+              console.log(entry.value);
+              return;
             }
-          }
-          if (entry.kind === "string" || entry.kind === "binary") {
-            console.log(entry.value);
-          } else {
             console.error(chalk.yellow(`Secret '${key}' is kind="${entry.kind}"`));
             process.exit(1);
           }
-          return;
+
+          if (result.kind === "not_found") {
+            // Broker is healthy and we're allowed; the key just doesn't
+            // exist. Direct vault decrypt won't help — exit straight away.
+            console.error(chalk.yellow(`Secret '${key}' not found in vault`));
+            process.exit(1);
+          }
+
+          if (result.kind === "denied") {
+            // ACL rejection or vault locked. For interactive callers, fall
+            // through to direct vault decrypt with the user's passphrase
+            // (--no-broker semantics). For non-interactive callers, fail
+            // with the broker's reason so cron logs explain it.
+            if (process.stdin.isTTY) {
+              console.error(
+                chalk.yellow(
+                  `broker denied request (${result.code}): ${result.msg}. ` +
+                  `Falling back to direct vault access.`,
+                ),
+              );
+              // fall through to direct-decrypt block below
+            } else {
+              console.error(
+                `broker denied request for '${key}' (${result.code}): ${result.msg}`,
+              );
+              process.exit(2);
+            }
+          } else {
+            // result.kind === "unreachable" — fall through to direct decrypt.
+            // The status check above already returned non-null, so this is a
+            // weird mid-request failure (broker died between status and get?).
+            if (process.stdin.isTTY) {
+              console.error(
+                chalk.yellow(`broker became unreachable mid-request: ${result.msg}`),
+              );
+            } else {
+              console.error(`broker unreachable: ${result.msg}`);
+              process.exit(1);
+            }
+          }
         }
 
         // Broker not reachable

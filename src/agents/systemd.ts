@@ -337,13 +337,21 @@ export function installAllUnits(config: SwitchroomConfig): void {
 
   // Install the vault-broker unit when any agent uses secrets or
   // vault.broker.enabled is set.
+  //
+  // Bug fix (issue #129): the previous call passed `"switchroom-vault-broker"`
+  // as the unit name, but `installUnit` wraps that with another `switchroom-`
+  // prefix, producing `switchroom-switchroom-vault-broker.service` on disk —
+  // which never matched the `switchroom-vault-broker.service` reference used
+  // by cron timers' After/Wants. Pass the bare `vault-broker` so the file
+  // ends up correctly named.
   if (shouldInstallBrokerUnit(config)) {
     const homeDir = process.env.HOME ?? "/root";
     const bunBinDir = resolve(homeDir, ".bun", "bin");
     const brokerContent = generateBrokerUnit({ homeDir, bunBinDir });
-    const brokerUnitName = "switchroom-vault-broker";
-    installUnit(brokerUnitName, brokerContent);
-    installedAgents.push(brokerUnitName);
+    installUnit("vault-broker", brokerContent);
+    // installedAgents holds the OS unit name (with the `switchroom-` prefix
+    // that systemctl needs).
+    installedAgents.push("switchroom-vault-broker");
   }
 
   // Every telegram-using agent gets its OWN gateway unit. The gateway
@@ -382,6 +390,14 @@ export function installAllUnits(config: SwitchroomConfig): void {
   daemonReload();
   enableUnits(installedAgents);
   ensureLinger();
+
+  // Auto-start the broker if it was just installed (issue #129). Agent and
+  // gateway units stay in the enabled-but-not-running state until the user
+  // runs `switchroom agent start <name>` — that's deliberate. The broker is
+  // a passive infrastructure daemon, so there's no reason not to start it.
+  if (installedAgents.includes("switchroom-vault-broker")) {
+    startBrokerUnit();
+  }
 }
 
 export function daemonReload(): void {
@@ -401,6 +417,42 @@ function enableUnits(unitNames: string[]): void {
     execFileSync("systemctl", ["--user", "enable", ...services], { stdio: "pipe" });
   } catch {
     // non-fatal — units are installed but won't auto-start on boot
+  }
+}
+
+/**
+ * Start (or restart) the vault-broker user unit.
+ *
+ * The broker is the only switchroom unit that should auto-start at install
+ * time: agent and gateway units are intentionally left in the
+ * enabled-but-not-running state until the user runs `switchroom agent start`.
+ * The broker, by contrast, is a stateless infrastructure daemon — there is
+ * no UX reason to delay starting it. Issue #129 added this so a fresh
+ * install ends up with `switchroom-vault-broker.service` actually running,
+ * rather than enabled-but-still-needs-manual-start.
+ *
+ * Best-effort: failure is logged but not fatal (broker can still be started
+ * on demand by `switchroom vault broker start`). Skipped on non-Linux where
+ * the broker is unsupported anyway.
+ */
+function startBrokerUnit(): void {
+  if (process.platform !== "linux") return;
+  try {
+    // `restart` instead of `start` so reconciling an already-running broker
+    // picks up any unit-file changes (PATH, RestartSec, etc.) on the spot.
+    execFileSync(
+      "systemctl",
+      ["--user", "restart", "switchroom-vault-broker.service"],
+      { stdio: "pipe" },
+    );
+  } catch (err) {
+    // Don't surface as an error — the daemon may simply not have a vault to
+    // unlock yet (it'll keep crashing until passphrase is pushed). Log on
+    // stderr so operators have a breadcrumb.
+    process.stderr.write(
+      `[switchroom] note: failed to (re)start switchroom-vault-broker.service: ` +
+      `${err instanceof Error ? err.message : String(err)}\n`,
+    );
   }
 }
 

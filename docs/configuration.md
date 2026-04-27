@@ -105,6 +105,25 @@ Materialized `kind="files"` dirs land under `$XDG_RUNTIME_DIR/switchroom/vault/<
 
 Manage entries with `switchroom vault set <key>`, `switchroom vault get <key>`, and `switchroom vault list`. Multi-line string values are preserved verbatim via piped stdin or `--file <path>`; file-kind entries are set programmatically via `setFilesSecret` (a CLI surface for multi-file set is tracked separately).
 
+### Vault broker (Linux only)
+
+For scheduled tasks that need vault access, switchroom can run a long-lived **vault broker** daemon that holds the decrypted vault in memory after a one-time passphrase entry. Cron scripts then ask the broker for keys instead of prompting for the passphrase on every run. The broker is **Linux-only by design** — its access control relies on cgroup-based systemd unit identification, which doesn't exist on macOS / WSL. On non-Linux platforms `switchroom vault get` always reads the vault file directly with the user's passphrase.
+
+```yaml
+agents:
+  myagent:
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "morning briefing"
+        secrets: [google_calendar_token, weather_api_key]   # NEW
+```
+
+The `secrets:` array is **misconfiguration protection, not a security boundary**: it prevents a typo in cron-A from accidentally reading cron-B's keys, and it makes the per-cron secret surface area explicit at config-review time. It does not prevent attack — anyone who can edit cron scripts on the host can also edit `switchroom.yaml` to declare any keys, and anyone who has the vault passphrase can read the vault file directly. Frame it as: "the cron-A script that asks for `weather_api_key` was clearly meant to ask for it" — not "the cron-A script can't reach `bank_token` even if compromised."
+
+The broker is started/stopped via `switchroom vault broker {start,stop,status,unlock,lock}`. When `installAllUnits()` runs (called by `switchroom agent create` and similar), a `switchroom-vault-broker.service` user unit is installed with `Restart=on-failure`, so the broker auto-restarts if it crashes and auto-starts at user login.
+
+For interactive use — `switchroom vault get key`, `switchroom vault set key`, etc. — the CLI does **not** go through the broker. It reads the vault file directly with your passphrase. The broker's ACL would deny an interactive caller anyway (no cron systemd unit), and the user already has the passphrase.
+
 ### Per-skill dependency caches
 
 Skills that need a Python venv or a Node `node_modules` tree get a lazy, hash-stamped cache per skill — no system-level installs, no per-agent duplication.
