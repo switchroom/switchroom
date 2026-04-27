@@ -671,6 +671,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       taskNum.total > 1 ? taskNum : undefined,
       { stuckMs },
     )
+    // Issue #81 diagnostic: which checklist branch is the renderer taking?
+    // The card prefers `narratives` (human preambles) over `items` (raw
+    // tool counts). When prose lands without narratives we want to know
+    // why — log the available state at the decision boundary.
+    if (forceDone || chatState.lastEmittedHtml == null /* first emit */) {
+      const s = chatState.state
+      const branch = s.narratives.length > 0
+        ? 'narratives'
+        : s.items.length > 0
+          ? 'tool-count-fallback'
+          : 'empty'
+      process.stderr.write(
+        `progress-card.diag: render branch=${branch} chatId=${chatState.chatId} turnKey=${chatState.turnKey} ` +
+        `narratives=${s.narratives.length} items=${s.items.length} latestText_len=${s.latestText?.length ?? 0} ` +
+        `subagents=${s.subAgents.size} pendingPreamble=${s.pendingPreamble ? 'yes' : 'no'} forceDone=${forceDone}\n`,
+      )
+    }
     if (html === chatState.lastEmittedHtml && !forceDone) return
     chatState.lastEmittedHtml = html
     chatState.lastEmittedAt = now()
@@ -886,6 +903,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       chatState.lastEventAt = now()
       const stageChanged = chatState.state.stage !== prev.stage
       const visibleChanged = visibleDiff(prev, chatState.state)
+
+      // Issue #81 diagnostic: when a 'text' event lands, did the reducer
+      // recognize it as a narrative step? If narratives.length didn't grow,
+      // the card's "human-readable preamble" path can't render and the
+      // tool-count fallback wins. The log lets us correlate "user typed
+      // status?" telemetry with the missing narrative path.
+      if (event.kind === 'text') {
+        const before = prev.narratives.length
+        const after = chatState.state.narratives.length
+        const last = chatState.state.narratives[after - 1]
+        const preview = last?.text ? last.text.slice(0, 60).replace(/\n/g, ' ') : ''
+        const took = before === after ? 'discarded' : 'captured'
+        process.stderr.write(
+          `progress-card.diag: text-event ${took} chatId=${chatState.chatId} turnKey=${chatState.turnKey} ` +
+          `narratives_before=${before} narratives_after=${after} text_len=${event.text.length} preview=${JSON.stringify(preview)}\n`,
+        )
+      }
 
       // Cancel any pending coalesce timer — we'll either fire now or
       // reschedule.

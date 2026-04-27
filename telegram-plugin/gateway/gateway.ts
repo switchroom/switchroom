@@ -1798,11 +1798,27 @@ function handleSessionEvent(ev: SessionEvent): void {
           threadId != null ? String(threadId) : undefined,
         )
         const recovered = recoverProseFromProgressCard(peek)
+        // Issue #81 diagnostic: record both the success and the empty-recover
+        // path so we can correlate "card showed tool-count" with "recovery
+        // had nothing to give either". The narrative count tells us whether
+        // the issue is at capture time (no narratives ever made it into the
+        // state) or at parse time (narratives existed but produced empty
+        // text after trim).
+        const narrativeCount = peek?.narratives.length ?? 0
         if (recovered.length > 0) {
           process.stderr.write(
             `telegram gateway: turn-flush prose-recovery — recovered ${recovered.length} chars from progress-card narratives chat=${chatId} turnKey=${currentTurnStartedAt}\n`,
           )
+          process.stderr.write(
+            `progress-card.diag: prose-recovery hit chatId=${chatId} turnKey=${currentTurnStartedAt} ` +
+            `narrative_count=${narrativeCount} recovered_len=${recovered.length}\n`,
+          )
           currentTurnCapturedText.push(recovered)
+        } else {
+          process.stderr.write(
+            `progress-card.diag: prose-recovery miss chatId=${chatId} turnKey=${currentTurnStartedAt} ` +
+            `narrative_count=${narrativeCount} peek_state=${peek == null ? 'null' : 'present'}\n`,
+          )
         }
       }
 
