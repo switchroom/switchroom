@@ -25,7 +25,7 @@
  */
 
 import * as net from "node:net";
-import { mkdirSync, chmodSync, existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, type VaultEntry } from "../vault.js";
@@ -186,6 +186,10 @@ export class VaultBroker {
 
     // Notify systemd if NOTIFY_SOCKET is set
     this._sdNotify("READY=1\n");
+
+    // Auto-unlock from $CREDENTIALS_DIRECTORY if the credential was injected
+    // by systemd LoadCredentialEncrypted= (opt-in via vault.broker.autoUnlock).
+    this._tryAutoUnlockFromCredentials();
 
     if (process.platform !== "linux") {
       // Reachable only when SWITCHROOM_BROKER_ALLOW_NON_LINUX=1 was set
@@ -535,6 +539,49 @@ export class VaultBroker {
       const pidPath = resolvePath(PID_FILE_DEFAULT);
       writeFileSync(pidPath, String(process.pid) + "\n", { mode: 0o600 });
     } catch { /* non-fatal */ }
+  }
+
+  /**
+   * Attempt to auto-unlock from $CREDENTIALS_DIRECTORY/vault-passphrase.
+   * Called once at startup after sd_notify READY=1. Any failure is non-fatal —
+   * the broker stays alive and interactive unlock via the unlock socket remains
+   * available as a fallback.
+   */
+  private _tryAutoUnlockFromCredentials(): void {
+    const dir = process.env.CREDENTIALS_DIRECTORY;
+    if (!dir) return;
+    const credPath = `${dir}/vault-passphrase`;
+    let passphrase: string;
+    try {
+      passphrase = readFileSync(credPath, "utf8").replace(/\n+$/, "");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        process.stderr.write(
+          `[vault-broker] note: CREDENTIALS_DIRECTORY set but vault-passphrase ` +
+          `not present; staying locked\n`
+        );
+        return;
+      }
+      process.stderr.write(
+        `[vault-broker] auto-unlock read failed: ${(err as Error).message}; ` +
+        `falling back to interactive\n`
+      );
+      return;
+    }
+    try {
+      this.unlockFromPassphrase(passphrase);
+      process.stderr.write(
+        `[vault-broker] auto-unlocked from $CREDENTIALS_DIRECTORY/vault-passphrase\n`
+      );
+    } catch (err) {
+      process.stderr.write(
+        `[vault-broker] auto-unlock failed: ${(err as Error).message}; ` +
+        `falling back to interactive\n`
+      );
+    }
+    // Drop the local reference. (Cannot guarantee GC, but no other ref retained.)
+    passphrase = "";
   }
 
   private _sdNotify(message: string): void {
