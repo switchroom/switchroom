@@ -1391,6 +1391,37 @@ describe('forceCompleteTurn — external completion signal', () => {
     expect(emitted).toHaveLength(1)
   })
 
+  it('pendingCompletion: orphan sub-agent (run_in_background) gates defer (closes #87)', () => {
+    // `Agent({run_in_background:true})` produces an orphan sub-agent because
+    // the parent's tool_result lands BEFORE sub_agent_started — there is no
+    // matching pendingAgentSpawn for prompt-text correlation, so
+    // parentToolUseId stays null. Pre-fix, hasInFlightSubAgents excluded
+    // orphans and the card unpinned at parent turn_end while the background
+    // worker was still running. After the fix, hasAnyRunningSubAgent gates
+    // the defer and the card stays pinned until the orphan reports done.
+    const emitted: Array<unknown> = []
+    const { driver, advance } = harness(0, 0, {
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+
+    driver.ingest(enqueue('c'), null)
+    // No preceding tool_use Agent → sub_agent_started has no parent to
+    // correlate to → orphan (parentToolUseId == null).
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' }, 'c')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+    advance(0)
+
+    // Parent turn_end landed but orphan X is still running → defer must
+    // hold. Pre-fix this would have completed immediately (orphans excluded).
+    expect(emitted).toHaveLength(0)
+
+    // Orphan reports its own turn_end → completion fires.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'X', durationMs: 5000 }, 'c')
+    advance(0)
+    expect(emitted).toHaveLength(1)
+  })
+
   it('two sub-agents running: completion waits for the last one', () => {
     const emitted: Array<unknown> = []
     const { driver, advance } = harness(0, 0, {
