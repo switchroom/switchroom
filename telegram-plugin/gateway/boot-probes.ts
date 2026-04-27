@@ -95,6 +95,14 @@ function mapPlan(billingType?: string, hasExtra?: boolean): string {
 }
 
 /**
+ * Threshold below which a still-valid OAuth token is treated as
+ * `degraded` so the boot card surfaces it before the user is locked
+ * out mid-turn. 7 days is the smallest window that still gives
+ * comfortable lead time for a manual reauth in normal use.
+ */
+const TOKEN_EXPIRING_SOON_DAYS = 7
+
+/**
  * Read account info from the agent's .claude.json.
  * agentDir: e.g. /home/user/.switchroom/agents/clerk
  */
@@ -117,8 +125,12 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
 
     const plan = mapPlan(acc.billingType, acc.hasExtraUsageEnabled)
 
-    // Read token expiry
+    // Read token expiry. Status is driven by the days-remaining bucket:
+    //   < 0 days  → fail     (already expired — agent is locked out)
+    //   < 7 days  → degraded (surface so the user can reauth in time)
+    //   ≥ 7 days  → ok       (no row in the boot card)
     let tokenStr = ''
+    let status: ProbeStatus = 'ok'
     for (const candidate of [
       join(claudeDir, '.oauth-token.meta.json'),
       join(claudeDir, 'accounts', 'default', '.oauth-token.meta.json'),
@@ -128,6 +140,9 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
           const meta = JSON.parse(readFileSync(candidate, 'utf8')) as OauthTokenMeta
           if (meta.expiresAt) {
             tokenStr = ' · ' + formatDaysFromNow(meta.expiresAt)
+            const daysLeft = Math.round((meta.expiresAt - Date.now()) / 86_400_000)
+            if (daysLeft < 0) status = 'fail'
+            else if (daysLeft < TOKEN_EXPIRING_SOON_DAYS) status = 'degraded'
           }
         } catch {}
         break
@@ -135,7 +150,7 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
     }
 
     return {
-      status: 'ok',
+      status,
       label: 'Account',
       detail: `${acc.emailAddress} · ${plan}${tokenStr}`,
     }

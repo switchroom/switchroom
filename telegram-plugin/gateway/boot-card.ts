@@ -1,17 +1,36 @@
 /**
- * Boot card — posts and live-updates a pinned Telegram message at gateway
- * startup showing real, evidential agent state.
+ * Boot card — posts a quiet, contextual ack at gateway startup. Closes
+ * #60 and is PR 1 of 3 in #142's "telegram surfaces: quiet, contextual
+ * cards" workstream.
  *
- * Flow:
- *   1. postInitialBootCard() sends the skeleton (all rows ⚪ "probing…").
- *   2. runProbesAndUpdateCard() runs all probes concurrently; edits the card
- *      as each probe settles. At 2.5s budget anything still pending → 🔴.
- *   3. A sentinel turn key "${chatId}:boot" is used in the pin manager so
- *      the boot card's lifecycle is independent from user-turn cards.
- *   4. The card is unpinned when the first user turn starts (caller
- *      responsibility — call completeBootCard() from the turn handler).
+ * Default state is a single line: `✅ <agent> back up · <version>`.
  *
- * Rendering uses plain Telegram HTML (no grammy helpers required).
+ * Probes still run, but only at a settle window (6s by default) — long
+ * enough that systemd transients (`deactivating`, `activating`, crons
+ * mid-re-register) self-heal before any row could surface. If after the
+ * settle a probe is genuinely degraded or failed, the card edits to
+ * append a row for THAT probe only. Healthy probes never produce rows.
+ *
+ * What's deleted (relative to pre-#142):
+ *   - The always-rendered six-row checklist (Account/Agent/Gateway/
+ *     Quota/Hindsight/Crons) — all replaced by the silent-when-healthy
+ *     contract.
+ *   - The skeleton "probing…" placeholder edit dance — the immediate
+ *     post is now the final post for healthy boots.
+ *   - The session-greeting card written by scaffold.ts (~750 lines of
+ *     curl + heredoc bash that baked Profile/Tools/Skills/Limits/
+ *     Channel/Memory at scaffold time and re-posted on every
+ *     SessionStart). That content moves to the future `/status`
+ *     command (PR 3).
+ *
+ * What's kept:
+ *   - The probe layer in `boot-probes.ts` — same probe set, same shapes,
+ *     same defensive-against-throw discipline.
+ *   - `BotApiForBootCard` / `BootCardHandle` / dedupe gate
+ *     (`shouldSkipDuplicateBootCard`) — public API stable for the
+ *     gateway's two call sites (boot path + bridge-reconnect).
+ *   - The pin lifecycle: card gets pinned at post and unpinned by
+ *     `complete()` (called from the first user-turn handler).
  */
 
 import type { ProbeResult, GatewayRuntimeInfo } from './boot-probes.js'
@@ -23,6 +42,7 @@ import {
   probeHindsight,
   probeCronTimers,
 } from './boot-probes.js'
+import { escapeHtml } from '../card-format.js'
 import { join } from 'path'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -103,8 +123,38 @@ export function shouldSkipDuplicateBootCard(
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
+/**
+ * Settle window before probes run. Long enough that systemd transients
+ * (`deactivating`/`activating`, dbus contention during reload, crons
+ * mid-re-register) self-heal so a transient red can't reach the user.
+ *
+ * Constant by design — not a config field. The issue is explicit:
+ * "Falls out of design, not a config knob." 6s is at the high end of the
+ * 5–7s range called out in #142 for headroom under load.
+ */
+const SETTLE_WINDOW_MS = 6000
+
+const DOT: Record<string, string> = {
+  ok: '🟢',
+  degraded: '🟡',
+  fail: '🔴',
+}
+
+const PROBE_LABELS: Record<ProbeKey, string> = {
+  account:   'Account',
+  agent:     'Agent',
+  gateway:   'Gateway',
+  quota:     'Quota',
+  hindsight: 'Hindsight',
+  crons:     'Crons',
+}
+
+const PROBE_KEYS: ReadonlyArray<ProbeKey> = [
+  'account', 'agent', 'gateway', 'quota', 'hindsight', 'crons',
+]
+
 const REASON_EMOJI: Record<RestartReason, string> = {
-  planned:  '🔄',
+  planned:  '✅',
   graceful: '✅',
   crash:    '⚠️',
   fresh:    '🆕',
@@ -117,181 +167,111 @@ const REASON_LABEL: Record<RestartReason, string> = {
   fresh:    'fresh start',
 }
 
-function renderRestartRow(reason: RestartReason, ageMs?: number): string {
-  const emoji = REASON_EMOJI[reason]
-  const label = REASON_LABEL[reason]
-  if (ageMs != null && ageMs > 0) {
-    const ageSec = (ageMs / 1000).toFixed(1)
-    return `${emoji} <b>Restart</b>  ${escapeHtml(label)} · ${ageSec}s ago`
-  }
-  return `${emoji} <b>Restart</b>  ${escapeHtml(label)}`
-}
-
-const DOT: Record<string, string> = {
-  ok: '🟢',
-  degraded: '🟡',
-  fail: '🔴',
-  probing: '⚪',
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
-}
-
-const PROBE_LABELS: Record<ProbeKey, string> = {
-  account: 'Account',
-  agent:   'Agent  ',
-  gateway: 'Gateway',
-  quota:   'Quota  ',
-  hindsight: 'Hindsight',
-  crons:   'Crons  ',
-}
-
-function renderRow(key: ProbeKey, result: ProbeResult | null | undefined): string {
-  if (result == null) {
-    return `${DOT.probing} <b>${PROBE_LABELS[key]}</b>  <i>probing…</i>`
-  }
-  const dot = DOT[result.status] ?? DOT.fail
-  return `${dot} <b>${PROBE_LABELS[key]}</b>  ${escapeHtml(result.detail)}`
-}
-
-export function renderBootCard(
-  probes: ProbeMap,
-  restartReason?: RestartReason,
-  restartAgeMs?: number,
-): string {
-  const rows: string[] = [
-    '🎛️ <b>Switchroom boot</b>',
-    '',
-  ]
-  if (restartReason != null) {
-    rows.push(renderRestartRow(restartReason, restartAgeMs))
-    rows.push('')
-  }
-  rows.push(
-    renderRow('account',   probes.account),
-    renderRow('agent',     probes.agent),
-    renderRow('gateway',   probes.gateway),
-    renderRow('quota',     probes.quota),
-    renderRow('hindsight', probes.hindsight),
-    renderRow('crons',     probes.crons),
-  )
-  return rows.join('\n')
-}
-
-// ─── Orchestrator ─────────────────────────────────────────────────────────────
-
-const BUDGET_MS = 2500
-
-export interface RunProbesOpts {
+export interface RenderBootCardOpts {
   agentName: string
-  agentDir: string
-  gatewayInfo: GatewayRuntimeInfo
-  bankName?: string
-  /** Why the gateway is starting — shown as a top row in the card. */
+  /** Pre-formatted version string, e.g. "v0.3.0+44" or "v0.3.0 · #143 · 2h ago". */
+  version: string
+  /** Probe results (only present after the settle window). When absent or
+   *  empty, the card is the bare ack line — no probe rows. */
+  probes?: ProbeMap
+  /** What kind of restart this is. Crash flips the ack emoji to ⚠️ AND
+   *  appends a "Crash recovery" row underneath. Other reasons just set
+   *  the emoji. */
   restartReason?: RestartReason
-  /** Age of the restart in milliseconds (for "X.Xs ago" display). */
+  /** Age of the restart marker in ms — shown in the crash row. */
   restartAgeMs?: number
-  /** Override fetch for tests. */
-  fetchImpl?: typeof fetch
-}
-
-export async function postInitialBootCard(
-  chatId: string,
-  threadId: number | undefined,
-  bot: BotApiForBootCard,
-  ackMessageId?: number,
-  opts?: Pick<RunProbesOpts, 'restartReason' | 'restartAgeMs'>,
-): Promise<number> {
-  const text = renderBootCard({}, opts?.restartReason, opts?.restartAgeMs)
-  const sent = await bot.sendMessage(chatId, text, {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    ...(threadId != null ? { message_thread_id: threadId } : {}),
-    ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
-  })
-  // Pin it — fire and forget; failure is non-fatal
-  bot.pinChatMessage(chatId, sent.message_id, { disable_notification: true }).catch(() => {})
-  return sent.message_id
-}
-
-export async function runProbesAndUpdateCard(
-  messageId: number,
-  chatId: string,
-  threadId: number | undefined,
-  bot: BotApiForBootCard,
-  opts: RunProbesOpts,
-): Promise<ProbeMap> {
-  const claudeDir = join(opts.agentDir, '.claude')
-  const probes: ProbeMap = {}
-
-  async function editCard(): Promise<void> {
-    try {
-      await bot.editMessageText(
-        chatId,
-        messageId,
-        renderBootCard(probes, opts.restartReason, opts.restartAgeMs),
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          ...(threadId != null ? { message_thread_id: threadId } : {}),
-        },
-      )
-    } catch {
-      // Edit failures are non-fatal; another edit will follow
-    }
-  }
-
-  // Launch all probes in parallel; edit the card as each settles
-  const start = Date.now()
-
-  const allProbes: Array<Promise<void>> = [
-    probeAccount(opts.agentDir).then(async r => {
-      probes.account = r; await editCard()
-    }),
-    probeAgentProcess(opts.agentName).then(async r => {
-      probes.agent = r; await editCard()
-    }),
-    probeGateway(opts.gatewayInfo).then(async r => {
-      probes.gateway = r; await editCard()
-    }),
-    probeQuota(claudeDir, opts.agentDir, opts.fetchImpl).then(async r => {
-      probes.quota = r; await editCard()
-    }),
-    probeHindsight(opts.bankName, opts.fetchImpl).then(async r => {
-      probes.hindsight = r; await editCard()
-    }),
-    probeCronTimers(opts.agentName).then(async r => {
-      probes.crons = r; await editCard()
-    }),
-  ]
-
-  // Wait up to BUDGET_MS for all probes
-  const budget = new Promise<void>((resolve) => setTimeout(resolve, BUDGET_MS))
-  await Promise.race([Promise.allSettled(allProbes), budget])
-
-  // Mark any still-null entries as timed-out
-  const keys: ProbeKey[] = ['account', 'agent', 'gateway', 'quota', 'hindsight', 'crons']
-  let anyTimedOut = false
-  for (const key of keys) {
-    if (probes[key] == null) {
-      probes[key] = { status: 'fail', label: PROBE_LABELS[key].trim(), detail: 'no response' }
-      anyTimedOut = true
-    }
-  }
-
-  const elapsed = Date.now() - start
-  process.stderr.write(`telegram gateway: boot-card: probes settled in ${elapsed}ms anyTimedOut=${anyTimedOut}\n`)
-
-  // Final edit with settled state
-  await editCard()
-  return probes
 }
 
 /**
- * Posts and runs the full boot card lifecycle.
- * Returns a handle for completing (unpinning) the card later.
+ * Render the boot card. Single line by default; appends one row per
+ * fail/degraded probe (and one for crash recovery, if applicable).
+ *
+ * Healthy probes never produce a row. The ack line is sufficient — the
+ * user only needs to know the agent came back up. Anything red catches
+ * the eye; everything else stays out of the way.
  */
+export function renderBootCard(opts: RenderBootCardOpts): string {
+  const { agentName, version, probes, restartReason, restartAgeMs } = opts
+  const ackEmoji = restartReason ? REASON_EMOJI[restartReason] : '✅'
+  const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}`
+
+  const degradedRows: string[] = []
+
+  // Crash recovery: surface explicitly so the user can tell whether
+  // their next message will land on a fresh process. The agent-crashed
+  // operator event from #92/#147 is a separate notification surface;
+  // this row exists for users who only check the boot card.
+  if (restartReason === 'crash') {
+    const ageStr = restartAgeMs != null && restartAgeMs > 0
+      ? ` · ${(restartAgeMs / 1000).toFixed(1)}s ago`
+      : ''
+    degradedRows.push(`⚠️ <b>Restart</b>  ${escapeHtml(REASON_LABEL.crash)}${ageStr}`)
+  }
+
+  // Probe rows — only those that surfaced as degraded/fail. Healthy
+  // (`ok`) probes don't render at all.
+  if (probes) {
+    for (const key of PROBE_KEYS) {
+      const r = probes[key]
+      if (!r) continue
+      if (r.status === 'ok') continue
+      const dot = DOT[r.status] ?? DOT.fail
+      degradedRows.push(`${dot} <b>${PROBE_LABELS[key]}</b>  ${escapeHtml(r.detail)}`)
+    }
+  }
+
+  if (degradedRows.length === 0) return ack
+  return [ack, '', ...degradedRows].join('\n')
+}
+
+// ─── Probe orchestration ─────────────────────────────────────────────────────
+
+export interface RunProbesOpts {
+  agentName: string
+  /** Pre-formatted version string passed through to the renderer. */
+  version: string
+  agentDir: string
+  gatewayInfo: GatewayRuntimeInfo
+  bankName?: string
+  /** Why the gateway is starting — feeds the ack-line emoji and the
+   *  optional crash-recovery row. */
+  restartReason?: RestartReason
+  /** Age of the restart marker in ms — shown in the crash row. */
+  restartAgeMs?: number
+  /** Override fetch for tests. */
+  fetchImpl?: typeof fetch
+  /** Override settle window for tests; production uses SETTLE_WINDOW_MS. */
+  settleWindowMs?: number
+  /** Override setTimeout for tests. */
+  setTimeoutImpl?: typeof setTimeout
+}
+
+/** Run all six probes concurrently with their own per-probe timeouts.
+ *  Used by both the production startBootCard flow and any caller that
+ *  wants the probe set without the post/edit dance. */
+export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
+  const claudeDir = join(opts.agentDir, '.claude')
+  const probes: ProbeMap = {}
+
+  await Promise.allSettled([
+    probeAccount(opts.agentDir).then(r => { probes.account = r }),
+    probeAgentProcess(opts.agentName).then(r => { probes.agent = r }),
+    probeGateway(opts.gatewayInfo).then(r => { probes.gateway = r }),
+    probeQuota(claudeDir, opts.agentDir, opts.fetchImpl).then(r => { probes.quota = r }),
+    probeHindsight(opts.bankName, opts.fetchImpl).then(r => { probes.hindsight = r }),
+    probeCronTimers(opts.agentName).then(r => { probes.crons = r }),
+  ])
+
+  return probes
+}
+
+/** Post the boot card, then run probes after a settle window and edit
+ *  the card in-place if any probe came back degraded/failed. Healthy
+ *  boots stay as the bare ack line forever.
+ *
+ *  Returns a handle whose `complete()` unpins the card. The probe edit
+ *  is fire-and-forget — failures are swallowed so the ack line is never
+ *  rolled back to a worse state. */
 export async function startBootCard(
   chatId: string,
   threadId: number | undefined,
@@ -301,20 +281,68 @@ export async function startBootCard(
   log?: (line: string) => void,
 ): Promise<BootCardHandle> {
   const logger = log ?? ((l: string) => process.stderr.write(l))
+  const setTimeoutFn = opts.setTimeoutImpl ?? setTimeout
+  const settleMs = opts.settleWindowMs ?? SETTLE_WINDOW_MS
+
+  // Render and post the bare ack line immediately. The user gets
+  // confirmation that the agent is back without waiting on probes.
+  const ackText = renderBootCard({
+    agentName: opts.agentName,
+    version: opts.version,
+    restartReason: opts.restartReason,
+    restartAgeMs: opts.restartAgeMs,
+  })
 
   let messageId: number
   try {
-    messageId = await postInitialBootCard(chatId, threadId, bot, ackMessageId, opts)
-    logger(`telegram gateway: boot-card: posted msgId=${messageId} chatId=${chatId}\n`)
+    const sent = await bot.sendMessage(chatId, ackText, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
+    })
+    messageId = sent.message_id
+    logger(`telegram gateway: boot-card: posted msgId=${messageId} chatId=${chatId} reason=${opts.restartReason ?? '-'}\n`)
   } catch (err: unknown) {
-    logger(`telegram gateway: boot-card: failed to post initial card: ${(err as Error)?.message ?? String(err)}\n`)
+    logger(`telegram gateway: boot-card: failed to post ack: ${(err as Error)?.message ?? String(err)}\n`)
     return { messageId: -1, complete: () => {} }
   }
 
-  // Run probes async — don't block the caller
-  runProbesAndUpdateCard(messageId, chatId, threadId, bot, opts).catch((err: unknown) => {
-    logger(`telegram gateway: boot-card: probe orchestration error: ${(err as Error)?.message ?? String(err)}\n`)
-  })
+  // Pin the ack — fire-and-forget; pin failures aren't worth rolling
+  // back the post for.
+  bot.pinChatMessage(chatId, messageId, { disable_notification: true }).catch(() => {})
+
+  // Schedule the post-settle probe run + edit. Wrapped in setTimeout so
+  // the boot path returns the handle immediately — the gateway can
+  // continue setup without waiting on probes.
+  setTimeoutFn(() => {
+    void (async () => {
+      try {
+        const probes = await runAllProbes(opts)
+        const updatedText = renderBootCard({
+          agentName: opts.agentName,
+          version: opts.version,
+          probes,
+          restartReason: opts.restartReason,
+          restartAgeMs: opts.restartAgeMs,
+        })
+        // Skip the edit when nothing degraded — saves the API call and
+        // avoids Telegram's "message is not modified" error.
+        if (updatedText === ackText) {
+          logger(`telegram gateway: boot-card: probes settled all-green msgId=${messageId}\n`)
+          return
+        }
+        await bot.editMessageText(chatId, messageId, updatedText, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        })
+        logger(`telegram gateway: boot-card: probes settled with degraded rows msgId=${messageId}\n`)
+      } catch (err: unknown) {
+        logger(`telegram gateway: boot-card: probe-edit error msgId=${messageId}: ${(err as Error)?.message ?? String(err)}\n`)
+      }
+    })()
+  }, settleMs)
 
   let completed = false
   return {

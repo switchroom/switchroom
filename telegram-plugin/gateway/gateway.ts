@@ -154,9 +154,11 @@ import {
   writeCleanShutdownMarker,
   readCleanShutdownMarker,
   // clearCleanShutdownMarker is intentionally NOT imported here —
-  // cleanup ownership moved to the agent-side session-greeting.sh after
-  // it renders the "Restarted <reason>" row. See the boot path comment
-  // around the reason-rendering block for the lifecycle rationale.
+  // the marker is a single self-overwriting file; staleness is bounded by
+  // `shouldSuppressRecoveryBanner` (DEFAULT_MAX_AGE_MS), so leaving it on
+  // disk is harmless. Pre-#142 the agent-side `session-greeting.sh` did
+  // the cleanup after rendering its "Restarted <reason>" row; that script
+  // was deleted in #142 PR 1.
   shouldSuppressRecoveryBanner,
   resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS as CLEAN_SHUTDOWN_MAX_AGE_MS,
@@ -177,6 +179,13 @@ import {
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
 import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
+import {
+  VERSION,
+  COMMIT_SHA,
+  COMMIT_DATE,
+  LATEST_PR,
+  COMMITS_AHEAD_OF_TAG,
+} from '../../src/build-info.js'
 import { classifyRejection } from './unhandled-rejection-policy.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
@@ -188,6 +197,43 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+
+/**
+ * Format the version string shown in the boot-card ack line. Two shapes
+ * matching the deleted greeting card's behavior:
+ *   - on a tag (commits_ahead = 0 or null):   "v0.2.0 · #44 · 2h ago"
+ *     (omit "#44 ·" when no PR was parsed)
+ *   - ahead of a tag (commits_ahead > 0):     "v0.2.0+3 · db6de9e · 2m ago"
+ *     (always show short SHA when ahead, omit PR)
+ * Age segment is omitted if no commit date is available (npm consumer).
+ */
+function formatBootVersion(): string {
+  const ago = formatRelativeAgo(COMMIT_DATE)
+  const onTag = COMMITS_AHEAD_OF_TAG === 0 || COMMITS_AHEAD_OF_TAG === null
+
+  if (onTag) {
+    const parts: string[] = [`v${VERSION}`]
+    if (LATEST_PR != null) parts.push(`#${LATEST_PR}`)
+    if (ago) parts.push(ago)
+    return parts.join(' · ')
+  }
+
+  const parts: string[] = [`v${VERSION}+${COMMITS_AHEAD_OF_TAG}`]
+  if (COMMIT_SHA) parts.push(COMMIT_SHA)
+  if (ago) parts.push(ago)
+  return parts.join(' · ')
+}
+
+function formatRelativeAgo(iso: string | null): string | null {
+  if (!iso) return null
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return null
+  const diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (diffSec < 60) return `${diffSec}s ago`
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`
+  return `${Math.floor(diffSec / 86400)}d ago`
+}
 
 try {
   chmodSync(ENV_FILE, 0o600)
@@ -956,6 +1002,7 @@ const ipcServer: IpcServer = createIpcServer({
           }
           startBootCard(chatId, threadId, botApiForCard, {
             agentName,
+            version: formatBootVersion(),
             agentDir: agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp'),
             gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
             restartReason: reason,
@@ -5386,11 +5433,10 @@ void (async () => {
             } else {
               process.stderr.write(`telegram gateway: boot.clean_shutdown_marker_stale age=${ageSec}s signal=${cleanMarker.signal}${reasonTag}\n`)
             }
-            // IMPORTANT: do NOT clearCleanShutdownMarker() here.
-            // session-greeting.sh reads clean-shutdown.json to render the
-            // "Restarted <reason>" row. Gateway and agent boot in parallel
-            // under systemd, so clearing here would race and drop the reason.
-            // Ownership of cleanup belongs to session-greeting.sh.
+            // No clearCleanShutdownMarker() call — the marker is a single
+            // self-overwriting file, age-gated by shouldSuppressRecoveryBanner,
+            // so leaving it on disk is harmless. (Pre-#142 the agent-side
+            // session-greeting.sh did the cleanup; that script is deleted.)
           }
 
           if (marker) {
@@ -5422,6 +5468,7 @@ void (async () => {
                 try {
                   const handle = await startBootCard(chatId, threadId, botApiForCard, {
                     agentName,
+                    version: formatBootVersion(),
                     agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentName),
                     gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
                     restartReason: reason,
