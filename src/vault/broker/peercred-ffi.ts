@@ -63,26 +63,49 @@ export function getPeerCred(fd: number): PeerCred | null {
     // (where require("bun:ffi") throws ERR_MODULE_NOT_FOUND).
     // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
     const ffi: any = (require as unknown as (m: string) => unknown)("bun:ffi");
-    const { dlopen, FFIType, ptr, suffix } = ffi;
+    const { dlopen, FFIType, ptr } = ffi;
 
     const SOL_SOCKET = 1;
     const SO_PEERCRED = 17;
     const UCRED_SIZE = 12;
 
-    // Open libc once and cache. Failure on first call is permanent —
-    // the symbols are part of glibc/musl and don't disappear at runtime.
+    // Open libc once and cache. We probe the SONAME variants we plausibly
+    // meet on a Linux host — glibc's `libc.so.6` and musl's unversioned
+    // `libc.so` (Alpine and similar). We deliberately do NOT use bun:ffi's
+    // `suffix` template (`so` / `dylib` / `dll`): the broker is Linux-only
+    // and `libc.dylib.6` is meaningless on macOS where it doesn't run
+    // anyway. The probe-and-log shape also gives operators a breadcrumb
+    // when a future glibc bumps to `libc.so.7` or some exotic libc isn't
+    // covered — without the warning we'd silently degrade to ss.
     type LibHandle = { symbols: { getsockopt: (...args: unknown[]) => number } };
     type WithCache = ((fd: number) => PeerCred | null) & { _lib?: LibHandle };
     const cache = getPeerCred as WithCache;
     const lib: LibHandle = cache._lib ?? (() => {
-      const opened = dlopen(`libc.${suffix}.6`, {
+      const candidates = ["libc.so.6", "libc.so"];
+      const symbolSpec = {
         getsockopt: {
           args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
           returns: FFIType.i32,
         },
-      });
-      cache._lib = opened;
-      return opened;
+      };
+      const errors: string[] = [];
+      for (const name of candidates) {
+        try {
+          const opened = dlopen(name, symbolSpec);
+          cache._lib = opened;
+          return opened;
+        } catch (e) {
+          errors.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      // Surface the failure once so an operator on an exotic libc sees
+      // why the FFI fast-path degraded. The outer catch returns null and
+      // identify() falls through to the ss-parsing path.
+      process.stderr.write(
+        `[vault-broker] peercred-ffi: dlopen failed for all libc candidates ` +
+        `(${errors.join("; ")}); falling back to ss-parsing.\n`,
+      );
+      throw new Error("no libc candidate could be opened");
     })();
 
     const credBuf = new ArrayBuffer(UCRED_SIZE);

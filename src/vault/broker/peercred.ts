@@ -374,18 +374,20 @@ export function identify(
 
   // ── Path 1: bun:ffi SO_PEERCRED ──────────────────────────────────────────
   // Returns null under node (bun:ffi unavailable) or if getsockopt errors.
-  // We then fall through to the ss-parsing path below.
+  // We then fall through to the ss-parsing path below. We extract only the
+  // PID — the rest of the pipeline (UID via /proc/<pid>/status, exe via
+  // /proc/<pid>/exe, systemd-unit via /proc/<pid>/cgroup) is shared with
+  // the ss path. We do NOT short-circuit using SO_PEERCRED's `uid` even
+  // though it would be authoritative: the cost is one /proc read and the
+  // benefit is a single code path for both runtimes (no "did the FFI path
+  // do the UID check?" branching downstream). The cgroup-derived
+  // systemdUnit is still the load-bearing identity check.
   let pid: number | null = null;
   if (socket !== undefined) {
     const fd = fdFromSocket(socket);
     if (fd !== null) {
       const cred = getPeerCred(fd);
-      if (cred !== null) {
-        pid = cred.pid;
-        // The UID from SO_PEERCRED is authoritative; record it now so we can
-        // skip the /proc/<pid>/status read below if it agrees with the broker.
-        // (We re-validate below for robustness.)
-      }
+      if (cred !== null) pid = cred.pid;
     }
   }
 

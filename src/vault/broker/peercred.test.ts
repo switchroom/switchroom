@@ -352,17 +352,21 @@ describe("peercred.identify", () => {
       throw new Error(`unexpected fd: ${fd}`);
     });
 
-    const fakeSocket = { _handle: { fd: SYNTH_FD } } as unknown as import("node:net").Socket;
-    const mockExec = mkMockExec(ssOutput);
-    const result = identify(SOCKET_PATH, fakeSocket, mockExec as any);
+    // try/finally so an assertion failure still restores the spy and
+    // doesn't leak fstat-mocked state into subsequent tests in the file.
+    try {
+      const fakeSocket = { _handle: { fd: SYNTH_FD } } as unknown as import("node:net").Socket;
+      const mockExec = mkMockExec(ssOutput);
+      const result = identify(SOCKET_PATH, fakeSocket, mockExec as any);
 
-    expect(result).not.toBeNull();
-    // Critical: the target client PID, not the OTHER client PID.
-    expect(result?.pid).toBe(TARGET_CLIENT_PID);
-    expect(result?.uid).toBe(brokerUid);
-    expect(result?.systemdUnit).toBe("switchroom-myagent-cron-3.service");
-
-    fstatSpy.mockRestore();
+      expect(result).not.toBeNull();
+      // Critical: the target client PID, not the OTHER client PID.
+      expect(result?.pid).toBe(TARGET_CLIENT_PID);
+      expect(result?.uid).toBe(brokerUid);
+      expect(result?.systemdUnit).toBe("switchroom-myagent-cron-3.service");
+    } finally {
+      fstatSpy.mockRestore();
+    }
   });
 });
 
