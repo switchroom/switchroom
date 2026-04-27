@@ -558,6 +558,88 @@ describe('progress-card driver — zombie ceiling (maxIdleMs)', () => {
     expect(completeCalls).toHaveLength(1)
   })
 
+  it('ghost-pin safety net: orphan never reports turn_end → maxIdleMs auto-closes (#142 follow-up)', () => {
+    // The orphan-defer change in this PR makes `hasAnyRunningSubAgent` the
+    // defer gate. The intended safety-net argument is that an orphan whose
+    // `sub_agent_turn_end` never arrives (JSONL-delivery race, agent
+    // process crash mid-tool, etc.) won't ghost-pin forever because the
+    // heartbeat zombie ceiling (maxIdleMs) force-closes any card whose
+    // last real session event is older than the cutoff.
+    //
+    // This test pins that safety net explicitly. Without it, a future
+    // change to maxIdleMs default (e.g. raising it to 24h or disabling
+    // it) would silently re-introduce the ghost-pin failure mode that
+    // PR #49's correlated-only carve-out was originally designed to
+    // prevent (#31, #43).
+    let now = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const completeCalls: Array<{ chatId: string }> = []
+    const emits: Array<{ done: boolean }> = []
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ done: a.done }),
+      onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId }),
+      heartbeatMs: 1000,
+      maxIdleMs: 5_000,        // tight test cutoff
+      initialDelayMs: 0,
+      now: () => now,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+    })
+    const advance = (ms: number): void => {
+      now += ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers[0]
+        if (!next || next.fireAt > now) break
+        if (next.repeat != null) {
+          next.fireAt += next.repeat
+          next.fn()
+        } else {
+          timers.shift()
+          next.fn()
+        }
+      }
+    }
+
+    // Setup: orphan sub-agent dispatched, parent turn_end fires while
+    // orphan is still running (the new defer behavior holds the card).
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'orphan', firstPromptText: 'P' }, 'c1')
+    driver.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c1')
+    advance(0)
+    expect(completeCalls).toHaveLength(0) // deferred — orphan still running
+
+    // No `sub_agent_turn_end` ever arrives. lastEventAt is stuck at the
+    // turn_end timestamp. After maxIdleMs (5s here, 5min in production)
+    // the heartbeat zombie ceiling must fire and close the card so the
+    // pin doesn't ghost forever.
+    advance(6_000) // past the 5s cutoff
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0].chatId).toBe('c1')
+    // Final emit carries done=true so the gateway unpins.
+    const lastEmit = emits[emits.length - 1]
+    expect(lastEmit?.done).toBe(true)
+  })
+
   it('maxIdleMs=0 disables the zombie ceiling entirely', () => {
     const completeCalls: Array<{ chatId: string }> = []
     const { driver, advance } = harness(500, 400, {
