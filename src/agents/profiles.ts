@@ -1,5 +1,5 @@
-import { readFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { readFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync, realpathSync } from "node:fs";
+import { resolve, join, sep as pathSep } from "node:path";
 import Handlebars from "handlebars";
 
 /**
@@ -15,14 +15,38 @@ const PROFILES_ROOT = resolve(import.meta.dirname, "../../profiles");
 /**
  * Resolve the filesystem path for a named profile. Falls back to
  * `default` if the requested profile directory doesn't exist. Rejects
- * names that would escape PROFILES_ROOT via `..` or absolute paths.
+ * names that would escape PROFILES_ROOT via `..`, absolute paths, or
+ * symlinks pointing outside the root.
  */
 export function getProfilePath(profileName: string): string {
   const requested = resolve(PROFILES_ROOT, profileName);
-  // Prevent path traversal — resolved path must stay within PROFILES_ROOT
-  if (requested !== PROFILES_ROOT && !requested.startsWith(PROFILES_ROOT + "/")) {
+
+  // Lexical boundary check — `resolve()` normalizes `..` segments so a
+  // traversal like `"../etc"` ends up as a string that does NOT start
+  // with PROFILES_ROOT + sep. Use `path.sep` (not a hardcoded "/") so
+  // the comparison is correct on Windows too.
+  if (requested !== PROFILES_ROOT && !requested.startsWith(PROFILES_ROOT + pathSep)) {
     throw new Error(`Invalid profile name: ${profileName}`);
   }
+
+  // Symlink boundary check — same pattern as `memory-search.ts:274` and
+  // `web/server.ts:302`. `path.resolve()` does NOT follow symlinks, so a
+  // profile dir under PROFILES_ROOT that's actually a symlink to /etc
+  // would pass the lexical check above and let `existsSync` /
+  // `readFileSync` operate on the symlink target. Re-check after
+  // realpath to close the gap. The `try { realpathSync } catch` is for
+  // ENOENT — non-existent paths fall through to the existsSync branch
+  // below where `hasProfileFiles` returns false and we use the fallback.
+  let real: string;
+  try {
+    real = realpathSync(requested);
+  } catch {
+    real = requested;
+  }
+  if (real !== PROFILES_ROOT && !real.startsWith(PROFILES_ROOT + pathSep)) {
+    throw new Error(`Invalid profile name: ${profileName}`);
+  }
+
   if (existsSync(requested) && hasProfileFiles(requested)) {
     return requested;
   }
