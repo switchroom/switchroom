@@ -199,6 +199,7 @@ const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
   "mcp__switchroom-telegram__forward_message",
   "mcp__switchroom-telegram__download_attachment",
   "mcp__switchroom-telegram__get_recent_messages",
+  "mcp__switchroom-telegram__progress_update",
 ];
 
 /**
