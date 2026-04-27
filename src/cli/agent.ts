@@ -45,6 +45,7 @@ import {
   type StatusInputs,
 } from "../agents/status.js";
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
+import { renameAgent, type HindsightMode } from "../agents/rename-orchestrator.js";
 import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { registerAgentPerfCommand } from "./perf.js";
 
@@ -1688,6 +1689,118 @@ export function registerAgentCommand(program: Command): void {
               `Start with: switchroom agent start ${name}\n`
             )
           );
+        }
+      })
+    );
+
+  // switchroom agent rename <old> <new>
+  //
+  // First-class command for slug renames. Orchestrates all 8 steps:
+  //   stop → snapshot → rename dir → rename systemd units → rename vault key
+  //   → update switchroom.yaml → reconcile → start new.
+  // On any failure, rolls back to the snapshot so the system is never
+  // left in a half-renamed / split state.
+  //
+  // Hindsight bank rename is opt-in (--hindsight=fresh) — the default
+  // "preserve" keeps the old bank ID untouched (agents continue to read
+  // from the same bank under the old collection name).
+  agent
+    .command("rename <old> <new>")
+    .description(
+      "Rename an agent slug: stop, snapshot, rename dir + systemd units + vault key, " +
+      "update switchroom.yaml, reconcile, start. Rolls back on any failure."
+    )
+    .option(
+      "--hindsight <mode>",
+      'Hindsight bank handling: "preserve" (default, keep old bank) or "fresh" (drop, recreate on first run). "migrate" is deferred.',
+      "preserve",
+    )
+    .option("-y, --yes", "Skip confirmation prompt")
+    .action(
+      withConfigError(async (
+        oldName: string,
+        newName: string,
+        opts: { hindsight?: string; yes?: boolean },
+      ) => {
+        const configPath = getConfigPath(program);
+        const config = getConfig(program);
+
+        if (!config.agents[oldName]) {
+          console.error(chalk.red(`Agent "${oldName}" is not defined in switchroom.yaml`));
+          process.exit(1);
+        }
+        if (config.agents[newName]) {
+          console.error(chalk.red(`Agent "${newName}" is already defined in switchroom.yaml`));
+          process.exit(1);
+        }
+
+        const hindsightMode = (opts.hindsight ?? "preserve") as HindsightMode;
+        if (hindsightMode !== "preserve" && hindsightMode !== "fresh") {
+          console.error(
+            chalk.red(
+              `Invalid --hindsight value: "${hindsightMode}". ` +
+              `Valid values: preserve, fresh.`,
+            ),
+          );
+          process.exit(1);
+        }
+
+        if (!opts.yes) {
+          process.stdout.write(
+            chalk.yellow(
+              `\nRename agent "${oldName}" → "${newName}"?\n` +
+              `  This will: stop ${oldName}, copy dir, rename systemd units,\n` +
+              `  rename vault keys (if passphrase available), update switchroom.yaml,\n` +
+              `  reconcile, and start ${newName}.\n` +
+              `  Hindsight mode: ${hindsightMode}\n` +
+              `[y/N] `
+            ),
+          );
+          const answer = await new Promise<string>((resolve) => {
+            process.stdin.setEncoding("utf-8");
+            process.stdin.once("data", (d) => resolve(d.toString().trim()));
+          });
+          if (answer.toLowerCase() !== "y") {
+            console.log("Aborted.");
+            return;
+          }
+        }
+
+        console.log(chalk.bold(`\nRenaming agent: ${oldName} → ${newName}\n`));
+
+        try {
+          const result = await renameAgent({
+            oldName,
+            newName,
+            configPath,
+            hindsightMode,
+          });
+
+          console.log(chalk.green(`  Agent dir:       ${result.agentDir}`));
+          if (result.vaultKeysRenamed.length > 0) {
+            console.log(
+              chalk.green(
+                `  Vault keys renamed: ${result.vaultKeysRenamed.join(", ")}`,
+              ),
+            );
+          } else {
+            console.log(chalk.gray(`  Vault keys: none matching "${oldName}" prefix found`));
+          }
+          if (result.reconcileChanges.length > 0) {
+            console.log(
+              chalk.green(`  Reconciled ${result.reconcileChanges.length} file(s)`),
+            );
+          }
+          console.log(chalk.bold.green(`\nAgent "${oldName}" → "${newName}" renamed and started.\n`));
+        } catch (err) {
+          console.error(chalk.red(`\nRename failed: ${(err as Error).message}`));
+          console.error(
+            chalk.yellow(
+              `\n  The system should be rolled back to the pre-rename state.\n` +
+              `  Check agent status: switchroom agent status ${oldName}\n`,
+            ),
+          );
+          process.exit(1);
         }
       })
     );
