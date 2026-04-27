@@ -29,8 +29,7 @@
  *   - `BotApiForBootCard` / `BootCardHandle` / dedupe gate
  *     (`shouldSkipDuplicateBootCard`) — public API stable for the
  *     gateway's two call sites (boot path + bridge-reconnect).
- *   - The pin lifecycle: card gets pinned at post and unpinned by
- *     `complete()` (called from the first user-turn handler).
+ *   - `BootCardHandle` / `complete()` (called from the first user-turn handler).
  */
 
 import type { ProbeResult, GatewayRuntimeInfo } from './boot-probes.js'
@@ -65,17 +64,11 @@ export interface BotApiForBootCard {
     text: string,
     opts?: Record<string, unknown>,
   ): Promise<unknown>
-  pinChatMessage(
-    chatId: string,
-    messageId: number,
-    opts?: Record<string, unknown>,
-  ): Promise<unknown>
-  unpinChatMessage(chatId: string, messageId: number): Promise<unknown>
 }
 
 export interface BootCardHandle {
   messageId: number
-  /** Call when the first user turn starts — unpins the card. */
+  /** Call when the first user turn starts. */
   complete(): void
 }
 
@@ -269,7 +262,7 @@ export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
  *  the card in-place if any probe came back degraded/failed. Healthy
  *  boots stay as the bare ack line forever.
  *
- *  Returns a handle whose `complete()` unpins the card. The probe edit
+ *  Returns a handle. The probe edit
  *  is fire-and-forget — failures are swallowed so the ack line is never
  *  rolled back to a worse state. */
 export async function startBootCard(
@@ -307,10 +300,6 @@ export async function startBootCard(
     logger(`telegram gateway: boot-card: failed to post ack: ${(err as Error)?.message ?? String(err)}\n`)
     return { messageId: -1, complete: () => {} }
   }
-
-  // Pin the ack — fire-and-forget; pin failures aren't worth rolling
-  // back the post for.
-  bot.pinChatMessage(chatId, messageId, { disable_notification: true }).catch(() => {})
 
   // Schedule the post-settle probe run + edit. Wrapped in setTimeout so
   // the boot path returns the handle immediately — the gateway can
@@ -350,8 +339,7 @@ export async function startBootCard(
     complete() {
       if (completed) return
       completed = true
-      bot.unpinChatMessage(chatId, messageId).catch(() => {})
-      logger(`telegram gateway: boot-card: completed (unpinned) msgId=${messageId}\n`)
+      logger(`telegram gateway: boot-card: completed msgId=${messageId}\n`)
     },
   }
 }

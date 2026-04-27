@@ -1073,8 +1073,6 @@ const ipcServer: IpcServer = createIpcServer({
           const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
             sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
             editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
-            pinChatMessage: (cid, mid, opts) => lockedBot.api.pinChatMessage(cid, mid, opts as Parameters<typeof lockedBot.api.pinChatMessage>[2]),
-            unpinChatMessage: (cid, mid) => lockedBot.api.unpinChatMessage(cid, mid),
           }
           startBootCard(chatId, threadId, botApiForCard, {
             agentName,
@@ -5713,8 +5711,6 @@ void (async () => {
                 const botApiForCard: import('./boot-card.js').BotApiForBootCard = {
                   sendMessage: (cid, text, opts) => lockedBot.api.sendMessage(cid, text, opts as Parameters<typeof lockedBot.api.sendMessage>[2]) as Promise<{ message_id: number }>,
                   editMessageText: (cid, mid, text, opts) => lockedBot.api.editMessageText(cid, mid, text, opts as Parameters<typeof lockedBot.api.editMessageText>[3]),
-                  pinChatMessage: (cid, mid, opts) => lockedBot.api.pinChatMessage(cid, mid, opts as Parameters<typeof lockedBot.api.pinChatMessage>[2]),
-                  unpinChatMessage: (cid, mid) => lockedBot.api.unpinChatMessage(cid, mid),
                 }
                 try {
                   const handle = await startBootCard(chatId, threadId, botApiForCard, {
