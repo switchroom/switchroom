@@ -692,10 +692,30 @@ describe("scaffoldAgent", () => {
     );
 
     expect(settings.permissions.allow).toContain("calendar");
-    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram");
-    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
-    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__react");
-    expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__edit_message");
+
+    // Assert every tool name registered by the plugin is in the allowlist.
+    // Drift between the plugin's tool registry and the scaffolded permission
+    // list silently breaks pre-approval — agents fall back to per-call
+    // permission prompts. This test catches the drift the next time it
+    // happens (PR #121 review found progress_update missing from this list
+    // after delete_message and get_recent_messages were added).
+    const expectedTools = [
+      "mcp__switchroom-telegram", // bare server name
+      "mcp__switchroom-telegram__reply",
+      "mcp__switchroom-telegram__stream_reply",
+      "mcp__switchroom-telegram__react",
+      "mcp__switchroom-telegram__edit_message",
+      "mcp__switchroom-telegram__send_typing",
+      "mcp__switchroom-telegram__pin_message",
+      "mcp__switchroom-telegram__delete_message",
+      "mcp__switchroom-telegram__forward_message",
+      "mcp__switchroom-telegram__download_attachment",
+      "mcp__switchroom-telegram__get_recent_messages",
+      "mcp__switchroom-telegram__progress_update",
+    ];
+    for (const tool of expectedTools) {
+      expect(settings.permissions.allow).toContain(tool);
+    }
   });
 
   it("writes project-level .mcp.json when channels.telegram.plugin is 'switchroom'", () => {
