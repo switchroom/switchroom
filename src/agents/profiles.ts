@@ -1,5 +1,5 @@
 import { readFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, sep as pathSep } from "node:path";
 import Handlebars from "handlebars";
 
 /**
@@ -19,8 +19,10 @@ const PROFILES_ROOT = resolve(import.meta.dirname, "../../profiles");
  */
 export function getProfilePath(profileName: string): string {
   const requested = resolve(PROFILES_ROOT, profileName);
-  // Prevent path traversal — resolved path must stay within PROFILES_ROOT
-  if (requested !== PROFILES_ROOT && !requested.startsWith(PROFILES_ROOT + "/")) {
+  // Prevent path traversal — resolved path must stay within PROFILES_ROOT.
+  // Use the platform separator so the boundary check works on Windows
+  // (where `resolve` returns backslash-separated paths) as well as POSIX.
+  if (requested !== PROFILES_ROOT && !requested.startsWith(PROFILES_ROOT + pathSep)) {
     throw new Error(`Invalid profile name: ${profileName}`);
   }
   if (existsSync(requested) && hasProfileFiles(requested)) {
