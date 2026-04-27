@@ -134,10 +134,13 @@ describe('auth-flow context rule — Channel B (structural wiring in gateway.ts)
 
   it('checks isAuthFlowContext in the no-passphrase path (deferred branch)', () => {
     // The no-passphrase branch must also check isAuthFlowContext so a context
-    // hit is deferred even without a cached passphrase
+    // hit is deferred even without a cached passphrase. (Window widened in
+    // #44's PR — the comment block above the branch grew when the legacy
+    // "/vault list + re-paste" UX got replaced with the inline-button
+    // flow; the structural invariant we're pinning is unchanged.)
     const noPpIdx = src.indexOf('No passphrase cached — detect, but defer')
     expect(noPpIdx).toBeGreaterThan(0)
-    const window = src.slice(noPpIdx, noPpIdx + 400)
+    const window = src.slice(noPpIdx, noPpIdx + 1200)
     expect(window).toMatch(/isAuthFlowContext/)
   })
 
@@ -251,7 +254,9 @@ describe('awaitingAuthCodeAt flag — consumption only on actual detection', () 
   it('awaitingAuthCodeAt.delete appears inside the no-passphrase hasHigh branch', () => {
     const noPpIdx = src.indexOf('No passphrase cached — detect, but defer')
     expect(noPpIdx).toBeGreaterThan(0)
-    const window = src.slice(noPpIdx, noPpIdx + 600)
+    // Window widened — see the matching note on the
+    // "checks isAuthFlowContext in the no-passphrase path" test.
+    const window = src.slice(noPpIdx, noPpIdx + 1200)
     // Conditional consume: only fires if isAuthFlowContext
     expect(window).toMatch(/if \(isAuthFlowContext\)/)
     expect(window).toMatch(/awaitingAuthCodeAt\.delete\(chat_id\)/)

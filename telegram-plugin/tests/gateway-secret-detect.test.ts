@@ -75,16 +75,43 @@ describe('gateway secret-detect intercept — structural wiring', () => {
     expect(tail).toMatch(/s\.masked/)
   })
 
-  it('no-passphrase deferred path: warns user, deletes message, returns (no broadcast)', () => {
+  it('no-passphrase deferred path: prompts user, deletes message, returns (no broadcast)', () => {
+    // Issue #44 turned the deferred path into a one-tap inline-button
+    // flow. The structural invariants we still want to pin:
+    //   1. The deferred record is set in `deferredSecrets` so the
+    //      post-unlock callback can find it.
+    //   2. The original message containing the raw bytes is deleted.
+    //   3. The path returns before falling through to recordInbound /
+    //      broadcast.
+    //   4. The reply uses the deferred-secret keyboard so a one-tap
+    //      unlock is offered instead of the legacy "/vault list +
+    //      re-paste" instructions.
     const pipelineIdx = src.indexOf('runPipeline({')
-    const tail = src.slice(pipelineIdx, pipelineIdx + 6000)
-    expect(tail).toMatch(/no vault passphrase is cached/)
-    expect(tail).toMatch(/this message was NOT stored/)
-    // Both branches of the deferred path must `return` so we don't fall
-    // through to recordInbound/broadcast with raw bytes.
-    const deferredIdx = tail.indexOf('this message was NOT stored')
-    const afterDeferred = tail.slice(deferredIdx)
-    expect(afterDeferred).toMatch(/\n\s*return\b/)
+    const tail = src.slice(pipelineIdx, pipelineIdx + 8000)
+    // 1. Deferred record set with the suggested slug captured up-front.
+    expect(tail).toMatch(/deferredSecrets\.set\(/)
+    expect(tail).toMatch(/suggested_slug:/)
+    // 2. The original message is deleted (so the raw bytes are scrubbed
+    //    from the chat client even before the user reacts).
+    expect(tail).toMatch(/bot\.api\.deleteMessage\(chat_id, msgId\)/)
+    // 4. The new inline keyboard helper is used in lieu of the legacy
+    //    plain-text "run /vault list" warning.
+    expect(tail).toMatch(/buildDeferredSecretKeyboard\(/)
+    // 3. `return` after the reply so the no-broadcast contract holds.
+    const keyboardIdx = tail.indexOf('buildDeferredSecretKeyboard(')
+    const afterKeyboard = tail.slice(keyboardIdx)
+    expect(afterKeyboard).toMatch(/\n\s*return\b/)
+  })
+
+  it('issue #44: deferred-secret callback handler + auto-write helper exist', () => {
+    // Static wiring check — the inline buttons need a dispatcher branch
+    // and a write helper, otherwise tapping the card does nothing.
+    expect(src).toMatch(/handleVaultDeferCallback\b/)
+    expect(src).toMatch(/executeDeferredSecretSave\b/)
+    expect(src).toMatch(/passphrase-for-deferred/)
+    // Dispatcher routes vd: prefix to the new handler.
+    const dispatcherIdx = src.indexOf("data.startsWith('vd:')")
+    expect(dispatcherIdx).toBeGreaterThan(0)
   })
 
   it('detectSecrets is used for the deferred peek (no-passphrase path)', () => {

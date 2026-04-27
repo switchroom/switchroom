@@ -637,6 +637,16 @@ const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
 type PendingVaultOp =
   | { kind: 'passphrase'; op: 'list' | 'get' | 'delete' | 'set'; key?: string; startedAt: number }
   | { kind: 'value'; op: 'set'; key: string; passphrase: string; startedAt: number }
+  // Issue #44: passphrase entry triggered by tapping "🔓 Unlock vault & save"
+  // on a deferred-secret card. After the passphrase is cached we look up the
+  // held secret by deferKey and write it directly — no re-paste required.
+  | {
+      kind: 'passphrase-for-deferred'
+      deferKey: string
+      cardChatId: string
+      cardMessageId: number
+      startedAt: number
+    }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
 const pendingVaultOps = new Map<string, PendingVaultOp>()
 
@@ -650,6 +660,14 @@ interface DeferredSecret {
   original_message_id: number
   text: string
   staged_at: number
+  /**
+   * Slug suggested by the detector at the time we deferred the secret.
+   * Captured up-front so the post-unlock auto-write doesn't have to re-run
+   * detection (which would have to handle the no-detection-fired case for
+   * Channel B context-rule defers — issue #44). Falls back to a generic
+   * slug if detection didn't fire.
+   */
+  suggested_slug: string
 }
 const deferredSecrets = new Map<string, DeferredSecret>()
 function deferredKey(chat_id: string, message_id: number): string {
@@ -663,6 +681,7 @@ function deferredKey(chat_id: string, message_id: number): string {
 // context rule covers future shape changes).
 const awaitingAuthCodeAt = new Map<string, number>()
 const AUTH_CODE_CONTEXT_TTL_MS = 5 * 60_000 // 5 min — OAuth code lifetime
+const DEFERRED_SECRET_TTL_MS = 24 * 60 * 60_000 // 24 h — ignored one-tap cards
 
 // ─── TTL reaper ───────────────────────────────────────────────────────────
 // Pending state maps above all grow whenever a flow starts and only shrink
@@ -690,6 +709,9 @@ const pendingStateReaper = setInterval(() => {
   }
   for (const [k, v] of awaitingAuthCodeAt) {
     if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
+  }
+  for (const [k, v] of deferredSecrets) {
+    if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
   // Drain cap: if a scheduled restart has been waiting >60s for a turn
   // to complete, force it through anyway (spec: 60s cap → SIGKILL fallback).
@@ -2341,6 +2363,20 @@ async function handleInbound(
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
         if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
         await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else if (pendingVault.kind === 'passphrase-for-deferred') {
+        // Issue #44: passphrase entered after tapping "🔓 Unlock vault &
+        // save" on the deferred-secret card. Cache the passphrase then
+        // auto-write the held secret directly — no re-paste required.
+        // The passphrase message itself is deleted so it doesn't linger
+        // in chat history (same protection as the original secret got).
+        const passphrase = text.trim()
+        if (!passphrase) {
+          await switchroomReply(ctx, 'Passphrase cannot be empty. Tap the unlock button again.', { html: true })
+          return
+        }
+        vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
+        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        await executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
       } else {
         let value = text
         const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
@@ -2477,17 +2513,24 @@ async function handleInbound(
         if (msgId != null) {
           try { await bot.api.deleteMessage(chat_id, msgId) } catch {}
         }
-        await switchroomReply(
-          ctx,
-          '⚠️ auth-flow secret detected (context rule). the message was deleted for safety. run <code>/vault list</code> to unlock and re-paste if you need to store it.',
-          { html: true },
-        )
-        deferredSecrets.set(deferredKey(chat_id, msgId ?? 0), {
+        // Issue #44: even with passphrase cached we hit this branch when the
+        // pattern didn't fire — but at this point a vault write would still
+        // need the user's intent. Stash with a one-tap unlock+save card so
+        // the post-context flow stays seamless.
+        const dKey = deferredKey(chat_id, msgId ?? 0)
+        const cachedBranchDetection = detectSecrets(effectiveText).find((d) => d.confidence === 'high' && !d.suppressed)
+        deferredSecrets.set(dKey, {
           chat_id,
           original_message_id: msgId ?? 0,
           text: effectiveText,
           staged_at: Date.now(),
+          suggested_slug: cachedBranchDetection?.suggested_slug ?? (isAuthFlowContext ? 'anthropic_oauth_code' : 'secret'),
         })
+        await switchroomReply(
+          ctx,
+          '🔒 auth-flow secret detected. we deleted it from chat. tap below to save it to the vault — no re-paste needed.',
+          { html: true, reply_markup: buildDeferredSecretKeyboard(dKey) },
+        )
         return
       } else if (pipeRes.ambiguous.length > 0) {
         for (const d of pipeRes.ambiguous) {
@@ -2503,28 +2546,40 @@ async function handleInbound(
         // user confirm first.
       }
     } else {
-      // No passphrase cached — detect, but defer. Tell the user once per
-      // message so they can /vault unlock and re-paste.
+      // No passphrase cached — detect, but defer. Issue #44 turned this
+      // into a one-tap unlock-and-save flow: previously the user had to
+      // run `/vault list`, type their passphrase, then re-paste the
+      // original secret (six steps for a non-technical user). Now they
+      // tap a button and re-enter the passphrase exactly once.
       const detections = detectSecrets(effectiveText)
-      const hasHigh = detections.some((d) => d.confidence === 'high' && !d.suppressed) || isAuthFlowContext
+      const highConfDetection = detections.find((d) => d.confidence === 'high' && !d.suppressed)
+      const hasHigh = highConfDetection !== undefined || isAuthFlowContext
       if (hasHigh) {
         if (isAuthFlowContext) {
           awaitingAuthCodeAt.delete(chat_id) // consume: one message per prompt
         }
-        deferredSecrets.set(deferredKey(chat_id, msgId ?? 0), {
+        // Capture the slug at defer-time so the post-unlock auto-write
+        // doesn't have to re-detect (which has a degenerate case for
+        // Channel-B context defers where no pattern fired).
+        const suggestedSlug =
+          highConfDetection?.suggested_slug
+          ?? (isAuthFlowContext ? 'anthropic_oauth_code' : 'secret')
+        const dKey = deferredKey(chat_id, msgId ?? 0)
+        deferredSecrets.set(dKey, {
           chat_id,
           original_message_id: msgId ?? 0,
           text: effectiveText,
           staged_at: Date.now(),
+          suggested_slug: suggestedSlug,
         })
-        await switchroomReply(
-          ctx,
-          '⚠️ detected a secret but no vault passphrase is cached — run <code>/vault list</code> to unlock, then re-paste. this message was NOT stored.',
-          { html: true },
-        )
         if (msgId != null) {
           try { await bot.api.deleteMessage(chat_id, msgId) } catch {}
         }
+        await switchroomReply(
+          ctx,
+          '🔒 caught a secret. we deleted it from chat. tap below to unlock the vault and save it — no re-paste needed.',
+          { html: true, reply_markup: buildDeferredSecretKeyboard(dKey) },
+        )
         return
       }
     }
@@ -3138,6 +3193,35 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
  */
 function buildAuthUrlKeyboard(authorizeUrl: string): InlineKeyboard {
   return new InlineKeyboard().url('🔐 Open Claude auth', authorizeUrl)
+}
+
+/**
+ * Issue #44: inline keyboard offering a one-tap unlock-and-save flow for
+ * a deferred secret. The two buttons fire `vd:` callback_data which the
+ * dispatcher in `bot.on('callback_query:data')` routes to
+ * `handleVaultDeferCallback`.
+ *
+ *   `vd:unlock:<deferKey>` → prompt for passphrase, then auto-write the
+ *                            held secret. Replaces the legacy six-step
+ *                            "/vault list → re-paste" flow.
+ *   `vd:cancel:<deferKey>` → discard the deferred secret without saving.
+ *
+ * `deferKey` is `<chat_id>:<message_id>` (the same key as
+ * `deferredSecrets.set()`). Telegram limits callback_data to 64 bytes;
+ * the prefix + key fits well within that on any realistic chat id.
+ */
+function buildDeferredSecretKeyboard(deferKey: string): InlineKeyboard {
+  const unlockData = `vd:unlock:${deferKey}`
+  const cancelData = `vd:cancel:${deferKey}`
+  if (unlockData.length > 64 || cancelData.length > 64) {
+    process.stderr.write(
+      `telegram gateway: callback_data overflow — deferKey=${deferKey} unlockLen=${unlockData.length} cancelLen=${cancelData.length}\n`,
+    )
+    throw new Error(`callback_data overflow: deferKey too long (${deferKey.length} chars)`)
+  }
+  return new InlineKeyboard()
+    .text('🔓 Unlock vault & save', unlockData)
+    .text('🗑 Discard', cancelData)
 }
 
 async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: string): Promise<void> {
@@ -4020,6 +4104,193 @@ function resolveAgentDirForName(agent: string): string | null {
  *   swap-slot, add-slot — Phase 4c will wire these; for now toast with the
  *                         equivalent CLI command for the user to run manually.
  */
+/**
+ * Issue #44: handle taps on the deferred-secret card's inline buttons.
+ *
+ *   `vd:unlock:<deferKey>` — register a `passphrase-for-deferred` pending
+ *      vault op and edit the card to ask the user for their passphrase.
+ *      The text-handler picks the passphrase up via the existing
+ *      pendingVaultOps intercept and calls `executeDeferredSecretSave`
+ *      to write the held secret directly. No re-paste required.
+ *
+ *   `vd:cancel:<deferKey>` — drop the deferred secret and clear the card.
+ *      The held bytes are evicted from the in-memory `deferredSecrets`
+ *      map (they were never written to disk) so the secret vanishes.
+ *
+ * Authorization mirrors the operator-event callback: only senders on the
+ * configured allowlist get to act on the buttons.
+ */
+async function handleVaultDeferCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  // vd:<action>:<deferKey>. deferKey itself contains a colon (chat:msgId)
+  // so we slice rather than split — only the first two segments are
+  // structural; the rest is the deferKey verbatim.
+  const rest = data.slice('vd:'.length)
+  const colon = rest.indexOf(':')
+  if (colon < 0) {
+    await ctx.answerCallbackQuery({ text: 'Malformed callback.' }).catch(() => {})
+    return
+  }
+  const action = rest.slice(0, colon)
+  const deferKey = rest.slice(colon + 1)
+  const deferred = deferredSecrets.get(deferKey)
+  if (!deferred) {
+    await ctx.answerCallbackQuery({ text: 'This card expired. Re-send the secret.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    return
+  }
+
+  const cardChatId = String(ctx.chat?.id ?? '')
+  const cardMessageId = ctx.callbackQuery.message?.message_id
+
+  if (action === 'cancel') {
+    deferredSecrets.delete(deferKey)
+    await ctx.answerCallbackQuery({ text: 'Discarded.' }).catch(() => {})
+    if (cardMessageId != null) {
+      await ctx
+        .editMessageText('🗑 Discarded — secret was not saved.', {
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    }
+    return
+  }
+
+  if (action === 'unlock') {
+    // If a passphrase is already cached we can skip straight to the write.
+    // Covers the case where the user had unlocked separately between
+    // detection and tap.
+    const cached = vaultPassphraseCache.get(cardChatId)
+    if (cached && cached.expiresAt > Date.now()) {
+      await ctx.answerCallbackQuery({ text: 'Saving…' }).catch(() => {})
+      await executeDeferredSecretSave(ctx, deferKey, cached.passphrase, cardMessageId)
+      return
+    }
+
+    if (cardMessageId == null) {
+      await ctx.answerCallbackQuery({ text: 'Missing card context.' }).catch(() => {})
+      return
+    }
+    pendingVaultOps.set(cardChatId, {
+      kind: 'passphrase-for-deferred',
+      deferKey,
+      cardChatId,
+      cardMessageId,
+      startedAt: Date.now(),
+    })
+    await ctx.answerCallbackQuery({ text: 'Send your passphrase…' }).catch(() => {})
+    await ctx
+      .editMessageText(
+        '🔐 Send your vault passphrase as your next message — we\'ll save the held secret automatically and delete the passphrase message.',
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+    return
+  }
+
+  await ctx.answerCallbackQuery({ text: 'Unknown action.' }).catch(() => {})
+}
+
+/**
+ * Issue #44: write a deferred secret to the vault using the now-cached
+ * passphrase. Confirms with a masked ref + slug; matches the "captured
+ * N secret" UX of the cached-passphrase happy path so the user
+ * experience is identical regardless of which path they came in on.
+ *
+ * Called from two places:
+ *   - The `passphrase-for-deferred` branch of the text-handler
+ *     pendingVaultOps intercept, after the passphrase is verified.
+ *   - The `vd:unlock` callback handler when a passphrase happens to
+ *     already be cached (rare but possible).
+ *
+ * If write fails, the deferred entry is preserved so the user can retry.
+ */
+async function executeDeferredSecretSave(
+  ctx: Context,
+  deferKey: string,
+  passphrase: string,
+  cardMessageId: number | undefined,
+): Promise<void> {
+  const deferred = deferredSecrets.get(deferKey)
+  if (!deferred) {
+    if (cardMessageId != null) {
+      await ctx.api
+        .editMessageText(
+          deferKey.split(':')[0]!,
+          cardMessageId,
+          '⚠️ This card expired before unlock — please re-send the secret.',
+          { reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // De-duplicate suggested_slug against existing vault keys by appending
+  // _2 / _3 / … if needed. Same logic as the cached-passphrase happy
+  // path uses (gateway.ts ~L2402 stash command).
+  const slugBase = deferred.suggested_slug || 'secret'
+  const listed = defaultVaultList(passphrase)
+  const existing = new Set(listed.ok ? listed.keys : [])
+  let slug = slugBase
+  let n = 2
+  while (existing.has(slug)) slug = `${slugBase}_${n++}`
+
+  const write = defaultVaultWrite(slug, deferred.text, passphrase)
+  if (!write.ok) {
+    // Keep the deferred entry so the user can retry by tapping again.
+    if (cardMessageId != null) {
+      await ctx.api
+        .editMessageText(
+          deferred.chat_id,
+          cardMessageId,
+          `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>\n\nRe-tap to retry.`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: buildDeferredSecretKeyboard(deferKey).inline_keyboard.length > 0
+              ? buildDeferredSecretKeyboard(deferKey)
+              : undefined,
+          },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  deferredSecrets.delete(deferKey)
+  const masked = maskToken(deferred.text)
+  if (cardMessageId != null) {
+    await ctx.api
+      .editMessageText(
+        deferred.chat_id,
+        cardMessageId,
+        `✅ stored as <code>vault:${slug}</code> (masked: <code>${masked}</code>)\n\nReply <code>rename NEW_NAME</code> to relabel.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  // Stage for follow-up rename, mirroring the cached-passphrase path.
+  secretStaging.set({
+    chat_id: deferred.chat_id,
+    message_id: deferred.original_message_id,
+    detection: {
+      rule_id: 'deferred',
+      matched_text: deferred.text,
+      start: 0,
+      end: deferred.text.length,
+      confidence: 'high' as const,
+      suppressed: false,
+      suggested_slug: slug,
+    },
+    staged_at: Date.now(),
+  })
+}
+
 async function handleOperatorEventCallback(ctx: Context, data: string): Promise<void> {
   const senderId = String(ctx.from?.id ?? '')
   const access = loadAccess()
@@ -4477,6 +4748,14 @@ bot.on('callback_query:data', async ctx => {
   // Actions: dismiss, restart, reauth, swap-slot, add-slot, logs.
   if (data.startsWith('op:')) {
     await handleOperatorEventCallback(ctx, data)
+    return
+  }
+
+  // vd:<action>:<deferKey> callbacks from the deferred-secret card.
+  // Actions: unlock (prompt for passphrase + auto-write), cancel.
+  // Issue #44.
+  if (data.startsWith('vd:')) {
+    await handleVaultDeferCallback(ctx, data)
     return
   }
 
