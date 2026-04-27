@@ -46,6 +46,13 @@ set -euo pipefail
 : "${LIVENESS_GRACE_SECS:=30}"            # liveness file mtime must be recent before we treat bridge as dead
 : "${JOURNAL_SILENCE_SECS:=600}"          # seconds of journal silence before suspecting a hang
 : "${JOURNAL_SILENCE_HARD_SECS:=600}"     # seconds the silence_since marker must predate before restarting
+# Recent-activity gate: only treat journal-silence as suspect-hang when the
+# agent had ANY log activity within this window. Distinguishes "hung mid-task"
+# (last log moments ago, then silence) from "genuinely idle" (no logs in
+# hours/days — agent waiting for the next user message). Default 1h: long
+# enough to span a normal session but short enough that a long overnight idle
+# doesn't get falsely flagged.
+: "${RECENT_ACTIVITY_WINDOW_SECS:=3600}"
 
 # Per-agent watchdog state lives under /run/user/$UID/switchroom-watchdog/
 # (tmpfs, cleared on logout — correct: we don't want stale silence markers
@@ -347,8 +354,24 @@ for agent_svc in "${agent_services[@]}"; do
     continue
   fi
 
-  # Journal has been silent for >= JOURNAL_SILENCE_SECS. Record the
-  # first observation so we can require sustained silence.
+  # Recent-activity gate: only suspect a hang if the agent had log activity
+  # within RECENT_ACTIVITY_WINDOW_SECS. A genuinely idle agent (e.g. a
+  # personal agent that hasn't received a message in hours/days) has its
+  # latest journal entry far in the past — restarting it would just churn
+  # state for no reason. A hung agent, by contrast, was active before
+  # freezing, so its most recent entry is recent (within the window).
+  #
+  # Implementation: if `journal_age >= RECENT_ACTIVITY_WINDOW_SECS`, the
+  # latest entry is older than the window, so by definition there's no
+  # activity inside it. Treat as idle — clear any stale marker and skip.
+  if [[ "$journal_age" -ge "$RECENT_ACTIVITY_WINDOW_SECS" ]]; then
+    rm -f "$silence_marker" 2>/dev/null || true
+    continue
+  fi
+
+  # Journal has been silent for >= JOURNAL_SILENCE_SECS but the agent had
+  # activity within RECENT_ACTIVITY_WINDOW_SECS. Record the first
+  # observation so we can require sustained silence.
   if [[ -f "$silence_marker" ]]; then
     silence_since="$(cat "$silence_marker" 2>/dev/null || echo "$now")"
     if ! [[ "$silence_since" =~ ^[0-9]+$ ]]; then
