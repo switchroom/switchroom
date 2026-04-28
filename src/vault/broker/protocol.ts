@@ -204,7 +204,40 @@ export function errorResponse(code: ErrorCode, msg: string): ErrorResponse {
 
 /**
  * Build a typed entry response object (not framed).
+ *
+ * #8 review-fix: strip the `scope` field before sending. The `scope`
+ * allow/deny lists describe the ENTRY'S TRUST TOPOLOGY (which other
+ * agents are permitted, which are denied). A successful `get` should
+ * deliver the value, not the topology — the recipient gaining knowledge
+ * of who else has access is an information disclosure.
+ *
+ * The Zod `VaultEntrySchema` strips `scope` on the client-side
+ * `decodeResponse` parse, so a typed caller's returned object never
+ * sees it. But the WIRE BYTES still contain it without this strip —
+ * any strace, socket tap, or future debug-log reader would see the
+ * full topology. Strip at the source.
  */
 export function entryResponse(entry: VaultEntry): OkEntryResponse {
-  return { ok: true, entry };
+  const stripped = stripWireFields(entry);
+  return { ok: true, entry: stripped };
+}
+
+/**
+ * Project a VaultEntry to the fields appropriate for the wire response.
+ * Drops `scope` (server-side ACL metadata, not for the recipient) and
+ * preserves the discriminated union over `kind`.
+ */
+function stripWireFields(entry: VaultEntry): VaultEntry {
+  if (entry.kind === "string" || entry.kind === "binary") {
+    return {
+      kind: entry.kind,
+      value: entry.value,
+      ...(entry.format !== undefined ? { format: entry.format } : {}),
+    };
+  }
+  // files
+  return {
+    kind: "files",
+    files: entry.files,
+  };
 }

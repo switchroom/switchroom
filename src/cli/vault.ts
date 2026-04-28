@@ -267,6 +267,37 @@ export function registerVaultCommand(program: Command): void {
               .map((s) => s.trim())
               .filter((s) => s.length > 0);
           }
+
+          // #8 review-fix: warn (don't error) on agent names that don't match
+          // any agent in switchroom.yaml. Operator typos like `--allow clerks`
+          // (instead of `clerk`) would otherwise silently lock out the
+          // intended agent — discoverable only by reading the audit log
+          // looking for `denied:scope-allow` with the wrong slug. A warning
+          // here catches the common case at write time.
+          //
+          // Non-fatal: a future agent name that doesn't exist yet is a
+          // legitimate use case (you can scope an entry for an agent you're
+          // about to add). Don't reject; nudge.
+          try {
+            const config = loadConfig();
+            const knownAgents = new Set(Object.keys(config.agents ?? {}));
+            const unknown: string[] = [];
+            for (const name of [...(scope.allow ?? []), ...(scope.deny ?? [])]) {
+              if (!knownAgents.has(name)) unknown.push(name);
+            }
+            if (unknown.length > 0) {
+              console.error(
+                chalk.yellow(
+                  `⚠️  Unknown agent name(s) in scope: ${unknown.join(", ")}. ` +
+                  `Known agents: ${[...knownAgents].sort().join(", ") || "(none)"}. ` +
+                  `Continuing — but verify this isn't a typo.`,
+                ),
+              );
+            }
+          } catch {
+            // loadConfig may fail in test contexts or before setup. Don't
+            // block the secret-set on a config-load problem.
+          }
         }
 
         setStringSecret(passphrase, vaultPath, key, value, formatHint, scope);
