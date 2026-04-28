@@ -94,6 +94,15 @@ export interface SubAgentState {
   readonly finishedAt?: number
   readonly toolCount: number
   /**
+   * Monotonically-increasing version counter bumped only on milestone
+   * transitions: sub-agent started, finished (done/failed). NOT bumped
+   * on per-tool ticks (sub_agent_tool_use, sub_agent_tool_result,
+   * sub_agent_text). The render layer uses this to avoid re-rendering
+   * the `<blockquote expandable>` section on every throttle tick, which
+   * would re-collapse the user's expanded view.
+   */
+  readonly milestoneVersion: number
+  /**
    * The first user-message text from the sub-agent's JSONL — kept so the
    * reverse-race adoption path (orphan first, parent later) can match
    * against incoming pendingAgentSpawns entries.
@@ -475,7 +484,13 @@ export function reduce(
         for (const [agentId, sa] of subAgents) {
           if (sa.parentToolUseId === event.toolUseId) {
             const next = new Map(subAgents)
-            next.set(agentId, { ...sa, state: nextState, finishedAt: now })
+            // Bump milestoneVersion — parent tool_result is a milestone transition.
+            next.set(agentId, {
+              ...sa,
+              state: nextState,
+              finishedAt: now,
+              milestoneVersion: (sa.milestoneVersion ?? 0) + 1,
+            })
             subAgents = next
             break
           }
@@ -531,6 +546,7 @@ export function reduce(
         toolCount: 0,
         firstPromptText: event.firstPromptText,
         nestedSpawnCount: 0,
+        milestoneVersion: 1,
       }
       const subAgents = new Map(state.subAgents)
       subAgents.set(event.agentId, sub)
@@ -628,8 +644,15 @@ export function reduce(
       // If it later arrives with isError=true, the tool_result case
       // overrides this 'done' with 'failed'. Clear any lingering
       // pendingPreamble defensively — mirrors the parent turn_end path.
+      // Bump milestoneVersion — this is a milestone transition.
       const next = new Map(state.subAgents)
-      next.set(event.agentId, { ...sa, state: 'done', finishedAt: now, pendingPreamble: null })
+      next.set(event.agentId, {
+        ...sa,
+        state: 'done',
+        finishedAt: now,
+        pendingPreamble: null,
+        milestoneVersion: (sa.milestoneVersion ?? 0) + 1,
+      })
       return { ...state, subAgents: next }
     }
 
@@ -726,11 +749,11 @@ function extractUserText(raw: string): string {
 /**
  * Render a single checklist line body: tool name + a short label hint.
  *
- * Format: `<tool> <label>` (space-separated, no code-span wrapping) so the
- * line reads like a natural sentence — "Read MANIFEST.md", "Grep "foo" (in
- * src/)", "Bash git status". The sub-agent `Agent` tool uses a colon
- * separator ("Agent: <description>") because the description tends to be
- * a full phrase, not a filename.
+ * Format: `<code>tool</code> <code>label</code>` — both tool name and
+ * target argument use fixed-width formatting for scanability on mobile
+ * narrow screens. The sub-agent `Agent` tool uses a colon separator
+ * ("Agent: <description>") because the description is a phrase, not a
+ * filename.
  *
  * `running` items bold the tool name so the eye jumps to the line that's
  * currently in flight.
@@ -755,10 +778,10 @@ function renderItemCore(
   if ((tool.startsWith('mcp__') || humanAuthored) && label) {
     return bold ? `<b>${escapeHtml(label)}</b>` : escapeHtml(label)
   }
-  const toolHtml = bold ? `<b>${escapeHtml(tool)}</b>` : escapeHtml(tool)
+  const toolHtml = bold ? `<b><code>${escapeHtml(tool)}</code></b>` : `<code>${escapeHtml(tool)}</code>`
   if (!label) return toolHtml
   const separator = tool === 'Agent' || tool === 'Task' ? ': ' : ' '
-  return `${toolHtml}${separator}${escapeHtml(label)}`
+  return `${toolHtml}${separator}<code>${escapeHtml(label)}</code>`
 }
 
 /**
@@ -858,12 +881,39 @@ export interface RenderOptions {
  */
 export const STUCK_THRESHOLD_MS = 2 * 60_000
 
-export function render(state: ProgressCardState, now: number, taskNum?: TaskNum, opts?: RenderOptions): string {
+/**
+ * Cache entry for a sub-agent's `<blockquote expandable>` section. The
+ * driver holds one of these per sub-agent and passes the whole map to
+ * render() on each flush. When the sub-agent's `milestoneVersion` hasn't
+ * changed, render() reuses the cached HTML instead of re-building it —
+ * this prevents the edit from touching the expandable section, so the
+ * user's expanded view survives per-tool throttle ticks.
+ */
+export interface ExpandableCacheEntry {
+  milestoneVersion: number
+  html: string
+}
+
+/** Keyed by agentId. */
+export type ExpandableCache = Map<string, ExpandableCacheEntry>
+
+export function render(
+  state: ProgressCardState,
+  now: number,
+  taskNum?: TaskNum,
+  opts?: RenderOptions,
+  expandableCache?: ExpandableCache,
+): string {
   if (state.turnStartedAt === 0) {
     return `${STEP_PENDING} Waiting…`
   }
 
-  const lines: string[] = []
+  // Header line — rendered OUTSIDE the blockquote so it anchors the card
+  // above the indented body. The header carries the status icon, elapsed
+  // time, and task counter; everything after it is body content.
+  const headerLines: string[] = []
+  // Body lines — will be wrapped in <blockquote> below.
+  const bodyLines: string[] = []
 
   const elapsed = formatDuration(now - state.turnStartedAt)
   // "Truly done" = parent turn_end fired AND no sub-agents of any kind
@@ -890,7 +940,7 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     headerLabel = 'Working…'
   }
   const taskSuffix = taskNum && taskNum.total > 1 ? ` (${taskNum.index}/${taskNum.total})` : ''
-  lines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
+  headerLines.push(`${headerIcon} <b>${headerLabel}${taskSuffix}</b> · ⏱ ${elapsed}`)
 
   // (#156) The user's request used to render here as an inline
   // <blockquote>. That was a styled element only — Telegram clients
@@ -902,7 +952,7 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     // Diagnostic hint shown only on silent-end turns. Distinct from the
     // "stuck" warning (which fires while the turn is still active) — this
     // tells the user what happened and what to try next.
-    lines.push(
+    bodyLines.push(
       `<i>⚠️ Agent ran tools but didn't send a reply. Try /restart or rephrase your message.</i>`,
     )
   } else if (replyNotDelivered) {
@@ -910,7 +960,7 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     // never landed — likely an MCP bridge stream tear-down between
     // tool-acceptance and final flush. Different remediation than
     // silent-end: a /restart is more likely to recover than a rephrase.
-    lines.push(
+    bodyLines.push(
       `<i>⚠️ Reply tool was called but the message never delivered. Try /restart — likely a transient bridge issue.</i>`,
     )
   }
@@ -927,7 +977,7 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
     opts.stuckMs >= STUCK_THRESHOLD_MS
   ) {
     const gap = formatDuration(opts.stuckMs)
-    lines.push(`⚠️ <i>No events for ${gap} — likely stuck.</i>`)
+    bodyLines.push(`⚠️ <i>No events for ${gap} — likely stuck.</i>`)
   }
 
   const multiAgentActive =
@@ -937,51 +987,70 @@ export function render(state: ProgressCardState, now: number, taskNum?: TaskNum,
   const hasNarratives = state.narratives.length > 0
 
   if (hasNarratives) {
-    lines.push('')
-    renderNarrativeChecklist(state.narratives, now, lines)
+    bodyLines.push('')
+    renderNarrativeChecklist(state.narratives, now, bodyLines)
   } else if (state.items.length > 0) {
-    lines.push('')
+    bodyLines.push('')
     if (multiAgentActive) {
-      lines.push(`[Main · ${state.items.length} tools]`)
+      bodyLines.push(`[<u>Main</u> · <u>${state.items.length} tools</u>]`)
     }
     const compacted = compactItems(state.items)
     const visible = applyVisibleCap(compacted)
     if (visible.overflowCount > 0) {
-      lines.push(`<i>(+${visible.overflowCount} earlier)</i>`)
+      bodyLines.push(`<i>(+${visible.overflowCount} earlier)</i>`)
     }
     for (const item of visible.items) {
-      lines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
-    }
-  }
-
-  if (multiAgentActive && state.subAgents.size > 0) {
-    lines.push('')
-    const counts = countSubAgentStates(state.subAgents)
-    lines.push(`[Sub-agents · ${formatSubAgentCounts(counts)}]`)
-    for (const sa of sortSubAgentsChrono(state.subAgents)) {
-      // forceCollapse only when TRULY done — during deferred-completion
-      // (parent ended but sub-agents still running), keep running
-      // sub-agents in the two-line running block so their ticking
-      // elapsed-time stays visible. When trulyDone is reached the
-      // reducer has already marked every sub-agent as done/failed, so
-      // this arg is effectively moot in that branch.
-      for (const l of renderSubAgent(sa, now, trulyDone)) {
-        lines.push(l)
-      }
+      bodyLines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
     }
   }
 
   if (state.stage !== 'done') {
     if (state.thinking) {
-      lines.push('')
-      lines.push(`${STEP_ACTIVE} <i>Thinking…</i>`)
+      bodyLines.push('')
+      bodyLines.push(`${STEP_ACTIVE} <i>Thinking…</i>`)
     } else if (!hasNarratives && state.latestText) {
-      lines.push('')
-      lines.push(`💭 <i>${escapeHtml(truncate(state.latestText.trim(), 160))}</i>`)
+      bodyLines.push('')
+      bodyLines.push(`💭 <i>${escapeHtml(truncate(state.latestText.trim(), 160))}</i>`)
     }
   }
 
-  return lines.join('\n')
+  // Build the main card: header + body wrapped in <blockquote>.
+  const bodyText = bodyLines.join('\n').trimStart()
+  const mainCard = bodyText
+    ? `${headerLines.join('\n')}\n<blockquote>${bodyText}</blockquote>`
+    : headerLines.join('\n')
+
+  // Sub-agent expandable sections — one <blockquote expandable> per agent,
+  // appended after the main </blockquote>. Each section is independently
+  // expandable by the user. To avoid re-collapsing the user's expanded view
+  // on every throttle tick, we only re-render a section when the agent's
+  // milestoneVersion has changed (start / finish / fail). Per-tool ticks
+  // don't bump milestoneVersion, so the expandable HTML is reused as-is.
+  const expandableParts: string[] = []
+  if (multiAgentActive && state.subAgents.size > 0) {
+    for (const sa of sortSubAgentsChrono(state.subAgents)) {
+      const cached = expandableCache?.get(sa.agentId)
+      let expandableHtml: string
+      if (cached && cached.milestoneVersion === sa.milestoneVersion) {
+        // Milestone unchanged — reuse cached HTML to preserve user's
+        // expanded/collapsed state across throttle-tick edits.
+        expandableHtml = cached.html
+      } else {
+        expandableHtml = renderSubAgentExpandable(sa, now, trulyDone)
+        // Update the cache entry so the driver can persist it.
+        if (expandableCache) {
+          expandableCache.set(sa.agentId, {
+            milestoneVersion: sa.milestoneVersion,
+            html: expandableHtml,
+          })
+        }
+      }
+      expandableParts.push(expandableHtml)
+    }
+  }
+
+  const parts = [mainCard, ...expandableParts]
+  return parts.join('\n')
 }
 
 function renderNarrativeChecklist(
@@ -1011,7 +1080,7 @@ function renderNarrativeChecklist(
         lines.push(`${STEP_ACTIVE} <b>${escapeHtml(step.text)}</b> <i>(${dur})</i>`)
       }
     } else {
-      lines.push(`${STEP_DONE} ${escapeHtml(step.text)}`)
+      lines.push(`${STEP_DONE} <s>${escapeHtml(step.text)}</s>`)
     }
   }
 }
@@ -1197,6 +1266,76 @@ function renderSubAgent(
     ]
   }
   return [headerLine, `     └ 💭 <i>thinking…</i> · ${sa.toolCount} tools`]
+}
+
+/**
+ * Render a sub-agent as a `<blockquote expandable>` section. Default-collapsed,
+ * showing `📂 #<agentId> <description>` in the header. Tap to expand the full
+ * tool stream.
+ *
+ * Only called on milestone transitions (start/finish/fail) via the
+ * milestoneVersion gate in render(). Per-tool ticks reuse the cached HTML so
+ * the user's expanded/collapsed state is not disturbed.
+ *
+ * Order: appended after the main `</blockquote>`, sorted by startedAt (stable).
+ */
+function renderSubAgentExpandable(
+  sa: SubAgentState,
+  now: number,
+  forceCollapse: boolean,
+): string {
+  const desc = subAgentDisplayDescription(sa)
+  const truncDesc = truncate(desc, 60)
+  const typeSuffix = sa.subagentType && sa.subagentType !== desc
+    ? ` · ${escapeHtml(sa.subagentType)}`
+    : ''
+  const spawnedSuffix = sa.nestedSpawnCount > 0
+    ? ` <i>(spawned ${sa.nestedSpawnCount})</i>`
+    : ''
+
+  // Collapsed header line: state emoji + agent id + description
+  let stateEmoji: string
+  if (sa.state === 'failed') {
+    stateEmoji = STEP_FAILED
+  } else if (sa.state === 'done' || forceCollapse) {
+    stateEmoji = STEP_DONE
+  } else {
+    stateEmoji = '🤖'
+  }
+
+  const headerLine = `${stateEmoji} 📂 #${escapeHtml(sa.agentId)} <b>${escapeHtml(truncDesc)}</b>${typeSuffix}${spawnedSuffix}`
+
+  // Inner body: tool stream details
+  const innerLines: string[] = []
+
+  // Stats line
+  const end = sa.finishedAt ?? now
+  const elapsed = formatDuration(end - sa.startedAt)
+  if (sa.state !== 'running' || forceCollapse) {
+    innerLines.push(`${STEP_DONE} ${sa.toolCount} tools · ${elapsed}`)
+  } else {
+    innerLines.push(`🤖 <b>${escapeHtml(truncDesc)}</b>${typeSuffix} · ⏱ ${elapsed}${spawnedSuffix}`)
+    // Activity line
+    if (sa.currentTool) {
+      const cur = sa.currentTool
+      const curDur = formatDuration(now - cur.startedAt)
+      innerLines.push(`${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label, false, cur.humanAuthored)} <i>(${curDur})</i>`)
+    } else if (sa.pendingPreamble && sa.pendingPreamble.length > 0) {
+      const preambleLine = sa.pendingPreamble.split('\n')[0].trim()
+      if (preambleLine.length > 0) {
+        innerLines.push(`🤔 <i>${escapeHtml(truncate(preambleLine, 80))}</i>`)
+      }
+    } else if (sa.lastCompletedTool) {
+      const last = sa.lastCompletedTool
+      innerLines.push(`✓ <i>just finished</i> ${renderItemCore(last.tool, last.label, false, last.humanAuthored)}`)
+    } else {
+      innerLines.push(`💭 <i>thinking…</i>`)
+    }
+    innerLines.push(`${sa.toolCount} tools total`)
+  }
+
+  const innerBody = innerLines.join('\n')
+  return `<blockquote expandable>${headerLine}\n${innerBody}</blockquote>`
 }
 
 /**

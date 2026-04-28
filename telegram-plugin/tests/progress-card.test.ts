@@ -294,7 +294,7 @@ describe('progress-card render', () => {
   it('renders running item with elapsed time (tool name bolded)', () => {
     const s = fold([enqueue('test'), { kind: 'tool_use', toolName: 'Bash' }])
     const out = render(s, 3200)
-    expect(out).toContain('◉ <b>Bash</b>')
+    expect(out).toContain('◉ <b><code>Bash</code></b>')
     expect(out).toContain('(00:02)')
   })
 
@@ -305,7 +305,7 @@ describe('progress-card render', () => {
       { kind: 'tool_result', toolUseId: 'x', toolName: 'Read' },
     ])
     const out = render(s, 1300)
-    expect(out).toContain('● Read')
+    expect(out).toContain('● <code>Read</code>')
     expect(out).not.toContain('(00:00)')
   })
 
@@ -314,7 +314,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Bash' }, 1100)
     st = reduce(st, { kind: 'tool_result', toolUseId: 'x', toolName: 'Bash' }, 4200)
     const out = render(st, 4300)
-    expect(out).toContain('● Bash')
+    expect(out).toContain('● <code>Bash</code>')
     expect(out).toContain('(00:03)')
   })
 
@@ -340,7 +340,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1800)
     const out = render(st, 2000)
     expect(out).not.toContain('×5')
-    expect(out).toContain('◉ <b>Read</b>')
+    expect(out).toContain('◉ <b><code>Read</code></b>')
   })
 
   it('does NOT roll up mixed tools', () => {
@@ -471,7 +471,7 @@ describe('progress-card render', () => {
     expect(render(st, 1500)).toContain('⚙️ <b>Working…</b>')
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1500)
     expect(render(st, 1600)).toContain('⚙️ <b>Working…</b>')
-    expect(render(st, 1600)).toContain('◉ <b>Read</b>')
+    expect(render(st, 1600)).toContain('◉ <b><code>Read</code></b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
     const done = render(st, 1700)
     expect(done).toContain('✅ <b>Done</b>')
@@ -483,7 +483,7 @@ describe('progress-card render', () => {
     // Text events now create narrative steps; thought bubble suppressed when narratives exist
     expect(render(st, 1500)).toContain('◉ <b>thinking…</b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
-    expect(render(st, 1700)).toContain('● thinking…')
+    expect(render(st, 1700)).toContain('● <s>thinking…</s>')
     expect(render(st, 1700)).not.toContain('💭')
   })
 
@@ -515,7 +515,7 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Edit' }, 2100)
     const out = render(st, 3000)
     // Narrative steps are primary — no tool names visible
-    expect(out).toContain('● Let me check the test files')
+    expect(out).toContain('● <s>Let me check the test files</s>')
     expect(out).toContain('◉ <b>Found the issue in merge.ts</b>')
     expect(out).not.toContain('Read')
     expect(out).not.toContain('Edit')
@@ -525,7 +525,7 @@ describe('progress-card render', () => {
     let st = reduce(initialState(), enqueue('test'), 1000)
     st = reduce(st, { kind: 'tool_use', toolName: 'Read' }, 1100)
     const out = render(st, 2000)
-    expect(out).toContain('◉ <b>Read</b>')
+    expect(out).toContain('◉ <b><code>Read</code></b>')
     expect(out).not.toContain('●')
   })
 
@@ -996,7 +996,7 @@ describe('progress-card reducer — multi-agent correlation', () => {
     }
   })
 
-  it('flag-on renderer adds [Main]/[Sub-agents] sections with chrono ordering and subagent_type', () => {
+  it('flag-on renderer adds [Main] section and sub-agent expandables with chrono ordering and subagent_type', () => {
     process.env.PROGRESS_CARD_MULTI_AGENT = '1'
     try {
       let st = fold([
@@ -1018,21 +1018,20 @@ describe('progress-card reducer — multi-agent correlation', () => {
       st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P2' }, 5000)
       st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P1' }, 5100)
       const html = render(st, 6000)
-      expect(html).toContain('[Main · 2 tools]')
-      expect(html).toContain('[Sub-agents · 2 running]')
+      // Main section uses underline formatting
+      expect(html).toContain('[<u>Main</u> · <u>2 tools</u>]')
+      // Sub-agents are now in <blockquote expandable> blocks (no inline [Sub-agents] header)
+      expect(html).not.toContain('[Sub-agents')
+      expect(html).toContain('<blockquote expandable>')
+      // Both sub-agents appear somewhere in the HTML
       expect(html).toContain('design ux')
       expect(html).toContain('audit')
       expect(html).toContain('researcher')
       expect(html).toContain('worker')
-      // Chrono order: B started first (5000) so it should appear before A (5100)
-      const idxB = html.indexOf('audit')
-      const idxA = html.indexOf('design ux')
-      // 'design ux' also appears in [Main]; find inside [Sub-agents]
-      const subSection = html.slice(html.indexOf('[Sub-agents'))
-      const subB = subSection.indexOf('audit')
-      const subA = subSection.indexOf('design ux')
-      expect(subB).toBeLessThan(subA)
-      void idxA; void idxB
+      // Chrono order: B started first (5000) so its expandable appears before A's (5100)
+      const idxAudit = html.indexOf('audit')
+      const idxDesignUx = html.lastIndexOf('design ux') // use last — [Main] also has it
+      expect(idxAudit).toBeLessThan(idxDesignUx)
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
     }
