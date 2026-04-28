@@ -50,6 +50,7 @@ const rateLimitedResult: ProbeResult = {
   status: 'ok',
   label: 'Quota',
   detail: 'quota check skipped: rate limited',
+  rateLimited: true,
 }
 
 const degradedSchemaUnknown: ProbeResult = {

@@ -28,6 +28,11 @@ export interface ProbeResult {
   status: ProbeStatus
   label: string
   detail: string
+  /** True when a 429 caused the probe to skip the live check. Used by
+   *  writeQuotaCache to select the short RATE_LIMIT_TTL_MS instead of the
+   *  default 5-min TTL. Keying off this boolean avoids matching on the
+   *  user-facing detail string, which is a maintenance trap. */
+  rateLimited?: boolean
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -279,9 +284,14 @@ export async function probeAgentProcess(
       const elapsedMs = Date.now() - startMs
       if (elapsedMs >= retryMaxMs) {
         // Committed to the current non-active state.
-        // `deactivating` is an unambiguous transient — honest severity is
-        // degraded (🟡), not fail (🔴). Any other non-active state is fail.
-        const status = state === 'deactivating' ? 'degraded' : 'fail'
+        // `deactivating`, `activating`, and `auto-restart` are unambiguous
+        // transients — honest severity is degraded (🟡), not fail (🔴).
+        // Any other non-active state (inactive, failed, …) is a hard fail.
+        const isTransient =
+          state === 'deactivating' ||
+          state === 'activating' ||
+          state === 'auto-restart'
+        const status = isTransient ? 'degraded' : 'fail'
         return { status, label: 'Agent', detail: `service ${state}` }
       }
 
@@ -382,10 +392,15 @@ export async function probeQuota(
       // reported in #210. Return ok-with-note and cache it for 30 s so
       // simultaneous fleet restarts read the cached result instead of piling
       // up on the same endpoint (see quota-cache.ts: RATE_LIMIT_TTL_MS).
+      //
+      // We assume 429 from /api/oauth/usage signals endpoint rate-limiting,
+      // not quota exhaustion. Anthropic uses 403 / 200-with-flag for the
+      // latter today; if that changes, revisit this 🟢 mapping.
       const rateLimitResult: ProbeResult = {
         status: 'ok',
         label: 'Quota',
         detail: 'quota check skipped: rate limited',
+        rateLimited: true,
       }
       writeQuotaCache(rateLimitResult)
       return rateLimitResult

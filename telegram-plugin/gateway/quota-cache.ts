@@ -80,7 +80,7 @@ export function readQuotaCache(opts: {
  * Write a probe result to the cache.
  *
  * Normal results (ok / degraded non-rate-limit) use the standard 5-min TTL.
- * A 429 "quota check skipped: rate limited" result uses the short
+ * A result with `rateLimited: true` (HTTP 429) uses the short
  * RATE_LIMIT_TTL_MS (30 s) so back-to-back fleet restarts read the cached
  * 'ok' row instead of piling up on the endpoint, while still clearing fast
  * enough for any real next-boot probe to see a live result.
@@ -105,8 +105,9 @@ export function writeQuotaCache(
   const path = opts.path ?? DEFAULT_CACHE_PATH
   // Rate-limit results use a shorter TTL: long enough to absorb a fleet
   // restart burst, short enough that subsequent boots get a live probe.
-  const isRateLimit = result.detail === 'quota check skipped: rate limited'
-  const ttlMs = opts.ttlMs ?? (isRateLimit ? RATE_LIMIT_TTL_MS : DEFAULT_TTL_MS)
+  // Use the structured `rateLimited` field rather than string-matching on
+  // `detail` — the detail string is user-facing and may change.
+  const ttlMs = opts.ttlMs ?? (result.rateLimited ? RATE_LIMIT_TTL_MS : DEFAULT_TTL_MS)
   const now = opts.now ?? Date.now()
 
   const entry: QuotaCacheEntry = {

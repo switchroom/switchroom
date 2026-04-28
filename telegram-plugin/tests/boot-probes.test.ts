@@ -112,6 +112,64 @@ describe('probeAgentProcess — #208: deactivating → 🟡 (degraded)', () => {
   })
 })
 
+// ── #247: activating + auto-restart → 🟡 ──────────────────────────────────
+
+describe('probeAgentProcess — #247: activating → 🟡 (degraded)', () => {
+  it('returns degraded when state is activating after budget exhausted', async () => {
+    const result = await probeAgentProcess('testbot', {
+      retryIntervalMs: 0,
+      retryMaxMs: 0,
+      sleepImpl: noopSleep,
+      execFileImpl: makeSequence([makeSystemctlOutput('activating')]),
+    })
+    expect(result.status).toBe('degraded')
+    expect(result.label).toBe('Agent')
+    expect(result.detail).toBe('service activating')
+  })
+
+  it('returns ok if activating resolves to active on retry', async () => {
+    const result = await probeAgentProcess('testbot', {
+      retryIntervalMs: 0,
+      retryMaxMs: 5000,
+      sleepImpl: noopSleep,
+      execFileImpl: makeSequence([
+        makeSystemctlOutput('activating'),
+        makeSystemctlOutput('active'),
+      ]),
+    })
+    expect(result.status).toBe('ok')
+    expect(result.detail).toContain('PID 1234')
+  })
+})
+
+describe('probeAgentProcess — #247: auto-restart → 🟡 (degraded)', () => {
+  it('returns degraded when state is auto-restart after budget exhausted', async () => {
+    const result = await probeAgentProcess('testbot', {
+      retryIntervalMs: 0,
+      retryMaxMs: 0,
+      sleepImpl: noopSleep,
+      execFileImpl: makeSequence([makeSystemctlOutput('auto-restart')]),
+    })
+    expect(result.status).toBe('degraded')
+    expect(result.label).toBe('Agent')
+    expect(result.detail).toBe('service auto-restart')
+  })
+
+  it('returns ok if auto-restart resolves to active on retry', async () => {
+    const result = await probeAgentProcess('testbot', {
+      retryIntervalMs: 0,
+      retryMaxMs: 5000,
+      sleepImpl: noopSleep,
+      execFileImpl: makeSequence([
+        makeSystemctlOutput('auto-restart'),
+        makeSystemctlOutput('active'),
+      ]),
+    })
+    expect(result.status).toBe('ok')
+    expect(result.detail).toContain('PID 1234')
+  })
+})
+
 // ── #208: re-probe loop ────────────────────────────────────────────────────
 
 describe('probeAgentProcess — #208: re-probe loop resolves transient', () => {
@@ -213,15 +271,18 @@ describe('probeQuota — #210: 429 returns ok-with-note', () => {
     expect(result.status).toBe('ok')
     expect(result.label).toBe('Quota')
     expect(result.detail).toBe('quota check skipped: rate limited')
+    // #247: structured field so writeQuotaCache can key TTL off it
+    expect(result.rateLimited).toBe(true)
   })
 
   it('writing 429 ok-result to cache produces a readable 30 s entry', () => {
     // Verify the cache contract: writeQuotaCache stores rate-limit results
-    // with RATE_LIMIT_TTL_MS, and readQuotaCache returns them within TTL.
+    // with RATE_LIMIT_TTL_MS keyed off rateLimited:true, not the detail string.
     const rateLimitResult = {
       status: 'ok' as const,
       label: 'Quota',
       detail: 'quota check skipped: rate limited',
+      rateLimited: true as const,
     }
     const now = Date.now()
     writeQuotaCache(rateLimitResult, { path: cachePath, now })
