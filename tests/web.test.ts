@@ -33,7 +33,7 @@ import {
   handleGetLogs,
   type AgentInfo,
 } from "../src/web/api.js";
-import { isOriginAllowed } from "../src/web/server.js";
+import { isOriginAllowed, isTailscaleIdentified } from "../src/web/server.js";
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { execFileSync } from "node:child_process";
@@ -295,5 +295,73 @@ describe("isOriginAllowed — network bind (--bind 0.0.0.0 or Tailscale IP)", ()
 
   it("allows even a remote-looking origin (token is the boundary)", () => {
     expect(isOriginAllowed(makeRequest("http://remote.example.com"), port, localhostOnly)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isTailscaleIdentified — Tailscale identity header auth
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal Request with optional Tailscale identity headers.
+ * makeServerStub returns a minimal server stub that reports the given source IP.
+ */
+function makeTsRequest(login?: string, extraHeaders?: Record<string, string>): Request {
+  const headers: Record<string, string> = {};
+  if (login !== undefined) headers["Tailscale-User-Login"] = login;
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+  return new Request("http://127.0.0.1:8080/api/agents", { headers });
+}
+
+function makeServerStub(address: string | null): { requestIP(req: Request): { address: string } | null } {
+  return {
+    requestIP(_req: Request) {
+      return address !== null ? { address } : null;
+    },
+  };
+}
+
+describe("isTailscaleIdentified", () => {
+  it("returns true when Tailscale-User-Login is present and source IP is 127.0.0.1", () => {
+    const req = makeTsRequest("ken@example.com");
+    const server = makeServerStub("127.0.0.1");
+    expect(isTailscaleIdentified(req, server)).toBe(true);
+  });
+
+  it("returns true when Tailscale-User-Login is present and source IP is ::1 (IPv6 loopback)", () => {
+    const req = makeTsRequest("ken@example.com");
+    const server = makeServerStub("::1");
+    expect(isTailscaleIdentified(req, server)).toBe(true);
+  });
+
+  it("returns false when Tailscale-User-Login is present but source IP is non-loopback", () => {
+    // Simulates a request from a remote IP with a spoofed identity header.
+    const req = makeTsRequest("ken@example.com");
+    const server = makeServerStub("100.64.0.5");
+    expect(isTailscaleIdentified(req, server)).toBe(false);
+  });
+
+  it("returns false when Tailscale-User-Login is absent even from loopback", () => {
+    const req = makeTsRequest();
+    const server = makeServerStub("127.0.0.1");
+    expect(isTailscaleIdentified(req, server)).toBe(false);
+  });
+
+  it("returns false when Tailscale-User-Login is empty string", () => {
+    const req = makeTsRequest("");
+    const server = makeServerStub("127.0.0.1");
+    expect(isTailscaleIdentified(req, server)).toBe(false);
+  });
+
+  it("returns false when server.requestIP returns null (no source IP info)", () => {
+    const req = makeTsRequest("ken@example.com");
+    const server = makeServerStub(null);
+    expect(isTailscaleIdentified(req, server)).toBe(false);
+  });
+
+  it("returns false when no header and no source IP (both conditions fail)", () => {
+    const req = makeTsRequest();
+    const server = makeServerStub(null);
+    expect(isTailscaleIdentified(req, server)).toBe(false);
   });
 });

@@ -103,6 +103,30 @@ function resolveWebToken(): string {
 }
 
 /**
+ * Returns true when the request carries a Tailscale identity header AND the
+ * connection originates from the loopback interface (127.0.0.1 or ::1).
+ *
+ * Safety rule — trust only from loopback:
+ *   Tailscale's `tailscale serve` daemon injects `Tailscale-User-Login` (and
+ *   related headers) into requests it proxies to the local backend. These
+ *   headers are authoritative ONLY when the request comes from the Tailscale
+ *   daemon itself, which always connects via loopback. If we trusted the header
+ *   from arbitrary remote IPs, any external caller could spoof it and bypass
+ *   the bearer-token check entirely. By requiring source IP to be loopback we
+ *   guarantee the header was injected by the daemon, not a remote attacker.
+ *
+ * Exported for unit-testing; not part of the public API.
+ */
+export function isTailscaleIdentified(req: Request, server: { requestIP(req: Request): { address: string } | null }): boolean {
+  const login = req.headers.get("Tailscale-User-Login");
+  if (!login || login.trim() === "") return false;
+  const ipInfo = server.requestIP(req);
+  if (!ipInfo) return false;
+  const addr = ipInfo.address;
+  return addr === "127.0.0.1" || addr === "::1";
+}
+
+/**
  * Reject requests whose Origin doesn't belong to our own localhost-bound
  * server. Prevents a malicious page the user happens to load in a browser
  * from issuing same-site-ish requests to 127.0.0.1:<port> and piggy-backing
@@ -150,7 +174,16 @@ function extractBearerToken(req: Request): string | null {
   return null;
 }
 
-function checkAuth(req: Request, token: string): Response | null {
+function checkAuth(
+  req: Request,
+  token: string,
+  server: { requestIP(req: Request): { address: string } | null },
+): Response | null {
+  // Tailscale identity header from loopback takes priority over bearer token.
+  // This allows tailnet-authenticated browser sessions (proxied via
+  // `tailscale serve`) to use the dashboard without needing the bearer token.
+  if (isTailscaleIdentified(req, server)) return null;
+
   const presented = extractBearerToken(req);
   if (!presented || !constantTimeEqual(presented, token)) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -161,7 +194,13 @@ function checkAuth(req: Request, token: string): Response | null {
   return null;
 }
 
-function checkWsAuth(req: Request, token: string): boolean {
+function checkWsAuth(
+  req: Request,
+  token: string,
+  server: { requestIP(req: Request): { address: string } | null },
+): boolean {
+  // Tailscale identity header from loopback is sufficient for WebSocket auth too.
+  if (isTailscaleIdentified(req, server)) return true;
   const presented = extractBearerToken(req);
   return presented !== null && constantTimeEqual(presented, token);
 }
@@ -240,7 +279,7 @@ export function startWebServer(
 
       // WebSocket upgrade
       if (pathname === "/ws") {
-        if (!checkWsAuth(req, token)) {
+        if (!checkWsAuth(req, token, server)) {
           return new Response("Unauthorized", { status: 401 });
         }
         // If the client sent a Sec-WebSocket-Protocol header for auth, echo
@@ -260,7 +299,7 @@ export function startWebServer(
       // API routes — require auth if SWITCHROOM_WEB_TOKEN is set
       const route = parseRoute(pathname, req.method);
       if (route) {
-        const authError = checkAuth(req, token);
+        const authError = checkAuth(req, token, server);
         if (authError) return authError;
 
         switch (route.handler) {
@@ -409,7 +448,12 @@ export function startWebServer(
 
   const displayHost = hostname === "0.0.0.0" ? "<host-ip>" : hostname;
   console.log(`Switchroom dashboard running at http://${displayHost}:${server.port}`);
-  if (!localhostOnly) {
+  if (localhostOnly) {
+    console.log(
+      `  Tailscale users: run \`tailscale serve --bg --https / http://localhost:${server.port}\`` +
+      ` then browse to https://<tailnet-name>.ts.net/ — tailnet members are authenticated automatically.`,
+    );
+  } else {
     console.log("  Network-accessible — token required for all requests.");
   }
   return { token };
