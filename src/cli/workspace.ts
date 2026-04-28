@@ -122,6 +122,11 @@ export function registerWorkspaceCommand(program: Command): void {
             ? safeParseInt(opts.maxTotal, defaultTotal)
             : defaultTotal;
 
+          // Resolve extra_stable_files from the agent's config for stable render.
+          const extraStableFiles = stable
+            ? resolveAgentExtraStableFiles(program, agentName)
+            : undefined;
+
           try {
             const result = dynamic
               ? await buildDynamicBootstrapPrompt({
@@ -134,6 +139,7 @@ export function registerWorkspaceCommand(program: Command): void {
                 })
               : await buildStableBootstrapPrompt({
                   workspaceDir: dir,
+                  extraStableFiles,
                   budget: {
                     bootstrapMaxChars: maxPerFile,
                     bootstrapTotalMaxChars: maxTotal,
@@ -399,6 +405,23 @@ function resolveAgentWorkspaceDirOrExit(
     return undefined;
   }
   return dir;
+}
+
+/**
+ * Return `extra_stable_files` from the named agent's raw config in
+ * switchroom.yaml. Returns an empty array when the agent is not defined or
+ * has no `extra_stable_files` entry — callers can pass this directly to
+ * `buildStableBootstrapPrompt` without any null-checks.
+ *
+ * NOTE: This reads the raw (unresolved) agent config. Profile / defaults
+ * cascade is intentionally skipped here because `extra_stable_files` is a
+ * workspace-level concern and callers that need the full resolved value
+ * (e.g. scaffold.ts) should call `resolveAgentConfig` themselves.
+ */
+function resolveAgentExtraStableFiles(program: Command, agentName: string): string[] {
+  const config = getConfig(program);
+  const agentConfig = config.agents[agentName];
+  return agentConfig?.extra_stable_files ?? [];
 }
 
 function normalizeWarningMode(value: string | undefined): BootstrapPromptWarningMode {

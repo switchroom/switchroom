@@ -81,6 +81,7 @@ import {
   type EmbeddedContextFile,
   type WorkspaceBootstrapFile,
   type WorkspaceBootstrapFileName,
+  type WorkspaceFileName,
 } from "./bootstrap-types.js";
 
 export const DEFAULT_WORKSPACE_DIR_NAME = "workspace";
@@ -171,7 +172,7 @@ function isErrnoException(value: unknown): value is NodeJS.ErrnoException {
 
 async function loadNamedFile(
   workspaceDir: string,
-  name: WorkspaceBootstrapFileName,
+  name: WorkspaceFileName,
   relativePath?: string,
 ): Promise<WorkspaceBootstrapFile> {
   const filePath = path.join(workspaceDir, relativePath ?? name);
@@ -186,14 +187,27 @@ async function loadNamedFile(
  * Load the stable workspace bootstrap files. Files that don't exist are
  * reported as `missing: true` rather than throwing, so callers can decide
  * whether absence is acceptable.
+ *
+ * `extraStableFiles` is an optional list of additional filenames (relative to
+ * `workspaceDir`) to append after the defaults. This corresponds to the
+ * per-agent `extra_stable_files` config field in `switchroom.yaml`. Missing
+ * files yield `missing: true` and are silently skipped during rendering.
  */
 export async function loadStableBootstrapFiles(
   workspaceDir: string,
+  options?: { extraStableFiles?: string[] },
 ): Promise<WorkspaceBootstrapFile[]> {
-  const loaded = await Promise.all(
+  const defaultFiles = await Promise.all(
     STABLE_BOOTSTRAP_FILENAMES.map((name) => loadNamedFile(workspaceDir, name)),
   );
-  return loaded;
+  const extras = options?.extraStableFiles ?? [];
+  if (extras.length === 0) {
+    return defaultFiles;
+  }
+  const extraFiles = await Promise.all(
+    extras.map((name) => loadNamedFile(workspaceDir, name)),
+  );
+  return [...defaultFiles, ...extraFiles];
 }
 
 /**
@@ -394,13 +408,20 @@ export function projectBootstrapFiles(params: {
 /**
  * Convenience: build the full `--append-system-prompt` block for stable
  * files. Returns empty string when no files exist.
+ *
+ * `extraStableFiles` is forwarded to `loadStableBootstrapFiles` and
+ * corresponds to the per-agent `extra_stable_files` config in
+ * `switchroom.yaml`. Pass an empty array or omit to get default behavior.
  */
 export async function buildStableBootstrapPrompt(params: {
   workspaceDir: string;
+  extraStableFiles?: string[];
   budget?: BootstrapBudgetConfig;
   seenSignatures?: string[];
 }): Promise<BootstrapInjectionResult> {
-  const files = await loadStableBootstrapFiles(params.workspaceDir);
+  const files = await loadStableBootstrapFiles(params.workspaceDir, {
+    extraStableFiles: params.extraStableFiles,
+  });
   const budget = {
     bootstrapMaxChars: params.budget?.bootstrapMaxChars ?? DEFAULT_BOOTSTRAP_MAX_CHARS,
     bootstrapTotalMaxChars:

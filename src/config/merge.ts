@@ -429,5 +429,16 @@ export function mergeAgentConfig(
     ];
   }
 
+  // --- extra_stable_files: union, dedup-preserving-order (defaults first) ---
+  //
+  // Follows the same pattern as `skills`: defaults provide the base list,
+  // per-agent entries extend it. Duplicates are removed so the same file
+  // isn't loaded twice if both layers declare it.
+  if (defaults.extra_stable_files || merged.extra_stable_files) {
+    const d = defaults.extra_stable_files ?? [];
+    const a = merged.extra_stable_files ?? [];
+    merged.extra_stable_files = dedupe([...d, ...a]);
+  }
+
   return merged;
 }

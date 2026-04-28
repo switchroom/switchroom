@@ -32,12 +32,19 @@ export type WorkspaceBootstrapFileName =
   | typeof DEFAULT_MEMORY_FILENAME;
 
 /**
+ * A file name used in the workspace bootstrap pipeline. Well-known names are
+ * enumerated in `WorkspaceBootstrapFileName`; agent-declared extra files from
+ * `extra_stable_files` use arbitrary `string` filenames.
+ */
+export type WorkspaceFileName = WorkspaceBootstrapFileName | (string & {});
+
+/**
  * A file discovered in the workspace bootstrap pipeline. `content` is the raw
  * file contents (no trimming) when present. `missing` is true when the file
  * does not exist in the workspace.
  */
 export type WorkspaceBootstrapFile = {
-  name: WorkspaceBootstrapFileName;
+  name: WorkspaceFileName;
   path: string;
   content?: string;
   missing: boolean;

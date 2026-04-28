@@ -591,6 +591,15 @@ const profileFields = {
   settings_raw: z.record(z.string(), z.unknown()).optional(),
   claude_md_raw: z.string().optional(),
   cli_args: z.array(z.string()).optional(),
+  extra_stable_files: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Extra filenames (relative to the agent's workspace directory) to append " +
+      "to the stable bootstrap render. Loaded once at session start via " +
+      "`--append-system-prompt`. Missing files are silently skipped. " +
+      "Example: ['BRIEF.md', 'CONTEXT.md'].",
+    ),
 };
 
 /**
@@ -804,6 +813,15 @@ export const AgentSchema = z.object({
       "invocation in start.sh. Use for Claude Code CLI flags switchroom " +
       "doesn't expose directly (e.g. --effort high, " +
       "--exclude-dynamic-system-prompt-sections)."
+    ),
+  extra_stable_files: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Extra filenames (relative to the agent's workspace directory) to append " +
+      "to the stable bootstrap render. Loaded once at session start via " +
+      "`--append-system-prompt`. Missing files are silently skipped. " +
+      "Example: ['BRIEF.md', 'CONTEXT.md'].",
     ),
   code_repos: z
     .array(CodeRepoEntrySchema)
