@@ -4271,6 +4271,16 @@ function parseGrantDuration(s: string): number | null {
   return m[2]!.toLowerCase() === 'd' ? n * 86400 : n * 3600
 }
 
+/** Validate that a string looks like a safe agent/resource name.
+ *  Agent names should be alphanumeric with hyphens/underscores only.
+ *  Prevents path traversal when joining agent name into a filesystem path.
+ *  Defense in depth — called before any path join using a user-supplied name. */
+function assertSafeAgentName(name: string): void {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name) && name !== 'all') {
+    throw new Error(`invalid agent name: ${name}`)
+  }
+}
+
 /** Format seconds as a human-readable expiry label. */
 function formatGrantExpiry(ttlSeconds: number | null, now: Date = new Date()): string {
   if (ttlSeconds === null) return 'Never'
@@ -4419,6 +4429,9 @@ async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<P
 /** Execute the grant: call broker mint_grant, write token, reply. */
 async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
   pendingVaultOps.delete(chatId)
+  // Guard against path traversal before any I/O: state.agent flows from the
+  // vg:agent:<name> callback_data which is user-controlled input.
+  try { assertSafeAgentName(state.agent!) } catch { return }
   const result = await mintGrantViaBroker({
     agent: state.agent!,
     keys: state.selectedKeys!,
