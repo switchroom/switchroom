@@ -73,6 +73,11 @@ import {
   shouldFireRestartBanner,
   type SessionMarker,
 } from './gateway/session-marker.js'
+import {
+  statusViaBroker,
+  lockViaBroker,
+  unlockViaBroker,
+} from '../src/vault/broker/client.js'
 
 // Route all process.stderr.write calls (including downstream "telegram channel:",
 // "[streaming-metrics] ...", and draft-stream edit-error lines) to a rotating
@@ -1155,6 +1160,8 @@ const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000  // 30 min
 type PendingVaultOp =
   | { kind: 'passphrase'; op: 'list' | 'get' | 'delete' | 'set'; key?: string; startedAt: number }
   | { kind: 'value'; op: 'set'; key: string; passphrase: string; startedAt: number }
+  // Issue #158: passphrase for /vault unlock — sent to broker, never cached.
+  | { kind: 'unlock'; startedAt: number }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000  // 5 min before prompts expire
 const pendingVaultOps = new Map<string, PendingVaultOp>()
 
@@ -4251,9 +4258,47 @@ bot.command('vault', async ctx => {
       '/vault get &lt;key&gt; — read a secret value',
       '/vault set &lt;key&gt; — set a secret (prompts for value)',
       '/vault delete &lt;key&gt; — remove a secret',
+      '/vault status — show broker state',
+      '/vault unlock — unlock the broker (prompts for passphrase)',
+      '/vault lock — lock the broker',
       '',
       'Your passphrase is cached in memory for 30 min after first use.',
     ].join('\n'), { html: true })
+    return
+  }
+
+  // Issue #158: broker lifecycle ops — no vault passphrase required
+  if (sub === 'status') {
+    const status = await statusViaBroker()
+    if (!status) {
+      await switchroomReply(ctx, '🔴 Broker is not running (or unreachable).', { html: true })
+      return
+    }
+    const lockIcon = status.unlocked ? '🔓' : '🔒'
+    const lockLabel = status.unlocked ? 'Unlocked' : 'Locked'
+    const uptimeSec = Math.round(status.uptimeSec)
+    const h = Math.floor(uptimeSec / 3600)
+    const m = Math.floor((uptimeSec % 3600) / 60)
+    const s = uptimeSec % 60
+    const uptime = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
+    await switchroomReply(ctx, `${lockIcon} ${lockLabel} · ${status.keyCount} key${status.keyCount === 1 ? '' : 's'} · uptime ${uptime}`, { html: true })
+    return
+  }
+
+  if (sub === 'lock') {
+    const ok = await lockViaBroker()
+    if (ok) {
+      await switchroomReply(ctx, '🔒 Vault broker locked.', { html: true })
+    } else {
+      await switchroomReply(ctx, '🔴 Could not lock broker — is it running?', { html: true })
+    }
+    return
+  }
+
+  if (sub === 'unlock') {
+    // Prompt for passphrase. Never cache it — goes straight to broker socket.
+    pendingVaultOps.set(chatId, { kind: 'unlock', startedAt: Date.now() })
+    await switchroomReply(ctx, '🔐 Send your vault passphrase to unlock the broker (message will be deleted, passphrase never cached):', { html: true })
     return
   }
 
@@ -4854,6 +4899,9 @@ const _legacySwitchroomHelp = (me: string): string => [
     '/vault get <key> - Read a secret value',
     '/vault set <key> - Set a secret (prompts for value)',
     '/vault delete <key> - Remove a secret',
+    '/vault status - Show broker state',
+    '/vault unlock - Unlock the broker (prompts for passphrase)',
+    '/vault lock - Lock the broker',
     '',
     '/switchroomhelp - Show this help message',
     '',
@@ -5225,6 +5273,24 @@ async function handleInbound(
         }
         // Execute the pending op
         await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else if (pendingVault.kind === 'unlock') {
+        // Issue #158: passphrase for /vault unlock — sent to broker unlock
+        // socket, never cached or logged anywhere.
+        const passphrase = text.trim()
+        if (!passphrase) {
+          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault unlock again.', { html: true })
+          return
+        }
+        // Delete the passphrase message immediately
+        if (msgId != null) {
+          void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        }
+        const result = await unlockViaBroker(passphrase)
+        if (result.ok) {
+          await switchroomReply(ctx, '🔓 Vault broker unlocked.', { html: true })
+        } else {
+          await switchroomReply(ctx, `<b>vault unlock failed:</b> ${escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
+        }
       } else {
         // kind === 'value': extract value from code block if present
         let value = text

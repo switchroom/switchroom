@@ -203,6 +203,11 @@ import {
   COMMITS_AHEAD_OF_TAG,
 } from '../../src/build-info.js'
 import { classifyRejection } from './unhandled-rejection-policy.js'
+import {
+  statusViaBroker,
+  lockViaBroker,
+  unlockViaBroker,
+} from '../../src/vault/broker/client.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -738,6 +743,9 @@ type PendingVaultOp =
       cardMessageId: number
       startedAt: number
     }
+  // Issue #158: passphrase collected for /vault unlock — sent directly to the
+  // broker unlock socket, never logged or cached beyond the op itself.
+  | { kind: 'unlock'; startedAt: number }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
 const pendingVaultOps = new Map<string, PendingVaultOp>()
 
@@ -2723,6 +2731,21 @@ async function handleInbound(
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
         if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
         await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
+      } else if (pendingVault.kind === 'unlock') {
+        // Issue #158: passphrase for /vault unlock — sent directly to the
+        // broker unlock socket, never cached or logged.
+        const passphrase = text.trim()
+        if (!passphrase) {
+          await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault unlock again.', { html: true })
+          return
+        }
+        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        const result = await unlockViaBroker(passphrase)
+        if (result.ok) {
+          await switchroomReply(ctx, '🔓 Vault broker unlocked.', { html: true })
+        } else {
+          await switchroomReply(ctx, `<b>vault unlock failed:</b> ${escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
+        }
       } else if (pendingVault.kind === 'passphrase-for-deferred') {
         // Issue #44: passphrase entered after tapping "🔓 Unlock vault &
         // save" on the deferred-secret card. Cache the passphrase then
@@ -5029,11 +5052,51 @@ bot.command('vault', async ctx => {
       '/vault get &lt;key&gt; — read a secret value',
       '/vault set &lt;key&gt; — set a secret',
       '/vault delete &lt;key&gt; — remove a secret',
+      '/vault status — show broker state',
+      '/vault unlock — unlock the broker (prompts for passphrase)',
+      '/vault lock — lock the broker',
     ].join('\n'), { html: true })
     return
   }
+
+  // Issue #158: broker lifecycle ops (no vault passphrase needed)
+  if (sub === 'status') {
+    const status = await statusViaBroker()
+    if (!status) {
+      await switchroomReply(ctx, '🔴 Broker is not running (or unreachable).', { html: true })
+      return
+    }
+    const lockIcon = status.unlocked ? '🔓' : '🔒'
+    const lockLabel = status.unlocked ? 'Unlocked' : 'Locked'
+    const uptimeSec = Math.round(status.uptimeSec)
+    const h = Math.floor(uptimeSec / 3600)
+    const m = Math.floor((uptimeSec % 3600) / 60)
+    const s = uptimeSec % 60
+    const uptime = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
+    await switchroomReply(ctx, `${lockIcon} ${lockLabel} · ${status.keyCount} key${status.keyCount === 1 ? '' : 's'} · uptime ${uptime}`, { html: true })
+    return
+  }
+
+  if (sub === 'lock') {
+    const ok = await lockViaBroker()
+    if (ok) {
+      await switchroomReply(ctx, '🔒 Vault broker locked.', { html: true })
+    } else {
+      await switchroomReply(ctx, '🔴 Could not lock broker — is it running?', { html: true })
+    }
+    return
+  }
+
+  if (sub === 'unlock') {
+    // Prompt for passphrase via the existing pending-op intercept, but never
+    // cache it — it goes straight to the broker unlock socket.
+    pendingVaultOps.set(chatId, { kind: 'unlock', startedAt: Date.now() })
+    await switchroomReply(ctx, '🔐 Send your vault passphrase to unlock the broker (message will be deleted, passphrase never cached):', { html: true })
+    return
+  }
+
   if (!['list', 'get', 'set', 'delete', 'remove'].includes(sub)) {
-    await switchroomReply(ctx, `Unknown vault subcommand: <code>${escapeHtmlForTg(sub)}</code>`, { html: true })
+    await switchroomReply(ctx, `Unknown vault subcommand: <code>${escapeHtmlForTg(sub)}</code>. Try /vault help`, { html: true })
     return
   }
   if ((sub === 'get' || sub === 'delete' || sub === 'remove') && !key) { await switchroomReply(ctx, `Usage: /vault ${sub} &lt;key&gt;`, { html: true }); return }
