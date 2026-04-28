@@ -296,6 +296,34 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 
 // ─── Bot + chat lock ──────────────────────────────────────────────────────
 const bot = new Bot(TOKEN)
+
+// ─── sendMessageDraft boot probe ──────────────────────────────────────────
+// grammY 1.x exposes all Telegram Bot API methods through bot.api.raw.
+// bot.api.sendMessageDraft (the typed wrapper) takes chat_id as number, but
+// answer-stream passes chatId as string, so we bridge through raw with an
+// explicit Number() cast and positional → object param translation.
+const _rawSendMessageDraft = (bot.api.raw as unknown as Record<string, unknown>).sendMessageDraft
+const GRAMMY_VERSION: string = (() => {
+  try {
+    const raw = readFileSync(new URL('../../node_modules/grammy/package.json', import.meta.url), 'utf8')
+    return (JSON.parse(raw) as { version: string }).version ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
+const sendMessageDraftFn: (
+  (chatId: string, draftId: number, text: string, params?: { message_thread_id?: number }) => Promise<unknown>
+) | undefined =
+  typeof _rawSendMessageDraft === 'function'
+    ? (chatId, draftId, text, params) =>
+        (_rawSendMessageDraft as (args: Record<string, unknown>) => Promise<unknown>)({
+          chat_id: Number(chatId),
+          draft_id: draftId,
+          text,
+          ...(params ?? {}),
+        })
+    : undefined
+
 const chatLock = createChatLock()
 const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
 let botUsername = ''
@@ -2021,16 +2049,7 @@ function handleSessionEvent(ev: SessionEvent): void {
             chatId: currentSessionChatId,
             isPrivateChat: currentTurnIsDm,
             threadId: currentSessionThreadId,
-            sendMessageDraft: (
-              bot.api as Bot['api'] & {
-                sendMessageDraft?: (
-                  chatId: string,
-                  draftId: number,
-                  text: string,
-                  params?: { message_thread_id?: number },
-                ) => Promise<unknown>
-              }
-            ).sendMessageDraft?.bind(bot.api),
+            sendMessageDraft: sendMessageDraftFn,
             sendMessage: async (chatId, text, params) => {
               const msg = await bot.api.sendMessage(chatId, text, {
                 parse_mode: params?.parse_mode,
@@ -6287,6 +6306,7 @@ void (async () => {
         }
       }
 
+      process.stderr.write(`telegram gateway: answer-stream draft transport=${sendMessageDraftFn != null ? 'available' : 'unavailable'} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot)
       // Start the long-poll health-check now that the runner is up.
