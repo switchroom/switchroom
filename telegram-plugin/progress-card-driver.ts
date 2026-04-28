@@ -288,6 +288,14 @@ interface PerChatState {
    *   - delivered>0             → real success
    */
   outboundDeliveredCount: number
+  /**
+   * Issue #259: true when the turn was started by an autonomous wakeup
+   * sentinel (`<<autonomous-loop>>` or `<<autonomous-loop-dynamic>>`).
+   * When set, the "🙊 Ended without reply" silent-end warning is
+   * suppressed — autonomous turns intentionally produce no user-visible
+   * reply and ending without one is entirely expected.
+   */
+  wasAutonomous: boolean
 }
 
 export interface ProgressDriver {
@@ -627,7 +635,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // is in flight, "no reply yet" is normal; the card stays in
         // "Working…". The renderer applies the same gate, so passing the
         // unconditional flag here is safe.
-        const silentEnd = !cs.replyToolCalled
+        // Issue #259: suppress for autonomous wakeup turns (no reply is expected).
+        const silentEnd = !cs.replyToolCalled && !cs.wasAutonomous
         // Issue #137: agent called reply/stream_reply (replyToolCalled=true)
         // but the actual outbound never landed (recordOutboundDelivered was
         // never called for this card). Distinct from silentEnd because the
@@ -737,7 +746,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     }
     const taskNum = taskNumFor(chatState)
     const stuckMs = Math.max(0, now() - chatState.lastEventAt)
-    const silentEnd = !chatState.replyToolCalled
+    // Issue #259: autonomous wakeup turns never produce a reply by design —
+    // suppress the silent-end warning so the card renders "✅ Done" instead
+    // of "🙊 Ended without reply" when ScheduleWakeup / CronCreate fires.
+    const silentEnd = !chatState.replyToolCalled && !chatState.wasAutonomous
     const replyNotDelivered =
       chatState.replyToolCalled && chatState.outboundDeliveredCount === 0
     const html = render(
@@ -954,6 +966,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           apiFailures: { consecutive4xx: 0, lastError: null, terminal: false },
           replyToolCalled: false,
           outboundDeliveredCount: 0,
+          wasAutonomous: false,
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1127,13 +1140,21 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         chatId,
         threadId,
       )
-      // Stash the source message_id on the newly-created PerChatState so
-      // flush() can pass it to the emit callback on the first send only.
-      // Do this AFTER ingest() so the new PerChatState entry is in chats.
-      if (replyToMessageId != null && currentTurnKey != null) {
+      // Stash the source message_id and autonomous flag on the newly-created
+      // PerChatState so flush() can use them. Do this AFTER ingest() so the
+      // new PerChatState entry is in chats.
+      if (currentTurnKey != null) {
         const cs = chats.get(currentTurnKey)
         if (cs != null && cs.chatId === chatId) {
-          cs.replyToMessageId = replyToMessageId
+          if (replyToMessageId != null) {
+            cs.replyToMessageId = replyToMessageId
+          }
+          // Issue #259: autonomous wakeup turns (ScheduleWakeup / CronCreate
+          // sentinel) never produce a user-visible reply by design. Suppress
+          // the "🙊 Ended without reply" warning for these turns.
+          if (userText.startsWith('<<autonomous-loop')) {
+            cs.wasAutonomous = true
+          }
         }
       }
     },
