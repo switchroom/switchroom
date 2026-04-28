@@ -25,8 +25,10 @@
  */
 
 import * as net from "node:net";
-import { mkdirSync, chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, type VaultEntry } from "../vault.js";
 import { resolvePath } from "../../config/loader.js";
@@ -41,6 +43,8 @@ import {
   type BrokerStatus,
 } from "./protocol.js";
 import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log.js";
+import type { Database } from "bun:sqlite";
+import { mintGrant, validateGrant, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
 
 const PID_FILE_DEFAULT = "~/.switchroom/vault-broker.pid";
 

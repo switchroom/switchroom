@@ -31,11 +31,36 @@ export const GetRequestSchema = z.object({
   op: z.literal("get"),
   key: z.string().min(1),
   filename: z.string().optional(),
+  /** Optional capability token for grant-based access (vg_<id>.<secret>) */
+  token: z.string().optional(),
 });
 
 export const ListRequestSchema = z.object({
   v: z.literal(1),
   op: z.literal("list"),
+  /** Optional capability token for grant-based access */
+  token: z.string().optional(),
+});
+
+export const MintGrantRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("mint_grant"),
+  agent: z.string().min(1),
+  keys: z.array(z.string().min(1)).min(1),
+  ttl_seconds: z.number().int().positive().nullable(),
+  description: z.string().optional(),
+});
+
+export const ListGrantsRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("list_grants"),
+  agent: z.string().optional(),
+});
+
+export const RevokeGrantRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("revoke_grant"),
+  id: z.string().min(1),
 });
 
 export const StatusRequestSchema = z.object({
@@ -53,12 +78,18 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ListRequestSchema,
   StatusRequestSchema,
   LockRequestSchema,
+  MintGrantRequestSchema,
+  ListGrantsRequestSchema,
+  RevokeGrantRequestSchema,
 ]);
 
 export type GetRequest = z.infer<typeof GetRequestSchema>;
 export type ListRequest = z.infer<typeof ListRequestSchema>;
 export type StatusRequest = z.infer<typeof StatusRequestSchema>;
 export type LockRequest = z.infer<typeof LockRequestSchema>;
+export type MintGrantRequest = z.infer<typeof MintGrantRequestSchema>;
+export type ListGrantsRequest = z.infer<typeof ListGrantsRequestSchema>;
+export type RevokeGrantRequest = z.infer<typeof RevokeGrantRequestSchema>;
 export type BrokerRequest = z.infer<typeof RequestSchema>;
 
 // ─── Response schemas ───────────────────────────────────────────────────────
@@ -114,6 +145,33 @@ export const OkLockResponseSchema = z.object({
   locked: z.literal(true),
 });
 
+export const OkMintGrantResponseSchema = z.object({
+  ok: z.literal(true),
+  token: z.string(),
+  id: z.string(),
+  expires_at: z.number().nullable(),
+});
+
+export const GrantMetaSchema = z.object({
+  id: z.string(),
+  agent_slug: z.string(),
+  key_allow: z.array(z.string()),
+  expires_at: z.number().nullable(),
+  created_at: z.number(),
+  description: z.string().nullable(),
+});
+export type GrantMeta = z.infer<typeof GrantMetaSchema>;
+
+export const OkListGrantsResponseSchema = z.object({
+  ok: z.literal(true),
+  grants: z.array(GrantMetaSchema),
+});
+
+export const OkRevokeGrantResponseSchema = z.object({
+  ok: z.literal(true),
+  revoked: z.boolean(),
+});
+
 export const ErrorResponseSchema = z.object({
   ok: z.literal(false),
   code: ErrorCode,
@@ -125,6 +183,9 @@ export const ResponseSchema = z.union([
   OkKeysResponseSchema,
   OkStatusResponseSchema,
   OkLockResponseSchema,
+  OkMintGrantResponseSchema,
+  OkListGrantsResponseSchema,
+  OkRevokeGrantResponseSchema,
   ErrorResponseSchema,
 ]);
 
@@ -132,6 +193,9 @@ export type OkEntryResponse = z.infer<typeof OkEntryResponseSchema>;
 export type OkKeysResponse = z.infer<typeof OkKeysResponseSchema>;
 export type OkStatusResponse = z.infer<typeof OkStatusResponseSchema>;
 export type OkLockResponse = z.infer<typeof OkLockResponseSchema>;
+export type OkMintGrantResponse = z.infer<typeof OkMintGrantResponseSchema>;
+export type OkListGrantsResponse = z.infer<typeof OkListGrantsResponseSchema>;
+export type OkRevokeGrantResponse = z.infer<typeof OkRevokeGrantResponseSchema>;
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
 export type BrokerResponse = z.infer<typeof ResponseSchema>;
 
