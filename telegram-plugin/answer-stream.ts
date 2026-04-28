@@ -433,7 +433,10 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       // (exact-match, with trailing-punctuation tolerance), suppress outbound
       // and log — mirrors the suppression in server.ts and turn-flush-safety.ts.
       if (isSilentFlushMarker(textToSend)) {
-        const marker = textToSend.trim().toUpperCase()
+        // Normalise the same way isSilentFlushMarker does so log searches for
+        // `marker=NO_REPLY` match both `NO_REPLY` and `NO_REPLY.` inputs.
+        let marker = textToSend.trim().toUpperCase()
+        if (marker.length > 0 && /\W$/.test(marker)) marker = marker.slice(0, -1)
         log?.(
           `telegram gateway: answer-stream: silent-marker-suppressed marker=${marker} chatId=${chatId}`,
         )

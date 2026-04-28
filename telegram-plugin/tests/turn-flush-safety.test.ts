@@ -157,6 +157,15 @@ describe('isSilentFlushMarker', () => {
     expect(isSilentFlushMarker('')).toBe(false)
     expect(isSilentFlushMarker('   ')).toBe(false)
   })
+
+  it('tolerates a single trailing non-word character (#299 review feedback)', () => {
+    expect(isSilentFlushMarker('NO_REPLY.')).toBe(true)
+    expect(isSilentFlushMarker('NO_REPLY!')).toBe(true)
+    expect(isSilentFlushMarker('HEARTBEAT_OK,')).toBe(true)
+    expect(isSilentFlushMarker('  HEARTBEAT_OK.  ')).toBe(true)
+    // Two trailing punctuation chars → not stripped, no match
+    expect(isSilentFlushMarker('NO_REPLY!!')).toBe(false)
+  })
 })
 
 describe('isTurnFlushSafetyEnabled', () => {

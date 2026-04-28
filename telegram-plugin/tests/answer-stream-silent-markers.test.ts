@@ -183,6 +183,35 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     expect(typeof msgId).toBe('number')
   })
 
+  it('multi-chunk update where final body equals NO_REPLY — still suppressed (#299 review feedback)', async () => {
+    // update() replaces pendingText wholesale on each call, so two updates
+    // where the second equals NO_REPLY should suppress at materialize().
+    // This pins the assumption that the guard fires on final resolved body,
+    // not on any intermediate chunk.
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const logs: string[] = []
+    const stream = createAnswerStream({
+      chatId: 'chat47',
+      isPrivateChat: true,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+      log: (msg) => logs.push(msg),
+    })
+
+    // Model first emits a draft thought, then revises to bare NO_REPLY.
+    stream.update('let me think...')
+    stream.update('NO_REPLY')
+    const msgId = await stream.materialize()
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(msgId).toBeUndefined()
+    expect(logs.some(l => /silent-marker-suppressed.*NO_REPLY.*chatId=chat47/i.test(l))).toBe(true)
+  })
+
   it('empty body — materialize returns undefined, no outbound (existing behaviour)', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
