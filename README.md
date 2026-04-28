@@ -374,6 +374,7 @@ Overlay entries win on collision with built-in defaults. Unknown files that appe
 | Guide | Description |
 |-------|-------------|
 | **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles |
+| **[Vault](docs/vault.md)** | Architecture, per-cron secrets, ACL, audit log, threat model |
 | **[Telegram Plugin](docs/telegram-plugin.md)** | Progress cards, 10 MCP tools, emoji reactions |
 | **[Sub-Agents](docs/sub-agents.md)** | Model routing, delegation patterns, frontmatter spec |
 | **[Scheduling](docs/scheduling.md)** | Cron tasks, systemd timers, model selection |
