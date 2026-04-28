@@ -2340,9 +2340,11 @@ describe("scheduled task cron script generation", () => {
     expect(content).not.toContain("claude-sonnet-4-6");
   });
 
-  // Issue #118: cron entries that send their own message via MCP tools
-  // shouldn't also forward stdout to Telegram (would arrive as a duplicate).
-  it("default cron script forwards stdout to Telegram (legacy behavior)", () => {
+  // Issue #269: all cron scripts now use the MCP-only delivery path.
+  // The model is guided via applyCronTelegramGuidance to call the reply tool
+  // directly and print HEARTBEAT_OK as its sole stdout line. Stdout is
+  // discarded so no trailing text reaches Telegram as a duplicate.
+  it("cron script uses MCP-only delivery path (stdout suppressed, no curl)", () => {
     const agentConfig = makeAgentConfig({
       schedule: [{ cron: "0 8 * * *", prompt: "default-route" }],
     });
@@ -2351,16 +2353,21 @@ describe("scheduled task cron script generation", () => {
       join(result.agentDir, "telegram", "cron-0.sh"),
       "utf-8",
     );
-    // Default path: capture stdout and curl it.
-    expect(content).toContain("OUTPUT=$(claude -p");
-    expect(content).toContain("api.telegram.org");
-    expect(content).toContain("sendMessage");
-    expect(content).not.toContain("suppress_stdout");
+    // MCP path: exec replaces the shell, stdout goes to /dev/null.
+    expect(content).toContain("exec claude -p");
+    expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
+    expect(content).not.toContain("> /dev/null 2>&1"); // don't swallow stderr
+    expect(content).not.toContain("api.telegram.org");
+    expect(content).not.toContain("OUTPUT=");
+    // The wrapped prompt must contain the MCP tool instruction
+    expect(content).toContain("mcp__switchroom-telegram__reply");
+    expect(content).toContain("HEARTBEAT_OK");
   });
 
-  it("suppress_stdout=true skips the curl-to-Telegram block", () => {
+  it("suppress_stdout field is accepted (now a no-op — all crons use MCP path)", () => {
     const agentConfig = makeAgentConfig({
       schedule: [
+        // suppress_stdout is now ignored; MCP path is always used
         { cron: "0 7 * * *", prompt: "mcp-only", suppress_stdout: true },
       ],
     });
@@ -2369,19 +2376,14 @@ describe("scheduled task cron script generation", () => {
       join(result.agentDir, "telegram", "cron-0.sh"),
       "utf-8",
     );
-    // Suppress path: `exec` replaces the shell with claude (no captured
-    // OUTPUT, no curl), and stdout goes to /dev/null. We assert on the
-    // structural shape — `exec claude -p ... > /dev/null` followed by the
-    // absence of the forwarding block — rather than the human-readable
-    // comment text, so the test doesn't break when the comment is reworded.
     expect(content).toContain("exec claude -p");
-    expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
-    expect(content).not.toContain("> /dev/null 2>&1"); // PR #125 review: don't swallow stderr
     expect(content).not.toContain("api.telegram.org");
     expect(content).not.toContain("OUTPUT=");
   });
 
-  it("reconcile flips a cron from default to suppress_stdout", () => {
+  it("reconcile regenerates cron scripts when suppress_stdout is removed", () => {
+    // Both with and without suppress_stdout now produce the same MCP-path
+    // script. If the prompt is the same, reconcile should detect no diff.
     const baseAgent = makeAgentConfig({
       schedule: [{ cron: "0 6 * * *", prompt: "test" }],
     });
@@ -2392,10 +2394,12 @@ describe("scheduled task cron script generation", () => {
     } as SwitchroomConfig;
     scaffoldAgent("flip-cron", baseAgent, tmpDir, telegramConfig, switchroomConfig);
     const scriptPath = join(tmpDir, "flip-cron", "telegram", "cron-0.sh");
-    expect(readFileSync(scriptPath, "utf-8")).toContain("api.telegram.org");
+    // Both scripts are identical — MCP path always used
+    expect(readFileSync(scriptPath, "utf-8")).toContain("exec claude -p");
+    expect(readFileSync(scriptPath, "utf-8")).not.toContain("api.telegram.org");
 
     const updated = makeAgentConfig({
-      schedule: [{ cron: "0 6 * * *", prompt: "test", suppress_stdout: true }],
+      schedule: [{ cron: "0 6 * * *", prompt: "test updated prompt" }],
     });
     const updatedConfig: SwitchroomConfig = {
       ...switchroomConfig,

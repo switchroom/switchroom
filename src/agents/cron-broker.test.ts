@@ -48,7 +48,7 @@ describe("buildCronScript: SWITCHROOM_VAULT_BROKER_SOCK export", () => {
       AGENT_DIR, PROMPT, MODEL, CHAT_ID, undefined, ["key_a"], BROKER_SOCKET,
     );
     const sockIdx = script.indexOf("SWITCHROOM_VAULT_BROKER_SOCK");
-    const claudeIdx = script.indexOf("OUTPUT=$(claude -p");
+    const claudeIdx = script.indexOf("exec claude -p");
     expect(sockIdx).toBeGreaterThan(-1);
     expect(claudeIdx).toBeGreaterThan(-1);
     expect(sockIdx).toBeLessThan(claudeIdx);
