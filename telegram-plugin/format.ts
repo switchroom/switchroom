@@ -203,6 +203,108 @@ export function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;')
 }
 
+// ---------------------------------------------------------------------------
+// Output sanitizer — enforces fleet-wide Telegram formatting invariants
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize outbound Telegram HTML text against well-known invariants.
+ *
+ * Runs AFTER markdownToHtml, just before the text is sent to the Bot API.
+ * Conservative by design: only rewrites things that are universally wrong;
+ * leaves semantic decisions (where to bold, link choice, list-vs-prose) to
+ * the agent.
+ *
+ * Rules applied (in order):
+ *  1. Strip markdown heading markers (`## Foo` → `<b>Foo</b>\n\n`).
+ *     Headings that survived the markdown→HTML pass (e.g. when the input
+ *     was already HTML and passed through isLikelyTelegramHtml) would render
+ *     as ugly `## Foo` plain text. Convert to bold + blank line.
+ *  2. Flatten nested bullet indentation: `\n  - sub` → `\n· sub`.
+ *  3. Collapse 3+ consecutive blank lines to exactly 2.
+ *  4. Strip trailing whitespace on each line.
+ *  5. Ensure `<` `>` `&` inside `<code>` and `<pre>` blocks are
+ *     HTML-escaped (idempotent: won't double-escape existing `&amp;` etc.).
+ *
+ * The function is idempotent: sanitize(sanitize(x)) === sanitize(x).
+ * Content inside `<code>` / `<pre>` blocks is excluded from rules 1–4.
+ */
+export function sanitizeForTelegram(text: string): string {
+  // ── Phase 1: extract <code> and <pre> blocks so rules 1-4 don't touch them.
+  //
+  // We capture the full tag with its content so we can round-trip correctly.
+  // Placeholders are non-printing control sequences that cannot appear in
+  // normal text.
+  const CODE_PH = '\x00SANCODE'
+  const PRE_PH = '\x00SANPRE'
+  const codeSegments: string[] = []
+  const preSegments: string[] = []
+
+  // Extract <pre>...</pre> blocks first (they may contain <code> inside).
+  let result = text.replace(/<pre>([\s\S]*?)<\/pre>/gi, (_m, inner: string) => {
+    const idx = preSegments.length
+    // Rule 5: escape unescaped < > & inside pre blocks.
+    preSegments.push(`<pre>${escapeUnescapedEntities(inner)}</pre>`)
+    return `${PRE_PH}${idx}\x00`
+  })
+
+  // Extract standalone <code>...</code> blocks (not nested inside <pre>).
+  result = result.replace(/<code([^>]*)>([\s\S]*?)<\/code>/gi, (_m, attrs: string, inner: string) => {
+    const idx = codeSegments.length
+    // Rule 5: escape unescaped < > & inside code spans.
+    codeSegments.push(`<code${attrs}>${escapeUnescapedEntities(inner)}</code>`)
+    return `${CODE_PH}${idx}\x00`
+  })
+
+  // ── Phase 2: apply text-level rules to the remaining (non-code) content.
+
+  // Rule 1: strip markdown heading markers that survived markdown→HTML pass.
+  // Matches lines starting with one or more `#` followed by a space.
+  // Preserves the heading text as bold + trailing blank line.
+  result = result.replace(/^(#{1,6}) +(.+?)\s*$/gm, (_m, _hashes, title: string) => {
+    return `<b>${title}</b>\n`
+  })
+
+  // Rule 2: flatten nested bullet indentation.
+  // Matches lines with 2+ spaces (or a tab) at the start followed by - or *.
+  // Converts to a middle-dot bullet so the sub-detail survives as readable text.
+  result = result.replace(/^[ \t]{2,}[*-] /gm, '· ')
+
+  // Rule 4: strip trailing whitespace on each line.
+  result = result.replace(/[ \t]+$/gm, '')
+
+  // Rule 3: collapse 3+ consecutive blank lines to exactly 2.
+  // A "blank line" is a line that contains only optional whitespace (already
+  // stripped above, but let's be safe).
+  result = result.replace(/(\n[ \t]*){3,}/g, '\n\n')
+
+  // ── Phase 3: restore placeholders.
+  result = result.replace(new RegExp(`${CODE_PH}(\\d+)\x00`, 'g'), (_m, idx) => codeSegments[Number(idx)])
+  result = result.replace(new RegExp(`${PRE_PH}(\\d+)\x00`, 'g'), (_m, idx) => preSegments[Number(idx)])
+
+  return result
+}
+
+/**
+ * Escape `<`, `>`, and `&` characters that are NOT already part of an HTML
+ * entity or tag. Used inside `<code>` and `<pre>` content to correct
+ * unescaped characters without double-escaping existing `&amp;`, `&lt;`, etc.
+ *
+ * Strategy: we walk the string and escape `&` only when it is not the start
+ * of a valid entity (`&name;` or `&#digits;` or `&#xhex;`). We always escape
+ * bare `<` and `>` because they cannot appear literally inside code content
+ * that is correct Telegram HTML.
+ */
+function escapeUnescapedEntities(inner: string): string {
+  // Escape bare & first: replace & that is NOT followed by a valid entity
+  // pattern. A valid entity is: &[a-zA-Z][a-zA-Z0-9]*; or &#[0-9]+; or &#x[0-9a-fA-F]+;
+  let out = inner.replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);)/g, '&amp;')
+  // Escape bare < and > (they should never appear literally in code content)
+  out = out.replace(/</g, '&lt;')
+  out = out.replace(/>/g, '&gt;')
+  return out
+}
+
 /**
  * Repair LLM-side JSON escape bungles.
  *
