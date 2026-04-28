@@ -109,8 +109,21 @@ function resolveWebToken(): string {
  * on any ambient credentials a browser might attach. We accept requests
  * with NO Origin header (CLI / curl / same-origin) but block any Origin
  * that isn't http[s]://localhost[:port] or http[s]://127.0.0.1[:port].
+ *
+ * When the server is bound to a non-loopback address (e.g. 0.0.0.0 or a
+ * Tailscale IP) the user has explicitly opted in to network exposure. In that
+ * case the original CSRF concern — a malicious website reaching localhost —
+ * doesn't apply: the attacker would need to know the target IP and defeat
+ * same-origin browser protections for a remote host. The randomly-generated
+ * bearer token is the security boundary; origin filtering is skipped.
+ *
+ * Exported for unit-testing; not part of the public API.
  */
-function isOriginAllowed(req: Request, port: number): boolean {
+export function isOriginAllowed(req: Request, port: number, localhostOnly: boolean): boolean {
+  if (!localhostOnly) {
+    // Non-loopback bind: token is the sole auth boundary; skip origin check.
+    return true;
+  }
   const origin = req.headers.get("Origin");
   if (!origin) return true;
   const allowed = [
@@ -189,24 +202,34 @@ function parseRoute(
   return null;
 }
 
-export function startWebServer(config: SwitchroomConfig, port: number): { token: string } {
+export function startWebServer(
+  config: SwitchroomConfig,
+  port: number,
+  hostname = "127.0.0.1",
+): { token: string } {
   const uiDirRaw = resolve(import.meta.dirname, "ui");
   // Resolve symlinks once at startup so the traversal check compares real paths.
   const uiDir = existsSync(uiDirRaw) ? realpathSync(uiDirRaw) : uiDirRaw;
   const token = resolveWebToken();
 
+  // Loopback-only when binding to a localhost address; any other bind address
+  // (including 0.0.0.0) is considered a deliberate network-exposure opt-in.
+  const localhostOnly =
+    hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+
   const server = Bun.serve({
     port,
-    hostname: "127.0.0.1",
+    hostname,
     fetch(req, server) {
       const url = new URL(req.url);
       const { pathname } = url;
 
       // Cross-origin requests from any page the user happens to load in a
-      // browser must not reach the privileged API. Reject anything whose
-      // Origin isn't our own loopback. Requests with no Origin (CLI, curl,
-      // same-origin fetches) are still allowed.
-      if (!isOriginAllowed(req, port)) {
+      // browser must not reach the privileged API. When bound to loopback,
+      // reject any Origin that isn't our own loopback address. When bound to
+      // a non-loopback address the user has opted in to network exposure and
+      // the bearer token is the sole security boundary (see isOriginAllowed).
+      if (!isOriginAllowed(req, port, localhostOnly)) {
         return new Response("Forbidden", { status: 403 });
       }
 
@@ -384,6 +407,10 @@ export function startWebServer(config: SwitchroomConfig, port: number): { token:
     },
   });
 
-  console.log(`Switchroom dashboard running at http://localhost:${server.port}`);
+  const displayHost = hostname === "0.0.0.0" ? "<host-ip>" : hostname;
+  console.log(`Switchroom dashboard running at http://${displayHost}:${server.port}`);
+  if (!localhostOnly) {
+    console.log("  Network-accessible — token required for all requests.");
+  }
   return { token };
 }

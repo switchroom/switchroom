@@ -33,6 +33,7 @@ import {
   handleGetLogs,
   type AgentInfo,
 } from "../src/web/api.js";
+import { isOriginAllowed } from "../src/web/server.js";
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { execFileSync } from "node:child_process";
@@ -235,5 +236,64 @@ describe("handleGetLogs", () => {
     const result = handleGetLogs("missing", 10);
     expect(result.ok).toBe(false);
     expect(result.error).toContain("no journal data");
+  });
+});
+
+// Helper to build a minimal Request with an optional Origin header.
+function makeRequest(origin?: string): Request {
+  const headers: Record<string, string> = {};
+  if (origin !== undefined) headers["Origin"] = origin;
+  return new Request("http://127.0.0.1:8080/api/agents", { headers });
+}
+
+describe("isOriginAllowed — localhost-only bind (default)", () => {
+  const port = 8080;
+  const localhostOnly = true;
+
+  it("allows requests with no Origin header (CLI / curl)", () => {
+    expect(isOriginAllowed(makeRequest(), port, localhostOnly)).toBe(true);
+  });
+
+  it("allows same-origin requests from localhost", () => {
+    expect(isOriginAllowed(makeRequest(`http://localhost:${port}`), port, localhostOnly)).toBe(true);
+  });
+
+  it("allows same-origin requests from 127.0.0.1", () => {
+    expect(isOriginAllowed(makeRequest(`http://127.0.0.1:${port}`), port, localhostOnly)).toBe(true);
+  });
+
+  it("rejects a cross-origin request from a remote host", () => {
+    expect(isOriginAllowed(makeRequest("http://evil.example.com"), port, localhostOnly)).toBe(false);
+  });
+
+  it("rejects a cross-origin request from a LAN IP", () => {
+    expect(isOriginAllowed(makeRequest("http://192.168.1.100:8080"), port, localhostOnly)).toBe(false);
+  });
+
+  it("rejects when port in Origin doesn't match server port", () => {
+    expect(isOriginAllowed(makeRequest("http://localhost:9999"), port, localhostOnly)).toBe(false);
+  });
+});
+
+describe("isOriginAllowed — network bind (--bind 0.0.0.0 or Tailscale IP)", () => {
+  const port = 8080;
+  const localhostOnly = false;
+
+  it("allows requests with no Origin header", () => {
+    expect(isOriginAllowed(makeRequest(), port, localhostOnly)).toBe(true);
+  });
+
+  it("allows a request from a LAN origin with a valid token (origin check skipped)", () => {
+    // When bound to 0.0.0.0 / non-loopback, the origin check is bypassed.
+    // The bearer token is the sole auth boundary — tested by checkAuth in the server.
+    expect(isOriginAllowed(makeRequest("http://192.168.1.100:8080"), port, localhostOnly)).toBe(true);
+  });
+
+  it("allows a request from a Tailscale origin (origin check skipped)", () => {
+    expect(isOriginAllowed(makeRequest("http://100.64.0.1:8080"), port, localhostOnly)).toBe(true);
+  });
+
+  it("allows even a remote-looking origin (token is the boundary)", () => {
+    expect(isOriginAllowed(makeRequest("http://remote.example.com"), port, localhostOnly)).toBe(true);
   });
 });
