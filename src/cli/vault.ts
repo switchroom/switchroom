@@ -15,6 +15,7 @@ import {
   VAULT_FORMAT_HINTS,
   VaultError,
   type VaultFormatHint,
+  type VaultEntryScope,
 } from "../vault/vault.js";
 import { registerVaultSweep } from "./vault-sweep.js";
 import {
@@ -175,7 +176,15 @@ export function registerVaultCommand(program: Command): void {
       "--format <kind>",
       `Annotate the stored value with a format hint (${VAULT_FORMAT_HINTS.join(", ")}). The hint is validated against the value at set time and checked against --expect at get time.`
     )
-    .action(async (key: string, opts: { file?: string; format?: string }) => {
+    .option(
+      "--allow <agents>",
+      "Comma-separated list of agent names allowed to read this secret via the broker. When set, only listed agents may access this key. Deny takes precedence over allow."
+    )
+    .option(
+      "--deny <agents>",
+      "Comma-separated list of agent names explicitly denied access to this secret via the broker. Takes precedence over --allow."
+    )
+    .action(async (key: string, opts: { file?: string; format?: string; allow?: string; deny?: string }) => {
       try {
         const parentOpts = program.opts();
         const vaultPath = getVaultPath(parentOpts.config);
@@ -242,9 +251,39 @@ export function registerVaultCommand(program: Command): void {
           }
         }
 
-        setStringSecret(passphrase, vaultPath, key, value, formatHint);
-        if (formatHint) {
+        // Build per-entry scope from --allow / --deny flags.
+        let scope: VaultEntryScope | undefined;
+        if (opts.allow !== undefined || opts.deny !== undefined) {
+          scope = {};
+          if (opts.allow !== undefined) {
+            scope.allow = opts.allow
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+          }
+          if (opts.deny !== undefined) {
+            scope.deny = opts.deny
+              .split(",")
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+          }
+        }
+
+        setStringSecret(passphrase, vaultPath, key, value, formatHint, scope);
+        if (formatHint && scope) {
+          const scopeDesc = [
+            scope.allow?.length ? `allow: ${scope.allow.join(", ")}` : "",
+            scope.deny?.length ? `deny: ${scope.deny.join(", ")}` : "",
+          ].filter(Boolean).join("; ");
+          console.log(chalk.green(`✓ Secret '${key}' saved (format: ${formatHint}, scope: ${scopeDesc})`));
+        } else if (formatHint) {
           console.log(chalk.green(`✓ Secret '${key}' saved (format: ${formatHint})`));
+        } else if (scope) {
+          const scopeDesc = [
+            scope.allow?.length ? `allow: ${scope.allow.join(", ")}` : "",
+            scope.deny?.length ? `deny: ${scope.deny.join(", ")}` : "",
+          ].filter(Boolean).join("; ");
+          console.log(chalk.green(`✓ Secret '${key}' saved (scope: ${scopeDesc})`));
         } else {
           console.log(chalk.green(`✓ Secret '${key}' saved`));
         }
