@@ -572,4 +572,59 @@ describe("submitAuthCode log-file polling integration", () => {
     expect(status.authenticated).toBe(false);
     expect(status.timeUntilExpiry).toBe("expired");
   });
+
+  // ── #171 / #176 regression tests ─────────────────────────────────────────
+
+  it("lazy-sync: getAuthStatus returns authenticated when slot token exists but legacy mirror is absent (#171)", () => {
+    // Simulates the scaffold race: accounts/default/.oauth-token was written
+    // by submitAuthCode but syncLegacyFromActive hadn't mirrored it to
+    // .claude/.oauth-token yet.  getAuthStatus should detect the active slot,
+    // mirror it on-demand, and return authenticated=true in the same call.
+    const accountsDir = resolve(tempDir, ".claude", "accounts", "default");
+    mkdirSync(accountsDir, { recursive: true });
+
+    const expiresAt = Date.now() + 365 * 24 * 60 * 60_000;
+    writeFileSync(
+      resolve(accountsDir, ".oauth-token"),
+      "sk-ant-oat01-slot-token\n",
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      resolve(accountsDir, ".oauth-token.meta.json"),
+      JSON.stringify({ createdAt: Date.now(), expiresAt, source: "claude-setup-token" }),
+      { mode: 0o600 },
+    );
+    // Write the active marker so getAuthStatus knows which slot is active.
+    writeFileSync(resolve(tempDir, ".claude", "active"), "default\n", { mode: 0o600 });
+
+    // Legacy mirror does NOT exist yet — this is the pre-race state.
+    expect(existsSync(resolve(tempDir, ".claude", ".oauth-token"))).toBe(false);
+
+    const status = getAuthStatus("test-agent", tempDir);
+
+    // After the lazy-sync, the status must be authenticated.
+    expect(status.authenticated).toBe(true);
+    expect(status.source).toBe("oauth-token");
+
+    // And the legacy file should now exist (was mirrored as a side-effect).
+    expect(existsSync(resolve(tempDir, ".claude", ".oauth-token"))).toBe(true);
+  });
+
+  it("lazy-sync: getAuthStatus is a no-op when legacy mirror already exists (#171 regression guard)", () => {
+    // When the legacy mirror is already in place, the lazy-sync branch must
+    // NOT overwrite it (idempotent guard — avoids clobbering a valid token).
+    const expiresAt = Date.now() + 365 * 24 * 60 * 60_000;
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token"),
+      "sk-ant-oat01-legacy-token\n",
+    );
+    writeFileSync(
+      resolve(tempDir, ".claude", ".oauth-token.meta.json"),
+      JSON.stringify({ createdAt: Date.now(), expiresAt, source: "claude-setup-token" }),
+    );
+
+    const status = getAuthStatus("test-agent", tempDir);
+    expect(status.authenticated).toBe(true);
+    expect(status.source).toBe("oauth-token");
+  });
 });
