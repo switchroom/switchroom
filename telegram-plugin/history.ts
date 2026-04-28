@@ -100,6 +100,13 @@ export interface RecordedMessage {
    */
   reply_to_message_id: number | null
   reply_to_text: string | null
+  /**
+   * The most recent emoji reaction the user placed on this (assistant)
+   * message. Null means no reaction or reaction was removed. Updated by
+   * the message_reaction handler when Telegram delivers reaction events.
+   * Only emoji reactions are tracked — custom emoji are ignored for v1.
+   */
+  user_reaction: string | null
 }
 
 export interface QueryOptions {
@@ -154,7 +161,7 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
   // Migration: add reply_to columns to existing DBs that pre-date issue #119.
   // SQLite has no IF NOT EXISTS for ALTER TABLE ADD COLUMN, so we tolerate
   // "duplicate column name" errors and re-throw anything else.
-  for (const column of ["reply_to_message_id INTEGER", "reply_to_text TEXT"]) {
+  for (const column of ["reply_to_message_id INTEGER", "reply_to_text TEXT", "user_reaction TEXT"]) {
     try {
       db.exec(`ALTER TABLE messages ADD COLUMN ${column}`)
     } catch (err) {
@@ -316,6 +323,32 @@ export function recordEdit(args: RecordEditArgs): void {
        WHERE chat_id = ? AND message_id = ?
     `)
     .run(args.text, args.chat_id, args.message_id)
+}
+
+export interface RecordReactionArgs {
+  chat_id: string
+  message_id: number
+  /** The emoji string to store, or null to clear the reaction field. */
+  emoji: string | null
+}
+
+/**
+ * Update (or clear) the user_reaction field for a message row. Called from
+ * the message_reaction gateway handler when Telegram delivers a reaction
+ * event. If the row doesn't exist (the message predates history, or the
+ * reaction was placed on an inbound message), silently no-ops.
+ *
+ * Telegram message_ids are unique within a chat regardless of thread, so
+ * we match on (chat_id, message_id) and ignore thread_id — same as recordEdit.
+ */
+export function recordReaction(args: RecordReactionArgs): void {
+  requireDb()
+    .prepare(`
+      UPDATE messages
+         SET user_reaction = ?
+       WHERE chat_id = ? AND message_id = ?
+    `)
+    .run(args.emoji, args.chat_id, args.message_id)
 }
 
 export interface DeleteFromHistoryArgs {

@@ -215,7 +215,7 @@ import {
   shouldSuppressToolActivity,
   type PtyTailHandle,
 } from './pty-tail.js'
-import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory, getLatestInboundMessageId } from './history.js'
+import { initHistory, recordInbound, recordOutbound, recordEdit, deleteFromHistory, query as queryHistory, getLatestInboundMessageId, recordReaction } from './history.js'
 import {
   parseQueuePrefix,
   formatPriorAssistantPreview,
@@ -2328,7 +2328,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const replyCtx = r.reply_to_message_id != null
               ? ` ↪️#${r.reply_to_message_id}${r.reply_to_text ? `:"${r.reply_to_text.slice(0, 60)}${r.reply_to_text.length > 60 ? '…' : ''}"` : ''}`
               : ''
-            return `[${time}] ${who}${attach}${replyCtx}: ${r.text}`
+            const reactionTag = r.user_reaction ? ` [reaction: ${r.user_reaction}]` : ''
+            return `[${time}] ${who}${attach}${replyCtx}: ${r.text}${reactionTag}`
           })
           .join('\n')
         const payload = {
@@ -6258,6 +6259,68 @@ async function handleInbound(
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
+
+// ─── Inbound message_reaction handler ────────────────────────────────────
+// Telegram delivers MessageReactionUpdated events when a user adds, changes,
+// or removes an emoji reaction from a bot message. We persist the current
+// reaction to the SQLite history row so get_recent_messages can surface it.
+//
+// Only emoji reactions are handled for v1 — custom emoji are silently skipped.
+// Requires "message_reaction" in allowed_updates (see run() call below).
+bot.on('message_reaction' as Parameters<typeof bot.on>[0], (ctx) => {
+  try {
+    const update = (ctx as unknown as {
+      update: {
+        message_reaction?: {
+          chat: { id: number }
+          message_id: number
+          old_reaction: Array<{ type: string; emoji?: string }>
+          new_reaction: Array<{ type: string; emoji?: string }>
+        }
+      }
+    }).update.message_reaction
+    if (!update) return
+
+    const chat_id = String(update.chat.id)
+    const message_id = update.message_id
+    const oldReaction = update.old_reaction ?? []
+    const newReaction = update.new_reaction ?? []
+
+    if (oldReaction.length === 0 && newReaction.length === 0) return
+
+    let action: 'add' | 'remove' | 'change'
+    let emoji: string | null
+
+    if (oldReaction.length === 0 && newReaction.length > 0) {
+      action = 'add'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return
+      emoji = first.emoji ?? null
+    } else if (oldReaction.length > 0 && newReaction.length === 0) {
+      action = 'remove'
+      emoji = null
+    } else {
+      action = 'change'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return
+      emoji = first.emoji ?? null
+    }
+
+    if (HISTORY_ENABLED) {
+      try {
+        recordReaction({ chat_id, message_id, emoji })
+      } catch (err) {
+        process.stderr.write(`telegram channel: history recordReaction failed: ${err}\n`)
+      }
+    }
+
+    process.stderr.write(
+      `telegram channel: reaction: chatId=${chat_id} messageId=${message_id} emoji=${emoji ?? '(none)'} action=${action}\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram channel: message_reaction handler error: ${err}\n`)
+  }
+})
 
 // Without this, any throw in a message handler stops polling permanently
 // (grammy's default error handler calls bot.stop() and rethrows).

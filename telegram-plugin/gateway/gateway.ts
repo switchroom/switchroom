@@ -66,6 +66,7 @@ import {
 import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
+  recordReaction,
 } from '../history.js'
 import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview, formatReplyToText } from '../steering.js'
 import {
@@ -2067,7 +2068,8 @@ async function executeGetRecentMessages(args: Record<string, unknown>): Promise<
       const who = r.role === 'user' ? r.user ?? 'user' : 'assistant'
       const time = new Date(r.ts * 1000).toISOString()
       const attach = r.attachment_kind ? ` [${r.attachment_kind}]` : ''
-      return `[${time}] ${who}${attach}: ${r.text}`
+      const reaction = r.user_reaction ? ` [reaction:${r.user_reaction}]` : ''
+      return `[${time}] ${who}${attach}${reaction}: ${r.text}`
     })
     .join('\n')
   return {
@@ -6175,6 +6177,72 @@ bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) =>
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
 })
 
+// ─── Inbound message_reaction handler ────────────────────────────────────
+// Telegram delivers MessageReactionUpdated events when a user adds, changes,
+// or removes an emoji reaction from a bot message. We persist the current
+// reaction to the SQLite history row so get_recent_messages can surface it.
+//
+// Only emoji reactions are handled for v1 — custom emoji are silently skipped.
+// Requires "message_reaction" in allowed_updates (see run() call below).
+bot.on('message_reaction' as Parameters<typeof bot.on>[0], (ctx) => {
+  try {
+    // The payload is typed loosely via grammy's Context; cast to the
+    // Bot API shape we need (MessageReactionUpdated).
+    const update = (ctx as unknown as {
+      update: {
+        message_reaction?: {
+          chat: { id: number }
+          message_id: number
+          old_reaction: Array<{ type: string; emoji?: string }>
+          new_reaction: Array<{ type: string; emoji?: string }>
+        }
+      }
+    }).update.message_reaction
+    if (!update) return
+
+    const chat_id = String(update.chat.id)
+    const message_id = update.message_id
+    const oldReaction = update.old_reaction ?? []
+    const newReaction = update.new_reaction ?? []
+
+    // Both empty — defensive no-op.
+    if (oldReaction.length === 0 && newReaction.length === 0) return
+
+    // Determine action and emoji for logging / storage.
+    let action: 'add' | 'remove' | 'change'
+    let emoji: string | null
+
+    if (oldReaction.length === 0 && newReaction.length > 0) {
+      action = 'add'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return // custom emoji only — skip
+      emoji = first.emoji ?? null
+    } else if (oldReaction.length > 0 && newReaction.length === 0) {
+      action = 'remove'
+      emoji = null
+    } else {
+      action = 'change'
+      const first = newReaction.find(r => r.type === 'emoji')
+      if (!first) return // custom emoji only — skip
+      emoji = first.emoji ?? null
+    }
+
+    if (HISTORY_ENABLED) {
+      try {
+        recordReaction({ chat_id, message_id, emoji })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: history recordReaction failed: ${err}\n`)
+      }
+    }
+
+    process.stderr.write(
+      `telegram gateway: reaction: chatId=${chat_id} messageId=${message_id} emoji=${emoji ?? '(none)'} action=${action}\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`telegram gateway: message_reaction handler error: ${err}\n`)
+  }
+})
+
 // ─── Error handler ────────────────────────────────────────────────────────
 bot.catch(err => {
   process.stderr.write(`telegram gateway: handler error (polling continues): ${err.error}\n`)
@@ -6928,7 +6996,23 @@ void (async () => {
 
       process.stderr.write(`telegram gateway: answer-stream draft transport=${sendMessageDraftFn != null ? 'available' : 'unavailable'} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
-      runnerHandle = run(bot)
+      runnerHandle = run(bot, {
+        runner: {
+          fetch: {
+            // message_reaction and message_reaction_count are opt-in —
+            // Telegram only delivers them when explicitly requested.
+            // message_reaction_count (anonymous group reaction tallies) is
+            // listed here for completeness but we don't handle it (out of scope).
+            allowed_updates: [
+              'message', 'edited_message', 'channel_post', 'edited_channel_post',
+              'callback_query', 'inline_query', 'chosen_inline_result',
+              'shipping_query', 'pre_checkout_query', 'poll', 'poll_answer',
+              'my_chat_member', 'chat_member', 'chat_join_request',
+              'message_reaction', 'message_reaction_count',
+            ],
+          },
+        },
+      })
       // Start the long-poll health-check now that the runner is up.
       // Stop first in case we're re-entering the loop after a stall recovery.
       pollHealthCheck?.stop()
