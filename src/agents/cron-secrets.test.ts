@@ -62,7 +62,7 @@ describe("buildCronScript: vault-broker ACL comment", () => {
   it("the ACL comment appears near the top, before the claude invocation", () => {
     const script = buildCronScript(AGENT_DIR, PROMPT, MODEL, CHAT_ID, undefined, ["foo"]);
     const commentIdx = script.indexOf("# Allowed vault keys");
-    const claudeIdx = script.indexOf("OUTPUT=$(claude -p");
+    const claudeIdx = script.indexOf("exec claude -p");
     expect(commentIdx).toBeGreaterThan(-1);
     expect(claudeIdx).toBeGreaterThan(-1);
     expect(commentIdx).toBeLessThan(claudeIdx);

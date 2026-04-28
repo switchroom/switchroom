@@ -27,6 +27,46 @@ describe('markdownToHtml', () => {
     expect(result).toContain('<i>italic</i>')
   })
 
+  // _..._ italic (underscore form) — 8 cases
+  test('converts _text_ to <i>text</i> (plain underscore italic)', () => {
+    expect(markdownToHtml('Hello _world_')).toContain('<i>world</i>')
+  })
+
+  test('converts emoji-leading _📥 queued as a new task_', () => {
+    expect(markdownToHtml('_📥 queued as a new task_')).toContain('<i>📥 queued as a new task</i>')
+  })
+
+  test('converts emoji-trailing _steer on the prior task 🔁_', () => {
+    expect(markdownToHtml('_steer on the prior task 🔁_')).toContain('<i>steer on the prior task 🔁</i>')
+  })
+
+  test('converts both-ends emoji _🔥 hot take 🔥_', () => {
+    expect(markdownToHtml('_🔥 hot take 🔥_')).toContain('<i>🔥 hot take 🔥</i>')
+  })
+
+  test('does NOT convert snake_case to italic', () => {
+    const result = markdownToHtml('my_snake_case_var')
+    expect(result).not.toContain('<i>')
+    expect(result).toContain('my_snake_case_var')
+  })
+
+  test('does NOT convert __double__ underscore to italic', () => {
+    const result = markdownToHtml('__double__')
+    expect(result).not.toContain('<i>')
+  })
+
+  test('does NOT convert word-internal underscores', () => {
+    const result = markdownToHtml('foo_bar')
+    expect(result).not.toContain('<i>')
+    expect(result).toContain('foo_bar')
+  })
+
+  test('_..._ and *...* italics coexist correctly', () => {
+    const result = markdownToHtml('*asterisk* and _underscore_')
+    expect(result).toContain('<i>asterisk</i>')
+    expect(result).toContain('<i>underscore</i>')
+  })
+
   test('converts inline `code` to <code>code</code>', () => {
     expect(markdownToHtml('Use `console.log`')).toContain('<code>console.log</code>')
   })

@@ -3161,104 +3161,28 @@ function handleSessionEvent(ev: SessionEvent): void {
       const threadId = currentSessionThreadId
       const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
 
-      // Orphaned-reply backstop: the model finished a turn without
-      // calling the reply tool. Forward the captured text so the user
-      // doesn't get silence. We send via bot.api.sendMessage directly
-      // since the model has already finished and won't call reply.
+      // DISABLED: answer-stream preview / orphaned-reply backstop (issues #251, #269).
       //
-      // Race-condition guard: turn_end fires as soon as the JSONL line
-      // is written, but the MCP reply tool handler (async) may still be
-      // in flight. We defer the backstop by 500ms and re-check the flag
-      // so a slow reply() that sets currentTurnReplyCalled = true
-      // during the wait window doesn't produce a duplicate send.
-      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) {
-        const capturedText = currentTurnCapturedText.join('\n').trim()
-        if (capturedText) {
-          // Capture state before the async wait — the variables might be
-          // reset by a subsequent enqueue event during the delay.
-          const backstopChatId = chatId
-          const backstopThreadId = threadId
-          const backstopCtrl = ctrl
-
-          // Reset immediately so the next turn can start tracking fresh.
-          currentSessionChatId = null
-          currentSessionThreadId = undefined
-          currentTurnReplyCalled = false
-          currentTurnCapturedText = []
-
-          void (async () => {
-            // Wait 500ms for any in-flight reply handler to finish its
-            // Telegram API call before we decide whether to duplicate it.
-            // The pre-reset check above already covers the common case
-            // (tool_use for reply was seen before turn_end); this wait
-            // covers the narrow race where the MCP reply handler is still
-            // mid-`sendMessage` when turn_end fires. History's
-            // `getRecentOutboundCount` is the post-wait signal we use.
-            await new Promise<void>(resolve => setTimeout(resolve, 500))
-
-            if (HISTORY_ENABLED) {
-              try {
-                const { getRecentOutboundCount } = await import('./history.js')
-                const recentCount = getRecentOutboundCount(backstopChatId, 2)
-                if (recentCount > 0) {
-                  process.stderr.write(
-                    `telegram channel: backstop suppressed — reply tool sent ${recentCount} message(s) in the last 2s\n`,
-                  )
-                  if (backstopCtrl) backstopCtrl.setDone()
-                  activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-                  activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
-                  return
-                }
-              } catch {
-                // History check failed; proceed with backstop to avoid silence
-              }
-            }
-
-            process.stderr.write(
-              `telegram channel: orphaned-reply backstop firing — model produced ${capturedText.length} chars of text without calling reply tool, forwarding via bot API\n`,
-            )
-            const sendOpts = {
-              parse_mode: 'HTML' as const,
-              ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
-              link_preview_options: { is_disabled: true },
-            }
-            const renderedText = markdownToHtml(capturedText)
-            const limit = 4000
-            const chunks = splitHtmlChunks(renderedText, limit)
-            const sentIds: number[] = []
-            try {
-              for (const chunk of chunks) {
-                const sent = await bot.api.sendMessage(backstopChatId, chunk, sendOpts)
-                sentIds.push(sent.message_id)
-              }
-              if (HISTORY_ENABLED && sentIds.length > 0) {
-                try {
-                  recordOutbound({
-                    chat_id: backstopChatId,
-                    thread_id: backstopThreadId ?? null,
-                    message_ids: sentIds,
-                    texts: chunks,
-                  })
-                } catch (e) {
-                  process.stderr.write(
-                    `telegram channel: history recordOutbound (orphaned-reply backstop) failed: ${e}\n`,
-                  )
-                }
-              }
-              if (backstopCtrl) backstopCtrl.setDone()
-            } catch (err) {
-              process.stderr.write(
-                `telegram channel: orphaned-reply backstop failed: ${(err as Error).message}\n`,
-              )
-              if (backstopCtrl) backstopCtrl.setError()
-            } finally {
-              activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-              activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
-            }
-          })()
-          return
-        }
-      }
+      // This block previously forwarded model stdout text to Telegram when the
+      // model finished a turn without calling the reply tool. That was the root
+      // cause of duplicate messages in issue #251: the MCP reply tool posted
+      // the formatted message and then this backstop posted a second copy of
+      // the trailing model summary.
+      //
+      // Issue #269 closes the loop: all cron scripts now route delivery through
+      // mcp__switchroom-telegram__reply (via applyCronTelegramGuidance), and live
+      // sessions are guided by sub-agent-telegram-prompt.ts to use the same tool.
+      // With every send path going through the MCP layer, there is no legitimate
+      // "orphaned reply" case — if no reply tool was called, the agent had nothing
+      // to say and the user should see silence (ctrl.setSilent below), not a raw
+      // plaintext dump of the model's trailing summary tokens.
+      //
+      // If a future regression reintroduces silent turns, re-enable this block
+      // and pair it with a `!currentTurnReplyCalled` guard that checks
+      // getRecentOutboundCount first (to avoid duplicates when the MCP handler
+      // races with turn_end).
+      //
+      // if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) { ... }
 
       // Normal path: terminate the controller cleanly. The reply tool's
       // own setDone() may already have fired — that's fine, the
@@ -3268,9 +3192,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       // without producing user-visible text" (🙊 silent). We reach this
       // branch when EITHER: (a) the reply/stream_reply tool was called
       // (currentTurnReplyCalled === true) and likely fired its own setDone
-      // already, OR (b) no reply tool AND no captured text — the agent
-      // ran tools and went silent. Case (b) is the silent end. The
-      // backstop above handles "no reply tool but captured text".
+      // already, OR (b) no reply tool called — the agent had nothing to say
+      // (silent end). All sends go through the MCP reply tool (issue #269)
+      // so there is no third "captured text but no tool call" case anymore.
       if (ctrl) {
         if (currentTurnReplyCalled) {
           ctrl.setDone()

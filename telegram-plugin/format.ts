@@ -150,6 +150,11 @@ export function markdownToHtml(text: string): string {
   // Italic: *text* (single asterisk, not preceded by another *)
   result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<i>$1</i>')
 
+  // Italic: _text_ (underscore form). Lookarounds guard snake_case,
+  // __double__, and word-internal underscores. Emoji codepoints are not
+  // \w, so emoji-leading/trailing italics like `_📥 queued_` work correctly.
+  result = result.replace(/(?<![\w_])_(?!_)([^_\n]+?)_(?![\w_])/g, '<i>$1</i>')
+
   // Strikethrough: ~~text~~
   result = result.replace(/~~(.+?)~~/g, '<s>$1</s>')
 

@@ -17,6 +17,15 @@
  *
  * The exported function signatures are kept intact so callers in scaffold.ts
  * continue to compile without changes.
+ *
+ * Cron guidance (issue #269): scheduled tasks run as isolated `claude -p`
+ * invocations with no live session. They must deliver their Telegram message
+ * via `mcp__switchroom-telegram__reply` (which applies markdown→HTML
+ * conversion) and then emit `HEARTBEAT_OK` as their sole stdout line so the
+ * cron script can confirm execution without forwarding model text to Telegram.
+ * The `buildCronTelegramGuidance` / `applyCronTelegramGuidance` helpers below
+ * are independent of the disabled progress-update guidance above and remain
+ * active.
  */
 
 /**
@@ -78,4 +87,54 @@ export function applyTelegramProgressGuidance(
 ): string {
   // Feature disabled (#256): always return body unchanged.
   return body
+}
+
+/**
+ * Instruction block appended to cron task prompts (issue #269).
+ *
+ * Cron tasks are isolated `claude -p` invocations — no live session, no
+ * PTY tail. They must deliver their Telegram message via the MCP reply tool
+ * (which applies markdown→HTML conversion, smart chunking, and all the same
+ * rendering logic as a live session) rather than relying on the cron script
+ * to forward stdout via curl (which sends raw text with no conversion).
+ *
+ * After sending, the model MUST print `HEARTBEAT_OK` as its sole stdout line.
+ * The cron script discards stdout, so this serves only as a structured
+ * exit-status indicator for monitoring (e.g. a future watchdog that fails the
+ * systemd service when the sentinel is absent).
+ */
+export function buildCronTelegramGuidance(args: {
+  chatId: string
+}): string {
+  return `
+
+## Delivery instructions (cron context)
+
+This task runs as a one-shot \`claude -p\` invocation — there is no live Telegram session. Your stdout is discarded; the user will NOT see anything you print.
+
+To deliver your response to the user, you MUST call:
+
+\`\`\`
+mcp__switchroom-telegram__reply(chat_id="${args.chatId}", text="<your message>")
+\`\`\`
+
+The \`reply\` tool handles markdown→HTML conversion, chunking, and all formatting automatically — write normal markdown and it will render correctly on the user's phone.
+
+After calling \`reply\`, print \`HEARTBEAT_OK\` as your final stdout line and nothing else. This confirms successful execution to the cron watchdog.
+
+If you have nothing useful to say (data is dull, all signals are nominal), print \`HEARTBEAT_OK\` without calling \`reply\` — a silent heartbeat is correct behaviour, not an error.
+`
+}
+
+/**
+ * Combine an existing cron prompt body with the cron Telegram delivery
+ * guidance. Pure: returns the body unchanged when chatId is absent.
+ */
+export function applyCronTelegramGuidance(
+  body: string,
+  args: { chatId: string | undefined },
+): string {
+  if (!args.chatId) return body
+  const trimmed = body.replace(/\s+$/, '')
+  return trimmed + buildCronTelegramGuidance({ chatId: args.chatId })
 }

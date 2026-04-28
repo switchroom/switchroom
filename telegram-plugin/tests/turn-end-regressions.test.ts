@@ -327,14 +327,21 @@ describe('bug 2 — stream_reply tool call sets reply-called flag regardless of 
     expect(result.wouldFireBackstop).toBe(false)
   })
 
-  it('genuine orphan (NO reply tool call, only text) still fires the backstop', () => {
+  it('genuine orphan (NO reply tool call, only text) — backstop is DISABLED (issues #251, #269)', () => {
+    // The orphaned-reply backstop was removed in issue #269. All Telegram
+    // delivery now goes through the MCP reply tool, so a turn that ends
+    // without calling the reply tool is treated as a silent turn (no message
+    // sent), not a forwarding opportunity.
     const result = simulateTurn([
       { kind: 'tool_use', toolName: 'Read' },
       { kind: 'text', text: "here's the answer" },
       { kind: 'turn_end' },
     ])
     expect(result.replyCalled).toBe(false)
-    expect(result.wouldFireBackstop).toBe(true)
+    // The wouldFireBackstop flag reflects the old logic; the actual backstop
+    // in server.ts is now commented out. This value is kept for diagnostic
+    // purposes but the block no longer fires.
+    expect(result.wouldFireBackstop).toBe(true) // still true logically, but never executed
   })
 })
 
