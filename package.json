@@ -19,7 +19,7 @@
     "build": "node scripts/build.mjs",
     "test": "vitest run && bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/ipc-server-race.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts telegram-plugin/tests/foreman-state.test.ts telegram-plugin/tests/boot-card-dedupe.test.ts telegram-plugin/tests/boot-card-reason.test.ts telegram-plugin/tests/progress-update.test.ts telegram-plugin/tests/quota-cache.test.ts telegram-plugin/tests/silent-reply-guard.test.ts telegram-plugin/tests/unhandled-rejection-policy.test.ts",
     "test:vitest": "vitest run",
-    "test:bun": "bun test telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/ipc-server-race.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts telegram-plugin/tests/foreman-state.test.ts telegram-plugin/tests/boot-card-dedupe.test.ts telegram-plugin/tests/boot-card-reason.test.ts telegram-plugin/tests/progress-update.test.ts telegram-plugin/tests/quota-cache.test.ts telegram-plugin/tests/silent-reply-guard.test.ts telegram-plugin/tests/unhandled-rejection-policy.test.ts",
+    "test:bun": "bun test src/vault/grants.test.ts telegram-plugin/tests/history.test.ts telegram-plugin/tests/ipc-server-client.test.ts telegram-plugin/tests/ipc-server-race.test.ts telegram-plugin/tests/gateway-bridge.test.ts telegram-plugin/tests/gateway-startup-mutex.test.ts telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts telegram-plugin/tests/foreman-state.test.ts telegram-plugin/tests/boot-card-dedupe.test.ts telegram-plugin/tests/boot-card-reason.test.ts telegram-plugin/tests/progress-update.test.ts telegram-plugin/tests/quota-cache.test.ts telegram-plugin/tests/silent-reply-guard.test.ts telegram-plugin/tests/unhandled-rejection-policy.test.ts",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run lint && npm test"
@@ -30,6 +30,7 @@
     "@opentelemetry/resources": "^2.7.0",
     "@opentelemetry/sdk-logs": "^0.215.0",
     "@opentelemetry/sdk-node": "^0.215.0",
+    "bcryptjs": "^3.0.3",
     "chalk": "^5.4.0",
     "commander": "^13.1.0",
     "handlebars": "^4.7.8",
@@ -39,6 +40,7 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
+    "@types/bcryptjs": "^3.0.0",
     "@types/bun": "^1.3.11",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "3.2.4",
