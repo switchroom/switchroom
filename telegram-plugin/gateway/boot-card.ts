@@ -40,6 +40,9 @@ import {
   probeQuota,
   probeHindsight,
   probeCronTimers,
+  watchAgentProcess,
+  AGENT_LIVE_WINDOW_MS,
+  AGENT_LIVE_POLL_INTERVAL_MS,
 } from './boot-probes.js'
 import { escapeHtml } from '../card-format.js'
 import { join } from 'path'
@@ -273,6 +276,20 @@ export interface RunProbesOpts {
   settleWindowMs?: number
   /** Override setTimeout for tests. */
   setTimeoutImpl?: typeof setTimeout
+  /**
+   * How long the live-agent-status loop keeps editing the card after the
+   * initial probe run. Defaults to AGENT_LIVE_WINDOW_MS (45s). Set to 0
+   * to disable the live loop entirely (e.g. in tests that only need the
+   * one-shot settle-window behaviour).
+   */
+  agentLiveWindowMs?: number
+  /** How often the live loop re-polls systemd. Defaults to
+   *  AGENT_LIVE_POLL_INTERVAL_MS (2s). Override in tests for speed. */
+  agentLivePollIntervalMs?: number
+  /** Override for tests — replaces real execFile calls in the live loop. */
+  agentLiveExecFileImpl?: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
+  /** Override for tests — replaces real delays in the live loop. */
+  agentLiveSleepImpl?: (ms: number) => Promise<void>
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -337,32 +354,93 @@ export async function startBootCard(
     return { messageId: -1, complete: () => {} }
   }
 
-  // Schedule the post-settle probe run + edit. Wrapped in setTimeout so
-  // the boot path returns the handle immediately — the gateway can
-  // continue setup without waiting on probes.
+  // Determine the live window for agent-service status updates. Callers
+  // can pass 0 to disable the live loop (e.g. in tests that only need
+  // the one-shot settle-window behaviour). Defaults to AGENT_LIVE_WINDOW_MS.
+  const liveWindowMs = opts.agentLiveWindowMs ?? AGENT_LIVE_WINDOW_MS
+
+  // Schedule the post-settle probe run + live agent-status loop. Wrapped
+  // in setTimeout so the boot path returns the handle immediately — the
+  // gateway can continue setup without waiting on probes.
   setTimeoutFn(() => {
     void (async () => {
       try {
+        // ── Phase 1: one-shot probe run after the settle window ───────────
+        // Run all probes concurrently. If the agent probe comes back ok at
+        // this point, no live loop is needed. If it's degraded/fail we
+        // start the live watch (Phase 2) to keep updating the card.
         const probes = await runAllProbes(opts)
-        const updatedText = renderBootCard({
+
+        // Render with current probe state and edit if anything changed.
+        let currentText = renderBootCard({
           agentName: opts.agentName,
           version: opts.version,
           probes,
           restartReason: opts.restartReason,
           restartAgeMs: opts.restartAgeMs,
         })
-        // Skip the edit when nothing degraded — saves the API call and
-        // avoids Telegram's "message is not modified" error.
-        if (updatedText === ackText) {
+
+        if (currentText !== ackText) {
+          try {
+            await bot.editMessageText(chatId, messageId, currentText, {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+              ...(threadId != null ? { message_thread_id: threadId } : {}),
+            })
+            logger(`telegram gateway: boot-card: probes settled with degraded rows msgId=${messageId}\n`)
+          } catch (editErr: unknown) {
+            logger(`telegram gateway: boot-card: probe-edit error msgId=${messageId}: ${(editErr as Error)?.message ?? String(editErr)}\n`)
+          }
+        } else {
           logger(`telegram gateway: boot-card: probes settled all-green msgId=${messageId}\n`)
+        }
+
+        // ── Phase 2: live agent-status watch loop ─────────────────────────
+        // If the agent probe is already ok, no need to keep watching.
+        if (probes.agent?.status === 'ok' || liveWindowMs <= 0) {
           return
         }
-        await bot.editMessageText(chatId, messageId, updatedText, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          ...(threadId != null ? { message_thread_id: threadId } : {}),
+
+        // Iterate watchAgentProcess — it yields on each meaningful state
+        // change and exits when active, failed, or the window expires.
+        const watcher = watchAgentProcess(opts.agentName, {
+          liveWindowMs,
+          pollIntervalMs: opts.agentLivePollIntervalMs,
+          sleepImpl: opts.agentLiveSleepImpl,
+          execFileImpl: opts.agentLiveExecFileImpl,
         })
-        logger(`telegram gateway: boot-card: probes settled with degraded rows msgId=${messageId}\n`)
+
+        for await (const agentResult of watcher) {
+          // Merge the new agent result into the probes snapshot so all
+          // probe rows are re-rendered consistently.
+          const updatedProbes: ProbeMap = { ...probes, agent: agentResult }
+          const updatedText = renderBootCard({
+            agentName: opts.agentName,
+            version: opts.version,
+            probes: updatedProbes,
+            restartReason: opts.restartReason,
+            restartAgeMs: opts.restartAgeMs,
+          })
+
+          if (updatedText === currentText) continue
+
+          try {
+            await bot.editMessageText(chatId, messageId, updatedText, {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+              ...(threadId != null ? { message_thread_id: threadId } : {}),
+            })
+            logger(`telegram gateway: boot-card: live agent update msgId=${messageId} state=${agentResult.status} "${agentResult.detail}"\n`)
+            currentText = updatedText
+          } catch (editErr: unknown) {
+            // Swallow edit errors — the card may have been deleted or the
+            // user dismissed it. Don't let this crash the whole loop.
+            logger(`telegram gateway: boot-card: live edit error msgId=${messageId}: ${(editErr as Error)?.message ?? String(editErr)}\n`)
+          }
+
+          // Once agent is active (ok), we're done — no more edits needed.
+          if (agentResult.status === 'ok') break
+        }
       } catch (err: unknown) {
         logger(`telegram gateway: boot-card: probe-edit error msgId=${messageId}: ${(err as Error)?.message ?? String(err)}\n`)
       }
