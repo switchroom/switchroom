@@ -156,3 +156,16 @@ function copyDirRecursive(src: string, dest: string): void {
 Handlebars.registerHelper("json", (value: unknown) => {
   return new Handlebars.SafeString(JSON.stringify(value, null, 2));
 });
+
+// Register shared profile fragments as Handlebars partials so any profile
+// template can use {{> fragment-name}} instead of copy-pasting the content.
+// The _shared/ directory is underscore-prefixed (like _base/) and is not
+// listed by listAvailableProfiles() — it's framework-internal.
+const SHARED_FRAGMENTS_DIR = resolve(PROFILES_ROOT, "_shared");
+const SHARED_FRAGMENTS = ["telegram-style"] as const;
+for (const name of SHARED_FRAGMENTS) {
+  const fragPath = join(SHARED_FRAGMENTS_DIR, `${name}.md.hbs`);
+  if (existsSync(fragPath)) {
+    Handlebars.registerPartial(name, readFileSync(fragPath, "utf-8"));
+  }
+}
