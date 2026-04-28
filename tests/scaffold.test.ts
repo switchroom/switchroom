@@ -228,6 +228,19 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("--permission-mode bypassPermissions");
   });
 
+  it("reconcile re-renders start.sh with fallback_model flag", () => {
+    const config = makeAgentConfig({ fallback_model: "sonnet" });
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "fallback-reconcile": config },
+    } as SwitchroomConfig;
+    scaffoldAgent("fallback-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("fallback-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    const startSh = readFileSync(join(tmpDir, "fallback-reconcile", "start.sh"), "utf-8");
+    expect(startSh).toContain("--fallback-model 'sonnet'");
+  });
+
   it("scaffold wiring: documented callers write the clean-shutdown marker with a reason before restarting", () => {
     // Source-grep regression for the five documented call sites so a
     // future refactor can't silently drop the reason-stamping step.

@@ -190,7 +190,7 @@ export const SubagentSchema = z.object({
     .optional()
     .describe("Permission mode override for this sub-agent"),
   effort: z
-    .enum(["low", "medium", "high", "max"])
+    .enum(["low", "medium", "high", "xhigh", "max"])
     .optional()
     .describe("Effort level override"),
   color: z
