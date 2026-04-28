@@ -28,6 +28,7 @@ import {
   type BrokerResponse,
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
+import { createAuditLogger, type AuditEntry } from "./audit-log.js";
 
 const TEST_SECRETS: Record<string, VaultEntry> = {
   foo: { kind: "string", value: "bar-value" },
@@ -474,6 +475,230 @@ describe("VaultBroker server: gated paths (denied identity via _testIdentify)", 
       if (!resp.ok) {
         expect(resp.code).toBe("DENIED");
       }
+    },
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit log emission tests
+//
+// Verifies that each broker operation emits exactly one audit line with the
+// correct fields. Uses _testAuditLogger + _testIdentify to exercise the full
+// request path without hitting the real audit log or peercred.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readAuditLines(logPath: string): AuditEntry[] {
+  try {
+    const raw = fs.readFileSync(logPath, "utf8");
+    return raw
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as AuditEntry);
+  } catch {
+    return [];
+  }
+}
+
+describe("VaultBroker server: audit log emission (allowed cron unit)", () => {
+  let broker: VaultBroker;
+  let socketPath: string;
+  let tmpDir: string;
+  let auditLogPath: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  const FAKE_PEER = {
+    uid: process.getuid?.() ?? 1000,
+    pid: 55555,
+    exe: "/usr/bin/bash",
+    systemdUnit: "switchroom-myagent-cron-0.service" as string | null,
+  };
+
+  function makeAuditAclConfig() {
+    const allowedKeys = [...Object.keys(TEST_SECRETS), "nonexistent"];
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "test", forum_chat_id: "123" },
+      vault: {
+        path: "~/.switchroom/vault.enc",
+        broker: { socket: "~/.switchroom/vault-broker.sock", enabled: true },
+      },
+      agents: {
+        myagent: { schedule: [{ secrets: allowedKeys }] },
+      },
+    } as any;
+  }
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-audit-test-"));
+    socketPath = path.join(tmpDir, "test.sock");
+    auditLogPath = path.join(tmpDir, "vault-audit.log");
+
+    broker = new VaultBroker({
+      _testSecrets: cloneSecrets(),
+      _testConfig: makeAuditAclConfig(),
+      _testIdentify: () => FAKE_PEER,
+      _testAuditLogger: createAuditLogger({ path: auditLogPath }),
+    });
+    await broker.start(socketPath, undefined, undefined);
+  });
+
+  afterEach(() => {
+    broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  it("get (allowed): emits exactly one audit line with correct fields", async () => {
+    await rpc(socketPath, { v: 1, op: "get", key: "foo" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    const entry = lines[0];
+    expect(entry.op).toBe("get");
+    expect(entry.key).toBe("foo");
+    expect(entry.caller).toBe("switchroom-myagent-cron-0.service");
+    expect(entry.pid).toBe(55555);
+    expect(entry.cgroup).toBe("switchroom-myagent-cron-0.service");
+    expect(entry.result).toBe("allowed");
+    expect(entry.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("get (allowed): does not log the secret value", async () => {
+    await rpc(socketPath, { v: 1, op: "get", key: "foo" });
+    const rawLog = fs.readFileSync(auditLogPath, "utf8");
+    // "bar-value" is the secret for key "foo" — must not appear in the log
+    expect(rawLog).not.toContain("bar-value");
+  });
+
+  it("list (allowed): emits exactly one audit line", async () => {
+    await rpc(socketPath, { v: 1, op: "list" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    const entry = lines[0];
+    expect(entry.op).toBe("list");
+    expect(entry.key).toBeUndefined();
+    expect(entry.result).toBe("allowed");
+    expect(entry.caller).toBe("switchroom-myagent-cron-0.service");
+  });
+
+  it("lock: emits exactly one audit line", async () => {
+    await rpc(socketPath, { v: 1, op: "lock" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    const entry = lines[0];
+    expect(entry.op).toBe("lock");
+    expect(entry.key).toBeUndefined();
+    expect(entry.result).toBe("allowed");
+  });
+
+  it("status: does NOT emit an audit line (informational only)", async () => {
+    await rpc(socketPath, { v: 1, op: "status" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(0);
+  });
+
+  it("get (denied by ACL): emits result:denied:<reason> and no value", async () => {
+    // "not-in-acl" is not in the allowlist — will be denied by ACL
+    await rpc(socketPath, { v: 1, op: "get", key: "not-in-acl" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    const entry = lines[0];
+    expect(entry.op).toBe("get");
+    expect(entry.key).toBe("not-in-acl");
+    expect(entry.result).toMatch(/^denied:/);
+    // Assert no secret value leaks into the log line
+    const rawLog = fs.readFileSync(auditLogPath, "utf8");
+    expect(rawLog).not.toContain("bar-value");
+    expect(rawLog).not.toContain("aGVsbG8=");
+  });
+
+  it("get (UNKNOWN_KEY): emits result:error:UNKNOWN_KEY", async () => {
+    // "nonexistent" is in the ACL allowlist (makeAuditAclConfig) but not in secrets
+    await rpc(socketPath, { v: 1, op: "get", key: "nonexistent" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    const entry = lines[0];
+    expect(entry.op).toBe("get");
+    expect(entry.key).toBe("nonexistent");
+    expect(entry.result).toBe("error:UNKNOWN_KEY");
+  });
+
+  it("multiple ops each emit one line each", async () => {
+    await rpc(socketPath, { v: 1, op: "get", key: "foo" });
+    await rpc(socketPath, { v: 1, op: "list" });
+    await rpc(socketPath, { v: 1, op: "lock" });
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(3);
+    expect(lines[0].op).toBe("get");
+    expect(lines[1].op).toBe("list");
+    expect(lines[2].op).toBe("lock");
+  });
+});
+
+describe("VaultBroker server: audit log emission (denied identity)", () => {
+  let broker: VaultBroker;
+  let socketPath: string;
+  let tmpDir: string;
+  let auditLogPath: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-audit-deny-test-"));
+    socketPath = path.join(tmpDir, "test.sock");
+    auditLogPath = path.join(tmpDir, "vault-audit.log");
+
+    broker = new VaultBroker({
+      _testSecrets: cloneSecrets(),
+      _testConfig: makeMinimalConfig(),
+      _testIdentify: () => null, // simulate unidentified caller
+      _testAuditLogger: createAuditLogger({ path: auditLogPath }),
+    });
+    await broker.start(socketPath, undefined, undefined);
+  });
+
+  afterEach(() => {
+    broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "get (unidentified caller): emits result:denied: and no value",
+    async () => {
+      await rpc(socketPath, { v: 1, op: "get", key: "foo" });
+      const lines = readAuditLines(auditLogPath);
+      expect(lines).toHaveLength(1);
+      const entry = lines[0];
+      expect(entry.op).toBe("get");
+      expect(entry.key).toBe("foo");
+      expect(entry.result).toMatch(/^denied:/);
+      const rawLog = fs.readFileSync(auditLogPath, "utf8");
+      expect(rawLog).not.toContain("bar-value");
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "list (unidentified caller): emits result:denied:",
+    async () => {
+      await rpc(socketPath, { v: 1, op: "list" });
+      const lines = readAuditLines(auditLogPath);
+      expect(lines).toHaveLength(1);
+      const entry = lines[0];
+      expect(entry.op).toBe("list");
+      expect(entry.result).toMatch(/^denied:/);
     },
   );
 });

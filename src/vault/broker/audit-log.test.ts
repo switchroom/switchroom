@@ -197,7 +197,7 @@ describe("denied requests", () => {
     // Assert the secret value is not present anywhere in the raw log line
     expect(lines[0]).not.toContain(SECRET_VALUE);
     // The entry itself must not have a value field
-    expect((entry as Record<string, unknown>).value).toBeUndefined();
+    expect((entry as unknown as Record<string, unknown>).value).toBeUndefined();
   });
 });
 
