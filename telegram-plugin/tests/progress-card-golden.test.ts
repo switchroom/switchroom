@@ -103,13 +103,15 @@ describe('progress-card golden turn', () => {
 
     // Structural assertions — don't brittle-pin the whole string, but
     // lock in the key visual elements and their ordering.
-    // User request is no longer rendered as a blockquote — it is shown via
-    // Telegram's native reply banner (reply_parameters on sendMessage).
-    expect(html).not.toContain('<blockquote>')
+    // User request is no longer rendered inline — it is shown via Telegram's
+    // native reply banner (reply_parameters on sendMessage). The body IS now
+    // wrapped in <blockquote> for the new HTML formatting overhaul (#275),
+    // so we check absence of the user-request specifically.
+    expect(html).not.toContain('user-req')
     expect(html).toContain('✅ <b>Done</b>')
 
     // Text events create narrative steps; the final text block becomes a narrative
-    expect(html).toContain('● Tests fixed but push was rejected.')
+    expect(html).toContain('● <s>Tests fixed but push was rejected.</s>')
 
     // Tool items are still rendered as fallback (narrative takes priority,
     // but tool items still appear when no narrative covers them)
@@ -132,8 +134,8 @@ describe('progress-card golden turn', () => {
     const html = render(state, t + 300)
 
     expect(html).toContain('⚙️ <b>Working…</b>')
-    expect(html).toContain('● Read')
-    expect(html).toContain('◉ <b>Bash</b> bun test')
-    expect(html).toMatch(/◉ <b>Bash<\/b> bun test <i>\(\d/)
+    expect(html).toContain('● <code>Read</code>')
+    expect(html).toContain('◉ <b><code>Bash</code></b> <code>bun test</code>')
+    expect(html).toMatch(/◉ <b><code>Bash<\/code><\/b> <code>bun test<\/code> <i>\(\d/)
   })
 })

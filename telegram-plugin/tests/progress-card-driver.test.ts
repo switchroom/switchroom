@@ -134,7 +134,7 @@ describe('progress-card driver', () => {
     // The card banner stays "Working…" during 'run'; the stage switch is
     // signalled by the new 🔧 checklist line rather than an inline header.
     expect(emits[0].html).toContain('⚙️ <b>Working…</b>')
-    expect(emits[0].html).toContain('◉ <b>Read</b>')
+    expect(emits[0].html).toContain('◉ <b><code>Read</code></b>')
   })
 
   it('emits immediately on turn_end with done=true', () => {
@@ -261,8 +261,8 @@ describe('progress-card driver', () => {
     advance(1000)
     expect(emits.length).toBe(3) // exactly one more flush for the burst
     const last = emits[emits.length - 1]
-    expect(last.html).toContain('● Read')
-    expect(last.html).toContain('● Grep')
+    expect(last.html).toContain('● <code>Read</code>')
+    expect(last.html).toContain('● <code>Grep</code>')
   })
 
   it('never emits the same HTML twice in a row (deduped)', () => {
@@ -347,11 +347,11 @@ describe('progress-card checklist rendering', () => {
     driver.ingest(enqueue('c1'), null)
     emits.length = 0
     driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/x/foo.ts' } }, 'c1')
-    expect(emits.at(-1)!.html).toContain('◉ <b>Read</b> foo.ts')
+    expect(emits.at(-1)!.html).toContain('◉ <b><code>Read</code></b> <code>foo.ts</code>')
     driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' }, 'c1')
     advance(1000)
-    expect(emits.at(-1)!.html).toContain('● Read foo.ts')
-    expect(emits.at(-1)!.html).not.toContain('◉ <b>Read</b>')
+    expect(emits.at(-1)!.html).toContain('● <code>Read</code> <code>foo.ts</code>')
+    expect(emits.at(-1)!.html).not.toContain('◉ <b><code>Read</code></b>')
   })
 
   it('multiple tools preserve insertion order in the rendered checklist', () => {
@@ -368,10 +368,10 @@ describe('progress-card checklist rendering', () => {
     driver.ingest({ kind: 'tool_result', toolUseId: 'C', toolName: null }, 'c1')
     advance(1000)
     const html = emits.at(-1)!.html
-    // Order preserved: Bash → Read → Grep.
-    const bashIdx = html.indexOf('Bash</b> ls') >= 0 ? html.indexOf('Bash</b> ls') : html.indexOf('Bash ls')
-    const readIdx = html.indexOf('Read</b> foo.ts') >= 0 ? html.indexOf('Read</b> foo.ts') : html.indexOf('Read foo.ts')
-    const grepIdx = html.indexOf('Grep</b>') >= 0 ? html.indexOf('Grep</b>') : html.indexOf('Grep ')
+    // Order preserved: Bash → Read → Grep. Tool names AND args render in <code>.
+    const bashIdx = html.indexOf('<code>Bash</code> <code>ls</code>')
+    const readIdx = html.indexOf('<code>Read</code> <code>foo.ts</code>')
+    const grepIdx = html.indexOf('<code>Grep</code>')
     expect(bashIdx).toBeGreaterThan(-1)
     expect(readIdx).toBeGreaterThan(bashIdx)
     expect(grepIdx).toBeGreaterThan(readIdx)
@@ -413,7 +413,7 @@ describe('progress-card checklist rendering', () => {
     driver.ingest({ kind: 'tool_result', toolUseId: 't1', toolName: 'Bash', isError: true }, 'c1')
     advance(1000)
     const html = emits.at(-1)!.html
-    expect(html).toContain('✗ Bash git push')
+    expect(html).toContain('✗ <code>Bash</code> <code>git push</code>')
   })
 
   it('overflow: 13+ items collapse oldest with "(+N more earlier steps)"', () => {
@@ -453,8 +453,8 @@ describe('progress-card checklist rendering', () => {
     expect(final.html).toContain('✅ <b>Done</b>')
     expect(final.html).not.toContain('⚙️ <b>Working…</b>')
     // Final checklist still visible.
-    expect(final.html).toContain('● Read a.ts')
-    expect(final.html).toContain('● Bash echo hi')
+    expect(final.html).toContain('● <code>Read</code> <code>a.ts</code>')
+    expect(final.html).toContain('● <code>Bash</code> <code>echo hi</code>')
   })
 })
 

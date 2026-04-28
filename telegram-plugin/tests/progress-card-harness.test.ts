@@ -475,12 +475,12 @@ describe('progress-card multi-agent harness', () => {
         }
         await wait(150)
 
-        // Pre-correlation: [Main] shows Agent lines but no [Sub-agents] block
+        // Pre-correlation: main card shows Agent lines but no per-sub-agent expandables yet
         const preHtml = bot.edits[bot.edits.length - 1].html
-        expect(preHtml).toContain('[Main')
+        expect(preHtml).toContain('⚙️ <b>Working…</b>')
         expect(preHtml).toContain('task 1')
         expect(preHtml).toContain('task 4')
-        expect(preHtml).not.toContain('[Sub-agents')
+        expect(preHtml).not.toContain('<blockquote expandable>')
 
         // Now create 4 sub-agent JSONLs in random-ish order with matching prompts
         const order = [3, 1, 4, 2]
@@ -491,7 +491,9 @@ describe('progress-card multi-agent harness', () => {
         await wait(200)
 
         const html = bot.edits[bot.edits.length - 1].html
-        expect(html).toContain('[Sub-agents · 4 running]')
+        // New format: 4 separate <blockquote expandable> blocks, one per sub-agent
+        const expandableCount = (html.match(/<blockquote expandable>/g) ?? []).length
+        expect(expandableCount).toBe(4)
         for (let i = 1; i <= 4; i++) {
           expect(html).toContain(`task ${i}`)
         }
@@ -503,7 +505,8 @@ describe('progress-card multi-agent harness', () => {
         }
         await wait(200)
         const midHtml = bot.edits[bot.edits.length - 1].html
-        expect(midHtml).toContain('└ ◉')
+        // New format: each sub-agent's running tool renders inside its expandable as ◉
+        expect(midHtml).toContain('◉')
 
         // Parent tool_results for all 4
         for (let i = 1; i <= 4; i++) {
@@ -513,7 +516,11 @@ describe('progress-card multi-agent harness', () => {
         await wait(250)
 
         const finalHtml = bot.edits[bot.edits.length - 1].html
-        expect(finalHtml).toMatch(/\[Sub-agents · 4 done\]/)
+        // New format: 4 expandables remain, each in done state (● 📂 header)
+        const finalExpandables = (finalHtml.match(/<blockquote expandable>/g) ?? []).length
+        expect(finalExpandables).toBe(4)
+        const doneHeaders = (finalHtml.match(/● 📂/g) ?? []).length
+        expect(doneHeaders).toBe(4)
         const doneEdits = bot.edits.filter((e) => e.done)
         expect(doneEdits.length).toBeGreaterThanOrEqual(1)
       } finally {
@@ -546,14 +553,14 @@ describe('progress-card multi-agent harness', () => {
         appendFileSync(sub, subAgentTurnEndLine())
         await wait(200)
         const earlyHtml = bot.edits[bot.edits.length - 1].html
-        // Tentative ✅ for the sub-agent on early turn_end
-        expect(earlyHtml).toMatch(/● investigate/)
+        // Tentative ✅ for the sub-agent on early turn_end — header is "● 📂 #aidX <b>investigate</b>"
+        expect(earlyHtml).toMatch(/● 📂 #aidX <b>investigate<\/b>/)
         // Parent tool_result with isError=true overrides → ✗
         appendFileSync(parent, toolResultLine('toolu_p1', true))
         appendFileSync(parent, turnEndLine())
         await wait(250)
         const finalHtml = bot.edits[bot.edits.length - 1].html
-        expect(finalHtml).toMatch(/✗ investigate/)
+        expect(finalHtml).toMatch(/✗ 📂 #aidX <b>investigate<\/b>/)
       } finally {
         tail.stop()
         driver.dispose?.()
@@ -581,13 +588,13 @@ describe('progress-card multi-agent harness', () => {
         appendFileSync(parent, parentAgentToolUseLine('toolu_p1', 'thing', 'PROMPT-X'))
         await wait(120)
         const before = bot.edits[bot.edits.length - 1].html
-        expect(before).not.toContain('[Sub-agents')
+        expect(before).not.toContain('<blockquote expandable>')
         // Now create the JSONL
         const sub = mkSubagentJsonl(projectsDir, stem, 'aidA')
         appendFileSync(sub, subAgentUserLine('PROMPT-X'))
         await wait(200)
         const after = bot.edits[bot.edits.length - 1].html
-        expect(after).toContain('[Sub-agents')
+        expect(after).toContain('<blockquote expandable>')
         expect(after).toContain('thing')
       } finally {
         tail.stop()
