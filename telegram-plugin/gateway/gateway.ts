@@ -5623,6 +5623,9 @@ void (async () => {
             process.stderr.write(`telegram gateway: startup: skipped chat ${id} (not yet reachable)\n`)
           }
           if (sweepableIds.length > 0) {
+            // Track chats that fail the boot probe so we can surface a
+            // user-facing notice after the sweep completes.
+            const bootProbeFailures: Array<{ chatId: string; reason: string }> = []
             void sweepBotAuthoredPins(
               sweepableIds, me.id,
               async (chatId) => {
@@ -5632,20 +5635,35 @@ void (async () => {
                   if (!pinned) return null
                   return { messageId: pinned.message_id, fromId: pinned.from?.id ?? null }
                 } catch (err) {
-                  if (
-                    err instanceof GrammyError &&
-                    err.error_code === 400 &&
-                    /chat not found/i.test(err.description)
-                  ) {
-                    process.stderr.write(`telegram gateway: startup: skipped chat ${chatId} (not yet reachable)\n`)
-                    return null
-                  }
-                  throw err
+                  // Catch ALL getChat errors at boot — a single unreachable
+                  // chat must never kill the gateway (issue #166). Log
+                  // structurally so operators can diagnose, then continue.
+                  const reason = err instanceof GrammyError
+                    ? `${err.error_code} ${err.description}`
+                    : (err instanceof Error ? err.message : String(err))
+                  process.stderr.write(
+                    `telegram gateway: boot-probe-failed: chatId=${chatId} reason=${JSON.stringify(reason)}\n`,
+                  )
+                  bootProbeFailures.push({ chatId, reason })
+                  return null
                 }
               },
               (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
               { log: (msg) => process.stderr.write(`telegram gateway: bot-authored pin sweep — ${msg}\n`) },
-            ).catch(() => {})
+            ).then(() => {
+              // After sweep: post a user-facing notice for each failed probe
+              // to the first reachable allowlisted DM chat. Failures here are
+              // non-fatal — we never let notification errors crash boot.
+              if (bootProbeFailures.length === 0) return
+              const notifyChat = bootAccess.allowFrom[0]
+              if (!notifyChat) return
+              for (const { chatId, reason } of bootProbeFailures) {
+                const text = `⚠️ <b>Boot probe failed</b>\nCould not reach chat <code>${chatId}</code> at startup — bot may not be a member.\n<i>${reason}</i>`
+                lockedBot.api.sendMessage(notifyChat, text, { parse_mode: 'HTML' }).catch((e: unknown) => {
+                  process.stderr.write(`telegram gateway: boot-probe-notify failed: ${e}\n`)
+                })
+              }
+            }).catch(() => {})
           }
         } catch {}
 
