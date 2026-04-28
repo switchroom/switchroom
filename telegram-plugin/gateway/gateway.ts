@@ -704,13 +704,20 @@ const robustApiCall = createRetryApiCall({
 
 // ─── Structured outbound log ──────────────────────────────────────────────
 function logOutbound(
-  path: 'reply' | 'stream_reply' | 'backstop' | 'pty_preview' | 'edit' | 'forward',
+  path: 'reply' | 'stream_reply' | 'backstop' | 'pty_preview' | 'edit' | 'forward' | 'answer_lane',
   chatId: string, messageId: number | null, chars: number, extra?: string,
+  opts?: { turnKey?: string; formatHint?: 'html' | 'markdownv2' | 'text'; textPreview?: string },
 ): void {
   const ts = new Date().toISOString()
+  const turnKeyPart = opts?.turnKey ? ` turnKey=${opts.turnKey}` : ''
+  const formatPart = opts?.formatHint ? ` formatHint=${opts.formatHint}` : ''
+  const previewPart = opts?.textPreview
+    ? ` text_preview="${opts.textPreview.replace(/\n/g, '\\n').slice(0, 80)}"`
+    : ''
   process.stderr.write(
     `telegram gateway [outbound] ${ts} path=${path} chat=${chatId} ` +
     `msg_id=${messageId ?? 'pending'} chars=${chars}` +
+    turnKeyPart + formatPart + previewPart +
     (extra ? ` ${extra}` : '') + '\n',
   )
 }
@@ -2049,6 +2056,8 @@ function handleSessionEvent(ev: SessionEvent): void {
                   ? { link_preview_options: params.link_preview_options }
                   : {}),
               }),
+            deleteMessage: (chatId, messageId) =>
+              bot.api.deleteMessage(chatId, messageId),
             log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             warn: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
             // Issue #203: route answer-lane events through the streaming
@@ -2157,8 +2166,21 @@ function handleSessionEvent(ev: SessionEvent): void {
               stream.stop()
             })
         } else {
-          // Reply path won — discard the answer-lane silently.
-          stream.stop()
+          // Reply path won — retract any preliminary answer-lane message
+          // so the user sees only the canonical stream_reply output.
+          // Issue #251: without retraction the answer-stream's raw-markdown
+          // preview (sent when captured text hit the minInitialChars threshold)
+          // coexists with the properly-rendered stream_reply message, producing
+          // a duplicate ~26 s apart with different formatting.
+          // retract() is best-effort: if deleteMessage fails the preliminary
+          // message lingers but no exception escapes to break turn_end.
+          void stream.retract().catch((err) => {
+            process.stderr.write(
+              `telegram gateway: answer-stream retract failed: ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            )
+          })
         }
       }
       if (currentSessionChatId == null) return

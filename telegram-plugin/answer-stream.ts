@@ -148,6 +148,18 @@ export interface AnswerStreamHandle {
   messageId(): number | undefined
   /** Stop the stream — cancels pending throttled edits. */
   stop(): void
+  /**
+   * Stop the stream AND delete any preliminary message that was already sent.
+   * Used when the reply/stream_reply tool takes over as the authoritative
+   * answer surface: the answer-lane preview must be retracted so the user
+   * sees only one message (the canonical stream_reply output) rather than a
+   * raw-markdown duplicate followed by the properly-formatted reply.
+   *
+   * Best-effort: if deleteMessage is not wired or the API call fails, the
+   * preliminary message is left in place (same behaviour as before the fix).
+   * Resolves after the delete attempt (or immediately when no message exists).
+   */
+  retract(): Promise<void>
 }
 
 // Module-level draft-id counter. Shared globally so concurrent answer streams
@@ -462,6 +474,32 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     stop(): void {
       stopped = true
       cancelScheduled()
+    },
+
+    async retract(): Promise<void> {
+      // Stop immediately so no further edits or sends go out.
+      stopped = true
+      cancelScheduled()
+      // Wait for any in-flight operation to settle so we don't race a
+      // concurrent sendMessage that would leave a dangling message.
+      if (inFlight) {
+        try { await inFlight } catch { /* ignore */ }
+      }
+      // Delete the preliminary message if one was sent and deleteMessage
+      // is wired. Best-effort: failures are logged but not re-thrown.
+      const msgId = streamMsgId
+      if (msgId != null && config.deleteMessage != null) {
+        try {
+          await config.deleteMessage(chatId, msgId)
+          log?.(`answer-stream: retracted preliminary message (id=${msgId})`)
+        } catch (err) {
+          warn?.(
+            `answer-stream: retract deleteMessage failed (id=${msgId}): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          )
+        }
+      }
     },
   }
 }

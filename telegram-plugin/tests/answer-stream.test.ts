@@ -590,6 +590,156 @@ describe('answer-stream — materialize() max-chars guard', () => {
   })
 })
 
+// ─── Issue #251: retract() — delete preliminary message when reply path wins ──
+describe('answer-stream — retract() (#251)', () => {
+  it('calls deleteMessage with (chatId, messageId) after a preliminary message was sent', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const deleteMessage = vi.fn(async () => {})
+    const stream = createAnswerStream({
+      chatId: 'chat251',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      deleteMessage,
+    })
+
+    // Push enough text to exceed the threshold and actually send a message
+    stream.update('x'.repeat(500))
+    await flushMicrotasks()
+
+    // Verify a message was sent and we know its id
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    const sentMsgId = (sendMessage.mock.results[0].value as Promise<{ message_id: number }>)
+    const resolved = await sentMsgId
+    expect(typeof resolved.message_id).toBe('number')
+
+    const msgId = stream.messageId()
+    expect(typeof msgId).toBe('number')
+
+    // Now retract — simulates the reply path winning
+    await stream.retract()
+
+    expect(deleteMessage).toHaveBeenCalledTimes(1)
+    expect(deleteMessage).toHaveBeenCalledWith('chat251', msgId)
+  })
+
+  it('does not call deleteMessage when no preliminary message was sent', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const deleteMessage = vi.fn(async () => {})
+    const stream = createAnswerStream({
+      chatId: 'chat251',
+      isPrivateChat: false,
+      // High threshold so the text below never triggers a send
+      minInitialChars: 5000,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      deleteMessage,
+    })
+
+    // Short text — stays below minInitialChars, no message sent
+    stream.update('x'.repeat(100))
+    vi.advanceTimersByTime(1000)
+    await flushMicrotasks()
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(stream.messageId()).toBeUndefined()
+
+    // retract() should be a no-op — no delete attempt
+    await stream.retract()
+
+    expect(deleteMessage).not.toHaveBeenCalled()
+  })
+
+  it('retract() stops the stream — subsequent update() calls are no-ops', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const deleteMessage = vi.fn(async () => {})
+    const stream = createAnswerStream({
+      chatId: 'chat251',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      deleteMessage,
+    })
+
+    // Establish an initial message
+    stream.update('hello world')
+    await flushMicrotasks()
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+
+    // Retract
+    await stream.retract()
+
+    // Any subsequent update should be silently dropped
+    sendMessage.mockClear()
+    editMessageText.mockClear()
+    stream.update('this should be ignored after retract')
+    vi.advanceTimersByTime(2000)
+    await flushMicrotasks()
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(editMessageText).not.toHaveBeenCalled()
+  })
+
+  it('retract() is best-effort — deleteMessage failure does not throw', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const deleteMessage = vi.fn(async () => {
+      throw new Error('deleteMessage: message to delete not found')
+    })
+    const warn = vi.fn()
+    const stream = createAnswerStream({
+      chatId: 'chat251',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      deleteMessage,
+      warn,
+    })
+
+    stream.update('x'.repeat(500))
+    await flushMicrotasks()
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+
+    // retract() must not throw even when deleteMessage rejects
+    await expect(stream.retract()).resolves.toBeUndefined()
+
+    // The failure should have been logged via warn
+    expect(warn).toHaveBeenCalled()
+    expect(warn.mock.calls.some((c) => /retract.*failed|deleteMessage.*failed/i.test(String(c[0])))).toBe(true)
+  })
+
+  it('retract() without deleteMessage wired is a no-op (no error)', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat251',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      // deleteMessage intentionally omitted
+    })
+
+    stream.update('hello world')
+    await flushMicrotasks()
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+
+    // retract() with no deleteMessage callback — should resolve without error
+    await expect(stream.retract()).resolves.toBeUndefined()
+  })
+})
+
 // ─── Issue #203: onMetric callback ──────────────────────────────────────────
 describe('answer-stream — onMetric callback (#203)', () => {
   it('fires answer_lane_update on first sendMessage (non-DM, message transport)', async () => {
