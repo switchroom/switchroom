@@ -316,11 +316,18 @@ interface PerChatState {
    */
   wasAutonomous: boolean
   /**
-   * Set by completeTurnFully when onSilentEnd returns { suppressed: true }.
-   * Causes flush() to render the final card without the "🙊 Ended without
-   * reply" header so no false-positive appears before the retry reply lands.
+   * Set by prepareSilentEndSuppression when onSilentEnd returns
+   * { suppressed: true }. Causes flush() to render the final card without
+   * the "🙊 Ended without reply" header so no false-positive appears before
+   * the retry reply lands.
    */
   silentEndSuppressed: boolean
+  /**
+   * Idempotent guard for prepareSilentEndSuppression — ensures the
+   * onSilentEnd callback (which writes the Stop-hook state file) only
+   * fires once per turn even if multiple sites call into the helper.
+   */
+  silentEndPrepared: boolean
 }
 
 export interface ProgressDriver {
@@ -511,29 +518,43 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
    *   - Deferred completion (last sub-agent finishes after parent turn_end)
    *   - Abandonment (closeZombie for maxIdle / enqueue-force-close)
    */
+  /**
+   * Prepare silent-end suppression BEFORE the final flush.
+   *
+   * Must run before the outer `flush(cs, true)` at every site that calls
+   * `completeTurnFully`, so the render at that flush already knows whether
+   * to suppress the "🙊 Ended without reply" header. If we relied on
+   * `completeTurnFully` to set the flag and re-flush, the outer flush would
+   * already have queued a warning-card edit/send to Telegram — and in the
+   * worst case (the first edit finalizes before the second arrives) the
+   * user sees both the warning AND the corrected card as separate messages.
+   *
+   * Idempotent — `silentEndPrepared` guards against re-firing the
+   * `onSilentEnd` callback (which writes a state file the Stop hook reads).
+   */
+  function prepareSilentEndSuppression(cs: PerChatState): void {
+    if (cs.silentEndPrepared) return
+    cs.silentEndPrepared = true
+    const isSilentEnd = !cs.replyToolCalled && !cs.wasAutonomous
+    if (!isSilentEnd || !config.onSilentEnd) return
+    try {
+      const result = config.onSilentEnd({ chatId: cs.chatId, threadId: cs.threadId, turnKey: cs.turnKey })
+      if (result?.suppressed === true) {
+        cs.silentEndSuppressed = true
+      }
+    } catch {
+      /* never let the callback break the completion path */
+    }
+  }
+
   function completeTurnFully(cs: PerChatState): void {
     if (cs.completionFired) return
     cs.completionFired = true
-    // Fire onSilentEnd when the turn ends without a reply (and isn't an
-    // autonomous wakeup). The callback can write a state file so the Stop
-    // hook can block the session and re-prompt the agent. If it returns
-    // { suppressed: true } we re-render the final card without the warning
-    // so no false-positive flash appears before the retry reply lands.
-    const isSilentEnd = !cs.replyToolCalled && !cs.wasAutonomous
-    if (isSilentEnd && config.onSilentEnd) {
-      try {
-        const result = config.onSilentEnd({ chatId: cs.chatId, threadId: cs.threadId, turnKey: cs.turnKey })
-        if (result?.suppressed === true) {
-          cs.silentEndSuppressed = true
-          // Re-render the final card without the "🙊 Ended without reply" header.
-          // flush() checks silentEndSuppressed, so a plain forceDone flush here
-          // will render "✅ Done" instead of the warning.
-          flush(cs, /*forceDone*/ true)
-        }
-      } catch {
-        /* never let the callback break the completion path */
-      }
-    }
+    // Defensive: if a caller forgot to call prepareSilentEndSuppression
+    // before its flush, run it now so the onSilentEnd callback still fires
+    // (the Stop hook still gets the state file). The flag is already set
+    // for any caller that did call it (idempotent guard).
+    prepareSilentEndSuppression(cs)
     const taskNum = taskNumFor(cs)
     const summary = summariseTurn(cs.state, now())
     if (config.onTurnEnd) {
@@ -593,6 +614,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     // `maxIdleMs` heartbeat ceiling.
     if (hasAnyRunningSubAgent(cs.state)) return
     process.stderr.write(`telegram gateway: progress-card: deferred completion firing turnKey=${cs.turnKey} (last sub-agent finished)\n`)
+    // Set silentEndSuppressed BEFORE the outer flush so the rendered card
+    // already excludes the "🙊 Ended without reply" header when a retry is
+    // queued. Otherwise the outer flush would queue a warning-card edit
+    // and a follow-up correction edit could race or land as a second msg.
+    prepareSilentEndSuppression(cs)
     flush(cs, /*forceDone*/ true)
     completeTurnFully(cs)
   }
@@ -629,6 +655,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }
       cs.state = { ...cs.state, subAgents: closed }
     }
+    // Set silentEndSuppressed BEFORE the outer flush — see deferred path.
+    prepareSilentEndSuppression(cs)
     flush(cs, /*forceDone*/ true)
     completeTurnFully(cs)
     // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
@@ -1019,6 +1047,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           outboundDeliveredCount: 0,
           wasAutonomous: false,
           silentEndSuppressed: false,
+          silentEndPrepared: false,
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1107,6 +1136,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (event.kind === 'turn_end' || event.kind === 'enqueue' || stageChanged) {
         if (event.kind === 'turn_end') {
           process.stderr.write(`telegram gateway: progress-card: turn_end flush chatId=${chatState.chatId} threadId=${chatState.threadId ?? '-'} turnKey=${chatState.turnKey}\n`)
+          // Only fire silent-end prep when we're actually about to complete —
+          // i.e. no sub-agents still running. The sub-agent defer path
+          // returns below and prep will run later via maybeCompleteDeferredTurn.
+          if (!hasAnyRunningSubAgent(chatState.state)) {
+            prepareSilentEndSuppression(chatState)
+          }
         }
         flush(chatState, /*forceDone*/ event.kind === 'turn_end')
         if (event.kind === 'turn_end') {
