@@ -12,9 +12,19 @@
  *   3. ~/.switchroom/vault-broker.sock
  *
  * Default timeout: 2000ms — kept tight because cron scripts block on this.
+ *
+ * Token resolution (issue #226):
+ *   createBrokerClient(agentSlug?, opts?) reads ~/.switchroom/agents/<slug>/.vault-token
+ *   at init time and includes the token in every get/list request. If the file
+ *   is missing or unreadable, the client falls through to peercred ACL silently.
+ *   If a token IS present but the broker rejects it with grant-expired or
+ *   grant-revoked, the client writes a clear message to stderr and throws so
+ *   the cron exits non-zero — silent fallback to peercred is intentionally
+ *   NOT done in that case (an operator must mint a fresh grant).
  */
 
 import * as net from "node:net";
+import * as fs from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -38,6 +48,185 @@ export interface BrokerClientOpts {
   timeoutMs?: number;
   /** Loaded config for socket path resolution */
   vaultBrokerSocket?: string;
+  /**
+   * Agent slug used for token-file discovery.
+   * When provided, createBrokerClient reads
+   * ~/.switchroom/agents/<agentSlug>/.vault-token at init time.
+   * Ignored when constructing opts inline (use createBrokerClient instead).
+   */
+  agentSlug?: string;
+}
+
+// ─── Token-file helpers ────────────────────────────────────────────────────────
+
+/**
+ * Compute the path to the agent's capability token file.
+ * Public so tests can locate the file without duplicating the path formula.
+ */
+export function vaultTokenFilePath(agentSlug: string): string {
+  return join(homedir(), ".switchroom", "agents", agentSlug, ".vault-token");
+}
+
+/**
+ * Attempt to read the agent's vault token from disk.
+ *
+ * Returns the trimmed first line of the file on success, or null when:
+ *   - ENOENT: file does not exist (no grant minted yet) — silent fall-through.
+ *   - EACCES: file is unreadable — logs a warning to stderr, falls through.
+ *   - Any other error: logs a warning to stderr, falls through.
+ *
+ * NEVER logs the token bytes themselves.
+ */
+export function readVaultTokenFile(agentSlug: string): string | null {
+  const filePath = vaultTokenFilePath(agentSlug);
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const token = raw.split("\n")[0].trim();
+    return token.length > 0 ? token : null;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // Normal: no grant has been minted for this agent yet.
+      return null;
+    }
+    // EACCES or anything else — warn and fall through to peercred.
+    const reason = code === "EACCES"
+      ? "permission denied"
+      : (err instanceof Error ? err.message : String(err));
+    process.stderr.write(
+      `[vault-broker] Warning: could not read token file ${filePath}: ${reason}. ` +
+      `Falling through to peercred ACL.\n`,
+    );
+    return null;
+  }
+}
+
+// ─── Stateful broker client (issue #226) ──────────────────────────────────────
+
+/**
+ * Error thrown when a capability token is present but the broker rejects it
+ * with grant-expired or grant-revoked. The cron must exit non-zero; silently
+ * falling back to peercred would mask a security-relevant event.
+ */
+export class VaultTokenRejectedError extends Error {
+  constructor(
+    public readonly reason: "grant-expired" | "grant-revoked",
+    msg: string,
+  ) {
+    super(msg);
+    this.name = "VaultTokenRejectedError";
+  }
+}
+
+/**
+ * A stateful broker client that carries an optional capability token.
+ * Obtained via `createBrokerClient()`.
+ *
+ * get() and list() include the token in the request payload when present.
+ * If the broker rejects the token with grant-expired or grant-revoked,
+ * they throw VaultTokenRejectedError (the caller / cron should exit non-zero).
+ */
+export interface BrokerClient {
+  /** True when a token was successfully read from disk at init time. */
+  readonly hasToken: boolean;
+  /** Structured get — same semantics as getViaBrokerStructured, plus token. */
+  get(key: string): Promise<GetResult>;
+  /** List all keys — same semantics as listViaBroker, plus token. */
+  list(): Promise<string[] | null>;
+}
+
+/**
+ * Create a broker client.
+ *
+ * If agentSlug is provided (or opts.agentSlug is set), attempts to read
+ * ~/.switchroom/agents/<agentSlug>/.vault-token. Falls through silently on
+ * ENOENT; warns on EACCES or other read errors. The agent slug is also
+ * discoverable via the SWITCHROOM_AGENT_NAME environment variable — callers
+ * that don't have the slug at hand can pass process.env.SWITCHROOM_AGENT_NAME.
+ *
+ * @example
+ *   const client = createBrokerClient(process.env.SWITCHROOM_AGENT_NAME);
+ *   const result = await client.get("my-key");
+ */
+export function createBrokerClient(
+  agentSlugOrOpts?: string | BrokerClientOpts,
+  opts?: BrokerClientOpts,
+): BrokerClient {
+  let agentSlug: string | undefined;
+  let baseOpts: BrokerClientOpts | undefined;
+
+  if (typeof agentSlugOrOpts === "string") {
+    agentSlug = agentSlugOrOpts || undefined;
+    baseOpts = opts;
+  } else {
+    baseOpts = agentSlugOrOpts;
+    agentSlug = baseOpts?.agentSlug;
+  }
+
+  // Read the token once at init time. Never store it in a closure that leaks
+  // to logs — only included in wire requests.
+  const token: string | null =
+    agentSlug ? readVaultTokenFile(agentSlug) : null;
+
+  return {
+    hasToken: token !== null,
+
+    async get(key: string): Promise<GetResult> {
+      const req: Parameters<typeof encodeRequest>[0] = token
+        ? { v: 1, op: "get", key, token }
+        : { v: 1, op: "get", key };
+      const result = await rpc(req, baseOpts);
+      if (result.kind === "unreachable") {
+        return { kind: "unreachable", msg: result.msg };
+      }
+      const resp = result.resp;
+      if (resp.ok && "entry" in resp) {
+        return { kind: "ok", entry: resp.entry as VaultEntry };
+      }
+      if (!resp.ok) {
+        // When a token was presented, grant-expired and grant-revoked are
+        // hard failures — do NOT silently fall back to peercred.
+        if (token !== null) {
+          const msg = resp.msg ?? "";
+          if (msg.includes("grant-expired")) {
+            const err = new VaultTokenRejectedError(
+              "grant-expired",
+              `vault-broker rejected capability token: ${msg}. ` +
+              `Mint a new grant with: switchroom vault grant mint <agent> --key <key>`,
+            );
+            process.stderr.write(`[vault-broker] ERROR: ${err.message}\n`);
+            throw err;
+          }
+          if (msg.includes("grant-revoked")) {
+            const err = new VaultTokenRejectedError(
+              "grant-revoked",
+              `vault-broker rejected capability token: ${msg}. ` +
+              `Mint a new grant with: switchroom vault grant mint <agent> --key <key>`,
+            );
+            process.stderr.write(`[vault-broker] ERROR: ${err.message}\n`);
+            throw err;
+          }
+        }
+        if (resp.code === "UNKNOWN_KEY") {
+          return { kind: "not_found", code: resp.code, msg: resp.msg };
+        }
+        return { kind: "denied", code: resp.code, msg: resp.msg };
+      }
+      return { kind: "unreachable", msg: "unexpected broker response shape" };
+    },
+
+    async list(): Promise<string[] | null> {
+      const req: Parameters<typeof encodeRequest>[0] = token
+        ? { v: 1, op: "list", token }
+        : { v: 1, op: "list" };
+      const result = await rpc(req, baseOpts);
+      if (result.kind === "unreachable") return null;
+      if (result.resp.ok && "keys" in result.resp) {
+        return result.resp.keys as string[];
+      }
+      return null;
+    },
+  };
 }
 
 export interface UnlockResult {
