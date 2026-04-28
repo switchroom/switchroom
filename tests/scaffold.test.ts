@@ -1576,9 +1576,10 @@ describe("scaffoldAgent with global defaults cascade", () => {
         ],
       },
     ]);
-    // User's Stop hook + switchroom-owned Stop hooks (handoff + secret-scrub).
-    // secret-scrub is added when the switchroom telegram plugin is used
-    // (the default in this test's telegramConfig).
+    // User's Stop hook + switchroom-owned Stop hooks (handoff + secret-scrub
+    // + silent-end-interrupt). secret-scrub and silent-end-interrupt are added
+    // when the switchroom telegram plugin is used (the default in this test's
+    // telegramConfig).
     expect(settings.hooks.Stop).toEqual([
       {
         hooks: [
@@ -1598,6 +1599,12 @@ describe("scaffoldAgent with global defaults cascade", () => {
             command: expect.stringContaining("secret-scrub-stop.mjs"),
             timeout: 15,
             async: true,
+          },
+          {
+            type: "command",
+            command: expect.stringContaining("silent-end-interrupt-stop.mjs"),
+            timeout: 5,
+            async: false,
           },
         ],
       },
