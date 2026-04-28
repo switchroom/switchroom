@@ -1,9 +1,9 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, realpathSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, realpathSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { withConfigError, getConfig } from "./helpers.js";
 import { reconcileAgent } from "../agents/scaffold.js";
 import { restartAgent, writeRestartReasonMarker } from "../agents/lifecycle.js";
@@ -93,6 +93,158 @@ function runCaptured(cmd: string, cwd: string, timeoutMs = 10_000): string | nul
   }
 }
 
+// ─── Build-info stash helpers (Fix 1) ─────────────────────────────────────
+
+/**
+ * The path of the auto-generated file that `scripts/build.mjs` regenerates
+ * on every build, leaving a permanently-dirty working tree.
+ */
+export const BUILD_INFO_FILE = "src/build-info.ts";
+
+/**
+ * Parse `git status --porcelain` and return two groups:
+ *  - buildInfoOnly: true when the ONLY dirty file is src/build-info.ts
+ *  - otherLines:    the lines for everything except src/build-info.ts
+ *
+ * Exported for unit testing.
+ */
+export function classifyDirtyTree(porcelain: string): {
+  buildInfoOnly: boolean;
+  otherLines: string[];
+} {
+  const lines = porcelain.trim() === "" ? [] : porcelain.trim().split("\n");
+  const otherLines = lines.filter(l => !l.endsWith(BUILD_INFO_FILE));
+  const buildInfoLines = lines.filter(l => l.endsWith(BUILD_INFO_FILE));
+  const buildInfoOnly = buildInfoLines.length > 0 && otherLines.length === 0;
+  return { buildInfoOnly, otherLines };
+}
+
+/**
+ * Stash src/build-info.ts using `git stash push --include-untracked -m <marker>`.
+ * Returns the stash entry name (e.g. "stash@{0}") so it can be popped later,
+ * or null if stashing failed.
+ *
+ * Exported for unit testing.
+ */
+export function stashBuildInfo(installDir: string): string | null {
+  const marker = "switchroom-update-auto-stash-build-info";
+  const ok = runCaptured(
+    `git stash push -m ${JSON.stringify(marker)} -- ${BUILD_INFO_FILE}`,
+    installDir,
+  );
+  if (ok === null) return null;
+  // Verify the stash was actually created by looking for our marker
+  const list = runCaptured("git stash list --max-count=1", installDir)?.trim() ?? "";
+  if (!list.includes(marker)) return null;
+  return "stash@{0}";
+}
+
+/**
+ * Pop the stash entry created by stashBuildInfo. Best-effort — errors are
+ * logged but don't abort the update.
+ */
+export function unstashBuildInfo(installDir: string, stashRef: string): void {
+  runCaptured(`git stash pop ${stashRef}`, installDir);
+}
+
+// ─── Upstream lag detection (Fix 2) ────────────────────────────────────────
+
+/**
+ * Check whether `origin/main` is behind `upstream/main`.
+ * Returns the number of commits origin is behind (0 if in sync or no upstream).
+ *
+ * Exported for unit testing.
+ */
+export function countOriginBehindUpstream(installDir: string, branch = "main"): number {
+  // Check if upstream remote exists
+  const remotes = runCaptured("git remote", installDir)?.trim() ?? "";
+  if (!remotes.split("\n").includes("upstream")) return 0;
+
+  // Fetch upstream (quiet — errors mean no network, treat as 0)
+  runCaptured(`git fetch --quiet upstream ${branch}`, installDir, 30_000);
+
+  // Count commits upstream/branch has that origin/branch doesn't
+  const count = runCaptured(
+    `git rev-list --count origin/${branch}..upstream/${branch}`,
+    installDir,
+  )?.trim() ?? "0";
+  return parseInt(count, 10) || 0;
+}
+
+// ─── Dist staleness detection (Fix 3) ──────────────────────────────────────
+
+/**
+ * Return true when `distFile` is older than any `.ts` file under the given
+ * source dirs. Also returns true when `distFile` doesn't exist at all.
+ *
+ * Exported for unit testing.
+ */
+export function isDistStale(installDir: string, distFile: string, sourceDirs: string[]): boolean {
+  const distPath = join(installDir, distFile);
+  if (!existsSync(distPath)) return true;
+
+  for (const dir of sourceDirs) {
+    const dirPath = join(installDir, dir);
+    if (!existsSync(dirPath)) continue;
+    const result = runCaptured(
+      `find ${JSON.stringify(dirPath)} -name "*.ts" -newer ${JSON.stringify(distPath)}`,
+      installDir,
+    )?.trim() ?? "";
+    if (result !== "") return true;
+  }
+  return false;
+}
+
+// ─── SHA-based restart detection (Fix 4) ───────────────────────────────────
+
+const LAST_DEPLOYED_SHA_FILE = join(homedir(), ".switchroom", "last-deployed-sha.json");
+
+interface DeployedShaState {
+  sha: string;
+}
+
+/**
+ * Read the last-deployed SHA from the state file. Returns null on first run
+ * (file doesn't exist) or parse error.
+ *
+ * Exported for unit testing.
+ */
+export function readLastDeployedSha(stateFile = LAST_DEPLOYED_SHA_FILE): string | null {
+  try {
+    const raw = readFileSync(stateFile, "utf-8");
+    return (JSON.parse(raw) as DeployedShaState).sha ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write the current deployed SHA to the state file, creating parent dirs.
+ *
+ * Exported for unit testing.
+ */
+export function writeLastDeployedSha(sha: string, stateFile = LAST_DEPLOYED_SHA_FILE): void {
+  mkdirSync(dirname(stateFile), { recursive: true });
+  writeFileSync(stateFile, JSON.stringify({ sha } satisfies DeployedShaState), "utf-8");
+}
+
+/**
+ * Extract COMMIT_SHA from a freshly-written src/build-info.ts without
+ * importing it (avoids module-cache issues in long-running processes).
+ *
+ * Exported for unit testing.
+ */
+export function extractBuiltSha(installDir: string): string | null {
+  try {
+    const content = readFileSync(join(installDir, BUILD_INFO_FILE), "utf-8");
+    const m = content.match(/COMMIT_SHA:\s*string\s*\|\s*null\s*=\s*("([^"]+)"|null)/);
+    if (!m) return null;
+    return m[2] ?? null; // m[2] is the capture inside the quotes; undefined when null literal
+  } catch {
+    return null;
+  }
+}
+
 /**
  * State persisted to a temp JSON file before self-reexec.
  * The freshly-built binary reads this in --phase=post-build.
@@ -104,6 +256,8 @@ interface UpdateResumeState {
   sourceChanged: boolean;
   before: string;
   noRestart: boolean;
+  /** Fix 4: SHA embedded in the newly-built src/build-info.ts, if known. */
+  newSha?: string;
 }
 
 /**
@@ -176,8 +330,10 @@ function runPostBuildPhase(opts: {
   before: string;
   sourceChanged: boolean;
   noRestart: boolean;
+  /** Fix 4: new COMMIT_SHA from the just-built binary. Written to state file after restart. */
+  newSha?: string;
 }): void {
-  const { program, installDir, agentNames, before, sourceChanged, noRestart } = opts;
+  const { program, installDir, agentNames, before, sourceChanged, noRestart, newSha } = opts;
   const config = getConfig(program);
   const agentsDir = resolveAgentsDir(config);
   const configPath = getConfigPath(program);
@@ -257,6 +413,17 @@ function runPostBuildPhase(opts: {
         );
       }
     }
+
+    // Fix 4: Persist the deployed SHA so the next `switchroom update` can
+    // detect whether the in-memory agents are already running this build.
+    if (newSha) {
+      try {
+        writeLastDeployedSha(newSha);
+        console.log(chalk.gray(`\n  Deployed SHA recorded: ${newSha}`));
+      } catch (err) {
+        console.warn(chalk.yellow(`  Warning: could not write deployed SHA: ${(err as Error).message}`));
+      }
+    }
   } else if (noRestart) {
     console.log(
       chalk.gray(
@@ -317,6 +484,7 @@ export function registerUpdateCommand(program: Command): void {
             before: state.before,
             sourceChanged: state.sourceChanged,
             noRestart: state.noRestart ?? false,
+            newSha: state.newSha,
           });
           return;
         }
@@ -335,26 +503,42 @@ export function registerUpdateCommand(program: Command): void {
 
         // Guard: dirty working tree blocks a pull. A dirty tree means
         // `git pull --ff-only` would either fail or silently clobber
-        // uncommitted work. Print explicit instructions and exit.
+        // uncommitted work.
+        //
+        // Fix 1: src/build-info.ts is regenerated on every build and leaves
+        // a permanently-dirty tree. Auto-stash ONLY that file; fail-loud for
+        // any other uncommitted changes so we don't silently swallow operator
+        // work.
+        //
         // --check is read-only so we skip this guard for it.
+        let buildInfoStashRef: string | null = null;
         if (!opts.check) {
           const porcelain = runCaptured("git status --porcelain", installDir)?.trim() ?? "";
           if (porcelain) {
-            console.error(
-              chalk.red(
-                `\n  Switchroom install directory has uncommitted changes:\n\n` +
-                  porcelain
-                    .split("\n")
-                    .map(l => `    ${l}`)
-                    .join("\n") +
-                  `\n\n  Resolve before updating:\n` +
-                  `    cd ${installDir}\n` +
-                  `    git stash         # stash your changes\n` +
-                  `    switchroom update # then retry\n` +
-                  `    git stash pop     # restore if needed\n`
-              )
-            );
-            process.exit(1);
+            const { buildInfoOnly, otherLines } = classifyDirtyTree(porcelain);
+            if (buildInfoOnly) {
+              console.log(chalk.gray(`\n  Auto-stashing ${BUILD_INFO_FILE} (regenerated by build)...`));
+              buildInfoStashRef = stashBuildInfo(installDir);
+              if (!buildInfoStashRef) {
+                console.error(chalk.red(`  Failed to auto-stash ${BUILD_INFO_FILE}. Resolve manually.`));
+                process.exit(1);
+              }
+            } else {
+              console.error(
+                chalk.red(
+                  `\n  Switchroom install directory has uncommitted changes:\n\n` +
+                    otherLines
+                      .map(l => `    ${l}`)
+                      .join("\n") +
+                    `\n\n  Resolve before updating:\n` +
+                    `    cd ${installDir}\n` +
+                    `    git stash         # stash your changes\n` +
+                    `    switchroom update # then retry\n` +
+                    `    git stash pop     # restore if needed\n`
+                )
+              );
+              process.exit(1);
+            }
           }
         }
 
@@ -364,15 +548,32 @@ export function registerUpdateCommand(program: Command): void {
         const before = runCaptured("git rev-parse --short HEAD", installDir)?.trim() ?? "unknown";
         console.log(chalk.gray(`  Current commit: ${before}`));
 
+        // Fix 2: Check for upstream lag before fetching origin.
+        // If origin/main is behind upstream/main (e.g. a fork that wasn't
+        // synced before today's PRs merged), warn and exit — don't silently
+        // pull stale code from origin.
+        const branch = runCaptured("git rev-parse --abbrev-ref HEAD", installDir)?.trim() ?? "main";
+        const upstreamLag = countOriginBehindUpstream(installDir, branch);
+        if (upstreamLag > 0) {
+          if (buildInfoStashRef) unstashBuildInfo(installDir, buildInfoStashRef);
+          console.error(
+            chalk.yellow(
+              `\n  ⚠️  origin/${branch} is ${upstreamLag} commit(s) behind upstream/${branch}.` +
+              `\n  Run \`git push origin upstream/${branch}:${branch}\` to sync, then re-run update.\n`
+            )
+          );
+          process.exit(1);
+        }
+
         // 2. Fetch from origin
         console.log(chalk.gray("\n  Fetching from origin..."));
         if (!runStreamed("git fetch --quiet origin", installDir, 30_000)) {
+          if (buildInfoStashRef) unstashBuildInfo(installDir, buildInfoStashRef);
           console.error(chalk.red("  git fetch failed"));
           process.exit(1);
         }
 
         // 3. Check what's pending
-        const branch = runCaptured("git rev-parse --abbrev-ref HEAD", installDir)?.trim() ?? "main";
         const log = runCaptured(
           `git log --oneline HEAD..origin/${branch}`,
           installDir,
@@ -380,7 +581,10 @@ export function registerUpdateCommand(program: Command): void {
 
         if (!log) {
           console.log(chalk.green("\n  Already up to date.\n"));
-          if (opts.check) return;
+          if (opts.check) {
+            if (buildInfoStashRef) unstashBuildInfo(installDir, buildInfoStashRef);
+            return;
+          }
           // Still reconcile in case switchroom.yaml changed locally without an update
         } else {
           const lines = log.split("\n");
@@ -391,6 +595,7 @@ export function registerUpdateCommand(program: Command): void {
         }
 
         if (opts.check) {
+          if (buildInfoStashRef) unstashBuildInfo(installDir, buildInfoStashRef);
           console.log(chalk.gray("\n  --check mode: not applying changes.\n"));
           return;
         }
@@ -401,6 +606,7 @@ export function registerUpdateCommand(program: Command): void {
         if (log) {
           console.log(chalk.gray("\n  Pulling..."));
           if (!runStreamed(`git pull --ff-only --quiet origin ${branch}`, installDir, 60_000)) {
+            if (buildInfoStashRef) unstashBuildInfo(installDir, buildInfoStashRef);
             console.error(
               chalk.red(
                 "  git pull failed (not a fast-forward?). " +
@@ -434,18 +640,54 @@ export function registerUpdateCommand(program: Command): void {
         //     Wrapped in try/warn — network/permission failures are non-fatal.
         bumpClaudeCli(installDir);
 
-        // 5c. Rebuild own CLI binary when TS source changed, then self-reexec
-        //     so the reconcile/restart/summary steps run under the new binary.
-        const changedFiles = sourceChanged
-          ? (runCaptured(`git diff --name-only ${before}..HEAD`, installDir)?.trim() ?? "")
-          : "";
-        const tsChanged = sourceChanged && changedFiles.split("\n").some(
-          f => f.startsWith("src/") || f.startsWith("bin/") || f.startsWith("telegram-plugin/")
-        );
+        // Fix 3: Always rebuild when dist is stale relative to source.
+        // Previously a build was only triggered when the pull saw diffs in
+        // src/|bin/|telegram-plugin/. That missed cases where dist was
+        // stale for other reasons (manual fast-forward, partial state,
+        // crashed build). Now we check mtime regardless of whether the pull
+        // brought in new commits.
+        const SOURCE_DIRS = ["src", "bin", "telegram-plugin"];
+        const DIST_CLI   = "dist/cli/switchroom.js";
+        const DIST_PLUGIN = join("telegram-plugin", "dist", "server.js");
 
-        if (tsChanged) {
+        const distCliStale    = isDistStale(installDir, DIST_CLI, SOURCE_DIRS);
+        const distPluginStale = existsSync(join(installDir, DIST_PLUGIN))
+          ? isDistStale(installDir, DIST_PLUGIN, SOURCE_DIRS)
+          : false;
+        const needsRebuild    = distCliStale || distPluginStale;
+
+        // Pop the stash now so build.mjs can regenerate build-info.ts cleanly.
+        // (build.mjs will write a fresh one; the stashed version is obsolete.)
+        if (buildInfoStashRef) {
+          // Drop rather than pop so the stale build-info.ts doesn't conflict
+          // with the file build.mjs is about to write.
+          runCaptured(`git stash drop ${buildInfoStashRef}`, installDir);
+          buildInfoStashRef = null;
+        }
+
+        if (needsRebuild) {
+          if (distCliStale) {
+            console.log(chalk.gray("\n  dist/cli/switchroom.js is stale — rebuilding..."));
+          }
+          if (distPluginStale) {
+            console.log(chalk.gray("\n  telegram-plugin/dist/server.js is stale — rebuilding..."));
+          }
+          // Always reinstall deps before a rebuild so any lockfile changes are applied.
+          console.log(chalk.gray("\n  Running bun install..."));
+          if (!runStreamed("bun install --quiet", installDir, 120_000)) {
+            console.error(chalk.yellow("  bun install reported a non-zero exit"));
+          }
           const built = rebuildCli(installDir);
+
           if (built) {
+            // Fix 4: After a successful build compare the new COMMIT_SHA
+            // against the last-deployed SHA. If they differ, force-restart all
+            // agents regardless of what reconcile reports, and persist the new
+            // SHA so subsequent runs can tell what's already deployed.
+            const newSha = extractBuiltSha(installDir);
+            const lastSha = readLastDeployedSha();
+            const shaChanged = newSha !== null && newSha !== lastSha;
+
             // Persist state and self-reexec the freshly-built binary
             const config = getConfig(program);
             const agentNames = Object.keys(config.agents);
@@ -453,9 +695,12 @@ export function registerUpdateCommand(program: Command): void {
               installDir,
               agentNames,
               branch,
-              sourceChanged,
+              // Mark sourceChanged=true when SHA changed so post-build phase
+              // unconditionally restarts all agents.
+              sourceChanged: sourceChanged || shaChanged,
               before,
               noRestart: opts.restart === false,
+              newSha: newSha ?? undefined,
             };
             const resumeFile = join(
               tmpdir(),
@@ -463,8 +708,7 @@ export function registerUpdateCommand(program: Command): void {
             );
             writeFileSync(resumeFile, JSON.stringify(state), "utf-8");
 
-            // Locate the new binary (built by scripts/build.mjs)
-            const newBinary = join(installDir, "dist/cli/switchroom.js");
+            const newBinary = join(installDir, DIST_CLI);
             console.log(chalk.gray(`\n  Handing off to rebuilt binary...`));
             selfReexec(newBinary, resumeFile);
             // selfReexec calls process.exit — unreachable
