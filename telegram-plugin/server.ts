@@ -1494,6 +1494,69 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id'],
       },
     },
+    {
+      name: 'send_checklist',
+      description:
+        'Send a native Telegram checklist (interactive task list) to a chat. Users can tick tasks directly in the Telegram app. Returns the message_id of the created checklist. The bot is notified when tasks are ticked — these arrive as channel events with kind="checklist_task_changed". Limit: 30 tasks per checklist.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Target chat ID.' },
+          title: { type: 'string', description: 'Checklist title shown above the task list.' },
+          tasks: {
+            type: 'array',
+            description: 'Task list. Each item has a text (required) and an optional done flag. Max 30 items.',
+            items: {
+              type: 'object',
+              properties: {
+                text: { type: 'string', description: 'Task label text.' },
+                done: { type: 'boolean', description: 'Pre-check the task. Default: false.' },
+              },
+              required: ['text'],
+            },
+          },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.',
+          },
+          reply_to: {
+            type: 'string',
+            description: 'Message ID to reply-to / thread under.',
+          },
+          protect_content: {
+            type: 'boolean',
+            description: 'When true, Telegram prevents forwarding or saving the message.',
+          },
+        },
+        required: ['chat_id', 'title', 'tasks'],
+      },
+    },
+    {
+      name: 'update_checklist',
+      description:
+        'Patch an existing native Telegram checklist. Supports updating the title, adding new tasks, removing tasks, or marking tasks done/undone. Tasks with an id target existing items; tasks without an id are appended. Preserves existing task ids across edits.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Chat that owns the checklist.' },
+          message_id: { type: 'string', description: 'Message ID of the checklist to update.' },
+          title: { type: 'string', description: 'New title. Omit to keep current title.' },
+          tasks: {
+            type: 'array',
+            description: 'Task patch list. Items with id target existing tasks; items without id are added.',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Existing task id (32-bit int as string). Omit to add a new task.' },
+                text: { type: 'string', description: 'New label text for the task.' },
+                done: { type: 'boolean', description: 'Mark the task done (true) or undone (false).' },
+              },
+            },
+          },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
   ],
 }))
 
@@ -2306,6 +2369,69 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         return { content: [{ type: 'text', text: `forwarded (id: ${fwd.message_id})` }] }
+      }
+      case 'send_checklist': {
+        const chat_id = args.chat_id as string
+        assertAllowedChat(chat_id)
+        const title = args.title as string | undefined
+        if (!title) throw new Error('send_checklist: title is required')
+        const tasks = args.tasks as Array<{ text: string; done?: boolean }> | undefined
+        if (!Array.isArray(tasks) || tasks.length === 0) {
+          throw new Error('send_checklist: tasks must be a non-empty array')
+        }
+        const MAX_TASKS = 30
+        if (tasks.length > MAX_TASKS) {
+          throw new Error(`send_checklist: checklist exceeds ${MAX_TASKS}-task limit (got ${tasks.length})`)
+        }
+        const threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+        const replyTo = args.reply_to != null ? Number(args.reply_to) : undefined
+        const protectContent = args.protect_content === true
+
+        // Use raw API passthrough — sendChecklist is not yet in grammY typed wrappers.
+        const rawApi = (bot.api.raw as unknown as Record<string, unknown>)
+        const rawSendChecklist = rawApi.sendChecklist
+        if (typeof rawSendChecklist !== 'function') {
+          throw new Error('send_checklist: not available in this Telegram Bot API version')
+        }
+        const sent = await (rawSendChecklist as (p: Record<string, unknown>) => Promise<{ message_id: number }>)({
+          chat_id: Number(chat_id),
+          title,
+          tasks: tasks.map(t => ({ text: t.text, ...(t.done != null ? { is_completed: t.done } : {}) })),
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+          ...(replyTo != null ? { reply_to_message_id: replyTo } : {}),
+          ...(protectContent ? { protect_content: true } : {}),
+        })
+        return { content: [{ type: 'text', text: `checklist sent (id: ${sent.message_id})` }] }
+      }
+      case 'update_checklist': {
+        const chat_id = args.chat_id as string
+        assertAllowedChat(chat_id)
+        const message_id = args.message_id as string | undefined
+        if (!message_id) throw new Error('update_checklist: message_id is required')
+        const title = args.title as string | undefined
+        const tasks = args.tasks as Array<{ id?: string; text?: string; done?: boolean }> | undefined
+
+        // Use raw API passthrough — editMessageChecklist is not yet in grammY typed wrappers.
+        const rawApi = (bot.api.raw as unknown as Record<string, unknown>)
+        const rawEditMessageChecklist = rawApi.editMessageChecklist
+        if (typeof rawEditMessageChecklist !== 'function') {
+          throw new Error('update_checklist: not available in this Telegram Bot API version')
+        }
+        await (rawEditMessageChecklist as (p: Record<string, unknown>) => Promise<unknown>)({
+          chat_id: Number(chat_id),
+          message_id: Number(message_id),
+          ...(title != null ? { title } : {}),
+          ...(tasks != null
+            ? {
+                tasks: tasks.map(t => ({
+                  ...(t.id != null ? { id: Number(t.id) } : {}),
+                  ...(t.text != null ? { text: t.text } : {}),
+                  ...(t.done != null ? { is_completed: t.done } : {}),
+                })),
+              }
+            : {}),
+        })
+        return { content: [{ type: 'text', text: `checklist updated (id: ${message_id})` }] }
       }
       default:
         return {

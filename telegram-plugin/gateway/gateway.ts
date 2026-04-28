@@ -326,6 +326,85 @@ const sendMessageDraftFn: (
         })
     : undefined
 
+// ─── sendChecklist / editMessageChecklist boot probes ─────────────────────
+// grammY 1.x exposes new Telegram Bot API methods via bot.api.raw before the
+// typed wrapper is generated. We probe for availability at boot so callers
+// can detect degraded mode gracefully instead of throwing at call time.
+const _rawSendChecklist = (bot.api.raw as unknown as Record<string, unknown>).sendChecklist
+const _rawEditMessageChecklist = (bot.api.raw as unknown as Record<string, unknown>).editMessageChecklist
+
+/** True when the connected Telegram Bot API supports native checklists. */
+const CHECKLIST_API_AVAILABLE =
+  typeof _rawSendChecklist === 'function' &&
+  typeof _rawEditMessageChecklist === 'function'
+
+if (!CHECKLIST_API_AVAILABLE) {
+  process.stderr.write(
+    `telegram gateway: sendChecklist / editMessageChecklist not available in this grammY/Bot API version (${GRAMMY_VERSION}) — checklist tools will error gracefully\n`,
+  )
+}
+
+/**
+ * Send a native Telegram checklist message.
+ * Wraps bot.api.raw.sendChecklist with string→number coercion (chat_id) and
+ * a 30-task cap enforced before the API call.
+ */
+async function rawSendChecklist(args: {
+  chat_id: string
+  title: string
+  tasks: Array<{ text: string; done?: boolean }>
+  message_thread_id?: number
+  reply_to_message_id?: number
+  protect_content?: boolean
+}): Promise<{ message_id: number }> {
+  if (!CHECKLIST_API_AVAILABLE) {
+    throw new Error('sendChecklist is not available in this grammY/Telegram Bot API version')
+  }
+  const MAX_TASKS = 30
+  if (args.tasks.length > MAX_TASKS) {
+    throw new Error(`checklist exceeds ${MAX_TASKS}-task limit (got ${args.tasks.length})`)
+  }
+  const result = await (_rawSendChecklist as (p: Record<string, unknown>) => Promise<{ message_id: number }>)({
+    chat_id: Number(args.chat_id),
+    title: args.title,
+    tasks: args.tasks.map(t => ({ text: t.text, ...(t.done != null ? { is_completed: t.done } : {}) })),
+    ...(args.message_thread_id != null ? { message_thread_id: args.message_thread_id } : {}),
+    ...(args.reply_to_message_id != null ? { reply_to_message_id: args.reply_to_message_id } : {}),
+    ...(args.protect_content === true ? { protect_content: true } : {}),
+  })
+  return { message_id: result.message_id }
+}
+
+/**
+ * Edit (patch) an existing Telegram checklist message.
+ * Supports updating title, adding/removing tasks, and marking tasks done/undone.
+ * Task objects with an `id` field target existing tasks; those without are added.
+ */
+async function rawEditMessageChecklist(args: {
+  chat_id: string
+  message_id: string
+  title?: string
+  tasks?: Array<{ id?: string; text?: string; done?: boolean }>
+}): Promise<void> {
+  if (!CHECKLIST_API_AVAILABLE) {
+    throw new Error('editMessageChecklist is not available in this grammY/Telegram Bot API version')
+  }
+  await (_rawEditMessageChecklist as (p: Record<string, unknown>) => Promise<unknown>)({
+    chat_id: Number(args.chat_id),
+    message_id: Number(args.message_id),
+    ...(args.title != null ? { title: args.title } : {}),
+    ...(args.tasks != null
+      ? {
+          tasks: args.tasks.map(t => ({
+            ...(t.id != null ? { id: Number(t.id) } : {}),
+            ...(t.text != null ? { text: t.text } : {}),
+            ...(t.done != null ? { is_completed: t.done } : {}),
+          })),
+        }
+      : {}),
+  })
+}
+
 const chatLock = createChatLock()
 const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
 let botUsername = ''
@@ -1339,6 +1418,7 @@ const ALLOWED_TOOLS = new Set([
   'reply', 'stream_reply', 'progress_update', 'react', 'download_attachment',
   'edit_message', 'send_typing', 'pin_message', 'delete_message',
   'forward_message', 'get_recent_messages',
+  'send_checklist', 'update_checklist',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1368,9 +1448,55 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeForwardMessage(args)
     case 'get_recent_messages':
       return executeGetRecentMessages(args)
+    case 'send_checklist':
+      return executeSendChecklist(args)
+    case 'update_checklist':
+      return executeUpdateChecklist(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
+}
+
+async function executeSendChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = args.chat_id as string
+  if (!chat_id) throw new Error('send_checklist: chat_id is required')
+  const title = args.title as string | undefined
+  if (!title) throw new Error('send_checklist: title is required')
+  const tasks = args.tasks as Array<{ text: string; done?: boolean }> | undefined
+  if (!Array.isArray(tasks) || tasks.length === 0) throw new Error('send_checklist: tasks must be a non-empty array')
+  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  const replyTo = args.reply_to != null ? Number(args.reply_to) : undefined
+  const protectContent = args.protect_content === true
+
+  assertAllowedChat(chat_id)
+
+  const sent = await rawSendChecklist({
+    chat_id,
+    title,
+    tasks,
+    ...(threadId != null ? { message_thread_id: threadId } : {}),
+    ...(replyTo != null ? { reply_to_message_id: replyTo } : {}),
+    ...(protectContent ? { protect_content: true } : {}),
+  })
+
+  process.stderr.write(`telegram gateway: send_checklist: sent chatId=${chat_id} messageId=${sent.message_id} tasks=${tasks.length}\n`)
+  return { content: [{ type: 'text', text: `checklist sent (id: ${sent.message_id})` }] }
+}
+
+async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = args.chat_id as string
+  if (!chat_id) throw new Error('update_checklist: chat_id is required')
+  const message_id = args.message_id as string | undefined
+  if (!message_id) throw new Error('update_checklist: message_id is required')
+  const title = args.title as string | undefined
+  const tasks = args.tasks as Array<{ id?: string; text?: string; done?: boolean }> | undefined
+
+  assertAllowedChat(chat_id)
+
+  await rawEditMessageChecklist({ chat_id, message_id, title, tasks })
+
+  process.stderr.write(`telegram gateway: update_checklist: updated chatId=${chat_id} messageId=${message_id}\n`)
+  return { content: [{ type: 'text', text: `checklist updated (id: ${message_id})` }] }
 }
 
 async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
@@ -5957,6 +6083,96 @@ bot.on('message:sticker', async ctx => {
   const sticker = ctx.message.sticker
   const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
   await handleInbound(ctx, `(sticker${emoji})`, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
+})
+
+// ─── Checklist service message handlers ──────────────────────────────────
+// Telegram emits `checklist_tasks_done` and `checklist_tasks_added` service
+// messages when users tick or add tasks in a native checklist. These arrive
+// as part of the `message` update type, so no extra `allowed_updates` config
+// is required — bots already receive them.
+//
+// We route them to the agent as a new channel event with
+// kind="checklist_task_changed" so the agent can react to user actions on
+// a checklist it sent.
+
+type ChecklistTaskUpdate = {
+  message_checklist?: {
+    title?: string
+    tasks?: Array<{ id?: number; text?: string; is_completed?: boolean }>
+  }
+  checklist_tasks_done?: Array<{ id?: number; user?: { id?: number; username?: string }; done?: boolean }>
+  checklist_tasks_added?: Array<{ id?: number; text?: string; user?: { id?: number; username?: string } }>
+}
+
+function handleChecklistUpdate(
+  ctx: Context,
+  kind: 'checklist_tasks_done' | 'checklist_tasks_added',
+): void {
+  try {
+    const msg = ctx.message as (typeof ctx.message & ChecklistTaskUpdate) | undefined
+    if (!msg) return
+
+    const chat = ctx.chat
+    if (!chat) return
+
+    const chat_id = String(chat.id)
+    const access = loadAccess()
+
+    // Only notify if this chat is allowlisted — same guard as inbound user messages.
+    if (!access.allowFrom.includes(chat_id) && access.allowFrom.length > 0) return
+
+    const message_id = String(msg.message_id)
+    const ts = msg.date ?? Math.floor(Date.now() / 1000)
+
+    // Extract task updates depending on service message type
+    const tasksDone = msg.checklist_tasks_done ?? []
+    const tasksAdded = msg.checklist_tasks_added ?? []
+    const allTasks = kind === 'checklist_tasks_done' ? tasksDone : tasksAdded
+
+    // Build per-task channel events and broadcast each to connected bridges.
+    for (const task of allTasks) {
+      const taskId = task.id != null ? String(task.id) : '?'
+      const user = (task.user as { username?: string; id?: number } | undefined)
+      const userName = user?.username ?? (user?.id != null ? String(user.id) : 'unknown')
+      const state = kind === 'checklist_tasks_done'
+        ? ((task as { done?: boolean }).done === false ? 'undone' : 'done')
+        : 'added'
+
+      const inboundMsg: InboundMessage = {
+        type: 'inbound',
+        chatId: chat_id,
+        messageId: Number(message_id),
+        user: userName,
+        userId: user?.id ?? 0,
+        ts,
+        text: `(checklist task ${state}: id=${taskId})`,
+        meta: {
+          chat_id,
+          message_id,
+          kind: 'checklist_task_changed',
+          task_id: taskId,
+          state,
+          user: userName,
+          user_id: user?.id != null ? String(user.id) : '0',
+          ts: new Date(ts * 1000).toISOString(),
+        },
+      }
+      ipcServer.broadcast(inboundMsg)
+      process.stderr.write(
+        `telegram gateway: checklist ${kind}: chat_id=${chat_id} message_id=${message_id} task_id=${taskId} state=${state} user=${userName}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: checklist handler error (${kind}): ${err}\n`)
+  }
+}
+
+bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => {
+  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_done')
+})
+
+bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) => {
+  handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
 })
 
 // ─── Error handler ────────────────────────────────────────────────────────
