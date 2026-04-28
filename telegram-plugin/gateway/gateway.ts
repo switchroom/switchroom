@@ -4920,6 +4920,12 @@ async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<P
 /** Execute the grant: call broker mint_grant, write token, reply. */
 async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
   pendingVaultOps.delete(chatId)
+  // Defence-in-depth: state.agent flows from callback_data into a path
+  // join below. A crafted vg:agent:../../etc payload would produce a
+  // path traversal. Validate against the same regex the rest of the
+  // file uses; on failure, drop silently — the wizard message has
+  // already been finalized.
+  try { assertSafeAgentName(state.agent!) } catch { return }
   const result = await mintGrantViaBroker({
     agent: state.agent!,
     keys: state.selectedKeys!,
