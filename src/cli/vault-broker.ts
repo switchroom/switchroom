@@ -65,40 +65,73 @@ function getAutoUnlockCredPath(configPath?: string): string {
   }
 }
 
-async function promptPassphrase(): Promise<string> {
-  const { createInterface } = await import("node:readline");
-  return new Promise((resolve, reject) => {
-    if (!process.stdin.isTTY) {
-      reject(new Error("stdin is not a TTY — cannot prompt for passphrase"));
-      return;
-    }
-
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
+/**
+ * Read the vault passphrase, masking input when stdin is a TTY.
+ *
+ * TTY path  — raw mode, no echo. Ctrl-C aborts with exit 130.
+ * Pipe path — read the first line from stdin (for scripted use-cases such as
+ *             `echo "passphrase" | switchroom vault broker unlock`).
+ *
+ * Rejects with a clear error when the passphrase is empty.
+ */
+export async function promptPassphrase(): Promise<string> {
+  // ── Non-TTY: piped passphrase ────────────────────────────────────────────
+  if (!process.stdin.isTTY) {
+    const { createInterface } = await import("node:readline");
+    return new Promise((resolve, reject) => {
+      const rl = createInterface({ input: process.stdin, terminal: false });
+      let settled = false;
+      rl.once("line", (line) => {
+        settled = true;
+        rl.close();
+        const passphrase = line.trimEnd();
+        if (!passphrase) {
+          reject(new Error("Empty passphrase — aborting"));
+          return;
+        }
+        resolve(passphrase);
+      });
+      rl.once("close", () => {
+        if (!settled) {
+          // stdin closed without emitting any line (empty pipe)
+          reject(new Error("Empty passphrase — aborting"));
+        }
+      });
     });
+  }
 
+  // ── TTY: masked interactive prompt ──────────────────────────────────────
+  return new Promise((resolve, reject) => {
     process.stdout.write("Vault passphrase: ");
     const stdin = process.stdin;
     stdin.setRawMode(true);
     stdin.resume();
 
     let input = "";
+    const cleanup = () => {
+      stdin.setRawMode(false);
+      stdin.removeListener("data", onData);
+    };
+
     const onData = (data: Buffer) => {
       const char = data.toString("utf8");
       if (char === "\n" || char === "\r") {
-        stdin.setRawMode(false);
-        stdin.removeListener("data", onData);
-        rl.close();
+        // Enter — accept input
+        cleanup();
         process.stdout.write("\n");
-        resolve(input);
+        if (!input) {
+          reject(new Error("Empty passphrase — aborting"));
+        } else {
+          resolve(input);
+        }
       } else if (char === "") {
-        stdin.setRawMode(false);
-        stdin.removeListener("data", onData);
-        rl.close();
+        // Ctrl-C — abort with conventional exit code 130
+        cleanup();
         process.stdout.write("\n");
-        reject(new Error("Aborted"));
+        process.stderr.write("Aborted\n");
+        process.exit(130);
       } else if (char === "" || char === "\b") {
+        // Backspace / Delete
         if (input.length > 0) input = input.slice(0, -1);
       } else {
         input += char;
