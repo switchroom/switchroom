@@ -1271,6 +1271,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'boolean',
             description: 'Disable link preview thumbnails. Default: true (configurable via access.json disableLinkPreview).',
           },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Max 8 buttons total; max 3 per row recommended. When provided, Telegram renders tappable buttons below the message.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1304,6 +1319,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           quote: {
             type: 'boolean',
             description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.',
+          },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Applied on the final done=true send only. Max 8 buttons total; max 3 per row recommended.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
           },
         },
         required: ['chat_id', 'text'],
