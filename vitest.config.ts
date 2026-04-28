@@ -56,6 +56,7 @@ export default defineConfig({
       "**/src/vault/resolver-via-broker.test.ts",
       "**/src/vault/broker/scope.test.ts",
       "**/src/vault/broker/server.test.ts",
+      "**/src/vault/broker/auto-unlock.test.ts",
       "**/telegram-plugin/tests/boot-probes.test.ts",
       "**/telegram-plugin/tests/setup-state.test.ts",
     ],
