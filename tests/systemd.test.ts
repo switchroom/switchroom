@@ -6,6 +6,7 @@ import {
   generateTimerUnit,
   generateTimerServiceUnit,
   resolveGatewayUnitName,
+  shouldInstallBrokerUnit,
 } from "../src/agents/systemd.js";
 import { usesSwitchroomTelegramPlugin } from "../src/config/merge.js";
 import type { AgentConfig, SwitchroomConfig } from "../src/config/schema.js";
@@ -411,5 +412,69 @@ describe("autoaccept detection via usesSwitchroomTelegramPlugin", () => {
     const plainUnit = generateUnit("plain", "/tmp/plain", usesSwitchroomTelegramPlugin(officialAgent));
     expect(plainUnit).not.toContain("autoaccept.exp");
     expect(plainUnit).toContain("/bin/bash");
+  });
+});
+
+describe("shouldInstallBrokerUnit (#207)", () => {
+  // The gate is now a CONJUNCTION: vault.broker.enabled === true AND at
+  // least one agent has a non-empty schedule[i].secrets. Either alone is
+  // not sufficient. Removing the last secrets[] entry flips the gate to
+  // false; reconcile then un-installs.
+
+  function configWithBroker(opts: {
+    enabled?: boolean;
+    secrets?: string[];
+  }): SwitchroomConfig {
+    return {
+      switchroom: { version: 1, agents_dir: "~/.switchroom/agents", skills_dir: "~/.switchroom/skills" },
+      telegram: { bot_token: "vault:telegram-bot-token" },
+      defaults: {},
+      vault: opts.enabled !== undefined ? { broker: { enabled: opts.enabled } } : undefined,
+      agents: {
+        a1: {
+          profile: "default",
+          schedule: opts.secrets ? [{ cron: "0 9 * * *", prompt: "test", secrets: opts.secrets }] : [],
+        } as AgentConfig,
+      },
+    } as unknown as SwitchroomConfig;
+  }
+
+  it("returns false when broker disabled, regardless of secrets", () => {
+    expect(shouldInstallBrokerUnit(configWithBroker({ enabled: false, secrets: ["foo"] }))).toBe(false);
+  });
+
+  it("returns false when broker.enabled is undefined", () => {
+    expect(shouldInstallBrokerUnit(configWithBroker({ secrets: ["foo"] }))).toBe(false);
+  });
+
+  it("returns false when enabled=true but no agent has secrets", () => {
+    // Regression of the old `enabled OR any-secrets` behaviour. Before
+    // #207, this returned true and installed an inert broker unit.
+    expect(shouldInstallBrokerUnit(configWithBroker({ enabled: true }))).toBe(false);
+    expect(shouldInstallBrokerUnit(configWithBroker({ enabled: true, secrets: [] }))).toBe(false);
+  });
+
+  it("returns true when enabled=true AND at least one agent has secrets", () => {
+    expect(shouldInstallBrokerUnit(configWithBroker({ enabled: true, secrets: ["foo"] }))).toBe(true);
+    expect(
+      shouldInstallBrokerUnit(configWithBroker({ enabled: true, secrets: ["foo", "bar/baz"] })),
+    ).toBe(true);
+  });
+
+  it("returns true when secrets exist on any agent (multi-agent fleet)", () => {
+    const cfg: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: "~/.switchroom/agents", skills_dir: "~/.switchroom/skills" },
+      telegram: { bot_token: "vault:telegram-bot-token" },
+      defaults: {},
+      vault: { broker: { enabled: true } },
+      agents: {
+        a1: { profile: "default", schedule: [] } as AgentConfig,
+        a2: { profile: "default", schedule: [
+          { cron: "0 9 * * *", prompt: "test", secrets: ["calendar/api-key"] },
+        ] } as AgentConfig,
+        a3: { profile: "default" } as AgentConfig,
+      },
+    } as unknown as SwitchroomConfig;
+    expect(shouldInstallBrokerUnit(cfg)).toBe(true);
   });
 });

@@ -329,12 +329,27 @@ export function installForemanUnit(): void {
 }
 
 /**
- * Returns true if any agent in the config has at least one schedule entry
- * with a non-empty secrets array, OR if vault.broker.enabled is explicitly
- * true. Used to decide whether the broker unit should be installed.
+ * Returns true when the broker unit should be installed: BOTH
+ * `vault.broker.enabled === true` AND at least one agent in the fleet
+ * has a non-empty `schedule[i].secrets` array.
+ *
+ * #207 (Phase 1C): the previous gate was an OR — `enabled` alone (without
+ * any cron consumer) installed an inert broker unit. Now we require an
+ * actual cron consumer, so the broker only runs when something needs it.
+ *
+ * The conjunction also guarantees the un-install path: when the last
+ * `secrets[]` declaration is removed from config, reconcile sees the gate
+ * flip to false and removes the unit. Per the `restart = reconcile +
+ * restart` contract (PR #59), no separate un-install handler is needed.
+ *
+ * Operator note: if you previously relied on `enabled=true` alone (e.g.
+ * to spin up a broker for interactive vault access without a cron),
+ * you now also need at least one schedule entry with a non-empty
+ * `secrets:`. The simplest workaround is to declare a benign cron entry
+ * that references the keys you want available.
  */
 export function shouldInstallBrokerUnit(config: SwitchroomConfig): boolean {
-  if (config.vault?.broker?.enabled === true) return true;
+  if (config.vault?.broker?.enabled !== true) return false;
   for (const agent of Object.values(config.agents)) {
     const schedule = agent.schedule ?? [];
     if (schedule.some((e) => (e.secrets?.length ?? 0) > 0)) return true;
@@ -355,6 +370,26 @@ export function installAllUnits(config: SwitchroomConfig): void {
   // which never matched the `switchroom-vault-broker.service` reference used
   // by cron timers' After/Wants. Pass the bare `vault-broker` so the file
   // ends up correctly named.
+  if (!shouldInstallBrokerUnit(config)) {
+    // #207: un-install the broker unit if it exists on disk but the gate
+    // flipped to false (e.g. the last schedule[i].secrets entry was just
+    // removed from config). Per the `restart = reconcile + restart`
+    // contract (PR #59), reconcile is responsible for converging to the
+    // declared state in BOTH directions.
+    const brokerUnitPath = resolve(SYSTEMD_USER_DIR, "switchroom-vault-broker.service");
+    if (existsSync(brokerUnitPath)) {
+      // Stop before disable+remove so the running daemon doesn't outlive
+      // the unit file (which would leave systemd in a confused state).
+      try {
+        execFileSync("systemctl", ["--user", "stop", "switchroom-vault-broker.service"], { stdio: "pipe" });
+      } catch { /* may not be running */ }
+      try {
+        execFileSync("systemctl", ["--user", "disable", "switchroom-vault-broker.service"], { stdio: "pipe" });
+      } catch { /* may not be enabled */ }
+      unlinkSync(brokerUnitPath);
+      daemonReload();
+    }
+  }
   if (shouldInstallBrokerUnit(config)) {
     const homeDir = process.env.HOME ?? "/root";
     const bunBinDir = resolve(homeDir, ".bun", "bin");
