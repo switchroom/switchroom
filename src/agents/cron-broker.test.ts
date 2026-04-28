@@ -107,6 +107,13 @@ describe("generateBrokerUnit", () => {
     expect(unit).toContain("vault broker start --foreground");
   });
 
+  it("ExecStart invokes bun explicitly (fix #285: bun-only installs where node is absent)", () => {
+    const unit = generateBrokerUnit(opts);
+    // The ExecStart must begin with the bun binary so systemd doesn't try to
+    // resolve #!/usr/bin/env node from the switchroom shebang (issue #285).
+    expect(unit).toMatch(/^ExecStart=.*\/bun .*\/switchroom vault broker start --foreground$/m);
+  });
+
   it("uses Restart=on-failure", () => {
     const unit = generateBrokerUnit(opts);
     expect(unit).toContain("Restart=on-failure");

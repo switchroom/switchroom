@@ -688,6 +688,7 @@ export interface BrokerUnitOpts {
  */
 export function generateBrokerUnit(opts: BrokerUnitOpts): string {
   const { homeDir, bunBinDir, autoUnlock } = opts;
+  const bunBin = resolve(bunBinDir, "bun");
   const switchroomCli = resolve(bunBinDir, "switchroom");
   const nodeBinDir = dirname(process.execPath);
   const unitPath = `${bunBinDir}:${nodeBinDir}:/usr/local/bin:/usr/bin:/bin`;
@@ -703,7 +704,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${switchroomCli} vault broker start --foreground
+ExecStart=${bunBin} ${switchroomCli} vault broker start --foreground
 Restart=on-failure
 RestartSec=2
 ${credentialLine}# Type=simple — see generateBrokerUnit() for the sd_notify-stream-vs-datagram
@@ -711,6 +712,8 @@ ${credentialLine}# Type=simple — see generateBrokerUnit() for the sd_notify-st
 # Type=notify caused a restart loop that destroyed unlock state.
 # No EnvironmentFile — the vault passphrase never touches disk.
 # Push the passphrase via: switchroom vault broker unlock
+# ExecStart invokes bun explicitly so the unit works on bun-only installs
+# where /usr/bin/env node is not resolvable (issue #285).
 Environment=PATH=${unitPath}
 Environment=HOME=${homeDir}
 

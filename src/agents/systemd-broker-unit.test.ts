@@ -58,4 +58,9 @@ describe("generateBrokerUnit", () => {
     const unit = generateBrokerUnit(BASE_OPTS);
     expect(unit).toContain("vault broker start --foreground");
   });
+
+  it("ExecStart invokes bun explicitly before the switchroom CLI (fix #285)", () => {
+    const unit = generateBrokerUnit(BASE_OPTS);
+    expect(unit).toMatch(/^ExecStart=.*\/bun .*\/switchroom vault broker start --foreground$/m);
+  });
 });
