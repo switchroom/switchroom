@@ -197,6 +197,10 @@ import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
 import { handleStreamReply } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
+import {
+  validateInlineKeyboard,
+  type AnyButton,
+} from './telegram-button-constraints.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { buildAttachmentPath, assertInsideInbox } from './attachment-path.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
@@ -1271,6 +1275,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'boolean',
             description: 'Disable link preview thumbnails. Default: true (configurable via access.json disableLinkPreview).',
           },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Max 8 buttons total; max 3 per row recommended. When provided, Telegram renders tappable buttons below the message.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1304,6 +1323,21 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           quote: {
             type: 'boolean',
             description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.',
+          },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Applied on the final done=true send only. Max 8 buttons total; max 3 per row recommended.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
           },
         },
         required: ['chat_id', 'text'],
@@ -1562,6 +1596,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? 4000, MAX_CHUNK_LIMIT))
         const replyMode = access.replyToMode ?? 'first'
 
+        // inline_keyboard: validate and build reply_markup (URL buttons only, v1).
+        // Validation rejects buttons missing text or url and flags constraint
+        // violations. reply_markup is attached to the LAST chunk so the buttons
+        // appear on the final visible message rather than an intermediate one.
+        let replyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+        const rawKeyboard = args.inline_keyboard as AnyButton[][] | undefined
+        if (rawKeyboard != null) {
+          const validationErrors = validateInlineKeyboard(rawKeyboard)
+          if (validationErrors.length > 0) {
+            const summary = validationErrors
+              .map((e) => `${e.path}.${e.field}: ${e.reason}`)
+              .join('; ')
+            throw new Error(`inline_keyboard validation failed: ${summary}`)
+          }
+          replyMarkup = { inline_keyboard: rawKeyboard }
+        }
+
         // Use smart HTML chunking for HTML mode, legacy chunking otherwise
         const chunks = parseMode === 'HTML'
           ? splitHtmlChunks(effectiveText, limit)
@@ -1643,11 +1694,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            // Attach inline keyboard to the last chunk only — buttons on
+            // intermediate chunks would be orphaned when the next chunk arrives.
+            const isLastChunk = i === chunks.length - 1
             const sendOpts = {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
               ...(threadId != null ? { message_thread_id: threadId } : {}),
               ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+              ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
             }
 
             // Chunk 0 edit-in-place path: edit the existing preview
@@ -1659,6 +1714,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               const editOpts: Record<string, unknown> = {}
               if (parseMode) editOpts.parse_mode = parseMode
               if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
+              // Include inline keyboard if this is also the only (last) chunk.
+              if (replyMarkup != null && isLastChunk) editOpts.reply_markup = replyMarkup
               try {
                 await robustApiCall(
                   () => lockedBot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
@@ -1858,6 +1915,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         const access = loadAccess()
+
+        // inline_keyboard for stream_reply: validate and build reply_markup.
+        // We only pass reply_markup on done=true so the buttons appear on the
+        // final answer message. Mid-turn (done=false) calls skip it — the
+        // stream-controller would persist it through every edit otherwise,
+        // which is only desired for the progress-card Steer button use case.
+        let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+        const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
+        if (rawStreamKeyboard != null && Boolean(args.done)) {
+          const validationErrors = validateInlineKeyboard(rawStreamKeyboard)
+          if (validationErrors.length > 0) {
+            const summary = validationErrors
+              .map((e) => `${e.path}.${e.field}: ${e.reason}`)
+              .join('; ')
+            throw new Error(`inline_keyboard validation failed: ${summary}`)
+          }
+          streamReplyMarkup = { inline_keyboard: rawStreamKeyboard }
+        }
+
         const result = await handleStreamReply(
           {
             chat_id: args.chat_id as string,
@@ -1867,6 +1943,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             reply_to: args.reply_to as string | undefined,
             quote: args.quote as boolean | undefined,
+            ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
