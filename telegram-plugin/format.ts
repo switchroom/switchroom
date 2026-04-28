@@ -78,6 +78,164 @@ export function isLikelyTelegramHtml(text: string): boolean {
   return count > 0
 }
 
+// ---------------------------------------------------------------------------
+// Markdown table → Telegram HTML
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a contiguous block of lines as a markdown table.
+ *
+ * A valid markdown table requires:
+ *   - A header row:    | col | col |   (leading/trailing pipes optional)
+ *   - A separator row: | --- | --- |   (cells are only dashes, colons, spaces)
+ *   - At least one data row.
+ *
+ * The separator row is the discriminating signal — it prevents plain prose
+ * lines that happen to contain a pipe (e.g. `echo foo | bar`) from being
+ * mistaken for tables.
+ *
+ * Returns null when the block is not a valid table.
+ */
+function parseMarkdownTable(lines: string[]): { headers: string[]; rows: string[][] } | null {
+  if (lines.length < 3) return null
+
+  // Separator line: cells contain only dashes, colons, and spaces.
+  const sepRe = /^\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-*:?[ \t]*\|?$/
+  // A pipe-delimited row: must contain at least one |
+  const rowRe = /\|/
+
+  // Find the separator line index (must be index 1 in this block)
+  if (!sepRe.test(lines[1].trim())) return null
+  // Double-check: the header row must also look like a table row
+  if (!rowRe.test(lines[0])) return null
+  // Must have at least one data row
+  if (lines.length < 3 || !rowRe.test(lines[2])) return null
+
+  const splitRow = (line: string): string[] =>
+    line
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map(c => c.trim())
+
+  const headers = splitRow(lines[0])
+  const rows: string[][] = []
+  for (let i = 2; i < lines.length; i++) {
+    if (!rowRe.test(lines[i])) break
+    rows.push(splitRow(lines[i]))
+  }
+
+  if (rows.length === 0) return null
+  return { headers, rows }
+}
+
+/**
+ * Render a parsed markdown table as Telegram-compatible HTML.
+ *
+ * Branch rules:
+ *   - ≤3 columns AND ≤6 rows → bullet list:
+ *       Each row is one bullet. First column in <b>; subsequent columns
+ *       appended as " — value".
+ *   - otherwise → <pre> block with padded columns.
+ */
+function renderTable(headers: string[], rows: string[][]): string {
+  const colCount = headers.length
+  const rowCount = rows.length
+
+  if (colCount <= 3 && rowCount <= 6) {
+    // Bullet list rendering
+    const bullets = rows.map(row => {
+      // Normalise row length to match header count (guard empty cells)
+      const cells = headers.map((_, i) => (row[i] ?? '').trim())
+      const key = escapeHtml(cells[0] || '—')
+      const rest = cells
+        .slice(1)
+        .filter(v => v !== '')
+        .map(v => ` — ${escapeHtml(v)}`)
+        .join('')
+      return `• <b>${key}</b>${rest}`
+    })
+    // Prepend header names as a label line when there are 2+ columns
+    const headerLine =
+      colCount >= 2
+        ? `<b>${headers.map(h => escapeHtml(h)).join(' / ')}</b>\n`
+        : ''
+    return headerLine + bullets.join('\n')
+  }
+
+  // Pre-block with padded columns
+  // Compute column widths across headers + all rows
+  const allRows = [headers, ...rows]
+  const widths = headers.map((_, ci) =>
+    Math.max(...allRows.map(r => (r[ci] ?? '').length))
+  )
+  const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length))
+
+  const formatRow = (r: string[]) =>
+    headers.map((_, ci) => pad(r[ci] ?? '', widths[ci])).join('  ')
+
+  const sepLine = widths.map(w => '-'.repeat(w)).join('  ')
+
+  const lines = [
+    formatRow(headers),
+    sepLine,
+    ...rows.map(r => formatRow(r)),
+  ]
+  return `<pre>${escapeHtml(lines.join('\n'))}</pre>`
+}
+
+/**
+ * Replace markdown table blocks in `text` with rendered HTML, storing the
+ * rendered output in `store` and emitting `placeholderPrefix<n>\x00` tokens
+ * so the rest of the pipeline does not re-process them.
+ *
+ * Tables are identified by their separator line (`| --- |`) which prevents
+ * plain prose containing a pipe (e.g. `echo foo | bar`) from being mistaken
+ * for a table. Fenced code blocks are extracted before this runs, so
+ * table-looking rows inside ``` blocks are already protected.
+ */
+function extractMarkdownTables(
+  text: string,
+  store: string[],
+  placeholderPrefix: string,
+): string {
+  const inputLines = text.split('\n')
+  const outputLines: string[] = []
+  let i = 0
+
+  while (i < inputLines.length) {
+    const line = inputLines[i]
+    if (!line.includes('|')) {
+      outputLines.push(line)
+      i++
+      continue
+    }
+
+    // Collect a run of pipe-containing lines as a candidate block
+    let j = i
+    while (j < inputLines.length && inputLines[j].includes('|')) {
+      j++
+    }
+    const block = inputLines.slice(i, j)
+
+    const parsed = parseMarkdownTable(block)
+    if (parsed) {
+      const tableLineCount = 2 + parsed.rows.length
+      const remainder = block.slice(tableLineCount)
+      const idx = store.length
+      store.push(renderTable(parsed.headers, parsed.rows))
+      outputLines.push(`${placeholderPrefix}${idx}\x00`)
+      for (const r of remainder) outputLines.push(r)
+      i = j
+    } else {
+      for (const b of block) outputLines.push(b)
+      i = j
+    }
+  }
+
+  return outputLines.join('\n')
+}
+
 /**
  * Convert markdown to Telegram-compatible HTML.
  * Handles bold, italic, code, code blocks, strikethrough, links.
@@ -98,6 +256,12 @@ export function markdownToHtml(text: string): string {
   const BLOCK_PH = '\x00CODEBLOCK'
   const INLINE_PH = '\x00CODEINLINE'
 
+  // Tables are extracted after code blocks so that table-looking rows inside
+  // fenced code blocks are already parked in codeBlocks placeholders and
+  // won't be touched. Rendered table HTML is stored alongside codeBlocks and
+  // uses the same placeholder so restoration happens in a single pass.
+  const TABLE_PH = '\x00TABLEBLOCK'
+
   // Code blocks: ```lang\ncode\n```
   let result = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang: string, code: string) => {
     const escaped = escapeHtml(code.replace(/\n$/, ''))
@@ -106,6 +270,11 @@ export function markdownToHtml(text: string): string {
     codeBlocks.push(`<pre><code${cls}>${escaped}</code></pre>`)
     return `${BLOCK_PH}${idx}\x00`
   })
+
+  // Extract markdown tables after fenced code blocks are parked. Rendered
+  // HTML is stored in codeBlocks (shared store); TABLE_PH is a distinct
+  // prefix so the two restore regexes below can target each independently.
+  result = extractMarkdownTables(result, codeBlocks, TABLE_PH)
 
   // Convert markdown headings (# / ## / ### ...) to bold lines on their
   // own. Telegram has no <h1> tag, and rendering ## as plain text leaves
@@ -140,8 +309,9 @@ export function markdownToHtml(text: string): string {
   // Escape HTML entities in remaining plain text
   result = escapeHtml(result)
 
-  // Restore code-block placeholders (entity-escaped, fix them)
+  // Restore code-block and table-block placeholders (entity-escaped, fix them)
   result = result.replace(new RegExp(`${escapeHtml(BLOCK_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
+  result = result.replace(new RegExp(`${escapeHtml(TABLE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
   result = result.replace(new RegExp(`${escapeHtml(INLINE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => inlineCodes[Number(idx)])
 
   // Bold: **text** (must come before italic)

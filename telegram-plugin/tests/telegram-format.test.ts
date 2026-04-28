@@ -898,3 +898,165 @@ describe('sanitizeForTelegram', () => {
     expect(twice).toBe(once)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Markdown table rendering
+// ---------------------------------------------------------------------------
+
+describe('markdownToHtml — markdown table rendering', () => {
+  // 2-col 3-row → bullet list
+  test('2-col 3-row renders as bullet list', () => {
+    const input = [
+      '| Name | Value |',
+      '| --- | --- |',
+      '| Alpha | 1 |',
+      '| Beta | 2 |',
+      '| Gamma | 3 |',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    // Header line present
+    expect(result).toContain('Name / Value')
+    // Each row is a bullet with <b> first column
+    expect(result).toContain('• <b>Alpha</b>')
+    expect(result).toContain('• <b>Beta</b>')
+    expect(result).toContain('• <b>Gamma</b>')
+    // Values appended after dash
+    expect(result).toContain('— 1')
+    expect(result).toContain('— 2')
+    expect(result).toContain('— 3')
+    // Must NOT contain any raw table markdown pipes
+    expect(result).not.toContain('| --- |')
+    expect(result).not.toContain('<table>')
+  })
+
+  // 3-col 4-row → bullet list (still within ≤3 cols AND ≤6 rows)
+  test('3-col 4-row renders as bullet list', () => {
+    const input = [
+      '| Tool | Status | Notes |',
+      '| ---- | ------ | ----- |',
+      '| bun | ok | fast |',
+      '| tsc | ok | strict |',
+      '| eslint | warn | fixable |',
+      '| vitest | skip | optional |',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    expect(result).toContain('• <b>bun</b>')
+    expect(result).toContain('• <b>tsc</b>')
+    // Third column appended too
+    expect(result).toContain('fast')
+    expect(result).toContain('strict')
+    expect(result).not.toContain('| ---- |')
+  })
+
+  // 4-col 3-row → <pre> block (4 cols exceeds limit)
+  test('4-col 3-row renders as <pre> block', () => {
+    const input = [
+      '| A | B | C | D |',
+      '| - | - | - | - |',
+      '| 1 | 2 | 3 | 4 |',
+      '| 5 | 6 | 7 | 8 |',
+      '| 9 | 0 | 1 | 2 |',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    expect(result).toContain('<pre>')
+    expect(result).toContain('</pre>')
+    // Column headers should appear in the pre block
+    expect(result).toContain('A')
+    expect(result).toContain('B')
+    // Must not produce a bullet list
+    expect(result).not.toContain('• <b>')
+  })
+
+  // 3-col 8-row → <pre> block (8 rows exceeds ≤6 limit)
+  test('3-col 8-row renders as <pre> block', () => {
+    const rows = Array.from({ length: 8 }, (_, i) => `| Row${i + 1} | X${i} | Y${i} |`)
+    const input = [
+      '| Name | ColX | ColY |',
+      '| ---- | ---- | ---- |',
+      ...rows,
+    ].join('\n')
+    const result = markdownToHtml(input)
+    expect(result).toContain('<pre>')
+    expect(result).toContain('</pre>')
+    expect(result).not.toContain('• <b>')
+  })
+
+  // Pipe in plain prose is NOT a table
+  test('plain prose with a pipe is not converted to a table', () => {
+    const input = 'Run echo foo | bar to see output'
+    const result = markdownToHtml(input)
+    expect(result).toContain('echo foo | bar')
+    expect(result).not.toContain('• <b>')
+    expect(result).not.toContain('<pre>')
+  })
+
+  // Pipe in code block is not a table
+  test('pipe inside fenced code block is left verbatim', () => {
+    const input = [
+      '```bash',
+      '| Name | Value |',
+      '| --- | --- |',
+      '| foo | bar |',
+      '```',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    // Should be inside <pre><code>, not a rendered table
+    expect(result).toContain('<pre>')
+    expect(result).toContain('| Name | Value |')
+    expect(result).not.toContain('• <b>')
+  })
+
+  // Table with empty cells
+  test('table with empty cells is handled gracefully', () => {
+    const input = [
+      '| Key | Value |',
+      '| --- | ----- |',
+      '| present |  |',
+      '|  | orphan |',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    // Should produce output without crashing; empty cells rendered as empty/—
+    expect(result).toContain('• <b>present</b>')
+    // No raw markdown pipes in output
+    expect(result).not.toContain('| --- |')
+  })
+
+  // Table preceded and followed by paragraph text — only the table transforms
+  test('table inside paragraph text: only the table block transforms', () => {
+    const input = [
+      'Before paragraph.',
+      '',
+      '| Name | Score |',
+      '| ---- | ----- |',
+      '| Alice | 95 |',
+      '| Bob | 87 |',
+      '',
+      'After paragraph.',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    // Prose preserved
+    expect(result).toContain('Before paragraph.')
+    expect(result).toContain('After paragraph.')
+    // Table converted
+    expect(result).toContain('• <b>Alice</b>')
+    expect(result).toContain('• <b>Bob</b>')
+    // No raw table markdown remains
+    expect(result).not.toContain('| ---- |')
+  })
+
+  // HTML entities in cell content are properly escaped
+  test('cell content with ampersand is safely escaped', () => {
+    const input = [
+      '| Operator | Meaning |',
+      '| -------- | ------- |',
+      '| AND | a & b |',
+      '| OR | x & y |',
+    ].join('\n')
+    const result = markdownToHtml(input)
+    // & in cell content must be entity-escaped
+    expect(result).toContain('&amp;')
+    // Output is still a bullet list
+    expect(result).toContain('• <b>AND</b>')
+    expect(result).toContain('• <b>OR</b>')
+  })
+})
