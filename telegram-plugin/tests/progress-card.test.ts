@@ -1063,8 +1063,8 @@ describe('progress-card reducer — multi-agent correlation', () => {
       const mainSection = html.split('[Sub-agents')[0]
       expect(mainSection).toContain('🤖')
       expect(mainSection).not.toContain('● Agent')
-      // Sub-agent activity line shows the current tool
-      expect(html).toContain('└ ◉')
+      // Sub-agent activity line shows the current tool (new format: ◉ without └ prefix)
+      expect(html).toContain('◉')
       expect(html).toContain('Read')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
@@ -1097,9 +1097,13 @@ describe('progress-card reducer — multi-agent correlation', () => {
       const html = render(st, 8000)
       expect(html).toContain('●')
       expect(html).toContain('task A')
-      expect(html).toMatch(/● task A.*· 1 tools/)
-      const subSection = html.split('[Sub-agents')[1] ?? ''
-      expect(subSection).not.toContain('└ ◉')
+      // New format: main blockquote has the one-line summary (● task A),
+      // expandable blockquote has the per-sub-agent forensics with tool count.
+      // The two are in separate blockquotes so we check them independently.
+      expect(html).toMatch(/● task A/)
+      expect(html).toContain('1 tools')
+      // Active tool spinner (◉) must not appear in a done state
+      expect(html).not.toContain('◉')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
     }
@@ -1741,5 +1745,212 @@ describe('progress-card reducer — tool-error-filter classification (#202)', ()
     ]
     const s = fold(events)
     expect(s.items[0].state).toBe('done')
+  })
+})
+
+// ─── Multi-agent layout snapshot tests ──────────────────────────────────────
+// These tests pin the rendered HTML for the three canonical multi-agent
+// scenarios described in issue #275: parent+1 worker, parent+3 parallel
+// workers, and the all-done (post-turn_end) state. They are structural
+// assertions rather than serialised snapshots because the elapsed-time
+// values change with wall-clock. Each test verifies all semantic sections
+// appear in the correct position and format.
+
+describe('progress-card multi-agent layout snapshots', () => {
+  it('snapshot: parent + 1 worker (in-flight)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('analyse the logs'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_w1',
+          input: { description: 'dig into error logs', prompt: 'Please analyse /var/log/app.log', subagent_type: 'researcher' },
+        },
+        { kind: 'sub_agent_started', agentId: 'W1', firstPromptText: 'Please analyse /var/log/app.log' },
+      ])
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'W1', toolUseId: 'tw1', toolName: 'Read', input: { file_path: '/var/log/app.log' } },
+        2000,
+      )
+      const html = render(st, 3000)
+
+      // Header: working state
+      expect(html).toContain('⚙️ <b>Working…</b>')
+
+      // Main blockquote: shows parent tool count and sub-agent description in summary line
+      expect(html).toContain('[<u>Main</u>')
+      expect(html).toContain('dig into error logs')
+
+      // Sub-agent expandable block present
+      expect(html).toContain('<blockquote expandable>')
+
+      // Sub-agent type label visible
+      expect(html).toContain('researcher')
+
+      // Active tool indicator (◉) is visible in the sub-agent block
+      expect(html).toContain('◉')
+      expect(html).toContain('Read')
+
+      // Layout: main blockquote before expandable
+      expect(html.indexOf('[<u>Main</u>')).toBeLessThan(html.indexOf('<blockquote expandable>'))
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('snapshot: parent + 3 parallel workers (in-flight)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      // Parent dispatches 3 sub-agents concurrently
+      let st = fold([
+        enqueue('refactor the codebase'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_a',
+          input: { description: 'update types', prompt: 'Update all TypeScript types', subagent_type: 'worker' },
+        },
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_b',
+          input: { description: 'run tests', prompt: 'Run the full test suite', subagent_type: 'worker' },
+        },
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_c',
+          input: { description: 'update docs', prompt: 'Update README and docs', subagent_type: 'worker' },
+        },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'Update all TypeScript types' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'Run the full test suite' }, 2100)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'Update README and docs' }, 2200)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'ta1', toolName: 'Edit', input: { file_path: '/src/types.ts' } },
+        2300,
+      )
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'tb1', toolName: 'Bash', input: { command: 'bun test' } },
+        2400,
+      )
+      const html = render(st, 3000)
+
+      // Header: working state
+      expect(html).toContain('⚙️ <b>Working…</b>')
+
+      // Main blockquote: 3 tools total
+      expect(html).toContain('[<u>Main</u>')
+      expect(html).toContain('3 tools')
+
+      // All 3 sub-agent descriptions visible somewhere
+      expect(html).toContain('update types')
+      expect(html).toContain('run tests')
+      expect(html).toContain('update docs')
+
+      // Multiple expandable blocks (one per sub-agent)
+      const expandableCount = (html.match(/<blockquote expandable>/g) ?? []).length
+      expect(expandableCount).toBe(3)
+
+      // Active tools visible (A doing Edit, B doing Bash)
+      expect(html).toContain('Edit')
+      expect(html).toContain('Bash')
+
+      // Chrono order: A (2000) before B (2100) before C (2200)
+      const idxA = html.indexOf('update types')
+      const idxB = html.indexOf('run tests')
+      const idxC = html.indexOf('update docs')
+      expect(idxA).toBeLessThan(idxB)
+      expect(idxB).toBeLessThan(idxC)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('snapshot: all-done state (parent + 3 workers, turn_end)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('refactor the codebase'),
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_a',
+          input: { description: 'update types', prompt: 'Update all TypeScript types', subagent_type: 'worker' },
+        },
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_b',
+          input: { description: 'run tests', prompt: 'Run the full test suite', subagent_type: 'worker' },
+        },
+        {
+          kind: 'tool_use',
+          toolName: 'Agent',
+          toolUseId: 'toolu_c',
+          input: { description: 'update docs', prompt: 'Update README and docs', subagent_type: 'worker' },
+        },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'Update all TypeScript types' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'Run the full test suite' }, 2100)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'Update README and docs' }, 2200)
+      // Each sub-agent does some work and completes
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'ta1', toolName: 'Edit', input: { file_path: '/src/types.ts' } },
+        2300,
+      )
+      st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'A', toolUseId: 'ta1' }, 2400)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'tb1', toolName: 'Bash', input: { command: 'bun test' } },
+        2500,
+      )
+      st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'B', toolUseId: 'tb1' }, 2600)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'C', toolUseId: 'tc1', toolName: 'Write', input: { file_path: '/README.md' } },
+        2700,
+      )
+      st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'C', toolUseId: 'tc1' }, 2800)
+      // Sub-agents complete
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_a', toolName: 'Agent' }, 3000)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_b', toolName: 'Agent' }, 3100)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_c', toolName: 'Agent' }, 3200)
+      st = reduce(st, { kind: 'turn_end', durationMs: 3500 }, 3300)
+      const html = render(st, 4000)
+
+      // Header: done state
+      expect(html).toContain('✅ <b>Done</b>')
+
+      // No active tool spinner in done state
+      expect(html).not.toContain('◉')
+
+      // All 3 sub-agent descriptions still visible in the forensic blockquotes
+      expect(html).toContain('update types')
+      expect(html).toContain('run tests')
+      expect(html).toContain('update docs')
+
+      // Tool counts appear in the expandable forensic blocks
+      expect(html).toContain('1 tools')
+
+      // 3 expandable forensic blocks, one per sub-agent
+      const expandableCount = (html.match(/<blockquote expandable>/g) ?? []).length
+      expect(expandableCount).toBe(3)
+
+      // Chrono ordering preserved in done state
+      const idxA = html.indexOf('update types')
+      const idxB = html.indexOf('run tests')
+      const idxC = html.indexOf('update docs')
+      expect(idxA).toBeLessThan(idxB)
+      expect(idxB).toBeLessThan(idxC)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
   })
 })
