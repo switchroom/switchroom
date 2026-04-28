@@ -82,11 +82,19 @@ doesn't have to:
 1. **Worktrees, not full clones.** Cheap, fast, share `.git/objects`,
    match the sub-agent pattern that already works.
 2. **One worktree per agent × repo.** Stable path
-   (`<agent_dir>/work/<repo_slug>/`). Created on first session that
-   needs the repo, removed when the agent is removed.
-3. **Per-agent long-lived branch.** `agent/<name>/main`, fast-forwarded
-   to `upstream/main` on session start when the worktree is clean. Task
-   work happens on transient branches off that branch.
+   (`<agent_dir>/work/<repo_slug>/`, where `<agent_dir>` is the agent's
+   switchroom directory and `<repo_slug>` is the kebab-case repo name).
+   The bare/canonical clone lives once per host at
+   `~/.switchroom/repos/<repo_slug>.git` (shared across agents);
+   per-agent worktrees are created off it. Worktrees are provisioned
+   lazily — on the first `agent restart`/`reconcile` that runs after the
+   repo appears in the agent's manifest, not on every session start.
+   Removed when the agent is removed.
+3. **Per-agent long-lived branch.** `agent/<agent-name>/main`, where
+   `<agent-name>` is the agent's id from `switchroom.yaml` (the same id
+   used in directory names and systemd units, e.g. `clerk`, `klanker`).
+   Fast-forwarded to `upstream/main` on session start when the worktree
+   is clean. Task work happens on transient branches off that branch.
 4. **Repos declared in `switchroom.yaml`.** An agent's manifest lists
    the repos it operates on. Worktrees are provisioned only for those.
    No surprise clones.
@@ -123,3 +131,31 @@ doesn't have to:
 - The user scales the fleet by adding agents. They never debug a
   "two agents stomped the working tree" incident, because the product
   doesn't allow it.
+
+## UAT prompts
+
+Use these to evaluate whether an implementation truly delivers the job:
+
+- "Add a second agent that works on the same repo as an existing agent.
+  Did you have to do anything beyond editing `switchroom.yaml`?"
+- "Have two agents both run a long task on the same repo at the same
+  time. Did either notice the other? Did either's tree end up in an
+  unexpected state?"
+- "Reboot the host while one agent has uncommitted work in its
+  worktree. After reboot, is the work still there, on the same branch?"
+- "Remove an agent that owns worktrees on three different repos. Did
+  any orphan branches or directories survive?"
+- "Read your agent's SOUL.md and skills. Do any of them hardcode an
+  absolute path to a repo? They shouldn't — they should use the env."
+
+## See also
+
+- [`run-a-fleet-of-specialists.md`](run-a-fleet-of-specialists.md) — the
+  consistent-lifecycle promise this job operationalises.
+- [`extend-without-forking.md`](extend-without-forking.md) — the
+  scaffold-not-code-change principle this job inherits.
+- [`survive-reboots-and-real-life.md`](survive-reboots-and-real-life.md)
+  — the recovery story the dirty-tree policy serves.
+- [`docs/sub-agents.md`](../docs/sub-agents.md) — the precedent: sub-agents
+  already get their own worktree per task. This job extends the same
+  pattern to main agents.
