@@ -658,6 +658,30 @@ function buildRepoEnvVars(
 }
 
 /**
+ * Export HUMANIZER_VOICE_FILE when the agent has a humanizer_voice_file
+ * configured. The bundled humanizer skill (and its calibrate companion)
+ * read this env var to locate the user's voice template. When unset, the
+ * humanizer falls back to its generic "human writing" rules.
+ *
+ * Relative paths are resolved against the agent's directory so per-agent
+ * templates can live alongside agent state.
+ */
+function buildHumanizerEnvVars(
+  agentDir: string,
+  agent: AgentConfig,
+): Record<string, string> {
+  const voiceFile = agent.humanizer_voice_file;
+  if (!voiceFile) return {};
+  const expanded = voiceFile.startsWith("~/")
+    ? voiceFile.replace(/^~/, process.env.HOME ?? "~")
+    : voiceFile;
+  const resolved = expanded.startsWith("/")
+    ? expanded
+    : resolve(agentDir, expanded);
+  return { HUMANIZER_VOICE_FILE: resolved };
+}
+
+/**
  * Top-level settings.json keys that switchroom's scaffold/reconcile
  * pipeline owns and rebuilds on every run. When the settings_raw
  * escape hatch injects additional top-level keys (e.g. `effort`,
@@ -1127,6 +1151,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
         ...channelsToEnv(agentConfig),
         ...(agentConfig.env ?? {}),
         ...buildRepoEnvVars(name, agentDir, agentConfig),
+        ...buildHumanizerEnvVars(agentDir, agentConfig),
       };
       if (Object.keys(combined).length === 0) return undefined;
       const out: Record<string, string> = {};

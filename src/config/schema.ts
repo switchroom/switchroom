@@ -663,6 +663,17 @@ export const AgentSchema = z.object({
       "Names of skills from switchroom.skills_dir to symlink into this " +
       "agent's skills/ directory. Unioned with defaults.skills.",
     ),
+  humanizer_voice_file: z
+    .string()
+    .optional()
+    .describe(
+      "Optional path to a voice-calibration template (markdown). " +
+      "When set, exported as HUMANIZER_VOICE_FILE so the bundled " +
+      "humanizer skill matches the user's writing style instead of " +
+      "applying generic 'human' rules. Generate one with the " +
+      "humanizer-calibrate skill, or hand-write it. Resolved relative " +
+      "to the agent's directory if not absolute.",
+    ),
   subagents: z
     .record(z.string(), SubagentSchema)
     .optional()
