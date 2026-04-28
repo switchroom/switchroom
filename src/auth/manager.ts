@@ -21,6 +21,7 @@ import {
   pickFallbackSlot,
   readActiveSlot,
   removeSlot,
+  slotTokenPath,
   suggestSlotName,
   syncLegacyFromActive,
   useSlot,
@@ -473,6 +474,23 @@ function readCredentials(agentDir: string): CredentialsFile["claudeAiOauth"] | n
 export function getAuthStatus(name: string, agentDir: string): AuthStatus {
   const pendingAuth = hasPendingAuthSession(name, agentDir);
   const creds = readCredentials(agentDir);
+
+  // Lazy-sync fix (#171): if the legacy .oauth-token mirror is absent but an
+  // active slot token exists, mirror it now.  This closes the race where the
+  // accounts/ slot was written (e.g. during scaffold) but syncLegacyFromActive
+  // hadn't run yet — legacy path was empty → status read "✗" until the next
+  // restart actually mirrored the file.
+  if (!existsSync(oauthTokenPath(agentDir))) {
+    const activeSlot = readActiveSlot(agentDir);
+    if (activeSlot && existsSync(slotTokenPath(agentDir, activeSlot))) {
+      try {
+        syncLegacyFromActive(agentDir);
+      } catch {
+        // best-effort — if sync fails, fall through to credential check below
+      }
+    }
+  }
+
   const oauthToken = readOAuthToken(agentDir);
 
   if (oauthToken) {

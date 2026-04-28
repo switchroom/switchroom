@@ -1,10 +1,39 @@
 import type { Command } from "commander";
 import chalk from "chalk";
+import { resolve } from "node:path";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { restartAgent, writeRestartReasonMarker, getAgentStatus } from "../agents/lifecycle.js";
 import { reconcileAndRestartAgent } from "./agent.js";
 import { printHealthSummary } from "./version.js";
+import { getAuthStatus } from "../auth/manager.js";
+
+/**
+ * Poll auth status for `name` until it reads authenticated=true, up to
+ * `timeoutMs` (default 30 s).  Returns true if auth converged within the
+ * window, false if it timed out.  Fixes #176: restart now blocks until auth
+ * status reflects reality so `switchroom restart && switchroom auth status`
+ * shows ✓ without a second manual run.
+ */
+function waitForAuthConverge(
+  name: string,
+  agentDir: string,
+  timeoutMs = 30_000,
+  intervalMs = 1_000,
+): boolean {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const s = getAuthStatus(name, agentDir);
+      if (s.authenticated) return true;
+    } catch {
+      // ignore transient errors during settle window
+    }
+    // Synchronous sleep — restart command is already blocking on systemctl.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, intervalMs);
+  }
+  return false;
+}
 
 /**
  * `switchroom restart [agent]`
@@ -79,6 +108,24 @@ export function registerRestartCommand(program: Command): void {
               }
             } else {
               console.log(chalk.green(`  ${name}: restarted`));
+            }
+
+            // Auth-settling wait (#176): after a synchronous restart, poll
+            // until auth status converges so the very next `auth status` run
+            // shows the correct value without a manual retry.  Only applies
+            // when the restart actually completed (not "waiting for turn") —
+            // for scheduled restarts auth settles asynchronously.
+            const didRestart = res.restarted || !graceful;
+            if (didRestart) {
+              const agentDir = resolve(agentsDir, name);
+              const converged = waitForAuthConverge(name, agentDir);
+              if (!converged) {
+                console.log(
+                  chalk.yellow(
+                    `  ${name}: agent is up but auth status didn't converge in 30s — check logs`,
+                  ),
+                );
+              }
             }
           } catch (err) {
             console.error(chalk.red(`  ${name}: restart failed: ${(err as Error).message}`));
