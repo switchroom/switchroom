@@ -1582,6 +1582,21 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         args.message_thread_id as string | undefined,
       )
     } catch { /* best-effort signal */ }
+    // Issue #203: stream_reply is the agent's primary reply path. Without
+    // ticking the silent-gap tracker here, turn_signal_gap reports the
+    // entire turn duration as silent for any turn that uses stream_reply
+    // — which per CLAUDE.md guidance is most of them. The metric would be
+    // worse than no metric. Tick on every successful delivery (partial or
+    // final) so the gap measurement reflects real silent intervals.
+    try {
+      const threadIdNum = args.message_thread_id != null
+        ? Number(args.message_thread_id)
+        : undefined
+      signalTracker.noteSignal(
+        statusKey(args.chat_id as string, threadIdNum),
+        Date.now(),
+      )
+    } catch { /* best-effort signal */ }
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
@@ -1664,6 +1679,12 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   }
 
   progressUpdateLastSent.set(key, now)
+
+  // Issue #203: progress_update is a user-visible signal — tick the
+  // silent-gap tracker so it doesn't count as silent time.
+  try {
+    signalTracker.noteSignal(key, Date.now())
+  } catch { /* best-effort signal */ }
 
   return {
     content: [
@@ -2581,6 +2602,14 @@ async function handleInbound(
 
   // Capture wall-clock receive time for inbound_ack metric (#203).
   // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
+  //
+  // Measurement caveat: the `setMessageReaction` API call that posts the 👀
+  // is `void`-dispatched (fire-and-forget) before the metric is logged, so
+  // `ackDelayMs` measures gateway-receive → reaction-DISPATCH not
+  // gateway-receive → reaction-ACKNOWLEDGED-by-Telegram. The optimistic
+  // bias is one network RTT (~50–200ms typically). Acceptable for
+  // ambient-signal alerting (the dominant variance is reasoning time, not
+  // network RTT) but not a user-perceived end-to-end measurement.
   const inboundReceivedAt = Date.now()
 
   const access = result.access
