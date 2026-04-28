@@ -44,11 +44,11 @@ export const ScheduleEntrySchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "When true, the cron script runs `claude -p` and discards stdout " +
-      "instead of forwarding it to Telegram. Use for tasks that send their " +
-      "own message via MCP tools (stream_reply / reply) so the trailing " +
-      "model summary doesn't post as a duplicate. Defaults to false to " +
-      "preserve the legacy stdout-forwarding behavior. See issue #118.",
+      "DEPRECATED — accepted but ignored as of #269. All cron tasks now " +
+      "deliver their Telegram message via the MCP `reply` tool, with stdout " +
+      "always discarded. Existing configs that set this field will not error, " +
+      "but the value has no effect. The field will be removed in a future " +
+      "release.",
     ),
 });
 
