@@ -25,13 +25,15 @@
  */
 
 import * as net from "node:net";
-import { mkdirSync, chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, type VaultEntry } from "../vault.js";
 import { resolvePath } from "../../config/loader.js";
 import { identify, type PeerInfo } from "./peercred.js";
-import { checkAcl, checkEntryScope, agentSlugFromPeer } from "./acl.js";
+import { checkAcl, checkEntryScope, agentSlugFromPeer, parseCronUnit } from "./acl.js";
 import {
   decodeRequest,
   encodeResponse,
@@ -41,6 +43,9 @@ import {
   type BrokerStatus,
 } from "./protocol.js";
 import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log.js";
+import { Database } from "bun:sqlite";
+import { mintGrant, validateGrant, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
+import { openGrantsDb } from "../grants-db.js";
 
 const PID_FILE_DEFAULT = "~/.switchroom/vault-broker.pid";
 
@@ -76,6 +81,12 @@ export interface BrokerTestOpts {
    * DO NOT set outside tests.
    */
   _testAuditLogger?: AuditLogger;
+  /**
+   * If provided, use this Database handle for the grants DB instead of
+   * opening ~/.switchroom/vault-grants.db. Use an in-memory SQLite DB in tests.
+   * DO NOT set outside tests.
+   */
+  _testGrantsDb?: Database;
 }
 
 export class VaultBroker {
@@ -88,6 +99,7 @@ export class VaultBroker {
   private unlockSocketPath: string = "";
   private vaultPath: string = "";
   private auditLogger: AuditLogger;
+  private grantsDb: Database;
 
   constructor(private readonly testOpts: BrokerTestOpts = {}) {
     // Defence-in-depth: BrokerTestOpts is exported (so vitest can construct
@@ -100,10 +112,11 @@ export class VaultBroker {
       testOpts._testSecrets !== undefined ||
       testOpts._testConfig !== undefined ||
       testOpts._testIdentify !== undefined ||
-      testOpts._testAuditLogger !== undefined;
+      testOpts._testAuditLogger !== undefined ||
+      testOpts._testGrantsDb !== undefined;
     if (usingTestOpt && process.env.NODE_ENV !== "test") {
       throw new Error(
-        "VaultBroker: BrokerTestOpts (_testSecrets/_testConfig/_testIdentify/_testAuditLogger) " +
+        "VaultBroker: BrokerTestOpts (_testSecrets/_testConfig/_testIdentify/_testAuditLogger/_testGrantsDb) " +
           "must not be set outside tests. Set NODE_ENV=test if you really mean it.",
       );
     }
@@ -111,6 +124,15 @@ export class VaultBroker {
     // Use the injected logger for tests; create the real one for production.
     // The real logger's path defaults to ~/.switchroom/vault-audit.log.
     this.auditLogger = testOpts._testAuditLogger ?? createAuditLogger();
+
+    // Open (or inject) the grants database. In tests we use :memory: via the
+    // _testGrantsDb knob. In production we open the canonical disk path at
+    // construction time so the DB handle is ready before the first request.
+    if (testOpts._testGrantsDb !== undefined) {
+      this.grantsDb = testOpts._testGrantsDb;
+    } else {
+      this.grantsDb = openGrantsDb();
+    }
   }
 
   /**
@@ -380,11 +402,11 @@ export class VaultBroker {
     });
   }
 
-  private _handleRequest(
+  private async _handleRequest(
     socket: net.Socket,
     peer: import("./peercred.js").PeerInfo | null,
     line: string,
-  ): void {
+  ): Promise<void> {
     let req: ReturnType<typeof import("./protocol.js").decodeRequest>;
     try {
       req = decodeRequest(line);
@@ -434,6 +456,76 @@ export class VaultBroker {
         socket.write(encodeResponse(errorResponse("LOCKED", "Vault is locked")));
         return;
       }
+
+      // ── Token-based list (capability grant) ────────────────────────────
+      // When a token is provided, return only keys the grant covers (those
+      // that exist in the vault). Bypasses peercred ACL — token IS the auth.
+      if (req.token !== undefined) {
+        // For list, we validate against a sentinel key ("*") to just check
+        // the token signature/expiry/revocation status, then filter by
+        // key_allow. We validate directly by checking any allowed key.
+        const dotIdx = req.token.indexOf(".");
+        const grantId = dotIdx !== -1 ? req.token.slice(0, dotIdx) : undefined;
+
+        // Look up the grant row to get key_allow without checking a specific key
+        // We validate the token against a non-existent key to get the grant row,
+        // but we need to handle "grant-key-not-allowed" specially for list.
+        // Instead, validate against the first known vault key (or a dummy check).
+        // Simplest: attempt validateGrant with a placeholder, accept ok or key-not-allowed
+        // (both mean token itself is valid). Only reject expired/revoked/invalid.
+        const sentinelKey = Object.keys(this.secrets)[0] ?? "__list_check__";
+        const tokenCheck = await validateGrant(this.grantsDb, req.token, sentinelKey);
+
+        // If the token is invalid/expired/revoked, deny
+        if (!tokenCheck.ok && tokenCheck.reason !== "grant-key-not-allowed") {
+          this.auditLogger.write({
+            ts: new Date().toISOString(),
+            op: "list",
+            caller: auditCaller,
+            pid: auditPid,
+            cgroup: auditCgroup,
+            result: `denied:${tokenCheck.reason}`,
+            method: "grant",
+            grant_id: grantId,
+          });
+          socket.write(encodeResponse(errorResponse("DENIED", tokenCheck.reason)));
+          return;
+        }
+
+        // Token is valid (ok or key-not-allowed means auth is fine).
+        // Get the key_allow list from the grant row.
+        const grantRow = tokenCheck.ok
+          ? tokenCheck.grant
+          : this.grantsDb
+              .query<{ key_allow: string }, [string]>(
+                "SELECT key_allow FROM vault_grants WHERE id = ?",
+              )
+              .get(grantId ?? "");
+
+        const allowedKeys: string[] = grantRow
+          ? (typeof (grantRow as { key_allow: string[] | string }).key_allow === "string"
+              ? JSON.parse((grantRow as { key_allow: string }).key_allow)
+              : (grantRow as { key_allow: string[] }).key_allow)
+          : [];
+
+        // Filter to keys that exist in the vault AND are allowed by the grant
+        const visibleKeys = allowedKeys.filter((k) => k in this.secrets!);
+
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: "list",
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: `allowed:${visibleKeys.length}`,
+          method: "grant",
+          grant_id: grantId,
+        });
+        socket.write(encodeResponse({ ok: true, keys: visibleKeys }));
+        return;
+      }
+
+      // ── Peercred path (no token) ────────────────────────────────────────
       // Issue #129 review: `list` previously skipped peercred entirely, so
       // any same-UID caller could enumerate vault key names without proving
       // identity. Inconsistent with `get`, which requires peer != null on
@@ -516,7 +608,68 @@ export class VaultBroker {
         return;
       }
 
-      // ACL check
+      // ── Token-based access (capability grant) ────────────────────────────
+      // When the request includes a token field, validate via the grants module
+      // and bypass the peercred ACL entirely. Token IS the auth.
+      if (req.token !== undefined) {
+        const grantResult = await validateGrant(this.grantsDb, req.token, req.key);
+        if (grantResult.ok) {
+          const grantId = grantResult.grant.id;
+          const entry = this.secrets[req.key];
+          if (entry === undefined) {
+            this.auditLogger.write({
+              ts: new Date().toISOString(),
+              op: "get",
+              key: req.key,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: "error:UNKNOWN_KEY",
+              method: "grant",
+              grant_id: grantId,
+            });
+            socket.write(
+              encodeResponse(errorResponse("UNKNOWN_KEY", `Key not found: ${req.key}`)),
+            );
+            return;
+          }
+          this.auditLogger.write({
+            ts: new Date().toISOString(),
+            op: "get",
+            key: req.key,
+            caller: auditCaller,
+            pid: auditPid,
+            cgroup: auditCgroup,
+            result: "allowed",
+            method: "grant",
+            grant_id: grantId,
+          });
+          socket.write(encodeResponse(entryResponse(entry)));
+          return;
+        } else {
+          // Token present but invalid — extract grant_id for audit (ID portion only)
+          const dotIdx = req.token.indexOf(".");
+          const grantId = dotIdx !== -1 ? req.token.slice(0, dotIdx) : undefined;
+          const denyReason = grantResult.reason; // e.g. "grant-expired"
+          this.auditLogger.write({
+            ts: new Date().toISOString(),
+            op: "get",
+            key: req.key,
+            caller: auditCaller,
+            pid: auditPid,
+            cgroup: auditCgroup,
+            result: `denied:${denyReason}`,
+            method: "grant",
+            grant_id: grantId,
+          });
+          socket.write(
+            encodeResponse(errorResponse("DENIED", denyReason)),
+          );
+          return;
+        }
+      }
+
+      // ── Peercred ACL path (no token) ────────────────────────────────────
       if (peer !== null && this.config !== null) {
         const aclResult = checkAcl(peer, this.config, req.key);
         if (!aclResult.allow) {
@@ -610,6 +763,196 @@ export class VaultBroker {
         result: "allowed",
       });
       socket.write(encodeResponse(entryResponse(entry)));
+      return;
+    }
+
+    // ── Grant management ops ─────────────────────────────────────────────────
+    //
+    // #225 review-fix: gate mint_grant / list_grants / revoke_grant on the
+    // caller NOT being a cron unit. The intent is "operator-only" — these
+    // ops mint capability tokens that grant cron access, so a cron itself
+    // must not be able to call them (otherwise a hijacked cron could mint
+    // tokens for sibling agents and exfiltrate their keys).
+    //
+    // Rule:
+    //   - peer === null on Linux → deny (fail-closed identity).
+    //   - peer with cron-pattern systemdUnit → deny (cron context).
+    //   - peer with no systemdUnit OR non-cron systemdUnit → allow
+    //     (operator interactive session, or a deliberately-allowed
+    //     management agent).
+    //
+    // Non-Linux dev mode (SWITCHROOM_BROKER_ALLOW_NON_LINUX=1): peer is null
+    // but identity is bypassed everywhere — accept the same dev-mode
+    // exception used by `get`/`list` so test harnesses can exercise the path.
+    const isGrantMgmtOp =
+      req.op === "mint_grant" ||
+      req.op === "list_grants" ||
+      req.op === "revoke_grant";
+    if (isGrantMgmtOp) {
+      const allowNonLinux = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX === "1";
+      if (peer === null && !allowNonLinux) {
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: req.op,
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: "denied:peercred-unavailable",
+        });
+        socket.write(
+          encodeResponse(errorResponse("DENIED", "peercred unavailable; cannot verify operator identity")),
+        );
+        return;
+      }
+      if (peer !== null && peer.systemdUnit !== null) {
+        const parsed = parseCronUnit(peer.systemdUnit);
+        if (parsed !== null) {
+          this.auditLogger.write({
+            ts: new Date().toISOString(),
+            op: req.op,
+            caller: auditCaller,
+            pid: auditPid,
+            cgroup: auditCgroup,
+            result: "denied:cron-cannot-manage-grants",
+          });
+          socket.write(
+            encodeResponse(
+              errorResponse(
+                "DENIED",
+                "Grant management ops are operator-only; cron units cannot mint, list, or revoke grants",
+              ),
+            ),
+          );
+          return;
+        }
+      }
+    }
+
+    if (req.op === "mint_grant") {
+      // Parse ttl_seconds into a duration for mintGrant
+      const { agent, keys, ttl_seconds, description } = req;
+      let mintResult: Awaited<ReturnType<typeof mintGrant>>;
+      try {
+        mintResult = await mintGrant(this.grantsDb, agent, keys, ttl_seconds, description);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: "mint_grant",
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: `error:${msg}`,
+        });
+        socket.write(encodeResponse(errorResponse("INTERNAL", `Failed to mint grant: ${msg}`)));
+        return;
+      }
+
+      // Write token file atomically at ~/.switchroom/agents/<agent>/.vault-token
+      // (mode 0600).
+      //
+      // #225 review-fix: write-then-rename so a cron racing the mint
+      // never reads a partial token. The previous direct writeFileSync left
+      // a one-syscall window where the cron could open the file between
+      // creation and the bytes being committed. Rename is atomic on Linux
+      // for same-filesystem moves.
+      try {
+        const tokenDir = path.join(os.homedir(), ".switchroom", "agents", agent);
+        mkdirSync(tokenDir, { recursive: true });
+        const tokenPath = path.join(tokenDir, ".vault-token");
+        const tmpPath = `${tokenPath}.tmp.${process.pid}`;
+        writeFileSync(tmpPath, mintResult.token, { mode: 0o600 });
+        renameSync(tmpPath, tokenPath);
+      } catch (err) {
+        // Non-fatal: the token is still returned. File write is best-effort.
+        process.stderr.write(
+          `[vault-broker] mint_grant: failed to write token file for agent ${agent}: ` +
+          `${(err as Error).message}\n`
+        );
+      }
+
+      this.auditLogger.write({
+        ts: new Date().toISOString(),
+        op: "mint_grant",
+        caller: auditCaller,
+        pid: auditPid,
+        cgroup: auditCgroup,
+        result: "allowed",
+        method: "grant",
+        grant_id: mintResult.id,
+      });
+      socket.write(
+        encodeResponse({
+          ok: true,
+          token: mintResult.token,
+          id: mintResult.id,
+          expires_at: mintResult.expires_at,
+        }),
+      );
+      return;
+    }
+
+    if (req.op === "list_grants") {
+      const grants = listGrants(this.grantsDb, req.agent);
+      this.auditLogger.write({
+        ts: new Date().toISOString(),
+        op: "list_grants",
+        caller: auditCaller,
+        pid: auditPid,
+        cgroup: auditCgroup,
+        result: `allowed:${grants.length}`,
+      });
+      // Strip revoked_at before sending (not part of the GrantMeta wire schema)
+      const grantMetas = grants.map(({ id, agent_slug, key_allow, expires_at, created_at, description }) => ({
+        id,
+        agent_slug,
+        key_allow,
+        expires_at,
+        created_at,
+        description,
+      }));
+      socket.write(encodeResponse({ ok: true, grants: grantMetas }));
+      return;
+    }
+
+    if (req.op === "revoke_grant") {
+      const { id } = req;
+      const revoked = revokeGrant(this.grantsDb, id);
+
+      // Best-effort: find and remove any token file for this grant ID.
+      // We don't know which agent it belonged to without querying — query the
+      // revoked row (revoked_at is now set) to get the agent slug.
+      try {
+        const row = this.grantsDb
+          .query<{ agent_slug: string }, [string]>(
+            "SELECT agent_slug FROM vault_grants WHERE id = ?",
+          )
+          .get(id);
+        if (row) {
+          const tokenPath = path.join(
+            os.homedir(),
+            ".switchroom",
+            "agents",
+            row.agent_slug,
+            ".vault-token",
+          );
+          if (existsSync(tokenPath)) {
+            try { unlinkSync(tokenPath); } catch { /* best-effort */ }
+          }
+        }
+      } catch { /* best-effort */ }
+
+      this.auditLogger.write({
+        ts: new Date().toISOString(),
+        op: "revoke_grant",
+        caller: auditCaller,
+        pid: auditPid,
+        cgroup: auditCgroup,
+        result: revoked ? "allowed" : "error:not-found",
+        method: "grant",
+        grant_id: id,
+      });
+      socket.write(encodeResponse({ ok: true, revoked }));
       return;
     }
 

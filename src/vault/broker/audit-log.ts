@@ -28,7 +28,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 /** Operations the broker can perform. */
-export type AuditOp = "get" | "set" | "delete" | "list" | "unlock" | "lock";
+export type AuditOp = "get" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant";
 
 /**
  * One audit log entry.
@@ -50,6 +50,17 @@ export interface AuditEntry {
   cgroup?: string;
   /** Outcome: "allowed", "denied:<reason>", or "error:<detail>" */
   result: string;
+  /**
+   * Access method — "peercred" for the normal cron-unit path, "grant" when
+   * a capability token was used. Omitted for ops that don't involve secret
+   * access (lock, unlock, status).
+   */
+  method?: "peercred" | "grant";
+  /**
+   * Grant ID (e.g. "vg_a1b2c3") when method === "grant". Never contains
+   * the secret half — only the ID prefix is logged.
+   */
+  grant_id?: string;
 }
 
 export interface AuditLogger {
