@@ -298,8 +298,10 @@ describe.runIf(tmuxAvailable())("Fix 2 — submitAuthCode unlinks credentials.js
     });
 
     // 4. Live, harmless tmux session so tmuxSessionExists returns true and
-    //    `tmux send-keys` has somewhere to deliver the code. Detached, no-op.
-    execSync(`tmux new-session -d -s ${sessionName} "sleep 30"`);
+    //    `tmux send-keys` has somewhere to deliver the code. The pane must
+    //    display "Paste code here" so probeForCodePrompt() returns ready=true
+    //    (the probe was added after this test was first written — fix 2026-04-28).
+    execSync(`tmux new-session -d -s ${sessionName} 'echo "Paste code here"; sleep 30'`);
 
     const result = submitAuthCode(agentName, agentDir, "BROWSERCODE", undefined, {
       pollIntervalMs: 10,

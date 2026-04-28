@@ -150,9 +150,15 @@ describe.skipIf(runSkipCondition)("token-helpers/google-cal-token.sh", () => {
     );
 
     configPath = join(tmpDir, "switchroom.yaml");
+    // Point vault.broker.socket at a path that cannot exist in the temp dir so
+    // 'switchroom vault get' sees the broker as unreachable and falls through to
+    // direct vault access with SWITCHROOM_VAULT_PASSPHRASE.  Without this, a
+    // live vault-broker daemon at ~/.switchroom/vault-broker.sock intercepts the
+    // call and exits with VAULT-BROKER-DENIED when stdin is not a TTY
+    // (2026-04-28 CI fix).
     writeFileSync(
       configPath,
-      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\n  broker:\n    socket: ${tmpDir}/no-broker.sock\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
     );
 
     // Shim that substitutes `switchroom` on PATH with the repo's
@@ -319,9 +325,15 @@ describe.skipIf(runSkipCondition)("token-helpers/ms-graph-token.sh", () => {
     setStringSecret(passphrase, vaultPath, "ms-graph-client-id", "ms-cid");
 
     configPath = join(tmpDir, "switchroom.yaml");
+    // Point vault.broker.socket at a path that cannot exist in the temp dir so
+    // 'switchroom vault get' sees the broker as unreachable and falls through to
+    // direct vault access with SWITCHROOM_VAULT_PASSPHRASE.  Without this, a
+    // live vault-broker daemon at ~/.switchroom/vault-broker.sock intercepts the
+    // call and exits with VAULT-BROKER-DENIED when stdin is not a TTY
+    // (2026-04-28 CI fix).
     writeFileSync(
       configPath,
-      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\n  broker:\n    socket: ${tmpDir}/no-broker.sock\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
     );
 
     shimDir = join(tmpDir, "bin");
