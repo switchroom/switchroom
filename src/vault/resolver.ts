@@ -247,23 +247,47 @@ export function resolveVaultReferences(
 }
 
 /**
+ * Structured result from `resolveVaultReferencesViaBroker`.
+ *
+ * Callers can now distinguish WHY resolution failed and act accordingly:
+ *
+ *   - `ok`          — all vault refs resolved; `config` has real values.
+ *   - `denied`      — broker refused at least one key (ACL, locked vault).
+ *                     The caller is not authorised; falling back to a
+ *                     passphrase prompt is correct for interactive contexts
+ *                     but wrong for headless cron — surface an actionable
+ *                     error instead of a confusing "no TTY" failure.
+ *   - `unreachable` — broker socket not found / timed out. Broker is likely
+ *                     not running; passphrase-based decrypt is appropriate.
+ *   - `locked`      — broker is running and the caller is authorised, but
+ *                     the vault has not been unlocked yet.
+ *
+ * Issue #207 item 2: replaces the previous silent-return-unchanged-config
+ * behaviour (which collapsed denied + unreachable + locked into the same
+ * opaque result), letting callers surface the right error or choose the
+ * right fallback.
+ */
+export type ResolveViaBrokerResult =
+  | { ok: true; config: SwitchroomConfig }
+  | { ok: false; reason: "denied" | "unreachable" | "locked" | "unknown" };
+
+/**
  * Resolve vault references in a config using the broker daemon.
  *
  * For each `vault:<key>` reference found in the config, fetches the value
  * from the running broker rather than decrypting the vault file directly.
- * Falls back to passphrase-based `resolveVaultReferences` when the broker
- * is unreachable (ENOENT / ECONNREFUSED / timeout) and `passphrase` is
- * provided.
  *
- * @param config    The parsed SwitchroomConfig.
- * @param passphrase Optional fallback passphrase for direct vault access.
- * @param brokerOpts  Optional broker client options (socket path, timeout).
+ * Returns a structured `ResolveViaBrokerResult` so the caller can
+ * distinguish success from each failure mode (denied, unreachable, locked)
+ * and decide whether to fall back, log differently, or surface the right error.
+ *
+ * @param config     The parsed SwitchroomConfig.
+ * @param brokerOpts Optional broker client options (socket path, timeout).
  */
 export async function resolveVaultReferencesViaBroker(
   config: SwitchroomConfig,
-  passphrase?: string,
   brokerOpts?: BrokerClientOpts,
-): Promise<SwitchroomConfig> {
+): Promise<ResolveViaBrokerResult> {
   const socketPath = resolveBrokerSocketPath({
     ...brokerOpts,
     vaultBrokerSocket: config.vault?.broker?.socket
@@ -276,73 +300,75 @@ export async function resolveVaultReferencesViaBroker(
   const refs = collectVaultRefs(config as unknown as Record<string, unknown>);
 
   if (refs.size === 0) {
-    // No vault references — return config unchanged
-    return config;
+    // No vault references — nothing to do
+    return { ok: true, config };
   }
 
-  // Try broker first. Use the structured result so we can distinguish:
-  //   - ok          → use the entry
-  //   - unreachable → fall back to passphrase decrypt (broker is dead /
-  //                   not started yet; passphrase is the right answer)
-  //   - denied      → fall back to passphrase decrypt (the config caller
-  //                   has the passphrase, so this is a CLI/scaffold path
-  //                   running without a cron unit identity; opening the
-  //                   vault directly is correct — same UX as the CLI's
-  //                   `vault get` flow)
-  //   - not_found   → return config unchanged (key truly missing — falling
-  //                   back to passphrase would just re-confirm the absence)
+  // Try broker for each key. Accumulate results to determine the aggregate
+  // outcome. We continue past the first failure so we can classify the
+  // reason accurately (a mix of denied + unreachable yields 'unknown').
   //
-  // Issue #129 review: previously this loop used the legacy null-shape
-  // getViaBroker, which collapsed unreachable / denied / not_found into
-  // a single null. denied + not_found both look like "fall back" cases,
-  // but the right behavior for a missing key is to NOT fall back, since
-  // a passphrase decrypt won't conjure it from nothing.
+  // Issue #129 review: previously used the legacy null-shape getViaBroker,
+  // which collapsed unreachable / denied / not_found into a single null.
+  // Issue #207: we now surface the specific reason to the caller.
   const brokerSecrets: Record<string, VaultEntry> = {};
-  let allResolved = true;
   let sawDenied = false;
   let sawUnreachable = false;
-  let sawNotFound = false;
+  let sawLocked = false;
 
   for (const key of refs) {
     const result = await getViaBrokerStructured(key, opts);
     if (result.kind === "ok") {
       brokerSecrets[key] = result.entry;
-    } else {
-      allResolved = false;
-      if (result.kind === "unreachable") sawUnreachable = true;
-      if (result.kind === "denied") sawDenied = true;
-      if (result.kind === "not_found") sawNotFound = true;
-      // Don't break — collect all keys so we can compute fallback need
-      // accurately. A short-circuit on first unreachable would be wrong if
-      // the same broker later denies a different key (mixed schedule).
-      if (sawUnreachable && !sawDenied && !sawNotFound) {
-        // Pure unreachable: bail early, every other call will time out
-        // for the same reason.
-        break;
+    } else if (result.kind === "unreachable") {
+      sawUnreachable = true;
+      // Pure unreachable: bail early, every subsequent call will time out.
+      break;
+    } else if (result.kind === "denied") {
+      // Distinguish LOCKED (vault not yet unlocked) from generic DENIED
+      // (ACL / peercred rejection) so callers can suggest the right action.
+      if (result.code === "LOCKED") {
+        sawLocked = true;
+      } else {
+        sawDenied = true;
       }
     }
+    // not_found: key is absent from the vault; other keys may still resolve.
+    // We don't treat not_found as a failure — partial resolution is fine;
+    // the caller will encounter the unresolved `vault:` reference later and
+    // can surface a proper "key not found" message then.
   }
+
+  // Compute the aggregate reason for the structured failure result.
+  // If all refs resolved (even partially with not_found gaps), return ok.
+  const resolvedCount = Object.keys(brokerSecrets).length;
+  const allResolved = resolvedCount === refs.size;
 
   if (allResolved) {
-    return resolveValue(config, brokerSecrets) as SwitchroomConfig;
+    return { ok: true, config: resolveValue(config, brokerSecrets) as SwitchroomConfig };
   }
 
-  // Mixed outcomes. If we saw `not_found`, the key is genuinely absent
-  // and a passphrase decrypt won't help — log and return unchanged so
-  // the caller surfaces the missing reference.
-  if (sawNotFound && !sawUnreachable && !sawDenied) {
-    return config;
+  // Partial or full failure. Determine why.
+  if (sawUnreachable && !sawDenied && !sawLocked) {
+    return { ok: false, reason: "unreachable" };
+  }
+  if (sawLocked && !sawDenied && !sawUnreachable) {
+    return { ok: false, reason: "locked" };
+  }
+  if (sawDenied && !sawUnreachable && !sawLocked) {
+    return { ok: false, reason: "denied" };
+  }
+  // Mixed: cannot definitively classify — surface 'unknown' rather than guess.
+  if (sawDenied || sawUnreachable || sawLocked) {
+    return { ok: false, reason: "unknown" };
   }
 
-  // Broker said denied OR unreachable: fall back to direct decrypt with
-  // the user's passphrase if we have one. Same fallback policy as before;
-  // the difference is we no longer treat not_found as a fallback trigger.
-  if (passphrase) {
-    return resolveVaultReferences(config, passphrase);
+  // Only not_found failures (no connectivity/auth issue): some keys are
+  // genuinely missing. Return what we could resolve; caller sees unresolved refs.
+  if (resolvedCount > 0) {
+    return { ok: true, config: resolveValue(config, brokerSecrets) as SwitchroomConfig };
   }
-
-  // No fallback available — return config unchanged (caller handles missing refs)
-  return config;
+  return { ok: false, reason: "unknown" };
 }
 
 /**
