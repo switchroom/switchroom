@@ -88,7 +88,7 @@ export type SessionEvent =
   | { kind: 'thinking' }
   | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown> }
   | { kind: 'text'; text: string }
-  | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean }
+  | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
   | { kind: 'turn_end'; durationMs: number }
   // Multi-agent: sub-agent-scoped events. agentId is the sub-agent JSONL
   // filename stem (e.g. "aac6f1…"). Routed through the same ingest path
@@ -96,7 +96,7 @@ export type SessionEvent =
   | { kind: 'sub_agent_started'; agentId: string; firstPromptText: string; subagentType?: string }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown> }
   | { kind: 'sub_agent_text'; agentId: string; text: string }
-  | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean }
+  | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean; errorText?: string }
   | { kind: 'sub_agent_turn_end'; agentId: string }
   | { kind: 'sub_agent_nested_spawn'; agentId: string }
 
@@ -129,6 +129,36 @@ function parseChannelMeta(content: string): {
  * chunk and keeps memory predictable under a corrupted or malicious file.
  */
 const MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+
+/** Max chars we capture from a tool error for pattern matching. */
+const MAX_ERROR_TEXT_CHARS = 500
+
+/**
+ * Extract a plain-text representation of tool_result `content` for error
+ * classification.  The field can be:
+ *   - a string (simple text)
+ *   - an array of Anthropic content blocks (e.g. [{type:'text', text:'…'}])
+ * Returns the first MAX_ERROR_TEXT_CHARS characters — enough for pattern
+ * matching while keeping SessionEvent objects lean.
+ */
+function extractToolResultErrorText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content.slice(0, MAX_ERROR_TEXT_CHARS)
+  }
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const block of content) {
+      if (typeof block === 'object' && block != null) {
+        const b = block as Record<string, unknown>
+        if (b.type === 'text' && typeof b.text === 'string') {
+          parts.push(b.text)
+        }
+      }
+    }
+    return parts.join('\n').slice(0, MAX_ERROR_TEXT_CHARS)
+  }
+  return ''
+}
 
 /**
  * Project a single transcript line into a SessionEvent (or null if it's
@@ -200,11 +230,13 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const events: SessionEvent[] = []
     for (const c of content) {
       if (c.type === 'tool_result') {
+        const isError = c.is_error === true ? true : undefined
         events.push({
           kind: 'tool_result',
           toolUseId: (c.tool_use_id as string | undefined) ?? '',
           toolName: null,
-          isError: c.is_error === true ? true : undefined,
+          isError,
+          errorText: isError ? extractToolResultErrorText(c.content) : undefined,
         })
       }
     }
@@ -285,11 +317,13 @@ export function projectSubagentLine(
       if (typeof c !== 'object' || c == null) continue
       const cc = c as Record<string, unknown>
       if (cc.type === 'tool_result') {
+        const isError = cc.is_error === true ? true : undefined
         events.push({
           kind: 'sub_agent_tool_result',
           agentId,
           toolUseId: (cc.tool_use_id as string | undefined) ?? '',
-          isError: cc.is_error === true ? true : undefined,
+          isError,
+          errorText: isError ? extractToolResultErrorText(cc.content) : undefined,
         })
       }
     }

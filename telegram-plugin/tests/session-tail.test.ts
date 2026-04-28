@@ -132,7 +132,7 @@ describe('projectTranscriptLine', () => {
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'tool_result', toolUseId: 'abc', toolName: null, isError: true },
+      { kind: 'tool_result', toolUseId: 'abc', toolName: null, isError: true, errorText: 'boom' },
     ])
   })
 
