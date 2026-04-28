@@ -207,6 +207,8 @@ import {
   statusViaBroker,
   lockViaBroker,
   unlockViaBroker,
+  mintGrantViaBroker,
+  listViaBroker,
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
@@ -783,6 +785,20 @@ type PendingVaultOp =
   // Issue #158: passphrase collected for /vault unlock — sent directly to the
   // broker unlock socket, never logged or cached beyond the op itself.
   | { kind: 'unlock'; startedAt: number }
+  // Issue #227: inline-keyboard wizard for /vault grant
+  | {
+      kind: 'grant-wizard'
+      step: 'agent' | 'keys' | 'duration' | 'confirm'
+      wizardMsgId?: number      // message to edit for each step
+      agent?: string
+      selectedKeys?: string[]   // keys toggled on in step 2
+      availableKeys?: string[]  // list fetched from broker
+      ttlSeconds?: number | null // null = never expires
+      expiresLabel?: string     // human-readable label for confirmation
+      description?: string
+      awaitingCustomDuration?: boolean  // true while waiting for text reply
+      startedAt: number
+    }
   // Issue #228: waiting for confirmation before revoking a grant.
   | { kind: 'revoke_confirm'; grantId: string; agent: string; keys: string[]; startedAt: number }
 const VAULT_INPUT_TTL_MS = 5 * 60 * 1000
@@ -1367,6 +1383,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const files = (args.files as string[] | undefined) ?? []
   const quoteOptIn = args.quote !== false
   let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+  const protectContent = args.protect_content === true
+  const quoteText = args.quote_text as string | undefined
   const access = loadAccess()
   const configParseMode = access.parseMode ?? 'html'
   const format = (args.format as string | undefined) ?? configParseMode
@@ -1462,10 +1480,18 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const shouldReplyTo =
         reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
       const sendOpts = {
-        ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(shouldReplyTo
+          ? {
+              reply_parameters: {
+                message_id: reply_to,
+                ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+              },
+            }
+          : {}),
         ...(parseMode ? { parse_mode: parseMode } : {}),
         ...(threadId != null ? { message_thread_id: threadId } : {}),
         ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+        ...(protectContent ? { protect_content: true } : {}),
       }
 
       if (i === 0 && previewMessageId != null) {
@@ -1588,6 +1614,8 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       format: args.format as string | undefined,
       reply_to: args.reply_to as string | undefined,
       quote: args.quote as boolean | undefined,
+      ...(args.protect_content === true ? { protect_content: true } : {}),
+      ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
     },
     { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
     {
@@ -2805,6 +2833,21 @@ async function handleInbound(
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
         if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
         await executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
+      } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
+        // Issue #227: custom duration text reply for grant wizard
+        const input = text.trim()
+        const ttlSeconds = parseGrantDuration(input)
+        if (ttlSeconds === null) {
+          // Re-set state so user can try again
+          pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
+          await switchroomReply(ctx, '⚠️ Invalid duration. Use <code>Nd</code> (days) or <code>Nh</code> (hours), e.g. <code>30d</code> or <code>12h</code>.', { html: true })
+          return
+        }
+        const newState = { ...pendingVault, ttlSeconds, awaitingCustomDuration: false }
+        await grantWizardConfirm(ctx, chat_id, newState)
+      } else if (pendingVault.kind === 'grant-wizard') {
+        // Text received mid-wizard but not awaiting custom duration — ignore and re-set
+        pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
       } else {
         let value = text
         const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
@@ -4735,12 +4778,223 @@ async function handleVaultDeferCallback(ctx: Context, data: string): Promise<voi
   await ctx.answerCallbackQuery({ text: 'Unknown action.' }).catch(() => {})
 }
 
+// ─── Grant wizard helpers (Issue #227) ──────────────────────────────────────
+// TODO: these helpers duplicate server.ts — extract to a shared module in a
+// future refactor once the two entrypoints are proven stable in production.
+
+/** Parse a duration string like "30d", "7h", "365d" into seconds. */
+function parseGrantDuration(s: string): number | null {
+  const m = /^(\d+)([dh])$/i.exec(s.trim())
+  if (!m) return null
+  const n = parseInt(m[1]!, 10)
+  if (n <= 0) return null
+  return m[2]!.toLowerCase() === 'd' ? n * 86400 : n * 3600
+}
+
+/** Format seconds as a human-readable expiry label. */
+function formatGrantExpiry(ttlSeconds: number | null, now: Date = new Date()): string {
+  if (ttlSeconds === null) return 'Never'
+  const exp = new Date(now.getTime() + ttlSeconds * 1000)
+  return exp.toISOString().slice(0, 10)
+}
+
+/** Build the Step 1 keyboard: agent selection. */
+function buildGrantAgentKeyboard(agents: string[]): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  // Max 3 per row to keep buttons readable on mobile
+  for (let i = 0; i < agents.length; i++) {
+    if (i > 0 && i % 3 === 0) kb.row()
+    kb.text(agents[i]!, `vg:agent:${agents[i]!}`)
+  }
+  kb.row().text('Cancel', 'vg:cancel')
+  return kb
+}
+
+/** Build the Step 2 keyboard: key multi-select toggle. */
+function buildGrantKeysKeyboard(keys: string[], selected: Set<string>): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  for (const k of keys) {
+    const check = selected.has(k) ? '☑' : '☐'
+    kb.row().text(`${check} ${k}`, `vg:key:${k}`)
+  }
+  kb.row()
+    .text('Continue', 'vg:keys-continue')
+    .text('Cancel', 'vg:cancel')
+  return kb
+}
+
+/** Build the Step 3 keyboard: duration selection. */
+function buildGrantDurationKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('30 days', 'vg:dur:30d')
+    .text('90 days', 'vg:dur:90d')
+    .text('1 year', 'vg:dur:1y')
+    .row()
+    .text('Custom…', 'vg:dur:custom')
+    .text('No expiry', 'vg:dur:never')
+    .row()
+    .text('Back', 'vg:back:duration')
+    .text('Cancel', 'vg:cancel')
+}
+
+/** Build the Confirm keyboard. */
+function buildGrantConfirmKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('Generate', 'vg:generate')
+    .text('Cancel', 'vg:cancel')
+}
+
+/** Start the grant wizard (step 1: pick agent). */
+async function startGrantWizardStep1(ctx: Context, chatId: string): Promise<void> {
+  type AgentListResp = { agents: Array<{ name: string }> }
+  const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+  const agents = data?.agents?.map(a => a.name).filter(Boolean) ?? []
+  if (agents.length === 0) {
+    await switchroomReply(ctx, '⚠️ No agents found in switchroom.yaml.', { html: true })
+    return
+  }
+  const kb = buildGrantAgentKeyboard(agents)
+  const sent = await switchroomReply(ctx, '<b>Grant capability token — Step 1/3</b>\n\nWhich agent?', { html: true, reply_markup: kb })
+  const wizardMsgId = (sent as { message_id?: number })?.message_id
+  pendingVaultOps.set(chatId, {
+    kind: 'grant-wizard',
+    step: 'agent',
+    wizardMsgId,
+    startedAt: Date.now(),
+  })
+}
+
+/** Advance grant wizard to step 2 (pick keys). */
+async function grantWizardStep2(ctx: Context, chatId: string, agent: string, wizardMsgId: number | undefined): Promise<void> {
+  const keys = await listViaBroker()
+  if (!keys) {
+    await switchroomReply(ctx, '🔴 Broker is not running (or unreachable). Cannot list vault keys.', { html: true })
+    pendingVaultOps.delete(chatId)
+    return
+  }
+  if (keys.length === 0) {
+    await switchroomReply(ctx, '⚠️ No vault keys found. Add secrets first with <code>/vault set</code>.', { html: true })
+    pendingVaultOps.delete(chatId)
+    return
+  }
+  const selected = new Set<string>()
+  const kb = buildGrantKeysKeyboard(keys, selected)
+  const text = `<b>Grant capability token — Step 2/3</b>\n\nWhich keys for <code>${escapeHtmlForTg(agent)}</code>?\n<i>Tap to toggle; tap Continue when done.</i>`
+  if (wizardMsgId != null) {
+    await ctx.api.editMessageText(chatId, wizardMsgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+  } else {
+    const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
+    wizardMsgId = (sent as { message_id?: number })?.message_id
+  }
+  pendingVaultOps.set(chatId, {
+    kind: 'grant-wizard',
+    step: 'keys',
+    agent,
+    selectedKeys: [],
+    availableKeys: keys,
+    wizardMsgId,
+    startedAt: Date.now(),
+  })
+}
+
+/** Advance grant wizard to step 3 (pick duration). */
+async function grantWizardStep3(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
+  const kb = buildGrantDurationKeyboard()
+  const keyList = state.selectedKeys!.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')
+  const text = `<b>Grant capability token — Step 3/3</b>\n\nKeys for <code>${escapeHtmlForTg(state.agent!)}</code>:\n${keyList}\n\nHow long should this grant be valid?`
+  const msgId = state.wizardMsgId
+  if (msgId != null) {
+    await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+  } else {
+    const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
+    state.wizardMsgId = (sent as { message_id?: number })?.message_id
+  }
+  pendingVaultOps.set(chatId, { ...state, step: 'duration' })
+}
+
+/** Advance grant wizard to confirmation step. */
+async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
+  const kb = buildGrantConfirmKeyboard()
+  const expiresLabel = formatGrantExpiry(state.ttlSeconds!)
+  const keyList = state.selectedKeys!.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')
+  const text = [
+    '<b>Confirm grant</b>',
+    '',
+    `Agent: <code>${escapeHtmlForTg(state.agent!)}</code>`,
+    `Keys:\n${keyList}`,
+    `Expires: <b>${escapeHtmlForTg(expiresLabel)}</b>`,
+    '',
+    'Tap <b>Generate</b> to mint the token.',
+  ].join('\n')
+  const msgId = state.wizardMsgId
+  if (msgId != null) {
+    await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+  } else {
+    const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
+    state.wizardMsgId = (sent as { message_id?: number })?.message_id
+  }
+  pendingVaultOps.set(chatId, { ...state, step: 'confirm', expiresLabel })
+}
+
+/** Execute the grant: call broker mint_grant, write token, reply. */
+async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
+  pendingVaultOps.delete(chatId)
+  // Defence-in-depth: state.agent flows from callback_data into a path
+  // join below. A crafted vg:agent:../../etc payload would produce a
+  // path traversal. Validate against the same regex the rest of the
+  // file uses; on failure, drop silently — the wizard message has
+  // already been finalized.
+  try { assertSafeAgentName(state.agent!) } catch { return }
+  const result = await mintGrantViaBroker({
+    agent: state.agent!,
+    keys: state.selectedKeys!,
+    ttl_seconds: state.ttlSeconds ?? null,
+    description: state.description,
+  })
+  if (result.kind === 'unreachable') {
+    await switchroomReply(ctx, `🔴 Broker unreachable: ${escapeHtmlForTg(result.msg)}`, { html: true })
+    return
+  }
+  if (result.kind === 'error') {
+    await switchroomReply(ctx, `<b>mint_grant failed:</b> ${escapeHtmlForTg(result.msg)}`, { html: true })
+    return
+  }
+  // Write token to the agent's .vault-token file
+  const { token, id } = result
+  const tokenPath = join(homedir(), '.switchroom', 'agents', state.agent!, '.vault-token')
+  try {
+    mkdirSync(join(homedir(), '.switchroom', 'agents', state.agent!), { recursive: true })
+    writeFileSync(tokenPath, token, { mode: 0o600 })
+  } catch (err) {
+    await switchroomReply(ctx, `<b>Grant created but token write failed:</b> ${escapeHtmlForTg(String(err))}`, { html: true })
+    return
+  }
+  // Collapse wizard message to just the outcome
+  const msgId = state.wizardMsgId
+  const successText = `✅ Grant <code>${escapeHtmlForTg(id)}</code> created. Written to <code>~/.switchroom/agents/${escapeHtmlForTg(state.agent!)}/.vault-token</code>`
+  if (msgId != null) {
+    await ctx.api.editMessageText(chatId, msgId, successText, { parse_mode: 'HTML' }).catch(() => {})
+  } else {
+    await switchroomReply(ctx, successText, { html: true })
+  }
+}
+
 /**
  * Issue #228: handle vault grant management callbacks.
  *
  *   `vg:revoke:<grantId>`  — fetch grant details and show confirmation card.
  *   `vg:confirm:<grantId>` — call broker revoke_grant, reply with success.
  *   `vg:cancel:<grantId>`  — dismiss (clear keyboard, no broker call).
+ *
+ * Issue #227: also handles /vault grant wizard callbacks.
+ *
+ *   `vg:cancel`            — cancel wizard at any step.
+ *   `vg:agent:<name>`      — step 1: select agent.
+ *   `vg:key:<name>`        — step 2: toggle key selection.
+ *   `vg:keys-continue`     — step 2 → 3.
+ *   `vg:dur:<value>`       — step 3: duration selection.
+ *   `vg:back:duration`     — step 3 → back to step 2.
+ *   `vg:generate`          — confirm and mint token.
  */
 async function handleVaultGrantCallback(ctx: Context, data: string): Promise<void> {
   const senderId = String(ctx.from?.id ?? '')
@@ -4816,7 +5070,111 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     return
   }
 
+  // #227 grant wizard callbacks (vg:cancel bare, vg:agent:*, vg:key:*, vg:keys-continue,
+  // vg:dur:*, vg:back:*, vg:generate). These come after the management callbacks above
+  // because management uses vg:cancel:<id> (with trailing id) while the wizard uses
+  // bare vg:cancel — the cancelMatch above only matches the id-suffixed form.
+  const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
   await ctx.answerCallbackQuery().catch(() => {})
+
+  // Cancel at any wizard step
+  if (data === 'vg:cancel') {
+    pendingVaultOps.delete(chatId)
+    const msg = ctx.callbackQuery.message
+    if (msg && 'text' in msg) {
+      await ctx.editMessageText('❌ Grant wizard cancelled.').catch(() => {})
+    }
+    return
+  }
+
+  const state = pendingVaultOps.get(chatId)
+  if (!state || state.kind !== 'grant-wizard') {
+    await ctx.editMessageText('⚠️ Wizard session expired. Run /vault grant to start again.').catch(() => {})
+    return
+  }
+
+  // vg:agent:<name> — step 1 selection
+  if (data.startsWith('vg:agent:')) {
+    const agent = data.slice('vg:agent:'.length)
+    const msgId = (ctx.callbackQuery.message as { message_id?: number })?.message_id ?? state.wizardMsgId
+    await grantWizardStep2(ctx, chatId, agent, msgId)
+    return
+  }
+
+  // vg:key:<name> — step 2 toggle
+  if (data.startsWith('vg:key:')) {
+    const key = data.slice('vg:key:'.length)
+    if (state.step !== 'keys') return
+    const selectedSet = new Set(state.selectedKeys ?? [])
+    if (selectedSet.has(key)) {
+      selectedSet.delete(key)
+    } else {
+      selectedSet.add(key)
+    }
+    const updatedState = { ...state, selectedKeys: [...selectedSet] }
+    pendingVaultOps.set(chatId, updatedState)
+    const kb = buildGrantKeysKeyboard(state.availableKeys ?? [], selectedSet)
+    await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => {})
+    return
+  }
+
+  // vg:keys-continue — step 2 → 3
+  if (data === 'vg:keys-continue') {
+    if (state.step !== 'keys') return
+    if (!state.selectedKeys || state.selectedKeys.length === 0) {
+      await ctx.answerCallbackQuery({ text: 'Select at least one key.' }).catch(() => {})
+      return
+    }
+    await grantWizardStep3(ctx, chatId, state)
+    return
+  }
+
+  // vg:dur:<value> — step 3 duration selection
+  if (data.startsWith('vg:dur:')) {
+    if (state.step !== 'duration') return
+    const dur = data.slice('vg:dur:'.length)
+    if (dur === 'custom') {
+      // Ask for text reply with n d|h format
+      pendingVaultOps.set(chatId, { ...state, awaitingCustomDuration: true })
+      const msg = ctx.callbackQuery.message
+      if (msg && 'text' in msg && msg.text) {
+        await ctx.editMessageText(
+          msg.text + '\n\n<i>Send a duration like <code>30d</code> or <code>12h</code>:</i>',
+          { parse_mode: 'HTML', reply_markup: buildGrantDurationKeyboard() },
+        ).catch(() => {})
+      }
+      return
+    }
+    let ttlSeconds: number | null
+    if (dur === 'never') {
+      ttlSeconds = null
+    } else if (dur === '1y') {
+      ttlSeconds = 365 * 86400
+    } else {
+      ttlSeconds = parseGrantDuration(dur)
+      if (ttlSeconds === null) return
+    }
+    const newState = { ...state, ttlSeconds, awaitingCustomDuration: false }
+    await grantWizardConfirm(ctx, chatId, newState)
+    return
+  }
+
+  // vg:back:duration — go back to step 2 (keys selection) from step 3
+  if (data === 'vg:back:duration') {
+    if (state.step !== 'duration') return
+    const msgId = state.wizardMsgId
+    await grantWizardStep2(ctx, chatId, state.agent!, msgId)
+    return
+  }
+
+  // vg:generate — final step
+  if (data === 'vg:generate') {
+    if (state.step !== 'confirm') return
+    await executeGrantWizard(ctx, chatId, state)
+    return
+  }
+
+  // Unrecognised vg: sub-action — already answered callbackQuery above
 }
 
 /**
@@ -5184,7 +5542,10 @@ bot.command('vault', async ctx => {
       '/vault status — show broker state',
       '/vault unlock — unlock the broker (prompts for passphrase)',
       '/vault lock — lock the broker',
+      '/vault grant — mint a capability token (inline wizard)',
       '/vault grants [agent] — list active capability grants (tap to revoke)',
+      '',
+      'Your passphrase is cached in memory for 30 min after first use.',
     ].join('\n'), { html: true })
     return
   }
@@ -5274,6 +5635,12 @@ bot.command('vault', async ctx => {
     // cache it — it goes straight to the broker unlock socket.
     pendingVaultOps.set(chatId, { kind: 'unlock', startedAt: Date.now() })
     await switchroomReply(ctx, '🔐 Send your vault passphrase to unlock the broker (message will be deleted, passphrase never cached):', { html: true })
+    return
+  }
+
+  // Issue #227: /vault grant — inline-keyboard wizard to mint capability tokens
+  if (sub === 'grant') {
+    await startGrantWizardStep1(ctx, chatId)
     return
   }
 
@@ -5936,6 +6303,43 @@ if (streamMode === 'checklist') {
           process.stderr.write(`telegram gateway: completion message failed: ${err.message}\n`)
         })
       }
+    },
+    onSilentEnd: ({ chatId, turnKey }) => {
+      // Write a state file so the Stop hook can detect a silent-end and
+      // block the session to re-prompt the agent. The hook increments
+      // retryCount; on the second silent-end (retryCount >= 1) it allows
+      // the stop so this warning card renders.
+      const statePath = join(STATE_DIR, 'silent-end-pending.json')
+      let retryCount = 0
+      try {
+        if (existsSync(statePath)) {
+          const prev = JSON.parse(readFileSync(statePath, 'utf8'))
+          // Only inherit retryCount from a stale file when it belongs to the
+          // SAME turn — otherwise a previous turn's exhausted counter would
+          // suppress the retry on a fresh silent-end.
+          if (prev.turnKey === turnKey) {
+            retryCount = typeof prev.retryCount === 'number' ? prev.retryCount : 0
+          }
+        }
+      } catch {
+        retryCount = 0
+      }
+      const suppressed = retryCount === 0
+      try {
+        writeFileSync(
+          statePath,
+          JSON.stringify({ chatId, turnKey, retryCount, timestamp: Date.now() }),
+          'utf8',
+        )
+        process.stderr.write(
+          `telegram gateway: silent-end: wrote state file turnKey=${turnKey} retryCount=${retryCount} suppressed=${suppressed}\n`,
+        )
+      } catch (err) {
+        process.stderr.write(
+          `telegram gateway: silent-end: failed to write state file: ${(err as Error).message}\n`,
+        )
+      }
+      return { suppressed }
     },
     maxIdleMs: 5 * 60_000,
   })

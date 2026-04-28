@@ -197,6 +197,10 @@ import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
 import { handleStreamReply } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
+import {
+  validateInlineKeyboard,
+  type AnyButton,
+} from './telegram-button-constraints.js'
 import { logStreamingEvent } from './streaming-metrics.js'
 import { buildAttachmentPath, assertInsideInbox } from './attachment-path.js'
 import { startSessionTail, type SessionEvent, type SessionTailHandle } from './session-tail.js'
@@ -915,8 +919,9 @@ export {
   markdownToHtml,
   splitHtmlChunks,
   escapeHtml,
+  sanitizeForTelegram,
 } from './format.js'
-import { markdownToHtml, splitHtmlChunks, escapeHtml, repairEscapedWhitespace } from './format.js'
+import { markdownToHtml, splitHtmlChunks, escapeHtml, repairEscapedWhitespace, sanitizeForTelegram } from './format.js'
 
 type AttachmentMeta = {
   kind: string
@@ -1270,6 +1275,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'boolean',
             description: 'Disable link preview thumbnails. Default: true (configurable via access.json disableLinkPreview).',
           },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Max 8 buttons total; max 3 per row recommended. When provided, Telegram renders tappable buttons below the message.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
+          },
+          protect_content: {
+            type: 'boolean',
+            description: 'When true, Telegram prevents the message from being forwarded or saved.',
+          },
+          quote_text: {
+            type: 'string',
+            description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1303,6 +1331,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           quote: {
             type: 'boolean',
             description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.',
+          },
+          inline_keyboard: {
+            type: 'array',
+            description: 'Optional inline keyboard. Outer array = rows, inner array = buttons per row. V1: URL buttons only (each button must have text + url). Applied on the final done=true send only. Max 8 buttons total; max 3 per row recommended.',
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'Button label (max 64 chars).' },
+                  url: { type: 'string', description: 'URL to open when tapped (http/https/tg://).' },
+                },
+                required: ['text', 'url'],
+              },
+            },
+          },
+          protect_content: {
+            type: 'boolean',
+            description: 'When true, Telegram prevents the message from being forwarded or saved.',
+          },
+          quote_text: {
+            type: 'string',
+            description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1497,6 +1548,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // want a bare (non-quoted) message pass quote:false.
         const quoteOptIn = args.quote !== false
         let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const protectContent = args.protect_content === true
+        const quoteText = args.quote_text as string | undefined
         const access = loadAccess()
         const configParseMode = access.parseMode ?? 'html'
         const format = (args.format as string | undefined) ?? configParseMode
@@ -1508,7 +1561,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         let effectiveText: string
         if (format === 'html') {
           parseMode = 'HTML' as const
-          effectiveText = markdownToHtml(text)
+          effectiveText = sanitizeForTelegram(markdownToHtml(text))
         } else if (format === 'markdownv2') {
           parseMode = 'MarkdownV2' as const
           effectiveText = escapeMarkdownV2(text)
@@ -1560,6 +1613,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? 4000, MAX_CHUNK_LIMIT))
         const replyMode = access.replyToMode ?? 'first'
+
+        // inline_keyboard: validate and build reply_markup (URL buttons only, v1).
+        // Validation rejects buttons missing text or url and flags constraint
+        // violations. reply_markup is attached to the LAST chunk so the buttons
+        // appear on the final visible message rather than an intermediate one.
+        let replyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+        const rawKeyboard = args.inline_keyboard as AnyButton[][] | undefined
+        if (rawKeyboard != null) {
+          const validationErrors = validateInlineKeyboard(rawKeyboard)
+          if (validationErrors.length > 0) {
+            const summary = validationErrors
+              .map((e) => `${e.path}.${e.field}: ${e.reason}`)
+              .join('; ')
+            throw new Error(`inline_keyboard validation failed: ${summary}`)
+          }
+          replyMarkup = { inline_keyboard: rawKeyboard }
+        }
 
         // Use smart HTML chunking for HTML mode, legacy chunking otherwise
         const chunks = parseMode === 'HTML'
@@ -1642,11 +1712,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            // Attach inline keyboard to the last chunk only — buttons on
+            // intermediate chunks would be orphaned when the next chunk arrives.
+            const isLastChunk = i === chunks.length - 1
             const sendOpts = {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(shouldReplyTo
+                ? {
+                    reply_parameters: {
+                      message_id: reply_to,
+                      ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+                    },
+                  }
+                : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
               ...(threadId != null ? { message_thread_id: threadId } : {}),
               ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+              ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
+              ...(protectContent ? { protect_content: true } : {}),
             }
 
             // Chunk 0 edit-in-place path: edit the existing preview
@@ -1658,6 +1740,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               const editOpts: Record<string, unknown> = {}
               if (parseMode) editOpts.parse_mode = parseMode
               if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
+              // Include inline keyboard if this is also the only (last) chunk.
+              if (replyMarkup != null && isLastChunk) editOpts.reply_markup = replyMarkup
               try {
                 await robustApiCall(
                   () => lockedBot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
@@ -1857,6 +1941,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         const access = loadAccess()
+
+        // inline_keyboard for stream_reply: validate and build reply_markup.
+        // We only pass reply_markup on done=true so the buttons appear on the
+        // final answer message. Mid-turn (done=false) calls skip it — the
+        // stream-controller would persist it through every edit otherwise,
+        // which is only desired for the progress-card Steer button use case.
+        let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+        const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
+        if (rawStreamKeyboard != null && Boolean(args.done)) {
+          const validationErrors = validateInlineKeyboard(rawStreamKeyboard)
+          if (validationErrors.length > 0) {
+            const summary = validationErrors
+              .map((e) => `${e.path}.${e.field}: ${e.reason}`)
+              .join('; ')
+            throw new Error(`inline_keyboard validation failed: ${summary}`)
+          }
+          streamReplyMarkup = { inline_keyboard: rawStreamKeyboard }
+        }
+
         const result = await handleStreamReply(
           {
             chat_id: args.chat_id as string,
@@ -1866,12 +1969,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             reply_to: args.reply_to as string | undefined,
             quote: args.quote as boolean | undefined,
+            ...(args.protect_content === true ? { protect_content: true } : {}),
+            ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
+            ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
             bot: lockedBot,
             retry: robustApiCall,
-            markdownToHtml,
+            markdownToHtml: (t: string) => sanitizeForTelegram(markdownToHtml(t)),
             escapeMarkdownV2,
             repairEscapedWhitespace,
             takeHandoffPrefix,
@@ -1974,7 +2080,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const access = loadAccess()
         const configParseMode = access.parseMode ?? 'html'
         const parseMode = configParseMode === 'html' ? 'HTML' : undefined
-        const effectiveText = configParseMode === 'html' ? markdownToHtml(text) : text
+        const effectiveText = configParseMode === 'html' ? sanitizeForTelegram(markdownToHtml(text)) : text
 
         const sendOpts = {
           ...(parseMode ? { parse_mode: parseMode } : {}),
@@ -2043,7 +2149,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         let editText: string
         if (editFormat === 'html') {
           editParseMode = 'HTML' as const
-          editText = markdownToHtml(editRawText)
+          editText = sanitizeForTelegram(markdownToHtml(editRawText))
         } else if (editFormat === 'markdownv2') {
           editParseMode = 'MarkdownV2' as const
           editText = escapeMarkdownV2(editRawText)
@@ -2544,7 +2650,7 @@ if (streamMode === 'checklist') {
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot,
         retry: robustApiCall,
-        markdownToHtml,
+        markdownToHtml: (t: string) => sanitizeForTelegram(markdownToHtml(t)),
         escapeMarkdownV2,
         repairEscapedWhitespace,
         takeHandoffPrefix: () => '',
@@ -2819,7 +2925,7 @@ function handlePtyPartial(text: string): void {
   handlePtyPartialPure(text, state, {
     bot,
     retry: robustApiCall,
-    renderText: markdownToHtml,
+    renderText: (t: string) => sanitizeForTelegram(markdownToHtml(t)),
     logEvent: logStreamingEvent,
     onStreamSend: (chatId, messageId, charCount) => {
       logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
@@ -3161,104 +3267,28 @@ function handleSessionEvent(ev: SessionEvent): void {
       const threadId = currentSessionThreadId
       const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
 
-      // Orphaned-reply backstop: the model finished a turn without
-      // calling the reply tool. Forward the captured text so the user
-      // doesn't get silence. We send via bot.api.sendMessage directly
-      // since the model has already finished and won't call reply.
+      // DISABLED: answer-stream preview / orphaned-reply backstop (issues #251, #269).
       //
-      // Race-condition guard: turn_end fires as soon as the JSONL line
-      // is written, but the MCP reply tool handler (async) may still be
-      // in flight. We defer the backstop by 500ms and re-check the flag
-      // so a slow reply() that sets currentTurnReplyCalled = true
-      // during the wait window doesn't produce a duplicate send.
-      if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) {
-        const capturedText = currentTurnCapturedText.join('\n').trim()
-        if (capturedText) {
-          // Capture state before the async wait — the variables might be
-          // reset by a subsequent enqueue event during the delay.
-          const backstopChatId = chatId
-          const backstopThreadId = threadId
-          const backstopCtrl = ctrl
-
-          // Reset immediately so the next turn can start tracking fresh.
-          currentSessionChatId = null
-          currentSessionThreadId = undefined
-          currentTurnReplyCalled = false
-          currentTurnCapturedText = []
-
-          void (async () => {
-            // Wait 500ms for any in-flight reply handler to finish its
-            // Telegram API call before we decide whether to duplicate it.
-            // The pre-reset check above already covers the common case
-            // (tool_use for reply was seen before turn_end); this wait
-            // covers the narrow race where the MCP reply handler is still
-            // mid-`sendMessage` when turn_end fires. History's
-            // `getRecentOutboundCount` is the post-wait signal we use.
-            await new Promise<void>(resolve => setTimeout(resolve, 500))
-
-            if (HISTORY_ENABLED) {
-              try {
-                const { getRecentOutboundCount } = await import('./history.js')
-                const recentCount = getRecentOutboundCount(backstopChatId, 2)
-                if (recentCount > 0) {
-                  process.stderr.write(
-                    `telegram channel: backstop suppressed — reply tool sent ${recentCount} message(s) in the last 2s\n`,
-                  )
-                  if (backstopCtrl) backstopCtrl.setDone()
-                  activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-                  activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
-                  return
-                }
-              } catch {
-                // History check failed; proceed with backstop to avoid silence
-              }
-            }
-
-            process.stderr.write(
-              `telegram channel: orphaned-reply backstop firing — model produced ${capturedText.length} chars of text without calling reply tool, forwarding via bot API\n`,
-            )
-            const sendOpts = {
-              parse_mode: 'HTML' as const,
-              ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
-              link_preview_options: { is_disabled: true },
-            }
-            const renderedText = markdownToHtml(capturedText)
-            const limit = 4000
-            const chunks = splitHtmlChunks(renderedText, limit)
-            const sentIds: number[] = []
-            try {
-              for (const chunk of chunks) {
-                const sent = await bot.api.sendMessage(backstopChatId, chunk, sendOpts)
-                sentIds.push(sent.message_id)
-              }
-              if (HISTORY_ENABLED && sentIds.length > 0) {
-                try {
-                  recordOutbound({
-                    chat_id: backstopChatId,
-                    thread_id: backstopThreadId ?? null,
-                    message_ids: sentIds,
-                    texts: chunks,
-                  })
-                } catch (e) {
-                  process.stderr.write(
-                    `telegram channel: history recordOutbound (orphaned-reply backstop) failed: ${e}\n`,
-                  )
-                }
-              }
-              if (backstopCtrl) backstopCtrl.setDone()
-            } catch (err) {
-              process.stderr.write(
-                `telegram channel: orphaned-reply backstop failed: ${(err as Error).message}\n`,
-              )
-              if (backstopCtrl) backstopCtrl.setError()
-            } finally {
-              activeStatusReactions.delete(statusKey(backstopChatId, backstopThreadId))
-              activeTurnStartedAt.delete(statusKey(backstopChatId, backstopThreadId))
-            }
-          })()
-          return
-        }
-      }
+      // This block previously forwarded model stdout text to Telegram when the
+      // model finished a turn without calling the reply tool. That was the root
+      // cause of duplicate messages in issue #251: the MCP reply tool posted
+      // the formatted message and then this backstop posted a second copy of
+      // the trailing model summary.
+      //
+      // Issue #269 closes the loop: all cron scripts now route delivery through
+      // mcp__switchroom-telegram__reply (via applyCronTelegramGuidance), and live
+      // sessions are guided by sub-agent-telegram-prompt.ts to use the same tool.
+      // With every send path going through the MCP layer, there is no legitimate
+      // "orphaned reply" case — if no reply tool was called, the agent had nothing
+      // to say and the user should see silence (ctrl.setSilent below), not a raw
+      // plaintext dump of the model's trailing summary tokens.
+      //
+      // If a future regression reintroduces silent turns, re-enable this block
+      // and pair it with a `!currentTurnReplyCalled` guard that checks
+      // getRecentOutboundCount first (to avoid duplicates when the MCP handler
+      // races with turn_end).
+      //
+      // if (!currentTurnReplyCalled && currentTurnCapturedText.length > 0) { ... }
 
       // Normal path: terminate the controller cleanly. The reply tool's
       // own setDone() may already have fired — that's fine, the
@@ -3268,9 +3298,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       // without producing user-visible text" (🙊 silent). We reach this
       // branch when EITHER: (a) the reply/stream_reply tool was called
       // (currentTurnReplyCalled === true) and likely fired its own setDone
-      // already, OR (b) no reply tool AND no captured text — the agent
-      // ran tools and went silent. Case (b) is the silent end. The
-      // backstop above handles "no reply tool but captured text".
+      // already, OR (b) no reply tool called — the agent had nothing to say
+      // (silent end). All sends go through the MCP reply tool (issue #269)
+      // so there is no third "captured text but no tool call" case anymore.
       if (ctrl) {
         if (currentTurnReplyCalled) {
           ctrl.setDone()
@@ -4271,6 +4301,16 @@ function parseGrantDuration(s: string): number | null {
   return m[2]!.toLowerCase() === 'd' ? n * 86400 : n * 3600
 }
 
+/** Validate that a string looks like a safe agent/resource name.
+ *  Agent names should be alphanumeric with hyphens/underscores only.
+ *  Prevents path traversal when joining agent name into a filesystem path.
+ *  Defense in depth — called before any path join using a user-supplied name. */
+function assertSafeAgentName(name: string): void {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name) && name !== 'all') {
+    throw new Error(`invalid agent name: ${name}`)
+  }
+}
+
 /** Format seconds as a human-readable expiry label. */
 function formatGrantExpiry(ttlSeconds: number | null, now: Date = new Date()): string {
   if (ttlSeconds === null) return 'Never'
@@ -4419,6 +4459,9 @@ async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<P
 /** Execute the grant: call broker mint_grant, write token, reply. */
 async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
   pendingVaultOps.delete(chatId)
+  // Guard against path traversal before any I/O: state.agent flows from the
+  // vg:agent:<name> callback_data which is user-controlled input.
+  try { assertSafeAgentName(state.agent!) } catch { return }
   const result = await mintGrantViaBroker({
     agent: state.agent!,
     keys: state.selectedKeys!,

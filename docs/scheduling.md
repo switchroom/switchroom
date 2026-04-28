@@ -37,22 +37,20 @@ For each schedule entry, switchroom generates:
 | `prompt` | Yes | — | The prompt sent to Claude |
 | `model` | No | `claude-sonnet-4-6` | Model for this task |
 | `secrets` | No | `[]` | Vault keys this task may read via the broker. See [configuration.md#vault-broker-linux-only](configuration.md#vault-broker-linux-only). |
-| `suppress_stdout` | No | `false` | When `true`, the cron script discards stdout instead of forwarding it to Telegram. Use for tasks that send their own message via MCP tools (`stream_reply` / `reply`) so the trailing model summary doesn't post as a duplicate. See [issue #118](https://github.com/switchroom/switchroom/issues/118). |
 
-### When to set `suppress_stdout: true`
+> **`suppress_stdout` was removed in [#269](https://github.com/switchroom/switchroom/issues/269).** All cron tasks now route their Telegram message through the MCP `reply` tool — see below.
 
-The default cron flow captures `claude -p`'s stdout and `curl`s it to Telegram, so the agent gets one message per cron run for free. That works for tasks that respond entirely via the model's final text — "morning briefing", "weekly summary", etc.
+### How cron tasks deliver to Telegram
 
-It backfires for tasks that already post their own message via MCP tools (`mcp__switchroom-telegram__stream_reply`, `mcp__switchroom-telegram__reply`). The MCP tool call posts the formatted message; then the cron script forwards the model's trailing summary as a second message:
+Cron-scheduled tasks run as one-shot `claude -p` invocations with no live Telegram session. The cron script:
 
-```
-[MCP tool call]: 🌅 Morning briefing — 3 items on today's calendar...
-[stdout]:        Morning briefing sent. Key signals flagged: low sleep, gym in 2h.
-```
+1. Wraps the configured `prompt` with delivery guidance instructing the model to call `mcp__switchroom-telegram__reply` with the chat ID and emit `HEARTBEAT_OK` to stdout.
+2. Executes `claude -p` with stdout routed to `/dev/null` so the discarded `HEARTBEAT_OK` (and any incidental model output) never reaches Telegram.
+3. The MCP `reply` tool applies the same markdown→HTML conversion, smart chunking, and sanitization as a live session — output renders identically regardless of trigger.
 
-The user sees both. The `HEARTBEAT_OK` / `NO_REPLY` sentinels can suppress the stdout but only if the model produces them as the exact final tokens — fragile.
+If a cron task has nothing meaningful to say (data is dull, all signals nominal), the model emits `HEARTBEAT_OK` without calling `reply`. A silent heartbeat is correct behaviour, not an error — the user is not pinged unnecessarily.
 
-`suppress_stdout: true` is the deterministic switch. The cron script `exec`s `claude -p` with stdout routed to `/dev/null`, so only the MCP-tool-posted message reaches Telegram.
+This replaces the previous flow (raw `claude -p` stdout piped through `curl ... -d parse_mode=HTML`), which produced broken markdown rendering on phones (literal `**asterisks**`) and the duplicate-message bug tracked in [#251](https://github.com/switchroom/switchroom/issues/251).
 
 ### Cron Expression Examples
 

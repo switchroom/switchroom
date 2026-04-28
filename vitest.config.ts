@@ -29,6 +29,8 @@ export default defineConfig({
       "**/src/vault/grants.test.ts",
       "**/src/vault/broker/server-grants.test.ts",
       "**/src/vault/broker/client-token.test.ts",
+      "**/src/vault/broker/server-unlock.test.ts",
+      "**/src/vault/broker/auto-unlock.test.ts",
       // `.claude/worktrees/<slug>/` are checkout copies created by sub-agent
       // sessions. Their tests duplicate the canonical ones and run against
       // stale code — never discover them from the canonical repo.
@@ -54,6 +56,7 @@ export default defineConfig({
       "**/src/vault/resolver-via-broker.test.ts",
       "**/src/vault/broker/scope.test.ts",
       "**/src/vault/broker/server.test.ts",
+      "**/src/vault/broker/auto-unlock.test.ts",
       "**/telegram-plugin/tests/boot-probes.test.ts",
       "**/telegram-plugin/tests/setup-state.test.ts",
     ],

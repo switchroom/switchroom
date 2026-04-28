@@ -254,6 +254,12 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "logs", description: "Show recent agent logs" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
+  // Vault — secrets + capability grants. /vault is a top-level command
+  // dispatching subcommands (list, get, set, delete, status, unlock, lock,
+  // grant, grants). Surfaced in the menu so mobile users can tap-to-pick
+  // instead of needing to know the verb (PR #221 added the handlers but
+  // forgot the menu entry, so /vault was effectively invisible).
+  { command: "vault", description: "Manage vault secrets + capability grants" },
   // Auth / subscription management. These are deliberately in the menu
   // rather than only typable — the whole point of the auth surface is
   // that it has to work from mobile without any other tooling

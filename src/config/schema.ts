@@ -44,11 +44,11 @@ export const ScheduleEntrySchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "When true, the cron script runs `claude -p` and discards stdout " +
-      "instead of forwarding it to Telegram. Use for tasks that send their " +
-      "own message via MCP tools (stream_reply / reply) so the trailing " +
-      "model summary doesn't post as a duplicate. Defaults to false to " +
-      "preserve the legacy stdout-forwarding behavior. See issue #118.",
+      "DEPRECATED — accepted but ignored as of #269. All cron tasks now " +
+      "deliver their Telegram message via the MCP `reply` tool, with stdout " +
+      "always discarded. Existing configs that set this field will not error, " +
+      "but the value has no effect. The field will be removed in a future " +
+      "release.",
     ),
 });
 
@@ -663,6 +663,17 @@ export const AgentSchema = z.object({
       "Names of skills from switchroom.skills_dir to symlink into this " +
       "agent's skills/ directory. Unioned with defaults.skills.",
     ),
+  humanizer_voice_file: z
+    .string()
+    .optional()
+    .describe(
+      "Optional path to a voice-calibration template (markdown). " +
+      "When set, exported as HUMANIZER_VOICE_FILE so the bundled " +
+      "humanizer skill matches the user's writing style instead of " +
+      "applying generic 'human' rules. Generate one with the " +
+      "humanizer-calibrate skill, or hand-write it. Resolved relative " +
+      "to the agent's directory if not absolute.",
+    ),
   subagents: z
     .record(z.string(), SubagentSchema)
     .optional()
@@ -739,6 +750,38 @@ export const AgentSchema = z.object({
       "optional concurrency cap (default 5). When code_repos is set, " +
       "claim_worktree accepts the alias as the repo argument. " +
       "Absolute paths may always be passed regardless of this list.",
+    ),
+  repos: z
+    .record(
+      z.string().regex(
+        /^[a-z0-9][a-z0-9-]*$/,
+        "Repo slug must be kebab-case ASCII: start with a lowercase letter or digit, contain only lowercase letters, digits, and hyphens",
+      ),
+      z.object({
+        url: z
+          .string()
+          .min(1)
+          .describe(
+            "Git remote URL for the repo (e.g. 'git@github.com:org/repo.git' or " +
+            "'https://github.com/org/repo.git'). Used verbatim for git clone.",
+          ),
+        branch_default: z
+          .string()
+          .optional()
+          .describe(
+            "Default branch to track (defaults to the remote's HEAD, typically 'main'). " +
+            "The per-agent branch 'agent/<agentName>/main' fast-forwards to this branch " +
+            "when the worktree is clean on session start.",
+          ),
+      }),
+    )
+    .optional()
+    .describe(
+      "Repos this agent operates on. Switchroom provisions a dedicated worktree for each " +
+      "repo at <agentDir>/work/<slug>/ on branch agent/<agentName>/main, backed by a " +
+      "shared bare clone at ~/.switchroom/repos/<slug>.git. The worktree path is injected " +
+      "into the agent's environment as SWITCHROOM_REPO_<SLUG_UPPER>. " +
+      "Agents without this field continue to work unchanged.",
     ),
 });
 
@@ -930,3 +973,4 @@ export type VaultConfig = z.infer<typeof VaultConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
 export type CodeRepoEntry = z.infer<typeof CodeRepoEntrySchema>;
+export type AgentRepoEntry = NonNullable<z.infer<typeof AgentSchema>["repos"]>[string];

@@ -330,28 +330,32 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
         process.exit(1);
       }
 
+      // Wrap the verify + encrypt block in try/finally so the passphrase
+      // variable is zeroed on every exit path — including openVault failure.
       try {
-        openVault(passphrase, vaultPath);
-      } catch (err) {
-        console.error(`Passphrase verification failed: ${err instanceof Error ? err.message : String(err)}`);
-        process.exit(1);
-      }
+        try {
+          openVault(passphrase, vaultPath);
+        } catch (err) {
+          console.error(`Passphrase verification failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
 
-      mkdirSync(dirname(credPath), { recursive: true, mode: 0o700 });
+        mkdirSync(dirname(credPath), { recursive: true, mode: 0o700 });
 
-      // systemd-creds encrypt --name=vault-passphrase --user --quiet - <credPath>
-      // Stdin: passphrase. Output: encrypted credential at credPath.
-      // The --name=vault-passphrase binding is required — systemd validates the
-      // embedded name matches the LoadCredentialEncrypted= id at decrypt time.
-      try {
-        execFileSync(
-          "systemd-creds",
-          ["encrypt", "--name=vault-passphrase", "--user", "--quiet", "-", credPath],
-          { input: passphrase, stdio: ["pipe", "inherit", "inherit"] },
-        );
-      } catch (err) {
-        console.error(`systemd-creds encrypt failed: ${err instanceof Error ? err.message : String(err)}`);
-        process.exit(1);
+        // systemd-creds encrypt --name=vault-passphrase --user --quiet - <credPath>
+        // Stdin: passphrase. Output: encrypted credential at credPath.
+        // The --name=vault-passphrase binding is required — systemd validates the
+        // embedded name matches the LoadCredentialEncrypted= id at decrypt time.
+        try {
+          execFileSync(
+            "systemd-creds",
+            ["encrypt", "--name=vault-passphrase", "--user", "--quiet", "-", credPath],
+            { input: passphrase, stdio: ["pipe", "inherit", "inherit"] },
+          );
+        } catch (err) {
+          console.error(`systemd-creds encrypt failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
       } finally {
         passphrase = "";
       }

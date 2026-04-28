@@ -2488,3 +2488,45 @@ describe('progress-card driver — API failure escalation', () => {
     expect(emits.length).toBeGreaterThan(emitsAfterTransient)
   })
 })
+
+describe('issue #259: autonomous wakeup turns skip silent-end warning', () => {
+  it('<<autonomous-loop-dynamic>> turn ending without reply renders ✅ Done, not 🙊', () => {
+    const { driver, emits } = harness()
+    // Simulate a ScheduleWakeup turn — the user-prompt body is the sentinel.
+    driver.startTurn({ chatId: 'c1', userText: '<<autonomous-loop-dynamic>>' })
+    // Agent runs some tools but never calls reply/stream_reply (normal for
+    // autonomous turns that just do background work and exit).
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'a', toolName: 'Bash' }, 'c1')
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    expect(emits).toHaveLength(1)
+    expect(emits[0].done).toBe(true)
+    // Must NOT show the silent-end warning for autonomous turns.
+    expect(emits[0].html).not.toContain('🙊')
+    expect(emits[0].html).not.toContain('Ended without reply')
+    expect(emits[0].html).not.toContain("Agent ran tools but didn't send a reply")
+    // Must render as normal completion.
+    expect(emits[0].html).toContain('✅ <b>Done</b>')
+  })
+
+  it('<<autonomous-loop>> (CronCreate variant) also suppresses silent-end', () => {
+    const { driver, emits } = harness()
+    driver.startTurn({ chatId: 'c1', userText: '<<autonomous-loop>>' })
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'c1')
+    expect(emits[0].html).not.toContain('🙊')
+    expect(emits[0].html).toContain('✅ <b>Done</b>')
+  })
+
+  it('non-autonomous turns (real Telegram messages) still show 🙊 when no reply fires', () => {
+    const { driver, emits } = harness()
+    driver.startTurn({ chatId: 'c1', userText: 'check the logs' })
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash' }, 'c1')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'a', toolName: 'Bash' }, 'c1')
+    emits.length = 0
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+    expect(emits[0].html).toContain('🙊 <b>Ended without reply</b>')
+    expect(emits[0].html).not.toContain('✅ <b>Done</b>')
+  })
+})

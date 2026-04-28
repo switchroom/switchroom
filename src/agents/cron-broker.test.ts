@@ -48,7 +48,7 @@ describe("buildCronScript: SWITCHROOM_VAULT_BROKER_SOCK export", () => {
       AGENT_DIR, PROMPT, MODEL, CHAT_ID, undefined, ["key_a"], BROKER_SOCKET,
     );
     const sockIdx = script.indexOf("SWITCHROOM_VAULT_BROKER_SOCK");
-    const claudeIdx = script.indexOf("OUTPUT=$(claude -p");
+    const claudeIdx = script.indexOf("exec claude -p");
     expect(sockIdx).toBeGreaterThan(-1);
     expect(claudeIdx).toBeGreaterThan(-1);
     expect(sockIdx).toBeLessThan(claudeIdx);
@@ -105,6 +105,13 @@ describe("generateBrokerUnit", () => {
   it("ExecStart references the switchroom CLI vault broker start --foreground", () => {
     const unit = generateBrokerUnit(opts);
     expect(unit).toContain("vault broker start --foreground");
+  });
+
+  it("ExecStart invokes bun explicitly (fix #285: bun-only installs where node is absent)", () => {
+    const unit = generateBrokerUnit(opts);
+    // The ExecStart must begin with the bun binary so systemd doesn't try to
+    // resolve #!/usr/bin/env node from the switchroom shebang (issue #285).
+    expect(unit).toMatch(/^ExecStart=.*\/bun .*\/switchroom vault broker start --foreground$/m);
   });
 
   it("uses Restart=on-failure", () => {

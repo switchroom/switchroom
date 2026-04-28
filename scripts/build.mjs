@@ -89,11 +89,15 @@ execSync(
   { stdio: "inherit", cwd: root }
 );
 
-// Rewrite shebang from `bun` to `node` so npm-installed users don't need bun.
-console.log("[build] rewriting shebang -> node");
+// Rewrite shebang from `node` to `bun` — bun:sqlite and other bun: imports
+// are not polyfillable in Node, and bun is already a hard runtime dependency
+// (broker uses it explicitly, gateway runs `bun gateway.ts`, build itself
+// requires `bun install`). Running the bundle under node produces an
+// immediate ERR_UNSUPPORTED_ESM_URL_SCHEME 'bun:' error.
+console.log("[build] rewriting shebang -> bun");
 let src = readFileSync(outFile, "utf8");
-if (src.startsWith("#!/usr/bin/env bun")) {
-  src = src.replace(/^#!\/usr\/bin\/env bun/, "#!/usr/bin/env node");
+if (src.startsWith("#!/usr/bin/env node")) {
+  src = src.replace(/^#!\/usr\/bin\/env node/, "#!/usr/bin/env bun");
   writeFileSync(outFile, src);
 }
 chmodSync(outFile, 0o755);

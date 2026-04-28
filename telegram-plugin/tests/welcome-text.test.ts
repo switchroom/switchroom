@@ -312,7 +312,9 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     // These used to be in the menu and are now handler-only (still
     // typable, but not in autocomplete). If they sneak back in, the
     // menu has regressed to pre-trim length.
-    for (const droppedFromMenu of ["vault", "grant", "dangerous", "permissions", "switchroomstart", "topics", "memory", "pins-status", "interrupt"]) {
+    // Note: /vault was re-added to the menu in PR #254 — users couldn't
+    // discover the vault subcommands without typing the verb manually.
+    for (const droppedFromMenu of ["grant", "dangerous", "permissions", "switchroomstart", "topics", "memory", "pins-status", "interrupt"]) {
       expect(names, `/${droppedFromMenu} should NOT be in the trimmed Telegram menu`).not.toContain(droppedFromMenu);
     }
   });

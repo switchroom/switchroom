@@ -70,6 +70,18 @@ export interface StreamReplyArgs {
    * updates. Used by the progress-card driver to persist the Steer button.
    */
   reply_markup?: unknown
+  /**
+   * When true, Telegram prevents the message from being forwarded or saved.
+   * Applied on the initial send only (editMessageText ignores it).
+   */
+  protect_content?: boolean
+  /**
+   * Optional surgical quote text. When set along with `reply_to`, the initial
+   * send includes `reply_parameters: { message_id, quote: { text, position: 0 } }`
+   * so Telegram highlights the specific quoted sentence rather than the whole
+   * referenced message. Ignored when `reply_to` is absent.
+   */
+  quote_text?: string
 }
 
 export interface StreamReplyState {
@@ -367,6 +379,8 @@ export async function handleStreamReply(
       throttleMs: deps.throttleMs ?? 600,
       retry: deps.retry,
       ...(replyToMessageId != null ? { replyToMessageId } : {}),
+      ...(args.quote_text != null && replyToMessageId != null ? { quoteText: args.quote_text } : {}),
+      ...(args.protect_content === true ? { protectContent: true } : {}),
       ...(args.reply_markup != null ? { replyMarkup: args.reply_markup } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),

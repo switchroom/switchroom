@@ -5,6 +5,8 @@ import {
   shouldAppendTelegramProgressGuidance,
 } from './sub-agent-telegram-prompt.js'
 
+// shouldAppendTelegramProgressGuidance is kept for call-site compatibility
+// but its result is no longer acted on by applyTelegramProgressGuidance (#256).
 describe('shouldAppendTelegramProgressGuidance', () => {
   it('is true when telegram is enabled and a chat id is known', () => {
     expect(
@@ -40,6 +42,7 @@ describe('shouldAppendTelegramProgressGuidance', () => {
   })
 })
 
+// buildTelegramProgressGuidance is deprecated but kept for compatibility.
 describe('buildTelegramProgressGuidance', () => {
   it('embeds the chat id verbatim', () => {
     const out = buildTelegramProgressGuidance({ defaultChatId: '12345' })
@@ -62,6 +65,8 @@ describe('buildTelegramProgressGuidance', () => {
 })
 
 describe('applyTelegramProgressGuidance', () => {
+  // --- Core contract: body is ALWAYS returned unchanged (#256) ---
+
   it('returns the body unchanged when telegram is disabled', () => {
     const body = 'You are the worker sub-agent.'
     expect(
@@ -82,25 +87,43 @@ describe('applyTelegramProgressGuidance', () => {
     ).toBe(body)
   })
 
-  it('appends the guidance block when telegram + chat id are present', () => {
+  it('returns the body unchanged even when telegram + chat id are both present (#256 regression)', () => {
+    // Previously this case appended the guidance block. After #256 it must NOT.
     const body = 'You are the worker sub-agent.'
     const out = applyTelegramProgressGuidance(body, {
       telegramEnabled: true,
       defaultChatId: '8248703757',
     })
-    expect(out).toContain(body)
-    expect(out).toContain('Telegram visibility')
-    expect(out).toContain('8248703757')
+    expect(out).toBe(body)
   })
 
-  it('trims trailing whitespace before appending so the join is clean', () => {
+  it('does not append any "Telegram visibility" content regardless of args (#256 regression)', () => {
+    // Regression guard: if a future change accidentally re-enables the feature
+    // this test will catch it.
+    const body = 'You are the worker sub-agent.'
+
+    const cases = [
+      { telegramEnabled: true, defaultChatId: '8248703757' },
+      { telegramEnabled: true, defaultChatId: '1' },
+      { telegramEnabled: false, defaultChatId: '8248703757' },
+      { telegramEnabled: false, defaultChatId: undefined },
+    ] as const
+
+    for (const args of cases) {
+      const out = applyTelegramProgressGuidance(body, args)
+      expect(out).toBe(body)
+      expect(out).not.toContain('Telegram visibility')
+      expect(out).not.toContain('mcp__switchroom-telegram__progress_update')
+    }
+  })
+
+  it('does not mutate trailing whitespace in the body', () => {
+    // Ensure the function is truly a no-op — no trimming or normalisation.
     const body = 'You are the worker.\n\n\n  '
     const out = applyTelegramProgressGuidance(body, {
       telegramEnabled: true,
       defaultChatId: '1',
     })
-    // No triple-blank between body and the appended block.
-    expect(out).not.toMatch(/\n\n\n\n## Telegram/)
-    expect(out).toMatch(/You are the worker\.\n\n## Telegram/)
+    expect(out).toBe(body)
   })
 })

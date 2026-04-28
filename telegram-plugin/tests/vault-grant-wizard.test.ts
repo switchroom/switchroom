@@ -11,10 +11,25 @@
  */
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// Resolve paths relative to the repo root, derived from this test file's
+// own location, instead of process.cwd() — which is brittle across run
+// modes (vitest from repo root vs `bun test` from telegram-plugin/ vs
+// CI's `cd telegram-plugin && bun test`). The repo root is two levels
+// up from this file (telegram-plugin/tests/vault-grant-wizard.test.ts).
+const TEST_DIR = (() => {
+  try {
+    return resolve(fileURLToPath(import.meta.url), '..')
+  } catch {
+    return resolve('.')
+  }
+})()
+const REPO_ROOT = resolve(TEST_DIR, '..', '..')
 
 function readSrc(rel: string): string {
-  return readFileSync(join(process.cwd(), rel), 'utf8')
+  return readFileSync(join(REPO_ROOT, rel), 'utf8')
 }
 
 describe('/vault grant inline-keyboard wizard (#227)', () => {

@@ -209,6 +209,25 @@ export const AGENT_RETRY_INTERVAL_MS = 1500
  */
 export const AGENT_RETRY_MAX_MS = 12_000
 
+/**
+ * How long the boot-card live-agent-status loop keeps polling and editing
+ * the card in-place after the initial probe run. The loop exits early as
+ * soon as the agent reaches `active`. If the window expires without the
+ * agent becoming active, the card commits to whatever state is current.
+ *
+ * 45 s covers the typical systemd restart cycle (deactivating → inactive →
+ * activating → active) even under load, while staying short enough that a
+ * genuinely stuck unit (still `inactive` at 45 s) is a real problem.
+ * Exported for test injection.
+ */
+export const AGENT_LIVE_WINDOW_MS = 45_000
+
+/**
+ * How often the live-watch loop re-polls systemd while waiting for the
+ * agent to become active. Exported for test injection.
+ */
+export const AGENT_LIVE_POLL_INTERVAL_MS = 2_000
+
 type ExecFileResult = { stdout: string; stderr: string }
 type ExecFileFnType = (
   cmd: string,
@@ -299,6 +318,114 @@ export async function probeAgentProcess(
       await sleep(retryIntervalMs)
     }
   })(), PROBE_TIMEOUT_MS + retryMaxMs)  // extend outer timeout to cover full retry budget
+}
+
+/**
+ * Async generator that watches the agent systemd unit and yields a
+ * ProbeResult each time the meaningful state changes, for up to
+ * `liveWindowMs` total. Exits early as soon as the unit reaches `active`.
+ *
+ * Designed for the boot-card live-update loop in `boot-card.ts`: the
+ * caller iterates, edits the card on each yielded result, and breaks once
+ * it sees `status === 'ok'` or the generator exhausts.
+ *
+ * Key contract:
+ *   - First yield is immediate (no initial delay) so the card can show
+ *     the current state right away.
+ *   - Subsequent yields happen every `pollIntervalMs`.
+ *   - `inactive` and `activating` within the window → status `degraded`
+ *     (🟡 "starting"), not `fail`. Only `failed` or window-expired-`inactive`
+ *     commits to `fail`.
+ *   - When the window expires without `active` the generator yields a
+ *     final committed result and then ends.
+ */
+export async function* watchAgentProcess(
+  agentName: string,
+  opts: {
+    liveWindowMs?: number
+    pollIntervalMs?: number
+    /** Override for tests — replaces real delays */
+    sleepImpl?: (ms: number) => Promise<void>
+    /** Override for tests — replaces real execFile calls */
+    execFileImpl?: ExecFileFnType
+  } = {},
+): AsyncGenerator<ProbeResult> {
+  const liveWindowMs = opts.liveWindowMs ?? AGENT_LIVE_WINDOW_MS
+  const pollIntervalMs = opts.pollIntervalMs ?? AGENT_LIVE_POLL_INTERVAL_MS
+  const sleep = opts.sleepImpl ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
+  const execFileFn: ExecFileFnType = opts.execFileImpl ?? execFile
+
+  const startMs = Date.now()
+  let lastYieldedDetail: string | null = null
+
+  /**
+   * Convert a raw systemd state into a ProbeResult suitable for the boot card.
+   * Within the live window: inactive, activating, auto-restart, and
+   * deactivating are all 🟡 "starting" — we don't know they're stuck yet.
+   * Only `failed` is immediately 🔴. Everything else (unknown) is also 🔴.
+   */
+  function toProbeResult(
+    state: string,
+    kv: Record<string, string>,
+    withinWindow: boolean,
+  ): ProbeResult {
+    if (state === 'active') {
+      const pid = kv['MainPID'] ?? '?'
+      const uptime = formatUptime(kv['ActiveEnterTimestamp'] ?? '')
+      const mem = formatMemory(kv['MemoryCurrent'] ?? '')
+      const parts = [`PID ${pid}`, uptime, mem].filter(Boolean)
+      return { status: 'ok', label: 'Agent', detail: parts.join(' · ') }
+    }
+    if (withinWindow) {
+      // Treat all non-active states as transient while still within the
+      // window. `failed` is the only exception — hard fail even in-window.
+      if (state === 'failed') {
+        return { status: 'fail', label: 'Agent', detail: 'service failed' }
+      }
+      return { status: 'degraded', label: 'Agent', detail: 'service starting' }
+    }
+    // Window expired — commit to the actual state.
+    const isTransient =
+      state === 'deactivating' ||
+      state === 'activating' ||
+      state === 'auto-restart' ||
+      state === 'inactive'
+    const status = isTransient ? 'degraded' : 'fail'
+    return { status, label: 'Agent', detail: `service ${state}` }
+  }
+
+  while (true) {
+    const elapsedMs = Date.now() - startMs
+    const withinWindow = elapsedMs < liveWindowMs
+
+    const snapshot = await queryAgentState(agentName, execFileFn)
+
+    if ('error' in snapshot) {
+      yield { status: 'fail', label: 'Agent', detail: snapshot.error }
+      return
+    }
+
+    const result = toProbeResult(snapshot.state, snapshot.kv, withinWindow)
+
+    // Only yield when the result detail actually changed — avoids
+    // redundant card edits ("service starting" → "service starting").
+    if (result.detail !== lastYieldedDetail) {
+      lastYieldedDetail = result.detail
+      yield result
+    }
+
+    // Terminal states: active (ok) or genuinely failed.
+    if (result.status === 'ok' || (result.status === 'fail' && snapshot.state === 'failed')) {
+      return
+    }
+
+    // If window expired, we already yielded the final committed result.
+    if (!withinWindow) {
+      return
+    }
+
+    await sleep(pollIntervalMs)
+  }
 }
 
 // ─── Probe: Gateway ──────────────────────────────────────────────────────────
