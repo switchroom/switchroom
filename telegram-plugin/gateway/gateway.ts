@@ -35,6 +35,7 @@ import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { createPinManager } from '../progress-card-pin-manager.js'
 import { createPinWatchdog } from '../progress-card-pin-watchdog.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
+import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
   createProgressDriver,
@@ -495,6 +496,27 @@ let currentSessionThreadId: number | undefined = undefined
 let currentTurnReplyCalled = false
 let currentTurnCapturedText: string[] = []
 let orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null = null
+
+// Issue #195 — answer-lane streaming.
+// Lazily created on the first text event of a turn (once enough text has
+// accumulated, the stream itself gates on minInitialChars). Materialized
+// and cleared at turn_end. One per active turn; supersession protection
+// on the answer-stream handle covers race with rapid steers/queues.
+let activeAnswerStream: AnswerStreamHandle | null = null
+let currentTurnIsDm = false
+let currentTurnGatewayReceiveAt = 0
+
+/**
+ * Telegram chat-id convention: positive ids are private chats (DM with a
+ * user; chat.id === user.id). Negative ids are groups, supergroups, or
+ * channels. Used to pick the answer-stream transport without an extra
+ * getChat round-trip.
+ */
+function isDmChatId(chatId: string | null | undefined): boolean {
+  if (!chatId) return false
+  const id = Number(chatId)
+  return Number.isFinite(id) && id > 0
+}
 
 const CONTEXT_EXHAUSTION_COOLDOWN_MS = 10 * 60 * 1000
 let lastContextExhaustionWarningAt = 0
@@ -1891,11 +1913,26 @@ function handleSessionEvent(ev: SessionEvent): void {
       // prior turn before resetting focus.
       typingWrapper.drainAll()
       if (ev.chatId) {
+        // Issue #195: if a previous turn left an answer-lane stream open
+        // (rapid steer/queue), force it to a new generation so its in-flight
+        // edits don't mutate the new turn's message. Materialize is best-effort
+        // — we don't await here because turn_end on the prior turn should
+        // have already done it; this is a defensive supersession guard.
+        if (activeAnswerStream != null) {
+          activeAnswerStream.forceNewMessage()
+          activeAnswerStream.stop()
+          activeAnswerStream = null
+        }
         currentSessionChatId = ev.chatId
         currentSessionThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
         currentTurnReplyCalled = false
         currentTurnCapturedText = []
         currentTurnStartedAt = Date.now()
+        // Issue #195: capture transport selection + time-to-ack baseline
+        // up-front so the per-turn answer-stream config is determined before
+        // the first text event arrives.
+        currentTurnIsDm = isDmChatId(ev.chatId)
+        currentTurnGatewayReceiveAt = currentTurnStartedAt
         if (pendingPtyPartial != null) {
           const pending = pendingPtyPartial
           pendingPtyPartial = null
@@ -1933,6 +1970,54 @@ function handleSessionEvent(ev: SessionEvent): void {
     case 'text': {
       if (currentSessionChatId != null) {
         currentTurnCapturedText.push(ev.text)
+        // Issue #195: feed the answer-lane stream. The stream itself
+        // gates on minInitialChars and throttles edits — short replies
+        // stay below the threshold and never spawn a message.
+        if (activeAnswerStream == null) {
+          activeAnswerStream = createAnswerStream({
+            chatId: currentSessionChatId,
+            isPrivateChat: currentTurnIsDm,
+            threadId: currentSessionThreadId,
+            sendMessageDraft: (
+              bot.api as Bot['api'] & {
+                sendMessageDraft?: (
+                  chatId: string,
+                  draftId: number,
+                  text: string,
+                  params?: { message_thread_id?: number },
+                ) => Promise<unknown>
+              }
+            ).sendMessageDraft?.bind(bot.api),
+            sendMessage: async (chatId, text, params) => {
+              const msg = await bot.api.sendMessage(chatId, text, {
+                parse_mode: params?.parse_mode,
+                ...(params?.message_thread_id != null
+                  ? { message_thread_id: params.message_thread_id }
+                  : {}),
+                ...(params?.link_preview_options != null
+                  ? { link_preview_options: params.link_preview_options }
+                  : {}),
+                ...(params?.reply_parameters != null
+                  ? { reply_parameters: params.reply_parameters }
+                  : {}),
+              })
+              return { message_id: msg.message_id }
+            },
+            editMessageText: (chatId, messageId, text, params) =>
+              bot.api.editMessageText(chatId, messageId, text, {
+                parse_mode: params?.parse_mode,
+                ...(params?.message_thread_id != null
+                  ? { message_thread_id: params.message_thread_id }
+                  : {}),
+                ...(params?.link_preview_options != null
+                  ? { link_preview_options: params.link_preview_options }
+                  : {}),
+              }),
+            log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+            warn: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+          })
+        }
+        activeAnswerStream.update(currentTurnCapturedText.join(''))
       }
       resetOrphanedReplyTimeout()
 
@@ -1955,6 +2040,13 @@ function handleSessionEvent(ev: SessionEvent): void {
         const ctrl = activeStatusReactions.get(statusKey(chatId, threadId))
         if (ctrl) ctrl.setError()
         purgeReactionTracking(statusKey(chatId, threadId))
+        // Issue #195: tear down the answer-lane stream on context-exhaustion
+        // bail-out. The user is being told the session needs /restart, so any
+        // partially-streamed answer would be misleading.
+        if (activeAnswerStream != null) {
+          activeAnswerStream.stop()
+          activeAnswerStream = null
+        }
         currentSessionChatId = null
         currentSessionThreadId = undefined
         currentTurnReplyCalled = false
@@ -1983,6 +2075,27 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (orphanedReplyTimeoutId != null) {
         clearTimeout(orphanedReplyTimeoutId)
         orphanedReplyTimeoutId = null
+      }
+      // Issue #195: materialize the answer-lane stream as a fresh
+      // sendMessage so the user's device gets a push notification on
+      // turn completion (edits don't fire pushes). Best-effort — if
+      // materialize fails, log and proceed; the existing reply path
+      // is still authoritative.
+      if (activeAnswerStream != null) {
+        const stream = activeAnswerStream
+        activeAnswerStream = null
+        void stream
+          .materialize()
+          .catch((err) => {
+            process.stderr.write(
+              `telegram gateway: answer-stream materialize failed: ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            )
+          })
+          .finally(() => {
+            stream.stop()
+          })
       }
       if (currentSessionChatId == null) return
       const chatId = currentSessionChatId
