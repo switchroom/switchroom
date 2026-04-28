@@ -297,9 +297,11 @@ describe.runIf(tmuxAvailable())("Fix 2 — submitAuthCode unlinks credentials.js
       credentialsMtimeAtStart: staleMtime, // gate blocks the stale file
     });
 
-    // 4. Live, harmless tmux session so tmuxSessionExists returns true and
-    //    `tmux send-keys` has somewhere to deliver the code. Detached, no-op.
-    execSync(`tmux new-session -d -s ${sessionName} "sleep 30"`);
+    // 4. Live tmux session so tmuxSessionExists returns true and
+    //    `tmux send-keys` has somewhere to deliver the code.
+    //    The pane must show "Paste code here" so probeForCodePrompt passes;
+    //    otherwise submitAuthCode returns pane-not-ready before checking logs.
+    execSync(`tmux new-session -d -s ${sessionName} "printf 'Paste code here\\n'; sleep 30"`);
 
     const result = submitAuthCode(agentName, agentDir, "BROWSERCODE", undefined, {
       pollIntervalMs: 10,

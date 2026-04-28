@@ -150,9 +150,14 @@ describe.skipIf(runSkipCondition)("token-helpers/google-cal-token.sh", () => {
     );
 
     configPath = join(tmpDir, "switchroom.yaml");
+    // Point vault.broker.socket to a non-existent path so the CLI bypasses
+    // the live system broker and falls through to direct vault access.
+    // Without this, `switchroom vault get` hits the real broker daemon running
+    // on ~/.switchroom/vault-broker.sock, which is locked and rejects non-TTY
+    // callers with VAULT-BROKER-DENIED.
     writeFileSync(
       configPath,
-      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\n  broker:\n    socket: ${tmpDir}/no-broker.sock\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
     );
 
     // Shim that substitutes `switchroom` on PATH with the repo's
@@ -319,9 +324,14 @@ describe.skipIf(runSkipCondition)("token-helpers/ms-graph-token.sh", () => {
     setStringSecret(passphrase, vaultPath, "ms-graph-client-id", "ms-cid");
 
     configPath = join(tmpDir, "switchroom.yaml");
+    // Point vault.broker.socket to a non-existent path so the CLI bypasses
+    // the live system broker and falls through to direct vault access.
+    // Without this, `switchroom vault get` hits the real broker daemon running
+    // on ~/.switchroom/vault-broker.sock, which is locked and rejects non-TTY
+    // callers with VAULT-BROKER-DENIED.
     writeFileSync(
       configPath,
-      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
+      `switchroom:\n  version: 1\n  agents_dir: ${tmpDir}/agents\nvault:\n  path: ${vaultPath}\n  broker:\n    socket: ${tmpDir}/no-broker.sock\ntelegram:\n  bot_token: x\n  forum_chat_id: "-1"\nagents: {}\n`
     );
 
     shimDir = join(tmpDir, "bin");
