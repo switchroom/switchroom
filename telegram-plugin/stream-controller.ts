@@ -46,13 +46,19 @@ export interface StreamSendOpts {
    * cannot add a quote reference to an existing message, so the controller
    * strips this from edit opts internally.
    */
-  reply_parameters?: { message_id: number }
+  reply_parameters?: { message_id: number; quote?: { text: string; position: number } }
   /**
    * Inline keyboard markup. Included in both sendMessage and editMessageText
    * so that inline buttons persist through text edits. Without this,
    * editMessageText strips any previously attached keyboard.
    */
   reply_markup?: unknown
+  /**
+   * When true, Telegram prevents the message from being forwarded or saved.
+   * Only meaningful on the initial `sendMessage` — `editMessageText` does not
+   * accept this parameter, so the controller omits it from edit opts.
+   */
+  protect_content?: boolean
 }
 
 export type RetryPolicy = <T>(
@@ -73,6 +79,18 @@ export interface StreamControllerConfig {
    * don't include it (Telegram rejects reply_parameters on edit).
    */
   replyToMessageId?: number
+  /**
+   * Optional quote text for surgical quoting. When set along with
+   * `replyToMessageId`, the initial send includes
+   * `reply_parameters: { message_id, quote: { text, position: 0 } }`.
+   */
+  quoteText?: string
+  /**
+   * When true, Telegram prevents the message from being forwarded or saved.
+   * Applied on the initial `sendMessage` only — editMessageText does not
+   * accept protect_content.
+   */
+  protectContent?: boolean
   /**
    * Inline keyboard markup attached to every send and edit. Without this,
    * editMessageText strips any previously attached keyboard. The progress-
@@ -121,12 +139,14 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     onEdit,
     log,
     replyToMessageId,
+    quoteText,
+    protectContent,
     replyMarkup,
   } = cfg
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
-  // on top (see below); edits must NOT carry reply_parameters — Telegram's
-  // editMessageText rejects it.
+  // and protect_content on top (see below); edits must NOT carry those —
+  // Telegram's editMessageText rejects them.
   const baseOpts: StreamSendOpts = {
     ...(parseMode ? { parse_mode: parseMode } : {}),
     ...(threadId != null ? { message_thread_id: threadId } : {}),
@@ -136,8 +156,14 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
   const sendOpts: StreamSendOpts = {
     ...baseOpts,
     ...(replyToMessageId != null
-      ? { reply_parameters: { message_id: replyToMessageId } }
+      ? {
+          reply_parameters: {
+            message_id: replyToMessageId,
+            ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+          },
+        }
       : {}),
+    ...(protectContent === true ? { protect_content: true } : {}),
   }
 
   return createDraftStream(
