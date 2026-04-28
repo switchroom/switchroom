@@ -21,11 +21,13 @@ export default defineConfig({
     // runs under vite/Node and can't resolve it. The history tests are
     // run separately via `bun test telegram-plugin/tests/history.test.ts`
     // (see the `test` script in package.json).
-    // grants.test.ts also uses bun:sqlite — excluded here, run via test:bun.
+    // grants.test.ts and server-grants.test.ts also use bun:sqlite —
+    // excluded here, run via test:bun.
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
       "**/src/vault/grants.test.ts",
+      "**/src/vault/broker/server-grants.test.ts",
       // `.claude/worktrees/<slug>/` are checkout copies created by sub-agent
       // sessions. Their tests duplicate the canonical ones and run against
       // stale code — never discover them from the canonical repo.
