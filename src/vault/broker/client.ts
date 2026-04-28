@@ -23,6 +23,8 @@ import {
   type BrokerResponse,
   type BrokerStatus,
   type ErrorCode,
+  type GrantMeta,
+  type OkMintGrantResponse,
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
 
@@ -308,4 +310,93 @@ export async function unlockViaBroker(
       client.end();
     });
   });
+}
+
+// ─── Grant management RPCs ─────────────────────────────────────────────────
+
+export interface MintGrantOpts extends BrokerClientOpts {
+  agent: string;
+  keys: string[];
+  ttl_seconds: number | null;
+  description?: string;
+}
+
+export type MintGrantResult =
+  | { kind: "ok"; token: string; id: string; expires_at: number | null }
+  | { kind: "unreachable"; msg: string }
+  | { kind: "error"; msg: string };
+
+/**
+ * Mint a new capability grant via the broker.
+ */
+export async function mintGrantViaBroker(
+  opts: MintGrantOpts,
+): Promise<MintGrantResult> {
+  const result = await rpc(
+    {
+      v: 1,
+      op: "mint_grant",
+      agent: opts.agent,
+      keys: opts.keys,
+      ttl_seconds: opts.ttl_seconds,
+      description: opts.description,
+    },
+    opts,
+  );
+  if (result.kind === "unreachable") return { kind: "unreachable", msg: result.msg };
+  const resp = result.resp;
+  if (resp.ok && "token" in resp) {
+    return {
+      kind: "ok",
+      token: (resp as OkMintGrantResponse).token,
+      id: (resp as OkMintGrantResponse).id,
+      expires_at: (resp as OkMintGrantResponse).expires_at,
+    };
+  }
+  if (!resp.ok) return { kind: "error", msg: resp.msg };
+  return { kind: "error", msg: "unexpected broker response" };
+}
+
+export type ListGrantsResult =
+  | { kind: "ok"; grants: GrantMeta[] }
+  | { kind: "unreachable"; msg: string }
+  | { kind: "error"; msg: string };
+
+/**
+ * List active grants via the broker, optionally filtered by agent.
+ */
+export async function listGrantsViaBroker(
+  agent: string | undefined,
+  opts?: BrokerClientOpts,
+): Promise<ListGrantsResult> {
+  const result = await rpc({ v: 1, op: "list_grants", agent }, opts);
+  if (result.kind === "unreachable") return { kind: "unreachable", msg: result.msg };
+  const resp = result.resp;
+  if (resp.ok && "grants" in resp) {
+    return { kind: "ok", grants: resp.grants as GrantMeta[] };
+  }
+  if (!resp.ok) return { kind: "error", msg: resp.msg };
+  return { kind: "error", msg: "unexpected broker response" };
+}
+
+export type RevokeGrantResult =
+  | { kind: "ok"; revoked: boolean }
+  | { kind: "unreachable"; msg: string }
+  | { kind: "error"; msg: string };
+
+/**
+ * Revoke a grant by ID via the broker.
+ */
+export async function revokeGrantViaBroker(
+  id: string,
+  opts?: BrokerClientOpts,
+): Promise<RevokeGrantResult> {
+  const result = await rpc({ v: 1, op: "revoke_grant", id }, opts);
+  if (result.kind === "unreachable") return { kind: "unreachable", msg: result.msg };
+  const resp = result.resp;
+  if (resp.ok && "revoked" in resp) {
+    return { kind: "ok", revoked: resp.revoked as boolean };
+  }
+  if (!resp.ok) return { kind: "error", msg: resp.msg };
+  return { kind: "error", msg: "unexpected broker response" };
 }

@@ -27,6 +27,7 @@ import {
 import { registerVaultBrokerCommand } from "./vault-broker.js";
 import { registerVaultDoctorCommand } from "./vault-doctor.js";
 import { registerVaultAuditCommand } from "./vault-audit.js";
+import { registerVaultGrantCommands } from "./vault-grant.js";
 
 function getVaultPath(configPath?: string): string {
   try {
@@ -625,4 +626,7 @@ export function registerVaultCommand(program: Command): void {
 
   // `vault audit` — tail/filter the vault audit log.
   registerVaultAuditCommand(vault, program);
+
+  // `vault grant` / `vault grants` / `vault revoke` — capability token management.
+  registerVaultGrantCommands(vault, program);
 }
