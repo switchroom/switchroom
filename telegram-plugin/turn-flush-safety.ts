@@ -31,12 +31,22 @@ const SILENT_MARKER_MAX_LEN = Math.max(
  * `isSilentReplyMarker` intentionally — keeping a local copy avoids a
  * circular-import dependency on server.ts (which has heavy top-level
  * side effects).
+ *
+ * Trailing-punctuation tolerance: a single trailing non-alphanumeric character
+ * (e.g. `NO_REPLY.`) is stripped before matching so accidental punctuation
+ * from model output doesn't prevent suppression. Substring matches (e.g.
+ * `the agent suggested NO_REPLY earlier`) are still rejected because the
+ * length guard rejects anything longer than SILENT_MARKER_MAX_LEN.
  */
 export function isSilentFlushMarker(text: string | undefined): boolean {
   if (typeof text !== 'string') return false
-  const trimmed = text.trim()
+  let trimmed = text.trim()
   if (trimmed.length === 0) return false
   if (trimmed.length > SILENT_MARKER_MAX_LEN) return false
+  // Strip a single trailing non-word character to handle "NO_REPLY." etc.
+  if (trimmed.length > 0 && /\W$/.test(trimmed)) {
+    trimmed = trimmed.slice(0, -1)
+  }
   return SILENT_MARKERS.has(trimmed.toUpperCase())
 }
 
