@@ -71,12 +71,33 @@ export const VAULT_FORMAT_HINTS: VaultFormatHint[] = [
   "string",
 ];
 
+/**
+ * Per-entry agent scope ACL (issue #8).
+ *
+ * Controls which agents may read this vault entry via the broker.
+ * Evaluated AFTER the existing cron-unit ACL (checkAcl) passes.
+ *
+ * Semantics:
+ *   - Neither allow nor deny set  → all agents may read (current behaviour)
+ *   - allow set (non-empty)       → only listed agents may read
+ *   - deny set (non-empty)        → listed agents are blocked (checked first)
+ *   - deny takes precedence over allow: an agent in both lists is denied
+ *
+ * Agent names are the slug portion of the systemd unit, e.g. "clerk" from
+ * "switchroom-clerk-cron-0.service".
+ */
+export interface VaultEntryScope {
+  allow?: string[];
+  deny?: string[];
+}
+
 export type VaultEntry =
-  | { kind: "string"; value: string; format?: VaultFormatHint }
-  | { kind: "binary"; value: string; format?: VaultFormatHint }
+  | { kind: "string"; value: string; format?: VaultFormatHint; scope?: VaultEntryScope }
+  | { kind: "binary"; value: string; format?: VaultFormatHint; scope?: VaultEntryScope }
   | {
       kind: "files";
       files: Record<string, { encoding: "utf8" | "base64"; value: string }>;
+      scope?: VaultEntryScope;
     };
 
 interface VaultFile {
@@ -355,10 +376,14 @@ export function setStringSecret(
   key: string,
   value: string,
   format?: VaultFormatHint,
+  scope?: VaultEntryScope,
 ): void {
   const entry: VaultEntry = format
     ? { kind: "string", value, format }
     : { kind: "string", value };
+  if (scope !== undefined) {
+    (entry as { kind: "string"; value: string; format?: VaultFormatHint; scope?: VaultEntryScope }).scope = scope;
+  }
   setSecret(passphrase, vaultPath, key, entry);
 }
 
