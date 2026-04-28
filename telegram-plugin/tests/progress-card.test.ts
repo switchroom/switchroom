@@ -99,7 +99,7 @@ describe('progress-card reducer', () => {
       { kind: 'tool_use', toolName: 'Bash', toolUseId: 'toolu_A' },
       { kind: 'tool_use', toolName: 'Read', toolUseId: 'toolu_B' },
       // Out-of-order results: B finishes first, with an error
-      { kind: 'tool_result', toolUseId: 'toolu_B', toolName: null, isError: true },
+      { kind: 'tool_result', toolUseId: 'toolu_B', toolName: null, isError: true, errorText: 'unhandled exception: segfault' },
       { kind: 'tool_result', toolUseId: 'toolu_A', toolName: null },
     ])
     expect(s.items.map((i) => [i.tool, i.state])).toEqual([
@@ -945,7 +945,7 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.subAgents.get('X')?.state).toBe('done')
     st = reduce(
       st,
-      { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent', isError: true },
+      { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent', isError: true, errorText: 'unhandled exception in sub-agent' },
       7000,
     )
     expect(st.subAgents.get('X')?.state).toBe('failed')

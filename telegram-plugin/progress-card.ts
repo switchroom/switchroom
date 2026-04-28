@@ -21,6 +21,7 @@ import {
   escapeHtml as sharedEscapeHtml,
   truncate as sharedTruncate,
 } from './card-format.js'
+import { isBenignToolError } from './tool-error-filter.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -451,7 +452,10 @@ export function reduce(
       }
       if (idx === -1) return state
       const items = state.items.slice()
-      const nextState: ItemState = event.isError === true ? 'failed' : 'done'
+      const nextState: ItemState =
+        event.isError === true && !isBenignToolError(event.errorText ?? '')
+          ? 'failed'
+          : 'done'
       items[idx] = { ...items[idx], state: nextState, finishedAt: now }
       // Multi-agent: a parent Agent/Task tool_result is the authoritative
       // close-out for its sub-agent. Find any sub-agent linked to this
