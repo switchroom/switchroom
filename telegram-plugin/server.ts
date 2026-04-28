@@ -1290,6 +1290,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
               },
             },
           },
+          protect_content: {
+            type: 'boolean',
+            description: 'When true, Telegram prevents the message from being forwarded or saved.',
+          },
+          quote_text: {
+            type: 'string',
+            description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1338,6 +1346,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                 required: ['text', 'url'],
               },
             },
+          },
+          protect_content: {
+            type: 'boolean',
+            description: 'When true, Telegram prevents the message from being forwarded or saved.',
+          },
+          quote_text: {
+            type: 'string',
+            description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
           },
         },
         required: ['chat_id', 'text'],
@@ -1532,6 +1548,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // want a bare (non-quoted) message pass quote:false.
         const quoteOptIn = args.quote !== false
         let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        const protectContent = args.protect_content === true
+        const quoteText = args.quote_text as string | undefined
         const access = loadAccess()
         const configParseMode = access.parseMode ?? 'html'
         const format = (args.format as string | undefined) ?? configParseMode
@@ -1698,11 +1716,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             // intermediate chunks would be orphaned when the next chunk arrives.
             const isLastChunk = i === chunks.length - 1
             const sendOpts = {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(shouldReplyTo
+                ? {
+                    reply_parameters: {
+                      message_id: reply_to,
+                      ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+                    },
+                  }
+                : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
               ...(threadId != null ? { message_thread_id: threadId } : {}),
               ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
               ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
+              ...(protectContent ? { protect_content: true } : {}),
             }
 
             // Chunk 0 edit-in-place path: edit the existing preview
@@ -1943,6 +1969,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             reply_to: args.reply_to as string | undefined,
             quote: args.quote as boolean | undefined,
+            ...(args.protect_content === true ? { protect_content: true } : {}),
+            ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
             ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },

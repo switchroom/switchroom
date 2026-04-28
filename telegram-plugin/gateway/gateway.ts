@@ -1355,6 +1355,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const files = (args.files as string[] | undefined) ?? []
   const quoteOptIn = args.quote !== false
   let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+  const protectContent = args.protect_content === true
+  const quoteText = args.quote_text as string | undefined
   const access = loadAccess()
   const configParseMode = access.parseMode ?? 'html'
   const format = (args.format as string | undefined) ?? configParseMode
@@ -1450,10 +1452,18 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const shouldReplyTo =
         reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
       const sendOpts = {
-        ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(shouldReplyTo
+          ? {
+              reply_parameters: {
+                message_id: reply_to,
+                ...(quoteText != null ? { quote: { text: quoteText, position: 0 } } : {}),
+              },
+            }
+          : {}),
         ...(parseMode ? { parse_mode: parseMode } : {}),
         ...(threadId != null ? { message_thread_id: threadId } : {}),
         ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
+        ...(protectContent ? { protect_content: true } : {}),
       }
 
       if (i === 0 && previewMessageId != null) {
@@ -1576,6 +1586,8 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       format: args.format as string | undefined,
       reply_to: args.reply_to as string | undefined,
       quote: args.quote as boolean | undefined,
+      ...(args.protect_content === true ? { protect_content: true } : {}),
+      ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
     },
     { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
     {
