@@ -141,9 +141,17 @@ describe("filterAuditEntries", () => {
   });
 
   it("handles invalid regex in --key gracefully (falls back to substring)", () => {
-    // "[invalid" is not a valid regex; should fall back to substring
-    const result = filterAuditEntries(entries, { key: "stripe" });
-    expect(result.length).toBeGreaterThan(0);
+    // The previous fixture (`"stripe"`) was a valid regex, so the
+    // fallback branch was untested. Use `"[unclosed"` — genuinely
+    // invalid — and a fixture whose literal key contains that substring,
+    // so the substring-fallback returns it.
+    const withBracketKey = [
+      ...entries,
+      makeEntry({ key: "broken[unclosed/key", result: "allowed" }),
+    ];
+    const result = filterAuditEntries(withBracketKey, { key: "[unclosed" });
+    expect(result.length).toBe(1);
+    expect(result[0].key).toBe("broken[unclosed/key");
   });
 });
 

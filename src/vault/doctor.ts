@@ -16,8 +16,18 @@ export interface Diagnostic {
 }
 
 // Regex for sensitive-looking key names.
+//
+// Each keyword requires `(?![a-zA-Z])` after it — the next character
+// must NOT be an ASCII letter. This permits snake_case / kebab-case
+// suffixes (`db_password`, `auth_token`, `secret-key`) while excluding
+// false positives where the keyword is a prefix of a benign word
+// (`tokenizer-config` → `token` followed by `i` → no match).
+//
+// Plural forms (`passwords`, `secrets`) miss this filter but are rare
+// in practice for vault key names — operators typically store one
+// secret per key, not collections.
 const SENSITIVE_KEY_RE =
-  /oauth|token|secret|api[-_]?key|password/i;
+  /oauth(?![a-zA-Z])|token(?![a-zA-Z])|secret(?![a-zA-Z])|api[-_]?key(?![a-zA-Z])|password(?![a-zA-Z])/i;
 
 /**
  * Input shape for analyseVaultHealth.

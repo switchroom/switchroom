@@ -155,6 +155,22 @@ export function registerVaultDoctorCommand(vault: Command, program: Command): vo
         brokerRunning,
       });
 
+      // Reviewer-fix: when SWITCHROOM_VAULT_PASSPHRASE is unset, key-level
+      // checks (missing-keys, sensitive-without-scope, unreferenced) all
+      // skip. In --json mode the previous output was a clean
+      // `{ diagnostics: [] }` (or just broker-state), which a CI runner
+      // would interpret as "all good" — falsely. Surface the skipped-checks
+      // as an explicit info-level diagnostic so callers can detect it.
+      if (vaultKeys === undefined) {
+        diagnostics.unshift({
+          check: "passphrase-not-available",
+          level: "info",
+          message:
+            "Per-key checks skipped: SWITCHROOM_VAULT_PASSPHRASE not set or vault could not be opened.",
+          fix: "Set SWITCHROOM_VAULT_PASSPHRASE to enable missing-key, sensitive-key, and unreferenced-key analysis.",
+        });
+      }
+
       // ── Output ────────────────────────────────────────────────────
       if (opts.json) {
         console.log(JSON.stringify({ diagnostics }, null, 2));
