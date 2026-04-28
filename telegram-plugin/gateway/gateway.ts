@@ -35,6 +35,7 @@ import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { createPinManager } from '../progress-card-pin-manager.js'
 import { createPinWatchdog } from '../progress-card-pin-watchdog.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
+import * as signalTracker from '../turn-signal-tracker.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
@@ -1519,6 +1520,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         threadId != null ? String(threadId) : undefined,
       )
     } catch { /* best-effort signal */ }
+    // #203: fresh sendMessage from reply tool is a user-visible signal.
+    signalTracker.noteSignal(statusKey(chat_id, threadId), Date.now())
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
@@ -2217,12 +2220,18 @@ function handleSessionEvent(ev: SessionEvent): void {
         // still appear in turn-duration graphs.
         {
           const sKey = streamKey(chatId, threadId)
+          const turnDurationMs = currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0
           logStreamingEvent({
             kind: 'turn_end',
             chatId,
-            durationMs: currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0,
+            durationMs: turnDurationMs,
             suppressClearedCount: suppressPtyPreview.has(sKey) ? 1 : 0,
           })
+          // #203: compute trailing gap (last signal → turn_end) then emit.
+          const tKey = statusKey(chatId, threadId)
+          signalTracker.noteSignal(tKey, Date.now())
+          logStreamingEvent({ kind: 'turn_signal_gap', chatId, longestGapMs: signalTracker.getLongestGap(tKey), turnDurationMs })
+          signalTracker.clear(tKey)
         }
         lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
         pendingPtyPartial = null
@@ -2304,12 +2313,18 @@ function handleSessionEvent(ev: SessionEvent): void {
       purgeReactionTracking(statusKey(chatId, threadId))
       {
         const sKey = streamKey(chatId, threadId)
+        const turnDurationMs = currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0
         logStreamingEvent({
           kind: 'turn_end',
           chatId,
-          durationMs: currentTurnStartedAt > 0 ? Date.now() - currentTurnStartedAt : 0,
+          durationMs: turnDurationMs,
           suppressClearedCount: suppressPtyPreview.has(sKey) ? 1 : 0,
         })
+        // #203: compute trailing gap (last signal → turn_end) then emit.
+        const tKey = statusKey(chatId, threadId)
+        signalTracker.noteSignal(tKey, Date.now())
+        logStreamingEvent({ kind: 'turn_signal_gap', chatId, longestGapMs: signalTracker.getLongestGap(tKey), turnDurationMs })
+        signalTracker.clear(tKey)
       }
       lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
       pendingPtyPartial = null
@@ -2550,6 +2565,10 @@ async function handleInbound(
     await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`)
     return
   }
+
+  // Capture wall-clock receive time for inbound_ack metric (#203).
+  // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
+  const inboundReceivedAt = Date.now()
 
   const access = result.access
   const from = ctx.from!
@@ -2925,6 +2944,8 @@ async function handleInbound(
         // controller; just ack the inbound message with 👀 so the user
         // knows we received it, without disrupting the in-flight reaction.
         void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '👀' }]).catch(() => {})
+        // #203: time-to-ack metric — measure gateway-receive → ack-post delta.
+        logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
       } else {
         // Fresh turn (no prior turn in flight): cancel any stale controller
         // and start a new one for this message.
@@ -2945,12 +2966,19 @@ async function handleInbound(
           await bot.api.setMessageReaction(chat_id, msgId, [
             { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
           ])
+          // #203: every status-reaction transition is a user-visible signal.
+          signalTracker.noteSignal(key, Date.now())
         })
         activeStatusReactions.set(key, ctrl)
         activeReactionMsgIds.set(key, { chatId: chat_id, messageId: msgId })
         activeTurnStartedAt.set(key, Date.now())
         progressUpdateTurnCount.set(key, 0)  // Reset turn counter
         ctrl.setQueued()
+        // #203: time-to-ack metric — setQueued() triggers the initial 👀 reaction
+        // asynchronously through the controller chain.
+        logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
+        // #203: signal tracker — start tracking silent gaps for this fresh turn.
+        signalTracker.reset(statusKey(chat_id, messageThreadId), Date.now())
         const agentDir = resolveAgentDirFromEnv()
         if (agentDir != null) {
           addActiveReaction(agentDir, { chatId: chat_id, messageId: msgId, threadId: messageThreadId ?? null, reactedAt: Date.now() })
@@ -2960,6 +2988,8 @@ async function handleInbound(
       void bot.api.setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
       ]).catch(() => {})
+      // #203: time-to-ack metric for the custom-ack-reaction path.
+      logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
     }
   }
 
@@ -5572,6 +5602,8 @@ if (streamMode === 'checklist') {
       }).then((result) => {
         // Successful API call — reset the consecutive-4xx counter.
         progressDriver?.reportApiSuccess(turnKey)
+        // #203: progress-card edit is a user-visible signal.
+        signalTracker.noteSignal(statusKey(chatId, threadId != null ? Number(threadId) : undefined), Date.now())
         if (!result?.messageId) return
         pinMgr.considerPin({
           chatId,
