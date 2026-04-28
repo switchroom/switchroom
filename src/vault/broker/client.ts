@@ -168,6 +168,28 @@ export function createBrokerClient(
   const token: string | null =
     agentSlug ? readVaultTokenFile(agentSlug) : null;
 
+  // Centralised token-rejection check. When the client has a token AND
+  // the broker rejects with grant-expired/grant-revoked, throw a hard
+  // failure (no peercred fallback). Used by both `get()` and `list()` so
+  // a future op can't silently lose the rejection signal — and so
+  // tightening the broker's wire format (e.g. moving the reason to the
+  // `code` enum) is a one-line change.
+  function assertTokenAccepted(msg: string | undefined): void {
+    if (token === null) return;
+    const text = msg ?? "";
+    let reason: "grant-expired" | "grant-revoked" | null = null;
+    if (text.includes("grant-expired")) reason = "grant-expired";
+    else if (text.includes("grant-revoked")) reason = "grant-revoked";
+    if (reason === null) return;
+    const err = new VaultTokenRejectedError(
+      reason,
+      `vault-broker rejected capability token: ${text}. ` +
+      `Mint a new grant with: switchroom vault grant mint <agent> --key <key>`,
+    );
+    process.stderr.write(`[vault-broker] ERROR: ${err.message}\n`);
+    throw err;
+  }
+
   return {
     hasToken: token !== null,
 
@@ -184,29 +206,8 @@ export function createBrokerClient(
         return { kind: "ok", entry: resp.entry as VaultEntry };
       }
       if (!resp.ok) {
-        // When a token was presented, grant-expired and grant-revoked are
-        // hard failures — do NOT silently fall back to peercred.
-        if (token !== null) {
-          const msg = resp.msg ?? "";
-          if (msg.includes("grant-expired")) {
-            const err = new VaultTokenRejectedError(
-              "grant-expired",
-              `vault-broker rejected capability token: ${msg}. ` +
-              `Mint a new grant with: switchroom vault grant mint <agent> --key <key>`,
-            );
-            process.stderr.write(`[vault-broker] ERROR: ${err.message}\n`);
-            throw err;
-          }
-          if (msg.includes("grant-revoked")) {
-            const err = new VaultTokenRejectedError(
-              "grant-revoked",
-              `vault-broker rejected capability token: ${msg}. ` +
-              `Mint a new grant with: switchroom vault grant mint <agent> --key <key>`,
-            );
-            process.stderr.write(`[vault-broker] ERROR: ${err.message}\n`);
-            throw err;
-          }
-        }
+        // Hard-fail on token rejection BEFORE classifying as denied/not_found.
+        assertTokenAccepted(resp.msg);
         if (resp.code === "UNKNOWN_KEY") {
           return { kind: "not_found", code: resp.code, msg: resp.msg };
         }
@@ -223,6 +224,13 @@ export function createBrokerClient(
       if (result.kind === "unreachable") return null;
       if (result.resp.ok && "keys" in result.resp) {
         return result.resp.keys as string[];
+      }
+      // #226 review-fix: hard-fail on token rejection here too — without
+      // this, a `list()` call with a revoked token silently returned null
+      // (caller would think the broker was unreachable, never know to mint
+      // a new grant).
+      if (!result.resp.ok) {
+        assertTokenAccepted(result.resp.msg);
       }
       return null;
     },

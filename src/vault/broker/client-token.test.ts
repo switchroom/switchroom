@@ -385,4 +385,31 @@ describe("createBrokerClient — token rejected (grant-expired / grant-revoked)"
       try { fs.rmSync(path.dirname(tokenPath), { recursive: true, force: true }); } catch { /* ignore */ }
     }
   });
+
+  // #226 review-fix: list() must hard-fail on token rejection, not return null silently.
+  it("list() throws VaultTokenRejectedError(grant-expired) — same hard-fail as get()", async () => {
+    const { token, id } = await mintGrant(grantsDb, "myagent", ["foo"], 3600);
+    const past = Math.floor(Date.now() / 1000) - 100;
+    grantsDb.run("UPDATE vault_grants SET expires_at = ? WHERE id = ?", [past, id]);
+
+    const slug = "myagent-list-expired-" + Date.now();
+    const tokenPath = vaultTokenFilePath(slug);
+    fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
+    fs.writeFileSync(tokenPath, token + "\n", { mode: 0o600 });
+
+    const stderrMsgs: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation(
+      (msg: string | Uint8Array) => { stderrMsgs.push(String(msg)); return true; },
+    );
+
+    try {
+      const client = createBrokerClient(slug, { socket: socketPath });
+
+      await expect(client.list()).rejects.toThrow(VaultTokenRejectedError);
+      await expect(client.list()).rejects.toMatchObject({ reason: "grant-expired" });
+      expect(stderrMsgs.some((m) => m.includes("grant-expired"))).toBe(true);
+    } finally {
+      try { fs.rmSync(path.dirname(tokenPath), { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
 });
