@@ -38,6 +38,7 @@
 
 import type { SwitchroomConfig } from "../../config/schema.js";
 import type { PeerInfo } from "./peercred.js";
+import type { VaultEntryScope } from "../vault.js";
 
 export interface AclAllow {
   allow: true;
@@ -80,6 +81,72 @@ export function parseCronUnit(
   if (!agentName) return null;
 
   return { agentName, index };
+}
+
+/**
+ * Extract the agent slug from a PeerInfo's systemd unit name.
+ *
+ * For a cron unit "switchroom-clerk-cron-0.service", returns "clerk".
+ * Returns null when the peer is not a recognised cron unit (systemdUnit is
+ * null, or the name doesn't parse — same input as parseCronUnit).
+ *
+ * This is the canonical place to go from PeerInfo → agent slug; keep it
+ * pure so tests can call it without starting a broker.
+ */
+export function agentSlugFromPeer(peer: PeerInfo): string | null {
+  if (peer.systemdUnit === null) return null;
+  const parsed = parseCronUnit(peer.systemdUnit);
+  return parsed?.agentName ?? null;
+}
+
+/**
+ * Evaluate a VaultEntry's per-entry scope against the calling agent slug.
+ *
+ * Called AFTER the existing checkAcl() cron-unit ACL passes. Both checks
+ * must pass before a secret is returned.
+ *
+ * Rules (fail-closed):
+ *   - scope undefined/null                → allowed (back-compat, all callers)
+ *   - agentSlug in scope.deny            → denied:scope-deny
+ *   - scope.allow is non-empty AND
+ *     agentSlug NOT in scope.allow       → denied:scope-allow
+ *   - otherwise                          → allowed
+ *
+ * agentSlug may be null when the caller is a cron unit whose name parses
+ * correctly but agentSlugFromPeer returned null for another reason. In that
+ * edge case we treat the entry as scope-restricted and deny if any allow
+ * list is present — fail-closed.
+ */
+export function checkEntryScope(
+  scope: VaultEntryScope | undefined,
+  agentSlug: string | null,
+): AclResult {
+  if (scope === undefined || scope === null) {
+    return { allow: true };
+  }
+
+  const deny = scope.deny ?? [];
+  const allow = scope.allow ?? [];
+
+  if (agentSlug !== null && deny.includes(agentSlug)) {
+    return {
+      allow: false,
+      reason: `agent '${agentSlug}' is in the entry's deny list (scope-deny)`,
+    };
+  }
+
+  if (allow.length > 0) {
+    if (agentSlug === null || !allow.includes(agentSlug)) {
+      return {
+        allow: false,
+        reason: agentSlug === null
+          ? "caller agent slug could not be determined; entry has a non-empty allow list (scope-allow)"
+          : `agent '${agentSlug}' is not in the entry's allow list (scope-allow)`,
+      };
+    }
+  }
+
+  return { allow: true };
 }
 
 /**

@@ -31,7 +31,7 @@ import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, type VaultEntry } from "../vault.js";
 import { resolvePath } from "../../config/loader.js";
 import { identify, type PeerInfo } from "./peercred.js";
-import { checkAcl } from "./acl.js";
+import { checkAcl, checkEntryScope, agentSlugFromPeer } from "./acl.js";
 import {
   decodeRequest,
   encodeResponse,
@@ -461,24 +461,41 @@ export class VaultBroker {
         return;
       }
 
-      // Issue #207: apply ACL scope filter to `list` so crons see only the
-      // keys they are allowed to read. An identified peer (cron unit) has a
-      // per-schedule allowlist in config; we iterate every key and include
-      // it only when checkAcl() says allow. Interactive sessions (peer===null
-      // on non-Linux, or no config) continue to see all keys — their only
-      // gate is the socket file mode 0600.
+      // Two gates apply to `list`, BOTH must pass for a key to be visible:
+      //   1. Per-key ACL (#207): the caller's cron unit must be allowed to
+      //      read the key under its `schedule.secrets` allowlist.
+      //   2. Per-entry scope (#8): the entry's allow/deny lists must permit
+      //      the caller's agent slug.
+      //
+      // Reviewer-flagged bypass for #8: this PR's worker REPLACED gate 1
+      // with gate 2 (rather than adding gate 2 ON TOP of gate 1). That
+      // allowed an agent without an ACL claim on key X to still enumerate
+      // X's name as long as X had no scope set. Now both gates fire.
+      //
+      // Interactive sessions (peer===null on non-Linux, or no config) skip
+      // gate 1 (no identity to gate on) but still apply gate 2 with a null
+      // slug — a deny list with literal-null entries would still take
+      // effect; an allow list of named agents would block (null is not in
+      // any named list). The socket file mode 0600 is the outer gate for
+      // that case.
+      const listAgentSlug = peer !== null ? agentSlugFromPeer(peer) : null;
       let visibleKeys: string[];
       if (peer !== null && this.config !== null) {
-        visibleKeys = Object.keys(this.secrets).filter(
-          (key) => checkAcl(peer, this.config!, key).allow,
-        );
+        visibleKeys = Object.entries(this.secrets)
+          .filter(
+            ([key, entry]) =>
+              checkAcl(peer, this.config!, key).allow &&
+              checkEntryScope(entry.scope, listAgentSlug).allow,
+          )
+          .map(([k]) => k);
       } else {
-        // Non-Linux (no peercred) or no config: full list as before.
-        visibleKeys = Object.keys(this.secrets);
+        visibleKeys = Object.entries(this.secrets)
+          .filter(([, entry]) => checkEntryScope(entry.scope, listAgentSlug).allow)
+          .map(([k]) => k);
       }
 
-      // Audit the visible key count. A bare "allowed" hides the case where
-      // an identified cron unit's ACL filter narrows to zero keys — almost
+      // Audit the visible key count (#207). A bare "allowed" hides the case
+      // where an identified cron unit's filter narrows to zero keys — almost
       // certainly a misconfiguration, but invisible in the log without the
       // count. `allowed:N` lets an operator grep for `result: "allowed:0"`.
       this.auditLogger.write({
@@ -557,6 +574,27 @@ export class VaultBroker {
         });
         socket.write(
           encodeResponse(errorResponse("UNKNOWN_KEY", `Key not found: ${req.key}`)),
+        );
+        return;
+      }
+
+      // Per-entry scope check (issue #8) — runs AFTER cron-unit ACL passes.
+      const getAgentSlug = peer !== null ? agentSlugFromPeer(peer) : null;
+      const scopeResult = checkEntryScope(entry.scope, getAgentSlug);
+      if (!scopeResult.allow) {
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: "get",
+          key: req.key,
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: `denied:${scopeResult.reason}`,
+        });
+        socket.write(
+          encodeResponse(
+            errorResponse("DENIED", scopeResult.reason),
+          ),
         );
         return;
       }
