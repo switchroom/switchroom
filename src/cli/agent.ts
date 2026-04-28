@@ -384,6 +384,13 @@ export interface ReconcileAndRestartOpts {
   graceful?: boolean;
   /** Suppress stdout logging (tests). */
   silent?: boolean;
+  /**
+   * Skip the bot-token / Telegram getMe validation that would otherwise
+   * abort the restart on a transient network error. Wired from the CLI's
+   * `--force` flag — if the operator says force, they mean it, including
+   * for checks that go to the network.
+   */
+  force?: boolean;
 }
 
 /**
@@ -499,7 +506,14 @@ export async function reconcileAndRestartAgent(
   // bot username contains the agent slug. This catches copy-paste mistakes
   // (e.g. clerk's token in finn's .env) before the agent restarts and starts
   // spamming 409 conflicts. Fails loudly — refuse to restart on mismatch.
-  {
+  //
+  // --force bypasses this. The validator hits api.telegram.org and so can
+  // fail for reasons unrelated to a token mismatch (transient network blip,
+  // Telegram rate-limit, DNS hiccup). When the operator passes --force they
+  // are asserting they know what they want; making `--force` honest about
+  // skipping all preflight (including network-dependent ones) matches the
+  // behaviour of the other preflight gates in the restart command.
+  if (!opts.force) {
     const envPath = resolve(agentsDir, name, "telegram", ".env");
     if (existsSync(envPath)) {
       const envContent = readFileSync(envPath, "utf-8");
@@ -513,7 +527,8 @@ export async function reconcileAndRestartAgent(
           // Fail loudly — do not restart with a wrong token.
           throw new Error(
             `Bot token mismatch for agent "${name}": ${msg}\n` +
-              `Fix telegram/.env or the vault entry, then re-run the command.`,
+              `Fix telegram/.env or the vault entry, then re-run the command.\n` +
+              `Or pass --force to skip this and other preflight checks.`,
           );
         }
       }
@@ -1094,7 +1109,7 @@ export function registerAgentCommand(program: Command): void {
                 config,
                 agentsDir,
                 getConfigPath(program),
-                { graceful: opts.gracefulRestart },
+                { graceful: opts.gracefulRestart, force: opts.force },
               );
 
               if (opts.gracefulRestart) {
