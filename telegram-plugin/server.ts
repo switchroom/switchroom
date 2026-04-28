@@ -1915,6 +1915,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         const access = loadAccess()
+
+        // inline_keyboard for stream_reply: validate and build reply_markup.
+        // We only pass reply_markup on done=true so the buttons appear on the
+        // final answer message. Mid-turn (done=false) calls skip it — the
+        // stream-controller would persist it through every edit otherwise,
+        // which is only desired for the progress-card Steer button use case.
+        let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+        const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
+        if (rawStreamKeyboard != null && Boolean(args.done)) {
+          const validationErrors = validateInlineKeyboard(rawStreamKeyboard)
+          if (validationErrors.length > 0) {
+            const summary = validationErrors
+              .map((e) => `${e.path}.${e.field}: ${e.reason}`)
+              .join('; ')
+            throw new Error(`inline_keyboard validation failed: ${summary}`)
+          }
+          streamReplyMarkup = { inline_keyboard: rawStreamKeyboard }
+        }
+
         const result = await handleStreamReply(
           {
             chat_id: args.chat_id as string,
@@ -1924,6 +1943,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format: args.format as string | undefined,
             reply_to: args.reply_to as string | undefined,
             quote: args.quote as boolean | undefined,
+            ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {
