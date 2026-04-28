@@ -115,6 +115,15 @@ export interface AnswerStreamConfig {
   onSuperseded?: OnSupersededCallback
   log?: (msg: string) => void
   warn?: (msg: string) => void
+  /**
+   * Optional metric callback. Fires after each successful send/edit and on
+   * materialize. Injected by the gateway so tests can mock it with vi.fn().
+   * Acceptance #203: answer_lane_update / answer_lane_materialized events.
+   */
+  onMetric?: (ev:
+    | { kind: 'answer_lane_update'; chatId: string; messageId: number | undefined; charCount: number; transport: 'draft' | 'message' | 'edit' }
+    | { kind: 'answer_lane_materialized'; chatId: string; messageId: number | undefined }
+  ) => void
 }
 
 export interface AnswerStreamHandle {
@@ -164,6 +173,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     onSuperseded,
     log,
     warn,
+    onMetric,
   } = config
 
   const effectiveThrottle = Math.max(250, throttleMs)
@@ -198,6 +208,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       const params: { message_thread_id?: number } = {}
       if (threadId != null) params.message_thread_id = threadId
       await draftApi(chatId, draftId, text, Object.keys(params).length > 0 ? params : undefined)
+      onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: text.length, transport: 'draft' })
       return true
     } catch (err) {
       if (shouldFallbackFromDraftTransport(err)) {
@@ -250,6 +261,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       if (threadId != null) editParams.message_thread_id = threadId
       try {
         await editMessageText(chatId, streamMsgId, trimmed, editParams)
+        onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: trimmed.length, transport: 'edit' })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (/message is not modified/i.test(msg)) {
@@ -287,6 +299,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       }
       streamMsgId = sentId
       log?.(`answer-stream: sent (id=${sentId})`)
+      onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: trimmed.length, transport: 'message' })
     }
   }
 
@@ -418,6 +431,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
         if (typeof sentId === 'number' && Number.isFinite(sentId)) {
           streamMsgId = sentId
           log?.(`answer-stream: materialized (id=${sentId})`)
+          onMetric?.({ kind: 'answer_lane_materialized', chatId, messageId: streamMsgId })
           return sentId
         }
       } catch (err) {

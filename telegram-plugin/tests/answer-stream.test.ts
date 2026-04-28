@@ -589,3 +589,140 @@ describe('answer-stream — materialize() max-chars guard', () => {
     expect(warn.mock.calls.some((c) => /4096|exceeds/i.test(String(c[0])))).toBe(true)
   })
 })
+
+// ─── Issue #203: onMetric callback ──────────────────────────────────────────
+describe('answer-stream — onMetric callback (#203)', () => {
+  it('fires answer_lane_update on first sendMessage (non-DM, message transport)', async () => {
+    const onMetric = vi.fn()
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chatX',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      onMetric,
+    })
+
+    stream.update('hello there friend, this is some answer text')
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    expect(onMetric).toHaveBeenCalledTimes(1)
+    const ev = onMetric.mock.calls[0][0] as { kind: string; chatId: string; transport: string; charCount: number }
+    expect(ev.kind).toBe('answer_lane_update')
+    expect(ev.chatId).toBe('chatX')
+    expect(ev.transport).toBe('message')
+    expect(typeof ev.charCount).toBe('number')
+    expect(ev.charCount).toBeGreaterThan(0)
+  })
+
+  it('fires answer_lane_update on edit (transport: edit)', async () => {
+    const onMetric = vi.fn()
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chatX',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      onMetric,
+    })
+
+    stream.update('initial text')
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    stream.update('initial text plus more')
+    vi.advanceTimersByTime(1500)
+    await flushMicrotasks()
+
+    const transports = onMetric.mock.calls.map((c) => (c[0] as { transport: string }).transport)
+    expect(transports).toContain('message')
+    expect(transports).toContain('edit')
+  })
+
+  it('fires answer_lane_update on draft transport for DMs', async () => {
+    const onMetric = vi.fn()
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chatX',
+      isPrivateChat: true,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+      onMetric,
+    })
+
+    stream.update('streaming via draft')
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    const draftEvents = onMetric.mock.calls
+      .map((c) => c[0] as { kind: string; transport?: string })
+      .filter((ev) => ev.kind === 'answer_lane_update' && ev.transport === 'draft')
+    expect(draftEvents.length).toBeGreaterThan(0)
+  })
+
+  it('fires answer_lane_materialized on materialize success', async () => {
+    const onMetric = vi.fn()
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chatX',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      onMetric,
+    })
+
+    stream.update('full answer text')
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    onMetric.mockClear()
+    const id = await stream.materialize()
+
+    expect(typeof id).toBe('number')
+    expect(onMetric).toHaveBeenCalledTimes(1)
+    const ev = onMetric.mock.calls[0][0] as { kind: string; chatId: string; messageId: number }
+    expect(ev.kind).toBe('answer_lane_materialized')
+    expect(ev.chatId).toBe('chatX')
+    expect(ev.messageId).toBe(id)
+  })
+
+  it('does not fire answer_lane_materialized when oversize guard rejects', async () => {
+    const onMetric = vi.fn()
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chatX',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      onMetric,
+    })
+
+    stream.update('x'.repeat(4097))
+    onMetric.mockClear()
+    const id = await stream.materialize()
+
+    expect(id).toBeUndefined()
+    const matEvents = onMetric.mock.calls
+      .map((c) => c[0] as { kind: string })
+      .filter((ev) => ev.kind === 'answer_lane_materialized')
+    expect(matEvents).toHaveLength(0)
+  })
+})
