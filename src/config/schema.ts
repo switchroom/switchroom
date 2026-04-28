@@ -740,6 +740,38 @@ export const AgentSchema = z.object({
       "claim_worktree accepts the alias as the repo argument. " +
       "Absolute paths may always be passed regardless of this list.",
     ),
+  repos: z
+    .record(
+      z.string().regex(
+        /^[a-z0-9][a-z0-9-]*$/,
+        "Repo slug must be kebab-case ASCII: start with a lowercase letter or digit, contain only lowercase letters, digits, and hyphens",
+      ),
+      z.object({
+        url: z
+          .string()
+          .min(1)
+          .describe(
+            "Git remote URL for the repo (e.g. 'git@github.com:org/repo.git' or " +
+            "'https://github.com/org/repo.git'). Used verbatim for git clone.",
+          ),
+        branch_default: z
+          .string()
+          .optional()
+          .describe(
+            "Default branch to track (defaults to the remote's HEAD, typically 'main'). " +
+            "The per-agent branch 'agent/<agentName>/main' fast-forwards to this branch " +
+            "when the worktree is clean on session start.",
+          ),
+      }),
+    )
+    .optional()
+    .describe(
+      "Repos this agent operates on. Switchroom provisions a dedicated worktree for each " +
+      "repo at <agentDir>/work/<slug>/ on branch agent/<agentName>/main, backed by a " +
+      "shared bare clone at ~/.switchroom/repos/<slug>.git. The worktree path is injected " +
+      "into the agent's environment as SWITCHROOM_REPO_<SLUG_UPPER>. " +
+      "Agents without this field continue to work unchanged.",
+    ),
 });
 
 export const TelegramConfigSchema = z.object({
@@ -930,3 +962,4 @@ export type VaultConfig = z.infer<typeof VaultConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
 export type CodeRepoEntry = z.infer<typeof CodeRepoEntrySchema>;
+export type AgentRepoEntry = NonNullable<z.infer<typeof AgentSchema>["repos"]>[string];

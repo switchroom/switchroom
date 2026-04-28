@@ -49,6 +49,14 @@ import {
   createMinimalClaudeConfig,
   loadUserConfig,
 } from "../setup/onboarding.js";
+import { ensureBareClone, bareClonePath } from "../repos/bare-clone.js";
+import {
+  ensureAgentWorktree,
+  removeAgentWorktree,
+  listAgentWorktrees,
+  agentWorktreePath,
+  type WorktreeState,
+} from "../repos/agent-worktree.js";
 
 export interface ScaffoldResult {
   agentDir: string;
@@ -647,6 +655,28 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
 }
 
 /**
+ * Build env vars exposing per-agent worktree paths to the agent's
+ * runtime. Slug `switchroom-web` → `SWITCHROOM_REPO_SWITCHROOM_WEB`.
+ * Path is computed deterministically from the agent dir and slug
+ * (`<agentDir>/work/<slug>/`); the worktree itself is provisioned
+ * separately during reconcile (see src/repos/agent-worktree.ts).
+ */
+function buildRepoEnvVars(
+  _agentName: string,
+  agentDir: string,
+  agent: AgentConfig,
+): Record<string, string> {
+  const repos = agent.repos;
+  if (!repos) return {};
+  const out: Record<string, string> = {};
+  for (const slug of Object.keys(repos)) {
+    const envName = `SWITCHROOM_REPO_${slug.toUpperCase().replace(/-/g, "_")}`;
+    out[envName] = agentWorktreePath(agentDir, slug);
+  }
+  return out;
+}
+
+/**
  * Top-level settings.json keys that switchroom's scaffold/reconcile
  * pipeline owns and rebuilds on every run. When the settings_raw
  * escape hatch injects additional top-level keys (e.g. `effort`,
@@ -1112,7 +1142,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       ? shellSingleQuote(agentConfig.fallback_model)
       : undefined,
     userEnvQuoted: (() => {
-      const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
+      const combined = {
+        ...channelsToEnv(agentConfig),
+        ...(agentConfig.env ?? {}),
+        ...buildRepoEnvVars(name, agentDir, agentConfig),
+      };
       if (Object.keys(combined).length === 0) return undefined;
       const out: Record<string, string> = {};
       for (const [k, v] of Object.entries(combined)) {
@@ -2167,7 +2201,11 @@ export function reconcileAgent(
         ? shellSingleQuote(agentConfig.fallback_model)
         : undefined,
       userEnvQuoted: (() => {
-        const combined = { ...channelsToEnv(agentConfig), ...(agentConfig.env ?? {}) };
+        const combined = {
+          ...channelsToEnv(agentConfig),
+          ...(agentConfig.env ?? {}),
+          ...buildRepoEnvVars(name, agentDir, agentConfig),
+        };
         if (Object.keys(combined).length === 0) return undefined;
         const out: Record<string, string> = {};
         for (const [k, v] of Object.entries(combined)) {
