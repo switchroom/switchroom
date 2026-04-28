@@ -33,7 +33,7 @@ import type { SwitchroomConfig } from "../../config/schema.js";
 import { openVault, type VaultEntry } from "../vault.js";
 import { resolvePath } from "../../config/loader.js";
 import { identify, type PeerInfo } from "./peercred.js";
-import { checkAcl, checkEntryScope, agentSlugFromPeer } from "./acl.js";
+import { checkAcl, checkEntryScope, agentSlugFromPeer, parseCronUnit } from "./acl.js";
 import {
   decodeRequest,
   encodeResponse,
@@ -767,6 +767,66 @@ export class VaultBroker {
     }
 
     // ── Grant management ops ─────────────────────────────────────────────────
+    //
+    // #225 review-fix: gate mint_grant / list_grants / revoke_grant on the
+    // caller NOT being a cron unit. The intent is "operator-only" — these
+    // ops mint capability tokens that grant cron access, so a cron itself
+    // must not be able to call them (otherwise a hijacked cron could mint
+    // tokens for sibling agents and exfiltrate their keys).
+    //
+    // Rule:
+    //   - peer === null on Linux → deny (fail-closed identity).
+    //   - peer with cron-pattern systemdUnit → deny (cron context).
+    //   - peer with no systemdUnit OR non-cron systemdUnit → allow
+    //     (operator interactive session, or a deliberately-allowed
+    //     management agent).
+    //
+    // Non-Linux dev mode (SWITCHROOM_BROKER_ALLOW_NON_LINUX=1): peer is null
+    // but identity is bypassed everywhere — accept the same dev-mode
+    // exception used by `get`/`list` so test harnesses can exercise the path.
+    const isGrantMgmtOp =
+      req.op === "mint_grant" ||
+      req.op === "list_grants" ||
+      req.op === "revoke_grant";
+    if (isGrantMgmtOp) {
+      const allowNonLinux = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX === "1";
+      if (peer === null && !allowNonLinux) {
+        this.auditLogger.write({
+          ts: new Date().toISOString(),
+          op: req.op,
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: "denied:peercred-unavailable",
+        });
+        socket.write(
+          encodeResponse(errorResponse("DENIED", "peercred unavailable; cannot verify operator identity")),
+        );
+        return;
+      }
+      if (peer !== null && peer.systemdUnit !== null) {
+        const parsed = parseCronUnit(peer.systemdUnit);
+        if (parsed !== null) {
+          this.auditLogger.write({
+            ts: new Date().toISOString(),
+            op: req.op,
+            caller: auditCaller,
+            pid: auditPid,
+            cgroup: auditCgroup,
+            result: "denied:cron-cannot-manage-grants",
+          });
+          socket.write(
+            encodeResponse(
+              errorResponse(
+                "DENIED",
+                "Grant management ops are operator-only; cron units cannot mint, list, or revoke grants",
+              ),
+            ),
+          );
+          return;
+        }
+      }
+    }
 
     if (req.op === "mint_grant") {
       // Parse ttl_seconds into a duration for mintGrant
@@ -788,12 +848,21 @@ export class VaultBroker {
         return;
       }
 
-      // Write token file at ~/.switchroom/agents/<agent>/.vault-token (mode 0600)
+      // Write token file atomically at ~/.switchroom/agents/<agent>/.vault-token
+      // (mode 0600).
+      //
+      // #225 review-fix: write-then-rename so a cron racing the mint
+      // never reads a partial token. The previous direct writeFileSync left
+      // a one-syscall window where the cron could open the file between
+      // creation and the bytes being committed. Rename is atomic on Linux
+      // for same-filesystem moves.
       try {
         const tokenDir = path.join(os.homedir(), ".switchroom", "agents", agent);
         mkdirSync(tokenDir, { recursive: true });
         const tokenPath = path.join(tokenDir, ".vault-token");
-        writeFileSync(tokenPath, mintResult.token, { mode: 0o600 });
+        const tmpPath = `${tokenPath}.tmp.${process.pid}`;
+        writeFileSync(tmpPath, mintResult.token, { mode: 0o600 });
+        renameSync(tmpPath, tokenPath);
       } catch (err) {
         // Non-fatal: the token is still returned. File write is best-effort.
         process.stderr.write(
