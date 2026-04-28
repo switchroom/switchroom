@@ -25,6 +25,8 @@ import {
   resolveBrokerSocketPath,
 } from "../vault/broker/client.js";
 import { registerVaultBrokerCommand } from "./vault-broker.js";
+import { registerVaultDoctorCommand } from "./vault-doctor.js";
+import { registerVaultAuditCommand } from "./vault-audit.js";
 
 function getVaultPath(configPath?: string): string {
   try {
@@ -617,4 +619,10 @@ export function registerVaultCommand(program: Command): void {
 
   // `vault broker` — manage the vault-broker daemon.
   registerVaultBrokerCommand(vault, program);
+
+  // `vault doctor` — health check for vault security model.
+  registerVaultDoctorCommand(vault, program);
+
+  // `vault audit` — tail/filter the vault audit log.
+  registerVaultAuditCommand(vault, program);
 }
