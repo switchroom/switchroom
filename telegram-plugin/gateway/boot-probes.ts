@@ -645,11 +645,15 @@ function parseTimerLeft(left: string | undefined): number | null {
   return ms > 0 ? ms : null
 }
 
-export async function probeCronTimers(agentName: string): Promise<ProbeResult> {
+export async function probeCronTimers(
+  agentName: string,
+  opts: { execFileImpl?: ExecFileFnType } = {},
+): Promise<ProbeResult> {
+  const execFileFn: ExecFileFnType = opts.execFileImpl ?? execFile
   return withTimeout('Crons', (async (): Promise<ProbeResult> => {
     let stdout: string
     try {
-      const result = await execFile('systemctl', [
+      const result = await execFileFn('systemctl', [
         '--user', 'list-timers',
         `switchroom-${agentName}-cron-*`,
         '--output=json',

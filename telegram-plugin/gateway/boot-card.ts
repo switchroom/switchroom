@@ -259,7 +259,12 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
 // ─── Probe orchestration ─────────────────────────────────────────────────────
 
 export interface RunProbesOpts {
+  /** Persona display name — used only for rendering (ack line, probe rows). */
   agentName: string
+  /** Lowercase systemd slug (e.g. "klanker") — used for systemctl unit targets.
+   *  Must differ from agentName when the soul.name differs in case from the slug.
+   *  Falls back to agentName when not provided (backwards-compat). */
+  agentSlug?: string
   /** Pre-formatted version string passed through to the renderer. */
   version: string
   agentDir: string
@@ -286,6 +291,10 @@ export interface RunProbesOpts {
   /** How often the live loop re-polls systemd. Defaults to
    *  AGENT_LIVE_POLL_INTERVAL_MS (2s). Override in tests for speed. */
   agentLivePollIntervalMs?: number
+  /** Override for tests — replaces real execFile calls in the initial probe run
+   *  (probeAgentProcess + probeCronTimers). Distinct from agentLiveExecFileImpl
+   *  which covers the post-settle live-watch loop. */
+  probeExecFileImpl?: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
   /** Override for tests — replaces real execFile calls in the live loop. */
   agentLiveExecFileImpl?: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
   /** Override for tests — replaces real delays in the live loop. */
@@ -298,14 +307,17 @@ export interface RunProbesOpts {
 export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
   const claudeDir = join(opts.agentDir, '.claude')
   const probes: ProbeMap = {}
+  // Use the explicit slug for systemd unit targets; fall back to agentName for
+  // callers that haven't been updated yet (backwards-compat).
+  const slug = opts.agentSlug ?? opts.agentName
 
   await Promise.allSettled([
     probeAccount(opts.agentDir).then(r => { probes.account = r }),
-    probeAgentProcess(opts.agentName).then(r => { probes.agent = r }),
+    probeAgentProcess(slug, { execFileImpl: opts.probeExecFileImpl }).then(r => { probes.agent = r }),
     probeGateway(opts.gatewayInfo).then(r => { probes.gateway = r }),
     probeQuota(claudeDir, opts.agentDir, opts.fetchImpl).then(r => { probes.quota = r }),
     probeHindsight(opts.bankName, opts.fetchImpl).then(r => { probes.hindsight = r }),
-    probeCronTimers(opts.agentName).then(r => { probes.crons = r }),
+    probeCronTimers(slug, { execFileImpl: opts.probeExecFileImpl }).then(r => { probes.crons = r }),
   ])
 
   return probes
@@ -403,7 +415,8 @@ export async function startBootCard(
 
         // Iterate watchAgentProcess — it yields on each meaningful state
         // change and exits when active, failed, or the window expires.
-        const watcher = watchAgentProcess(opts.agentName, {
+        // Use the slug for the systemd unit target, not the display name.
+        const watcher = watchAgentProcess(opts.agentSlug ?? opts.agentName, {
           liveWindowMs,
           pollIntervalMs: opts.agentLivePollIntervalMs,
           sleepImpl: opts.agentLiveSleepImpl,

@@ -1145,6 +1145,7 @@ const ipcServer: IpcServer = createIpcServer({
           }
           startBootCard(chatId, threadId, botApiForCard, {
             agentName: agentDisplayName,
+            agentSlug,
             version: formatBootVersion(),
             agentDir: agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp'),
             gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
@@ -6586,6 +6587,7 @@ void (async () => {
                 try {
                   const handle = await startBootCard(chatId, threadId, botApiForCard, {
                     agentName: agentDisplayName,
+                    agentSlug,
                     version: formatBootVersion(),
                     agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentSlug),
                     gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
