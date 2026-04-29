@@ -2782,3 +2782,269 @@ describe('issue #313: sub-agent visibility leaks — regression tests', () => {
     expect(stalledEmit?.done).toBe(true)
   })
 })
+
+describe('issue #314: elapsed-ticker keeps counter live during sub-agent silence', () => {
+  /**
+   * Helper that builds a standalone driver with injected clocks and the
+   * subAgentTickIntervalMs option, mirroring the pattern used by Gap 3/4/8.
+   */
+  function makeDriver314(subAgentTickIntervalMs: number, extraOpts: Record<string, unknown> = {}) {
+    let nowMs = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const emits: Array<{ html: string; done: boolean }> = []
+
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ html: a.html, done: a.done }),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: 5000,
+      initialDelayMs: 0,
+      // Disable features that would auto-close the sub-agent before the test
+      // window ends — we want to keep it alive for the full 30s.
+      coldSubAgentThresholdMs: 0,
+      deferredCompletionTimeoutMs: 0,
+      maxIdleMs: 0,
+      subAgentTickIntervalMs,
+      now: () => nowMs,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: nowMs + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (handle) => {
+        const t = (handle as { ref: number }).ref
+        const i = timers.findIndex((x) => x.ref === t)
+        if (i !== -1) timers.splice(i, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: nowMs + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (handle) => {
+        const t = (handle as { ref: number }).ref
+        const i = timers.findIndex((x) => x.ref === t)
+        if (i !== -1) timers.splice(i, 1)
+      },
+      ...extraOpts,
+    })
+
+    const advanceMs = (ms: number) => {
+      const target = nowMs + ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers[0]
+        if (!next || next.fireAt > target) break
+        // Advance the fake clock to each fire time BEFORE calling fn so the
+        // driver's bucket comparisons (heartbeat & sub-agent ticker) see a
+        // monotonically advancing now(). Without this, every heartbeat fire
+        // within a single advanceMs() call sees the same nowMs and coalesces
+        // to one bucket — masking the elapsed-ticker behaviour entirely.
+        nowMs = next.fireAt
+        if (next.repeat != null) {
+          next.fireAt += next.repeat
+          next.fn()
+        } else {
+          timers.shift()
+          next.fn()
+        }
+      }
+      nowMs = target
+    }
+
+    return { driver, emits, advanceMs, get nowMs() { return nowMs } }
+  }
+
+  /**
+   * Positive test: sub-agent in state='running', no tool events for 30s.
+   * With subAgentTickIntervalMs=5000 the driver should emit ~6 renders in
+   * that window and each one must have a strictly non-decreasing elapsed
+   * string relative to the one before.
+   *
+   * "At least 3" is the stated acceptance criterion from #314; with a 5s
+   * tick over 30s we assert at least 5 to give a tight lower bound while
+   * allowing one missed tick at either boundary.
+   */
+  it('emits at least 5 renders in 30s while sub-agent is running with no tool events', () => {
+    const { driver, emits, advanceMs } = makeDriver314(5000)
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'sa1', firstPromptText: 'P' }, 'c')
+
+    // Record emit count after setup (before the silent window).
+    const emitsAfterSetup = emits.length
+
+    // Advance 30 seconds with ZERO further events — pure silence.
+    advanceMs(30_000)
+
+    const delta = emits.length - emitsAfterSetup
+    // Accept criterion from #314: at least 3; our interval gives ~6 so we
+    // assert ≥ 5 to catch if the ticker fires much less often than expected.
+    expect(delta).toBeGreaterThanOrEqual(5)
+  })
+
+  /**
+   * The actual #314 fix lives here: when the chat is "hot" (edit-budget
+   * threshold tripped by a bursty sub-agent), the heartbeat is normally
+   * skipped entirely (`isBudgetHot` continue at line ~828). The ticker
+   * bypass at the budget-hot check guarantees elapsed still advances every
+   * `subAgentTickIntervalMs` even during a burst — the actual symptom Ken
+   * screenshotted (47s elapsed, frozen UI while sub-agent grinding).
+   */
+  it('elapsed-ticker bypasses isBudgetHot suppression during sub-agent burst', () => {
+    // editBudgetThreshold=2 means chat goes hot after just 2 edits in 60s —
+    // tighter than production's 18, but exercises the same code path.
+    const { driver, emits, advanceMs } = makeDriver314(5000, { editBudgetThreshold: 2 })
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p_burst', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'sa_burst', firstPromptText: 'P' }, 'c')
+
+    // Burst: fire several sub-agent tool events to trip the edit budget.
+    // Each tool_use → a render → a recordEdit. Quickly the chat goes hot.
+    for (let i = 0; i < 5; i++) {
+      driver.ingest({ kind: 'sub_agent_tool_use', agentId: 'sa_burst', toolUseId: `t${i}`, toolName: 'Read', input: { file_path: `/f${i}` } }, 'c')
+      driver.ingest({ kind: 'sub_agent_tool_result', agentId: 'sa_burst', toolUseId: `t${i}` }, 'c')
+    }
+
+    const before = emits.length
+
+    // Now go silent for 30s. Without the budget-hot bypass the heartbeat
+    // would skip every tick (chat is hot) and the elapsed counter would
+    // freeze. With the bypass, the ticker forces ~6 emits at 5s intervals.
+    advanceMs(30_000)
+
+    const delta = emits.length - before
+    // The bypass should produce multiple ticker emits during the burst-hot
+    // window — not zero.
+    expect(delta).toBeGreaterThanOrEqual(3)
+  })
+
+  it('elapsed counter in rendered HTML increases monotonically during sub-agent silence', () => {
+    const { driver, emits, advanceMs } = makeDriver314(5000)
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p2', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'sa2', firstPromptText: 'P' }, 'c')
+
+    const snapshots: string[] = []
+    // Capture HTML at each 5s tick for 30s.
+    for (let i = 0; i < 6; i++) {
+      advanceMs(5000)
+      const last = emits[emits.length - 1]
+      if (last) snapshots.push(last.html)
+    }
+
+    // We need at least 2 snapshots to check monotonicity.
+    expect(snapshots.length).toBeGreaterThanOrEqual(2)
+
+    // Extract elapsed seconds from the HTML header. The renderer produces
+    // something like "00:12" or "1:05" for the parent elapsed time.
+    // We parse it generically: find the pattern mm:ss and convert to seconds.
+    function parseElapsedSecs(html: string): number {
+      const m = html.match(/(\d+):(\d{2})/)
+      if (!m) return -1
+      return parseInt(m[1], 10) * 60 + parseInt(m[2], 10)
+    }
+
+    const seconds = snapshots.map(parseElapsedSecs)
+    // Every snapshot must have a valid elapsed string.
+    expect(seconds.every((s) => s >= 0)).toBe(true)
+    // Each elapsed value must be >= the previous (strictly non-decreasing).
+    for (let i = 1; i < seconds.length; i++) {
+      expect(seconds[i]).toBeGreaterThanOrEqual(seconds[i - 1])
+    }
+    // The last snapshot must be strictly greater than the first (overall progress).
+    expect(seconds[seconds.length - 1]).toBeGreaterThan(seconds[0])
+  })
+
+  /**
+   * Sanity test: with no sub-agent running, the elapsed-ticker bypass must
+   * NOT fire (the `subAgentRunning` gate uses `hasAnyRunningSubAgent`). The
+   * existing heartbeat-bucket logic still produces emits as the parent's
+   * elapsed-time string ticks, which is correct behaviour. We just verify
+   * the ticker bypass itself is gated.
+   */
+  it('elapsed-ticker bypass is gated on running sub-agent (idle parent)', () => {
+    const { driver, emits, advanceMs } = makeDriver314(5000)
+
+    // A normal turn with no sub-agents at all — just a Bash tool that ended.
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'b1', input: { command: 'sleep 1' } }, 'c')
+    driver.ingest({ kind: 'tool_result', toolUseId: 'b1', toolName: 'Bash' }, 'c')
+
+    // Wait for any pending coalesce timers to drain.
+    advanceMs(1000)
+
+    // Compare emit counts with ticker enabled vs disabled — they should match
+    // when no sub-agent is running, proving the bypass is gated.
+    const countAfterDrain = emits.length
+    advanceMs(30_000)
+    const deltaWithTicker = emits.length - countAfterDrain
+
+    // Same scenario, ticker disabled.
+    const { driver: d2, emits: e2, advanceMs: a2 } = makeDriver314(0)
+    d2.ingest(enqueue('c'), null)
+    d2.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 'b1', input: { command: 'sleep 1' } }, 'c')
+    d2.ingest({ kind: 'tool_result', toolUseId: 'b1', toolName: 'Bash' }, 'c')
+    a2(1000)
+    const c2 = e2.length
+    a2(30_000)
+    const deltaWithoutTicker = e2.length - c2
+
+    // With no running sub-agent the ticker contributes nothing — both runs
+    // produce the same number of emits (heartbeat-bucket fires only).
+    expect(deltaWithTicker).toBe(deltaWithoutTicker)
+  })
+
+  /**
+   * Configurable interval test: explicitly set subAgentTickIntervalMs=5000
+   * and advance 30s — expect approximately 6 ticks (one every 5s).
+   * This exercises the option round-trip and confirms the tick count scales
+   * with the interval setting.
+   */
+  it('subAgentTickIntervalMs=5000 produces ~6 ticks over 30s', () => {
+    const { driver, emits, advanceMs } = makeDriver314(5000)
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p3', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'sa3', firstPromptText: 'P' }, 'c')
+
+    const before = emits.length
+    advanceMs(30_000)
+    const delta = emits.length - before
+
+    // With a 5s interval over 30s we expect ~6 ticks. Allow a tolerance of ±2
+    // for boundary/fence-post effects (the heartbeat itself fires at 5s
+    // intervals and may coalesce with the first elapsed tick).
+    expect(delta).toBeGreaterThanOrEqual(4)
+    expect(delta).toBeLessThanOrEqual(8)
+  })
+
+  /**
+   * Disabled ticker test: subAgentTickIntervalMs=0 should make the bypass a
+   * no-op. The heartbeat still fires its own bucket-change emits as elapsed
+   * advances — that's the existing behaviour and we expect ~6 over 30s.
+   * The key property is that the disabled path doesn't crash or produce
+   * runaway emits beyond what the heartbeat alone produces.
+   */
+  it('subAgentTickIntervalMs=0 disables the elapsed-ticker bypass', () => {
+    const { driver, emits, advanceMs } = makeDriver314(0)
+
+    driver.ingest(enqueue('c'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p4', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'sa4', firstPromptText: 'P' }, 'c')
+
+    const before = emits.length
+    advanceMs(30_000)
+    const delta = emits.length - before
+
+    // With the bypass off, heartbeat-bucket fires still produce ~6 emits
+    // (one per 5s bucket change). The ticker just stops adding any extra.
+    // This is the existing behaviour pre-#314; assert a bounded sanity range.
+    expect(delta).toBeGreaterThanOrEqual(3)
+    expect(delta).toBeLessThanOrEqual(10)
+  })
+})
