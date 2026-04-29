@@ -216,6 +216,8 @@ import {
 import {
   openTurnsDb,
   markOrphanedAsRestarted,
+  recordTurnStart,
+  recordTurnEnd,
 } from '../registry/turns-schema.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
@@ -643,6 +645,18 @@ let currentSessionThreadId: number | undefined = undefined
 let currentTurnReplyCalled = false
 let currentTurnCapturedText: string[] = []
 let orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null = null
+// Stage 3b: per-turn registry-key (chat:thread:startTs). Set on enqueue,
+// cleared after recordTurnEnd. Used by turn_end / SIGTERM / schedule_restart
+// paths to stamp the right row.
+let currentTurnRegistryKey: string | null = null
+// Last assistant outbound message id for the current turn — populated on
+// reply / stream_reply emit, captured into recordTurnEnd. Stage 4 reads
+// this on resume to thread-jump back to the in-flight conversation.
+let currentTurnLastAssistantMsgId: string | null = null
+// Whether the current turn produced a stream_reply with done=true. The
+// resume protocol uses this to decide "did the previous turn actually
+// finish a reply, or was it interrupted before commit?".
+let currentTurnLastAssistantDone = false
 
 // Issue #195 — answer-lane streaming.
 // Lazily created on the first text event of a turn (once enough text has
@@ -2201,6 +2215,26 @@ function handleSessionEvent(ev: SessionEvent): void {
         currentTurnReplyCalled = false
         currentTurnCapturedText = []
         currentTurnStartedAt = Date.now()
+        currentTurnLastAssistantMsgId = null
+        currentTurnLastAssistantDone = false
+        // Stage 3b: stamp turn-start in the registry. turn_key is
+        // chat:thread:startTs — unique per turn, distinct from the
+        // progress-card-driver's per-chat sequence number (these are two
+        // independent identifier schemes and don't need to align).
+        if (turnsDb != null) {
+          const turnKey = `${ev.chatId}:${ev.threadId ?? '_'}:${currentTurnStartedAt}`
+          currentTurnRegistryKey = turnKey
+          try {
+            recordTurnStart(turnsDb, {
+              turnKey,
+              chatId: String(ev.chatId),
+              threadId: ev.threadId != null ? String(ev.threadId) : null,
+              lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+            })
+          } catch (err) {
+            process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
+          }
+        }
         // Issue #195: capture transport selection + time-to-ack baseline
         // up-front so the per-turn answer-stream config is determined before
         // the first text event arrives.
@@ -2619,10 +2653,28 @@ function handleSessionEvent(ev: SessionEvent): void {
       pendingPtyPartial = null
       closeActivityLane(chatId, threadId)
       closeProgressLane(chatId, threadId)
+      // Stage 3b: stamp turn-end in the registry as endedVia='stop' (clean
+      // turn_end emit). The kill paths (schedule_restart / SIGTERM) handle
+      // the 'restart' / 'sigterm' cases separately in 3c.
+      if (turnsDb != null && currentTurnRegistryKey != null) {
+        try {
+          recordTurnEnd(turnsDb, {
+            turnKey: currentTurnRegistryKey,
+            endedVia: 'stop',
+            lastAssistantMsgId: currentTurnLastAssistantMsgId,
+            lastAssistantDone: currentTurnLastAssistantDone,
+          })
+        } catch (err) {
+          process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${currentTurnRegistryKey}: ${(err as Error).message}\n`)
+        }
+      }
+      currentTurnRegistryKey = null
       currentSessionChatId = null
       currentSessionThreadId = undefined
       currentTurnReplyCalled = false
       currentTurnCapturedText = []
+      currentTurnLastAssistantMsgId = null
+      currentTurnLastAssistantDone = false
       return
     }
   }
