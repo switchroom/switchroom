@@ -7,6 +7,12 @@
  *   2. Tails the JSONL to count tool calls and detect turn_end.
  *   3. Emits inline notifications for stall / completion state transitions.
  *
+ * Phase 3 of #333: when a sub-agent JSONL's size advances (mtime equivalent),
+ * the watcher writes `last_activity_at = <timestamp>` to the matching
+ * `subagents` row in the registry DB via `bumpSubagentActivity`. If the row
+ * does not yet exist (Phase 2 Pre hook hasn't fired), the update is a no-op
+ * and the event is logged — no INSERT here, identity belongs to Phase 2.
+ *
  * Sub-agent state is surfaced to the user via the progress card's
  * [Sub-agents · N running] block (progress-card.ts), not a separate pinned
  * card. See issue #142.
@@ -35,8 +41,21 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
 import { escapeHtml, truncate } from './card-format.js'
+import { bumpSubagentActivity, getSubagent } from './registry/subagents-schema.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+
+/**
+ * Minimal DB interface needed by the watcher for Phase 3 liveness writes.
+ * Typed as a structural duck-type so tests can pass an in-memory stub
+ * without importing bun:sqlite directly.
+ */
+export interface SubagentLivenessDb {
+  prepare(sql: string): {
+    run(...params: unknown[]): unknown
+    get(...params: unknown[]): unknown
+  }
+}
 
 export type WorkerState = 'running' | 'done' | 'failed'
 
@@ -88,6 +107,14 @@ export interface SubagentWatcherConfig {
    * Default 60_000.
    */
   stallThresholdMs?: number
+  /**
+   * Optional registry DB for Phase 3 liveness writes. When provided, the
+   * watcher calls `bumpSubagentActivity` each time a sub-agent JSONL grows
+   * (i.e. mtime advances). If the matching row does not yet exist (Phase 2
+   * Pre hook hasn't fired), the UPDATE is a no-op and the event is logged.
+   * Passing `null` or omitting this field disables DB writes entirely.
+   */
+  db?: SubagentLivenessDb | null
   /** Optional logger for debug output. */
   log?: (msg: string) => void
   /** `Date.now` override for tests. */
@@ -151,6 +178,7 @@ function readSubTail(
   onDescriptionUpdate: (desc: string) => void,
   fs: FsLike,
   log?: (msg: string) => void,
+  db?: SubagentLivenessDb | null,
 ): void {
   try {
     const stat = fs.statSync(entry.filePath)
@@ -168,6 +196,23 @@ function readSubTail(
       fs.closeSync(fd)
     }
     tail.cursor = stat.size
+
+    // Phase 3 (#333): JSONL grew → write liveness update to the registry DB.
+    // The agentId (JSONL filename stem) equals the tool_use_id used as the
+    // DB primary key. If the row doesn't exist yet (Phase 2 Pre hook hasn't
+    // fired), UPDATE is a no-op — log and continue, don't INSERT here.
+    if (db != null) {
+      try {
+        const existing = db.prepare('SELECT id FROM subagents WHERE id = ?').get(entry.agentId)
+        if (existing == null) {
+          log?.(`subagent-watcher: liveness skip ${entry.agentId} — row not in DB yet (Phase 2 Pre hook pending)`)
+        } else {
+          bumpSubagentActivity(db, { id: entry.agentId, ts: now })
+        }
+      } catch (dbErr) {
+        log?.(`subagent-watcher: liveness write error ${entry.agentId}: ${(dbErr as Error).message}`)
+      }
+    }
 
     const text = tail.pendingPartial + buf.toString('utf-8')
     const lines = text.split('\n')
@@ -211,6 +256,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const stallThresholdMs = config.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS
   const rescanMs = config.rescanMs ?? DEFAULT_RESCAN_MS
   const log = config.log
+  const db = config.db ?? null
   const nowFn = config.now ?? (() => Date.now())
 
   const setI = config.setInterval ?? ((fn, ms) => {
@@ -295,7 +341,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // Initial read
     readSubTail(entry, tail, n, (desc) => {
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-    }, fs, log)
+    }, fs, log, db)
 
     // If the JSONL already contained a turn_end at registration time
     // (file written-then-watched), fire the state-transition + completion
@@ -323,7 +369,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         if (!entry || !t) return
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log)
+        }, fs, log, db)
         maybySendStateTransition(agentId)
       })
     } catch (err) {
@@ -465,7 +511,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (!tail) continue
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      }, fs, log)
+      }, fs, log, db)
       maybySendStateTransition(agentId)
     }
 
