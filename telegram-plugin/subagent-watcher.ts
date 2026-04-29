@@ -227,14 +227,10 @@ function readSubTail(
         if (ev.kind === 'sub_agent_tool_use') {
           entry.toolCount++
         } else if (ev.kind === 'sub_agent_text') {
-          // Use first narrative text as description if we haven't set one yet.
-          if (!entry.description || entry.description === 'sub-agent') {
-            const line1 = ev.text.split('\n')[0].trim()
-            if (line1) {
-              entry.description = line1.length > 80 ? line1.slice(0, 79) + '…' : line1
-              onDescriptionUpdate(entry.description)
-            }
-          }
+          // Do NOT overwrite description with narrative text — description is
+          // set at dispatch time (from the parent Agent/Task tool_use input)
+          // and must remain stable. Overwriting it with the sub-agent's first
+          // narrative line caused a race-condition-dependent display (issue #352).
           entry.lastSummaryLine = ev.text.split('\n')[0].trim().slice(0, 120)
         } else if (ev.kind === 'sub_agent_turn_end') {
           if (entry.state === 'running') {

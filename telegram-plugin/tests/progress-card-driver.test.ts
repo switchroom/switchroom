@@ -2645,11 +2645,13 @@ describe('issue #313: sub-agent visibility leaks — regression tests', () => {
     // Advance 2 more seconds (6s total > 5s threshold) — heartbeat fires promotion.
     advanceMs(2000)
     const htmlAt6s = emits2[emits2.length - 1]?.html ?? ''
-    // After promotion the synthetic sub-agent row must be visible. Renderer
-    // produces a `<blockquote expandable>🤖 📂 #orphan-spawn1 …` block
-    // containing the description from the pending spawn ("Analyse logs").
-    expect(htmlAt6s).toContain('orphan-spawn1')
+    // After promotion the synthetic sub-agent row must be visible. Pre-#352
+    // the renderer surfaced the synthetic agentId (`📂 #orphan-spawn1`); after
+    // #352 the per-agent header is universal `🤖 <description> …` with the
+    // hash dropped. Verify the orphan was promoted by checking the dispatch
+    // description from the pending spawn renders into a sub-agent block.
     expect(htmlAt6s).toContain('Analyse logs')
+    expect(htmlAt6s).toContain('<blockquote expandable>')
   })
 
   /**

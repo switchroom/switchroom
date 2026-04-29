@@ -146,6 +146,22 @@ export interface SubAgentState {
     readonly humanAuthored: boolean
     readonly finishedAt: number
   }
+  /**
+   * Issue #352: ring buffer of the last 2 completed tools, ordered oldest
+   * first. Combined with `lastCompletedTool` and `currentTool` this lets
+   * the expandable section show up to 3 recent actions with strikethrough
+   * for completed items and a `↳` arrow for the active one.
+   *
+   * Only `lastCompletedTool` is used for the between-tool fallback chain
+   * outside the expandable; `recentCompletedTools` is purely for the
+   * expandable view (issue #352).
+   */
+  readonly recentCompletedTools: ReadonlyArray<{
+    readonly tool: string
+    readonly label: string
+    readonly humanAuthored: boolean
+    readonly finishedAt: number
+  }>
   /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
   readonly nestedSpawnCount: number
   /**
@@ -627,6 +643,7 @@ export function reduce(
         nestedSpawnCount: 0,
         milestoneVersion: 1,
         lastEventAt: now,
+        recentCompletedTools: [],
       }
       const subAgents = new Map(state.subAgents)
       subAgents.set(event.agentId, sub)
@@ -729,11 +746,17 @@ export function reduce(
           humanAuthored: sa.currentTool.humanAuthored,
           finishedAt: now,
         }
+        // Maintain a ring buffer of the last 2 completed tools for the
+        // expandable section (issue #352). Slide the window: drop the oldest
+        // when we're already at capacity (2), then append the new entry.
+        const prevRecent = sa.recentCompletedTools ?? []
+        const nextRecent = [...prevRecent, justFinished].slice(-2)
         const next = new Map(state.subAgents)
         next.set(event.agentId, {
           ...sa,
           currentTool: undefined,
           lastCompletedTool: justFinished,
+          recentCompletedTools: nextRecent,
           toolCount: sa.toolCount + 1,
           lastEventAt: now,
         })
@@ -1187,8 +1210,13 @@ export function render(
   // on every throttle tick, we only re-render a section when the agent's
   // milestoneVersion has changed (start / finish / fail). Per-tool ticks
   // don't bump milestoneVersion, so the expandable HTML is reused as-is.
+  //
+  // Issue #352: prepend an always-visible summary header before the per-agent
+  // expandable blocks so the user sees status counts at a glance.
   const expandableParts: string[] = []
   if (multiAgentActive && state.subAgents.size > 0) {
+    const counts = countSubAgentStates(state.subAgents, now)
+    expandableParts.push(renderSubAgentSummaryHeader(counts))
     for (const sa of sortSubAgentsChrono(state.subAgents)) {
       const cached = expandableCache?.get(sa.agentId)
       let expandableHtml: string
@@ -1304,32 +1332,49 @@ function sortSubAgentsChrono(
   return Array.from(subAgents.values()).sort((a, b) => a.startedAt - b.startedAt)
 }
 
+/** Stall threshold: sub-agent is ⚠️ stalled if running with no events for this long. */
+const SUBAGENT_STALL_MS = 60_000
+
 interface SubAgentCounts {
   running: number
   done: number
   failed: number
+  stalled: number
 }
 
 function countSubAgentStates(
   subAgents: ReadonlyMap<string, SubAgentState>,
+  now: number,
 ): SubAgentCounts {
   let running = 0
   let done = 0
   let failed = 0
+  let stalled = 0
   for (const sa of subAgents.values()) {
-    if (sa.state === 'running') running++
-    else if (sa.state === 'done') done++
+    if (sa.state === 'running') {
+      const isStalled = sa.lastEventAt != null && (now - sa.lastEventAt) >= SUBAGENT_STALL_MS
+      if (isStalled) stalled++
+      else running++
+    } else if (sa.state === 'done') done++
     else if (sa.state === 'failed') failed++
   }
-  return { running, done, failed }
+  return { running, done, failed, stalled }
 }
 
-function formatSubAgentCounts(c: SubAgentCounts): string {
+/**
+ * Issue #352: always-visible summary header above per-agent expandables.
+ * Format: `🤖 Sub-agents · ✅ N · 🔄 N · ❌ N · ⚠️ N`
+ * Omits any emoji whose count is 0.
+ * When all running (no done/failed/stalled): `🤖 Sub-agents · 🔄 N`
+ */
+function renderSubAgentSummaryHeader(c: SubAgentCounts): string {
   const parts: string[] = []
-  if (c.running > 0) parts.push(`${c.running} running`)
-  if (c.done > 0) parts.push(`${c.done} done`)
-  if (c.failed > 0) parts.push(`${c.failed} failed`)
-  return parts.length === 0 ? '0' : parts.join(', ')
+  if (c.done > 0) parts.push(`✅ ${c.done}`)
+  if (c.running > 0) parts.push(`🔄 ${c.running}`)
+  if (c.failed > 0) parts.push(`❌ ${c.failed}`)
+  if (c.stalled > 0) parts.push(`⚠️ ${c.stalled}`)
+  const counters = parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
+  return `🤖 Sub-agents${counters}`
 }
 
 /**
@@ -1370,81 +1415,25 @@ function subAgentDisplayDescription(sa: SubAgentState): string {
   return 'sub-agent'
 }
 
-function renderSubAgent(
-  sa: SubAgentState,
-  now: number,
-  forceCollapse: boolean,
-): string[] {
-  const desc = subAgentDisplayDescription(sa)
-  // Show subagent type as a suffix only if it's NOT already the display
-  // description (i.e. only when we have a real description + a type).
-  const typeSuffix = sa.subagentType && sa.subagentType !== desc
-    ? ` · ${escapeHtml(sa.subagentType)}`
-    : ''
-  const spawnedSuffix = sa.nestedSpawnCount > 0
-    ? ` <i>(spawned ${sa.nestedSpawnCount})</i>`
-    : ''
-
-  if (sa.state !== 'running' || forceCollapse) {
-    const symbol = sa.state === 'failed' ? STEP_FAILED : STEP_DONE
-    const end = sa.finishedAt ?? now
-    const dur = formatDuration(end - sa.startedAt)
-    return [
-      `  ${symbol} ${escapeHtml(truncate(desc, 50))}${typeSuffix} · ${dur} · ${sa.toolCount} tools${spawnedSuffix}`,
-    ]
-  }
-
-  // Running: header + activity + footer block.
-  // Header shows dispatch context (agent ID) + description once. Elapsed time
-  // and tool count move to the footer so the description never duplicates (#315).
-  const elapsed = formatDuration(now - sa.startedAt)
-  const shortId = sa.agentId.slice(0, 8)
-  const headerLine = `  🤖 📂 <code>#${shortId}</code> ${escapeHtml(truncate(desc, 50))}${typeSuffix}${spawnedSuffix}`
-  const footerLine = `     ${sa.toolCount} tools · ⏱ ${elapsed}`
-
-  // Activity-line fallback chain — never render the literal "(idle)" string.
-  // Priority: currently-executing tool > pending narrative text > last
-  // completed tool > generic "thinking..." filler.
-  if (sa.currentTool) {
-    const cur = sa.currentTool
-    const curDur = formatDuration(now - cur.startedAt)
-    return [
-      headerLine,
-      `     ${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label, false, cur.humanAuthored)} <i>(${curDur})</i>`,
-      footerLine,
-    ]
-  }
-  if (sa.pendingPreamble && sa.pendingPreamble.length > 0) {
-    const preambleLine = sa.pendingPreamble.split('\n')[0].trim()
-    if (preambleLine.length > 0) {
-      return [
-        headerLine,
-        `     🤔 <i>${escapeHtml(truncate(preambleLine, 60))}</i>`,
-        footerLine,
-      ]
-    }
-  }
-  if (sa.lastCompletedTool) {
-    const last = sa.lastCompletedTool
-    return [
-      headerLine,
-      `     ✓ <i>just finished</i> ${renderItemCore(last.tool, last.label, false, last.humanAuthored)}`,
-      footerLine,
-    ]
-  }
-  return [headerLine, `     💭 <i>thinking…</i>`, footerLine]
-}
-
 /**
- * Render a sub-agent as a `<blockquote expandable>` section. Default-collapsed,
- * showing `📂 #<agentId> <description>` in the header. Tap to expand the full
- * tool stream.
+ * Issue #352: Render a sub-agent as a `<blockquote expandable>` section.
+ *
+ * Collapsed header (always visible):
+ *   🤖 <description> <status-emoji> <state-label> · <duration>
+ *
+ * Inside the expandable: last 2-3 recent actions.
+ *   - Completed actions: `<s>action label</s>` (strikethrough)
+ *   - Current in-flight action: `↳ action label` (no strikethrough)
+ *
+ * Status emoji: 🔄 working · ✅ done · ❌ failed · ⚠️ stalled
+ *
+ * The `forceCollapse` arg is set on `turn_end` so the archived card renders
+ * the done/failed state. The `📂 #<agentId>` hash is intentionally dropped
+ * per issue #352 (meaningless to humans; was the old UX bug).
  *
  * Only called on milestone transitions (start/finish/fail) via the
  * milestoneVersion gate in render(). Per-tool ticks reuse the cached HTML so
  * the user's expanded/collapsed state is not disturbed.
- *
- * Order: appended after the main `</blockquote>`, sorted by startedAt (stable).
  */
 function renderSubAgentExpandable(
   sa: SubAgentState,
@@ -1453,52 +1442,73 @@ function renderSubAgentExpandable(
 ): string {
   const desc = subAgentDisplayDescription(sa)
   const truncDesc = truncate(desc, 60)
-  const typeSuffix = sa.subagentType && sa.subagentType !== desc
-    ? ` · ${escapeHtml(sa.subagentType)}`
-    : ''
-  const spawnedSuffix = sa.nestedSpawnCount > 0
-    ? ` <i>(spawned ${sa.nestedSpawnCount})</i>`
-    : ''
 
-  // Collapsed header line: state emoji + agent id + description
-  let stateEmoji: string
-  if (sa.state === 'failed') {
-    stateEmoji = STEP_FAILED
-  } else if (sa.state === 'done' || forceCollapse) {
-    stateEmoji = STEP_DONE
-  } else {
-    stateEmoji = '🤖'
-  }
-
-  const headerLine = `${stateEmoji} 📂 #${escapeHtml(sa.agentId)} <b>${escapeHtml(truncDesc)}</b>${typeSuffix}${spawnedSuffix}`
-
-  // Inner body: tool stream details
-  const innerLines: string[] = []
-
-  // Stats line
+  // Status emoji + label for the collapsed header line.
+  let statusEmoji: string
+  let statusLabel: string
   const end = sa.finishedAt ?? now
   const elapsed = formatDuration(end - sa.startedAt)
-  if (sa.state !== 'running' || forceCollapse) {
-    innerLines.push(`${STEP_DONE} ${sa.toolCount} tools · ${elapsed}`)
+  const isStalled = sa.state === 'running'
+    && sa.lastEventAt != null
+    && (now - sa.lastEventAt) >= SUBAGENT_STALL_MS
+
+  if (sa.state === 'failed') {
+    statusEmoji = '❌'
+    statusLabel = 'failed'
+  } else if (sa.state === 'done' || forceCollapse) {
+    statusEmoji = '✅'
+    statusLabel = 'done'
+  } else if (isStalled) {
+    statusEmoji = '⚠️'
+    statusLabel = 'stalled'
   } else {
-    innerLines.push(`🤖 <b>${escapeHtml(truncDesc)}</b>${typeSuffix} · ⏱ ${elapsed}${spawnedSuffix}`)
-    // Activity line
+    statusEmoji = '🔄'
+    statusLabel = 'working'
+  }
+
+  // Collapsed header: 🤖 <description> <status> · <duration>
+  const headerLine = `🤖 <b>${escapeHtml(truncDesc)}</b>  ${statusEmoji} ${statusLabel} · ${elapsed}`
+
+  // ── Inner body: last 2-3 recent actions ─────────────────────────────────
+  const innerLines: string[] = []
+
+  if (sa.state !== 'running' || forceCollapse) {
+    // Terminal state: show last completed tool as a result summary line,
+    // falling back to the tool count when no completed tool is tracked.
+    if (sa.lastCompletedTool) {
+      const last = sa.lastCompletedTool
+      innerLines.push(`↳ ${renderItemCore(last.tool, last.label, false, last.humanAuthored)}`)
+    } else {
+      innerLines.push(`↳ ${sa.toolCount} tool${sa.toolCount !== 1 ? 's' : ''} completed`)
+    }
+  } else {
+    // Running state: show recent completed actions (strikethrough) + current (↳).
+    //
+    // `recentCompletedTools` holds up to 2 previously completed tools.
+    // `currentTool` is the in-flight tool (shown with ↳, no strikethrough).
+    // Together they give up to 3 action lines per the spec.
+    const recent = sa.recentCompletedTools ?? []
+    for (const t of recent) {
+      // renderItemCore returns HTML (with <code> tags) — do NOT re-escape it.
+      innerLines.push(`<s>${renderItemCore(t.tool, t.label, false, t.humanAuthored)}</s>`)
+    }
+
     if (sa.currentTool) {
       const cur = sa.currentTool
-      const curDur = formatDuration(now - cur.startedAt)
-      innerLines.push(`${STEP_ACTIVE} ${renderItemCore(cur.tool, cur.label, false, cur.humanAuthored)} <i>(${curDur})</i>`)
+      innerLines.push(`↳ ${renderItemCore(cur.tool, cur.label, false, cur.humanAuthored)}`)
     } else if (sa.pendingPreamble && sa.pendingPreamble.length > 0) {
       const preambleLine = sa.pendingPreamble.split('\n')[0].trim()
       if (preambleLine.length > 0) {
-        innerLines.push(`🤔 <i>${escapeHtml(truncate(preambleLine, 80))}</i>`)
+        innerLines.push(`↳ <i>${escapeHtml(truncate(preambleLine, 80))}</i>`)
       }
     } else if (sa.lastCompletedTool) {
+      // Between tools: show the last completed tool without strikethrough
+      // (it's the most recent action and the agent is about to do something).
       const last = sa.lastCompletedTool
-      innerLines.push(`✓ <i>just finished</i> ${renderItemCore(last.tool, last.label, false, last.humanAuthored)}`)
+      innerLines.push(`↳ <i>just finished</i> ${renderItemCore(last.tool, last.label, false, last.humanAuthored)}`)
     } else {
-      innerLines.push(`💭 <i>thinking…</i>`)
+      innerLines.push(`↳ <i>starting…</i>`)
     }
-    innerLines.push(`${sa.toolCount} tools total`)
   }
 
   const innerBody = innerLines.join('\n')
