@@ -1764,17 +1764,15 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         if (!cs.state.subAgents.has(agentId)) continue
         const sa = cs.state.subAgents.get(agentId)!
         if (sa.state !== 'running') continue
-        // Update lastEventAt on the sub-agent state so the cold-JSONL
-        // detection path and the ⚠️ stall threshold in render() both
-        // see a "fresh" timestamp that still allows the stall badge to
-        // appear (we advance by 0 — the render uses the threshold on
-        // lastEventAt relative to now(), so leaving lastEventAt as-is
-        // is correct; we just need to trigger a re-render).
+        // Leave sa.lastEventAt unchanged — the render computes the ⚠️
+        // stall badge from (now - sa.lastEventAt) >= SUBAGENT_STALL_MS,
+        // so the stale value is exactly what makes the badge appear.
+        // All we need to do here is force a re-render so the user sees it.
         //
-        // Force a flush by clearing the heartbeat diff-guard bucket for
-        // this turn key. The next heartbeat tick will see a changed bucket
-        // and push an edit, which the renderer will annotate with the
-        // stuck-warning (stuckMs will be >= the threshold at this point).
+        // Force the next heartbeat tick to emit by clearing the diff-guard
+        // buckets for this turnKey. Note: this clears the chat-level and
+        // sub-agent-tick buckets — distinct from cs.lastEventAt (chat-level,
+        // drives stuckMs) which is left untouched.
         lastHeartbeatBucket.delete(cs.turnKey)
         lastSubAgentTickBucket.delete(cs.turnKey)
         // If the heartbeat isn't running (it would have been kept alive by

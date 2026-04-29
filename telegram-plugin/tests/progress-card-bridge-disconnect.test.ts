@@ -203,10 +203,13 @@ describe('bridge disconnect mid-deferred-completion (fix #393)', () => {
     expect(completeCalls).toHaveLength(1)
     expect(completeCalls[0].chatId).toBe('chat1')
 
-    // The final emit must be done=true with stalledClose header (⚠️)
+    // The final emit must be done=true with stalledClose header.
+    // Asserting on the specific "forced close" / "Stalled" text — a generic
+    // ⚠️ check would also match silentEnd or stuckMs renders.
     const finalEmit = [...emits].reverse().find(e => e.chatId === 'chat1')
     expect(finalEmit?.done).toBe(true)
-    expect(finalEmit?.html).toContain('⚠️')
+    expect(finalEmit?.html).toContain('Stalled')
+    expect(finalEmit?.html).toContain('forced close')
   })
 
   // Test 14: maxIdleMs zombie ceiling fires after disconnect
@@ -258,6 +261,18 @@ describe('bridge disconnect mid-deferred-completion (fix #393)', () => {
     // No new card should have been created — isFirstEmit should still be exactly 1
     const firstEmitsAfter = emits.filter(e => e.isFirstEmit).length
     expect(firstEmitsAfter).toBe(firstEmitsBefore)
+
+    // Verify the new event actually mutated the PRESERVED chat state — i.e.,
+    // the sub-agent's currentTool was set by the sub_agent_tool_use event.
+    // If the new bridge had created a duplicate state slot, the preserved-
+    // state's currentTool would still be undefined. This is the strong
+    // assertion that state was REUSED, not duplicated.
+    // (toolCount is incremented on tool_result, not tool_use — Gap 5 #316.)
+    const preservedState = driver.peek('chat1')
+    expect(preservedState).toBeDefined()
+    const sa = preservedState!.subAgents.get('bg1')
+    expect(sa).toBeDefined()
+    expect(sa!.currentTool?.tool).toBe('Read')
   })
 
   // Test 16: Multiple bridge connect/disconnect cycles — no chat-state corruption
