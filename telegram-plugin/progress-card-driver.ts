@@ -23,6 +23,7 @@ import {
   render,
   type ProgressCardState,
   type TaskNum,
+  type SubAgentState,
 } from './progress-card.js'
 import { isTelegramReplyTool } from './tool-names.js'
 
@@ -539,6 +540,16 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   }
 
   const chats = new Map<string, PerChatState>()
+
+  // Issue #334: per-chat registry of sub-agents that are still running.
+  // Keyed by baseKey(chatId, threadId) → Map<agentId, SubAgentState>.
+  // When a sub-agent starts it's added; when it reaches a terminal state
+  // (done/failed) it's removed. On a new turn for the same chat, any
+  // entries here are cloned into the new PerChatState's subAgents so the
+  // new turn's progress card shows still-running background sub-agents
+  // from the prior turn.
+  const chatRunningSubagents = new Map<string, Map<string, SubAgentState>>()
+
   // Per-chat turn sequence counters. Key = baseKey(chatId, threadId).
   // Each new startTurn increments the counter; the value is the NEXT seq
   // to allocate (so current total = value - 1 once at least one was allocated).
@@ -1238,13 +1249,27 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         currentThreadId = threadId
         currentTurnKey = slot.turnKey
 
+        // Issue #334: seed the new turn's subAgents from any still-running
+        // background sub-agents dispatched in a prior turn for this chat.
+        const initialTurnState = reduce(initialState(), event, now())
+        const cBaseKey = baseKey(chatId, threadId)
+        const carriedOver = chatRunningSubagents.get(cBaseKey)
+        const seededState: ProgressCardState = (carriedOver != null && carriedOver.size > 0)
+          ? {
+              ...initialTurnState,
+              subAgents: new Map<string, SubAgentState>(
+                [...carriedOver.entries()].map(([id, sa]) => [id, { ...sa }]),
+              ),
+            }
+          : initialTurnState
+
         const chatState: PerChatState = {
           chatId,
           threadId,
           turnKey: slot.turnKey,
           taskIndex: slot.index,
           taskTotal: slot.total,
-          state: reduce(initialState(), event, now()),
+          state: seededState,
           lastEmittedAt: 0,
           lastEmittedHtml: null,
           pendingTimer: null,
@@ -1298,6 +1323,40 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       chatState.lastEventAt = now()
       const stageChanged = chatState.state.stage !== prev.stage
       const visibleChanged = visibleDiff(prev, chatState.state)
+
+      // Issue #334: mirror sub-agent state changes into the chat-scoped
+      // running-sub-agent registry so new turns can seed from it.
+      // We diff prev.subAgents vs chatState.state.subAgents to catch all
+      // mutation paths: sub_agent_started, sub_agent_turn_end, and parent
+      // tool_result (which can finalize a sub-agent via parentToolUseId).
+      if (prev.subAgents !== chatState.state.subAgents) {
+        const cBaseKey = baseKey(chatState.chatId, chatState.threadId)
+        // Check for new or newly-running entries (sub_agent_started path).
+        for (const [agentId, sa] of chatState.state.subAgents) {
+          if (sa.state === 'running') {
+            const prevSa = prev.subAgents.get(agentId)
+            if (prevSa == null || prevSa.state !== 'running') {
+              // Newly running — register in chat-scoped registry.
+              let chatMap = chatRunningSubagents.get(cBaseKey)
+              if (chatMap == null) {
+                chatMap = new Map<string, SubAgentState>()
+                chatRunningSubagents.set(cBaseKey, chatMap)
+              }
+              chatMap.set(agentId, sa)
+            }
+          } else if (sa.state === 'done' || sa.state === 'failed') {
+            // Terminal state — remove from chat registry if present.
+            chatRunningSubagents.get(cBaseKey)?.delete(agentId)
+          }
+        }
+        // Also handle entries that were removed from subAgents entirely
+        // (shouldn't happen normally but be defensive).
+        for (const agentId of prev.subAgents.keys()) {
+          if (!chatState.state.subAgents.has(agentId)) {
+            chatRunningSubagents.get(cBaseKey)?.delete(agentId)
+          }
+        }
+      }
 
       // Issue #132: track whether the agent has called `reply` or
       // `stream_reply` at least once this turn so the renderer can
