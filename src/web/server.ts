@@ -19,6 +19,8 @@ import {
   handleStopAgent,
   handleRestartAgent,
   handleGetLogs,
+  handleGetTurns,
+  handleGetSubagents,
 } from "./api.js";
 
 const MIME_TYPES: Record<string, string> = {
@@ -238,6 +240,18 @@ function parseRoute(
     return { handler: "restartAgent", params: { name: restartMatch[1] } };
   }
 
+  // GET /api/agents/:name/turns
+  const turnsMatch = pathname.match(/^\/api\/agents\/([^/]+)\/turns$/);
+  if (method === "GET" && turnsMatch) {
+    return { handler: "getTurns", params: { name: turnsMatch[1] } };
+  }
+
+  // GET /api/agents/:name/subagents
+  const subagentsMatch = pathname.match(/^\/api\/agents\/([^/]+)\/subagents$/);
+  if (method === "GET" && subagentsMatch) {
+    return { handler: "getSubagents", params: { name: subagentsMatch[1] } };
+  }
+
   return null;
 }
 
@@ -341,6 +355,36 @@ export function startWebServer(
               return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
             }
             return jsonResponse(handleRestartAgent(agentName));
+          }
+
+          case "getTurns": {
+            const agentName = route.params.name;
+            if (!config.agents[agentName]) {
+              return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
+            }
+            const rawLimit = Number(url.searchParams.get("limit") ?? "20");
+            const limit =
+              Number.isInteger(rawLimit) && rawLimit >= 1 && rawLimit <= 200
+                ? rawLimit
+                : 20;
+            const result = handleGetTurns(config, agentName, limit);
+            if (!result.ok) {
+              return jsonResponse({ ok: false, error: result.error }, 500);
+            }
+            return jsonResponse(result.turns);
+          }
+
+          case "getSubagents": {
+            const agentName = route.params.name;
+            if (!config.agents[agentName]) {
+              return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
+            }
+            const status = url.searchParams.get("status") ?? undefined;
+            const result = handleGetSubagents(config, agentName, status);
+            if (!result.ok) {
+              return jsonResponse({ ok: false, error: result.error }, 500);
+            }
+            return jsonResponse(result.subagents);
           }
         }
       }

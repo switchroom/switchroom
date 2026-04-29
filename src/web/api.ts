@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { resolve } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   getAllAgentStatuses,
@@ -9,6 +10,9 @@ import {
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent } from "../memory/hindsight.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
+import { resolveAgentsDir } from "../config/loader.js";
+import { openTurnsDb, listTurnsForAgent, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
+import { applySubagentsSchema, listSubagents, type Subagent } from "../../telegram-plugin/registry/subagents-schema.js";
 
 export interface AgentInfo {
   name: string;
@@ -102,6 +106,53 @@ export function handleGetLogs(
       { encoding: "utf-8", timeout: 5000 }
     );
     return { ok: true, logs: output };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export function handleGetTurns(
+  config: SwitchroomConfig,
+  agentName: string,
+  limit: number,
+): { ok: boolean; turns?: Turn[]; error?: string } {
+  try {
+    const agentsDir = resolveAgentsDir(config);
+    const agentDir = resolve(agentsDir, agentName);
+    const db = openTurnsDb(agentDir);
+    try {
+      const turns = listTurnsForAgent(db, { limit });
+      return { ok: true, turns };
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export function handleGetSubagents(
+  config: SwitchroomConfig,
+  agentName: string,
+  status: string | undefined,
+): { ok: boolean; subagents?: Subagent[]; error?: string } {
+  try {
+    const agentsDir = resolveAgentsDir(config);
+    const agentDir = resolve(agentsDir, agentName);
+    const db = openTurnsDb(agentDir);
+    try {
+      applySubagentsSchema(db);
+      const subagents = listSubagents(db, { status });
+      return { ok: true, subagents };
+    } finally {
+      db.close();
+    }
   } catch (err) {
     return {
       ok: false,

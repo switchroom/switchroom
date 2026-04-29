@@ -334,6 +334,30 @@ export function bumpSubagentActivity(db: SqliteDatabase, args: BumpSubagentActiv
 }
 
 /**
+ * Return all subagents, optionally filtered by status, ordered by
+ * started_at DESC. Intended for the REST API endpoint
+ * `GET /api/agents/:name/subagents?status=running`.
+ */
+export function listSubagents(
+  db: SqliteDatabase,
+  opts: { status?: string } = {},
+): Subagent[] {
+  if (opts.status !== undefined) {
+    const rows = db.prepare(`
+      SELECT * FROM subagents
+      WHERE status = ?
+      ORDER BY started_at DESC
+    `).all(opts.status) as RawSubagentRow[]
+    return rows.map(mapSubagentRow)
+  }
+  const rows = db.prepare(`
+    SELECT * FROM subagents
+    ORDER BY started_at DESC
+  `).all() as RawSubagentRow[]
+  return rows.map(mapSubagentRow)
+}
+
+/**
  * Retrieve a single subagent row by id. Returns null if not found.
  * Useful in tests and for callers that need to inspect current state.
  */

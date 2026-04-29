@@ -373,6 +373,26 @@ export function findRecentTurnsForChat(
 }
 
 /**
+ * Return the most recent N turns across all chats for an agent, ordered by
+ * started_at DESC. Intended for the REST API endpoint
+ * `GET /api/agents/:name/turns?limit=20`.
+ *
+ * `limit` defaults to 20, max 200.
+ */
+export function listTurnsForAgent(
+  db: SqliteDatabase,
+  opts: { limit?: number } = {},
+): Turn[] {
+  const limit = Math.min(Math.max(1, opts.limit ?? 20), 200)
+  const rows = db.prepare(`
+    SELECT * FROM turns
+    ORDER BY started_at DESC
+    LIMIT ?
+  `).all(limit) as RawTurnRow[]
+  return rows.map(mapRow)
+}
+
+/**
  * Find the single most-recently-started turn that ended via an interrupt
  * (`'restart'` | `'sigterm'` | `'timeout'`) OR is still open
  * (`ended_at IS NULL`). Used by Stage 4 to surface "you had pending work"
