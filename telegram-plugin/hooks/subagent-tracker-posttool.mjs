@@ -12,11 +12,17 @@
  *
  * DB location: <agentDir>/telegram/registry.db
  *   agentDir = SWITCHROOM_AGENT_DIR env var, falling back to process.cwd()
+ *
+ * Performance: the actual DB write is deferred via setImmediate (Node 22+
+ * node:sqlite path) or non-blocking spawn (CLI fallback) so the hook returns
+ * to Claude Code as fast as possible. The process still exits only after the
+ * write completes, so observers that wait for process exit (e.g. spawnSync in
+ * tests) see a consistent DB state.
  */
 
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -44,8 +50,42 @@ function fillPlaceholders(sql, params) {
   return sql.replace(/\?/g, () => sqlLiteral(params[i++]))
 }
 
-function execSql(dbPath, sql) {
-  execFileSync('sqlite3', [dbPath, sql], { timeout: 5000 })
+/**
+ * Run SQL against the DB via the sqlite3 CLI (non-blocking).
+ * Calls cb(error | null) when the process exits.
+ */
+function spawnSql(dbPath, sql, cb) {
+  const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', (d) => { stderr += d })
+  child.on('close', (code) => {
+    if (code !== 0) {
+      cb(new Error(`sqlite3 exited ${code}: ${stderr.trim()}`))
+    } else {
+      cb(null)
+    }
+  })
+  child.on('error', cb)
+}
+
+/**
+ * Run a SELECT via the sqlite3 CLI (non-blocking) and return trimmed stdout.
+ * Calls cb(error | null, stdout | null).
+ */
+function spawnSqlRead(dbPath, sql, cb) {
+  const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d) => { stdout += d })
+  child.stderr.on('data', (d) => { stderr += d })
+  child.on('close', (code) => {
+    if (code !== 0) {
+      cb(new Error(`sqlite3 exited ${code}: ${stderr.trim()}`), null)
+    } else {
+      cb(null, stdout.trim())
+    }
+  })
+  child.on('error', (err) => cb(err, null))
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +136,10 @@ function extractResultSummary(toolResponse) {
  * result_summary; leave status/ended_at alone so the watcher's
  * recordSubagentEnd (driven by the JSONL turn_end event) remains the
  * authoritative end-of-life signal.
+ *
+ * The done(err | null) callback is invoked after all DB operations complete.
  */
-function updateRow(dbPath, { id, status, resultSummary, now }) {
+function updateRow(dbPath, { id, status, resultSummary, now }, done) {
   // SQL to read the background flag so we can choose the right update path.
   const SELECT_SQL = `SELECT background FROM subagents WHERE id = ?`
 
@@ -117,34 +159,63 @@ function updateRow(dbPath, { id, status, resultSummary, now }) {
       AND status NOT IN ('completed', 'failed')
   `
 
+  // Snapshot all values used inside closures before setImmediate fires.
+  const snapDbPath = dbPath
+  const snapId = id
+  const snapStatus = status
+  const snapResultSummary = resultSummary
+  const snapNow = now
+
   const [major] = process.versions.node.split('.').map(Number)
+
+  // Resolve node:sqlite availability synchronously (before deferring), so the
+  // setImmediate closure knows which path to take without further try/catch.
+  let DatabaseSync = null
   if (major >= 22) {
-    try {
-      const { DatabaseSync } = require('node:sqlite')
-      const db = new DatabaseSync(dbPath)
-      const row = db.prepare(SELECT_SQL).get(id)
-      const isBackground = row != null && row.background === 1
-      if (isBackground) {
-        db.prepare(BACKGROUND_SQL).run(resultSummary, now, id)
-      } else {
-        db.prepare(FOREGROUND_SQL).run(now, status, resultSummary, now, id)
-      }
-      db.close()
-      return
-    } catch {
-      // Fall through to sqlite3 CLI
-    }
+    try { DatabaseSync = require('node:sqlite').DatabaseSync } catch { /* CLI fallback */ }
   }
 
-  // sqlite3 CLI fallback — two statements issued sequentially.
-  const bgResult = execFileSync('sqlite3', [dbPath, fillPlaceholders(SELECT_SQL, [id])], { timeout: 5000 }).toString().trim()
-  // sqlite3 outputs "0" or "1" (or empty if row not found).
-  const isBackground = bgResult === '1'
-  if (isBackground) {
-    execSql(dbPath, fillPlaceholders(BACKGROUND_SQL.trim(), [resultSummary, now, id]))
-  } else {
-    execSql(dbPath, fillPlaceholders(FOREGROUND_SQL.trim(), [now, status, resultSummary, now, id]))
+  if (DatabaseSync != null) {
+    // Node 22+ with node:sqlite available — defer the write to the next tick.
+    const SnapDatabaseSync = DatabaseSync
+    setImmediate(() => {
+      try {
+        const db = new SnapDatabaseSync(snapDbPath)
+        const row = db.prepare(SELECT_SQL).get(snapId)
+        const isBackground = row != null && row.background === 1
+        if (isBackground) {
+          db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
+        } else {
+          db.prepare(FOREGROUND_SQL).run(snapNow, snapStatus, snapResultSummary, snapNow, snapId)
+        }
+        db.close()
+        done(null)
+      } catch (err) {
+        done(err)
+      }
+    })
+    return
   }
+
+  // sqlite3 CLI fallback — SELECT then conditional UPDATE, both non-blocking.
+  spawnSqlRead(snapDbPath, fillPlaceholders(SELECT_SQL, [snapId]), (err, bgResult) => {
+    if (err) { done(err); return }
+    // sqlite3 outputs "0" or "1" (or empty if row not found).
+    const isBackground = bgResult === '1'
+    if (isBackground) {
+      spawnSql(
+        snapDbPath,
+        fillPlaceholders(BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
+        done,
+      )
+    } else {
+      spawnSql(
+        snapDbPath,
+        fillPlaceholders(FOREGROUND_SQL.trim(), [snapNow, snapStatus, snapResultSummary, snapNow, snapId]),
+        done,
+      )
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -174,19 +245,23 @@ function main() {
   // If DB doesn't exist yet, nothing to update
   if (!existsSync(dbPath)) process.exit(0)
 
-  try {
-    const toolResponse = event.tool_response ?? null
-    updateRow(dbPath, {
+  const toolResponse = event.tool_response ?? null
+  updateRow(
+    dbPath,
+    {
       id,
       status: detectStatus(toolResponse),
       resultSummary: extractResultSummary(toolResponse),
       now: Date.now(),
-    })
-  } catch (err) {
-    process.stderr.write(`[subagent-tracker-posttool] DB error: ${err?.message ?? err}\n`)
-  }
-
-  process.exit(0)
+    },
+    (err) => {
+      if (err) {
+        process.stderr.write(`[subagent-tracker-posttool] DB error: ${err?.message ?? err}\n`)
+        process.exit(1)
+      }
+      process.exit(0)
+    },
+  )
 }
 
 main()

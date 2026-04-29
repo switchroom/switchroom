@@ -12,11 +12,17 @@
  *
  * DB location: <agentDir>/telegram/registry.db
  *   agentDir = SWITCHROOM_AGENT_DIR env var, falling back to process.cwd()
+ *
+ * Performance: the actual DB write is deferred via setImmediate (Node 22+
+ * node:sqlite path) or a non-blocking spawn (CLI fallback) so the hook
+ * returns to Claude Code as fast as possible. The process still exits only
+ * after the write completes, so observers that wait for process exit (e.g.
+ * spawnSync in tests) see a consistent DB state.
  */
 
 import { readFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -77,15 +83,29 @@ function fillPlaceholders(sql, params) {
   return sql.replace(/\?/g, () => sqlLiteral(params[i++]))
 }
 
-function execSql(dbPath, sql) {
-  execFileSync('sqlite3', [dbPath, sql], { timeout: 5000 })
+/**
+ * Run SQL against the DB via the sqlite3 CLI (non-blocking).
+ * Calls cb(error | null) when the process exits.
+ */
+function spawnSql(dbPath, sql, cb) {
+  const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'ignore', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', (d) => { stderr += d })
+  child.on('close', (code) => {
+    if (code !== 0) {
+      cb(new Error(`sqlite3 exited ${code}: ${stderr.trim()}`))
+    } else {
+      cb(null)
+    }
+  })
+  child.on('error', cb)
 }
 
 // ---------------------------------------------------------------------------
 // DB write
 // ---------------------------------------------------------------------------
 
-function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, description, background, now }) {
+function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, description, background, now }, done) {
   const INSERT_SQL = `
     INSERT OR IGNORE INTO subagents
       (id, parent_session_id, parent_turn_key, agent_type, description,
@@ -94,30 +114,49 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
   `
   const params = [id, parentSessionId, parentTurnKey, agentType, description, background, now, now]
 
-  // Try Node 22+ built-in sqlite first (synchronous API)
+  // Resolve node:sqlite availability synchronously (before deferring), so the
+  // setImmediate closure knows which path to take without further try/catch.
   const [major] = process.versions.node.split('.').map(Number)
+  let DatabaseSync = null
   if (major >= 22) {
-    try {
-      const { DatabaseSync } = require('node:sqlite')
-      const db = new DatabaseSync(dbPath)
-      db.exec(SCHEMA_SQL)
-      // Migrate older DBs that pre-date jsonl_agent_id.
-      const hasJsonlCol = db.prepare(MIGRATE_JSONL_COL_SQL).get()
-      if (hasJsonlCol == null) {
-        db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
-        db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
-      }
-      db.prepare(INSERT_SQL).run(...params)
-      db.close()
-      return
-    } catch {
-      // Fall through to sqlite3 CLI
-    }
+    try { DatabaseSync = require('node:sqlite').DatabaseSync } catch { /* CLI fallback */ }
   }
 
-  // sqlite3 CLI fallback
-  execSql(dbPath, SCHEMA_SQL.replace(/\n\s+/g, ' '))
-  execSql(dbPath, fillPlaceholders(INSERT_SQL.trim(), params))
+  if (DatabaseSync != null) {
+    // Node 22+ with node:sqlite available — defer the write to the next tick.
+    // Snapshot all values used inside the closure now, before setImmediate fires.
+    const SnapDatabaseSync = DatabaseSync
+    const snapDbPath = dbPath
+    const snapInsertSql = INSERT_SQL
+    const snapParams = params.slice()
+    const snapSchemaSql = SCHEMA_SQL
+    const snapMigrateSql = MIGRATE_JSONL_COL_SQL
+
+    setImmediate(() => {
+      try {
+        const db = new SnapDatabaseSync(snapDbPath)
+        db.exec(snapSchemaSql)
+        // Migrate older DBs that pre-date jsonl_agent_id.
+        const hasJsonlCol = db.prepare(snapMigrateSql).get()
+        if (hasJsonlCol == null) {
+          db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
+          db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
+        }
+        db.prepare(snapInsertSql).run(...snapParams)
+        db.close()
+        done(null)
+      } catch (err) {
+        done(err)
+      }
+    })
+    return
+  }
+
+  // sqlite3 CLI fallback — two non-blocking spawns sequenced via callbacks.
+  spawnSql(dbPath, SCHEMA_SQL.replace(/\n\s+/g, ' '), (err) => {
+    if (err) { done(err); return }
+    spawnSql(dbPath, fillPlaceholders(INSERT_SQL.trim(), params), done)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -142,13 +181,19 @@ function main() {
   const telegramDir = join(agentDir, 'telegram')
   const dbPath = join(telegramDir, 'registry.db')
 
-  try {
-    if (!existsSync(telegramDir)) {
+  if (!existsSync(telegramDir)) {
+    try {
       mkdirSync(telegramDir, { recursive: true })
+    } catch (err) {
+      process.stderr.write(`[subagent-tracker-pretool] mkdir error: ${err?.message ?? err}\n`)
+      process.exit(1)
     }
+  }
 
-    const input = event.tool_input ?? {}
-    writeRow(dbPath, {
+  const input = event.tool_input ?? {}
+  writeRow(
+    dbPath,
+    {
       id: event.tool_use_id ?? null,
       parentSessionId: event.session_id ?? null,
       parentTurnKey: event.turn_id ?? null,
@@ -156,12 +201,15 @@ function main() {
       description: input.description ?? null,
       background: input.run_in_background === true ? 1 : 0,
       now: Date.now(),
-    })
-  } catch (err) {
-    process.stderr.write(`[subagent-tracker-pretool] DB error: ${err?.message ?? err}\n`)
-  }
-
-  process.exit(0)
+    },
+    (err) => {
+      if (err) {
+        process.stderr.write(`[subagent-tracker-pretool] DB error: ${err?.message ?? err}\n`)
+        process.exit(1)
+      }
+      process.exit(0)
+    },
+  )
 }
 
 main()
