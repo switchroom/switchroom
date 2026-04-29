@@ -85,21 +85,50 @@ function extractResultSummary(toolResponse) {
 // DB write
 // ---------------------------------------------------------------------------
 
+/**
+ * Apply posttool DB updates for a subagent.
+ *
+ * Foreground agents (background = 0): set status, ended_at, result_summary,
+ * and last_activity_at — PostToolUse fires on actual completion.
+ *
+ * Background agents (background = 1): PostToolUse fires on the launch ACK
+ * (~10 s), NOT on actual completion. Only bump last_activity_at and capture
+ * result_summary; leave status/ended_at alone so the watcher's
+ * recordSubagentEnd (driven by the JSONL turn_end event) remains the
+ * authoritative end-of-life signal.
+ */
 function updateRow(dbPath, { id, status, resultSummary, now }) {
-  const UPDATE_SQL = `
+  // SQL to read the background flag so we can choose the right update path.
+  const SELECT_SQL = `SELECT background FROM subagents WHERE id = ?`
+
+  // Foreground update: set terminal status + ended_at.
+  const FOREGROUND_SQL = `
     UPDATE subagents
     SET ended_at = ?, status = ?, result_summary = COALESCE(?, result_summary), last_activity_at = ?
     WHERE id = ?
       AND status NOT IN ('completed', 'failed')
   `
-  const params = [now, status, resultSummary, now, id]
+
+  // Background update: bump activity only; do NOT touch status or ended_at.
+  const BACKGROUND_SQL = `
+    UPDATE subagents
+    SET result_summary = COALESCE(?, result_summary), last_activity_at = ?
+    WHERE id = ?
+      AND status NOT IN ('completed', 'failed')
+  `
 
   const [major] = process.versions.node.split('.').map(Number)
   if (major >= 22) {
     try {
       const { DatabaseSync } = require('node:sqlite')
       const db = new DatabaseSync(dbPath)
-      db.prepare(UPDATE_SQL).run(...params)
+      const row = db.prepare(SELECT_SQL).get(id)
+      const isBackground = row != null && row.background === 1
+      if (isBackground) {
+        db.prepare(BACKGROUND_SQL).run(resultSummary, now, id)
+      } else {
+        db.prepare(FOREGROUND_SQL).run(now, status, resultSummary, now, id)
+      }
       db.close()
       return
     } catch {
@@ -107,8 +136,15 @@ function updateRow(dbPath, { id, status, resultSummary, now }) {
     }
   }
 
-  // sqlite3 CLI fallback
-  execSql(dbPath, fillPlaceholders(UPDATE_SQL.trim(), params))
+  // sqlite3 CLI fallback — two statements issued sequentially.
+  const bgResult = execFileSync('sqlite3', [dbPath, fillPlaceholders(SELECT_SQL, [id])], { timeout: 5000 }).toString().trim()
+  // sqlite3 outputs "0" or "1" (or empty if row not found).
+  const isBackground = bgResult === '1'
+  if (isBackground) {
+    execSql(dbPath, fillPlaceholders(BACKGROUND_SQL.trim(), [resultSummary, now, id]))
+  } else {
+    execSql(dbPath, fillPlaceholders(FOREGROUND_SQL.trim(), [now, status, resultSummary, now, id]))
+  }
 }
 
 // ---------------------------------------------------------------------------

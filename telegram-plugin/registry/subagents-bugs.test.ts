@@ -213,7 +213,9 @@ describe('Boot reconciliation', () => {
   })
 })
 
-// ─── Bug 4: result_summary always NULL in hook integration ───────────────────
+// ─── Bug 2: posttool gating — hook integration ────────────────────────────────
+// These tests run the actual hook scripts end-to-end to verify that the
+// background flag read from the DB controls which update path executes.
 
 const PRETOOL_SCRIPT = join(import.meta.dir, '..', 'hooks', 'subagent-tracker-pretool.mjs')
 const POSTTOOL_SCRIPT = join(import.meta.dir, '..', 'hooks', 'subagent-tracker-posttool.mjs')
@@ -251,6 +253,74 @@ function openDb() {
   }
   return new Database(dbPath)
 }
+
+describe('Bug 2 — posttool gating: foreground vs background (hook integration)', () => {
+  it('foreground agent: posttool sets status=completed and ended_at', () => {
+    // Pretool registers a foreground agent (run_in_background: false)
+    const preEvent = {
+      session_id: 'sess-fg-gate',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_gate_fg001',
+      tool_input: { description: 'Foreground task', run_in_background: false },
+    }
+    runHook(PRETOOL_SCRIPT, preEvent)
+
+    const postEvent = {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_gate_fg001',
+      tool_response: {
+        content: [{ type: 'text', text: 'Foreground task done.' }],
+      },
+    }
+    const result = runHook(POSTTOOL_SCRIPT, postEvent)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT status, ended_at, result_summary FROM subagents WHERE id = ?').get('toolu_gate_fg001') as
+      | { status: string; ended_at: number | null; result_summary: string | null }
+      | undefined
+
+    expect(row).toBeDefined()
+    // Foreground: posttool must set terminal status and ended_at
+    expect(row!.status).toBe('completed')
+    expect(row!.ended_at).not.toBeNull()
+    expect(row!.result_summary).toContain('Foreground task done')
+  })
+
+  it('background agent: posttool leaves status=running and ended_at=null', () => {
+    // Pretool registers a background agent (run_in_background: true)
+    const preEvent = {
+      session_id: 'sess-bg-gate',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_gate_bg001',
+      tool_input: { description: 'Background task', run_in_background: true },
+    }
+    runHook(PRETOOL_SCRIPT, preEvent)
+
+    // PostToolUse fires on launch ACK (~10s) — not actual completion
+    const postEvent = {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_gate_bg001',
+      tool_response: {
+        content: [{ type: 'text', text: 'Background task acknowledged.' }],
+      },
+    }
+    const result = runHook(POSTTOOL_SCRIPT, postEvent)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT status, ended_at, last_activity_at FROM subagents WHERE id = ?').get('toolu_gate_bg001') as
+      | { status: string; ended_at: number | null; last_activity_at: number | null }
+      | undefined
+
+    expect(row).toBeDefined()
+    // Background: posttool must NOT set terminal status or ended_at
+    expect(row!.status).toBe('running')
+    expect(row!.ended_at).toBeNull()
+    // But last_activity_at should be bumped
+    expect(row!.last_activity_at).not.toBeNull()
+  })
+})
 
 describe('Bug 4 — result_summary always NULL (hook integration)', () => {
   it('posttool extracts result_summary from content[0].text', () => {
