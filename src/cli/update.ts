@@ -271,6 +271,11 @@ interface UpdateResumeState {
   noRestart: boolean;
   /** Fix 4: SHA embedded in the newly-built src/build-info.ts, if known. */
   newSha?: string;
+  /**
+   * When true, the settle-gate and in-flight checks are skipped.
+   * Mirrors the restart --force semantics.
+   */
+  force?: boolean;
 }
 
 /**
@@ -419,8 +424,18 @@ async function runPostBuildPhase(opts: {
   noRestart: boolean;
   /** Fix 4: new COMMIT_SHA from the just-built binary. Written to state file after restart. */
   newSha?: string;
+  /**
+   * When true, skip the per-agent settle-gate and in-flight checks so the
+   * rolling restart proceeds immediately without waiting for each agent to
+   * report ready. Mirrors the `restart --force` semantics.
+   *
+   * Trade-off: a bad binary will cycle the whole fleet before the operator
+   * notices. Use only when you know what you're doing or are recovering from
+   * a stuck restart.
+   */
+  force?: boolean;
 }): Promise<void> {
-  const { program, installDir, agentNames, before, sourceChanged, noRestart, newSha } = opts;
+  const { program, installDir, agentNames, before, sourceChanged, noRestart, newSha, force } = opts;
   const config = getConfig(program);
   const agentsDir = resolveAgentsDir(config);
   const configPath = getConfigPath(program);
@@ -521,11 +536,21 @@ async function runPostBuildPhase(opts: {
   }
 
   // Rolling restart with settle gate. One-at-a-time, halt on first failure.
-  console.log(
-    chalk.bold(
-      `\n  Rolling restart of ${toRestart.length} agent(s) (settle timeout ${RESTART_SETTLE_TIMEOUT_MS / 1000}s each)...`
-    )
-  );
+  // When --force is set, skip the settle-gate entirely — the operator opts out
+  // of the safety net that catches a bad binary before the whole fleet is cycled.
+  if (force) {
+    console.log(
+      chalk.bold(
+        `\n  Rolling restart of ${toRestart.length} agent(s) (--force: settle-gate skipped)...`
+      )
+    );
+  } else {
+    console.log(
+      chalk.bold(
+        `\n  Rolling restart of ${toRestart.length} agent(s) (settle timeout ${RESTART_SETTLE_TIMEOUT_MS / 1000}s each)...`
+      )
+    );
+  }
   const restarted: string[] = [];
 
   for (let i = 0; i < toRestart.length; i++) {
@@ -535,7 +560,11 @@ async function runPostBuildPhase(opts: {
     try {
       writeRestartReasonMarker(name, updateReason);
       restartAgent(name);
-      console.log(chalk.gray(`    ${name}: restart issued, waiting for settle...`));
+      if (force) {
+        console.log(chalk.gray(`    ${name}: restart issued (no settle wait)`));
+      } else {
+        console.log(chalk.gray(`    ${name}: restart issued, waiting for settle...`));
+      }
     } catch (err) {
       console.error(
         chalk.red(`    ${name}: restart failed: ${(err as Error).message}`)
@@ -544,25 +573,29 @@ async function runPostBuildPhase(opts: {
       process.exit(1);
     }
 
-    const inputs = buildStatusInputsForAgent(name, config, agentsDir);
-    const result = await waitForAgentReady(inputs, { timeoutMs: RESTART_SETTLE_TIMEOUT_MS });
-    const secs = (result.elapsedMs / 1000).toFixed(1);
-    if (result.ready) {
-      console.log(chalk.green(`    ${name}: settled in ${secs}s`));
-      restarted.push(name);
+    if (!force) {
+      const inputs = buildStatusInputsForAgent(name, config, agentsDir);
+      const result = await waitForAgentReady(inputs, { timeoutMs: RESTART_SETTLE_TIMEOUT_MS });
+      const secs = (result.elapsedMs / 1000).toFixed(1);
+      if (result.ready) {
+        console.log(chalk.green(`    ${name}: settled in ${secs}s`));
+        restarted.push(name);
+      } else {
+        console.error(
+          chalk.red(
+            `    ${name}: did not settle within ${secs}s — gaps: ${result.notReady.join(", ")}`
+          )
+        );
+        printRollingHaltMessage(
+          name,
+          `did not settle (${result.notReady.join(", ")})`,
+          restarted,
+          [name, ...remainingAfter],
+        );
+        process.exit(1);
+      }
     } else {
-      console.error(
-        chalk.red(
-          `    ${name}: did not settle within ${secs}s — gaps: ${result.notReady.join(", ")}`
-        )
-      );
-      printRollingHaltMessage(
-        name,
-        `did not settle (${result.notReady.join(", ")})`,
-        restarted,
-        [name, ...remainingAfter],
-      );
-      process.exit(1);
+      restarted.push(name);
     }
   }
 
@@ -594,11 +627,19 @@ export function registerUpdateCommand(program: Command): void {
       "--no-restart",
       "Update sources and reconcile config but skip restarting agents"
     )
+    .option(
+      "--force",
+      "Skip the rolling-restart settle gate. Faster, but if the new\n" +
+      "binary fails to start, the whole fleet will be cycled to the\n" +
+      "broken build before you notice. Use only when you know what\n" +
+      "you're doing or are recovering from a stuck restart.\n" +
+      "Exit code is 0 regardless of agent health — health-check externally."
+    )
     // Hidden internal flags for the self-reexec resume path
     .option("--phase <phase>", undefined, undefined)
     .option("--resume <file>", undefined, undefined)
     .action(
-      withConfigError(async (opts: { check?: boolean; restart?: boolean; phase?: string; resume?: string }) => {
+      withConfigError(async (opts: { check?: boolean; restart?: boolean; force?: boolean; phase?: string; resume?: string }) => {
 
         // ── Post-build resume path ───────────────────────────────────────────
         // When we self-reexec after rebuilding, the new binary is called with
@@ -627,8 +668,16 @@ export function registerUpdateCommand(program: Command): void {
             sourceChanged: state.sourceChanged,
             noRestart: state.noRestart ?? false,
             newSha: state.newSha,
+            force: state.force ?? false,
           });
           return;
+        }
+
+        // Guard: --force and --no-restart are mutually exclusive — force has
+        // no effect when the restart phase is skipped entirely.
+        if (opts.force && opts.restart === false) {
+          console.error(chalk.red("  --force and --no-restart are mutually exclusive."));
+          process.exit(1);
         }
 
         // ── Normal (pre-build) path ─────────────────────────────────────────
@@ -850,6 +899,7 @@ export function registerUpdateCommand(program: Command): void {
               before,
               noRestart: opts.restart === false,
               newSha: newSha ?? undefined,
+              force: opts.force ?? false,
             };
             const resumeFile = join(
               tmpdir(),
@@ -875,6 +925,7 @@ export function registerUpdateCommand(program: Command): void {
           before,
           sourceChanged,
           noRestart: opts.restart === false,
+          force: opts.force ?? false,
         });
       })
     );
