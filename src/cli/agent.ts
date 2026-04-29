@@ -6,7 +6,7 @@ import YAML from "yaml";
 import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
-import { scaffoldAgent, reconcileAgent } from "../agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift } from "../agents/scaffold.js";
 import { listAvailableProfiles } from "../agents/profiles.js";
 import {
   startAgent,
@@ -1184,13 +1184,62 @@ export function registerAgentCommand(program: Command): void {
       "--preserve-claude-md",
       "Opt out of regenerating CLAUDE.md — use if you have hand-edits you don't want to migrate to CLAUDE.custom.md yet"
     )
+    .option("--check", "Report drift between yaml and settings.json without writing")
     .action(
-      withConfigError(async (name: string, opts: { restart?: boolean; noRestart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean }) => {
+      withConfigError(async (name: string, opts: { restart?: boolean; noRestart?: boolean; gracefulRestart?: boolean; preserveClaudeMd?: boolean; check?: boolean }) => {
         const config = getConfig(program);
         const agentsDir = resolveAgentsDir(config);
         const configPath = getConfigPath(program);
 
         const names = name === "all" ? Object.keys(config.agents) : [name];
+
+        // --check mode: compare expected vs actual hooks block, no writes
+        if (opts.check) {
+          let anyDrift = false;
+          for (const n of names) {
+            const agentConfigRaw = config.agents[n];
+            if (!agentConfigRaw) {
+              console.error(chalk.red(`Agent "${n}" is not defined in switchroom.yaml`));
+              continue;
+            }
+            const agentConfig = resolveAgentConfig(config.defaults, config.profiles, agentConfigRaw);
+            const memoryBackend = config.memory?.backend;
+            const hindsightEnabled = memoryBackend === "hindsight"
+              && agentConfig.memory?.auto_recall !== false;
+
+            const expected = buildSettingsHooksBlock({
+              agentName: n,
+              agentConfig,
+              hindsightEnabled,
+              useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+              configPath,
+            });
+
+            const settingsPath = resolve(agentsDir, n, ".claude", "settings.json");
+            let actual: Record<string, unknown> = {};
+            if (existsSync(settingsPath)) {
+              try {
+                const raw = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+                actual = (raw.hooks as Record<string, unknown>) ?? {};
+              } catch {
+                console.error(chalk.red(`  ${n}: could not parse settings.json`));
+                continue;
+              }
+            }
+
+            const { drifted, summary } = detectHooksDrift(expected, actual);
+            if (drifted) {
+              console.log(chalk.red(`  ${n}: hooks ${summary}`));
+              anyDrift = true;
+            } else {
+              console.log(chalk.green(`  ${n}: hooks in sync`));
+            }
+          }
+          if (anyDrift) {
+            process.exitCode = 1;
+          }
+          return;
+        }
         let totalChanges = 0;
         let agentsTouched = 0;
 

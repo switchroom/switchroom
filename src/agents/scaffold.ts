@@ -1466,197 +1466,22 @@ export function scaffoldAgent(
       // object — plugin-installed hooks (hindsight) live in the plugin's
       // own hooks.json and are loaded via --plugin-dir, so they're not
       // affected by this and Claude Code merges them at runtime.
-      const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
       // Per #142, the SessionStart greeting hook + session-greeting.sh
       // curl script are deleted. The boot card (telegram-plugin/gateway/
       // boot-card.ts) now handles "agent is back" UX with a quiet, settle-
       // gated single-line ack; the full config audit content moves to a
       // future `/status` command (#142 PR 3).
-      // Switchroom-owned Stop hook: produce the session-handoff briefing so
-      // the next session can wake up with a compact summary injected
-      // via --append-system-prompt. Gated on session_continuity.enabled
-      // (default true). async+timeout so it never blocks shutdown.
-      const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
-      const handoffConfigArg = switchroomConfigPath
-        ? ` --config ${shellSingleQuote(resolve(switchroomConfigPath))}`
-        : "";
-      const switchroomStopHooks: Array<{ type: string; command: string; timeout: number; async: boolean }> = [];
-      if (handoffEnabled) {
-        switchroomStopHooks.push({
-          type: "command",
-          command: `switchroom${handoffConfigArg} handoff ${name}`,
-          timeout: 35,
-          async: true,
-        });
-      }
-      // User-profile Mental Model refresh hook (when Hindsight is enabled)
-      if (hindsightEnabled) {
-        switchroomStopHooks.push({
-          type: "command",
-          command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
-          timeout: 10,
-          async: true,
-        });
-      }
-      // Switchroom-owned secret-scrub Stop hook: scans transcript at shutdown
-      // and rewrites any currently-active vault values to vault:${slug}.
-      // Gated on telegram-plugin being in use (the hook script ships with
-      // the plugin and only makes sense when the plugin-backed vault flow
-      // is active). Async so it can't block session shutdown.
-      const useSwitchroomPluginHook = usesSwitchroomTelegramPlugin(agentConfig);
-      if (useSwitchroomPluginHook) {
-        switchroomStopHooks.push({
-          type: "command",
-          command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-scrub-stop.mjs")}"`,
-          timeout: 15,
-          async: true,
-        });
-        // Silent-end auto-interrupt: when the agent ends a turn without
-        // sending a reply, return decision:block to re-prompt the agent
-        // (capped at 1 retry per turn — see hook + gateway state file).
-        // Must be SYNC so Claude Code reads stdout for the block decision.
-        switchroomStopHooks.push({
-          type: "command",
-          command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "silent-end-interrupt-stop.mjs")}"`,
-          timeout: 5,
-          async: false,
-        });
-      }
-      const switchroomStop = switchroomStopHooks.length > 0
-        ? [{ hooks: switchroomStopHooks }]
-        : [];
-      // Switchroom-owned PreToolUse hooks:
-      //   1. secret-guard: blocks any tool call whose input contains a
-      //      currently-active vault value verbatim (second-line defense against
-      //      secrets leaking past the ingest-side detector).
-      //   2. subagent-tracker: writes a 'running' row to the subagents table
-      //      whenever an Agent() tool call is about to fire (Phase 2 of #333).
-      // Same plugin gating as the Stop hook.
-      const switchroomPreToolUse = useSwitchroomPluginHook
-        ? [
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
-                  timeout: 10,
-                },
-              ],
-            },
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
-                  timeout: 10,
-                },
-              ],
-            },
-          ]
-        : [];
-      // Switchroom-owned PostToolUse hook: updates the subagents row to
-      // 'completed' or 'failed' once an Agent() call returns.
-      const switchroomPostToolUse = useSwitchroomPluginHook
-        ? [
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
-                  timeout: 10,
-                },
-              ],
-            },
-          ]
-        : [];
-      // Switchroom-owned UserPromptSubmit hooks: inject workspace content at
-      // the start of every turn. When hotReloadStable is true, the stable
-      // workspace files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOOLS.md,
-      // HEARTBEAT.md) are injected here instead of baked into start.sh's
-      // --append-system-prompt. Dynamic files (MEMORY.md, daily notes) are
-      // always injected per-turn. Coexists with Hindsight's own
-      // UserPromptSubmit hook (loaded via the plugin's hooks.json). 5-6s
-      // timeouts so slow renders never block the turn; silent failure (no
-      // stderr) so missing workspace files don't spam errors.
-      const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
-      const switchroomUserPromptSubmit = [
-        ...(useHotReloadStable
-          ? [
-              {
-                hooks: [
-                  {
-                    type: "command",
-                    command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
-                    timeout: 6,
-                  },
-                ],
-              },
-            ]
-          : []),
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
-              timeout: 5,
-            },
-          ],
-        },
-        // Timezone hook — fast (one `date` call), emits a one-line
-        // additionalContext string so the LLM sees fresh local time on every
-        // turn. Placed last so the time-of-turn line renders near the bottom
-        // of the hook-injected preamble. 3s timeout is generous headroom for
-        // a call that should finish in <20ms.
-        {
-          hooks: [
-            {
-              type: "command",
-              command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
-              timeout: 3,
-            },
-          ],
-        },
-      ];
-      if (userHooks) {
-        settings.hooks = {
-          ...userHooks,
-          UserPromptSubmit: [
-            ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
-            ...switchroomUserPromptSubmit,
-          ],
-          ...(switchroomPreToolUse.length > 0
-            ? {
-                PreToolUse: [
-                  ...((userHooks.PreToolUse as unknown[]) ?? []),
-                  ...switchroomPreToolUse,
-                ],
-              }
-            : {}),
-          ...(switchroomPostToolUse.length > 0
-            ? {
-                PostToolUse: [
-                  ...((userHooks.PostToolUse as unknown[]) ?? []),
-                  ...switchroomPostToolUse,
-                ],
-              }
-            : {}),
-          ...(switchroomStop.length > 0
-            ? {
-                Stop: [
-                  ...((userHooks.Stop as unknown[]) ?? []),
-                  ...switchroomStop,
-                ],
-              }
-            : {}),
-        };
-      } else {
-        settings.hooks = {
-          UserPromptSubmit: switchroomUserPromptSubmit,
-          ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
-          ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
-          ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
-        };
-      }
+      //
+      // buildSettingsHooksBlock() is the single source of truth for the full
+      // hooks block (user yaml + switchroom-owned). Reconcile calls the same
+      // function so both paths are guaranteed byte-identical.
+      settings.hooks = buildSettingsHooksBlock({
+        agentName: name,
+        agentConfig,
+        hindsightEnabled,
+        useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+        configPath: switchroomConfigPath,
+      });
       // Explicit model override: written to settings.model so the user
       // doesn't have to pass --model on every invocation.
       if (agentConfig.model !== undefined) {
@@ -2170,6 +1995,249 @@ export interface ReconcileOptions {
   preserveClaudeMd?: boolean;
 }
 
+/**
+ * Parameters for buildSettingsHooksBlock — extracted so the function can be
+ * called from both reconcileAgent and the drift-check path without
+ * duplicating the logic.
+ */
+export interface HooksBlockParams {
+  /** Agent name (used for `switchroom handoff <name>`) */
+  agentName: string;
+  /** Merged yaml hooks (defaults → profile → agent, already resolved) */
+  agentConfig: AgentConfig;
+  /** Whether the Hindsight memory backend is active for this agent */
+  hindsightEnabled: boolean;
+  /** Whether this agent uses the switchroom telegram plugin */
+  useSwitchroomPlugin: boolean;
+  /**
+   * Path to switchroom.yaml — when set, the handoff hook includes
+   * `--config <path>` so the handoff command can locate the right config
+   * even when invoked outside the default config search path.
+   */
+  configPath?: string;
+}
+
+/**
+ * Compute the full settings.json `hooks` block for a given agent config.
+ *
+ * Combines:
+ *   1. User-declared hooks from switchroom.yaml (via translateHooksToClaudeShape)
+ *   2. Switchroom-owned hooks (handoff, user-profile-refresh, secret-scrub,
+ *      secret-guard, subagent-tracker, workspace injection, timezone)
+ *
+ * This is the single source of truth for what reconcileAgent writes to
+ * settings.json. Exported so the drift-check path can call it without
+ * performing a full reconcile.
+ *
+ * The output is a plain JSON-serialisable object suitable for
+ * `settings.hooks = buildSettingsHooksBlock(...)`.
+ */
+export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unknown> {
+  const { agentName, agentConfig, hindsightEnabled, useSwitchroomPlugin, configPath } = p;
+
+  const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
+
+  // --- Switchroom-owned Stop hooks ---
+  const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
+  const handoffConfigArg = configPath
+    ? ` --config ${shellSingleQuote(resolve(configPath))}`
+    : "";
+  const stopHooks: Array<Record<string, unknown>> = [];
+  if (handoffEnabled) {
+    stopHooks.push({
+      type: "command",
+      command: `switchroom${handoffConfigArg} handoff ${agentName}`,
+      timeout: 35,
+      async: true,
+    });
+  }
+  if (hindsightEnabled) {
+    stopHooks.push({
+      type: "command",
+      command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
+      timeout: 10,
+      async: true,
+    });
+  }
+  if (useSwitchroomPlugin) {
+    stopHooks.push({
+      type: "command",
+      command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-scrub-stop.mjs")}"`,
+      timeout: 15,
+      async: true,
+    });
+    stopHooks.push({
+      type: "command",
+      command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "silent-end-interrupt-stop.mjs")}"`,
+      timeout: 5,
+      async: false,
+    });
+  }
+  const switchroomStop = stopHooks.length > 0 ? [{ hooks: stopHooks }] : [];
+
+  // --- Switchroom-owned PreToolUse hooks ---
+  const switchroomPreToolUse = useSwitchroomPlugin
+    ? [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
+              timeout: 10,
+            },
+          ],
+        },
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
+              timeout: 10,
+            },
+          ],
+        },
+      ]
+    : [];
+
+  // --- Switchroom-owned PostToolUse hooks ---
+  const switchroomPostToolUse = useSwitchroomPlugin
+    ? [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
+              timeout: 10,
+            },
+          ],
+        },
+      ]
+    : [];
+
+  // --- Switchroom-owned UserPromptSubmit hooks ---
+  const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
+  const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
+    ...(useHotReloadStable
+      ? [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
+                timeout: 6,
+              },
+            ],
+          },
+        ]
+      : []),
+    {
+      hooks: [
+        {
+          type: "command",
+          command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
+          timeout: 5,
+        },
+      ],
+    },
+    {
+      hooks: [
+        {
+          type: "command",
+          command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
+          timeout: 3,
+        },
+      ],
+    },
+  ];
+
+  // Combine user hooks + switchroom-owned hooks
+  if (userHooks) {
+    return {
+      ...userHooks,
+      UserPromptSubmit: [
+        ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
+        ...switchroomUserPromptSubmit,
+      ],
+      ...(switchroomPreToolUse.length > 0
+        ? {
+            PreToolUse: [
+              ...((userHooks.PreToolUse as unknown[]) ?? []),
+              ...switchroomPreToolUse,
+            ],
+          }
+        : {}),
+      ...(switchroomPostToolUse.length > 0
+        ? {
+            PostToolUse: [
+              ...((userHooks.PostToolUse as unknown[]) ?? []),
+              ...switchroomPostToolUse,
+            ],
+          }
+        : {}),
+      ...(switchroomStop.length > 0
+        ? {
+            Stop: [
+              ...((userHooks.Stop as unknown[]) ?? []),
+              ...switchroomStop,
+            ],
+          }
+        : {}),
+    };
+  }
+
+  return {
+    UserPromptSubmit: switchroomUserPromptSubmit,
+    ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
+    ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
+    ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
+  };
+}
+
+/**
+ * Compare an expected hooks block (from buildSettingsHooksBlock) against the
+ * actual block read from settings.json.  Returns whether they differ and a
+ * short human-readable summary of the difference.
+ *
+ * Comparison is done via canonical JSON strings (sorted keys) so key-order
+ * differences don't produce false positives.
+ */
+export function detectHooksDrift(
+  expected: Record<string, unknown>,
+  actual: Record<string, unknown>,
+): { drifted: boolean; summary: string } {
+  // Canonical serialisation: sort keys at every level so ordering never
+  // produces a false positive.
+  function canon(v: unknown): string {
+    return JSON.stringify(v, (_, val) => {
+      if (val && typeof val === "object" && !Array.isArray(val)) {
+        return Object.fromEntries(
+          Object.entries(val as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+        );
+      }
+      return val;
+    });
+  }
+
+  const expectedStr = canon(expected);
+  const actualStr = canon(actual);
+
+  if (expectedStr === actualStr) {
+    return { drifted: false, summary: "in sync" };
+  }
+
+  // Summarise which top-level categories differ
+  const allKeys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+  const driftedKeys: string[] = [];
+  for (const k of allKeys) {
+    if (canon(expected[k]) !== canon(actual[k])) {
+      driftedKeys.push(k);
+    }
+  }
+
+  const summary = `DRIFTED (categories: ${driftedKeys.join(", ")})`;
+  return { drifted: true, summary };
+}
+
 export function reconcileAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -2598,166 +2666,19 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     // settings.json. Plugin-installed hooks (hindsight) live in the
     // plugin's own hooks.json and are loaded via --plugin-dir, so
     // they're not affected by this. Switchroom-owned.
-    const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
+    //
+    // buildSettingsHooksBlock() is the single source of truth for the full
+    // hooks block (user yaml + switchroom-owned). It is also called by the
+    // drift-check path (reconcile --check) without performing a write.
     // SessionStart greeting hook deleted in #142 — see scaffoldAgent
     // for the rationale.
-    const handoffEnabledReconcile = agentConfig.session_continuity?.enabled !== false;
-    const switchroomStopHooksReconcile: Array<{ type: string; command: string; timeout: number; async: boolean }> = [];
-    if (handoffEnabledReconcile) {
-      switchroomStopHooksReconcile.push({
-        type: "command",
-        command: `switchroom handoff ${name}`,
-        timeout: 35,
-        async: true,
-      });
-    }
-    // User-profile Mental Model refresh hook (when Hindsight is enabled)
-    if (hindsightEnabled) {
-      switchroomStopHooksReconcile.push({
-        type: "command",
-        command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
-        timeout: 10,
-        async: true,
-      });
-    }
-    // Switchroom-owned secret-scrub Stop hook (mirror of scaffoldAgent
-    // above — keep these two blocks in sync). See scaffold.ts secret-detect
-    // commit for context.
-    const useSwitchroomPluginReconcile = usesSwitchroomTelegramPlugin(agentConfig);
-    if (useSwitchroomPluginReconcile) {
-      switchroomStopHooksReconcile.push({
-        type: "command",
-        command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-scrub-stop.mjs")}"`,
-        timeout: 15,
-        async: true,
-      });
-      // Silent-end auto-interrupt (mirror of scaffoldAgent above —
-      // keep these two blocks in sync).
-      switchroomStopHooksReconcile.push({
-        type: "command",
-        command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "silent-end-interrupt-stop.mjs")}"`,
-        timeout: 5,
-        async: false,
-      });
-    }
-    const switchroomStop = switchroomStopHooksReconcile.length > 0
-      ? [{ hooks: switchroomStopHooksReconcile }]
-      : [];
-    // Switchroom-owned PreToolUse hooks (same as scaffoldAgent — keep in sync):
-    //   1. secret-guard
-    //   2. subagent-tracker (Phase 2 of #333)
-    const switchroomPreToolUse = useSwitchroomPluginReconcile
-      ? [
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
-                timeout: 10,
-              },
-            ],
-          },
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
-                timeout: 10,
-              },
-            ],
-          },
-        ]
-      : [];
-    // Switchroom-owned PostToolUse hook (same as scaffoldAgent — keep in sync).
-    const switchroomPostToolUse = useSwitchroomPluginReconcile
-      ? [
-          {
-            hooks: [
-              {
-                type: "command",
-                command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
-                timeout: 10,
-              },
-            ],
-          },
-        ]
-      : [];
-    // Switchroom-owned UserPromptSubmit hooks (same as scaffoldAgent above)
-    const useHotReloadStableReconcile = agentConfig.channels?.telegram?.hotReloadStable === true;
-    const switchroomUserPromptSubmit = [
-      ...(useHotReloadStableReconcile
-        ? [
-            {
-              hooks: [
-                {
-                  type: "command",
-                  command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
-                  timeout: 6,
-                },
-              ],
-            },
-          ]
-        : []),
-      {
-        hooks: [
-          {
-            type: "command",
-            command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
-            timeout: 5,
-          },
-        ],
-      },
-      // Timezone hook — see matching comment in scaffoldAgent for rationale.
-      {
-        hooks: [
-          {
-            type: "command",
-            command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
-            timeout: 3,
-          },
-        ],
-      },
-    ];
-    if (userHooks) {
-      settings.hooks = {
-        ...userHooks,
-        UserPromptSubmit: [
-          ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
-          ...switchroomUserPromptSubmit,
-        ],
-        ...(switchroomPreToolUse.length > 0
-          ? {
-              PreToolUse: [
-                ...((userHooks.PreToolUse as unknown[]) ?? []),
-                ...switchroomPreToolUse,
-              ],
-            }
-          : {}),
-        ...(switchroomPostToolUse.length > 0
-          ? {
-              PostToolUse: [
-                ...((userHooks.PostToolUse as unknown[]) ?? []),
-                ...switchroomPostToolUse,
-              ],
-            }
-          : {}),
-        ...(switchroomStop.length > 0
-          ? {
-              Stop: [
-                ...((userHooks.Stop as unknown[]) ?? []),
-                ...switchroomStop,
-              ],
-            }
-          : {}),
-      };
-    } else {
-      settings.hooks = {
-        UserPromptSubmit: switchroomUserPromptSubmit,
-        ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
-        ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
-        ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
-      };
-    }
+    settings.hooks = buildSettingsHooksBlock({
+      agentName: name,
+      agentConfig,
+      hindsightEnabled,
+      useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+      configPath: switchroomConfigPath,
+    });
 
     // Read userId from access.json (written during scaffold) — used by
     // both the sub-agent prompt addendum and the greeting script below.
