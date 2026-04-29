@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { sep as pathSep, resolve } from "node:path";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getProfilePath, listAvailableProfiles } from "./profiles.js";
+import { getProfilePath, listAvailableProfiles, renderProfileClaudeTemplate } from "./profiles.js";
 
 describe("getProfilePath", () => {
   it("resolves a real profile that exists on disk", () => {
@@ -108,5 +108,60 @@ describe("listAvailableProfiles", () => {
     const profiles = listAvailableProfiles();
     expect(profiles).not.toContain("_base");
     expect(profiles.every((name) => !name.startsWith("_"))).toBe(true);
+  });
+});
+
+describe("renderProfileClaudeTemplate", () => {
+  it("renders CLAUDE.md.hbs to CLAUDE.md and returns { wrote: true, path }", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "switchroom-profile-render-test-"));
+    try {
+      const profileName = "test-profile";
+      const profileDir = join(tmp, profileName);
+      mkdirSync(profileDir, { recursive: true });
+      writeFileSync(
+        join(profileDir, "CLAUDE.md.hbs"),
+        "# Profile: {{profile}}\nHello from the template.",
+      );
+
+      const result = renderProfileClaudeTemplate(profileName, tmp);
+
+      expect(result.wrote).toBe(true);
+      expect(result.path).toBe(join(profileDir, "CLAUDE.md"));
+      expect(existsSync(result.path)).toBe(true);
+      const content = readFileSync(result.path, "utf-8");
+      expect(content).toBe("# Profile: test-profile\nHello from the template.");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("returns { wrote: false } when no .hbs template exists", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "switchroom-profile-render-test-"));
+    try {
+      const result = renderProfileClaudeTemplate("no-such-profile", tmp);
+      expect(result.wrote).toBe(false);
+      expect(existsSync(result.path)).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("overwrites an existing CLAUDE.md on re-render", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "switchroom-profile-render-test-"));
+    try {
+      const profileName = "test-profile";
+      const profileDir = join(tmp, profileName);
+      mkdirSync(profileDir, { recursive: true });
+      writeFileSync(join(profileDir, "CLAUDE.md.hbs"), "v1 {{profile}}");
+      writeFileSync(join(profileDir, "CLAUDE.md"), "old content");
+
+      const result = renderProfileClaudeTemplate(profileName, tmp);
+
+      expect(result.wrote).toBe(true);
+      const content = readFileSync(result.path, "utf-8");
+      expect(content).toBe("v1 test-profile");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

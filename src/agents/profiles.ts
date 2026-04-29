@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, copyFileSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, join, sep as pathSep } from "node:path";
 import Handlebars from "handlebars";
 
@@ -168,4 +168,33 @@ for (const name of SHARED_FRAGMENTS) {
   if (existsSync(fragPath)) {
     Handlebars.registerPartial(name, readFileSync(fragPath, "utf-8"));
   }
+}
+
+/**
+ * Render `profiles/<profileName>/CLAUDE.md.hbs` into
+ * `profiles/<profileName>/CLAUDE.md` using the profile-level context
+ * (no agent-specific values — those belong in the per-agent layer).
+ *
+ * Returns `{ wrote: true, path }` when the template was found and the
+ * output file was written, or `{ wrote: false, path }` when the .hbs
+ * source doesn't exist (caller can skip gracefully).
+ */
+export function renderProfileClaudeTemplate(
+  profileName: string,
+  /** Override the profiles root; used by tests to avoid touching real profiles. */
+  profilesRoot: string = PROFILES_ROOT,
+): { wrote: boolean; path: string } {
+  const profileDir = resolve(profilesRoot, profileName);
+  const hbsPath = join(profileDir, "CLAUDE.md.hbs");
+  const outPath = join(profileDir, "CLAUDE.md");
+
+  if (!existsSync(hbsPath)) {
+    return { wrote: false, path: outPath };
+  }
+
+  const source = readFileSync(hbsPath, "utf-8");
+  const template = Handlebars.compile(source, { noEscape: true });
+  const rendered = template({ profile: profileName });
+  writeFileSync(outPath, rendered, "utf-8");
+  return { wrote: true, path: outPath };
 }
