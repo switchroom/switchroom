@@ -102,7 +102,7 @@ SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}handoff{{/if}}
 SWITCHROOM_RESUME_MAX_BYTES="{{#if resumeMaxBytes}}{{{resumeMaxBytes}}}{{else}}2000000{{/if}}"
 CONTINUE_FLAG=""
 
-_RESUME_LATEST_JSONL="$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")"
+{{#if resumeModeHasContinuePath}}_RESUME_LATEST_JSONL="$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")"
 case "$SWITCHROOM_RESUME_MODE" in
   continue)
     if [ -n "$_RESUME_LATEST_JSONL" ]; then
@@ -126,6 +126,7 @@ case "$SWITCHROOM_RESUME_MODE" in
     : # Unknown mode, stay empty
     ;;
 esac
+{{/if}}
 
 # --- /reset and /new override: force fresh session ---
 #

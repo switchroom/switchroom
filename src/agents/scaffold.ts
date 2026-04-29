@@ -1263,6 +1263,14 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     resumeMode: agentConfig.session_continuity?.resume_mode ?? "handoff",
     resumeMaxBytes:
       agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
+    // True only when the generated start.sh can actually set CONTINUE_FLAG="--continue"
+    // at runtime (i.e. resume_mode is 'auto' or 'continue'). In handoff/none mode the
+    // case branches for auto/continue are omitted entirely so the literal string
+    // CONTINUE_FLAG="--continue" never appears in the rendered script (closes #377).
+    resumeModeHasContinuePath: (() => {
+      const mode = agentConfig.session_continuity?.resume_mode ?? "handoff";
+      return mode === "auto" || mode === "continue";
+    })(),
   };
 }
 

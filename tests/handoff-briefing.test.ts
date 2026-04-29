@@ -96,11 +96,10 @@ describe("scaffold: start.sh resume mode behaviours", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     expect(startSh).toContain('SWITCHROOM_RESUME_MODE="handoff"');
-    // The handoff|none case branch leaves CONTINUE_FLAG empty —
-    // CONTINUE_FLAG="--continue" still exists as static text inside the
-    // auto and continue branches of the case statement (that's expected;
-    // those branches are unreachable when mode is handoff).
-    expect(startSh).toMatch(/handoff\|none\)[\s\S]*?: # CONTINUE_FLAG stays empty/);
+    // In handoff/none mode the auto/continue case branches are omitted entirely
+    // so CONTINUE_FLAG="--continue" never appears in the rendered script (#377).
+    expect(startSh).not.toContain('CONTINUE_FLAG="--continue"');
+    expect(startSh).not.toMatch(/case "\$SWITCHROOM_RESUME_MODE" in/);
   });
 
   it("explicit continue mode DOES pass --continue (regression guard for opt-in)", () => {
@@ -180,6 +179,15 @@ const HANDOFF_BRIEFING_SCRIPT = join(
   "../bin/handoff-briefing.sh",
 );
 
+/** Returns today's date as YYYY-MM-DD in local time, matching `date +%Y-%m-%d` in bash. */
+function localDateString(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 describe("handoff-briefing.sh assembler", () => {
   let tmpDir: string;
 
@@ -228,7 +236,7 @@ describe("handoff-briefing.sh assembler", () => {
 
   it("daily memory: injects today's daily memory file when present", () => {
     // Create a fake daily memory file for today
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = localDateString(); // YYYY-MM-DD in local time (matches bash `date +%Y-%m-%d`)
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Worked on handoff feature\n- PR review pending\n", "utf-8");
@@ -269,7 +277,7 @@ describe("handoff-briefing.sh assembler", () => {
   });
 
   it("writes output to .handoff-briefing.md when not in stdout mode", () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Daily note for file output test\n", "utf-8");
@@ -293,7 +301,7 @@ describe("handoff-briefing.sh assembler", () => {
   });
 
   it("includes restart timestamp header when any source has content", () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Some content\n", "utf-8");
@@ -316,7 +324,7 @@ describe("handoff-briefing.sh assembler", () => {
   });
 
   it("hindsight skipped gracefully when API URL is empty", () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Hindsight skip test\n", "utf-8");
@@ -340,7 +348,7 @@ describe("handoff-briefing.sh assembler", () => {
   });
 
   it("hindsight skipped gracefully when API is unreachable", () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateString();
     const memDir = join(tmpDir, "memory");
     mkdirSync(memDir, { recursive: true });
     writeFileSync(join(memDir, `${today}.md`), "- Unreachable hindsight test\n", "utf-8");
