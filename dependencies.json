@@ -1,0 +1,19 @@
+{
+  "switchroom_version": "0.4.0",
+  "tested_at": "2026-04-29T20:30:00+10:00",
+  "runtime": {
+    "bun": "1.3.11",
+    "node": "22.22.2"
+  },
+  "claude": {
+    "cli": "2.1.123"
+  },
+  "playwright_mcp": "0.0.71",
+  "hindsight": {
+    "backend": null,
+    "client": null
+  },
+  "vault_broker": {
+    "protocol": 1
+  }
+}

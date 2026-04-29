@@ -20,6 +20,7 @@ import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 
 /**
  * Result of a single doctor check.
@@ -1380,6 +1381,76 @@ export async function checkMff(
   return results;
 }
 
+/**
+ * Warn-only components for manifest drift checks.
+ * Drift on these components produces a "warn" result, not a "fail".
+ */
+const MANIFEST_WARN_ONLY = new Set([
+  "@playwright/mcp",
+  "hindsight.backend",
+  "hindsight.client",
+  "vault_broker.protocol",
+]);
+
+/**
+ * Probe installed versions and compare against the pinned manifest.
+ * Returns an empty array when `dependencies.json` is not found — the
+ * manifest is optional for users running from a non-git install.
+ *
+ * @param probers - Optional injectable version probers (for tests).
+ * @internal exported for testing
+ */
+export async function checkManifestDrift(probers?: DriftProbers): Promise<CheckResult[]> {
+  let manifest;
+  try {
+    manifest = loadManifest();
+  } catch {
+    // Missing manifest is not a failure — users without the file (e.g.
+    // npm-installed switchroom without the repo) skip this check.
+    return [];
+  }
+
+  const report = await detectDrift(manifest, probers);
+  if (report.drift.length === 0) {
+    return [
+      {
+        name: "dependency manifest",
+        status: "ok",
+        detail: `all versions match (manifest ${manifest.switchroom_version})`,
+      },
+    ];
+  }
+
+  const results: CheckResult[] = [];
+  for (const item of report.drift) {
+    const warnOnly = MANIFEST_WARN_ONLY.has(item.component);
+    const installedStr = item.installed ?? "(not installed)";
+
+    // Determine severity
+    let status: CheckStatus = warnOnly ? "warn" : "fail";
+    if (!warnOnly && item.installed !== null) {
+      // Only fail on major-version mismatch; minor/patch → warn
+      const dMajor = item.declared.match(/^(\d+)/)?.[1];
+      const iMajor = item.installed.replace(/^v/, "").match(/^(\d+)/)?.[1];
+      if (dMajor !== undefined && iMajor !== undefined && dMajor === iMajor) {
+        status = "warn";
+      }
+    }
+
+    results.push({
+      name: `manifest drift: ${item.component}`,
+      status,
+      detail: `declared ${item.declared}, installed ${installedStr}`,
+      fix:
+        status === "fail"
+          ? `Update ${item.component} to match the manifest, or re-run \`switchroom update\``
+          : undefined,
+    });
+  }
+
+  return results;
+}
+
 export function registerDoctorCommand(program: Command): void {
   program
     .command("doctor")
@@ -1425,6 +1496,7 @@ export function registerDoctorCommand(program: Command): void {
         const sections: Array<{ title: string; results: CheckResult[] }> = [
           { title: "Dependencies", results: checkDependencies() },
           { title: "Skills Prerequisites", results: checkSkillsPrerequisites() },
+          { title: "Manifest Drift", results: await checkManifestDrift() },
           { title: "Configuration", results: checkConfig(config, configPath) },
           { title: "Vault", results: checkVault(config) },
           { title: "Memory (Hindsight)", results: checkHindsight(config) },
