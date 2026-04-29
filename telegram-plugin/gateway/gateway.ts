@@ -47,6 +47,7 @@ import {
   shouldSuppressToolActivity,
 } from '../pty-tail.js'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
+import { gatewayStartupRetry } from './startup-network-retry.js'
 import {
   parseAuthSubCommand,
   checkRemoveSafety,
@@ -6964,13 +6965,23 @@ let didOneTimeSetup = false
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
-      // Clear any orphan long-poll from a previous gateway process
-      // before we start our own. See clearStaleTelegramPollingState
-      // docstring for the production incident that motivates this.
-      // Safe to re-run on retries: it's idempotent.
-      await clearStaleTelegramPollingState(bot.api)
-
-      const me = await bot.api.getMe()
+      // ── Startup network-retry fence ───────────────────────────────────────
+      // On boot the network stack may not be truly usable yet even after
+      // network-online.target fires (observed 2026-04-29: all 5 gateways
+      // started at ~21:26:26 and couldn't reach api.telegram.org for ~27 min).
+      // Grammy throws HttpError for both deleteWebhook and getMe in that case.
+      // `gatewayStartupRetry` absorbs those with exponential backoff (1s→64s,
+      // 8 total attempts, ~2 min budget). On exhaustion it calls process.exit(1)
+      // so systemd's Restart=always can restart the unit from a clean state.
+      // Non-network errors (bad token, 403, etc.) are rethrown immediately so
+      // the catch block below can handle them as before.
+      const me = await gatewayStartupRetry(async () => {
+        // Clear any orphan long-poll from a previous gateway process before we
+        // start our own. See clearStaleTelegramPollingState docstring for the
+        // production incident that motivates this. Safe to re-run on retries.
+        await clearStaleTelegramPollingState(bot.api)
+        return bot.api.getMe()
+      })
       botUsername = me.username
       process.stderr.write(`telegram gateway: polling as @${me.username}\n`)
       if (TOPIC_ID != null) process.stderr.write(`telegram gateway: topic filter active — thread_id=${TOPIC_ID}\n`)
@@ -7290,7 +7301,15 @@ void (async () => {
       }
       if (err instanceof Error && err.message === 'Aborted delay') return
       process.stderr.write(`telegram gateway: polling failed: ${err}\n`)
-      return
+      // Exit non-zero so systemd's Restart=always re-runs the unit instead of
+      // leaving a live-but-silent process that never polls. Previously this path
+      // just `return`ed — that IS the bug from 2026-04-29 where all 5 gateways
+      // stayed alive but deaf after a boot-time network failure.
+      // Note: network errors at startup are handled earlier by gatewayStartupRetry
+      // (with bounded retries before the exit); reaching here means either a
+      // non-network fatal error, or an unexpected mid-session failure. Either
+      // way, exiting is safer than silently staying alive with polling stopped.
+      process.exit(1)
     }
   }
 })()
