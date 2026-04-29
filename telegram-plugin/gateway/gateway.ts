@@ -1384,9 +1384,12 @@ const ipcServer: IpcServer = createIpcServer({
     }
     { const ad = resolveAgentDirFromEnv(); if (ad) clearActiveReactions(ad) }
 
-    // Stop the progress-card driver's heartbeat + coalesce timers so it
-    // can't emit into deleted draft streams and spawn duplicate messages.
-    progressDriver?.dispose()
+    // Stop coalesce timers that could emit into a finalized draft stream, but
+    // preserve chats with pendingCompletion=true — those have background
+    // sub-agents that legitimately outlive the parent bridge disconnect.
+    // The heartbeat continues for preserved chats so elapsed-time ticks and
+    // the deferred-completion-timeout path remain active. Fix for #393.
+    progressDriver?.dispose({ preservePending: true })
 
     // Finalize any open draft streams so they don't hang mid-edit.
     for (const [key, stream] of activeDraftStreams.entries()) {
@@ -7236,6 +7239,12 @@ void (async () => {
                 })
               },
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+              // Option C (#393): route stall detections into the progress-card
+              // driver so the pinned card re-renders with a ⚠️ indicator even
+              // when the bridge has disconnected and events have stopped flowing.
+              onStall: (agentId, idleMs, description) => {
+                progressDriver?.onSubAgentStall(agentId, idleMs, description)
+              },
             })
             process.stderr.write('telegram gateway: subagent-watcher active\n')
           }

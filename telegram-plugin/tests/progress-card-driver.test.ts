@@ -3050,3 +3050,262 @@ describe('issue #314: elapsed-ticker keeps counter live during sub-agent silence
     expect(delta).toBeLessThanOrEqual(10)
   })
 })
+
+// ─── dispose({ preservePending }) — tests 1-7 (issue #393) ───────────────────
+//
+// These tests lock the selective-dispose behavior introduced to fix #393.
+// A bridge disconnect (stdio-MCP per-call lifecycle) must NOT kill the
+// heartbeat and deferred-completion timeout for chats that have
+// pendingCompletion=true (background sub-agents still running).
+
+/**
+ * Helper: build a harness with a running sub-agent and parent turn_end
+ * already fired, leaving the chat in pendingCompletion=true.
+ * Returns { driver, emits, advance } plus the turnKey for inspection.
+ */
+function pendingHarness(opts?: { heartbeatMs?: number; deferredCompletionTimeoutMs?: number }) {
+  const heartbeatMs = opts?.heartbeatMs ?? 5_000
+  let now = 1000
+  const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+  let nextRef = 0
+  const emits: Array<{ chatId: string; threadId?: string; turnKey: string; html: string; done: boolean; isFirstEmit: boolean }> = []
+  const completeCalls: Array<{ chatId: string; turnKey: string }> = []
+  let stopHeartbeatCalled = false
+
+  const driver = createProgressDriver({
+    emit: (a) => emits.push(a),
+    onTurnComplete: (a) => completeCalls.push({ chatId: a.chatId, turnKey: a.turnKey }),
+    minIntervalMs: 0,
+    coalesceMs: 0,
+    heartbeatMs,
+    initialDelayMs: 0,
+    deferredCompletionTimeoutMs: opts?.deferredCompletionTimeoutMs ?? 3 * 60_000,
+    maxIdleMs: 5 * 60_000,
+    now: () => now,
+    setTimeout: (fn, ms) => {
+      const ref = nextRef++
+      timers.push({ fireAt: now + ms, fn, ref })
+      return { ref }
+    },
+    clearTimeout: (handle) => {
+      const target = (handle as { ref: number }).ref
+      const idx = timers.findIndex((t) => t.ref === target)
+      if (idx !== -1) timers.splice(idx, 1)
+    },
+    setInterval: (fn, ms) => {
+      const ref = nextRef++
+      timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+      return { ref }
+    },
+    clearInterval: (handle) => {
+      const target = (handle as { ref: number }).ref
+      const idx = timers.findIndex((t) => t.ref === target)
+      if (idx !== -1) timers.splice(idx, 1)
+    },
+  })
+
+  const advance = (ms: number): void => {
+    now += ms
+    for (;;) {
+      timers.sort((a, b) => a.fireAt - b.fireAt)
+      const next = timers[0]
+      if (!next || next.fireAt > now) break
+      if (next.repeat != null) {
+        next.fireAt += next.repeat
+        next.fn()
+      } else {
+        timers.shift()
+        next.fn()
+      }
+    }
+  }
+
+  // Set up: enqueue, start a sub-agent, fire parent turn_end → pendingCompletion=true
+  driver.ingest(enqueue('c1'), null)
+  driver.ingest({ kind: 'sub_agent_started', agentId: 'bg-agent', firstPromptText: 'do background work' }, 'c1')
+  driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'c1')
+  // Chat should now have pendingCompletion=true
+  advance(0)
+
+  return { driver, emits, completeCalls, advance, timers, stopHeartbeatCalled: () => stopHeartbeatCalled }
+}
+
+describe('dispose({ preservePending }) — selective dispose (fix #393)', () => {
+  // Test 1: preserve chats with pendingCompletion=true, clear their coalesce timers
+  it('preserves chats with pendingCompletion=true and clears their coalesce timers', () => {
+    const { driver, emits } = pendingHarness()
+
+    // Verify pendingCompletion state is active (card not done yet)
+    const stateBeforeDispose = driver.peek('c1')
+    expect(stateBeforeDispose).toBeDefined()
+
+    // Schedule a coalesce timer by feeding an event that triggers a defer
+    driver.ingest({ kind: 'sub_agent_tool_use', agentId: 'bg-agent', toolName: 'Read', toolUseId: 'tu1', toolLabel: 'Read' }, 'c1', undefined)
+    // pendingTimer may now exist (coalesce window). Call selective dispose.
+    driver.dispose?.({ preservePending: true })
+
+    // Chat state must still exist (pendingCompletion=true was preserved)
+    const stateAfterDispose = driver.peek('c1')
+    expect(stateAfterDispose).toBeDefined()
+  })
+
+  // Test 2: removes chats WITHOUT pendingCompletion
+  it('removes chats without pendingCompletion on dispose({ preservePending: true })', () => {
+    const { driver: d1 } = harness(0, 0, { heartbeatMs: 5_000 })
+    // A plain turn with no background sub-agent — pendingCompletion stays false
+    d1.ingest(enqueue('plain'), null)
+    // Do NOT fire turn_end — but pendingCompletion is still false (default)
+    // Verify it's visible before dispose
+    expect(d1.peek('plain')).toBeDefined()
+
+    d1.dispose?.({ preservePending: true })
+
+    // Should have been removed (no pendingCompletion)
+    expect(d1.peek('plain')).toBeUndefined()
+  })
+
+  // Test 3: does NOT call stopHeartbeat when at least one chat has pendingCompletion=true
+  it('does not stop heartbeat when a pendingCompletion chat survives', () => {
+    const { driver, emits, advance } = pendingHarness({ heartbeatMs: 5_000 })
+
+    const beforeDispose = emits.length
+    driver.dispose?.({ preservePending: true })
+
+    // Advance 15 seconds — heartbeat must still fire (3 ticks at 5s each)
+    advance(15_000)
+    expect(emits.length).toBeGreaterThan(beforeDispose)
+  })
+
+  // Test 4: DOES call stopHeartbeat when no chat has pendingCompletion=true
+  it('stops heartbeat when no pendingCompletion chat survives', () => {
+    const { driver: d1, emits: e1, advance: adv1 } = harness(0, 0, { heartbeatMs: 5_000 })
+    // Plain turn with no sub-agent → pendingCompletion=false
+    d1.ingest(enqueue('c2'), null)
+    const countBeforeDispose = e1.length
+    adv1(0)
+
+    d1.dispose?.({ preservePending: true })
+
+    // After dispose, no pendingCompletion → heartbeat must be stopped
+    adv1(30_000)
+    expect(e1.length).toBe(countBeforeDispose) // no further emits
+  })
+
+  // Test 5: back-compat — dispose() with no args wipes everything
+  it('dispose() with no args (back-compat) wipes all chat state including pendingCompletion', () => {
+    const { driver, completeCalls } = pendingHarness()
+
+    // Verify chat exists before dispose
+    expect(driver.peek('c1')).toBeDefined()
+
+    // Original back-compat call (no args)
+    driver.dispose?.()
+
+    // Everything should be cleared
+    expect(driver.peek('c1')).toBeUndefined()
+  })
+
+  // Test 5b: dispose({ preservePending: false }) also wipes everything
+  it('dispose({ preservePending: false }) also wipes all state', () => {
+    const { driver } = pendingHarness()
+    expect(driver.peek('c1')).toBeDefined()
+
+    driver.dispose?.({ preservePending: false })
+
+    expect(driver.peek('c1')).toBeUndefined()
+  })
+
+  // Test 6: calling dispose twice is idempotent (no errors)
+  it('calling dispose twice is idempotent', () => {
+    const { driver } = pendingHarness()
+
+    // First call — selective dispose, chat preserved
+    expect(() => driver.dispose?.({ preservePending: true })).not.toThrow()
+    // Second call on same driver — chat still exists (pendingCompletion), no errors
+    expect(() => driver.dispose?.({ preservePending: true })).not.toThrow()
+    // Back-compat wipe — also no errors
+    expect(() => driver.dispose?.()).not.toThrow()
+    expect(() => driver.dispose?.()).not.toThrow()
+  })
+
+  // Test 7: two parallel chats — A has pendingCompletion, B does not
+  it('two parallel chats: A (pendingCompletion) survives, B (no pendingCompletion) is removed', () => {
+    let now = 1000
+    const timers: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef = 0
+    const emits: Array<{ chatId: string; done: boolean }> = []
+
+    const driver = createProgressDriver({
+      emit: (a) => emits.push({ chatId: a.chatId, done: a.done }),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: 5_000,
+      initialDelayMs: 0,
+      deferredCompletionTimeoutMs: 3 * 60_000,
+      maxIdleMs: 5 * 60_000,
+      now: () => now,
+      setTimeout: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref })
+        return { ref }
+      },
+      clearTimeout: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+      setInterval: (fn, ms) => {
+        const ref = nextRef++
+        timers.push({ fireAt: now + ms, fn, ref, repeat: ms })
+        return { ref }
+      },
+      clearInterval: (handle) => {
+        const target = (handle as { ref: number }).ref
+        const idx = timers.findIndex((t) => t.ref === target)
+        if (idx !== -1) timers.splice(idx, 1)
+      },
+    })
+
+    const advance = (ms: number): void => {
+      now += ms
+      for (;;) {
+        timers.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers[0]
+        if (!next || next.fireAt > now) break
+        if (next.repeat != null) {
+          next.fireAt += next.repeat
+          next.fn()
+        } else {
+          timers.shift()
+          next.fn()
+        }
+      }
+    }
+
+    // Chat A: gets a background sub-agent → pendingCompletion=true
+    driver.ingest(enqueue('chatA'), null)
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'bg-a', firstPromptText: 'bg work' }, 'chatA')
+    driver.ingest({ kind: 'turn_end', durationMs: 500 }, 'chatA')
+    advance(0)
+
+    // Chat B: plain turn in progress (no sub-agent) — pendingCompletion=false
+    driver.ingest(enqueue('chatB', 'normal work'), null)
+    advance(0)
+
+    // Both chats exist before dispose
+    expect(driver.peek('chatA')).toBeDefined()
+    expect(driver.peek('chatB')).toBeDefined()
+
+    driver.dispose?.({ preservePending: true })
+
+    // A must survive (pendingCompletion=true), B must be removed
+    expect(driver.peek('chatA')).toBeDefined()
+    expect(driver.peek('chatB')).toBeUndefined()
+
+    // Heartbeat must still be running for chatA — advance and see emits
+    const beforeCount = emits.filter(e => e.chatId === 'chatA').length
+    advance(10_000)
+    const afterCount = emits.filter(e => e.chatId === 'chatA').length
+    expect(afterCount).toBeGreaterThan(beforeCount)
+  })
+})
