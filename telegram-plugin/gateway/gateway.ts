@@ -6414,6 +6414,27 @@ async function shutdown(signal: string): Promise<void> {
     process.stderr.write(`telegram gateway: shutdown.clean_marker_skipped signal=${signal} (crash path — banner will fire on next boot)\n`)
   }
 
+  // Stage 3c: stamp any in-flight turn as endedVia='sigterm' (or 'restart'
+  // for the schedule_restart-initiated case where pendingRestarts is set).
+  // Best-effort — SIGKILL / OOM skip this path entirely and the next-boot
+  // reaper catches them as endedVia='restart'.
+  if (turnsDb != null && currentTurnRegistryKey != null) {
+    const wasScheduledRestart = pendingRestarts.size > 0
+    const endedVia = wasScheduledRestart ? 'restart' : 'sigterm'
+    try {
+      recordTurnEnd(turnsDb, {
+        turnKey: currentTurnRegistryKey,
+        endedVia,
+        lastAssistantMsgId: currentTurnLastAssistantMsgId,
+        lastAssistantDone: currentTurnLastAssistantDone,
+      })
+      process.stderr.write(`telegram gateway: shutdown.turn_stamped turnKey=${currentTurnRegistryKey} endedVia=${endedVia}\n`)
+    } catch (err) {
+      process.stderr.write(`telegram gateway: shutdown.turn_stamp_failed turnKey=${currentTurnRegistryKey} err=${(err as Error).message}\n`)
+    }
+    currentTurnRegistryKey = null
+  }
+
   // Stop the long-poll health check before draining so it doesn't trigger
   // a stall-recovery restart while we're already in shutdown.
   pollHealthCheck?.stop()
