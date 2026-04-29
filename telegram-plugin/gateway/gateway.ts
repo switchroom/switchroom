@@ -421,33 +421,6 @@ const chatLock = createChatLock()
 const lockedBot = chatLock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
 let botUsername = ''
 
-// ─── DEBUG TRACER (issue #109 / dual-message investigation) ───────────────
-// Patches every Telegram API write op so we can grep journalctl and reconstruct
-// exactly what messages got sent for each turn. Remove before merging — this is
-// a live diagnostic for the DM-channel duplicate-message bug Ken hit on
-// 2026-04-29. See chat for context.
-;(() => {
-  const ops: Array<keyof typeof bot.api> = [
-    'sendMessage', 'editMessageText', 'editMessageReplyMarkup',
-    'pinChatMessage', 'unpinChatMessage', 'unpinAllChatMessages',
-    'deleteMessage', 'sendChatAction', 'sendPhoto', 'sendDocument',
-  ] as Array<keyof typeof bot.api>
-  for (const op of ops) {
-    const orig = (bot.api as unknown as Record<string, Function>)[op as string]
-    if (typeof orig !== 'function') continue
-    const bound = orig.bind(bot.api)
-    ;(bot.api as unknown as Record<string, Function>)[op as string] = function (...args: unknown[]) {
-      const stack = new Error().stack?.split('\n').slice(2, 5).map(l => l.trim()).join(' ← ') ?? 'unknown'
-      const chatId = args[0] != null ? String(args[0]) : 'none'
-      // Slice gateway-relative source paths so logs are grep-friendly
-      const cleanStack = stack.replace(/file:\/\/[^/]+\//g, '').replace(/\?[^)]+\)/g, ')')
-      process.stderr.write(`telegram gateway: TRACE op=${String(op)} chatId=${chatId} caller=${cleanStack}\n`)
-      return (bound as (...a: unknown[]) => unknown)(...args)
-    }
-  }
-})()
-
-
 // ─── Access control ───────────────────────────────────────────────────────
 
 type PendingEntry = {
