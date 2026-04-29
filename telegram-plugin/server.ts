@@ -2938,6 +2938,24 @@ if (streamMode === 'checklist') {
     // plenty for a genuine long-running turn to show activity, and it
     // cuts the worst-case orphan window from 30 min to 5 min.
     maxIdleMs: 5 * 60_000,
+    // Tunable thresholds — read from env vars set by channelsToEnv()
+    // when the user declares channels.telegram.<knob> in switchroom.yaml.
+    // Each falls back to the driver's built-in default when unset.
+    ...(process.env.SWITCHROOM_TG_ORPHAN_PROMOTION_MS !== undefined && {
+      orphanPromotionMs: Number(process.env.SWITCHROOM_TG_ORPHAN_PROMOTION_MS),
+    }),
+    ...(process.env.SWITCHROOM_TG_COLD_SUB_AGENT_THRESHOLD_MS !== undefined && {
+      coldSubAgentThresholdMs: Number(process.env.SWITCHROOM_TG_COLD_SUB_AGENT_THRESHOLD_MS),
+    }),
+    ...(process.env.SWITCHROOM_TG_DEFERRED_COMPLETION_TIMEOUT_MS !== undefined && {
+      deferredCompletionTimeoutMs: Number(process.env.SWITCHROOM_TG_DEFERRED_COMPLETION_TIMEOUT_MS),
+    }),
+    ...(process.env.SWITCHROOM_TG_SUB_AGENT_TICK_INTERVAL_MS !== undefined && {
+      subAgentTickIntervalMs: Number(process.env.SWITCHROOM_TG_SUB_AGENT_TICK_INTERVAL_MS),
+    }),
+    ...(process.env.SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD !== undefined && {
+      editBudgetThreshold: Number(process.env.SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD),
+    }),
   })
   process.stderr.write('telegram channel: progress-card driver active (stream_mode=checklist)\n')
 }

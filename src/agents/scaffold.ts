@@ -614,7 +614,7 @@ export function installSwitchroomSkills(agentDir: string): void {
 /**
  * Translate per-channel YAML fields into env vars the telegram-plugin
  * will read at startup. Today: SWITCHROOM_TG_FORMAT, SWITCHROOM_TG_RATE_LIMIT_MS,
- * SWITCHROOM_TG_STREAM_MODE.
+ * SWITCHROOM_TG_STREAM_MODE, and the progress-card threshold knobs.
  *
  * Returns an object that can be merged into the user env. User-declared
  * env vars with the same key take precedence (see the call site) since
@@ -631,6 +631,22 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   }
   if (tg.stream_mode !== undefined) {
     out.SWITCHROOM_TG_STREAM_MODE = tg.stream_mode;
+  }
+  // Progress-card driver thresholds — only effective when stream_mode=checklist.
+  if (tg.orphan_promotion_ms !== undefined) {
+    out.SWITCHROOM_TG_ORPHAN_PROMOTION_MS = String(tg.orphan_promotion_ms);
+  }
+  if (tg.cold_sub_agent_threshold_ms !== undefined) {
+    out.SWITCHROOM_TG_COLD_SUB_AGENT_THRESHOLD_MS = String(tg.cold_sub_agent_threshold_ms);
+  }
+  if (tg.deferred_completion_timeout_ms !== undefined) {
+    out.SWITCHROOM_TG_DEFERRED_COMPLETION_TIMEOUT_MS = String(tg.deferred_completion_timeout_ms);
+  }
+  if (tg.sub_agent_tick_interval_ms !== undefined) {
+    out.SWITCHROOM_TG_SUB_AGENT_TICK_INTERVAL_MS = String(tg.sub_agent_tick_interval_ms);
+  }
+  if (tg.edit_budget_threshold !== undefined) {
+    out.SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD = String(tg.edit_budget_threshold);
   }
   return out;
 }

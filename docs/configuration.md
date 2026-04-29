@@ -41,9 +41,40 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `channels.telegram.plugin` | override | `switchroom` (default, enhanced) or `official` |
 | `channels.telegram.format` | override | Reply format (`html`, `markdownv2`, `text`) |
 | `channels.telegram.rate_limit_ms` | override | Min delay between outgoing messages |
+| `channels.telegram.orphan_promotion_ms` | override | Progress-card: ms before an unmatched spawn is promoted to a running row (default 5000) |
+| `channels.telegram.cold_sub_agent_threshold_ms` | override | Progress-card: ms of JSONL silence before a sub-agent is synthesised as finished (default 30000) |
+| `channels.telegram.deferred_completion_timeout_ms` | override | Progress-card: force-close timeout (ms) after parent `turn_end` while sub-agents are still running (default 180000) |
+| `channels.telegram.sub_agent_tick_interval_ms` | override | Progress-card: elapsed-counter tick interval (ms) while a sub-agent is running (default 10000) |
+| `channels.telegram.edit_budget_threshold` | override | Progress-card: card-edit budget per minute before throttled mode (default 18) |
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
+
+## Progress-Card Tunable Thresholds
+
+When `channels.telegram.stream_mode` is `checklist` (the default), the progress-card driver manages an edit-in-place Telegram message that tracks tool calls and sub-agent activity during a turn. The five knobs below control how it handles edge cases — timeouts, JSONL gaps, and Telegram API rate limits.
+
+All values are in milliseconds unless otherwise noted. Omit a field to keep the built-in default. These fields are only effective when `stream_mode` is `checklist`.
+
+| Field | Default | Description | When to tune |
+|---|---|---|---|
+| `orphan_promotion_ms` | 5000 (5 s) | How long a parent turn waits for a sub-agent JSONL watcher to deliver `sub_agent_started` before the heartbeat promotes the spawn to a synthesised "running" row. | Increase if fast sub-agents are appearing as orphan rows before their JSONL watcher can connect; decrease if you want orphan detection to fire sooner. Set to `0` to disable orphan promotion entirely. |
+| `cold_sub_agent_threshold_ms` | 30000 (30 s) | JSONL-cold threshold. When a running sub-agent emits no events for this long, the heartbeat synthesises a `turn_end` for it so the deferred-completion path can proceed — avoids cards pinned forever on a dead watcher. | Increase if legitimate long-running sub-agents (e.g. waiting on a slow external API) are being falsely closed; decrease to recover faster from a genuinely dead watcher. |
+| `deferred_completion_timeout_ms` | 180000 (3 min) | Force-close timeout after the parent `turn_end` arrives while sub-agents are still running. The card is force-closed after this many ms even if the sub-agents never finish. | Increase for agents that routinely spawn very long-running background sub-agents; decrease to shorten the worst-case delay before the card and pin are cleaned up. |
+| `sub_agent_tick_interval_ms` | 10000 (10 s) | Elapsed-counter tick interval while a sub-agent is running. Forces a re-render so the elapsed counter advances even during silent stretches between tool calls. | Decrease for a more real-time counter (costs extra edits); increase to reduce edit traffic when many parallel sub-agents are active. Set to `0` to disable. |
+| `edit_budget_threshold` | 18 | Card-edit budget per minute before the driver falls back to a slower coalesce window. When a chat exceeds this many edits in the trailing 60 s, the coalesce interval widens until the rate drops. | Increase if your gateway frequently hits the Telegram edit-rate ceiling with many parallel sub-agents; decrease for a more conservative buffer. |
+
+Example: an agent with many parallel sub-agents that hit the Telegram rate ceiling:
+
+```yaml
+agents:
+  worker:
+    channels:
+      telegram:
+        stream_mode: checklist
+        edit_budget_threshold: 12
+        sub_agent_tick_interval_ms: 15000
+```
 
 ## Profiles
 

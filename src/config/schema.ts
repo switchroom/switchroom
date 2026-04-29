@@ -378,6 +378,68 @@ export const TelegramChannelSchema = z
         "Costs ~5-10% per-turn latency/spend since the stable prefix is no " +
         "longer prompt-cached."
       ),
+    /**
+     * Progress-card driver tuning. These knobs are only effective when
+     * stream_mode is 'checklist' (the default). All values are in
+     * milliseconds unless noted. Omit a field to keep the built-in default.
+     */
+    orphan_promotion_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "How long (ms) a parent turn waits for a sub-agent JSONL watcher " +
+        "to deliver sub_agent_started before the heartbeat promotes the spawn " +
+        "to a synthesised 'running' row. Default 5000. Set to 0 to disable " +
+        "orphan promotion entirely."
+      ),
+    cold_sub_agent_threshold_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "JSONL-cold threshold (ms). When a running sub-agent emits no events " +
+        "for this long, the heartbeat synthesises a turn_end for it so the " +
+        "deferred-completion path can proceed. Default 30000. Set to 0 to " +
+        "disable the synthetic close."
+      ),
+    deferred_completion_timeout_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Force-close timeout (ms) for deferred sub-agent completion. After " +
+        "the parent turn_end arrives while sub-agents are still running, the " +
+        "card is force-closed after this many ms even if sub-agents never " +
+        "finish. Watcher-disconnect safety net. Default 180000 (3 min)."
+      ),
+    sub_agent_tick_interval_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Heartbeat tick interval (ms) for sub-agent rendering. Forces a " +
+        "re-render of the elapsed-time counter while sub-agents are running, " +
+        "even during silent stretches between tool calls. Default 10000 (10 s). " +
+        "Set to 0 to disable the elapsed-ticker path."
+      ),
+    edit_budget_threshold: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Telegram API edit budget per minute before the progress-card driver " +
+        "falls back to a slower coalesce window. When a chat accumulates more " +
+        "than this many card edits in the trailing 60 s, the driver switches " +
+        "to a wider coalesce interval until the rate drops back. Default 18. " +
+        "Increase if your gateway frequently bumps the Telegram edit-rate ceiling " +
+        "with many parallel sub-agents; decrease for a more conservative buffer."
+      ),
   })
   .optional();
 
