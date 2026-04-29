@@ -72,7 +72,7 @@ export const REACTION_VARIANTS: Record<ReactionState, string[]> = {
   thinking:  ['🤔', '🤓', '👀'],     // unchanged
   tool:      ['✍', '⚡', '👌'],      // WORKING: actively using a tool
   coding:    ['👨‍💻', '✍', '⚡'],     // WORKING: writing / running code
-  web:       ['⚡', '👀', '👌'],      // WORKING: lookup in motion
+  web:       ['⚡', '🤔', '👌'],      // WORKING: lookup in motion (👀 reserved for READ)
   compacting:['✍', '🤔', '👀'],      // unchanged
   done:      ['👍', '💯', '🎉'],      // FINISHED: reply landed
   // 🙊 — turn ended without producing a user-visible reply. Distinct from
