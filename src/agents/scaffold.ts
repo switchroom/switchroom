@@ -1475,9 +1475,12 @@ export function scaffoldAgent(
       const switchroomStop = switchroomStopHooks.length > 0
         ? [{ hooks: switchroomStopHooks }]
         : [];
-      // Switchroom-owned PreToolUse hook: blocks any tool call whose input
-      // contains a currently-active vault value verbatim (second-line
-      // defense against secrets leaking past the ingest-side detector).
+      // Switchroom-owned PreToolUse hooks:
+      //   1. secret-guard: blocks any tool call whose input contains a
+      //      currently-active vault value verbatim (second-line defense against
+      //      secrets leaking past the ingest-side detector).
+      //   2. subagent-tracker: writes a 'running' row to the subagents table
+      //      whenever an Agent() tool call is about to fire (Phase 2 of #333).
       // Same plugin gating as the Stop hook.
       const switchroomPreToolUse = useSwitchroomPluginHook
         ? [
@@ -1486,6 +1489,30 @@ export function scaffoldAgent(
                 {
                   type: "command",
                   command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
+                  timeout: 10,
+                },
+              ],
+            },
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
+                  timeout: 10,
+                },
+              ],
+            },
+          ]
+        : [];
+      // Switchroom-owned PostToolUse hook: updates the subagents row to
+      // 'completed' or 'failed' once an Agent() call returns.
+      const switchroomPostToolUse = useSwitchroomPluginHook
+        ? [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
                   timeout: 10,
                 },
               ],
@@ -1555,6 +1582,14 @@ export function scaffoldAgent(
                 ],
               }
             : {}),
+          ...(switchroomPostToolUse.length > 0
+            ? {
+                PostToolUse: [
+                  ...((userHooks.PostToolUse as unknown[]) ?? []),
+                  ...switchroomPostToolUse,
+                ],
+              }
+            : {}),
           ...(switchroomStop.length > 0
             ? {
                 Stop: [
@@ -1568,6 +1603,7 @@ export function scaffoldAgent(
         settings.hooks = {
           UserPromptSubmit: switchroomUserPromptSubmit,
           ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
+          ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
           ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
         };
       }
@@ -2500,7 +2536,9 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     const switchroomStop = switchroomStopHooksReconcile.length > 0
       ? [{ hooks: switchroomStopHooksReconcile }]
       : [];
-    // Switchroom-owned PreToolUse hook: secret-guard (same as scaffoldAgent).
+    // Switchroom-owned PreToolUse hooks (same as scaffoldAgent — keep in sync):
+    //   1. secret-guard
+    //   2. subagent-tracker (Phase 2 of #333)
     const switchroomPreToolUse = useSwitchroomPluginReconcile
       ? [
           {
@@ -2508,6 +2546,29 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
               {
                 type: "command",
                 command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
+                timeout: 10,
+              },
+            ],
+          },
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
+                timeout: 10,
+              },
+            ],
+          },
+        ]
+      : [];
+    // Switchroom-owned PostToolUse hook (same as scaffoldAgent — keep in sync).
+    const switchroomPostToolUse = useSwitchroomPluginReconcile
+      ? [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
                 timeout: 10,
               },
             ],
@@ -2565,6 +2626,14 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
               ],
             }
           : {}),
+        ...(switchroomPostToolUse.length > 0
+          ? {
+              PostToolUse: [
+                ...((userHooks.PostToolUse as unknown[]) ?? []),
+                ...switchroomPostToolUse,
+              ],
+            }
+          : {}),
         ...(switchroomStop.length > 0
           ? {
               Stop: [
@@ -2578,6 +2647,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       settings.hooks = {
         UserPromptSubmit: switchroomUserPromptSubmit,
         ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
+        ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
         ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
       };
     }
