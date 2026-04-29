@@ -59,6 +59,8 @@ export default defineConfig({
       "**/src/vault/broker/auto-unlock.test.ts",
       "**/telegram-plugin/tests/boot-probes.test.ts",
       "**/telegram-plugin/tests/setup-state.test.ts",
+      // registry-turns.test.ts uses bun:sqlite — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/registry-turns.test.ts",
     ],
     coverage: {
       provider: "v8",
