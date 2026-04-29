@@ -31,7 +31,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `memory` | per-field | Hindsight collection and recall settings |
 | `hooks` | per-event concat | Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SessionEnd) |
 | `env` | per-key | Environment variables for start.sh |
-| `mcp_servers` | per-key | Additional MCP server configurations |
+| `mcp_servers` | per-key | Additional MCP server configurations. Set a key to `false` to suppress a built-in default (e.g. `playwright: false`) |
 | `system_prompt_append` | concatenate | Appended to the system prompt via `--append-system-prompt` |
 | `skills` | union | Named skills from the global skills pool (`switchroom.skills_dir`) |
 | `subagents` | per-key | Sub-agent definitions rendered to `.claude/agents/<name>.md` |
@@ -49,6 +49,33 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
+
+## Built-in MCP Servers
+
+The scaffold wires the following MCP servers automatically:
+
+- **switchroom** — management CLI wrapper (list/start/stop agents, check auth). Always wired.
+- **playwright** — Microsoft's `@playwright/mcp` browser automation server, launched via `npx -y @playwright/mcp@<pinned-version> --snapshot`. Always wired by default; opt out with `mcp_servers: { playwright: false }`. Runs in accessibility-tree (snapshot) mode, which is token-cheap and reliable for most web automation tasks. Exposes `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, and related tools directly to the agent without requiring a local Playwright installation. The version is pinned in `src/memory/scaffold-integration.ts` — bump deliberately when validating against a newer release.
+- **hindsight** — semantic memory bank, wired only when `memory.backend` is `hindsight`. Agents using a different memory backend (or none) don't get this server.
+
+Any server from `defaults.mcp_servers` also flows to all agents via the normal cascade.
+
+To suppress the built-in `playwright` server for a specific agent:
+
+```yaml
+agents:
+  my-agent:
+    mcp_servers:
+      playwright: false   # opt-out: don't include the browser MCP for this agent
+```
+
+Or globally for every agent (in `defaults`):
+
+```yaml
+defaults:
+  mcp_servers:
+    playwright: false   # opt-out: no agent gets the browser MCP unless they explicitly enable it
+```
 
 ## Progress-Card Tunable Thresholds
 

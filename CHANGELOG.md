@@ -2,54 +2,103 @@
 
 ## [Unreleased]
 
-### Fixed
-- **Vault broker ACL was unconditionally denying every cron** in #113. The
-  ACL matched `/proc/<pid>/exe` against the cron script path, but the
-  generated systemd unit invokes `/bin/bash <script>`, so the kernel-set
-  exe is `/bin/bash` and the path pattern never matched in production.
-  Replaced with cgroup-based identity: peercred reads
-  `/proc/<pid>/cgroup` to find the systemd unit name
-  (`switchroom-<agent>-cron-<i>.service`).
-- **Hardened against cgroup spoofing under user delegation.** `/proc/<pid>/cgroup`
-  is attacker-controlled when the broker and caller share UID — under
-  cgroup v2 user delegation, a regular process can `mkdir` arbitrary
-  directories under their `user@<uid>.service` subtree (including paths
-  shaped like `switchroom-<agent>-cron-<i>.service`) and move their own
-  PID into one. Peercred now cross-checks the cgroup-derived unit name
-  against `systemctl --user show`; only units systemd-user reports as
-  `LoadState=loaded` and `ActiveState ∈ {active, activating}` are
-  accepted. Spoofed cgroups have no corresponding registered unit and
-  fail the check.
-- Unit-test fixtures now exercise the full `ss -xpn` inode-pair lookup
-  that production needs to map a connecting client back to its PID.
-- **Peercred `ss` query was returning the broker's own PID.** The
-  `src <socket>` filter selects the server-side row of a unix
-  connection, whose `users:()` column is the listening process. The
-  caller is the *client side*, identifiable by walking the inode pair
-  in the same `ss -xpn` output. Fix lands the two-step lookup.
+## v0.4.0 — 2026-04-29
 
 ### Added
-- `tests/integration/vault-broker-e2e.test.ts` — gated systemd e2e
-  harness (set `INTEGRATION=1`). Spawns a real broker, places the cron
-  in a transient `switchroom-<agent>-cron-0.service` via
-  `systemd-run --user`, and proves end-to-end:
-  - allowed-key happy path returns the value through the broker
-  - disallowed-key path is denied with `ACL DENIED`, no value leaks
-  - broker-stopped path fails loud (no silent fallback to interactive
-    passphrase prompt in headless mode)
-- **Agent watchdog now detects journal-silent hangs.** Three classes of
-  agent hang were observed in production with the unit reporting
-  `active (running)` to systemd while internally frozen — no journal
-  output for many minutes, manual restart was the only recovery.
-  `bin/bridge-watchdog.sh` now also checks journal-output freshness
-  per-agent and restarts via `switchroom agent restart <agent>` when an
-  agent has been silent for `JOURNAL_SILENCE_SECS` (default 600s) and
-  has cleared the existing `UPTIME_GRACE_SECS`. Closes #116.
+- **Sub-agent registry infrastructure** — SQLite-backed `subagents` and
+  `turns` tables track every active sub-agent with liveness updates,
+  tool-hook population, and a turns writer wired to gateway enqueue and
+  completion. Exposes `/api/agents/:name/{turns,subagents}` REST routes
+  (#333, #332, #325, #340, #342, #347).
+- **Idle/active topic footer** — pure renderer computes and posts a live
+  footer line on every topic reflecting idle vs. active state; wired into
+  the gateway render path (#332, #338, #343).
+- **Interrupted-turn resume protocol** — gateway stamps turn start/end on
+  every path including kill/SIGTERM; scaffold surfaces `SWITCHROOM_PENDING_TURN`
+  env-var to the agent on cold start so it can acknowledge the gap; agent
+  CLAUDE.md documents the full resume flow (stages 3a–3c, 4, 5; #329–#331,
+  #336, #337).
+- **Incremental answer streaming** — agent replies stream token-by-token to
+  Telegram via `sendMessageDraft` before the turn ends; answer-stream preview
+  is retracted when the reply path wins (#195, #201, #261).
+- **Vault broker** — full daemon with Unix socket, `SO_PEERCRED` + cgroup
+  ACL, append-only audit log, auto-unlock via `LoadCredentialEncrypted` on
+  boot, `secrets[]` schedule field, namespaced key names, and Telegram
+  `/vault` subcommands (unlock/lock/status/grants list+revoke with inline
+  buttons). Cgroup ACL hardened against spoofing under user delegation
+  (#112, #113, #117, #153, #154, #158, #206, #207, #209, #213, #221,
+  #224–#228, #241–#245).
+- **Inline status-accent headers** — `reply` and `stream_reply` accept an
+  `accent` parameter that prepends a `🔵 In progress…` / `✅ Done` /
+  `⚠️ Issue` status line above the message body (#328).
+- **Boot card overhaul** — posts on every gateway start with restart reason,
+  live-watches agent service status after boot, and drops the static session
+  greeting in favour of a quiet settle-gated probe sequence (#93, #95, #150,
+  #178, #208, #210, #279).
+- **Humanizer and calibrate skills** bundled as defaults so every agent can
+  run `/humanizer` and `/humanizer-calibrate` without extra setup (#292).
+- **Switchroom-worktree** MCP + CLI for parallel sub-agent code isolation;
+  worktree primitives (schema, modules, env injection) wired in (#74, #75,
+  #274).
+- Web dashboard `--bind` flag for LAN/Tailscale access; trust
+  `Tailscale-User-Login` header for loopback requests.
+- `switchroom agent rename` command for slug renames (#168).
+- Native Telegram checklist messages (`send_checklist` / `update_checklist`);
+  inline keyboard URL buttons on `reply`/`stream_reply`; `protect_content`
+  and `quote_text` params; inbound message reaction forwarding (#272, #271,
+  #273, #297, #301, #302).
+- Hindsight recall now injects active directives as a separate top-of-prompt
+  block (#115).
+- `/foreman setup` wizard for onboarding new agents (#175).
+- Cache-hit telemetry and hook content-dedupe (Phase 1 of perf work) (#110).
 
 ### Changed
-- Agent service units now declare `MemoryMax=2G` and `MemoryHigh=1536M`,
-  so unbounded memory growth (observed up to 1 GB before hang) hits a
-  ceiling and gets OOM-killed. `Restart=on-failure` then recovers.
+- **Sub-agent Telegram visibility removed** — sub-agent identity stripped
+  from prompt and tool denylist so the parent agent's Telegram session stays
+  clean (#256, #260).
+- Session greeting dropped; boot card now serves as the sole session-start
+  signal (#150).
+- `switchroom update` gains `--force` flag; CLI collapsed to
+  `update`/`restart`/`version` surface with foreman and Telegram menu aligned
+  (#63, #65, #67, #68, #317).
+- `🔥` reaction dropped from active-work states; reactions are now
+  `👀 → 🤔 → 👍` (#320, #323).
+- Agent service units declare `MemoryMax=2G` / `MemoryHigh=1536M` to cap
+  unbounded growth; `Restart=on-failure` recovers after OOM kill (#116).
+- Progress card native HTML formatting overhaul; deterministic markdown-table
+  rendering; `_..._` italic conversion fixed (#265, #275, #277, #284, #287).
+- Vault broker ACL replaced with cgroup-based identity; peercred
+  `ss`-lookup two-step fixed; spoofing hardened against user-delegation
+  cgroup writes (#117).
+- `switchroom update` reliability: bun shebang fix, rolling restart with
+  settle gate, 4 further defects patched (#249, #291).
+
+### Fixed
+- Gateway boot-card crash loop broken: discriminate `unhandledRejection`,
+  dedupe boot card, cache quota probe (#99, #102).
+- Watchdog: bridge liveness file eliminates false-positive restarts;
+  `DISCONNECT_GRACE_SECS` bumped 120 → 600s; journal-silence hang detection
+  added (#97, #96, #116).
+- Sub-agent watcher: skip pre-existing JSONL files at startup; exclude
+  historical entries from active card; escape HTML in last-activity age
+  (#83, #89, #90, #91).
+- Progress card: elapsed counter stays live during sub-agent silence; cross-turn
+  sub-agent visibility restored; deduplicated row rendering; reducer correctness
+  (toolCount, lastCompletedTool, preamble); visibility leaks closed; sub-agent
+  format redesigned (#313–#316, #318–#319, #321, #326, #334, #350, #352, #356).
+- Stream-reply: record delivery before `forceCompleteTurn` (#310, #311).
+- Secret-detect: one-tap unlock + auto-write for deferred secrets (#44, #143).
+- Boot probe: transient carve-outs, 429 doc, `rateLimited` field; agent slug
+  used for systemd probes (#208–#211, #309, #312).
+- Answer-stream: honour `NO_REPLY`/`HEARTBEAT_OK` in materialisation path;
+  retract preview when reply path wins (#299, #300).
+- Vault broker: hard-fail when `BrokerTestOpts` set outside `NODE_ENV=test`;
+  `SO_PEERCRED` via `bun:ffi` simplified and hardened (#129, #135).
+- Scaffold: validate bot token via `getMe` at init; pre-approve
+  `delete_message` and `get_recent_messages` tools (#121, #167, #182).
+- Auth-status: lazy sync + restart settle for meta race (#171, #176, #193).
+- CI: bktec brace-alternation, parallelism, and golden-test sharding fixes
+  (#111, #120, #128).
 
 ## v0.3.0 — 2026-04-25
 

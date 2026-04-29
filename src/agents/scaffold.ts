@@ -33,7 +33,7 @@ import {
   renderTemplate,
   copyProfileSkills,
 } from "./profiles.js";
-import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry } from "../memory/scaffold-integration.js";
+import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry, getPlaywrightMcpSettingsEntry } from "../memory/scaffold-integration.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
@@ -716,6 +716,23 @@ const SWITCHROOM_OWNED_SETTINGS_KEYS = new Set<string>([
   "model",
 ]);
 
+/**
+ * Strip opt-out entries from a user-declared mcp_servers map before writing
+ * to settings.json. An entry with value `false` means "don't include this
+ * server" — used to suppress a built-in default (e.g. playwright) on a
+ * per-agent basis without removing it from `defaults.mcp_servers`.
+ */
+function filterMcpServers(
+  servers: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(servers)) {
+    if (value === false) continue; // opt-out: skip this server
+    out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 const ALL_BUILTIN_TOOLS = [
   "Bash",
   "BashOutput",
@@ -1142,7 +1159,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     defaultModeAcceptEdits: hasAllWildcard,
     memory: agentConfig.memory,
     model: agentConfig.model,
-    mcpServers: agentConfig.mcp_servers,
+    mcpServers: agentConfig.mcp_servers
+      ? filterMcpServers(agentConfig.mcp_servers)
+      : agentConfig.mcp_servers,
     schedule: agentConfig.schedule,
     botToken: resolvedBotToken ?? rawBotToken,
     forumChatId: telegramConfig.forum_chat_id,
@@ -1406,6 +1425,20 @@ export function scaffoldAgent(
       const switchroomMcpEntry = getSwitchroomMcpSettingsEntry();
       if (!settings.mcpServers[switchroomMcpEntry.key]) {
         settings.mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
+      }
+
+      // Playwright browser automation MCP (built-in default).
+      // Agents can suppress this with `mcp_servers: { playwright: false }` in
+      // switchroom.yaml. Playwright is added as a built-in here AFTER the
+      // template renders user-declared mcp_servers — so this is the only
+      // place that decides whether to wire it in. The opt-out check below
+      // reads the user's mcp_servers map directly to honour `false` even
+      // though that sentinel never reaches the template (filterMcpServers
+      // strips it).
+      const playwrightMcpEntry = getPlaywrightMcpSettingsEntry();
+      const agentOptOut = (agentConfig.mcp_servers ?? {})[playwrightMcpEntry.key] === false;
+      if (!agentOptOut && !settings.mcpServers[playwrightMcpEntry.key]) {
+        settings.mcpServers[playwrightMcpEntry.key] = playwrightMcpEntry.value;
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
@@ -2443,6 +2476,9 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
 
     // mcpServers: rebuild from current switchroom.yaml. Preserves user-defined
     // mcp_servers from agentConfig.mcp_servers in addition to the built-ins.
+    // Entries with value `false` in mcp_servers are opt-outs — they suppress
+    // a built-in default (e.g. playwright) for this agent and are not written
+    // to settings.json.
     const mcpServers: Record<string, unknown> = {};
 
     // Hindsight first (so it's the most visible to a reader)
@@ -2455,9 +2491,19 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     const switchroomMcpEntry = getSwitchroomMcpSettingsEntry(switchroomConfigPath);
     mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
 
-    // User-defined extras from switchroom.yaml agents.<name>.mcp_servers
+    // Playwright browser automation MCP (built-in default).
+    // Agents can suppress it with `mcp_servers: { playwright: false }`.
+    const playwrightEntry = getPlaywrightMcpSettingsEntry();
+    const playwrightOptOut = (agentConfig.mcp_servers ?? {})[playwrightEntry.key] === false;
+    if (!playwrightOptOut) {
+      mcpServers[playwrightEntry.key] = playwrightEntry.value;
+    }
+
+    // User-defined extras from switchroom.yaml agents.<name>.mcp_servers.
+    // Skip `false` values — those are opt-outs for built-in defaults above.
     if (agentConfig.mcp_servers) {
       for (const [key, value] of Object.entries(agentConfig.mcp_servers)) {
+        if (value === false) continue; // opt-out sentinel — already handled above
         mcpServers[key] = value;
       }
     }
