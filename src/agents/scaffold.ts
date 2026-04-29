@@ -33,7 +33,7 @@ import {
   renderTemplate,
   copyProfileSkills,
 } from "./profiles.js";
-import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry, getPlaywrightMcpSettingsEntry } from "../memory/scaffold-integration.js";
+import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry, getBuiltinDefaultMcpEntries } from "../memory/scaffold-integration.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
@@ -1427,18 +1427,19 @@ export function scaffoldAgent(
         settings.mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
       }
 
-      // Playwright browser automation MCP (built-in default).
-      // Agents can suppress this with `mcp_servers: { playwright: false }` in
-      // switchroom.yaml. Playwright is added as a built-in here AFTER the
-      // template renders user-declared mcp_servers — so this is the only
-      // place that decides whether to wire it in. The opt-out check below
-      // reads the user's mcp_servers map directly to honour `false` even
-      // though that sentinel never reaches the template (filterMcpServers
-      // strips it).
-      const playwrightMcpEntry = getPlaywrightMcpSettingsEntry();
-      const agentOptOut = (agentConfig.mcp_servers ?? {})[playwrightMcpEntry.key] === false;
-      if (!agentOptOut && !settings.mcpServers[playwrightMcpEntry.key]) {
-        settings.mcpServers[playwrightMcpEntry.key] = playwrightMcpEntry.value;
+      // Built-in default MCPs (e.g. playwright). Single source of truth lives
+      // in scaffold-integration.ts so scaffold + `switchroom update` reconcile
+      // stay in sync. Agents can suppress any default with
+      // `mcp_servers: { <key>: false }` in switchroom.yaml; defaults are added
+      // here AFTER the template renders user-declared mcp_servers, and the
+      // opt-out check reads the user's mcp_servers map directly to honour
+      // `false` even though filterMcpServers strips that sentinel before the
+      // template sees it.
+      for (const entry of getBuiltinDefaultMcpEntries()) {
+        const agentOptOut = (agentConfig.mcp_servers ?? {})[entry.optOutKey] === false;
+        if (!agentOptOut && !settings.mcpServers[entry.key]) {
+          settings.mcpServers[entry.key] = entry.value;
+        }
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
@@ -2532,12 +2533,15 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     const switchroomMcpEntry = getSwitchroomMcpSettingsEntry(switchroomConfigPath);
     mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
 
-    // Playwright browser automation MCP (built-in default).
-    // Agents can suppress it with `mcp_servers: { playwright: false }`.
-    const playwrightEntry = getPlaywrightMcpSettingsEntry();
-    const playwrightOptOut = (agentConfig.mcp_servers ?? {})[playwrightEntry.key] === false;
-    if (!playwrightOptOut) {
-      mcpServers[playwrightEntry.key] = playwrightEntry.value;
+    // Built-in default MCPs (e.g. playwright). Single source of truth lives
+    // in scaffold-integration.ts; `switchroom update` reconciles the same
+    // list onto pre-existing agents. Agents opt out via
+    // `mcp_servers: { <key>: false }` in switchroom.yaml.
+    for (const entry of getBuiltinDefaultMcpEntries()) {
+      const optOut = (agentConfig.mcp_servers ?? {})[entry.optOutKey] === false;
+      if (!optOut) {
+        mcpServers[entry.key] = entry.value;
+      }
     }
 
     // User-defined extras from switchroom.yaml agents.<name>.mcp_servers.
