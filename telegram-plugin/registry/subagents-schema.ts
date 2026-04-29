@@ -20,6 +20,7 @@
  *     ended_at            INTEGER          -- nullable until terminal
  *     status              TEXT NOT NULL    -- running | stalled | completed | failed
  *     result_summary      TEXT             -- nullable; set on completion
+ *     jsonl_agent_id      TEXT             -- nullable; JSONL filename stem for watcher ID linkage
  *
  * Status transitions:
  *   running → stalled     (via recordSubagentStall — no ended_at, may resume)
@@ -98,6 +99,8 @@ export interface Subagent {
   ended_at: number | null
   status: SubagentStatus
   result_summary: string | null
+  /** JSONL filename stem (e.g. "a37ad7639ae61476c") for watcher ID linkage. */
+  jsonl_agent_id: string | null
 }
 
 export interface RecordSubagentStartArgs {
@@ -108,6 +111,8 @@ export interface RecordSubagentStartArgs {
   description?: string | null
   background: boolean
   startedAt: number
+  /** JSONL filename stem for watcher liveness linkage. */
+  jsonlAgentId?: string | null
 }
 
 export interface RecordSubagentEndArgs {
@@ -143,18 +148,32 @@ const SUBAGENTS_SCHEMA_SQL = `
     last_activity_at  INTEGER,
     ended_at          INTEGER,
     status            TEXT    NOT NULL,
-    result_summary    TEXT
+    result_summary    TEXT,
+    jsonl_agent_id    TEXT
   );
-  CREATE INDEX IF NOT EXISTS subagents_turn   ON subagents(parent_turn_key);
-  CREATE INDEX IF NOT EXISTS subagents_status ON subagents(status);
+  CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
+  CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
+  CREATE INDEX IF NOT EXISTS subagents_jsonl_id  ON subagents(jsonl_agent_id);
 `
 
 /**
  * Apply the subagents schema to an existing DB. Safe to call on a DB that
  * already has the turns table — uses CREATE IF NOT EXISTS throughout.
+ *
+ * Also runs an ALTER TABLE migration to add `jsonl_agent_id` to pre-existing
+ * tables that were created before this column was introduced.
  */
 export function applySubagentsSchema(db: SqliteDatabase): void {
   db.exec(SUBAGENTS_SCHEMA_SQL)
+  // Idempotent column migration for DBs created before jsonl_agent_id existed.
+  // SQLite's ALTER TABLE ADD COLUMN fails if the column already exists, so we
+  // check pragma_table_info first.
+  const cols = db.prepare("SELECT name FROM pragma_table_info('subagents')").all() as { name: string }[]
+  const hasJsonlId = cols.some((c) => c.name === 'jsonl_agent_id')
+  if (!hasJsonlId) {
+    db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
+    db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +242,7 @@ interface RawSubagentRow {
   ended_at: number | null
   status: string
   result_summary: string | null
+  jsonl_agent_id: string | null
 }
 
 function mapSubagentRow(row: RawSubagentRow): Subagent {
@@ -238,6 +258,7 @@ function mapSubagentRow(row: RawSubagentRow): Subagent {
     ended_at: row.ended_at,
     status: row.status as SubagentStatus,
     result_summary: row.result_summary,
+    jsonl_agent_id: row.jsonl_agent_id,
   }
 }
 
@@ -257,8 +278,8 @@ export function recordSubagentStart(db: SqliteDatabase, args: RecordSubagentStar
   db.prepare(`
     INSERT OR IGNORE INTO subagents
       (id, parent_session_id, parent_turn_key, agent_type, description,
-       background, started_at, last_activity_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running')
+       background, started_at, last_activity_at, status, jsonl_agent_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
   `).run(
     args.id,
     args.parentSessionId ?? null,
@@ -268,7 +289,22 @@ export function recordSubagentStart(db: SqliteDatabase, args: RecordSubagentStar
     args.background ? 1 : 0,
     args.startedAt,
     args.startedAt,
+    args.jsonlAgentId ?? null,
   )
+}
+
+/**
+ * Look up a subagent row by its JSONL filename stem (jsonl_agent_id).
+ * Returns the full row so the watcher can get the tool_use_id PK to pass
+ * to bumpSubagentActivity.
+ *
+ * Returns null if not found.
+ */
+export function getSubagentByJsonlId(db: SqliteDatabase, jsonlAgentId: string): Subagent | null {
+  const row = db
+    .prepare('SELECT * FROM subagents WHERE jsonl_agent_id = ?')
+    .get(jsonlAgentId) as RawSubagentRow | undefined
+  return row ? mapSubagentRow(row) : null
 }
 
 /**

@@ -73,6 +73,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/idle-footer-wiring.test.ts",
       // subagent-tracker-hooks.test.ts uses bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/tests/subagent-tracker-hooks.test.ts",
+      // subagents-bugs.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
+      "**/telegram-plugin/registry/subagents-bugs.test.ts",
     ],
     coverage: {
       provider: "v8",
