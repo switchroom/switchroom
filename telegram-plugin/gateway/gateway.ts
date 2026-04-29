@@ -221,6 +221,7 @@ import {
   findMostRecentInterruptedTurn,
   findRecentTurnsForChat,
 } from '../registry/turns-schema.js'
+import { applySubagentsSchema } from '../registry/subagents-schema.js'
 import { formatIdleFooter } from '../idle-footer.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
@@ -628,6 +629,10 @@ try {
     ? STATE_DIR.slice(0, -'/telegram'.length)
     : STATE_DIR
   turnsDb = openTurnsDb(agentDir)
+  // Apply subagents schema in the same DB. openTurnsDb only applies the turns
+  // schema; subagents lives alongside in registry.db. Idempotent — safe on
+  // pre-existing DBs (handles the jsonl_agent_id column migration).
+  applySubagentsSchema(turnsDb)
   const reaped = markOrphanedAsRestarted(turnsDb)
   if (reaped > 0) {
     process.stderr.write(`telegram gateway: turn-registry boot-reaper stamped ${reaped} orphaned turn(s) as ended_via='restart'\n`)
@@ -7210,6 +7215,10 @@ void (async () => {
           if (watcherAgentDir != null) {
             subagentWatcher = startSubagentWatcher({
               agentDir: watcherAgentDir,
+              // Bug 0 fix: previously omitted, leaving the watcher unable to
+              // write liveness/stall/turn_end updates to the registry DB.
+              // Liveness writes are now persisted across the gateway lifetime.
+              db: turnsDb,
               sendNotification: (text: string) => {
                 const ownerChatId = loadAccess().allowFrom[0]
                 if (!ownerChatId) return

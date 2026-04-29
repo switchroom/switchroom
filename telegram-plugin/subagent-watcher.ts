@@ -35,13 +35,14 @@ import {
   closeSync,
   watch,
   readdirSync,
+  readFileSync,
   type FSWatcher,
 } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
 import { escapeHtml, truncate } from './card-format.js'
-import { bumpSubagentActivity, getSubagent } from './registry/subagents-schema.js'
+import { bumpSubagentActivity, recordSubagentStall, recordSubagentEnd } from './registry/subagents-schema.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -171,6 +172,72 @@ interface FsLike {
   watch: typeof watch
 }
 
+/**
+ * Backfill `jsonl_agent_id` for a sub-agent row that was inserted by the
+ * PreToolUse hook (keyed on tool_use_id) but didn't yet know the JSONL stem.
+ *
+ * Strategy: read the `agent-<id>.meta.json` sibling Claude Code writes next
+ * to each sub-agent JSONL. It carries the same `{ agentType, description }`
+ * pair the parent passed to the Agent() tool. We match that pair to the
+ * most-recent row in `subagents` where `jsonl_agent_id IS NULL` and link them.
+ *
+ * Edge cases:
+ *   - meta.json missing or unreadable: no-op (the row stays unlinked; liveness
+ *     writes from this agent's JSONL won't land, but the system stays correct).
+ *   - Multiple in-flight rows with identical (agent_type, description): the
+ *     most recently started one wins (FIFO matches dispatch order in practice).
+ *   - Row already linked to a different agentId: SQL `WHERE jsonl_agent_id IS
+ *     NULL` skips it. Re-runs are safe.
+ */
+function backfillJsonlAgentId(
+  db: SubagentLivenessDb,
+  jsonlPath: string,
+  agentId: string,
+  log?: (msg: string) => void,
+): void {
+  const metaPath = jsonlPath.replace(/\.jsonl$/, '.meta.json')
+  let meta: { agentType?: string; description?: string }
+  try {
+    const raw = readFileSync(metaPath, 'utf8')
+    meta = JSON.parse(raw)
+  } catch {
+    log?.(`subagent-watcher: backfill skip ${agentId} — meta.json not readable at ${metaPath}`)
+    return
+  }
+  if (!meta.agentType && !meta.description) {
+    log?.(`subagent-watcher: backfill skip ${agentId} — meta.json has no agentType/description`)
+    return
+  }
+
+  // Already linked? Nothing to do.
+  const already = db
+    .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ? LIMIT 1')
+    .get(agentId)
+  if (already != null) return
+
+  // Find the most-recent matching unmatched row.
+  const candidate = db
+    .prepare(`
+      SELECT id FROM subagents
+      WHERE jsonl_agent_id IS NULL
+        AND agent_type IS ?
+        AND description IS ?
+      ORDER BY started_at DESC
+      LIMIT 1
+    `)
+    .get(meta.agentType ?? null, meta.description ?? null) as { id: string } | null
+
+  if (candidate == null) {
+    log?.(`subagent-watcher: backfill no candidate for ${agentId} (type=${meta.agentType} desc=${meta.description})`)
+    return
+  }
+
+  db
+    .prepare('UPDATE subagents SET jsonl_agent_id = ? WHERE id = ?')
+    .run(agentId, candidate.id)
+  log?.(`subagent-watcher: backfill linked ${agentId} → ${candidate.id}`)
+}
+
 function readSubTail(
   entry: WorkerEntry,
   tail: SubTail,
@@ -198,16 +265,20 @@ function readSubTail(
     tail.cursor = stat.size
 
     // Phase 3 (#333): JSONL grew → write liveness update to the registry DB.
-    // The agentId (JSONL filename stem) equals the tool_use_id used as the
-    // DB primary key. If the row doesn't exist yet (Phase 2 Pre hook hasn't
-    // fired), UPDATE is a no-op — log and continue, don't INSERT here.
+    // Bug fix (#1): DB rows are keyed on tool_use_id (e.g. "toolu_…") but the
+    // watcher only knows the JSONL filename stem (e.g. "a37ad763…"). We look up
+    // the row by jsonl_agent_id and bump using the actual tool_use_id PK.
+    // If the row doesn't exist yet (Phase 2 Pre hook hasn't fired), the UPDATE
+    // is a no-op — log and continue, don't INSERT here.
     if (db != null) {
       try {
-        const existing = db.prepare('SELECT id FROM subagents WHERE id = ?').get(entry.agentId)
+        const existing = db
+          .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ?')
+          .get(entry.agentId) as { id: string } | null
         if (existing == null) {
           log?.(`subagent-watcher: liveness skip ${entry.agentId} — row not in DB yet (Phase 2 Pre hook pending)`)
         } else {
-          bumpSubagentActivity(db, { id: entry.agentId, ts: now })
+          bumpSubagentActivity(db, { id: existing.id, ts: now })
         }
       } catch (dbErr) {
         log?.(`subagent-watcher: liveness write error ${entry.agentId}: ${(dbErr as Error).message}`)
@@ -235,6 +306,27 @@ function readSubTail(
         } else if (ev.kind === 'sub_agent_turn_end') {
           if (entry.state === 'running') {
             entry.state = 'done'
+            // Bug 2 fix (#333): mark the DB row completed via watcher's turn_end
+            // observation. This is the authoritative completion signal for
+            // background agents (whose PostToolUse fires on "launched" not "done").
+            // For foreground agents PostToolUse may have already marked the row —
+            // recordSubagentEnd is idempotent so the second write is a safe no-op.
+            if (db != null) {
+              try {
+                const rowRef = db
+                  .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ?')
+                  .get(entry.agentId) as { id: string } | null
+                if (rowRef != null) {
+                  recordSubagentEnd(db, {
+                    id: rowRef.id,
+                    endedAt: now,
+                    status: 'completed',
+                  })
+                }
+              } catch (dbErr) {
+                log?.(`subagent-watcher: turn_end DB write error ${entry.agentId}: ${(dbErr as Error).message}`)
+              }
+            }
           }
         }
       }
@@ -326,6 +418,20 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     }
     registry.set(agentId, entry)
 
+    // Backfill jsonl_agent_id linkage. The PreToolUse hook inserts the row
+    // keyed on tool_use_id and doesn't know the JSONL stem yet (the JSONL
+    // doesn't exist when PreToolUse fires). We bridge that gap here: read
+    // the meta.json sibling Claude Code writes alongside the JSONL, match
+    // the (agentType, description) pair against the most-recent unmatched
+    // row in the registry, and link them by setting jsonl_agent_id.
+    if (db != null && !isHistorical) {
+      try {
+        backfillJsonlAgentId(db, filePath, agentId, log)
+      } catch (err) {
+        log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
+      }
+    }
+
     const tail: SubTail = {
       cursor: 0, // read from start to capture description
       pendingPartial: '',
@@ -408,6 +514,20 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         const desc = escapeHtml(truncate(entry.description, 80))
         const idleSec = Math.floor(idleMs / 1000)
         log?.(`subagent-watcher: stall detected for ${entry.agentId} (idle ${idleSec}s): ${desc}`)
+        // Bug 3 fix (#333): persist the stall into the registry DB.
+        // Look up the row by jsonl_agent_id to get the tool_use_id PK.
+        if (db != null) {
+          try {
+            const rowRef = db
+              .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ?')
+              .get(entry.agentId) as { id: string } | null
+            if (rowRef != null) {
+              recordSubagentStall(db, { id: rowRef.id, stalledAt: n })
+            }
+          } catch (dbErr) {
+            log?.(`subagent-watcher: stall DB write error ${entry.agentId}: ${(dbErr as Error).message}`)
+          }
+        }
       }
     }
   }

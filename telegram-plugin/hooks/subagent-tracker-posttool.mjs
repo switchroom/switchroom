@@ -63,7 +63,15 @@ function detectStatus(toolResponse) {
 
 function extractResultSummary(toolResponse) {
   if (!toolResponse) return null
-  // tool_response.result is the canonical field for PostToolUse
+  // Claude Code's Agent tool wraps text in `content: [{ type: 'text', text }]`.
+  // Try that first since it's the actual production shape.
+  if (Array.isArray(toolResponse.content)) {
+    const textPart = toolResponse.content.find(
+      (c) => c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string',
+    )
+    if (textPart) return textPart.text.slice(0, 200) || null
+  }
+  // Older / alternate shapes.
   const raw =
     toolResponse.result ??
     toolResponse.output ??
