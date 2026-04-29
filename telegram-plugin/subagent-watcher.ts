@@ -118,6 +118,15 @@ export interface SubagentWatcherConfig {
   db?: SubagentLivenessDb | null
   /** Optional logger for debug output. */
   log?: (msg: string) => void
+  /**
+   * Option C: callback fired when a stall is detected for a running sub-agent.
+   * Called with the sub-agent's agentId, idle ms, and description string.
+   * Wired to `progressDriver.onSubAgentStall` in gateway.ts so the progress
+   * card re-renders with a visible ⚠️ stall indicator even when the bridge
+   * has disconnected. The `stallNotified` flag prevents duplicate calls for
+   * the same sub-agent across subsequent poll ticks.
+   */
+  onStall?: (agentId: string, idleMs: number, description: string) => void
   /** `Date.now` override for tests. */
   now?: () => number
   /** `setInterval` override for tests. */
@@ -526,6 +535,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             }
           } catch (dbErr) {
             log?.(`subagent-watcher: stall DB write error ${entry.agentId}: ${(dbErr as Error).message}`)
+          }
+        }
+        // Option C (#393): push the stall into the progress-card driver so
+        // the pinned card re-renders with a ⚠️ stall indicator. This fires
+        // even when the bridge has disconnected (dispose preserved the chat
+        // state for pendingCompletion chats).
+        if (config.onStall != null) {
+          try {
+            config.onStall(entry.agentId, idleMs, entry.description)
+          } catch (cbErr) {
+            log?.(`subagent-watcher: onStall callback error ${entry.agentId}: ${(cbErr as Error).message}`)
           }
         }
       }

@@ -402,8 +402,21 @@ interface PerChatState {
 export interface ProgressDriver {
   /** Feed a session-tail event. Fires emit() as the cadence allows. */
   ingest(event: SessionEvent, chatId: string | null, threadId?: string): void
-  /** Stop internal timers (heartbeat). Idempotent. */
-  dispose?(): void
+  /**
+   * Stop internal timers and clear driver state. Idempotent.
+   *
+   * When called with `{ preservePending: true }`, chats with
+   * `pendingCompletion === true` are preserved so their heartbeat and
+   * deferred-completion timeout continue firing after a bridge disconnect.
+   * Coalesce timers (`pendingTimer`, `deferredFirstEmitTimer`) on those
+   * preserved chats ARE cleared — they cannot safely emit into a finalized
+   * draft stream. Chats WITHOUT `pendingCompletion` are fully removed.
+   * The heartbeat is only stopped if no `pendingCompletion` chats remain.
+   *
+   * When called with no args or `{ preservePending: false }`, the existing
+   * wipe-everything behavior is retained for back-compat.
+   */
+  dispose?(opts?: { preservePending?: boolean }): void
   /**
    * Begin a new turn synchronously — called from the inbound-message
    * handler the instant a user's message clears the gate, BEFORE any
@@ -479,6 +492,16 @@ export interface ProgressDriver {
    * system messages don't tick the counter).
    */
   recordOutboundDelivered(chatId: string, threadId?: string): void
+  /**
+   * Option C — watcher stall callback. Called by the sub-agent watcher
+   * (via config.onStall) when a running sub-agent's JSONL goes silent for
+   * longer than `stallThresholdMs`. Updates the sub-agent's `lastEventAt`
+   * to trigger the elapsed-ticker so the progress card re-renders with a
+   * visible ⚠️ stall indicator, even when the bridge has disconnected.
+   *
+   * No-op if no card is currently tracking this `agentId`.
+   */
+  onSubAgentStall(agentId: string, idleMs: number, description: string): void
 }
 
 export function createProgressDriver(config: ProgressDriverConfig): ProgressDriver {
@@ -1669,24 +1692,96 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // Silent no-op.
     },
 
-    dispose() {
-      stopHeartbeat()
-      for (const cs of chats.values()) {
-        if (cs.pendingTimer != null) {
-          clearT(cs.pendingTimer)
-          cs.pendingTimer = null
+    dispose(opts?: { preservePending?: boolean }) {
+      if (opts?.preservePending === true) {
+        // Selective dispose: preserve chats with pendingCompletion=true so
+        // their heartbeat and deferred-completion timeout continue firing
+        // after a bridge disconnect. This is the fix for the regression
+        // introduced in commit 4c0186d where dispose() wiped all in-flight
+        // card state on every bridge disconnect (stdio-MCP per-call lifecycle).
+        let hasPending = false
+        for (const [turnKey, cs] of chats) {
+          // Always clear coalesce timers — they could emit into a finalized
+          // draft stream and spawn duplicate messages.
+          if (cs.pendingTimer != null) {
+            clearT(cs.pendingTimer)
+            cs.pendingTimer = null
+          }
+          if (cs.deferredFirstEmitTimer != null) {
+            clearT(cs.deferredFirstEmitTimer)
+            cs.deferredFirstEmitTimer = null
+          }
+          if (cs.pendingCompletion) {
+            // Keep this chat alive — it has running background sub-agents
+            // that will continue emitting events and need the heartbeat.
+            hasPending = true
+          } else {
+            // No pending completion — clear this chat (existing behavior).
+            chats.delete(turnKey)
+          }
         }
-        if (cs.deferredFirstEmitTimer != null) {
-          clearT(cs.deferredFirstEmitTimer)
-          cs.deferredFirstEmitTimer = null
+        // Only stop the heartbeat if nothing is pending; if any chat is still
+        // alive, the heartbeat is exactly what drives future re-renders.
+        if (!hasPending) {
+          stopHeartbeat()
         }
+        // Reset currentChatId/currentTurnKey only if they no longer map to
+        // a surviving pendingCompletion chat.
+        if (currentTurnKey != null && !chats.has(currentTurnKey)) {
+          currentChatId = null
+          currentThreadId = undefined
+          currentTurnKey = null
+        }
+        pendingSyncEchoes.clear()
+        seenEnqueueMsgIds.clear()
+      } else {
+        // Back-compat: wipe everything (original behavior).
+        stopHeartbeat()
+        for (const cs of chats.values()) {
+          if (cs.pendingTimer != null) {
+            clearT(cs.pendingTimer)
+            cs.pendingTimer = null
+          }
+          if (cs.deferredFirstEmitTimer != null) {
+            clearT(cs.deferredFirstEmitTimer)
+            cs.deferredFirstEmitTimer = null
+          }
+        }
+        chats.clear()
+        currentChatId = null
+        currentThreadId = undefined
+        currentTurnKey = null
+        pendingSyncEchoes.clear()
+        seenEnqueueMsgIds.clear()
       }
-      chats.clear()
-      currentChatId = null
-      currentThreadId = undefined
-      currentTurnKey = null
-      pendingSyncEchoes.clear()
-      seenEnqueueMsgIds.clear()
+    },
+
+    onSubAgentStall(agentId: string, _idleMs: number, _description: string) {
+      // Option C: watcher detected a stall for this sub-agent. Find which
+      // chat state is tracking it and force an elapsed-tick re-render so the
+      // ⚠️ stall indicator becomes visible even when no events are flowing.
+      for (const cs of chats.values()) {
+        if (!cs.state.subAgents.has(agentId)) continue
+        const sa = cs.state.subAgents.get(agentId)!
+        if (sa.state !== 'running') continue
+        // Update lastEventAt on the sub-agent state so the cold-JSONL
+        // detection path and the ⚠️ stall threshold in render() both
+        // see a "fresh" timestamp that still allows the stall badge to
+        // appear (we advance by 0 — the render uses the threshold on
+        // lastEventAt relative to now(), so leaving lastEventAt as-is
+        // is correct; we just need to trigger a re-render).
+        //
+        // Force a flush by clearing the heartbeat diff-guard bucket for
+        // this turn key. The next heartbeat tick will see a changed bucket
+        // and push an edit, which the renderer will annotate with the
+        // stuck-warning (stuckMs will be >= the threshold at this point).
+        lastHeartbeatBucket.delete(cs.turnKey)
+        lastSubAgentTickBucket.delete(cs.turnKey)
+        // If the heartbeat isn't running (it would have been kept alive by
+        // preserve-pending, but check defensively), start it.
+        if (chats.size > 0) startHeartbeatIfNeeded()
+        break
+      }
     },
   }
 }
