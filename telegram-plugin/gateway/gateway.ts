@@ -213,6 +213,10 @@ import {
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
+import {
+  openTurnsDb,
+  markOrphanedAsRestarted,
+} from '../registry/turns-schema.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -576,6 +580,31 @@ if (HISTORY_ENABLED) {
   } catch (err) {
     process.stderr.write(`telegram gateway: history init failed (${(err as Error).message}) — capture disabled\n`)
   }
+}
+
+// ─── Turn-tracking registry (Stage 3a of simplify-restart, Phase 0 of #250) ─
+// On boot, open the per-agent registry.db and stamp any rows that never got
+// an ended_at as ended_via='restart'. Those are turns where the previous
+// gateway died mid-flight (SIGKILL / OOM / hard reboot — any path that
+// skipped the SIGTERM handler). Stages 3b/3c will populate new rows during
+// turn enqueue/end and on graceful shutdown; Stage 4 reads on cold start.
+let turnsDb: ReturnType<typeof openTurnsDb> | null = null
+try {
+  // STATE_DIR is `<agentDir>/telegram` in production. openTurnsDb expects
+  // the parent (agent dir) and joins `telegram/registry.db` itself.
+  const agentDir = STATE_DIR.endsWith('/telegram')
+    ? STATE_DIR.slice(0, -'/telegram'.length)
+    : STATE_DIR
+  turnsDb = openTurnsDb(agentDir)
+  const reaped = markOrphanedAsRestarted(turnsDb)
+  if (reaped > 0) {
+    process.stderr.write(`telegram gateway: turn-registry boot-reaper stamped ${reaped} orphaned turn(s) as ended_via='restart'\n`)
+  } else {
+    process.stderr.write(`telegram gateway: turn-registry initialized at ${join(agentDir, 'telegram', 'registry.db')}\n`)
+  }
+} catch (err) {
+  process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
+  turnsDb = null
 }
 
 // ─── Approval polling ─────────────────────────────────────────────────────
