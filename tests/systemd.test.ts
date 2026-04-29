@@ -73,20 +73,20 @@ describe("generateUnit", () => {
 
   // Regression test for issue #116: three klanker hangs in 10h where the
   // agent climbed past 1 GB RSS and froze — systemd still reported
-  // active (running) with no auto-recovery. MemoryMax=2G gives a hard
-  // ceiling; MemoryHigh=1536M triggers kernel reclaim first; both together
+  // active (running) with no auto-recovery. MemoryMax=8G gives a hard
+  // ceiling; MemoryHigh=6G triggers kernel reclaim first; both together
   // with Restart=on-failure guarantee the agent self-heals after OOM.
-  it("declares MemoryMax=2G and MemoryHigh=1536M for memory ceiling (issue #116)", () => {
+  it("declares MemoryMax=8G and MemoryHigh=6G for memory ceiling (issue #116)", () => {
     const unit = generateUnit("test", "/tmp/test");
-    expect(unit).toContain("MemoryMax=2G");
-    expect(unit).toContain("MemoryHigh=1536M");
+    expect(unit).toContain("MemoryMax=8G");
+    expect(unit).toContain("MemoryHigh=6G");
   });
 
   it("places MemoryMax and MemoryHigh in the [Service] section", () => {
     const unit = generateUnit("test", "/tmp/test");
     const serviceSection = unit.split("[Service]")[1].split("[Install]")[0];
-    expect(serviceSection).toContain("MemoryMax=2G");
-    expect(serviceSection).toContain("MemoryHigh=1536M");
+    expect(serviceSection).toContain("MemoryMax=8G");
+    expect(serviceSection).toContain("MemoryHigh=6G");
   });
 
   it("places StartLimitBurst and StartLimitIntervalSec in [Unit] section, not [Service]", () => {
