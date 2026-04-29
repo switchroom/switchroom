@@ -62,6 +62,19 @@ describe('REACTION_VARIANTS', () => {
       }
     }
   })
+
+  it('🔥 is not in active-work states (queued/tool/coding/web) — #320', () => {
+    const activeWorkStates = ['queued', 'tool', 'coding', 'web'] as const
+    for (const state of activeWorkStates) {
+      expect(REACTION_VARIANTS[state]).not.toContain('🔥')
+    }
+  })
+
+  it('done includes at least one positive completion emoji (👍 or 💯)', () => {
+    const done = REACTION_VARIANTS['done']
+    const hasPositive = done.includes('👍') || done.includes('💯')
+    expect(hasPositive).toBe(true)
+  })
 })
 
 describe('StatusReactionController', () => {
@@ -247,9 +260,9 @@ describe('StatusReactionController', () => {
     const allowed = new Set(['👍', '🔥'])
     const ctrl = new StatusReactionController(emit, allowed)
 
-    ctrl.setQueued() // wants 👀, falls back to 🔥 (3rd queued variant) ... actually 👀 → fallback chain
+    ctrl.setQueued() // wants 👀, then 🤔, then 🤓 — none allowed; broad fallback picks 👍
     await flush()
-    // 👀 is not allowed, 👍 is the second queued variant → 👍
+    // 👀, 🤔, 🤓 — none in allowed; broad fallback hits 👍 → 👍
     expect(calls).toEqual(['👍'])
 
     ctrl.setThinking() // wants 🤔, falls back through variants, then generic — none in allowed

@@ -4,7 +4,7 @@
  * Ports the pattern from openclaw's src/channels/status-reactions.ts +
  * extensions/telegram/src/status-reaction-variants.ts. The goal is to give
  * the user a glanceable, non-spammy progress signal on their inbound
- * message: 👀 received → 🤔 thinking → 🔥/👨‍💻/⚡ working → 👍 done → 😱 error.
+ * message: 👀 received → 🤔 thinking → ✍/👨‍💻/⚡ working → 👍 done → 😱 error.
  *
  * Three load-bearing properties (all from openclaw research):
  *
@@ -58,22 +58,30 @@ export type ReactionState =
  * Per-state emoji preference, with fallbacks if the first isn't allowed
  * in this particular chat. Modeled on openclaw's
  * TELEGRAM_STATUS_REACTION_VARIANTS.
+ *
+ * Semantic split — do not conflate these three tiers:
+ *   READ     👀  = "I have seen your message" (acknowledgement only)
+ *   WORKING  ✍   = actively doing something (tools, coding, compacting)
+ *   FINISHED 👍/💯/🎉 = definitively done; a reply landed
+ *
+ * 🔥 is reserved for genuine 5xx server errors (operator-events.ts).
+ * It reads as "on fire / broken" — keep it out of normal active-work states.
  */
 export const REACTION_VARIANTS: Record<ReactionState, string[]> = {
-  queued:    ['👀', '👍', '🔥'],
-  thinking:  ['🤔', '🤓', '👀'],
-  tool:      ['🔥', '⚡', '👍'],
-  coding:    ['👨‍💻', '🔥', '⚡'],
-  web:       ['⚡', '🔥', '👍'],
-  compacting:['✍', '🤔', '👀'],
-  done:      ['👍', '🎉', '💯'],
+  queued:    ['👀', '🤔', '🤓'],     // READ: I see your message
+  thinking:  ['🤔', '🤓', '👀'],     // unchanged
+  tool:      ['✍', '⚡', '👌'],      // WORKING: actively using a tool
+  coding:    ['👨‍💻', '✍', '⚡'],     // WORKING: writing / running code
+  web:       ['⚡', '👀', '👌'],      // WORKING: lookup in motion
+  compacting:['✍', '🤔', '👀'],      // unchanged
+  done:      ['👍', '💯', '🎉'],      // FINISHED: reply landed
   // 🙊 — turn ended without producing a user-visible reply. Distinct from
   // 'done' (which means "reply landed") so the user doesn't read 👍 as
   // "agent acknowledged" when actually nothing was sent. See issue #132.
-  silent:    ['🙊', '🤔', '😐'],
-  error:     ['😱', '😨', '🤯'],
-  stallSoft: ['🥱', '😴', '🤔'],
-  stallHard: ['😨', '🤯', '😱'],
+  silent:    ['🙊', '🤔', '😐'],      // unchanged
+  error:     ['😱', '😨', '🤯'],      // unchanged (genuine alarm)
+  stallSoft: ['🥱', '😴', '🤔'],      // unchanged
+  stallHard: ['😨', '🤯', '😱'],      // unchanged
 }
 
 /**
@@ -264,7 +272,7 @@ export class StatusReactionController {
       }
     }
     // Last resort: any whitelisted-and-allowed emoji from the broad fallback set
-    for (const v of ['👍', '👀', '🔥']) {
+    for (const v of ['👍', '👀', '✍']) {
       if (this.allowedReactions == null || this.allowedReactions.has(v)) {
         return v
       }
