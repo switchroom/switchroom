@@ -1758,6 +1758,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       defaultFormat: access.parseMode ?? 'html',
       logStreamingEvent,
       endStatusReaction,
+      // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
+      // so the terminal render sees outboundDeliveredCount > 0. The handler
+      // calls this dep in that order internally.
+      recordOutboundDelivered: (chatId, threadId) => {
+        progressDriver?.recordOutboundDelivered(
+          chatId,
+          threadId != null ? String(threadId) : undefined,
+        )
+      },
       forceCompleteTurn: (chatId, threadId) => {
         progressDriver?.forceCompleteTurn({
           chatId,

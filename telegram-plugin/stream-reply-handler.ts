@@ -176,6 +176,18 @@ export interface StreamReplyDeps {
    * re-entry). Safe to leave unset for callers that don't use the driver.
    */
   forceCompleteTurn?: (chatId: string, threadId: number | undefined) => void
+  /**
+   * Optional: progress-card driver delivery counter hook. Wired by the
+   * gateway to `progressDriver.recordOutboundDelivered(...)`. Called
+   * BEFORE `forceCompleteTurn` so the driver's per-turn outbound counter
+   * is non-zero when the terminal render fires. Without this ordering
+   * guarantee, `forceCompleteTurn` flushes the card while
+   * `outboundDeliveredCount === 0` → ⚠️ false positive (issue #310).
+   * Only called on the default (unnamed) lane when `done=true` and the
+   * stream produced a non-null messageId. Safe to leave unset for callers
+   * that don't use the driver.
+   */
+  recordOutboundDelivered?: (chatId: string, threadId: number | undefined) => void
   /** Whether to persist outbound history. */
   historyEnabled: boolean
   /** History row writer. Only called when historyEnabled && done && messageId != null. */
@@ -458,13 +470,32 @@ export async function handleStreamReply(
   const finalMessageId = stream.getMessageId()
   if (done) {
     process.stderr.write(`telegram channel: stream_reply: finalized done=true chatId=${chat_id} lane=${args.lane ?? 'default'} messageId=${finalMessageId ?? 'null'}\n`)
+    const isDefaultLaneForCompletion = args.lane == null || args.lane.length === 0
+    // Issue #310: record delivery BEFORE forceCompleteTurn so the
+    // progress-card driver's outboundDeliveredCount is non-zero when the
+    // terminal render fires. forceCompleteTurn synchronously flushes the
+    // card; if we recorded after that flush, outboundDeliveredCount would
+    // still be 0 at render time → ⚠️ false positive even though the
+    // message landed. Only record when a messageId is confirmed — a null
+    // id means the send never succeeded and the ⚠️ branch is correct.
+    if (
+      deps.recordOutboundDelivered != null
+      && finalMessageId != null
+      && isDefaultLaneForCompletion
+    ) {
+      try {
+        deps.recordOutboundDelivered(chat_id, threadId)
+      } catch (err) {
+        deps.writeError(`telegram channel: stream_reply: recordOutboundDelivered hook threw: ${err}\n`)
+      }
+    }
     // Fire the authoritative turn-complete signal to the progress-card
     // driver so any in-flight card for this chat is closed out alongside
     // the final answer landing. Only for the default (unnamed) lane —
     // the progress lane is the driver's own emit path and routing
     // completion through it would re-enter the driver from within its
     // own flush. Idempotent on the driver side: first caller wins.
-    if (deps.forceCompleteTurn != null && (args.lane == null || args.lane.length === 0)) {
+    if (deps.forceCompleteTurn != null && isDefaultLaneForCompletion) {
       try {
         deps.forceCompleteTurn(chat_id, threadId)
       } catch (err) {

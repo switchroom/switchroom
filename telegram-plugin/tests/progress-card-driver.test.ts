@@ -248,6 +248,51 @@ describe('progress-card driver', () => {
     expect(emits[0].html).toContain('✅ <b>Done</b>')
   })
 
+  it('issue #310: recordOutboundDelivered BEFORE forceCompleteTurn → ✅ Done, not ⚠️', () => {
+    // Regression for the delivery-record race: when stream_reply(done=true)
+    // fires forceCompleteTurn from inside the handler, the terminal render
+    // must see outboundDeliveredCount > 0. The fix records delivery first,
+    // then invokes forceCompleteTurn. This test simulates that ordering
+    // directly against the driver so the render outcome can be asserted.
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__stream_reply' }, 'c1')
+    emits.length = 0
+
+    // Simulate the fixed ordering: delivery recorded first, then the
+    // turn-complete signal fires. Before the fix this order was reversed
+    // (recordOutboundDelivered happened AFTER handleStreamReply resolved)
+    // so the render saw outboundDeliveredCount=0 → ⚠️ false positive.
+    driver.recordOutboundDelivered('c1')          // step 1: delivery confirmed
+    driver.forceCompleteTurn({ chatId: 'c1' })    // step 2: terminal flush
+
+    // Terminal emit must be ✅ Done, never ⚠️.
+    expect(emits).toHaveLength(1)
+    expect(emits[0].done).toBe(true)
+    expect(emits[0].html).toContain('✅ <b>Done</b>')
+    expect(emits[0].html).not.toContain('⚠️')
+    expect(emits[0].html).not.toContain('Reply attempted but not delivered')
+  })
+
+  it('issue #310 (negative): wrong order — forceCompleteTurn before recordOutboundDelivered → ⚠️', () => {
+    // Documents the race that the fix eliminates: if forceCompleteTurn fires
+    // before recordOutboundDelivered the card renders ⚠️. This test proves
+    // the ordering matters, giving confidence that the positive test above
+    // actually validates the fix rather than passing trivially.
+    const { driver, emits } = harness()
+    driver.ingest(enqueue('c1'), null)
+    driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__stream_reply' }, 'c1')
+    emits.length = 0
+
+    // Wrong (pre-fix) order: forceCompleteTurn fires while count is still 0.
+    driver.forceCompleteTurn({ chatId: 'c1' })    // step 1: terminal flush (count=0)
+    driver.recordOutboundDelivered('c1')          // step 2: too late — card already committed
+
+    expect(emits[0].done).toBe(true)
+    expect(emits[0].html).toContain('⚠️ <b>Reply attempted but not delivered</b>')
+    expect(emits[0].html).not.toContain('✅ <b>Done</b>')
+  })
+
   it('coalesces bursts of non-stage-changing events', () => {
     const { driver, emits, advance } = harness(500, 400)
     driver.ingest(enqueue('c1'), null) // emit #1
