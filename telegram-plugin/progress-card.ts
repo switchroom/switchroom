@@ -175,9 +175,34 @@ export interface PendingAgentSpawn {
 export interface NarrativeStep {
   readonly id: number
   readonly text: string
-  readonly state: 'done' | 'active'
+  /**
+   * State machine:
+   * - `active`: the narrative step is currently the latest, actively narrating.
+   * - `done`: the step is complete (next text event or turn_end fired, and no
+   *   background sub-agents are pending).
+   * - `awaiting-subagent`: the step dispatched one or more background
+   *   sub-agents (Agent/Task tool_use) that haven't reached terminal state
+   *   yet. Rendered identically to `active` (◉) so the card never shows
+   *   "done" while sub-agents are still running. Transitions to `done` once
+   *   all entries in `awaitingSubAgentIds` have completed.
+   */
+  readonly state: 'done' | 'active' | 'awaiting-subagent'
   readonly startedAt: number
   readonly toolCount: number
+  /**
+   * Agent/Task `toolUseId`s from the parent turn that this narrative step
+   * triggered but whose sub-agents haven't yet been correlated (i.e. the
+   * `sub_agent_started` event hasn't landed yet). When correlation arrives,
+   * the entry migrates from here to `awaitingSubAgentIds`. Allows the step
+   * to know about in-flight spawns even before the sub-agent JSONL appears.
+   */
+  readonly pendingAgentToolUseIds: ReadonlyArray<string>
+  /**
+   * `agentId`s of sub-agents spawned during this narrative step that are
+   * still running. When this set becomes empty and the step is in
+   * `awaiting-subagent` state, it flips to `done`.
+   */
+  readonly awaitingSubAgentIds: ReadonlyArray<string>
 }
 
 export interface ProgressCardState {
@@ -265,6 +290,36 @@ export function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boole
 
 // ─── Reducer ────────────────────────────────────────────────────────────────
 
+/**
+ * Decide what state an `active` NarrativeStep should transition to when it
+ * would normally flip to `done` (on a new `text` event or `turn_end`).
+ *
+ * If the narrative has dispatched background sub-agents that are still
+ * running (i.e. `awaitingSubAgentIds` overlap with sub-agents in `running`
+ * state, or `pendingAgentToolUseIds` haven't yet been correlated), we keep
+ * it in `awaiting-subagent` rather than immediately marking it `done`.
+ *
+ * Foreground Agent/Task calls complete before the tool_result returns, so
+ * they won't appear in `awaitingSubAgentIds` by the time we reach here —
+ * those flip straight to `done` as before (#324 fix, no regression).
+ */
+function narrativeTransitionFromActive(
+  n: NarrativeStep,
+  subAgents: ReadonlyMap<string, SubAgentState>,
+): NarrativeStep {
+  // Any still-running sub-agents this narrative is waiting for?
+  const hasRunningAwaited = n.awaitingSubAgentIds.some(
+    id => subAgents.get(id)?.state === 'running',
+  )
+  // Any agent tool_use that hasn't yet been correlated to a sub_agent_started?
+  // (Rare race: tool_use fired but sub_agent_started hasn't landed yet.)
+  const hasPendingCorrelation = n.pendingAgentToolUseIds.length > 0
+  if (hasRunningAwaited || hasPendingCorrelation) {
+    return { ...n, state: 'awaiting-subagent' }
+  }
+  return { ...n, state: 'done' }
+}
+
 function extractNarrativeLabel(text: string): string {
   const trimmed = text.trim()
   if (!trimmed) return ''
@@ -312,7 +367,7 @@ export function reduce(
         return { ...state, latestText: event.text, thinking: false, pendingPreamble }
       }
       const prevNarratives = state.narratives.map(n =>
-        n.state === 'active' ? { ...n, state: 'done' as const } : n,
+        n.state === 'active' ? narrativeTransitionFromActive(n, state.subAgents) : n,
       )
       const newNarrative: NarrativeStep = {
         id: prevNarratives.length,
@@ -320,6 +375,8 @@ export function reduce(
         state: 'active',
         startedAt: now,
         toolCount: 0,
+        pendingAgentToolUseIds: [],
+        awaitingSubAgentIds: [],
       }
       return {
         ...state,
@@ -422,7 +479,20 @@ export function reduce(
       if (narratives.length > 0) {
         const last = narratives[narratives.length - 1]
         if (last.state === 'active') {
-          narratives = [...narratives.slice(0, -1), { ...last, toolCount: last.toolCount + 1 }]
+          const isAgentCall =
+            (event.toolName === 'Agent' || event.toolName === 'Task') &&
+            !!event.toolUseId
+          const updatedLast: NarrativeStep = {
+            ...last,
+            toolCount: last.toolCount + 1,
+            // When the active narrative just triggered a background Agent/Task
+            // call, record the toolUseId so that when sub_agent_started
+            // correlates it, we can link the sub-agent to this narrative step.
+            pendingAgentToolUseIds: isAgentCall
+              ? [...last.pendingAgentToolUseIds, event.toolUseId!]
+              : last.pendingAgentToolUseIds,
+          }
+          narratives = [...narratives.slice(0, -1), updatedLast]
         }
       }
       // Cap the raw item history. Only the last MAX_VISIBLE_ITEMS are
@@ -571,7 +641,23 @@ export function reduce(
         const pendingCount = state.pendingAgentSpawns.size
         process.stderr.write(`telegram gateway: progress-card: sub_agent_started agentId=${event.agentId} correlated=orphan pendingSpawns=${pendingCount} promptSnip="${promptSnip}" — NOTE: orphan sub-agents no longer gate parent turn_end defer (#31 fix)\n`)
       }
-      return { ...state, subAgents, pendingAgentSpawns, items }
+      // Gate parent narrative steps: if a narrative has a pendingAgentToolUseId
+      // matching this new sub-agent's parentToolUseId, migrate it from
+      // pendingAgentToolUseIds → awaitingSubAgentIds so the narrative knows
+      // which agentId to watch for completion (fixes #324).
+      const narratives = parentToolUseId != null
+        ? state.narratives.map(n => {
+            if (n.pendingAgentToolUseIds.includes(parentToolUseId)) {
+              return {
+                ...n,
+                pendingAgentToolUseIds: n.pendingAgentToolUseIds.filter(id => id !== parentToolUseId),
+                awaitingSubAgentIds: [...n.awaitingSubAgentIds, event.agentId],
+              }
+            }
+            return n
+          })
+        : state.narratives
+      return { ...state, subAgents, pendingAgentSpawns, items, narratives }
     }
 
     case 'sub_agent_text': {
@@ -672,7 +758,24 @@ export function reduce(
         pendingPreamble: null,
         milestoneVersion: (sa.milestoneVersion ?? 0) + 1,
       })
-      return { ...state, subAgents: next }
+      // Gate parent narrative steps (#324): remove this agentId from any
+      // narrative step's awaitingSubAgentIds. If a step's awaiting list
+      // becomes empty (all sub-agents done) and the step is in
+      // `awaiting-subagent` state, flip it to `done`.
+      const narratives = state.narratives.map(n => {
+        if (!n.awaitingSubAgentIds.includes(event.agentId)) return n
+        const remaining = n.awaitingSubAgentIds.filter(id => id !== event.agentId)
+        // Keep pendingAgentToolUseIds in mind: those migrate to awaitingSubAgentIds
+        // when their sub_agent_started fires. Only flip to done when BOTH
+        // lists are empty.
+        const allDone = remaining.length === 0 && n.pendingAgentToolUseIds.length === 0
+        return {
+          ...n,
+          awaitingSubAgentIds: remaining,
+          state: (n.state === 'awaiting-subagent' && allDone) ? ('done' as const) : n.state,
+        }
+      })
+      return { ...state, subAgents: next, narratives }
     }
 
     case 'sub_agent_nested_spawn': {
@@ -703,8 +806,12 @@ export function reduce(
           subAgents.set(k, { ...sa, pendingPreamble: null })
         }
       }
+      // At turn_end, pass the up-to-date subAgents map (built above) so
+      // narrativeTransitionFromActive can see which sub-agents are still
+      // running. Active narratives that dispatched background sub-agents
+      // become `awaiting-subagent`; the rest become `done` (#324).
       const narratives = state.narratives.map(n =>
-        n.state === 'active' ? { ...n, state: 'done' as const } : n,
+        n.state === 'active' ? narrativeTransitionFromActive(n, subAgents) : n,
       )
       return {
         ...state,
@@ -1118,16 +1225,15 @@ function renderNarrativeChecklist(
   }
   const visible = narratives.slice(-MAX_VISIBLE_ITEMS)
   for (const step of visible) {
-    if (step.state === 'active') {
+    if (step.state === 'active' || step.state === 'awaiting-subagent') {
       const age = now - step.startedAt
       const dur = formatDuration(age)
-      // When an active narrative is older than the stuck threshold, the
-      // "No events for X" banner will already be rendered above. A
-      // confidently-bolded narrative with a ticking age next to it sends
-      // mixed signals ("stuck" vs "actively working on X"). De-emphasise
-      // the narrative to italic with a `stale` marker so the signals
-      // agree: the last announced step, not necessarily what's running
-      // right now.
+      // When an active (or awaiting-subagent) narrative is older than the
+      // stuck threshold, the "No events for X" banner will already be rendered
+      // above. A confidently-bolded narrative with a ticking age next to it
+      // sends mixed signals ("stuck" vs "actively working on X"). De-emphasise
+      // the narrative to italic with a `stale` marker so the signals agree:
+      // the last announced step, not necessarily what's running right now.
       if (age > STUCK_THRESHOLD_MS) {
         lines.push(`${STEP_ACTIVE} <i>${escapeHtml(step.text)} · stale (${dur})</i>`)
       } else {
