@@ -61,6 +61,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/setup-state.test.ts",
       // registry-turns.test.ts uses bun:sqlite — excluded here, run via test:bun.
       "**/telegram-plugin/tests/registry-turns.test.ts",
+      // subagents.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
+      "**/telegram-plugin/registry/subagents.test.ts",
     ],
     coverage: {
       provider: "v8",
