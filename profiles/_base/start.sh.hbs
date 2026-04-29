@@ -166,6 +166,32 @@ if [ -n "$_RESUME_LATEST_JSONL" ]; then
 fi
 export SWITCHROOM_PRIOR_SESSION_EPOCH
 
+# --- Pending-turn signal (Stage 4 of simplify-restart, see #250) ---
+#
+# The gateway writes <agentDir>/.pending-turn.env on boot if the previous
+# shutdown left an interrupted turn (ended_via='restart' / 'sigterm' /
+# 'timeout' or never closed at all). Source it here so the agent process
+# inherits SWITCHROOM_PENDING_TURN=true plus chat/thread/last-user-msg
+# context. The agent's resume protocol (per-agent CLAUDE.md) reads these
+# and decides whether to ack the interruption + ask for direction or
+# silently continue.
+#
+# Consume the file (rm) so it only applies to ONE boot — multi-restart
+# scenarios shouldn't re-fire the resume prompt repeatedly.
+SWITCHROOM_PENDING_TURN_ENV="{{agentDir}}/.pending-turn.env"
+if [ -f "$SWITCHROOM_PENDING_TURN_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$SWITCHROOM_PENDING_TURN_ENV"
+  rm -f "$SWITCHROOM_PENDING_TURN_ENV"
+  export SWITCHROOM_PENDING_TURN \
+         SWITCHROOM_PENDING_TURN_KEY \
+         SWITCHROOM_PENDING_CHAT_ID \
+         SWITCHROOM_PENDING_THREAD_ID \
+         SWITCHROOM_PENDING_USER_MSG_ID \
+         SWITCHROOM_PENDING_ENDED_VIA \
+         SWITCHROOM_PENDING_STARTED_AT
+fi
+
 {{#if handoffEnabled}}
 # --- Session handoff briefing ---
 # On a normal shutdown the Stop hook writes .handoff.md (compact

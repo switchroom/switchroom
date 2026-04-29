@@ -306,3 +306,27 @@ export function markOrphanedAsRestarted(db: SqliteDatabase): number {
   `).run(now, now) as { changes: number }
   return result.changes
 }
+
+/**
+ * Find the single most-recently-started turn that ended via an interrupt
+ * (`'restart'` | `'sigterm'` | `'timeout'`) OR is still open
+ * (`ended_at IS NULL`). Used by Stage 4 to surface "you had pending work"
+ * to the agent on cold start.
+ *
+ * Returns null if no such turn exists (clean boot — last turn ended 'stop').
+ *
+ * Note on ordering: we use `started_at DESC` (not `updated_at`) so the
+ * boot-time reaper (which mass-stamps orphans with the SAME `ended_at` /
+ * `updated_at`) doesn't reorder them; the temporal "last turn" is what
+ * the user remembers, and that's `started_at`.
+ */
+export function findMostRecentInterruptedTurn(db: SqliteDatabase): Turn | null {
+  const row = db.prepare(`
+    SELECT * FROM turns
+    WHERE ended_at IS NULL
+       OR ended_via IN ('restart', 'sigterm', 'timeout')
+    ORDER BY started_at DESC
+    LIMIT 1
+  `).get() as RawTurnRow | undefined
+  return row ? mapRow(row) : null
+}

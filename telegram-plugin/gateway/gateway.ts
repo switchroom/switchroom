@@ -218,6 +218,7 @@ import {
   markOrphanedAsRestarted,
   recordTurnStart,
   recordTurnEnd,
+  findMostRecentInterruptedTurn,
 } from '../registry/turns-schema.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
@@ -603,6 +604,36 @@ try {
     process.stderr.write(`telegram gateway: turn-registry boot-reaper stamped ${reaped} orphaned turn(s) as ended_via='restart'\n`)
   } else {
     process.stderr.write(`telegram gateway: turn-registry initialized at ${join(agentDir, 'telegram', 'registry.db')}\n`)
+  }
+
+  // Stage 4: surface the most-recently-interrupted turn to start.sh as a
+  // shell-sourceable env file. The agent's start.sh reads this on next
+  // boot, exports the env vars to the spawned `claude` process, and
+  // deletes the file (one-shot — only ever applies to the immediately
+  // following session). If there's no interrupted turn (clean previous
+  // shutdown), we delete any stale file so the resume protocol doesn't
+  // mis-fire.
+  const pendingEnvPath = join(agentDir, '.pending-turn.env')
+  try {
+    const pending = findMostRecentInterruptedTurn(turnsDb)
+    if (pending != null) {
+      const lines = [
+        `SWITCHROOM_PENDING_TURN=true`,
+        `SWITCHROOM_PENDING_TURN_KEY=${pending.turn_key}`,
+        `SWITCHROOM_PENDING_CHAT_ID=${pending.chat_id}`,
+        pending.thread_id != null ? `SWITCHROOM_PENDING_THREAD_ID=${pending.thread_id}` : `SWITCHROOM_PENDING_THREAD_ID=`,
+        pending.last_user_msg_id != null ? `SWITCHROOM_PENDING_USER_MSG_ID=${pending.last_user_msg_id}` : `SWITCHROOM_PENDING_USER_MSG_ID=`,
+        `SWITCHROOM_PENDING_ENDED_VIA=${pending.ended_via ?? 'unknown'}`,
+        `SWITCHROOM_PENDING_STARTED_AT=${pending.started_at}`,
+      ]
+      writeFileSync(pendingEnvPath, lines.join('\n') + '\n', { mode: 0o600 })
+      process.stderr.write(`telegram gateway: pending-turn env written to ${pendingEnvPath} turnKey=${pending.turn_key} endedVia=${pending.ended_via ?? 'open'}\n`)
+    } else if (existsSync(pendingEnvPath)) {
+      rmSync(pendingEnvPath, { force: true })
+      process.stderr.write(`telegram gateway: pending-turn env cleared (clean previous shutdown)\n`)
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: pending-turn env write failed (${(err as Error).message}) — resume protocol may not fire\n`)
   }
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)

@@ -18,6 +18,7 @@ import {
   recordTurnEnd,
   findOrphanedTurns,
   markOrphanedAsRestarted,
+  findMostRecentInterruptedTurn,
 } from '../registry/turns-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -345,6 +346,87 @@ describe('markOrphanedAsRestarted', () => {
   it('is safe to call on an empty DB (returns 0, no error)', () => {
     const db = openTurnsDbInMemory()
     expect(markOrphanedAsRestarted(db)).toBe(0)
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// findMostRecentInterruptedTurn
+// ---------------------------------------------------------------------------
+
+describe('findMostRecentInterruptedTurn', () => {
+  it('returns null when no turns exist', () => {
+    const db = openTurnsDbInMemory()
+    expect(findMostRecentInterruptedTurn(db)).toBeNull()
+    db.close()
+  })
+
+  it('returns null when the only turn ended cleanly via stop', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: '888:1', chatId: '888' })
+    recordTurnEnd(db, { turnKey: '888:1', endedVia: 'stop' })
+    expect(findMostRecentInterruptedTurn(db)).toBeNull()
+    db.close()
+  })
+
+  it('returns an open turn (ended_at IS NULL) as interrupted', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: '999:1', chatId: '999', lastUserMsgId: 'msg-1' })
+    const t = findMostRecentInterruptedTurn(db)
+    expect(t).not.toBeNull()
+    expect(t!.turn_key).toBe('999:1')
+    expect(t!.last_user_msg_id).toBe('msg-1')
+    db.close()
+  })
+
+  it('returns a sigterm-stamped turn as interrupted', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'aaa:1', chatId: 'aaa' })
+    recordTurnEnd(db, { turnKey: 'aaa:1', endedVia: 'sigterm' })
+    const t = findMostRecentInterruptedTurn(db)
+    expect(t).not.toBeNull()
+    expect(t!.ended_via).toBe('sigterm')
+    db.close()
+  })
+
+  it('returns a restart-stamped turn as interrupted', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'bbb:1', chatId: 'bbb' })
+    recordTurnEnd(db, { turnKey: 'bbb:1', endedVia: 'restart' })
+    const t = findMostRecentInterruptedTurn(db)
+    expect(t).not.toBeNull()
+    expect(t!.ended_via).toBe('restart')
+    db.close()
+  })
+
+  it('picks the most-recently-started across multiple interrupted turns', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'ccc:1', chatId: 'ccc' })
+    // Different started_at by waiting one ms; bun:sqlite stores the
+    // recordTurnStart call's Date.now() so we use raw insert below to be
+    // deterministic.
+    db.exec(`UPDATE turns SET started_at = 1000 WHERE turn_key = 'ccc:1'`)
+    recordTurnStart(db, { turnKey: 'ccc:2', chatId: 'ccc' })
+    db.exec(`UPDATE turns SET started_at = 2000 WHERE turn_key = 'ccc:2'`)
+    recordTurnEnd(db, { turnKey: 'ccc:1', endedVia: 'restart' })
+    recordTurnEnd(db, { turnKey: 'ccc:2', endedVia: 'sigterm' })
+    const t = findMostRecentInterruptedTurn(db)
+    expect(t).not.toBeNull()
+    expect(t!.turn_key).toBe('ccc:2')
+    db.close()
+  })
+
+  it('skips a clean stop and picks an older interrupted turn', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'ddd:1', chatId: 'ddd' })
+    db.exec(`UPDATE turns SET started_at = 1000 WHERE turn_key = 'ddd:1'`)
+    recordTurnStart(db, { turnKey: 'ddd:2', chatId: 'ddd' })
+    db.exec(`UPDATE turns SET started_at = 2000 WHERE turn_key = 'ddd:2'`)
+    recordTurnEnd(db, { turnKey: 'ddd:1', endedVia: 'sigterm' })
+    recordTurnEnd(db, { turnKey: 'ddd:2', endedVia: 'stop' })
+    const t = findMostRecentInterruptedTurn(db)
+    expect(t).not.toBeNull()
+    expect(t!.turn_key).toBe('ddd:1')
     db.close()
   })
 })
