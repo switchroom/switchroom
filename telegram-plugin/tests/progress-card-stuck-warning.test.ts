@@ -208,13 +208,12 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     expect(postHasWarning).toBe(false);
   });
 
-  it("heartbeat keeps ticking while sub-agent outlives parent turn_end", () => {
-    // Regression: pre-fix, the heartbeat skipped any card with
-    // `state.stage === 'done'` — which the reducer sets the moment
-    // turn_end fires, even when sub-agents are still running. Result:
-    // user saw a frozen "✅ Done" card with stopped elapsed time while
-    // a sub-agent ground away. Post-fix the heartbeat only skips when
-    // BOTH stage='done' AND !hasAnyRunningSubAgent (display gate).
+  it("heartbeat keeps card pinned while sub-agent outlives parent turn_end (#313 Gap 8)", () => {
+    // Post-#313: parent `turn_end` immediately renders the final card with
+    // ✅ Done in the header (decoupled from unpin). The card stays pinned —
+    // onTurnComplete fires only when the last running sub-agent finishes
+    // OR the deferred-completion timeout expires. Heartbeat still ticks so
+    // the sub-agent's per-row elapsed advances visibly.
     //
     // Note: this scenario exercises a CORRELATED sub-agent — the parent
     // tool_use's `prompt` matches sub_agent_started's `firstPromptText`
@@ -222,7 +221,11 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
     // orphan sub-agents (parentToolUseId == null) no longer gate the
     // defer at turn_end — the card closes immediately for those.
     // Correlated sub-agents like this one DO keep the card alive.
-    const { driver, emits, advance } = harness({ heartbeatMs: 5_000 });
+    const completions: Array<{ chatId: string; turnKey: string }> = [];
+    const { driver, emits, advance } = harness({
+      heartbeatMs: 5_000,
+      onTurnComplete: ({ chatId, turnKey }) => completions.push({ chatId, turnKey }),
+    });
     driver.ingest(enqueue("c1"), null);
     // Start a background Agent sub-agent. `prompt` matches firstPromptText
     // below so correlation succeeds and parentToolUseId is set.
@@ -244,23 +247,30 @@ describe("progress-card driver — stuck warning propagation via heartbeat", () 
       },
       "c1",
     );
-    // Parent turn ends while sub-agent still running.
+    // Parent turn ends while sub-agent still running. Per Gap 8, this
+    // produces an immediate ✅ Done render but does NOT fire onTurnComplete.
     driver.ingest({ kind: "turn_end", durationMs: 500 }, "c1");
     const emitsAtTurnEnd = emits.length;
-    // Tick a few heartbeats forward. The sub-agent is still running, so
-    // hasAnyRunningSubAgent gates the defer and the card stays alive — the
-    // heartbeat re-renders as the elapsed-time bucket advances.
+    expect(completions.length).toBe(0); // unpin deferred
+    // The most recent emit at turn_end carries the ✅ Done header.
+    expect(emits[emits.length - 1].html).toContain("✅");
+    // Tick heartbeats forward. The sub-agent is still running, so the card
+    // stays alive and heartbeat re-renders as the sub-agent's elapsed advances.
     advance(20_000);
     const postHeartbeatEmits = emits.length;
     expect(postHeartbeatEmits).toBeGreaterThan(emitsAtTurnEnd);
-    // None of those heartbeat emits should carry done=true — the card
-    // is still waiting on the sub-agent.
     const heartbeatEmits = emits.slice(emitsAtTurnEnd);
+    // Heartbeat emits are non-terminal (not done=true) — terminal already fired
+    // at turn_end. The card stays pinned; unpin is the separate deferred path.
     expect(heartbeatEmits.every((e) => e.done === false)).toBe(true);
-    // And the header should still say "Working…" (⚙️), not "✅ Done".
+    // Heartbeat keeps ✅ Done in the header (parent committed at turn_end);
+    // sub-agent rows underneath still show 🤖 running.
     const lastHeartbeat = heartbeatEmits[heartbeatEmits.length - 1];
-    expect(lastHeartbeat.html).toContain("⚙️");
-    expect(lastHeartbeat.html).not.toContain("✅");
+    expect(lastHeartbeat.html).toContain("✅");
+    expect(lastHeartbeat.html).toContain("🤖");
+    // Still no unpin signal — onTurnComplete only fires when sub-agent finishes
+    // (natural) or the deferred-completion timeout expires.
+    expect(completions.length).toBe(0);
   });
 
   it("zombie ceiling force-closes a card whose lastEventAt is older than maxIdleMs", () => {

@@ -348,9 +348,13 @@ describe('progress-card integration harness', () => {
       now = target
     }
 
-    // Start turn + issue one tool_use, then go idle (simulates Task running).
+    // Start turn + issue one tool_use, then go idle (simulates a long-running
+    // tool such as a slow Bash command). Use a non-dispatching tool (Bash, not
+    // Task/Agent) so the heartbeat scenario isn't perturbed by #313 Gap 3
+    // orphan promotion creating a synthetic sub-agent that would defer the
+    // turn_end terminal emit.
     driver.startTurn({ chatId: 'c1', userText: 'do thing' })
-    driver.ingest({ kind: 'tool_use', toolName: 'Task', toolUseId: 't_task', input: {} } as SessionEvent, 'c1')
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't_bash', input: { command: 'sleep 30' } } as SessionEvent, 'c1')
     advance(100) // let coalesce flush
 
     const countBeforeIdle = emits.length

@@ -2575,3 +2575,210 @@ describe('issue #259: autonomous wakeup turns skip silent-end warning', () => {
     expect(emits[0].html).not.toContain('✅ <b>Done</b>')
   })
 })
+
+describe('issue #313: sub-agent visibility leaks — regression tests', () => {
+  /**
+   * Gap 3 (orphan promotion): A PendingAgentSpawn sitting > 5s without a
+   * matching sub_agent_started must be promoted to a synthetic sub-agent
+   * row so the work is visible on the card.
+   */
+  it('Gap 3 — orphan promoted to sub-agent row after 5s heartbeat', () => {
+    const emitted: Array<unknown> = []
+    const { driver, emits, advance } = harness(0, 0, {
+      heartbeatMs: 1000,
+      initialDelayMs: 0,
+      onTurnComplete: (args) => emitted.push(args),
+    })
+    // Override defaults: use a short orphanPromotionMs so the test doesn't
+    // need a real 5s fake-clock advance. We do this by re-creating the
+    // driver with a custom config via the extended harness options below.
+    // Since harness() doesn't expose orphanPromotionMs, we use a separate
+    // driver instance here with a fast threshold.
+    let nowMs = 1000
+    const timers2: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef2 = 0
+    const emits2: Array<{ html: string; done: boolean }> = []
+    const driver2 = createProgressDriver({
+      emit: (a) => emits2.push(a),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: 1000,
+      initialDelayMs: 0,
+      orphanPromotionMs: 5000,
+      now: () => nowMs,
+      setTimeout: (fn, ms) => { const ref = nextRef2++; timers2.push({ fireAt: nowMs + ms, fn, ref }); return { ref } },
+      clearTimeout: (handle) => { const t = (handle as { ref: number }).ref; const i = timers2.findIndex(x => x.ref === t); if (i !== -1) timers2.splice(i, 1) },
+      setInterval: (fn, ms) => { const ref = nextRef2++; timers2.push({ fireAt: nowMs + ms, fn, ref, repeat: ms }); return { ref } },
+      clearInterval: (handle) => { const t = (handle as { ref: number }).ref; const i = timers2.findIndex(x => x.ref === t); if (i !== -1) timers2.splice(i, 1) },
+    })
+    const advanceMs = (ms: number) => {
+      nowMs += ms
+      for (;;) {
+        timers2.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers2[0]
+        if (!next || next.fireAt > nowMs) break
+        if (next.repeat != null) { next.fireAt += next.repeat; next.fn() }
+        else { timers2.shift(); next.fn() }
+      }
+    }
+
+    // Enqueue and dispatch an Agent tool_use — creates a PendingAgentSpawn.
+    driver2.ingest(enqueue('c'), null)
+    driver2.ingest({
+      kind: 'tool_use',
+      toolName: 'Agent',
+      toolUseId: 'spawn1',
+      input: { description: 'Analyse logs', prompt: 'Please analyse the logs' },
+    }, 'c')
+
+    // At t=0 no sub_agent_started arrives — simulating watcher race.
+    const htmlBefore = emits2[emits2.length - 1]?.html ?? ''
+    // The pending spawn should NOT yet be in subAgents (no sub_agent_started).
+    expect(htmlBefore).not.toContain('orphan-spawn1')
+
+    // Advance 4s — orphan threshold not yet reached.
+    advanceMs(4000)
+    const htmlAt4s = emits2[emits2.length - 1]?.html ?? ''
+    // Synthetic sub-agent must not exist yet (still pending, no sub_agent_started).
+    expect(htmlAt4s).not.toContain('orphan-spawn1')
+
+    // Advance 2 more seconds (6s total > 5s threshold) — heartbeat fires promotion.
+    advanceMs(2000)
+    const htmlAt6s = emits2[emits2.length - 1]?.html ?? ''
+    // After promotion the synthetic sub-agent row must be visible. Renderer
+    // produces a `<blockquote expandable>🤖 📂 #orphan-spawn1 …` block
+    // containing the description from the pending spawn ("Analyse logs").
+    expect(htmlAt6s).toContain('orphan-spawn1')
+    expect(htmlAt6s).toContain('Analyse logs')
+  })
+
+  /**
+   * Gap 4 (cold-JSONL detection): a running sub-agent whose lastEventAt is
+   * > 30s old must receive a synthetic sub_agent_turn_end so the deferred
+   * completion path can proceed.
+   */
+  it('Gap 4 — cold JSONL causes synthetic sub_agent_turn_end and deferred completion fires', () => {
+    const emitted: Array<unknown> = []
+    let nowMs = 1000
+    const timers3: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef3 = 0
+    const emits3: Array<{ html: string; done: boolean }> = []
+    const driver3 = createProgressDriver({
+      emit: (a) => emits3.push(a),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: 5000,
+      initialDelayMs: 0,
+      coldSubAgentThresholdMs: 30_000,
+      onTurnComplete: (args) => emitted.push(args),
+      now: () => nowMs,
+      setTimeout: (fn, ms) => { const ref = nextRef3++; timers3.push({ fireAt: nowMs + ms, fn, ref }); return { ref } },
+      clearTimeout: (handle) => { const t = (handle as { ref: number }).ref; const i = timers3.findIndex(x => x.ref === t); if (i !== -1) timers3.splice(i, 1) },
+      setInterval: (fn, ms) => { const ref = nextRef3++; timers3.push({ fireAt: nowMs + ms, fn, ref, repeat: ms }); return { ref } },
+      clearInterval: (handle) => { const t = (handle as { ref: number }).ref; const i = timers3.findIndex(x => x.ref === t); if (i !== -1) timers3.splice(i, 1) },
+    })
+    const advanceMs3 = (ms: number) => {
+      nowMs += ms
+      for (;;) {
+        timers3.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers3[0]
+        if (!next || next.fireAt > nowMs) break
+        if (next.repeat != null) { next.fireAt += next.repeat; next.fn() }
+        else { timers3.shift(); next.fn() }
+      }
+    }
+
+    driver3.ingest(enqueue('c'), null)
+    driver3.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p2', input: { description: 'bg', prompt: 'P' } }, 'c')
+    driver3.ingest({ kind: 'sub_agent_started', agentId: 'sa1', firstPromptText: 'P' }, 'c')
+    // Parent turn_end while sa1 is still running → pendingCompletion=true.
+    driver3.ingest({ kind: 'turn_end', durationMs: 1000 }, 'c')
+
+    expect(emitted).toHaveLength(0) // deferred — sa1 still running
+
+    // Simulate JSONL watcher silence: no events for 35s.
+    // The heartbeat (every 5s) fires 7 times → after 35s coldSubAgentThresholdMs (30s) triggers.
+    advanceMs3(35_000)
+
+    // Synthetic sub_agent_turn_end should have fired and unblocked completion.
+    expect(emitted).toHaveLength(1)
+    // Final emit must be done=true.
+    const last = emits3[emits3.length - 1]
+    expect(last?.done).toBe(true)
+  })
+
+  /**
+   * Gap 8 (decoupled render and unpin):
+   *   1. Parent turn_end fires while a sub-agent is still running.
+   *   2. The immediate flush must render done=true (✅ Done header) without
+   *      waiting for the sub-agent.
+   *   3. After deferredCompletionTimeoutMs the heartbeat force-closes with
+   *      the "Stalled — forced close" header and fires onTurnComplete.
+   */
+  it('Gap 8 — turn_end renders ✅ Done immediately; force-unpin fires after deferred timeout', () => {
+    const emitted: Array<unknown> = []
+    let nowMs = 1000
+    const timers4: Array<{ fireAt: number; fn: () => void; ref: number; repeat?: number }> = []
+    let nextRef4 = 0
+    const emits4: Array<{ html: string; done: boolean }> = []
+    const driver4 = createProgressDriver({
+      emit: (a) => emits4.push(a),
+      minIntervalMs: 0,
+      coalesceMs: 0,
+      heartbeatMs: 5000,
+      initialDelayMs: 0,
+      // Disable cold-JSONL so Gap 4 doesn't fire before Gap 8 timeout.
+      coldSubAgentThresholdMs: 0,
+      // Short deferred timeout for the test.
+      deferredCompletionTimeoutMs: 60_000,
+      onTurnComplete: (args) => emitted.push(args),
+      now: () => nowMs,
+      setTimeout: (fn, ms) => { const ref = nextRef4++; timers4.push({ fireAt: nowMs + ms, fn, ref }); return { ref } },
+      clearTimeout: (handle) => { const t = (handle as { ref: number }).ref; const i = timers4.findIndex(x => x.ref === t); if (i !== -1) timers4.splice(i, 1) },
+      setInterval: (fn, ms) => { const ref = nextRef4++; timers4.push({ fireAt: nowMs + ms, fn, ref, repeat: ms }); return { ref } },
+      clearInterval: (handle) => { const t = (handle as { ref: number }).ref; const i = timers4.findIndex(x => x.ref === t); if (i !== -1) timers4.splice(i, 1) },
+    })
+    const advanceMs4 = (ms: number) => {
+      nowMs += ms
+      for (;;) {
+        timers4.sort((a, b) => a.fireAt - b.fireAt)
+        const next = timers4[0]
+        if (!next || next.fireAt > nowMs) break
+        if (next.repeat != null) { next.fireAt += next.repeat; next.fn() }
+        else { timers4.shift(); next.fn() }
+      }
+    }
+
+    driver4.ingest(enqueue('c'), null)
+    driver4.ingest({ kind: 'tool_use', toolName: 'Agent', toolUseId: 'p3', input: { description: 'bg', prompt: 'Q' } }, 'c')
+    driver4.ingest({ kind: 'sub_agent_started', agentId: 'sa2', firstPromptText: 'Q' }, 'c')
+
+    const emitsBefore = emits4.length
+
+    // Parent turn_end while sa2 is still running.
+    driver4.ingest({ kind: 'turn_end', durationMs: 500 }, 'c')
+
+    // Gap 8 assertion 1: the immediate flush on turn_end must render ✅ Done.
+    const afterTurnEnd = emits4.slice(emitsBefore)
+    expect(afterTurnEnd.length).toBeGreaterThanOrEqual(1)
+    const turnEndEmit = afterTurnEnd[afterTurnEnd.length - 1]
+    // Gap 8: header must show ✅ Done immediately (parentDone renders it).
+    expect(turnEndEmit?.html).toContain('✅ <b>Done</b>')
+    // done flag remains false while sub-agents are still running — the
+    // notification-spam guard prevents premature unpin. The HTML header
+    // shows Done (parentDone) but the emit.done=false defers the actual unpin.
+    expect(turnEndEmit?.done).toBe(false)
+
+    // Sub-agent still running → onTurnComplete must NOT have fired yet.
+    expect(emitted).toHaveLength(0)
+
+    // Gap 8 assertion 2: after deferredCompletionTimeoutMs the heartbeat
+    // force-closes with "Stalled — forced close" and fires onTurnComplete.
+    advanceMs4(65_000) // > 60s timeout
+
+    expect(emitted).toHaveLength(1)
+    const stalledEmit = emits4[emits4.length - 1]
+    expect(stalledEmit?.html).toContain('Stalled')
+    expect(stalledEmit?.done).toBe(true)
+  })
+})

@@ -194,6 +194,35 @@ export interface ProgressDriverConfig {
    * Default 3. Set to 0 to disable the escalation mechanism entirely.
    */
   maxConsecutive4xx?: number
+  /**
+   * Gap 3 (orphan promotion): how long a `PendingAgentSpawn` must be
+   * outstanding before the heartbeat promotes it to a synthesised
+   * sub-agent row (state='running'). Gives the sub-agent JSONL watcher a
+   * chance to deliver the real `sub_agent_started` event first.
+   *
+   * Default 5000 (5 seconds). Set to 0 to disable promotion entirely.
+   */
+  orphanPromotionMs?: number
+  /**
+   * Gap 4 (cold-JSONL detection): when a running sub-agent's last event
+   * is older than this threshold, the heartbeat synthesises a
+   * `sub_agent_turn_end` for it so the deferred-completion path can
+   * proceed (avoids the card staying pinned forever on a dead watcher).
+   *
+   * Default 30000 (30 seconds). Set to 0 to disable the synthetic close.
+   */
+  coldSubAgentThresholdMs?: number
+  /**
+   * Gap 8 (decoupled render and unpin): after `turn_end` arrives while
+   * sub-agents are still running, this is the maximum ms to wait before
+   * force-closing the card with a "stalled — forced close" header and
+   * calling `onTurnComplete`. This is separate from `maxIdleMs` (which
+   * watches for absence of ALL events) — this timeout starts specifically
+   * on parent `turn_end` and fires regardless of sub-agent activity.
+   *
+   * Default 180000 (3 minutes). Set to 0 to disable.
+   */
+  deferredCompletionTimeoutMs?: number
 }
 
 /**
@@ -328,6 +357,26 @@ interface PerChatState {
    * fires once per turn even if multiple sites call into the helper.
    */
   silentEndPrepared: boolean
+  /**
+   * Gap 8 (decoupled render and unpin): set to the timestamp when parent
+   * `turn_end` landed while sub-agents were still running. Used by the
+   * heartbeat to enforce `deferredCompletionTimeoutMs`. Null until
+   * parent turn_end with in-flight sub-agents is observed.
+   */
+  parentTurnEndAt: number | null
+  /**
+   * Gap 8: true once the parent-done render (✅ Done header with sub-agents
+   * still visible) has been emitted. Prevents re-rendering the ✅ Done
+   * frame on every sub-agent event while deferred.
+   */
+  parentDoneRendered: boolean
+  /**
+   * Gap 3 (orphan promotion): set of toolUseIds from `pendingAgentSpawns`
+   * that have already been promoted to synthetic sub-agent rows. Guards
+   * against re-promotion on successive heartbeat ticks and against
+   * double-registration if a real `sub_agent_started` arrives later.
+   */
+  promotedSpawnIds: Set<string>
 }
 
 export interface ProgressDriver {
@@ -446,6 +495,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
   const initialDelayMs = config.initialDelayMs ?? 30_000
   const maxConsecutive4xx = config.maxConsecutive4xx ?? 3
+  const orphanPromotionMs = config.orphanPromotionMs ?? 5_000
+  const coldSubAgentThresholdMs = config.coldSubAgentThresholdMs ?? 30_000
+  const deferredCompletionTimeoutMs = config.deferredCompletionTimeoutMs ?? 3 * 60_000
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
@@ -679,6 +731,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // Deferring the close keeps Map iteration safe and lets us batch
       // the cleanup.
       const zombies: PerChatState[] = []
+      // Gap 3: pendingAgentSpawns that need orphan promotion this tick.
+      const orphanPromotions: PerChatState[] = []
+      // Gap 4: running sub-agents whose JSONL watcher appears cold.
+      const coldSubAgents: Array<{ cs: PerChatState; agentId: string }> = []
+      // Gap 8: cards where the deferred-completion timeout has expired.
+      const stalledCards: PerChatState[] = []
       for (const [, cs] of chats) {
         // Skip only when TRULY done. During the deferred-completion
         // window (parent turn_end fired but sub-agents — correlated or
@@ -697,6 +755,43 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           zombies.push(cs)
           continue
         }
+
+        // Gap 3 — orphan promotion: if any PendingAgentSpawn has been
+        // waiting longer than orphanPromotionMs without a matching
+        // sub_agent_started, promote it to a synthesised sub-agent row so
+        // the work is at least visible on the card.
+        if (orphanPromotionMs > 0 && cs.state.pendingAgentSpawns.size > 0) {
+          for (const [toolUseId, pending] of cs.state.pendingAgentSpawns) {
+            if (!cs.promotedSpawnIds.has(toolUseId) && now() - pending.startedAt >= orphanPromotionMs) {
+              orphanPromotions.push(cs)
+              break
+            }
+          }
+        }
+
+        // Gap 4 — cold-JSONL detection: if a running sub-agent hasn't
+        // emitted an event for coldSubAgentThresholdMs, synthesise a
+        // sub_agent_turn_end so the deferred-completion path can proceed.
+        if (coldSubAgentThresholdMs > 0 && cs.pendingCompletion) {
+          for (const [agentId, sa] of cs.state.subAgents) {
+            if (sa.state === 'running' && sa.lastEventAt != null && now() - sa.lastEventAt >= coldSubAgentThresholdMs) {
+              coldSubAgents.push({ cs, agentId })
+            }
+          }
+        }
+
+        // Gap 8 — deferred-completion timeout: if the parent turn_end fired
+        // but sub-agents never finished within deferredCompletionTimeoutMs,
+        // force-close with a "stalled" header.
+        if (
+          deferredCompletionTimeoutMs > 0
+          && cs.parentTurnEndAt != null
+          && now() - cs.parentTurnEndAt >= deferredCompletionTimeoutMs
+        ) {
+          stalledCards.push(cs)
+          continue
+        }
+
         // Skip heartbeat while the chat is hot — sub-agent bursts are
         // already producing edits, the elapsed counter is ticking from
         // those, and an extra heartbeat edit just spends budget. (Design
@@ -717,7 +812,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // never called for this card). Distinct from silentEnd because the
         // agent TRIED — the failure is in the delivery layer, not the model.
         const replyNotDelivered = cs.replyToolCalled && cs.outboundDeliveredCount === 0
-        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered })
+        // Gap 8: pass parentDone to renderer during the deferred-unpin window.
+        const parentDone = cs.parentTurnEndAt != null && hasAnyRunningSubAgent(cs.state)
+        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered, parentDone })
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
         if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
@@ -735,6 +832,65 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         })
       }
       for (const cs of zombies) closeZombie(cs)
+
+      // Gap 3: promote stale PendingAgentSpawns to synthetic sub-agent rows.
+      for (const cs of orphanPromotions) {
+        for (const [toolUseId, pending] of cs.state.pendingAgentSpawns) {
+          if (cs.promotedSpawnIds.has(toolUseId)) continue
+          if (now() - pending.startedAt < orphanPromotionMs) continue
+          cs.promotedSpawnIds.add(toolUseId)
+          const syntheticId = `orphan-${toolUseId}`
+          process.stderr.write(
+            `telegram gateway: progress-card: orphan-promotion toolUseId=${toolUseId} syntheticId=${syntheticId} description="${pending.description}" (Gap 3 #313)\n`,
+          )
+          // Synthesise a sub_agent_started event — drives the reducer's
+          // existing sub_agent_started path (adds to subAgents, removes
+          // from pendingAgentSpawns, links checklist item via spawnedAgentId).
+          cs.state = reduce(cs.state, {
+            kind: 'sub_agent_started',
+            agentId: syntheticId,
+            firstPromptText: pending.promptText,
+          }, now())
+          cs.lastEventAt = now()
+          flush(cs, false)
+        }
+      }
+
+      // Gap 4: synthesise sub_agent_turn_end for cold-JSONL sub-agents.
+      for (const { cs, agentId } of coldSubAgents) {
+        process.stderr.write(
+          `telegram gateway: progress-card: cold-jsonl-synth-turn-end agentId=${agentId} turnKey=${cs.turnKey} (Gap 4 #313)\n`,
+        )
+        cs.state = reduce(cs.state, { kind: 'sub_agent_turn_end', agentId }, now())
+        cs.lastEventAt = now()
+        maybeCompleteDeferredTurn(cs)
+        if (!cs.completionFired) flush(cs, false)
+      }
+
+      // Gap 8: force-close cards whose deferred-completion timeout has expired.
+      for (const cs of stalledCards) {
+        process.stderr.write(
+          `telegram gateway: progress-card: deferred-completion-timeout-expired turnKey=${cs.turnKey} deferredCompletionTimeoutMs=${deferredCompletionTimeoutMs} (Gap 8 #313)\n`,
+        )
+        // Mark all still-running sub-agents as done first so that the emit's
+        // `done` flag is true (the notification-spam guard suppresses done=true
+        // while sub-agents are running). The renderer still shows
+        // "⚠️ Stalled — forced close" because stalledClose=true now overrides
+        // trulyDone in progress-card.ts.
+        if (hasAnyRunningSubAgent(cs.state)) {
+          const closed = new Map(cs.state.subAgents)
+          const nowMs = now()
+          for (const [k, sa] of closed) {
+            if (sa.state === 'running') {
+              closed.set(k, { ...sa, state: 'done', finishedAt: nowMs, pendingPreamble: null })
+            }
+          }
+          cs.state = { ...cs.state, subAgents: closed }
+        }
+        prepareSilentEndSuppression(cs)
+        flush(cs, /*forceDone*/ true, /*stalledClose*/ true)
+        completeTurnFully(cs)
+      }
       // Evict stale dedup entries to prevent unbounded map growth.
       const t60 = now() - 60_000
       for (const [k, ts] of seenEnqueueMsgIds) {
@@ -787,7 +943,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   }
 
   const DELAY_ELAPSED = 'elapsed'
-  function flush(chatState: PerChatState, forceDone: boolean): void {
+  function flush(chatState: PerChatState, forceDone: boolean, stalledClose = false): void {
     // If this card has hit the permanent-failure threshold, don't attempt
     // any more edits. Avoids log spam and pointless retries for deleted
     // messages / blocked bots.
@@ -831,11 +987,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       !chatState.replyToolCalled && !chatState.wasAutonomous && !chatState.silentEndSuppressed
     const replyNotDelivered =
       chatState.replyToolCalled && chatState.outboundDeliveredCount === 0
+    // Gap 8: during the deferred-unpin window (parent turn_end fired but
+    // sub-agents still running), show ✅ Done in the parent header immediately.
+    const parentDone = chatState.parentTurnEndAt != null && hasAnyRunningSubAgent(chatState.state)
     const html = render(
       chatState.state,
       now(),
       taskNum.total > 1 ? taskNum : undefined,
-      { stuckMs, silentEnd, replyNotDelivered },
+      { stuckMs, silentEnd, replyNotDelivered, parentDone, stalledClose },
     )
     // Issue #81 diagnostic: which checklist branch is the renderer taking?
     // The card prefers `narratives` (human preambles) over `items` (raw
@@ -1048,6 +1207,9 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           wasAutonomous: false,
           silentEndSuppressed: false,
           silentEndPrepared: false,
+          parentTurnEndAt: null,
+          parentDoneRendered: false,
+          promotedSpawnIds: new Set(),
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1142,6 +1304,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           if (!hasAnyRunningSubAgent(chatState.state)) {
             prepareSilentEndSuppression(chatState)
           }
+        }
+        if (event.kind === 'turn_end' && hasAnyRunningSubAgent(chatState.state)) {
+          // Gap 8: parent turn_end with sub-agents still running — render
+          // done=true immediately (card shows ✅ Done) then defer unpin.
+          // Set parentTurnEndAt BEFORE flush so flush()'s parentDone
+          // computation picks it up on this very call.
+          chatState.parentTurnEndAt = now()
         }
         flush(chatState, /*forceDone*/ event.kind === 'turn_end')
         if (event.kind === 'turn_end') {

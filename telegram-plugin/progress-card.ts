@@ -148,6 +148,15 @@ export interface SubAgentState {
   }
   /** Sub-sub-agents observed (rendered as `(spawned N)` only, not as rows). */
   readonly nestedSpawnCount: number
+  /**
+   * Gap 4 (cold-JSONL detection): wall-clock ms of the most recent sub-agent
+   * event (sub_agent_tool_use, sub_agent_tool_result, sub_agent_text, etc.).
+   * Set on every event that updates this sub-agent's state. When the driver
+   * observes that a running sub-agent's `lastEventAt` is more than
+   * `coldSubAgentThresholdMs` (default 30s) in the past, it synthesises a
+   * `sub_agent_turn_end` so the deferred-completion path can proceed.
+   */
+  readonly lastEventAt?: number
 }
 
 /**
@@ -547,6 +556,7 @@ export function reduce(
         firstPromptText: event.firstPromptText,
         nestedSpawnCount: 0,
         milestoneVersion: 1,
+        lastEventAt: now,
       }
       const subAgents = new Map(state.subAgents)
       subAgents.set(event.agentId, sub)
@@ -581,6 +591,7 @@ export function reduce(
         // chain. Once set, never overwrite — we want the sub-agent's
         // initial framing, not its latest chatter.
         firstNarrativeText: sa.firstNarrativeText ?? event.text,
+        lastEventAt: now,
       })
       return { ...state, subAgents: next }
     }
@@ -609,6 +620,7 @@ export function reduce(
             }
           : sa.currentTool,
         pendingPreamble: null,
+        lastEventAt: now,
       })
       return { ...state, subAgents: next }
     }
@@ -637,6 +649,7 @@ export function reduce(
           currentTool: undefined,
           lastCompletedTool: justFinished,
           toolCount: sa.toolCount + 1,
+          lastEventAt: now,
         })
         return { ...state, subAgents: next }
       }
@@ -878,6 +891,22 @@ export interface RenderOptions {
    * "⚠️ Reply attempted but not delivered".
    */
   replyNotDelivered?: boolean
+  /**
+   * Gap 8 (decoupled render and unpin): when true, the parent turn has
+   * ended (turn_end received) but sub-agents are still running. The
+   * renderer shows "✅ Done" in the parent header immediately rather than
+   * "⚙️ Working…", while sub-agent rows still show their running state.
+   * Distinct from `silentEnd` / `replyNotDelivered` — those apply only
+   * on true terminal state. This flag applies during the deferred-unpin
+   * window.
+   */
+  parentDone?: boolean
+  /**
+   * Gap 8 (stalled forced close): when true, the deferred-completion
+   * timeout fired (sub-agents never reported done). Render a "stalled"
+   * header rather than "✅ Done" to signal forced closure.
+   */
+  stalledClose?: boolean
 }
 
 /**
@@ -930,15 +959,32 @@ export function render(
   const trulyDone = state.stage === 'done' && !hasAnyRunningSubAgent(state)
   const silentEnd = trulyDone && opts?.silentEnd === true
   const replyNotDelivered = trulyDone && !silentEnd && opts?.replyNotDelivered === true
+  // Gap 8: parentDone is set when parent turn_end fired but sub-agents are still
+  // running (deferred-unpin window). Show ✅ Done header immediately without
+  // waiting for sub-agents. stalledClose takes precedence — forced timeout close.
+  // stalledClose is allowed even when trulyDone=true (the stalled-close flush
+  // may run after sub-agents are explicitly marked done for cleanup purposes).
+  const parentDone = !trulyDone && opts?.parentDone === true
+  const stalledClose = opts?.stalledClose === true
   let headerIcon: string
   let headerLabel: string
-  if (silentEnd) {
+  if (stalledClose) {
+    // stalledClose takes priority over all other headers — it's an explicit
+    // forced-close signal that overrides silentEnd/replyNotDelivered/trulyDone.
+    // The driver marks sub-agents done before the final flush so trulyDone=true,
+    // but we still want the stalled header to show.
+    headerIcon = '⚠️'
+    headerLabel = 'Stalled — forced close'
+  } else if (silentEnd) {
     headerIcon = '🙊'
     headerLabel = 'Ended without reply'
   } else if (replyNotDelivered) {
     headerIcon = '⚠️'
     headerLabel = 'Reply attempted but not delivered'
   } else if (trulyDone) {
+    headerIcon = '✅'
+    headerLabel = 'Done'
+  } else if (parentDone) {
     headerIcon = '✅'
     headerLabel = 'Done'
   } else {
@@ -974,11 +1020,13 @@ export function render(
   // Stuck-warning: after 2 min of no session events the card is likely
   // orphaned or the sub-agent is in a long-running silent tool call.
   // Surface the gap early so users aren't left guessing until the 5-min
-  // zombie ceiling force-closes. Suppressed only on TRUE done — during
-  // the deferred-completion window (parent done, sub-agents still
-  // running silently) the warning is still the correct signal.
+  // zombie ceiling force-closes. Suppressed when the parent is done
+  // (trulyDone, parentDone, or stalledClose) — showing "stuck" after
+  // the parent has already acknowledged completion is confusing.
   if (
     !trulyDone &&
+    !parentDone &&
+    !stalledClose &&
     opts?.stuckMs != null &&
     opts.stuckMs >= STUCK_THRESHOLD_MS
   ) {
