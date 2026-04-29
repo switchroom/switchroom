@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createDraftStream } from '../draft-stream.js'
+import { __resetDraftIdForTests } from '../draft-transport.js'
 
 interface MockTelegram {
   send: (text: string) => Promise<number>
@@ -453,5 +454,241 @@ describe('createDraftStream', () => {
     vi.advanceTimersByTime(200)
     await microtaskFlush()
     expect(m.editCalls.length).toBe(1)
+  })
+})
+
+// ─── Draft transport (sendMessageDraft) ───────────────────────────────────
+
+describe('createDraftStream — draft transport', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    __resetDraftIdForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('DM happy path: sendMessageDraft called per update, sendMessage NOT called during stream', async () => {
+    const m = makeMock()
+    const draftCalls: Array<{ chatId: string; draftId: number; text: string }> = []
+    const sendMessageDraft = vi.fn(async (chatId: string, draftId: number, text: string) => {
+      draftCalls.push({ chatId, draftId, text })
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'auto',
+      isPrivateChat: true,
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('First update')
+    await microtaskFlush()
+
+    // Draft called, not sendMessage
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+    expect(draftCalls[0].text).toBe('First update')
+    expect(m.sendCalls.length).toBe(0)
+    expect(m.editCalls.length).toBe(0)
+
+    // Second update after throttle
+    vi.advanceTimersByTime(1000)
+    void stream.update('Second update')
+    await microtaskFlush()
+
+    expect(sendMessageDraft).toHaveBeenCalledTimes(2)
+    expect(draftCalls[1].text).toBe('Second update')
+    expect(m.sendCalls.length).toBe(0)
+  })
+
+  it('materialize on finalize: sends real sendMessage for push notification + clears draft', async () => {
+    const m = makeMock()
+    const draftClearCalls: string[] = []
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, text: string) => {
+      if (text === '') draftClearCalls.push(text)
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Final answer')
+    await microtaskFlush()
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+
+    await stream.finalize()
+
+    // sendMessage should have been called to materialize
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('Final answer')
+    expect(stream.getMessageId()).toBe(100)
+
+    // Draft should have been cleared (empty string call)
+    expect(draftClearCalls.length).toBe(1)
+    expect(stream.isFinal()).toBe(true)
+  })
+
+  it('init-time fallback when sendMessageDraft is undefined → uses sendMessage/editMessageText', async () => {
+    const m = makeMock()
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      // No sendMessageDraft provided
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello')
+    await microtaskFlush()
+
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('Hello')
+  })
+
+  it('runtime fallback on rejection matching DRAFT_METHOD_UNAVAILABLE_RE', async () => {
+    const m = makeMock()
+    let draftCallCount = 0
+    const sendMessageDraft = vi.fn(async () => {
+      draftCallCount++
+      throw new Error('sendMessageDraft: unknown method')
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello')
+    await microtaskFlush()
+
+    // Draft tried once, then fell back to sendMessage
+    expect(draftCallCount).toBe(1)
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('Hello')
+
+    // Subsequent updates should use editMessageText, not draft
+    vi.advanceTimersByTime(1000)
+    void stream.update('Follow-up')
+    await microtaskFlush()
+
+    expect(draftCallCount).toBe(1) // no more draft calls
+    expect(m.editCalls.length).toBe(1)
+  })
+
+  it('runtime fallback on rejection matching DRAFT_CHAT_UNSUPPORTED_RE', async () => {
+    const m = makeMock()
+    const sendMessageDraft = vi.fn(async () => {
+      throw new Error("sendMessageDraft can't be used in this type of chat")
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello')
+    await microtaskFlush()
+
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+    expect(m.sendCalls.length).toBe(1)
+  })
+
+  it('non-matching rejection bubbles up — does not silently swap to message transport', async () => {
+    const m = makeMock()
+    const sendMessageDraft = vi.fn(async () => {
+      throw new Error('sendMessageDraft: internal server error 500')
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    // The error should NOT trigger fallback — it should propagate (draft-stream
+    // logs it but doesn't swap; subsequent update can retry).
+    void stream.update('Hello')
+    await microtaskFlush()
+
+    // Did not fall through to sendMessage
+    expect(m.sendCalls.length).toBe(0)
+    // Draft was called
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+  })
+
+  it('group chat (isPrivateChat=false with auto transport) → never tries draft', async () => {
+    const m = makeMock()
+    const sendMessageDraft = vi.fn(async () => {})
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'auto',
+      isPrivateChat: false,
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello group')
+    await microtaskFlush()
+
+    expect(sendMessageDraft).not.toHaveBeenCalled()
+    expect(m.sendCalls.length).toBe(1)
+  })
+
+  it('forum topic (message transport) → never tries draft', async () => {
+    const m = makeMock()
+    const sendMessageDraft = vi.fn(async () => {})
+
+    // Caller forces message transport for forum topics
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'message',
+      isPrivateChat: true, // even if DM, message transport wins
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello forum')
+    await microtaskFlush()
+
+    expect(sendMessageDraft).not.toHaveBeenCalled()
+    expect(m.sendCalls.length).toBe(1)
+  })
+
+  it('draft-clear failure is swallowed (best-effort)', async () => {
+    const m = makeMock()
+    let callCount = 0
+    const sendMessageDraft = vi.fn(async (_chatId: string, _draftId: number, text: string) => {
+      callCount++
+      if (text === '') throw new Error('Draft clear failed')
+      // Normal update — succeeds
+    })
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Content')
+    await microtaskFlush()
+
+    // finalize should not throw even if draft-clear fails
+    await expect(stream.finalize()).resolves.toBeUndefined()
+    expect(m.sendCalls.length).toBe(1) // materialized
+    expect(callCount).toBeGreaterThan(1) // draft update + failed clear attempt
   })
 })

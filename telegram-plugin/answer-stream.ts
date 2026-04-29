@@ -1,4 +1,11 @@
 import { isSilentFlushMarker } from './turn-flush-safety.js'
+import {
+  DRAFT_METHOD_UNAVAILABLE_RE as _DRAFT_METHOD_UNAVAILABLE_RE,
+  DRAFT_CHAT_UNSUPPORTED_RE as _DRAFT_CHAT_UNSUPPORTED_RE,
+  shouldFallbackFromDraftTransport as _shouldFallbackFromDraftTransport,
+  allocateDraftId as _allocateDraftId,
+  __resetDraftIdForTests as _resetDraftIdForTests,
+} from './draft-transport.js'
 
 /**
  * Answer-lane incremental streaming for long Telegram replies.
@@ -29,36 +36,20 @@ import { isSilentFlushMarker } from './turn-flush-safety.js'
  *   - No finalizable-draft-lifecycle SDK — we implement the loop directly.
  *   - materialize() always sends a fresh message regardless of transport,
  *     to guarantee a push notification on turn completion.
+ *
+ * Draft-transport helpers (regex constants, shouldFallbackFromDraftTransport,
+ * allocateDraftId) live in draft-transport.ts and are re-exported here so
+ * existing callers that import from this module continue to work.
  */
 
 export const MIN_INITIAL_CHARS = 400
 export const DEFAULT_THROTTLE_MS = 1000
 const TELEGRAM_MAX_CHARS = 4096
 
-// Error patterns matching OpenClaw's shouldFallbackFromDraftTransport.
-// Exported for tests.
-export const DRAFT_METHOD_UNAVAILABLE_RE =
-  /(unknown method|method .*not (found|available|supported)|unsupported)/i
-export const DRAFT_CHAT_UNSUPPORTED_RE = /(can't be used|can be used only)/i
-
-/**
- * Returns true when a sendMessageDraft rejection means "this API is not
- * available" rather than a transient network error.
- */
-export function shouldFallbackFromDraftTransport(err: unknown): boolean {
-  const text =
-    typeof err === 'string'
-      ? err
-      : err instanceof Error
-        ? err.message
-        : typeof err === 'object' && err != null && 'description' in err
-          ? typeof (err as { description: unknown }).description === 'string'
-            ? (err as { description: string }).description
-            : ''
-          : ''
-  if (!/sendMessageDraft/i.test(text)) return false
-  return DRAFT_METHOD_UNAVAILABLE_RE.test(text) || DRAFT_CHAT_UNSUPPORTED_RE.test(text)
-}
+// Re-export shared constants so existing callers / tests keep working.
+export const DRAFT_METHOD_UNAVAILABLE_RE = _DRAFT_METHOD_UNAVAILABLE_RE
+export const DRAFT_CHAT_UNSUPPORTED_RE = _DRAFT_CHAT_UNSUPPORTED_RE
+export { _shouldFallbackFromDraftTransport as shouldFallbackFromDraftTransport }
 
 /** Called when a late sendMessage/edit resolves after a new turn has started. */
 export type OnSupersededCallback = (params: {
@@ -164,14 +155,9 @@ export interface AnswerStreamHandle {
   retract(): Promise<void>
 }
 
-// Module-level draft-id counter. Shared globally so concurrent answer streams
-// don't collide on draft ids — mirrors OpenClaw's getDraftStreamState().
-let _nextDraftId = 1
-function allocateDraftId(): number {
-  const id = _nextDraftId
-  _nextDraftId = _nextDraftId >= 2_147_483_647 ? 1 : _nextDraftId + 1
-  return id
-}
+// Draft-id allocation now lives in draft-transport.ts (shared with
+// draft-stream.ts). Re-alias locally so the rest of this file is unchanged.
+const allocateDraftId = _allocateDraftId
 
 export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHandle {
   const {
@@ -225,7 +211,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: text.length, transport: 'draft' })
       return true
     } catch (err) {
-      if (shouldFallbackFromDraftTransport(err)) {
+      if (_shouldFallbackFromDraftTransport(err)) {
         warn?.(
           `answer-stream: sendMessageDraft rejected — falling back to sendMessage/editMessageText (${err instanceof Error ? err.message : String(err)})`,
         )
@@ -521,6 +507,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
 }
 
 /** Reset the draft-id counter for tests. */
+/** Reset the shared draft-id counter for tests. Delegates to draft-transport.ts. */
 export function __resetDraftIdForTests(): void {
-  _nextDraftId = 1
+  _resetDraftIdForTests()
 }

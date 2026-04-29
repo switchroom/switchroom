@@ -16,7 +16,7 @@
  * entire server.ts top-level initialization.
  */
 
-import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
+import { createDraftStream, type DraftStreamHandle, type StreamDraftFn } from './draft-stream.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -117,6 +117,31 @@ export interface StreamControllerConfig {
    * Pass a stderr writer in production to surface them.
    */
   log?: (msg: string) => void
+  /**
+   * Optional warning logger. Used for transport fallback notices.
+   */
+  warn?: (msg: string) => void
+  /**
+   * Transport selector passed to createDraftStream.
+   * - "auto" (default): use draft transport for DMs only
+   * - "draft": always prefer draft (if sendMessageDraft is available)
+   * - "message": always use sendMessage/editMessageText
+   *
+   * The gateway forces "message" for forum topics (threads), since
+   * sendMessageDraft does not support threaded chats.
+   */
+  previewTransport?: 'auto' | 'message' | 'draft'
+  /**
+   * True when the chat is a private DM. Passed to createDraftStream so
+   * "auto" transport knows whether to activate draft.
+   */
+  isPrivateChat?: boolean
+  /**
+   * sendMessageDraft callback. When provided (and transport allows it),
+   * intermediate stream updates use the draft API. On finalize(), a real
+   * sendMessage is posted for push notification and the draft is cleared.
+   */
+  sendMessageDraft?: StreamDraftFn
 }
 
 /**
@@ -138,10 +163,14 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     onSend,
     onEdit,
     log,
+    warn,
     replyToMessageId,
     quoteText,
     protectContent,
     replyMarkup,
+    previewTransport,
+    isPrivateChat,
+    sendMessageDraft,
   } = cfg
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
@@ -186,6 +215,11 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       ...(throttleMs != null ? { throttleMs } : {}),
       ...(idleMs != null ? { idleMs } : {}),
       ...(log != null ? { log } : {}),
+      ...(warn != null ? { warn } : {}),
+      ...(previewTransport != null ? { previewTransport } : {}),
+      ...(isPrivateChat != null ? { isPrivateChat } : {}),
+      ...(sendMessageDraft != null ? { sendMessageDraft } : {}),
+      chatId,
     },
   )
 }
