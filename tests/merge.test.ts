@@ -162,6 +162,30 @@ describe("mergeAgentConfig", () => {
     );
   });
 
+  it("preserves false opt-out values in mcp_servers so scaffold can filter them", () => {
+    // An agent can suppress a built-in default (e.g. playwright) by setting
+    // its mcp_servers key to `false`. The merge layer preserves this sentinel
+    // so scaffold.ts can detect and skip the entry when writing settings.json.
+    const defaults: AgentDefaults = {
+      mcp_servers: {
+        playwright: { command: "npx", args: ["-y", "@playwright/mcp@latest", "--snapshot"] },
+        perplexity: { command: "/usr/local/bin/perplexity-mcp.sh" },
+      },
+    };
+    const agent = baseAgent({
+      mcp_servers: {
+        playwright: false,
+      },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    // `false` from agent wins over the defaults entry — scaffold will filter it
+    expect(result.mcp_servers?.playwright).toBe(false);
+    // Other defaults entries flow through unchanged
+    expect((result.mcp_servers?.perplexity as { command: string }).command).toBe(
+      "/usr/local/bin/perplexity-mcp.sh",
+    );
+  });
+
   it("shallow-merges soul field-by-field", () => {
     const defaults: AgentDefaults = {
       soul: { style: "warm, concise", boundaries: "no medical advice" },

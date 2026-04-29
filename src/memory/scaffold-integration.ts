@@ -28,6 +28,28 @@ export function getHindsightSettingsEntry(
 }
 
 /**
+ * Return the MCP server entry for the Playwright browser automation server.
+ *
+ * The @playwright/mcp server is Microsoft's official browser automation MCP,
+ * launched on demand via npx. It exposes browser_navigate, browser_snapshot
+ * (accessibility-tree mode — token-cheap), browser_click, browser_type, and
+ * related tools. Included as a built-in default so agents and skills can drive
+ * web UIs without installing Playwright locally.
+ *
+ * Agents that don't need browser access can opt out by setting
+ * `mcp_servers: { playwright: false }` in their switchroom.yaml config.
+ */
+export function getPlaywrightMcpSettingsEntry(): { key: string; value: McpServerConfig } {
+  return {
+    key: "playwright",
+    value: {
+      command: "npx",
+      args: ["-y", "@playwright/mcp@latest", "--snapshot"],
+    },
+  };
+}
+
+/**
  * Return the MCP server entry for the Switchroom management server.
  *
  * The switchroom-mcp server is a thin wrapper around the `switchroom` CLI,
