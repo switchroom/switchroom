@@ -1190,8 +1190,11 @@ describe('progress-card reducer — multi-agent correlation', () => {
       // Both sub-agents appear somewhere in the HTML
       expect(html).toContain('design ux')
       expect(html).toContain('audit')
-      expect(html).toContain('researcher')
-      expect(html).toContain('worker')
+      // Per #352 the per-agent header drops the typeSuffix — only dispatch
+      // description, status emoji, and duration remain. Verify the rows
+      // render as 🤖 + description rather than asserting the type label.
+      expect(html).toContain('🤖 <b>design ux</b>')
+      expect(html).toContain('🤖 <b>audit</b>')
       // Chrono order: B started first (5000) so its expandable appears before A's (5100)
       const idxAudit = html.indexOf('audit')
       const idxDesignUx = html.lastIndexOf('design ux') // use last — [Main] also has it
@@ -1201,7 +1204,10 @@ describe('progress-card reducer — multi-agent correlation', () => {
     }
   })
 
-  it('flag-on: nested spawn renders (spawned N) suffix; running Agent line stays 🤖 until tool_result', () => {
+  it('flag-on: nested spawn count tracked in state; main Agent line stays 🤖 until tool_result', () => {
+    // Per #352, the `(spawned N)` suffix is no longer rendered in the per-agent
+    // header (cleaner one-line format). The `nestedSpawnCount` is still tracked
+    // in state for telemetry, just not surfaced visually.
     process.env.PROGRESS_CARD_MULTI_AGENT = '1'
     try {
       let st = fold([
@@ -1221,14 +1227,17 @@ describe('progress-card reducer — multi-agent correlation', () => {
         { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 't1', toolName: 'Read', input: { file_path: '/f' } },
         6200,
       )
+      // State tracks the nested spawn count even though render drops it.
+      expect(st.subAgents.get('X')?.nestedSpawnCount).toBe(2)
       const html = render(st, 7000)
-      expect(html).toContain('(spawned 2)')
+      // Render does NOT surface the spawned count in the new format.
+      expect(html).not.toContain('spawned')
       // Main agent line uses 🤖 not ✅ while running
       const mainSection = html.split('[Sub-agents')[0]
       expect(mainSection).toContain('🤖')
       expect(mainSection).not.toContain('● Agent')
-      // Sub-agent activity line shows the current tool (no └ prefix after #315)
-      expect(html).toContain('◉')
+      // Sub-agent activity line shows the current tool with the new ↳ prefix.
+      expect(html).toContain('↳')
       expect(html).toContain('Read')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
@@ -1427,14 +1436,17 @@ describe('sub-agent activity-line fallback (never "(idle)")', () => {
     expect(html).not.toContain('(idle)')
   })
 
-  it('running with no tools yet: shows "thinking..."', () => {
+  it('running with no tools yet: shows "starting..." (post-#352 wording)', () => {
     const st = fold([
       enqueue('g'),
       { kind: 'tool_use', toolName: 'Agent', toolUseId: 'p1', input: { description: 'w', prompt: 'P' } },
       { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
     ])
     const html = render(st, 3000)
-    expect(html).toContain('thinking')
+    // Post #352: the pre-tool fallback line was renamed from "thinking…" to
+    // "starting…" and uses the ↳ prefix consistent with other action lines.
+    expect(html).toContain('starting')
+    expect(html).toContain('↳')
     expect(html).not.toContain('(idle)')
   })
 
@@ -1951,11 +1963,13 @@ describe('progress-card multi-agent layout snapshots', () => {
       // Sub-agent expandable block present
       expect(html).toContain('<blockquote expandable>')
 
-      // Sub-agent type label visible
-      expect(html).toContain('researcher')
+      // Per #352: per-agent header is universal 🤖 + dispatch description +
+      // status emoji + duration; the typeSuffix (e.g. "researcher") is dropped.
+      expect(html).toContain('🤖 <b>dig into error logs</b>')
+      expect(html).toContain('🔄 working')
 
-      // Active tool indicator (◉) is visible in the sub-agent block
-      expect(html).toContain('◉')
+      // Sub-agent activity uses the new ↳ prefix for the current tool.
+      expect(html).toContain('↳')
       expect(html).toContain('Read')
 
       // Layout: main blockquote before expandable
@@ -2100,8 +2114,13 @@ describe('progress-card multi-agent layout snapshots', () => {
       expect(html).toContain('run tests')
       expect(html).toContain('update docs')
 
-      // Tool counts appear in the expandable forensic blocks
-      expect(html).toContain('1 tools')
+      // Per #352: each per-agent expandable shows the new ✅ done status
+      // emoji in its collapsed header (replaces the old "1 tools" line).
+      const doneCount = (html.match(/✅ done/g) ?? []).length
+      expect(doneCount).toBe(3)
+
+      // Header summary line shows emoji counts ("🤖 Sub-agents · ✅ 3").
+      expect(html).toContain('🤖 Sub-agents · ✅ 3')
 
       // 3 expandable forensic blocks, one per sub-agent
       const expandableCount = (html.match(/<blockquote expandable>/g) ?? []).length
@@ -2113,6 +2132,108 @@ describe('progress-card multi-agent layout snapshots', () => {
       const idxC = html.indexOf('update docs')
       expect(idxA).toBeLessThan(idxB)
       expect(idxB).toBeLessThan(idxC)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  // ── #352 state-coverage snapshots ───────────────────────────────────────
+  // The acceptance criteria require snapshot coverage for each top-level
+  // sub-agent state the new card can render: all-done (above), mixed,
+  // all-running (above as "parent + 3 parallel workers"), all-failed, and
+  // stalled. The three below fill in the gaps.
+
+  it('snapshot: mixed state (1 done + 1 running + 1 failed)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('mixed batch'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'finished work', prompt: 'P-A' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'in flight', prompt: 'P-B' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_c', input: { description: 'broken work', prompt: 'P-C' } },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P-A' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P-B' }, 2100)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'P-C' }, 2200)
+      // A finishes — parent tool_result with isError:false promotes A to done.
+      st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'ta', toolName: 'Edit', input: { file_path: '/x.ts' } }, 2300)
+      st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'A', toolUseId: 'ta' }, 2400)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_a', toolName: 'Agent', isError: false }, 2500)
+      // B is still running, mid-tool.
+      st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'tb', toolName: 'Bash', input: { command: 'bun test' } }, 2600)
+      // C fails — parent tool_result with isError:true flips C to 'failed'.
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_c', toolName: 'Agent', isError: true, errorText: 'context exhausted' }, 2700)
+      const html = render(st, 3000)
+
+      // Header summary line lists each non-zero count.
+      expect(html).toContain('🤖 Sub-agents · ✅ 1 · 🔄 1 · ❌ 1')
+
+      // Each per-agent header carries the right status emoji + label.
+      expect(html).toContain('🤖 <b>finished work</b>')
+      expect(html).toContain('✅ done')
+      expect(html).toContain('🤖 <b>in flight</b>')
+      expect(html).toContain('🔄 working')
+      expect(html).toContain('🤖 <b>broken work</b>')
+      expect(html).toContain('❌ failed')
+
+      // Three expandable blocks, one per sub-agent.
+      expect((html.match(/<blockquote expandable>/g) ?? []).length).toBe(3)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('snapshot: all-failed state (3 sub-agents all failed)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('failure cascade'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'task A', prompt: 'P-A' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'task B', prompt: 'P-B' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_c', input: { description: 'task C', prompt: 'P-C' } },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P-A' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P-B' }, 2100)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'P-C' }, 2200)
+      // Parent tool_result with isError:true is the canonical signal that
+      // flips a sub-agent into 'failed' state.
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_a', toolName: 'Agent', isError: true, errorText: 'a' }, 2300)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_b', toolName: 'Agent', isError: true, errorText: 'b' }, 2400)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_c', toolName: 'Agent', isError: true, errorText: 'c' }, 2500)
+      const html = render(st, 3000)
+
+      // Header summary line: only the failed count, no done/running/stalled.
+      expect(html).toContain('🤖 Sub-agents · ❌ 3')
+      expect(html).not.toContain('✅')
+      expect(html).not.toContain('🔄')
+
+      // Every per-agent header shows ❌ failed.
+      expect((html.match(/❌ failed/g) ?? []).length).toBe(3)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('snapshot: stalled state (running sub-agent with no events for 60s)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('stalled'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'long task', prompt: 'P' } },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'ta', toolName: 'Bash', input: { command: 'sleep 1000' } }, 2100)
+      // Render `now` is 70_000ms after the last event (>60s SUBAGENT_STALL_MS).
+      const html = render(st, 72_100)
+
+      // Stalled state surfaces in both the header summary and per-agent header.
+      expect(html).toContain('🤖 Sub-agents · ⚠️ 1')
+      expect(html).toContain('⚠️ stalled')
+
+      // The sub-agent's underlying state stays 'running' — stalled is a
+      // render-time classification based on lastEventAt freshness, not a
+      // separate state machine value.
+      expect(st.subAgents.get('A')?.state).toBe('running')
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
     }

@@ -373,7 +373,16 @@ describe('startSubagentWatcher', () => {
       }
     }
 
-    it('updates description from sub_agent_text event', () => {
+    it('does NOT overwrite description with sub_agent_text narrative (#352)', () => {
+      // Pre-#352 the watcher would overwrite a sub-agent's dispatch
+      // description with the first narrative line it saw. That made identical
+      // dispatches render differently depending on which event reached the
+      // watcher first — a race-condition-dependent UX bug.
+      //
+      // Post-#352 the description must remain whatever the watcher started
+      // with (the dispatch description set by the parent Agent tool_use
+      // input, or the placeholder when the watcher is bootstrapped without
+      // one). Narrative text is recorded in `lastSummaryLine` instead.
       const content = buildJSONL(
         subAgentUserMsg('Do the thing'),
         subAgentAssistantText('I will implement the feature now'),
@@ -383,8 +392,11 @@ describe('startSubagentWatcher', () => {
       h.poll()
       const entry = h.watcher.getRegistry().get('deadbeef')
       expect(entry).toBeDefined()
-      expect(entry?.description).not.toBe('sub-agent')
-      expect(entry?.description).toMatch(/I will implement/)
+      // Description stays as the bootstrap value — the watcher must NOT
+      // promote the narrative line into the description field.
+      expect(entry?.description).not.toMatch(/I will implement/)
+      // Narrative text still flows into lastSummaryLine for telemetry.
+      expect(entry?.lastSummaryLine).toMatch(/I will implement/)
     })
 
     it('counts tools from sub_agent_tool_use events', () => {
