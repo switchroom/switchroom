@@ -195,7 +195,7 @@ installPluginLogger()
 import { type DraftStreamHandle } from './draft-stream.js'
 import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
-import { handleStreamReply } from './stream-reply-handler.js'
+import { handleStreamReply, buildAccentHeader } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
 import {
   validateInlineKeyboard,
@@ -1298,6 +1298,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
           },
+          accent: {
+            type: 'string',
+            enum: ['in-progress', 'done', 'issue'],
+            description: "Optional status accent prepended as a leading header line. 'in-progress' → 🔵 In progress…, 'done' → ✅ Done, 'issue' → ⚠️ Issue. Omit for plain reply (default behavior).",
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1354,6 +1359,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           quote_text: {
             type: 'string',
             description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to. When set, Telegram shows just this excerpt rather than the whole referenced message.',
+          },
+          accent: {
+            type: 'string',
+            enum: ['in-progress', 'done', 'issue'],
+            description: "Optional status accent prepended as a leading header line. 'in-progress' → 🔵 In progress…, 'done' → ✅ Done, 'issue' → ⚠️ Issue. Omit for plain reply (default behavior).",
           },
         },
         required: ['chat_id', 'text'],
@@ -1642,6 +1652,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
           )
           if (prefix.length > 0) effectiveText = prefix + effectiveText
+        }
+
+        // Inline status-accent header (issue #320 fallback). Prepended AFTER
+        // handoff prefix so the accent header always leads the visible body.
+        {
+          const accentHeader = buildAccentHeader(args.accent as string | undefined)
+          if (accentHeader.length > 0) effectiveText = accentHeader + effectiveText
         }
 
         assertAllowedChat(chat_id)
@@ -2035,6 +2052,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ...(args.protect_content === true ? { protect_content: true } : {}),
             ...(args.quote_text != null ? { quote_text: args.quote_text as string } : {}),
             ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
+            ...(args.accent != null ? { accent: args.accent as string } : {}),
           },
           { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
           {

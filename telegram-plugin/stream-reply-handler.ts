@@ -23,6 +23,30 @@ import {
   type RetryPolicy,
 } from './stream-controller.js'
 
+/**
+ * Builds the inline status-accent header line for `reply` / `stream_reply`.
+ *
+ * Returns a string to prepend to the effective (already-rendered) message
+ * body, including a trailing blank line so the header is visually separated.
+ * Returns an empty string when accent is undefined or unrecognised (silent
+ * ignore) so calls without `accent` produce identical output to today.
+ *
+ * The header uses Telegram HTML tags. Callers must ensure parseMode is HTML
+ * (or that the body has already been rendered to HTML) before prepending.
+ */
+export function buildAccentHeader(accent: string | undefined): string {
+  switch (accent) {
+    case 'in-progress':
+      return '🔵 <i>In progress…</i>\n\n'
+    case 'done':
+      return '✅ <b>Done</b>\n\n'
+    case 'issue':
+      return '⚠️ <b>Issue</b>\n\n'
+    default:
+      return ''
+  }
+}
+
 export interface StreamReplyArgs {
   chat_id: string
   text: string
@@ -82,6 +106,18 @@ export interface StreamReplyArgs {
    * referenced message. Ignored when `reply_to` is absent.
    */
   quote_text?: string
+  /**
+   * Optional status accent prepended as a leading header line (issue #320
+   * fallback for missing Telegram quote-bar color API).
+   *
+   * - `'in-progress'` → `🔵 <i>In progress…</i>\n\n`
+   * - `'done'`        → `✅ <b>Done</b>\n\n`
+   * - `'issue'`       → `⚠️ <b>Issue</b>\n\n`
+   *
+   * Unrecognised values are silently ignored. Omit for plain reply (default
+   * behavior — identical to today's output).
+   */
+  accent?: string
 }
 
 export interface StreamReplyState {
@@ -292,6 +328,18 @@ export async function handleStreamReply(
   } else {
     parseMode = undefined
     effectiveText = rawText
+  }
+
+  // Inline status-accent header (issue #320 fallback). Prepended AFTER
+  // format rendering so it leads the fully-rendered body. Since
+  // stream_reply callers pass the full text snapshot each call, the
+  // header is prepended on every call that supplies `accent` — this
+  // keeps the rendered message consistent across edits. Callers that
+  // don't want the header on a subsequent edit simply omit `accent`.
+  // Unrecognised values are silently ignored (empty string returned).
+  if (args.accent != null) {
+    const accentHeader = buildAccentHeader(args.accent)
+    if (accentHeader.length > 0) effectiveText = accentHeader + effectiveText
   }
 
   // Over-limit pre-check. Throws BEFORE touching stream state so that
