@@ -34,15 +34,44 @@ describe('parseCommandName', () => {
 // ─── ADMIN_COMMAND_NAMES ─────────────────────────────────────────────────────
 
 describe('ADMIN_COMMAND_NAMES', () => {
-  it('contains the core admin commands', () => {
-    const required = ['agents', 'logs', 'restart', 'update', 'version', 'auth', 'reconcile']
+  it('contains the fleet-management admin commands', () => {
+    const required = ['agents', 'logs', 'restart', 'update', 'reconcile', 'stop', 'switchroomstart', 'grant', 'dangerous', 'permissions', 'vault']
     for (const cmd of required) {
       expect(ADMIN_COMMAND_NAMES.has(cmd)).toBe(true)
     }
   })
 
-  it('contains version (fleet management verb)', () => {
-    expect(ADMIN_COMMAND_NAMES.has('version')).toBe(true)
+  it('does not contain per-agent auth ops (must work without model)', () => {
+    // /auth, /reauth, /authfallback are handled by the gateway directly so
+    // the user can re-authenticate even when the model is rate-limited or the
+    // token is expired. Routing them through Claude would defeat the point.
+    expect(ADMIN_COMMAND_NAMES.has('auth')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('reauth')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('authfallback')).toBe(false)
+  })
+
+  it('does not contain interrupt (cancellation must always work)', () => {
+    expect(ADMIN_COMMAND_NAMES.has('interrupt')).toBe(false)
+  })
+
+  it('does not contain the permission-response flow', () => {
+    // /approve, /deny, /pending are intercepted by the gateway before the
+    // model is invoked anyway — they have nothing to do with admin gating.
+    expect(ADMIN_COMMAND_NAMES.has('approve')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('deny')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('pending')).toBe(false)
+  })
+
+  it('does not contain info commands (must work when model is down)', () => {
+    expect(ADMIN_COMMAND_NAMES.has('version')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('doctor')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('usage')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('switchroomhelp')).toBe(false)
+  })
+
+  it('does not contain session-reset commands', () => {
+    expect(ADMIN_COMMAND_NAMES.has('new')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('reset')).toBe(false)
   })
 
   it('does not contain create-agent (out of scope for phase 1)', () => {
@@ -64,8 +93,22 @@ describe('dispatchAdminCommand', () => {
       expect(dispatchAdminCommand('/logs', true)).toEqual({ handled: true })
       expect(dispatchAdminCommand('/restart', true)).toEqual({ handled: true })
       expect(dispatchAdminCommand('/update', true)).toEqual({ handled: true })
-      expect(dispatchAdminCommand('/version', true)).toEqual({ handled: true })
-      expect(dispatchAdminCommand('/auth', true)).toEqual({ handled: true })
+      expect(dispatchAdminCommand('/vault', true)).toEqual({ handled: true })
+      expect(dispatchAdminCommand('/permissions', true)).toEqual({ handled: true })
+    })
+
+    it('does NOT handle per-agent ops (auth/interrupt/info/session)', () => {
+      // These are intentionally NOT admin-gated — they always run via the
+      // gateway, regardless of admin status, so the user can recover when
+      // the model is unreachable.
+      expect(dispatchAdminCommand('/auth', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/reauth', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/interrupt', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/version', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/doctor', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/usage', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/new', true)).toEqual({ handled: false })
+      expect(dispatchAdminCommand('/reset', true)).toEqual({ handled: false })
     })
 
     it('handles a known command with arguments', () => {

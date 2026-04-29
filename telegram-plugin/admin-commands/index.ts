@@ -32,35 +32,33 @@
  * The set of command names that are treated as "admin commands" — intercepted
  * by the gateway when SWITCHROOM_AGENT_ADMIN=true, forwarded to Claude otherwise.
  *
+ * Scope: ONLY fleet-management verbs (lifecycle, scaffolding, privileges,
+ * secrets). Per-agent / per-chat ops — auth, interrupt, permission flow,
+ * info commands (`/version`, `/doctor`, `/usage`), session reset (`/new`,
+ * `/reset`), and `/switchroomhelp` — must always be gateway-handled
+ * regardless of admin status, because they need to work even when the model
+ * is unreachable (rate-limited, expired token, network down). Routing those
+ * through Claude defeats the entire point of the slash-command UX.
+ *
  * Keep in sync with the bot.command() registrations in gateway.ts.
  */
 export const ADMIN_COMMAND_NAMES = new Set<string>([
+  // Fleet lifecycle
   'agents',
   'logs',
   'restart',
-  'update',
-  'version',
-  'auth',
-  'reauth',
-  'reconcile',
   'stop',
   'switchroomstart',
+  'update',
+  'reconcile',
+  // Privileges + secrets
   'grant',
   'dangerous',
   'permissions',
-  'switchroomhelp',
-  'doctor',
-  'memory',
-  'usage',
-  'topics',
   'vault',
-  'authfallback',
-  'new',
-  'reset',
-  'approve',
-  'deny',
-  'pending',
-  'interrupt',
+  // Per-agent ops that read shared fleet state via the switchroom CLI
+  'memory',
+  'topics',
 ])
 
 /**
