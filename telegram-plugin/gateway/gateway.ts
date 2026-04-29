@@ -688,6 +688,9 @@ let currentTurnLastAssistantMsgId: string | null = null
 // resume protocol uses this to decide "did the previous turn actually
 // finish a reply, or was it interrupted before commit?".
 let currentTurnLastAssistantDone = false
+// Phase 1 of #332: count of tool_use events in the current turn, for the
+// tool_call_count column in the turns registry.
+let currentTurnToolCallCount = 0
 
 // Issue #195 — answer-lane streaming.
 // Lazily created on the first text event of a turn (once enough text has
@@ -708,6 +711,18 @@ function isDmChatId(chatId: string | null | undefined): boolean {
   if (!chatId) return false
   const id = Number(chatId)
   return Number.isFinite(id) && id > 0
+}
+
+// Phase 1 of #332: extract the plain-text body from the channel XML wrapper
+// produced by the Telegram MCP plugin. The wrapper looks like:
+//   <channel source="telegram" chat_id="..." ...>user text here</channel>
+// We strip the outer tag and return a ~200-char preview for the turns table.
+const TURN_PREVIEW_MAX = 200
+function extractUserPromptPreview(rawContent: string): string | null {
+  const m = rawContent.match(/<channel[^>]*>([\s\S]*?)<\/channel>/)
+  const body = m ? m[1].trim() : rawContent.trim()
+  if (!body) return null
+  return body.length > TURN_PREVIEW_MAX ? body.slice(0, TURN_PREVIEW_MAX) : body
 }
 
 const CONTEXT_EXHAUSTION_COOLDOWN_MS = 10 * 60 * 1000
@@ -2248,6 +2263,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         currentTurnStartedAt = Date.now()
         currentTurnLastAssistantMsgId = null
         currentTurnLastAssistantDone = false
+        currentTurnToolCallCount = 0
         // Stage 3b: stamp turn-start in the registry. turn_key is
         // chat:thread:startTs — unique per turn, distinct from the
         // progress-card-driver's per-chat sequence number (these are two
@@ -2255,12 +2271,15 @@ function handleSessionEvent(ev: SessionEvent): void {
         if (turnsDb != null) {
           const turnKey = `${ev.chatId}:${ev.threadId ?? '_'}:${currentTurnStartedAt}`
           currentTurnRegistryKey = turnKey
+          // Phase 1 of #332: capture first ~200 chars of the user's message.
+          const userPromptPreview = extractUserPromptPreview(ev.rawContent)
           try {
             recordTurnStart(turnsDb, {
               turnKey,
               chatId: String(ev.chatId),
               threadId: ev.threadId != null ? String(ev.threadId) : null,
               lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+              userPromptPreview,
             })
           } catch (err) {
             process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
@@ -2288,6 +2307,8 @@ function handleSessionEvent(ev: SessionEvent): void {
     }
     case 'tool_use': {
       if (currentSessionChatId == null) return
+      // Phase 1 of #332: count every tool_use in the current turn.
+      currentTurnToolCallCount++
       const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
       const name = ev.toolName
       if (isTelegramReplyTool(name)) {
@@ -2688,12 +2709,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       // turn_end emit). The kill paths (schedule_restart / SIGTERM) handle
       // the 'restart' / 'sigterm' cases separately in 3c.
       if (turnsDb != null && currentTurnRegistryKey != null) {
+        // Phase 1 of #332: capture first ~200 chars of the assistant's reply.
+        const capturedJoined = currentTurnCapturedText.join('')
+        const assistantReplyPreview = capturedJoined
+          ? capturedJoined.slice(0, TURN_PREVIEW_MAX)
+          : null
         try {
           recordTurnEnd(turnsDb, {
             turnKey: currentTurnRegistryKey,
             endedVia: 'stop',
             lastAssistantMsgId: currentTurnLastAssistantMsgId,
             lastAssistantDone: currentTurnLastAssistantDone,
+            assistantReplyPreview,
+            toolCallCount: currentTurnToolCallCount,
           })
         } catch (err) {
           process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${currentTurnRegistryKey}: ${(err as Error).message}\n`)
@@ -2706,6 +2734,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       currentTurnCapturedText = []
       currentTurnLastAssistantMsgId = null
       currentTurnLastAssistantDone = false
+      currentTurnToolCallCount = 0
       return
     }
   }
@@ -6458,6 +6487,9 @@ async function shutdown(signal: string): Promise<void> {
         endedVia,
         lastAssistantMsgId: currentTurnLastAssistantMsgId,
         lastAssistantDone: currentTurnLastAssistantDone,
+        // Phase 1 of #332: record how many tools fired before the kill.
+        // No assistant_reply_preview here — the reply was never committed.
+        toolCallCount: currentTurnToolCallCount,
       })
       process.stderr.write(`telegram gateway: shutdown.turn_stamped turnKey=${currentTurnRegistryKey} endedVia=${endedVia}\n`)
     } catch (err) {

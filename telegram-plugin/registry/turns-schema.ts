@@ -12,17 +12,20 @@
  * Schema (one table):
  *
  *   turns
- *     turn_key      TEXT PK          -- e.g. "8248703757:11"
- *     chat_id       TEXT NOT NULL
- *     thread_id     TEXT             -- nullable: forum topics only
- *     started_at    INTEGER NOT NULL -- unix ms
- *     ended_at      INTEGER          -- nullable until turn ends
- *     ended_via     TEXT             -- 'stop' | 'sigterm' | 'restart' | 'timeout' | 'unknown'
- *     last_assistant_msg_id TEXT     -- last outbound message_id in this turn
- *     last_assistant_done   INTEGER  -- 0|1; 1 = stream_reply done=true sent
- *     last_user_msg_id      TEXT     -- inbound message_id that started the turn
- *     created_at    INTEGER NOT NULL
- *     updated_at    INTEGER NOT NULL
+ *     turn_key              TEXT PK           -- e.g. "8248703757:11"
+ *     chat_id               TEXT NOT NULL
+ *     thread_id             TEXT              -- nullable: forum topics only
+ *     started_at            INTEGER NOT NULL  -- unix ms
+ *     ended_at              INTEGER           -- nullable until turn ends
+ *     ended_via             TEXT              -- 'stop' | 'sigterm' | 'restart' | 'timeout' | 'unknown'
+ *     last_assistant_msg_id TEXT              -- last outbound message_id in this turn
+ *     last_assistant_done   INTEGER           -- 0|1; 1 = stream_reply done=true sent
+ *     last_user_msg_id      TEXT              -- inbound message_id that started the turn
+ *     user_prompt_preview   TEXT              -- first ~200 chars of user message (Phase 1)
+ *     assistant_reply_preview TEXT            -- first ~200 chars of bot's terminal message (Phase 1)
+ *     tool_call_count       INTEGER           -- count of tool_use events in the turn (Phase 1)
+ *     created_at            INTEGER NOT NULL
+ *     updated_at            INTEGER NOT NULL
  *
  * Boot-time usage:
  *   On every gateway boot, call `markOrphanedAsRestarted(db)` immediately
@@ -92,6 +95,9 @@ export interface Turn {
   last_assistant_msg_id: string | null
   last_assistant_done: boolean | null
   last_user_msg_id: string | null
+  user_prompt_preview: string | null
+  assistant_reply_preview: string | null
+  tool_call_count: number | null
   created_at: number
   updated_at: number
 }
@@ -101,6 +107,7 @@ export interface RecordTurnStartArgs {
   chatId: string
   threadId?: string | null
   lastUserMsgId?: string | null
+  userPromptPreview?: string | null
 }
 
 export interface RecordTurnEndArgs {
@@ -108,6 +115,8 @@ export interface RecordTurnEndArgs {
   endedVia: TurnEndedVia
   lastAssistantMsgId?: string | null
   lastAssistantDone?: boolean
+  assistantReplyPreview?: string | null
+  toolCallCount?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -116,25 +125,46 @@ export interface RecordTurnEndArgs {
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS turns (
-    turn_key               TEXT    PRIMARY KEY,
-    chat_id                TEXT    NOT NULL,
-    thread_id              TEXT,
-    started_at             INTEGER NOT NULL,
-    ended_at               INTEGER,
-    ended_via              TEXT,
-    last_assistant_msg_id  TEXT,
-    last_assistant_done    INTEGER,
-    last_user_msg_id       TEXT,
-    created_at             INTEGER NOT NULL,
-    updated_at             INTEGER NOT NULL
+    turn_key                TEXT    PRIMARY KEY,
+    chat_id                 TEXT    NOT NULL,
+    thread_id               TEXT,
+    started_at              INTEGER NOT NULL,
+    ended_at                INTEGER,
+    ended_via               TEXT,
+    last_assistant_msg_id   TEXT,
+    last_assistant_done     INTEGER,
+    last_user_msg_id        TEXT,
+    user_prompt_preview     TEXT,
+    assistant_reply_preview TEXT,
+    tool_call_count         INTEGER,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_turns_chat_ended ON turns(chat_id, ended_at);
 `
+
+// Columns added in Phase 1 of #332. Applied via ALTER TABLE so existing
+// registry.db files on disk are migrated non-destructively on first open.
+const PHASE1_MIGRATIONS = [
+  `ALTER TABLE turns ADD COLUMN user_prompt_preview TEXT`,
+  `ALTER TABLE turns ADD COLUMN assistant_reply_preview TEXT`,
+  `ALTER TABLE turns ADD COLUMN tool_call_count INTEGER`,
+]
 
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
   db.exec(SCHEMA_SQL)
+  // Run migrations for Phase 1 columns. SQLite doesn't support
+  // "ADD COLUMN IF NOT EXISTS", so we swallow the "duplicate column" error.
+  for (const sql of PHASE1_MIGRATIONS) {
+    try {
+      db.exec(sql)
+    } catch (err) {
+      const msg = (err as Error).message ?? ''
+      if (!msg.includes('duplicate column')) throw err
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +222,9 @@ interface RawTurnRow {
   last_assistant_msg_id: string | null
   last_assistant_done: number | null
   last_user_msg_id: string | null
+  user_prompt_preview: string | null
+  assistant_reply_preview: string | null
+  tool_call_count: number | null
   created_at: number
   updated_at: number
 }
@@ -208,6 +241,9 @@ function mapRow(row: RawTurnRow): Turn {
     last_assistant_done:
       row.last_assistant_done === null ? null : row.last_assistant_done !== 0,
     last_user_msg_id: row.last_user_msg_id,
+    user_prompt_preview: row.user_prompt_preview,
+    assistant_reply_preview: row.assistant_reply_preview,
+    tool_call_count: row.tool_call_count,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -226,14 +262,16 @@ export function recordTurnStart(db: SqliteDatabase, args: RecordTurnStartArgs): 
   const now = Date.now()
   db.prepare(`
     INSERT OR IGNORE INTO turns
-      (turn_key, chat_id, thread_id, started_at, last_user_msg_id, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+      (turn_key, chat_id, thread_id, started_at, last_user_msg_id,
+       user_prompt_preview, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     args.turnKey,
     args.chatId,
     args.threadId ?? null,
     now,
     args.lastUserMsgId ?? null,
+    args.userPromptPreview ?? null,
     now,
     now,
   )
@@ -241,7 +279,8 @@ export function recordTurnStart(db: SqliteDatabase, args: RecordTurnStartArgs): 
 
 /**
  * Record that a turn has ended cleanly. Updates `ended_at`, `ended_via`,
- * and optionally the last outbound message fields.
+ * and optionally the last outbound message fields, reply preview, and
+ * tool-call count.
  *
  * No-ops gracefully if `turnKey` is not found (turn may have already been
  * swept by `markOrphanedAsRestarted` on a prior boot).
@@ -251,17 +290,21 @@ export function recordTurnEnd(db: SqliteDatabase, args: RecordTurnEndArgs): void
   db.prepare(`
     UPDATE turns
     SET
-      ended_at              = ?,
-      ended_via             = ?,
-      last_assistant_msg_id = COALESCE(?, last_assistant_msg_id),
-      last_assistant_done   = COALESCE(?, last_assistant_done),
-      updated_at            = ?
+      ended_at                = ?,
+      ended_via               = ?,
+      last_assistant_msg_id   = COALESCE(?, last_assistant_msg_id),
+      last_assistant_done     = COALESCE(?, last_assistant_done),
+      assistant_reply_preview = COALESCE(?, assistant_reply_preview),
+      tool_call_count         = COALESCE(?, tool_call_count),
+      updated_at              = ?
     WHERE turn_key = ?
   `).run(
     now,
     args.endedVia,
     args.lastAssistantMsgId ?? null,
     args.lastAssistantDone !== undefined ? (args.lastAssistantDone ? 1 : 0) : null,
+    args.assistantReplyPreview ?? null,
+    args.toolCallCount !== undefined ? args.toolCallCount : null,
     now,
     args.turnKey,
   )
