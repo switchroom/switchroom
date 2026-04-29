@@ -652,6 +652,76 @@ describe('progress-card render', () => {
   })
 })
 
+// ─── #324: awaiting-subagent narrative-step tests ────────────────────────
+
+describe('progress-card — #324 awaiting-subagent narrative step', () => {
+  // Helper: build the common setup: enqueue → text (narrative) → Agent tool_use
+  function buildWithAgentDispatch(agentId = 'sa1', toolUseId = 'toolu_324') {
+    let st = reduce(initialState(), enqueue('run review'), 1000)
+    st = reduce(st, { kind: 'text', text: 'Dispatching background review' }, 1100)
+    st = reduce(st, {
+      kind: 'tool_use',
+      toolName: 'Agent',
+      toolUseId,
+      input: { description: 'run review', prompt: 'PROMPT', subagent_type: 'reviewer' },
+    }, 1200)
+    st = reduce(st, {
+      kind: 'sub_agent_started',
+      agentId,
+      firstPromptText: 'PROMPT',
+      subagentType: 'reviewer',
+    }, 1300)
+    return { st, agentId, toolUseId }
+  }
+
+  it('awaiting-subagent step renders as ◉ (active), not ● (done)', () => {
+    // After turn_end with sub-agent still running, the narrative step should
+    // be in awaiting-subagent state and render with ◉, not ●.
+    let { st, agentId } = buildWithAgentDispatch()
+    st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1500)
+    // Sub-agent is still running at render time.
+    expect(st.subAgents.get(agentId)?.state).toBe('running')
+    const out = render(st, 2000)
+    // Must render as active (◉) not done (●).
+    expect(out).toContain('◉')
+    expect(out).toContain('Dispatching background review')
+    expect(out).not.toMatch(/●.*Dispatching background review/)
+  })
+
+  it('state machine: background Agent dispatch → step ends in awaiting-subagent, not done', () => {
+    let { st } = buildWithAgentDispatch()
+    st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1500)
+    const narrative = st.narratives.find(n => n.text === 'Dispatching background review')!
+    expect(narrative).toBeDefined()
+    expect(narrative.state).toBe('awaiting-subagent')
+  })
+
+  it('state machine: sub_agent_turn_end transitions awaiting-subagent step to done', () => {
+    let { st, agentId } = buildWithAgentDispatch()
+    st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1500)
+    // Confirm awaiting-subagent before the sub-agent finishes.
+    const before = st.narratives.find(n => n.text === 'Dispatching background review')!
+    expect(before.state).toBe('awaiting-subagent')
+    // Sub-agent completes.
+    st = reduce(st, { kind: 'sub_agent_turn_end', agentId, durationMs: 2000 }, 3500)
+    const after = st.narratives.find(n => n.text === 'Dispatching background review')!
+    expect(after.state).toBe('done')
+  })
+
+  it('regression: foreground tool_result flips narrative step directly to done', () => {
+    // A non-Agent tool call (foreground) should still flip to done immediately —
+    // no awaiting-subagent detour.
+    let st = reduce(initialState(), enqueue('read a file'), 1000)
+    st = reduce(st, { kind: 'text', text: 'Reading the file' }, 1100)
+    st = reduce(st, { kind: 'tool_use', toolName: 'Read', toolUseId: 'toolu_r', input: { file_path: '/x' } }, 1200)
+    st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_r', toolName: 'Read' }, 1300)
+    st = reduce(st, { kind: 'text', text: 'Done reading' }, 1400)
+    const narrative = st.narratives.find(n => n.text === 'Reading the file')!
+    expect(narrative).toBeDefined()
+    expect(narrative.state).toBe('done')
+  })
+})
+
 // ─── Multi-agent correlation reducer tests ───────────────────────────────
 //
 // Renderer is unchanged in this PR, so we only assert state-shape — the
