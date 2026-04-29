@@ -351,6 +351,28 @@ export function markOrphanedAsRestarted(db: SqliteDatabase): number {
 }
 
 /**
+ * Return the most recent N turns for `chatId` (any state — running or ended),
+ * ordered by started_at DESC. Used by the idle-footer renderer to decide
+ * whether to render "working since" vs "idle · last reply".
+ *
+ * `limit` defaults to 1 because the renderer only inspects the top row, but
+ * callers can pass more if they need backfill.
+ */
+export function findRecentTurnsForChat(
+  db: SqliteDatabase,
+  chatId: string,
+  limit = 1,
+): Turn[] {
+  const rows = db.prepare(`
+    SELECT * FROM turns
+    WHERE chat_id = ?
+    ORDER BY started_at DESC
+    LIMIT ?
+  `).all(chatId, limit) as RawTurnRow[]
+  return rows.map(mapRow)
+}
+
+/**
  * Find the single most-recently-started turn that ended via an interrupt
  * (`'restart'` | `'sigterm'` | `'timeout'`) OR is still open
  * (`ended_at IS NULL`). Used by Stage 4 to surface "you had pending work"

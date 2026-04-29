@@ -219,7 +219,9 @@ import {
   recordTurnStart,
   recordTurnEnd,
   findMostRecentInterruptedTurn,
+  findRecentTurnsForChat,
 } from '../registry/turns-schema.js'
+import { formatIdleFooter } from '../idle-footer.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -6768,6 +6770,28 @@ if (streamMode === 'checklist') {
         lockedBot.api.sendMessage(chatId, `✅ Done — ${summary}`).catch((err: Error) => {
           process.stderr.write(`telegram gateway: completion message failed: ${err.message}\n`)
         })
+      }
+      // Phase 3 of #332: update the progress-card pin with the idle footer so
+      // the user can see at a glance when the agent last replied.
+      if (turnsDb != null) {
+        try {
+          const rows = findRecentTurnsForChat(turnsDb, chatId, 1)
+          const turnRows = rows.map(r => ({
+            turnKey: r.turn_key,
+            chatId: r.chat_id,
+            startedAt: r.started_at,
+            endedAt: r.ended_at,
+          }))
+          const footer = formatIdleFooter(turnRows, Date.now())
+          const pinnedMsgId = pinMgr.pinnedMessageId(turnKey)
+          if (pinnedMsgId != null) {
+            lockedBot.api.editMessageText(chatId, pinnedMsgId, footer, { parse_mode: 'HTML' }).catch((err: Error) => {
+              process.stderr.write(`telegram gateway: idle-footer edit failed chatId=${chatId} msgId=${pinnedMsgId}: ${err.message}\n`)
+            })
+          }
+        } catch (err) {
+          process.stderr.write(`telegram gateway: idle-footer render failed chatId=${chatId}: ${(err as Error).message}\n`)
+        }
       }
     },
     onSilentEnd: ({ chatId, turnKey }) => {
