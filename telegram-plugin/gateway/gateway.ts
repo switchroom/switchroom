@@ -2308,17 +2308,22 @@ function handleSessionEvent(ev: SessionEvent): void {
           currentTurnRegistryKey = turnKey
           // Phase 1 of #332: capture first ~200 chars of the user's message.
           const userPromptPreview = extractUserPromptPreview(ev.rawContent)
-          try {
-            recordTurnStart(turnsDb, {
-              turnKey,
-              chatId: String(ev.chatId),
-              threadId: ev.threadId != null ? String(ev.threadId) : null,
-              lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
-              userPromptPreview,
-            })
-          } catch (err) {
-            process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
-          }
+          // Non-blocking: defer the DB write so it doesn't stall the turn handler.
+          // The SIGTERM path writes synchronously (see shutdown handler below).
+          const _db = turnsDb
+          setImmediate(() => {
+            try {
+              recordTurnStart(_db, {
+                turnKey,
+                chatId: String(ev.chatId),
+                threadId: ev.threadId != null ? String(ev.threadId) : null,
+                lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+                userPromptPreview,
+              })
+            } catch (err) {
+              process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
+            }
+          })
         }
         // Issue #195: capture transport selection + time-to-ack baseline
         // up-front so the per-turn answer-stream config is determined before
@@ -2749,18 +2754,25 @@ function handleSessionEvent(ev: SessionEvent): void {
         const assistantReplyPreview = capturedJoined
           ? capturedJoined.slice(0, TURN_PREVIEW_MAX)
           : null
-        try {
-          recordTurnEnd(turnsDb, {
-            turnKey: currentTurnRegistryKey,
-            endedVia: 'stop',
-            lastAssistantMsgId: currentTurnLastAssistantMsgId,
-            lastAssistantDone: currentTurnLastAssistantDone,
-            assistantReplyPreview,
-            toolCallCount: currentTurnToolCallCount,
-          })
-        } catch (err) {
-          process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${currentTurnRegistryKey}: ${(err as Error).message}\n`)
+        // Non-blocking: defer the DB write so it doesn't stall the turn handler.
+        // The SIGTERM path writes synchronously (see shutdown handler below).
+        const _db = turnsDb
+        const _turnKey = currentTurnRegistryKey
+        const _endArgs = {
+          turnKey: _turnKey,
+          endedVia: 'stop' as const,
+          lastAssistantMsgId: currentTurnLastAssistantMsgId,
+          lastAssistantDone: currentTurnLastAssistantDone,
+          assistantReplyPreview,
+          toolCallCount: currentTurnToolCallCount,
         }
+        setImmediate(() => {
+          try {
+            recordTurnEnd(_db, _endArgs)
+          } catch (err) {
+            process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
+          }
+        })
       }
       currentTurnRegistryKey = null
       currentSessionChatId = null
