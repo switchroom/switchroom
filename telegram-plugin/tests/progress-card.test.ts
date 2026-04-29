@@ -809,7 +809,10 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.subAgents.get('newer')?.parentToolUseId).toBeNull()
   })
 
-  it('sub_agent_tool_use increments toolCount and sets currentTool', () => {
+  it('sub_agent_tool_use sets currentTool (toolCount still 0 until result arrives)', () => {
+    // Gap 5 fix (#316): toolCount increments on sub_agent_tool_result (completed),
+    // NOT on sub_agent_tool_use (started), so the count reflects tools that have
+    // actually finished. After tool_use alone, toolCount stays 0.
     let st = fold([
       enqueue('go'),
       {
@@ -826,11 +829,12 @@ describe('progress-card reducer — multi-agent correlation', () => {
       6000,
     )
     const sa = st.subAgents.get('X')!
-    expect(sa.toolCount).toBe(1)
+    expect(sa.toolCount).toBe(0)
     expect(sa.currentTool?.tool).toBe('Read')
-    // Tool result clears currentTool
+    // Tool result increments toolCount and clears currentTool
     st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 'toolu_x1' }, 6100)
     expect(st.subAgents.get('X')!.currentTool).toBeUndefined()
+    expect(st.subAgents.get('X')!.toolCount).toBe(1)
   })
 
   it('sub_agent_text stashes pendingPreamble on the target sub-agent only', () => {
@@ -966,6 +970,96 @@ describe('progress-card reducer — multi-agent correlation', () => {
     st = reduce(st, { kind: 'sub_agent_nested_spawn', agentId: 'X' }, 8100)
     expect(st.subAgents.get('X')?.nestedSpawnCount).toBe(2)
     expect(st.subAgents.size).toBe(1) // no row for the nested ones
+  })
+
+  // ── Gap 5 (#316): toolCount counts completed tools ────────────────────────
+
+  it('toolCount counts: 3 tool_use+tool_result cycles → toolCount === 3', () => {
+    // Gap 5 fix (#316): toolCount must increment on sub_agent_tool_result
+    // (completed) not sub_agent_tool_use (started). After 3 full use+result
+    // cycles, toolCount must be 3.
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    for (let i = 1; i <= 3; i++) {
+      st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: `toolu_x${i}`, toolName: 'Read', input: { file_path: `/f${i}` } }, 6000 + i * 100)
+      // Between use and result: toolCount must still be i-1 (not yet incremented)
+      expect(st.subAgents.get('X')!.toolCount).toBe(i - 1)
+      st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: `toolu_x${i}` }, 6000 + i * 100 + 50)
+      // After result: toolCount must be i
+      expect(st.subAgents.get('X')!.toolCount).toBe(i)
+    }
+    // Final check: exactly 3 completed tools
+    expect(st.subAgents.get('X')!.toolCount).toBe(3)
+  })
+
+  // ── Gap 6 (#316): lastCompletedTool populated on sub_agent_tool_result ────
+
+  it('lastCompletedTool populated: after Read use+result, currentTool is null and lastCompletedTool has Read info', () => {
+    // Gap 6 fix (#316): sub_agent_tool_result must populate lastCompletedTool
+    // from currentTool before clearing it. Render fallback chain then shows
+    // "✓ just finished Read …" instead of bare "(idle)" during silent stretches.
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'X', toolUseId: 'toolu_x1', toolName: 'Read', input: { file_path: '/src/foo.ts' } }, 6000)
+    expect(st.subAgents.get('X')!.currentTool?.tool).toBe('Read')
+    expect(st.subAgents.get('X')!.lastCompletedTool).toBeUndefined()
+
+    st = reduce(st, { kind: 'sub_agent_tool_result', agentId: 'X', toolUseId: 'toolu_x1' }, 6200)
+    const sa = st.subAgents.get('X')!
+    // currentTool must be cleared
+    expect(sa.currentTool).toBeUndefined()
+    // lastCompletedTool must be populated with the Read tool info
+    expect(sa.lastCompletedTool).toBeDefined()
+    expect(sa.lastCompletedTool!.tool).toBe('Read')
+    expect(sa.lastCompletedTool!.finishedAt).toBe(6200)
+  })
+
+  // ── Gap 7 (#316): pendingPreamble per-agent isolation regression ──────────
+
+  it('pendingPreamble isolated: A text then B tool_use — A preamble intact, B has no preamble', () => {
+    // Gap 7 regression (#316): sub_agent_text and sub_agent_tool_use must both
+    // index by agentId so preamble from sub-agent A cannot leak onto sub-agent B.
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'dA', prompt: 'PA' } },
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'dB', prompt: 'PB' } },
+      { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'PA' },
+      { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'PB' },
+    ])
+    // A emits text — stash preamble on A only
+    st = reduce(st, { kind: 'sub_agent_text', agentId: 'A', text: 'A is about to read a file' }, 6000)
+    // B fires a tool_use — should NOT pick up A's preamble
+    st = reduce(st, { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'toolu_b1', toolName: 'Read', input: { file_path: '/x/b.ts' } }, 6100)
+    // B's tool label must fall back to the filename (not A's text)
+    expect(st.subAgents.get('B')!.currentTool?.label).toBe('b.ts')
+    // A's preamble must still be intact
+    expect(st.subAgents.get('A')!.pendingPreamble).toBe('A is about to read a file')
+    // B's preamble must be cleared (consumed as undefined → null)
+    expect(st.subAgents.get('B')!.pendingPreamble ?? null).toBeNull()
+
+    // Reverse order: B text then A tool_use — B preamble intact, A has no preamble
+    let st2 = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a2', input: { description: 'dA', prompt: 'PA2' } },
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b2', input: { description: 'dB', prompt: 'PB2' } },
+      { kind: 'sub_agent_started', agentId: 'A2', firstPromptText: 'PA2' },
+      { kind: 'sub_agent_started', agentId: 'B2', firstPromptText: 'PB2' },
+    ])
+    st2 = reduce(st2, { kind: 'sub_agent_text', agentId: 'B2', text: 'B is about to grep something' }, 7000)
+    st2 = reduce(st2, { kind: 'sub_agent_tool_use', agentId: 'A2', toolUseId: 'toolu_a2_1', toolName: 'Grep', input: { pattern: 'foo' } }, 7100)
+    // A2's tool must NOT inherit B2's preamble — label comes from the Grep
+    // pattern fallback ("<pattern>" (in repo)) not B2's text.
+    const a2Label = st2.subAgents.get('A2')!.currentTool?.label ?? ''
+    expect(a2Label).toContain('foo')
+    expect(a2Label).not.toBe('B is about to grep something')
+    // B2's preamble must still be intact
+    expect(st2.subAgents.get('B2')!.pendingPreamble).toBe('B is about to grep something')
   })
 
   it('flag-off renderer ignores subAgents (byte-identical legacy output)', () => {

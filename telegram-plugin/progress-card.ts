@@ -580,7 +580,9 @@ export function reduce(
       const next = new Map(state.subAgents)
       next.set(event.agentId, {
         ...sa,
-        toolCount: sa.toolCount + 1,
+        // toolCount is incremented on sub_agent_tool_result (not here) so
+        // the count reflects completed tools — matching the semantics the
+        // renderer surfaces as "N tools total" (Gap 5 fix, #316).
         currentTool: event.toolUseId
           ? {
               tool: event.toolName,
@@ -602,7 +604,10 @@ export function reduce(
       // parent's tool_result does. We clear currentTool if it matches,
       // AND stash it as lastCompletedTool so the render fallback chain
       // can surface "just finished X" instead of a bare "(idle)" line
-      // while the sub-agent thinks between tools.
+      // while the sub-agent thinks between tools (Gap 6 fix, #316).
+      // toolCount increments here (on result, not on use) so the count
+      // reflects completed tools — consistent with render semantics and
+      // the spec in the issue (Gap 5 fix, #316).
       if (sa.currentTool && sa.currentTool.toolUseId === event.toolUseId) {
         const justFinished = {
           tool: sa.currentTool.tool,
@@ -615,6 +620,7 @@ export function reduce(
           ...sa,
           currentTool: undefined,
           lastCompletedTool: justFinished,
+          toolCount: sa.toolCount + 1,
         })
         return { ...state, subAgents: next }
       }
