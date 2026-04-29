@@ -40,6 +40,12 @@
 - **Switchroom-worktree** MCP + CLI for parallel sub-agent code isolation;
   worktree primitives (schema, modules, env injection) wired in (#74, #75,
   #274).
+- **Browser automation by default** — every agent gets Microsoft's official
+  `@playwright/mcp` (pinned to `0.0.71`, snapshot mode) wired in via
+  `npx -y @playwright/mcp` so `browser_navigate`, `browser_snapshot`,
+  `browser_click`, `browser_type`, etc. work out of the box without a
+  local Playwright install. Opt out per-agent or globally with
+  `mcp_servers: { playwright: false }` (#358).
 - Web dashboard `--bind` flag for LAN/Tailscale access; trust
   `Tailscale-User-Login` header for loopback requests.
 - `switchroom agent rename` command for slug renames (#168).
