@@ -15,9 +15,24 @@
  *
  * In our model-driven architecture (no inference hooks), the controller
  * is driven by the model calling stream_reply(text, done) multiple times
- * during a long task. First call → sendMessage. Subsequent calls →
- * throttled editMessageText. done=true → flush, lock, no more edits.
+ * during a long task. First call → sendMessage (or sendMessageDraft in DMs).
+ * Subsequent calls → throttled editMessageText (or sendMessageDraft). done=true
+ * → flush, materialize as a fresh sendMessage (push notification), clear draft.
+ *
+ * Transport selection:
+ *   - previewTransport: "auto" (default) — use draft in DMs only
+ *   - previewTransport: "draft"           — always use draft (if API available)
+ *   - previewTransport: "message"         — always use sendMessage/editMessageText
+ *
+ * Forum topics (message_thread_id set) force message transport because
+ * sendMessageDraft does not support threads. The caller (stream-controller.ts)
+ * handles this by passing previewTransport: "message" for threaded chats.
  */
+
+import {
+  shouldFallbackFromDraftTransport,
+  allocateDraftId,
+} from './draft-transport.js'
 
 const TELEGRAM_MAX_CHARS = 4096
 const DEFAULT_THROTTLE_MS = 1000
@@ -33,6 +48,18 @@ export type StreamSendFn = (text: string) => Promise<number>
  * Edit an existing stream message. Receives the message_id and rendered text.
  */
 export type StreamEditFn = (messageId: number, text: string) => Promise<void>
+
+/**
+ * Optional sendMessageDraft callback. When present and the transport is
+ * "draft", this is called instead of sendMessage/editMessageText.
+ * Signature mirrors Telegram's sendMessageDraft Bot API method.
+ */
+export type StreamDraftFn = (
+  chatId: string,
+  draftId: number,
+  text: string,
+  params?: { message_thread_id?: number },
+) => Promise<unknown>
 
 export interface DraftStreamConfig {
   /** Throttle window in ms. Floored at 250. Default 1000. */
@@ -53,10 +80,41 @@ export interface DraftStreamConfig {
    *
    * Default 0 (no pre-send debounce — first update fires immediately).
    * Only affects the first send; subsequent edits use throttleMs.
+   *
+   * NOTE: This debounce only applies to message transport. Draft transport
+   * fires immediately on the first update because drafts are ephemeral —
+   * the throttle/flush loop already collapses bursts into 1 API call/sec
+   * via throttleMs.
    */
   idleMs?: number
+  /**
+   * Transport selector.
+   * - "auto" (default): use draft transport when isPrivateChat=true AND
+   *   sendMessageDraft is provided; otherwise use message transport.
+   * - "draft": always prefer draft (falls back to message if sendMessageDraft absent).
+   * - "message": always use sendMessage/editMessageText.
+   */
+  previewTransport?: 'auto' | 'message' | 'draft'
+  /**
+   * True if the current chat is a private DM. Used by "auto" transport to
+   * decide whether to activate draft. Has no effect when previewTransport
+   * is "draft" or "message".
+   */
+  isPrivateChat?: boolean
+  /**
+   * sendMessageDraft callback. When absent, the stream falls back to
+   * sendMessage/editMessageText regardless of previewTransport.
+   */
+  sendMessageDraft?: StreamDraftFn
+  /**
+   * The Telegram chat id string — required when sendMessageDraft is provided,
+   * so the draft can be cleared on finalize.
+   */
+  chatId?: string
   /** Optional logger for debugging. Receives one string per event. */
   log?: (msg: string) => void
+  /** Optional warning logger. Used for transport fallback notices. */
+  warn?: (msg: string) => void
 }
 
 export interface DraftStreamHandle {
@@ -86,6 +144,11 @@ export interface DraftStreamHandle {
  *
  * The first update() call invokes `send` to create the message. All
  * subsequent calls invoke `edit` against the captured message_id.
+ *
+ * When sendMessageDraft is provided (and transport allows it), intermediate
+ * updates use the draft API instead of sendMessage/editMessageText. On
+ * finalize(), a real sendMessage is sent for push notification, then the
+ * draft is cleared best-effort.
  */
 export function createDraftStream(
   send: StreamSendFn,
@@ -96,6 +159,37 @@ export function createDraftStream(
   const maxChars = config.maxChars ?? TELEGRAM_MAX_CHARS
   const idleMs = Math.max(0, config.idleMs ?? 0)
   const log = config.log
+  const warn = config.warn
+  const draftApi = config.sendMessageDraft
+  const chatId = config.chatId ?? ''
+
+  // Resolve transport
+  const requestedTransport = config.previewTransport ?? 'auto'
+  const prefersDraft =
+    requestedTransport === 'draft'
+      ? true
+      : requestedTransport === 'message'
+        ? false
+        : (config.isPrivateChat === true) // 'auto': DM only
+
+  // Footgun guard: caller asked for "auto" + provided sendMessageDraft but
+  // forgot isPrivateChat. They almost certainly wanted draft in DMs but will
+  // silently get message transport everywhere. Warn so the bug is visible.
+  if (
+    requestedTransport === 'auto'
+    && draftApi != null
+    && config.isPrivateChat === undefined
+  ) {
+    warn?.('draft-stream: previewTransport="auto" with sendMessageDraft but isPrivateChat undefined — defaulting to message transport')
+  }
+
+  // Use draft transport only if we have the API
+  let usesDraftTransport = prefersDraft && draftApi != null
+  let draftId: number | undefined = usesDraftTransport ? allocateDraftId() : undefined
+
+  if (prefersDraft && !usesDraftTransport) {
+    warn?.('draft-stream: sendMessageDraft unavailable; falling back to sendMessage/editMessageText')
+  }
 
   let messageId: number | null = null
   let pendingText: string | null = null
@@ -115,6 +209,24 @@ export function createDraftStream(
       try {
         fn()
       } catch { /* ignore waiter errors */ }
+    }
+  }
+
+  async function sendViaDraft(textToSend: string): Promise<boolean> {
+    if (!draftApi || draftId == null) return false
+    try {
+      await draftApi(chatId, draftId, textToSend)
+      log?.(`stream → draft (id: ${draftId}, ${textToSend.length} chars)`)
+      return true
+    } catch (err) {
+      if (shouldFallbackFromDraftTransport(err)) {
+        const msg = err instanceof Error ? err.message : String(err)
+        warn?.(`draft-stream: sendMessageDraft rejected — falling back to sendMessage/editMessageText (${msg})`)
+        usesDraftTransport = false
+        draftId = undefined
+        return false
+      }
+      throw err
     }
   }
 
@@ -144,26 +256,20 @@ export function createDraftStream(
     }
 
     try {
-      if (messageId == null) {
-        messageId = await send(textToSend)
-        log?.(`stream → sent (id: ${messageId}, ${textToSend.length} chars)`)
+      if (usesDraftTransport) {
+        const ok = await sendViaDraft(textToSend)
+        if (!ok) {
+          // Draft failed with a permanent error → fell back to message transport.
+          // Replay this text via message transport.
+          await sendViaMessage(textToSend)
+        }
       } else {
-        await edit(messageId, textToSend)
-        log?.(`stream → edited (id: ${messageId}, ${textToSend.length} chars)`)
+        await sendViaMessage(textToSend)
       }
       lastSentText = textToSend
       lastSentAt = Date.now()
     } catch (err) {
       const msg = (err as Error).message ?? String(err)
-      // "message is not modified" — the new text equals the current
-      // server-side text. Treat as success.
-      //
-      // NOTE: the regexes below are intentionally anchored to the EXACT
-      // Telegram Bot API error strings (via word boundaries and the
-      // "message" prefix). Earlier versions matched /not modified/i and
-      // /not found/i anywhere in the message, which would misclassify
-      // unrelated errors like "chat not found" or "thread not found" as
-      // recoverable and silently drop them.
       if (/\bmessage is not modified\b/i.test(msg)) {
         lastSentText = textToSend
         lastSentAt = Date.now()
@@ -172,20 +278,26 @@ export function createDraftStream(
         /\bmessage to edit not found\b/i.test(msg)
         || /\bMESSAGE_ID_INVALID\b/i.test(msg)
       ) {
-        // The preview was deleted by the user (or Telegram) between send
-        // and edit. Clear the captured id + lastSentText and requeue the
-        // text so the next loop iteration re-sends from scratch.
         log?.(`stream → message not found (id: ${messageId}), re-sending`)
         messageId = null
         lastSentText = null
         if (pendingText == null) pendingText = textToSend
       } else {
         log?.(`stream → edit failed: ${msg}`)
-        // Don't throw; the loop will try again on the next update.
       }
     }
 
     notifyWaiters()
+  }
+
+  async function sendViaMessage(textToSend: string): Promise<void> {
+    if (messageId == null) {
+      messageId = await send(textToSend)
+      log?.(`stream → sent (id: ${messageId}, ${textToSend.length} chars)`)
+    } else {
+      await edit(messageId, textToSend)
+      log?.(`stream → edited (id: ${messageId}, ${textToSend.length} chars)`)
+    }
   }
 
   async function flushLoop(): Promise<void> {
@@ -223,9 +335,9 @@ export function createDraftStream(
       // Pre-send idle debounce: for the FIRST send of a stream, optionally
       // defer by idleMs so a burst of update() calls collapses into one
       // send. Each incoming update resets the timer. Once the initial
-      // send has landed (messageId != null), this path is skipped and the
-      // regular throttle kicks in.
-      if (idleMs > 0 && messageId == null && inFlight == null) {
+      // send has landed (messageId != null OR draft has fired), this path
+      // is skipped and the regular throttle kicks in.
+      if (idleMs > 0 && messageId == null && !usesDraftTransport && inFlight == null) {
         if (scheduledTimer != null) clearTimeout(scheduledTimer)
         scheduledTimer = setTimeout(() => {
           scheduledTimer = null
@@ -277,6 +389,29 @@ export function createDraftStream(
       if (pendingText != null && !stopped) {
         await flush()
       }
+
+      // Draft transport: materialize as a real sendMessage for push notification,
+      // then clear the draft best-effort.
+      if (usesDraftTransport && draftApi != null) {
+        const textToMaterialize = lastSentText
+        if (textToMaterialize) {
+          try {
+            messageId = await send(textToMaterialize)
+            log?.(`stream → materialized (id: ${messageId}, ${textToMaterialize.length} chars)`)
+          } catch (err) {
+            warn?.(`draft-stream: materialize sendMessage failed: ${err instanceof Error ? err.message : String(err)}`)
+          }
+          // Clear draft best-effort (cosmetic — Telegram input area cleanup)
+          if (draftId != null) {
+            try {
+              await draftApi(chatId, draftId, '')
+            } catch {
+              // Best-effort — ignore failures
+            }
+          }
+        }
+      }
+
       log?.(`stream finalized (id: ${messageId})`)
     },
 

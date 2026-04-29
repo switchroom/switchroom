@@ -1830,9 +1830,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
   const access = loadAccess()
+  // Detect chat type for draft-transport selection.
+  // Private (DM) chats have positive numeric IDs; groups/channels are negative.
+  // Forum topics have a message_thread_id set — sendMessageDraft is unsupported there.
+  const streamChatId = args.chat_id as string
+  const streamIsPrivate = isDmChatId(streamChatId)
+  const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
   const result = await handleStreamReply(
     {
-      chat_id: args.chat_id as string,
+      chat_id: streamChatId,
       text: args.text as string,
       done: Boolean(args.done),
       message_thread_id: args.message_thread_id as string | undefined,
@@ -1856,6 +1862,9 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       defaultFormat: access.parseMode ?? 'html',
       logStreamingEvent,
       endStatusReaction,
+      isPrivateChat: streamIsPrivate,
+      isForumTopic: streamIsForumTopic,
+      ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
       // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
       // so the terminal render sees outboundDeliveredCount > 0. The handler
       // calls this dep in that order internally.

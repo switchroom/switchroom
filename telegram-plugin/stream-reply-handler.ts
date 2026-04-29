@@ -16,7 +16,7 @@
  *     wraps into an MCP content response.
  */
 
-import type { DraftStreamHandle } from './draft-stream.js'
+import type { DraftStreamHandle, StreamDraftFn } from './draft-stream.js'
 import {
   createStreamController,
   type StreamBotApi,
@@ -237,6 +237,23 @@ export interface StreamReplyDeps {
   writeError: (line: string) => void
   throttleMs?: number
   /**
+   * sendMessageDraft callback. When provided, stream_reply uses the draft
+   * API for intermediate updates (DM transport). On done=true, a real
+   * sendMessage fires for push notification, then the draft is cleared.
+   * Optional — omit to keep the existing sendMessage/editMessageText path.
+   */
+  sendMessageDraft?: StreamDraftFn
+  /**
+   * True when the current chat is a private DM. Passed to the stream
+   * controller so "auto" transport activates draft in DMs only.
+   */
+  isPrivateChat?: boolean
+  /**
+   * True when the current chat is a forum topic. Forum topics do not
+   * support sendMessageDraft — this forces message transport.
+   */
+  isForumTopic?: boolean
+  /**
    * When true, the progress-card driver is emitting a live checklist on
    * the `progress` lane and owns mid-turn display. In that mode, a
    * caller-initiated `stream_reply` on the default (unnamed) lane with
@@ -430,6 +447,14 @@ export async function handleStreamReply(
       }
     }
 
+    // Resolve draft-transport options. Forum topics force message transport
+    // because sendMessageDraft does not support threads.
+    const isForumTopic = deps.isForumTopic === true
+    const resolvedTransport: 'auto' | 'message' | 'draft' =
+      isForumTopic || deps.sendMessageDraft == null
+        ? 'message'
+        : 'auto'
+
     stream = createStreamController({
       bot: deps.bot,
       chatId: chat_id,
@@ -442,6 +467,9 @@ export async function handleStreamReply(
       ...(args.quote_text != null && replyToMessageId != null ? { quoteText: args.quote_text } : {}),
       ...(args.protect_content === true ? { protectContent: true } : {}),
       ...(args.reply_markup != null ? { replyMarkup: args.reply_markup } : {}),
+      previewTransport: resolvedTransport,
+      isPrivateChat: deps.isPrivateChat === true,
+      ...(deps.sendMessageDraft != null ? { sendMessageDraft: deps.sendMessageDraft } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
       onEdit: (messageId, charCount) =>
@@ -464,7 +492,12 @@ export async function handleStreamReply(
           || msg.startsWith('stream → edited')
           || msg.startsWith('stream → not modified')
           || msg.startsWith('stream finalized')
+          || msg.startsWith('stream → draft')
+          || msg.startsWith('stream → materialized')
         ) return
+        deps.writeError(`telegram channel: stream_reply ${msg}\n`)
+      },
+      warn: (msg) => {
         deps.writeError(`telegram channel: stream_reply ${msg}\n`)
       },
     })
