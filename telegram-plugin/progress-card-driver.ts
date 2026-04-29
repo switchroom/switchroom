@@ -223,6 +223,25 @@ export interface ProgressDriverConfig {
    * Default 180000 (3 minutes). Set to 0 to disable.
    */
   deferredCompletionTimeoutMs?: number
+  /**
+   * Fix #314 — elapsed-ticker interval for silent sub-agent gaps.
+   *
+   * While at least one sub-agent is in `state='running'`, the parent card
+   * only re-renders when an event changes the HTML (tool start/end, stage
+   * change). During silent stretches between tool calls the elapsed counter
+   * freezes — the diff guard suppresses edits when only the timestamp
+   * advances. This interval forces a render (bypassing that guard) every N ms
+   * so the elapsed counter visibly ticks even when the sub-agent is quietly
+   * thinking or waiting for I/O.
+   *
+   * 10 s was chosen as a balance: short enough that the counter advances
+   * at human-perceptible speed (users notice a 15+ second freeze), long
+   * enough to stay well under Telegram's ~20 edits/minute budget even when
+   * multiple cards are active in parallel.
+   *
+   * Default 10000. Set to 0 to disable the elapsed-ticker path entirely.
+   */
+  subAgentTickIntervalMs?: number
 }
 
 /**
@@ -498,6 +517,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const orphanPromotionMs = config.orphanPromotionMs ?? 5_000
   const coldSubAgentThresholdMs = config.coldSubAgentThresholdMs ?? 30_000
   const deferredCompletionTimeoutMs = config.deferredCompletionTimeoutMs ?? 3 * 60_000
+  const subAgentTickIntervalMs = config.subAgentTickIntervalMs ?? 10_000
   // Per-chat sliding 60s window of recent emit timestamps. When the
   // window holds more than `editBudgetThreshold` entries we're "hot"
   // and coalesce more aggressively.
@@ -558,6 +578,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   // header elapsed counter (rounded to the heartbeat cadence) would
   // still render identically, skip the edit.
   const lastHeartbeatBucket = new Map<string, number>()
+  // Fix #314: tracks the last sub-agent elapsed-tick bucket per turn.
+  // Works exactly like `lastHeartbeatBucket` but uses `subAgentTickIntervalMs`
+  // as the bucket width. When the bucket advances AND at least one sub-agent
+  // is running, the heartbeat forces an emit even when the HTML hash is
+  // unchanged. Bucket-based (not timestamp-based) so the comparison is stable
+  // even when multiple heartbeat ticks fire at the same `now()` value during
+  // a fake-clock advance in tests.
+  const lastSubAgentTickBucket = new Map<string, number>()
 
   /**
    * Fire completion callbacks + delete chatState + tidy bookkeeping.
@@ -641,6 +669,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     }
     chats.delete(cs.turnKey)
     lastHeartbeatBucket.delete(cs.turnKey)
+    lastSubAgentTickBucket.delete(cs.turnKey)
     editTimestamps.delete(cs.turnKey)
     if (currentTurnKey === cs.turnKey) {
       currentChatId = null
@@ -792,11 +821,28 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           continue
         }
 
+        // Fix #314 — elapsed-ticker bucket: compute BEFORE the budget-hot
+        // skip so the ticker can override the skip when the elapsed counter
+        // would otherwise freeze. A bursty sub-agent (many tool calls) makes
+        // the chat hot, which suppresses the heartbeat — but the user still
+        // expects elapsed time to advance visibly. The ticker provides a hard
+        // floor every `subAgentTickIntervalMs` so the UI never looks dead for
+        // longer than that, even when a sub-agent is grinding through tools.
+        const subAgentRunning = subAgentTickIntervalMs > 0 && hasAnyRunningSubAgent(cs.state)
+        const subAgentBucket = subAgentTickIntervalMs > 0 ? Math.floor(now() / subAgentTickIntervalMs) : 0
+        const prevSubAgentBucket = lastSubAgentTickBucket.get(cs.turnKey)
+        const elapsedTickDue = subAgentRunning && subAgentBucket !== prevSubAgentBucket
+
         // Skip heartbeat while the chat is hot — sub-agent bursts are
         // already producing edits, the elapsed counter is ticking from
         // those, and an extra heartbeat edit just spends budget. (Design
-        // §4.4: "heartbeat respects budget too".)
-        if (isBudgetHot(cs.turnKey)) continue
+        // §4.4: "heartbeat respects budget too".) EXCEPTION: when the
+        // elapsed-ticker is due, push one render through to keep elapsed
+        // visibly advancing — this is the floor that fixes #314.
+        if (isBudgetHot(cs.turnKey) && !elapsedTickDue) continue
+        if (elapsedTickDue) {
+          lastSubAgentTickBucket.set(cs.turnKey, subAgentBucket)
+        }
         const stuckMs = Math.max(0, now() - cs.lastEventAt)
         // Issue #132: silentEnd only matters once the parent turn is in
         // `stage='done'` AND no sub-agents are still running. While work
@@ -817,7 +863,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered, parentDone })
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
-        if (html === cs.lastEmittedHtml && bucket === prevBucket) continue
+
+        // Fix #314 — elapsed-ticker bypass for the html-unchanged guard. When
+        // the elapsed-ticker is due, push the emit through even if html and
+        // heartbeat-bucket are both unchanged. Combined with the budget-hot
+        // bypass above, this guarantees the elapsed counter advances at most
+        // `subAgentTickIntervalMs` apart while a sub-agent is running.
+        if (html === cs.lastEmittedHtml && bucket === prevBucket && !elapsedTickDue) continue
         lastHeartbeatBucket.set(cs.turnKey, bucket)
         cs.lastEmittedHtml = html
         cs.lastEmittedAt = now()
