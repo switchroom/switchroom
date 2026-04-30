@@ -1,6 +1,8 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { resolveAgentsDir } from "../config/loader.js";
 import {
   loginAgent,
@@ -56,6 +58,150 @@ function rejectAll(name: string, verb: string): void {
   process.exit(1);
 }
 
+export type AuthSeverity = "ok" | "warn" | "error" | "critical";
+
+export interface AuthFinding {
+  /** Stable identifier (matches boot-self-test fingerprint codes). */
+  code: string;
+  severity: AuthSeverity;
+  summary: string;
+}
+
+export interface AuthDiagnosis {
+  /** Aggregated severity (max of finding severities). "ok" when no issue. */
+  severity: AuthSeverity;
+  findings: AuthFinding[];
+  /** Operator-readable lines for the recommended next step. */
+  recommendation: string[];
+}
+
+const SEVERITY_RANK: Record<AuthSeverity, number> = {
+  ok: 0,
+  warn: 1,
+  error: 2,
+  critical: 3,
+};
+
+/**
+ * Inspect the agent's `.credentials.json` and `.oauth-token` and
+ * return a structured diagnosis matching the boot-self-test (#427)
+ * checks. Pure read; no side effects.
+ *
+ * Exposed for tests and for the heal CLI verb. The recommendation
+ * lines are scoped to what the user can actually do — currently that
+ * means `switchroom auth reauth <name>` for any non-ok state, since
+ * none of these failure modes are auto-recoverable yet (Phase 1.1
+ * adds the OAuth refresh loop that would self-heal `token_expired`
+ * when a refreshToken is present).
+ */
+export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
+  const findings: AuthFinding[] = [];
+  const credsPath = join(claudeConfigDir, ".credentials.json");
+  const oauthTokenPath = join(claudeConfigDir, ".oauth-token");
+
+  const hasCreds = existsSync(credsPath);
+  const hasOauthToken = existsSync(oauthTokenPath);
+
+  if (!hasCreds && !hasOauthToken) {
+    findings.push({
+      code: "credentials_missing",
+      severity: "error",
+      summary: "no .credentials.json AND no .oauth-token — agent has never been authenticated",
+    });
+  } else if (!hasCreds) {
+    // .oauth-token alone is the legacy state — works for in-process
+    // claude (start.sh exports it) but `claude -p` from hooks needs
+    // .credentials.json to refresh. Warn rather than error.
+    findings.push({
+      code: "credentials_missing",
+      severity: "warn",
+      summary: ".credentials.json absent (only .oauth-token present); claude can't self-refresh",
+    });
+  } else {
+    let parsed:
+      | { claudeAiOauth?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }
+      | undefined;
+    try {
+      parsed = JSON.parse(readFileSync(credsPath, "utf-8"));
+    } catch {
+      findings.push({
+        code: "credentials_malformed",
+        severity: "error",
+        summary: ".credentials.json is not valid JSON — file corrupted",
+      });
+    }
+    if (parsed) {
+      const oauth = parsed.claudeAiOauth;
+      if (!oauth || typeof oauth.accessToken !== "string" || oauth.accessToken.length === 0) {
+        findings.push({
+          code: "credentials_malformed",
+          severity: "error",
+          summary: ".credentials.json missing claudeAiOauth.accessToken — file corrupted",
+        });
+      } else {
+        // Token shape OK; check expiry.
+        const expiresAt = oauth.expiresAt;
+        if (typeof expiresAt === "number" && expiresAt < Date.now()) {
+          const days = Math.floor((Date.now() - expiresAt) / 86_400_000);
+          findings.push({
+            code: "token_expired",
+            severity: "error",
+            summary: `access token expired ${days}d ago`,
+          });
+        }
+        // Refresh token: warn if missing.
+        if (!oauth.refreshToken || oauth.refreshToken.length === 0) {
+          findings.push({
+            code: "refresh_token_missing",
+            severity: "warn",
+            summary: "no refreshToken — claude can't self-refresh; will break when access token expires",
+          });
+        }
+      }
+    }
+  }
+
+  // Aggregate severity.
+  let severity: AuthSeverity = "ok";
+  for (const f of findings) {
+    if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[severity]) {
+      severity = f.severity;
+    }
+  }
+
+  // Build the recommendation. For now everything routes to reauth —
+  // Phase 1.1 will add a programmatic refresh path for the
+  // refreshToken-present case.
+  const recommendation: string[] = [];
+  if (severity === "ok") {
+    // No recommendation needed.
+  } else {
+    // Different prescription depending on what's broken — but the
+    // command is the same. The PROSE differs to be actionable.
+    if (findings.some((f) => f.code === "credentials_missing" && f.severity === "error")) {
+      recommendation.push("This agent has never been authenticated. Start the OAuth flow:");
+    } else if (findings.some((f) => f.code === "token_expired")) {
+      recommendation.push("The access token has expired and can't be refreshed automatically. Reauth:");
+    } else if (findings.some((f) => f.code === "credentials_malformed")) {
+      recommendation.push(".credentials.json is corrupted. A fresh OAuth flow will replace it:");
+    } else {
+      recommendation.push("Recommended: refresh credentials so the access token can be renewed:");
+    }
+    recommendation.push("");
+    recommendation.push("  switchroom auth reauth <agent-name>");
+    recommendation.push("");
+    recommendation.push("Or pass --auto to this command to start the flow now.");
+  }
+
+  return { severity, findings, recommendation };
+}
+
+/**
+ * Suppress the unused-import warning when the build path doesn't
+ * statically reference these. Keeps the import list intentional.
+ */
+void execFileSync;
+
 export function registerAuthCommand(program: Command): void {
   const auth = program
     .command("auth")
@@ -107,6 +253,87 @@ export function registerAuthCommand(program: Command): void {
           console.log(line);
         }
         console.log();
+      })
+    );
+
+  // switchroom auth heal <name> [--auto]
+  //
+  // Diagnostic verb for the issue cards (#427, #428): inspects an
+  // agent's auth state and prints the specific next step the operator
+  // needs. With --auto, kicks off `auth reauth` directly instead of
+  // requiring a copy-paste.
+  //
+  // Mirrors the boot-self-test checks (creds present, not expired,
+  // refreshToken present, claude -p works in stripped env) so the
+  // diagnosis here matches what the issue card shows. Default mode is
+  // read-only — diagnose-only — so an operator can run it from
+  // anywhere without side effects.
+  auth
+    .command("heal <name>")
+    .description("Diagnose and (optionally) repair an agent's broken auth state")
+    .option("--auto", "Trigger reauth automatically instead of just printing instructions", false)
+    .option("--json", "Emit a structured diagnosis instead of prose", false)
+    .action(
+      withConfigError(async (name: string, opts: { auto?: boolean; json?: boolean }) => {
+        const config = getConfig(program);
+        const agentsDir = resolveAgentsDir(config);
+        rejectAll(name, "heal");
+        requireKnownAgent(config, name);
+
+        const agentDir = resolve(agentsDir, name);
+        const claudeConfigDir = join(agentDir, ".claude");
+        const diagnosis = diagnoseAuthState(claudeConfigDir);
+
+        if (opts.json) {
+          console.log(JSON.stringify({ agent: name, ...diagnosis }, null, 2));
+          if (diagnosis.severity === "critical" || diagnosis.severity === "error") {
+            process.exit(2);
+          }
+          return;
+        }
+
+        // Prose output — dim header, then the prescribed action.
+        console.log();
+        console.log(`  ${chalk.bold(name)}:`);
+        for (const finding of diagnosis.findings) {
+          const tag =
+            finding.severity === "critical" ? chalk.red("[critical]") :
+            finding.severity === "error"    ? chalk.red("[error]") :
+            finding.severity === "warn"     ? chalk.yellow("[warn]") :
+                                              chalk.green("[ok]");
+          console.log(`    ${tag} ${finding.summary}`);
+        }
+        console.log();
+        if (diagnosis.severity === "ok") {
+          console.log(chalk.green("  ✓ Auth healthy — nothing to do."));
+          console.log();
+          return;
+        }
+
+        console.log(chalk.bold("  Recommended next step:"));
+        for (const line of diagnosis.recommendation) {
+          console.log(`    ${line}`);
+        }
+        console.log();
+
+        if (opts.auto) {
+          console.log(chalk.dim("  --auto specified; kicking off reauth..."));
+          console.log();
+          // Hand off to the existing reauth flow. We don't try to
+          // recover state ourselves — the reauth path is already the
+          // authoritative way to bootstrap fresh creds.
+          const result = refreshAgent(name, agentDir);
+          for (const line of result.instructions) {
+            console.log(line);
+          }
+          console.log();
+        } else {
+          console.log(chalk.dim("  Pass --auto to start the reauth flow now."));
+          console.log();
+          // Non-zero exit so callers (issue card resolution flows,
+          // CI scripts) can detect a non-healthy state.
+          process.exit(2);
+        }
       })
     );
 

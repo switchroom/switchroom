@@ -94,7 +94,7 @@ resolve_one() {
 if [ ! -f "$CREDS" ]; then
   record credentials_missing error \
     "$AGENT_NAME has no .credentials.json — claude -p from hooks will fail" \
-    "Path: $CREDS\nFix: run \`switchroom auth use $AGENT_NAME\` (or the heal command from #429 once it lands)."
+    "Path: $CREDS\nFix: run \`switchroom auth heal $AGENT_NAME\`."
   # Skip subsequent token-shape checks; nothing to inspect.
   CREDS_PRESENT=0
 else
@@ -121,7 +121,7 @@ if [ "$CREDS_PRESENT" -eq 1 ]; then
     if [ -z "$REFRESH_TOKEN" ]; then
       record refresh_token_missing warn \
         "$AGENT_NAME .credentials.json has no refreshToken; claude can't self-refresh" \
-        "Without a refreshToken, the access token will eventually expire and \`claude -p\` from hooks will start failing. Re-auth ($AGENT_NAME) to populate it."
+        "Without a refreshToken, the access token will eventually expire and \`claude -p\` from hooks will start failing. Run \`switchroom auth heal $AGENT_NAME\`."
     else
       resolve_one refresh_token_missing
     fi
