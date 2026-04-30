@@ -250,6 +250,35 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
 ];
 
 /**
+ * Switchroom-shipped default model + thinking effort for main agents.
+ *
+ * Sonnet 4.6 + effort=low is the right starting point for the
+ * conversational main-agent role:
+ *   - Time-to-first-token is ~3–5s vs Opus's 15–30s on chat replies.
+ *     Forensics on a real klanker turn (2026-04-30 11:59:30Z) showed
+ *     19s of Opus extended-thinking dominating a 25s turn — most of
+ *     that thinking is wasted on chat-mode answers.
+ *   - Sonnet 4.6 input cost is ~5x lower; effort=low cuts hidden
+ *     thinking tokens to near-zero.
+ *   - Accuracy on chat / lookup / structured replies is ~95% of Opus.
+ *     The accuracy gap opens up on hard reasoning, code, research
+ *     synthesis — exactly the workloads CLAUDE.md tells the main agent
+ *     to delegate to sub-agents (worker / researcher / reviewer).
+ *
+ * Operators override per-agent or in `defaults.model` / `defaults.thinking_effort`
+ * in switchroom.yaml when an agent's role demands more reasoning at the
+ * main-session level (rare).
+ *
+ * Sub-agents are NOT affected by these constants — sub-agent models are
+ * resolved separately from `SubagentSchema.model` (default falls back to
+ * "claude-sonnet-4-6" when a sub-agent doesn't specify, see line ~1778
+ * in this file). Sub-agents that want Opus reasoning should set
+ * `model: opus` explicitly.
+ */
+export const SWITCHROOM_DEFAULT_MAIN_MODEL = "claude-sonnet-4-6";
+export const SWITCHROOM_DEFAULT_THINKING_EFFORT = "low";
+
+/**
  * Built-in Claude Code tools. When `tools.allow: [all]` is set in
  * switchroom.yaml, every one of these is pre-approved so the agent never
  * blocks on a permission prompt at runtime.
@@ -1183,8 +1212,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     switchroomConfigPathQ: switchroomConfigPath
       ? shellSingleQuote(resolve(switchroomConfigPath))
       : undefined,
-    modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
-    thinkingEffort: agentConfig.thinking_effort,
+    modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+    thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
     permissionMode: agentConfig.permission_mode,
     fallbackModelQ: agentConfig.fallback_model
       ? shellSingleQuote(agentConfig.fallback_model)
@@ -1511,11 +1540,12 @@ export function scaffoldAgent(
         useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
         configPath: switchroomConfigPath,
       });
-      // Explicit model override: written to settings.model so the user
-      // doesn't have to pass --model on every invocation.
-      if (agentConfig.model !== undefined) {
-        settings.model = agentConfig.model;
-      }
+      // Model: explicit override from yaml wins; otherwise apply the
+      // switchroom default (sonnet 4.6, see SWITCHROOM_DEFAULT_MAIN_MODEL
+      // for rationale). Always written to settings.model so the user
+      // doesn't have to pass --model on every invocation, and so the
+      // doctor / debug surfaces show the resolved choice.
+      settings.model = agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL;
 
       // --- Phase 5: settings_raw escape hatch ---
       //
@@ -2496,8 +2526,8 @@ export function reconcileAgent(
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
-      modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
-      thinkingEffort: agentConfig.thinking_effort,
+      modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+      thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
       fallbackModelQ: agentConfig.fallback_model
         ? shellSingleQuote(agentConfig.fallback_model)
@@ -2828,11 +2858,11 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       }
     }
 
-    if (agentConfig.model !== undefined) {
-      settings.model = agentConfig.model;
-    } else if ("model" in settings) {
-      delete settings.model;
-    }
+    // Model resolution mirrors scaffoldAgent's path so reconcile + create
+    // produce the same settings.model byte-for-byte. Apply the switchroom
+    // default (Sonnet 4.6) when the operator hasn't set an explicit
+    // override in switchroom.yaml.
+    settings.model = agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL;
 
     // --- Phase 5: settings_raw escape hatch ---
     //

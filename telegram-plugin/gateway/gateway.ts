@@ -1782,6 +1782,31 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     lastPtyPreviewByChat.delete(replySKey)
   }
 
+  // Consume the pre-alloc placeholder draft synchronously, so the user
+  // sees one clean transition (placeholder → final reply) instead of
+  // the legacy three-step UX (placeholder → reply appears as new
+  // message → placeholder vanishes 2s later on turn_end).
+  //
+  // Pre-alloc fires only on DM inbounds (forum topics are skipped),
+  // and only when sendMessageDraft is available. When present, clear
+  // the draft text to '' which removes the WIP message client-side
+  // immediately. The fresh sendMessage that follows below then lands
+  // as the only visible bot message for the turn.
+  if (sendMessageDraftFn != null) {
+    const preAllocated = preAllocatedDrafts.get(chat_id)
+    if (preAllocated != null) {
+      preAllocatedDrafts.delete(chat_id)
+      // Best-effort: a clear failure (rate limit, expired draft) is
+      // harmless — the orphan-cleanup path on turn_end is still wired
+      // and will retry. Don't await: the subsequent sendMessage is
+      // the user-visible work and we shouldn't gate it on a draft
+      // bookkeeping call.
+      void sendMessageDraftFn(chat_id, preAllocated.draftId, '').catch(() => {
+        /* best-effort */
+      })
+    }
+  }
+
   const deleteStalePreview = async (id: number): Promise<void> => {
     try {
       await lockedBot.api.deleteMessage(chat_id, id)

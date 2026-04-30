@@ -296,6 +296,39 @@ def main():
         debug_log(config, "Prompt too short for recall, skipping")
         return
 
+    # Switchroom-local: skip recall on conversational acks.
+    #
+    # The 5-char short-circuit catches `ok`/`yes`/`no`/`ty` but passes
+    # longer acks like `thanks!`, `got it`, `see you tomorrow` that
+    # don't benefit from recall. Recall costs ~1-2s (low budget) to
+    # ~5s (mid budget) per turn — wasted on "I acknowledge" replies
+    # where the model is going to produce a one-liner regardless of
+    # what came back.
+    #
+    # Strip the optional `<channel ...>` wrapper that telegram-plugin
+    # prepends on inbound, then trim common trailing punctuation/emoji.
+    # Conservative match — we'd rather pay the recall cost on a
+    # borderline case than miss memory on a real query.
+    _stripped = prompt
+    _channel_close = _stripped.find(">")
+    if _stripped.startswith("<channel") and _channel_close != -1:
+        _stripped = _stripped[_channel_close + 1:]
+    _stripped = _stripped.replace("</channel>", "").strip()
+    _ack_form = _stripped.lower().strip(" \t\n\r.,!?…👍👌✅🆗🙏")
+    ACK_PHRASES = frozenset({
+        "ok", "okay", "k", "kk", "yes", "yep", "yup", "yeah", "y",
+        "no", "nope", "nah", "n",
+        "ty", "thanks", "thank you", "thx", "cheers",
+        "got it", "gotcha", "understood", "noted", "roger",
+        "sure", "sure thing", "alright", "all right",
+        "see you", "see ya", "later", "bye", "good night", "goodnight",
+        "great", "nice", "cool", "perfect",
+        "👍", "👌", "✅", "🆗", "🙏",
+    })
+    if _ack_form in ACK_PHRASES:
+        debug_log(config, f"Prompt is ack-only ({_ack_form!r}), skipping recall")
+        return
+
     session_id = hook_input.get("session_id") or ""
 
     # Switchroom #303 — push a "📚 recalling…" status to the user's

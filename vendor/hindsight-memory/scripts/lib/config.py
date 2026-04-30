@@ -11,7 +11,16 @@ import sys
 DEFAULTS = {
     # Recall
     "autoRecall": True,
-    "recallBudget": "mid",
+    # Switchroom default: "low" — vector search only, no LLM reranking.
+    # Cuts the recall hook latency from ~5s (mid budget) to ~1-2s (low).
+    # Operators who want richer recall can set HINDSIGHT_RECALL_BUDGET=mid
+    # via per-agent env or write `recallBudget: "mid"` into the user
+    # config file. Forensics on real klanker turns showed mid-budget
+    # recall was ~5s of wall-clock latency dominated by the LLM filter
+    # pass; for chat-pattern agents the vector hits alone are fine and
+    # the 5s is the second-largest contributor to perceived dead air
+    # (after the model TTFT).
+    "recallBudget": "low",
     "recallMaxTokens": 1024,
     # Switchroom-local: cap on the number of memories injected into the
     # `<hindsight_memories>` block, regardless of token budget. Plugin v0.4.0

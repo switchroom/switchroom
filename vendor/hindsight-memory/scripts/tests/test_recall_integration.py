@@ -412,5 +412,69 @@ class RecallTelemetryLogTests(unittest.TestCase):
         os.environ["CLAUDE_PLUGIN_DATA"] = self._tmpdir
 
 
+class AckShortCircuitTests(unittest.TestCase):
+    """Switchroom: skip recall entirely on conversational acks
+    ("thanks", "ok", "got it", etc.) — saves the ~1-5s recall on
+    turns where the model is going to produce a one-liner regardless.
+    """
+
+    def _assert_no_recall(self, prompt):
+        # When ack-skip kicks in, the recall hook returns BEFORE
+        # constructing the client, so we can pass a client whose
+        # `recall` raises — if the test expectations hold, the raise
+        # never fires.
+        class _BoomClient:
+            def list_directives(self, *a, **kw):
+                raise AssertionError("list_directives called on ack-only turn")
+
+            def recall(self, *a, **kw):
+                raise AssertionError("recall called on ack-only turn")
+
+        ctx, raw = _run_main_with(_BoomClient(), prompt=prompt)
+        # No output → empty stdout, no hookSpecificOutput.
+        self.assertIsNone(ctx)
+        self.assertEqual(raw.strip(), "")
+
+    def test_simple_thanks(self):
+        self._assert_no_recall("thanks")
+
+    def test_thanks_with_punctuation(self):
+        self._assert_no_recall("thanks!")
+        self._assert_no_recall("Thank you.")
+
+    def test_got_it(self):
+        self._assert_no_recall("got it")
+
+    def test_emoji_ack(self):
+        self._assert_no_recall("👍")
+        self._assert_no_recall("👍👍")  # also stripped to a known phrase
+
+    def test_channel_wrapped_ack(self):
+        # Telegram-plugin wraps inbound prompts; the ack-skip must look
+        # past the wrapper.
+        self._assert_no_recall(
+            '<channel source="switchroom-telegram" chat_id="123">thanks</channel>',
+        )
+
+    def test_real_question_does_not_skip(self):
+        # Sanity: a real question should not be treated as an ack —
+        # we expect recall to be CALLED. Use a real fake client (not
+        # _BoomClient) and assert it produced output.
+        client = _FakeClient(directives=[], memories=[_memory("relevant memory")])
+        ctx, _ = _run_main_with(client, prompt="What did we decide about the auth flow?")
+        self.assertIsNotNone(ctx)
+        self.assertIn("relevant memory", ctx)
+
+    def test_ack_with_extra_words_does_not_skip(self):
+        # "thanks for the update" is not a pure ack — should fall
+        # through to recall.
+        client = _FakeClient(directives=[], memories=[_memory("the relevant fact")])
+        ctx, _ = _run_main_with(
+            client,
+            prompt="thanks for the update on the deployment",
+        )
+        self.assertIsNotNone(ctx)
+
+
 if __name__ == "__main__":
     unittest.main()

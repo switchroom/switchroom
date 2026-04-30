@@ -6,7 +6,7 @@
   "autoRecall": true,
   "autoRetain": true,
   "retainMode": "full-session",
-  "recallBudget": "mid",
+  "recallBudget": "low",
   "recallMaxTokens": 1024,
   "recallMaxMemories": 12,
   "recallTypes": ["world", "experience"],

@@ -167,11 +167,38 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("--effort xhigh");
   });
 
-  it("start.sh omits --effort when thinking_effort is not set", () => {
+  it("start.sh defaults --effort to 'low' when thinking_effort is not set in yaml", () => {
+    // Switchroom default: chat-pattern main agents don't benefit from
+    // extended thinking; effort=low cuts hidden thinking tokens to
+    // near-zero on conversational replies. See
+    // SWITCHROOM_DEFAULT_THINKING_EFFORT in src/agents/scaffold.ts.
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-effort-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).not.toContain("--effort");
+    expect(startSh).toContain("--effort low");
+  });
+
+  it("start.sh respects an explicit thinking_effort override", () => {
+    const config = makeAgentConfig({ thinking_effort: "high" });
+    const result = scaffoldAgent("explicit-effort", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--effort high");
+    expect(startSh).not.toContain("--effort low");
+  });
+
+  it("start.sh defaults --model to claude-sonnet-4-6 when model is not set in yaml", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("no-model-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--model 'claude-sonnet-4-6'");
+  });
+
+  it("start.sh respects an explicit model override", () => {
+    const config = makeAgentConfig({ model: "claude-opus-4-7" });
+    const result = scaffoldAgent("opus-agent", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--model 'claude-opus-4-7'");
+    expect(startSh).not.toContain("claude-sonnet-4-6");
   });
 
   it("start.sh includes --permission-mode flag when permission_mode is set", () => {
