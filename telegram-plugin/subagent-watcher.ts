@@ -161,6 +161,21 @@ export interface SubagentWatcherHandle {
 
 const DEFAULT_RESCAN_MS = 1000
 const DEFAULT_STALL_THRESHOLD_MS = 60_000
+/**
+ * Grace period between a sub-agent transitioning to terminal state
+ * (`done` / `failed`) and the watcher closing its FSWatcher + dropping
+ * its Map entries. The grace lets late writes (a final `turn_end`
+ * marker landing in the same poll tick as the completion event, the
+ * registry-DB UPDATE finishing, a downstream consumer reading the
+ * tail one more time) flush without losing data.
+ *
+ * Pre-fix the per-subagent FSWatcher lived for the entire process
+ * lifetime, so a long-running gateway with sustained sub-agent load
+ * accumulated FDs until it hit `ulimit -n` (default 1024 on Linux)
+ * and the process started failing every fs.watch call. See MEM1 in
+ * the overnight forensic audit on #472.
+ */
+const TERMINAL_CLEANUP_GRACE_MS = 30_000
 
 // ─── JSONL tail per sub-agent ─────────────────────────────────────────────
 
@@ -363,6 +378,13 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const clearI = config.clearInterval ?? ((ref) => {
     clearInterval((ref as { ref: ReturnType<typeof setInterval> }).ref)
   })
+  const setT = config.setTimeout ?? ((fn, ms) => {
+    const h = setTimeout(fn, ms)
+    return { ref: h }
+  })
+  const clearT = config.clearTimeout ?? ((ref) => {
+    clearTimeout((ref as { ref: ReturnType<typeof setTimeout> }).ref)
+  })
 
   // fs DI: tests pass a mock; production uses the real node:fs functions.
   const fs = config.fs ?? {
@@ -383,6 +405,10 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const dirWatchers = new Map<string, FSWatcher>()
   // Known subagent files: filePath → true
   const knownFiles = new Set<string>()
+  // Pending deferred-cleanups for terminal-state sub-agents. Keyed by
+  // agentId so a re-transition (shouldn't happen, but defensively) or
+  // a stop() call can cancel pending timers cleanly. See MEM1 fix.
+  const pendingCloses = new Map<string, { ref: unknown }>()
   /**
    * Files that existed before the watcher started (boot-time snapshot).
    * The `historical` flag on each entry suppresses two notification paths:
@@ -465,8 +491,11 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // in-flight agent that finishes while we're watching) fire.
     if (isHistorical && entry.state === 'done') {
       // Already finished before we started — mark as notified so we
-      // don't fire a spurious completion notification later.
+      // don't fire a spurious completion notification later, and
+      // schedule cleanup so the FSWatcher we just opened doesn't leak
+      // forever. See MEM1 fix.
       entry.completionNotified = true
+      scheduleTerminalCleanup(agentId)
     } else {
       maybySendStateTransition(agentId)
     }
@@ -506,7 +535,54 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       } catch (err) {
         log?.(`subagent-watcher: completion notification error: ${(err as Error).message}`)
       }
+      scheduleTerminalCleanup(agentId)
     }
+    // Defensive: if state ever flips to 'failed' (currently no caller
+    // sets this, but the type allows it), still clean up the FSWatcher.
+    if (entry.state === 'failed') {
+      scheduleTerminalCleanup(agentId)
+    }
+  }
+
+  // ─── Per-agent cleanup ──────────────────────────────────────────────────
+
+  /**
+   * Schedule a deferred close of the per-subagent FSWatcher + Map
+   * entries `TERMINAL_CLEANUP_GRACE_MS` after the sub-agent transitions
+   * to terminal state. Idempotent — repeated calls for the same agent
+   * cancel the previous timer and reset the grace window.
+   */
+  function scheduleTerminalCleanup(agentId: string): void {
+    if (stopped) return
+    const existing = pendingCloses.get(agentId)
+    if (existing) {
+      clearT(existing)
+    }
+    const handle = setT(() => {
+      pendingCloses.delete(agentId)
+      cleanupTerminalAgent(agentId)
+    }, TERMINAL_CLEANUP_GRACE_MS)
+    pendingCloses.set(agentId, handle)
+  }
+
+  /**
+   * Close the FSWatcher and drop Map entries for a terminal sub-agent.
+   * Safe to call multiple times: each Map operation is a no-op for an
+   * already-deleted key.
+   */
+  function cleanupTerminalAgent(agentId: string): void {
+    const tail = tails.get(agentId)
+    if (tail?.watcher) {
+      try { tail.watcher.close() } catch { /* ignore */ }
+      tail.watcher = null
+    }
+    tails.delete(agentId)
+    const entry = registry.get(agentId)
+    if (entry?.filePath) {
+      knownFiles.delete(entry.filePath)
+    }
+    registry.delete(agentId)
+    log?.(`subagent-watcher: cleaned up terminal agent ${agentId}`)
   }
 
   // ─── Stall detection ────────────────────────────────────────────────────
@@ -666,6 +742,13 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     stop(): void {
       stopped = true
       clearI(pollHandle)
+      // Cancel any pending deferred-cleanup timers — the unconditional
+      // close loop below covers their work and we don't want straggler
+      // setTimeout callbacks firing after the watcher is supposedly stopped.
+      for (const handle of pendingCloses.values()) {
+        clearT(handle)
+      }
+      pendingCloses.clear()
       for (const w of dirWatchers.values()) {
         try { w.close() } catch { /* ignore */ }
       }

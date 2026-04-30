@@ -24,10 +24,12 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
 const DEFAULT_SLOT = "default";
@@ -229,6 +231,13 @@ export function writeSlotToken(
 /**
  * Sync the legacy top-level .oauth-token (+ meta) path from the active slot
  * so that start.sh / Claude Code see no layout change.
+ *
+ * Atomic write: read source → write to a sibling tempfile in the same
+ * directory → renameSync onto the destination. Pre-fix this used
+ * copyFileSync, which is non-atomic on Linux — a concurrent cron reader
+ * doing `cat .oauth-token` mid-failover could observe a partial file
+ * (zero-bytes / truncated). The 401 that followed manifested as a
+ * silent OAuth failure with no monitoring. See #418.
  */
 export function syncLegacyFromActive(agentDir: string): void {
   const active = readActiveSlot(agentDir);
@@ -237,9 +246,33 @@ export function syncLegacyFromActive(agentDir: string): void {
   const srcMeta = slotMetaPath(agentDir, active);
   if (!existsSync(srcToken)) return;
   mkdirSync(claudeDir(agentDir), { recursive: true });
-  copyFileSync(srcToken, legacyTokenPath(agentDir));
+  atomicCopy(srcToken, legacyTokenPath(agentDir), 0o600);
   if (existsSync(srcMeta)) {
-    copyFileSync(srcMeta, legacyMetaPath(agentDir));
+    atomicCopy(srcMeta, legacyMetaPath(agentDir), 0o600);
+  }
+}
+
+/**
+ * Read `src`, write to a sibling tempfile in the same directory as
+ * `dest`, then renameSync onto `dest`. The same-directory invariant
+ * keeps the rename on a single filesystem (rename(2) is only atomic
+ * within one fs).
+ */
+function atomicCopy(src: string, dest: string, mode: number): void {
+  const contents = readFileSync(src);
+  const tmp = `${dest}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  try {
+    writeFileSync(tmp, contents, { mode });
+    renameSync(tmp, dest);
+  } catch (err) {
+    // Best-effort cleanup of the tempfile on failure so a crash mid-copy
+    // doesn't leave a permanent half-written sibling.
+    try {
+      rmSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw err;
   }
 }
 

@@ -12,7 +12,7 @@ import {
   lstatSync,
   readlinkSync,
 } from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
@@ -1010,13 +1010,22 @@ Thumbs.db
     execSync("git init --quiet", { cwd: workspaceDir, stdio: "pipe" });
     execSync("git add -A", { cwd: workspaceDir, stdio: "pipe" });
 
-    // Use switchroom's git identity if available from env, else fall back to generic
+    // Use switchroom's git identity if available from env, else fall back to generic.
+    // execFileSync (argv array) — never interpolate env vars into a shell string.
+    // GIT_AUTHOR_NAME='";rm -rf $HOME;#' as an env var would have been a real
+    // injection vector through the previous execSync template literal.
     const userEmail = process.env.GIT_AUTHOR_EMAIL || "switchroom@localhost";
     const userName = process.env.GIT_AUTHOR_NAME || "Switchroom Agent";
 
-    execSync(
-      `git -c user.email="${userEmail}" -c user.name="${userName}" commit -m "chore: seed workspace from switchroom scaffold"`,
-      { cwd: workspaceDir, stdio: "pipe" }
+    execFileSync(
+      "git",
+      [
+        "-c", `user.email=${userEmail}`,
+        "-c", `user.name=${userName}`,
+        "commit",
+        "-m", "chore: seed workspace from switchroom scaffold",
+      ],
+      { cwd: workspaceDir, stdio: "pipe" },
     );
 
     console.log(chalk.green(`  initialized workspace git repo (${agentName})`));
@@ -1293,9 +1302,30 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       }
       return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
     })(),
-    extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
-      ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
-      : undefined,
+    extraCliArgs: (() => {
+      const parts: string[] = []
+      if (agentConfig.cli_args && agentConfig.cli_args.length > 0) {
+        parts.push(...agentConfig.cli_args.map(shellSingleQuote))
+      }
+      // #199: native Claude Code flag pass-through. add_dirs becomes
+      // repeated --add-dir <path>; allowed_tools / disallowed_tools become
+      // a single space-separated --allowedTools "..." / --disallowedTools "..."
+      // arg. Coexistence semantics with the coarse `tools.allow`: granular-
+      // only-when-present (Claude Code's own OR semantics), so existing
+      // operators on `tools.allow` are unaffected.
+      if (agentConfig.add_dirs && agentConfig.add_dirs.length > 0) {
+        for (const dir of agentConfig.add_dirs) {
+          parts.push("--add-dir", shellSingleQuote(dir))
+        }
+      }
+      if (agentConfig.allowed_tools && agentConfig.allowed_tools.length > 0) {
+        parts.push("--allowedTools", shellSingleQuote(agentConfig.allowed_tools.join(" ")))
+      }
+      if (agentConfig.disallowed_tools && agentConfig.disallowed_tools.length > 0) {
+        parts.push("--disallowedTools", shellSingleQuote(agentConfig.disallowed_tools.join(" ")))
+      }
+      return parts.length > 0 ? " " + parts.join(" ") : undefined
+    })(),
     sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
     sessionMaxTurns: agentConfig.session?.max_turns,
     handoffEnabled: agentConfig.session_continuity?.enabled !== false,
@@ -2195,7 +2225,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          matcher: "Agent",
+          // Claude Code's hook matcher is a regex. Cover both the legacy
+          // 'Agent' and newer 'Task' tool names — same dispatch
+          // semantics, only the name varies by Claude Code version. The
+          // tracker hooks themselves also gate on both.
+          matcher: "^(Agent|Task)$",
           hooks: [
             {
               type: "command",
@@ -2214,7 +2248,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   const switchroomPostToolUse = useSwitchroomPlugin
     ? [
         {
-          matcher: "Agent",
+          // Claude Code's hook matcher is a regex. Cover both the legacy
+          // 'Agent' and newer 'Task' tool names — same dispatch
+          // semantics, only the name varies by Claude Code version. The
+          // tracker hooks themselves also gate on both.
+          matcher: "^(Agent|Task)$",
           hooks: [
             {
               type: "command",
@@ -2616,9 +2654,26 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
         }
         return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
       })(),
-      extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
-        ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
-        : undefined,
+      extraCliArgs: (() => {
+        const parts: string[] = []
+        if (agentConfig.cli_args && agentConfig.cli_args.length > 0) {
+          parts.push(...agentConfig.cli_args.map(shellSingleQuote))
+        }
+        // #199: native Claude Code flag pass-through (mirror of the
+        // initial-scaffold path above; reconcile must keep parity).
+        if (agentConfig.add_dirs && agentConfig.add_dirs.length > 0) {
+          for (const dir of agentConfig.add_dirs) {
+            parts.push("--add-dir", shellSingleQuote(dir))
+          }
+        }
+        if (agentConfig.allowed_tools && agentConfig.allowed_tools.length > 0) {
+          parts.push("--allowedTools", shellSingleQuote(agentConfig.allowed_tools.join(" ")))
+        }
+        if (agentConfig.disallowed_tools && agentConfig.disallowed_tools.length > 0) {
+          parts.push("--disallowedTools", shellSingleQuote(agentConfig.disallowed_tools.join(" ")))
+        }
+        return parts.length > 0 ? " " + parts.join(" ") : undefined
+      })(),
       sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
       sessionMaxTurns: agentConfig.session?.max_turns,
       handoffEnabled: agentConfig.session_continuity?.enabled !== false,

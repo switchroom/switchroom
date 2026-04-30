@@ -155,19 +155,57 @@ export interface CreateIssuesCardOpts {
   log?: (msg: string) => void;
 }
 
+/**
+ * Inspect an error thrown by a grammY API call and, if it's a 429
+ * flood-wait, return the retry_after value in seconds. Returns null
+ * for any non-429 error (or non-grammY shape). We avoid importing
+ * `GrammyError` directly to keep this module test-friendly — duck-typing
+ * on the documented public field shape suffices for our needs.
+ *
+ * See #442.
+ */
+function extractRetryAfterSecs(err: unknown): number | null {
+  if (err == null || typeof err !== "object") return null;
+  const e = err as { error_code?: unknown; parameters?: { retry_after?: unknown } };
+  if (e.error_code !== 429) return null;
+  const ra = e.parameters?.retry_after;
+  if (typeof ra === "number" && Number.isFinite(ra) && ra > 0) return ra;
+  return null;
+}
+
+const COOLDOWN_JITTER_MS = 500;
+
 export function createIssuesCardHandle(
   opts: CreateIssuesCardOpts,
 ): IssuesCardHandle {
   let messageId: number | null = null;
   let lastBody: string | null = null;
+  // Cooldown gate: when we hit a 429, suspend further refreshes until
+  // retry_after elapses. The watcher polls every 2s; without this gate
+  // we'd burn through grammY's auto-retry budget and risk a bot-wide
+  // 24h ban under sustained issue-flapping. See #442.
+  let cooldownUntil = 0;
   const log = opts.log ?? (() => {});
   const nowFn = opts.now ?? Date.now;
+
+  function noteRateLimited(err: unknown, label: string): void {
+    const retryAfter = extractRetryAfterSecs(err);
+    if (retryAfter == null) return;
+    cooldownUntil = nowFn() + retryAfter * 1000 + COOLDOWN_JITTER_MS;
+    log(
+      `issues-card: ${label} 429 — backing off ${retryAfter}s (cooldown until ${cooldownUntil})`,
+    );
+  }
 
   return {
     messageId() {
       return messageId;
     },
     async refresh(events: IssueEvent[]) {
+      // Honour Telegram's flood-wait. Skipping a refresh is cheap;
+      // burning through the wait is what gets bots banned.
+      if (nowFn() < cooldownUntil) return;
+
       const body = renderIssuesCard({
         agentName: opts.agentName,
         events,
@@ -181,6 +219,7 @@ export function createIssuesCardHandle(
           try {
             await opts.bot.deleteMessage(opts.chatId, messageId);
           } catch (err) {
+            noteRateLimited(err, "delete");
             log(`issues-card: delete failed: ${(err as Error).message}`);
           }
           messageId = null;
@@ -205,6 +244,7 @@ export function createIssuesCardHandle(
           messageId = sent.message_id;
           lastBody = body;
         } catch (err) {
+          noteRateLimited(err, "send");
           log(`issues-card: send failed: ${(err as Error).message}`);
         }
         return;
@@ -214,16 +254,22 @@ export function createIssuesCardHandle(
         await opts.bot.editMessageText(opts.chatId, messageId, body, sendOpts);
         lastBody = body;
       } catch (err) {
+        noteRateLimited(err, "edit");
         // The card's message_id is stale (manually deleted, edit window
         // expired, etc.). Re-post fresh on the next tick.
         log(`issues-card: edit failed, re-posting: ${(err as Error).message}`);
         messageId = null;
         lastBody = null;
+        // If we've just been told to back off, don't double-down by
+        // immediately re-posting — let the cooldown gate above pick
+        // up the next call.
+        if (nowFn() < cooldownUntil) return;
         try {
           const sent = await opts.bot.sendMessage(opts.chatId, body, sendOpts);
           messageId = sent.message_id;
           lastBody = body;
         } catch (err2) {
+          noteRateLimited(err2, "re-post");
           log(`issues-card: re-post failed: ${(err2 as Error).message}`);
         }
       }

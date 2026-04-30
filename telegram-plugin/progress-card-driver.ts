@@ -741,7 +741,20 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   function prepareSilentEndSuppression(cs: PerChatState): void {
     if (cs.silentEndPrepared) return
     cs.silentEndPrepared = true
-    const isSilentEnd = !cs.replyToolCalled && !cs.wasAutonomous
+    // #371 fix: when stream_reply(done=true) lands as the final tool call,
+    // the Stop hook can fire before session-tail observes the matching
+    // tool_use event. Pre-fix replyToolCalled stayed false long enough for
+    // isSilentEnd to read true → the silent-end retry kicks in → the user
+    // sees a duplicate reply.
+    //
+    // outboundDeliveredCount is bumped synchronously by
+    // recordOutboundDelivered() inside the stream_reply MCP handler when
+    // the API call returns successfully — it doesn't depend on the
+    // session-tail event landing. Consulting it here closes the race.
+    const isSilentEnd =
+      !cs.replyToolCalled
+      && cs.outboundDeliveredCount === 0
+      && !cs.wasAutonomous
     if (!isSilentEnd || !config.onSilentEnd) return
     try {
       const result = config.onSilentEnd({ chatId: cs.chatId, threadId: cs.threadId, turnKey: cs.turnKey })

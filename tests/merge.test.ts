@@ -239,6 +239,22 @@ describe("mergeAgentConfig", () => {
     expect(result.memory?.recall?.max_memories).toBe(3);
   });
 
+  it("agent setting memory.recall.<other-key> does NOT clobber defaults.memory.recall.max_memories (DOC2)", () => {
+    // Pre-DOC2 fix the recall sub-object was shallow-merged: agent setting
+    // any recall.* key replaced the entire recall object, silently dropping
+    // every other recall.* default. The fix deep-merges the recall block
+    // (one level) so individual knobs override independently.
+    const defaults: AgentDefaults = {
+      memory: { recall: { max_memories: 12, cache_ttl_secs: 600 } },
+    };
+    const agent = baseAgent({
+      memory: { recall: { cache_ttl_secs: 30 } },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.recall?.max_memories).toBe(12); // preserved from defaults
+    expect(result.memory?.recall?.cache_ttl_secs).toBe(30); // agent override
+  });
+
   it("prepends defaults.schedule to agent.schedule", () => {
     const defaults: AgentDefaults = {
       schedule: [{ cron: "0 8 * * *", prompt: "Morning check-in" }],

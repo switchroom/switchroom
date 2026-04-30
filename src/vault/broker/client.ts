@@ -80,6 +80,22 @@ export function vaultTokenFilePath(agentSlug: string): string {
 export function readVaultTokenFile(agentSlug: string): string | null {
   const filePath = vaultTokenFilePath(agentSlug);
   try {
+    // Defense-in-depth: token file MUST be 0600 (owner-only). The broker
+    // treats the token as full auth (peercred ACL is bypassed when a
+    // valid token is presented), so a widened mode = anyone in the same
+    // UID can exfiltrate the bearer. Real causes: backup tools restoring
+    // with default umask, an errant chmod, an rsync without -p. Fail
+    // closed and tell the operator how to fix.
+    const stat = fs.statSync(filePath);
+    const mode = stat.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      process.stderr.write(
+        `[vault-broker] Refusing to read ${filePath} with mode ${mode.toString(8).padStart(3, "0")} ` +
+        `(must be 0600). Delete the file and re-mint with 'switchroom vault grant mint <agent>'. ` +
+        `Falling through to peercred ACL.\n`,
+      );
+      return null;
+    }
     const raw = fs.readFileSync(filePath, "utf8");
     const token = raw.split("\n")[0].trim();
     return token.length > 0 ? token : null;
@@ -308,12 +324,18 @@ async function rpc(
       resolve(val);
     };
 
+    // Build the socket and wire listeners BEFORE initiating connect().
+    // Bun (1.3.x) can emit `error` synchronously from inside connect()
+    // when the socket path doesn't exist, so net.createConnection (which
+    // calls connect immediately) races against the next-line `.on('error')`
+    // attachment under bun. Splitting into `new Socket()` + `.connect()`
+    // guarantees listeners are attached first under both runtimes.
+    const client = new net.Socket();
+
     const timer = setTimeout(() => {
       client.destroy();
       settle({ kind: "unreachable", msg: `broker did not respond within ${timeoutMs}ms` });
     }, timeoutMs);
-
-    const client = net.createConnection({ path: socketPath });
 
     client.on("error", (err: NodeJS.ErrnoException) => {
       clearTimeout(timer);
@@ -358,6 +380,8 @@ async function rpc(
         });
       }
     });
+
+    client.connect({ path: socketPath });
   });
 }
 

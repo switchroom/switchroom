@@ -228,6 +228,23 @@ export const AGENT_LIVE_WINDOW_MS = 45_000
  */
 export const AGENT_LIVE_POLL_INTERVAL_MS = 2_000
 
+/**
+ * After the live window expires with the agent still not `active`, the
+ * generator schedules ONE follow-up re-poll this many ms later. If the
+ * agent has reached `active` by then, an updated ✅ ProbeResult is
+ * yielded and the boot card edits in place. Otherwise no further yield.
+ *
+ * Pre-#296 fix the generator returned immediately at window-expiry, so
+ * an agent that became active 1-30s after the window stayed visibly
+ * 🟡 "service inactive" forever (until the user noticed and asked).
+ *
+ * 30 s is the recommended-by-issue-author value: long enough to catch
+ * the common late-boot scenario (slow disk, claude-cli npm install
+ * ticking down), short enough that genuinely stuck units still surface
+ * as a real problem within ~75 s total.
+ */
+export const AGENT_LIVE_FOLLOWUP_REPOLL_MS = 30_000
+
 type ExecFileResult = { stdout: string; stderr: string }
 type ExecFileFnType = (
   cmd: string,
@@ -344,18 +361,33 @@ export async function* watchAgentProcess(
   opts: {
     liveWindowMs?: number
     pollIntervalMs?: number
+    /**
+     * Wait this many ms after the live window expires before doing one
+     * follow-up state check. If the agent reached `active` in that
+     * window, yield an updated ✅ ProbeResult so the boot card flips
+     * from 🟡 "service inactive" to ✅. See #296. Set to 0 to disable.
+     */
+    followupRepollMs?: number
     /** Override for tests — replaces real delays */
     sleepImpl?: (ms: number) => Promise<void>
     /** Override for tests — replaces real execFile calls */
     execFileImpl?: ExecFileFnType
+    /**
+     * Override for tests. Defaults to Date.now. The within-window
+     * check uses this; injecting lets tests advance "time" without
+     * real sleeps.
+     */
+    nowImpl?: () => number
   } = {},
 ): AsyncGenerator<ProbeResult> {
   const liveWindowMs = opts.liveWindowMs ?? AGENT_LIVE_WINDOW_MS
   const pollIntervalMs = opts.pollIntervalMs ?? AGENT_LIVE_POLL_INTERVAL_MS
+  const followupRepollMs = opts.followupRepollMs ?? AGENT_LIVE_FOLLOWUP_REPOLL_MS
   const sleep = opts.sleepImpl ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
   const execFileFn: ExecFileFnType = opts.execFileImpl ?? execFile
+  const now = opts.nowImpl ?? (() => Date.now())
 
-  const startMs = Date.now()
+  const startMs = now()
   let lastYieldedDetail: string | null = null
 
   /**
@@ -395,7 +427,7 @@ export async function* watchAgentProcess(
   }
 
   while (true) {
-    const elapsedMs = Date.now() - startMs
+    const elapsedMs = now() - startMs
     const withinWindow = elapsedMs < liveWindowMs
 
     const snapshot = await queryAgentState(agentName, execFileFn)
@@ -421,6 +453,25 @@ export async function* watchAgentProcess(
 
     // If window expired, we already yielded the final committed result.
     if (!withinWindow) {
+      // #296 follow-up: schedule ONE re-poll after the live window so a
+      // late-boot transition (active arriving 1-30s after the window) flips
+      // the card from 🟡 "service inactive" to ✅ instead of staying stale
+      // until the next user-driven event. Skipped when:
+      //   - followupRepollMs <= 0 (test override / explicit disable)
+      //   - the final result was already 'ok' (handled by the early-return above)
+      //   - the final result was 'fail' due to systemd reporting `failed`
+      //     (also handled above) — anything reaching here is degraded
+      if (followupRepollMs <= 0) return
+      await sleep(followupRepollMs)
+      const followup = await queryAgentState(agentName, execFileFn)
+      if ('error' in followup) return
+      // Only yield on a state we DIDN'T see before — silently no-op if the
+      // agent is still inactive/activating/etc., to avoid card flapping.
+      if (followup.state !== 'active') return
+      const okResult = toProbeResult(followup.state, followup.kv, false)
+      if (okResult.detail !== lastYieldedDetail) {
+        yield okResult
+      }
       return
     }
 

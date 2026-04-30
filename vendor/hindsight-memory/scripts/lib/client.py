@@ -149,6 +149,46 @@ class HindsightClient:
         }
         return self._request("POST", path, body, timeout=timeout)
 
+    def list_directives(
+        self,
+        bank_id: str,
+        active_only: bool = True,
+        tags: Optional[list] = None,
+        timeout: int = 5,
+    ) -> dict:
+        """List active directives for a bank.
+
+        Switchroom-local: this method was missing in the vendored
+        HindsightClient even though `lib/directives.py` (also
+        switchroom-local, the workaround for upstream
+        vectorize-io/hindsight#1269) calls it on every recall hook.
+        Without this method the directives fetch always raised
+        AttributeError → silently caught at directives.py:47-49 → no
+        directives ever surfaced in the recall block.
+
+        The upstream REST endpoint is `GET
+        /v1/default/banks/{bank_id}/directives` with `active_only` and
+        optional `tags` query params (see upstream
+        `hindsight-clients/python/hindsight_client_api/api/directives_api.py`).
+
+        Returns the raw response dict, expected to have an `items` list
+        of directives where each item has at least `id`, `name`,
+        `content`, `priority`, `is_active`, `tags`. Caller (directives.py)
+        already defends against missing/malformed entries.
+        """
+        params = {}
+        if active_only:
+            # Server expects lowercase string per the OpenAPI spec.
+            params["active_only"] = "true"
+        if tags:
+            # Hindsight accepts repeated `tags=` query params for
+            # multi-tag filtering. urlencode with doseq=True handles it.
+            params["tags"] = tags
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/directives"
+        if params:
+            path = f"{path}?{urllib.parse.urlencode(params, doseq=True)}"
+        return self._request("GET", path, timeout=timeout)
+
     def set_bank_mission(
         self, bank_id: str, mission: str, retain_mission: Optional[str] = None, timeout: int = 15
     ) -> dict:

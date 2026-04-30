@@ -157,6 +157,28 @@ describe('foreman-create-flow: handleFlowText step=asked-profile', () => {
       }
     }
   })
+
+  it('cancels with missing-name when state.name is unset (#28 item 1)', () => {
+    // Pre-#28 fix this fell back to using the profile name as the agent
+    // name. Now we cancel cleanly so the user gets a clear restart
+    // signal instead of an agent named "default".
+    const stateNoName = {
+      chatId: 'chat-1',
+      step: 'asked-profile' as const,
+      name: null,
+      profile: null,
+      botToken: null,
+      authSessionName: null,
+      loginUrl: null,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    }
+    const action = handleFlowText({ state: stateNoName, text: 'default', profiles: PROFILES })
+    expect(action.kind).toBe('cancel')
+    if (action.kind === 'cancel') {
+      expect(action.reason).toBe('missing-name')
+    }
+  })
 })
 
 // ─── handleFlowText — asked-bot-token step ───────────────────────────────

@@ -109,8 +109,16 @@ export function handleFlowText(input: StepTransitionInput): CreateFlowAction {
           stayInStep: true,
         }
       }
-      const name = state.name ?? trimmed // name was set when we transitioned here
-      return { kind: 'ask-bot-token', name, profile: trimmed }
+      // Pre-#28 fix this fell back to `trimmed` (the profile name)
+      // when state.name was missing — silently treating the profile
+      // as the agent name. Now we cancel with missing-name instead,
+      // matching the asked-bot-token step's behaviour on corrupt
+      // state. The fallback wasn't exploitable (assertSafeAgentName
+      // catches it downstream), but it's semantically wrong.
+      if (!state.name) {
+        return { kind: 'cancel', reason: 'missing-name' }
+      }
+      return { kind: 'ask-bot-token', name: state.name, profile: trimmed }
     }
 
     case 'asked-bot-token': {

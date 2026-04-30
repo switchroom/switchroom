@@ -31,8 +31,10 @@ export interface IssuesWatcherOpts {
   /** Inject for tests. */
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
-  /** Inject for tests. Defaults to fs.statSync(...).mtimeMs. */
-  mtimeProvider?: (path: string) => number | null;
+  /** Inject for tests. Defaults to a "<mtimeMs>:<size>" signature from
+   * fs.statSync. Combining mtime + size makes the watcher robust to two
+   * writes inside the same millisecond — the bug from #446. */
+  signatureProvider?: (path: string) => string | null;
   /** Inject for tests. Defaults to readAll from src/issues. */
   readEvents?: (stateDir: string) => IssueEvent[];
 }
@@ -52,10 +54,10 @@ export function startIssuesWatcher(
   const intervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const setIntervalFn = opts.setInterval ?? setInterval;
   const clearIntervalFn = opts.clearInterval ?? clearInterval;
-  const mtimeProvider = opts.mtimeProvider ?? defaultMtimeProvider;
+  const signatureProvider = opts.signatureProvider ?? defaultSignatureProvider;
   const readEvents = opts.readEvents ?? defaultReadEvents;
 
-  let lastMtime: number | null = null;
+  let lastSignature: string | null = null;
   let stopped = false;
 
   async function readAndRefresh(): Promise<void> {
@@ -69,9 +71,9 @@ export function startIssuesWatcher(
 
   async function tick(): Promise<void> {
     if (stopped) return;
-    const mtime = mtimeProvider(path);
-    if (mtime === lastMtime) return;
-    lastMtime = mtime;
+    const signature = signatureProvider(path);
+    if (signature === lastSignature) return;
+    lastSignature = signature;
     await readAndRefresh();
   }
 
@@ -86,6 +88,15 @@ export function startIssuesWatcher(
       log(`issues-watcher: tick failed: ${(err as Error).message}`);
     });
   }, intervalMs);
+  // Defense in depth: don't let the watcher itself keep the process
+  // alive. The gateway has other ref'd resources (bot polling, IPC
+  // socket listener) that own the process lifecycle. If those go
+  // away, this watcher should NOT block exit.
+  // `unref()` is a no-op in test runners that pass a fake setInterval
+  // returning a non-Timer value; guard with optional chaining.
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
 
   return {
     stop() {
@@ -97,10 +108,13 @@ export function startIssuesWatcher(
   };
 }
 
-function defaultMtimeProvider(path: string): number | null {
+function defaultSignatureProvider(path: string): string | null {
   if (!existsSync(path)) return null;
   try {
-    return statSync(path).mtimeMs;
+    const stat = statSync(path);
+    // Combine mtime + size so two writes within the same ms (which would
+    // share an mtimeMs value) still register as a change. See #446.
+    return `${stat.mtimeMs}:${stat.size}`;
   } catch {
     return null;
   }

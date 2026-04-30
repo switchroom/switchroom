@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, readlinkSync, lstatSync, readdirSync, cpSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills } from "../src/agents/scaffold.js";
@@ -821,26 +821,33 @@ describe("reconcileAgent", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
-    // Safety net: A4a/A4b tests write ephemeral __A4*_TEST_* templates
-    // into profiles/default/workspace/ (the repo source tree) and clean
-    // them up in their own try/finally. If a test crashes between
-    // writeFileSync and the finally, the orphan would linger and get
-    // picked up by subsequent test runs. Sweep any leftovers here as
-    // belt-and-braces; no-op in the common case.
-    const profileWorkspaceDir = resolve(
-      import.meta.dirname,
-      "../profiles/default/workspace",
-    );
+    // Safety net: A4a/A4b tests create sibling temp profiles
+    // (profiles/__test_a4{a,b}_<pid>_<ts>) and clean up in their own
+    // try/finally. Sweep any orphans as belt-and-braces.
+    const profilesRoot = resolve(import.meta.dirname, "../profiles");
     try {
-      for (const entry of readdirSync(profileWorkspaceDir)) {
-        if (/^__A4[AB]_(TEST|CONTRACT)_\d+\.md\.hbs$/.test(entry)) {
-          rmSync(join(profileWorkspaceDir, entry), { force: true });
+      for (const entry of readdirSync(profilesRoot)) {
+        if (/^__test_a4[ab]_\d+_\d+$/.test(entry)) {
+          rmSync(join(profilesRoot, entry), { recursive: true, force: true });
         }
       }
     } catch {
-      // profile dir missing is fine — nothing to clean
+      // profiles root missing is fine — nothing to clean
     }
   });
+
+  // Build a unique sibling profile dir under profiles/ whose contents
+  // are a copy of profiles/default. Caller can mutate workspace/ inside
+  // it without polluting the shared default profile (which other vitest
+  // workers walk in parallel). Returns the profile name (suitable for
+  // `extends:` in the agent config) and its absolute path.
+  function makeTempDefaultProfile(label: string): { profileName: string; profileDir: string } {
+    const profilesRoot = resolve(import.meta.dirname, "../profiles");
+    const profileName = `__test_${label}_${process.pid}_${Date.now()}`;
+    const profileDir = join(profilesRoot, profileName);
+    cpSync(join(profilesRoot, "default"), profileDir, { recursive: true });
+    return { profileName, profileDir };
+  }
 
   function buildSwitchroomConfig(
     agentConfig: AgentConfig,
@@ -972,12 +979,15 @@ describe("reconcileAgent", () => {
     // workspace directories. The earlier smoke test only proved that a
     // DELETED file gets re-seeded, not that a NEW template in the
     // profile flows through.
-    const profileWorkspaceDir = resolve(
-      import.meta.dirname,
-      "../profiles/default/workspace",
-    );
-    const newTemplateName = `__A4A_TEST_${Date.now()}.md.hbs`;
-    const newTemplatePath = join(profileWorkspaceDir, newTemplateName);
+    //
+    // We work against a sibling temp profile (profiles/__test_a4a_<pid>_<ts>),
+    // not profiles/default — earlier the test wrote into the shared
+    // default workspace and another vitest worker walking that dir in
+    // parallel could ENOENT mid-statSync when the cleanup raced. The
+    // `__` prefix keeps the temp profile out of `listAvailableProfiles`.
+    const { profileName, profileDir } = makeTempDefaultProfile("a4a");
+    const newTemplateName = "__A4A_TEST.md.hbs";
+    const newTemplatePath = join(profileDir, "workspace", newTemplateName);
     const renderedName = newTemplateName.replace(/\.hbs$/, "");
     writeFileSync(
       newTemplatePath,
@@ -985,7 +995,7 @@ describe("reconcileAgent", () => {
       "utf-8",
     );
     try {
-      const agentConfig = makeAgentConfig();
+      const agentConfig = makeAgentConfig({ extends: profileName });
       const scaffolded = scaffoldAgent("a4a", agentConfig, tmpDir, telegramConfig);
       // Sanity: scaffold already seeded it too… delete so we can prove
       // reconcile alone puts it back when missing. (Simulates "agent
@@ -1007,7 +1017,7 @@ describe("reconcileAgent", () => {
       const contents = readFileSync(renderedPath, "utf-8");
       expect(contents).toBe("# Late-arriving template for a4a\n");
     } finally {
-      if (existsSync(newTemplatePath)) rmSync(newTemplatePath);
+      rmSync(profileDir, { recursive: true, force: true });
     }
   });
 
@@ -1017,12 +1027,12 @@ describe("reconcileAgent", () => {
     // rendering (scaffold ~60 keys, reconcile 7 keys). They now share
     // buildWorkspaceContext() — pin that contract with a template that
     // references a key from outside the old 7-key subset.
-    const profileWorkspaceDir = resolve(
-      import.meta.dirname,
-      "../profiles/default/workspace",
-    );
-    const templateName = `__A4B_CONTRACT_${Date.now()}.md.hbs`;
-    const templatePath = join(profileWorkspaceDir, templateName);
+    //
+    // Same isolation as the A4a regression test: write into a sibling
+    // temp profile, not profiles/default.
+    const { profileName, profileDir } = makeTempDefaultProfile("a4b");
+    const templateName = "__A4B_CONTRACT.md.hbs";
+    const templatePath = join(profileDir, "workspace", templateName);
     const renderedName = templateName.replace(/\.hbs$/, "");
     // Reference `{{model}}` — not in the old 7-key reconcile subset,
     // so this would render as "" on reconcile before the refactor.
@@ -1033,6 +1043,7 @@ describe("reconcileAgent", () => {
     );
     try {
       const agentConfig = makeAgentConfig({
+        extends: profileName,
         model: "sonnet",
         soul: { name: "TestSoul" } as unknown,
       } as Partial<AgentConfig>);
@@ -1065,7 +1076,7 @@ describe("reconcileAgent", () => {
       expect(reconcileRendered).toContain("model=sonnet");
       expect(reconcileRendered).toContain("soul=TestSoul");
     } finally {
-      if (existsSync(templatePath)) rmSync(templatePath);
+      rmSync(profileDir, { recursive: true, force: true });
     }
   });
 
@@ -1920,6 +1931,81 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
     expect(startSh).toMatch(/exec claude.*'--effort' 'high' '--add-dir' '\/tmp\/has space'/);
+  });
+
+  it("add_dirs become repeated --add-dir flags (#199)", () => {
+    const agentConfig = makeAgentConfig({
+      add_dirs: ["/share/collab", "/home/me/finance"],
+    });
+    const result = scaffoldAgent(
+      "adddirs-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("--add-dir '/share/collab'");
+    expect(startSh).toContain("--add-dir '/home/me/finance'");
+  });
+
+  it("allowed_tools become a single quoted --allowedTools flag (#199)", () => {
+    const agentConfig = makeAgentConfig({
+      allowed_tools: ["Bash(git *)", "Bash(npm *)", "Edit"],
+    });
+    const result = scaffoldAgent(
+      "allowedtools-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toMatch(/--allowedTools 'Bash\(git \*\) Bash\(npm \*\) Edit'/);
+  });
+
+  it("disallowed_tools become a single quoted --disallowedTools flag (#199)", () => {
+    const agentConfig = makeAgentConfig({
+      disallowed_tools: ["WebFetch", "Bash(rm *)"],
+    });
+    const result = scaffoldAgent(
+      "disallowedtools-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toMatch(/--disallowedTools 'WebFetch Bash\(rm \*\)'/);
+  });
+
+  it("add_dirs + allowed_tools + cli_args coexist (#199)", () => {
+    const agentConfig = makeAgentConfig({
+      cli_args: ["--effort", "high"],
+      add_dirs: ["/share"],
+      allowed_tools: ["Edit"],
+    });
+    const result = scaffoldAgent(
+      "combined-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("'--effort' 'high'");
+    expect(startSh).toContain("--add-dir '/share'");
+    expect(startSh).toContain("--allowedTools 'Edit'");
+  });
+
+  it("agents with no add_dirs/allowed_tools/disallowed_tools render no flags (#199)", () => {
+    const agentConfig = makeAgentConfig();
+    const result = scaffoldAgent(
+      "bare-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).not.toContain("--add-dir");
+    expect(startSh).not.toContain("--allowedTools");
+    expect(startSh).not.toContain("--disallowedTools");
   });
 
   it("channels.telegram.plugin: 'switchroom' writes .mcp.json for forked telegram plugin", () => {
@@ -2862,6 +2948,28 @@ describe("session freshness in start.sh", () => {
     expect(startSh).not.toContain("_IDLE");
     expect(startSh).not.toContain("_TURNS");
     expect(startSh).not.toContain(".resume-next-start");
+  });
+
+  it("session.max_idle wires SWITCHROOM_SESSION_MAX_IDLE_SECS into auto-mode resume (#218)", () => {
+    const agentConfig = makeAgentConfig({
+      session: { max_idle: "2h" },
+      session_continuity: { resume_mode: "auto" },
+    });
+    const result = scaffoldAgent(
+      "idle-bound-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // Configured max_idle is exported as the env var (2h = 7200s).
+    expect(startSh).toContain('SWITCHROOM_SESSION_MAX_IDLE_SECS="7200"');
+    // Auto-mode comparison consults the env var (with 7d default fallback).
+    expect(startSh).toContain('"${SWITCHROOM_SESSION_MAX_IDLE_SECS:-604800}"');
+    // The hard-coded 604800 from the comparison should no longer appear
+    // — it now lives only in the bash-default fallback.
+    expect(startSh).not.toMatch(/-lt 604800 ];/);
   });
 
   it("installs the Stop hook for handoff by default", () => {

@@ -23,7 +23,7 @@
 
 import { GrammyError, type Bot, type Context } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
-import { execFileSync, execSync } from 'child_process'
+import { execFileSync, spawnSync } from 'child_process'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 
@@ -92,16 +92,38 @@ export function makeSwitchroomExecCombined(cfg: CliConfig = {}) {
   const cli = cfg.cliPath ?? process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
   const config = cfg.configPath ?? process.env.SWITCHROOM_CONFIG
 
+  // Pre-#28 fix this used `execSync(\`${quoted} 2>&1\`, { shell: '/bin/bash' })`,
+  // hand-quoting each argument. The shell-quoting was correct today, but the
+  // structural shape meant any future caller passing user-controlled input
+  // would re-introduce a command-injection class of bug. spawnSync with
+  // argv array eliminates the shell entirely; we then concat stdout + stderr
+  // ourselves to preserve the merged-output contract callers depend on.
   return function switchroomExecCombined(args: string[], timeoutMs = 15000): string {
     const fullArgs = config ? ['--config', config, ...args] : args
-    const quoted = [cli, ...fullArgs].map((a) => `'${String(a).replace(/'/g, "'\\''")}'`).join(' ')
-    return execSync(`${quoted} 2>&1`, {
+    const result = spawnSync(cli, fullArgs, {
       encoding: 'utf-8',
       timeout: timeoutMs,
       env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
       maxBuffer: 4 * 1024 * 1024,
-      shell: '/bin/bash',
     })
+    const stdout = (result.stdout as string | undefined) ?? ''
+    const stderr = (result.stderr as string | undefined) ?? ''
+    const merged = stderr.length > 0 ? stdout + stderr : stdout
+    if (result.error) throw result.error
+    if (result.status !== 0) {
+      // Mirror execSync's behaviour: throw on non-zero exit, attaching the
+      // merged output so callers (which catch and inspect .stdout) can read it.
+      const err = new Error(`Command failed: ${cli} ${fullArgs.join(' ')}`) as Error & {
+        stdout?: string
+        stderr?: string
+        status?: number | null
+      }
+      err.stdout = merged
+      err.stderr = stderr
+      err.status = result.status
+      throw err
+    }
+    return merged
   }
 }
 

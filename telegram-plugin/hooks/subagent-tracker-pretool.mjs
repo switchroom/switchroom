@@ -84,6 +84,47 @@ function fillPlaceholders(sql, params) {
 }
 
 /**
+ * Resolve a synchronous SQLite binding compatible with the
+ * `DatabaseSync(path)` API (`db.exec(sql)`, `db.prepare(sql).run(...)`,
+ * `db.prepare(sql).get(...)`, `db.close()`).
+ *
+ * Production hooks are spawned via the `#!/usr/bin/env node` shebang, so
+ * Node 22+'s `node:sqlite` is the primary path. When the hook is invoked
+ * under bun (e.g. `bun test` calling spawnSync(process.execPath, ...) on
+ * CI), `node:sqlite` isn't available — fall back to `bun:sqlite` wrapped
+ * in a tiny adapter so the call-site code below stays identical.
+ *
+ * Returns null if neither is available; callers then drop to the
+ * `sqlite3` CLI fallback further down.
+ */
+function resolveSyncSqlite() {
+  const [major] = process.versions.node.split('.').map(Number)
+  if (major >= 22) {
+    try {
+      const { DatabaseSync } = require('node:sqlite')
+      if (DatabaseSync) return DatabaseSync
+    } catch { /* fall through to bun:sqlite */ }
+  }
+  if (typeof globalThis.Bun !== 'undefined') {
+    try {
+      const { Database } = require('bun:sqlite')
+      // Adapt bun:sqlite to the node:sqlite DatabaseSync surface used
+      // below. bun's Database.prepare/run/get/all and exec are
+      // sufficient — we only need the call-site shape.
+      return function BunDatabaseSyncAdapter(p) {
+        const d = new Database(p)
+        return {
+          exec: (sql) => d.exec(sql),
+          prepare: (sql) => d.prepare(sql),
+          close: () => d.close(),
+        }
+      }
+    } catch { /* fall through to CLI */ }
+  }
+  return null
+}
+
+/**
  * Run SQL against the DB via the sqlite3 CLI (non-blocking).
  * Calls cb(error | null) when the process exits.
  */
@@ -114,16 +155,14 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
   `
   const params = [id, parentSessionId, parentTurnKey, agentType, description, background, now, now]
 
-  // Resolve node:sqlite availability synchronously (before deferring), so the
-  // setImmediate closure knows which path to take without further try/catch.
-  const [major] = process.versions.node.split('.').map(Number)
-  let DatabaseSync = null
-  if (major >= 22) {
-    try { DatabaseSync = require('node:sqlite').DatabaseSync } catch { /* CLI fallback */ }
-  }
+  // Resolve a synchronous SQLite binding. Try in order:
+  //   1. node:sqlite (Node 22+, production path) — exposes DatabaseSync
+  //   2. bun:sqlite (when invoked under bun, e.g. from `bun test`) — wrapped
+  //      in a tiny adapter so call sites stay unchanged
+  // Falls back to the sqlite3 CLI block below if neither is available.
+  const DatabaseSync = resolveSyncSqlite()
 
   if (DatabaseSync != null) {
-    // Node 22+ with node:sqlite available — defer the write to the next tick.
     // Snapshot all values used inside the closure now, before setImmediate fires.
     const SnapDatabaseSync = DatabaseSync
     const snapDbPath = dbPath
@@ -174,8 +213,15 @@ function main() {
     process.exit(0)
   }
 
-  // Only care about Agent tool calls
-  if (event.tool_name !== 'Agent') process.exit(0)
+  // Only care about sub-agent dispatches. Claude Code emits the dispatch
+  // tool under either the legacy name 'Agent' or the newer 'Task'
+  // depending on version. Other call sites in this codebase (session-tail.ts,
+  // progress-card.ts, pty-tail.ts, tool-labels.ts) already recognize both —
+  // these tracker hooks were the lone gate accepting only 'Agent', which
+  // would silently drop every dispatch on any Claude Code version emitting
+  // 'Task' (rows never inserted → progress card heuristic + watcher both
+  // misroute).
+  if (event.tool_name !== 'Agent' && event.tool_name !== 'Task') process.exit(0)
 
   const agentDir = process.env.SWITCHROOM_AGENT_DIR ?? process.cwd()
   const telegramDir = join(agentDir, 'telegram')

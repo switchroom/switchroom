@@ -96,6 +96,14 @@ emit_warn() {
   echo "run-hook.sh: $1" >&2
 }
 
+# When RUN_HOOK_DEBUG=1 is set, drop the stderr redirect on the
+# issues-CLI invocations so an operator debugging a broken record-path
+# sees the actual cause in journald instead of just the generic
+# "failed to record issue (non-fatal)" line. See #445.
+debug_mode() {
+  [ "${RUN_HOOK_DEBUG:-}" = "1" ]
+}
+
 record_failure() {
   local detail summary
   # Last ~60 lines of stderr; CLI will further cap to DETAIL_MAX_BYTES.
@@ -108,33 +116,62 @@ record_failure() {
 
   # Pipe detail via stdin so we don't have to shell-quote arbitrary
   # error text. CLI reads it when --detail-stdin is set.
-  if [ -n "$detail" ]; then
-    printf '%s' "$detail" | "$SWITCHROOM_CLI" issues record \
-      --severity error \
-      --source "$SOURCE" \
-      --code "$CODE" \
-      --summary "$summary" \
-      --detail-stdin \
-      --quiet \
-      ${STATE_DIR:+--state-dir "$STATE_DIR"} \
-      >/dev/null 2>&1 || emit_warn "failed to record issue (non-fatal)"
+  if debug_mode; then
+    if [ -n "$detail" ]; then
+      printf '%s' "$detail" | "$SWITCHROOM_CLI" issues record \
+        --severity error \
+        --source "$SOURCE" \
+        --code "$CODE" \
+        --summary "$summary" \
+        --detail-stdin \
+        --quiet \
+        ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+        || emit_warn "failed to record issue (non-fatal)"
+    else
+      "$SWITCHROOM_CLI" issues record \
+        --severity error \
+        --source "$SOURCE" \
+        --code "$CODE" \
+        --summary "$summary" \
+        --quiet \
+        ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+        || emit_warn "failed to record issue (non-fatal)"
+    fi
   else
-    "$SWITCHROOM_CLI" issues record \
-      --severity error \
-      --source "$SOURCE" \
-      --code "$CODE" \
-      --summary "$summary" \
-      --quiet \
-      ${STATE_DIR:+--state-dir "$STATE_DIR"} \
-      >/dev/null 2>&1 || emit_warn "failed to record issue (non-fatal)"
+    if [ -n "$detail" ]; then
+      printf '%s' "$detail" | "$SWITCHROOM_CLI" issues record \
+        --severity error \
+        --source "$SOURCE" \
+        --code "$CODE" \
+        --summary "$summary" \
+        --detail-stdin \
+        --quiet \
+        ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+        >/dev/null 2>&1 || emit_warn "failed to record issue (non-fatal)"
+    else
+      "$SWITCHROOM_CLI" issues record \
+        --severity error \
+        --source "$SOURCE" \
+        --code "$CODE" \
+        --summary "$summary" \
+        --quiet \
+        ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+        >/dev/null 2>&1 || emit_warn "failed to record issue (non-fatal)"
+    fi
   fi
 }
 
 resolve_success() {
   # Resolve by source+code; the CLI computes the fingerprint.
-  "$SWITCHROOM_CLI" issues resolve --source "$SOURCE" --code "$CODE" \
-    ${STATE_DIR:+--state-dir "$STATE_DIR"} \
-    >/dev/null 2>&1 || true
+  if debug_mode; then
+    "$SWITCHROOM_CLI" issues resolve --source "$SOURCE" --code "$CODE" \
+      ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+      || true
+  else
+    "$SWITCHROOM_CLI" issues resolve --source "$SOURCE" --code "$CODE" \
+      ${STATE_DIR:+--state-dir "$STATE_DIR"} \
+      >/dev/null 2>&1 || true
+  fi
 }
 
 if [ -z "$SWITCHROOM_CLI" ]; then

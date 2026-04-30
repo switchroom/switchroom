@@ -125,7 +125,11 @@ _find_latest_jsonl() {
 # on each UserPromptSubmit so recent context isn't lost.
 SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}handoff{{/if}}"
 SWITCHROOM_RESUME_MAX_BYTES="{{#if resumeMaxBytes}}{{{resumeMaxBytes}}}{{else}}2000000{{/if}}"
-CONTINUE_FLAG=""
+{{#if sessionMaxIdleSecs}}# When session.max_idle is configured, auto-mode resume uses it as the
+# freshness window instead of the 7-day default. Lets chat-cadence
+# agents (e.g. health-coach) demand a fresher session — see #218.
+SWITCHROOM_SESSION_MAX_IDLE_SECS="{{{sessionMaxIdleSecs}}}"
+{{/if}}CONTINUE_FLAG=""
 
 {{#if resumeModeHasContinuePath}}_RESUME_LATEST_JSONL="$(_find_latest_jsonl "$CLAUDE_CONFIG_DIR/projects")"
 case "$SWITCHROOM_RESUME_MODE" in
@@ -139,7 +143,8 @@ case "$SWITCHROOM_RESUME_MODE" in
       _RESUME_SIZE="$(_stat_size "$_RESUME_LATEST_JSONL")"
       _RESUME_MTIME="$(_stat_mtime "$_RESUME_LATEST_JSONL")"
       _RESUME_AGE=$(( $(date +%s) - _RESUME_MTIME ))
-      if [ "$_RESUME_SIZE" -gt 0 ] && [ "$_RESUME_SIZE" -lt "$SWITCHROOM_RESUME_MAX_BYTES" ] && [ "$_RESUME_AGE" -lt 604800 ]; then
+      _RESUME_MAX_AGE="${SWITCHROOM_SESSION_MAX_IDLE_SECS:-604800}"
+      if [ "$_RESUME_SIZE" -gt 0 ] && [ "$_RESUME_SIZE" -lt "$SWITCHROOM_RESUME_MAX_BYTES" ] && [ "$_RESUME_AGE" -lt "$_RESUME_MAX_AGE" ]; then
         CONTINUE_FLAG="--continue"
       fi
     fi

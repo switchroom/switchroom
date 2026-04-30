@@ -51,6 +51,35 @@ function fillPlaceholders(sql, params) {
 }
 
 /**
+ * Resolve a synchronous SQLite binding compatible with the
+ * `DatabaseSync(path)` API. See subagent-tracker-pretool.mjs for the
+ * full doc — kept in lockstep across both hook scripts.
+ */
+function resolveSyncSqlite() {
+  const [major] = process.versions.node.split('.').map(Number)
+  if (major >= 22) {
+    try {
+      const { DatabaseSync } = require('node:sqlite')
+      if (DatabaseSync) return DatabaseSync
+    } catch { /* fall through to bun:sqlite */ }
+  }
+  if (typeof globalThis.Bun !== 'undefined') {
+    try {
+      const { Database } = require('bun:sqlite')
+      return function BunDatabaseSyncAdapter(p) {
+        const d = new Database(p)
+        return {
+          exec: (sql) => d.exec(sql),
+          prepare: (sql) => d.prepare(sql),
+          close: () => d.close(),
+        }
+      }
+    } catch { /* fall through to CLI */ }
+  }
+  return null
+}
+
+/**
  * Run SQL against the DB via the sqlite3 CLI (non-blocking).
  * Calls cb(error | null) when the process exits.
  */
@@ -166,17 +195,13 @@ function updateRow(dbPath, { id, status, resultSummary, now }, done) {
   const snapResultSummary = resultSummary
   const snapNow = now
 
-  const [major] = process.versions.node.split('.').map(Number)
-
-  // Resolve node:sqlite availability synchronously (before deferring), so the
-  // setImmediate closure knows which path to take without further try/catch.
-  let DatabaseSync = null
-  if (major >= 22) {
-    try { DatabaseSync = require('node:sqlite').DatabaseSync } catch { /* CLI fallback */ }
-  }
+  // Resolve a synchronous SQLite binding (node:sqlite under Node 22+,
+  // bun:sqlite under bun, else null → CLI fallback). See helper docs.
+  const DatabaseSync = resolveSyncSqlite()
 
   if (DatabaseSync != null) {
-    // Node 22+ with node:sqlite available — defer the write to the next tick.
+    // Sync SQLite binding available — defer the write to the next tick
+    // so the hook returns to Claude Code as fast as possible.
     const SnapDatabaseSync = DatabaseSync
     setImmediate(() => {
       try {
@@ -233,8 +258,12 @@ function main() {
     process.exit(0)
   }
 
-  // Only care about Agent tool calls
-  if (event.tool_name !== 'Agent') process.exit(0)
+  // Only care about sub-agent dispatches. Claude Code emits the dispatch
+  // tool under either the legacy name 'Agent' or the newer 'Task'
+  // depending on version. The matching session-tail / progress-card /
+  // tool-label code paths already recognize both. See pretool hook for
+  // detail.
+  if (event.tool_name !== 'Agent' && event.tool_name !== 'Task') process.exit(0)
 
   const id = event.tool_use_id ?? null
   if (!id) process.exit(0)

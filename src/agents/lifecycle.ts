@@ -210,13 +210,25 @@ export function restartAgent(name: string, reason?: string): void {
   // if the dir is missing.
   if (reason) writeRestartReasonMarker(name, reason);
   try {
-    // Gateway owns the long-running Telegram connection and loads
-    // telegram-plugin code at process start. Restart it alongside the agent
-    // so code changes in telegram-plugin/*.ts always propagate on user
-    // action, not silently 6 hours later. Gateway first so the fresh gateway
-    // is ready when the agent wakes.
-    systemctlIfExists("restart", gatewayServiceName(name));
+    // ORDERING (#177): agent first, gateway second.
+    //
+    // When this function runs inside a child spawned from the gateway
+    // (e.g. /new from Telegram → spawnSwitchroomDetached → here), the
+    // child can be in the gateway's cgroup. If we restart the gateway
+    // FIRST (the previous order) and the cgroup escape (systemd-run
+    // --scope wrapper) is missing or fails, the child gets cgroup-
+    // killed mid-flight before reaching the second `systemctl` call,
+    // and the agent service is never actually restarted — the user
+    // says "/new" and sees the gateway bounce but their session
+    // doesn't actually rotate.
+    //
+    // With the agent service restarted first, even a worst-case
+    // cgroup kill on the second call still leaves the user's session
+    // rotated. Gateway restart is purely about picking up
+    // telegram-plugin code changes; missing it is annoying but not
+    // user-visible the way "session didn't rotate" is.
     systemctl(["restart", serviceName(name)]);
+    systemctlIfExists("restart", gatewayServiceName(name));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to restart agent "${name}": ${message}`);

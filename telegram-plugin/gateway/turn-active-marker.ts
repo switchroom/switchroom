@@ -1,0 +1,101 @@
+/**
+ * Turn-active liveness marker (#412).
+ *
+ * Writes `<STATE_DIR>/turn-active.json` on turn_start, touches its mtime
+ * on every tool_use, removes it on turn_complete. The watchdog
+ * (bin/bridge-watchdog.sh) reads the mtime: if the file exists AND its
+ * mtime is older than TURN_HANG_SECS (default 300s = 5min), the agent
+ * is wedged mid-turn and the watchdog restarts.
+ *
+ * Why this exists: PR #410 raised the journal-silence detector to 4000s
+ * to kill false positives on chat-cadence agents that legitimately
+ * idle for hours between turns. That left a gap — Stop-hook deadlocks
+ * (the original failure mode #116 tracked) are no longer caught under
+ * default thresholds.
+ *
+ * The distinguisher is "in-turn-and-silent" vs "between-turns-and-silent":
+ * the former is a wedge, the latter is healthy idle. This marker exists
+ * exactly during in-turn windows, so its staleness uniquely indicates
+ * the wedge.
+ *
+ * Pure file I/O. The actual hang-detection-and-restart loop lives in the
+ * bash watchdog, where it composes with the existing
+ * Restart=on-failure / journal-silence / bridge-disconnect detectors.
+ */
+
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+
+export const TURN_ACTIVE_MARKER_FILE = "turn-active.json";
+
+export interface TurnActiveMarker {
+  turnKey: string;
+  chatId: string;
+  threadId?: string | null;
+  startedAt: number;
+}
+
+/**
+ * Write the marker file at turn-start. Idempotent — if the file
+ * already exists from a stale prior turn (unlikely; turn_complete
+ * removes it), the new write wins.
+ */
+export function writeTurnActiveMarker(stateDir: string, marker: TurnActiveMarker): void {
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, TURN_ACTIVE_MARKER_FILE),
+      JSON.stringify(marker, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // Best-effort: marker file is a watchdog optimisation, not a
+    // correctness requirement. Don't break the turn-start path on
+    // disk-full, ENOSPC, etc.
+  }
+}
+
+/**
+ * Touch the marker file's mtime. Called on every tool_use event so an
+ * agent doing real work continually advances the mtime. The watchdog's
+ * threshold compares against this mtime.
+ */
+export function touchTurnActiveMarker(stateDir: string): void {
+  const path = join(stateDir, TURN_ACTIVE_MARKER_FILE);
+  if (!existsSync(path)) return;
+  const now = new Date();
+  try {
+    utimesSync(path, now, now);
+  } catch {
+    // utimesSync can fail on some filesystems; fall back to a tiny
+    // open-close cycle to bump the mtime via writes from the kernel side.
+    try {
+      const fd = openSync(path, "r+");
+      closeSync(fd);
+    } catch {
+      /* swallow — best-effort */
+    }
+  }
+}
+
+/**
+ * Remove the marker file at turn_complete. Absence of the file is the
+ * watchdog's signal that no turn is in flight (legitimate idle, no
+ * reason to suspect a hang).
+ */
+export function removeTurnActiveMarker(stateDir: string): void {
+  try {
+    unlinkSync(join(stateDir, TURN_ACTIVE_MARKER_FILE));
+  } catch {
+    // ENOENT is fine (already removed); other errors don't justify
+    // breaking the turn-end path.
+  }
+}

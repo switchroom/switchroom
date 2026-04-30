@@ -130,6 +130,37 @@ describe('markdownToHtml', () => {
     expect(result).not.toContain('</code></code>')
   })
 
+  test('inline code containing asterisks does not get re-matched by italic regex (#415)', () => {
+    // Regression for #415: inline-code spans containing `*` (e.g. C
+    // pointer syntax) used to be restored from their placeholder BEFORE
+    // the italic pass, so the italic regex would see `<code>size_t *p</code>`
+    // and try to wrap `p</code>...` in <i>...</i>, producing invalid HTML
+    // that Telegram rejected with 400 Bad Request, sending the caller into
+    // a `format: text` fallback for the rest of the chunk.
+    const result = markdownToHtml('Use `size_t *p` to declare a pointer.')
+    expect(result).toContain('<code>size_t *p</code>')
+    // No stray <i> wrapping the asterisk — pre-fix the buggy output was
+    // `<code>size_t <i>p</code> to declare a pointer.</i>`.
+    expect(result).not.toMatch(/<i>[^<]*<\/code>/)
+    expect(result).not.toMatch(/<code>[^<]*<i>/)
+  })
+
+  test('inline code containing double-asterisks does not get re-matched by bold regex (#415)', () => {
+    const result = markdownToHtml('Pattern is `**glob**` not regex.')
+    expect(result).toContain('<code>**glob**</code>')
+    // The bold regex must not have wrapped the literal asterisks inside <code>.
+    expect(result).not.toMatch(/<b>[^<]*<\/code>/)
+    expect(result).not.toMatch(/<code>[^<]*<b>/)
+  })
+
+  test('code block containing asterisks does not get re-matched by italic regex (#415)', () => {
+    const input = '```c\nsize_t *p = NULL;\n```'
+    const result = markdownToHtml(input)
+    expect(result).toContain('size_t *p = NULL;')
+    expect(result).not.toMatch(/<i>[^<]*<\/code>/)
+    expect(result).not.toMatch(/<i>[^<]*<\/pre>/)
+  })
+
   test('does not double-wrap when inline code sits alongside prose with file refs', () => {
     // Regression for the user-observed bug: messages that mixed inline code
     // spans (backticks around filenames) with prose produced

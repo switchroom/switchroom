@@ -1,0 +1,20 @@
+{
+  "name": "switchroom-telegram",
+  "description": "Switchroom's enhanced Telegram channel: HTML formatting, smart message chunking, message coalescing, attachment helpers, progress card with sub-agent visibility, vault-grant wizard, and slash-command admin surface (/restart, /usage, /auth, /vault, /issues).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Ken Thompson",
+    "email": "me@kenthompson.com.au"
+  },
+  "homepage": "https://github.com/mekenthompson/switchroom",
+  "repository": "https://github.com/mekenthompson/switchroom",
+  "license": "MIT",
+  "keywords": [
+    "telegram",
+    "switchroom",
+    "channel",
+    "multi-agent",
+    "progress-card",
+    "vault"
+  ]
+}

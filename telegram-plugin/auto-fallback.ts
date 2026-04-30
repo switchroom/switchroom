@@ -137,6 +137,13 @@ export type FallbackPlan =
       resetAtMs: number | null;
       notificationHtml: string;
       agentName: string;
+      /** Carried through from the FallbackDecision so the executor can
+       *  decide whether to do a hard or graceful restart. Reactive
+       *  (`429-response`) failover wants a hard restart — the request
+       *  the user just made already failed, so there's no in-flight
+       *  turn worth preserving. Preemptive (`utilization-over-threshold`
+       *  / `explicit`) failover wants a graceful one. See #420. */
+      triggerReason: 'utilization-over-threshold' | '429-response' | 'explicit';
     }
   | {
       kind: 'exhausted-all';
@@ -203,6 +210,7 @@ export function performAutoFallback(args: PerformArgs): FallbackPlan {
     resetAtMs: args.decision.resetAtMs,
     notificationHtml: buildSwitchedMessage(prev, newActive, args.agentName, args.decision.resetAtMs),
     agentName: args.agentName,
+    triggerReason: args.decision.triggerReason,
   };
 }
 
@@ -213,6 +221,75 @@ export function nextLockout(previousSlot: string, now: number): LockoutRecord {
 
 export function emptyLockout(): LockoutRecord {
   return { lastTransitionedFrom: null, lastTransitionAt: 0 };
+}
+
+/**
+ * Disk-persistence helpers for the lockout record. The cooldown guard
+ * lives entirely in process memory pre-fix, so a gateway restart inside
+ * the cooldown window resets the timer to zero — and a quota-flap on
+ * the now-recovering slot can re-trigger fallback the moment the
+ * gateway comes back. See #417.
+ *
+ * Storage path: \`<agentDir>/.claude/auto-fallback-lockout.json\`. We
+ * tolerate any read/parse error by returning emptyLockout (the same
+ * outcome as a fresh process), since the cooldown is a noise filter,
+ * not a security boundary.
+ */
+const LOCKOUT_FILE = "auto-fallback-lockout.json";
+
+export interface LockoutPersistOps {
+  readFileSync: (path: string, encoding: BufferEncoding) => string;
+  writeFileSync: (path: string, data: string, opts: { mode?: number }) => void;
+  existsSync: (path: string) => boolean;
+  mkdirSync: (path: string, opts: { recursive: true }) => void;
+  joinPath: (...parts: string[]) => string;
+  now?: () => number;
+}
+
+export function lockoutPath(agentDir: string, joinPath: LockoutPersistOps['joinPath']): string {
+  return joinPath(agentDir, '.claude', LOCKOUT_FILE);
+}
+
+export function loadLockout(agentDir: string, ops: LockoutPersistOps): LockoutRecord {
+  const path = lockoutPath(agentDir, ops.joinPath);
+  if (!ops.existsSync(path)) return emptyLockout();
+  try {
+    const raw = ops.readFileSync(path, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      (typeof parsed.lastTransitionedFrom === 'string' ||
+        parsed.lastTransitionedFrom === null) &&
+      typeof parsed.lastTransitionAt === 'number' &&
+      Number.isFinite(parsed.lastTransitionAt)
+    ) {
+      return {
+        lastTransitionedFrom: parsed.lastTransitionedFrom,
+        lastTransitionAt: parsed.lastTransitionAt,
+      };
+    }
+  } catch {
+    /* fall through to empty */
+  }
+  return emptyLockout();
+}
+
+export function saveLockout(
+  agentDir: string,
+  record: LockoutRecord,
+  ops: LockoutPersistOps,
+): void {
+  const path = lockoutPath(agentDir, ops.joinPath);
+  // Best-effort: ensure the .claude directory exists, then write. Any
+  // failure is swallowed by the caller's try/catch — losing the lockout
+  // file just degrades to in-memory-only behaviour, not a hard failure.
+  ops.mkdirSync(ops.joinPath(agentDir, '.claude'), { recursive: true });
+  ops.writeFileSync(
+    path,
+    JSON.stringify(record, null, 2) + '\n',
+    { mode: 0o600 },
+  );
 }
 
 /**
