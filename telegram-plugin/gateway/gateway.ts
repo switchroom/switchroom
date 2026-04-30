@@ -4970,7 +4970,15 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
         return { kind: 'error', message: `invalid agent name: ${plan.agentName}` }
       }
       try {
-        switchroomExec(['agent', 'restart', plan.agentName])
+        // Preemptive failover (utilization-over-threshold / explicit) waits
+        // for the active turn to drain. Reactive failover (429-response)
+        // hard-restarts because the request that triggered it has already
+        // failed — there's no in-flight turn worth preserving. See #420.
+        const restartArgs = ['agent', 'restart', plan.agentName]
+        if (plan.triggerReason !== '429-response') {
+          restartArgs.push('--graceful-restart')
+        }
+        switchroomExec(restartArgs)
       } catch (err) {
         process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
       }

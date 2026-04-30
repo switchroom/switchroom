@@ -141,12 +141,32 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
       } else {
         // Token shape OK; check expiry.
         const expiresAt = oauth.expiresAt;
-        if (typeof expiresAt === "number" && expiresAt < Date.now()) {
-          const days = Math.floor((Date.now() - expiresAt) / 86_400_000);
+        if (typeof expiresAt === "number") {
+          if (!Number.isFinite(expiresAt)) {
+            // NaN / Infinity — same masking concern as #441: silently
+            // skipping non-numeric values lets a corrupt creds file
+            // appear healthy when it isn't.
+            findings.push({
+              code: "credentials_malformed",
+              severity: "warn",
+              summary: ".credentials.json claudeAiOauth.expiresAt is non-finite",
+            });
+          } else if (expiresAt < Date.now()) {
+            const days = Math.floor((Date.now() - expiresAt) / 86_400_000);
+            findings.push({
+              code: "token_expired",
+              severity: "error",
+              summary: `access token expired ${days}d ago`,
+            });
+          }
+        } else if (expiresAt !== undefined) {
+          // expiresAt present but the wrong type (string/null/object).
+          // Pre-fix this branch silently fell through, masking a corrupt
+          // creds file as healthy. See #441.
           findings.push({
-            code: "token_expired",
-            severity: "error",
-            summary: `access token expired ${days}d ago`,
+            code: "credentials_malformed",
+            severity: "warn",
+            summary: ".credentials.json claudeAiOauth.expiresAt is missing or non-numeric",
           });
         }
         // Refresh token: warn if missing.

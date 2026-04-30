@@ -137,6 +137,13 @@ export type FallbackPlan =
       resetAtMs: number | null;
       notificationHtml: string;
       agentName: string;
+      /** Carried through from the FallbackDecision so the executor can
+       *  decide whether to do a hard or graceful restart. Reactive
+       *  (`429-response`) failover wants a hard restart — the request
+       *  the user just made already failed, so there's no in-flight
+       *  turn worth preserving. Preemptive (`utilization-over-threshold`
+       *  / `explicit`) failover wants a graceful one. See #420. */
+      triggerReason: 'utilization-over-threshold' | '429-response' | 'explicit';
     }
   | {
       kind: 'exhausted-all';
@@ -203,6 +210,7 @@ export function performAutoFallback(args: PerformArgs): FallbackPlan {
     resetAtMs: args.decision.resetAtMs,
     notificationHtml: buildSwitchedMessage(prev, newActive, args.agentName, args.decision.resetAtMs),
     agentName: args.agentName,
+    triggerReason: args.decision.triggerReason,
   };
 }
 
