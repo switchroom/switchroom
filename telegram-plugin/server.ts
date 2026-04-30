@@ -1247,7 +1247,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
+        '**Terminal — sends a final message and ends the turn.** Use for one-shot answers requiring zero further tool calls (factual answers, confirmations, simple replies). For any response that involves dispatching work (Agent calls, Bash commands, multi-step tool chains), use `stream_reply` and keep doing work — calling `reply` to announce in-flight work will leave the work undone, because the turn ends after this call. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
