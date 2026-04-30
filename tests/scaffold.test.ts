@@ -2864,6 +2864,28 @@ describe("session freshness in start.sh", () => {
     expect(startSh).not.toContain(".resume-next-start");
   });
 
+  it("session.max_idle wires SWITCHROOM_SESSION_MAX_IDLE_SECS into auto-mode resume (#218)", () => {
+    const agentConfig = makeAgentConfig({
+      session: { max_idle: "2h" },
+      session_continuity: { resume_mode: "auto" },
+    });
+    const result = scaffoldAgent(
+      "idle-bound-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+
+    // Configured max_idle is exported as the env var (2h = 7200s).
+    expect(startSh).toContain('SWITCHROOM_SESSION_MAX_IDLE_SECS="7200"');
+    // Auto-mode comparison consults the env var (with 7d default fallback).
+    expect(startSh).toContain('"${SWITCHROOM_SESSION_MAX_IDLE_SECS:-604800}"');
+    // The hard-coded 604800 from the comparison should no longer appear
+    // — it now lives only in the bash-default fallback.
+    expect(startSh).not.toMatch(/-lt 604800 ];/);
+  });
+
   it("installs the Stop hook for handoff by default", () => {
     const agentConfig = makeAgentConfig();
     const switchroomConfig: SwitchroomConfig = {

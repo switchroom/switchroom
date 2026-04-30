@@ -5510,8 +5510,16 @@ bot.on('callback_query:data', async ctx => {
     }
 
     // #227 grant wizard callbacks (vg:cancel bare, vg:agent:*, vg:keys:*, vg:dur:*, vg:gen)
+    //
+    // Note: pre-#265 fix this function did `await ctx.answerCallbackQuery().catch(() => {})`
+    // unconditionally up front. That meant the `vg:keys-continue` branch's
+    // toast call (`Select at least one key.`) hit a Telegram error
+    // ("query is too old or query ID is invalid") because the query was
+    // already answered, and the toast never reached the user. Each branch
+    // now owns its own ack — the spinner dismissal is part of the branch's
+    // post-condition.
     const chatId = String(ctx.chat!.id)
-    await ctx.answerCallbackQuery().catch(() => {})
+    const ackSilently = () => ctx.answerCallbackQuery().catch(() => {})
 
     // Cancel at any step
     if (data === 'vg:cancel') {
@@ -5520,12 +5528,14 @@ bot.on('callback_query:data', async ctx => {
       if (msg && 'text' in msg) {
         await ctx.editMessageText('❌ Grant wizard cancelled.').catch(() => {})
       }
+      await ackSilently()
       return
     }
 
     const state = pendingVaultOps.get(chatId)
     if (!state || state.kind !== 'grant-wizard') {
       await ctx.editMessageText('⚠️ Wizard session expired. Run /vault grant to start again.').catch(() => {})
+      await ackSilently()
       return
     }
 
@@ -5534,13 +5544,14 @@ bot.on('callback_query:data', async ctx => {
       const agent = data.slice('vg:agent:'.length)
       const msgId = (ctx.callbackQuery.message as { message_id?: number })?.message_id ?? state.wizardMsgId
       await grantWizardStep2(ctx, chatId, agent, msgId)
+      await ackSilently()
       return
     }
 
     // vg:key:<name> — step 2 toggle
     if (data.startsWith('vg:key:')) {
       const key = data.slice('vg:key:'.length)
-      if (state.step !== 'keys') return
+      if (state.step !== 'keys') { await ackSilently(); return }
       const selectedSet = new Set(state.selectedKeys ?? [])
       if (selectedSet.has(key)) {
         selectedSet.delete(key)
@@ -5551,23 +5562,27 @@ bot.on('callback_query:data', async ctx => {
       pendingVaultOps.set(chatId, updatedState)
       const kb = buildGrantKeysKeyboard(state.availableKeys ?? [], selectedSet)
       await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => {})
+      await ackSilently()
       return
     }
 
     // vg:keys-continue — step 2 → 3
     if (data === 'vg:keys-continue') {
-      if (state.step !== 'keys') return
+      if (state.step !== 'keys') { await ackSilently(); return }
       if (!state.selectedKeys || state.selectedKeys.length === 0) {
+        // Toast-only ack: this is the branch the unconditional pre-ack
+        // used to silently swallow. See #265.
         await ctx.answerCallbackQuery({ text: 'Select at least one key.' }).catch(() => {})
         return
       }
       await grantWizardStep3(ctx, chatId, state)
+      await ackSilently()
       return
     }
 
     // vg:dur:<value> — step 3 duration selection
     if (data.startsWith('vg:dur:')) {
-      if (state.step !== 'duration') return
+      if (state.step !== 'duration') { await ackSilently(); return }
       const dur = data.slice('vg:dur:'.length)
       if (dur === 'custom') {
         // Ask for text reply with n d|h format
@@ -5579,6 +5594,7 @@ bot.on('callback_query:data', async ctx => {
             { parse_mode: 'HTML', reply_markup: buildGrantDurationKeyboard() },
           ).catch(() => {})
         }
+        await ackSilently()
         return
       }
       let ttlSeconds: number | null
@@ -5588,30 +5604,33 @@ bot.on('callback_query:data', async ctx => {
         ttlSeconds = 365 * 86400
       } else {
         ttlSeconds = parseGrantDuration(dur)
-        if (ttlSeconds === null) return
+        if (ttlSeconds === null) { await ackSilently(); return }
       }
       const newState = { ...state, ttlSeconds, awaitingCustomDuration: false }
       await grantWizardConfirm(ctx, chatId, newState)
+      await ackSilently()
       return
     }
 
     // vg:back:duration — go back to step 2 (keys selection) from step 3
     if (data === 'vg:back:duration') {
-      if (state.step !== 'duration') return
+      if (state.step !== 'duration') { await ackSilently(); return }
       const msgId = state.wizardMsgId
       await grantWizardStep2(ctx, chatId, state.agent!, msgId)
+      await ackSilently()
       return
     }
 
     // vg:generate — final step
     if (data === 'vg:generate') {
-      if (state.step !== 'confirm') return
+      if (state.step !== 'confirm') { await ackSilently(); return }
       await executeGrantWizard(ctx, chatId, state)
+      await ackSilently()
       return
     }
 
     // Unrecognised vg: sub-action
-    await ctx.answerCallbackQuery().catch(() => {})
+    await ackSilently()
     return
   }
 
