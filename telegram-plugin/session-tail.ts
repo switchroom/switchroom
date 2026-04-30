@@ -621,8 +621,25 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     pendingPartial: string
     hasEmittedStart: boolean
     watcher: FSWatcher | null
+    /**
+     * Last wall-clock time the file's byte count actually advanced.
+     * Used for idle-based FSWatcher cleanup — sub-agents that haven't
+     * written in IDLE_FSWATCH_TTL_MS get their watcher closed and the
+     * SubTail entry dropped. The rescan loop re-attaches if the file
+     * grows again. See MEM2 in the overnight forensic audit on #472.
+     */
+    lastActivityAt: number
   }
   const subTails = new Map<string, SubTail>() // keyed by absolute file path
+
+  /**
+   * Idle window before a sub-agent FSWatcher is considered safe to
+   * close. Sub-agents finish in seconds-to-minutes; 5 min is well
+   * past the 99th-percentile completion time and cheap on the rare
+   * very-long task (rescanSubagents picks the file back up on the
+   * next tick if it grows).
+   */
+  const IDLE_FSWATCH_TTL_MS = 5 * 60 * 1000
 
   function readSub(t: SubTail): void {
     if (stopped) return
@@ -641,6 +658,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
         closeSync(fd)
       }
       t.cursor = stat.size
+      t.lastActivityAt = Date.now()
       const text = t.pendingPartial + buf.toString('utf-8')
       const lines = text.split('\n')
       t.pendingPartial = lines.pop() ?? ''
@@ -679,6 +697,7 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       pendingPartial: '',
       hasEmittedStart: false,
       watcher: null,
+      lastActivityAt: Date.now(),
     }
     void cursor
     try {
@@ -689,6 +708,32 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     subTails.set(file, t)
     log?.(`session-tail: attached sub ${agentId} (${file})`)
     readSub(t)
+  }
+
+  /**
+   * Drop sub-tails whose underlying file hasn't grown in
+   * IDLE_FSWATCH_TTL_MS. Closes the FSWatcher (releasing the FD) and
+   * removes the entry from `subTails`. If the file later grows again
+   * — unusual but possible if a sub-agent resumes — `rescanSubagents`
+   * will re-attach on its next tick.
+   *
+   * Pre-MEM2 fix the per-file FSWatcher lived for the entire process
+   * lifetime. With the subagent-watcher (MEM1) ALSO holding a watcher
+   * on the same file, the FD bleed was doubled.
+   */
+  function reapIdleSubTails(): void {
+    if (subTails.size === 0) return
+    const cutoff = Date.now() - IDLE_FSWATCH_TTL_MS
+    for (const [file, t] of subTails) {
+      if (t.lastActivityAt < cutoff) {
+        if (t.watcher) {
+          try { t.watcher.close() } catch { /* ignore */ }
+          t.watcher = null
+        }
+        subTails.delete(file)
+        log?.(`session-tail: reaped idle sub ${t.agentId} (${file})`)
+      }
+    }
   }
 
   /**
@@ -733,6 +778,10 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     // Always read in case fs.watch missed an event (common on WSL/network mounts)
     readNew()
     rescanSubagents()
+    // MEM2: reap subtails whose underlying JSONL has been idle for a
+    // while. The reap is guarded by IDLE_FSWATCH_TTL_MS (5 min by
+    // default) so steady-state workloads don't thrash.
+    reapIdleSubTails()
   }
 
   // Initial pass

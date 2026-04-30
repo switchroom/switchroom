@@ -4,6 +4,8 @@ import {
   performAutoFallback,
   nextLockout,
   emptyLockout,
+  loadLockout,
+  saveLockout,
   DEFAULT_TRIGGER_UTILIZATION_PCT,
   DEFAULT_FALLBACK_COOLDOWN_MS,
   type LockoutRecord,
@@ -313,10 +315,6 @@ describe("nextLockout / emptyLockout", () => {
 });
 
 describe("loadLockout / saveLockout (#417)", () => {
-  // Use require to avoid hoisting the import to top of file (and to keep the
-  // existing import block untouched).
-  const { loadLockout, saveLockout } = require("../auto-fallback") as typeof import("../auto-fallback");
-
   function fakeOps() {
     const files = new Map<string, string>();
     const dirs = new Set<string>();
