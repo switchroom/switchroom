@@ -242,4 +242,74 @@ describe("createIssuesCardHandle", () => {
     await handle.refresh([makeEvent({})]);
     expect(bot.sent[0].opts?.message_thread_id).toBe(42);
   });
+
+  it("respects retry_after on a 429 send: skips refreshes during cooldown (#442)", async () => {
+    let now = 1_000_000;
+    const bot = makeFakeBot();
+    let throwOnSend = true;
+    bot.sendMessage = async (_chat, text, opts) => {
+      if (throwOnSend) {
+        throwOnSend = false;
+        // Shape mirrors grammY's GrammyError public surface.
+        throw Object.assign(new Error("Too Many Requests"), {
+          error_code: 429,
+          parameters: { retry_after: 30 },
+        });
+      }
+      bot.sent.push({ text, opts });
+      return { message_id: 9999 };
+    };
+    const handle = createIssuesCardHandle({
+      agentName: "klanker",
+      chatId: "1",
+      bot,
+      now: () => now,
+    });
+    // First refresh: gets 429, no card recorded.
+    await handle.refresh([makeEvent({})]);
+    expect(bot.sent).toHaveLength(0);
+    expect(handle.messageId()).toBeNull();
+
+    // Second refresh inside the cooldown window: must skip silently.
+    now += 5_000; // 5s later, still within 30s cooldown
+    await handle.refresh([makeEvent({})]);
+    expect(bot.sent).toHaveLength(0);
+
+    // After the cooldown elapses, the next refresh succeeds.
+    now += 30_000;
+    await handle.refresh([makeEvent({})]);
+    expect(bot.sent).toHaveLength(1);
+    expect(handle.messageId()).toBe(9999);
+  });
+
+  it("respects retry_after on a 429 edit: skips refreshes during cooldown (#442)", async () => {
+    let now = 1_000_000;
+    const bot = makeFakeBot();
+    const handle = createIssuesCardHandle({
+      agentName: "klanker",
+      chatId: "1",
+      bot,
+      now: () => now,
+    });
+    // Initial post succeeds.
+    await handle.refresh([makeEvent({ summary: "v1" })]);
+    expect(handle.messageId()).toBe(1000);
+
+    // Next edit raises 429.
+    bot.editMessageText = async () => {
+      throw Object.assign(new Error("Too Many Requests"), {
+        error_code: 429,
+        parameters: { retry_after: 10 },
+      });
+    };
+    now += 1_000;
+    await handle.refresh([makeEvent({ summary: "v2" })]);
+    // Cooldown engaged — no re-post attempt should hit the bot until the wait elapses.
+    expect(bot.sent).toHaveLength(1);
+
+    // Within the cooldown: still skipped.
+    now += 5_000;
+    await handle.refresh([makeEvent({ summary: "v3" })]);
+    expect(bot.sent).toHaveLength(1);
+  });
 });

@@ -138,8 +138,11 @@ import {
   evaluateFallbackTrigger,
   performAutoFallback,
   emptyLockout,
+  loadLockout,
   nextLockout,
+  saveLockout,
   type LockoutRecord,
+  type LockoutPersistOps,
 } from '../auto-fallback.js'
 import { markSlotQuotaExhausted } from '../../src/auth/accounts.js'
 import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
@@ -4927,7 +4930,38 @@ bot.command('interrupt', async ctx => {
 // Shared auto-fallback state. `lockout` is a per-process in-memory
 // guard against rapid re-fire between the scheduled poll and a
 // manual /authfallback trigger (see telegram-plugin/auto-fallback.ts).
+//
+// Pre-#417 fix this was always emptyLockout() at process start, so a
+// gateway restart inside the cooldown window reset the timer and a
+// quota-flap on the recovering slot could re-trigger fallback the
+// moment the gateway came back. We now seed from disk on first use
+// and persist on every transition. Errors are swallowed: losing the
+// lockout file just degrades to in-memory-only behaviour.
+const lockoutOps: LockoutPersistOps = {
+  readFileSync: (p, enc) => readFileSync(p, enc),
+  writeFileSync: (p, data, opts) => writeFileSync(p, data, opts),
+  existsSync: (p) => existsSync(p),
+  mkdirSync: (p, opts) => mkdirSync(p, opts),
+  joinPath: (...parts) => join(...parts),
+}
 let autoFallbackLockout: LockoutRecord = emptyLockout()
+let autoFallbackLockoutSeeded = false
+function seedAutoFallbackLockoutIfNeeded(agentDir: string): void {
+  if (autoFallbackLockoutSeeded) return
+  autoFallbackLockoutSeeded = true
+  try {
+    autoFallbackLockout = loadLockout(agentDir, lockoutOps)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: auto-fallback lockout seed failed (using empty): ${(err as Error).message}\n`)
+  }
+}
+function persistLockout(agentDir: string): void {
+  try {
+    saveLockout(agentDir, autoFallbackLockout, lockoutOps)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: auto-fallback lockout persist failed: ${(err as Error).message}\n`)
+  }
+}
 
 type AutoFallbackCheckResult =
   | { kind: 'no-action'; reason: string; decision: 'noop' | 'fallback-skipped' }
@@ -4939,6 +4973,7 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
   try {
     const agentDir = resolveAgentDirFromEnv()
     const agentName = getMyAgentName()
+    seedAutoFallbackLockoutIfNeeded(agentDir)
     const active = currentActiveSlot(agentDir)
     const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
     const decision = evaluateFallbackTrigger({
@@ -4983,9 +5018,11 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
         process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
       }
       autoFallbackLockout = nextLockout(plan.previousSlot, Date.now())
+      persistLockout(agentDir)
       return { kind: 'executed', previousSlot: plan.previousSlot, newSlot: plan.newSlot }
     }
     autoFallbackLockout = nextLockout(plan.activeSlot, Date.now())
+    persistLockout(agentDir)
     return { kind: 'exhausted-all', activeSlot: plan.activeSlot }
   } catch (err) {
     process.stderr.write(`telegram gateway: auto-fallback ${opts.trigger} poll error: ${err}\n`)

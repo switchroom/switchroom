@@ -311,3 +311,73 @@ describe("nextLockout / emptyLockout", () => {
     expect(l.lastTransitionAt).toBe(NOW);
   });
 });
+
+describe("loadLockout / saveLockout (#417)", () => {
+  // Use require to avoid hoisting the import to top of file (and to keep the
+  // existing import block untouched).
+  const { loadLockout, saveLockout } = require("../auto-fallback") as typeof import("../auto-fallback");
+
+  function fakeOps() {
+    const files = new Map<string, string>();
+    const dirs = new Set<string>();
+    return {
+      files,
+      dirs,
+      readFileSync: (p: string) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      writeFileSync: (p: string, data: string) => {
+        files.set(p, data);
+      },
+      existsSync: (p: string) => files.has(p),
+      mkdirSync: (p: string) => {
+        dirs.add(p);
+      },
+      joinPath: (...parts: string[]) => parts.join("/"),
+    };
+  }
+
+  it("returns emptyLockout when no file exists", () => {
+    const ops = fakeOps();
+    expect(loadLockout("/agent", ops)).toEqual(emptyLockout());
+  });
+
+  it("round-trips a saved lockout", () => {
+    const ops = fakeOps();
+    const original = nextLockout("default", NOW);
+    saveLockout("/agent", original, ops);
+    expect(loadLockout("/agent", ops)).toEqual(original);
+  });
+
+  it("creates the .claude directory before writing", () => {
+    const ops = fakeOps();
+    saveLockout("/agent", nextLockout("default", NOW), ops);
+    expect(ops.dirs.has("/agent/.claude")).toBe(true);
+  });
+
+  it("falls back to emptyLockout on malformed JSON (not a hard fail)", () => {
+    const ops = fakeOps();
+    ops.files.set("/agent/.claude/auto-fallback-lockout.json", "{broken json");
+    expect(loadLockout("/agent", ops)).toEqual(emptyLockout());
+  });
+
+  it("falls back to emptyLockout on missing fields", () => {
+    const ops = fakeOps();
+    ops.files.set(
+      "/agent/.claude/auto-fallback-lockout.json",
+      JSON.stringify({ wrong: "shape" }),
+    );
+    expect(loadLockout("/agent", ops)).toEqual(emptyLockout());
+  });
+
+  it("falls back to emptyLockout on non-finite lastTransitionAt", () => {
+    const ops = fakeOps();
+    ops.files.set(
+      "/agent/.claude/auto-fallback-lockout.json",
+      JSON.stringify({ lastTransitionedFrom: "x", lastTransitionAt: "nope" }),
+    );
+    expect(loadLockout("/agent", ops)).toEqual(emptyLockout());
+  });
+});
