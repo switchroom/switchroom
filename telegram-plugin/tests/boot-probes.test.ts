@@ -14,6 +14,7 @@ import { join } from 'path'
 import {
   probeAgentProcess,
   probeQuota,
+  watchAgentProcess,
 } from '../gateway/boot-probes.js'
 import { readQuotaCache, RATE_LIMIT_TTL_MS } from '../gateway/quota-cache.js'
 
@@ -309,5 +310,142 @@ describe('probeQuota — #210: 429 returns ok-with-note', () => {
     // readQuotaCache should see it as expired
     const cached = readQuotaCache({ path: cachePath })
     expect(cached).toBeNull()
+  })
+})
+
+// ── #296: watchAgentProcess follow-up re-poll ─────────────────────────────
+
+describe('watchAgentProcess — #296: re-poll after window expiry', () => {
+  /**
+   * Build a fake clock that the test can advance manually. The first
+   * call returns the start time; each subsequent `tick` advances now()
+   * by the given ms.
+   */
+  function makeFakeClock(startMs = 0) {
+    let current = startMs
+    return {
+      now: () => current,
+      tick: (ms: number) => { current += ms },
+    }
+  }
+
+  it('flips degraded → ok when agent reaches active after the follow-up re-poll', async () => {
+    const clock = makeFakeClock()
+    const sequence = makeSequence([
+      makeSystemctlOutput('inactive'),
+      makeSystemctlOutput('active', '99999'),
+    ])
+    const execFileImpl = ((...args: unknown[]) =>
+      sequence(...args)) as ExecFileFn
+    // Each sleep call advances the fake clock past the window.
+    const sleepImpl = async (ms: number) => { clock.tick(ms) }
+
+    const yields: Array<{ status: string; detail: string }> = []
+    const gen = watchAgentProcess('testbot', {
+      liveWindowMs: 100, // expire after first tick (sleep advances 1000ms past)
+      pollIntervalMs: 1000,
+      followupRepollMs: 30_000,
+      sleepImpl,
+      execFileImpl: execFileImpl as never,
+      nowImpl: clock.now,
+    })
+    for await (const result of gen) {
+      yields.push({ status: result.status, detail: result.detail ?? '' })
+    }
+
+    // First yield: degraded (within-window-expired commit). Second yield:
+    // ok (the follow-up re-poll caught the late-boot active transition).
+    expect(yields.length).toBeGreaterThanOrEqual(2)
+    const final = yields[yields.length - 1]
+    expect(final.status).toBe('ok')
+    expect(final.detail).toContain('PID 99999')
+  })
+
+  it('does NOT yield ok when agent stays inactive after the follow-up re-poll', async () => {
+    const clock = makeFakeClock()
+    const sequence = makeSequence([
+      makeSystemctlOutput('inactive'),
+      makeSystemctlOutput('inactive'),
+      makeSystemctlOutput('inactive'),
+    ])
+    const execFileImpl = ((...args: unknown[]) =>
+      sequence(...args)) as ExecFileFn
+    const sleepImpl = async (ms: number) => { clock.tick(ms) }
+
+    const yields: Array<{ status: string; detail: string }> = []
+    const gen = watchAgentProcess('testbot', {
+      liveWindowMs: 100,
+      pollIntervalMs: 1000,
+      followupRepollMs: 30_000,
+      sleepImpl,
+      execFileImpl: execFileImpl as never,
+      nowImpl: clock.now,
+    })
+    for await (const result of gen) {
+      yields.push({ status: result.status, detail: result.detail ?? '' })
+    }
+
+    // Final status must be degraded — the follow-up re-poll saw inactive
+    // again so no ok yield was added. (The number of yields varies by how
+    // many distinct "service X" detail strings the loop saw; what matters
+    // is that ok never appears.)
+    expect(yields.every((y) => y.status === 'degraded')).toBe(true)
+    expect(yields.find((y) => y.status === 'ok')).toBeUndefined()
+  })
+
+  it('skips the re-poll entirely when followupRepollMs <= 0', async () => {
+    const clock = makeFakeClock()
+    const sequence = makeSequence([makeSystemctlOutput('inactive')])
+    const execCalls: number[] = []
+    const execFileImpl = ((...args: unknown[]) => {
+      execCalls.push(1)
+      return sequence(...args)
+    }) as ExecFileFn
+
+    const yields: Array<{ status: string }> = []
+    const gen = watchAgentProcess('testbot', {
+      liveWindowMs: 100,
+      pollIntervalMs: 1000,
+      followupRepollMs: 0, // disabled
+      sleepImpl: async (ms: number) => { clock.tick(ms) },
+      execFileImpl: execFileImpl as never,
+      nowImpl: clock.now,
+    })
+    for await (const result of gen) {
+      yields.push({ status: result.status })
+    }
+
+    // followupRepollMs=0 means no follow-up after the window expires.
+    // Final yield must be degraded; no ok ever surfaces.
+    expect(yields.every((y) => y.status === 'degraded')).toBe(true)
+    expect(yields.find((y) => y.status === 'ok')).toBeUndefined()
+  })
+
+  it('returns immediately on ok within window — no follow-up needed', async () => {
+    const clock = makeFakeClock()
+    const sequence = makeSequence([makeSystemctlOutput('active', '12345')])
+    let extraCalls = 0
+    const execFileImpl = ((...args: unknown[]) => {
+      const result = sequence(...args)
+      extraCalls += 1
+      return result
+    }) as ExecFileFn
+
+    const yields: Array<{ status: string }> = []
+    const gen = watchAgentProcess('testbot', {
+      liveWindowMs: 60_000,
+      pollIntervalMs: 1000,
+      followupRepollMs: 30_000,
+      sleepImpl: async (ms: number) => { clock.tick(ms) },
+      execFileImpl: execFileImpl as never,
+      nowImpl: clock.now,
+    })
+    for await (const result of gen) {
+      yields.push({ status: result.status })
+    }
+
+    expect(yields).toHaveLength(1)
+    expect(yields[0].status).toBe('ok')
+    expect(extraCalls).toBe(1) // only the initial probe; no follow-up
   })
 })
