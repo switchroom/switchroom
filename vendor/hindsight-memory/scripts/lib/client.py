@@ -5,15 +5,30 @@ Openclaw HindsightClient (client.js), adapted for Python stdlib.
 """
 
 import json
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
 DEFAULT_TIMEOUT = 15  # seconds
 HEALTH_CHECK_RETRIES = 3
 HEALTH_CHECK_DELAY = 2  # seconds
+
+
+def _plugin_version() -> str:
+    """Read the plugin version from plugin.json (single source of truth)."""
+    manifest = Path(__file__).resolve().parents[2] / ".claude-plugin" / "plugin.json"
+    try:
+        return json.loads(manifest.read_text()).get("version", "0.0.0")
+    except (OSError, ValueError):
+        return "0.0.0"
+
+
+# Sent on every request so self-hosted deployments behind Cloudflare (or any
+# reverse proxy with UA-based bot filtering) don't block the stdlib default
+# "Python-urllib/X.Y", which trips Cloudflare error 1010.
+USER_AGENT = f"hindsight-claude-code/{_plugin_version()}"
 
 
 def _validate_api_url(url: str) -> str:
@@ -34,7 +49,10 @@ class HindsightClient:
         self.api_token = api_token
 
     def _headers(self) -> dict:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
@@ -60,6 +78,8 @@ class HindsightClient:
         Mirrors Openclaw's checkExternalApiHealth: retries up to 3 times
         with 2s delay between attempts.
         """
+        import time
+
         for attempt in range(1, HEALTH_CHECK_RETRIES + 1):
             try:
                 url = f"{self.api_url}/health"
@@ -128,29 +148,6 @@ class HindsightClient:
             "async": True,
         }
         return self._request("POST", path, body, timeout=timeout)
-
-    def list_directives(
-        self,
-        bank_id: str,
-        active_only: bool = True,
-        timeout: int = 5,
-    ) -> dict:
-        """List directives for a bank.
-
-        Returns the raw API response dict with 'items' list. Each item has:
-        id, bank_id, name, content, priority, is_active, tags, created_at,
-        updated_at.
-
-        We intentionally do NOT pass tags or isolation_mode arguments — the
-        upstream `reflect` tool has a known bug (vectorize-io/hindsight#1269)
-        where tagged directives are dropped by isolation_mode filtering.
-        `list_directives` itself works correctly with no filters, so we keep
-        the call surface minimal.
-        """
-        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/directives"
-        if active_only:
-            path = f"{path}?active_only=true"
-        return self._request("GET", path, body=None, timeout=timeout)
 
     def set_bank_mission(
         self, bank_id: str, mission: str, retain_mission: Optional[str] = None, timeout: int = 15
