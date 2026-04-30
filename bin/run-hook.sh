@@ -72,18 +72,25 @@ fi
 # this via env; we just check up-front so the degraded path is obvious.
 STATE_DIR="${TELEGRAM_STATE_DIR:-}"
 
-# Run the wrapped command, capture stderr in addition to passing it through.
-# `exec` would be tempting but we need the wrapper to outlive the child to
-# record / resolve afterward.
+# Run the wrapped command, capturing stderr to a temp file. After the
+# command exits, replay the buffer to our own stderr so journald sees
+# everything as before. This is intentionally NOT a process substitution
+# with tee — bash does not wait for process substitutions to drain
+# before the next command runs, which previously meant tail-reading
+# the buffer could miss the final lines (the most informative ones).
+# See review on #434/#435.
 STDERR_TMP="$(mktemp -t run-hook-stderr.XXXXXX 2>/dev/null || mktemp)"
 trap 'rm -f "$STDERR_TMP" 2>/dev/null || true' EXIT
 
-# Pipe stderr through tee so it lands in journald AND in our buffer.
-# Use a process substitution; on systems without it we'd have to fall
-# back to a temp file copy. Bash + bun + the agents' shells all
-# support it.
-"$COMMAND" "$@" 2> >(tee -a "$STDERR_TMP" >&2)
+"$COMMAND" "$@" 2>"$STDERR_TMP"
 STATUS=$?
+
+# Replay captured stderr to our own stderr now that the command has
+# fully exited — preserves journald visibility without the streaming
+# property (which hooks don't need; they're short-lived).
+if [ -s "$STDERR_TMP" ]; then
+  cat "$STDERR_TMP" >&2
+fi
 
 emit_warn() {
   echo "run-hook.sh: $1" >&2
