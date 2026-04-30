@@ -531,6 +531,29 @@ export interface ProgressDriver {
    */
   hasActiveCard(chatId: string, threadId?: string): boolean
   /**
+   * Issue #305 Option A — push a sub-agent narrative line into the
+   * pinned progress card's row body for `agentId` (jsonl_agent_id).
+   * Replace-on-each-call. Caller (gateway) is responsible for truncating
+   * `text` to the 200-char card cap before invocation.
+   *
+   * Returns:
+   *   - `{ ok: true }` when the narrative was applied + flush triggered.
+   *   - `{ ok: false, reason: 'no_active_card' }` if no card is tracked
+   *     for (chatId, threadId) or its turn already completionFired.
+   *   - `{ ok: false, reason: 'unknown_agent' }` if the card is active
+   *     but does not yet contain a sub-agent for `agentId` (likely a
+   *     race with sub-agent watcher's jsonl_agent_id backfill — caller
+   *     should fall through to the message-send path).
+   *
+   * Never throws.
+   */
+  recordSubAgentNarrative(args: {
+    chatId: string
+    threadId?: string
+    agentId: string
+    text: string
+  }): { ok: true } | { ok: false; reason: 'no_active_card' | 'unknown_agent' }
+  /**
    * Report a Telegram API failure back to the driver after an async emit
    * fails. The outer layer (server.ts catch handler) classifies the raw
    * error and calls this so the driver can track consecutive 4xx failures
@@ -1307,6 +1330,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (sa.parentToolUseId !== sb.parentToolUseId) return true
       if (sa.nestedSpawnCount !== sb.nestedSpawnCount) return true
       if ((sa.currentTool?.toolUseId ?? null) !== (sb.currentTool?.toolUseId ?? null)) return true
+      if (sa.currentNarrative !== sb.currentNarrative) return true
     }
     return false
   }
@@ -1775,6 +1799,38 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         }
       }
       return false
+    },
+
+    recordSubAgentNarrative({ chatId, threadId, agentId, text }) {
+      // Locate the active card for (chatId, threadId). Mirrors
+      // hasActiveCard's iteration since `chats` is keyed by turnKey.
+      let cs: PerChatState | null = null
+      for (const candidate of chats.values()) {
+        if (
+          candidate.chatId === chatId
+          && candidate.threadId === threadId
+          && !candidate.completionFired
+        ) {
+          cs = candidate
+          break
+        }
+      }
+      if (cs == null) {
+        return { ok: false, reason: 'no_active_card' }
+      }
+      // Sub-agents are keyed by jsonl_agent_id in the reducer state.
+      if (!cs.state.subAgents.has(agentId)) {
+        return { ok: false, reason: 'unknown_agent' }
+      }
+      // Dispatch through the same reduce path used by ingest().
+      cs.state = reduce(
+        cs.state,
+        { kind: 'sub_agent_narrative', agentId, text },
+        now(),
+      )
+      // Force re-render even though milestoneVersion didn't bump.
+      flush(cs, false)
+      return { ok: true }
     },
 
     reportApiFailure(turnKey, failure) {
