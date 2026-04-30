@@ -691,4 +691,109 @@ describe('createDraftStream — draft transport', () => {
     expect(m.sendCalls.length).toBe(1) // materialized
     expect(callCount).toBeGreaterThan(1) // draft update + failed clear attempt
   })
+
+  // ─── Issue #416 — pre-allocated draft id ────────────────────────────────
+
+  it('preAllocatedDraftId: stream uses provided id instead of allocating fresh', async () => {
+    const m = makeMock()
+    const draftCalls: Array<{ chatId: string; draftId: number; text: string }> = []
+    const sendMessageDraft = vi.fn(async (chatId: string, draftId: number, text: string) => {
+      draftCalls.push({ chatId, draftId, text })
+    })
+
+    // Reset shared counter so we can detect whether allocateDraftId was called.
+    __resetDraftIdForTests()
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      sendMessageDraft,
+      chatId: 'chat1',
+      preAllocatedDraftId: 9999,
+    })
+
+    void stream.update('Hello from pre-alloc')
+    await microtaskFlush()
+
+    // The draft call must have used the pre-allocated id, NOT a freshly
+    // allocated counter value (which would start at 1 after reset).
+    expect(draftCalls.length).toBe(1)
+    expect(draftCalls[0].draftId).toBe(9999)
+  })
+
+  it('no preAllocatedDraftId: stream allocates a fresh draft id (existing behavior)', async () => {
+    const m = makeMock()
+    const draftCalls: Array<{ chatId: string; draftId: number; text: string }> = []
+    const sendMessageDraft = vi.fn(async (chatId: string, draftId: number, text: string) => {
+      draftCalls.push({ chatId, draftId, text })
+    })
+
+    __resetDraftIdForTests()
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      sendMessageDraft,
+      chatId: 'chat1',
+    })
+
+    void stream.update('Hello fresh')
+    await microtaskFlush()
+
+    expect(draftCalls.length).toBe(1)
+    // Fresh allocation starts at 1 after reset.
+    expect(draftCalls[0].draftId).toBe(1)
+  })
+
+  it('preAllocatedDraftId is ignored when draft transport is unavailable', async () => {
+    const m = makeMock()
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      // No sendMessageDraft — forces fallback to message transport
+      chatId: 'chat1',
+      preAllocatedDraftId: 12345,
+    })
+
+    void stream.update('Falls back')
+    await microtaskFlush()
+
+    // Without a draft API, the stream falls through to sendMessage. The
+    // pre-allocated id is irrelevant — there's nothing to consume.
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('Falls back')
+  })
+
+  it('preAllocatedDraftId is reused across multiple updates (no fresh allocation mid-stream)', async () => {
+    const m = makeMock()
+    const draftCalls: Array<{ chatId: string; draftId: number; text: string }> = []
+    const sendMessageDraft = vi.fn(async (chatId: string, draftId: number, text: string) => {
+      draftCalls.push({ chatId, draftId, text })
+    })
+
+    __resetDraftIdForTests()
+
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 1000,
+      previewTransport: 'draft',
+      isPrivateChat: true,
+      sendMessageDraft,
+      chatId: 'chat1',
+      preAllocatedDraftId: 7777,
+    })
+
+    void stream.update('First chunk')
+    await microtaskFlush()
+    vi.advanceTimersByTime(1000)
+    void stream.update('Second chunk')
+    await microtaskFlush()
+
+    expect(draftCalls.length).toBe(2)
+    expect(draftCalls[0].draftId).toBe(7777)
+    expect(draftCalls[1].draftId).toBe(7777) // same id, no reallocation
+  })
 })

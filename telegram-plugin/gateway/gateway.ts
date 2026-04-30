@@ -27,6 +27,7 @@ import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
+import { allocateDraftId } from '../draft-transport.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
@@ -678,6 +679,17 @@ const suppressPtyPreview = new Set<string>()
 const lastPtyPreviewByChat = new Map<string, string>()
 const progressUpdateLastSent = new Map<string, number>()
 const progressUpdateTurnCount = new Map<string, number>()
+
+// Issue #416 — pre-allocated stream_reply draft id, populated on inbound DM
+// receipt so the user sees a placeholder draft within ~1 s. Consumed by the
+// agent's first stream_reply call (which uses this draftId instead of
+// allocating a fresh one). Cleared on turn_end if the agent never called
+// stream_reply. DM-only: keyed by chatId since DMs don't have threads.
+interface PreAllocatedDraft {
+  draftId: number
+  allocatedAt: number
+}
+const preAllocatedDrafts = new Map<string, PreAllocatedDraft>()
 
 let currentSessionChatId: string | null = null
 let currentTurnStartedAt = 0
@@ -1840,6 +1852,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const streamChatId = args.chat_id as string
   const streamIsPrivate = isDmChatId(streamChatId)
   const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
+  // Issue #416: consume any pre-allocated draft for this DM. The gateway
+  // populates this map on inbound; the first stream_reply hands it off to
+  // the draft-stream so the existing placeholder is edited in place rather
+  // than a fresh draft being allocated and visibly flickering. Forum topics
+  // never have a pre-alloc entry (gateway skips them).
+  const preAllocated = streamIsPrivate ? preAllocatedDrafts.get(streamChatId) : undefined
+  if (preAllocated != null) {
+    preAllocatedDrafts.delete(streamChatId)
+  }
   const result = await handleStreamReply(
     {
       chat_id: streamChatId,
@@ -1869,6 +1890,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       isPrivateChat: streamIsPrivate,
       isForumTopic: streamIsForumTopic,
       ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
+      ...(preAllocated != null ? { preAllocatedDraftId: preAllocated.draftId } : {}),
       // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
       // so the terminal render sees outboundDeliveredCount > 0. The handler
       // calls this dep in that order internally.
@@ -2770,6 +2792,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       pendingPtyPartial = null
       closeActivityLane(chatId, threadId)
       closeProgressLane(chatId, threadId)
+      // Issue #416 — clean up an unconsumed pre-allocated draft. Telegram's
+      // current Bot API exposes no deleteMessageDraft, but sendMessageDraft
+      // with empty text effectively clears the placeholder (same trick the
+      // draft-stream uses on finalize). Best-effort: failures are silent.
+      const orphanDraft = preAllocatedDrafts.get(chatId)
+      if (orphanDraft != null) {
+        preAllocatedDrafts.delete(chatId)
+        if (sendMessageDraftFn != null) {
+          void sendMessageDraftFn(chatId, orphanDraft.draftId, '').catch(() => {
+            /* best-effort cleanup */
+          })
+        }
+      }
       // Stage 3b: stamp turn-end in the registry as endedVia='stop' (clean
       // turn_end emit). The kill paths (schedule_restart / SIGTERM) handle
       // the 'restart' / 'sigterm' cases separately in 3c.
@@ -3517,6 +3552,33 @@ async function handleInbound(
       })
     } catch (err) {
       process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
+    }
+
+    // Issue #416 — pre-allocate a sendMessageDraft for instant visual feedback
+    // in DMs. The agent's first stream_reply consumes this draft id instead
+    // of allocating a new one, so the user sees a placeholder draft within
+    // ~1 s. Only fires for fresh DM turns; if the agent finishes the turn
+    // without calling stream_reply, turn_end clears the orphan.
+    if (
+      sendMessageDraftFn != null
+      && isDmChatId(chat_id)
+      && messageThreadId == null
+      && !preAllocatedDrafts.has(chat_id)
+    ) {
+      const draftId = allocateDraftId()
+      // Best-effort, non-blocking: any failure (transport down, API not
+      // available) falls through to today's behavior.
+      void sendMessageDraftFn(chat_id, draftId, '…')
+        .then(() => {
+          preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
+        })
+        .catch((err) => {
+          process.stderr.write(
+            `telegram gateway: pre-allocate draft failed chatId=${chat_id}: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          )
+        })
     }
   }
 
