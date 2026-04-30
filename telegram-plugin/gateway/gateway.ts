@@ -141,8 +141,9 @@ import {
   nextLockout,
   type LockoutRecord,
 } from '../auto-fallback.js'
-import { markSlotQuotaExhausted } from '../../src/auth/accounts.js'
+import { markSlotQuotaExhausted, DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
+import { decideBannerAction, type BannerState } from '../slot-banner.js'
 import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
@@ -4913,6 +4914,60 @@ bot.command('interrupt', async ctx => {
 // manual /authfallback trigger (see telegram-plugin/auto-fallback.ts).
 let autoFallbackLockout: LockoutRecord = emptyLockout()
 
+// Pinned slot-banner state (#421). One banner per gateway process,
+// in the owner chat (access.allowFrom[0]). Per-topic forum support
+// + multi-chat pinning are tracked as #421 follow-ups.
+let pinnedBannerState: BannerState | null = null
+
+async function refreshPinnedBanner(reason: string): Promise<void> {
+  try {
+    const ownerChatId = loadAccess().allowFrom[0]
+    if (!ownerChatId) return
+    const agentDir = resolveAgentDirFromEnv()
+    const agentName = getMyAgentName()
+    const slot = currentActiveSlot(agentDir)
+    const action = decideBannerAction(pinnedBannerState, slot, agentName, DEFAULT_SLOT)
+    if (action.kind === 'noop') return
+    if (action.kind === 'unpin') {
+      try {
+        await bot.api.unpinChatMessage(ownerChatId, action.messageId)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: banner unpin failed (${reason}): ${err}\n`)
+      }
+      pinnedBannerState = null
+      return
+    }
+    if (action.kind === 'pin') {
+      const sent = await bot.api.sendMessage(ownerChatId, action.text, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      })
+      try {
+        await bot.api.pinChatMessage(ownerChatId, sent.message_id, { disable_notification: true })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: banner pin failed (${reason}): ${err}\n`)
+        return
+      }
+      pinnedBannerState = { messageId: sent.message_id, slot: action.slot }
+      return
+    }
+    if (action.kind === 'edit') {
+      try {
+        await bot.api.editMessageText(ownerChatId, action.messageId, action.text, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        })
+        pinnedBannerState = { messageId: action.messageId, slot: action.slot }
+      } catch (err) {
+        process.stderr.write(`telegram gateway: banner edit failed (${reason}): ${err}\n`)
+      }
+      return
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: banner refresh error (${reason}): ${err}\n`)
+  }
+}
+
 type AutoFallbackCheckResult =
   | { kind: 'no-action'; reason: string; decision: 'noop' | 'fallback-skipped' }
   | { kind: 'executed'; previousSlot: string; newSlot: string }
@@ -4959,6 +5014,7 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
         process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
       }
       autoFallbackLockout = nextLockout(plan.previousSlot, Date.now())
+      void refreshPinnedBanner('auto-fallback')
       return { kind: 'executed', previousSlot: plan.previousSlot, newSlot: plan.newSlot }
     }
     autoFallbackLockout = nextLockout(plan.activeSlot, Date.now())
@@ -5032,14 +5088,29 @@ bot.command('auth', async ctx => {
   if (intent.kind === 'add') {
     await runSwitchroomAuthCommand(ctx, intent.cliArgs, intent.label)
     pendingReauthFlows.set(String(ctx.chat!.id), { agent: intent.agent, startedAt: Date.now() })
+    void refreshPinnedBanner('auth-add')
     return
   }
 
   if (intent.kind === 'use') {
+    // Soft-confirm: a slot swap restarts the agent process, killing any
+    // in-flight turn. If a turn is currently running, refuse without
+    // --force so a fat-finger tap doesn't quietly destroy the user's
+    // work-in-progress. Idle-state swaps proceed with no friction. (#421B)
+    if (!intent.force && activeTurnStartedAt.size > 0) {
+      await switchroomReply(
+        ctx,
+        `⚠️ A turn is in flight. Swapping to <code>${escapeHtmlForTg(intent.slot)}</code> will abort it.\n` +
+          `Resend as <code>/auth use ${escapeHtmlForTg(intent.agent)} ${escapeHtmlForTg(intent.slot)} --force</code> to proceed.`,
+        { html: true },
+      )
+      return
+    }
     await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
     // Restart the agent so the new OAuth token is picked up.
     try { assertSafeAgentName(intent.agent) } catch { return }
     await runSwitchroomCommand(ctx, ['agent', 'restart', intent.agent], `restart ${intent.agent}`)
+    void refreshPinnedBanner('auth-use')
     return
   }
 

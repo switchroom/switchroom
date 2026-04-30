@@ -30,7 +30,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-const DEFAULT_SLOT = "default";
+export const DEFAULT_SLOT = "default";
 const SLOT_NAME_MAX = 64;
 const SLOT_NAME_RE = /^[A-Za-z0-9._-]+$/;
 const FIVE_HOURS_MS = 5 * 60 * 60_000;

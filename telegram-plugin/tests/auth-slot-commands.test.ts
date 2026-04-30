@@ -125,6 +125,7 @@ describe("parseAuthSubCommand — /auth use", () => {
     if (intent.kind === "use") {
       expect(intent.agent).toBe("clerk");
       expect(intent.slot).toBe("personal");
+      expect(intent.force).toBe(false);
       expect(intent.cliArgs).toEqual(["auth", "use", "clerk", "personal"]);
       expect(intent.restartAgentAfter).toBe(true);
     }
@@ -136,6 +137,26 @@ describe("parseAuthSubCommand — /auth use", () => {
     if (intent.kind === "use") {
       expect(intent.agent).toBe("klanker");
       expect(intent.slot).toBe("personal");
+      expect(intent.force).toBe(false);
+    }
+  });
+
+  it("--force sets force=true (#421)", () => {
+    const intent = parseAuthSubCommand(["use", "personal", "--force"], "clerk");
+    expect(intent.kind).toBe("use");
+    if (intent.kind === "use") {
+      expect(intent.slot).toBe("personal");
+      expect(intent.force).toBe(true);
+    }
+  });
+
+  it("--force with explicit agent + slot", () => {
+    const intent = parseAuthSubCommand(["use", "klanker", "personal", "--force"], "clerk");
+    expect(intent.kind).toBe("use");
+    if (intent.kind === "use") {
+      expect(intent.agent).toBe("klanker");
+      expect(intent.slot).toBe("personal");
+      expect(intent.force).toBe(true);
     }
   });
 

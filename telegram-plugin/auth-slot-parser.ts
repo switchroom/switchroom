@@ -33,7 +33,7 @@ export type AuthIntent =
   | { kind: 'cancel'; agent: string; label: string; cliArgs: string[] }
   | { kind: 'status'; label: string; cliArgs: string[] }
   | { kind: 'add'; agent: string; slot?: string; label: string; cliArgs: string[] }
-  | { kind: 'use'; agent: string; slot: string; label: string; cliArgs: string[]; restartAgentAfter: true }
+  | { kind: 'use'; agent: string; slot: string; force: boolean; label: string; cliArgs: string[]; restartAgentAfter: true }
   | { kind: 'list'; agent: string; label: string; cliArgs: string[] }
   | { kind: 'rm'; agent: string; slot: string; force: boolean; label: string; cliArgs: string[] }
   | { kind: 'usage'; message: string }
@@ -57,7 +57,7 @@ export function usageText(): string {
     '/auth code [agent] <browser-code>',
     '/auth cancel [agent]',
     '/auth add [agent] [--slot <name>]',
-    '/auth use [agent] <slot>',
+    '/auth use [agent] <slot> [--force]',
     '/auth list [agent]',
     '/auth rm [agent] <slot> [--force]',
   ].join('\n');
@@ -133,20 +133,22 @@ export function parseAuthSubCommand(
   }
 
   if (sub === 'use') {
-    // /auth use [agent] <slot>
-    const rest = parts.slice(1).filter(p => !p.startsWith('--'));
-    if (rest.length === 0) {
-      return { kind: 'usage', message: 'Usage: /auth use [agent] <slot>' };
+    // /auth use [agent] <slot> [--force]
+    const rest = parts.slice(1);
+    const { flags, positional } = splitFlags(rest, []);
+    if (positional.length === 0) {
+      return { kind: 'usage', message: 'Usage: /auth use [agent] <slot> [--force]' };
     }
-    const [agent, slot] = rest.length === 1
-      ? [currentAgent, rest[0]]
-      : [rest[0], rest[1]];
+    const [agent, slot] = positional.length === 1
+      ? [currentAgent, positional[0]]
+      : [positional[0], positional[1]];
     try { assertSafeAgentNameForParser(agent); }
     catch { return { kind: 'error', message: 'Invalid agent name.' }; }
     try { assertSafeSlotName(slot); }
     catch { return { kind: 'error', message: 'Invalid slot name. Use [A-Za-z0-9_-], 1-32 chars.' }; }
     return {
       kind: 'use', agent, slot,
+      force: flags['--force'] === true,
       label: `auth use ${agent} ${slot}`,
       cliArgs: ['auth', 'use', agent, slot],
       restartAgentAfter: true,
