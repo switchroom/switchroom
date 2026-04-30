@@ -52,15 +52,30 @@ describe("buildSettingsHooksBlock", () => {
 
     expect(result.PreToolUse).toBeDefined();
     expect(Array.isArray(result.PreToolUse)).toBe(true);
-    const preHooks = result.PreToolUse as Array<{ hooks: Array<{ command: string }> }>;
+    const preHooks = result.PreToolUse as Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
     const preCmds = preHooks.flatMap(e => e.hooks.map(h => h.command));
     expect(preCmds.some(c => c.includes("secret-guard-pretool.mjs"))).toBe(true);
     expect(preCmds.some(c => c.includes("subagent-tracker-pretool.mjs"))).toBe(true);
 
+    // secret-guard must run on every tool (no matcher); subagent-tracker must
+    // be scoped to the Agent tool so it doesn't fire ~120ms/turn for nothing.
+    const secretGuardEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("secret-guard-pretool.mjs")),
+    );
+    expect(secretGuardEntry?.matcher).toBeUndefined();
+    const subagentPreEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("subagent-tracker-pretool.mjs")),
+    );
+    expect(subagentPreEntry?.matcher).toBe("Agent");
+
     expect(result.PostToolUse).toBeDefined();
-    const postHooks = result.PostToolUse as Array<{ hooks: Array<{ command: string }> }>;
+    const postHooks = result.PostToolUse as Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
     const postCmds = postHooks.flatMap(e => e.hooks.map(h => h.command));
     expect(postCmds.some(c => c.includes("subagent-tracker-posttool.mjs"))).toBe(true);
+    const subagentPostEntry = postHooks.find(e =>
+      e.hooks.some(h => h.command.includes("subagent-tracker-posttool.mjs")),
+    );
+    expect(subagentPostEntry?.matcher).toBe("Agent");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {

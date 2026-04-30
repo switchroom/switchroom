@@ -2104,6 +2104,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          matcher: "Agent",
           hooks: [
             {
               type: "command",
@@ -2119,6 +2120,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   const switchroomPostToolUse = useSwitchroomPlugin
     ? [
         {
+          matcher: "Agent",
           hooks: [
             {
               type: "command",
