@@ -309,11 +309,6 @@ export function markdownToHtml(text: string): string {
   // Escape HTML entities in remaining plain text
   result = escapeHtml(result)
 
-  // Restore code-block and table-block placeholders (entity-escaped, fix them)
-  result = result.replace(new RegExp(`${escapeHtml(BLOCK_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
-  result = result.replace(new RegExp(`${escapeHtml(TABLE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
-  result = result.replace(new RegExp(`${escapeHtml(INLINE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => inlineCodes[Number(idx)])
-
   // Bold: **text** (must come before italic)
   result = result.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
 
@@ -327,6 +322,18 @@ export function markdownToHtml(text: string): string {
 
   // Strikethrough: ~~text~~
   result = result.replace(/~~(.+?)~~/g, '<s>$1</s>')
+
+  // Restore inline-code, code-block, and table-block placeholders ONLY
+  // AFTER bold/italic/strike have run. If the inline-code placeholder
+  // is restored before italic, an inline-code span containing asterisks
+  // (e.g. `\`size_t *p\``) gets matched by the italic regex on the
+  // restored `<code>...*p</code>` buffer and produces invalid HTML
+  // that Telegram rejects with 400 Bad Request — sending the caller
+  // into a `format: text` fallback for the rest of the chunk. Same
+  // fault class for code blocks containing `**` literals. See #415.
+  result = result.replace(new RegExp(`${escapeHtml(BLOCK_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
+  result = result.replace(new RegExp(`${escapeHtml(TABLE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => codeBlocks[Number(idx)])
+  result = result.replace(new RegExp(`${escapeHtml(INLINE_PH)}(\\d+)${escapeHtml('\x00')}`, 'g'), (_m, idx) => inlineCodes[Number(idx)])
 
   // Links: [text](url). Two safety requirements here:
   //

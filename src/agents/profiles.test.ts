@@ -165,3 +165,40 @@ describe("renderProfileClaudeTemplate", () => {
     }
   });
 });
+
+describe("telegram-style partial — status? RCA-offer guidance (#162)", () => {
+  it("instructs the agent to treat 'status?' as a UX-failure signal", () => {
+    const REPO_ROOT = resolve(__dirname, "..", "..");
+    const partial = readFileSync(
+      join(REPO_ROOT, "profiles", "_shared", "telegram-style.md.hbs"),
+      "utf-8",
+    );
+    expect(partial).toContain("status?");
+    expect(partial).toContain("UX-failure signal");
+    // Must reference the JTBD source for context
+    expect(partial).toContain("know-what-my-agent-is-doing.md");
+  });
+
+  it("offers to file an RCA via the /file-bug skill", () => {
+    const REPO_ROOT = resolve(__dirname, "..", "..");
+    const partial = readFileSync(
+      join(REPO_ROOT, "profiles", "_shared", "telegram-style.md.hbs"),
+      "utf-8",
+    );
+    expect(partial).toContain("/file-bug");
+    expect(partial).toContain("incident-rca");
+  });
+
+  it("warns against auto-filing on every status? (offer-then-confirm pattern)", () => {
+    const REPO_ROOT = resolve(__dirname, "..", "..");
+    const partial = readFileSync(
+      join(REPO_ROOT, "profiles", "_shared", "telegram-style.md.hbs"),
+      "utf-8",
+    );
+    // The "auto-file from a single status?" anti-pattern is explicitly
+    // called out — without it the agent might invoke /file-bug
+    // immediately on every "status?".
+    expect(partial.toLowerCase()).toContain("auto-file");
+    expect(partial.toLowerCase()).toContain("offer-then-confirm");
+  });
+});

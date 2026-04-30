@@ -261,13 +261,28 @@ export function mergeAgentConfig(
     merged.soul = combined as AgentConfig["soul"];
   }
 
-  // --- memory: shallow field merge, agent wins ---
+  // --- memory: top-level field merge with one-level-deep merge of `recall` ---
+  //
+  // Pre-DOC2 fix this was a single shallow merge. That meant
+  //   defaults.memory.recall = { max_memories: 12 }
+  //   agents.foo.memory.recall = { cache_ttl_secs: 30 }
+  // produced agents.foo.memory.recall = { cache_ttl_secs: 30 } — silently
+  // dropping max_memories. The doc table at docs/configuration.md:32 says
+  // "per-field merge" implying deep behaviour; cascade users expected
+  // overriding one knob to leave the rest in place. Now `recall` deep-merges
+  // (one level — sufficient because recall has only scalar children) and
+  // every other top-level memory key keeps the existing override behaviour.
   if (defaults.memory || merged.memory) {
     const base = defaults.memory ?? {};
     const override = merged.memory ?? {};
     const combined: Record<string, unknown> = { ...base };
     for (const [k, v] of Object.entries(override)) {
-      if (v !== undefined) combined[k] = v;
+      if (v === undefined) continue;
+      if (k === "recall" && base.recall && typeof v === "object" && v !== null && !Array.isArray(v)) {
+        combined[k] = { ...base.recall, ...(v as Record<string, unknown>) };
+      } else {
+        combined[k] = v;
+      }
     }
     merged.memory = combined as AgentConfig["memory"];
   }

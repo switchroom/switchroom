@@ -53,7 +53,17 @@ export function registerWebCommand(program: Command): void {
             )
           );
         }
-        console.log(chalk.gray(`  Token: ${token}`));
+        // Token only echoes to TTY. Possession = full dashboard
+        // access — non-TTY captures (CI logs, tmux scrollback, support
+        // screen-shares) shouldn't get a copy. Operators reading from
+        // a non-TTY context should fetch from ~/.switchroom/web-token.
+        if (process.stdout.isTTY) {
+          console.log(chalk.gray(`  Token: ${token}`));
+        } else {
+          console.log(
+            chalk.gray(`  Token: <hidden, read ~/.switchroom/web-token>`),
+          );
+        }
         console.log(
           chalk.gray(
             "  Open the dashboard in a browser that can pass the bearer via\n" +

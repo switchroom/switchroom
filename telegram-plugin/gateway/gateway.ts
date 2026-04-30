@@ -138,8 +138,11 @@ import {
   evaluateFallbackTrigger,
   performAutoFallback,
   emptyLockout,
+  loadLockout,
   nextLockout,
+  saveLockout,
   type LockoutRecord,
+  type LockoutPersistOps,
 } from '../auto-fallback.js'
 import { markSlotQuotaExhausted, DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
@@ -202,6 +205,19 @@ import { determineRestartReason } from './boot-reason.js'
 import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
+import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
+import { summarizeToolForTitle } from '../permission-title.js'
+import {
+  readClaudeJsonOverage,
+  evaluateCreditState,
+  loadCreditState,
+  saveCreditState,
+} from '../credits-watch.js'
+import {
+  writeTurnActiveMarker,
+  touchTurnActiveMarker,
+  removeTurnActiveMarker,
+} from './turn-active-marker.js'
 import {
   VERSION,
   COMMIT_SHA,
@@ -640,7 +656,16 @@ try {
         `SWITCHROOM_PENDING_ENDED_VIA=${pending.ended_via ?? 'unknown'}`,
         `SWITCHROOM_PENDING_STARTED_AT=${pending.started_at}`,
       ]
-      writeFileSync(pendingEnvPath, lines.join('\n') + '\n', { mode: 0o600 })
+      // Atomic write: tmp + rename. Without this, a crash mid-write
+      // (power loss, OOM, panic) leaves a truncated `.pending-turn.env`
+      // that start.sh `source`s — partial SWITCHROOM_PENDING_* vars
+      // half-trigger the resume protocol with incomplete context, or
+      // a malformed line breaks shell parsing inside the source.
+      // Same pattern used by the access-file write a few hundred lines
+      // above and by src/issues/store.ts.
+      const pendingEnvTmp = `${pendingEnvPath}.tmp-${process.pid}`
+      writeFileSync(pendingEnvTmp, lines.join('\n') + '\n', { mode: 0o600 })
+      renameSync(pendingEnvTmp, pendingEnvPath)
       process.stderr.write(`telegram gateway: pending-turn env written to ${pendingEnvPath} turnKey=${pending.turn_key} endedVia=${pending.ended_via ?? 'open'}\n`)
     } else if (existsSync(pendingEnvPath)) {
       rmSync(pendingEnvPath, { force: true })
@@ -1505,7 +1530,10 @@ const ipcServer: IpcServer = createIpcServer({
     const { requestId, toolName, description, inputPreview } = msg
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     const access = loadAccess()
-    const text = `🔐 Permission: ${toolName}`
+    // Lift the most-identifying field into the title so the user can
+    // approve at a glance — e.g. `Skill (mail)` instead of bare `Skill`.
+    // See #186.
+    const text = `🔐 Permission: ${summarizeToolForTitle(toolName, inputPreview)}`
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${requestId}`)
       .text('✅ Allow', `perm:allow:${requestId}`)
@@ -2214,11 +2242,13 @@ async function executeDownloadAttachment(args: Record<string, unknown>): Promise
   }
   const file = await bot.api.getFile(file_id)
   if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-  // Build download URL — token is embedded but NEVER included in error messages
+  // Build download URL — token is embedded but NEVER included in error messages.
+  // Bounded fetch (30s) — without a timeout, the agent's tool_call hangs
+  // indefinitely on a stalled CDN connection.
   const downloadUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
   let res: Response
   try {
-    res = await fetch(downloadUrl)
+    res = await fetch(downloadUrl, { signal: AbortSignal.timeout(30_000) })
   } catch (err) {
     // Sanitize: never leak the token in network error messages
     throw new Error(`download failed: network error`)
@@ -2486,6 +2516,17 @@ function handleSessionEvent(ev: SessionEvent): void {
               process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
             }
           })
+          // #412: turn-active marker for the bridge-watchdog. File exists
+          // for the duration of the in-flight turn; mtime advances on
+          // every tool_use; deleted on turn_complete. The watchdog
+          // distinguishes wedged-mid-turn from healthy-idle by checking
+          // for this file's presence + mtime staleness.
+          writeTurnActiveMarker(STATE_DIR, {
+            turnKey,
+            chatId: String(ev.chatId),
+            threadId: ev.threadId != null ? String(ev.threadId) : null,
+            startedAt: currentTurnStartedAt,
+          })
         }
         // Issue #195: capture transport selection + time-to-ack baseline
         // up-front so the per-turn answer-stream config is determined before
@@ -2511,6 +2552,11 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (currentSessionChatId == null) return
       // Phase 1 of #332: count every tool_use in the current turn.
       currentTurnToolCallCount++
+      // #412: bump turn-active marker mtime so the watchdog sees this
+      // turn is making forward progress. Stop-hook deadlocks (the
+      // failure mode #116 originally tracked) emit no more tool_use
+      // events, so the marker mtime stops advancing → watchdog acts.
+      touchTurnActiveMarker(STATE_DIR)
       const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
       const name = ev.toolName
       if (isTelegramReplyTool(name)) {
@@ -4059,6 +4105,35 @@ function stampUserRestartReason(reason: string): void {
  * fail-fast CLI errors to the Telegram user instead of silently
  * swallowing them into detached-spawn.log.
  */
+/**
+ * Detect whether `systemd-run --user` is callable. Cached for the
+ * process lifetime — the answer is essentially fixed by the host OS.
+ *
+ * When available, `spawnSwitchroomDetached` wraps every spawn through
+ * `systemd-run --user --scope --collect` so the spawned child escapes
+ * the gateway's cgroup. Without this escape, restarting the gateway
+ * cgroup-kills the in-flight child mid-restart, and the agent service
+ * never actually restarts (#177).
+ *
+ * `--scope` makes a transient scope unit (lives in its own cgroup,
+ * doesn't trigger the spawn-supervised semantics of `--service`).
+ * `--collect` auto-removes the unit when it exits so we don't
+ * accumulate transient units.
+ */
+let _systemdRunPath: string | null | undefined
+function resolveSystemdRunPath(): string | null {
+  if (_systemdRunPath !== undefined) return _systemdRunPath
+  // Try `command -v systemd-run` via execSync; on missing-binary or
+  // a non-systemd box we set null and fall back to direct spawn.
+  try {
+    const out = execSync('command -v systemd-run 2>/dev/null', { encoding: 'utf-8' }).trim()
+    _systemdRunPath = out.length > 0 ? out : null
+  } catch {
+    _systemdRunPath = null
+  }
+  return _systemdRunPath
+}
+
 function spawnSwitchroomDetached(
   args: string[],
   onFailure?: (info: { code: number; tail: string }) => void,
@@ -4071,7 +4146,16 @@ function spawnSwitchroomDetached(
     outFd = openSync(logPath, 'a')
     writeFileSync(logPath, `\n[${new Date().toISOString()}] spawn ${SWITCHROOM_CLI} ${fullArgs.join(' ')}\n`, { flag: 'a' })
   } catch {}
-  const child = spawn(SWITCHROOM_CLI, fullArgs, {
+  // Escape the gateway's cgroup via systemd-run --scope when available.
+  // Without this, a gateway service restart (e.g. triggered as part of
+  // the detached child's own work) cgroup-kills the child mid-flight.
+  // See #177.
+  const systemdRun = resolveSystemdRunPath()
+  const spawnBin = systemdRun ?? SWITCHROOM_CLI
+  const spawnArgs = systemdRun
+    ? ['--user', '--scope', '--collect', '--quiet', '--', SWITCHROOM_CLI, ...fullArgs]
+    : fullArgs
+  const child = spawn(spawnBin, spawnArgs, {
     detached: true,
     stdio: outFd != null ? ['ignore', outFd, outFd] : 'ignore',
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
@@ -4912,7 +4996,38 @@ bot.command('interrupt', async ctx => {
 // Shared auto-fallback state. `lockout` is a per-process in-memory
 // guard against rapid re-fire between the scheduled poll and a
 // manual /authfallback trigger (see telegram-plugin/auto-fallback.ts).
+//
+// Pre-#417 fix this was always emptyLockout() at process start, so a
+// gateway restart inside the cooldown window reset the timer and a
+// quota-flap on the recovering slot could re-trigger fallback the
+// moment the gateway came back. We now seed from disk on first use
+// and persist on every transition. Errors are swallowed: losing the
+// lockout file just degrades to in-memory-only behaviour.
+const lockoutOps: LockoutPersistOps = {
+  readFileSync: (p, enc) => readFileSync(p, enc),
+  writeFileSync: (p, data, opts) => writeFileSync(p, data, opts),
+  existsSync: (p) => existsSync(p),
+  mkdirSync: (p, opts) => mkdirSync(p, opts),
+  joinPath: (...parts) => join(...parts),
+}
 let autoFallbackLockout: LockoutRecord = emptyLockout()
+let autoFallbackLockoutSeeded = false
+function seedAutoFallbackLockoutIfNeeded(agentDir: string): void {
+  if (autoFallbackLockoutSeeded) return
+  autoFallbackLockoutSeeded = true
+  try {
+    autoFallbackLockout = loadLockout(agentDir, lockoutOps)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: auto-fallback lockout seed failed (using empty): ${(err as Error).message}\n`)
+  }
+}
+function persistLockout(agentDir: string): void {
+  try {
+    saveLockout(agentDir, autoFallbackLockout, lockoutOps)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: auto-fallback lockout persist failed: ${(err as Error).message}\n`)
+  }
+}
 
 // Pinned slot-banner state (#421). One banner per gateway process,
 // in the owner chat (access.allowFrom[0]). Per-topic forum support
@@ -4978,6 +5093,7 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
   try {
     const agentDir = resolveAgentDirFromEnv()
     const agentName = getMyAgentName()
+    seedAutoFallbackLockoutIfNeeded(agentDir)
     const active = currentActiveSlot(agentDir)
     const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
     const decision = evaluateFallbackTrigger({
@@ -5009,19 +5125,79 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
         return { kind: 'error', message: `invalid agent name: ${plan.agentName}` }
       }
       try {
-        switchroomExec(['agent', 'restart', plan.agentName])
+        // Preemptive failover (utilization-over-threshold / explicit) waits
+        // for the active turn to drain. Reactive failover (429-response)
+        // hard-restarts because the request that triggered it has already
+        // failed — there's no in-flight turn worth preserving. See #420.
+        const restartArgs = ['agent', 'restart', plan.agentName]
+        if (plan.triggerReason !== '429-response') {
+          restartArgs.push('--graceful-restart')
+        }
+        switchroomExec(restartArgs)
       } catch (err) {
         process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
       }
       autoFallbackLockout = nextLockout(plan.previousSlot, Date.now())
+      persistLockout(agentDir)
       void refreshPinnedBanner('auto-fallback')
       return { kind: 'executed', previousSlot: plan.previousSlot, newSlot: plan.newSlot }
     }
     autoFallbackLockout = nextLockout(plan.activeSlot, Date.now())
+    persistLockout(agentDir)
     return { kind: 'exhausted-all', activeSlot: plan.activeSlot }
   } catch (err) {
     process.stderr.write(`telegram gateway: auto-fallback ${opts.trigger} poll error: ${err}\n`)
     return { kind: 'error', message: String((err as Error).message ?? err) }
+  }
+}
+
+/**
+ * Credit-exhaustion watcher loop body (#348). Reads the agent's
+ * `.claude.json` for `cachedExtraUsageDisabledReason`, evaluates the
+ * transition against the last-notified state, and emits a Telegram
+ * message via the existing access.allowFrom path when the state
+ * crosses a fatal-billing boundary.
+ *
+ * Idempotent: if the state hasn't changed since the last check, no
+ * message is sent. State persists across gateway restarts via
+ * `<stateDir>/credits-watch.json` so a restart inside an out-of-credits
+ * window doesn't re-spam the user.
+ */
+async function runCreditWatch(): Promise<void> {
+  const agentDir = resolveAgentDirFromEnv()
+  const agentName = getMyAgentName()
+  const claudeConfigDir = join(agentDir, '.claude')
+  const stateDir = STATE_DIR
+  const reason = readClaudeJsonOverage(claudeConfigDir)
+  const prev = loadCreditState(stateDir)
+  const decision = evaluateCreditState({
+    agentName,
+    currentReason: reason,
+    prev,
+    now: Date.now(),
+  })
+  if (decision.kind === 'skip') {
+    return
+  }
+  // Notify path. Send to all configured allowFrom chats — the
+  // assumption mirrors auto-fallback's notification routing.
+  const access = loadAccess()
+  for (const chat_id of access.allowFrom) {
+    try {
+      await bot.api.sendMessage(chat_id, decision.message, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: credit-watch notify chat=${chat_id} failed: ${err}\n`)
+    }
+  }
+  // Persist state regardless of whether send succeeded — losing a
+  // notify is bad, but re-spamming on every poll tick is worse.
+  try {
+    saveCreditState(stateDir, decision.newState)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: credit-watch state persist failed: ${err}\n`)
   }
 }
 
@@ -5684,8 +5860,15 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
   // vg:dur:*, vg:back:*, vg:generate). These come after the management callbacks above
   // because management uses vg:cancel:<id> (with trailing id) while the wizard uses
   // bare vg:cancel — the cancelMatch above only matches the id-suffixed form.
+  //
+  // Note: pre-#265 fix this function did `await ctx.answerCallbackQuery().catch(() => {})`
+  // unconditionally up front. That meant the `vg:keys-continue` branch's
+  // toast call (`Select at least one key.`) hit a Telegram error
+  // ("query is too old or query ID is invalid") because the query was
+  // already answered, and the toast never reached the user. Each branch
+  // now owns its own ack.
   const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
-  await ctx.answerCallbackQuery().catch(() => {})
+  const ackSilently = () => ctx.answerCallbackQuery().catch(() => {})
 
   // Cancel at any wizard step
   if (data === 'vg:cancel') {
@@ -5694,12 +5877,14 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     if (msg && 'text' in msg) {
       await ctx.editMessageText('❌ Grant wizard cancelled.').catch(() => {})
     }
+    await ackSilently()
     return
   }
 
   const state = pendingVaultOps.get(chatId)
   if (!state || state.kind !== 'grant-wizard') {
     await ctx.editMessageText('⚠️ Wizard session expired. Run /vault grant to start again.').catch(() => {})
+    await ackSilently()
     return
   }
 
@@ -5708,13 +5893,14 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     const agent = data.slice('vg:agent:'.length)
     const msgId = (ctx.callbackQuery.message as { message_id?: number })?.message_id ?? state.wizardMsgId
     await grantWizardStep2(ctx, chatId, agent, msgId)
+    await ackSilently()
     return
   }
 
   // vg:key:<name> — step 2 toggle
   if (data.startsWith('vg:key:')) {
     const key = data.slice('vg:key:'.length)
-    if (state.step !== 'keys') return
+    if (state.step !== 'keys') { await ackSilently(); return }
     const selectedSet = new Set(state.selectedKeys ?? [])
     if (selectedSet.has(key)) {
       selectedSet.delete(key)
@@ -5725,23 +5911,27 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     pendingVaultOps.set(chatId, updatedState)
     const kb = buildGrantKeysKeyboard(state.availableKeys ?? [], selectedSet)
     await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => {})
+    await ackSilently()
     return
   }
 
   // vg:keys-continue — step 2 → 3
   if (data === 'vg:keys-continue') {
-    if (state.step !== 'keys') return
+    if (state.step !== 'keys') { await ackSilently(); return }
     if (!state.selectedKeys || state.selectedKeys.length === 0) {
+      // Toast-only ack: this is the branch the unconditional pre-ack
+      // used to silently swallow. See #265.
       await ctx.answerCallbackQuery({ text: 'Select at least one key.' }).catch(() => {})
       return
     }
     await grantWizardStep3(ctx, chatId, state)
+    await ackSilently()
     return
   }
 
   // vg:dur:<value> — step 3 duration selection
   if (data.startsWith('vg:dur:')) {
-    if (state.step !== 'duration') return
+    if (state.step !== 'duration') { await ackSilently(); return }
     const dur = data.slice('vg:dur:'.length)
     if (dur === 'custom') {
       // Ask for text reply with n d|h format
@@ -5753,6 +5943,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
           { parse_mode: 'HTML', reply_markup: buildGrantDurationKeyboard() },
         ).catch(() => {})
       }
+      await ackSilently()
       return
     }
     let ttlSeconds: number | null
@@ -5762,29 +5953,33 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
       ttlSeconds = 365 * 86400
     } else {
       ttlSeconds = parseGrantDuration(dur)
-      if (ttlSeconds === null) return
+      if (ttlSeconds === null) { await ackSilently(); return }
     }
     const newState = { ...state, ttlSeconds, awaitingCustomDuration: false }
     await grantWizardConfirm(ctx, chatId, newState)
+    await ackSilently()
     return
   }
 
   // vg:back:duration — go back to step 2 (keys selection) from step 3
   if (data === 'vg:back:duration') {
-    if (state.step !== 'duration') return
+    if (state.step !== 'duration') { await ackSilently(); return }
     const msgId = state.wizardMsgId
     await grantWizardStep2(ctx, chatId, state.agent!, msgId)
+    await ackSilently()
     return
   }
 
   // vg:generate — final step
   if (data === 'vg:generate') {
-    if (state.step !== 'confirm') return
+    if (state.step !== 'confirm') { await ackSilently(); return }
     await executeGrantWizard(ctx, chatId, state)
+    await ackSilently()
     return
   }
 
-  // Unrecognised vg: sub-action — already answered callbackQuery above
+  // Unrecognised vg: sub-action
+  await ackSilently()
 }
 
 /**
@@ -6323,11 +6518,10 @@ bot.command('issues', async ctx => {
     try {
       const stateDir = process.env.TELEGRAM_STATE_DIR
       if (stateDir) {
-        const { list, resolve: resolveOne } = require('../../src/issues/index.js') as typeof import('../../src/issues/index.js')
-        const events = list(stateDir)
+        const events = listIssues(stateDir)
         let n = 0
         for (const e of events) {
-          n += resolveOne(stateDir, e.fingerprint)
+          n += resolveIssue(stateDir, e.fingerprint)
         }
         await switchroomReply(ctx, `Resolved ${n} issue${n === 1 ? '' : 's'}.`, { html: true })
         return
@@ -6558,9 +6752,15 @@ bot.on('message:photo', async ctx => {
       const file = await ctx.api.getFile(best.file_id)
       if (!file.file_path) return undefined
       // Build download URL — token is embedded in the URL but never exposed
-      // in error messages or logs (caught and sanitized below)
+      // in error messages or logs (caught and sanitized below).
+      //
+      // Bounded fetch: a stalled Telegram CDN connection without a
+      // timeout would hang the entire inbound handler, blocking the
+      // user's photo from ever being acked or seen by the agent.
+      // 15s is generous for normal photos (typical 100ms-2s) and
+      // tight enough to surface a real outage.
       const downloadUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(downloadUrl)
+      const res = await fetch(downloadUrl, { signal: AbortSignal.timeout(15_000) })
       if (!res.ok) {
         process.stderr.write(`telegram gateway: photo download failed: HTTP ${res.status}\n`)
         return undefined
@@ -6881,6 +7081,15 @@ async function shutdown(signal: string): Promise<void> {
   subagentWatcher?.stop()
   subagentWatcher = null
 
+  // Issues watcher polls issues.jsonl on a setInterval (default 2s) and
+  // edits the issues card on every tick. Without an explicit stop() the
+  // poll keeps firing for the lifetime of the process and accumulates
+  // editMessageText calls during shutdown drain — log noise plus a
+  // genuine resource leak if the gateway runs long after the bridge
+  // disconnected. Mirrors the subagentWatcher pattern above.
+  activeIssuesWatcher?.stop()
+  activeIssuesWatcher = null
+
   for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
@@ -7137,6 +7346,25 @@ if (streamMode === 'checklist') {
       process.stderr.write(`telegram gateway: progress-card: onTurnComplete callback turnKey=${turnKey}\n`)
       pinMgr.completeTurn({ chatId, threadId, turnKey })
       pinWatchdog.clear(turnKey)
+      // #412: drop the turn-active marker so the watchdog stops tracking
+      // this turn. Absent file = no in-flight turn = legitimate idle (no
+      // hang to detect).
+      removeTurnActiveMarker(STATE_DIR)
+      // Clean up silent-end-pending.json once the turn delivered for real.
+      // Without this, the file lingers between sessions and the Stop hook
+      // can read a stale `retryCount` from a long-resolved turn. See #289.
+      try {
+        const statePath = join(STATE_DIR, 'silent-end-pending.json')
+        if (existsSync(statePath)) {
+          const prev = JSON.parse(readFileSync(statePath, 'utf8'))
+          if (prev.turnKey === turnKey) {
+            unlinkSync(statePath)
+          }
+        }
+      } catch {
+        // Best-effort: a stale file or vanished mid-read is fine — the
+        // hook will re-create it on the next silent-end if needed.
+      }
       if (threadId != null) {
         lockedBot.api.sendMessage(chatId, `✅ Done — ${summary}`).catch((err: Error) => {
           process.stderr.write(`telegram gateway: completion message failed: ${err.message}\n`)
@@ -7518,6 +7746,31 @@ void (async () => {
         const AUTO_FALLBACK_POLL_MS = Number(process.env.SWITCHROOM_AUTO_FALLBACK_POLL_MS ?? 60 * 60_000)
         if (AUTO_FALLBACK_POLL_MS > 0) {
           setInterval(() => { void runAutoFallbackCheck({ trigger: 'scheduled' }) }, AUTO_FALLBACK_POLL_MS).unref()
+        }
+
+        // Credit-exhaustion watcher (#348). Reads `<agentDir>/.claude/.claude.json`
+        // for `cachedExtraUsageDisabledReason`. Fires a Telegram notification
+        // on transition into / out of fatal billing states (out_of_credits,
+        // org_level_disabled, credits_exhausted, extra_usage_disabled).
+        // Pre-#348, cron tasks against an exhausted account silently failed
+        // because stdout was discarded — direct violation of P1 JTBD (silent
+        // failure is the worst case).
+        //
+        // Cadence: 15 min by default; tuned to be cheaper than the API
+        // quota poll because this is a local file read (no network).
+        // SWITCHROOM_CREDIT_WATCH_POLL_MS=0 disables.
+        const CREDIT_WATCH_POLL_MS = Number(process.env.SWITCHROOM_CREDIT_WATCH_POLL_MS ?? 15 * 60_000)
+        if (CREDIT_WATCH_POLL_MS > 0) {
+          // Run an immediate check at boot so a recent fatal transition
+          // doesn't have to wait 15 min to surface.
+          void runCreditWatch().catch((err) => {
+            process.stderr.write(`telegram gateway: credit-watch initial run failed: ${err}\n`)
+          })
+          setInterval(() => {
+            void runCreditWatch().catch((err) => {
+              process.stderr.write(`telegram gateway: credit-watch scheduled run failed: ${err}\n`)
+            })
+          }, CREDIT_WATCH_POLL_MS).unref()
         }
 
         // Restart-watchdog: poll systemd's NRestarts for the agent unit.

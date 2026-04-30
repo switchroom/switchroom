@@ -499,3 +499,26 @@ describe('projectSubagentLine', () => {
     expect(st.hasEmittedStart).toBe(false)
   })
 })
+
+describe('idle sub-tail reap (MEM2)', () => {
+  // Pre-MEM2 fix the per-sub-agent FSWatcher in startSessionTail
+  // lived for the entire process lifetime. A long-running gateway
+  // with sustained sub-agent load eventually FD-exhausted. The reap
+  // logic is invoked from the rescan tick; full-path testing requires
+  // injectable time, so we pin the structural shape via source-grep
+  // and rely on the existing rescan-tick tests to prove the rest.
+  it('source declares lastActivityAt + reap on the sub-tail path', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve, join: joinPath } = await import('node:path')
+    const { fileURLToPath } = await import('node:url')
+    const TEST_DIR = resolve(fileURLToPath(import.meta.url), '..')
+    const REPO_ROOT = resolve(TEST_DIR, '..', '..')
+    const src = readFileSync(joinPath(REPO_ROOT, 'telegram-plugin/session-tail.ts'), 'utf-8')
+
+    expect(src).toContain('lastActivityAt: number')
+    expect(src).toContain('reapIdleSubTails')
+    expect(src).toContain('IDLE_FSWATCH_TTL_MS')
+    // Must be invoked from the rescan tick, not just declared.
+    expect(src).toMatch(/rescanSubagents\(\)\s*[\s\S]*?reapIdleSubTails\(\)/)
+  })
+})

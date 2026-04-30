@@ -8,6 +8,10 @@ dist/
 # Agent runtime data (generated, not committed)
 /agents/
 
+# Test-generated sibling profiles (cleanup in afterEach normally handles
+# these; this catches the case where vitest is killed mid-run).
+/profiles/__test_*/
+
 # Vault
 *.enc
 
@@ -35,6 +39,13 @@ Thumbs.db
 # Build
 *.tsbuildinfo
 telegram-plugin/server.js
+
+# Rendered profile artifact — Handlebars source is profiles/<name>/CLAUDE.md.hbs;
+# renderProfileClaudeTemplate (src/agents/profiles.ts) writes profiles/<name>/CLAUDE.md
+# next to it. The rendered output is per-machine and per-render; only .hbs is tracked.
+# Without this entry the artifact appears as untracked and blocks `switchroom update`'s
+# clean-tree precondition. See #402.
+profiles/*/CLAUDE.md
 
 # Python bytecode (from vendored Hindsight plugin)
 __pycache__/

@@ -236,7 +236,11 @@ afterEach(() => {
 })
 
 function runHook(scriptPath: string, event: object) {
-  return spawnSync('node', [scriptPath], {
+  // Invoke the hook with the current runtime (bun under `bun test`,
+  // node in production), not a hard-coded 'node'. CI's hosted Buildkite
+  // agent doesn't ship node:sqlite or sqlite3 CLI, so requiring node
+  // would fail; the hook detects bun and uses bun:sqlite instead.
+  return spawnSync(process.execPath, [scriptPath], {
     input: JSON.stringify(event),
     encoding: 'utf8',
     env: { ...process.env, SWITCHROOM_AGENT_DIR: agentDir },

@@ -68,6 +68,15 @@ set -euo pipefail
 # enough to span a normal session but short enough that a long overnight idle
 # doesn't get falsely flagged.
 : "${RECENT_ACTIVITY_WINDOW_SECS:=3600}"
+# Turn-active marker check (issue #412): the gateway writes a per-agent
+# `turn-active.json` at turn-start, touches its mtime on every tool_use,
+# and removes it on turn_complete. If the file exists AND its mtime
+# hasn't advanced in TURN_HANG_SECS, the agent is wedged mid-turn —
+# distinguishable from "legitimately idle" because legitimate idle
+# leaves no marker file at all. Default 5 min: bigger than the slowest
+# legitimate single-tool turn (a long Bash compile maybe) but tight
+# enough to catch Stop-hook deadlocks before the user notices.
+: "${TURN_HANG_SECS:=300}"
 
 # Per-agent watchdog state lives under /run/user/$UID/switchroom-watchdog/
 # (tmpfs, cleared on logout — correct: we don't want stale silence markers
@@ -330,6 +339,47 @@ for agent_svc in "${agent_services[@]}"; do
         # Clear stale silence marker on fresh start so the grace window
         # is a clean slate.
         rm -f "$silence_marker" 2>/dev/null || true
+        continue
+      fi
+    fi
+  fi
+
+  # Issue #412: turn-active marker hang detector. The gateway writes
+  # `<agentDir>/telegram/turn-active.json` at turn-start, bumps its
+  # mtime on every tool_use, and removes it on turn_complete. If the
+  # file is older than TURN_HANG_SECS, the agent is wedged mid-turn —
+  # distinguishable from healthy idle because healthy idle leaves no
+  # marker file at all. This closes the gap left when JOURNAL_SILENCE_SECS
+  # was raised to 4000s (PR #410) to kill chat-cadence false positives.
+  agent_state_dir="${HOME}/.switchroom/agents/${agent}/telegram"
+  turn_active_file="${agent_state_dir}/turn-active.json"
+  if [[ -f "$turn_active_file" ]]; then
+    turn_mtime=$(stat -c %Y "$turn_active_file" 2>/dev/null || echo 0)
+    if [[ "$turn_mtime" -gt 0 ]]; then
+      turn_age=$(( $(now_epoch) - turn_mtime ))
+      if [[ "$turn_age" -ge "$TURN_HANG_SECS" ]]; then
+        logger -t switchroom-watchdog "agent ${agent}: turn-active marker stale (${turn_age}s >= ${TURN_HANG_SECS}s); restarting via switchroom agent restart (#412)"
+        echo "$(date -Iseconds) watchdog: ${agent} wedged mid-turn (${turn_age}s), restarting"
+        # Resolve the switchroom CLI (same belt-and-suspenders as below)
+        switchroom_cli=""
+        for candidate in "${HOME}/.bun/bin/switchroom" "${HOME}/.local/bin/switchroom"; do
+          if [[ -x "$candidate" ]]; then
+            switchroom_cli="$candidate"
+            break
+          fi
+        done
+        if [[ -z "$switchroom_cli" ]] && command -v switchroom >/dev/null 2>&1; then
+          switchroom_cli="$(command -v switchroom)"
+        fi
+        if [[ -n "$switchroom_cli" ]]; then
+          "$switchroom_cli" agent restart "$agent" || {
+            logger -t switchroom-watchdog "agent ${agent}: switchroom agent restart failed; falling back to systemctl"
+            systemctl --user restart "$agent_svc" || true
+          }
+        else
+          systemctl --user restart "$agent_svc" || true
+        fi
+        # Restarted — skip remaining checks for this agent this tick.
         continue
       fi
     fi

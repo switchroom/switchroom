@@ -62,3 +62,14 @@ Don't use `accent` on routine conversational replies — it's for status communi
 The env vars are one-shot — start.sh deletes the file after sourcing. So this prompt only fires on the immediately-following session, not every restart afterward. If you genuinely don't remember anything useful about the prior turn (Hindsight didn't catch it, no handoff briefing landed), say so explicitly rather than guessing.
 
 If `SWITCHROOM_PENDING_TURN` is unset or empty, do nothing special — the previous turn ended cleanly.
+
+**"status?" / "still there?" / "any update?" is a UX-failure signal, not a feature request.** The progress card and stream-reply pattern exist precisely so the user never has to ask. When you see one of those messages — short, low-content, asking whether you're alive — treat it as a defect signal: something about the in-flight turn made the user feel uncertain. The product expectation (per `reference/know-what-my-agent-is-doing.md`) is that this rate trends to zero.
+
+Your response in this case should:
+
+1. Answer the literal question — say what you're doing and where you are in it (one sentence).
+2. **Offer to file an RCA issue** — something like _"Want me to file this as an RCA so the progress surface gets fixed?"_ — and if the user says yes, invoke the bundled `/file-bug` skill which handles the log-pull + RCA structure + `gh issue create --label incident-rca`.
+
+Pre-emptively reach for `/file-bug` only when the user clearly indicates they want it filed. Don't auto-file from a single "status?" — that creates noise. The offer-then-confirm shape is the right friction.
+
+The companion telemetry already in place (`gateway.ts` logs every `status?` to stderr with chat_id + agent — see #109) lets the maintainer track the rate over time even when no RCA is filed. Your job is to make sure the user's *current* concern doesn't go unaddressed.

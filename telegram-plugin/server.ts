@@ -197,6 +197,7 @@ import { createStreamController } from './stream-controller.js'
 import { handlePtyPartialPure, type PtyHandlerState } from './pty-partial-handler.js'
 import { handleStreamReply, buildAccentHeader } from './stream-reply-handler.js'
 import { createChatLock } from './chat-lock.js'
+import { summarizeToolForTitle } from './permission-title.js'
 import {
   validateInlineKeyboard,
   type AnyButton,
@@ -1088,52 +1089,12 @@ const mcp = new Server(
  * Exact-match only to avoid suppressing legitimate replies that happen to
  * mention the tokens.
  */
-const SILENT_REPLY_MARKERS = new Set(['NO_REPLY', 'HEARTBEAT_OK'])
-
-// Derive the char-length bound from the marker set so adding a new
-// marker doesn't silently desync with a hand-tuned constant.
-const SILENT_REPLY_MAX_LEN = Math.max(
-  ...Array.from(SILENT_REPLY_MARKERS, (m) => m.length),
-) + 2 // small buffer for trailing punctuation callers might add accidentally
-
-export function isSilentReplyMarker(text: string | undefined): boolean {
-  if (typeof text !== 'string') return false
-  const trimmed = text.trim()
-  if (trimmed.length === 0) return false
-  if (trimmed.length > SILENT_REPLY_MAX_LEN) return false
-  // Case-insensitive match: models occasionally emit `no_reply` or
-  // `NoReply`. Require letters/underscores/digits only so legitimate
-  // prose that happens to contain "NO_REPLY was suggested" still sends.
-  return SILENT_REPLY_MARKERS.has(trimmed.toUpperCase())
-}
-
-/**
- * Decide whether a `reply`/`stream_reply` invocation should be short-
- * circuited as a silent-reply ack, enforcing the allowlist FIRST.
- *
- * Sprint1 review finding #6: an earlier revision returned the silent ack
- * before calling `assertAllowedChat`, so unauthorised chats could bypass
- * the outbound allowlist by having the agent emit `NO_REPLY`. The ack
- * itself is a cross-chat signal (it confirms to the LLM that the chat
- * exists and is reachable) even though no Telegram message is sent, so
- * we must refuse disallowed chats *before* producing it.
- *
- * `assertAllowed` throws when `chat_id` is not on the allowlist; callers
- * let that propagate so the MCP tool call fails loudly.
- */
-export function guardSilentReply(params: {
-  chat_id: string
-  text: string | undefined
-  hasFiles: boolean
-  assertAllowed: (chat_id: string) => void
-}): { kind: 'silent'; markerText: string } | { kind: 'continue' } {
-  const { chat_id, text, hasFiles, assertAllowed } = params
-  if (hasFiles) return { kind: 'continue' }
-  if (!isSilentReplyMarker(text)) return { kind: 'continue' }
-  // Allowlist check BEFORE returning the ack — see docblock above.
-  assertAllowed(chat_id)
-  return { kind: 'silent', markerText: (text as string).trim() }
-}
+// Implementation moved to ./silent-reply.ts so unit tests can import
+// the helpers without booting the full MCP server (which has top-level
+// side effects like env-load, TELEGRAM_BOT_TOKEN check, and session-tail
+// spawn). Re-exported here for backwards-compatible internal call sites.
+export { isSilentReplyMarker, guardSilentReply } from './silent-reply.js'
+import { guardSilentReply } from './silent-reply.js'
 
 // Stores full permission details for "See more" expansion keyed by request_id.
 // Entries expire after PENDING_PERMISSION_TTL_MS to prevent stuck requests
@@ -1225,7 +1186,10 @@ mcp.setNotificationHandler(
       expiresAt: Date.now() + PENDING_PERMISSION_TTL_MS,
     })
     const access = loadAccess()
-    const text = `🔐 Permission: ${tool_name}`
+    // Lift the most-identifying field into the title so the user can
+    // approve at a glance — e.g. `Skill (mail)` instead of bare `Skill`.
+    // See #186.
+    const text = `🔐 Permission: ${summarizeToolForTitle(tool_name, input_preview)}`
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
@@ -1243,7 +1207,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
+        '**Terminal — sends a final message and ends the turn.** Use for one-shot answers requiring zero further tool calls (factual answers, confirmations, simple replies). For any response that involves dispatching work (Agent calls, Bash commands, multi-step tool chains), use `stream_reply` and keep doing work — calling `reply` to announce in-flight work will leave the work undone, because the turn ends after this call. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1310,7 +1274,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stream_reply',
       description:
-        'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. By default the streamed message quote-replies to the latest inbound user message in this chat+thread — pass quote:false to opt out, or reply_to to target a specific message. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
+        '**Use to keep the turn alive while you work.** Pass `done=false` for interim updates (the plugin throttles edits to ~1/sec automatically) and `done=true` only when the response is final. Prefer this over `reply` whenever the response involves Agent / Bash / Task tool calls, multi-step tool chains, or any work that has not completed yet — `reply` is terminal and ends the turn. Pattern: First call `stream_reply(chat_id, "Reading the file...", done=false)` immediately on receipt of the user message; interim calls pass the FULL current text with `done=false`; final call passes the complete answer with `done=true`. By default quote-replies to the latest inbound user message in this chat+thread — pass quote:false to opt out, or reply_to to target a specific message. Hard-stops at 4096 chars — longer text throws; fall back to `reply` for chunking. The progress card runs alongside in parallel for ambient phase signal, but stream_reply is what carries narrative content.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1318,7 +1282,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string', description: 'Full text snapshot. NOT a delta — pass the complete current content each call.' },
           done: {
             type: 'boolean',
-            description: 'Must be true. Posts this text as the final answer for the turn and locks the message.',
+            description: 'False for interim updates while work is in flight; true for the final message that locks the turn. Pass false until you have the complete answer.',
           },
           message_thread_id: {
             type: 'string',
@@ -5506,8 +5470,16 @@ bot.on('callback_query:data', async ctx => {
     }
 
     // #227 grant wizard callbacks (vg:cancel bare, vg:agent:*, vg:keys:*, vg:dur:*, vg:gen)
+    //
+    // Note: pre-#265 fix this function did `await ctx.answerCallbackQuery().catch(() => {})`
+    // unconditionally up front. That meant the `vg:keys-continue` branch's
+    // toast call (`Select at least one key.`) hit a Telegram error
+    // ("query is too old or query ID is invalid") because the query was
+    // already answered, and the toast never reached the user. Each branch
+    // now owns its own ack — the spinner dismissal is part of the branch's
+    // post-condition.
     const chatId = String(ctx.chat!.id)
-    await ctx.answerCallbackQuery().catch(() => {})
+    const ackSilently = () => ctx.answerCallbackQuery().catch(() => {})
 
     // Cancel at any step
     if (data === 'vg:cancel') {
@@ -5516,12 +5488,14 @@ bot.on('callback_query:data', async ctx => {
       if (msg && 'text' in msg) {
         await ctx.editMessageText('❌ Grant wizard cancelled.').catch(() => {})
       }
+      await ackSilently()
       return
     }
 
     const state = pendingVaultOps.get(chatId)
     if (!state || state.kind !== 'grant-wizard') {
       await ctx.editMessageText('⚠️ Wizard session expired. Run /vault grant to start again.').catch(() => {})
+      await ackSilently()
       return
     }
 
@@ -5530,13 +5504,14 @@ bot.on('callback_query:data', async ctx => {
       const agent = data.slice('vg:agent:'.length)
       const msgId = (ctx.callbackQuery.message as { message_id?: number })?.message_id ?? state.wizardMsgId
       await grantWizardStep2(ctx, chatId, agent, msgId)
+      await ackSilently()
       return
     }
 
     // vg:key:<name> — step 2 toggle
     if (data.startsWith('vg:key:')) {
       const key = data.slice('vg:key:'.length)
-      if (state.step !== 'keys') return
+      if (state.step !== 'keys') { await ackSilently(); return }
       const selectedSet = new Set(state.selectedKeys ?? [])
       if (selectedSet.has(key)) {
         selectedSet.delete(key)
@@ -5547,23 +5522,27 @@ bot.on('callback_query:data', async ctx => {
       pendingVaultOps.set(chatId, updatedState)
       const kb = buildGrantKeysKeyboard(state.availableKeys ?? [], selectedSet)
       await ctx.editMessageReplyMarkup({ reply_markup: kb }).catch(() => {})
+      await ackSilently()
       return
     }
 
     // vg:keys-continue — step 2 → 3
     if (data === 'vg:keys-continue') {
-      if (state.step !== 'keys') return
+      if (state.step !== 'keys') { await ackSilently(); return }
       if (!state.selectedKeys || state.selectedKeys.length === 0) {
+        // Toast-only ack: this is the branch the unconditional pre-ack
+        // used to silently swallow. See #265.
         await ctx.answerCallbackQuery({ text: 'Select at least one key.' }).catch(() => {})
         return
       }
       await grantWizardStep3(ctx, chatId, state)
+      await ackSilently()
       return
     }
 
     // vg:dur:<value> — step 3 duration selection
     if (data.startsWith('vg:dur:')) {
-      if (state.step !== 'duration') return
+      if (state.step !== 'duration') { await ackSilently(); return }
       const dur = data.slice('vg:dur:'.length)
       if (dur === 'custom') {
         // Ask for text reply with n d|h format
@@ -5575,6 +5554,7 @@ bot.on('callback_query:data', async ctx => {
             { parse_mode: 'HTML', reply_markup: buildGrantDurationKeyboard() },
           ).catch(() => {})
         }
+        await ackSilently()
         return
       }
       let ttlSeconds: number | null
@@ -5584,30 +5564,33 @@ bot.on('callback_query:data', async ctx => {
         ttlSeconds = 365 * 86400
       } else {
         ttlSeconds = parseGrantDuration(dur)
-        if (ttlSeconds === null) return
+        if (ttlSeconds === null) { await ackSilently(); return }
       }
       const newState = { ...state, ttlSeconds, awaitingCustomDuration: false }
       await grantWizardConfirm(ctx, chatId, newState)
+      await ackSilently()
       return
     }
 
     // vg:back:duration — go back to step 2 (keys selection) from step 3
     if (data === 'vg:back:duration') {
-      if (state.step !== 'duration') return
+      if (state.step !== 'duration') { await ackSilently(); return }
       const msgId = state.wizardMsgId
       await grantWizardStep2(ctx, chatId, state.agent!, msgId)
+      await ackSilently()
       return
     }
 
     // vg:generate — final step
     if (data === 'vg:generate') {
-      if (state.step !== 'confirm') return
+      if (state.step !== 'confirm') { await ackSilently(); return }
       await executeGrantWizard(ctx, chatId, state)
+      await ackSilently()
       return
     }
 
     // Unrecognised vg: sub-action
-    await ctx.answerCallbackQuery().catch(() => {})
+    await ackSilently()
     return
   }
 

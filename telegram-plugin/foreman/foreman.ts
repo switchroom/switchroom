@@ -71,7 +71,7 @@ import {
 } from './foreman-create-flow.js'
 import { listAvailableProfiles } from '../../src/agents/profiles.js'
 import { createAgent, completeCreation } from '../../src/agents/create-orchestrator.js'
-import { validateBotToken, validateBotTokenMatchesAgent } from '../../src/setup/telegram-api.js'
+import { validateBotToken } from '../../src/setup/telegram-api.js'
 import { resolveAgentsDir, loadConfig } from '../../src/config/loader.js'
 import {
   getSetupState,
@@ -580,6 +580,20 @@ bot.on('message:text', async ctx => {
     await switchroomReply(ctx, 'Deletion cancelled.', { html: false })
     return
   }
+  // No pendingDelete on this chat. If the user's text is `YES` or `YES.`,
+  // they probably typed it expecting to confirm a delete that was queued
+  // before a foreman restart (pendingDeletes is in-memory; #28 item 7).
+  // Pre-fix this fell through and eventually rendered "Unknown command",
+  // which left the user wondering whether the delete went through. Surface
+  // a clear "no pending delete" message instead.
+  if (/^yes\.?$/i.test(text.trim())) {
+    await switchroomReply(
+      ctx,
+      'There is no pending delete to confirm — the foreman may have restarted since you ran <code>/delete</code>. Re-run <code>/delete &lt;agent&gt;</code> if you still want to delete.',
+      { html: true },
+    )
+    return
+  }
 
   // 2. Check for active /setup wizard flow
   const setupState = getSetupState(chatId)
@@ -859,16 +873,13 @@ async function handleCreateFlowText(
 
     case 'call-create-agent': {
       const { name, profile, botToken } = action
-      // Validate token via Telegram API before scaffold
-      await switchroomReply(ctx, 'Validating token…', { html: false })
-      try {
-        await validateBotToken(botToken)
-      } catch (err) {
-        await switchroomReply(ctx, `Token rejected by Telegram — ${(err as Error).message}. Try again:`, { html: false })
-        return
-      }
-
-      await switchroomReply(ctx, `Token OK. Creating agent <b>${escapeHtmlForTg(name)}</b>…`, { html: true })
+      // Pre-#28 fix this called validateBotToken here AND createAgent
+      // (via validateBotTokenMatchesAgent at create-orchestrator.ts:150)
+      // would call it again — two sequential Telegram getMe() requests in
+      // the happy path. We now trust the orchestrator's check and surface
+      // its error if it fails. The /setup flow at line 723 keeps its own
+      // pre-check because it uses the returned botInfo.username for UX.
+      await switchroomReply(ctx, `Creating agent <b>${escapeHtmlForTg(name)}</b>…`, { html: true })
       try {
         const result = await createAgent({
           name,

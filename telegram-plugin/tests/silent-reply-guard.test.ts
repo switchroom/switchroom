@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { guardSilentReply, isSilentReplyMarker } from '../server.js'
+// Import directly from the helper module (not server.js), so this test
+// doesn't boot the full MCP server — server.ts has top-level side
+// effects (env load, TELEGRAM_BOT_TOKEN check, session-tail spawn) that
+// kill the test process when run under bun-test without a real env.
+import { guardSilentReply, isSilentReplyMarker } from '../silent-reply.js'
 
 /**
  * Regression coverage for sprint1 review finding #6: the reply /

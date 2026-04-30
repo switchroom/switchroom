@@ -66,7 +66,7 @@ describe("buildSettingsHooksBlock", () => {
     const subagentPreEntry = preHooks.find(e =>
       e.hooks.some(h => h.command.includes("subagent-tracker-pretool.mjs")),
     );
-    expect(subagentPreEntry?.matcher).toBe("Agent");
+    expect(subagentPreEntry?.matcher).toBe("^(Agent|Task)$");
 
     expect(result.PostToolUse).toBeDefined();
     const postHooks = result.PostToolUse as Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
@@ -75,7 +75,7 @@ describe("buildSettingsHooksBlock", () => {
     const subagentPostEntry = postHooks.find(e =>
       e.hooks.some(h => h.command.includes("subagent-tracker-posttool.mjs")),
     );
-    expect(subagentPostEntry?.matcher).toBe("Agent");
+    expect(subagentPostEntry?.matcher).toBe("^(Agent|Task)$");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {

@@ -30,8 +30,10 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -250,6 +252,11 @@ function ensureDir(stateDir: string): void {
 
 function writeAll(stateDir: string, events: IssueEvent[]): void {
   const path = join(stateDir, ISSUES_FILE);
+  // Sweep orphan tempfiles from prior crashes before allocating a new
+  // one. Any `issues.jsonl.tmp-*` older than ORPHAN_TMP_TTL_MS is
+  // assumed crashed (writeAll completes in ms, so even a slow disk is
+  // way under the threshold). See #447.
+  sweepOrphanTmpFiles(stateDir);
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   const body =
     events.length === 0
@@ -257,6 +264,37 @@ function writeAll(stateDir: string, events: IssueEvent[]): void {
       : events.map((e) => JSON.stringify(e)).join("\n") + "\n";
   writeFileSync(tmp, body, "utf-8");
   renameSync(tmp, path);
+}
+
+const ORPHAN_TMP_TTL_MS = 60_000;
+const TMP_PREFIX = `${ISSUES_FILE}.tmp-`;
+
+/**
+ * Best-effort cleanup of tempfiles left behind by prior crashes. Any
+ * `<stateDir>/issues.jsonl.tmp-*` whose mtime is older than
+ * ORPHAN_TMP_TTL_MS is unlinked. Errors are ignored — this is a sweep,
+ * not a guarantee, and we never want it to fail an in-progress write.
+ */
+function sweepOrphanTmpFiles(stateDir: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(stateDir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - ORPHAN_TMP_TTL_MS;
+  for (const entry of entries) {
+    if (!entry.startsWith(TMP_PREFIX)) continue;
+    const tmpPath = join(stateDir, entry);
+    try {
+      const stat = statSync(tmpPath);
+      if (stat.mtimeMs < cutoff) {
+        unlinkSync(tmpPath);
+      }
+    } catch {
+      // Vanished mid-sweep or unreadable — fine, skip.
+    }
+  }
 }
 
 /**

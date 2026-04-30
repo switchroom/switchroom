@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "switchroom-telegram": {
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--silent",
+        "start"
+      ]
+    }
+  }
+}

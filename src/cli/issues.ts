@@ -41,14 +41,46 @@ function resolveAgentName(opts: { agent?: string }): string {
   );
 }
 
+const STDIN_READ_CAP_BYTES = 64 * 1024;
+
 function readDetailFromStdin(): string | undefined {
-  // Synchronously read all of stdin. Used by `record --detail-stdin`
-  // so callers can pipe stderr through without shell-quoting hell.
-  // Cap at 64KB; the store will truncate further to DETAIL_MAX_BYTES.
+  // Synchronously read up to STDIN_READ_CAP_BYTES of stdin. Used by
+  // `record --detail-stdin` so callers can pipe stderr through without
+  // shell-quoting hell. The store will further truncate to
+  // DETAIL_MAX_BYTES; this cap protects against multi-MB blobs being
+  // slurped into memory before that truncation.
+  //
+  // TTY guard: refuse if stdin is a TTY. The previous behaviour blocked
+  // forever on `readFileSync(0)` waiting for EOF that would never come,
+  // and the parent hook then hung for the full 35s claude-hook timeout.
+  // See #439.
   const fs = require("node:fs") as typeof import("node:fs");
+  if (process.stdin.isTTY) {
+    process.stderr.write(
+      "issues record: refusing to read --detail-stdin from a TTY (would hang).\n",
+    );
+    return undefined;
+  }
   try {
-    const buf = fs.readFileSync(0, { encoding: "utf-8" });
-    return buf || undefined;
+    const buf = Buffer.alloc(STDIN_READ_CAP_BYTES);
+    const bytesRead = fs.readSync(0, buf, 0, STDIN_READ_CAP_BYTES, null);
+    if (bytesRead <= 0) return undefined;
+    let text = buf.subarray(0, bytesRead).toString("utf-8");
+    if (bytesRead === STDIN_READ_CAP_BYTES) {
+      // Probe one more byte to know if the input was longer; surface the
+      // truncation honestly rather than silently dropping content.
+      const probe = Buffer.alloc(1);
+      let extra = 0;
+      try {
+        extra = fs.readSync(0, probe, 0, 1, null);
+      } catch {
+        extra = 0;
+      }
+      if (extra > 0) {
+        text += "\n[truncated: stdin exceeded 64KB]";
+      }
+    }
+    return text || undefined;
   } catch {
     return undefined;
   }
