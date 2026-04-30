@@ -224,6 +224,7 @@ import {
 } from '../registry/turns-schema.js'
 import { applySubagentsSchema } from '../registry/subagents-schema.js'
 import { formatIdleFooter } from '../idle-footer.js'
+import { resolveCallingSubagent } from './resolve-calling-subagent.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
 installPluginLogger()
@@ -1920,61 +1921,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     } catch { /* best-effort signal */ }
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
-}
-
-/**
- * Issue #305 Option A — resolve which sub-agent (by jsonl_agent_id) is
- * calling progress_update. Three resolution strategies, in priority order:
- *   1. agentIdHint — exact match on subagents.jsonl_agent_id
- *   2. toolUseIdHint — exact match on subagents.id (parent's Agent tool_use_id)
- *   3. Heuristic: most-recently-started running sub-agent in the active turn
- *      for this chat. Logs a stderr warning when multiple candidates exist.
- *
- * Returns null if no match (caller falls through to message-send).
- * Never throws; SQL errors return null.
- */
-function resolveCallingSubagent(opts: {
-  db: ReturnType<typeof openTurnsDb> | null
-  chatId: string
-  threadId?: number | string
-  agentIdHint: string | null
-  toolUseIdHint: string | null
-}): { agentId: string } | null {
-  if (opts.db == null) return null
-  try {
-    if (opts.agentIdHint != null) {
-      const row = opts.db.prepare(
-        "SELECT jsonl_agent_id FROM subagents WHERE jsonl_agent_id = ? AND status = 'running'"
-      ).get(opts.agentIdHint) as { jsonl_agent_id: string } | undefined
-      if (row?.jsonl_agent_id) return { agentId: row.jsonl_agent_id }
-    }
-    if (opts.toolUseIdHint != null) {
-      const row = opts.db.prepare(
-        "SELECT jsonl_agent_id FROM subagents WHERE id = ? AND status = 'running'"
-      ).get(opts.toolUseIdHint) as { jsonl_agent_id: string | null } | undefined
-      if (row?.jsonl_agent_id) return { agentId: row.jsonl_agent_id }
-    }
-    // Heuristic fallback.
-    const turnRow = opts.db.prepare(
-      "SELECT turn_key FROM turns WHERE chat_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
-    ).get(opts.chatId) as { turn_key: string } | undefined
-    if (turnRow?.turn_key == null) return null
-    const candidates = opts.db.prepare(
-      "SELECT jsonl_agent_id FROM subagents WHERE parent_turn_key = ? AND status = 'running' AND jsonl_agent_id IS NOT NULL ORDER BY started_at DESC"
-    ).all(turnRow.turn_key) as Array<{ jsonl_agent_id: string }>
-    if (candidates.length === 0) return null
-    if (candidates.length > 1) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `progress_update: heuristic resolution selected most-recent of ${candidates.length} running sub-agents (chat=${opts.chatId}); pass agent_id explicitly to avoid mis-attribution`
-      )
-    }
-    return { agentId: candidates[0].jsonl_agent_id }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('progress_update: resolveCallingSubagent SQL error', err)
-    return null
-  }
 }
 
 async function executeProgressUpdate(args: Record<string, unknown>): Promise<unknown> {
