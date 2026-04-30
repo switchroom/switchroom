@@ -3530,6 +3530,33 @@ async function handleInbound(
     } catch (err) {
       process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
     }
+
+    // Issue #416 — pre-allocate a sendMessageDraft for instant visual feedback
+    // in DMs. The agent's first stream_reply consumes this draft id instead
+    // of allocating a new one, so the user sees a placeholder draft within
+    // ~1 s. Only fires for fresh DM turns; if the agent finishes the turn
+    // without calling stream_reply, turn_end clears the orphan.
+    if (
+      sendMessageDraftFn != null
+      && isDmChatId(chat_id)
+      && messageThreadId == null
+      && !preAllocatedDrafts.has(chat_id)
+    ) {
+      const draftId = allocateDraftId()
+      // Best-effort, non-blocking: any failure (transport down, API not
+      // available) falls through to today's behavior.
+      void sendMessageDraftFn(chat_id, draftId, '…')
+        .then(() => {
+          preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
+        })
+        .catch((err) => {
+          process.stderr.write(
+            `telegram gateway: pre-allocate draft failed chatId=${chat_id}: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          )
+        })
+    }
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
