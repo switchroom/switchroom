@@ -20,12 +20,12 @@ import time
 import urllib.error
 import urllib.request
 
+from .client import USER_AGENT
 from .llm import detect_llm_config, get_llm_env_vars
 from .state import read_state, write_state
 
 DAEMON_STATE_FILE = "daemon.json"
 PROFILE_NAME = "claude-code"
-DEFAULT_DAEMON_IDLE_TIMEOUT = 300
 
 
 def _get_embed_command(config: dict) -> list:
@@ -75,7 +75,7 @@ def _check_health(base_url: str, timeout: int = 2) -> bool:
     """Quick health check against a Hindsight server."""
     try:
         url = f"{base_url.rstrip('/')}/health"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
@@ -161,7 +161,7 @@ def _ensure_daemon_running(config: dict, port: int, debug_fn=None):
 
     # Build daemon environment
     daemon_env = dict(llm_env)
-    idle_timeout = config.get("daemonIdleTimeout", DEFAULT_DAEMON_IDLE_TIMEOUT)
+    idle_timeout = config.get("daemonIdleTimeout", 300)
     daemon_env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(idle_timeout)
 
     # On macOS, force CPU for embeddings/reranker (mirrors Openclaw)
@@ -274,7 +274,7 @@ def prestart_daemon_background(config: dict, debug_fn=None):
     llm_env = get_llm_env_vars(llm_config)
     daemon_env = dict(os.environ)
     daemon_env.update(llm_env)
-    idle_timeout = config.get("daemonIdleTimeout", DEFAULT_DAEMON_IDLE_TIMEOUT)
+    idle_timeout = config.get("daemonIdleTimeout", 300)
     daemon_env["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(idle_timeout)
     if platform.system() == "Darwin":
         daemon_env["HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"] = "1"
@@ -287,24 +287,14 @@ def prestart_daemon_background(config: dict, debug_fn=None):
         if env_val:
             profile_args.extend(["--env", f"{env_name}={env_val}"])
 
-    # Run profile create synchronously (fast, ~1s) then detach the daemon start.
-    # Avoids shell=True and the &&-chain; profile must complete before daemon starts.
-    import subprocess as _sp
-    try:
-        _sp.run(
-            embed_cmd + profile_args,
-            env=daemon_env,
-            stdout=_sp.DEVNULL,
-            stderr=_sp.DEVNULL,
-            timeout=10,
-        )
-    except Exception as e:
-        if debug_fn:
-            debug_fn(f"Daemon pre-start: profile create failed: {e}")
-        return
+    import shlex
+    profile_str = shlex.join(embed_cmd + profile_args)
+    daemon_str = shlex.join(embed_cmd + ["daemon", "--profile", PROFILE_NAME, "start"])
 
+    import subprocess as _sp
     _sp.Popen(
-        embed_cmd + ["daemon", "--profile", PROFILE_NAME, "start"],
+        f"{profile_str} && {daemon_str}",
+        shell=True,
         env=daemon_env,
         stdout=_sp.DEVNULL,
         stderr=_sp.DEVNULL,
