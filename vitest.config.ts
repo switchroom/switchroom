@@ -75,6 +75,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/subagent-tracker-hooks.test.ts",
       // subagents-bugs.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/registry/subagents-bugs.test.ts",
+      // subagents-schema-init-order.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/subagents-schema-init-order.test.ts",
     ],
     coverage: {
       provider: "v8",

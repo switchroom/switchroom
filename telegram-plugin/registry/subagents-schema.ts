@@ -136,6 +136,13 @@ export interface BumpSubagentActivityArgs {
 // Schema
 // ---------------------------------------------------------------------------
 
+// Base table + indexes that don't depend on the jsonl_agent_id column.
+// The jsonl_agent_id column is added (if missing) by the migration block in
+// applySubagentsSchema, and its index is created there too — putting the
+// index in this base SQL would fail on pre-existing tables that don't yet
+// have the column ("no such column: jsonl_agent_id"), because
+// `CREATE TABLE IF NOT EXISTS` is a no-op on those tables and the column
+// only appears after the ALTER below.
 const SUBAGENTS_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS subagents (
     id                TEXT    PRIMARY KEY,
@@ -153,7 +160,6 @@ const SUBAGENTS_SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS subagents_turn      ON subagents(parent_turn_key);
   CREATE INDEX IF NOT EXISTS subagents_status    ON subagents(status);
-  CREATE INDEX IF NOT EXISTS subagents_jsonl_id  ON subagents(jsonl_agent_id);
 `
 
 /**
@@ -161,7 +167,11 @@ const SUBAGENTS_SCHEMA_SQL = `
  * already has the turns table — uses CREATE IF NOT EXISTS throughout.
  *
  * Also runs an ALTER TABLE migration to add `jsonl_agent_id` to pre-existing
- * tables that were created before this column was introduced.
+ * tables that were created before this column was introduced. The migration
+ * runs BEFORE the jsonl_agent_id index is created — putting that index in
+ * the base SQL would throw "no such column: jsonl_agent_id" on pre-existing
+ * tables, because `CREATE TABLE IF NOT EXISTS` is a no-op there and the
+ * column only appears after the ALTER below.
  */
 export function applySubagentsSchema(db: SqliteDatabase): void {
   db.exec(SUBAGENTS_SCHEMA_SQL)
@@ -172,8 +182,13 @@ export function applySubagentsSchema(db: SqliteDatabase): void {
   const hasJsonlId = cols.some((c) => c.name === 'jsonl_agent_id')
   if (!hasJsonlId) {
     db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
-    db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
   }
+  // Always (re-)apply the index. `IF NOT EXISTS` makes this a no-op when it
+  // already exists. Splitting it from SUBAGENTS_SCHEMA_SQL is what fixes the
+  // pre-existing-table failure mode — by the time we reach this line, the
+  // column is guaranteed to exist (either created with the table or added by
+  // the migration above).
+  db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
 }
 
 // ---------------------------------------------------------------------------
