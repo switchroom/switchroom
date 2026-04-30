@@ -6810,6 +6810,15 @@ async function shutdown(signal: string): Promise<void> {
   subagentWatcher?.stop()
   subagentWatcher = null
 
+  // Issues watcher polls issues.jsonl on a setInterval (default 2s) and
+  // edits the issues card on every tick. Without an explicit stop() the
+  // poll keeps firing for the lifetime of the process and accumulates
+  // editMessageText calls during shutdown drain — log noise plus a
+  // genuine resource leak if the gateway runs long after the bridge
+  // disconnected. Mirrors the subagentWatcher pattern above.
+  activeIssuesWatcher?.stop()
+  activeIssuesWatcher = null
+
   for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)

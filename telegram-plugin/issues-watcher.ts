@@ -86,6 +86,15 @@ export function startIssuesWatcher(
       log(`issues-watcher: tick failed: ${(err as Error).message}`);
     });
   }, intervalMs);
+  // Defense in depth: don't let the watcher itself keep the process
+  // alive. The gateway has other ref'd resources (bot polling, IPC
+  // socket listener) that own the process lifecycle. If those go
+  // away, this watcher should NOT block exit.
+  // `unref()` is a no-op in test runners that pass a fake setInterval
+  // returning a non-Timer value; guard with optional chaining.
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
 
   return {
     stop() {
