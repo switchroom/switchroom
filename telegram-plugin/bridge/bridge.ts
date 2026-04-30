@@ -36,7 +36,27 @@ installPluginLogger()
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID ? Number(process.env.TELEGRAM_TOPIC_ID) : undefined
-const AGENT_NAME = process.env.SWITCHROOM_AGENT_NAME ?? 'default'
+
+// Refuse to start as an unidentified bridge. Without SWITCHROOM_AGENT_NAME
+// we'd previously default to 'default' and register against whichever
+// gateway socket happened to be reachable — which is not us! Other
+// claude-code sessions on the same host (e.g. an operator debugging in
+// ~/code/) load the telegram MCP plugin and would crosstalk into the
+// agent's chat. See #430. The fingerprint of this in the wild is
+// dozens of `registered agent=default` lines per gateway log per hour
+// (analysis: #424). Phase 2 of #424 closes this hole at the source —
+// the bridge — and adds a server-side guard in ipc-server.ts as
+// defence in depth.
+const AGENT_NAME = process.env.SWITCHROOM_AGENT_NAME
+if (!AGENT_NAME) {
+  process.stderr.write(
+    'telegram bridge: SWITCHROOM_AGENT_NAME is not set; refusing to register against ' +
+    `gateway at ${SOCKET_PATH} (would crosstalk into another agent's chat). ` +
+    'If this is a switchroom agent, ensure start.sh exports the agent name. ' +
+    'If this is a stray claude-code session, this exit is the correct outcome.\n',
+  )
+  process.exit(0)
+}
 
 // ─── MCP server ──────────────────────────────────────────────────────────
 
