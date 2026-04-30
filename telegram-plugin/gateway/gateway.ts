@@ -4077,6 +4077,35 @@ function stampUserRestartReason(reason: string): void {
  * fail-fast CLI errors to the Telegram user instead of silently
  * swallowing them into detached-spawn.log.
  */
+/**
+ * Detect whether `systemd-run --user` is callable. Cached for the
+ * process lifetime — the answer is essentially fixed by the host OS.
+ *
+ * When available, `spawnSwitchroomDetached` wraps every spawn through
+ * `systemd-run --user --scope --collect` so the spawned child escapes
+ * the gateway's cgroup. Without this escape, restarting the gateway
+ * cgroup-kills the in-flight child mid-restart, and the agent service
+ * never actually restarts (#177).
+ *
+ * `--scope` makes a transient scope unit (lives in its own cgroup,
+ * doesn't trigger the spawn-supervised semantics of `--service`).
+ * `--collect` auto-removes the unit when it exits so we don't
+ * accumulate transient units.
+ */
+let _systemdRunPath: string | null | undefined
+function resolveSystemdRunPath(): string | null {
+  if (_systemdRunPath !== undefined) return _systemdRunPath
+  // Try `command -v systemd-run` via execSync; on missing-binary or
+  // a non-systemd box we set null and fall back to direct spawn.
+  try {
+    const out = execSync('command -v systemd-run 2>/dev/null', { encoding: 'utf-8' }).trim()
+    _systemdRunPath = out.length > 0 ? out : null
+  } catch {
+    _systemdRunPath = null
+  }
+  return _systemdRunPath
+}
+
 function spawnSwitchroomDetached(
   args: string[],
   onFailure?: (info: { code: number; tail: string }) => void,
@@ -4089,7 +4118,16 @@ function spawnSwitchroomDetached(
     outFd = openSync(logPath, 'a')
     writeFileSync(logPath, `\n[${new Date().toISOString()}] spawn ${SWITCHROOM_CLI} ${fullArgs.join(' ')}\n`, { flag: 'a' })
   } catch {}
-  const child = spawn(SWITCHROOM_CLI, fullArgs, {
+  // Escape the gateway's cgroup via systemd-run --scope when available.
+  // Without this, a gateway service restart (e.g. triggered as part of
+  // the detached child's own work) cgroup-kills the child mid-flight.
+  // See #177.
+  const systemdRun = resolveSystemdRunPath()
+  const spawnBin = systemdRun ?? SWITCHROOM_CLI
+  const spawnArgs = systemdRun
+    ? ['--user', '--scope', '--collect', '--quiet', '--', SWITCHROOM_CLI, ...fullArgs]
+    : fullArgs
+  const child = spawn(spawnBin, spawnArgs, {
     detached: true,
     stdio: outFd != null ? ['ignore', outFd, outFd] : 'ignore',
     env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
