@@ -198,6 +198,8 @@ import {
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
 import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
+import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
+import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import {
   VERSION,
   COMMIT_SHA,
@@ -1255,6 +1257,65 @@ const GATEWAY_STARTED_AT_MS = Date.now()
 const BOOT_CARD_ENABLED = process.env.SWITCHROOM_BOOT_CARD !== 'false'
 let activeBootCard: BootCardHandle | null = null
 
+// Issues card (#428) — pinned per-agent surface listing current
+// unresolved entries from the issue sink (#425). Idempotent across
+// the bridge-reconnect and boot-card paths so we never spawn two
+// watchers per gateway lifetime.
+const ISSUES_CARD_ENABLED = process.env.SWITCHROOM_ISSUES_CARD !== 'false'
+let activeIssuesCard: IssuesCardHandle | null = null
+let activeIssuesWatcher: IssuesWatcherHandle | null = null
+
+/**
+ * Idempotently start the issues card + watcher for this gateway. Called
+ * from both the boot-path and bridge-reconnect paths once we've
+ * resolved the chat to post into. Subsequent calls are no-ops — the
+ * first call wins for the gateway's lifetime.
+ */
+function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
+  if (!ISSUES_CARD_ENABLED) return
+  if (activeIssuesCard != null) return
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME ?? '-'
+  const agentDisplayName = resolvePersonaName(agentSlug)
+  const stateDir = process.env.TELEGRAM_STATE_DIR
+  if (!stateDir) {
+    process.stderr.write(
+      `telegram gateway: issues-card: TELEGRAM_STATE_DIR unset, skipping\n`,
+    )
+    return
+  }
+  const botApi: import('../issues-card.js').BotApiForIssuesCard = {
+    sendMessage: (cid, text, opts) =>
+      lockedBot.api.sendMessage(
+        cid,
+        text,
+        opts as Parameters<typeof lockedBot.api.sendMessage>[2],
+      ) as Promise<{ message_id: number }>,
+    editMessageText: (cid, mid, text, opts) =>
+      lockedBot.api.editMessageText(
+        cid,
+        mid,
+        text,
+        opts as Parameters<typeof lockedBot.api.editMessageText>[3],
+      ),
+    deleteMessage: (cid, mid) => lockedBot.api.deleteMessage(cid, mid),
+  }
+  activeIssuesCard = createIssuesCardHandle({
+    agentName: agentDisplayName,
+    chatId,
+    threadId,
+    bot: botApi,
+    log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+  })
+  activeIssuesWatcher = startIssuesWatcher({
+    stateDir,
+    card: activeIssuesCard,
+    log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+  })
+  process.stderr.write(
+    `telegram gateway: issues-card: started watcher chat_id=${chatId} thread_id=${threadId ?? '-'} state_dir=${stateDir}\n`,
+  )
+}
+
 // Startup mutex. Atomic single-writer claim on the PID file so two
 // gateway processes can't race on Telegram's getUpdates long-poll.
 // See startup-mutex.ts for the 2026-04-23 incident this closes
@@ -1353,6 +1414,7 @@ const ipcServer: IpcServer = createIpcServer({
       if (target) {
         const { chatId, threadId, ackMsgId } = target
         process.stderr.write(`telegram gateway: bridge-reconnect: posting boot card reason=${reason} chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
+        ensureIssuesCard(chatId, threadId)
         if (BOOT_CARD_ENABLED) {
           const agentDir = resolveAgentDirFromEnv()
           const agentSlug = process.env.SWITCHROOM_AGENT_NAME ?? client.agentName ?? '-'
@@ -6107,6 +6169,55 @@ bot.command('memory', async ctx => {
   await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search')
 })
 
+bot.command('issues', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const arg = (ctx.match ?? '').trim()
+  // /issues resolve <fp> | /issues clear | /issues — these subcommands
+  // shell out to the issues CLI verb (#426). The verb itself enforces
+  // the dedup / fingerprint logic; we just relay output.
+  if (!arg || arg === 'list') {
+    await runSwitchroomCommand(ctx, ['issues', 'list'], 'issues list')
+    return
+  }
+  const parts = arg.split(/\s+/)
+  if (parts[0] === 'resolve' && parts.length >= 2) {
+    await runSwitchroomCommand(
+      ctx,
+      ['issues', 'resolve', parts[1]],
+      `issues resolve ${parts[1]}`,
+    )
+    return
+  }
+  if (parts[0] === 'clear') {
+    // "Clear all" = list current, resolve each. The CLI's `prune` is
+    // for retention; clearing live issues is a UI concern. Implement
+    // here by walking the list and resolving each. Best-effort.
+    try {
+      const stateDir = process.env.TELEGRAM_STATE_DIR
+      if (stateDir) {
+        const { list, resolve: resolveOne } = require('../../src/issues/index.js') as typeof import('../../src/issues/index.js')
+        const events = list(stateDir)
+        let n = 0
+        for (const e of events) {
+          n += resolveOne(stateDir, e.fingerprint)
+        }
+        await switchroomReply(ctx, `Resolved ${n} issue${n === 1 ? '' : 's'}.`, { html: true })
+        return
+      }
+    } catch (err) {
+      await switchroomReply(ctx, `clear failed: ${escapeHtmlForTg((err as Error).message)}`, { html: true })
+      return
+    }
+    await switchroomReply(ctx, 'clear: no TELEGRAM_STATE_DIR; cannot operate.', { html: true })
+    return
+  }
+  await switchroomReply(
+    ctx,
+    'Usage: <code>/issues</code> | <code>/issues resolve &lt;fingerprint&gt;</code> | <code>/issues clear</code>',
+    { html: true },
+  )
+})
+
 bot.command('usage', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const agentDir = resolveAgentDirFromEnv()
@@ -7226,6 +7337,7 @@ void (async () => {
             if (target) {
               const { chatId, threadId, ackMsgId } = target
               process.stderr.write(`telegram gateway: boot: posting boot card reason=${reason} chat_id=${chatId} thread_id=${threadId ?? '-'} ackReply=${ackMsgId ?? '-'} boot_card=${BOOT_CARD_ENABLED}\n`)
+              ensureIssuesCard(chatId, threadId)
               if (BOOT_CARD_ENABLED) {
                 const agentDir = resolveAgentDirFromEnv()
                 const agentSlug = process.env.SWITCHROOM_AGENT_NAME ?? '-'
