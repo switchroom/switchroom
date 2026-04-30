@@ -386,15 +386,58 @@ describe("concurrency", () => {
     expect(all[0].occurrences).toBe(N);
   });
 
-  it("steals stale locks rather than blocking forever", () => {
-    // Drop a stale lock file directly. record() must succeed by
-    // recognizing the lock as too old and reclaiming it.
+  it("steals an empty lockfile (legacy format / pre-PID) without blocking", () => {
+    // Empty lock file represents pre-PID-aware lock holders. record()
+    // must reclaim it rather than wait the full LOCK_TIMEOUT_MS.
     const lockPath = join(tmp, "issues.lock");
     writeFileSync(lockPath, "");
-    // Backdate the lock file so the staleness check trips.
-    const old = Date.now() - 60_000;
-    require("node:fs").utimesSync(lockPath, old / 1000, old / 1000);
 
+    const e = record(
+      tmp,
+      { agent: "a", severity: "warn", source: "s", code: "c", summary: "x" },
+      tick,
+    );
+    expect(e.occurrences).toBe(1);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("steals a lockfile whose PID is dead", () => {
+    const lockPath = join(tmp, "issues.lock");
+    // PID 999999 is overwhelmingly likely to not exist on the test host.
+    writeFileSync(lockPath, "999999");
+    const e = record(
+      tmp,
+      { agent: "a", severity: "warn", source: "s", code: "c", summary: "x" },
+      tick,
+    );
+    expect(e.occurrences).toBe(1);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("does NOT steal a lockfile whose PID is alive (refuses to corrupt)", () => {
+    // Stamp a live PID (the parent of the test process — vitest itself).
+    // The lock is *contended* by a real holder; we must NOT just steal
+    // it. Since record() is sync we can't watch a timer cancel mid-wait;
+    // instead we assert that record() hits the lock timeout and throws,
+    // which is the correct behaviour: better to surface a timeout than
+    // silently stomp another writer's state.
+    const lockPath = join(tmp, "issues.lock");
+    writeFileSync(lockPath, String(process.ppid));
+    expect(() =>
+      record(
+        tmp,
+        { agent: "a", severity: "warn", source: "s", code: "c", summary: "x" },
+        tick,
+      ),
+    ).toThrow(/lock timeout/);
+  }, 15_000);
+
+  it("works against a stale lock written by us (legacy)", () => {
+    // Edge case the new code handles: lockfile contains our own PID
+    // (e.g. a previous crashed run of this same process slot). We
+    // unlink and proceed.
+    const lockPath = join(tmp, "issues.lock");
+    writeFileSync(lockPath, String(process.pid));
     const e = record(
       tmp,
       { agent: "a", severity: "warn", source: "s", code: "c", summary: "x" },

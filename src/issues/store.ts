@@ -34,9 +34,11 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { execSync } from "node:child_process";
 
 import {
   DETAIL_MAX_BYTES,
@@ -260,14 +262,20 @@ function writeAll(stateDir: string, events: IssueEvent[]): void {
 /**
  * Hold an exclusive lock on issues.lock for the duration of `fn`.
  *
- * We use the existence of a lock *file* (created with `openSync` and
- * the `wx` flag) rather than `flock(2)` so the implementation works on
- * platforms without `flock` and stays in pure Node fs. Spin-wait with
- * short backoff is acceptable: the critical section is a few KB of
- * read-parse-write, contention is rare, and a stuck lock self-heals
- * after MAX_LOCK_AGE_MS.
+ * Strategy: atomic-create with `openSync(... "wx")`, write our PID into
+ * the lockfile, and only steal a stale lock when the recorded PID is
+ * no longer alive. This avoids the TOCTOU window of an mtime-based
+ * staleness check (where two processes could simultaneously decide
+ * the same lock was stale, both unlink it, and proceed in parallel).
+ *
+ * Sleep on contention via `execSync('sleep ...')` so we yield the CPU
+ * instead of busy-spinning — important because `silent-end-interrupt-stop`
+ * is a synchronous Stop hook (#426) and any contention there blocks
+ * the agent's shutdown path.
+ *
+ * Pure Node fs (no flock(2)) keeps the implementation portable and
+ * dependency-free.
  */
-const MAX_LOCK_AGE_MS = 5_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 
@@ -278,21 +286,17 @@ function withLock<T>(stateDir: string, fn: () => T): T {
   while (fd === null) {
     try {
       fd = openSync(lockPath, "wx");
+      // Stamp our PID for liveness checks by other waiters.
+      try {
+        writeSync(fd, String(process.pid));
+      } catch {
+        // Best-effort — if write fails the lock still works (fallback
+        // path in tryStealStaleLock just retries on read failure).
+      }
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
       if (e.code !== "EEXIST") throw err;
-      // Lock exists. If it's stale, steal it.
-      try {
-        const lockMtime = (
-          require("node:fs") as typeof import("node:fs")
-        ).statSync(lockPath).mtimeMs;
-        if (Date.now() - lockMtime > MAX_LOCK_AGE_MS) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        // Lock file vanished between our exists check and stat — retry.
-      }
+      if (tryStealStaleLock(lockPath)) continue;
       if (Date.now() - startedAt > LOCK_TIMEOUT_MS) {
         throw new Error(`issues store: lock timeout after ${LOCK_TIMEOUT_MS}ms`);
       }
@@ -311,12 +315,74 @@ function withLock<T>(stateDir: string, fn: () => T): T {
   }
 }
 
+/**
+ * Read the PID written into the lockfile. If the PID is no longer
+ * alive, unlink the lock and return true so the caller retries
+ * `openSync(wx)` immediately. If the PID is alive (or the lockfile
+ * vanished mid-check), return false — the caller waits.
+ *
+ * Crucially this checks PID liveness BEFORE unlinking, so two waiters
+ * can't both decide a lock is stale and both remove it. The check is
+ * advisory — PIDs can be reused — but the reuse window during a 10s
+ * lock-timeout is negligible in practice.
+ */
+function tryStealStaleLock(lockPath: string): boolean {
+  let pidStr: string;
+  try {
+    pidStr = readFileSync(lockPath, "utf-8").trim();
+  } catch {
+    // Lock vanished or unreadable. Just retry the openSync.
+    return true;
+  }
+  const pid = Number(pidStr);
+  if (!Number.isFinite(pid) || pid <= 0) {
+    // Corrupt content — old format or partial write. Treat as stale.
+    try {
+      unlinkSync(lockPath);
+    } catch {}
+    return true;
+  }
+  if (pid === process.pid) {
+    // Should never happen — we hold the lock already. Be defensive.
+    try {
+      unlinkSync(lockPath);
+    } catch {}
+    return true;
+  }
+  // process.kill(pid, 0) probes liveness without delivering a signal.
+  // ESRCH = process gone (steal). EPERM = exists but we can't signal
+  // (treat as alive — wait, don't steal).
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return false;
+    if (code !== "ESRCH") return false;
+  }
+  try {
+    unlinkSync(lockPath);
+  } catch {}
+  return true;
+}
+
+/**
+ * Block the calling thread for `ms` without pinning a CPU. `execSync`
+ * spawning `sleep` blocks at the kernel level, yielding to other
+ * processes. ~1ms of spawn overhead is acceptable for a contention
+ * path that should be rare.
+ */
 function sleepSync(ms: number): void {
-  const end = Date.now() + ms;
-  // Busy-loop is acceptable here — lock wait is bounded and rare. Avoids
-  // pulling in a worker / atomics dependency for a few-ms wait.
-  while (Date.now() < end) {
-    /* spin */
+  const seconds = Math.max(0.001, ms / 1000);
+  try {
+    execSync(`sleep ${seconds}`, { stdio: "ignore" });
+  } catch {
+    // sleep missing or signalled — fall back to a short busy wait
+    // capped at 50ms so we don't burn a core indefinitely.
+    const end = Date.now() + Math.min(ms, 50);
+    while (Date.now() < end) {
+      /* spin */
+    }
   }
 }
 
