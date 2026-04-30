@@ -109,6 +109,17 @@ export const AgentMemorySchema = z
             "auto-recall, regardless of token budget. Plugin default is 12. " +
             "0 disables the cap (all memories Hindsight returns are injected).",
           ),
+        cache_ttl_secs: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Per-session recall cache TTL in seconds. When > 0, identical " +
+            "(prompt, bank) within the same session reuse the cached recall " +
+            "result instead of round-tripping to Hindsight. 0 disables. " +
+            "Default is 600 (10 min) for switchroom-managed agents.",
+          ),
       })
       .optional()
       .describe("Auto-recall tuning knobs"),

@@ -1121,6 +1121,7 @@ interface BuildWorkspaceContextArgs {
   hindsightBankId: string;
   hindsightApiBaseUrl: string;
   hindsightRecallMaxMemories: number | undefined;
+  hindsightRecallCacheTtlSecs: number | undefined;
 }
 
 /**
@@ -1146,6 +1147,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightBankId,
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
+    hindsightRecallCacheTtlSecs,
   } = args;
   return {
     name,
@@ -1177,6 +1179,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightBankIdQ: shellSingleQuote(hindsightBankId),
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
     hindsightRecallMaxMemories,
+    hindsightRecallCacheTtlSecs,
     switchroomConfigPathQ: switchroomConfigPath
       ? shellSingleQuote(resolve(switchroomConfigPath))
       : undefined,
@@ -1371,6 +1374,11 @@ export function scaffoldAgent(
   // value. `undefined` means "let the plugin's settings.json default
   // apply" — start.sh.hbs gates the env var on this being defined.
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
+  // Per-session recall cache TTL (#424 phase 4.1). Same cascade
+  // semantics as max_memories. `undefined` here means "use the
+  // switchroom-managed default of 600s baked into start.sh.hbs."
+  // Set to 0 in switchroom.yaml to disable caching for an agent.
+  const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
 
   // Build the template rendering context via the shared helper so
   // scaffold and reconcile always produce the same shape for workspace
@@ -1392,6 +1400,7 @@ export function scaffoldAgent(
     hindsightBankId,
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
+    hindsightRecallCacheTtlSecs,
   });
 
   // --- Create directory structure ---
@@ -2460,6 +2469,7 @@ export function reconcileAgent(
     ? (switchroomConfig.memory!.config!.url as string).replace(/\/mcp\/?$/, "").replace(/\/$/, "")
     : "http://127.0.0.1:8888";
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
+  const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
   // No existsSync guard: start.sh is a pure function of config+template.
@@ -2485,6 +2495,7 @@ export function reconcileAgent(
       hindsightBankIdQ: shellSingleQuote(hindsightBankId),
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
       hindsightRecallMaxMemories,
+      hindsightRecallCacheTtlSecs,
       modelQ: agentConfig.model ? shellSingleQuote(agentConfig.model) : undefined,
       thinkingEffort: agentConfig.thinking_effort,
       permissionMode: agentConfig.permission_mode,
@@ -2950,6 +2961,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     hindsightBankId,
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
+    hindsightRecallCacheTtlSecs,
   });
   // Phase 5 migration: preserve any agent-specific edits to the legacy
   // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before

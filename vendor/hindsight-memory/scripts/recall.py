@@ -6,19 +6,23 @@ Adapted for Claude Code hooks (ephemeral process, JSON stdin/stdout).
 
 Flow:
   1. Read hook input from stdin (prompt, session_id, transcript_path, cwd)
-  2. Resolve API URL (external, existing local, or auto-start daemon)
-  3. Derive bank ID (static or dynamic from project context)
-  4. Ensure bank mission is set (first use only)
-  5. Compose multi-turn query if recallContextTurns > 1
-  6. Truncate to recallMaxQueryChars
-  7. Call Hindsight recall API
-  8. Format memories and output hookSpecificOutput.additionalContext
-  9. Save last recall to state (for PostCompact re-injection)
+  2. (switchroom #424 4.1) Check per-session recall cache; on hit, emit
+     cached output and skip the API round-trip.
+  3. Resolve API URL (external, existing local, or auto-start daemon)
+  4. Derive bank ID (static or dynamic from project context)
+  5. Ensure bank mission is set (first use only)
+  6. Compose multi-turn query if recallContextTurns > 1
+  7. Truncate to recallMaxQueryChars
+  8. Call Hindsight recall API
+  9. Format memories and output hookSpecificOutput.additionalContext
+ 10. Persist to per-session cache for the next prompt-equal invocation.
+ 11. Save last recall to state (for PostCompact re-injection)
 
 Exit codes:
   0 — always (graceful degradation on any error)
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -37,9 +41,118 @@ from lib.content import (
 )
 from lib.daemon import get_api_url
 from lib.directives import fetch_active_directives, format_active_directives_block
-from lib.state import write_state
+from lib.state import read_state, write_state
 
 LAST_RECALL_STATE = "last_recall.json"
+RECALL_CACHE_STATE = "recall_cache.json"
+
+# Switchroom #424 phase 4.1 — per-session recall cache.
+#
+# Caching is opt-in via env var: HINDSIGHT_RECALL_CACHE_TTL_SECS=N. Set N
+# to 0 (or leave unset) to disable. On hit, the script emits the cached
+# `additionalContext` and skips the directive + recall API round-trips
+# entirely.
+#
+# Hits fire when (session_id, prompt, bank_id, extra_banks) match a
+# prior entry within the TTL. Cache entries are scoped to a single
+# session_id — a new session (e.g. agent restart, /reset, /new) starts
+# a fresh cache window even if the env-configured TTL hasn't elapsed.
+#
+# The expected hit rate in production is modest (real users don't
+# typically resubmit identical prompts), but this trims redundant
+# recall traffic on session-resume re-processing and any retry paths.
+CACHE_ENV = "HINDSIGHT_RECALL_CACHE_TTL_SECS"
+
+# Maximum number of cache entries kept per session before LRU eviction.
+# 100 is comfortably above the typical session size (~30 inbounds) and
+# well below any concern about state-file size growth.
+CACHE_MAX_ENTRIES = 100
+
+
+def _cache_ttl_secs() -> int:
+    """Read the recall-cache TTL from env. Returns 0 (disabled) on any
+    parse error or sub-zero value — caller treats 0 as "skip cache."""
+    raw = os.environ.get(CACHE_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        n = int(raw)
+        return n if n > 0 else 0
+    except ValueError:
+        return 0
+
+
+def _cache_key(session_id: str, prompt: str, bank_id: str, extra_banks: list) -> str:
+    """Stable hash for cache keying. Session_id is included so a new
+    session always misses, regardless of the TTL setting. Extra banks
+    are sorted so list-order doesn't change the key."""
+    parts = [
+        session_id or "",
+        prompt or "",
+        bank_id or "",
+        ",".join(sorted(extra_banks or [])),
+    ]
+    payload = "\x1f".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_lookup(key: str, ttl_secs: int) -> str | None:
+    """Return the cached `additionalContext` for `key` if present and
+    within TTL, else None. Failure-tolerant — any read error returns
+    None and the caller falls through to a fresh recall."""
+    if ttl_secs <= 0:
+        return None
+    state = read_state(RECALL_CACHE_STATE, {}) or {}
+    entries = state.get("entries") or {}
+    entry = entries.get(key)
+    if not isinstance(entry, dict):
+        return None
+    saved_at = entry.get("saved_at")
+    context = entry.get("context")
+    if not isinstance(saved_at, (int, float)) or not isinstance(context, str):
+        return None
+    if time.time() - saved_at > ttl_secs:
+        return None
+    return context
+
+
+def _cache_store(key: str, context: str) -> None:
+    """Write a cache entry. LRU-evicts the oldest entry when exceeding
+    CACHE_MAX_ENTRIES so the file stays bounded. Failure-tolerant."""
+    state = read_state(RECALL_CACHE_STATE, {}) or {}
+    entries = state.get("entries") or {}
+    if not isinstance(entries, dict):
+        entries = {}
+    entries[key] = {
+        "context": context,
+        "saved_at": time.time(),
+    }
+    if len(entries) > CACHE_MAX_ENTRIES:
+        # LRU evict by saved_at ascending.
+        sorted_keys = sorted(
+            entries.keys(),
+            key=lambda k: entries[k].get("saved_at") if isinstance(entries[k], dict) else 0,
+        )
+        for k in sorted_keys[: len(entries) - CACHE_MAX_ENTRIES]:
+            entries.pop(k, None)
+    state["entries"] = entries
+    state["updated_at"] = time.time()
+    write_state(RECALL_CACHE_STATE, state)
+
+
+def _emit_cached_context(context: str) -> None:
+    """Emit the same hookSpecificOutput shape that the fresh-recall
+    path emits, so the cached path is byte-equivalent from claude
+    code's perspective."""
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context,
+            }
+        },
+        sys.stdout,
+    )
 
 
 def read_transcript_messages(transcript_path: str) -> list:
@@ -99,6 +212,8 @@ def main():
         debug_log(config, "Prompt too short for recall, skipping")
         return
 
+    session_id = hook_input.get("session_id") or ""
+
     # Resolve API URL (handles all three connection modes)
     def _dbg(*a):
         debug_log(config, *a)
@@ -118,6 +233,27 @@ def main():
 
     # Derive bank ID (static or dynamic from project context)
     bank_id = derive_bank_id(hook_input, config)
+    additional_banks = config.get("recallAdditionalBanks", []) or []
+
+    # Switchroom #424 phase 4.1 — cache check BEFORE any HTTP traffic.
+    # Whole-session-scoped, opt-in via HINDSIGHT_RECALL_CACHE_TTL_SECS.
+    cache_ttl = _cache_ttl_secs()
+    cache_key = (
+        _cache_key(session_id, prompt, bank_id, additional_banks)
+        if cache_ttl > 0
+        else ""
+    )
+    if cache_ttl > 0:
+        try:
+            cached_context = _cache_lookup(cache_key, cache_ttl)
+        except Exception as e:
+            debug_log(config, f"Recall cache read failed (non-fatal): {e}")
+            cached_context = None
+        if cached_context is not None:
+            debug_log(config, f"Recall cache HIT (key={cache_key[:12]}…) — skipping API call")
+            _emit_cached_context(cached_context)
+            return
+        debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
 
     # Set bank mission on first use
     ensure_bank_mission(client, bank_id, config, debug_fn=_dbg)
@@ -173,8 +309,10 @@ def main():
         # have one, so a recall API failure doesn't blind the agent to
         # its own active directives.
 
-    # Also recall from any additional banks (e.g. shared user profile bank)
-    additional_banks = config.get("recallAdditionalBanks", [])
+    # Also recall from any additional banks (e.g. shared user profile bank).
+    # `additional_banks` was already extracted above the cache check so the
+    # cache key reflects every bank queried; reuse that local instead of
+    # re-reading config.
     for extra_bank_id in additional_banks:
         try:
             extra_response = client.recall(
@@ -253,6 +391,14 @@ def main():
             "directive_count": len(directives),
         },
     )
+
+    # Switchroom #424 phase 4.1 — populate the cache for the next hit.
+    # Failure-tolerant: a write error here doesn't mask the recall result.
+    if cache_ttl > 0 and cache_key:
+        try:
+            _cache_store(cache_key, context_message)
+        except Exception as e:
+            debug_log(config, f"Recall cache write failed (non-fatal): {e}")
 
     # Output JSON for Claude Code hook system
     output = {
