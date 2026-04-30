@@ -2053,6 +2053,15 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
 
+  // Wrapping helper. Every switchroom-owned hook is invoked through
+  // bin/run-hook.sh so a non-zero exit or a stderr-only failure ends up
+  // in the issue sink (#425) and on the Telegram issues card (#428).
+  // The wrapper preserves the original exit code, so claude code's
+  // hook contract (decision: block, etc.) is unchanged.
+  const wrapper = `bash "${join(REPO_ROOT, "bin", "run-hook.sh")}"`;
+  const wrap = (source: string, command: string): string =>
+    `${wrapper} ${shellSingleQuote(source)} ${command}`;
+
   // --- Switchroom-owned Stop hooks ---
   const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
   const handoffConfigArg = configPath
@@ -2062,7 +2071,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   if (handoffEnabled) {
     stopHooks.push({
       type: "command",
-      command: `switchroom${handoffConfigArg} handoff ${agentName}`,
+      command: wrap(
+        "hook:handoff",
+        `switchroom${handoffConfigArg} handoff ${agentName}`,
+      ),
       timeout: 35,
       async: true,
     });
@@ -2070,7 +2082,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   if (hindsightEnabled) {
     stopHooks.push({
       type: "command",
-      command: `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
+      command: wrap(
+        "hook:user-profile-refresh",
+        `bash "${join(REPO_ROOT, "bin", "user-profile-refresh-hook.sh")}"`,
+      ),
       timeout: 10,
       async: true,
     });
@@ -2078,13 +2093,19 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   if (useSwitchroomPlugin) {
     stopHooks.push({
       type: "command",
-      command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-scrub-stop.mjs")}"`,
+      command: wrap(
+        "hook:secret-scrub-stop",
+        `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-scrub-stop.mjs")}"`,
+      ),
       timeout: 15,
       async: true,
     });
     stopHooks.push({
       type: "command",
-      command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "silent-end-interrupt-stop.mjs")}"`,
+      command: wrap(
+        "hook:silent-end-interrupt-stop",
+        `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "silent-end-interrupt-stop.mjs")}"`,
+      ),
       timeout: 5,
       async: false,
     });
@@ -2098,7 +2119,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           hooks: [
             {
               type: "command",
-              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
+              command: wrap(
+                "hook:secret-guard-pretool",
+                `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "secret-guard-pretool.mjs")}"`,
+              ),
               timeout: 10,
             },
           ],
@@ -2108,7 +2132,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           hooks: [
             {
               type: "command",
-              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
+              command: wrap(
+                "hook:subagent-tracker-pretool",
+                `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-pretool.mjs")}"`,
+              ),
               timeout: 10,
             },
           ],
@@ -2124,7 +2151,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           hooks: [
             {
               type: "command",
-              command: `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
+              command: wrap(
+                "hook:subagent-tracker-posttool",
+                `node "${join(REPO_ROOT, "telegram-plugin", "hooks", "subagent-tracker-posttool.mjs")}"`,
+              ),
               timeout: 10,
             },
           ],
@@ -2141,7 +2171,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
             hooks: [
               {
                 type: "command",
-                command: `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
+                command: wrap(
+                  "hook:workspace-stable",
+                  `bash "${join(REPO_ROOT, "bin", "workspace-stable-hook.sh")}"`,
+                ),
                 timeout: 6,
               },
             ],
@@ -2152,7 +2185,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       hooks: [
         {
           type: "command",
-          command: `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
+          command: wrap(
+            "hook:workspace-dynamic",
+            `bash "${join(REPO_ROOT, "bin", "workspace-dynamic-hook.sh")}"`,
+          ),
           timeout: 5,
         },
       ],
@@ -2161,7 +2197,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       hooks: [
         {
           type: "command",
-          command: `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
+          command: wrap(
+            "hook:timezone",
+            `bash "${join(REPO_ROOT, "bin", "timezone-hook.sh")}"`,
+          ),
           timeout: 3,
         },
       ],

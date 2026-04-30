@@ -1607,7 +1607,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
         hooks: [
           {
             type: "command",
-            command: "switchroom handoff hooks-agent",
+            command: expect.stringContaining("switchroom handoff hooks-agent"),
             timeout: 35,
             async: true,
           },
@@ -2852,9 +2852,11 @@ describe("secret-detect hook wiring", () => {
     expect(pre).toBeDefined();
     const commands = pre.flatMap((e) => e.hooks).map((h) => h.command);
     expect(commands.some((c) => c.includes("secret-guard-pretool.mjs"))).toBe(true);
-    // Ends in .mjs and uses node
+    // Ends in .mjs and the inner command uses node (wrapped via run-hook.sh
+    // so the line begins with `bash <wrapper>` then `<source>` then `node ...`).
     const guardCmd = commands.find((c) => c.includes("secret-guard-pretool.mjs"))!;
-    expect(guardCmd.startsWith("node ")).toBe(true);
+    expect(guardCmd).toMatch(/run-hook\.sh/);
+    expect(guardCmd).toContain("node ");
   });
 
   it("wires secret-scrub-stop.mjs into settings.json Stop when plugin is switchroom", () => {
