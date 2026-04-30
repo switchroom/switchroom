@@ -258,28 +258,34 @@ describe('streaming e2e smoke', () => {
 
   // --- checklist-mode contract ----------------------------------------
   //
-  // In checklist mode the progress-card driver owns the mid-turn surface.
-  // The model-facing stream_reply tool must:
-  //   - reject any call with done=false (throws, surfaces to the model as
-  //     an MCP tool error so it learns in-context not to call it)
-  //   - accept done=true and post the answer as a single message
+  // In checklist mode the progress-card driver renders tool structure on
+  // lane:'progress'; the model's stream_reply / reply lands on the
+  // default lane. They coexist — the rejection that used to force
+  // single-shot final replies is gone (#481). The model-facing
+  // stream_reply tool must:
+  //   - accept done=false (streams interim text into the answer message)
+  //   - accept done=true (finalizes the answer message)
   //
-  // Internal callers (the progress-card driver) pass lane:'progress' and
-  // bypass the rejection. End-to-end shape exercised here mirrors
-  // production when SWITCHROOM_TG_STREAM_MODE=checklist (the default).
+  // Internal callers (the progress-card driver) pass lane:'progress'
+  // and land on the card stream. End-to-end shape exercised here
+  // mirrors production when SWITCHROOM_TG_STREAM_MODE=checklist
+  // (the default).
 
-  it('checklist mode: done=false (default lane) throws a clear tool error', async () => {
+  it('checklist mode: done=false (default lane) streams interim text into the answer message', async () => {
     holder.current = setup({ progressCardActive: true })
     const f = holder.current
 
-    await expect(
-      f.fireStreamReply({ chat_id: '42', text: 'looking into this…' }),
-    ).rejects.toThrow(/stream_reply\(done=false\) is not supported in checklist mode/)
+    const pending = f.fireStreamReply({ chat_id: '42', text: 'looking into this…' })
+    await microtaskFlush()
+    const r = await pending
 
-    expect(f.bot.api.sendMessage).not.toHaveBeenCalled()
-    expect(f.bot.api.editMessageText).not.toHaveBeenCalled()
-    // PTY slot is still claimed — stops a late PTY partial from leaking
-    // a raw-TUI draft after the rejection.
+    expect(r.status).toBe('updated')
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>looking into this…</b>')
+    // PTY slot is claimed because the model is now the answer-lane
+    // surface owner — late PTY partials defer to the model's stream
+    // rather than racing it. (Same suppression pattern as before;
+    // ownership reason now, not cleanup-after-rejection.)
     expect(f.suppress.has('42:_')).toBe(true)
   })
 
@@ -298,13 +304,16 @@ describe('streaming e2e smoke', () => {
     expect(f.map.has('1:_')).toBe(false)
   })
 
-  it('checklist mode: rejection does NOT block a subsequent done=true answer', async () => {
+  it('checklist mode: progressive done=false then done=true edits the same message', async () => {
     holder.current = setup({ progressCardActive: true })
     const f = holder.current
 
-    await expect(
-      f.fireStreamReply({ chat_id: '1', text: 'wrong call' }),
-    ).rejects.toThrow()
+    const p1 = f.fireStreamReply({ chat_id: '1', text: 'thinking…' })
+    await microtaskFlush()
+    await p1
+
+    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>thinking…</b>')
 
     vi.advanceTimersByTime(1000)
     await microtaskFlush()
@@ -312,8 +321,9 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
     await pdone
 
+    // First call sent the message; second call edits it (no second send).
     expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>right answer</b>')
+    expect(f.bot.api.editMessageText).toHaveBeenCalled()
   })
 
   it('checklist mode: internal lane=progress callers bypass the rejection', async () => {

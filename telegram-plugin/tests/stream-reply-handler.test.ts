@@ -777,27 +777,37 @@ describe('handleStreamReply', () => {
     expect(streamReplyCalledEvents[1].streamExisted).toBe(true)
   })
 
-  describe('progressCardActive enforcement', () => {
-    // In checklist mode the progress-card driver owns the mid-turn
-    // surface. A default-lane stream_reply(done=false) is rejected with
-    // an error so the caller (the model) learns in-context to only call
-    // stream_reply with done=true. Previously this was silently
-    // suppressed — the loud error makes the contract deterministic.
-    it('rejects default-lane done=false with a clear error when progress card is active', async () => {
+  describe('progressCardActive coexistence', () => {
+    // The progress card and the answer message live on different lanes
+    // (progress vs default) and render different content (tool structure
+    // vs model prose), so default-lane stream_reply(done=false) is
+    // accepted in checklist mode. The card is no longer treated as the
+    // sole mid-turn surface — it shows tool structure on its own lane
+    // while the model's progressive replies stream into the answer
+    // message. See #481.
+    it('accepts default-lane done=false when progress card is active (streams into answer)', async () => {
       const state: StreamReplyState = {
         ...makeState(),
         suppressPtyPreview: new Set<string>(),
       }
       const deps = makeDeps(bot, { progressCardActive: true })
 
-      await expect(
-        handleStreamReply({ chat_id: '1', text: 'working...' }, state, deps),
-      ).rejects.toThrow(/stream_reply\(done=false\) is not supported in checklist mode/)
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'working...' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      const result = await pending
 
-      expect(bot.api.sendMessage).not.toHaveBeenCalled()
-      expect(state.activeDraftStreams.size).toBe(0)
-      // PTY-preview slot still claimed so a late PTY partial doesn't
-      // leak a raw-TUI draft_send after the rejection.
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>working...</html>')
+      expect(result.status).toBe('updated')
+      // PTY-preview slot is claimed because the model is now the
+      // answer-lane surface owner — late PTY partials should defer to
+      // the model's stream rather than racing it with a parallel edit.
+      // (Same suppression pattern as before — no longer for cleanup
+      // after a rejection, but for ownership during normal streaming.)
       expect(state.suppressPtyPreview?.has('1:_')).toBe(true)
     })
 

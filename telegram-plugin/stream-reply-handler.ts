@@ -310,41 +310,19 @@ export async function handleStreamReply(
     process.stderr.write(`telegram channel: stream_reply: invoked done=true chatId=${chat_id} lane=${args.lane ?? 'default'} charCount=${rawText.length}\n`)
   }
 
-  // Access check runs BEFORE the progress-card short-circuit: a denied
-  // chat id must throw regardless of streaming mode. Previously the
-  // suppression path silently "succeeded" for unauthorized chats.
+  // Access check runs BEFORE any other branch: a denied chat id must
+  // throw regardless of streaming mode. Previously the suppression path
+  // silently "succeeded" for unauthorized chats.
   deps.assertAllowedChat(chat_id)
   const threadId = deps.resolveThreadId(chat_id, args.message_thread_id)
 
-  // In checklist mode the progress card is the mid-turn surface. A
-  // caller-initiated default-lane stream_reply(done=false) creates a
-  // second surface that either duplicates the card's narrative or
-  // races it. We reject it with a clear error so the caller learns
-  // in-context rather than through silent suppression + a missing
-  // message later. Internal callers (the progress-card driver itself)
-  // pass lane:'progress' and are allowed through.
-  const isDefaultLane = args.lane == null || args.lane.length === 0
-  if (deps.progressCardActive === true && isDefaultLane && !done) {
-    // Claim the PTY-preview slot so any PTY partial that fires after
-    // this rejected call doesn't leak a raw-TUI draft. The claim is
-    // keyed lane-less because the PTY handler uses lane-less keys.
-    state.suppressPtyPreview?.add(streamKey(chat_id, threadId))
-    deps.logStreamingEvent({
-      kind: 'stream_reply_called',
-      chatId: chat_id,
-      charCount: rawText.length,
-      done: false,
-      streamExisted: state.activeDraftStreams.has(
-        streamKey(chat_id, threadId, args.lane, args.turnKey),
-      ),
-    })
-    throw new Error(
-      'stream_reply(done=false) is not supported in checklist mode. ' +
-        'The progress card already renders mid-turn status (Plan → Run → Done ' +
-        'with live tool bullets). Call stream_reply exactly once per turn ' +
-        'with done=true and your complete final answer.',
-    )
-  }
+  // Note: caller-initiated stream_reply(done=false) used to be rejected
+  // when the progress card was active. The card and the answer message
+  // live on different lanes (progress vs default) and render different
+  // content (tool structure vs model prose), so they don't actually
+  // collide — the rejection forced single-shot final replies and broke
+  // the progressive-streaming contract documented in
+  // profiles/default/CLAUDE.md. See #481.
 
   let parseMode: 'HTML' | 'MarkdownV2' | undefined
   let effectiveText: string
