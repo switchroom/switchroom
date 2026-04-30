@@ -476,5 +476,146 @@ class AckShortCircuitTests(unittest.TestCase):
         self.assertIsNotNone(ctx)
 
 
+class JaccardOverlapUnitTests(unittest.TestCase):
+    """Switchroom #475: pure-function tests for the relevance helpers."""
+
+    def test_identical_text_is_full_overlap(self):
+        # Modulo stop-word stripping (`is`, `the`, `a`, `to` removed).
+        self.assertEqual(
+            recall.jaccard_overlap("deploy the staging server", "deploy the staging server"),
+            1.0,
+        )
+
+    def test_disjoint_text_is_zero(self):
+        self.assertEqual(
+            recall.jaccard_overlap("deploy staging server", "vegan dinner recipes"),
+            0.0,
+        )
+
+    def test_partial_overlap_is_between(self):
+        score = recall.jaccard_overlap(
+            "deploy staging server",
+            "deploy production server",
+        )
+        # {deploy, staging, server} vs {deploy, production, server}
+        # → intersection 2, union 4 → 0.5
+        self.assertAlmostEqual(score, 0.5, places=2)
+
+    def test_stopwords_dont_inflate_overlap(self):
+        # "the" / "is" / "a" present in both shouldn't count.
+        score = recall.jaccard_overlap("the cat is a pet", "the dog is a pet")
+        # Real tokens after stopword strip: {cat, pet} vs {dog, pet}
+        # → intersection 1, union 3 → 0.333…
+        self.assertAlmostEqual(score, 1 / 3, places=2)
+
+    def test_empty_text_yields_zero(self):
+        self.assertEqual(recall.jaccard_overlap("", "anything at all"), 0.0)
+        self.assertEqual(recall.jaccard_overlap("query", ""), 0.0)
+
+    def test_non_string_inputs_yield_zero(self):
+        self.assertEqual(recall.jaccard_overlap(None, "x"), 0.0)
+        self.assertEqual(recall.jaccard_overlap("x", None), 0.0)
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            recall.jaccard_overlap("DEPLOY Server", "deploy server"),
+            1.0,
+        )
+
+    def test_punctuation_stripped(self):
+        self.assertEqual(
+            recall.jaccard_overlap("deploy, server!", "deploy server"),
+            1.0,
+        )
+
+
+class OverlapFilterUnitTests(unittest.TestCase):
+    """Switchroom #475: _filter_by_overlap behaviour."""
+
+    def test_threshold_zero_passthrough(self):
+        results = [_memory("totally unrelated text")]
+        kept, dropped = recall._filter_by_overlap(results, "deploy server", 0.0)
+        self.assertEqual(kept, results)
+        self.assertEqual(dropped, 0)
+
+    def test_high_threshold_drops_weak_matches(self):
+        results = [
+            _memory("deploy server staging"),  # full overlap
+            _memory("vegan dinner recipes"),    # zero overlap
+        ]
+        kept, dropped = recall._filter_by_overlap(results, "deploy server staging", 0.5)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(kept[0]["text"], "deploy server staging")
+
+    def test_threshold_keeps_partial_match_at_or_above(self):
+        results = [_memory("deploy production server")]
+        kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.5)
+        # 2/4 = 0.5 ≥ 0.5 → kept
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 0)
+
+    def test_threshold_drops_partial_match_below(self):
+        results = [_memory("deploy production server")]
+        kept, dropped = recall._filter_by_overlap(results, "deploy staging server", 0.51)
+        self.assertEqual(len(kept), 0)
+        self.assertEqual(dropped, 1)
+
+
+class OverlapGateIntegrationTests(unittest.TestCase):
+    """Switchroom #475: gate wired through main()."""
+
+    def test_default_off_passes_everything_through(self):
+        # No recallMinOverlap in config → behaves as before.
+        client = _FakeClient(
+            directives=[],
+            memories=[
+                _memory("deploy staging server"),
+                _memory("vegan dinner recipes"),
+            ],
+        )
+        ctx, _ = _run_main_with(client, prompt="how do we deploy staging?")
+        self.assertIsNotNone(ctx)
+        self.assertIn("deploy staging server", ctx)
+        self.assertIn("vegan dinner recipes", ctx)
+
+    def test_high_threshold_drops_irrelevant_memories(self):
+        client = _FakeClient(
+            directives=[],
+            memories=[
+                _memory("deploy staging server"),
+                _memory("vegan dinner recipes"),
+            ],
+        )
+        ctx, _ = _run_main_with(
+            client,
+            prompt="how do we deploy staging server",
+            config_extra={"recallMinOverlap": 0.5},
+        )
+        # Relevant survives, junk doesn't.
+        self.assertIsNotNone(ctx)
+        self.assertIn("deploy staging server", ctx)
+        self.assertNotIn("vegan", ctx)
+
+    def test_threshold_emits_no_block_when_all_dropped(self):
+        # All memories below threshold → no <hindsight_memories> block.
+        # Telemetry still records the dropped count.
+        client = _FakeClient(
+            directives=[],
+            memories=[
+                _memory("vegan dinner recipes"),
+                _memory("totally unrelated chatter"),
+            ],
+        )
+        ctx, _ = _run_main_with(
+            client,
+            prompt="how do we deploy staging server",
+            config_extra={"recallMinOverlap": 0.5},
+        )
+        # No memories survived; with no directives either, we expect no
+        # additionalContext at all.
+        self.assertIsNone(ctx)
+
+
 if __name__ == "__main__":
     unittest.main()

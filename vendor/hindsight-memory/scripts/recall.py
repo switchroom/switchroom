@@ -196,6 +196,104 @@ def _is_demoted_memory(memory) -> bool:
     return False
 
 
+# Switchroom #475 — lexical-overlap relevance gate.
+#
+# Hindsight's HTTP API does not return similarity scores. Without a
+# score the existing `recallMaxMemories` cap acts as a *floor* on
+# low-relevance prompts: weak matches still fill the slot up to N,
+# mis-steering the model. This gate computes Jaccard overlap between
+# the user's query terms and each memory's text terms, and drops
+# memories below a configurable threshold.
+#
+# Threshold default is 0.0 (disabled) so the gate is opt-in initially.
+# Operators tune via `memory.recall.min_overlap` in switchroom.yaml or
+# `HINDSIGHT_RECALL_MIN_OVERLAP=0.15` env. Telemetry surfaces the dropped
+# count via the existing recall_log.jsonl (#432 4.3) under
+# `overlap_dropped`, so the gate's effect is observable per turn from
+# `switchroom memory recall-log <agent>`.
+#
+# A small English stop-word set is removed from both sides before the
+# overlap is computed — common-word coincidence is not a real signal.
+# Token comparison is case-insensitive and strips punctuation. The set
+# is intentionally tight; we'd rather miss a borderline drop than
+# silently throw out a real match.
+_OVERLAP_STOPWORDS = frozenset({
+    "a", "an", "and", "any", "are", "as", "at",
+    "be", "been", "being", "but", "by",
+    "can", "could", "did", "do", "does", "doing",
+    "for", "from",
+    "had", "has", "have", "having", "how",
+    "i", "if", "in", "into", "is", "it", "its",
+    "me", "my",
+    "of", "on", "one", "or",
+    "should", "so",
+    "that", "the", "their", "them", "then", "there", "these", "they",
+    "this", "to",
+    "was", "we", "were", "what", "when", "where", "which", "who",
+    "why", "will", "with", "would", "you", "your",
+})
+
+
+def _overlap_tokens(text) -> set:
+    """Tokenize text into a stop-word-stripped, lowercased set of terms.
+
+    Punctuation, digits, and short fragments (<= 1 char) are dropped.
+    Returns an empty set on non-string / empty input.
+    """
+    if not isinstance(text, str) or not text:
+        return set()
+    out = set()
+    cur = []
+    for ch in text:
+        if ch.isalpha():
+            cur.append(ch.lower())
+        else:
+            if cur:
+                tok = "".join(cur)
+                if len(tok) > 1 and tok not in _OVERLAP_STOPWORDS:
+                    out.add(tok)
+                cur = []
+    if cur:
+        tok = "".join(cur)
+        if len(tok) > 1 and tok not in _OVERLAP_STOPWORDS:
+            out.add(tok)
+    return out
+
+
+def jaccard_overlap(query: str, memory_text: str) -> float:
+    """Jaccard similarity between two texts, after stop-word + punctuation
+    stripping. Returns a float in [0.0, 1.0]. Empty/degenerate inputs
+    return 0.0 — it's safer to drop than retain when we can't compute.
+    """
+    a = _overlap_tokens(query)
+    b = _overlap_tokens(memory_text)
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _filter_by_overlap(results, query: str, threshold: float):
+    """Drop memories whose Jaccard overlap with the query is below the
+    threshold. Threshold <= 0 short-circuits to passthrough (no
+    iteration cost).
+
+    Returns (kept_results, dropped_count).
+    """
+    if threshold <= 0:
+        return results, 0
+    kept = []
+    dropped = 0
+    for m in results:
+        text = m.get("text", "") if isinstance(m, dict) else ""
+        if jaccard_overlap(query, text) >= threshold:
+            kept.append(m)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def _write_recall_log(entry: dict) -> None:
     """Append a JSONL line to recall_log.jsonl. Bounded by line count.
 
@@ -479,6 +577,25 @@ def main():
     if demoted_count > 0:
         debug_log(config, f"Filtered {demoted_count} demote-from-recall memories")
 
+    # Switchroom #475 — lexical-overlap relevance gate. Drops memories
+    # whose Jaccard overlap with the query is below
+    # `recallMinOverlap` (default 0.0 = disabled). Runs after the
+    # demote filter so the threshold sees the operator-curated set.
+    overlap_threshold = config.get("recallMinOverlap", 0.0)
+    if isinstance(overlap_threshold, (int, float)) and overlap_threshold > 0:
+        pre_overlap_count = len(results)
+        results, overlap_dropped = _filter_by_overlap(
+            results, query, float(overlap_threshold)
+        )
+        if overlap_dropped > 0:
+            debug_log(
+                config,
+                f"Overlap gate dropped {overlap_dropped}/{pre_overlap_count} "
+                f"memories below threshold {overlap_threshold}",
+            )
+    else:
+        overlap_dropped = 0
+
     # Switchroom-local: client-side count cap. Plugin v0.4.0 has no
     # `recallTopK` in the Claude Code integration (Openclaw-only), and a
     # token budget alone doesn't bound count — a single long memory can
@@ -570,6 +687,7 @@ def main():
         "result_count": len(results),
         "directive_count": len(directives),
         "demoted_count": demoted_count,
+        "overlap_dropped": overlap_dropped,
         "capped": capped,
         "pre_cap_count": pre_cap_count,
         "memory_ids": [

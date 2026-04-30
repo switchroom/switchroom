@@ -48,6 +48,15 @@ export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{else}}
 export HINDSIGHT_RECALL_CACHE_TTL_SECS=600
 {{/if}}
+# Lexical-overlap relevance gate (#475). Drops memories whose Jaccard
+# overlap with the user's query is below this threshold (range 0.0–1.0).
+# Plugin default is 0.0 (gate disabled); export only when the operator
+# overrode it via memory.recall.min_overlap in switchroom.yaml. Try
+# 0.10–0.20 to start; observe `overlap_dropped` via
+# `switchroom memory recall-log <agent>`.
+{{#if (isNumber hindsightRecallMinOverlap)}}
+export HINDSIGHT_RECALL_MIN_OVERLAP={{hindsightRecallMinOverlap}}
+{{/if}}
 # Wait for Hindsight API to be reachable before launching Claude, otherwise
 # the MCP server connection fails at startup with "1 MCP server failed".
 HINDSIGHT_WAIT=0

@@ -1160,6 +1160,7 @@ interface BuildWorkspaceContextArgs {
   hindsightApiBaseUrl: string;
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
+  hindsightRecallMinOverlap: number | undefined;
 }
 
 /**
@@ -1186,6 +1187,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallMinOverlap,
   } = args;
   return {
     name,
@@ -1218,6 +1220,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallMinOverlap,
     switchroomConfigPathQ: switchroomConfigPath
       ? shellSingleQuote(resolve(switchroomConfigPath))
       : undefined,
@@ -1438,6 +1441,10 @@ export function scaffoldAgent(
   // switchroom-managed default of 600s baked into start.sh.hbs."
   // Set to 0 in switchroom.yaml to disable caching for an agent.
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  // Lexical-overlap relevance gate (#475). Same cascade. `undefined`
+  // means "use the plugin's settings.json default of 0.0" (i.e. gate
+  // disabled, current behaviour). Set 0.10–0.20 to start filtering.
+  const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
 
   // Build the template rendering context via the shared helper so
   // scaffold and reconcile always produce the same shape for workspace
@@ -1460,6 +1467,7 @@ export function scaffoldAgent(
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallMinOverlap,
   });
 
   // --- Create directory structure ---
@@ -2538,6 +2546,7 @@ export function reconcileAgent(
     : "http://127.0.0.1:8888";
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
+  const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
   // No existsSync guard: start.sh is a pure function of config+template.
@@ -2564,6 +2573,7 @@ export function reconcileAgent(
       hindsightApiBaseUrlQ: shellSingleQuote(hindsightApiBaseUrl),
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
+      hindsightRecallMinOverlap,
       modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
@@ -3047,6 +3057,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     hindsightApiBaseUrl,
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
+    hindsightRecallMinOverlap,
   });
   // Phase 5 migration: preserve any agent-specific edits to the legacy
   // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before

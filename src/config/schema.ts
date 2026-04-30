@@ -120,6 +120,19 @@ export const AgentMemorySchema = z
             "result instead of round-tripping to Hindsight. 0 disables. " +
             "Default is 600 (10 min) for switchroom-managed agents.",
           ),
+        min_overlap: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe(
+            "Minimum Jaccard token overlap [0.0–1.0] between the user " +
+            "prompt and a memory's text for the memory to be injected. " +
+            "Drops low-relevance matches before the count cap so weak hits " +
+            "don't fill the slot on real queries. 0.0 disables (default — " +
+            "current behaviour). Try 0.10–0.20 to start; observe the " +
+            "`overlap_dropped` field via `switchroom memory recall-log`.",
+          ),
       })
       .optional()
       .describe("Auto-recall tuning knobs"),
@@ -567,6 +580,8 @@ const profileFields = {
       recall: z
         .object({
           max_memories: z.number().int().min(0).optional(),
+          cache_ttl_secs: z.number().int().min(0).optional(),
+          min_overlap: z.number().min(0).max(1).optional(),
         })
         .optional(),
     })

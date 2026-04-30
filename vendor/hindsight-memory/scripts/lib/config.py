@@ -29,6 +29,13 @@ DEFAULTS = {
     # formatting. Set to 0 (or any non-positive value) to disable the cap
     # and inject everything Hindsight returns.
     "recallMaxMemories": 12,
+    # Switchroom-local: minimum lexical (Jaccard) overlap between the
+    # user's query terms and a memory's text terms. Memories below this
+    # threshold are dropped before formatting. 0.0 disables the gate
+    # (current behaviour: inject everything Hindsight returns up to the
+    # count cap). Hindsight's HTTP API does not expose similarity
+    # scores, so this is the switchroom-side quality filter — see #475.
+    "recallMinOverlap": 0.0,
     "recallTypes": ["world", "experience"],
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
@@ -87,6 +94,10 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.recall.max_memories (cascading through
     # defaults.memory.recall.max_memories) when present in switchroom.yaml.
     "HINDSIGHT_RECALL_MAX_MEMORIES": ("recallMaxMemories", int),
+    # Switchroom-local: lexical-overlap threshold (#475). Float in
+    # [0.0, 1.0]. Set by start.sh from agents.<name>.memory.recall.min_overlap
+    # (cascading through defaults). 0.0 = off (current behaviour).
+    "HINDSIGHT_RECALL_MIN_OVERLAP": ("recallMinOverlap", float),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     "HINDSIGHT_API_PORT": ("apiPort", int),
@@ -108,6 +119,8 @@ def _cast_env(value: str, typ):
             return value.lower() in ("true", "1", "yes")
         if typ is int:
             return int(value)
+        if typ is float:
+            return float(value)
         return value
     except (ValueError, AttributeError):
         return None
