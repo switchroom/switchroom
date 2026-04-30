@@ -278,9 +278,81 @@ export async function summarize(opts: SummarizeOpts): Promise<string> {
 }
 
 /**
+ * Read the live OAuth token from disk so we can inject it into a
+ * `claude -p` subprocess. Claude Code strips `CLAUDE_CODE_OAUTH_TOKEN`
+ * from any subprocess it spawns (verified empirically — see #429),
+ * so a Stop hook that shells `claude -p` arrives with no token in
+ * env and falls through to `.credentials.json` — which is often
+ * expired or missing across the fleet.
+ *
+ * Source priority:
+ *
+ *   1. `.credentials.json.claudeAiOauth.accessToken` IF the recorded
+ *      `expiresAt` is still in the future. Claude code keeps this
+ *      file refreshed (when a refreshToken is present) so a fresh
+ *      one is always more accurate than the static install-time file.
+ *
+ *   2. `.oauth-token` — the static file start.sh wrote at install
+ *      time. Switchroom doesn't update this beyond install, but in
+ *      practice the parent agent's claude process exports its
+ *      contents into env at boot AND treats it as the current token,
+ *      so it's the value the agent is actually authenticating with
+ *      right now. If `.credentials.json` has drifted (expired,
+ *      refreshTokenless), `.oauth-token` is the source of truth.
+ *
+ *   3. `.credentials.json.claudeAiOauth.accessToken` regardless of
+ *      `expiresAt`. Last-ditch — better try than nothing if no
+ *      `.oauth-token` exists.
+ *
+ * Returns null when no candidate is available.
+ */
+function readLiveOauthToken(claudeConfigDir: string | undefined): string | null {
+  if (!claudeConfigDir) return null;
+
+  let credsTok: string | null = null;
+  let credsFresh = false;
+  try {
+    const raw = readFileSync(`${claudeConfigDir}/.credentials.json`, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      claudeAiOauth?: { accessToken?: string; expiresAt?: number };
+    };
+    const tok = parsed.claudeAiOauth?.accessToken;
+    if (typeof tok === "string" && tok.length > 0) {
+      credsTok = tok;
+      const exp = parsed.claudeAiOauth?.expiresAt;
+      credsFresh = typeof exp === "number" && exp > Date.now();
+    }
+  } catch {
+    /* fall through */
+  }
+
+  if (credsFresh && credsTok) return credsTok;
+
+  try {
+    const tok = readFileSync(`${claudeConfigDir}/.oauth-token`, "utf-8").replace(
+      /[\r\n]/g,
+      "",
+    );
+    if (tok.length > 0) return tok;
+  } catch {
+    /* fall through */
+  }
+
+  return credsTok;
+}
+
+/**
  * Spawns `claude -p <user> --append-system-prompt <system> --model
  * <model> --no-session-persistence`, collects stdout, enforces a
  * wall-clock timeout. Uses the caller's `$PATH` to locate `claude`.
+ *
+ * Injects `CLAUDE_CODE_OAUTH_TOKEN` into the spawn env from disk
+ * because Claude Code strips that var from subprocesses it spawns —
+ * which is exactly the env shape this runner runs under (parent
+ * agent claude → Stop hook → switchroom handoff → claude -p).
+ * Without injection the subprocess falls through to `.credentials.json`
+ * which is unreliable (expired, refreshTokenless, or absent across
+ * the fleet — see #429 and the boot self-test cards).
  */
 export const defaultClaudeCliRunner: ClaudeCliRunner = {
   async run({ model, system, user, timeoutMs }) {
@@ -294,9 +366,23 @@ export const defaultClaudeCliRunner: ClaudeCliRunner = {
         system,
         "--no-session-persistence",
       ];
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        FORCE_COLOR: "0",
+        NO_COLOR: "1",
+      };
+      // Inject token from disk only if not already set in env. The
+      // env-set path covers manual CLI use (operator running
+      // `switchroom handoff` from a shell where they've exported the
+      // token); the disk path covers hook context where claude code
+      // has stripped the var.
+      if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
+        const fromDisk = readLiveOauthToken(env.CLAUDE_CONFIG_DIR);
+        if (fromDisk) env.CLAUDE_CODE_OAUTH_TOKEN = fromDisk;
+      }
       const child = spawn("claude", args, {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
+        env,
       });
       let stdout = "";
       let stderr = "";
