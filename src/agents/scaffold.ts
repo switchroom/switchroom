@@ -12,7 +12,7 @@ import {
   lstatSync,
   readlinkSync,
 } from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
@@ -1010,13 +1010,22 @@ Thumbs.db
     execSync("git init --quiet", { cwd: workspaceDir, stdio: "pipe" });
     execSync("git add -A", { cwd: workspaceDir, stdio: "pipe" });
 
-    // Use switchroom's git identity if available from env, else fall back to generic
+    // Use switchroom's git identity if available from env, else fall back to generic.
+    // execFileSync (argv array) — never interpolate env vars into a shell string.
+    // GIT_AUTHOR_NAME='";rm -rf $HOME;#' as an env var would have been a real
+    // injection vector through the previous execSync template literal.
     const userEmail = process.env.GIT_AUTHOR_EMAIL || "switchroom@localhost";
     const userName = process.env.GIT_AUTHOR_NAME || "Switchroom Agent";
 
-    execSync(
-      `git -c user.email="${userEmail}" -c user.name="${userName}" commit -m "chore: seed workspace from switchroom scaffold"`,
-      { cwd: workspaceDir, stdio: "pipe" }
+    execFileSync(
+      "git",
+      [
+        "-c", `user.email=${userEmail}`,
+        "-c", `user.name=${userName}`,
+        "commit",
+        "-m", "chore: seed workspace from switchroom scaffold",
+      ],
+      { cwd: workspaceDir, stdio: "pipe" },
     );
 
     console.log(chalk.green(`  initialized workspace git repo (${agentName})`));

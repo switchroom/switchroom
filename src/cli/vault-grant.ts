@@ -203,7 +203,22 @@ export function registerVaultGrantCommands(vault: Command, program: Command): vo
         );
 
         console.log(chalk.green(`✓ Grant minted`));
-        console.log(chalk.bold("Token: ") + result.token);
+        // Token: only print when stdout is a TTY. Possession of the
+        // token = full vault scope access, so non-TTY surfaces (CI logs,
+        // tmux scrollback shared by another user, asciinema recordings,
+        // ssh -T that captures stdout, support-share screen recordings)
+        // shouldn't get a copy. The token file at the path below is the
+        // canonical ergonomic source. Operators who genuinely need the
+        // token in a script can read the file directly.
+        if (process.stdout.isTTY) {
+          console.log(chalk.bold("Token: ") + result.token);
+        } else {
+          console.log(
+            chalk.dim(
+              "Token: <hidden, read it from the token file printed below>",
+            ),
+          );
+        }
         console.log(chalk.bold("Grant ID: ") + result.id);
         console.log(
           chalk.bold("Expires: ") +
