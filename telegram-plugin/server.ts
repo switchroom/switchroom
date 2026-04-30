@@ -1372,7 +1372,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'progress_update',
       description:
-        'Send a mid-turn check-in message to the user. Use this at inflection points where a colleague would naturally want to know what\'s happening: plan formed, pivot or blocker encountered, chunk of work finished. Does NOT quote-reply, does NOT affect status reactions or progress card. Rate-limited: minimum 20s between calls per chat+thread, max 5 calls per turn. Text capped at 300 chars.',
+        "Post a one-line narrative status update. When called from a sub-agent and the parent has a pinned progress card, the text lands as that sub-agent's row body in the card (no new Telegram message). Otherwise sends a standalone message in the chat (rate-limited, ≥20s between calls, max 5/turn). Use at: start of work, on blocker/pivot, on completion. Text auto-truncated (200 chars on card, 300 chars on message).",
       inputSchema: {
         type: 'object',
         properties: {
@@ -1381,6 +1381,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           message_thread_id: {
             type: 'string',
             description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.',
+          },
+          agent_id: {
+            type: 'string',
+            description: 'Optional sub-agent JSONL stem; gateway resolves automatically when omitted.',
+          },
+          tool_use_id: {
+            type: 'string',
+            description: 'Optional parent Agent tool_use_id; gateway resolves automatically when omitted.',
           },
         },
         required: ['chat_id', 'text'],
