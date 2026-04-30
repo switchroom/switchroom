@@ -192,6 +192,7 @@ function makeHarness(opts: {
 
   // Injected timers
   const intervals: Array<{ fn: () => void; ms: number; ref: number; fireAt: number }> = []
+  const timeouts: Array<{ fn: () => void; ref: number; fireAt: number }> = []
   let nextRef = 1
 
   const watcher = startSubagentWatcher({
@@ -210,6 +211,16 @@ function makeHarness(opts: {
       const idx = intervals.findIndex((i) => i.ref === ref)
       if (idx !== -1) intervals.splice(idx, 1)
     },
+    setTimeout: (fn, ms) => {
+      const ref = nextRef++
+      timeouts.push({ fn, ref, fireAt: currentTime + ms })
+      return { ref }
+    },
+    clearTimeout: (handle) => {
+      const { ref } = handle as { ref: number }
+      const idx = timeouts.findIndex((t) => t.ref === ref)
+      if (idx !== -1) timeouts.splice(idx, 1)
+    },
     fs: mockFs,
     log: (msg: string) => { logs.push(msg) },
   })
@@ -222,6 +233,15 @@ function makeHarness(opts: {
       const next = intervals[0]
       if (!next || next.fireAt > currentTime) break
       next.fireAt += next.ms
+      next.fn()
+    }
+    // Fire any one-shot timeouts whose fireAt <= currentTime — drain
+    // the queue (oneshots, so remove on fire).
+    for (;;) {
+      timeouts.sort((a, b) => a.fireAt - b.fireAt)
+      const next = timeouts[0]
+      if (!next || next.fireAt > currentTime) break
+      timeouts.shift()
       next.fn()
     }
   }
@@ -239,6 +259,8 @@ function makeHarness(opts: {
     watcher,
     now: () => currentTime,
     mockFs,
+    fakeWatchers,
+    pendingTimeouts: () => timeouts.length,
   }
 }
 
@@ -343,9 +365,11 @@ describe('startSubagentWatcher', () => {
       notifications: string[]
       poll: () => void
       watcher: ReturnType<typeof startSubagentWatcher>
+      fireScheduledCleanups: () => number
     } {
       const notifications: string[] = []
       const intervals: Array<{ fn: () => void; ref: number }> = []
+      const timeouts: Array<{ fn: () => void; ref: number }> = []
       let nextRef = 1
       const watcher = startSubagentWatcher({
         agentDir: opts.agentDir,
@@ -363,6 +387,16 @@ describe('startSubagentWatcher', () => {
           const idx = intervals.findIndex((i) => i.ref === ref)
           if (idx !== -1) intervals.splice(idx, 1)
         },
+        setTimeout: (fn) => {
+          const ref = nextRef++
+          timeouts.push({ fn, ref })
+          return { ref }
+        },
+        clearTimeout: (handle) => {
+          const { ref } = handle as { ref: number }
+          const idx = timeouts.findIndex((t) => t.ref === ref)
+          if (idx !== -1) timeouts.splice(idx, 1)
+        },
         log: () => {},
       })
       startedWatchers.push(watcher)
@@ -370,6 +404,17 @@ describe('startSubagentWatcher', () => {
         notifications,
         poll: () => intervals[0]?.fn(),
         watcher,
+        // Drain any scheduled deferred-cleanups regardless of fireAt time
+        // (tests use this to advance past the 30s grace deterministically).
+        fireScheduledCleanups: () => {
+          let fired = 0
+          while (timeouts.length) {
+            const next = timeouts.shift()!
+            next.fn()
+            fired++
+          }
+          return fired
+        },
       }
     }
 
@@ -461,6 +506,69 @@ describe('startSubagentWatcher', () => {
 
       const completionNotifs = h.notifications.filter((n) => n.includes('Worker done'))
       expect(completionNotifs).toHaveLength(1)
+    })
+
+    it('drops the FSWatcher + Map entries after terminal-state grace fires (MEM1)', () => {
+      // Pre-MEM1 fix: per-subagent FSWatcher entries lived for the
+      // entire process lifetime. With sustained sub-agent load a
+      // long-running gateway hit ulimit -n. This test pins the deferred
+      // cleanup contract: completion → fire grace timer → tails/registry
+      // entries removed → underlying FSWatcher closed.
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-cleanme.jsonl')
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Do the task')))
+
+      const h = startWatcherSync({ agentDir })
+
+      // Discover + register the agent (running state).
+      h.poll()
+      expect(h.watcher.getRegistry().has('cleanme')).toBe(true)
+
+      // Append turn_end → done state → completion notification + scheduled cleanup.
+      appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
+      h.poll()
+      expect(h.notifications.some((n) => n.includes('Worker done'))).toBe(true)
+      // Registry still has it during the 30s grace window.
+      expect(h.watcher.getRegistry().has('cleanme')).toBe(true)
+
+      // Drain pending timeouts (simulates 30s elapsing).
+      const fired = h.fireScheduledCleanups()
+      expect(fired).toBeGreaterThan(0)
+
+      // Post-grace: registry entry gone, downstream consumers see no
+      // dangling FSWatcher.
+      expect(h.watcher.getRegistry().has('cleanme')).toBe(false)
+    })
+
+    it('cleans up historical-and-already-done agents after grace (MEM1)', () => {
+      // Historical files (pre-existing at boot, already done) used to
+      // keep their FSWatcher open forever — they bypass the
+      // maybySendStateTransition done branch because completionNotified
+      // is set to true in the registerAgent path. Cleanup must still
+      // schedule there.
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-historical.jsonl')
+      // Already-done at boot: contains turn_end already.
+      writeFileSync(jsonlPath, buildJSONL(
+        subAgentUserMsg('From a prior session'),
+        subAgentTurnDuration(),
+      ))
+
+      const h = startWatcherSync({ agentDir })
+
+      // Boot scan picks it up as historical-and-done; no completion
+      // notification fires (would be a spurious replay).
+      expect(h.notifications.filter((n) => n.includes('Worker done'))).toHaveLength(0)
+      expect(h.watcher.getRegistry().has('historical')).toBe(true)
+
+      // Cleanup is still scheduled (the FSWatcher would otherwise leak).
+      const fired = h.fireScheduledCleanups()
+      expect(fired).toBeGreaterThan(0)
+      expect(h.watcher.getRegistry().has('historical')).toBe(false)
     })
   })
 

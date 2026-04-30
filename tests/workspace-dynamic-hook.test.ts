@@ -24,6 +24,11 @@ function runHook(opts: {
   agentName?: string;
   cacheDir: string;
   shimDir: string;
+  /** Override the workspace dir the mtime fast-skip walks. Default is
+   * `~/.switchroom/agents/<agentName>/workspace`. Tests use this to
+   * point at a tmp tree so they can touch source files to invalidate
+   * the cache deterministically. */
+  agentDirOverride?: string;
 }): RunResult {
   const env: Record<string, string> = {
     ...process.env as Record<string, string>,
@@ -34,6 +39,11 @@ function runHook(opts: {
     env.SWITCHROOM_AGENT_NAME = opts.agentName;
   } else {
     delete env.SWITCHROOM_AGENT_NAME;
+  }
+  if (opts.agentDirOverride !== undefined) {
+    env.SWITCHROOM_AGENT_DIR = opts.agentDirOverride;
+  } else {
+    delete env.SWITCHROOM_AGENT_DIR;
   }
   try {
     const stdout = execFileSync("bash", [HOOK], { env, encoding: "utf-8" });
@@ -72,6 +82,13 @@ describe("workspace-dynamic-hook.sh", () => {
   let cacheDir: string;
   let shimDir: string;
 
+  // The hook date-keys cache filenames so the calendar-day rollover
+  // invalidates yesterday's cache (the renderer embeds today's daily
+  // path in the body). Compute the same UTC date the script does.
+  function todayUtc(): string {
+    return new Date().toISOString().slice(0, 10);
+  }
+
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "ws-dyn-hook-"));
     cacheDir = join(tmp, "claude");
@@ -89,7 +106,7 @@ describe("workspace-dynamic-hook.sh", () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("");
     // Critically: NO cache file. Otherwise we'd re-emit empty forever.
-    const hookCache = join(cacheDir, "switchroom-hookcache", "workspace-dynamic.hash");
+    const hookCache = join(cacheDir, "switchroom-hookcache", `workspace-dynamic.${todayUtc()}.hash`);
     expect(existsSync(hookCache)).toBe(false);
   });
 
@@ -101,8 +118,9 @@ describe("workspace-dynamic-hook.sh", () => {
     expect(r.stdout).toContain("thing one");
     expect(r.stdout).toContain("thing two");
 
-    const hashFile = join(cacheDir, "switchroom-hookcache", "workspace-dynamic.hash");
-    const bodyFile = join(cacheDir, "switchroom-hookcache", "workspace-dynamic.body");
+    const date = todayUtc();
+    const hashFile = join(cacheDir, "switchroom-hookcache", `workspace-dynamic.${date}.hash`);
+    const bodyFile = join(cacheDir, "switchroom-hookcache", `workspace-dynamic.${date}.body`);
     expect(existsSync(hashFile)).toBe(true);
     expect(existsSync(bodyFile)).toBe(true);
     expect(readFileSync(bodyFile, "utf-8")).toContain("thing one");
@@ -119,17 +137,44 @@ describe("workspace-dynamic-hook.sh", () => {
     expect(a.stdout).toContain("stable-payload-");
   });
 
-  it("re-emits and re-caches when the render output changes", () => {
+  it("re-emits and re-caches when the render output changes", async () => {
+    // The mtime-fastskip path emits the cached body when no workspace
+    // source file is newer than it. To exercise the content-changed
+    // path deterministically we use a tmp agent dir + touch a source
+    // file between runs. Without this the fast-skip would short-circuit
+    // and the second runHook would never call the new shim.
+    const fakeAgentDir = join(tmp, "agent");
+    const wsDir = join(fakeAgentDir, "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    const memPath = join(wsDir, "MEMORY.md");
+    writeFileSync(memPath, "v1");
+
     makeShim(shimDir, "first body content");
-    const a = runHook({ agentName: "klanker", cacheDir, shimDir });
+    const a = runHook({
+      agentName: "klanker",
+      cacheDir,
+      shimDir,
+      agentDirOverride: fakeAgentDir,
+    });
     expect(a.stdout).toContain("first body");
 
+    // Sleep ≥ 1s so the next stat-based mtime tick is observable
+    // (stat -c %Y returns whole seconds).
+    await new Promise((r) => setTimeout(r, 1100));
+    writeFileSync(memPath, "v2"); // bumps mtime past the body file
+
     makeShim(shimDir, "second body content");
-    const b = runHook({ agentName: "klanker", cacheDir, shimDir });
+    const b = runHook({
+      agentName: "klanker",
+      cacheDir,
+      shimDir,
+      agentDirOverride: fakeAgentDir,
+    });
     expect(b.stdout).toContain("second body");
     expect(b.stdout).not.toBe(a.stdout);
 
-    const bodyFile = join(cacheDir, "switchroom-hookcache", "workspace-dynamic.body");
+    const date = todayUtc();
+    const bodyFile = join(cacheDir, "switchroom-hookcache", `workspace-dynamic.${date}.body`);
     expect(readFileSync(bodyFile, "utf-8")).toContain("second body");
   });
 
