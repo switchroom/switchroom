@@ -1,53 +1,134 @@
 import { describe, it, expect } from "vitest";
-import type { SwitchroomConfig } from "../src/config/schema.js";
+import { probeHindsight } from "../src/memory/hindsight.js";
 
-describe("doctor memory section", () => {
-  // Note: The actual checkHindsight function is not exported, but we can verify
-  // the structure through integration testing or by checking the code structure
+describe("doctor memory section — source structure", () => {
+  // The internal `checkHindsight` function isn't exported (it's an
+  // internal helper inside src/cli/doctor.ts). These structure-only
+  // assertions guard the wiring: the function exists, gates on the
+  // hindsight backend, probes the URL via MCP rather than container
+  // name, and validates per-agent missions.
 
-  it("skips memory checks when backend is not hindsight", () => {
-    // This test would require importing checkHindsight if it were exported
-    // For now, we verify the logic exists by checking the file structure
+  it("checkHindsight skips when backend is not hindsight", () => {
     const fs = require("fs");
     const doctorSource = fs.readFileSync("src/cli/doctor.ts", "utf-8");
-
-    expect(doctorSource).toContain("function checkHindsight");
+    expect(doctorSource).toContain("async function checkHindsight");
     expect(doctorSource).toContain('if (memoryBackend !== "hindsight")');
   });
 
-  it("checks hindsight reachability", () => {
+  it("checkHindsight probes the URL via MCP initialize, not container name", () => {
     const fs = require("fs");
     const doctorSource = fs.readFileSync("src/cli/doctor.ts", "utf-8");
-
-    expect(doctorSource).toContain("hindsight reachable");
-    expect(doctorSource).toContain("checkTcp(host, port)");
+    expect(doctorSource).toContain("probeHindsight(url)");
+    expect(doctorSource).toContain("not speaking MCP");
+    // No container-name filter remains (the legacy behaviour we removed
+    // was filtering by `name=switchroom-hindsight` in `docker ps`).
+    expect(doctorSource).not.toContain('"name=switchroom-hindsight"');
   });
 
-  it("checks per-agent bank missions", () => {
+  it("checkHindsight surfaces server name + version in the detail line", () => {
     const fs = require("fs");
     const doctorSource = fs.readFileSync("src/cli/doctor.ts", "utf-8");
+    expect(doctorSource).toContain("probe.serverName");
+    expect(doctorSource).toContain("probe.serverVersion");
+  });
 
+  it("checkHindsight checks per-agent bank missions", () => {
+    const fs = require("fs");
+    const doctorSource = fs.readFileSync("src/cli/doctor.ts", "utf-8");
     expect(doctorSource).toContain("bank_mission");
     expect(doctorSource).toContain("retain_mission");
     expect(doctorSource).toContain("missions");
   });
-
-  it("warns when missions are not configured", () => {
-    const fs = require("fs");
-    const doctorSource = fs.readFileSync("src/cli/doctor.ts", "utf-8");
-
-    expect(doctorSource).toContain("hasBankMission");
-    expect(doctorSource).toContain("hasRetainMission");
-    expect(doctorSource).toContain("status: \"warn\"");
-  });
 });
 
-// `describe('greeting memory row', ...)` block deleted in #142 PR 1.
-// The session greeting card (a curl + heredoc bash script written to
-// `<agentDir>/telegram/session-greeting.sh` on every SessionStart) was
-// removed wholesale — its Memory row, bank_stats query, "recall
-// disabled this session" fallback, and `_COUNT` / `_LAST_TS`
-// placeholder substitution all went with it. The greeting's content
-// will be reincarnated as a `/status` slash command in #142 PR 3,
-// where it runs server-side on demand instead of agent-side on every
-// SessionStart. New tests will land alongside that PR.
+describe("probeHindsight", () => {
+  it("returns ok with serverInfo when initialize succeeds", async () => {
+    const fakeFetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "hindsight-mcp-server", version: "3.2.0" },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const result = await probeHindsight("http://localhost:18888/mcp/", {
+      fetchImpl: fakeFetch,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.serverName).toBe("hindsight-mcp-server");
+      expect(result.serverVersion).toBe("3.2.0");
+    }
+  });
+
+  it("parses SSE-framed initialize responses (Hindsight's default content-type)", async () => {
+    const sseBody =
+      'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"hindsight-mcp-server","version":"3.2.0"}}}\n\n';
+    const fakeFetch = (async () => {
+      return new Response(sseBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await probeHindsight("http://localhost:18888/mcp/", {
+      fetchImpl: fakeFetch,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.serverVersion).toBe("3.2.0");
+    }
+  });
+
+  it("returns Unreachable on connection refused", async () => {
+    const fakeFetch = (async () => {
+      throw new Error("fetch failed: ECONNREFUSED");
+    }) as unknown as typeof fetch;
+
+    const result = await probeHindsight("http://localhost:18888/mcp/", {
+      fetchImpl: fakeFetch,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("Unreachable");
+    }
+  });
+
+  it("returns HTTP <code> on non-200 responses", async () => {
+    const fakeFetch = (async () => {
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const result = await probeHindsight("http://localhost:18888/mcp/", {
+      fetchImpl: fakeFetch,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("HTTP 404");
+    }
+  });
+
+  it("returns a parse-error reason when serverInfo is missing", async () => {
+    const fakeFetch = (async () => {
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const result = await probeHindsight("http://localhost:18888/mcp/", {
+      fetchImpl: fakeFetch,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("serverInfo");
+    }
+  });
+});

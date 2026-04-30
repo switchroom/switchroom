@@ -21,6 +21,7 @@ import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
+import { probeHindsight } from "../memory/hindsight.js";
 
 /**
  * Result of a single doctor check.
@@ -466,7 +467,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
   }
 }
 
-function checkHindsight(config: SwitchroomConfig): CheckResult[] {
+async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> {
   const memoryBackend = config.memory?.backend;
   if (memoryBackend !== "hindsight") {
     return [];
@@ -499,16 +500,34 @@ function checkHindsight(config: SwitchroomConfig): CheckResult[] {
         status: "fail",
         detail: `${host}:${port} not responding`,
         fix:
-          "Run `switchroom memory setup` to start the Hindsight container, " +
-          "or check `docker ps --filter name=hindsight`",
+          `Confirm Hindsight is running and serving \`${url}\`. ` +
+          "Run `switchroom memory --start` to start the bundled container, " +
+          "or point `memory.config.url` at your existing Hindsight (any " +
+          "container name / remote host is fine).",
       },
     ];
+  }
+
+  // TCP reachability is necessary but not sufficient — confirm the URL
+  // is actually serving Hindsight's MCP protocol (vs. some other process
+  // happening to bind the same port). Surfaces the server version too.
+  const probe = await probeHindsight(url);
+  if (!probe.ok) {
+    results.push({
+      name: "hindsight reachable",
+      status: "fail",
+      detail: `${host}:${port} not speaking MCP (${probe.reason})`,
+      fix:
+        `Confirm \`${url}\` is a Hindsight MCP endpoint. ` +
+        "Some other service may be bound to that port.",
+    });
+    return results;
   }
 
   results.push({
     name: "hindsight reachable",
     status: "ok",
-    detail: `${host}:${port}`,
+    detail: `${probe.serverName} ${probe.serverVersion} at ${host}:${port}`,
   });
 
   // Per-agent bank health checks
@@ -1499,7 +1518,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Manifest Drift", results: await checkManifestDrift() },
           { title: "Configuration", results: checkConfig(config, configPath) },
           { title: "Vault", results: checkVault(config) },
-          { title: "Memory (Hindsight)", results: checkHindsight(config) },
+          { title: "Memory (Hindsight)", results: await checkHindsight(config) },
           { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath) },

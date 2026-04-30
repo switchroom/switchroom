@@ -109,6 +109,91 @@ async function parseSseOrJson<T>(resp: Response): Promise<T> {
 }
 
 /**
+ * Result of a Hindsight MCP probe.
+ */
+export type HindsightProbe =
+  | { ok: true; serverName: string; serverVersion: string }
+  | { ok: false; reason: string };
+
+/**
+ * Probe a Hindsight MCP endpoint by issuing an `initialize` request and
+ * reading the `serverInfo` it returns. Used by `switchroom doctor` to
+ * confirm that the URL configured in `memory.config.url` is actually
+ * serving Hindsight (vs. some other process happening to bind the same
+ * port) and to surface the server version in the doctor output.
+ *
+ * Best-effort with a short timeout; never throws. Connection refused /
+ * fetch failures normalize to `{ ok: false, reason: "Unreachable" }` so
+ * callers can render an operator-specific message; protocol errors
+ * (HTTP non-200, missing session id, malformed JSON) surface as
+ * `{ ok: false, reason: "..." }` with a concrete reason.
+ *
+ * @param apiUrl Hindsight MCP endpoint (e.g. "http://127.0.0.1:18888/mcp/")
+ * @param opts Optional fetch implementation and timeout
+ */
+export async function probeHindsight(
+  apiUrl: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number }
+): Promise<HindsightProbe> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 3000;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "switchroom-doctor", version: "0.1" },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      return { ok: false, reason: `HTTP ${resp.status}` };
+    }
+
+    const data = await parseSseOrJson<{
+      result?: { serverInfo?: { name?: string; version?: string } };
+    }>(resp);
+
+    const info = data.result?.serverInfo;
+    if (!info?.name || !info?.version) {
+      return { ok: false, reason: "Missing serverInfo in initialize response" };
+    }
+
+    return { ok: true, serverName: info.name, serverVersion: info.version };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return { ok: false, reason: "Timeout" };
+    }
+    const msg = String(err);
+    if (
+      msg.includes("ECONNREFUSED") ||
+      msg.includes("fetch failed") ||
+      msg.includes("Failed to fetch") ||
+      msg.includes("ENOTFOUND")
+    ) {
+      return { ok: false, reason: "Unreachable" };
+    }
+    return { ok: false, reason: msg };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * Ensure the user-profile Mental Model exists for a bank.
  *
  * Creates the Mental Model if it doesn't exist, idempotent on subsequent calls.
