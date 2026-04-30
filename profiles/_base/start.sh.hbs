@@ -38,6 +38,16 @@ export HINDSIGHT_AGENT_NAME="{{name}}"
 # overrode it via switchroom.yaml. 0 disables the cap entirely.
 export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
 {{/if}}
+# Per-session recall cache (#424 phase 4.1). Identical (prompt, bank)
+# within a session reuses the prior recall result instead of round-
+# tripping to Hindsight. Defaults to 600s (10 min); operators can
+# override via memory.recall.cache_ttl_secs in switchroom.yaml.
+# Setting it to 0 disables caching for that agent.
+{{#if (isNumber hindsightRecallCacheTtlSecs)}}
+export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
+{{else}}
+export HINDSIGHT_RECALL_CACHE_TTL_SECS=600
+{{/if}}
 # Wait for Hindsight API to be reachable before launching Claude, otherwise
 # the MCP server connection fails at startup with "1 MCP server failed".
 HINDSIGHT_WAIT=0

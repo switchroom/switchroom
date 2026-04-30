@@ -171,6 +171,145 @@ class TestRecallHook:
         if "body" in captured_body:
             assert "Python" in captured_body["body"].get("query", "")
 
+    def test_cache_disabled_by_default_no_state_written(self, monkeypatch, tmp_path):
+        """Without HINDSIGHT_RECALL_CACHE_TTL_SECS the recall_cache.json
+        state file should never be created — backwards-compatible default."""
+        memory = make_memory("Some fact", "world")
+        response = FakeHTTPResponse({"results": [memory]})
+        hook_input = make_hook_input(prompt="A meaningful prompt that stays put")
+        _run_hook("recall", hook_input, monkeypatch, tmp_path,
+                  urlopen_side_effect=lambda *a, **kw: response)
+
+        cache_path = tmp_path / "plugin_data" / "state" / "recall_cache.json"
+        assert not cache_path.exists()
+
+    def test_cache_hit_skips_http_call(self, monkeypatch, tmp_path):
+        """Two identical recall calls with TTL>0 should hit HTTP exactly once."""
+        memory = make_memory("Paris is the capital of France", "world")
+        response = FakeHTTPResponse({"results": [memory]})
+
+        call_count = {"n": 0}
+
+        def counting_urlopen(*a, **kw):
+            call_count["n"] += 1
+            return FakeHTTPResponse({"results": [memory]})
+
+        hook_input = make_hook_input(prompt="What is the capital of France?")
+
+        # First call — must hit HTTP
+        out1 = _run_hook(
+            "recall", hook_input, monkeypatch, tmp_path,
+            urlopen_side_effect=counting_urlopen,
+            extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"},
+        )
+        first_http = call_count["n"]
+        assert first_http >= 1
+        assert "Paris is the capital of France" in out1
+
+        # Second call — same prompt, same session → cache hit, no extra HTTP
+        out2 = _run_hook(
+            "recall", hook_input, monkeypatch, tmp_path,
+            urlopen_side_effect=counting_urlopen,
+            extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"},
+        )
+        assert call_count["n"] == first_http  # unchanged
+        # Cached output is byte-equivalent context
+        data1 = json.loads(out1)
+        data2 = json.loads(out2)
+        assert data1["hookSpecificOutput"]["additionalContext"] == \
+            data2["hookSpecificOutput"]["additionalContext"]
+
+    def test_cache_miss_on_different_prompt(self, monkeypatch, tmp_path):
+        memory = make_memory("Some fact", "world")
+        call_count = {"n": 0}
+
+        def counting_urlopen(*a, **kw):
+            call_count["n"] += 1
+            return FakeHTTPResponse({"results": [memory]})
+
+        hook_a = make_hook_input(prompt="Question one about France?")
+        hook_b = make_hook_input(prompt="Question two about Spain?")
+
+        _run_hook("recall", hook_a, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        before_b = call_count["n"]
+        _run_hook("recall", hook_b, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        # Different prompts → both must hit HTTP independently
+        assert call_count["n"] > before_b
+
+    def test_cache_miss_on_session_change(self, monkeypatch, tmp_path):
+        """Same prompt but different session_id must MISS the cache —
+        sessions are isolated to prevent cross-contamination."""
+        memory = make_memory("Some fact", "world")
+        call_count = {"n": 0}
+
+        def counting_urlopen(*a, **kw):
+            call_count["n"] += 1
+            return FakeHTTPResponse({"results": [memory]})
+
+        hook_session_a = make_hook_input(prompt="The same prompt", session_id="session-a")
+        hook_session_b = make_hook_input(prompt="The same prompt", session_id="session-b")
+
+        _run_hook("recall", hook_session_a, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        first = call_count["n"]
+        _run_hook("recall", hook_session_b, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        assert call_count["n"] > first
+
+    def test_cache_miss_after_ttl_expiry(self, monkeypatch, tmp_path):
+        """An entry older than TTL should NOT serve a cache hit. We
+        backdate the cache file's saved_at to simulate TTL elapse."""
+        memory = make_memory("Some fact", "world")
+        call_count = {"n": 0}
+
+        def counting_urlopen(*a, **kw):
+            call_count["n"] += 1
+            return FakeHTTPResponse({"results": [memory]})
+
+        hook_input = make_hook_input(prompt="Same exact prompt twice")
+
+        # Populate cache with TTL=60.
+        _run_hook("recall", hook_input, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        first = call_count["n"]
+
+        # Backdate every entry's saved_at to an hour ago.
+        cache_path = tmp_path / "plugin_data" / "state" / "recall_cache.json"
+        assert cache_path.exists()
+        state = json.loads(cache_path.read_text())
+        long_ago = time.time() - 3600
+        for k, entry in (state.get("entries") or {}).items():
+            entry["saved_at"] = long_ago
+        cache_path.write_text(json.dumps(state))
+
+        # Re-run with the same TTL — should MISS because of expiry.
+        _run_hook("recall", hook_input, monkeypatch, tmp_path,
+                  urlopen_side_effect=counting_urlopen,
+                  extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": "60"})
+        assert call_count["n"] > first
+
+    def test_cache_invalid_env_disables_caching(self, monkeypatch, tmp_path):
+        """Garbage TTL env vars are treated as 'disabled' — no cache file."""
+        memory = make_memory("Some fact", "world")
+        response = FakeHTTPResponse({"results": [memory]})
+        hook_input = make_hook_input(prompt="A normal prompt")
+
+        for bad in ("not-a-number", "-5", "0", " "):
+            _run_hook(
+                "recall", hook_input, monkeypatch, tmp_path,
+                urlopen_side_effect=lambda *a, **kw: response,
+                extra_env={"HINDSIGHT_RECALL_CACHE_TTL_SECS": bad},
+            )
+            cache_path = tmp_path / "plugin_data" / "state" / "recall_cache.json"
+            assert not cache_path.exists(), f"Cache should not be written for TTL={bad!r}"
+
     def test_disabled_auto_recall_produces_no_output(self, monkeypatch, tmp_path):
         (tmp_path / "plugin_root").mkdir(exist_ok=True)
         (tmp_path / "plugin_data").mkdir(exist_ok=True)

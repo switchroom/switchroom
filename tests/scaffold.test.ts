@@ -1267,6 +1267,54 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=0");
   });
 
+  it("start.sh exports HINDSIGHT_RECALL_CACHE_TTL_SECS=600 by default for hindsight agents", () => {
+    // Per-session recall cache (#424 phase 4.1) — the switchroom-managed
+    // default is 10 minutes. Operators can override or disable via
+    // memory.recall.cache_ttl_secs.
+    const agentConfig = makeAgentConfig();
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS=600");
+  });
+
+  it("start.sh respects an operator override of memory.recall.cache_ttl_secs", () => {
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { cache_ttl_secs: 300 } },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS=300");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS=600");
+  });
+
+  it("start.sh exports HINDSIGHT_RECALL_CACHE_TTL_SECS=0 to disable caching for an agent", () => {
+    // 0 is a meaningful sentinel ("disabled") — recall.py treats it as off.
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { cache_ttl_secs: 0 } },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS=0");
+  });
+
   it("returns no changes when settings already match", () => {
     const agentConfig = makeAgentConfig();
     const config = buildSwitchroomConfig(agentConfig);
