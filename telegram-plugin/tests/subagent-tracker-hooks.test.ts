@@ -128,7 +128,14 @@ describe('subagent-tracker-pretool', () => {
 
 describe('subagent-tracker-posttool', () => {
   it('updates the row to completed with result_summary after pretool + posttool', () => {
-    // First run the pretool to create the row
+    // First run the pretool to create the row.
+    //
+    // Foreground (run_in_background: false) is intentional here:
+    // PostToolUse fires on actual completion for foreground agents, so
+    // it owns the status transition. For background agents, PostToolUse
+    // fires on the launch ACK and the watcher (driven by JSONL
+    // turn_end) is the authoritative end signal — see the
+    // background-only assertion further below.
     const preEvent = {
       session_id: 'sess-xyz789',
       tool_name: 'Agent',
@@ -136,7 +143,7 @@ describe('subagent-tracker-posttool', () => {
       tool_input: {
         subagent_type: 'researcher',
         description: 'Research the topic',
-        run_in_background: true,
+        run_in_background: false,
       },
     }
     const preResult = runHook(PRETOOL_SCRIPT, preEvent)
