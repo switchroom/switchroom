@@ -324,12 +324,18 @@ async function rpc(
       resolve(val);
     };
 
+    // Build the socket and wire listeners BEFORE initiating connect().
+    // Bun (1.3.x) can emit `error` synchronously from inside connect()
+    // when the socket path doesn't exist, so net.createConnection (which
+    // calls connect immediately) races against the next-line `.on('error')`
+    // attachment under bun. Splitting into `new Socket()` + `.connect()`
+    // guarantees listeners are attached first under both runtimes.
+    const client = new net.Socket();
+
     const timer = setTimeout(() => {
       client.destroy();
       settle({ kind: "unreachable", msg: `broker did not respond within ${timeoutMs}ms` });
     }, timeoutMs);
-
-    const client = net.createConnection({ path: socketPath });
 
     client.on("error", (err: NodeJS.ErrnoException) => {
       clearTimeout(timer);
@@ -374,6 +380,8 @@ async function rpc(
         });
       }
     });
+
+    client.connect({ path: socketPath });
   });
 }
 

@@ -8,6 +8,10 @@ dist/
 # Agent runtime data (generated, not committed)
 /agents/
 
+# Test-generated sibling profiles (cleanup in afterEach normally handles
+# these; this catches the case where vitest is killed mid-run).
+/profiles/__test_*/
+
 # Vault
 *.enc
 
