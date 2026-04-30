@@ -1,36 +1,31 @@
 #!/usr/bin/env bash
-# boot-self-test.sh — pre-flight an agent's auth state at boot. Phase
-# 0.3 of #424. Records issues via `switchroom issues` so a Telegram
-# user sees the moment something breaks, instead of silently watching
-# their handoff hook fail for weeks.
+# boot-self-test.sh — pre-flight an agent's auth state at boot and
+# record findings to the issue sink. Phase 0.3 of #424, refactored
+# in #429 1.3 to delegate diagnosis to `switchroom auth heal --json`
+# so the boot self-test and the heal CLI speak with one voice.
 #
 # Invoked by start.sh after env is set up, before `claude` launches.
 # Best-effort throughout: every check that can fail does so cleanly,
-# and the script always exits 0 — boot must not be blocked by visibility
-# tooling.
+# and the script always exits 0 — boot must not be blocked by
+# visibility tooling.
 #
-# What it checks (each maps to a stable fingerprint):
+# Why delegate to heal:
+# Previously this script ran a bare `claude -p hello` with the env
+# stripped to detect "would a hook subprocess work." That produced
+# `cli_unauthenticated:critical` for any agent whose `.credentials.json`
+# was unreliable — including agents whose .oauth-token still works
+# fine for the only consumer that actually shells `claude -p` (the
+# handoff hook, which routes around the env strip via Phase 1.2's
+# disk injection in defaultClaudeCliRunner). Result: false-positive
+# critical issue cards on Telegram.
 #
-#   auth.credentials_missing  — `.credentials.json` is absent. claude
-#     code can't shell `claude -p` without it (or without a live
-#     CLAUDE_CODE_OAUTH_TOKEN env, which child processes don't get —
-#     see #424). Hooks that spawn `claude -p` will fail.
-#
-#   auth.token_expired         — `.credentials.json` parses but the
-#     accessToken's expiresAt has passed.
-#
-#   auth.refresh_token_missing — refreshToken is empty or absent.
-#     Without it, claude can't self-refresh; the agent will work today
-#     but break later. Severity warn (not error) since immediate boot
-#     still works.
-#
-#   auth.cli_unauthenticated   — `claude -p hello` actually fails
-#     with the env stripped (which is what hook context looks like).
-#     This is the empirical, definitive check: if it passes, hooks
-#     can shell out. If it fails, they can't.
-#
-# On every check passing: resolve all four fingerprints. So the issue
-# card auto-clears once the user fixes the underlying problem.
+# heal's diagnoser inspects `.credentials.json` + `.oauth-token`
+# structurally and severity-ranks per the actual operational risk:
+# expired access token = error (will break), no refreshToken = warn
+# (works today, breaks later), creds-missing-but-oauth-token-present
+# = warn (handoff works via fallback). That matches what users care
+# about. cli_unauthenticated as a separate empirical check is
+# dropped — heal's structural view is sufficient and more accurate.
 
 set -u
 
@@ -53,11 +48,17 @@ else
   exit 0
 fi
 
-CREDS="$CLAUDE_CONFIG_DIR_LOCAL/.credentials.json"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "boot-self-test: jq not found; cannot parse heal output, skipping" >&2
+  exit 0
+fi
 
-# Fingerprints we may toggle. Listed up-front so the resolve-all path
-# at the bottom doesn't drift if we add new checks.
-ALL_CODES=(credentials_missing token_expired refresh_token_missing cli_unauthenticated)
+# All fingerprints we may toggle. If a code is NOT in heal's findings
+# this run, we resolve it (so the issue card auto-clears once the
+# user fixes the underlying problem). cli_unauthenticated is listed
+# so its prior occurrences (from older boot-self-test versions) get
+# resolved on the next boot under the new logic.
+ALL_CODES=(credentials_missing token_expired refresh_token_missing credentials_malformed cli_unauthenticated)
 
 record() {
   # record <code> <severity> <summary> [<detail>]
@@ -90,67 +91,51 @@ resolve_one() {
     >/dev/null 2>&1 || true
 }
 
-# ─── Check 1: .credentials.json present ──────────────────────────────────────
-if [ ! -f "$CREDS" ]; then
-  record credentials_missing error \
-    "$AGENT_NAME has no .credentials.json — claude -p from hooks will fail" \
-    "Path: $CREDS\nFix: run \`switchroom auth heal $AGENT_NAME\`."
-  # Skip subsequent token-shape checks; nothing to inspect.
-  CREDS_PRESENT=0
-else
-  resolve_one credentials_missing
-  CREDS_PRESENT=1
+# Run heal --json. It has its own opinionated severity ranking and
+# matches the codes we use in the issue sink; we trust its findings
+# one-for-one. heal exits 0 for ok/warn and 2 for error/critical;
+# either way the JSON is on stdout.
+DIAG_JSON=$("$SWITCHROOM_CLI" auth heal "$AGENT_NAME" --json --config-dir "$CLAUDE_CONFIG_DIR_LOCAL" 2>/dev/null || true)
+
+if [ -z "$DIAG_JSON" ]; then
+  # heal failed to run. Don't pretend success — record an info-level
+  # entry so this is visible without escalating severity.
+  record auth_diagnosis_failed warn \
+    "$AGENT_NAME boot self-test: \`switchroom auth heal\` produced no output" \
+    "The auth heal command failed to run or returned no JSON. Boot continues."
+  exit 0
 fi
 
-# ─── Check 2: token not expired (only if creds present) ──────────────────────
-if [ "$CREDS_PRESENT" -eq 1 ]; then
-  # jq is preferred. If unavailable, skip these structural checks.
-  if command -v jq >/dev/null 2>&1; then
-    EXPIRES_AT=$(jq -r '.claudeAiOauth.expiresAt // empty' "$CREDS" 2>/dev/null)
-    REFRESH_TOKEN=$(jq -r '.claudeAiOauth.refreshToken // empty' "$CREDS" 2>/dev/null)
-    NOW_MS=$(($(date +%s) * 1000))
-    if [ -n "$EXPIRES_AT" ] && [ "$EXPIRES_AT" -lt "$NOW_MS" ] 2>/dev/null; then
-      DAYS=$(( (NOW_MS - EXPIRES_AT) / 86400000 ))
-      record token_expired error \
-        "$AGENT_NAME .credentials.json access token expired ${DAYS}d ago" \
-        "expiresAt: $EXPIRES_AT (unix ms)\nnow:        $NOW_MS\ndelta_days: $DAYS"
-    else
-      resolve_one token_expired
-    fi
+# Resolve cli_unauthenticated unconditionally — it's no longer
+# produced by this script, and any leftover entries from older
+# versions should clean up on the next reconcile + restart.
+resolve_one cli_unauthenticated
 
-    if [ -z "$REFRESH_TOKEN" ]; then
-      record refresh_token_missing warn \
-        "$AGENT_NAME .credentials.json has no refreshToken; claude can't self-refresh" \
-        "Without a refreshToken, the access token will eventually expire and \`claude -p\` from hooks will start failing. Run \`switchroom auth heal $AGENT_NAME\`."
-    else
-      resolve_one refresh_token_missing
-    fi
-  fi
-fi
+# Walk findings; record each present, resolve each absent code.
+PRESENT_CODES=$(printf '%s' "$DIAG_JSON" | jq -r '.findings[]?.code' 2>/dev/null)
 
-# ─── Check 3: claude -p actually works in hook-shaped env ────────────────────
-# Strip CLAUDE_CODE_OAUTH_TOKEN so this matches the env hooks see.
-# Wall-clock cap so a network hang can't block boot.
-if command -v claude >/dev/null 2>&1; then
-  CLI_OUT=$(env -u CLAUDE_CODE_OAUTH_TOKEN \
-    timeout 12 claude -p "ping" \
-      --model claude-haiku-4-5-20251001 \
-      --no-session-persistence </dev/null 2>&1)
-  CLI_STATUS=$?
-  if [ "$CLI_STATUS" -eq 124 ]; then
-    # Treat timeout as warn — slow network, not a clear-cut auth break.
-    record cli_unauthenticated warn \
-      "$AGENT_NAME boot self-test: \`claude -p\` timed out after 12s" \
-      "Network conditions or claude code subprocess startup; not necessarily an auth failure. Retry next boot."
-  elif [ "$CLI_STATUS" -ne 0 ]; then
-    # Tail the output to keep the issue detail readable.
-    DETAIL=$(printf '%s' "$CLI_OUT" | tail -n 20)
-    record cli_unauthenticated critical \
-      "$AGENT_NAME boot self-test: \`claude -p\` exited $CLI_STATUS — hooks that shell claude will fail" \
-      "$DETAIL"
+for code in "${ALL_CODES[@]}"; do
+  [ "$code" = "cli_unauthenticated" ] && continue # already resolved above
+  if printf '%s\n' "$PRESENT_CODES" | grep -qx "$code"; then
+    severity=$(printf '%s' "$DIAG_JSON" | jq -r --arg c "$code" '.findings[] | select(.code == $c) | .severity' | head -1)
+    summary=$(printf '%s' "$DIAG_JSON" | jq -r --arg c "$code" '.findings[] | select(.code == $c) | .summary' | head -1)
+    # Build a detail block: include heal's recommendation so the
+    # issue card detail is directly actionable.
+    recommendation=$(printf '%s' "$DIAG_JSON" | jq -r '.recommendation[]?' 2>/dev/null)
+    detail="Run \`switchroom auth heal $AGENT_NAME\` for full diagnosis."
+    if [ -n "$recommendation" ]; then
+      detail="$detail
+$recommendation"
+    fi
+    record "$code" "$severity" "$AGENT_NAME $summary" "$detail"
   else
-    resolve_one cli_unauthenticated
+    resolve_one "$code"
   fi
-fi
+done
+
+# Resolve any leftover legacy code if it wasn't in ALL_CODES — keeps
+# the script robust against drift between boot-self-test and the
+# diagnoser over future versions.
+resolve_one auth_diagnosis_failed
 
 exit 0
