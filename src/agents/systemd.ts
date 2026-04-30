@@ -484,8 +484,21 @@ export function installAllUnits(config: SwitchroomConfig): void {
     }
   }
 
+  // Install the bridge-watchdog .service + .timer alongside the agent
+  // units (issue #406). Generating these from the CLI guarantees the
+  // service file pins Environment=PATH so the script can locate the
+  // `switchroom` CLI under ~/.bun/bin and route restarts through the
+  // reconcile-bearing CLI verb instead of the raw-systemctl fallback.
+  installWatchdogUnits();
+
   daemonReload();
   enableUnits(installedAgents);
+  // Enable the watchdog .timer separately — enableUnits appends ".service"
+  // to every name, which would mangle a .timer. Only enable the timer when
+  // at least one agent unit was installed (nothing to watchdog otherwise).
+  if (Object.keys(config.agents).length > 0) {
+    enableWatchdogTimer();
+  }
   ensureLinger();
 
   // Auto-start the broker if it was just installed (issue #129). Agent and
@@ -514,6 +527,66 @@ function enableUnits(unitNames: string[]): void {
     execFileSync("systemctl", ["--user", "enable", ...services], { stdio: "pipe" });
   } catch {
     // non-fatal — units are installed but won't auto-start on boot
+  }
+}
+
+/**
+ * Enable and start the bridge-watchdog timer.
+ *
+ * Separated from `enableUnits` because that helper unconditionally appends
+ * ".service" to every name — passing `switchroom-watchdog` through it would
+ * try to enable a non-existent `switchroom-watchdog.service` (sans .timer)
+ * and skip the timer entirely.
+ *
+ * Idempotent: `systemctl enable --now` on an already-enabled-and-running
+ * timer is a no-op, so this is safe to call on every reconcile pass.
+ * Best-effort error handling matches `enableUnits` — install succeeded;
+ * a failed enable is recoverable by the operator.
+ */
+function enableWatchdogTimer(): void {
+  try {
+    execFileSync(
+      "systemctl",
+      ["--user", "enable", "--now", `${WATCHDOG_TIMER_NAME}.timer`],
+      { stdio: "pipe" },
+    );
+  } catch {
+    // non-fatal — timer is installed but won't fire until manually enabled
+  }
+}
+
+/**
+ * Stop, disable, and remove the bridge-watchdog .service + .timer units.
+ *
+ * Counterpart to `installWatchdogUnits` — called from
+ * `switchroom systemd uninstall` so removing the agent fleet doesn't leave
+ * an orphan watchdog timer firing every 60s against agents that no longer
+ * exist. Idempotent: each step swallows "already gone / not running"
+ * errors so it's safe to call when the units were never installed.
+ */
+export function uninstallWatchdogUnits(): void {
+  // Stop the timer first so it can't re-fire the .service mid-uninstall.
+  try {
+    execFileSync(
+      "systemctl",
+      ["--user", "stop", `${WATCHDOG_TIMER_NAME}.timer`],
+      { stdio: "pipe" },
+    );
+  } catch { /* may not be running */ }
+  try {
+    execFileSync(
+      "systemctl",
+      ["--user", "disable", `${WATCHDOG_TIMER_NAME}.timer`],
+      { stdio: "pipe" },
+    );
+  } catch { /* may not be enabled */ }
+
+  for (const path of [watchdogTimerFilePath(), watchdogServiceFilePath()]) {
+    if (existsSync(path)) {
+      try {
+        unlinkSync(path);
+      } catch { /* file already gone — daemon-reload will sync systemd's view */ }
+    }
   }
 }
 
@@ -750,6 +823,120 @@ Environment=HOME=${homeDir}
 [Install]
 WantedBy=default.target
 `;
+}
+
+// ─── Bridge watchdog units ─────────────────────────────────────────────────
+//
+// The bridge watchdog (`bin/bridge-watchdog.sh`) runs on a periodic systemd
+// user timer. It restarts agents whose Telegram bridge has disconnected or
+// whose journal output has been silent for too long (issue #116).
+//
+// Issue #406: previously this unit was hand-installed by operators, which
+// meant it shipped without `Environment=PATH=...`. user-systemd's default
+// PATH (`/usr/local/bin:/usr/bin:/bin`) doesn't include `~/.bun/bin`, so
+// `command -v switchroom` failed inside the unit and the script's "rare"
+// fallback to raw `systemctl --user restart` ran on every fire — silently
+// skipping the reconcile pass that the project contract requires for every
+// lifecycle transition. Generating the unit from the CLI lets us pin
+// `Environment=PATH=<bunBinDir>:<nodeBinDir>:/usr/local/bin:/usr/bin:/bin`
+// exactly the way the agent/gateway/foreman/broker units already do.
+
+const WATCHDOG_SERVICE_NAME = "switchroom-watchdog";
+const WATCHDOG_TIMER_NAME = "switchroom-watchdog";
+// Default cadence: every 60s with a small randomized delay. Matches what
+// hand-installed deployments use today; cheap enough that more frequent
+// firing isn't worth the wakeups.
+const WATCHDOG_TIMER_INTERVAL_SEC = 60;
+const WATCHDOG_TIMER_RANDOM_DELAY_SEC = 5;
+
+function watchdogServiceFilePath(): string {
+  return resolve(SYSTEMD_USER_DIR, `${WATCHDOG_SERVICE_NAME}.service`);
+}
+
+function watchdogTimerFilePath(): string {
+  return resolve(SYSTEMD_USER_DIR, `${WATCHDOG_TIMER_NAME}.timer`);
+}
+
+/**
+ * Generate the bridge-watchdog .service unit.
+ *
+ * Type=oneshot: the watchdog is a single sweep that exits when done. The
+ * .timer unit re-fires it on a cadence.
+ *
+ * Environment=PATH is pinned (issue #406) so the script can locate the
+ * `switchroom` CLI installed by `bun install -g`. Without it, the script's
+ * `command -v switchroom` check fails and the fallback systemctl-restart
+ * path bypasses reconcile.
+ */
+export function generateWatchdogServiceUnit(): string {
+  const homeDir = process.env.HOME ?? "/root";
+  const bunBin = resolve(homeDir, ".bun/bin/bun");
+  const bunBinDir = dirname(bunBin);
+  const nodeBinDir = dirname(process.execPath);
+  const localBinDir = resolve(homeDir, ".local/bin");
+  const scriptPath = resolve(import.meta.dirname, "../../bin/bridge-watchdog.sh");
+  // PATH order mirrors generateGatewayUnit/generateForemanUnit: package
+  // manager bin first, then node-bundled bin, then local user bin, then
+  // standard system bins.
+  const unitPath = `${bunBinDir}:${nodeBinDir}:${localBinDir}:/usr/local/bin:/usr/bin:/bin`;
+
+  return `[Unit]
+Description=switchroom bridge watchdog
+Documentation=https://github.com/switchroom/switchroom
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${scriptPath}
+StandardOutput=journal
+StandardError=journal
+# PATH is pinned here so the watchdog script can locate the \`switchroom\`
+# CLI (installed under ~/.bun/bin by \`bun install -g\`). Without this,
+# \`command -v switchroom\` fails inside the user-systemd environment and
+# the script's fallback systemctl-restart path bypasses reconcile — the
+# project contract is that all agent lifecycle transitions go through
+# the CLI so config reconciliation always runs (issue #406).
+Environment=PATH=${unitPath}
+`;
+}
+
+/**
+ * Generate the bridge-watchdog .timer unit. Re-fires the .service every
+ * WATCHDOG_TIMER_INTERVAL_SEC seconds.
+ *
+ * OnUnitActiveSec re-arms relative to the last completion (not the last
+ * start) — the right semantics for a sweep that may take longer than the
+ * cadence under load. RandomizedDelaySec spreads load across the cadence
+ * so timers don't all fire at the same wall clock instant on a host that
+ * runs multiple switchroom timers.
+ */
+export function generateWatchdogTimerUnit(): string {
+  return `[Unit]
+Description=switchroom bridge watchdog timer
+Documentation=https://github.com/switchroom/switchroom
+
+[Timer]
+OnBootSec=${WATCHDOG_TIMER_INTERVAL_SEC}
+OnUnitActiveSec=${WATCHDOG_TIMER_INTERVAL_SEC}
+RandomizedDelaySec=${WATCHDOG_TIMER_RANDOM_DELAY_SEC}
+AccuracySec=1s
+Unit=${WATCHDOG_SERVICE_NAME}.service
+
+[Install]
+WantedBy=timers.target
+`;
+}
+
+/**
+ * Write the bridge-watchdog .service and .timer to the systemd user dir.
+ * Idempotent: safe to call from `installAllUnits` on every reconcile.
+ *
+ * Does NOT call `daemonReload` or `enableUnits` — those are batched in
+ * `installAllUnits` so a single reconcile incurs one daemon-reload.
+ */
+export function installWatchdogUnits(): void {
+  mkdirSync(SYSTEMD_USER_DIR, { recursive: true });
+  writeFileSync(watchdogServiceFilePath(), generateWatchdogServiceUnit(), { mode: 0o644 });
+  writeFileSync(watchdogTimerFilePath(), generateWatchdogTimerUnit(), { mode: 0o644 });
 }
 
 /**

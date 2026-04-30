@@ -3,6 +3,7 @@ import chalk from "chalk";
 import {
   installAllUnits,
   uninstallUnit,
+  uninstallWatchdogUnits,
   daemonReload,
 } from "../agents/systemd.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
@@ -107,6 +108,21 @@ export function registerSystemdCommand(program: Command): void {
               )
             );
           }
+        }
+
+        // Symmetric with installAllUnits → installWatchdogUnits (issue #406):
+        // remove the bridge-watchdog .service + .timer too, otherwise the
+        // timer keeps firing every 60s against agents that no longer exist.
+        try {
+          uninstallWatchdogUnits();
+          console.log(chalk.green(`  - switchroom-watchdog.service`));
+          console.log(chalk.green(`  - switchroom-watchdog.timer`));
+        } catch (err) {
+          console.error(
+            chalk.red(
+              `  Failed to remove watchdog units: ${(err as Error).message}`
+            )
+          );
         }
 
         try {

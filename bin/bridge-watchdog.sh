@@ -400,10 +400,27 @@ for agent_svc in "${agent_services[@]}"; do
 
   # Use `switchroom agent restart` (not raw systemctl) — the project
   # contract is that all agent lifecycle transitions go through the CLI
-  # so config reconciliation always runs. The CLI is on PATH when the
-  # watchdog is invoked via its systemd timer unit.
-  if command -v switchroom >/dev/null 2>&1; then
-    switchroom agent restart "$agent" || {
+  # so config reconciliation always runs.
+  #
+  # Belt-and-suspenders CLI resolution (issue #406): the systemd .service
+  # unit pins Environment=PATH=~/.bun/bin:..., but if a hand-installed
+  # legacy unit is still on disk the PATH may be empty. Probe the two
+  # known install locations directly before falling back to PATH lookup,
+  # so a silent PATH gap can't silently downgrade us to the systemctl
+  # fallback (which bypasses reconcile).
+  switchroom_cli=""
+  for candidate in "${HOME}/.bun/bin/switchroom" "${HOME}/.local/bin/switchroom"; do
+    if [[ -x "$candidate" ]]; then
+      switchroom_cli="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$switchroom_cli" ]] && command -v switchroom >/dev/null 2>&1; then
+    switchroom_cli="$(command -v switchroom)"
+  fi
+
+  if [[ -n "$switchroom_cli" ]]; then
+    "$switchroom_cli" agent restart "$agent" || {
       logger -t switchroom-watchdog "agent ${agent}: switchroom agent restart failed; falling back to systemctl"
       systemctl --user restart "$agent_svc" || true
     }
