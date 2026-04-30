@@ -1314,7 +1314,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stream_reply',
       description:
-        'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. By default the streamed message quote-replies to the latest inbound user message in this chat+thread — pass quote:false to opt out, or reply_to to target a specific message. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
+        '**Use to keep the turn alive while you work.** Pass `done=false` for interim updates (the plugin throttles edits to ~1/sec automatically) and `done=true` only when the response is final. Prefer this over `reply` whenever the response involves Agent / Bash / Task tool calls, multi-step tool chains, or any work that has not completed yet — `reply` is terminal and ends the turn. Pattern: First call `stream_reply(chat_id, "Reading the file...", done=false)` immediately on receipt of the user message; interim calls pass the FULL current text with `done=false`; final call passes the complete answer with `done=true`. By default quote-replies to the latest inbound user message in this chat+thread — pass quote:false to opt out, or reply_to to target a specific message. Hard-stops at 4096 chars — longer text throws; fall back to `reply` for chunking. The progress card runs alongside in parallel for ambient phase signal, but stream_reply is what carries narrative content.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1322,7 +1322,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string', description: 'Full text snapshot. NOT a delta — pass the complete current content each call.' },
           done: {
             type: 'boolean',
-            description: 'Must be true. Posts this text as the final answer for the turn and locks the message.',
+            description: 'False for interim updates while work is in flight; true for the final message that locks the turn. Pass false until you have the complete answer.',
           },
           message_thread_id: {
             type: 'string',
