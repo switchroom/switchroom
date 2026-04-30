@@ -18,6 +18,17 @@
       "keywords": ["switchroom", "agents", "telegram", "orchestration", "skills"],
       "category": "agents",
       "tags": ["switchroom", "multi-agent", "telegram", "ops"]
+    },
+    {
+      "name": "switchroom-telegram",
+      "source": "./telegram-plugin",
+      "description": "Switchroom's enhanced Telegram channel — HTML formatting, smart message chunking, message coalescing, attachment helpers, progress card with sub-agent visibility, vault-grant wizard, and slash-command admin surface (/restart, /usage, /auth, /vault, /issues).",
+      "homepage": "https://github.com/mekenthompson/switchroom",
+      "repository": "https://github.com/mekenthompson/switchroom",
+      "license": "MIT",
+      "keywords": ["telegram", "switchroom", "channel", "progress-card", "vault"],
+      "category": "messaging",
+      "tags": ["telegram", "channel", "switchroom", "multi-agent"]
     }
   ]
 }
