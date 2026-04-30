@@ -301,6 +301,17 @@ $APPEND_PROMPT"
 fi
 {{/unless}}
 
+# --- Boot self-test (#427) ---
+# Pre-flights .credentials.json + claude-p auth in a hook-shaped env so
+# any auth break shows up on the Telegram issues card (#428) the day
+# it starts, not three weeks later. Async + best-effort: never blocks
+# boot and never fails it.
+{{#if repoRoot}}
+if [ -x "{{repoRoot}}/bin/boot-self-test.sh" ]; then
+  ( "{{repoRoot}}/bin/boot-self-test.sh" >/dev/null 2>&1 ) &
+fi
+{{/if}}
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
   exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}

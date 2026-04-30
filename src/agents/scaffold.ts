@@ -1148,6 +1148,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
   return {
     name,
     agentDir,
+    repoRoot: REPO_ROOT,
     topicId,
     topicName: agentConfig.topic_name,
     topicEmoji: agentConfig.topic_emoji,
@@ -2451,6 +2452,7 @@ export function reconcileAgent(
     const startShContext: Record<string, unknown> = {
       name,
       agentDir,
+      repoRoot: REPO_ROOT,
       botToken: resolvedBotToken ?? rawBotToken,
       forumChatId: telegramConfig.forum_chat_id,
       dangerousMode: agentConfig.dangerous_mode === true,
