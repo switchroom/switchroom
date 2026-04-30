@@ -35,24 +35,19 @@ Hindsight is a memory bank with semantic search, knowledge graph, entity resolut
 ### Day-to-day tools
 - `mcp__hindsight__recall` — semantic-search the bank for relevant past memories. Auto-fires on every inbound user message via the plugin's UserPromptSubmit hook (you'll see "Relevant memories from past conversations" in your context). Call manually when you need a more specific query than the auto-fired one.
 - `mcp__hindsight__retain` — store a new memory. The plugin automatically retains the conversation transcript every ~10 turns via the Stop hook, so you usually don't need this. Call manually for significant decisions, corrections, or facts you want immediately searchable.
-- `mcp__hindsight__list_memories` — browse what's stored.
 - `mcp__hindsight__reflect` — Hindsight's LLM-powered "answer this query using the bank's content + directives". Use when the user asks a question that requires synthesis across multiple past memories.
 
 ### Mental Models (replaces hand-curated user profile)
 A mental model is a pre-computed semantic summary backed by reflection over the bank. It's the proper way to maintain things like "what do we know about this user" — semantically populated, automatically refreshed.
 
-- `mcp__hindsight__create_mental_model(name, source_query)` — create one
-- `mcp__hindsight__list_mental_models` / `get_mental_model` / `update_mental_model` / `refresh_mental_model`
-
-When the user shares a fact about themselves (preferences, background, goals), don't write a file — instead, retain the fact and (if no User Profile mental model exists yet) create one with `source_query: "what do we know about this user?"`. Hindsight will populate it from the retained memories.
+- `mcp__hindsight__create_mental_model(name, source_query)` — create one. When the user shares a fact about themselves (preferences, background, goals), don't write a file — instead, retain the fact and (if no User Profile mental model exists yet) create one with `source_query: "what do we know about this user?"`. Hindsight will populate it from the retained memories.
 
 ### Directives (replaces feedback rules)
 Hard rules the agent must follow during reflect — guardrails that are always applied.
 
-- `mcp__hindsight__create_directive(text)` — e.g., `create_directive("Always prefer TypeScript over JavaScript for this user's projects")`
-- `mcp__hindsight__list_directives` / `delete_directive`
+- `mcp__hindsight__create_directive(text)` — e.g., `create_directive("Always prefer TypeScript over JavaScript for this user's projects")`. When the user gives you a correction or "always do X" rule, create a directive instead of writing a feedback `.md` file.
 
-When the user gives you a correction or "always do X" rule, create a directive instead of writing a feedback `.md` file.
+(Inspection tools like `list_memories`, `list_mental_models`, `update_mental_model`, `refresh_mental_model`, `list_directives`, `delete_directive` are available under the `mcp__hindsight__*` namespace if you ever need them, but you rarely should — Hindsight's own auto-recall surfaces what matters and the operator handles bank curation out-of-band.)
 
 ### What to retain — and what NOT to retain
 
