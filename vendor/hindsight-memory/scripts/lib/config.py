@@ -13,6 +13,13 @@ DEFAULTS = {
     "autoRecall": True,
     "recallBudget": "mid",
     "recallMaxTokens": 1024,
+    # Switchroom-local: cap on the number of memories injected into the
+    # `<hindsight_memories>` block, regardless of token budget. Plugin v0.4.0
+    # exposes `recallTopK` only in the Openclaw integration, not the
+    # Claude Code integration, so we slice client-side in recall.py before
+    # formatting. Set to 0 (or any non-positive value) to disable the cap
+    # and inject everything Hindsight returns.
+    "recallMaxMemories": 12,
     "recallTypes": ["world", "experience"],
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
@@ -67,6 +74,10 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
     "HINDSIGHT_RECALL_BUDGET": ("recallBudget", str),
     "HINDSIGHT_RECALL_MAX_TOKENS": ("recallMaxTokens", int),
+    # Switchroom-local: count cap. Set by start.sh from
+    # agents.<name>.memory.recall.max_memories (cascading through
+    # defaults.memory.recall.max_memories) when present in switchroom.yaml.
+    "HINDSIGHT_RECALL_MAX_MEMORIES": ("recallMaxMemories", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     "HINDSIGHT_API_PORT": ("apiPort", int),

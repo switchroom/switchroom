@@ -32,6 +32,12 @@ export HINDSIGHT_BANK_ID={{{hindsightBankIdQ}}}
 export HINDSIGHT_AUTO_RECALL=true
 export HINDSIGHT_AUTO_RETAIN=true
 export HINDSIGHT_AGENT_NAME="{{name}}"
+{{#if (isNumber hindsightRecallMaxMemories)}}
+# Cap on memories injected per turn (memory.recall.max_memories cascade).
+# Plugin's settings.json default is 12; export only when the operator
+# overrode it via switchroom.yaml. 0 disables the cap entirely.
+export HINDSIGHT_RECALL_MAX_MEMORIES={{hindsightRecallMaxMemories}}
+{{/if}}
 # Wait for Hindsight API to be reachable before launching Claude, otherwise
 # the MCP server connection fails at startup with "1 MCP server failed".
 HINDSIGHT_WAIT=0

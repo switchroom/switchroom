@@ -1221,6 +1221,52 @@ describe("reconcileAgent", () => {
     expect(startSh).not.toContain("HINDSIGHT_WAIT");
   });
 
+  it("start.sh omits HINDSIGHT_RECALL_MAX_MEMORIES when no override is set (plugin default applies)", () => {
+    const agentConfig = makeAgentConfig();
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).not.toContain("HINDSIGHT_RECALL_MAX_MEMORIES");
+  });
+
+  it("start.sh exports HINDSIGHT_RECALL_MAX_MEMORIES when agent overrides the cap", () => {
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { max_memories: 5 } },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=5");
+  });
+
+  it("start.sh exports HINDSIGHT_RECALL_MAX_MEMORIES=0 when operator explicitly disables the cap", () => {
+    // 0 is a meaningful sentinel ("uncapped"), not the same as unset.
+    // The template uses an isNumber helper specifically so 0 still
+    // emits the export (vs being treated as falsy by plain {{#if}}).
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { max_memories: 0 } },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=0");
+  });
+
   it("returns no changes when settings already match", () => {
     const agentConfig = makeAgentConfig();
     const config = buildSwitchroomConfig(agentConfig);

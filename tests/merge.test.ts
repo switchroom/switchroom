@@ -216,6 +216,29 @@ describe("mergeAgentConfig", () => {
     });
   });
 
+  it("cascades memory.recall.max_memories from defaults when agent omits it", () => {
+    const defaults: AgentDefaults = {
+      memory: { recall: { max_memories: 8 } },
+    };
+    const agent = baseAgent({
+      memory: { collection: "coach" },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.recall?.max_memories).toBe(8);
+    expect(result.memory?.collection).toBe("coach");
+  });
+
+  it("agent memory.recall.max_memories overrides defaults", () => {
+    const defaults: AgentDefaults = {
+      memory: { recall: { max_memories: 8 } },
+    };
+    const agent = baseAgent({
+      memory: { recall: { max_memories: 3 } },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.recall?.max_memories).toBe(3);
+  });
+
   it("prepends defaults.schedule to agent.schedule", () => {
     const defaults: AgentDefaults = {
       schedule: [{ cron: "0 8 * * *", prompt: "Morning check-in" }],

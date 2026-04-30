@@ -58,6 +58,32 @@ The scaffold wires the following MCP servers automatically:
 - **playwright** — Microsoft's `@playwright/mcp` browser automation server, launched via `npx -y @playwright/mcp@<pinned-version> --snapshot`. Always wired by default; opt out with `mcp_servers: { playwright: false }`. Runs in accessibility-tree (snapshot) mode, which is token-cheap and reliable for most web automation tasks. Exposes `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, and related tools directly to the agent without requiring a local Playwright installation. The version is pinned in `src/memory/scaffold-integration.ts` — bump deliberately when validating against a newer release.
 - **hindsight** — semantic memory bank, wired only when `memory.backend` is `hindsight`. Agents using a different memory backend (or none) don't get this server.
 
+### Tuning auto-recall — `memory.recall.max_memories`
+
+Hindsight's auto-recall hook injects relevant memories into every inbound prompt. Without a cap, a busy bank can return 16–22 memories per turn (forensic on real fleets), bloating the prompt and risking irrelevant memories steering the response.
+
+```yaml
+defaults:
+  memory:
+    recall:
+      max_memories: 12   # workspace default (also the plugin default)
+
+agents:
+  coach:
+    memory:
+      recall:
+        max_memories: 8  # tighter for a chatty agent
+
+  research:
+    memory:
+      recall:
+        max_memories: 0  # 0 = uncapped; let the token budget alone bound the block
+```
+
+The cap applies to the *combined* result list across the primary bank and any `recallAdditionalBanks`, not per-bank. Lower values reduce noise; very low values (≤3) can starve the agent of useful long-term context. The plugin's own default is `12`; omit the field to inherit it. Setting `0` (or any non-positive value) disables the cap entirely.
+
+Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
+
 Any server from `defaults.mcp_servers` also flows to all agents via the normal cascade.
 
 To suppress the built-in `playwright` server for a specific agent:

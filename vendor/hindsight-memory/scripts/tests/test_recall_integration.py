@@ -62,10 +62,15 @@ class _FakeClient:
         return {"results": list(self._memories)}
 
 
-def _run_main_with(client, prompt="What is the meaning of life?"):
+def _run_main_with(client, prompt="What is the meaning of life?", config_extra=None):
     """Invoke recall.main with a fake client and capture stdout JSON.
 
     Returns (additional_context_string_or_None, raw_stdout).
+
+    `config_extra` is merged on top of the baseline config so individual
+    tests can override knobs like `recallMaxMemories` or
+    `recallAdditionalBanks` without growing the helper signature for
+    every new field.
     """
     hook_input = {
         "prompt": prompt,
@@ -82,6 +87,8 @@ def _run_main_with(client, prompt="What is the meaning of life?"):
         "recallMaxQueryChars": 800,
         "recallPromptPreamble": "",
     }
+    if config_extra:
+        config.update(config_extra)
 
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -173,6 +180,87 @@ class RecallIntegrationTests(unittest.TestCase):
         )
         ctx, _ = _run_main_with(client)
         self.assertIn("</active_directives>\n\n<hindsight_memories>", ctx)
+
+
+class RecallMaxMemoriesCapTests(unittest.TestCase):
+    """Tests for the switchroom-local recallMaxMemories count cap.
+
+    The cap is applied client-side after the (primary + additional banks)
+    results are concatenated and BEFORE formatting, so it bounds the
+    final injected memory count regardless of token budget. <= 0
+    disables the cap.
+    """
+
+    def test_cap_truncates_over_limit(self):
+        memories = [_memory(f"memory {i}") for i in range(8)]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client, config_extra={"recallMaxMemories": 3})
+        self.assertIsNotNone(ctx)
+        self.assertIn("memory 0", ctx)
+        self.assertIn("memory 2", ctx)
+        # memory 3 and beyond must be trimmed.
+        self.assertNotIn("memory 3", ctx)
+        self.assertNotIn("memory 7", ctx)
+
+    def test_cap_zero_disables_truncation(self):
+        memories = [_memory(f"memory {i}") for i in range(20)]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client, config_extra={"recallMaxMemories": 0})
+        self.assertIsNotNone(ctx)
+        # All 20 should make it through.
+        for i in range(20):
+            self.assertIn(f"memory {i}", ctx)
+
+    def test_cap_below_count_no_op(self):
+        # Cap=12 but only 5 memories returned → no slicing.
+        memories = [_memory(f"memory {i}") for i in range(5)]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client, config_extra={"recallMaxMemories": 12})
+        self.assertIsNotNone(ctx)
+        for i in range(5):
+            self.assertIn(f"memory {i}", ctx)
+
+    def test_cap_applies_after_additional_banks_concat(self):
+        # Primary bank returns 4 memories; additional bank returns 4
+        # more. Cap of 5 must apply to the total (slicing keeps primary
+        # 0..3 + first 1 from additional). This locks in the rule:
+        # "cap is total, not per-bank."
+        primary = [_memory(f"primary-{i}") for i in range(4)]
+
+        # Build a client whose `recall` returns different sets per bank.
+        class _MultiBankClient(_FakeClient):
+            def recall(self, bank_id, **kwargs):
+                if bank_id == "test-bank":
+                    return {"results": list(primary)}
+                if bank_id == "shared-bank":
+                    return {"results": [_memory(f"shared-{i}") for i in range(4)]}
+                return {"results": []}
+
+        client = _MultiBankClient(directives=[], memories=[])
+        ctx, _ = _run_main_with(
+            client,
+            config_extra={
+                "recallMaxMemories": 5,
+                "recallAdditionalBanks": ["shared-bank"],
+            },
+        )
+        self.assertIsNotNone(ctx)
+        # Primary 0..3 + the first shared (shared-0) survive the cap.
+        for i in range(4):
+            self.assertIn(f"primary-{i}", ctx)
+        self.assertIn("shared-0", ctx)
+        # shared-1..3 are sliced off.
+        self.assertNotIn("shared-1", ctx)
+        self.assertNotIn("shared-3", ctx)
+
+    def test_cap_negative_disables(self):
+        # Defensive: negative values are treated the same as 0 (uncapped).
+        memories = [_memory(f"memory {i}") for i in range(15)]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client, config_extra={"recallMaxMemories": -1})
+        self.assertIsNotNone(ctx)
+        for i in range(15):
+            self.assertIn(f"memory {i}", ctx)
 
 
 if __name__ == "__main__":

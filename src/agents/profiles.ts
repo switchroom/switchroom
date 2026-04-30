@@ -157,6 +157,15 @@ Handlebars.registerHelper("json", (value: unknown) => {
   return new Handlebars.SafeString(JSON.stringify(value, null, 2));
 });
 
+// Register an "isNumber" helper. Plain `{{#if value}}` treats 0 as
+// falsy, but several config knobs (like memory.recall.max_memories)
+// use 0 as a meaningful "disable cap" sentinel — rendering must
+// distinguish "operator set 0" from "operator left it unset". This
+// helper returns true for any finite number, including 0.
+Handlebars.registerHelper("isNumber", (value: unknown) => {
+  return typeof value === "number" && Number.isFinite(value);
+});
+
 // Register shared profile fragments as Handlebars partials so any profile
 // template can use {{> fragment-name}} instead of copy-pasting the content.
 // The _shared/ directory is underscore-prefixed (like _base/) and is not

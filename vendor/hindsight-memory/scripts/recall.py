@@ -192,6 +192,25 @@ def main():
         except Exception as e:
             debug_log(config, f"Recall from additional bank '{extra_bank_id}' failed: {e}")
 
+    # Switchroom-local: client-side count cap. Plugin v0.4.0 has no
+    # `recallTopK` in the Claude Code integration (Openclaw-only), and a
+    # token budget alone doesn't bound count — a single long memory can
+    # blow past intended caps, while many short ones can flood the prompt.
+    # Slice the combined results from primary + additional banks before
+    # formatting. <= 0 disables the cap.
+    recall_max_memories = config.get("recallMaxMemories", 0)
+    if (
+        isinstance(recall_max_memories, int)
+        and recall_max_memories > 0
+        and len(results) > recall_max_memories
+    ):
+        debug_log(
+            config,
+            f"Capping {len(results)} memories to {recall_max_memories} "
+            f"(set HINDSIGHT_RECALL_MAX_MEMORIES=0 to disable)",
+        )
+        results = results[:recall_max_memories]
+
     memories_block = None
     if results:
         debug_log(config, f"Injecting {len(results)} memories")

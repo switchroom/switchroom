@@ -97,6 +97,21 @@ export const AgentMemorySchema = z
       .string()
       .optional()
       .describe("Instructions for the fact extraction LLM during retain"),
+    recall: z
+      .object({
+        max_memories: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Cap on the number of memories injected into the prompt by " +
+            "auto-recall, regardless of token budget. Plugin default is 12. " +
+            "0 disables the cap (all memories Hindsight returns are injected).",
+          ),
+      })
+      .optional()
+      .describe("Auto-recall tuning knobs"),
   })
   .optional();
 
@@ -538,6 +553,11 @@ const profileFields = {
       collection: z.string().optional(),
       auto_recall: z.boolean().optional(),
       isolation: z.enum(["default", "strict"]).optional(),
+      recall: z
+        .object({
+          max_memories: z.number().int().min(0).optional(),
+        })
+        .optional(),
     })
     .optional(),
   schedule: z.array(ScheduleEntrySchema).optional(),
