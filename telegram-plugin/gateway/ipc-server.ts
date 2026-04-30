@@ -98,8 +98,16 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
   const m = msg as Record<string, unknown>;
   switch (m.type) {
     case "register":
+      // Reject the literal "default" — that's the legacy fallback used
+      // by anonymous bridges (see #430). A correctly-configured bridge
+      // sets SWITCHROOM_AGENT_NAME to the real agent name; a bridge
+      // sending "default" is either an older binary or a stray
+      // claude-code session and would crosstalk into another agent's
+      // chat. Server-side rejection is defence in depth — the bridge
+      // refuses to register without a name first.
       return typeof m.agentName === "string"
         && m.agentName.length > 0
+        && m.agentName !== "default"
         && m.agentName.length <= 128
         && (m.topicId === undefined
           || (typeof m.topicId === "number"
@@ -228,6 +236,27 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
   }
 
   function handleRegister(client: IpcClientImpl, msg: RegisterMessage) {
+    // Defence in depth for #430. The bridge refuses to register
+    // without SWITCHROOM_AGENT_NAME (set in start.sh per agent), but
+    // an older bridge or a third-party caller could still send the
+    // string "default" — which crosstalks into whichever agent's
+    // gateway happens to accept the connection. Reject server-side
+    // so the gateway never confuses an anonymous client for the
+    // agent it was launched to serve. The expected switchroom
+    // contract is exactly one agent name per gateway socket; any
+    // mismatch is an outright bug, not a transient.
+    if (msg.agentName === "default") {
+      log(
+        `rejecting register: agentName="default" — anonymous bridges are not allowed (close+drop client=${client.id})`,
+      );
+      try {
+        client.close();
+      } catch {
+        /* nothing to do */
+      }
+      return;
+    }
+
     if (client.agentName) agentIndex.delete(client.agentName);
     if (client.topicId != null) topicIndex.delete(client.topicId);
 
