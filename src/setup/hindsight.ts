@@ -8,6 +8,25 @@ export const HINDSIGHT_DEFAULT_API_PORT = 8888;
 export const HINDSIGHT_DEFAULT_UI_PORT = 9999;
 
 /**
+ * Default cap on observations per consolidation scope.
+ *
+ * Upstream Hindsight defaults this to "unbounded" — observation entries
+ * accumulate forever inside a bank. For a 24/7 conversational agent
+ * (switchroom's primary use case) that means experience entries grow
+ * indefinitely; vectorize-io/hindsight#1284 is the open upstream
+ * tracking issue. Setting `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE` on
+ * the container caps the count and lets older observations be
+ * consolidated/aged out.
+ *
+ * 1000 is a reasonable starting cap for a personal assistant pattern:
+ * comfortably above any single user's likely-relevant memory window,
+ * comfortably below the point where consolidation costs balloon. Tunable
+ * by setting `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE` directly on the
+ * `docker run` invocation if you want to override.
+ */
+export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
+
+/**
  * Check if a TCP port is free for binding on 127.0.0.1.
  * Returns true if free, false if something is already listening.
  */
@@ -139,7 +158,12 @@ export function startHindsight(
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
-  const envArgs: string[] = [];
+  const envArgs: string[] = [
+    // Cap unbounded observation growth (vectorize-io/hindsight#1284).
+    // Always set on switchroom-managed containers so 24/7 agent banks
+    // don't accumulate indefinitely.
+    "-e", `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
+  ];
   if (provider) envArgs.push("-e", `HINDSIGHT_API_LLM_PROVIDER=${provider}`);
   if (apiKey) envArgs.push("-e", `HINDSIGHT_API_LLM_API_KEY=${apiKey}`);
   const args = [
@@ -202,9 +226,11 @@ export function getHindsightMcpUrl(): {
  * Generate a docker-compose snippet for Hindsight.
  */
 export function generateHindsightComposeSnippet(provider?: string): string {
-  const envLines = provider
-    ? [`      - LLM_PROVIDER=${provider}`]
-    : [];
+  const envLines = [
+    // Always-on cap — see startHindsight() for context.
+    `      - HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=${HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE}`,
+  ];
+  if (provider) envLines.push(`      - LLM_PROVIDER=${provider}`);
 
   return [
     "services:",
@@ -214,9 +240,8 @@ export function generateHindsightComposeSnippet(provider?: string): string {
     "    ports:",
     "      - \"8888:8888\"",
     "      - \"9999:9999\"",
-    ...(envLines.length > 0
-      ? ["    environment:", ...envLines]
-      : []),
+    "    environment:",
+    ...envLines,
     "    volumes:",
     "      - switchroom-hindsight-data:/home/hindsight/.pg0",
     "    restart: unless-stopped",

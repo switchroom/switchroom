@@ -245,4 +245,17 @@ describe("generateHindsightComposeSnippet", () => {
     expect(snippet).toContain("LLM_PROVIDER=openai");
     expect(snippet).toContain("environment:");
   });
+
+  it("always sets HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE (caps unbounded growth)", () => {
+    // Mitigation for vectorize-io/hindsight#1284. Must be present even
+    // when no LLM provider is configured (e.g. operator using an
+    // external Hindsight server but still wanting the cap on a self-
+    // managed container they generate the compose snippet for).
+    const noProvider = generateHindsightComposeSnippet();
+    expect(noProvider).toContain("HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000");
+    expect(noProvider).toContain("environment:");
+
+    const withProvider = generateHindsightComposeSnippet("openai");
+    expect(withProvider).toContain("HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000");
+  });
 });

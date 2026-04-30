@@ -84,6 +84,14 @@ The cap applies to the *combined* result list across the primary bank and any `r
 
 Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
 
+### Server-side caps on the Hindsight container
+
+`switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. This caps how many observation entries Hindsight will hold per consolidation scope (per bank, per memory type) — without it, a 24/7 agent's bank grows unboundedly (vectorize-io/hindsight#1284 is the upstream tracking issue). The same default is baked into the `--compose` snippet output.
+
+You don't need to do anything to opt in. Override by stopping the bundled container and re-running `docker run` with a different `-e HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=N` value, or by editing the generated docker-compose snippet before applying it.
+
+If you run your own Hindsight container outside `switchroom memory --start` (e.g. you point `memory.config.url` at an external server), switchroom doesn't manage that container's env — set the cap on your own image.
+
 Any server from `defaults.mcp_servers` also flows to all agents via the normal cascade.
 
 To suppress the built-in `playwright` server for a specific agent:
