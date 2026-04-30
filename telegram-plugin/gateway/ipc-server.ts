@@ -10,6 +10,7 @@ import type {
   SessionEventForward,
   ToolCallMessage,
   ToolCallResult,
+  UpdatePlaceholderMessage,
 } from "./ipc-protocol.js";
 
 export interface IpcServerOptions {
@@ -22,6 +23,7 @@ export interface IpcServerOptions {
   onHeartbeat: (client: IpcClient, msg: HeartbeatMessage) => void;
   onScheduleRestart: (client: IpcClient, msg: ScheduleRestartMessage) => void;
   onOperatorEvent?: (client: IpcClient, msg: OperatorEventForward) => void;
+  onUpdatePlaceholder?: (client: IpcClient, msg: UpdatePlaceholderMessage) => void;
   log?: (msg: string) => void;
   /**
    * How long (in ms) to wait without a heartbeat before force-closing the
@@ -137,6 +139,18 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof m.detail === "string"
         && (m.detail as string).length <= OPERATOR_EVENT_DETAIL_MAX
         && typeof m.chatId === "string";
+    case "update_placeholder":
+      // chatId: non-empty string, restricted to safe characters so a
+      // rogue process can't inject arbitrary payloads via the chat id
+      // (Telegram chat ids are numeric, possibly leading minus).
+      // text: non-empty, capped — the gateway slices to 200 chars
+      // again on its side, but reject anything obviously oversized
+      // here to keep the buffer + log bounded.
+      return typeof m.chatId === "string"
+        && /^-?\d{1,32}$/.test(m.chatId as string)
+        && typeof m.text === "string"
+        && (m.text as string).length > 0
+        && (m.text as string).length <= 500;
     default:
       return false;
   }
@@ -153,6 +167,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onHeartbeat,
     onScheduleRestart,
     onOperatorEvent,
+    onUpdatePlaceholder,
     log = () => {},
     heartbeatTimeoutMs = 30_000,
   } = options;
@@ -229,6 +244,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "operator_event":
         if (onOperatorEvent) onOperatorEvent(client, msg as OperatorEventForward);
+        break;
+      case "update_placeholder":
+        if (onUpdatePlaceholder) onUpdatePlaceholder(client, msg as UpdatePlaceholderMessage);
         break;
       default:
         log(`unknown IPC message type from client ${client.id}: ${(msg as any).type}`);

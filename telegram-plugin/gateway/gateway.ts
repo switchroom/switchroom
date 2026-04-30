@@ -157,6 +157,7 @@ import type {
   HeartbeatMessage,
   ScheduleRestartMessage,
   OperatorEventForward,
+  UpdatePlaceholderMessage,
   InboundMessage,
 } from './ipc-protocol.js'
 import { writePidFile, clearPidFile } from './pid-file.js'
@@ -1581,6 +1582,32 @@ const ipcServer: IpcServer = createIpcServer({
       detail: msg.detail,
       suggestedActions: [],
       firstSeenAt: new Date(),
+    })
+  },
+
+  onUpdatePlaceholder(_client: IpcClient, msg: UpdatePlaceholderMessage) {
+    // Edit the pre-allocated draft for this DM to show a more specific
+    // status during the wait between inbound and the agent's first
+    // tool call. Sent by hooks (e.g. recall.py) so the user sees
+    // `📚 recalling…` and `💭 thinking…` instead of the static
+    // `🔵 thinking…` placeholder for the entire model TTFT.
+    //
+    // Best-effort, silent on three legitimate misses:
+    //   1. No pre-alloc draft (forum topic, sendMessageDraft API absent,
+    //      pre-alloc API call still in flight).
+    //   2. Telegram API rejects the edit (rate limit, invalid text).
+    //   3. The draft was already consumed by stream_reply.
+    if (sendMessageDraftFn == null) return
+    const preAllocated = preAllocatedDrafts.get(msg.chatId)
+    if (preAllocated == null) return
+    const text = String(msg.text ?? '').slice(0, 200)  // sanity cap
+    if (text.length === 0) return
+    void sendMessageDraftFn(msg.chatId, preAllocated.draftId, text).catch((err) => {
+      process.stderr.write(
+        `telegram gateway: update_placeholder edit failed chatId=${msg.chatId}: ${
+          err instanceof Error ? err.message : String(err)
+        }\n`,
+      )
     })
   },
 
@@ -3621,6 +3648,11 @@ async function handleInbound(
     // of allocating a new one, so the user sees a placeholder draft within
     // ~1 s. Only fires for fresh DM turns; if the agent finishes the turn
     // without calling stream_reply, turn_end clears the orphan.
+    //
+    // Placeholder content is meaningful ('🔵 thinking…') rather than '…'
+    // so the user sees a real "I'm working" signal, not three dots that
+    // could read as "still loading the message." Hooks can refine this
+    // mid-turn via the `update_placeholder` IPC message.
     if (
       sendMessageDraftFn != null
       && isDmChatId(chat_id)
@@ -3630,7 +3662,7 @@ async function handleInbound(
       const draftId = allocateDraftId()
       // Best-effort, non-blocking: any failure (transport down, API not
       // available) falls through to today's behavior.
-      void sendMessageDraftFn(chat_id, draftId, '…')
+      void sendMessageDraftFn(chat_id, draftId, '🔵 thinking…')
         .then(() => {
           preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
         })

@@ -41,6 +41,7 @@ from lib.content import (
 )
 from lib.daemon import get_api_url
 from lib.directives import fetch_active_directives, format_active_directives_block
+from lib.gateway_ipc import extract_chat_id_from_prompt, update_placeholder
 from lib.state import read_state, write_state
 
 LAST_RECALL_STATE = "last_recall.json"
@@ -297,6 +298,16 @@ def main():
 
     session_id = hook_input.get("session_id") or ""
 
+    # Switchroom #303 — push a "📚 recalling…" status to the user's
+    # pre-allocated Telegram draft so the gap between inbound and the
+    # model's first content token isn't 25 s of dead air. Best-effort
+    # and silent on every failure path; the gateway no-ops the IPC
+    # message when there's no draft for this chat (forum topic, fresh
+    # session before pre-alloc lands, etc.).
+    placeholder_chat_id = extract_chat_id_from_prompt(prompt)
+    if placeholder_chat_id:
+        update_placeholder(placeholder_chat_id, "📚 recalling memories…")
+
     # Resolve API URL (handles all three connection modes)
     def _dbg(*a):
         debug_log(config, *a)
@@ -473,6 +484,12 @@ def main():
         )
     else:
         debug_log(config, "No memories found")
+
+    # Switchroom #303 — recall is done, model is about to start the long
+    # TTFT. Update the placeholder so the user doesn't keep staring at
+    # `📚 recalling…` for the next 15–20 s of opus thinking.
+    if placeholder_chat_id:
+        update_placeholder(placeholder_chat_id, "💭 thinking…")
 
     # If neither block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput.
