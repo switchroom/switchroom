@@ -27,6 +27,7 @@ import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
+import { allocateDraftId } from '../draft-transport.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
@@ -678,6 +679,17 @@ const suppressPtyPreview = new Set<string>()
 const lastPtyPreviewByChat = new Map<string, string>()
 const progressUpdateLastSent = new Map<string, number>()
 const progressUpdateTurnCount = new Map<string, number>()
+
+// Issue #416 — pre-allocated stream_reply draft id, populated on inbound DM
+// receipt so the user sees a placeholder draft within ~1 s. Consumed by the
+// agent's first stream_reply call (which uses this draftId instead of
+// allocating a fresh one). Cleared on turn_end if the agent never called
+// stream_reply. DM-only: keyed by chatId since DMs don't have threads.
+interface PreAllocatedDraft {
+  draftId: number
+  allocatedAt: number
+}
+const preAllocatedDrafts = new Map<string, PreAllocatedDraft>()
 
 let currentSessionChatId: string | null = null
 let currentTurnStartedAt = 0
