@@ -213,6 +213,11 @@ import {
   saveCreditState,
 } from '../credits-watch.js'
 import {
+  writeTurnActiveMarker,
+  touchTurnActiveMarker,
+  removeTurnActiveMarker,
+} from './turn-active-marker.js'
+import {
   VERSION,
   COMMIT_SHA,
   COMMIT_DATE,
@@ -2510,6 +2515,17 @@ function handleSessionEvent(ev: SessionEvent): void {
               process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
             }
           })
+          // #412: turn-active marker for the bridge-watchdog. File exists
+          // for the duration of the in-flight turn; mtime advances on
+          // every tool_use; deleted on turn_complete. The watchdog
+          // distinguishes wedged-mid-turn from healthy-idle by checking
+          // for this file's presence + mtime staleness.
+          writeTurnActiveMarker(STATE_DIR, {
+            turnKey,
+            chatId: String(ev.chatId),
+            threadId: ev.threadId != null ? String(ev.threadId) : null,
+            startedAt: currentTurnStartedAt,
+          })
         }
         // Issue #195: capture transport selection + time-to-ack baseline
         // up-front so the per-turn answer-stream config is determined before
@@ -2535,6 +2551,11 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (currentSessionChatId == null) return
       // Phase 1 of #332: count every tool_use in the current turn.
       currentTurnToolCallCount++
+      // #412: bump turn-active marker mtime so the watchdog sees this
+      // turn is making forward progress. Stop-hook deadlocks (the
+      // failure mode #116 originally tracked) emit no more tool_use
+      // events, so the marker mtime stops advancing → watchdog acts.
+      touchTurnActiveMarker(STATE_DIR)
       const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
       const name = ev.toolName
       if (isTelegramReplyTool(name)) {
@@ -7254,6 +7275,10 @@ if (streamMode === 'checklist') {
       process.stderr.write(`telegram gateway: progress-card: onTurnComplete callback turnKey=${turnKey}\n`)
       pinMgr.completeTurn({ chatId, threadId, turnKey })
       pinWatchdog.clear(turnKey)
+      // #412: drop the turn-active marker so the watchdog stops tracking
+      // this turn. Absent file = no in-flight turn = legitimate idle (no
+      // hang to detect).
+      removeTurnActiveMarker(STATE_DIR)
       // Clean up silent-end-pending.json once the turn delivered for real.
       // Without this, the file lingers between sessions and the Stop hook
       // can read a stale `retryCount` from a long-resolved turn. See #289.
