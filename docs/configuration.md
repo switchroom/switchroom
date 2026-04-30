@@ -84,6 +84,41 @@ The cap applies to the *combined* result list across the primary bank and any `r
 
 Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
 
+### Demoting individual memories from auto-recall
+
+If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.
+
+```
+# inside an agent, against its own bank
+mcp__hindsight__update_memory(memory_id="abc-123", tags=["[demote-from-recall]"])
+```
+
+The filter runs before the `max_memories` cap, so demoting a noisy memory doesn't waste a slot.
+
+### Inspecting auto-recall in production — `switchroom memory recall-log`
+
+Every auto-recall run (cache hit or miss) appends a JSONL record to the agent's plugin-state dir. View via:
+
+```
+switchroom memory recall-log [agent] [-n N] [--json]
+```
+
+Per-agent output looks like:
+
+```
+clerk:
+  last 20 turns: avg=11.4 max=12 cache_hits=2 capped=8
+  2026-04-30T07:53:45Z OK    n=12 ids=mem-a1,mem-c4,mem-9f…+9
+  2026-04-30T07:52:10Z CAP   n=12/18 ids=mem-a1,mem-c4,mem-7e…+9
+  2026-04-30T07:51:33Z CACHE n=—
+```
+
+`OK` = uncapped recall fired; `CAP` = recall returned more than `max_memories` and was sliced; `CACHE` = served from the per-session cache (#424 4.1).
+
+Use this to answer "is 12 the right cap?" — if `CAP` fires on most turns, the bank has more relevant content than 12 lets through; consider raising. If `CAP` rarely fires and `avg` stays well below the cap, the cap isn't the lever and other tuning (`recallBudget`, retain hygiene) probably matters more.
+
+The log is bounded to the last ~5000 events per agent.
+
 ### Server-side caps on the Hindsight container
 
 `switchroom memory --start` launches the bundled Hindsight container with `HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE=1000` already set. The same default is baked into the `--compose` snippet output.

@@ -38,8 +38,13 @@ def _directive(name, content, priority=5):
     }
 
 
-def _memory(text, mem_type="fact", mentioned_at="2026-01-01"):
-    return {"text": text, "type": mem_type, "mentioned_at": mentioned_at}
+def _memory(text, mem_type="fact", mentioned_at="2026-01-01", mem_id=None, tags=None):
+    out = {"text": text, "type": mem_type, "mentioned_at": mentioned_at}
+    if mem_id is not None:
+        out["id"] = mem_id
+    if tags is not None:
+        out["tags"] = tags
+    return out
 
 
 class _FakeClient:
@@ -261,6 +266,150 @@ class RecallMaxMemoriesCapTests(unittest.TestCase):
         self.assertIsNotNone(ctx)
         for i in range(15):
             self.assertIn(f"memory {i}", ctx)
+
+
+class DemoteFromRecallTagTests(unittest.TestCase):
+    """Switchroom #432 phase 4.4 — memories tagged demote-from-recall
+    are filtered out of the auto-recall block but otherwise stay in the
+    bank.
+    """
+
+    def test_bracketed_tag_is_filtered(self):
+        memories = [
+            _memory("keep this", tags=[]),
+            _memory("drop this", tags=["[demote-from-recall]"]),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client)
+        self.assertIsNotNone(ctx)
+        self.assertIn("keep this", ctx)
+        self.assertNotIn("drop this", ctx)
+
+    def test_unbracketed_tag_is_filtered(self):
+        memories = [
+            _memory("keep this"),
+            _memory("drop this", tags=["demote-from-recall"]),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client)
+        self.assertIn("keep this", ctx)
+        self.assertNotIn("drop this", ctx)
+
+    def test_no_recall_alias_is_filtered(self):
+        # `no-recall` is the third accepted variant — shorter to type when
+        # tagging via `mcp__hindsight__update_memory`.
+        memories = [
+            _memory("keep this"),
+            _memory("drop this", tags=["no-recall"]),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client)
+        self.assertIn("keep this", ctx)
+        self.assertNotIn("drop this", ctx)
+
+    def test_unrelated_tag_is_kept(self):
+        memories = [_memory("keep this", tags=["topic:fitness", "user:ken"])]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client)
+        self.assertIn("keep this", ctx)
+
+    def test_filter_applies_before_cap(self):
+        # 8 memories total, 3 demoted, cap=4. Result: 4 non-demoted
+        # memories survive (proves the filter runs first; if the cap
+        # ran first we'd see 4 of the 8 including demoted ones).
+        memories = [_memory(f"keep {i}") for i in range(5)] + [
+            _memory(f"drop {i}", tags=["[demote-from-recall]"]) for i in range(3)
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        ctx, _ = _run_main_with(client, config_extra={"recallMaxMemories": 4})
+        self.assertIsNotNone(ctx)
+        # All 4 cap survivors come from the "keep" pool.
+        for i in range(4):
+            self.assertIn(f"keep {i}", ctx)
+        for i in range(3):
+            self.assertNotIn(f"drop {i}", ctx)
+
+
+class RecallTelemetryLogTests(unittest.TestCase):
+    """Switchroom #432 phase 4.3 — every recall (hit or miss) appends
+    a JSONL record to state/recall_log.jsonl when CLAUDE_PLUGIN_DATA is
+    set.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp(prefix="recall-log-test-")
+        # The log writer reads CLAUDE_PLUGIN_DATA at write time. Set it
+        # for the test and restore on tearDown.
+        self._prev = os.environ.get("CLAUDE_PLUGIN_DATA")
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        if self._prev is None:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+        else:
+            os.environ["CLAUDE_PLUGIN_DATA"] = self._prev
+
+    def _read_log(self):
+        path = os.path.join(self._tmpdir, "state", "recall_log.jsonl")
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_logs_one_line_per_recall_with_memory_ids(self):
+        memories = [
+            _memory("first", mem_id="mem-1"),
+            _memory("second", mem_id="mem-2"),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        _run_main_with(client)
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertEqual(e["result_count"], 2)
+        self.assertEqual(e["memory_ids"], ["mem-1", "mem-2"])
+        self.assertFalse(e["cache_hit"])
+        self.assertFalse(e["capped"])
+        self.assertEqual(e["bank_id"], "test-bank")
+
+    def test_logs_capped_flag_when_cap_fires(self):
+        memories = [_memory(f"m {i}", mem_id=f"id-{i}") for i in range(8)]
+        client = _FakeClient(directives=[], memories=memories)
+        _run_main_with(client, config_extra={"recallMaxMemories": 3})
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertTrue(e["capped"])
+        self.assertEqual(e["pre_cap_count"], 8)
+        self.assertEqual(e["result_count"], 3)
+        # Only the kept IDs are logged.
+        self.assertEqual(e["memory_ids"], ["id-0", "id-1", "id-2"])
+
+    def test_logs_demoted_count(self):
+        memories = [
+            _memory("keep", mem_id="k1"),
+            _memory("drop", mem_id="d1", tags=["[demote-from-recall]"]),
+        ]
+        client = _FakeClient(directives=[], memories=memories)
+        _run_main_with(client)
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["demoted_count"], 1)
+        self.assertEqual(entries[0]["memory_ids"], ["k1"])
+
+    def test_no_log_when_plugin_data_unset(self):
+        # If CLAUDE_PLUGIN_DATA isn't set, the writer no-ops silently —
+        # we don't want a stray log file in the working directory.
+        del os.environ["CLAUDE_PLUGIN_DATA"]
+        client = _FakeClient(directives=[], memories=[_memory("x", mem_id="x1")])
+        _run_main_with(client)
+        # No file ever created.
+        self.assertEqual(self._read_log(), [])
+        # Restore so tearDown's pop doesn't error.
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmpdir
 
 
 if __name__ == "__main__":

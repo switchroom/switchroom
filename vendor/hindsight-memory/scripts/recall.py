@@ -68,6 +68,29 @@ CACHE_ENV = "HINDSIGHT_RECALL_CACHE_TTL_SECS"
 # well below any concern about state-file size growth.
 CACHE_MAX_ENTRIES = 100
 
+# Switchroom #432 phase 4.4 — demote-from-recall tag.
+#
+# A memory tagged with any of these strings stays in the bank (it can
+# still surface via reflect, manual mcp__hindsight__recall, etc.) but is
+# excluded from the auto-recall block injected on every UserPromptSubmit.
+# Useful when an over-broad "world fact" memory keeps drowning out more
+# relevant recent memories.
+DEMOTE_TAG_VARIANTS = (
+    "[demote-from-recall]",
+    "demote-from-recall",
+    "no-recall",
+)
+
+# Switchroom #432 phase 4.3 — recall telemetry log.
+#
+# Every recall (cache hit or miss) appends a JSONL record to
+# state/recall_log.jsonl: timestamp, session_id, bank, count, capped flag,
+# memory IDs. The file is bounded by RECALL_LOG_MAX_LINES so it stays
+# under a few MB even on chatty 24/7 agents. View via
+# `switchroom memory recall-log <agent>`.
+RECALL_LOG_FILE = "recall_log.jsonl"
+RECALL_LOG_MAX_LINES = 5000
+
 
 def _cache_ttl_secs() -> int:
     """Read the recall-cache TTL from env. Returns 0 (disabled) on any
@@ -153,6 +176,66 @@ def _emit_cached_context(context: str) -> None:
         },
         sys.stdout,
     )
+
+
+def _is_demoted_memory(memory) -> bool:
+    """Return True if the memory has any demote-from-recall tag.
+
+    Switchroom #432 phase 4.4. Tags are case-sensitive and can be
+    written with or without surrounding brackets (`[demote-from-recall]`
+    or `demote-from-recall` or `no-recall`). Anything that's not a list
+    of strings is treated as untagged.
+    """
+    tags = memory.get("tags") if isinstance(memory, dict) else None
+    if not isinstance(tags, list):
+        return False
+    for tag in tags:
+        if isinstance(tag, str) and tag.strip() in DEMOTE_TAG_VARIANTS:
+            return True
+    return False
+
+
+def _write_recall_log(entry: dict) -> None:
+    """Append a JSONL line to recall_log.jsonl. Bounded by line count.
+
+    Switchroom #432 phase 4.3. Failure-tolerant — telemetry must never
+    block recall, so any write error is swallowed silently. Unbounded
+    growth is prevented by truncating to the last RECALL_LOG_MAX_LINES
+    when the file is rolled over (cheap because we read once per
+    append; the alternative — keeping a separate index — is more code
+    for a feature that runs at most once per turn).
+    """
+    try:
+        plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
+        if not plugin_data:
+            return
+        log_dir = os.path.join(plugin_data, "state")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, RECALL_LOG_FILE)
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
+        # Append-then-trim. For typical operation the file is well
+        # under the cap and the trim path is a no-op.
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        # Cheap rolling trim every ~50 writes (estimated by file size
+        # vs. 200 bytes/line average) to amortize the read cost.
+        try:
+            size = os.path.getsize(log_path)
+        except OSError:
+            return
+        if size > RECALL_LOG_MAX_LINES * 250:
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) > RECALL_LOG_MAX_LINES:
+                    keep = lines[-RECALL_LOG_MAX_LINES:]
+                    with open(log_path, "w", encoding="utf-8") as f:
+                        f.writelines(keep)
+            except OSError:
+                pass
+    except Exception:
+        # Silently swallow — telemetry is never load-bearing.
+        pass
 
 
 def read_transcript_messages(transcript_path: str) -> list:
@@ -252,6 +335,18 @@ def main():
         if cached_context is not None:
             debug_log(config, f"Recall cache HIT (key={cache_key[:12]}…) — skipping API call")
             _emit_cached_context(cached_context)
+            _write_recall_log({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "session_id": (session_id or "")[:32],
+                "bank_id": bank_id,
+                "additional_banks": additional_banks,
+                "query_chars": len(prompt),
+                "result_count": None,  # not known on cache hit
+                "directive_count": None,
+                "demoted_count": 0,
+                "capped": False,
+                "cache_hit": True,
+            })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
 
@@ -330,6 +425,16 @@ def main():
         except Exception as e:
             debug_log(config, f"Recall from additional bank '{extra_bank_id}' failed: {e}")
 
+    # Switchroom #432 phase 4.4 — drop demote-tagged memories before
+    # the cap. Filtering early means the cap kicks in over the
+    # non-demoted set (i.e. the user gets up to N "real" hits,
+    # not N including ones they explicitly demoted).
+    pre_filter_count = len(results)
+    results = [m for m in results if not _is_demoted_memory(m)]
+    demoted_count = pre_filter_count - len(results)
+    if demoted_count > 0:
+        debug_log(config, f"Filtered {demoted_count} demote-from-recall memories")
+
     # Switchroom-local: client-side count cap. Plugin v0.4.0 has no
     # `recallTopK` in the Claude Code integration (Openclaw-only), and a
     # token budget alone doesn't bound count — a single long memory can
@@ -337,6 +442,8 @@ def main():
     # Slice the combined results from primary + additional banks before
     # formatting. <= 0 disables the cap.
     recall_max_memories = config.get("recallMaxMemories", 0)
+    pre_cap_count = len(results)
+    capped = False
     if (
         isinstance(recall_max_memories, int)
         and recall_max_memories > 0
@@ -348,6 +455,7 @@ def main():
             f"(set HINDSIGHT_RECALL_MAX_MEMORIES=0 to disable)",
         )
         results = results[:recall_max_memories]
+        capped = True
 
     memories_block = None
     if results:
@@ -399,6 +507,27 @@ def main():
             _cache_store(cache_key, context_message)
         except Exception as e:
             debug_log(config, f"Recall cache write failed (non-fatal): {e}")
+
+    # Switchroom #432 phase 4.3 — telemetry log. memory IDs (when
+    # available) let an operator confirm what was injected on a given
+    # turn. Failure-tolerant.
+    _write_recall_log({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "session_id": (session_id or "")[:32],
+        "bank_id": bank_id,
+        "additional_banks": additional_banks,
+        "query_chars": len(query),
+        "result_count": len(results),
+        "directive_count": len(directives),
+        "demoted_count": demoted_count,
+        "capped": capped,
+        "pre_cap_count": pre_cap_count,
+        "memory_ids": [
+            m.get("id") for m in results
+            if isinstance(m, dict) and m.get("id")
+        ],
+        "cache_hit": False,
+    })
 
     # Output JSON for Claude Code hook system
     output = {

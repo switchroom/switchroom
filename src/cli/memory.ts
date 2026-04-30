@@ -15,7 +15,66 @@ import {
   HINDSIGHT_DEFAULT_API_PORT,
 } from "../setup/hindsight.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { resolveAgentsDir } from "../config/loader.js";
 import YAML from "yaml";
+
+interface RecallLogEntry {
+  ts: string;
+  session_id?: string;
+  bank_id?: string;
+  additional_banks?: string[];
+  query_chars?: number;
+  result_count?: number | null;
+  directive_count?: number | null;
+  demoted_count?: number;
+  capped?: boolean;
+  pre_cap_count?: number;
+  memory_ids?: string[];
+  cache_hit?: boolean;
+}
+
+/**
+ * Read the most recent N entries from an agent's recall_log.jsonl.
+ *
+ * Path: <agentsDir>/<agent>/.claude/plugins/data/hindsight-memory-inline/state/recall_log.jsonl
+ * Returns [] if the file is missing (e.g. agent hasn't fired a recall
+ * since #432 phase 4.3 was deployed) or unreadable.
+ *
+ * Exported for tests.
+ */
+export function readRecallLog(
+  agentDir: string,
+  limit: number,
+): RecallLogEntry[] {
+  const path = join(
+    agentDir,
+    ".claude",
+    "plugins",
+    "data",
+    "hindsight-memory-inline",
+    "state",
+    "recall_log.jsonl",
+  );
+  if (!existsSync(path)) return [];
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return [];
+  }
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  const tail = lines.slice(-limit);
+  const out: RecallLogEntry[] = [];
+  for (const line of tail) {
+    try {
+      out.push(JSON.parse(line) as RecallLogEntry);
+    } catch {
+      // Skip malformed lines silently — telemetry is best-effort.
+    }
+  }
+  return out;
+}
 
 export function registerMemoryCommand(program: Command): void {
   const memory = program
@@ -292,4 +351,94 @@ export function registerMemoryCommand(program: Command): void {
       console.log(generateHindsightComposeSnippet(opts.provider));
       console.log();
     });
+
+  // switchroom memory recall-log [agent]
+  memory
+    .command("recall-log [agent]")
+    .description(
+      "Show recent auto-recall events (per-turn JSONL log) — see what was injected, when the cap fired, hit rate hints",
+    )
+    .option("-n, --limit <n>", "Tail the last N events per agent (default 20)", "20")
+    .option("--json", "Emit raw JSONL (one entry per line)")
+    .action(
+      withConfigError(async (
+        agent: string | undefined,
+        opts: { limit: string; json?: boolean },
+      ) => {
+        const config = getConfig(program);
+        const agentsDir = resolveAgentsDir(config);
+        const limit = Math.max(1, parseInt(opts.limit, 10) || 20);
+
+        const targets = agent
+          ? config.agents[agent]
+            ? [agent]
+            : (() => {
+              console.error(chalk.red(`Agent "${agent}" is not defined in switchroom.yaml`));
+              process.exit(1);
+            })()
+          : Object.keys(config.agents);
+
+        for (const name of targets as string[]) {
+          const agentDir = join(agentsDir, name);
+          const entries = readRecallLog(agentDir, limit);
+
+          if (opts.json) {
+            for (const e of entries) {
+              console.log(JSON.stringify({ agent: name, ...e }));
+            }
+            continue;
+          }
+
+          if (entries.length === 0) {
+            console.log(
+              chalk.gray(`${name}: no recall events recorded yet (agent hasn't fired UserPromptSubmit since #432.4.3 deployed)`),
+            );
+            continue;
+          }
+
+          console.log(chalk.bold(`\n${name}:`));
+          // Aggregate at the top — one-line summary so scanning is fast.
+          const total = entries.length;
+          const hits = entries.filter((e) => e.cache_hit).length;
+          const cappedTurns = entries.filter((e) => e.capped).length;
+          const memCounts = entries
+            .map((e) => e.result_count)
+            .filter((n): n is number => typeof n === "number");
+          const avg =
+            memCounts.length > 0
+              ? Math.round(
+                  (memCounts.reduce((s, n) => s + n, 0) / memCounts.length) * 10,
+                ) / 10
+              : null;
+          const max = memCounts.length > 0 ? Math.max(...memCounts) : null;
+          console.log(
+            chalk.gray(
+              `  last ${total} turn${total === 1 ? "" : "s"}: ` +
+              `avg=${avg ?? "—"} max=${max ?? "—"} ` +
+              `cache_hits=${hits} capped=${cappedTurns}`,
+            ),
+          );
+
+          for (const e of entries) {
+            const flag = e.cache_hit
+              ? chalk.cyan("CACHE")
+              : e.capped
+                ? chalk.yellow("CAP")
+                : chalk.green("OK");
+            const dem = e.demoted_count && e.demoted_count > 0
+              ? chalk.dim(` -${e.demoted_count}d`)
+              : "";
+            const ids = e.memory_ids && e.memory_ids.length > 0
+              ? chalk.dim(` ids=${e.memory_ids.slice(0, 3).join(",")}${e.memory_ids.length > 3 ? `…+${e.memory_ids.length - 3}` : ""}`)
+              : "";
+            console.log(
+              `  ${chalk.gray(e.ts)} ${flag} ` +
+              `n=${e.result_count ?? "—"}${e.pre_cap_count != null && e.pre_cap_count !== e.result_count ? `/${e.pre_cap_count}` : ""}` +
+              `${dem}${ids}`,
+            );
+          }
+        }
+        console.log();
+      }),
+    );
 }
