@@ -37,7 +37,7 @@ import {
 import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry, getBuiltinDefaultMcpEntries } from "../memory/scaffold-integration.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, ensureUserProfileMentalModel } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, ensureUserProfileMentalModel, DEFAULT_RETAIN_MISSION } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -1867,30 +1867,39 @@ export function scaffoldAgent(
 
     // Update bank missions and ensure user-profile MM — both gated on the
     // bank actually existing.
+    //
+    // Mission selection: explicit user yaml wins. When the operator hasn't
+    // set a `retain_mission`, scaffold (NOT reconcile) seeds the upstream-
+    // recommended default — this lifts retained memory quality on fresh
+    // agents without touching agents that already have a customized
+    // mission. `reconcileAgent` deliberately does not push the default,
+    // so existing agents' Hindsight-side missions stay untouched.
     bankOpsChain.then((bankReady) => {
       if (!bankReady) return;
 
-      if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission) {
-        const missions: { bank_mission?: string; retain_mission?: string } = {};
-        if (agentConfig.memory?.bank_mission) {
-          missions.bank_mission = agentConfig.memory.bank_mission;
-        }
-        if (agentConfig.memory?.retain_mission) {
-          missions.retain_mission = agentConfig.memory.retain_mission;
-        }
+      const userBankMission = agentConfig.memory?.bank_mission;
+      const userRetainMission = agentConfig.memory?.retain_mission;
+      const seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION;
 
-        updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
-          .then((result) => {
-            if (result.ok) {
-              console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)}`);
-            } else {
-              console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-            }
-          })
-          .catch((err) => {
-            console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-          });
+      const missions: { bank_mission?: string; retain_mission?: string } = {
+        retain_mission: seededRetainMission,
+      };
+      if (userBankMission) {
+        missions.bank_mission = userBankMission;
       }
+
+      updateBankMissions(apiUrl, hindsightBankId, missions, { timeoutMs: 5000 })
+        .then((result) => {
+          if (result.ok) {
+            const note = userRetainMission ? "(custom retain_mission)" : "(default retain_mission)";
+            console.log(`  ${chalk.green("✓")} Bank missions updated for ${formatAgentBankLabel(name, hindsightBankId)} ${chalk.dim(note)}`);
+          } else {
+            console.warn(`  ${chalk.yellow("⚠")} Failed to update bank missions for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
+          }
+        })
+        .catch((err) => {
+          console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
+        });
 
       ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
         .then((result) => {

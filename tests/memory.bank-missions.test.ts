@@ -1,5 +1,47 @@
 import { describe, it, expect, vi } from "vitest";
-import { updateBankMissions } from "../src/memory/hindsight.js";
+import { updateBankMissions, DEFAULT_RETAIN_MISSION } from "../src/memory/hindsight.js";
+
+describe("DEFAULT_RETAIN_MISSION", () => {
+  it("matches upstream Hindsight per-user-memory guide wording", () => {
+    // Sourced verbatim from
+    // hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
+    // lines 188-193.
+    expect(DEFAULT_RETAIN_MISSION).toBe(
+      "Extract user preferences, ongoing projects, recurring commitments, " +
+        "important context, and durable facts that should help across future " +
+        "conversations. Skip one-off chatter and temporary task noise.",
+    );
+  });
+
+  it("explicitly tells extraction to skip conversational filler", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain("Skip one-off chatter");
+    expect(DEFAULT_RETAIN_MISSION).toContain("temporary task noise");
+  });
+
+  it("focuses on durable, cross-conversation signal", () => {
+    expect(DEFAULT_RETAIN_MISSION).toContain("durable facts");
+    expect(DEFAULT_RETAIN_MISSION).toContain("across future");
+  });
+});
+
+describe("scaffold seed wiring", () => {
+  // Source-structure assertion: scaffold imports the constant and uses
+  // it as the retain_mission default, while reconcile does NOT (existing
+  // agents' missions stay untouched).
+  it("scaffold imports DEFAULT_RETAIN_MISSION but reconcile path does not seed it", () => {
+    const fs = require("fs");
+    const scaffoldSource = fs.readFileSync("src/agents/scaffold.ts", "utf-8");
+    expect(scaffoldSource).toContain("DEFAULT_RETAIN_MISSION");
+    expect(scaffoldSource).toContain("seededRetainMission = userRetainMission ?? DEFAULT_RETAIN_MISSION");
+    // The reconcile-side bank-mission update block must remain
+    // explicit-only (the original `if user yaml has missions` gate).
+    // Asserting both forms exist guards against an accidental copy of
+    // the seed-default behaviour into reconcile.
+    expect(scaffoldSource).toContain(
+      "if (agentConfig.memory?.bank_mission || agentConfig.memory?.retain_mission)",
+    );
+  });
+});
 
 describe("updateBankMissions", () => {
   it("calls update_bank with both missions when provided", async () => {

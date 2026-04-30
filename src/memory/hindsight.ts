@@ -89,6 +89,30 @@ export function isStrictIsolation(
 }
 
 /**
+ * Recommended default `retain_mission` for new agents.
+ *
+ * Sourced verbatim from upstream Hindsight's per-user-memory guide:
+ *   https://github.com/vectorize-io/hindsight/blob/main/hindsight-docs/guides/2026-04-15-guide-openclaw-per-user-memory-across-channels-setup.md
+ *   (lines 188–193)
+ *
+ * The mission shapes the LLM extraction step that fires inside
+ * Hindsight's auto-retain. Tighter wording here directly lifts retained
+ * memory quality (less conversational filler stored, fewer marginal hits
+ * surfacing in subsequent recalls).
+ *
+ * Switchroom seeds this for newly scaffolded agents only (see
+ * `scaffoldAgent` in `src/agents/scaffold.ts`). Existing agents'
+ * missions are left alone — operators may have customized them, and
+ * `reconcileAgent` does not push a default. Operators can always
+ * override per-agent via `agents.<name>.memory.retain_mission` in
+ * `switchroom.yaml`.
+ */
+export const DEFAULT_RETAIN_MISSION =
+  "Extract user preferences, ongoing projects, recurring commitments, " +
+  "important context, and durable facts that should help across future " +
+  "conversations. Skip one-off chatter and temporary task noise.";
+
+/**
  * Parse a Hindsight MCP response body.
  *
  * Hindsight's MCP server returns text/event-stream responses of the form:
