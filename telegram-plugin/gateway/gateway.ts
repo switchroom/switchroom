@@ -1852,6 +1852,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const streamChatId = args.chat_id as string
   const streamIsPrivate = isDmChatId(streamChatId)
   const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
+  // Issue #416: consume any pre-allocated draft for this DM. The gateway
+  // populates this map on inbound; the first stream_reply hands it off to
+  // the draft-stream so the existing placeholder is edited in place rather
+  // than a fresh draft being allocated and visibly flickering. Forum topics
+  // never have a pre-alloc entry (gateway skips them).
+  const preAllocated = streamIsPrivate ? preAllocatedDrafts.get(streamChatId) : undefined
+  if (preAllocated != null) {
+    preAllocatedDrafts.delete(streamChatId)
+  }
   const result = await handleStreamReply(
     {
       chat_id: streamChatId,
@@ -1881,6 +1890,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       isPrivateChat: streamIsPrivate,
       isForumTopic: streamIsForumTopic,
       ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
+      ...(preAllocated != null ? { preAllocatedDraftId: preAllocated.draftId } : {}),
       // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
       // so the terminal render sees outboundDeliveredCount > 0. The handler
       // calls this dep in that order internally.
