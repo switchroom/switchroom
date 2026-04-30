@@ -1299,9 +1299,30 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       }
       return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
     })(),
-    extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
-      ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
-      : undefined,
+    extraCliArgs: (() => {
+      const parts: string[] = []
+      if (agentConfig.cli_args && agentConfig.cli_args.length > 0) {
+        parts.push(...agentConfig.cli_args.map(shellSingleQuote))
+      }
+      // #199: native Claude Code flag pass-through. add_dirs becomes
+      // repeated --add-dir <path>; allowed_tools / disallowed_tools become
+      // a single space-separated --allowedTools "..." / --disallowedTools "..."
+      // arg. Coexistence semantics with the coarse `tools.allow`: granular-
+      // only-when-present (Claude Code's own OR semantics), so existing
+      // operators on `tools.allow` are unaffected.
+      if (agentConfig.add_dirs && agentConfig.add_dirs.length > 0) {
+        for (const dir of agentConfig.add_dirs) {
+          parts.push("--add-dir", shellSingleQuote(dir))
+        }
+      }
+      if (agentConfig.allowed_tools && agentConfig.allowed_tools.length > 0) {
+        parts.push("--allowedTools", shellSingleQuote(agentConfig.allowed_tools.join(" ")))
+      }
+      if (agentConfig.disallowed_tools && agentConfig.disallowed_tools.length > 0) {
+        parts.push("--disallowedTools", shellSingleQuote(agentConfig.disallowed_tools.join(" ")))
+      }
+      return parts.length > 0 ? " " + parts.join(" ") : undefined
+    })(),
     sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
     sessionMaxTurns: agentConfig.session?.max_turns,
     handoffEnabled: agentConfig.session_continuity?.enabled !== false,
@@ -2623,9 +2644,26 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
         }
         return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
       })(),
-      extraCliArgs: agentConfig.cli_args && agentConfig.cli_args.length > 0
-        ? " " + agentConfig.cli_args.map(shellSingleQuote).join(" ")
-        : undefined,
+      extraCliArgs: (() => {
+        const parts: string[] = []
+        if (agentConfig.cli_args && agentConfig.cli_args.length > 0) {
+          parts.push(...agentConfig.cli_args.map(shellSingleQuote))
+        }
+        // #199: native Claude Code flag pass-through (mirror of the
+        // initial-scaffold path above; reconcile must keep parity).
+        if (agentConfig.add_dirs && agentConfig.add_dirs.length > 0) {
+          for (const dir of agentConfig.add_dirs) {
+            parts.push("--add-dir", shellSingleQuote(dir))
+          }
+        }
+        if (agentConfig.allowed_tools && agentConfig.allowed_tools.length > 0) {
+          parts.push("--allowedTools", shellSingleQuote(agentConfig.allowed_tools.join(" ")))
+        }
+        if (agentConfig.disallowed_tools && agentConfig.disallowed_tools.length > 0) {
+          parts.push("--disallowedTools", shellSingleQuote(agentConfig.disallowed_tools.join(" ")))
+        }
+        return parts.length > 0 ? " " + parts.join(" ") : undefined
+      })(),
       sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
       sessionMaxTurns: agentConfig.session?.max_turns,
       handoffEnabled: agentConfig.session_continuity?.enabled !== false,

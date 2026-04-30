@@ -845,6 +845,33 @@ export const AgentSchema = z.object({
       "doesn't expose directly (e.g. --effort high, " +
       "--exclude-dynamic-system-prompt-sections)."
     ),
+  add_dirs: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Additional filesystem paths the agent's tools can access. Passed " +
+      "as repeated --add-dir <path> on the claude invocation. Use to grant " +
+      "an agent reach into shared dirs (e.g. '/share/collab') without " +
+      "scaffold hacks. Per-agent only — paths are persona-specific. See #199."
+    ),
+  allowed_tools: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Granular tool allowlist passed verbatim to Claude Code's --allowedTools " +
+      "flag. Supports patterns like 'Bash(git *)' or 'Edit(*.md)' that the " +
+      "coarse `tools.allow` field can't express. When set, Claude Code OR-merges " +
+      "with `tools.allow` (granular only when present, otherwise coarse — chosen " +
+      "via #199 to keep blast radius minimal for existing operators on tools.allow). " +
+      "See #199."
+    ),
+  disallowed_tools: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Granular tool denylist passed verbatim to Claude Code's --disallowedTools " +
+      "flag. Same pattern syntax as allowed_tools (e.g. 'Bash(rm *)'). See #199."
+    ),
   extra_stable_files: z
     .array(z.string())
     .optional()
