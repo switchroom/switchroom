@@ -1004,6 +1004,89 @@ describe('progress-card reducer — multi-agent correlation', () => {
     expect(st.subAgents.has('ghost')).toBe(false)
   })
 
+  // ── Issue #305 Option A: sub_agent_narrative reducer + render ─────────────
+
+  it('sub_agent_narrative sets currentNarrative and bumps lastEventAt', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    const before = st.subAgents.get('X')!
+    const beforeMilestone = before.milestoneVersion
+    st = reduce(st, { kind: 'sub_agent_narrative', agentId: 'X', text: 'Analyzing 12 files in /src/auth' }, 7000)
+    const sa = st.subAgents.get('X')!
+    expect(sa.currentNarrative).toBe('Analyzing 12 files in /src/auth')
+    expect(sa.lastEventAt).toBe(7000)
+    // Per-tick update — milestoneVersion must NOT bump.
+    expect(sa.milestoneVersion).toBe(beforeMilestone)
+  })
+
+  it('sub_agent_narrative for an unknown agent is a no-op', () => {
+    const before = fold([enqueue('go')])
+    const after = reduce(before, { kind: 'sub_agent_narrative', agentId: 'ghost', text: 'nobody home' }, 5000)
+    // State must be untouched (same reference is fine; subAgents must not have ghost).
+    expect(after.subAgents.has('ghost')).toBe(false)
+    expect(after).toBe(before)
+  })
+
+  it('subsequent sub_agent_narrative replaces prior narrative (last write wins)', () => {
+    let st = fold([
+      enqueue('go'),
+      { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'd', prompt: 'P' } },
+      { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+    ])
+    st = reduce(st, { kind: 'sub_agent_narrative', agentId: 'X', text: 'first line' }, 7000)
+    expect(st.subAgents.get('X')!.currentNarrative).toBe('first line')
+    st = reduce(st, { kind: 'sub_agent_narrative', agentId: 'X', text: 'second line' }, 7100)
+    expect(st.subAgents.get('X')!.currentNarrative).toBe('second line')
+  })
+
+  it('renders currentNarrative ↳ <i>...</i> above pendingPreamble in running fallback chain', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('go'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'work', prompt: 'P' } },
+        { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+        // Both pendingPreamble and currentNarrative present — narrative must win.
+        { kind: 'sub_agent_text', agentId: 'X', text: 'preamble line that should lose' },
+        { kind: 'sub_agent_narrative', agentId: 'X', text: 'Analyzing 12 files in /src/auth' },
+      ])
+      const html = render(st, 7000)
+      expect(html).toContain('↳ <i>Analyzing 12 files in /src/auth</i>')
+      // pendingPreamble must NOT appear in the inner-body fallback line —
+      // the narrative branch ran first.
+      expect(html).not.toContain('preamble line that should lose')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('terminal-state render does not surface currentNarrative (terminal branch only renders lastCompletedTool / count)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('go'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_p1', input: { description: 'work', prompt: 'P' } },
+        { kind: 'sub_agent_started', agentId: 'X', firstPromptText: 'P' },
+        { kind: 'sub_agent_narrative', agentId: 'X', text: 'narrative-that-should-not-render-in-done' },
+        // Move sub-agent into terminal 'done' state via the parent tool_result path.
+        { kind: 'tool_result', toolUseId: 'toolu_p1', toolName: 'Agent', isError: false },
+      ])
+      const sa = st.subAgents.get('X')!
+      // Sanity: state must be terminal and the narrative must still be on the slot.
+      expect(sa.state).toBe('done')
+      expect(sa.currentNarrative).toBe('narrative-that-should-not-render-in-done')
+      const html = render(st, 7000)
+      // Terminal branch falls through to lastCompletedTool / "N tools completed".
+      // The narrative text must not appear in the rendered output.
+      expect(html).not.toContain('narrative-that-should-not-render-in-done')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
   it("parent's tool_result is authoritative: overrides early sub_agent_turn_end on isError", () => {
     let st = fold([
       enqueue('go'),
