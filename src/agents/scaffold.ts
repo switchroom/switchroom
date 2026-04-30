@@ -2196,7 +2196,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          matcher: "Agent",
+          // Claude Code's hook matcher is a regex. Cover both the legacy
+          // 'Agent' and newer 'Task' tool names — same dispatch
+          // semantics, only the name varies by Claude Code version. The
+          // tracker hooks themselves also gate on both.
+          matcher: "^(Agent|Task)$",
           hooks: [
             {
               type: "command",
@@ -2215,7 +2219,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   const switchroomPostToolUse = useSwitchroomPlugin
     ? [
         {
-          matcher: "Agent",
+          // Claude Code's hook matcher is a regex. Cover both the legacy
+          // 'Agent' and newer 'Task' tool names — same dispatch
+          // semantics, only the name varies by Claude Code version. The
+          // tracker hooks themselves also gate on both.
+          matcher: "^(Agent|Task)$",
           hooks: [
             {
               type: "command",

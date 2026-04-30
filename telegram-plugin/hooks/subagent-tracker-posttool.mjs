@@ -233,8 +233,12 @@ function main() {
     process.exit(0)
   }
 
-  // Only care about Agent tool calls
-  if (event.tool_name !== 'Agent') process.exit(0)
+  // Only care about sub-agent dispatches. Claude Code emits the dispatch
+  // tool under either the legacy name 'Agent' or the newer 'Task'
+  // depending on version. The matching session-tail / progress-card /
+  // tool-label code paths already recognize both. See pretool hook for
+  // detail.
+  if (event.tool_name !== 'Agent' && event.tool_name !== 'Task') process.exit(0)
 
   const id = event.tool_use_id ?? null
   if (!id) process.exit(0)

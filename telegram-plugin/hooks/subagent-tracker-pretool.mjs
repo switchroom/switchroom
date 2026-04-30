@@ -174,8 +174,15 @@ function main() {
     process.exit(0)
   }
 
-  // Only care about Agent tool calls
-  if (event.tool_name !== 'Agent') process.exit(0)
+  // Only care about sub-agent dispatches. Claude Code emits the dispatch
+  // tool under either the legacy name 'Agent' or the newer 'Task'
+  // depending on version. Other call sites in this codebase (session-tail.ts,
+  // progress-card.ts, pty-tail.ts, tool-labels.ts) already recognize both —
+  // these tracker hooks were the lone gate accepting only 'Agent', which
+  // would silently drop every dispatch on any Claude Code version emitting
+  // 'Task' (rows never inserted → progress card heuristic + watcher both
+  // misroute).
+  if (event.tool_name !== 'Agent' && event.tool_name !== 'Task') process.exit(0)
 
   const agentDir = process.env.SWITCHROOM_AGENT_DIR ?? process.cwd()
   const telegramDir = join(agentDir, 'telegram')

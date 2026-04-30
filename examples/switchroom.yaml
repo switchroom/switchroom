@@ -68,7 +68,14 @@ defaults:
       model: sonnet
       background: true
       isolation: worktree
-      maxTurns: 50
+      # 100 turns is a comfortable budget for most worker tasks; if a
+      # worker exhausts this mid-flow, it'll be reported as #423-style
+      # ceiling. Bump to 200 for genuinely long PR-shipping flows or
+      # remove the line entirely to inherit Claude Code's default.
+      # Origin: this used to be 50 and was the literal cause of #423
+      # ("worker sub-agents hit ~50 tool-use ceiling mid-flow before
+      # finishing"). Don't shrink it without good reason.
+      maxTurns: 100
       color: blue
       disallowedTools:
         - "mcp__switchroom-telegram__*"
