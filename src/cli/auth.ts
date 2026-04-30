@@ -273,15 +273,39 @@ export function registerAuthCommand(program: Command): void {
     .description("Diagnose and (optionally) repair an agent's broken auth state")
     .option("--auto", "Trigger reauth automatically instead of just printing instructions", false)
     .option("--json", "Emit a structured diagnosis instead of prose", false)
+    .option(
+      "--config-dir <path>",
+      "Inspect this CLAUDE_CONFIG_DIR directly instead of resolving from " +
+        "switchroom.yaml. Used by boot-self-test and tests where agents may " +
+        "not be registered in a yaml file.",
+    )
     .action(
-      withConfigError(async (name: string, opts: { auto?: boolean; json?: boolean }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        rejectAll(name, "heal");
-        requireKnownAgent(config, name);
-
-        const agentDir = resolve(agentsDir, name);
-        const claudeConfigDir = join(agentDir, ".claude");
+      withConfigError(async (
+        name: string,
+        opts: { auto?: boolean; json?: boolean; configDir?: string },
+      ) => {
+        // --config-dir bypasses yaml validation. The agent must still
+        // be a valid name (used in output), but we don't require a
+        // switchroom.yaml entry. --auto is incompatible because the
+        // reauth flow requires the registered agentsDir.
+        let claudeConfigDir: string;
+        let agentDir: string;
+        if (opts.configDir) {
+          if (opts.auto) {
+            console.error(chalk.red("--auto is incompatible with --config-dir; " +
+              "the reauth flow needs the agent registered in switchroom.yaml."));
+            process.exit(2);
+          }
+          claudeConfigDir = resolve(opts.configDir);
+          agentDir = resolve(claudeConfigDir, "..");
+        } else {
+          const config = getConfig(program);
+          const agentsDir = resolveAgentsDir(config);
+          rejectAll(name, "heal");
+          requireKnownAgent(config, name);
+          agentDir = resolve(agentsDir, name);
+          claudeConfigDir = join(agentDir, ".claude");
+        }
         const diagnosis = diagnoseAuthState(claudeConfigDir);
 
         if (opts.json) {

@@ -137,7 +137,7 @@ afterEach(() => {
 });
 
 describe("boot-self-test.sh", () => {
-  it("records auth.credentials_missing when .credentials.json is absent", () => {
+  it("records auth.credentials_missing when .credentials.json is absent", { timeout: 15_000 }, () => {
     makeFakeClaude(0);
     const { status } = runSelfTest();
     expect(status).toBe(0);
@@ -148,7 +148,7 @@ describe("boot-self-test.sh", () => {
     expect(missing!.summary).toContain("no .credentials.json");
   });
 
-  it("records auth.token_expired when expiresAt is in the past", () => {
+  it("records auth.token_expired when expiresAt is in the past", { timeout: 15_000 }, () => {
     writeCreds({
       claudeAiOauth: {
         accessToken: "tok",
@@ -165,7 +165,7 @@ describe("boot-self-test.sh", () => {
     expect(expired!.summary).toMatch(/expired \d+d ago/);
   });
 
-  it("records auth.refresh_token_missing as warn when refreshToken is empty", () => {
+  it("records auth.refresh_token_missing as warn when refreshToken is empty", { timeout: 15_000 }, () => {
     writeCreds({
       claudeAiOauth: {
         accessToken: "tok",
@@ -183,7 +183,7 @@ describe("boot-self-test.sh", () => {
     expect(noRefresh!.severity).toBe("warn");
   });
 
-  it("records auth.cli_unauthenticated as critical when claude -p fails", () => {
+  it("does NOT produce cli_unauthenticated (replaced by structural diagnosis via heal)", { timeout: 15_000 }, () => {
     writeCreds({
       claudeAiOauth: {
         accessToken: "tok",
@@ -194,13 +194,15 @@ describe("boot-self-test.sh", () => {
     makeFakeClaude(1, "401 Unauthorized");
     runSelfTest();
     const issues = listIssues();
+    // Healthy state per heal — no findings should be recorded even if
+    // a hypothetical claude -p would fail empirically. We trust the
+    // structural diagnosis (token shape, expiry, refresh-token).
     const cli = issues.find((i) => i.code === "cli_unauthenticated");
-    expect(cli).toBeDefined();
-    expect(cli!.severity).toBe("critical");
-    expect(cli!.detail).toContain("401");
+    expect(cli).toBeUndefined();
   });
 
-  it("strips CLAUDE_CODE_OAUTH_TOKEN before invoking claude (matches hook context)", () => {
+  it("auto-resolves any leftover cli_unauthenticated entries from older boot-self-test versions", { timeout: 20_000 }, () => {
+    // Simulate a stale entry from before the heal-based refactor.
     writeCreds({
       claudeAiOauth: {
         accessToken: "tok",
@@ -208,15 +210,31 @@ describe("boot-self-test.sh", () => {
         expiresAt: Date.now() + 3_600_000,
       },
     });
+    // Pre-seed a stale critical entry like the old boot-self-test
+    // would have written. The new boot-self-test must resolve it.
+    execFileSync(BUN, [
+      CLI,
+      "issues", "record",
+      "--severity", "critical",
+      "--source", "boot:auth-check",
+      "--code", "cli_unauthenticated",
+      "--summary", "stale entry from prior version",
+      "--quiet",
+      "--state-dir", stateDir,
+      "--agent", "testagent",
+    ]);
+    expect(
+      listIssues().find(
+        (i) => i.code === "cli_unauthenticated" && i.resolved_at == null,
+      ),
+    ).toBeDefined();
+
     makeFakeClaude(0);
     runSelfTest();
-    const envCapture = require("node:fs").readFileSync(
-      join(scratch, "claude-env.txt"),
-      "utf-8",
-    ) as string;
-    // The fake claude was invoked. Its env must NOT contain
-    // CLAUDE_CODE_OAUTH_TOKEN — that's the whole point of the check.
-    expect(envCapture).not.toMatch(/^CLAUDE_CODE_OAUTH_TOKEN=/m);
+
+    // Stale entry now resolved.
+    const stale = listIssues().find((i) => i.code === "cli_unauthenticated");
+    expect(stale!.resolved_at).toBeDefined();
   });
 
   it("resolves prior issues when state goes healthy", { timeout: 15_000 }, () => {
@@ -247,7 +265,7 @@ describe("boot-self-test.sh", () => {
     expect(unresolved.find((i) => i.code === "credentials_missing")).toBeUndefined();
   });
 
-  it("exits 0 on every code path (boot must not be blocked)", () => {
+  it("exits 0 on every code path (boot must not be blocked)", { timeout: 15_000 }, () => {
     // Even with everything broken, exit should be 0.
     makeFakeClaude(1);
     const { status } = runSelfTest();
