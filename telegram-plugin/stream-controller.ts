@@ -142,6 +142,12 @@ export interface StreamControllerConfig {
    * sendMessage is posted for push notification and the draft is cleared.
    */
   sendMessageDraft?: StreamDraftFn
+  /**
+   * Optional pre-allocated draft id (issue #416). Forwarded to
+   * createDraftStream so the first send reuses a placeholder draft already
+   * created by the gateway on inbound DM receipt.
+   */
+  preAllocatedDraftId?: number
 }
 
 /**
@@ -171,6 +177,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     previewTransport,
     isPrivateChat,
     sendMessageDraft,
+    preAllocatedDraftId,
   } = cfg
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
@@ -219,6 +226,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       ...(previewTransport != null ? { previewTransport } : {}),
       ...(isPrivateChat != null ? { isPrivateChat } : {}),
       ...(sendMessageDraft != null ? { sendMessageDraft } : {}),
+      ...(preAllocatedDraftId != null ? { preAllocatedDraftId } : {}),
       chatId,
     },
   )

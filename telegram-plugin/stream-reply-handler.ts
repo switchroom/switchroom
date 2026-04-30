@@ -267,6 +267,18 @@ export interface StreamReplyDeps {
    * to preserve legacy behavior.
    */
   progressCardActive?: boolean
+  /**
+   * Optional pre-allocated draft id (issue #416). When provided alongside
+   * `sendMessageDraft`, the new stream uses this id for its first send
+   * instead of allocating fresh. The gateway sets this when consuming a
+   * placeholder draft created on inbound DM receipt — the agent's first
+   * stream_reply edits the existing visual draft so the user sees a
+   * smooth update instead of a flash from one draft to another.
+   *
+   * Only consumed on the first stream_reply call for a chat+thread+lane.
+   * Subsequent calls reuse the existing stream and ignore this field.
+   */
+  preAllocatedDraftId?: number
 }
 
 export interface StreamReplyResult {
@@ -470,6 +482,7 @@ export async function handleStreamReply(
       previewTransport: resolvedTransport,
       isPrivateChat: deps.isPrivateChat === true,
       ...(deps.sendMessageDraft != null ? { sendMessageDraft: deps.sendMessageDraft } : {}),
+      ...(deps.preAllocatedDraftId != null ? { preAllocatedDraftId: deps.preAllocatedDraftId } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
       onEdit: (messageId, charCount) =>
