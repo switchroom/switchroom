@@ -44,8 +44,23 @@ set -euo pipefail
 : "${UPTIME_GRACE_SECS:=90}"              # skip checks for this long after agent (re)start
 : "${DISCONNECT_GRACE_SECS:=600}"         # require disconnection to persist this long before restarting
 : "${LIVENESS_GRACE_SECS:=30}"            # liveness file mtime must be recent before we treat bridge as dead
-: "${JOURNAL_SILENCE_SECS:=600}"          # seconds of journal silence before suspecting a hang
-: "${JOURNAL_SILENCE_HARD_SECS:=600}"     # seconds the silence_since marker must predate before restarting
+# Journal-silence thresholds. Defaults raised from 600s to 4000s on
+# 2026-04-30 (issue #405). The previous 600s default opened a trap zone
+# where any agent whose latest journal entry sat between
+# JOURNAL_SILENCE_SECS (600s) and RECENT_ACTIVITY_WINDOW_SECS (3600s)
+# was eligible for restart. Normal chat-cadence agents (10–60 min between
+# user messages) land in that zone every cycle, producing ~208 false
+# restarts/24h on a typical host. With both defaults at 4000s (> the
+# 3600s recent-activity window), the trap zone closes: by the time
+# silence reaches 4000s, the latest entry is already past the
+# recent-activity gate and gets treated as idle. The hang detector is
+# effectively inert under defaults — operators who want it active must
+# opt in by lowering these values via env, and `Restart=on-failure` in
+# the unit file still catches actual crashes. See issue #405 for the
+# worked example showing the 21.5-min restart cadence the trap zone
+# produced.
+: "${JOURNAL_SILENCE_SECS:=4000}"          # seconds of journal silence before suspecting a hang
+: "${JOURNAL_SILENCE_HARD_SECS:=4000}"     # seconds the silence_since marker must predate before restarting
 # Recent-activity gate: only treat journal-silence as suspect-hang when the
 # agent had ANY log activity within this window. Distinguishes "hung mid-task"
 # (last log moments ago, then silence) from "genuinely idle" (no logs in
