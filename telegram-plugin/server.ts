@@ -4159,10 +4159,10 @@ bot.command('agents', async ctx => {
   })
 })
 
-// /switchroomstart [name] — start an agent. Defaults to the current agent
-// (the one this bot is bound to) so the common case is just `/switchroomstart`.
-// (use switchroomstart to avoid conflict with Telegram's built-in /start)
-bot.command('switchroomstart', async ctx => {
+// /agentstart [name] — start an agent. Defaults to the current agent
+// (the one this bot is bound to) so the common case is just `/agentstart`.
+// (use /agentstart to avoid conflict with Telegram's built-in /start)
+bot.command('agentstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
   await runSwitchroomCommand(ctx, ['agent', 'start', name], `start ${name}`)
@@ -5308,8 +5308,8 @@ bot.command('version', async ctx => {
   }
 })
 
-// /switchroomhelp — show all available bot commands
-bot.command('switchroomhelp', async ctx => {
+// /commands — show all available bot commands
+bot.command('commands', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
 })
@@ -5347,7 +5347,7 @@ const _legacySwitchroomHelp = (me: string): string => [
     '/memory <query> - Search agent memory',
     '',
     'Operate (default: current agent)',
-    '/switchroomstart [name] - Start an agent',
+    '/agentstart [name] - Start an agent',
     '/stop [name] - Stop an agent',
     '/restart [name|all] - Restart an agent (or all)',
     '',
@@ -5371,7 +5371,7 @@ const _legacySwitchroomHelp = (me: string): string => [
     '/vault unlock - Unlock the broker (prompts for passphrase)',
     '/vault lock - Lock the broker',
     '',
-    '/switchroomhelp - Show this help message',
+    '/commands - Show this help message',
     '',
     'These commands run the switchroom CLI directly — no AI tokens used.',
 ].join('\n')

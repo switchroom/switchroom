@@ -5024,7 +5024,7 @@ bot.command('agents', async ctx => {
   })
 })
 
-bot.command('switchroomstart', async ctx => {
+bot.command('agentstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
   try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
@@ -6922,7 +6922,7 @@ bot.command('version', async ctx => {
 })
 
 
-bot.command('switchroomhelp', async ctx => {
+bot.command('commands', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
 })
@@ -6931,7 +6931,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   // Slash-menu is deliberately trimmed from the full command catalogue.
   // See telegram-plugin/welcome-text.ts TELEGRAM_MENU_COMMANDS for the
   // rationale (mobile UX focus; ops primitives stay typable but out of
-  // the autocomplete clutter). /switchroomhelp surfaces the full list.
+  // the autocomplete clutter). /commands surfaces the full list.
   await bot.api.setMyCommands(
     [...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS],
     { scope: { type: 'all_private_chats' } },

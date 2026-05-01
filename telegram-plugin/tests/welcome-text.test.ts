@@ -106,10 +106,10 @@ describe("startText", () => {
     expect(out).toContain("/telegram:access pair");
     expect(out).toContain("6-char code");
   });
-  it("points at /status and /switchroomhelp", () => {
+  it("points at /status and /commands", () => {
     const out = startText("assistant", false);
     expect(out).toContain("/status");
-    expect(out).toContain("/switchroomhelp");
+    expect(out).toContain("/commands");
   });
   it("HTML-escapes agent name", () => {
     expect(startText("<x>", false)).toContain("&lt;x&gt;");
@@ -128,8 +128,8 @@ describe("helpText", () => {
     expect(out).toContain("/new");
     expect(out).toContain("/reset");
   });
-  it("points at the richer /switchroomhelp", () => {
-    expect(helpText("assistant")).toContain("/switchroomhelp");
+  it("points at the richer /commands", () => {
+    expect(helpText("assistant")).toContain("/commands");
   });
   it("drops the old 'Claude Code session' phrasing", () => {
     expect(helpText("assistant")).not.toMatch(/Claude Code session/);
@@ -302,7 +302,7 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
   it("menu includes the session-control commands (the most-used trio)", () => {
     const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
     // These MUST be in the menu — they're the primary mobile UX flows
-    for (const must of ["new", "reset", "approve", "deny", "pending", "restart", "logs", "switchroomhelp"]) {
+    for (const must of ["new", "reset", "approve", "deny", "pending", "restart", "logs", "commands"]) {
       expect(names, `missing /${must} from Telegram menu`).toContain(must);
     }
   });
@@ -314,7 +314,7 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     // menu has regressed to pre-trim length.
     // Note: /vault was re-added to the menu in PR #254 — users couldn't
     // discover the vault subcommands without typing the verb manually.
-    for (const droppedFromMenu of ["grant", "dangerous", "permissions", "switchroomstart", "topics", "memory", "pins-status", "interrupt"]) {
+    for (const droppedFromMenu of ["grant", "dangerous", "permissions", "agentstart", "topics", "memory", "pins-status", "interrupt"]) {
       expect(names, `/${droppedFromMenu} should NOT be in the trimmed Telegram menu`).not.toContain(droppedFromMenu);
     }
   });
@@ -328,9 +328,9 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
   it("every menu command is documented in switchroomHelpText", () => {
     const helpDoc = switchroomHelpText("assistant");
     for (const { command } of TELEGRAM_SWITCHROOM_COMMANDS) {
-      // Special case: /switchroomhelp describes itself; the check still passes
-      // because the list item literally reads '/switchroomhelp — this help'.
-      expect(helpDoc, `menu command /${command} missing from /switchroomhelp text`).toContain(`/${command}`);
+      // Special case: /commands describes itself; the check still passes
+      // because the list item literally reads '/commands — this help'.
+      expect(helpDoc, `menu command /${command} missing from /commands text`).toContain(`/${command}`);
     }
   });
 });

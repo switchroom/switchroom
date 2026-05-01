@@ -52,9 +52,10 @@ const WARN_ONLY = new Set([
 
 export function registerVersionsCommand(program: Command): void {
   program
-    .command("versions")
+    .command("versions", { hidden: true })
     .description(
-      "Show pinned manifest versions vs installed, highlighting drift",
+      "Show pinned manifest versions vs installed, highlighting drift " +
+        "(hidden — confusable with `version`; follow-up: rename to `drift` or fold into `doctor`)",
     )
     .action(async () => {
       let manifest;

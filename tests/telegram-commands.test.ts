@@ -69,7 +69,7 @@ describe('telegram bot commands', () => {
   describe('command argument parsing', () => {
     // Simulates how Grammy provides ctx.match for /command <args>
 
-    it('extracts agent name from /switchroomstart health-coach', () => {
+    it('extracts agent name from /agentstart health-coach', () => {
       const match = 'health-coach'
       const name = match.trim()
       expect(name).toBe('health-coach')
