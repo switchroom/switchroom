@@ -27,6 +27,12 @@ import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
+import {
+  startHeartbeat as startPlaceholderHeartbeatImpl,
+  DEFAULT_INTERVAL_MS as HEARTBEAT_DEFAULT_INTERVAL_MS,
+  DEFAULT_MAX_DURATION_MS as HEARTBEAT_DEFAULT_MAX_DURATION_MS,
+  type HeartbeatHandle,
+} from '../placeholder-heartbeat.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -730,6 +736,57 @@ interface PreAllocatedDraft {
   allocatedAt: number
 }
 const preAllocatedDrafts = new Map<string, PreAllocatedDraft>()
+
+// Heartbeat lifecycle (Path A §3 minimum). One handle per active
+// pre-alloc draft. Started at pre-alloc success; cancelled at every
+// preAllocatedDrafts.delete() call site. See
+// telegram-plugin/docs/heartbeat-placeholder-design.md and
+// tests/gateway-heartbeat-call-sites.test.ts (which pins the
+// start-cancel pairing structurally).
+const placeholderHeartbeats = new Map<string, HeartbeatHandle>()
+
+/** Tick interval for the heartbeat. Override via env (rollback path
+ * documented in design §10.1). 0 = disabled, agent reverts to today's
+ * static placeholder behaviour. */
+const HEARTBEAT_INTERVAL_MS = (() => {
+  const env = process.env.SWITCHROOM_TG_PLACEHOLDER_HEARTBEAT_MS
+  if (env != null) {
+    const parsed = Number(env)
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed
+  }
+  return HEARTBEAT_DEFAULT_INTERVAL_MS
+})()
+
+/** Start a heartbeat for a freshly pre-allocated placeholder. Idempotent —
+ * if one is already running for this chat, the prior is cancelled first. */
+function startPlaceholderHeartbeat(chat_id: string, draftId: number, startedAt: number): void {
+  // Defensive: cancel any prior heartbeat for this chat. Shouldn't
+  // happen because pre-alloc only fires when no prior draft exists,
+  // but a half-cleaned state from a crash recovery shouldn't leak.
+  cancelPlaceholderHeartbeat(chat_id)
+  if (sendMessageDraftFn == null) return  // No draft API → no heartbeat
+  const handle = startPlaceholderHeartbeatImpl(chat_id, draftId, startedAt, {
+    sendMessageDraft: sendMessageDraftFn,
+    isPlaceholderActive: (cid) => preAllocatedDrafts.has(cid),
+    // §3 minimum: no enrichment source. Always use the default label.
+    // §4 enrichment will swap in a label-map reader here.
+    getCurrentLabel: () => null,
+    intervalMs: HEARTBEAT_INTERVAL_MS,
+    maxDurationMs: HEARTBEAT_DEFAULT_MAX_DURATION_MS,
+    log: (msg) => process.stderr.write(`${msg}\n`),
+  })
+  placeholderHeartbeats.set(chat_id, handle)
+}
+
+/** Cancel any heartbeat running for this chat. Called at every
+ * preAllocatedDrafts.delete() site. Idempotent — safe to call when
+ * no heartbeat exists. */
+function cancelPlaceholderHeartbeat(chat_id: string): void {
+  const handle = placeholderHeartbeats.get(chat_id)
+  if (handle == null) return
+  handle.cancel()
+  placeholderHeartbeats.delete(chat_id)
+}
 
 let currentSessionChatId: string | null = null
 let currentTurnStartedAt = 0
@@ -1873,6 +1930,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     const preAllocated = preAllocatedDrafts.get(chat_id)
     if (preAllocated != null) {
       preAllocatedDrafts.delete(chat_id)
+      cancelPlaceholderHeartbeat(chat_id)  // Path A heartbeat: stop ticking once the draft is consumed
       // Best-effort: a clear failure (rate limit, expired draft) is
       // harmless — the orphan-cleanup path on turn_end is still wired
       // and will retry. Don't await: the subsequent sendMessage is
@@ -2077,6 +2135,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const preAllocated = streamIsPrivate ? preAllocatedDrafts.get(streamChatId) : undefined
   if (preAllocated != null) {
     preAllocatedDrafts.delete(streamChatId)
+    cancelPlaceholderHeartbeat(streamChatId)  // Path A heartbeat: stop ticking — stream_reply now owns the draft
   }
 
   // #271 (URL-button half): validate inline_keyboard for stream_reply.
@@ -3052,6 +3111,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       const orphanDraft = preAllocatedDrafts.get(chatId)
       if (orphanDraft != null) {
         preAllocatedDrafts.delete(chatId)
+        cancelPlaceholderHeartbeat(chatId)  // Path A heartbeat: stop ticking — turn ended without consuming
         if (sendMessageDraftFn != null) {
           void sendMessageDraftFn(chatId, orphanDraft.draftId, '').catch(() => {
             /* best-effort cleanup */
@@ -3869,8 +3929,17 @@ async function handleInbound(
       // today's behavior — the existing .catch already silently logs.
       void sendMessageDraftFn!(chat_id, draftId, PRE_ALLOC_PLACEHOLDER_TEXT)
         .then(() => {
-          preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
+          const allocatedAt = Date.now()
+          preAllocatedDrafts.set(chat_id, { draftId, allocatedAt })
           process.stderr.write(`telegram gateway: pre-allocate draft ok chatId=${chat_id} draftId=${draftId}\n`)
+          // Start the heartbeat (Path A §3 minimum) — keeps the
+          // placeholder text moving so the chat doesn't appear
+          // frozen during the model's TTFT window. See
+          // telegram-plugin/docs/heartbeat-placeholder-design.md.
+          // Must be paired with cancelPlaceholderHeartbeat() at every
+          // preAllocatedDrafts.delete() site (pinned by
+          // tests/gateway-heartbeat-call-sites.test.ts).
+          startPlaceholderHeartbeat(chat_id, draftId, allocatedAt)
         })
         .catch((err) => {
           process.stderr.write(
