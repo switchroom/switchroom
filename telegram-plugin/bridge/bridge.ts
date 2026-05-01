@@ -485,17 +485,22 @@ if (ptyTailEnabled) {
     ptyTailHandle = startPtyTail({
       logFile: serviceLogPath,
       log: (msg) => process.stderr.write(`telegram bridge: ${msg}\n`),
-      onPartial: (_text) => {
-        // PTY partial draft previews (live text as the model types) are
-        // intentionally disabled in gateway mode. The progress card
-        // (driven by session-tail events forwarded over IPC) provides
-        // the primary "model is working" UX surface instead. Draft
-        // previews would require a high-frequency IPC channel for raw
-        // PTY output which isn't worth the complexity.
+      onPartial: (text) => {
+        // Forward to the gateway so it can drive a draft-stream edit.
+        // Best-effort: ipc.sendPtyPartial silently no-ops when not
+        // connected, mirroring how sendSessionEvent handles the gap.
+        // Disable forwarding entirely with SWITCHROOM_PTY_TAIL=off
+        // (handled by ptyTailEnabled above) — there's no per-side
+        // toggle because the bridge doesn't know whether the gateway
+        // wants the events. The gateway-side `onPtyPartial` handler
+        // is also optional, so a downgraded gateway gets silent drops.
+        ipc?.sendPtyPartial({ type: 'pty_partial', text })
       },
       activityExtractor: new V1ToolActivityExtractor(),
       onActivity: (_text) => {
-        // Activity is also handled gateway-side via session events.
+        // Activity (the "Running Read…" tool-use lane) is currently
+        // surfaced gateway-side via session_event tool_use → progress
+        // card. No separate IPC forward needed for that lane.
       },
     })
     process.stderr.write(`telegram bridge: pty tail watching ${serviceLogPath}\n`)

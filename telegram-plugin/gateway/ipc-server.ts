@@ -5,6 +5,7 @@ import type {
   HeartbeatMessage,
   OperatorEventForward,
   PermissionRequestForward,
+  PtyPartialForward,
   RegisterMessage,
   ScheduleRestartMessage,
   SessionEventForward,
@@ -24,6 +25,13 @@ export interface IpcServerOptions {
   onScheduleRestart: (client: IpcClient, msg: ScheduleRestartMessage) => void;
   onOperatorEvent?: (client: IpcClient, msg: OperatorEventForward) => void;
   onUpdatePlaceholder?: (client: IpcClient, msg: UpdatePlaceholderMessage) => void;
+  /**
+   * Forwarded PTY-tail partial — the latest extracted reply text from
+   * Claude Code's TUI rendering. Optional: gateways without streaming
+   * configured (or in test fixtures) can omit this and pty_partial
+   * messages will be silently dropped at dispatch.
+   */
+  onPtyPartial?: (client: IpcClient, msg: PtyPartialForward) => void;
   log?: (msg: string) => void;
   /**
    * How long (in ms) to wait without a heartbeat before force-closing the
@@ -151,6 +159,14 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof m.text === "string"
         && (m.text as string).length > 0
         && (m.text as string).length <= 500;
+    case "pty_partial":
+      // Extracted reply text from PTY-tail. May be empty (the extractor
+      // returns empty strings for "no text yet" snapshots — gateway
+      // handler dedups on lastPtyPreviewByChat). Capped at 8192 to
+      // give some headroom over Telegram's 4096-char wire limit while
+      // still bounding buffer growth from a runaway extractor.
+      return typeof m.text === "string"
+        && (m.text as string).length <= 8192;
     default:
       return false;
   }
@@ -168,6 +184,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onScheduleRestart,
     onOperatorEvent,
     onUpdatePlaceholder,
+    onPtyPartial,
     log = () => {},
     heartbeatTimeoutMs = 30_000,
   } = options;
@@ -247,6 +264,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "update_placeholder":
         if (onUpdatePlaceholder) onUpdatePlaceholder(client, msg as UpdatePlaceholderMessage);
+        break;
+      case "pty_partial":
+        if (onPtyPartial) onPtyPartial(client, msg as PtyPartialForward);
         break;
       default:
         log(`unknown IPC message type from client ${client.id}: ${(msg as any).type}`);

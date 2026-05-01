@@ -121,6 +121,26 @@ export interface UpdatePlaceholderMessage {
   text: string;
 }
 
+/**
+ * Forwarded from bridge → gateway when PTY-tail extracts updated reply
+ * text from Claude Code's TUI rendering. The gateway routes the text
+ * through `handlePtyPartial` → draft-stream so the user sees the model's
+ * reply assemble character-by-character (Claude.ai-style streaming).
+ *
+ * Sent by bridge.ts's `startPtyTail({onPartial})` callback. The bridge
+ * doesn't know the chat id — the gateway resolves it from
+ * `currentSessionChatId`, which is set when the bridge forwards the
+ * matching `enqueue` session event.
+ *
+ * No throttle on the wire: PTY-tail's onPartial already coalesces at
+ * ~150 ms. Same pattern as session_event forwarding.
+ */
+export interface PtyPartialForward {
+  type: "pty_partial";
+  /** Extracted reply text snapshot. Up to ~4096 chars (Telegram limit). */
+  text: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -129,4 +149,5 @@ export type ClientToGateway =
   | HeartbeatMessage
   | ScheduleRestartMessage
   | OperatorEventForward
-  | UpdatePlaceholderMessage;
+  | UpdatePlaceholderMessage
+  | PtyPartialForward;

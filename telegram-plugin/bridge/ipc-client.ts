@@ -6,6 +6,7 @@ import type {
   OperatorEventForward,
   PermissionEvent,
   PermissionRequestForward,
+  PtyPartialForward,
   SessionEventForward,
   StatusEvent,
   ToolCallResult,
@@ -58,6 +59,16 @@ export interface IpcClientHandle {
   sendSessionEvent(event: SessionEventForward): void;
   sendPermissionRequest(msg: PermissionRequestForward): void;
   sendOperatorEvent(msg: OperatorEventForward): void;
+  /**
+   * Forward a PTY-tail partial — the latest extracted reply text from
+   * Claude Code's TUI rendering of an in-flight `reply (MCP)` /
+   * `stream_reply (MCP)` tool call. The gateway routes the text into a
+   * draft stream so the user sees the model's reply assemble character-
+   * by-character (Claude.ai-style streaming). Wire-protocol only —
+   * silent no-op when not connected. See `PtyPartialForward` in
+   * `gateway/ipc-protocol.ts`.
+   */
+  sendPtyPartial(msg: PtyPartialForward): void;
   isConnected(): boolean;
   close(): void;
 }
@@ -275,6 +286,10 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
     },
 
     sendOperatorEvent(msg: OperatorEventForward): void {
+      sendRaw(msg);
+    },
+
+    sendPtyPartial(msg: PtyPartialForward): void {
       sendRaw(msg);
     },
 
