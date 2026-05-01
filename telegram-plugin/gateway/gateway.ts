@@ -41,6 +41,7 @@ import {
   type Phase,
 } from '../placeholder-phase.js'
 import { StatusReactionController } from '../status-reactions.js'
+import { firstPaintTurn } from '../first-paint.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -3970,107 +3971,50 @@ async function handleInbound(
     return
   }
 
-  // Status reaction controller
-  let isSteering = false
-  let priorTurnStartedAt: number | undefined
-  if (msgId != null) {
-    const key = statusKey(chat_id, messageThreadId)
-    const priorActive = activeStatusReactions.get(key)
-    const priorTurnInFlight = priorActive != null
-    // New default: mid-turn messages are queued unless the user explicitly
-    // steers. isSteering is true only when the steer prefix is present.
-    // (Legacy: without any prefix the old behavior was isSteering=true; now
-    // it's false so the message goes through as queued="true".)
-    isSteering = priorTurnInFlight && isSteerPrefix
-    if (priorTurnInFlight) priorTurnStartedAt = activeTurnStartedAt.get(key)
+  // First-paint slice: status-reaction setup + progressDriver.startTurn for
+  // fresh turns. Extracted to telegram-plugin/first-paint.ts so the
+  // waiting-UX harness can drive the real path with fakes (Phase 1 of #545).
+  // Behavior here is unchanged — the seam is a thin wrapper around the
+  // existing logic with module-level state passed via deps.
+  const firstPaintResult = await firstPaintTurn(
+    {
+      bot,
+      progressDriver,
+      activeStatusReactions,
+      activeReactionMsgIds,
+      activeTurnStartedAt,
+      progressUpdateTurnCount,
+      activeDraftStreams,
+      activeDraftParseModes,
+      suppressPtyPreview,
+      statusKey,
+      streamKey,
+      purgeReactionTracking,
+      signalTracker,
+      resolveAgentDirFromEnv,
+      addActiveReaction,
+      logStreamingEvent,
+    },
+    {
+      chatId: chat_id,
+      messageId: msgId,
+      messageThreadId,
+      isSteerPrefix,
+      effectiveText,
+      inboundReceivedAt,
+      access,
+    },
+  )
+  const isSteering = firstPaintResult.isSteering
+  const priorTurnStartedAt = firstPaintResult.priorTurnStartedAt
 
-    if (access.statusReactions !== false) {
-      if (isSteering) {
-        // Explicit steer: mark with 🤝 on the inbound message; leave the
-        // existing StatusReactionController running for the in-flight turn.
-        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '🤝' }]).catch(() => {})
-      } else if (priorTurnInFlight) {
-        // Queued mid-turn message (new default): don't touch the existing
-        // controller; just ack the inbound message with 👀 so the user
-        // knows we received it, without disrupting the in-flight reaction.
-        void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '👀' }]).catch(() => {})
-        // #203: time-to-ack metric — measure gateway-receive → ack-post delta.
-        logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
-      } else {
-        // Fresh turn (no prior turn in flight): cancel any stale controller
-        // and start a new one for this message.
-        if (priorActive) {
-          priorActive.cancel()
-          purgeReactionTracking(key)
-        }
-        const sKey = streamKey(chat_id, messageThreadId)
-        const priorStream = activeDraftStreams.get(sKey)
-        if (priorStream && !priorStream.isFinal()) {
-          // Closes #472 finding #17 — pre-fix this finalize was
-          // fire-and-forget. The new turn's reply tool would then create
-          // a fresh stream and send its first chunk while the prior
-          // stream's terminal sendMessage was still in flight. The
-          // late-materialise landed AFTER the new turn's content,
-          // visible to the user as a stale "Done" message followed by
-          // the new reply (or worse — duplicate content).
-          //
-          // Awaiting here costs the few hundred ms the final API call
-          // takes, but only on rapid follow-ups where the prior turn
-          // hadn't yet flushed. The latency hit beats the duplicate-
-          // content bug. Delete from the map FIRST so any concurrent
-          // reads can't see the stale stream while we await.
-          activeDraftStreams.delete(sKey)
-          activeDraftParseModes.delete(sKey)
-          await priorStream.finalize().catch(() => {})
-        }
-        suppressPtyPreview.delete(sKey)
-
-        const ctrl = new StatusReactionController(async (emoji) => {
-          await bot.api.setMessageReaction(chat_id, msgId, [
-            { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-          ])
-          // #203: every status-reaction transition is a user-visible signal.
-          signalTracker.noteSignal(key, Date.now())
-        })
-        activeStatusReactions.set(key, ctrl)
-        activeReactionMsgIds.set(key, { chatId: chat_id, messageId: msgId })
-        activeTurnStartedAt.set(key, Date.now())
-        progressUpdateTurnCount.set(key, 0)  // Reset turn counter
-        ctrl.setQueued()
-        // #203: time-to-ack metric — setQueued() triggers the initial 👀 reaction
-        // asynchronously through the controller chain.
-        logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
-        // #203: signal tracker — start tracking silent gaps for this fresh turn.
-        signalTracker.reset(statusKey(chat_id, messageThreadId), Date.now())
-        const agentDir = resolveAgentDirFromEnv()
-        if (agentDir != null) {
-          addActiveReaction(agentDir, { chatId: chat_id, messageId: msgId, threadId: messageThreadId ?? null, reactedAt: Date.now() })
-        }
-      }
-    } else if (access.ackReaction) {
-      void bot.api.setMessageReaction(chat_id, msgId, [
-        { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
-      // #203: time-to-ack metric for the custom-ack-reaction path.
-      logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
-    }
-  }
-
-  // Start a new progress card only for fresh turns (no prior turn in flight).
-  // Queued mid-turn messages piggyback on the existing card; steer messages
-  // also don't start a new card (the in-flight turn owns it).
+  // Fresh-turn-only block: progressDriver.startTurn already fired inside
+  // firstPaintTurn above. What stays inline here is the pre-alloc draft +
+  // forum-topic placeholder + heartbeat scheduling — gated by the same
+  // !isSteering && no-prior-turn condition because they're all "first
+  // visible signal" siblings of startTurn. They depend on too much
+  // module-level state to fold into the seam without ballooning deps.
   if (!isSteering && priorTurnStartedAt == null) {
-    try {
-      progressDriver?.startTurn({
-        chatId: chat_id,
-        threadId: messageThreadId != null ? String(messageThreadId) : undefined,
-        userText: effectiveText,
-        replyToMessageId: msgId != null ? msgId : undefined,
-      })
-    } catch (err) {
-      process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
-    }
-
     // Issue #416 — pre-allocate a sendMessageDraft for instant visual feedback
     // in DMs. The agent's first stream_reply consumes this draft id instead
     // of allocating a new one, so the user sees a placeholder draft within
