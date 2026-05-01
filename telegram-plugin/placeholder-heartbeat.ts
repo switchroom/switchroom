@@ -152,6 +152,10 @@ export function startHeartbeat(
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let cancelled = false
+  // Dedup state — last text we actually emitted to sendMessageDraft.
+  // null on first tick; subsequent ticks compare composed text against
+  // this and skip the API call when unchanged. See dedup branch below.
+  let lastEmittedText: string | null = null
 
   const tick = (): void => {
     if (cancelled) return
@@ -179,6 +183,28 @@ export function startHeartbeat(
 
     const label = getCurrentLabel(chatId)
     const text = composeHeartbeatText(label, elapsedMs)
+
+    // Dedup: skip the API call when the new text equals the last
+    // emitted text for this heartbeat. Defends against operator
+    // intervals that don't align with formatElapsed precision tiers
+    // (e.g. 2s ticks land 2-3× in the same 5s bucket and produce
+    // the same text). Telegram would respond "message not modified"
+    // which is wasted bandwidth + log noise. Stays correct under §4
+    // enrichment because label changes produce different text.
+    if (text === lastEmittedText) {
+      log?.(`telegram gateway: heartbeat tick chatId=${chatId} text="${text}" (deduped — no edit)`)
+      if (!cancelled) {
+        timer = setTimeout(tick, intervalMs)
+      }
+      return
+    }
+
+    lastEmittedText = text
+
+    // Diagnostic: log every tick so operators can confirm the
+    // heartbeat is firing without resorting to inspecting Telegram.
+    // Cheap (one stderr line per ~5s per active chat).
+    log?.(`telegram gateway: heartbeat tick chatId=${chatId} text="${text}"`)
 
     // Fire-and-forget. Errors (rate limit, deleted message, etc.)
     // are swallowed by design — next tick will either succeed or

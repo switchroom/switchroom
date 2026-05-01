@@ -297,4 +297,65 @@ describe('startHeartbeat — §3 lifecycle (with fake timers)', () => {
     expect(DEFAULT_MAX_DURATION_MS).toBe(5 * 60 * 1000)
     expect(DEFAULT_HEARTBEAT_LABEL).toBe('🔵 thinking')
   })
+
+  describe('dedup — skip edit when text unchanged', () => {
+    it('dedups when 2s interval lands multiple ticks in the same 5s formatElapsed bucket', () => {
+      // Live-traffic finding: at intervalMs=2000, formatElapsed's 5s
+      // precision in the 10-59s window means consecutive ticks
+      // produce identical text ("· 10s", "· 10s", "· 15s"). Without
+      // dedup these become wasted Telegram editMessageText calls
+      // returning "message not modified". Pin the dedup so an operator
+      // tuning the interval doesn't rediscover the issue.
+      const { calls, deps } = makeDeps({ intervalMs: 2000 })
+      startHeartbeat('123', 99, Date.now(), deps)
+
+      vi.advanceTimersByTime(20000)
+      // Ticks fire at: 2s, 4s, 6s, 8s, 10s, 12s, 14s, 16s, 18s, 20s
+      // formatElapsed produces:
+      //   2s, 4s, 6s, 8s, 10s, 10s (12s rounds to 10), 15s, 15s, 20s, 20s
+      // Distinct: 2s, 4s, 6s, 8s, 10s, 15s, 20s = 7 unique texts
+      // Without dedup: 10 sendMessageDraft calls
+      // With dedup: 7 sendMessageDraft calls
+      expect(calls.length).toBe(7)
+      const texts = calls.map((c) => c.text)
+      expect(texts).toEqual([
+        `${DEFAULT_HEARTBEAT_LABEL} · 2s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 4s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 6s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 8s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 10s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 15s`,
+        `${DEFAULT_HEARTBEAT_LABEL} · 20s`,
+      ])
+    })
+
+    it('does NOT dedup when label changes mid-bucket (forward-compat with §4 enrichment)', () => {
+      // §4 enrichment: recall.py / session-tail change the label
+      // mid-tick. Even if the elapsed bucket is the same, a label
+      // change MUST emit because the visible text differs.
+      let currentLabel: string | null = null
+      const { calls, deps } = makeDeps({
+        intervalMs: 2000,
+        getCurrentLabel: vi.fn(() => currentLabel),
+      })
+      startHeartbeat('123', 99, Date.now(), deps)
+
+      vi.advanceTimersByTime(2000)
+      expect(calls[0]!.text).toBe(`${DEFAULT_HEARTBEAT_LABEL} · 2s`)
+
+      // Label changes — same bucket would normally dedup, but the
+      // text actually differs because of the new label.
+      currentLabel = '📚 recalling memories'
+      vi.advanceTimersByTime(2000)
+      expect(calls[1]!.text).toBe('📚 recalling memories · 4s')
+      expect(calls.length).toBe(2)
+    })
+
+    it('first tick always emits (no prior text to compare against)', () => {
+      const { calls, deps } = makeDeps({ intervalMs: 5000 })
+      startHeartbeat('123', 99, Date.now(), deps)
+      vi.advanceTimersByTime(5000)
+      expect(calls.length).toBe(1)
+    })
+  })
 })
