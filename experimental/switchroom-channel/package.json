@@ -1,8 +1,0 @@
-{
-  "name": "switchroom-channel",
-  "version": "0.1.0",
-  "type": "module",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
-  }
-}

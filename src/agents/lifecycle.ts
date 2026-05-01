@@ -321,24 +321,6 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
   });
 }
 
-export function enableAgent(name: string): void {
-  try {
-    systemctl(["enable", serviceName(name)]);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to enable agent "${name}": ${message}`);
-  }
-}
-
-export function disableAgent(name: string): void {
-  try {
-    systemctl(["disable", serviceName(name)]);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to disable agent "${name}": ${message}`);
-  }
-}
-
 export function interruptAgent(name: string): { pid: number } {
   const status = getAgentStatus(name);
   if (!status.pid) {
