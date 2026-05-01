@@ -2651,22 +2651,26 @@ function handleSessionEvent(ev: SessionEvent): void {
           currentTurnRegistryKey = turnKey
           // Phase 1 of #332: capture first ~200 chars of the user's message.
           const userPromptPreview = extractUserPromptPreview(ev.rawContent)
-          // Non-blocking: defer the DB write so it doesn't stall the turn handler.
-          // The SIGTERM path writes synchronously (see shutdown handler below).
-          const _db = turnsDb
-          setImmediate(() => {
-            try {
-              recordTurnStart(_db, {
-                turnKey,
-                chatId: String(ev.chatId),
-                threadId: ev.threadId != null ? String(ev.threadId) : null,
-                lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
-                userPromptPreview,
-              })
-            } catch (err) {
-              process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
-            }
-          })
+          // Closes #472 finding #11. Pre-fix: this write was scheduled
+          // via setImmediate to "avoid stalling the turn handler" — but
+          // SQLite local writes are sub-millisecond, and the deferral
+          // opened a SIGTERM race window: a kill landing in the gap
+          // between scheduling and firing left a turn with no start
+          // row, invisible to the resume protocol (the user sent a
+          // message, the gateway lost it, no SWITCHROOM_PENDING_TURN
+          // env on next boot). Sibling writeTurnActiveMarker has always
+          // been synchronous here; this matches it.
+          try {
+            recordTurnStart(turnsDb, {
+              turnKey,
+              chatId: String(ev.chatId),
+              threadId: ev.threadId != null ? String(ev.threadId) : null,
+              lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+              userPromptPreview,
+            })
+          } catch (err) {
+            process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
+          }
           // #412: turn-active marker for the bridge-watchdog. File exists
           // for the duration of the in-flight turn; mtime advances on
           // every tool_use; deleted on turn_complete. The watchdog
@@ -3127,25 +3131,25 @@ function handleSessionEvent(ev: SessionEvent): void {
         const assistantReplyPreview = capturedJoined
           ? capturedJoined.slice(0, TURN_PREVIEW_MAX)
           : null
-        // Non-blocking: defer the DB write so it doesn't stall the turn handler.
-        // The SIGTERM path writes synchronously (see shutdown handler below).
-        const _db = turnsDb
+        // Closes #472 finding #11 — same SIGTERM race as recordTurnStart
+        // above. Sub-ms SQLite write; the setImmediate deferral wasn't
+        // saving anything observable but was opening a window where a
+        // SIGTERM between turn_end and the microtask losing the end row
+        // (turn appears in DB as still-running, then 3c relabels it as
+        // 'sigterm' on shutdown — false negative for clean completion).
         const _turnKey = currentTurnRegistryKey
-        const _endArgs = {
-          turnKey: _turnKey,
-          endedVia: 'stop' as const,
-          lastAssistantMsgId: currentTurnLastAssistantMsgId,
-          lastAssistantDone: currentTurnLastAssistantDone,
-          assistantReplyPreview,
-          toolCallCount: currentTurnToolCallCount,
+        try {
+          recordTurnEnd(turnsDb, {
+            turnKey: _turnKey,
+            endedVia: 'stop' as const,
+            lastAssistantMsgId: currentTurnLastAssistantMsgId,
+            lastAssistantDone: currentTurnLastAssistantDone,
+            assistantReplyPreview,
+            toolCallCount: currentTurnToolCallCount,
+          })
+        } catch (err) {
+          process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
         }
-        setImmediate(() => {
-          try {
-            recordTurnEnd(_db, _endArgs)
-          } catch (err) {
-            process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
-          }
-        })
       }
       currentTurnRegistryKey = null
       currentSessionChatId = null
