@@ -30,7 +30,6 @@ import { join, dirname } from 'node:path'
 const __dir = dirname(fileURLToPath(import.meta.url))
 const pluginDir = join(__dir, '..')
 
-const serverSrc = readFileSync(join(pluginDir, 'server.ts'), 'utf8')
 const gatewaySrc = readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8')
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -56,7 +55,7 @@ function vaultHandlerBlock(src: string): string {
 // ─── broker client imports ────────────────────────────────────────────────────
 
 describe('/vault #158 — broker client imports', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label} imports statusViaBroker, lockViaBroker, unlockViaBroker`, () => {
       expect(src).toMatch(/statusViaBroker/)
       expect(src).toMatch(/lockViaBroker/)
@@ -68,7 +67,7 @@ describe('/vault #158 — broker client imports', () => {
 // ─── /vault status ───────────────────────────────────────────────────────────
 
 describe('/vault status — happy path', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: calls statusViaBroker inside the status branch`, () => {
@@ -89,7 +88,7 @@ describe('/vault status — happy path', () => {
 })
 
 describe('/vault status — broker unreachable', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: replies with clear error when statusViaBroker returns null`, () => {
@@ -105,7 +104,7 @@ describe('/vault status — broker unreachable', () => {
 // ─── /vault lock ─────────────────────────────────────────────────────────────
 
 describe('/vault lock — happy path', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: calls lockViaBroker and confirms lock on success`, () => {
@@ -126,7 +125,7 @@ describe('/vault lock — happy path', () => {
 // ─── /vault unlock — prompt flow ─────────────────────────────────────────────
 
 describe('/vault unlock — passphrase prompt', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: records a pending-op of kind 'unlock'`, () => {
@@ -154,7 +153,7 @@ describe('/vault unlock — passphrase prompt', () => {
 // ─── /vault unlock — intercept (passphrase received) ─────────────────────────
 
 describe('/vault unlock — pending-op intercept (passphrase received)', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label}: empty passphrase is rejected with clear message`, () => {
       // The intercept (bot.on message:text handler) checks the kind and
       // rejects empty passphrase for the unlock branch.
@@ -200,7 +199,7 @@ describe('/vault unlock — pending-op intercept (passphrase received)', () => {
 // ─── help text ───────────────────────────────────────────────────────────────
 
 describe('/vault help text includes new subcommands', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: /vault help lists status, unlock, lock`, () => {

@@ -33,7 +33,6 @@ import { join, dirname } from 'node:path'
 const __dir = dirname(fileURLToPath(import.meta.url))
 const pluginDir = join(__dir, '..')
 
-const serverSrc = readFileSync(join(pluginDir, 'server.ts'), 'utf8')
 const gatewaySrc = readFileSync(join(pluginDir, 'gateway', 'gateway.ts'), 'utf8')
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -57,7 +56,7 @@ function vaultHandlerBlock(src: string): string {
 // ─── broker client imports ────────────────────────────────────────────────────
 
 describe('/vault grants #228 — broker client imports', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label} imports listGrantsViaBroker`, () => {
       expect(src).toMatch(/listGrantsViaBroker/)
     })
@@ -71,7 +70,7 @@ describe('/vault grants #228 — broker client imports', () => {
 // ─── /vault grants dispatcher ────────────────────────────────────────────────
 
 describe('/vault grants — dispatcher entry', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: has a grants branch inside the vault handler`, () => {
@@ -89,7 +88,7 @@ describe('/vault grants — dispatcher entry', () => {
 // ─── /vault grants — list rendering ──────────────────────────────────────────
 
 describe('/vault grants — list rendering wires to list_grants', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: renders grouped grants with agent names as headers`, () => {
@@ -121,7 +120,7 @@ describe('/vault grants — list rendering wires to list_grants', () => {
 // ─── /vault grants <agent> — filter form ─────────────────────────────────────
 
 describe('/vault grants <agent> — agent filter argument', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: parses optional agent argument from args`, () => {
@@ -145,7 +144,7 @@ describe('/vault grants <agent> — agent filter argument', () => {
 // ─── vg: callback dispatch ────────────────────────────────────────────────────
 
 describe('vg: callback query handler exists', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label}: has a handler block that checks data.startsWith('vg:')`, () => {
       expect(src).toMatch(/data\.startsWith\(['"]vg:['"]\)/)
     })
@@ -168,7 +167,7 @@ describe('vg: callback query handler exists', () => {
 // ─── revoke callback — invokes revokeGrantViaBroker ──────────────────────────
 
 describe('vg:confirm callback invokes revokeGrantViaBroker', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label}: vg:confirm branch calls revokeGrantViaBroker with the grant ID`, () => {
       // Use 'const confirmMatch =' as the unique code marker (avoids comment occurrences)
       const confirmArea = sliceFrom(src, 'const confirmMatch = /^vg:confirm:', 800)
@@ -195,7 +194,7 @@ describe('vg:confirm callback invokes revokeGrantViaBroker', () => {
 // ─── two-step confirmation flow ───────────────────────────────────────────────
 
 describe('revoke flow uses two-step confirmation (no immediate revoke on first tap)', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label}: vg:revoke tap shows confirmation card, not immediate revoke`, () => {
       // Use 'const revokeMatch =' as the unique code marker
       const revokeArea = sliceFrom(src, 'const revokeMatch = /^vg:revoke:', 1500)
@@ -218,7 +217,7 @@ describe('revoke flow uses two-step confirmation (no immediate revoke on first t
 // ─── vg:cancel — dismiss without revoke ──────────────────────────────────────
 
 describe('vg:cancel dismisses without revoking', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     it(`${label}: vg:cancel does NOT call revokeGrantViaBroker`, () => {
       const cancelArea = sliceFrom(src, 'const cancelMatch = /^vg:cancel:', 500)
       expect(cancelArea).not.toMatch(/revokeGrantViaBroker/)
@@ -234,7 +233,7 @@ describe('vg:cancel dismisses without revoking', () => {
 // ─── help text ───────────────────────────────────────────────────────────────
 
 describe('/vault help text includes grants subcommand', () => {
-  for (const [label, src] of [['server.ts', serverSrc], ['gateway.ts', gatewaySrc]] as const) {
+  for (const [label, src] of [['gateway.ts', gatewaySrc]] as const) {
     const block = vaultHandlerBlock(src)
 
     it(`${label}: /vault help lists grants subcommand`, () => {

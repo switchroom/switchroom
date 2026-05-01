@@ -120,27 +120,22 @@ describe('redactAuthCodeMessage', () => {
  *   1. gateway.ts — bare-code paste during pending reauth
  *   2. gateway.ts — /auth code intent dispatch
  *   3. gateway.ts — /reauth <code> shortcut
- *   4. server.ts — bare-code paste during pending reauth
- *   5. server.ts — /auth code explicit command
- *   6. server.ts — /reauth <code> shortcut
+ *
+ * #235 Wave 3 F4: server.ts monolith removed; the 3 server.ts call
+ * sites previously listed (bare paste / /auth code / /reauth <code>)
+ * no longer exist — gateway.ts is the only file with the live paths.
  */
 describe('auth-code paste call-site coverage (architectural pin)', () => {
-  it('every call site calls redactAuthCodeMessage', async () => {
+  it('every gateway.ts call site calls redactAuthCodeMessage', async () => {
     const fs = await import('node:fs')
     const path = await import('node:path')
     const repoRoot = path.resolve(__dirname, '..', '..')
-    const sources = [
+    const text = fs.readFileSync(
       path.join(repoRoot, 'telegram-plugin', 'gateway', 'gateway.ts'),
-      path.join(repoRoot, 'telegram-plugin', 'server.ts'),
-    ]
-    let totalCallSites = 0
-    for (const file of sources) {
-      const text = fs.readFileSync(file, 'utf-8')
-      const matches = text.match(/redactAuthCodeMessage\s*\(/g) ?? []
-      totalCallSites += matches.length
-    }
-    // 6 call sites + the import statements (1 per file).
-    // Match-count includes both, so floor at 6 (real call sites).
-    expect(totalCallSites).toBeGreaterThanOrEqual(6)
+      'utf-8',
+    )
+    const matches = text.match(/redactAuthCodeMessage\s*\(/g) ?? []
+    // 3 call sites + 1 import statement = ≥4. Floor at 3 to be safe.
+    expect(matches.length).toBeGreaterThanOrEqual(3)
   })
 })

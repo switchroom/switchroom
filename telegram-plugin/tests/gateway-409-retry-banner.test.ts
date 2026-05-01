@@ -102,19 +102,9 @@ describe("source-level guard present", () => {
     expect(src).toContain("Recovered from unexpected restart");
   });
 
-  it("server.ts declares didOneTimeSetup before the retry loop", async () => {
-    const fs = await import("node:fs");
-    const src = fs.readFileSync(
-      new URL("../server.ts", import.meta.url),
-      "utf8",
-    );
-    expect(src).toContain("let didOneTimeSetup = false");
-    expect(
-      /if\s*\(!didOneTimeSetup\)/.test(src) ||
-        /if\s*\(didOneTimeSetup\)\s*return/.test(src),
-    ).toBe(true);
-    expect(src).toContain("Recovered from unexpected restart");
-  });
+  // #235 Wave 3 F4: server.ts monolith removed; the source-level guard
+  // for `didOneTimeSetup` now only applies to gateway.ts (the single
+  // source of truth). The pre-F4 server.ts `it` block is gone.
 });
 
 /**
@@ -144,15 +134,11 @@ describe("server.ts dual-mode probe must not delete live gateway socket", () => 
 
     // Isolate the dual-mode block. We key off the block's distinctive
     // comment header so a rename/move doesn't silently neuter the check.
+    // After Wave 3 F4 (server.ts monolith deleted), the dual-mode block
+    // is essentially the entire file body, so the slice runs to EOF.
     const blockStart = src.indexOf("─── Dual-mode detection ───");
     expect(blockStart).toBeGreaterThan(-1);
-    // Block ends at the bridge import line that follows the probe.
-    const blockEnd = src.indexOf(
-      "import { type DraftStreamHandle }",
-      blockStart,
-    );
-    expect(blockEnd).toBeGreaterThan(blockStart);
-    const block = src.slice(blockStart, blockEnd);
+    const block = src.slice(blockStart);
 
     // The probe must not attempt to delete the gateway socket under
     // any circumstance. rmSync / unlinkSync against _gatewaySocket are

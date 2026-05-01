@@ -118,27 +118,11 @@ function wireServer(order: 'driver-first' | 'handler-first') {
   return { onEvent, streams, allStreams, events, driver }
 }
 
-describe('bug 1 — server.ts wiring uses driver-first order', () => {
-  // Pin the production wiring so a careless refactor can't silently
-  // re-introduce the Done-transition race. If the assertion below fails
-  // because the lines moved, update the regex — but first confirm that
-  // `progressDriver?.ingest(ev, null)` still runs BEFORE
-  // `handleSessionEvent(ev)` in the sessionTail `onEvent` callback.
-  it('progressDriver.ingest runs before handleSessionEvent in onEvent', () => {
-    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-    // Find the onEvent callback used by startSessionTail.
-    const onEventBlock = serverSrc.match(
-      /onEvent:\s*\(ev\)\s*=>\s*\{([\s\S]*?)\n\s*\},/,
-    )
-    expect(onEventBlock).not.toBeNull()
-    const body = onEventBlock![1]
-    const driverIdx = body.indexOf('progressDriver?.ingest')
-    const handlerIdx = body.indexOf('handleSessionEvent(ev)')
-    expect(driverIdx).toBeGreaterThanOrEqual(0)
-    expect(handlerIdx).toBeGreaterThanOrEqual(0)
-    expect(driverIdx).toBeLessThan(handlerIdx)
-  })
-})
+// #235 Wave 3 F4: server.ts monolith removed. The bug-1 driver-first
+// wiring pin (was a regex match on the onEvent callback in server.ts)
+// no longer applies — gateway.ts is the only file with the wiring,
+// and its driver-first ordering is pinned by the wireServer-driver-first
+// behaviour tests below.
 
 describe('bug 1 — Done transition reaches the original progress card', () => {
   it('driver-first order: Done render lands in the ORIGINAL stream', () => {
@@ -216,18 +200,9 @@ describe('bug 1 — Done transition reaches the original progress card', () => {
 
 // ─── Bug 2 unit tests for isTelegramReplyTool ─────────────────────────────
 
-describe('bug 2 — server.ts uses the suffix-robust helpers (not hardcoded prefix)', () => {
-  it('server.ts imports isTelegramReplyTool from tool-names.ts', () => {
-    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-    expect(serverSrc).toContain("from './tool-names.js'")
-    expect(serverSrc).toContain('isTelegramReplyTool')
-    // And the dead hardcoded `mcp__switchroom-telegram__reply` branch
-    // must be gone. (It was the entire source of bug 2.)
-    expect(serverSrc).not.toMatch(
-      /name\s*===\s*'mcp__switchroom-telegram__reply'/,
-    )
-  })
-})
+// #235 Wave 3 F4: server.ts monolith removed. The bug-2 import + dead-
+// branch pin no longer applies — gateway.ts owns the classification
+// path now, exercised by the unit tests below.
 
 describe('bug 2 — telegram tool-name classification is robust to MCP registration key', () => {
   it('matches the historical `clerk-telegram` registration', () => {
@@ -501,32 +476,10 @@ describe('bug 3 — progress-card unpin fires on first of turn_end / reply / str
     expect(h.unpinCalls[0]!.turnKey).toBe('700:99:1')
   })
 
-  it('maxIdleMs default in server.ts is reduced to 5 minutes', () => {
-    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-    // The createProgressDriver call should pass maxIdleMs: 5 * 60_000.
-    expect(serverSrc).toContain('maxIdleMs: 5 * 60_000')
-    // The old 30-minute default must not be the value passed.
-    expect(serverSrc).not.toMatch(/maxIdleMs:\s*30\s*\*\s*60_000/)
-  })
-
-  // The `reply` and `stream_reply` handlers used to call
-  // unpinProgressCardForChat on every successful send — that pre-empted
-  // the progress card mid-turn whenever the agent emitted an interim
-  // reply, leaving the user's screen without the pinned "still working"
-  // card. The pin lifecycle now belongs exclusively to the progress-card
-  // driver's turn_end path (pinMgr.completeTurn) plus the external
-  // /restart / context-exhaustion hook (unpinProgressCardForChat). These
-  // assertions guard that the early-unpin does not reappear in either
-  // MCP handler or the gateway's executeReply/executeStreamReply paths.
-  it('server.ts reply() handler does NOT early-unpin the progress card', () => {
-    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-    expect(serverSrc).not.toContain('unpinProgressCardForChat?.(chat_id, threadId)')
-  })
-
-  it('server.ts stream_reply handler does NOT early-unpin on finalize', () => {
-    const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-    expect(serverSrc).not.toContain('unpinProgressCardForChat?.(srChatId, srThreadId)')
-  })
+  // #235 Wave 3 F4: server.ts monolith removed. The maxIdleMs +
+  // early-unpin source-text pins for server.ts no longer apply —
+  // gateway.ts is the source of truth, pinned by the gateway.ts
+  // assertion below.
 
   it('gateway.ts executeReply/executeStreamReply do NOT early-unpin', () => {
     const gatewaySrc = readFileSync(join(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
