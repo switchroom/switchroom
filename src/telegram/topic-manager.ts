@@ -327,7 +327,15 @@ export function cleanupOrphanedTopics(
 
     for (const orphan of orphans) {
       const closed = await closeForumTopic(botToken, chatId, orphan.topic_id);
-      delete state.topics[orphan.agent];
+      // Closes #472 finding #18 — pre-fix the local state entry was
+      // deleted regardless of close success. A transient Telegram 5xx
+      // (rate limit, network blip) returned closed=false; we lost the
+      // topic_id locally and could never retry the close from the CLI,
+      // so the topic stayed open in Telegram forever. Keep the local
+      // entry on close failure so the next sweep retries.
+      if (closed) {
+        delete state.topics[orphan.agent];
+      }
       results.push({
         agent: orphan.agent,
         topic_id: orphan.topic_id,
@@ -339,7 +347,14 @@ export function cleanupOrphanedTopics(
     return results;
   });
   // Chain must continue even if one caller rejects, so later callers aren't
-  // poisoned by an earlier failure.
-  cleanupChain = next.catch(() => {});
+  // poisoned by an earlier failure. Closes #472 finding #21 — log the
+  // rejection so a wedged cleanup (wrong bot token, chat-perms revoked)
+  // surfaces on the operator console instead of silently failing every
+  // sweep forever.
+  cleanupChain = next.catch((err) => {
+    process.stderr.write(
+      `topic-manager: cleanupOrphanedTopics rejected (next sweep will retry): ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  });
   return next;
 }

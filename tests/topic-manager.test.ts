@@ -8,6 +8,7 @@ import {
   listTopics,
   resolveTopicId,
   resolveBotToken,
+  cleanupOrphanedTopics,
   TopicSyncError,
 } from "../src/telegram/topic-manager.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -424,5 +425,124 @@ describe("syncTopics", () => {
     await syncTopics(config, statePath);
 
     expect(capturedBody.icon_custom_emoji_id).toBe("5368324170671202286");
+  });
+});
+
+describe("cleanupOrphanedTopics (#472 #18 + #21)", () => {
+  let tmpDir: string;
+  let statePath: string;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-cleanup-test-"));
+    statePath = join(tmpDir, "topics.json");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // Closes #472 finding #18 — pre-fix the local state entry was deleted
+  // even when closeForumTopic returned false. A transient Telegram 5xx
+  // (rate limit, network blip) leaked the topic_id so we could never
+  // retry the close from the CLI.
+  it("preserves state.topics entry when closeForumTopic fails (transient close error)", async () => {
+    saveTopicState(
+      {
+        topics: {
+          orphan: { topic_id: 99, topic_name: "Orphan", created_at: "2026-01-01T00:00:00.000Z" },
+        },
+      },
+      statePath,
+    );
+
+    // Telegram returns ok:false → closeForumTopic returns false.
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({ ok: false, description: "Internal Server Error", error_code: 500 }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }) as any;
+
+    // No agents in config → orphan triggers cleanup attempt.
+    const config = makeConfig({});
+    const results = await cleanupOrphanedTopics(config, statePath);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ agent: "orphan", topic_id: 99, closed: false });
+
+    // The local entry must STILL be present so the next sweep retries.
+    const state = loadTopicState(statePath);
+    expect(state.topics.orphan).toBeDefined();
+    expect(state.topics.orphan.topic_id).toBe(99);
+  });
+
+  it("removes state.topics entry when closeForumTopic succeeds", async () => {
+    saveTopicState(
+      {
+        topics: {
+          orphan: { topic_id: 99, topic_name: "Orphan", created_at: "2026-01-01T00:00:00.000Z" },
+        },
+      },
+      statePath,
+    );
+
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({ ok: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as any;
+
+    const config = makeConfig({});
+    const results = await cleanupOrphanedTopics(config, statePath);
+
+    expect(results[0]).toMatchObject({ agent: "orphan", closed: true });
+    const state = loadTopicState(statePath);
+    expect(state.topics.orphan).toBeUndefined();
+  });
+
+  // Closes #472 finding #21 — pre-fix the cleanupChain.catch silently
+  // swallowed every rejection. A wedged cleanup (wrong bot token, perms
+  // revoked) failed every sweep with no operator signal.
+  it("logs to stderr when cleanup rejects so a wedged cleanup surfaces", async () => {
+    const stderrCalls: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: any) => {
+      if (typeof s === "string") stderrCalls.push(s);
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      saveTopicState(
+        {
+          topics: {
+            orphan: { topic_id: 99, topic_name: "Orphan", created_at: "2026-01-01T00:00:00.000Z" },
+          },
+        },
+        statePath,
+      );
+
+      // Force the resolveBotToken path to throw via empty config.
+      const config = makeConfig({});
+      config.telegram.bot_token = "vault:nonexistent";
+      delete process.env.TELEGRAM_BOT_TOKEN;
+
+      // The first call rejects (caller-visible). The chain's .catch
+      // logs the rejection so future sweeps can detect that the prior
+      // sweep failed even though no exception bubbled to them.
+      await expect(cleanupOrphanedTopics(config, statePath)).rejects.toThrow(
+        /Cannot resolve bot token/,
+      );
+
+      // Drain microtasks so the .catch on the chain runs.
+      await new Promise((r) => setImmediate(r));
+
+      const surfaced = stderrCalls.some((s) => s.includes("cleanupOrphanedTopics rejected"));
+      expect(surfaced).toBe(true);
+    } finally {
+      process.stderr.write = originalWrite;
+    }
   });
 });
