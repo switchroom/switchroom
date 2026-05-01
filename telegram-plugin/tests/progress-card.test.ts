@@ -305,7 +305,10 @@ describe('progress-card render', () => {
       { kind: 'tool_result', toolUseId: 'x', toolName: 'Read' },
     ])
     const out = render(s, 1300)
+    // #320: no <s> wrap on done items. The ● symbol + plain weight
+    // (vs ◉ + bold for active) distinguishes done from active.
     expect(out).toContain('● <code>Read</code>')
+    expect(out).not.toContain('<s>')
     expect(out).not.toContain('(00:00)')
   })
 
@@ -314,8 +317,10 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'tool_use', toolName: 'Bash' }, 1100)
     st = reduce(st, { kind: 'tool_result', toolUseId: 'x', toolName: 'Bash' }, 4200)
     const out = render(st, 4300)
+    // #320: no <s> wrap on done items. Duration stays as <i>(...)</i>.
     expect(out).toContain('● <code>Bash</code>')
     expect(out).toContain('(00:03)')
+    expect(out).not.toContain('<s>')
   })
 
   it('rolls up 2+ consecutive identical done tools (threshold lowered from 5)', () => {
@@ -483,7 +488,9 @@ describe('progress-card render', () => {
     // Text events now create narrative steps; thought bubble suppressed when narratives exist
     expect(render(st, 1500)).toContain('◉ <b>thinking…</b>')
     st = reduce(st, { kind: 'turn_end', durationMs: 500 }, 1700)
-    expect(render(st, 1700)).toContain('● <s>thinking…</s>')
+    // #320: done items render without <s> wrap.
+    expect(render(st, 1700)).toContain('● thinking…')
+    expect(render(st, 1700)).not.toContain('<s>')
     expect(render(st, 1700)).not.toContain('💭')
   })
 
@@ -514,8 +521,10 @@ describe('progress-card render', () => {
     st = reduce(st, { kind: 'text', text: 'Found the issue in merge.ts' }, 2000)
     st = reduce(st, { kind: 'tool_use', toolName: 'Edit' }, 2100)
     const out = render(st, 3000)
-    // Narrative steps are primary — no tool names visible
-    expect(out).toContain('● <s>Let me check the test files</s>')
+    // Narrative steps are primary — no tool names visible.
+    // #320: done step renders without <s> wrap (bullet symbol is the done signal).
+    expect(out).toContain('● Let me check the test files')
+    expect(out).not.toContain('<s>')
     expect(out).toContain('◉ <b>Found the issue in merge.ts</b>')
     expect(out).not.toContain('Read')
     expect(out).not.toContain('Edit')
@@ -1356,7 +1365,10 @@ describe('progress-card reducer — multi-agent correlation', () => {
       // After #315 dedup: main blockquote has the one-line summary; expandable
       // blockquote has the per-sub-agent forensics. Tool count moves to its own
       // line in the expandable, so check assertions independently.
+      // #320: completed items render WITHOUT strikethrough — bullet
+      // symbol + plain weight is the done signal.
       expect(html).toMatch(/● task A/)
+      expect(html).not.toContain('<s>')
       expect(html).toContain('1 tools')
       // Active tool spinner (◉) must not appear in a done state.
       expect(html).not.toContain('◉')

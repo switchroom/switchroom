@@ -1294,7 +1294,13 @@ function renderNarrativeChecklist(
         lines.push(`${STEP_ACTIVE} <b>${escapeHtml(step.text)}</b> <i>(${dur})</i>`)
       }
     } else {
-      lines.push(`${STEP_DONE} <s>${escapeHtml(step.text)}</s>`)
+      // #320: drop the <s>...</s> wrap on done items. Telegram desktop
+      // renders strikethrough with a salmon/red strike-line in both
+      // light and dark themes — users read it as "deleted/failed/error",
+      // not "done". The leading STEP_DONE bullet (●) + the symbol
+      // distinction (vs ◉ for active) + bold-vs-plain weight already
+      // signal completion without the alarm. See #320 Option A.
+      lines.push(`${STEP_DONE} ${escapeHtml(step.text)}`)
     }
   }
 }
@@ -1339,6 +1345,13 @@ function renderMainItem(
     }
     const dur = formatDuration(item.finishedAt - item.startedAt)
     const needsDuration = item.finishedAt - item.startedAt >= 1000
+    // #320: no <s> wrap on done items here either. The symbol
+    // distinction (● vs ◉) + the bold-vs-plain treatment already
+    // differentiate done from active; strikethrough renders red in
+    // Telegram desktop and reads as "deleted/failed". See #320
+    // Option A — this aligns the rolled-card path with the
+    // narrative-checklist + sub-agent-expandable paths now that all
+    // three drop strikethrough.
     return `${indent}${symbol} ${renderItemCore(item.tool, item.label, false, humanAuthored)}${needsDuration ? ` <i>(${dur})</i>` : ''}`
   }
   void subAgents
@@ -1508,15 +1521,20 @@ function renderSubAgentExpandable(
       innerLines.push(`↳ ${sa.toolCount} tool${sa.toolCount !== 1 ? 's' : ''} completed`)
     }
   } else {
-    // Running state: show recent completed actions (strikethrough) + current (↳).
+    // Running state: show recent completed actions + current (↳).
     //
     // `recentCompletedTools` holds up to 2 previously completed tools.
-    // `currentTool` is the in-flight tool (shown with ↳, no strikethrough).
+    // `currentTool` is the in-flight tool (shown with ↳).
     // Together they give up to 3 action lines per the spec.
+    //
+    // #320: no <s> wrap on completed actions here. The active line is
+    // distinguished by its `↳` prefix; the recent-completed lines have
+    // no prefix. Strikethrough adds a salmon/red line that reads as
+    // "deleted/failed" rather than "done" — drop it for visual calm.
     const recent = sa.recentCompletedTools ?? []
     for (const t of recent) {
       // renderItemCore returns HTML (with <code> tags) — do NOT re-escape it.
-      innerLines.push(`<s>${renderItemCore(t.tool, t.label, false, t.humanAuthored)}</s>`)
+      innerLines.push(renderItemCore(t.tool, t.label, false, t.humanAuthored))
     }
 
     if (sa.currentTool) {
