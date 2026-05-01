@@ -376,9 +376,6 @@ export function appendBootstrapPromptWarning(
   return prompt ? `${prompt}\n\n${warningBlock}` : warningBlock;
 }
 
-// Backward-compatible alias while older callers still import the prepend name.
-export const prependBootstrapPromptWarning = appendBootstrapPromptWarning;
-
 export function buildBootstrapTruncationReportMeta(params: {
   analysis: BootstrapBudgetAnalysis;
   warningMode: BootstrapPromptWarningMode;
