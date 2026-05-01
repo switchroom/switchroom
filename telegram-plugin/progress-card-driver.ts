@@ -206,6 +206,22 @@ export interface ProgressDriverConfig {
    */
   promoteOnSubAgent?: boolean
   /**
+   * Promote the card out of initial-delay suppression once the agent has
+   * issued this many parent-side tool calls in the suppression window.
+   * Closes #478 — the user sees no progress card for the first 30s of a
+   * substantial turn that does parent-side work (Read/Grep/Bash/Edit)
+   * but never dispatches a sub-agent.
+   *
+   * Symmetric to `promoteOnSubAgent`. Default 3: a turn with ≥3 tool
+   * calls is not "short" by any reasonable definition, so the
+   * fast-turn suppression goal (no clutter on quick replies) still
+   * holds. Set to a large value (e.g. 999) to effectively disable.
+   *
+   * Fast-turn suppression in `flush()` is unchanged — if the turn
+   * ends before promotion, the card still skips the emit.
+   */
+  promoteOnParentToolCount?: number
+  /**
    * Number of consecutive 4xx Telegram API failures on card edits before
    * the card is marked terminal and all further edits are suppressed for
    * this turn. Transient (5xx/network) errors and "message is not modified"
@@ -629,6 +645,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
   const initialDelayMs = config.initialDelayMs ?? 30_000
   const promoteOnSubAgent = config.promoteOnSubAgent ?? true
+  const promoteOnParentToolCount = config.promoteOnParentToolCount ?? 3
   const maxConsecutive4xx = config.maxConsecutive4xx ?? 3
   const orphanPromotionMs = config.orphanPromotionMs ?? 5_000
   const coldSubAgentThresholdMs = config.coldSubAgentThresholdMs ?? 30_000
@@ -1564,6 +1581,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         && !chatState.apiFailures.terminal
       ) {
         promoteFirstEmit(chatState, 'sub_agent_started')
+      }
+
+      // #478: promote the card when the agent has issued enough parent-
+      // side tool calls during the suppression window. The previous
+      // logic only promoted on sub-agent dispatch, so a turn that did
+      // 5 Read/Grep/Bash calls in 30s never showed a card — user saw
+      // typing-indicator-only and described it as "feels dead." A turn
+      // with ≥3 parent tools is not "short" by any reasonable
+      // definition, so this doesn't regress the fast-turn-suppression
+      // goal (which continues to fire in flush() for sub-3-tool turns).
+      if (
+        chatState.isFirstEmit
+        && chatState.deferredFirstEmitTimer !== DELAY_ELAPSED
+        && !chatState.apiFailures.terminal
+        && chatState.state.items.length >= promoteOnParentToolCount
+      ) {
+        promoteFirstEmit(chatState, `parent_tool_count_${chatState.state.items.length}`)
       }
 
       // Issue #132: track whether the agent has called `reply` or

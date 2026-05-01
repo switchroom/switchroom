@@ -3776,15 +3776,23 @@ async function handleInbound(
     // so the user sees a real "I'm working" signal, not three dots that
     // could read as "still loading the message." Hooks can refine this
     // mid-turn via the `update_placeholder` IPC message.
+    // #479 fix: drop the DM-only gate so non-forum group chats also get
+    // the 🔵 thinking… placeholder within ~1s. Pre-fix the placeholder UX
+    // was locked to DMs even though sendMessageDraft works in groups —
+    // exactly the population (groups, including the standard switchroom
+    // forum-topic layout) that reported "feels dead until the status
+    // card appears." Forum topics still excluded via the messageThreadId
+    // guard because sendMessageDraft doesn't accept message_thread_id;
+    // forum-topic placeholder needs a separate path (out of scope here).
     if (
       sendMessageDraftFn != null
-      && isDmChatId(chat_id)
       && messageThreadId == null
       && !preAllocatedDrafts.has(chat_id)
     ) {
       const draftId = allocateDraftId()
       // Best-effort, non-blocking: any failure (transport down, API not
-      // available) falls through to today's behavior.
+      // available, group rejects sendMessageDraft) falls through to
+      // today's behavior — the existing .catch already silently logs.
       void sendMessageDraftFn(chat_id, draftId, '🔵 thinking…')
         .then(() => {
           preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })

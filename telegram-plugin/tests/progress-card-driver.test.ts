@@ -3328,6 +3328,7 @@ describe('progress-card driver — promote-on-sub-agent', () => {
   function promoHarness(opts?: {
     initialDelayMs?: number
     promoteOnSubAgent?: boolean
+    promoteOnParentToolCount?: number
     maxConsecutive4xx?: number
     onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
   }) {
@@ -3343,6 +3344,7 @@ describe('progress-card driver — promote-on-sub-agent', () => {
       heartbeatMs: 0,
       initialDelayMs: opts?.initialDelayMs ?? 30_000,
       promoteOnSubAgent: opts?.promoteOnSubAgent,
+      promoteOnParentToolCount: opts?.promoteOnParentToolCount,
       maxConsecutive4xx: opts?.maxConsecutive4xx,
       now: () => now,
       setTimeout: (fn, ms) => {
@@ -3624,6 +3626,63 @@ describe('progress-card driver — promote-on-sub-agent', () => {
     // timer must have been cancelled by promote — no second isFirstEmit.
     advance(40_000)
     expect(emits.filter((e) => e.isFirstEmit)).toHaveLength(1)
+  })
+
+  // ─── #478 — promote-on-parent-tool-count ────────────────────────────────
+
+  it('parent tools during suppression promote the card after threshold (#478)', () => {
+    const { driver, emits, advance } = promoHarness({
+      initialDelayMs: 30_000,
+      promoteOnParentToolCount: 3,
+    })
+    driver.startTurn({ chatId: 'c', userText: 'do work' })
+    advance(2_000)
+    expect(emits).toHaveLength(0) // suppressed during initialDelay
+
+    // First two parent tool calls — still suppressed (under threshold).
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/a' } }, 'c')
+    driver.ingest({ kind: 'tool_use', toolName: 'Grep', toolUseId: 't2', input: { pattern: 'foo' } }, 'c')
+    advance(0)
+    expect(emits).toHaveLength(0)
+
+    // Third parent tool — threshold met, promotion fires.
+    driver.ingest({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't3', input: { command: 'ls' } }, 'c')
+    advance(0)
+    expect(emits.length).toBeGreaterThan(0)
+    expect(emits[0].isFirstEmit).toBe(true)
+  })
+
+  it('parent tools below threshold do NOT promote — fast turns still suppressed (#478)', () => {
+    const { driver, emits, advance } = promoHarness({
+      initialDelayMs: 30_000,
+      promoteOnParentToolCount: 3,
+    })
+    driver.startTurn({ chatId: 'c', userText: 'quick lookup' })
+    advance(1_000)
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1', input: { file_path: '/a' } }, 'c')
+    driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: 't2', input: { file_path: '/b' } }, 'c')
+    advance(0)
+    expect(emits).toHaveLength(0) // 2 tools < threshold of 3
+
+    // Turn ends fast — fast-turn suppression in flush() wins.
+    driver.ingest({ kind: 'turn_end', durationMs: 1500 }, 'c')
+    advance(60_000)
+    expect(emits).toHaveLength(0)
+  })
+
+  it('promoteOnParentToolCount very high effectively disables (#478)', () => {
+    const { driver, emits, advance } = promoHarness({
+      initialDelayMs: 30_000,
+      promoteOnParentToolCount: 999, // effectively disabled
+    })
+    driver.startTurn({ chatId: 'c', userText: 'work' })
+    advance(2_000)
+    for (let i = 0; i < 10; i++) {
+      driver.ingest({ kind: 'tool_use', toolName: 'Read', toolUseId: `t${i}`, input: { file_path: `/${i}` } }, 'c')
+    }
+    advance(0)
+    // 10 tools but threshold is 999 — no promote, normal initialDelay rules apply.
+    expect(emits).toHaveLength(0)
   })
 })
 
