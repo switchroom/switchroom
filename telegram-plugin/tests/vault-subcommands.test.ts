@@ -170,8 +170,10 @@ describe('/vault unlock — pending-op intercept (passphrase received)', () => {
 
     it(`${label}: deletes the passphrase message immediately after receipt`, () => {
       const interceptArea = sliceFrom(src, "kind === 'unlock'", 800)
-      // Must call deleteMessage to scrub the passphrase from chat
-      expect(interceptArea).toMatch(/deleteMessage/)
+      // Must scrub the passphrase from chat. server.ts (legacy) calls
+      // deleteMessage directly; gateway.ts (post #472 #22) routes through
+      // the deleteSensitiveMessage helper that escalates on failure.
+      expect(interceptArea).toMatch(/deleteMessage|deleteSensitiveMessage/)
     })
 
     it(`${label}: replies with success when unlockViaBroker returns ok:true`, () => {
