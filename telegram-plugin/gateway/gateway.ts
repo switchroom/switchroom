@@ -148,7 +148,9 @@ import {
 } from '../auto-fallback.js'
 import { markSlotQuotaExhausted, DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
-import { decideBannerAction, type BannerState } from '../slot-banner.js'
+import { type BannerState } from '../slot-banner.js'
+import { refreshBanner } from '../slot-banner-driver.js'
+import { dispatchFallbackNotification } from '../auto-fallback-dispatcher.js'
 import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
@@ -5097,43 +5099,17 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
     const agentDir = resolveAgentDirFromEnv()
     const agentName = getMyAgentName()
     const slot = currentActiveSlot(agentDir)
-    const action = decideBannerAction(pinnedBannerState, slot, agentName, DEFAULT_SLOT)
-    if (action.kind === 'noop') return
-    if (action.kind === 'unpin') {
-      try {
-        await bot.api.unpinChatMessage(ownerChatId, action.messageId)
-      } catch (err) {
-        process.stderr.write(`telegram gateway: banner unpin failed (${reason}): ${err}\n`)
-      }
-      pinnedBannerState = null
-      return
-    }
-    if (action.kind === 'pin') {
-      const sent = await bot.api.sendMessage(ownerChatId, action.text, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      })
-      try {
-        await bot.api.pinChatMessage(ownerChatId, sent.message_id, { disable_notification: true })
-      } catch (err) {
-        process.stderr.write(`telegram gateway: banner pin failed (${reason}): ${err}\n`)
-        return
-      }
-      pinnedBannerState = { messageId: sent.message_id, slot: action.slot }
-      return
-    }
-    if (action.kind === 'edit') {
-      try {
-        await bot.api.editMessageText(ownerChatId, action.messageId, action.text, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-        })
-        pinnedBannerState = { messageId: action.messageId, slot: action.slot }
-      } catch (err) {
-        process.stderr.write(`telegram gateway: banner edit failed (${reason}): ${err}\n`)
-      }
-      return
-    }
+    pinnedBannerState = await refreshBanner({
+      bot,
+      ownerChatId,
+      agentName,
+      currentSlot: slot,
+      defaultSlot: DEFAULT_SLOT,
+      prevState: pinnedBannerState,
+      onError: (phase, err) => {
+        process.stderr.write(`telegram gateway: banner ${phase} failed (${reason}): ${err}\n`)
+      },
+    })
   } catch (err) {
     process.stderr.write(`telegram gateway: banner refresh error (${reason}): ${err}\n`)
   }
@@ -5168,13 +5144,14 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
       deps: { currentActiveSlot, markSlotQuotaExhausted, fallbackToNextSlot },
     })
     const ownerChatId = loadAccess().allowFrom[0]
-    if (ownerChatId) {
-      try {
-        await bot.api.sendMessage(ownerChatId, plan.notificationHtml, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
-      } catch (err) {
+    await dispatchFallbackNotification({
+      bot,
+      ownerChatId,
+      plan,
+      onError: (err) => {
         process.stderr.write(`telegram gateway: auto-fallback notify failed (${opts.trigger}): ${err}\n`)
-      }
-    }
+      },
+    })
     if (plan.kind === 'executed') {
       try { assertSafeAgentName(plan.agentName) }
       catch {
