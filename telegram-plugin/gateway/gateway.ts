@@ -163,6 +163,7 @@ import type {
   ScheduleRestartMessage,
   OperatorEventForward,
   UpdatePlaceholderMessage,
+  PtyPartialForward,
   InboundMessage,
 } from './ipc-protocol.js'
 import { writePidFile, clearPidFile } from './pid-file.js'
@@ -1639,6 +1640,24 @@ const ipcServer: IpcServer = createIpcServer({
         }\n`,
       )
     })
+  },
+
+  /**
+   * Forwarded PTY-tail partial: the latest extracted assistant-reply
+   * text from Claude Code's TUI rendering. Routes through
+   * `handlePtyPartial` (declared further down) which writes the text
+   * into the active draft stream for `currentSessionChatId`. The chat
+   * id is resolved from the most recent enqueue session_event the
+   * bridge has forwarded — same pattern as the legacy monolith path
+   * in server.ts.
+   *
+   * Best-effort: silently no-op when the stream isn't ready (no chat
+   * resolved yet, suppressed by an in-flight reply, dedup match).
+   * `handlePtyPartial` does its own buffering for the
+   * partial-before-enqueue race.
+   */
+  onPtyPartial(_client: IpcClient, msg: PtyPartialForward) {
+    handlePtyPartial(msg.text)
   },
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
