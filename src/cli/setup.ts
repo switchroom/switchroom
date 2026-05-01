@@ -931,8 +931,7 @@ async function stepAutoUnlock(
     return;
   }
 
-  const detection = detectSystemdCreds();
-  if (!detection) {
+  if (!detectSystemdCreds()) {
     console.log(chalk.gray("  Skipping (systemd-creds not on PATH)."));
     return;
   }
@@ -986,7 +985,7 @@ async function stepAutoUnlock(
 
     let scope: string;
     try {
-      scope = await encryptCredential(passphrase, credPath, detection.supportsUser);
+      scope = await encryptCredential(passphrase, credPath);
     } catch (err) {
       if (err instanceof EncryptCancelledError) {
         console.log(chalk.gray("  Skipped (user declined sudo)."));

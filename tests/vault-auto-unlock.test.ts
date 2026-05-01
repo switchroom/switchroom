@@ -1,15 +1,15 @@
 /**
  * Tests for the vault auto-unlock encryption cascade and YAML mutation.
  *
- * The cascade has four real-world environments:
- *   1. systemd <256 + host keystore present + polkit allows non-root
- *      → host-scope succeeds (no sudo)
- *   2. systemd >=256 + user-scope socket up
- *      → user-scope succeeds
- *   3. systemd >=256 + no user-scope socket + host keystore + polkit denies
- *      → all unprivileged paths fail; sudo escalation needed
- *   4. systemd >=256, polkit denies, stdin not a TTY
- *      → cannot auto-escalate; throws EncryptFailedError
+ * The cascade is intentionally minimal: host-scope encrypt with `--with-key=host`
+ * (no TPM dependency, decryptable in user units), tried as user first and
+ * escalated to sudo when the host secret is root-only-readable.
+ *
+ *   1. host secret readable to user (rare on default Ubuntu) → host-as-user wins
+ *   2. host secret root-only (default Ubuntu 24.04+) → polkit-denies-as-user → sudo
+ *   3. polkit denies + non-TTY → cannot auto-escalate; EncryptFailedError
+ *   4. user declines sudo → EncryptCancelledError
+ *   5. host secret missing → straight to sudo (root creates it on first encrypt)
  *
  * We exercise each by mocking `spawnSync` and existsSync.
  */
@@ -108,36 +108,11 @@ describe("encryptCredential cascade", () => {
     vi.clearAllMocks();
   });
 
-  it("user-scope succeeds on first try (systemd >=256, socket up)", async () => {
-    existsMock.mockReturnValue(true); // mkdirSync of credPath dir uses existsSync internally on some libs; safe default
-    spawnQueue.push({ status: 0 }); // tryEncrypt user-scope success
-
-    const scope = await encryptCredential("p4ss", credPath, /*supportsUser=*/ true, {
-      isTTY: true,
-      log: () => {},
-      err: () => {},
-    });
-    expect(scope).toBe("user");
-  });
-
-  it("falls back to host-scope when user-scope fails varlink and keystore exists", async () => {
+  it("host-as-user succeeds when host secret is readable", async () => {
     existsMock.mockImplementation((p: string) => p === HOST_SECRET);
-    spawnQueue.push({ status: 1, stderr: "Failed to encrypt: io.systemd.System" }); // user-scope fails
-    spawnQueue.push({ status: 0 }); // host-scope succeeds
+    spawnQueue.push({ status: 0 }); // host-scope encrypt as user succeeds
 
-    const scope = await encryptCredential("p4ss", credPath, true, {
-      isTTY: true,
-      log: () => {},
-      err: () => {},
-    });
-    expect(scope).toBe("host");
-  });
-
-  it("on systemd <256, skips user-scope and uses host-scope", async () => {
-    existsMock.mockImplementation((p: string) => p === HOST_SECRET);
-    spawnQueue.push({ status: 0 }); // host-scope succeeds; no user-scope attempt
-
-    const scope = await encryptCredential("p4ss", credPath, /*supportsUser=*/ false, {
+    const scope = await encryptCredential("p4ss", credPath, {
       isTTY: true,
       log: () => {},
       err: () => {},
@@ -149,12 +124,11 @@ describe("encryptCredential cascade", () => {
     existsMock.mockImplementation((p: string) => p === HOST_SECRET);
     askYesNoMock.mockResolvedValue(true);
 
-    spawnQueue.push({ status: 1, stderr: "Failed to encrypt: io.systemd.System" }); // user-scope: socket gone
-    spawnQueue.push({ status: 1, stderr: "Failed to encrypt: io.systemd.InteractiveAuthenticationRequired" }); // host-scope: polkit
+    spawnQueue.push({ status: 1, stderr: "Failed to encrypt: io.systemd.InteractiveAuthenticationRequired" }); // polkit denies
     spawnQueue.push({ status: 0 }); // sudo systemd-creds encrypt
     spawnQueue.push({ status: 0 }); // sudo -n chown
 
-    const scope = await encryptCredential("p4ss", credPath, true, {
+    const scope = await encryptCredential("p4ss", credPath, {
       isTTY: true,
       log: () => {},
       err: () => {},
@@ -165,11 +139,10 @@ describe("encryptCredential cascade", () => {
 
   it("refuses to auto-escalate when stdin is not a TTY", async () => {
     existsMock.mockImplementation((p: string) => p === HOST_SECRET);
-    spawnQueue.push({ status: 1, stderr: "io.systemd.System" });
     spawnQueue.push({ status: 1, stderr: "InteractiveAuthenticationRequired" });
 
     await expect(
-      encryptCredential("p4ss", credPath, true, {
+      encryptCredential("p4ss", credPath, {
         isTTY: false,
         log: () => {},
         err: () => {},
@@ -182,11 +155,10 @@ describe("encryptCredential cascade", () => {
     existsMock.mockImplementation((p: string) => p === HOST_SECRET);
     askYesNoMock.mockResolvedValue(false);
 
-    spawnQueue.push({ status: 1, stderr: "io.systemd.System" });
     spawnQueue.push({ status: 1, stderr: "InteractiveAuthenticationRequired" });
 
     await expect(
-      encryptCredential("p4ss", credPath, true, {
+      encryptCredential("p4ss", credPath, {
         isTTY: true,
         log: () => {},
         err: () => {},
@@ -194,22 +166,51 @@ describe("encryptCredential cascade", () => {
     ).rejects.toBeInstanceOf(EncryptCancelledError);
   });
 
-  it("escalates straight to sudo when host keystore is absent (no host-scope attempt)", async () => {
+  it("escalates straight to sudo when host keystore is absent (no host-as-user attempt)", async () => {
     existsMock.mockReturnValue(false); // no HOST_SECRET
     askYesNoMock.mockResolvedValue(true);
 
-    spawnQueue.push({ status: 1, stderr: "io.systemd.System" }); // user-scope only
     spawnQueue.push({ status: 0 }); // sudo encrypt
     spawnQueue.push({ status: 0 }); // sudo -n chown
 
-    const scope = await encryptCredential("p4ss", credPath, true, {
+    const scope = await encryptCredential("p4ss", credPath, {
       isTTY: true,
       log: () => {},
       err: () => {},
     });
     expect(scope).toBe("host-sudo");
-    // exactly 3 spawnSync calls: user-encrypt, sudo-encrypt, sudo-chown
+    // exactly 2 spawnSync calls (no host-as-user attempt): sudo-encrypt + sudo-chown
     expect(spawnQueue.length).toBe(0);
+  });
+
+  it("always passes --with-key=host to systemd-creds (regression: TPM auto-default broke decrypt at unit start)", async () => {
+    // Capture argv from spawnSync so we can assert.
+    const seenArgs: string[][] = [];
+    spawnQueue.push({ status: 0 });
+    existsMock.mockImplementation((p: string) => p === HOST_SECRET);
+
+    const cp = await import("node:child_process");
+    const original = vi.mocked(cp.spawnSync);
+    original.mockImplementationOnce((_cmd: string, args: string[]) => {
+      seenArgs.push(args);
+      const next = spawnQueue.shift()!;
+      return {
+        status: next.status,
+        stderr: next.stderr ?? "",
+        stdout: "",
+        signal: null,
+        output: [null, "", next.stderr ?? ""],
+        pid: 0,
+      } as ReturnType<typeof cp.spawnSync>;
+    });
+
+    await encryptCredential("p4ss", credPath, {
+      isTTY: true,
+      log: () => {},
+      err: () => {},
+    });
+
+    expect(seenArgs[0]).toContain("--with-key=host");
   });
 });
 
