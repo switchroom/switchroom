@@ -1955,19 +1955,42 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     stopTypingLoop(chat_id)
   }
 
-  for (const f of files) {
-    const ext = extname(f).toLowerCase()
-    const input = new InputFile(f)
+  // #273: when files is 2-10 photos, batch them into a single
+  // sendMediaGroup album rather than N separate sendPhoto calls. The
+  // user's device fires one notification for the album instead of N
+  // (notification-budget protection per the issue's JTBD note). Falls
+  // back to the per-file path for any non-all-photo set.
+  const allPhotos = files.length >= 2 && files.length <= 10
+    && files.every((f) => PHOTO_EXTS.has(extname(f).toLowerCase()))
+  if (allPhotos) {
     const baseOpts = {
       ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
       ...(threadId != null ? { message_thread_id: threadId } : {}),
     }
-    if (PHOTO_EXTS.has(ext)) {
-      const sent = await robustApiCall(() => lockedBot.api.sendPhoto(chat_id, input, baseOpts), { threadId, chat_id })
-      sentIds.push(sent.message_id)
-    } else {
-      const sent = await robustApiCall(() => lockedBot.api.sendDocument(chat_id, input, baseOpts), { threadId, chat_id })
-      sentIds.push(sent.message_id)
+    const media = files.map((f) => ({
+      type: 'photo' as const,
+      media: new InputFile(f),
+    }))
+    const sent = await robustApiCall(
+      () => lockedBot.api.sendMediaGroup(chat_id, media, baseOpts),
+      { threadId, chat_id },
+    )
+    for (const m of sent) sentIds.push(m.message_id)
+  } else {
+    for (const f of files) {
+      const ext = extname(f).toLowerCase()
+      const input = new InputFile(f)
+      const baseOpts = {
+        ...(reply_to != null && replyMode !== 'off' ? { reply_parameters: { message_id: reply_to } } : {}),
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      }
+      if (PHOTO_EXTS.has(ext)) {
+        const sent = await robustApiCall(() => lockedBot.api.sendPhoto(chat_id, input, baseOpts), { threadId, chat_id })
+        sentIds.push(sent.message_id)
+      } else {
+        const sent = await robustApiCall(() => lockedBot.api.sendDocument(chat_id, input, baseOpts), { threadId, chat_id })
+        sentIds.push(sent.message_id)
+      }
     }
   }
 
