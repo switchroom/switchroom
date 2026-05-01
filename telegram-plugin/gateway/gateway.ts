@@ -3772,10 +3772,13 @@ async function handleInbound(
     // ~1 s. Only fires for fresh DM turns; if the agent finishes the turn
     // without calling stream_reply, turn_end clears the orphan.
     //
-    // Placeholder content is meaningful ('🔵 thinking…') rather than '…'
+    // Placeholder content is meaningful ('🔵 thinking') rather than '…'
     // so the user sees a real "I'm working" signal, not three dots that
-    // could read as "still loading the message." Hooks can refine this
-    // mid-turn via the `update_placeholder` IPC message.
+    // could read as "still loading the message." No trailing ellipsis —
+    // sendMessageDraft already animates a "typing" indicator on the
+    // user's client, so a `…` after the word is redundant visual noise.
+    // Hooks can refine the placeholder text mid-turn via the
+    // `update_placeholder` IPC message.
     // #479 fix: drop the DM-only gate so non-forum group chats also get
     // the 🔵 thinking… placeholder within ~1s. Pre-fix the placeholder UX
     // was locked to DMs even though sendMessageDraft works in groups —
@@ -3793,7 +3796,7 @@ async function handleInbound(
       // Best-effort, non-blocking: any failure (transport down, API not
       // available, group rejects sendMessageDraft) falls through to
       // today's behavior — the existing .catch already silently logs.
-      void sendMessageDraftFn(chat_id, draftId, '🔵 thinking…')
+      void sendMessageDraftFn(chat_id, draftId, '🔵 thinking')
         .then(() => {
           preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
         })

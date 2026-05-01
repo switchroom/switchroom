@@ -429,15 +429,17 @@ def main():
 
     session_id = hook_input.get("session_id") or ""
 
-    # Switchroom #303 — push a "📚 recalling…" status to the user's
-    # pre-allocated Telegram draft so the gap between inbound and the
-    # model's first content token isn't 25 s of dead air. Best-effort
-    # and silent on every failure path; the gateway no-ops the IPC
-    # message when there's no draft for this chat (forum topic, fresh
-    # session before pre-alloc lands, etc.).
+    # Switchroom #303 — push a "📚 recalling memories" status to the
+    # user's pre-allocated Telegram draft so the gap between inbound and
+    # the model's first content token isn't 25 s of dead air. No
+    # trailing ellipsis: sendMessageDraft already animates a "typing"
+    # indicator on the user's client, so a `…` is redundant noise.
+    # Best-effort and silent on every failure path; the gateway no-ops
+    # the IPC message when there's no draft for this chat (forum topic,
+    # fresh session before pre-alloc lands, etc.).
     placeholder_chat_id = extract_chat_id_from_prompt(prompt)
     if placeholder_chat_id:
-        update_placeholder(placeholder_chat_id, "📚 recalling memories…")
+        update_placeholder(placeholder_chat_id, "📚 recalling memories")
 
     # Resolve API URL (handles all three connection modes)
     def _dbg(*a):
@@ -637,9 +639,11 @@ def main():
 
     # Switchroom #303 — recall is done, model is about to start the long
     # TTFT. Update the placeholder so the user doesn't keep staring at
-    # `📚 recalling…` for the next 15–20 s of opus thinking.
+    # `📚 recalling memories` for the next 15–20 s of opus thinking.
+    # No trailing ellipsis — sendMessageDraft already animates the
+    # "typing" indicator, the `…` is redundant.
     if placeholder_chat_id:
-        update_placeholder(placeholder_chat_id, "💭 thinking…")
+        update_placeholder(placeholder_chat_id, "💭 thinking")
 
     # If neither block has content, there's nothing to inject — exit
     # silently to avoid emitting an empty hookSpecificOutput.
