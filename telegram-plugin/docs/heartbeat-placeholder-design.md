@@ -38,7 +38,15 @@ architectural change.
 
 A user sending a message to a switchroom agent should see **visible
 progress** on the placeholder draft message at all times during the
-turn:
+turn.
+
+**Scope**: heartbeat fires wherever pre-alloc fires today — DMs and
+groups (via PR #491). Forum topics are excluded because pre-alloc is
+excluded (`sendMessageDraft` doesn't accept `message_thread_id`;
+forum-topic placeholder needs a separate non-draft path tracked
+under #479-class follow-up). **A user in a forum topic gets no
+heartbeat because there's no placeholder to tick.** Acceptable in
+v1; revisit when forum-topic placeholder lands.
 
 - **T+~500ms**: `🔵 thinking` (existing pre-alloc)
 - **T+~3s**: `🔵 thinking · 3s`
@@ -131,9 +139,9 @@ heartbeat is independent).
 | `sendMessageDraftFn` returns null (no draft API) | Heartbeat never starts; no placeholder exists to tick |
 | Telegram rate-limits the edit | Swallow with `.catch(() => {})`; next tick still fires |
 | Telegram returns 400 (e.g. message deleted by user) | Swallow; next tick verifies via `preAllocatedDrafts.has(chatId)` and exits if entry was cleared |
-| Gateway restarts mid-turn | Heartbeat lost (in-memory only); user sees the `🔵 thinking` placeholder freeze until either consumed or turn ends. Acceptable — the boot-clear in PR #500 handles the worst case |
+| Gateway restarts mid-turn | Heartbeat lost (in-memory only); user sees the `🔵 thinking` placeholder freeze until either consumed or turn ends. **This is unchanged from today** — pre-alloc drafts already orphan on restart with no boot cleanup (no `preAllocatedDrafts.json` sidecar exists). Heartbeat doesn't make this worse; tracked separately as a follow-up |
 | Pre-alloc consumed between tick scheduling and firing | Tick checks `preAllocatedDrafts.has(chatId)` and exits |
-| `update_placeholder` from recall.py races with heartbeat | Both paths use `sendMessageDraftFn` against the same `draftId`; last-write-wins is fine because both are textually similar (label + elapsed); next heartbeat tick re-asserts the right text shortly |
+| `update_placeholder` from recall.py races with heartbeat (only relevant in §4 enrichment, NOT in §3 minimum) | See §4.6 for the explicit coordination protocol that eliminates the race — heartbeat reads from `currentPlaceholderLabel` map, recall.py writes to it, neither writes directly to the draft when enrichment is enabled |
 
 ### 3.5 Why this minimum is a real UX win
 
@@ -245,6 +253,56 @@ recent wins. Reset to `🔵 thinking` on a new pre-alloc (new turn).
 The system never goes WORSE than today. Worst case = today's static
 placeholder.
 
+### 4.6 Coordination protocol (eliminates the race)
+
+The race in earlier drafts: heartbeat and `update_placeholder` both
+write to the same Telegram draft via `sendMessageDraftFn`. If they
+both fire within ms of each other, last-write-wins, and the user sees
+text flash.
+
+**The fix**: introduce a single source of truth for the placeholder's
+current "label" (the meaningful prefix before the elapsed counter).
+Only the heartbeat writes to Telegram; everything else writes to the
+label map.
+
+```ts
+// In gateway.ts (or a new placeholder-state.ts module)
+const currentPlaceholderLabel = new Map<string, string>()
+//                                              ^^^^^^^ chatId  ^^^^^^^ label text
+```
+
+Mutation contract:
+
+| Caller | Action |
+|---|---|
+| Pre-alloc success (`gateway.ts:3854`) | `set(chatId, '🔵 thinking')` — initial label |
+| `update_placeholder` IPC handler | `set(chatId, msg.text)` — recall.py overrides label; **does NOT call `sendMessageDraftFn` directly anymore** |
+| session-tail `tool_use` event | `set(chatId, toolLabel(event))` — overrides label with tool-specific text |
+| Heartbeat tick | `read(chatId)` — composes `${label} · ${elapsed}` and calls `sendMessageDraftFn` |
+| Pre-alloc consumed / orphan-cleanup | `delete(chatId)` |
+
+Result: every Telegram edit goes through a single code path
+(heartbeat tick), with predictable text and predictable timing. Race
+gone.
+
+**Migration impact for existing `update_placeholder` callers**: minimal.
+The IPC handler in `update-placeholder-handler.ts` (PR #504) already
+returns a discriminated outcome; we just change the success-path
+side effect from "edit the draft" to "write the label." Tests in
+`tests/update-placeholder-handler.e2e.test.ts` need updates to match
+the new shape.
+
+**Edge case**: what if heartbeat is disabled
+(`placeholder_heartbeat_ms: 0`) but `update_placeholder` IPC arrives?
+Then `update_placeholder` falls back to the existing direct-edit
+behaviour — preserving today's UX for operators who opt out of
+heartbeat. Specified explicitly in the handler so the fallback is
+deterministic.
+
+**This entire §4.6 is part of §4 enrichment work**, NOT §3 minimum.
+The §3 minimum has only one writer (heartbeat itself, with a static
+`🔵 thinking` label) so there's nothing to coordinate.
+
 ## 5. Configuration
 
 Three knobs, all with defaults that work out of the box:
@@ -259,6 +317,31 @@ Defaults align with §1 goal ("no silent gap > 5s") without any user
 config. Operators who want more aggressive ticks can lower the
 interval; those who don't want session-tail in this loop can disable
 enrichment.
+
+### 5.1 Why 5000ms (5s) is the default
+
+Three constraints, the smallest one wins:
+
+1. **Telegram per-chat edit cap** — recommended ≤1/sec. 5000ms is
+   5× under the recommended cap, leaving headroom for compounding
+   callers (recall.py, future hooks) without tripping rate limits.
+2. **User perception of "alive"** — UX research on chat interfaces
+   suggests text changes within 3-5s register as "the system is
+   working" vs >5s registering as "stuck." 5s is at the upper end of
+   that band; 3s would be safer for perception but trips constraint
+   1 if any other caller adds traffic.
+3. **Mobile battery** — every edit triggers a Telegram push to the
+   user's mobile client, which decodes + re-renders. 5s = 12 wake
+   events per minute under sustained streaming. At 3s the rate
+   doubles. Conservative tilt toward 5s.
+
+5000ms is the safe-by-default starting point. Operators who want
+snappier UX and have headroom can drop to 3000ms; those running
+constrained accounts (multiple agents on one bot, slow networks)
+can raise to 10000ms.
+
+Tuning policy: ship at 5000ms, monitor edit-rate dashboards, adjust
+based on real user reports — not on theory.
 
 ## 6. Lifecycle integration with existing code
 
@@ -380,14 +463,17 @@ the test fails.
 ### 7.4 E2E behavioral test (vitest with fake-bot-api)
 
 `tests/placeholder-heartbeat.e2e.test.ts` using the harness from
-PR #495:
+PR #495 + `vi.useFakeTimers`:
 
 ```ts
 describe('heartbeat lifecycle end-to-end', () => {
-  it('emits 3 sendMessageDraft edits over 15 simulated seconds')
-  it('uses the latest update_placeholder text in the heartbeat label')
-  it('stops when reply consumes the placeholder')
-  it('stops on turn-end orphan cleanup')
+  it('emits exactly 3 sendMessageDraftFn calls between t=0 and t=15s with intervalMs=5000')
+  it('first call at t=5000ms shows "🔵 thinking · 5s"')
+  it('second call at t=10000ms shows "🔵 thinking · 10s"')
+  it('third call at t=15000ms shows "🔵 thinking · 15s"')
+  it('zero subsequent calls after isPlaceholderActive returns false')
+  it('stops at maxDurationMs=300000 even if isPlaceholderActive still returns true')
+  it('cancel() cancels the next pending tick — zero further calls')
 })
 ```
 
@@ -402,6 +488,33 @@ describe('heartbeat with session-tail enrichment', () => {
 ```
 
 ## 8. Performance + rate-limit analysis
+
+### 8.0 Per-chat edit budget under compounding callers
+
+The single most important number to bound: **edits per chat per
+minute**, since Telegram's recommended cap is ~60/min per chat
+(1/sec).
+
+Compounding callers post-implementation:
+
+| Caller | Edits per turn (typical) | Edits per minute (worst case) |
+|---|---|---|
+| Heartbeat (5s interval, 30s avg turn) | ~6 | 12 |
+| `update_placeholder` from recall.py | 2 (recall start + recall end) | 4 |
+| Future hook callers (hypothetical) | varies | varies |
+| **Combined under §3 minimum (heartbeat only)** | **~6** | **12** |
+| **Combined under §4 enrichment (heartbeat reads label)** | **~6** | **12** |
+
+The §4.6 coordination protocol means recall.py and session-tail
+events DON'T add edits — they only update the in-memory label that
+heartbeat reads. Net: no matter how many enrichment sources land,
+the per-chat edit rate is bounded by the heartbeat tick interval.
+
+If a future caller wants to write to Telegram outside the heartbeat
+(e.g. an "instant reaction" path that needs sub-tick latency),
+**that caller is responsible for its own rate-limit math**. The
+heartbeat doesn't enforce a global per-chat budget; it only manages
+its own ticks.
 
 Each agent runs ~30 turns/hour at peak. Each turn = ~6 heartbeat
 edits (5s interval × 30s avg turn). Per agent: ~180 edits/hour. Five
@@ -453,6 +566,29 @@ deployments. Knobs in §5 are opt-out:
 Compatible with all existing agents. No rebuild-and-restart-everything
 scenario; per-agent restart at the operator's normal cadence picks
 up the new behaviour.
+
+### 10.1 Rollback plan
+
+If the heartbeat causes an unforeseen production issue (e.g.,
+Telegram rate-limits the bot temporarily, drafts go past the 48h
+edit window, recall.py edge case):
+
+```bash
+# Per-agent disable (no code revert):
+echo 'channels:
+  telegram:
+    placeholder_heartbeat_ms: 0' >> ~/.switchroom/<agent>/switchroom.yaml
+switchroom agent restart <agent>
+
+# Or fleet-wide via env (also no code revert):
+export SWITCHROOM_TG_PLACEHOLDER_HEARTBEAT_MS=0
+switchroom agent restart all
+```
+
+Setting the interval to `0` short-circuits the heartbeat-start branch
+in the gateway. The placeholder reverts to today's static behaviour
+within seconds of the restart. The on-call playbook should reference
+this section.
 
 ## 11. Out of scope for this PR (tracked separately)
 
@@ -515,7 +651,10 @@ up the new behaviour.
 
 ## 14. Implementation estimate
 
-- Design review (this doc): 1 day
+Split per Weakness 2 (review): two PRs.
+
+### PR 1 — §3 minimum (pure elapsed timer)
+
 - `placeholder-heartbeat.ts` module + pure tests: 2-3 hours
 - `gateway.ts` integration + cancel site wiring: 2-3 hours
 - E2E test using fake-bot-api: 1-2 hours
@@ -523,8 +662,30 @@ up the new behaviour.
 - Live verification + tune: 1 hour
 - PR write-up + review cycle: 2 hours
 
-**Total: 1-2 days from design approval to merged PR.**
+**PR 1 total: 1-2 days clean room. 2-3 days realistic with CI debug + review iterations.**
+
+### PR 2 — §4 enrichment (label-map coordination + session-tail integration)
+
+- `currentPlaceholderLabel` map extraction + tests: 2-3 hours
+- `update-placeholder-handler.ts` modification (write-to-label
+  instead of direct edit) + test updates: 1-2 hours
+- session-tail event consumer in heartbeat: 2 hours
+- Tool-label rendering reuse from `tool-labels.ts`: 1 hour
+- E2E tests for §4.1, §4.2, §4.6 race elimination: 2-3 hours
+- Live verification: 1 hour
+- PR write-up + review: 2 hours
+
+**PR 2 total: 1-2 days clean room. 2-3 days realistic.**
+
+### Combined: 4-6 days realistic from design approval to both PRs merged
 
 Compare with Path C (`stream-json-daemon-mode.md`): 2-4 weeks plus
 spike. Path A delivers the user-visible UX win in a fraction of the
 time at zero architectural risk.
+
+**Why split into two PRs**: per review Weakness 2, ship the §3
+minimum first and gather one week of real user reaction before
+adding §4 enrichment. The minimum is provably never-worse-than-today;
+the enrichment introduces session-tail dependency (theoretical
+fragility class) that should be validated against real traffic
+before defaulting on.
