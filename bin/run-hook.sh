@@ -162,7 +162,45 @@ record_failure() {
 }
 
 resolve_success() {
-  # Resolve by source+code; the CLI computes the fingerprint.
+  # Fast-skip the CLI fork when there is nothing to resolve.
+  #
+  # Cold-starting the switchroom CLI to call `issues resolve` costs
+  # ~785ms on a typical box (measured 2026-05-01 across three runs).
+  # With 3-5 successful hooks per turn this is 2.4-4 s of pure wrapper
+  # overhead per turn — bigger than the model's first-token latency.
+  #
+  # Most hooks succeed and most successful hooks have nothing to clear
+  # (a fleet check on 2026-05-01 found 0 unresolved entries across 5
+  # production agents). In that case `issues resolve` walks the file,
+  # finds no matching unresolved entry, and returns 0 — pure waste.
+  #
+  # Bash-side prefilter mirrors the CLI's match condition exactly:
+  #   - fingerprint == "<source>::<code>"  (per src/issues/fingerprint.ts)
+  #   - resolved_at is null/missing        (per IssueEvent.resolved_at?)
+  # Since IssueEvent.resolved_at is optional and JSON.stringify omits
+  # undefined fields, an unresolved entry's JSONL line will NOT contain
+  # the substring `"resolved_at":` at all. So the prefilter is:
+  #
+  #   any line containing the fingerprint AND lacking `"resolved_at":`
+  #
+  # If no such line exists, the CLI's resolve op is a guaranteed no-op
+  # and we skip the fork. False positives (forking when we don't need
+  # to) match today's behaviour and are harmless. False negatives
+  # (skipping when we should fork) require a fingerprint substring
+  # collision with `"resolved_at":` somewhere on the same line, which
+  # the JSON ordering and key set make impossible.
+  local fingerprint="${SOURCE}::${CODE}"
+  local issues_file="${STATE_DIR}/issues.jsonl"
+
+  if [ -z "$STATE_DIR" ] || [ ! -s "$issues_file" ]; then
+    return 0
+  fi
+  if ! grep -F "\"fingerprint\":\"${fingerprint}\"" "$issues_file" 2>/dev/null \
+    | grep -vqF '"resolved_at":'; then
+    return 0
+  fi
+
+  # Real work — fork the CLI to do the actual flip.
   if debug_mode; then
     "$SWITCHROOM_CLI" issues resolve --source "$SOURCE" --code "$CODE" \
       ${STATE_DIR:+--state-dir "$STATE_DIR"} \

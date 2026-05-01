@@ -208,6 +208,91 @@ describe("run-hook.sh", () => {
     expect(issues).toContain("hook:s::bar.sh");
   });
 
+  it("fast-skips the CLI fork when there is nothing to resolve", () => {
+    // Replace the shim with one that LOGS every invocation. The fix should
+    // bash-prefilter and never call `issues resolve` when the JSONL has
+    // no unresolved entry for this fingerprint. That cuts ~785ms per
+    // success-path hook (measured 2026-05-01); per-turn cost across
+    // 3-5 hooks is several seconds.
+    const invocationLog = join(scriptDir, "shim-invocations.log");
+    writeFileSync(
+      cliShimPath,
+      `#!/usr/bin/env bash\necho "$*" >> ${invocationLog}\nexec ${BUN} ${CLI} "$@"\n`,
+    );
+    chmodSync(cliShimPath, 0o755);
+
+    const script = makeScript("ok.sh", "exit 0");
+    runHook("hook:test", script);
+
+    // Read invocation log (file may not exist if fast-skip worked).
+    const fs = require("node:fs") as typeof import("node:fs");
+    const calls = fs.existsSync(invocationLog)
+      ? fs.readFileSync(invocationLog, "utf-8").trim().split("\n").filter(Boolean)
+      : [];
+    // No prior failure → no fingerprint in store → resolve is a guaranteed
+    // no-op → wrapper must skip the fork. Zero CLI invocations expected.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("fast-skips on success when all matching entries are already resolved", () => {
+    // Pre-seed: one failure (creates unresolved entry), one success
+    // (resolves it). After this the JSONL contains a fingerprint with
+    // `resolved_at` set. A subsequent success must not re-fork the CLI.
+    const failing = makeScript("h.sh", "echo bad >&2; exit 1");
+    runHook("hook:reused", failing);
+    writeFileSync(failing, `#!/usr/bin/env bash\nexit 0\n`);
+    chmodSync(failing, 0o755);
+    runHook("hook:reused", failing);
+
+    // From here, the entry is resolved. Swap the shim to a counter and
+    // run again — fast-skip should kick in.
+    const invocationLog = join(scriptDir, "shim-invocations.log");
+    writeFileSync(
+      cliShimPath,
+      `#!/usr/bin/env bash\necho "$*" >> ${invocationLog}\nexec ${BUN} ${CLI} "$@"\n`,
+    );
+    chmodSync(cliShimPath, 0o755);
+
+    runHook("hook:reused", failing);
+
+    const fs = require("node:fs") as typeof import("node:fs");
+    const calls = fs.existsSync(invocationLog)
+      ? fs.readFileSync(invocationLog, "utf-8").trim().split("\n").filter(Boolean)
+      : [];
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does NOT fast-skip when an unresolved entry exists for the fingerprint", () => {
+    // Create a real unresolved entry, then run success with the same
+    // fingerprint. The wrapper must fork the CLI to flip the entry.
+    const failing = makeScript("h.sh", "echo bad >&2; exit 1");
+    runHook("hook:must-flip", failing);
+
+    // Swap shim to count invocations, then run success.
+    const invocationLog = join(scriptDir, "shim-invocations.log");
+    writeFileSync(
+      cliShimPath,
+      `#!/usr/bin/env bash\necho "$*" >> ${invocationLog}\nexec ${BUN} ${CLI} "$@"\n`,
+    );
+    chmodSync(cliShimPath, 0o755);
+
+    writeFileSync(failing, `#!/usr/bin/env bash\nexit 0\n`);
+    chmodSync(failing, 0o755);
+    runHook("hook:must-flip", failing);
+
+    const fs = require("node:fs") as typeof import("node:fs");
+    const calls = fs.existsSync(invocationLog)
+      ? fs.readFileSync(invocationLog, "utf-8").trim().split("\n").filter(Boolean)
+      : [];
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[0]).toContain("issues resolve");
+
+    // And the entry actually flipped.
+    const issues = listIssues() as Array<{ resolved_at?: number }>;
+    expect(issues).toHaveLength(1);
+    expect(issues[0].resolved_at).toBeDefined();
+  });
+
   it("rejects malformed invocation (no source/command)", () => {
     let status = 0;
     let stderr = "";
