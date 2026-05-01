@@ -125,11 +125,38 @@ export interface RecordSubagentEndArgs {
 export interface RecordSubagentStallArgs {
   id: string
   stalledAt: number
+  /**
+   * Optional human-readable reason written to `result_summary`. Used by the
+   * reaper to record WHY a row was stalled out (e.g. "reaped: stuck in
+   * running for 47h with no jsonl linkage"). Omitted for the watcher's
+   * normal stall-detection path so existing callers are unchanged.
+   */
+  reason?: string
 }
 
 export interface BumpSubagentActivityArgs {
   id: string
   ts: number
+}
+
+export interface ReapStuckRunningArgs {
+  /**
+   * Maximum age (ms since `last_activity_at`, or since `started_at` for rows
+   * that never had liveness writes) before a `running` background row is
+   * considered orphaned. Default 1h is enough that a real long-running
+   * sub-agent isn't false-positived but a watcher-missed row is caught
+   * within a window the operator notices.
+   */
+  ttlMs: number
+  /** Current time (DI for tests). */
+  now: number
+}
+
+export interface ReapStuckRunningResult {
+  /** How many rows were transitioned. */
+  reaped: number
+  /** Tool-use ids of rows that were reaped — for logging / tests. */
+  ids: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -361,12 +388,74 @@ export function recordSubagentEnd(db: SqliteDatabase, args: RecordSubagentEndArg
  */
 export function recordSubagentStall(db: SqliteDatabase, args: RecordSubagentStallArgs): void {
   void args.stalledAt // available for callers that want to log it; not stored (no ended_at)
+  // When `reason` is supplied, write it to result_summary so a later
+  // operator (or `switchroom debug` output) can see why the row was
+  // stalled — distinguishes "JSONL idle past stall threshold" from
+  // "reaped because no jsonl linkage was ever established."
+  // result_summary is preserved (COALESCE) for callers without a reason.
+  if (args.reason !== undefined) {
+    db.prepare(`
+      UPDATE subagents
+      SET status         = 'stalled',
+          result_summary = ?
+      WHERE id = ?
+        AND status NOT IN ('completed', 'failed')
+    `).run(args.reason, args.id)
+    return
+  }
   db.prepare(`
     UPDATE subagents
     SET status = 'stalled'
     WHERE id = ?
       AND status NOT IN ('completed', 'failed')
   `).run(args.id)
+}
+
+/**
+ * Reap any background subagent row that's been stuck in `status='running'`
+ * past `ttlMs` of inactivity. Transitions to `status='stalled'` with a
+ * result_summary recording the reason — same terminal-ish state as a normal
+ * stall (resumable if activity returns, but the row no longer counts as
+ * an in-flight worker for fleet-status purposes).
+ *
+ * Rationale: the watcher's `sub_agent_turn_end` handler and `checkStalls`
+ * both update rows by `jsonl_agent_id`. Rows whose JSONL was never linked
+ * (backfill failed — meta.json missing, descriptor mismatch, etc.) are
+ * invisible to both paths and stay in `running` indefinitely. The reaper
+ * is the unconditional safety net.
+ *
+ * Activity test:
+ *   - prefer `last_activity_at` (set by Phase 3 liveness writes)
+ *   - fall back to `started_at` (the row was inserted but no JSONL ever
+ *     bumped activity — strong signal the linkage never happened)
+ *
+ * Foreground rows are excluded — their lifecycle goes through PostToolUse
+ * which writes `completed` directly; if those are stuck it's a different
+ * bug than the JSONL-linkage gap this reaper addresses.
+ */
+export function reapStuckRunningRows(
+  db: SqliteDatabase,
+  args: ReapStuckRunningArgs,
+): ReapStuckRunningResult {
+  const cutoff = args.now - args.ttlMs
+  const candidates = db
+    .prepare(`
+      SELECT id FROM subagents
+      WHERE status = 'running'
+        AND background = 1
+        AND COALESCE(last_activity_at, started_at) < ?
+    `)
+    .all(cutoff) as Array<{ id: string }>
+
+  for (const row of candidates) {
+    recordSubagentStall(db, {
+      id: row.id,
+      stalledAt: args.now,
+      reason: `reaped: stuck in running past ${Math.round(args.ttlMs / 60_000)}min ttl (jsonl linkage likely missing)`,
+    })
+  }
+
+  return { reaped: candidates.length, ids: candidates.map((r) => r.id) }
 }
 
 /**

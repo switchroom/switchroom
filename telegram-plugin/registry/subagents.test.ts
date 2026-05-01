@@ -26,6 +26,7 @@ import {
   recordSubagentStall,
   bumpSubagentActivity,
   getSubagent,
+  reapStuckRunningRows,
 } from './subagents-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -371,5 +372,105 @@ describe('bumpSubagentActivity', () => {
     const row = getSubagent(db, 'sa-mono')
     expect(row!.last_activity_at).toBe(4000)
     db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// recordSubagentStall — reason field (issue #522)
+// ---------------------------------------------------------------------------
+
+describe('recordSubagentStall — reason field', () => {
+  it('writes reason into result_summary when supplied', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-r1', background: true, startedAt: 1000 })
+    recordSubagentStall(db, { id: 'sa-r1', stalledAt: 2000, reason: 'reaped: test reason' })
+    const row = getSubagent(db, 'sa-r1')
+    expect(row!.status).toBe('stalled')
+    expect(row!.result_summary).toBe('reaped: test reason')
+    db.close()
+  })
+
+  it('preserves existing result_summary when reason is omitted (existing callers unchanged)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-r2', background: true, startedAt: 1000 })
+    // Simulate a prior write that set result_summary directly via SQL.
+    db.prepare('UPDATE subagents SET result_summary = ? WHERE id = ?').run('prior summary', 'sa-r2')
+    recordSubagentStall(db, { id: 'sa-r2', stalledAt: 2000 })
+    const row = getSubagent(db, 'sa-r2')
+    expect(row!.status).toBe('stalled')
+    expect(row!.result_summary).toBe('prior summary')
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reapStuckRunningRows (issue #522)
+// ---------------------------------------------------------------------------
+
+describe('reapStuckRunningRows', () => {
+  it('reaps a background row whose last_activity_at is past ttl', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-stuck', background: true, startedAt: 1000 })
+    bumpSubagentActivity(db, { id: 'sa-stuck', ts: 1500 })
+    const result = reapStuckRunningRows(db, { ttlMs: 500, now: 5000 })
+    expect(result.reaped).toBe(1)
+    expect(result.ids).toEqual(['sa-stuck'])
+    const row = getSubagent(db, 'sa-stuck')
+    expect(row!.status).toBe('stalled')
+    expect(row!.result_summary).toMatch(/reaped: stuck in running/)
+  })
+
+  it('reaps rows that never had a liveness bump after start (still on initial last_activity_at)', () => {
+    // Production failure mode: backfill never linked the JSONL so liveness
+    // writes never fired. recordSubagentStart seeds last_activity_at=started_at,
+    // so the reaper compares COALESCE(last_activity_at, started_at) — same
+    // outcome whether or not bumpSubagentActivity ever ran.
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-noactivity', background: true, startedAt: 1000 })
+    const row0 = getSubagent(db, 'sa-noactivity')
+    expect(row0!.last_activity_at).toBe(1000)
+    const result = reapStuckRunningRows(db, { ttlMs: 500, now: 5000 })
+    expect(result.reaped).toBe(1)
+    const row = getSubagent(db, 'sa-noactivity')
+    expect(row!.status).toBe('stalled')
+  })
+
+  it('does not reap rows still within ttl', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-fresh', background: true, startedAt: 4000 })
+    bumpSubagentActivity(db, { id: 'sa-fresh', ts: 4500 })
+    const result = reapStuckRunningRows(db, { ttlMs: 1000, now: 5000 })
+    expect(result.reaped).toBe(0)
+    const row = getSubagent(db, 'sa-fresh')
+    expect(row!.status).toBe('running')
+  })
+
+  it('does not reap foreground rows (not the JSONL-linkage failure mode)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-fg', background: false, startedAt: 1000 })
+    const result = reapStuckRunningRows(db, { ttlMs: 100, now: 5000 })
+    expect(result.reaped).toBe(0)
+    const row = getSubagent(db, 'sa-fg')
+    expect(row!.status).toBe('running')
+  })
+
+  it('does not re-reap rows already in terminal status (idempotent)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'sa-done', background: true, startedAt: 1000 })
+    recordSubagentEnd(db, { id: 'sa-done', endedAt: 2000, status: 'completed' })
+    const result = reapStuckRunningRows(db, { ttlMs: 100, now: 9000 })
+    expect(result.reaped).toBe(0)
+    const row = getSubagent(db, 'sa-done')
+    expect(row!.status).toBe('completed')
+  })
+
+  it('handles many stuck rows in one pass', () => {
+    const db = openFreshSubagentsDbInMemory()
+    for (let i = 0; i < 5; i++) {
+      recordSubagentStart(db, { id: `sa-${i}`, background: true, startedAt: 1000 + i })
+    }
+    const result = reapStuckRunningRows(db, { ttlMs: 100, now: 9999 })
+    expect(result.reaped).toBe(5)
+    expect(result.ids.sort()).toEqual(['sa-0', 'sa-1', 'sa-2', 'sa-3', 'sa-4'])
   })
 })

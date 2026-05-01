@@ -42,7 +42,7 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
 import { escapeHtml, truncate } from './card-format.js'
-import { bumpSubagentActivity, recordSubagentStall, recordSubagentEnd } from './registry/subagents-schema.js'
+import { bumpSubagentActivity, recordSubagentStall, recordSubagentEnd, reapStuckRunningRows } from './registry/subagents-schema.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -109,6 +109,22 @@ export interface SubagentWatcherConfig {
    */
   stallThresholdMs?: number
   /**
+   * Reaper TTL (ms): background rows in `status='running'` whose
+   * `last_activity_at` (or `started_at` if liveness never wrote) is older
+   * than this are transitioned to `status='stalled'` with a result_summary
+   * explaining the reap. Default 1h. The reaper exists because the normal
+   * stall + completion paths both look up rows by `jsonl_agent_id`; if
+   * backfill never linked the JSONL to the row, neither path can update
+   * it and it sits in `running` forever (issue #522).
+   */
+  reaperTtlMs?: number
+  /**
+   * How often to run the reaper (ms). Default 15 minutes. Also runs once
+   * synchronously at watcher startup to catch rows left over from a
+   * previous gateway process.
+   */
+  reaperIntervalMs?: number
+  /**
    * Optional registry DB for Phase 3 liveness writes. When provided, the
    * watcher calls `bumpSubagentActivity` each time a sub-agent JSONL grows
    * (i.e. mtime advances). If the matching row does not yet exist (Phase 2
@@ -161,6 +177,8 @@ export interface SubagentWatcherHandle {
 
 const DEFAULT_RESCAN_MS = 1000
 const DEFAULT_STALL_THRESHOLD_MS = 60_000
+const DEFAULT_REAPER_TTL_MS = 60 * 60_000          // 1 hour
+const DEFAULT_REAPER_INTERVAL_MS = 15 * 60_000     // 15 minutes
 /**
  * Grace period between a sub-agent transitioning to terminal state
  * (`done` / `failed`) and the watcher closing its FSWatcher + dropping
@@ -366,6 +384,8 @@ function readSubTail(
 export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWatcherHandle {
   const agentDir = config.agentDir
   const stallThresholdMs = config.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS
+  const reaperTtlMs = config.reaperTtlMs ?? DEFAULT_REAPER_TTL_MS
+  const reaperIntervalMs = config.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS
   const rescanMs = config.rescanMs ?? DEFAULT_RESCAN_MS
   const log = config.log
   const db = config.db ?? null
@@ -736,12 +756,37 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   rescanSubagentDirs()
   bootScanInProgress = false
 
+  // ─── Reaper for stuck-running rows (issue #522) ─────────────────────────
+  // Background subagents whose JSONL was never linked to their registry row
+  // (backfill failed) are invisible to the normal stall + completion paths,
+  // both of which look up rows by `jsonl_agent_id`. Without this reaper they
+  // sit in `status='running'` forever. Run once at startup to clean up rows
+  // left by a previous gateway, then on a periodic timer.
+  function runReaper(): void {
+    if (db == null) return
+    try {
+      const result = reapStuckRunningRows(db, { ttlMs: reaperTtlMs, now: nowFn() })
+      if (result.reaped > 0) {
+        log?.(`subagent-watcher: reaper transitioned ${result.reaped} stuck-running row(s) to stalled (ttl=${Math.round(reaperTtlMs / 60_000)}min)`)
+      }
+    } catch (err) {
+      log?.(`subagent-watcher: reaper error: ${(err as Error).message}`)
+    }
+  }
+  runReaper()
+
+  // Register the poll interval BEFORE the reaper interval. Existing tests'
+  // harness `poll()` helper grabs `intervals[0]` and fires it, treating the
+  // first-registered interval as the poll loop. Keep the reaper second to
+  // preserve that contract.
   const pollHandle = setI(poll, rescanMs)
+  const reaperHandle = setI(runReaper, reaperIntervalMs)
 
   return {
     stop(): void {
       stopped = true
       clearI(pollHandle)
+      clearI(reaperHandle)
       // Cancel any pending deferred-cleanup timers — the unconditional
       // close loop below covers their work and we don't want straggler
       // setTimeout callbacks firing after the watcher is supposedly stopped.
