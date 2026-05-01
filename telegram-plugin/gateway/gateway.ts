@@ -25,6 +25,8 @@ import { join, extname, sep, basename } from 'path'
 import { installPluginLogger } from '../plugin-logger.js'
 import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
+import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
+import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -1631,29 +1633,19 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onUpdatePlaceholder(_client: IpcClient, msg: UpdatePlaceholderMessage) {
-    // Edit the pre-allocated draft for this DM to show a more specific
-    // status during the wait between inbound and the agent's first
-    // tool call. Sent by hooks (e.g. recall.py) so the user sees
-    // `📚 recalling…` and `💭 thinking…` instead of the static
-    // `🔵 thinking…` placeholder for the entire model TTFT.
-    //
-    // Best-effort, silent on three legitimate misses:
-    //   1. No pre-alloc draft (forum topic, sendMessageDraft API absent,
-    //      pre-alloc API call still in flight).
-    //   2. Telegram API rejects the edit (rate limit, invalid text).
-    //   3. The draft was already consumed by stream_reply.
-    if (sendMessageDraftFn == null) return
-    const preAllocated = preAllocatedDrafts.get(msg.chatId)
-    if (preAllocated == null) return
-    const text = String(msg.text ?? '').slice(0, 200)  // sanity cap
-    if (text.length === 0) return
-    void sendMessageDraftFn(msg.chatId, preAllocated.draftId, text).catch((err) => {
-      process.stderr.write(
-        `telegram gateway: update_placeholder edit failed chatId=${msg.chatId}: ${
-          err instanceof Error ? err.message : String(err)
-        }\n`,
-      )
-    })
+    // Decision + side effect extracted to ../update-placeholder-handler
+    // so the contract is testable without booting the gateway. See
+    // update-placeholder-handler.ts and tests/update-placeholder-handler.e2e.test.ts.
+    handleUpdatePlaceholder(
+      { msg, sendMessageDraftFn, preAllocatedDrafts },
+      (result) => {
+        if (result.kind === 'edit-failed') {
+          process.stderr.write(
+            `telegram gateway: update_placeholder edit failed chatId=${result.chatId}: ${result.error.message}\n`,
+          )
+        }
+      },
+    )
   },
 
   /**
@@ -3789,16 +3781,17 @@ async function handleInbound(
     // card appears." Forum topics still excluded via the messageThreadId
     // guard because sendMessageDraft doesn't accept message_thread_id;
     // forum-topic placeholder needs a separate path (out of scope here).
-    if (
-      sendMessageDraftFn != null
-      && messageThreadId == null
-      && !preAllocatedDrafts.has(chat_id)
-    ) {
+    const decision = decideShouldPreAlloc({
+      sendMessageDraftAvailable: sendMessageDraftFn != null,
+      messageThreadId,
+      alreadyHasDraft: preAllocatedDrafts.has(chat_id),
+    })
+    if (decision.allocate) {
       const draftId = allocateDraftId()
       // Best-effort, non-blocking: any failure (transport down, API not
       // available, group rejects sendMessageDraft) falls through to
       // today's behavior — the existing .catch already silently logs.
-      void sendMessageDraftFn(chat_id, draftId, '🔵 thinking')
+      void sendMessageDraftFn!(chat_id, draftId, PRE_ALLOC_PLACEHOLDER_TEXT)
         .then(() => {
           preAllocatedDrafts.set(chat_id, { draftId, allocatedAt: Date.now() })
         })
