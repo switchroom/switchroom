@@ -574,7 +574,7 @@ export async function reconcileAndRestartAgent(
       if (match) {
         const token = match[1].trim();
         try {
-          await validateBotTokenMatchesAgent(token, name);
+          await validateBotTokenMatchesAgent(token, name, agentConfig.bot_username);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           // Fail loudly — do not restart with a wrong token.

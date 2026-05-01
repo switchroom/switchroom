@@ -73,22 +73,35 @@ export async function validateBotToken(token: string): Promise<BotInfo> {
  * BotFather history. The minimal convention we enforce is that the slug
  * appears somewhere in the username (case-insensitive).
  *
- * Throws with a human-readable message when the username does not contain
- * the slug, so the caller can surface it as a loud error.
+ * When `expectedUsername` is supplied, the check is exact (case-
+ * insensitive) equality against that value instead — used when the agent
+ * config explicitly declares its bot username because the slug doesn't
+ * appear in it (e.g. agent `lawgpt` paired with bot `@meken_law_bot`).
  *
- * @param username - The bot username returned by getMe (without leading @).
- * @param agentSlug - The agent name / slug (e.g. "finn", "gymbro").
+ * Throws with a human-readable message when the username does not match,
+ * so the caller can surface it as a loud error.
  */
 export function assertBotUsernameMatchesAgent(
   username: string,
   agentSlug: string,
+  expectedUsername?: string,
 ): void {
   const lowerUsername = username.toLowerCase();
+  if (expectedUsername) {
+    if (lowerUsername !== expectedUsername.toLowerCase()) {
+      throw new Error(
+        `agent "${agentSlug}" bot_token resolves to @${username} — expected @${expectedUsername} (from bot_username in switchroom.yaml). ` +
+          `Check switchroom.yaml or the vault entry (bot_token key may point to the wrong bot).`,
+      );
+    }
+    return;
+  }
   const lowerSlug = agentSlug.toLowerCase();
   if (!lowerUsername.includes(lowerSlug)) {
     throw new Error(
       `agent "${agentSlug}" bot_token resolves to @${username} — expected username to contain "${agentSlug}". ` +
-        `Check switchroom.yaml or the vault entry (bot_token key may point to the wrong bot).`,
+        `Check switchroom.yaml or the vault entry (bot_token key may point to the wrong bot). ` +
+        `If the bot is intentionally named without the slug, declare \`bot_username\` on the agent in switchroom.yaml.`,
     );
   }
 }
@@ -105,9 +118,10 @@ export function assertBotUsernameMatchesAgent(
 export async function validateBotTokenMatchesAgent(
   token: string,
   agentSlug: string,
+  expectedUsername?: string,
 ): Promise<BotInfo> {
   const botInfo = await validateBotToken(token);
-  assertBotUsernameMatchesAgent(botInfo.username, agentSlug);
+  assertBotUsernameMatchesAgent(botInfo.username, agentSlug, expectedUsername);
   return botInfo;
 }
 

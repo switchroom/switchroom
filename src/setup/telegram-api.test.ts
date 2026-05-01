@@ -69,6 +69,36 @@ describe("assertBotUsernameMatchesAgent", () => {
       assertBotUsernameMatchesAgent("", "finn"),
     ).toThrow();
   });
+
+  describe("with expectedUsername override", () => {
+    it("accepts an exact match (case-insensitive) even when slug isn't in the username", () => {
+      expect(() =>
+        assertBotUsernameMatchesAgent("meken_law_bot", "lawgpt", "meken_law_bot"),
+      ).not.toThrow();
+      expect(() =>
+        assertBotUsernameMatchesAgent("MEKEN_LAW_BOT", "lawgpt", "meken_law_bot"),
+      ).not.toThrow();
+    });
+
+    it("rejects a username that doesn't equal the declared expected one", () => {
+      let caught: Error | null = null;
+      try {
+        assertBotUsernameMatchesAgent("meken_other_bot", "lawgpt", "meken_law_bot");
+      } catch (err) {
+        caught = err as Error;
+      }
+      expect(caught).not.toBeNull();
+      expect(caught!.message).toMatch(/@meken_other_bot/);
+      expect(caught!.message).toMatch(/@meken_law_bot/);
+      expect(caught!.message).toMatch(/bot_username/);
+    });
+
+    it("substring match alone is not enough when an exact override is set", () => {
+      expect(() =>
+        assertBotUsernameMatchesAgent("meken_law_bot_v2", "lawgpt", "meken_law_bot"),
+      ).toThrow();
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -684,6 +684,16 @@ export const AgentSchema = z.object({
     .string()
     .optional()
     .describe("Per-agent Telegram bot token or vault reference (overrides global telegram.bot_token)"),
+  bot_username: z
+    .string()
+    .optional()
+    .describe(
+      "Per-agent Telegram bot username (without leading @) when it doesn't " +
+      "contain the agent slug. Replaces the default 'username includes slug' " +
+      "preflight check with an exact (case-insensitive) match. Use when an " +
+      "agent and its bot have intentionally divergent names (e.g. agent " +
+      "'lawgpt' paired with bot '@meken_law_bot').",
+    ),
   timezone: z
     .string()
     .regex(
