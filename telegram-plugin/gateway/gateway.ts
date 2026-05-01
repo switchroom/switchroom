@@ -7048,7 +7048,14 @@ function handleChecklistUpdate(
     const access = loadAccess()
 
     // Only notify if this chat is allowlisted — same guard as inbound user messages.
-    if (!access.allowFrom.includes(chat_id) && access.allowFrom.length > 0) return
+    // Closes #472 finding #13. Pre-fix the `&& access.allowFrom.length > 0`
+    // tail made this fail-OPEN when the allowlist was empty: every chat's
+    // checklist tasks would forward to the agent. Sibling guards (the
+    // inbound-message gate at line ~588 and the operator-event broadcast
+    // at line ~1221) are both fail-closed for empty allowlists. The
+    // empty-allowlist case is the most likely state for a misconfiguration
+    // (e.g. /unpair just ran), so fail-OPEN is the worst default.
+    if (!access.allowFrom.includes(chat_id)) return
 
     const message_id = String(msg.message_id)
     const ts = msg.date ?? Math.floor(Date.now() / 1000)
