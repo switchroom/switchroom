@@ -66,3 +66,59 @@ describe('shouldSkipDuplicateBootCard — reason format', () => {
     expect(decision.reason).toBeUndefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// In-flight race window (issue #489)
+//
+// Before #489, the gate only saw activeBootCard, which is only assigned
+// AFTER the boot path's `await startBootCard(...)` resolved. If the agent's
+// IPC client connected during that 1–2s sendMessage round-trip,
+// onClientRegistered would dedupe-check, see activeBootCard = null, and
+// fire its own boot card. Klanker on 2026-05-01 10:13:15 produced msgId
+// 4715 + 4716 from the same gateway PID via this race. The bootCardPending
+// flag is set synchronously before the await so the dedupe sees in-flight.
+// ---------------------------------------------------------------------------
+
+describe('shouldSkipDuplicateBootCard — in-flight (race window, #489)', () => {
+  it('skips bridge-reconnect when boot path is still awaiting sendMessage', () => {
+    const decision = shouldSkipDuplicateBootCard(
+      { activeBootCard: null, bootCardPending: true },
+      'bridge-reconnect',
+    )
+    expect(decision.skip).toBe(true)
+    expect(decision.reason).toMatch(/in-flight/i)
+  })
+
+  it('skips bridge-reconnect when both pending and active are set (post-resolution overlap)', () => {
+    // A bridge-reconnect can fire after activeBootCard was assigned but
+    // before the finally-clears bootCardPending — both true is legal.
+    const decision = shouldSkipDuplicateBootCard(
+      { activeBootCard: { messageId: 4715 }, bootCardPending: true },
+      'bridge-reconnect',
+    )
+    expect(decision.skip).toBe(true)
+    // In-flight wins because it's checked first; either reason is fine
+    // for observability — the card is correctly skipped either way.
+    expect(decision.reason).toBeDefined()
+  })
+
+  it('does not skip boot path even when something else is in-flight', () => {
+    // The boot path is the primary site — it's the only thing that should
+    // ever set bootCardPending=true in the first place. Defensive check.
+    const decision = shouldSkipDuplicateBootCard(
+      { activeBootCard: null, bootCardPending: true },
+      'boot',
+    )
+    expect(decision.skip).toBe(false)
+  })
+
+  it('treats undefined bootCardPending as "not pending" for backward compat', () => {
+    // Callers that pre-date the flag still pass { activeBootCard } only.
+    // Their behaviour must not change.
+    const decision = shouldSkipDuplicateBootCard(
+      { activeBootCard: null },
+      'bridge-reconnect',
+    )
+    expect(decision.skip).toBe(false)
+  })
+})

@@ -121,6 +121,14 @@ export interface BootCardGate {
    * (2026-04-26 11:19:47).
    */
   activeBootCard: { messageId: number } | null
+  /**
+   * True while a boot card emission is in-flight (sendMessage round-trip
+   * not yet resolved). Closes the race window where bridge-reconnect ran
+   * during the boot path's await and saw activeBootCard still null —
+   * observed as klanker msgId 4715 + 4716 (2026-05-01 10:13:15, issue #489).
+   * Optional for backward compatibility with callers that pre-date the flag.
+   */
+  bootCardPending?: boolean
 }
 
 export interface BootCardSkipDecision {
@@ -137,13 +145,18 @@ export interface BootCardSkipDecision {
  * registers; without this guard it posts a duplicate card.
  *
  * Boot path: never skip — it's the primary post site.
- * Bridge-reconnect: skip if a card was already posted this lifetime.
+ * Bridge-reconnect: skip if a card is in-flight OR was already posted
+ * this lifetime. The in-flight check closes the race against an
+ * unresolved sendMessage await (issue #489).
  */
 export function shouldSkipDuplicateBootCard(
   gate: BootCardGate,
   site: BootCardSite,
 ): BootCardSkipDecision {
   if (site === 'boot') return { skip: false }
+  if (gate.bootCardPending) {
+    return { skip: true, reason: 'in-flight-on-boot-path' }
+  }
   if (gate.activeBootCard != null) {
     return {
       skip: true,
