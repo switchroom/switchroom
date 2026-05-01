@@ -1,7 +1,6 @@
 import { Command } from "commander";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { execFileSync } from "node:child_process";
 import { registerInitCommand } from "./init.js";
 import { registerAgentCommand } from "./agent.js";
 import { registerSystemdCommand } from "./systemd.js";
@@ -66,30 +65,3 @@ registerDepsCommand(program);
 registerWorkspaceCommand(program);
 registerDebugCommand(program);
 registerWorktreeCommand(program);
-
-// Deprecated aliases — kept for one release, will be removed after.
-// Invoking these prints a clear deprecation warning and delegates to `update`.
-for (const oldVerb of ["upgrade", "rebuild", "reconcile"] as const) {
-  program
-    .command(oldVerb, { hidden: true })
-    .description(`[DEPRECATED] Use 'switchroom update' instead`)
-    .allowUnknownOption(true)
-    .action(() => {
-      console.warn(
-        `\n  ⚠  '${oldVerb}' is deprecated — use 'switchroom update' instead.\n`
-      );
-      // Delegate by re-invoking with the canonical verb. argv layout for
-      // a CLI invocation is [node, /path/to/switchroom, <verb>, ...rest],
-      // so slice(3) drops the deprecated verb and keeps the rest of the
-      // user's flags. Test harnesses that mock argv differently must
-      // construct the array themselves.
-      try {
-        const self = process.argv[1];
-        execFileSync(process.execPath, [self, "update", ...process.argv.slice(3)], {
-          stdio: "inherit",
-        });
-      } catch (err: any) {
-        process.exit(err.status ?? 1);
-      }
-    });
-}

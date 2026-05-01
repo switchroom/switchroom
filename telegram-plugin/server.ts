@@ -2535,10 +2535,9 @@ if (streamMode === 'checklist') {
   // Failsafe: unpin any progress cards left over from a prior session
   // that crashed or was killed mid-turn. The in-memory pin map is lost
   // on restart, so without this sweep the stale pins stick forever.
-  // The /restart, /reconcile --restart, and /update command handlers
-  // also call sweepActivePins proactively before spawning the restart
-  // child — this startup sweep is the backstop for crash/kill paths
-  // that never reach that code.
+  // The /restart and /update command handlers also call sweepActivePins
+  // proactively before spawning the restart child — this startup sweep is
+  // the backstop for crash/kill paths that never reach that code.
   const startupAgentDir = resolveAgentDirFromEnv()
   if (startupAgentDir != null) {
     void sweepActivePins(
@@ -3700,9 +3699,9 @@ function clearRestartMarker(): void {
 }
 
 /**
- * Spawn `switchroom` in a detached background process. Used by `/restart`,
- * `/reconcile --restart`, and `/update` when the target operation would
- * SIGTERM the bot's own systemd unit — execFileSync would die mid-call
+ * Spawn `switchroom` in a detached background process. Used by `/restart`
+ * and `/update` when the target operation would SIGTERM the bot's own
+ * systemd unit — execFileSync would die mid-call
  * and the user would see a misleading "command failed" error even
  * though the operation succeeded.
  *
@@ -3726,9 +3725,9 @@ function clearRestartMarker(): void {
  * ever observe the exit, so any exit we DO see is almost certainly a
  * fail-fast CLI error (bad agent name, bad args, missing config). That
  * matters because the production bug — gateway unit not exporting
- * SWITCHROOM_AGENT_NAME — makes `/restart`, `/reconcile`, `/update`
- * resolve the agent as "telegram", which fails validation in the CLI
- * and used to disappear silently into detached-spawn.log.
+ * SWITCHROOM_AGENT_NAME — makes `/restart` and `/update` resolve the
+ * agent as "telegram", which fails validation in the CLI and used to
+ * disappear silently into detached-spawn.log.
  */
 function spawnSwitchroomDetached(
   args: string[],
@@ -3814,10 +3813,9 @@ function notifyDetachedFailure(
  * crashes and SIGKILLs that never reach command handlers, but we
  * want the pins to disappear *as the user reads the ack message*
  * rather than a few seconds later when the new bot boots. Call this
- * from /restart, /reconcile --restart, and /update right after
- * sending the ack and before spawning the detached switchroom
- * child. Bounded by a 2s timeout so a hung Telegram API can't
- * block the restart.
+ * from /restart and /update right after sending the ack and before
+ * spawning the detached switchroom child. Bounded by a 2s timeout so a
+ * hung Telegram API can't block the restart.
  */
 async function sweepPinsBeforeSelfRestart(): Promise<void> {
   const agentDir = resolveAgentDirFromEnv()
@@ -4897,23 +4895,6 @@ bot.command('doctor', async ctx => {
       { html: true },
     )
   }
-})
-
-// Deprecated: /reconcile → /update. Kept for one release with a deprecation notice.
-bot.command('reconcile', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  await switchroomReply(
-    ctx,
-    `⚠️ <b>/reconcile is deprecated</b> — use <code>/update</code> instead.\n\nRunning <b>switchroom update</b> now…`,
-    { html: true },
-  )
-  await sweepPinsBeforeSelfRestart()
-  const chatId = String(ctx.chat!.id)
-  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  spawnSwitchroomDetached(
-    ['update'],
-    notifyDetachedFailure(chatId, threadId ?? null, 'update (via deprecated /reconcile)'),
-  )
 })
 
 // /grant <tool> [agent] — add a tool permission and reconcile.

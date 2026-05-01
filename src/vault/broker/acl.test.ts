@@ -36,7 +36,6 @@ function makeConfig(
         cron: s.cron,
         prompt: s.prompt,
         secrets: s.secrets ?? [],
-        suppress_stdout: false,
       })),
     };
   }
