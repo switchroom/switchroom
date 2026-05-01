@@ -57,6 +57,59 @@ import { registerAgentPerfCommand } from "./perf.js";
  *
  * Returns an array of error strings. Empty = all checks passed.
  */
+/**
+ * Defense-in-depth (#61): detect when the switchroom checkout is on a
+ * non-main branch or has a dirty working tree. The gateway runs source
+ * directly via `bun gateway.ts` (no compile step), so whatever branch
+ * is checked out IS what the gateway picks up after restart. Restarting
+ * from a feature branch silently bypasses release tags + PR-merged fixes.
+ *
+ * Returns:
+ *   - null when on main with a clean tree (or git is unavailable —
+ *     swallow the error rather than break the restart path)
+ *   - a one-line warning string otherwise
+ *
+ * The check uses execFileSync against git in the cwd. Any git error
+ * (not a repo, no main ref, no remote, etc) returns null so this
+ * never blocks restart on hosts that aren't running from a git
+ * checkout (npm-global installs, prebuilt dist, etc).
+ */
+function checkSwitchroomBranch(): string | null {
+  // Locate the switchroom install directory. The CLI may be running
+  // from a global install (in which case there's no git checkout) or
+  // from `bun run dev` (in which case the cwd is the checkout).
+  // process.cwd() works for the dev path; the global path returns a
+  // non-git error which we swallow.
+  try {
+    // node-fetch-style execFileSync for predictable shell-free invocation.
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+    const cwd = process.cwd();
+    const branch = execFileSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (branch === "" || branch === "HEAD") return null; // detached or empty — punt
+    if (branch === "main" || branch === "master") {
+      // On main — check for uncommitted changes (which would also alter
+      // gateway behaviour).
+      const status = execFileSync("git", ["-C", cwd, "status", "--porcelain"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (status.trim().length > 0) {
+        return `switchroom checkout has uncommitted changes on ${branch}`;
+      }
+      return null;
+    }
+    return `switchroom checkout is on branch '${branch}', not main`;
+  } catch {
+    // Not a git repo, or git unavailable, or any other error — assume
+    // the host runs from a non-checkout install (npm-global, prebuilt
+    // dist, etc) and skip the warning.
+    return null;
+  }
+}
+
 function preflightCheck(
   name: string,
   agentDir: string,
@@ -986,6 +1039,30 @@ export function registerAgentCommand(program: Command): void {
           const agentsDir = resolveAgentsDir(config);
           const names =
             name === "all" ? Object.keys(config.agents) : [name];
+
+          // #61 defense #1: warn if the switchroom checkout is on a non-main
+          // branch. The gateway runs source directly via `bun gateway.ts`
+          // (no compile step), so whatever branch is checked out IS what the
+          // gateway will pick up after restart. Restarting from a feature
+          // branch silently bypasses release tags + PR-merged fixes — which
+          // is exactly the scenario most likely to surface bugs.
+          if (!opts.force) {
+            const branchWarning = checkSwitchroomBranch();
+            if (branchWarning != null) {
+              console.error(chalk.yellow(`\n  ⚠ ${branchWarning}`));
+              console.error(
+                chalk.gray(
+                  `\n  The gateway will run code from this branch after restart.`
+                )
+              );
+              console.error(
+                chalk.gray(
+                  `  Switch to main with \`git checkout main && git pull\`, or use --force to proceed anyway.\n`
+                )
+              );
+              process.exit(1);
+            }
+          }
 
           let sawAbort = false;
 

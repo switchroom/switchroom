@@ -110,8 +110,11 @@ describe('progress-card golden turn', () => {
     expect(html).not.toContain('user-req')
     expect(html).toContain('✅ <b>Done</b>')
 
-    // Text events create narrative steps; the final text block becomes a narrative
-    expect(html).toContain('● <s>Tests fixed but push was rejected.</s>')
+    // Text events create narrative steps; the final text block becomes a narrative.
+    // #320: done items render WITHOUT <s> wrap (the bullet symbol + plain weight
+    // is the done signal; strikethrough rendered red and read as "deleted").
+    expect(html).toContain('● Tests fixed but push was rejected.')
+    expect(html).not.toContain('<s>')
 
     // Tool items are still rendered as fallback (narrative takes priority,
     // but tool items still appear when no narrative covers them)
