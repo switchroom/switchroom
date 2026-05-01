@@ -13,10 +13,45 @@ Pro/Max subscription via OAuth (no API keys, no Docker, no custom
 runtime). The headline feature is a live **progress card** that pins into
 each Telegram topic while an agent works.
 
-See `README.md` for the user-facing description. Deeper design notes
-live in `reference/`: outcome-focused JTBDs (`reference/*.md`) describe
-what the product is *for*, and `reference/PRD.md` is the (partially
-dated) original product-intent doc kept for architectural rationale.
+See `README.md` for the user-facing description.
+
+## Design contract
+
+`reference/` is the design contract for any non-trivial change. Three
+docs, three questions:
+
+**Vision — `reference/vision.md`** — *should we build this?*
+Every feature serves one of four outcomes:
+
+1. **Visibility** — see every step, pinned to the chat (progress card)
+2. **Multi-agent fleet** — specialists, not one generalist
+3. **Subscription-honest** — Pro/Max is the ceiling, no API-key routing
+4. **Always-on** — runs while you sleep or work offline
+
+**Principles — `reference/principles.md`** — *did we build it well?*
+Three checks. A "no" on any one is a redesign, not a follow-up:
+
+1. **Docs test** — can someone use this without opening `docs/`?
+2. **Defaults test** — does it work on a fresh `switchroom setup` with zero config?
+3. **Consistency test** — same CLI shape, cascade, vault syntax, progress card as adjacent features?
+
+**JTBDs — `reference/<job>.md`** — *did it do the user's job?*
+13 outcome-focused jobs grouped by outcome in `reference/README.md`.
+Survey cheaply: `head -5 reference/*.md` reads every `job: / outcome:
+/ stakes:` frontmatter in one shot. Read in full only the JTBD(s) the
+change touches.
+
+### Triggers — when to consult deeper
+
+- **Designing or scoping** → read `vision.md`; name which outcome.
+- **Opening a PR / doing review** → run the three checks above; cite the JTBD the change serves in the PR description.
+- **Touching a UX surface** (CLI output, error messages, progress card, setup flow, profile/skill defaults) → read the matching JTBD's *Anti-patterns* section before designing.
+
+### Verdict rule
+
+A change ships when it (a) advances one of the four outcomes,
+(b) satisfies its JTBD, and (c) passes all three principle checks.
+Anything else is out of scope, however clever.
 
 ## Repo layout
 
@@ -44,8 +79,8 @@ telegram-plugin/        The enhanced MCP Telegram plugin (own Bun tests)
 profiles/               Built-in agent profiles (CLAUDE.md.hbs + SOUL.md.hbs)
 skills/                 Bundled Claude Code skills (symlinked into agents)
 docs/                   User-facing docs
-reference/              Internal reference notes — outcome-focused JTBDs
-                        (*.md) + PRD.md (original product-intent doc)
+reference/              Design contract — vision.md, principles.md,
+                        and outcome-focused JTBDs (*.md)
 scripts/                Build + release helpers
 tests/                  Vitest suite for src/
 ```
@@ -167,8 +202,9 @@ contiguous token pattern. See
 
 ## Where to look first
 
-- **"Why is feature X the way it is?"** → `reference/` (JTBD notes,
-  design rationale) then `docs/`.
+(For *design intent* — outcomes, principles, JTBDs — see "Design
+contract" above. The pointers below are for *implementation*.)
+
 - **"How does config resolution work?"** → `src/config/merge.ts` +
   `docs/configuration.md`.
 - **"How does the progress card render?"** →
