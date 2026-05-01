@@ -6452,27 +6452,53 @@ bot.command('issues', async ctx => {
     // "Clear all" = list current, resolve each. The CLI's `prune` is
     // for retention; clearing live issues is a UI concern. Implement
     // here by walking the list and resolving each. Best-effort.
+    //
+    // #443: require an explicit `--confirm` flag. A fat-finger
+    // `/issues clear` used to mass-resolve every unresolved entry in
+    // one shot — destructive verbs deserve a guard. Bare `/issues
+    // clear` now counts and prints the prompt; `--confirm` actually
+    // executes.
     try {
       const stateDir = process.env.TELEGRAM_STATE_DIR
-      if (stateDir) {
-        const events = listIssues(stateDir)
-        let n = 0
-        for (const e of events) {
-          n += resolveIssue(stateDir, e.fingerprint)
-        }
-        await switchroomReply(ctx, `Resolved ${n} issue${n === 1 ? '' : 's'}.`, { html: true })
+      if (!stateDir) {
+        await switchroomReply(ctx, 'clear: no TELEGRAM_STATE_DIR; cannot operate.', { html: true })
         return
       }
+      const confirmed = parts.slice(1).includes('--confirm')
+      if (!confirmed) {
+        const events = listIssues(stateDir)
+        const n = events.length
+        if (n === 0) {
+          await switchroomReply(ctx, 'No unresolved issues to clear.', { html: true })
+          return
+        }
+        const noun = n === 1 ? 'issue' : 'issues'
+        await switchroomReply(
+          ctx,
+          [
+            `This will resolve <b>${n} ${noun}</b>. To confirm, run:`,
+            '',
+            '<code>/issues clear --confirm</code>',
+          ].join('\n'),
+          { html: true },
+        )
+        return
+      }
+      const events = listIssues(stateDir)
+      let n = 0
+      for (const e of events) {
+        n += resolveIssue(stateDir, e.fingerprint)
+      }
+      await switchroomReply(ctx, `Resolved ${n} issue${n === 1 ? '' : 's'}.`, { html: true })
+      return
     } catch (err) {
       await switchroomReply(ctx, `clear failed: ${escapeHtmlForTg((err as Error).message)}`, { html: true })
       return
     }
-    await switchroomReply(ctx, 'clear: no TELEGRAM_STATE_DIR; cannot operate.', { html: true })
-    return
   }
   await switchroomReply(
     ctx,
-    'Usage: <code>/issues</code> | <code>/issues resolve &lt;fingerprint&gt;</code> | <code>/issues clear</code>',
+    'Usage: <code>/issues</code> | <code>/issues resolve &lt;fingerprint&gt;</code> | <code>/issues clear [--confirm]</code>',
     { html: true },
   )
 })
