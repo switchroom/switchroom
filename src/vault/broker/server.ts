@@ -1057,7 +1057,15 @@ export class VaultBroker {
           cgroup: auditCgroup,
           result: "error:decryption failed",
         });
-        socket.write(`ERR ${msg}\n`);
+        // Closes #472 finding #24 — pre-fix the wire response was
+        // `ERR ${msg}` which leaked underlying error fingerprints
+        // (wrong-passphrase vs wrong-KDF-param vs corrupt-ciphertext).
+        // Same-UID processes that probed the unlock socket could
+        // enumerate failure shapes and infer structural details
+        // (which KDF, which cipher, whether the file is even a vault).
+        // Stderr (operator console) and audit log keep the verbose
+        // form for diagnostics; the wire surface is now constant.
+        socket.write("ERR decryption failed\n");
       } finally {
         socket.destroy();
       }

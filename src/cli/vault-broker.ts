@@ -250,6 +250,25 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
       const parentOpts = program.opts();
       const socket = getSocketPath(parentOpts.config);
 
+      // Closes #472 finding #23 — without this guard, an operator
+      // accidentally wiring `vault broker unlock` into a non-TTY
+      // context (cron, ssh -T, systemd ExecStart, an automated
+      // pipeline) silently consumes the first stdin line as the
+      // passphrase. That value can be visible upstream in process
+      // listings, log captures, or pipe buffers — and there is no
+      // rate-limiting to slow a probing script. Refuse non-TTY
+      // unlocks unless the operator explicitly opts in via env var
+      // (the intentional-pipe case).
+      if (!process.stdin.isTTY && process.env.SWITCHROOM_VAULT_UNLOCK_FROM_STDIN !== "1") {
+        console.error(
+          "vault broker unlock: stdin is not a TTY. Refusing to read a passphrase from a pipe.\n" +
+            "  - Run interactively from a terminal, or\n" +
+            "  - Set SWITCHROOM_VAULT_UNLOCK_FROM_STDIN=1 to opt in to piped input, or\n" +
+            "  - Use 'switchroom vault broker setup-autounlock' for one-time systemd-creds storage.",
+        );
+        process.exit(1);
+      }
+
       let passphrase: string;
       try {
         passphrase = await promptPassphrase();

@@ -227,18 +227,20 @@ describe("VaultBroker unlock socket: audit sanitization (issue #214)", () => {
     expect(stderrOutput.length).toBeGreaterThan("vault broker: unlock error:".length);
   });
 
-  // ── Acceptance criterion 3: raw error goes to client ERR response ─────────
+  // ── Acceptance criterion 3: client ERR response is the sanitized constant ────
+  //
+  // Updated for #472 finding #24. Pre-fix the wire response embedded the
+  // raw crypto-library error message, distinguishing wrong-passphrase
+  // from wrong-KDF-param from corrupt-ciphertext from "not actually a
+  // vault file". A same-UID process probing the unlock socket could
+  // enumerate failure shapes and infer structural details. The client
+  // surface is now constant; verbose msg still flows to stderr (operator
+  // diagnostic) and audit (sanitized).
 
-  it("wrong passphrase: raw error message appears in client ERR response", async () => {
+  it("wrong passphrase: client ERR response is the constant 'decryption failed' (#472 #24)", async () => {
     const resp = await unlockRpc(unlockSocketPath, WRONG_PASSPHRASE);
 
-    // Protocol: "ERR <message>" (server.ts line ~1060)
-    expect(resp).toMatch(/^ERR /);
-    // The message after "ERR " should be the raw error — not the constant string.
-    const errMsg = resp.slice(4); // strip "ERR "
-    // It should NOT be the sanitized constant (that goes to audit, not client)
-    expect(errMsg).not.toBe("decryption failed");
-    // It should be non-empty (real error text from the crypto library)
-    expect(errMsg.trim().length).toBeGreaterThan(0);
+    // Protocol: "ERR <message>" — the message is now a constant.
+    expect(resp).toBe("ERR decryption failed");
   });
 });
