@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Removed
+- **`switchroom-mcp/` management server (#235).** The 4 tools it exposed
+  (`switchroom_memory_search`, `switchroom_memory_stats`,
+  `workspace_memory_search`, `workspace_memory_get`) had zero production
+  callers — every active code path used Hindsight's MCP
+  (`mcp__hindsight__*`) directly, plus Claude Code's built-in `Read` /
+  `Grep` for workspace files. The server was spawning a child process per
+  agent at boot for no observable benefit. New agents no longer get the
+  entry; reconcile actively retracts it from existing agents'
+  `settings.json` and strips `mcp__switchroom__*` from
+  `permissions.allow`. **Migration:** run `switchroom agent reconcile <name>`
+  for each existing agent (or just restart — Claude Code tolerates a
+  missing MCP server with a silent log line).
+
 ## v0.4.0 — 2026-04-29
 
 ### Added

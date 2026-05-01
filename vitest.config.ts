@@ -79,6 +79,11 @@ export default defineConfig({
       "**/telegram-plugin/tests/subagents-schema-init-order.test.ts",
       // resolve-calling-subagent.test.ts uses bun:test + bun:sqlite — excluded here, run via test:bun.
       "**/telegram-plugin/tests/resolve-calling-subagent.test.ts",
+      // secret-guard-pretool.test.ts uses bun:test (NDJSON unix-socket
+      // integration test for the PreToolUse hook) — excluded here, run via
+      // test:bun. Without this exclude, the cross-package vitest pass on
+      // tests-core fails to resolve `bun:test` and the build goes red.
+      "**/telegram-plugin/tests/secret-guard-pretool.test.ts",
     ],
     coverage: {
       provider: "v8",

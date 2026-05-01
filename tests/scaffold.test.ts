@@ -353,10 +353,12 @@ describe("scaffoldAgent", () => {
       readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
     );
 
-    // Always pre-approves the switchroom MCP wildcards alongside user-listed tools
+    // User-declared tools end up on the allowlist
     expect(settings.permissions.allow).toContain("calendar");
     expect(settings.permissions.allow).toContain("notion");
-    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
+    // #235: switchroom-mcp deprecated — mcp__switchroom__* is no longer
+    // pre-approved (the underlying server is removed).
+    expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
     expect(settings.permissions.deny).toEqual(["bash"]);
     expect(settings.permissions.defaultMode).toBeUndefined();
   });
@@ -1358,7 +1360,8 @@ describe("reconcileAgent", () => {
     const config = buildSwitchroomConfig(agentConfig);
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, config);
 
-    // First reconcile may apply scaffold->reconcile drift (e.g. switchroom-mcp entry)
+    // First reconcile may apply scaffold->reconcile drift (template
+    // additions or migrations that landed after the agent was scaffolded).
     reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, config);
     // Second should be a no-op
     const result = reconcileAgent(
@@ -1535,8 +1538,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.permissions.allow).toContain("Read");
     expect(settings.permissions.allow).toContain("Grep");
     expect(settings.permissions.allow).toContain("Edit");
-    // Switchroom-MCP wildcards still pre-approved
-    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
+    // #235: switchroom-mcp deprecated — its wildcard is no longer pre-approved.
+    expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
   });
 
   it("unions defaults.tools.allow with per-agent tools.allow", () => {
@@ -1898,8 +1901,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
     // Escape hatch wins — overrides switchroom's default permissions.defaultMode
     expect(settings.effort).toBe("high");
     expect(settings.permissions.defaultMode).toBe("bypassPermissions");
-    // And the pre-existing switchroom-managed keys still present
-    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
+    // #235: switchroom-mcp deprecated — wildcard no longer present after reconcile.
+    expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
   });
 
   it("claude_md_raw is appended to CLAUDE.md on scaffold", () => {
@@ -2154,7 +2157,8 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(settings.permissions.allow).toContain("Bash");
     expect(settings.permissions.allow).toContain("Edit");
     expect(settings.permissions.allow).toContain("mcp__switchroom-telegram__reply");
-    expect(settings.permissions.allow).toContain("mcp__switchroom__*");
+    // #235: switchroom-mcp deprecated — wildcard no longer pre-approved.
+    expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
   });
 });
 

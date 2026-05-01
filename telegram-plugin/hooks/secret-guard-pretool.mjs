@@ -10,15 +10,35 @@
  *   Output: exit 0 + empty stdout → allow.
  *           exit 0 + JSON on stdout with `decision: "block"` + `reason` → block.
  *
- * This script requires the vault passphrase via SWITCHROOM_VAULT_PASSPHRASE;
- * without it we fail-open (allow) rather than blocking every tool call.
- * The justification is pragmatic — the Telegram plugin only caches the
- * passphrase in memory for 30 min, but the Stop hook needs the vault too,
- * so the agent is expected to run with the env var set in production.
+ * Performance note (closes #472 finding #7):
+ *   Earlier versions forked `switchroom vault list` + `switchroom vault get`
+ *   per key — each fork paid ~785ms of CLI cold-start cost. With N vault
+ *   keys × every tool call, that compounded to seconds of overhead per turn.
+ *
+ *   This version connects directly to the running vault-broker daemon via
+ *   its NDJSON unix socket protocol (see src/vault/broker/protocol.ts) and
+ *   issues sequential list+get requests over a single connection. Sub-10ms
+ *   total even with several keys, vs 800ms × (1 + N) before.
+ *
+ *   When the broker is unreachable (not running, socket missing, denied)
+ *   the hook fails open — same behavior as before. Vault security is owned
+ *   by the broker; we are an opportunistic second-line checker.
  */
 
-import { readFileSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { readFileSync, statSync } from 'node:fs'
+import { connect } from 'node:net'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+// ─── Tunables ─────────────────────────────────────────────────────────────
+
+const BROKER_SOCKET =
+  process.env.SWITCHROOM_VAULT_BROKER_SOCK
+  ?? join(homedir(), '.switchroom', 'vault-broker.sock')
+const BROKER_TIMEOUT_MS = 1500
+const MIN_VALUE_LENGTH_TO_GUARD = 8
+
+// ─── Stdin ────────────────────────────────────────────────────────────────
 
 function readStdin() {
   try {
@@ -28,27 +48,117 @@ function readStdin() {
   }
 }
 
-function loadVaultValues() {
-  const pp = process.env.SWITCHROOM_VAULT_PASSPHRASE
-  if (!pp) return []
+// ─── Token-file discovery (mirrors src/vault/broker/client.ts) ────────────
+
+function readVaultToken() {
+  const slug = process.env.SWITCHROOM_AGENT_NAME
+  if (!slug) return null
+  const path = join(homedir(), '.switchroom', 'agents', slug, '.vault-token')
   try {
-    const cli = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
-    const keysOut = execFileSync(cli, ['vault', 'list'], { encoding: 'utf8', timeout: 5000 })
-    const keys = keysOut.split('\n').map((k) => k.trim()).filter(Boolean)
-    const values = []
-    for (const k of keys) {
-      try {
-        const v = execFileSync(cli, ['vault', 'get', k], { encoding: 'utf8', timeout: 5000 }).trim()
-        if (v.length >= 8) values.push({ key: k, value: v })
-      } catch {
-        /* skip — kind=files etc. */
-      }
-    }
-    return values
+    // 0o600 enforcement matches the TS client. The broker treats the token
+    // as full auth (peercred ACL is bypassed), so a widened mode is a
+    // real privilege-escalation surface — same UID processes could
+    // exfiltrate the bearer.
+    const st = statSync(path)
+    if ((st.mode & 0o077) !== 0) return null
+    const raw = readFileSync(path, 'utf8')
+    const tok = raw.split('\n')[0].trim()
+    return tok.length > 0 ? tok : null
   } catch {
-    return []
+    return null
   }
 }
+
+// ─── Inline NDJSON broker client ──────────────────────────────────────────
+
+/**
+ * Open a connection, run sequential request/response pairs, close.
+ * Fails open (returns []) on any error — connection refused, timeout,
+ * malformed response, broker locked, etc.
+ */
+function loadVaultValuesViaBroker() {
+  return new Promise((resolve) => {
+    const token = readVaultToken()
+    const sock = connect(BROKER_SOCKET)
+    let buf = ''
+    let done = false
+    let pending = null   // { resolve(line) }
+    const finish = (result) => {
+      if (done) return
+      done = true
+      try { sock.destroy() } catch { /* best-effort */ }
+      resolve(result)
+    }
+
+    const timer = setTimeout(() => finish([]), BROKER_TIMEOUT_MS)
+
+    sock.on('error', () => finish([]))
+    sock.on('close', () => {
+      clearTimeout(timer)
+      if (!done) finish([])
+    })
+
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('utf8')
+      // Split on newlines; emit complete lines through the pending request.
+      let idx
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx)
+        buf = buf.slice(idx + 1)
+        if (pending) {
+          const p = pending
+          pending = null
+          p.resolve(line)
+        }
+      }
+    })
+
+    function send(req) {
+      return new Promise((respond) => {
+        pending = { resolve: respond }
+        sock.write(JSON.stringify(req) + '\n')
+      })
+    }
+
+    sock.on('connect', async () => {
+      try {
+        // 1. list keys
+        const listReq = token ? { v: 1, op: 'list', token } : { v: 1, op: 'list' }
+        const listLine = await send(listReq)
+        let listRsp
+        try { listRsp = JSON.parse(listLine) } catch { return finish([]) }
+        if (!listRsp || listRsp.ok !== true || !Array.isArray(listRsp.keys)) {
+          // LOCKED / DENIED / etc. — fall through, no values.
+          return finish([])
+        }
+        // 2. fetch each value
+        const values = []
+        for (const k of listRsp.keys) {
+          const getReq = token
+            ? { v: 1, op: 'get', key: k, token }
+            : { v: 1, op: 'get', key: k }
+          const getLine = await send(getReq)
+          let getRsp
+          try { getRsp = JSON.parse(getLine) } catch { continue }
+          if (!getRsp || getRsp.ok !== true || !getRsp.entry) continue
+          // Only string-kind entries are scannable haystack candidates;
+          // binary/files entries can't be substring-matched against a
+          // tool-input string in any meaningful way.
+          if (getRsp.entry.kind === 'string'
+              && typeof getRsp.entry.value === 'string'
+              && getRsp.entry.value.length >= MIN_VALUE_LENGTH_TO_GUARD) {
+            values.push({ key: k, value: getRsp.entry.value })
+          }
+        }
+        finish(values)
+      } catch {
+        finish([])
+      }
+    })
+  })
+}
+
+// ─── Scan ─────────────────────────────────────────────────────────────────
 
 function scanToolInput(toolInput, vaultValues) {
   const haystack = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput ?? '')
@@ -58,7 +168,9 @@ function scanToolInput(toolInput, vaultValues) {
   return null
 }
 
-function main() {
+// ─── Main ─────────────────────────────────────────────────────────────────
+
+async function main() {
   const raw = readStdin().trim()
   if (!raw) {
     process.exit(0)
@@ -73,9 +185,11 @@ function main() {
   if (toolInput == null) {
     process.exit(0)
   }
-  const vaultValues = loadVaultValues()
+  const vaultValues = await loadVaultValuesViaBroker()
   if (vaultValues.length === 0) {
-    // Fail-open when we can't read the vault — don't break the session.
+    // Fail-open when the broker is unreachable or locked. Vault security
+    // is owned by the broker; we are an opportunistic checker. Blocking
+    // every tool call when the broker hiccups would break the session.
     process.exit(0)
   }
   const hit = scanToolInput(toolInput, vaultValues)
@@ -91,4 +205,4 @@ function main() {
   process.exit(0)
 }
 
-main()
+main().catch(() => process.exit(0))

@@ -34,7 +34,7 @@ import {
   copyProfileSkills,
   renderProfileClaudeTemplate,
 } from "./profiles.js";
-import { getHindsightSettingsEntry, getSwitchroomMcpSettingsEntry, getBuiltinDefaultMcpEntries } from "../memory/scaffold-integration.js";
+import { getHindsightSettingsEntry, getBuiltinDefaultMcpEntries } from "../memory/scaffold-integration.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureUserProfileMentalModel, DEFAULT_RETAIN_MISSION } from "../memory/hindsight.js";
@@ -215,14 +215,14 @@ const HINDSIGHT_MCP_TOOLS = [
 ];
 
 /**
- * Pre-approved MCP tool names for the switchroom management MCP server.
- * Lets agents call switchroom_agent_*, switchroom_auth_status, switchroom_memory_search
- * etc. without prompting.
+ * Legacy `mcp__switchroom__*` permission tokens that pre-#235 agents have
+ * baked into their `settings.permissions.allow`. The switchroom-mcp server
+ * is deprecated (#235) — its 4 tools were dormant (zero callers) and the
+ * functionality is covered natively by Hindsight's MCP (`mcp__hindsight__*`)
+ * + Claude Code's built-in `Read`/`Grep`/`Edit`. Reconcile actively strips
+ * these so existing agents don't keep stale entries forever.
  */
-const SWITCHROOM_MCP_TOOLS = [
-  "mcp__switchroom",
-  "mcp__switchroom__*",
-];
+const LEGACY_SWITCHROOM_MCP_TOKENS = ["mcp__switchroom", "mcp__switchroom__*"];
 
 /**
  * Read-only built-in tools that are safe to pre-approve for every agent,
@@ -1417,7 +1417,6 @@ export function scaffoldAgent(
     ...readOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    ...SWITCHROOM_MCP_TOOLS,
   ]);
 
   // Compute Hindsight plugin context for the start.sh + settings.json
@@ -1517,10 +1516,12 @@ export function scaffoldAgent(
         settings.mcpServers[hindsightEntry.key] = hindsightEntry.value;
       }
 
-      // Switchroom management MCP
-      const switchroomMcpEntry = getSwitchroomMcpSettingsEntry();
-      if (!settings.mcpServers[switchroomMcpEntry.key]) {
-        settings.mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
+      // #235: actively retract the legacy switchroom-mcp entry on reconcile
+      // so existing agents stop spawning the dormant child process. The 4
+      // tools it exposed had zero callers and are subsumed by Hindsight's
+      // MCP + Claude Code's built-in Read/Grep.
+      if (settings.mcpServers && "switchroom" in settings.mcpServers) {
+        delete settings.mcpServers["switchroom"];
       }
 
       // Built-in default MCPs (e.g. playwright). Single source of truth lives
@@ -2517,12 +2518,17 @@ export function reconcileAgent(
       : [];
   const memoryBackend = switchroomConfig.memory?.backend;
   const hindsightEnabled = memoryBackend === "hindsight";
+  // #235: drop legacy mcp__switchroom__* tokens from any pre-existing
+  // allowlist on every reconcile so existing agents converge on the
+  // same shape new ones get.
+  if (Array.isArray(tools.allow)) {
+    tools.allow = tools.allow.filter(p => !LEGACY_SWITCHROOM_MCP_TOKENS.includes(p));
+  }
   const desiredAllow = dedupe([
     ...baseAllow,
     ...reconcileReadOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
-    ...SWITCHROOM_MCP_TOOLS,
   ]);
   const desiredDeny = tools.deny ?? [];
 
@@ -2783,9 +2789,10 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       mcpServers[hindsightEntry.key] = hindsightEntry.value;
     }
 
-    // Switchroom management MCP
-    const switchroomMcpEntry = getSwitchroomMcpSettingsEntry(switchroomConfigPath);
-    mcpServers[switchroomMcpEntry.key] = switchroomMcpEntry.value;
+    // #235: switchroom-mcp is deprecated — its 4 tools (switchroom_memory_*,
+    // workspace_memory_*) had zero callers; Hindsight's MCP +
+    // Claude Code's built-in Read/Grep cover the same ground. New agents
+    // skip the entry entirely; reconcile retracts it from existing ones.
 
     // Built-in default MCPs (e.g. playwright). Single source of truth lives
     // in scaffold-integration.ts; `switchroom update` reconciles the same

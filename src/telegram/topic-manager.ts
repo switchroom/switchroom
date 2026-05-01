@@ -1,5 +1,6 @@
 import type { SwitchroomConfig } from "../config/schema.js";
 import { loadTopicState, saveTopicState, type TopicState, type TopicEntry } from "./state.js";
+import { redactToken } from "./redact-token.js";
 
 export interface TopicSyncResult {
   agent: string;
@@ -80,8 +81,11 @@ async function createForumTopic(
       body: JSON.stringify(body),
     });
   } catch (err) {
+    // Closes #472 finding #12 — node fetch errors can include the request
+    // URL (DNS, ECONNREFUSED, TLS), which carries the bot token as a
+    // path segment. Redact before the message escapes to operator logs.
     throw new TopicSyncError(
-      `Network error calling Telegram API: ${(err as Error).message}`
+      redactToken(`Network error calling Telegram API: ${(err as Error).message}`, botToken)
     );
   }
 

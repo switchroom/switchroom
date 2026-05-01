@@ -221,6 +221,27 @@ steps:
         - exit_status: 143
           limit: 2
 
+  - label: ":snake: Python tests (Hindsight scripts)"
+    key: tests-python
+    timeout_in_minutes: 5
+    # Closes #472 finding #15 — pre-fix the 80+ Python tests under
+    # vendor/hindsight-memory/scripts/tests/ only ran on dev machines.
+    # Every Python test added by #468/#469/#470 (recall integration,
+    # gateway IPC, directives) was on the honor system. python3 is on
+    # the hosted-agent image by default; no install step needed.
+    if_changed:
+      - "vendor/hindsight-memory/scripts/**"
+      - ".buildkite/pipeline.yml"
+    command: |
+      cd vendor/hindsight-memory/scripts
+      python3 -m unittest discover tests/
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
   - label: ":telegram: Plugin tests (402)"
     key: tests-plugin
     timeout_in_minutes: 8

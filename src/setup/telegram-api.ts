@@ -2,17 +2,7 @@
  * Telegram Bot API helpers for the setup wizard.
  */
 
-/**
- * Telegram's Bot API requires the token as a URL path segment. If the
- * underlying fetch error ever includes the request URL — or if a caller
- * ever stringifies a Response object that preserves `.url` — the token
- * would leak to whatever log sink consumes the error. This helper scrubs
- * the literal token from a string before it escapes to the caller.
- */
-function redactToken(message: string, token: string): string {
-  if (!token || token.length < 8) return message;
-  return message.split(token).join("<redacted-bot-token>");
-}
+import { redactToken } from "../telegram/redact-token.js";
 
 export interface BotInfo {
   id: number;

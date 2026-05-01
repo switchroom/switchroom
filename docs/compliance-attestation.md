@@ -74,7 +74,7 @@ Operators who require strict use of Anthropic-published code paths should set `c
 
 **Source:** [Connect Claude Code to tools via MCP - Claude Code Docs](https://code.claude.com/docs/en/mcp)
 
-**Switchroom's compliance:** The switchroom-mcp management server and switchroom-telegram plugin are standard MCP servers. They use the official `@modelcontextprotocol/sdk` package (confirmed in `telegram-plugin/package.json` v1.0.0) and follow the documented MCP protocol.
+**Switchroom's compliance:** The switchroom-telegram plugin is a standard MCP server using the official `@modelcontextprotocol/sdk` package (confirmed in `telegram-plugin/package.json` v1.0.0) and follows the documented MCP protocol. (The legacy `switchroom-mcp/` management server was removed under #235; its 4 tools were dormant and the functionality is now covered natively by Hindsight's MCP and Claude Code's built-in `Read`/`Grep`.)
 
 ### 4. systemd/tmux Process Management Is Standard Operations
 

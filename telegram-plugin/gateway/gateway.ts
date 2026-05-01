@@ -27,6 +27,12 @@ import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
+import {
+  startHeartbeat as startPlaceholderHeartbeatImpl,
+  DEFAULT_INTERVAL_MS as HEARTBEAT_DEFAULT_INTERVAL_MS,
+  DEFAULT_MAX_DURATION_MS as HEARTBEAT_DEFAULT_MAX_DURATION_MS,
+  type HeartbeatHandle,
+} from '../placeholder-heartbeat.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -747,6 +753,57 @@ interface PreAllocatedDraft {
   consumed?: boolean
 }
 const preAllocatedDrafts = new Map<string, PreAllocatedDraft>()
+
+// Heartbeat lifecycle (Path A §3 minimum). One handle per active
+// pre-alloc draft. Started at pre-alloc success; cancelled at every
+// preAllocatedDrafts.delete() call site. See
+// telegram-plugin/docs/heartbeat-placeholder-design.md and
+// tests/gateway-heartbeat-call-sites.test.ts (which pins the
+// start-cancel pairing structurally).
+const placeholderHeartbeats = new Map<string, HeartbeatHandle>()
+
+/** Tick interval for the heartbeat. Override via env (rollback path
+ * documented in design §10.1). 0 = disabled, agent reverts to today's
+ * static placeholder behaviour. */
+const HEARTBEAT_INTERVAL_MS = (() => {
+  const env = process.env.SWITCHROOM_TG_PLACEHOLDER_HEARTBEAT_MS
+  if (env != null) {
+    const parsed = Number(env)
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed
+  }
+  return HEARTBEAT_DEFAULT_INTERVAL_MS
+})()
+
+/** Start a heartbeat for a freshly pre-allocated placeholder. Idempotent —
+ * if one is already running for this chat, the prior is cancelled first. */
+function startPlaceholderHeartbeat(chat_id: string, draftId: number, startedAt: number): void {
+  // Defensive: cancel any prior heartbeat for this chat. Shouldn't
+  // happen because pre-alloc only fires when no prior draft exists,
+  // but a half-cleaned state from a crash recovery shouldn't leak.
+  cancelPlaceholderHeartbeat(chat_id)
+  if (sendMessageDraftFn == null) return  // No draft API → no heartbeat
+  const handle = startPlaceholderHeartbeatImpl(chat_id, draftId, startedAt, {
+    sendMessageDraft: sendMessageDraftFn,
+    isPlaceholderActive: (cid) => preAllocatedDrafts.has(cid),
+    // §3 minimum: no enrichment source. Always use the default label.
+    // §4 enrichment will swap in a label-map reader here.
+    getCurrentLabel: () => null,
+    intervalMs: HEARTBEAT_INTERVAL_MS,
+    maxDurationMs: HEARTBEAT_DEFAULT_MAX_DURATION_MS,
+    log: (msg) => process.stderr.write(`${msg}\n`),
+  })
+  placeholderHeartbeats.set(chat_id, handle)
+}
+
+/** Cancel any heartbeat running for this chat. Called at every
+ * preAllocatedDrafts.delete() site. Idempotent — safe to call when
+ * no heartbeat exists. */
+function cancelPlaceholderHeartbeat(chat_id: string): void {
+  const handle = placeholderHeartbeats.get(chat_id)
+  if (handle == null) return
+  handle.cancel()
+  placeholderHeartbeats.delete(chat_id)
+}
 
 let currentSessionChatId: string | null = null
 let currentTurnStartedAt = 0
@@ -1889,18 +1946,16 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   if (sendMessageDraftFn != null) {
     const preAllocated = preAllocatedDrafts.get(chat_id)
     if (preAllocated != null && !preAllocated.consumed) {
-      // Closes #472 finding #9 — mark consumed BEFORE the API clear so a
+      // #472 finding #9 — mark consumed BEFORE the API clear so a
       // hook update_placeholder racing with this consume bails out
       // (handleUpdatePlaceholder rejects consumed entries). Pre-fix the
       // delete + concurrent IPC could leave a "📚 recalling" edit landing
       // AFTER our empty-text clear, so the placeholder text reappeared
-      // alongside the just-sent reply.
-      //
-      // Leaving the entry in the map (with consumed=true) instead of
-      // deleting also gives turn_end / shutdown a way to distinguish
-      // "consumed cleanly" from "abandoned mid-turn" so they can skip
-      // the redundant clear in the consumed case.
+      // alongside the just-sent reply. Leaving the entry in the map
+      // (with consumed=true) gives turn_end / shutdown a way to skip the
+      // redundant clear in the consumed case.
       preAllocated.consumed = true
+      cancelPlaceholderHeartbeat(chat_id)  // Path A heartbeat: stop ticking once the draft is consumed
       // Best-effort: a clear failure (rate limit, expired draft) is
       // harmless — the orphan-cleanup path on turn_end is still wired
       // and will retry. Don't await: the subsequent sendMessage is
@@ -2110,7 +2165,11 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // cases.
   const preAllocated = streamIsPrivate ? preAllocatedDrafts.get(streamChatId) : undefined
   if (preAllocated != null && !preAllocated.consumed) {
+    // #472 #9 — mark consumed (handleUpdatePlaceholder bails on consumed).
+    // Don't delete yet — turn_end's orphan cleanup distinguishes consumed
+    // from abandoned and skips the redundant clear in the consumed case.
     preAllocated.consumed = true
+    cancelPlaceholderHeartbeat(streamChatId)  // Path A heartbeat: stop ticking — stream_reply now owns the draft
   }
 
   // #271 (URL-button half): validate inline_keyboard for stream_reply.
@@ -2626,22 +2685,26 @@ function handleSessionEvent(ev: SessionEvent): void {
           currentTurnRegistryKey = turnKey
           // Phase 1 of #332: capture first ~200 chars of the user's message.
           const userPromptPreview = extractUserPromptPreview(ev.rawContent)
-          // Non-blocking: defer the DB write so it doesn't stall the turn handler.
-          // The SIGTERM path writes synchronously (see shutdown handler below).
-          const _db = turnsDb
-          setImmediate(() => {
-            try {
-              recordTurnStart(_db, {
-                turnKey,
-                chatId: String(ev.chatId),
-                threadId: ev.threadId != null ? String(ev.threadId) : null,
-                lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
-                userPromptPreview,
-              })
-            } catch (err) {
-              process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
-            }
-          })
+          // Closes #472 finding #11. Pre-fix: this write was scheduled
+          // via setImmediate to "avoid stalling the turn handler" — but
+          // SQLite local writes are sub-millisecond, and the deferral
+          // opened a SIGTERM race window: a kill landing in the gap
+          // between scheduling and firing left a turn with no start
+          // row, invisible to the resume protocol (the user sent a
+          // message, the gateway lost it, no SWITCHROOM_PENDING_TURN
+          // env on next boot). Sibling writeTurnActiveMarker has always
+          // been synchronous here; this matches it.
+          try {
+            recordTurnStart(turnsDb, {
+              turnKey,
+              chatId: String(ev.chatId),
+              threadId: ev.threadId != null ? String(ev.threadId) : null,
+              lastUserMsgId: ev.messageId != null ? String(ev.messageId) : null,
+              userPromptPreview,
+            })
+          } catch (err) {
+            process.stderr.write(`telegram gateway: recordTurnStart failed turnKey=${turnKey}: ${(err as Error).message}\n`)
+          }
           // #412: turn-active marker for the bridge-watchdog. File exists
           // for the duration of the in-flight turn; mtime advances on
           // every tool_use; deleted on turn_complete. The watchdog
@@ -3092,6 +3155,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       const orphanDraft = preAllocatedDrafts.get(chatId)
       if (orphanDraft != null) {
         preAllocatedDrafts.delete(chatId)
+        cancelPlaceholderHeartbeat(chatId)  // Path A heartbeat: stop ticking — turn ended
+        // #472 #9 — skip the redundant empty-text clear if the entry was
+        // already consumed by a reply path; that path owns the draft.
         if (sendMessageDraftFn != null && !orphanDraft.consumed) {
           void sendMessageDraftFn(chatId, orphanDraft.draftId, '').catch(() => {
             /* best-effort cleanup */
@@ -3107,25 +3173,25 @@ function handleSessionEvent(ev: SessionEvent): void {
         const assistantReplyPreview = capturedJoined
           ? capturedJoined.slice(0, TURN_PREVIEW_MAX)
           : null
-        // Non-blocking: defer the DB write so it doesn't stall the turn handler.
-        // The SIGTERM path writes synchronously (see shutdown handler below).
-        const _db = turnsDb
+        // Closes #472 finding #11 — same SIGTERM race as recordTurnStart
+        // above. Sub-ms SQLite write; the setImmediate deferral wasn't
+        // saving anything observable but was opening a window where a
+        // SIGTERM between turn_end and the microtask losing the end row
+        // (turn appears in DB as still-running, then 3c relabels it as
+        // 'sigterm' on shutdown — false negative for clean completion).
         const _turnKey = currentTurnRegistryKey
-        const _endArgs = {
-          turnKey: _turnKey,
-          endedVia: 'stop' as const,
-          lastAssistantMsgId: currentTurnLastAssistantMsgId,
-          lastAssistantDone: currentTurnLastAssistantDone,
-          assistantReplyPreview,
-          toolCallCount: currentTurnToolCallCount,
+        try {
+          recordTurnEnd(turnsDb, {
+            turnKey: _turnKey,
+            endedVia: 'stop' as const,
+            lastAssistantMsgId: currentTurnLastAssistantMsgId,
+            lastAssistantDone: currentTurnLastAssistantDone,
+            assistantReplyPreview,
+            toolCallCount: currentTurnToolCallCount,
+          })
+        } catch (err) {
+          process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
         }
-        setImmediate(() => {
-          try {
-            recordTurnEnd(_db, _endArgs)
-          } catch (err) {
-            process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
-          }
-        })
       }
       currentTurnRegistryKey = null
       currentSessionChatId = null
@@ -3926,14 +3992,29 @@ async function handleInbound(
       // subsequent reads don't queue edits against a non-existent draft.
       void sendMessageDraftFn!(chat_id, draftId, PRE_ALLOC_PLACEHOLDER_TEXT)
         .then(() => {
-          // Clear the pending flag in place — the entry may have been
-          // consumed in the gap by a fast reply, in which case we leave
-          // the consumed marker untouched.
+          // Clear the pending flag in place — the entry was pre-seeded
+          // synchronously above (#472 #8). If it was consumed in the
+          // gap by a fast reply, leave the consumed marker untouched.
+          // The entry may also have been replaced by a newer allocation
+          // (very rare): the draftId guard catches that.
           const cur = preAllocatedDrafts.get(chat_id)
+          let allocatedAt: number
           if (cur != null && cur.draftId === draftId) {
             cur.apiPending = false
+            allocatedAt = cur.allocatedAt
+          } else {
+            // Entry vanished or replaced — start heartbeat with `now`.
+            allocatedAt = Date.now()
           }
           process.stderr.write(`telegram gateway: pre-allocate draft ok chatId=${chat_id} draftId=${draftId}\n`)
+          // Start the heartbeat (Path A §3 minimum) — keeps the
+          // placeholder text moving so the chat doesn't appear
+          // frozen during the model's TTFT window. See
+          // telegram-plugin/docs/heartbeat-placeholder-design.md.
+          // Must be paired with cancelPlaceholderHeartbeat() at every
+          // preAllocatedDrafts.delete() site (pinned by
+          // tests/gateway-heartbeat-call-sites.test.ts).
+          startPlaceholderHeartbeat(chat_id, draftId, allocatedAt)
         })
         .catch((err) => {
           // Entry-by-draftId guard: don't delete if a NEWER allocation
@@ -7049,7 +7130,14 @@ function handleChecklistUpdate(
     const access = loadAccess()
 
     // Only notify if this chat is allowlisted — same guard as inbound user messages.
-    if (!access.allowFrom.includes(chat_id) && access.allowFrom.length > 0) return
+    // Closes #472 finding #13. Pre-fix the `&& access.allowFrom.length > 0`
+    // tail made this fail-OPEN when the allowlist was empty: every chat's
+    // checklist tasks would forward to the agent. Sibling guards (the
+    // inbound-message gate at line ~588 and the operator-event broadcast
+    // at line ~1221) are both fail-closed for empty allowlists. The
+    // empty-allowlist case is the most likely state for a misconfiguration
+    // (e.g. /unpair just ran), so fail-OPEN is the worst default.
+    if (!access.allowFrom.includes(chat_id)) return
 
     const message_id = String(msg.message_id)
     const ts = msg.date ?? Math.floor(Date.now() / 1000)

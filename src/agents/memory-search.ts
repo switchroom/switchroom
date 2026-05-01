@@ -62,7 +62,8 @@ async function listMarkdownFiles(workspaceDir: string, maxDepth = 3): Promise<st
       // withFileTypes + isSymbolicLink() lets us skip symlinks without
       // following them. Reading the .md target of a symlinked dir (e.g.
       // memory -> /etc) would otherwise let the index surface content
-      // from outside the workspace via workspace_memory_search.
+      // from outside the workspace via the `switchroom workspace search`
+      // CLI verb (which is what consumes this index).
       entries = (await readdir(dir, { withFileTypes: true })) as Dirent[];
     } catch {
       continue;
