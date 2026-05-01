@@ -8,7 +8,15 @@ import { scaffoldAgent } from "../agents/scaffold.js";
 import { installAllUnits, installForemanUnit } from "../agents/systemd.js";
 import { syncTopics } from "../telegram/topic-manager.js";
 import { loadTopicState } from "../telegram/state.js";
-import { createVault, setStringSecret } from "../vault/vault.js";
+import { createVault, openVault, setStringSecret } from "../vault/vault.js";
+import {
+  applyAutoUnlock,
+  detectSystemdCreds,
+  encryptCredential,
+  EncryptCancelledError,
+  EncryptFailedError,
+} from "./vault-auto-unlock.js";
+import { promptPassphrase } from "./vault-broker.js";
 import { getAuthStatus } from "../auth/manager.js";
 import {
   validateBotToken,
@@ -128,13 +136,16 @@ export function registerSetupCommand(program: Command): void {
           switchroomConfigPath,
         );
 
-        // ── Step 8: Dangerous mode ──────────────────────────────
+        // ── Step 8: Vault auto-unlock at boot ────────────────────
+        await stepAutoUnlock(config, switchroomConfigPath, nonInteractive);
+
+        // ── Step 9: Dangerous mode ──────────────────────────────
         await stepDangerousMode(config, nonInteractive);
 
-        // ── Step 9: Agent onboarding guidance ────────────────────
+        // ── Step 10: Agent onboarding guidance ───────────────────
         await stepOnboardingGuidance(config, nonInteractive);
 
-        // ── Step 10: Verification ────────────────────────────────
+        // ── Step 11: Verification ────────────────────────────────
         await stepVerification(config, nonInteractive);
 
         await captureEvent("setup_completed", {
@@ -886,13 +897,133 @@ async function stepScaffoldAgents(
   }
 }
 
-// ─── Step 8: Dangerous Mode ─────────────────────────────────────────────────
+// ─── Step 8: Vault Auto-Unlock ──────────────────────────────────────────────
+
+/**
+ * Offer to enable vault auto-unlock at boot. The "defaults test" in
+ * reference/principles.md says the product should work on a fresh setup
+ * with zero post-wizard config — and on Linux that means the vault
+ * should unlock itself after every reboot, with no terminal session
+ * required. We ask once here and run the same flow as
+ * `switchroom vault broker enable-auto-unlock --apply` inline.
+ *
+ * Skip silently when:
+ *   - non-interactive (CI / scripts shouldn't trigger sudo prompts)
+ *   - non-Linux (systemd-creds is Linux-only)
+ *   - systemd-creds binary is missing (older or stripped systemd)
+ *   - the vault doesn't exist yet (no broker to auto-unlock)
+ *   - auto-unlock is already configured AND the credential file is
+ *     already on disk (idempotency)
+ */
+async function stepAutoUnlock(
+  config: SwitchroomConfig,
+  switchroomConfigPath: string,
+  nonInteractive: boolean,
+): Promise<void> {
+  stepHeader(8, "Vault auto-unlock at boot", STEP_ACTIVE);
+
+  if (nonInteractive) {
+    console.log(chalk.gray("  Skipping in non-interactive mode."));
+    return;
+  }
+  if (process.platform !== "linux") {
+    console.log(chalk.gray("  Skipping (auto-unlock requires Linux + systemd-creds)."));
+    return;
+  }
+
+  const detection = detectSystemdCreds();
+  if (!detection) {
+    console.log(chalk.gray("  Skipping (systemd-creds not on PATH)."));
+    return;
+  }
+
+  const vaultPath = resolvePath(config.vault?.path ?? "~/.switchroom/vault.enc");
+  if (!existsSync(vaultPath)) {
+    console.log(chalk.gray("  Skipping (vault not created yet)."));
+    return;
+  }
+
+  const credPathRaw =
+    config.vault?.broker?.autoUnlockCredentialPath ??
+    "~/.config/credstore.encrypted/vault-passphrase";
+  const credPath = resolvePath(credPathRaw);
+  if (config.vault?.broker?.autoUnlock === true && existsSync(credPath)) {
+    console.log(chalk.green(`  ${STEP_DONE} Already configured (${credPath})`));
+    return;
+  }
+
+  console.log(chalk.gray("  Without this, vault must be unlocked manually after every reboot."));
+  const enable = await askYesNo("  Enable vault auto-unlock at boot?", true);
+  if (!enable) {
+    console.log(chalk.gray("  Skipped. Run later with: switchroom vault broker enable-auto-unlock"));
+    return;
+  }
+
+  // Re-prompt with masked input. The wizard uses plain `ask()` for the
+  // vault passphrase elsewhere, but we deliberately use the masked path
+  // here because we're handing the value to systemd-creds, not echoing
+  // it back to the user.
+  let passphrase: string;
+  try {
+    passphrase = await promptPassphrase();
+  } catch (err) {
+    console.log(chalk.yellow(`  Skipped: ${err instanceof Error ? err.message : String(err)}`));
+    return;
+  }
+
+  try {
+    try {
+      openVault(passphrase, vaultPath);
+    } catch (err) {
+      console.log(
+        chalk.yellow(
+          `  Skipped: passphrase verification failed (${err instanceof Error ? err.message : String(err)}).`,
+        ),
+      );
+      console.log(chalk.gray("  Run later with: switchroom vault broker enable-auto-unlock"));
+      return;
+    }
+
+    let scope: string;
+    try {
+      scope = await encryptCredential(passphrase, credPath, detection.supportsUser);
+    } catch (err) {
+      if (err instanceof EncryptCancelledError) {
+        console.log(chalk.gray("  Skipped (user declined sudo)."));
+        return;
+      }
+      if (err instanceof EncryptFailedError) {
+        console.log(chalk.yellow("  Could not encrypt credential. Continuing setup."));
+        console.log(chalk.gray("  Retry later with: switchroom vault broker enable-auto-unlock"));
+        return;
+      }
+      throw err;
+    }
+    console.log(chalk.green(`  ${STEP_DONE} Encrypted credential (scope: ${scope})`));
+  } finally {
+    passphrase = "";
+  }
+
+  try {
+    await applyAutoUnlock({ configPath: switchroomConfigPath });
+    console.log(chalk.green(`  ${STEP_DONE} Auto-unlock active`));
+  } catch (err) {
+    console.log(
+      chalk.yellow(
+        `  Credential is encrypted but apply step failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
+    console.log(chalk.gray("  Retry with: switchroom reconcile && systemctl --user restart switchroom-vault-broker.service"));
+  }
+}
+
+// ─── Step 9: Dangerous Mode ─────────────────────────────────────────────────
 
 async function stepDangerousMode(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(8, "Auto-approve mode", STEP_ACTIVE);
+  stepHeader(9, "Auto-approve mode", STEP_ACTIVE);
 
   let enableDangerous = false;
 
@@ -950,13 +1081,13 @@ async function stepDangerousMode(
   }
 }
 
-// ─── Step 9: Agent Onboarding Guidance ───────────────────────────────────────
+// ─── Step 10: Agent Onboarding Guidance ──────────────────────────────────────
 
 async function stepOnboardingGuidance(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(9, "Agent onboarding", STEP_ACTIVE);
+  stepHeader(10, "Agent onboarding", STEP_ACTIVE);
 
   const agentsDir = resolveAgentsDir(config);
   const agentNames = Object.keys(config.agents);
@@ -1011,13 +1142,13 @@ async function stepOnboardingGuidance(
   }
 }
 
-// ─── Step 9: Verification ────────────────────────────────────────────────────
+// ─── Step 11: Verification ───────────────────────────────────────────────────
 
 async function stepVerification(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(10, "Verification", STEP_ACTIVE);
+  stepHeader(11, "Verification", STEP_ACTIVE);
 
   const agentNames = Object.keys(config.agents);
   const firstName = agentNames[0];
