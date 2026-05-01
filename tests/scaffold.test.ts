@@ -2595,26 +2595,9 @@ describe("scheduled task cron script generation", () => {
     expect(content).toContain("HEARTBEAT_OK");
   });
 
-  it("suppress_stdout field is accepted (now a no-op — all crons use MCP path)", () => {
-    const agentConfig = makeAgentConfig({
-      schedule: [
-        // suppress_stdout is now ignored; MCP path is always used
-        { cron: "0 7 * * *", prompt: "mcp-only", suppress_stdout: true },
-      ],
-    });
-    const result = scaffoldAgent("mcp-cron", agentConfig, tmpDir, telegramConfig);
-    const content = readFileSync(
-      join(result.agentDir, "telegram", "cron-0.sh"),
-      "utf-8",
-    );
-    expect(content).toContain("exec claude -p");
-    expect(content).not.toContain("api.telegram.org");
-    expect(content).not.toContain("OUTPUT=");
-  });
-
-  it("reconcile regenerates cron scripts when suppress_stdout is removed", () => {
-    // Both with and without suppress_stdout now produce the same MCP-path
-    // script. If the prompt is the same, reconcile should detect no diff.
+  it("reconcile regenerates cron scripts when prompt content changes", () => {
+    // Sanity check that the MCP-path cron script is what we expect, and
+    // that prompt edits propagate through reconcile to the .sh file.
     const baseAgent = makeAgentConfig({
       schedule: [{ cron: "0 6 * * *", prompt: "test" }],
     });

@@ -40,16 +40,6 @@ export const ScheduleEntrySchema = z.object({
       "anyone with the vault passphrase can read the vault file directly. " +
       "See docs/configuration.md for the full framing.",
     ),
-  suppress_stdout: z
-    .boolean()
-    .default(false)
-    .describe(
-      "DEPRECATED — accepted but ignored as of #269. All cron tasks now " +
-      "deliver their Telegram message via the MCP `reply` tool, with stdout " +
-      "always discarded. Existing configs that set this field will not error, " +
-      "but the value has no effect. The field will be removed in a future " +
-      "release.",
-    ),
 });
 
 export const AgentSoulSchema = z

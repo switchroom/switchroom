@@ -4136,7 +4136,7 @@ function resolveBootChatId(
 /**
  * Stamp a user-facing restart reason into the clean-shutdown marker
  * (same file the SIGTERM handler writes to and the next session greeting
- * consumes). Called by /restart, /reconcile, /new, /reset BEFORE the
+ * consumes). Called by /restart, /new, /reset BEFORE the
  * detached `switchroom agent restart …` CLI fires — so the agent-side
  * greeting card shows who asked ("user: /restart from chat") instead of
  * the downstream CLI's "cli: restart" default.
@@ -6642,23 +6642,6 @@ bot.command('doctor', async ctx => {
   } catch (err: unknown) {
     await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
   }
-})
-
-// Deprecated: /reconcile is now /update. Kept for one release with a warning.
-bot.command('reconcile', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  await switchroomReply(
-    ctx,
-    `⚠️ <b>/reconcile is deprecated</b> — use <code>/update</code> instead.\n\nRunning <b>switchroom update</b> now…`,
-    { html: true },
-  )
-  await sweepBeforeSelfRestart()
-  const chatId = String(ctx.chat!.id)
-  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  spawnSwitchroomDetached(
-    ['update'],
-    notifyDetachedFailure(chatId, threadId ?? null, 'update (via deprecated /reconcile)'),
-  )
 })
 
 bot.command('grant', async ctx => {
