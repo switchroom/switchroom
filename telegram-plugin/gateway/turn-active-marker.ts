@@ -28,6 +28,8 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
+  statSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -97,5 +99,57 @@ export function removeTurnActiveMarker(stateDir: string): void {
   } catch {
     // ENOENT is fine (already removed); other errors don't justify
     // breaking the turn-end path.
+  }
+}
+
+/**
+ * Sweep a stale marker file. Defence-in-depth backstop for #550 — when
+ * the primary `turn_end` removal path is silently skipped (e.g. SDK
+ * killed before the JSONL turn_duration record is written, or the
+ * progress-card driver's `forceCompleteTurn` no-ops because the card
+ * was already torn down), the marker leaks across restarts and the
+ * watchdog reads it as a hung turn.
+ *
+ * Removes the marker if EITHER:
+ *   - mtime is older than `idleSweepMs` AND the caller asserts that no
+ *     turn is currently in flight (`turnInFlight=false`), OR
+ *   - mtime is older than `hardTtlMs` unconditionally (the absolute
+ *     ceiling — anything older than this can't be a real turn).
+ *
+ * Both conditions are best-effort and idempotent. Returns true if the
+ * marker was removed, false otherwise.
+ */
+export function sweepStaleTurnActiveMarker(
+  stateDir: string,
+  opts: {
+    turnInFlight: boolean;
+    idleSweepMs: number;
+    hardTtlMs: number;
+    now?: number;
+  },
+): boolean {
+  const path = join(stateDir, TURN_ACTIVE_MARKER_FILE);
+  if (!existsSync(path)) return false;
+  const now = opts.now ?? Date.now();
+  try {
+    const st = statSync(path);
+    const ageMs = now - st.mtimeMs;
+    const hardExpired = ageMs > opts.hardTtlMs;
+    const idleExpired = !opts.turnInFlight && ageMs > opts.idleSweepMs;
+    if (!hardExpired && !idleExpired) return false;
+    // Also drop if the writing process is gone (best-effort — the
+    // marker JSON doesn't include pid today, so this is a no-op stub
+    // unless extended later. Reading the file lets a future caller
+    // attach pid liveness without changing the signature.)
+    try {
+      readFileSync(path, "utf8");
+    } catch {
+      /* unreadable — fall through to unlink */
+    }
+    unlinkSync(path);
+    return true;
+  } catch {
+    // ENOENT race or stat failure — nothing actionable.
+    return false;
   }
 }

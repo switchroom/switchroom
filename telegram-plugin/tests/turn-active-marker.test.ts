@@ -13,6 +13,7 @@ import {
   writeTurnActiveMarker,
   touchTurnActiveMarker,
   removeTurnActiveMarker,
+  sweepStaleTurnActiveMarker,
 } from '../gateway/turn-active-marker.js'
 
 describe('turn-active-marker (#412)', () => {
@@ -109,6 +110,75 @@ describe('turn-active-marker (#412)', () => {
       startedAt: 1,
     })
     expect(existsSync(join(fresh, TURN_ACTIVE_MARKER_FILE))).toBe(true)
+  })
+
+  // #550: defence-in-depth sweeper for orphaned markers.
+  describe('sweepStaleTurnActiveMarker (#550)', () => {
+    const writeWithMtime = (ageMs: number) => {
+      writeTurnActiveMarker(tmp, {
+        turnKey: 'k',
+        chatId: 'c',
+        threadId: null,
+        startedAt: 1,
+      })
+      const path = join(tmp, TURN_ACTIVE_MARKER_FILE)
+      const past = new Date(Date.now() - ageMs)
+      utimesSync(path, past, past)
+      return path
+    }
+
+    it('returns false when no marker file exists', () => {
+      const swept = sweepStaleTurnActiveMarker(tmp, {
+        turnInFlight: false,
+        idleSweepMs: 60_000,
+        hardTtlMs: 600_000,
+      })
+      expect(swept).toBe(false)
+    })
+
+    it('removes a stale marker when no turn is in flight (idle path)', () => {
+      const path = writeWithMtime(120_000) // 2 min old
+      const swept = sweepStaleTurnActiveMarker(tmp, {
+        turnInFlight: false,
+        idleSweepMs: 60_000,
+        hardTtlMs: 600_000,
+      })
+      expect(swept).toBe(true)
+      expect(existsSync(path)).toBe(false)
+    })
+
+    it('does NOT remove a fresh marker even when no turn is in flight', () => {
+      const path = writeWithMtime(5_000) // 5s old
+      const swept = sweepStaleTurnActiveMarker(tmp, {
+        turnInFlight: false,
+        idleSweepMs: 60_000,
+        hardTtlMs: 600_000,
+      })
+      expect(swept).toBe(false)
+      expect(existsSync(path)).toBe(true)
+    })
+
+    it('does NOT remove a recent marker while a turn is in flight (idle bound)', () => {
+      const path = writeWithMtime(120_000) // 2 min old
+      const swept = sweepStaleTurnActiveMarker(tmp, {
+        turnInFlight: true,
+        idleSweepMs: 60_000,
+        hardTtlMs: 600_000,
+      })
+      expect(swept).toBe(false)
+      expect(existsSync(path)).toBe(true)
+    })
+
+    it('removes a marker past hardTtl even if a turn claims to be in flight', () => {
+      const path = writeWithMtime(20 * 60_000) // 20 min old
+      const swept = sweepStaleTurnActiveMarker(tmp, {
+        turnInFlight: true,
+        idleSweepMs: 60_000,
+        hardTtlMs: 10 * 60_000,
+      })
+      expect(swept).toBe(true)
+      expect(existsSync(path)).toBe(false)
+    })
   })
 
   it('writes mode 0600 (operator-only readable)', () => {

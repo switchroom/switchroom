@@ -241,6 +241,7 @@ import {
   writeTurnActiveMarker,
   touchTurnActiveMarker,
   removeTurnActiveMarker,
+  sweepStaleTurnActiveMarker,
 } from './turn-active-marker.js'
 import {
   VERSION,
@@ -1248,6 +1249,27 @@ const pendingStateReaper = setInterval(() => {
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
+  // #550: sweep a stale turn-active marker. Defence-in-depth for the
+  // case where neither the turn_end arm nor onTurnComplete fired (SDK
+  // killed before the JSONL turn_duration record, compaction window,
+  // forceCompleteTurn silent no-op on torn-down card, etc). We use
+  // currentTurnRegistryKey as the "is a turn in flight?" signal — when
+  // null we sweep aggressively (>60s mtime), and we always sweep when
+  // the marker is older than 10min regardless. Both bounds are well
+  // under the watchdog's TURN_HANG_SECS=300s threshold for the in-
+  // flight case but generous enough that real long-running tool calls
+  // (which touch mtime on every tool_use) won't trip the idle path.
+  try {
+    const swept = sweepStaleTurnActiveMarker(STATE_DIR, {
+      turnInFlight: currentTurnRegistryKey != null,
+      idleSweepMs: 60_000,
+      hardTtlMs: 10 * 60_000,
+      now,
+    })
+    if (swept) {
+      process.stderr.write(`telegram gateway: turn-active marker swept (stale, no live turn)\n`)
+    }
+  } catch { /* best-effort */ }
   // Drain cap: if a scheduled restart has been waiting >60s for a turn
   // to complete, force it through anyway (spec: 60s cap → SIGKILL fallback).
   for (const [agentName, requestedAt] of pendingRestarts.entries()) {
@@ -3319,6 +3341,15 @@ function handleSessionEvent(ev: SessionEvent): void {
           process.stderr.write(`telegram gateway: recordTurnEnd(stop) failed turnKey=${_turnKey}: ${(err as Error).message}\n`)
         }
       }
+      // #550: symmetric cleanup with the writeTurnActiveMarker call at
+      // the enqueue arm (line ~2810). Pre-fix, removal was single-pathed
+      // through progressDriver.onTurnComplete, which silently no-ops
+      // when forceCompleteTurn finds no active card — leaking the
+      // marker across restarts and triggering watchdog false-positive
+      // restarts. The onTurnComplete callback is retained as defence-
+      // in-depth (both paths are idempotent — unlinkSync swallows
+      // ENOENT).
+      removeTurnActiveMarker(STATE_DIR)
       currentTurnRegistryKey = null
       currentSessionChatId = null
       currentSessionThreadId = undefined
