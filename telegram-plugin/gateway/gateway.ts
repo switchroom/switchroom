@@ -26,6 +26,7 @@ import { installPluginLogger } from '../plugin-logger.js'
 import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
+import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
 import {
   startHeartbeat as startPlaceholderHeartbeatImpl,
@@ -2980,6 +2981,24 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Drain any still-pending tool dispatch typing entries — covers
       // transcript truncation or a Claude Code crash mid-tool.
       typingWrapper.drainAll()
+      // Issue #479 forum-topic case: clear the regular-message
+      // placeholder we sent on inbound (only present when this turn
+      // landed in a forum topic — no-op otherwise). Best-effort fire-
+      // and-forget; the placeholder map self-clears whether or not
+      // deleteMessage succeeds.
+      if (currentSessionChatId != null && currentSessionThreadId != null) {
+        void clearForumTopicPlaceholder(
+          {
+            sendMessage: (cid, text, opts) =>
+              bot.api.sendMessage(cid, text, opts as Parameters<typeof bot.api.sendMessage>[2]) as Promise<{
+                message_id: number
+              }>,
+            deleteMessage: (cid, mid) => bot.api.deleteMessage(cid, mid),
+          },
+          currentSessionChatId,
+          currentSessionThreadId,
+        )
+      }
       if (orphanedReplyTimeoutId != null) {
         clearTimeout(orphanedReplyTimeoutId)
         orphanedReplyTimeoutId = null
@@ -4088,6 +4107,36 @@ async function handleInbound(
     process.stderr.write(
       `telegram gateway: pre-alloc decision chatId=${chat_id} threadId=${messageThreadId ?? 'none'} → ${decision.allocate ? 'allocate' : `skip:${decision.reason}`}\n`,
     )
+    // Issue #479 forum-topic case: when pre-alloc skips because the
+    // inbound is in a forum topic (sendMessageDraft can't target
+    // message_thread_id), substitute a regular sendMessage placeholder
+    // tracked in `forum-topic-placeholder.ts` for cleanup at turn_end.
+    // Best-effort, never blocks the turn — if the API errors, the user
+    // simply doesn't get a placeholder (same as pre-#479 behaviour).
+    if (
+      !decision.allocate &&
+      decision.reason === 'forum-topic' &&
+      messageThreadId != null &&
+      messageThreadId !== ''
+    ) {
+      void sendForumTopicPlaceholder(
+        {
+          sendMessage: (cid, text, opts) =>
+            bot.api.sendMessage(cid, text, opts as Parameters<typeof bot.api.sendMessage>[2]) as Promise<{
+              message_id: number
+            }>,
+          deleteMessage: (cid, mid) => bot.api.deleteMessage(cid, mid),
+        },
+        chat_id,
+        messageThreadId,
+      ).then((mid) => {
+        if (mid != null) {
+          process.stderr.write(
+            `telegram gateway: forum-topic placeholder sent chatId=${chat_id} threadId=${messageThreadId} msgId=${mid}\n`,
+          )
+        }
+      })
+    }
     if (decision.allocate) {
       const draftId = allocateDraftId()
       // Closes #472 finding #8 — synchronously seed the map BEFORE the
