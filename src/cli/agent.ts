@@ -45,6 +45,7 @@ import {
   type StatusInputs,
 } from "../agents/status.js";
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
+import { addAgent, type AgentTopology } from "../agents/add-orchestrator.js";
 import { renameAgent, type HindsightMode } from "../agents/rename-orchestrator.js";
 import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { registerAgentPerfCommand } from "./perf.js";
@@ -1832,6 +1833,144 @@ export function registerAgentCommand(program: Command): void {
           );
         }
       })
+    );
+
+  // switchroom agent add <name>
+  //
+  // Workstream 1 of epic #543 — n+1 bot wizard. Single verb that takes a
+  // new bot from zero to running, paired, with persona seeded. Wraps
+  // bootstrap (createAgent + completeCreation) and adds:
+  //   - topology selection (--topology dm|forum)
+  //   - DM pairing block (poll Telegram for /start, auto-write access.json)
+  //   - final preflight loud-fail (autoaccept, token, systemd, access.json)
+  //
+  // BotFather automation (#188) and profile/skill picker (#190) are stubbed
+  // — supply --profile and --bot-token from the existing setup until those
+  // ship.
+  agent
+    .command("add <name>")
+    .description(
+      "n+1 bot wizard — scaffold + auth + start + DM-pair + preflight in one verb (epic #543)."
+    )
+    .requiredOption("--profile <profile>", "Profile to extend from (e.g. 'health-coach')")
+    .option(
+      "--topology <topology>",
+      "Channel topology: 'dm' (default) or 'forum' (forum support deferred — see #190)",
+      "dm",
+    )
+    .option(
+      "--bot-token <token>",
+      "BotFather token for the new agent's bot (or set SWITCHROOM_BOT_TOKEN env var)",
+    )
+    .option(
+      "--allow-from <user_id>",
+      "Skip the DM pairing block and write this Telegram user_id to allowFrom directly",
+    )
+    .option(
+      "--pair-timeout-ms <ms>",
+      "Override the DM pairing timeout (default 300000 = 5 min)",
+    )
+    .action(
+      withConfigError(async (
+        name: string,
+        opts: {
+          profile: string;
+          topology: string;
+          botToken?: string;
+          allowFrom?: string;
+          pairTimeoutMs?: string;
+        },
+      ) => {
+        const configPath = getConfigPath(program);
+
+        const botToken = opts.botToken ?? process.env.SWITCHROOM_BOT_TOKEN;
+        if (!botToken) {
+          console.error(
+            chalk.red(
+              "Error: --bot-token is required (or set SWITCHROOM_BOT_TOKEN env var to keep it out of shell history).",
+            ),
+          );
+          process.exit(1);
+        }
+
+        if (opts.topology !== "dm" && opts.topology !== "forum") {
+          console.error(
+            chalk.red(`Invalid --topology: "${opts.topology}". Must be "dm" or "forum".`),
+          );
+          process.exit(1);
+        }
+        const topology = opts.topology as AgentTopology;
+        if (topology === "forum") {
+          console.warn(
+            chalk.yellow(
+              "Note: --topology forum is accepted but the forum-pairing UX is deferred to #190. " +
+                "Falling back to DM access.json shape (a placeholder allowFrom for the forum chat).",
+            ),
+          );
+        }
+
+        const pairTimeoutMs = opts.pairTimeoutMs
+          ? Number.parseInt(opts.pairTimeoutMs, 10)
+          : undefined;
+        if (pairTimeoutMs !== undefined && (!Number.isFinite(pairTimeoutMs) || pairTimeoutMs <= 0)) {
+          console.error(chalk.red(`Invalid --pair-timeout-ms: "${opts.pairTimeoutMs}".`));
+          process.exit(1);
+        }
+
+        console.log(chalk.bold(`\nswitchroom agent add: ${name}\n`));
+
+        // Read OAuth code from stdin, mirroring bootstrap's terminal stub.
+        // (Foreman bot relay path is the future replacement — see #175.)
+        const readOAuthCode = async (loginUrl: string | undefined): Promise<string> => {
+          if (loginUrl) {
+            console.log(chalk.bold(`\n  Open this URL in your browser to authenticate:\n`));
+            console.log(chalk.cyan(`  ${loginUrl}\n`));
+          }
+          process.stdout.write(chalk.bold("  Paste the browser code here: "));
+          return new Promise<string>((resolveCode) => {
+            process.stdin.setEncoding("utf-8");
+            let buf = "";
+            const onData = (chunk: Buffer | string) => {
+              buf += chunk.toString();
+              const newlineIdx = buf.indexOf("\n");
+              if (newlineIdx !== -1) {
+                process.stdin.removeListener("data", onData);
+                resolveCode(buf.slice(0, newlineIdx).trim());
+              }
+            };
+            process.stdin.on("data", onData);
+          });
+        };
+
+        try {
+          const result = await addAgent({
+            name,
+            profile: opts.profile,
+            botToken,
+            topology,
+            allowFromUserId: opts.allowFrom,
+            pairTimeoutMs,
+            configPath,
+            readOAuthCode,
+          });
+
+          if (result.preflightOk) {
+            console.log(chalk.bold.green(`\n  Agent "${name}" is online and paired.\n`));
+            console.log(chalk.gray(`  Agent dir: ${result.agentDir}`));
+            console.log(chalk.gray(`  allowFrom: ${result.userId}\n`));
+          } else {
+            console.log(
+              chalk.yellow(
+                `\n  Agent "${name}" was created but final preflight has failures (see above).\n`,
+              ),
+            );
+            process.exit(2);
+          }
+        } catch (err) {
+          console.error(chalk.red(`\n  agent add failed: ${(err as Error).message}\n`));
+          process.exit(1);
+        }
+      }),
     );
 
   // switchroom agent rename <old> <new>
