@@ -31,6 +31,10 @@ import { execFileSync } from "node:child_process";
 import { createAgent, completeCreation } from "./create-orchestrator.js";
 import { writeAccessJson } from "../setup/onboarding.js";
 import { pollForDmStart } from "../setup/telegram-api.js";
+import {
+  runBotFatherWalkthrough,
+  type BotFatherWalkthroughOpts,
+} from "../setup/botfather-walkthrough.js";
 
 export type AgentTopology = "dm" | "forum";
 
@@ -39,8 +43,31 @@ export interface AddAgentOpts {
   name: string;
   /** Profile to extend from (e.g. "health-coach"). */
   profile: string;
-  /** BotFather token for the new agent's bot. */
-  botToken: string;
+  /**
+   * BotFather token for the new agent's bot. Optional — when omitted the
+   * wizard runs the BotFather walkthrough (#188) to guide the operator
+   * through @BotFather, validates the resulting token via getMe, and
+   * asserts the bot's username matches the agent slug. Supplying a token
+   * up-front (--bot-token / SWITCHROOM_BOT_TOKEN) skips the walkthrough
+   * entirely — the validate-and-assert path still runs.
+   */
+  botToken?: string;
+  /**
+   * Optional explicit bot username — passed through to the walkthrough
+   * for exact-equality assertion when the bot is intentionally named
+   * without the slug.
+   */
+  botUsername?: string;
+  /**
+   * Downgrade the slug-in-username assertion to warn-only. Off by default.
+   */
+  loose?: boolean;
+  /**
+   * Stdin reader injected by the CLI (or tests). Used both for the OAuth
+   * code prompt and — when the BotFather walkthrough runs — for the
+   * "paste the token" loop.
+   */
+  readLine?: (prompt: string) => Promise<string>;
   /** Topology — "dm" today; "forum" reserved for #190 forum-pairing UX. */
   topology: AgentTopology;
   /**
@@ -65,10 +92,15 @@ export interface AddAgentOpts {
   /** Logger — defaults to console.log; tests inject a sink. */
   log?: (line: string) => void;
   /**
-   * Stub hook for BotFather automation (#188). Not yet implemented —
-   * present only so wiring tests can confirm the seam exists.
+   * Test seam — overrides `runBotFatherWalkthrough` so unit tests can
+   * exercise the wiring without touching Telegram. Defaults to the real
+   * walkthrough (which calls validateBotToken under the hood). Receives
+   * the same opts object the orchestrator builds internally.
    */
-  botFatherStub?: () => Promise<void>;
+  runBotFather?: (opts: BotFatherWalkthroughOpts) => Promise<{
+    token: string;
+    bot: { username: string };
+  }>;
   /**
    * Optional override of the pairing poller. Tests inject a fake; the
    * wizard otherwise calls pollForDmStart from telegram-api.
@@ -135,13 +167,22 @@ export async function addAgent(opts: AddAgentOpts): Promise<AddAgentResult> {
   const pollPair = opts.pollForPair ?? pollForDmStart;
   const isActive = opts.isUnitActive ?? defaultIsUnitActive;
 
-  // ── Step 1: BotFather automation (#188) — stub ───────────────────────────
-  // TODO(#188): when BotFather automation lands this hook will create the
-  // bot, capture the token, and feed it into createAgent. Today the caller
-  // supplies the token via CLI flag.
-  if (opts.botFatherStub) {
-    await opts.botFatherStub();
-  }
+  // ── Step 1: BotFather walkthrough (#188) ─────────────────────────────────
+  // Either validate the token the operator already has, or guide them
+  // through @BotFather to create one. Both paths end with a getMe call
+  // and a slug-in-username assertion so a stale / wrong-bot token is
+  // caught here rather than at first restart.
+  const walkthroughRunner = opts.runBotFather ?? runBotFatherWalkthrough;
+  const wt = await walkthroughRunner({
+    agentSlug: opts.name,
+    existingToken: opts.botToken,
+    expectedUsername: opts.botUsername,
+    loose: opts.loose,
+    readLine: opts.readLine,
+    log,
+  });
+  const resolvedBotToken = wt.token;
+  log(`[1/6] Bot token validated for @${wt.bot.username}`);
 
   // ── Step 1b: profile/skill picker (#190) — stub ──────────────────────────
   // TODO(#190): replace the --profile flag with an interactive picker that
@@ -154,7 +195,7 @@ export async function addAgent(opts: AddAgentOpts): Promise<AddAgentResult> {
   const created = await createAgent({
     name: opts.name,
     profile: opts.profile,
-    telegramBotToken: opts.botToken,
+    telegramBotToken: resolvedBotToken,
     configPath: opts.configPath,
     rollbackOnFail: true,
   });
@@ -201,7 +242,7 @@ export async function addAgent(opts: AddAgentOpts): Promise<AddAgentResult> {
     log(`      Open Telegram and DM your new bot: send /start`);
     let pair: Awaited<ReturnType<typeof pollPair>>;
     try {
-      pair = await pollPair(opts.botToken, pairTimeout);
+      pair = await pollPair(resolvedBotToken, pairTimeout);
     } catch (err) {
       throw new Error(
         `Pairing timed out after ${(pairTimeout / 1000).toFixed(0)}s. ` +
