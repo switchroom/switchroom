@@ -21,6 +21,32 @@
 #   commits (no .ts/.py/.yml/.md-skill changes) build empty (just the
 #   pipeline upload) — no compute spent. Touching `.buildkite/pipeline.yml`
 #   re-runs everything by listing it in every if_changed.
+#
+# Cost protection (timeout_in_minutes):
+#   Every step has a wall-clock cap so a hung test or an infinite-loop
+#   bug doesn't run to the agent's default max (~60 min) and burn
+#   compute. Caps: lint=5, core=15, plugin=8, evals=30, summary=5.
+#   When tweaking, leave at least 2× current p99 of the step.
+#
+# bun install speed:
+#   Every step uses `--prefer-offline --no-progress`. Prefer-offline
+#   skips registry round-trips when the cache already has the package
+#   (~5-10s saved per warm-cache build); no-progress drops terminal
+#   redraw noise from the build log.
+#
+# Eval steps:
+#   `claude-code` global is install-skipped when it's already on PATH
+#   from a cache restore. The `~/.npm` cache (key `v1-claude-code-global`)
+#   carries the package metadata across builds; the binary symlink under
+#   /usr/local/bin survives because the hosted-agent image preserves it
+#   when present.
+#
+# bktec (#107):
+#   Re-enable gated by SWITCHROOM_USE_BKTEC=1 cluster env. The TEST_FILE
+#   patterns are now comma-separated (no brace expansion — bktec's zzglob
+#   library doesn't honour `{a,b}` and silently exits 16 when given them).
+#   Once the cluster env flips on, the bktec block discovers tests
+#   correctly and parallel sharding kicks in. See block at line ~145.
 
 agents:
   queue: "hosted"
@@ -28,6 +54,7 @@ agents:
 steps:
   - label: ":lock: Type check"
     key: lint
+    timeout_in_minutes: 5
     if_changed:
       - "**/*.ts"
       - "**/*.tsx"
@@ -45,7 +72,10 @@ steps:
         curl -fsSL https://bun.sh/install | bash
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
-      bun install --frozen-lockfile
+      # --prefer-offline: skip registry lookups when the cache already has
+      # the package; saves ~5-10s per build on warm caches.
+      # --no-progress: cleaner CI logs, no terminal-redraw noise.
+      bun install --frozen-lockfile --prefer-offline --no-progress
       bun lint
     cache:
       paths:
@@ -61,6 +91,7 @@ steps:
 
   - label: ":vitest: Core tests"
     key: tests-core
+    timeout_in_minutes: 15
     # Stub token so importing server.ts (via cross-package coverage of
     # telegram-plugin/tests/*.test.ts) doesn't boot the legacy monolith path
     # and demand a live TELEGRAM_BOT_TOKEN. Tests never actually poll Telegram.
@@ -82,10 +113,10 @@ steps:
         curl -fsSL https://bun.sh/install | bash
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
-      bun install --frozen-lockfile
+      bun install --frozen-lockfile --prefer-offline --no-progress
       # vitest also runs telegram-plugin/tests/*.test.ts (excluding bun-only
       # history.test.ts) for cross-package coverage, so install plugin deps.
-      (cd telegram-plugin && bun install --frozen-lockfile)
+      (cd telegram-plugin && bun install --frozen-lockfile --prefer-offline --no-progress)
       # Build dist/ before tests. Several integration tests under tests/
       # (cli.issues.test.ts, run-hook.test.ts, boot-self-test.test.ts) shell
       # out to dist/cli/switchroom.js to exercise the same binary path
@@ -142,14 +173,25 @@ steps:
         #    it. The directive was removed in this PR because plain vitest
         #    runs the suite once, so duplicating jobs would just waste
         #    compute.
+        # 7. (#107 fix) The TEST_FILE_PATTERN below is comma-separated, NOT
+        #    brace-expanded. bktec's zzglob library does not honor `{a,b}`
+        #    brace expansion — patterns containing braces silently match
+        #    zero files and bktec exits 16 with "no files found". The
+        #    same applies to the EXCLUDE pattern: each excluded path is
+        #    listed separately rather than packed into a brace group.
         export BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN="$$(buildkite-agent secret get SWITCHROOM_TEST_ENGINE_API_TOKEN 2>/dev/null || true)"
         if [[ -n "$$BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN" ]]; then
           export BUILDKITE_TEST_ENGINE_DEBUG_ENABLED="true"
           export BUILDKITE_TEST_ENGINE_SUITE_SLUG="switchroom-vitest"
           export BUILDKITE_TEST_ENGINE_TEST_RUNNER="custom"
           export BUILDKITE_TEST_ENGINE_TEST_CMD="bunx vitest run {{testExamples}}"
-          export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="{tests,test,experimental,src,telegram-plugin}/**/*.test.ts"
-          export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/{history,ipc-server-client,ipc-server-race,gateway-bridge,gateway-startup-mutex,gateway-clean-shutdown-marker,foreman-state,boot-card-dedupe,boot-card-reason,progress-update,quota-cache,silent-reply-guard,unhandled-rejection-policy}.test.ts"
+          # Comma-separated globs — bktec's zzglob matches each independently.
+          # Order: largest test directories first so the discovery log is
+          # human-scannable (you see the bulk first, then the long tail).
+          export BUILDKITE_TEST_ENGINE_TEST_FILE_PATTERN="src/**/*.test.ts,telegram-plugin/**/*.test.ts,tests/**/*.test.ts,test/**/*.test.ts,experimental/**/*.test.ts"
+          # Exclude list — each path on its own (no brace expansion).
+          # Mirrors the vitest.config.ts exclude list for the bun-only suites.
+          export BUILDKITE_TEST_ENGINE_TEST_FILE_EXCLUDE_PATTERN="telegram-plugin/tests/history.test.ts,telegram-plugin/tests/ipc-server-client.test.ts,telegram-plugin/tests/ipc-server-race.test.ts,telegram-plugin/tests/gateway-bridge.test.ts,telegram-plugin/tests/gateway-startup-mutex.test.ts,telegram-plugin/tests/gateway-clean-shutdown-marker.test.ts,telegram-plugin/tests/foreman-state.test.ts,telegram-plugin/tests/boot-card-dedupe.test.ts,telegram-plugin/tests/boot-card-reason.test.ts,telegram-plugin/tests/progress-update.test.ts,telegram-plugin/tests/quota-cache.test.ts,telegram-plugin/tests/silent-reply-guard.test.ts,telegram-plugin/tests/unhandled-rejection-policy.test.ts"
           if command -v bktec >/dev/null 2>&1; then
             bktec --version
             bktec run
@@ -181,6 +223,7 @@ steps:
 
   - label: ":telegram: Plugin tests (402)"
     key: tests-plugin
+    timeout_in_minutes: 8
     # Stub token so `silent-reply-guard.test.ts` and any other test that
     # imports from `../server.js` doesn't trigger the monolith boot path and
     # exit with "TELEGRAM_BOT_TOKEN required".
@@ -195,7 +238,7 @@ steps:
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       cd telegram-plugin
-      bun install --frozen-lockfile
+      bun install --frozen-lockfile --prefer-offline --no-progress
       bun test
     cache:
       paths:
@@ -219,6 +262,7 @@ steps:
 
   - label: ":compass: Skills evals — trigger routing"
     key: evals-trigger
+    timeout_in_minutes: 30
     # Serialize eval runs across parallel builds: Anthropic API calls on the
     # subscription OAuth token share a weekly quota, and bunches of evals
     # racing in parallel can burn through it or hit rate limits. Two builds
@@ -249,10 +293,20 @@ steps:
         exit 0
       fi
       pip install -q pyyaml
-      npm i -g @anthropic-ai/claude-code
+      # Skip the global re-install when claude-code is already on PATH from
+      # a cache restore (~/.npm + the binary symlink under /usr/local/bin).
+      # `npm i -g` is ~20-30s on a cold agent; skipping it on warm cache
+      # halves total eval-step latency on the common case.
+      if ! command -v claude >/dev/null 2>&1; then
+        npm i -g --prefer-offline --no-audit --no-fund @anthropic-ai/claude-code
+      fi
       python3 evals/run_trigger.py --parallel 5
     artifact_paths:
       - "evals/results/**/*.json"
+    cache:
+      paths:
+        - "~/.npm"
+      key: "v1-claude-code-global"
     soft_fail:
       - exit_status: 1
     retry:
@@ -264,6 +318,7 @@ steps:
 
   - label: ":sparkles: Skills evals — quality"
     key: evals-quality
+    timeout_in_minutes: 30
     # Same reasoning as evals-trigger above: serialize to protect the
     # subscription quota + rate limits.
     concurrency: 1
@@ -286,10 +341,16 @@ steps:
         exit 0
       fi
       pip install -q pyyaml
-      npm i -g @anthropic-ai/claude-code
+      if ! command -v claude >/dev/null 2>&1; then
+        npm i -g --prefer-offline --no-audit --no-fund @anthropic-ai/claude-code
+      fi
       python3 evals/run_quality.py --parallel 5
     artifact_paths:
       - "evals/results/**/*.json"
+    cache:
+      paths:
+        - "~/.npm"
+      key: "v1-claude-code-global"
     soft_fail:
       - exit_status: 1
     retry:
@@ -303,6 +364,7 @@ steps:
     continue_on_failure: true
 
   - label: ":bar_chart: Eval summary"
+    timeout_in_minutes: 5
     depends_on:
       - evals-trigger
       - evals-quality
