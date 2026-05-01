@@ -1,6 +1,11 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { getCollectionForAgent, isStrictIsolation } from "../memory/hindsight.js";
+import {
+  getCollectionForAgent,
+  isStrictIsolation,
+  addMemoryTag,
+  DEMOTE_FROM_RECALL_TAG,
+} from "../memory/hindsight.js";
 import { searchMemory, getMemoryStats, reflectAcrossAgents } from "../memory/search.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import {
@@ -440,5 +445,100 @@ export function registerMemoryCommand(program: Command): void {
         }
         console.log();
       }),
+    );
+
+  // switchroom memory demote <agent> <memory-id> [--tag <tag>]
+  //
+  // Closes the operator loop opened by #432 4.3 (recall_log shows
+  // memory IDs that surfaced) + #432 4.4 (demote tag is honoured by
+  // recall.py) + #475 (overlap gate). When the operator spots a noisy
+  // memory in `switchroom memory recall-log <agent>`, this verb adds
+  // the `[demote-from-recall]` tag without leaving the terminal.
+  // After the next agent restart (or naturally on the next cache
+  // miss), the demoted memory stops surfacing in auto-recall while
+  // remaining queryable via `mcp__hindsight__recall` and `reflect`.
+  memory
+    .command("demote <agent> <memory-id>")
+    .description(
+      "Tag a memory in the agent's bank to exclude it from auto-recall (closes the recall-log → demote loop, #475 follow-up)",
+    )
+    .option(
+      "--tag <tag>",
+      `Override the demote tag (default: ${DEMOTE_FROM_RECALL_TAG})`,
+      DEMOTE_FROM_RECALL_TAG,
+    )
+    .option(
+      "--timeout <ms>",
+      "Timeout for each Hindsight API call in milliseconds (default: 5000)",
+      "5000",
+    )
+    .action(
+      withConfigError(
+        async (
+          agent: string,
+          memoryId: string,
+          opts: { tag: string; timeout: string },
+        ) => {
+          const config = getConfig(program);
+
+          if (!config.agents[agent]) {
+            console.error(
+              chalk.red(`Agent "${agent}" is not defined in switchroom.yaml`),
+            );
+            process.exit(1);
+          }
+          if (!memoryId || memoryId.trim().length === 0) {
+            console.error(chalk.red("Memory ID is required"));
+            process.exit(1);
+          }
+
+          const collection = getCollectionForAgent(agent, config);
+          const apiUrl =
+            (config.memory?.config?.url as string | undefined) ??
+            "http://localhost:8888/mcp/";
+          const timeoutMs = Math.max(500, parseInt(opts.timeout, 10) || 5000);
+
+          console.log(
+            chalk.bold(`\nDemoting memory ${chalk.cyan(memoryId)}`),
+          );
+          console.log(
+            chalk.gray(
+              `  agent=${agent}  bank=${collection}  tag=${opts.tag}`,
+            ),
+          );
+          console.log(chalk.gray(`  api=${apiUrl}\n`));
+
+          const result = await addMemoryTag(
+            apiUrl,
+            collection,
+            memoryId,
+            opts.tag,
+            { timeoutMs },
+          );
+
+          if (result.ok) {
+            console.log(
+              chalk.green("✓ Tag applied."),
+              chalk.gray(
+                "Recall.py's filter excludes the memory on the next auto-recall (or after agent restart if a session cache is warm).",
+              ),
+            );
+            return;
+          }
+
+          console.error(
+            chalk.red("✗ Tag failed:"),
+            chalk.gray(result.reason),
+          );
+          console.error(
+            chalk.gray(
+              "  The Hindsight MCP `update_memory` tool may not be exposed by your deployment, or the memory ID may be wrong. Try `switchroom memory recall-log " +
+                agent +
+                " --json` to confirm the ID surfaced recently.",
+            ),
+          );
+          process.exit(1);
+        },
+      ),
     );
 }

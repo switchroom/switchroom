@@ -571,3 +571,116 @@ export async function updateBankMissions(
     return { ok: false, reason: String(err) };
   }
 }
+
+/**
+ * Append a tag to an existing memory in a Hindsight bank.
+ *
+ * Wraps the Hindsight MCP `update_memory` tool. Used by
+ * `switchroom memory demote` (#475 follow-up) to add the
+ * `[demote-from-recall]` tag to noisy memories that the operator
+ * spots in the recall-log. Once tagged, recall.py's
+ * `_is_demoted_memory` filter (#432 4.4) excludes the memory from
+ * subsequent auto-recall blocks while keeping it queryable via
+ * `mcp__hindsight__recall` and `reflect`.
+ *
+ * Best-effort with timeout; never throws. Mirrors `updateBankMissions`
+ * shape so the caller pattern stays consistent across switchroom's
+ * Hindsight-touching helpers.
+ */
+export async function addMemoryTag(
+  apiUrl: string,
+  bankId: string,
+  memoryId: string,
+  tag: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    // Step 1: initialize MCP session (required for any subsequent tools/call).
+    const initResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "switchroom", version: "0.1" },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!initResponse.ok) {
+      return { ok: false, reason: `HTTP ${initResponse.status}` };
+    }
+
+    const sessionId = initResponse.headers.get("mcp-session-id");
+    if (!sessionId) {
+      return { ok: false, reason: "No session ID returned" };
+    }
+
+    // Step 2: call update_memory with `add_tags` to append (rather than
+    // replace) the tag. Hindsight's update_memory accepts an `add_tags`
+    // list per the MCP tool schema; if the deployment is older and only
+    // accepts `tags` (replace), the tool call returns ok but the tag
+    // may overwrite. Operators on stale deployments should bump the
+    // plugin (#438 Tier 1).
+    const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
+    const toolResponse = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "update_memory",
+          arguments: {
+            bank_id: bankId,
+            memory_id: memoryId,
+            add_tags: [tag],
+          },
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout2);
+
+    if (!toolResponse.ok) {
+      return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      return { ok: false, reason: "Timeout" };
+    }
+    return { ok: false, reason: String(err) };
+  }
+}
+
+/** Canonical demote tag honoured by `_is_demoted_memory` in
+ *  `vendor/hindsight-memory/scripts/recall.py` (#432 phase 4.4).
+ *  Exported so CLI commands and tests stay in lockstep with the
+ *  Python-side filter without hard-coding the literal in two places. */
+export const DEMOTE_FROM_RECALL_TAG = "[demote-from-recall]";
