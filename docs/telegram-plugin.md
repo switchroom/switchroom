@@ -8,12 +8,12 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 
 ## What the switchroom fork adds
 
-### Message tools (10 MCP tools)
+### Message tools (12 MCP tools)
 
 | Tool | What it does |
 |------|-------------|
-| `reply` | Send text, photos, or documents. Supports threading, topic routing, and multi-file attachments. |
-| `stream_reply` | Edit a single message in place as work progresses (~1/sec throttle). Avoids spamming the chat with many short messages. |
+| `reply` | Send text, photos, or documents. Supports threading, topic routing, multi-file attachments, inline keyboard URL buttons, `protect_content`, `quote_text`, and an optional `accent` status header (`in-progress`/`done`/`issue`). |
+| `stream_reply` | Edit a single message in place as work progresses (~1/sec throttle). Same `accent` and inline-keyboard support as `reply`. Optional `lane` parameter splits parallel streams (e.g. `thinking` vs default answer) per chat+thread. |
 | `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
 | `edit_message` | Update a previously sent message. |
 | `delete_message` | Remove a bot-sent message (48h Telegram limit). |
@@ -22,6 +22,16 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 | `send_typing` | Show typing indicator during long operations (5s auto-expire). |
 | `download_attachment` | Fetch files attached to inbound messages. |
 | `get_recent_messages` | Query the local SQLite history buffer with pagination and thread filtering. |
+| `send_checklist` | Native Telegram checklist message — fixed-order items with per-item state. Returns a checklist id usable with `update_checklist` (#272). |
+| `update_checklist` | Patch the state of items on a previously sent checklist (e.g. mark item 2 done) without re-sending the whole message. |
+
+### Status accent headers
+
+Both `reply` and `stream_reply` accept an optional `accent: 'in-progress' | 'done' | 'issue'` parameter that prepends a status indicator line (`🔵 In progress…`, `✅ Done`, `⚠️ Issue`) above the message body. Use it for status communication on long-running work and completion announcements; omit it for routine conversational replies. (#328)
+
+### Inline keyboard URL buttons
+
+`reply` and `stream_reply` accept an `inline_keyboard` parameter — an array of rows, each row an array of `{ text, url }` buttons — for tap-to-open links rendered as Telegram inline buttons (#271).
 
 ### Emoji status reactions
 

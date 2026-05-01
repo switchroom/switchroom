@@ -36,9 +36,11 @@ adds the ergonomics and reliability that an always-on agent fleet needs:
 - **Switchroom slash-commands** — `/agents`, `/restart`, `/logs`, `/memory`,
   `/grant`, `/dangerous`, `/permissions`, `/reconcile` etc., handled by the
   plugin without consuming Claude Code tokens.
-- **10 MCP tools** — `reply`, `stream_reply`, `react`, `edit_message`,
+- **12 MCP tools** — `reply`, `stream_reply`, `react`, `edit_message`,
   `delete_message`, `forward_message`, `pin_message`, `send_typing`,
-  `download_attachment`, `get_recent_messages`.
+  `download_attachment`, `get_recent_messages`, `send_checklist`,
+  `update_checklist` (the latter two ship native Telegram checklists,
+  see #272).
 
 The fork is the **default** for switchroom agents (no config needed). Set
 `channels.telegram.plugin: official` to fall back to the upstream plugin.
