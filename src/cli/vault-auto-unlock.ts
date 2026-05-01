@@ -34,7 +34,7 @@ import { askYesNo } from "../setup/prompt.js";
 
 export const HOST_SECRET = "/var/lib/systemd/credential.secret";
 
-export type EncryptScope = "user" | "host" | "host-sudo";
+export type EncryptScope = "host" | "host-sudo";
 
 export type EncryptErrorClass =
   | "polkit-required"
@@ -61,49 +61,58 @@ export function classifyEncryptStderr(stderr: string): EncryptErrorClass {
 }
 
 /**
- * Detect whether `systemd-creds` is available and supports `--user`. The
- * `--user` flag was added in systemd 256; earlier releases reject it as
- * unrecognized. Returns null if the binary isn't on PATH.
+ * Detect whether `systemd-creds` is available on PATH. We don't care about
+ * version-specific feature flags — every flag we use (`--with-key=host`,
+ * `--name=`, `--quiet`) is supported in every systemd-creds release we
+ * target. Returns null when the binary is missing.
  */
-export function detectSystemdCreds(): { supportsUser: boolean } | null {
+export function detectSystemdCreds(): { available: true } | null {
   try {
-    const versionOut = execFileSync("systemd-creds", ["--version"], {
-      stdio: ["ignore", "pipe", "ignore"],
-      encoding: "utf8",
+    execFileSync("systemd-creds", ["--version"], {
+      stdio: ["ignore", "ignore", "ignore"],
     });
-    const m = versionOut.match(/systemd\s+(\d+)/);
-    return { supportsUser: m ? parseInt(m[1], 10) >= 256 : false };
+    return { available: true };
   } catch {
     return null;
   }
 }
 
 /**
- * Run a single systemd-creds encrypt invocation in the requested scope.
- * Returns an outcome object instead of throwing — caller orchestrates the
- * fall-through cascade.
+ * Why `--with-key=host` and not the systemd-creds default ("auto")?
+ *
+ * `auto` picks `tpm2+host` when a TPM is present. The resulting credential
+ * needs `/dev/tpmrm0` access at *decrypt* time — i.e., when the broker user
+ * unit starts at boot. Ubuntu's default permissions on `/dev/tpmrm0` require
+ * group `tss`, which kenthompson-style user accounts aren't members of by
+ * default. Result: encrypt succeeds, decrypt at unit start fails with
+ * "Permission denied" on /dev/tpmrm0 → systemd refuses to start the unit
+ * with `status=243/CREDENTIALS`. By forcing `host`, the credential needs
+ * only the host secret — which user-systemd brokers via the system manager
+ * for any user unit, no group membership required. Trade-off: no TPM
+ * sealing. Acceptable, since the encrypted file lives at mode 0600 in the
+ * user's home and the real defence is filesystem perms, not TPM binding.
+ *
+ * Run a single systemd-creds encrypt invocation in host scope. Returns an
+ * outcome object instead of throwing — caller orchestrates the fall-through
+ * cascade.
  *
  * Passphrase is piped via stdin so it never appears in argv, environ, or
  * any process listing. stderr is captured (not inherited) so we can
  * classify the failure; stdout is empty on success because of --quiet.
  */
-export function tryEncrypt(
-  scope: "user" | "host",
-  passphrase: string,
-  credPath: string,
-): EncryptOutcome {
-  const args = ["encrypt", "--name=vault-passphrase"];
-  if (scope === "user") args.push("--user");
-  args.push("--quiet", "-", credPath);
-
-  const result = spawnSync("systemd-creds", args, {
-    input: passphrase,
-    stdio: ["pipe", "ignore", "pipe"],
-    encoding: "utf8",
-  });
+export function tryEncrypt(passphrase: string, credPath: string): EncryptOutcome {
+  const result = spawnSync(
+    "systemd-creds",
+    ["encrypt", "--with-key=host", "--name=vault-passphrase", "--quiet", "-", credPath],
+    {
+      input: passphrase,
+      stdio: ["pipe", "ignore", "pipe"],
+      encoding: "utf8",
+    },
+  );
 
   if (result.status === 0) {
-    return { ok: true, scope };
+    return { ok: true, scope: "host" };
   }
   const stderr = (result.stderr ?? "") + (result.error ? `\n${result.error.message}` : "");
   return { ok: false, class: classifyEncryptStderr(stderr), stderr };
@@ -127,6 +136,7 @@ export function runSudoEncrypt(
       "[sudo] password to encrypt vault auto-unlock credential: ",
       "systemd-creds",
       "encrypt",
+      "--with-key=host",
       "--name=vault-passphrase",
       "--quiet",
       "-",
@@ -200,7 +210,6 @@ export class EncryptFailedError extends Error {
 export async function encryptCredential(
   passphrase: string,
   credPath: string,
-  systemdCredsSupportsUser: boolean,
   opts: EncryptOptions = {},
 ): Promise<EncryptScope> {
   const log = opts.log ?? ((s: string) => console.log(s));
@@ -209,35 +218,26 @@ export async function encryptCredential(
 
   mkdirSync(dirname(credPath), { recursive: true, mode: 0o700 });
 
+  // Host-scope encrypt-as-user only works when the host keystore is present
+  // AND readable to the user (default Ubuntu has it root-only at mode 0400,
+  // so this is mostly a fast-path for systems where it's been intentionally
+  // shared). When that fails we escalate to sudo, which can always read it.
   let lastFail: EncryptOutcome | null = null;
 
-  if (systemdCredsSupportsUser) {
-    const r = tryEncrypt("user", passphrase, credPath);
+  if (existsSync(HOST_SECRET)) {
+    const r = tryEncrypt(passphrase, credPath);
     if (r.ok) return r.scope;
     lastFail = r;
   }
 
-  // Host-scope encrypt-as-user only works when the host keystore exists AND
-  // polkit allows the call. If the keystore is missing, skip straight to sudo
-  // — there's nothing to attempt.
-  if (existsSync(HOST_SECRET)) {
-    const r = tryEncrypt("host", passphrase, credPath);
-    if (r.ok) {
-      if (lastFail) {
-        log("  (--user encryption was unavailable; used host-scope instead)");
-      }
-      return r.scope;
-    }
-    lastFail = r;
-  }
-
-  // Both unprivileged paths exhausted. Decide whether to escalate.
+  // Unprivileged path exhausted. Decide whether to escalate.
+  const sudoEncryptCmd = `sudo systemd-creds encrypt --with-key=host --name=vault-passphrase - ${credPath}`;
   if (!isTTY) {
     err("systemd-creds encrypt failed and stdin is not a TTY; refusing to auto-escalate via sudo.");
     if (lastFail) err(`  Last error: ${lastFail.stderr.trim().split("\n")[0]}`);
     err("");
     err("  Run interactively, or run this manually with sudo:");
-    err(`    sudo systemd-creds encrypt --name=vault-passphrase - ${credPath}`);
+    err(`    ${sudoEncryptCmd}`);
     err(`    sudo chown $USER:$USER ${credPath} && chmod 600 ${credPath}`);
     throw new EncryptFailedError(credPath, "non-tty: cannot auto-escalate");
   }
@@ -249,15 +249,15 @@ export async function encryptCredential(
     log(`  ${firstLine}`);
   }
   log("");
-  log("This is the default state of Ubuntu 24.04+ with systemd ≥256:");
-  log("  the system varlink socket is polkit-gated for non-root callers");
-  log("  and no user-scope socket ships out of the box. sudo bypasses both.");
+  log("This is the default state of Ubuntu 24.04+: the host secret at");
+  log(`  ${HOST_SECRET} is mode 0400 root-only, so unprivileged callers`);
+  log("  can't read it. sudo bypasses that.");
   log("");
 
   const proceed = opts.assumeYesSudo ?? (await askYesNo("Encrypt with sudo (one-time prompt)?", true));
   if (!proceed) {
     err("Aborted. To finish manually:");
-    err(`  sudo systemd-creds encrypt --name=vault-passphrase - ${credPath}`);
+    err(`  ${sudoEncryptCmd}`);
     err(`  sudo chown $USER:$USER ${credPath} && chmod 600 ${credPath}`);
     throw new EncryptCancelledError(credPath);
   }
@@ -315,7 +315,9 @@ export async function applyAutoUnlock(opts: ApplyOptions = {}): Promise<void> {
   const err = opts.err ?? ((s: string) => console.error(s));
   const runSystemctl =
     opts.runSystemctl ?? ((args: string[]) => spawnSync("systemctl", args, { stdio: "inherit" }));
-  const verifyTimeoutMs = opts.verifyTimeoutMs ?? 5000;
+  // 10s default — generous enough for cold-cache decrypt on slow boxes, short
+  // enough that a real cred-decrypt failure surfaces before the user gives up.
+  const verifyTimeoutMs = opts.verifyTimeoutMs ?? 10000;
 
   const configPath = opts.configPath ?? findConfigFile();
   setVaultBrokerAutoUnlock(configPath, true);

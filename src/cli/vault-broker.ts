@@ -342,8 +342,7 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
         process.exit(1);
       }
 
-      const detection = detectSystemdCreds();
-      if (!detection) {
+      if (!detectSystemdCreds()) {
         console.error(
           "systemd-creds not found on PATH. Requires systemd >= 250. " +
           "Try: sudo apt install systemd",
@@ -376,7 +375,7 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
         }
 
         try {
-          scope = await encryptCredential(passphrase, credPath, detection.supportsUser);
+          scope = await encryptCredential(passphrase, credPath);
         } catch (err) {
           // encryptCredential prints its own diagnostics; we just need to exit.
           if (err instanceof EncryptCancelledError || err instanceof EncryptFailedError) {
