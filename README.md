@@ -83,7 +83,7 @@ Switchroom is **not a harness**. Each agent runs the unmodified `claude` binary,
 | **Persistent memory** | Hindsight semantic memory with knowledge graphs. |
 | **Session continuity** | Resume sessions across restarts with freshness gating. |
 | **Encrypted vault** | AES-256-GCM for secrets. |
-| **10 Telegram MCP tools** | Reply, pin, react, history, attachments, stream progress, all of it. |
+| **12 Telegram MCP tools** | Reply, stream replies, pin, react, history, attachments, native checklists, all of it. |
 
 ## How it stacks up against the alternatives
 
@@ -272,9 +272,15 @@ switchroom restart [agent] [--force]          # Bounce agent(s); drains in-fligh
 switchroom version                            # Show versions + running agent health summary
 
 switchroom agent list                         # Status of all agents
+switchroom agent status <name>                # Status of one agent
+switchroom agent add [name]                   # Wizard: scaffold a new agent end-to-end (#543)
 switchroom agent create <name> [--profile <p>] # Scaffold + install timers; --profile writes yaml entry
+switchroom agent bootstrap <name> --profile <p> --bot-token <t>  # One-shot scaffold + auth + start
 switchroom agent reconcile <name|all>         # Re-apply switchroom.yaml (without pulling/building)
 switchroom agent start|stop|restart <name>    # Lifecycle (with preflight)
+switchroom agent interrupt <name>             # Cancel in-flight turn without restarting
+switchroom agent rename <old> <new>           # Rename an agent slug (#168)
+switchroom agent destroy <name>               # Tear down systemd units + scaffold dir
 switchroom agent attach <name>                # Interactive tmux session
 switchroom agent logs <name> [-f]             # View logs
 switchroom agent grant <name> <tool>          # Grant a tool permission
