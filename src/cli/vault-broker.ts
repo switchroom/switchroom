@@ -307,9 +307,20 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
         process.exit(1);
       }
 
-      // Verify systemd-creds is on PATH.
+      // Verify systemd-creds is on PATH and detect version. The --user flag
+      // was added in systemd 256; on older releases (e.g. Ubuntu 24.04 ships
+      // 255) we must omit it or the encrypt call fails with
+      // "unrecognized option '--user'".
+      let systemdCredsSupportsUser = false;
       try {
-        execFileSync("systemd-creds", ["--version"], { stdio: "ignore" });
+        const versionOut = execFileSync("systemd-creds", ["--version"], {
+          stdio: ["ignore", "pipe", "ignore"],
+          encoding: "utf8",
+        });
+        const m = versionOut.match(/systemd\s+(\d+)/);
+        if (m) {
+          systemdCredsSupportsUser = parseInt(m[1], 10) >= 256;
+        }
       } catch {
         console.error(
           "systemd-creds not found on PATH. Requires systemd >= 250. " +
@@ -342,16 +353,20 @@ export function registerVaultBrokerCommand(vaultCmd: Command, program: Command):
 
         mkdirSync(dirname(credPath), { recursive: true, mode: 0o700 });
 
-        // systemd-creds encrypt --name=vault-passphrase --user --quiet - <credPath>
+        // systemd-creds encrypt --name=vault-passphrase [--user] --quiet - <credPath>
         // Stdin: passphrase. Output: encrypted credential at credPath.
         // The --name=vault-passphrase binding is required — systemd validates the
         // embedded name matches the LoadCredentialEncrypted= id at decrypt time.
+        // --user is only added on systemd >= 256 (where the flag exists). On
+        // older systemd, host-scope encryption still decrypts inside user units.
         try {
-          execFileSync(
-            "systemd-creds",
-            ["encrypt", "--name=vault-passphrase", "--user", "--quiet", "-", credPath],
-            { input: passphrase, stdio: ["pipe", "inherit", "inherit"] },
-          );
+          const args = ["encrypt", "--name=vault-passphrase"];
+          if (systemdCredsSupportsUser) args.push("--user");
+          args.push("--quiet", "-", credPath);
+          execFileSync("systemd-creds", args, {
+            input: passphrase,
+            stdio: ["pipe", "inherit", "inherit"],
+          });
         } catch (err) {
           console.error(`systemd-creds encrypt failed: ${err instanceof Error ? err.message : String(err)}`);
           process.exit(1);
