@@ -33,6 +33,12 @@ import {
   DEFAULT_MAX_DURATION_MS as HEARTBEAT_DEFAULT_MAX_DURATION_MS,
   type HeartbeatHandle,
 } from '../placeholder-heartbeat.js'
+import {
+  PHASES,
+  toolUseToPhase,
+  recallTextToPhase,
+  type Phase,
+} from '../placeholder-phase.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { createTypingWrapper } from '../typing-wrap.js'
@@ -785,9 +791,9 @@ function startPlaceholderHeartbeat(chat_id: string, draftId: number, startedAt: 
   const handle = startPlaceholderHeartbeatImpl(chat_id, draftId, startedAt, {
     sendMessageDraft: sendMessageDraftFn,
     isPlaceholderActive: (cid) => preAllocatedDrafts.has(cid),
-    // §3 minimum: no enrichment source. Always use the default label.
-    // §4 enrichment will swap in a label-map reader here.
-    getCurrentLabel: () => null,
+    // §4 enrichment: read the current phase label. null falls back
+    // to the heartbeat module's DEFAULT_HEARTBEAT_LABEL ("🔵 thinking").
+    getCurrentLabel: (cid) => currentPhase.get(cid)?.label ?? null,
     intervalMs: HEARTBEAT_INTERVAL_MS,
     maxDurationMs: HEARTBEAT_DEFAULT_MAX_DURATION_MS,
     log: (msg) => process.stderr.write(`${msg}\n`),
@@ -803,6 +809,76 @@ function cancelPlaceholderHeartbeat(chat_id: string): void {
   if (handle == null) return
   handle.cancel()
   placeholderHeartbeats.delete(chat_id)
+}
+
+// ─── Phase enrichment (Path A §4) ──────────────────────────────────
+// User-facing phase labels for the placeholder. The heartbeat reads
+// the current phase from `currentPhase`; subscribers (recall.py via
+// update_placeholder, session-tail tool_use events, auto-ack timer)
+// write to it. See telegram-plugin/docs/heartbeat-phases-design.md.
+const currentPhase = new Map<string, Phase>()
+// `writing_reply` is sticky once set — protects the user-perceived
+// "✍️ Writing your reply" from being overridden by mid-reply tool
+// calls. Cleared at the same lifecycle points as preAllocatedDrafts.
+const writingReplyStarted = new Set<string>()
+// Auto-ack timers — fire at T+1s if no other phase has been set,
+// guarantees "🔵 Got your message…" appears for non-Hindsight agents.
+const autoAckTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+const AUTO_ACK_DELAY_MS = 1000
+
+/** Set the current phase for a chat. Honours the writing_reply sticky
+ * rule — once the model has started writing, subsequent tool calls
+ * don't change the user-visible phase. Returns true if the phase
+ * actually changed (for diagnostic logging). */
+function setCurrentPhase(chat_id: string, phase: Phase): boolean {
+  // Sticky: once writing_reply is set, hold it for the rest of the turn
+  if (writingReplyStarted.has(chat_id) && phase.kind !== 'writing_reply') {
+    return false
+  }
+  if (phase.kind === 'writing_reply') {
+    writingReplyStarted.add(chat_id)
+  }
+  const prior = currentPhase.get(chat_id)
+  if (prior?.kind === phase.kind) return false  // no-op
+  currentPhase.set(chat_id, phase)
+  process.stderr.write(`telegram gateway: phase chatId=${chat_id} → ${phase.kind} ("${phase.label}")\n`)
+  return true
+}
+
+/** Schedule the auto-ack timer. Fires at T+1s; sets `acknowledged`
+ * phase ONLY if no other phase has been set yet (recall.py would
+ * have set `recalling` before then for Hindsight agents). */
+function scheduleAutoAck(chat_id: string): void {
+  // Defensive: cancel any prior timer for this chat.
+  cancelAutoAck(chat_id)
+  const timer = setTimeout(() => {
+    autoAckTimers.delete(chat_id)
+    if (currentPhase.has(chat_id)) {
+      // Something else already set the phase (recall.py / tool_use) —
+      // skip the auto-ack, the more-specific phase wins.
+      return
+    }
+    setCurrentPhase(chat_id, PHASES.acknowledged)
+  }, AUTO_ACK_DELAY_MS)
+  autoAckTimers.set(chat_id, timer)
+}
+
+/** Cancel the auto-ack timer for a chat. Called alongside
+ * cancelPlaceholderHeartbeat at every preAllocatedDrafts.delete() site. */
+function cancelAutoAck(chat_id: string): void {
+  const timer = autoAckTimers.get(chat_id)
+  if (timer == null) return
+  clearTimeout(timer)
+  autoAckTimers.delete(chat_id)
+}
+
+/** Clear all per-chat phase state. Called alongside
+ * cancelPlaceholderHeartbeat at every preAllocatedDrafts.delete() site. */
+function clearPhaseState(chat_id: string): void {
+  cancelAutoAck(chat_id)
+  currentPhase.delete(chat_id)
+  writingReplyStarted.delete(chat_id)
 }
 
 let currentSessionChatId: string | null = null
@@ -1711,9 +1787,22 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onUpdatePlaceholder(_client: IpcClient, msg: UpdatePlaceholderMessage) {
+    // Path A §4: if the text matches a known recall.py transition,
+    // update the phase map so the heartbeat keeps rendering the
+    // right label on subsequent ticks. Unknown text falls through
+    // to the direct-edit path (preserves backward-compat for any
+    // future caller that uses a custom literal label).
+    const phase = recallTextToPhase(msg.text)
+    if (phase != null) {
+      setCurrentPhase(msg.chatId, phase)
+    }
+
     // Decision + side effect extracted to ../update-placeholder-handler
     // so the contract is testable without booting the gateway. See
     // update-placeholder-handler.ts and tests/update-placeholder-handler.e2e.test.ts.
+    // The direct edit happens regardless — gives immediate visibility
+    // (sub-second) while the phase map keeps subsequent heartbeat ticks
+    // in sync with the latest label.
     handleUpdatePlaceholder(
       { msg, sendMessageDraftFn, preAllocatedDrafts },
       (result) => {
@@ -1956,6 +2045,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // redundant clear in the consumed case.
       preAllocated.consumed = true
       cancelPlaceholderHeartbeat(chat_id)  // Path A heartbeat: stop ticking once the draft is consumed
+      clearPhaseState(chat_id)              // Path A §4: drop phase + auto-ack state for next turn
       // Best-effort: a clear failure (rate limit, expired draft) is
       // harmless — the orphan-cleanup path on turn_end is still wired
       // and will retry. Don't await: the subsequent sendMessage is
@@ -2170,6 +2260,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     // from abandoned and skips the redundant clear in the consumed case.
     preAllocated.consumed = true
     cancelPlaceholderHeartbeat(streamChatId)  // Path A heartbeat: stop ticking — stream_reply now owns the draft
+    clearPhaseState(streamChatId)              // Path A §4: drop phase + auto-ack state
   }
 
   // #271 (URL-button half): validate inline_keyboard for stream_reply.
@@ -2748,6 +2839,16 @@ function handleSessionEvent(ev: SessionEvent): void {
       touchTurnActiveMarker(STATE_DIR)
       const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
       const name = ev.toolName
+      // Path A §4: map the tool to a user-facing phase. Bash splits
+      // into checking (read-only) vs working (everything else); other
+      // tools follow the static lookup. Unknown tools / cosmetic tools
+      // (react, send_typing, etc.) return null → no phase change. The
+      // sticky writing_reply rule means once the model has started
+      // replying, mid-reply tool calls don't flip the phase back.
+      const phase = toolUseToPhase(name, ev.input)
+      if (phase != null) {
+        setCurrentPhase(currentSessionChatId, phase)
+      }
       if (isTelegramReplyTool(name)) {
         currentTurnReplyCalled = true
         if (orphanedReplyTimeoutId != null) {
@@ -3156,6 +3257,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (orphanDraft != null) {
         preAllocatedDrafts.delete(chatId)
         cancelPlaceholderHeartbeat(chatId)  // Path A heartbeat: stop ticking — turn ended
+        clearPhaseState(chatId)              // Path A §4: drop phase + auto-ack state
         // #472 #9 — skip the redundant empty-text clear if the entry was
         // already consumed by a reply path; that path owns the draft.
         if (sendMessageDraftFn != null && !orphanDraft.consumed) {
@@ -4015,6 +4117,11 @@ async function handleInbound(
           // preAllocatedDrafts.delete() site (pinned by
           // tests/gateway-heartbeat-call-sites.test.ts).
           startPlaceholderHeartbeat(chat_id, draftId, allocatedAt)
+          // Schedule the auto-ack timer (Path A §4) — fires at T+1s
+          // with the "🔵 Got your message…" phase IF nothing else has
+          // set the phase by then (recall.py → recalling phase wins
+          // for Hindsight agents). See heartbeat-phases-design.md §5.
+          scheduleAutoAck(chat_id)
         })
         .catch((err) => {
           // Entry-by-draftId guard: don't delete if a NEWER allocation
@@ -5024,7 +5131,7 @@ bot.command('agents', async ctx => {
   })
 })
 
-bot.command('switchroomstart', async ctx => {
+bot.command('agentstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
   try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
@@ -6922,7 +7029,7 @@ bot.command('version', async ctx => {
 })
 
 
-bot.command('switchroomhelp', async ctx => {
+bot.command('commands', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })
 })
@@ -6931,7 +7038,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
   // Slash-menu is deliberately trimmed from the full command catalogue.
   // See telegram-plugin/welcome-text.ts TELEGRAM_MENU_COMMANDS for the
   // rationale (mobile UX focus; ops primitives stay typable but out of
-  // the autocomplete clutter). /switchroomhelp surfaces the full list.
+  // the autocomplete clutter). /commands surfaces the full list.
   await bot.api.setMyCommands(
     [...TELEGRAM_BASE_COMMANDS, ...TELEGRAM_SWITCHROOM_COMMANDS],
     { scope: { type: 'all_private_chats' } },

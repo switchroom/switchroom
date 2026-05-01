@@ -123,8 +123,8 @@ Final answers still go through \`stream_reply\` with done=true as usual,
 
 export function registerDebugCommand(program: Command): void {
   const cmd = program
-    .command("debug")
-    .description("Observability tools for inspecting agent prompt layering");
+    .command("debug", { hidden: true })
+    .description("Observability tools for inspecting agent prompt layering [advanced]");
 
   cmd
     .command("turn <agent>")

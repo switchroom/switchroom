@@ -35,7 +35,7 @@ describe('parseCommandName', () => {
 
 describe('ADMIN_COMMAND_NAMES', () => {
   it('contains the fleet-management admin commands', () => {
-    const required = ['agents', 'logs', 'restart', 'update', 'reconcile', 'stop', 'switchroomstart', 'grant', 'dangerous', 'permissions', 'vault']
+    const required = ['agents', 'logs', 'restart', 'update', 'reconcile', 'stop', 'agentstart', 'grant', 'dangerous', 'permissions', 'vault']
     for (const cmd of required) {
       expect(ADMIN_COMMAND_NAMES.has(cmd)).toBe(true)
     }
@@ -66,7 +66,7 @@ describe('ADMIN_COMMAND_NAMES', () => {
     expect(ADMIN_COMMAND_NAMES.has('version')).toBe(false)
     expect(ADMIN_COMMAND_NAMES.has('doctor')).toBe(false)
     expect(ADMIN_COMMAND_NAMES.has('usage')).toBe(false)
-    expect(ADMIN_COMMAND_NAMES.has('switchroomhelp')).toBe(false)
+    expect(ADMIN_COMMAND_NAMES.has('commands')).toBe(false)
   })
 
   it('does not contain session-reset commands', () => {

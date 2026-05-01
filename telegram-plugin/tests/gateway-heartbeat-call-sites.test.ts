@@ -116,4 +116,48 @@ describe('gateway heartbeat — start/cancel structural pairing', () => {
     // Pins the rollback path from §10.1 — the env var must be honored.
     expect(GATEWAY_SRC).toContain('SWITCHROOM_TG_PLACEHOLDER_HEARTBEAT_MS')
   })
+
+  // ─── Path A §4 phase enrichment — additional structural pins ───
+
+  it('clearPhaseState is called near every preAllocatedDrafts.delete site (phase lifecycle)', () => {
+    // Each delete must clear the phase map + auto-ack timer for that
+    // chat. Same proximity rule as the heartbeat cancel pin.
+    // Skips the .catch site where neither heartbeat nor phase state
+    // was ever set up (the .then() never ran).
+    const deleteIdxs: number[] = []
+    const re = /preAllocatedDrafts\.delete\s*\(/g
+    let match: RegExpExecArray | null
+    while ((match = re.exec(codeOnly)) != null) {
+      deleteIdxs.push(match.index)
+    }
+    expect(deleteIdxs.length).toBeGreaterThan(0)
+    for (const idx of deleteIdxs) {
+      const window = codeOnly.slice(idx, idx + 400)
+      const isCatchSite = /pre-allocate draft failed/.test(window)
+      if (isCatchSite) continue
+      expect(window).toMatch(/clearPhaseState\s*\(/)
+    }
+  })
+
+  it('imports the phase helpers from the dedicated module', () => {
+    expect(GATEWAY_SRC).toMatch(/from ['"]\.\.\/placeholder-phase\.js['"]/)
+  })
+
+  it('scheduleAutoAck fires from the pre-alloc success branch', () => {
+    // Auto-ack must be scheduled inside the success branch, not on
+    // the .catch path. Same anchor as startPlaceholderHeartbeat.
+    const successBlock = codeOnly.indexOf('pre-allocate draft ok chatId=')
+    expect(successBlock).toBeGreaterThan(0)
+    const window = codeOnly.slice(successBlock, successBlock + 800)
+    expect(window).toMatch(/scheduleAutoAck\s*\(/)
+  })
+
+  it('tool_use → phase: gateway calls toolUseToPhase in the session-event handler', () => {
+    expect(codeOnly).toMatch(/toolUseToPhase\s*\(/)
+    expect(codeOnly).toMatch(/setCurrentPhase\s*\(/)
+  })
+
+  it('update_placeholder handler maps recall.py text to phases', () => {
+    expect(codeOnly).toMatch(/recallTextToPhase\s*\(/)
+  })
 })
