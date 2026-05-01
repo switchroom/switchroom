@@ -93,6 +93,17 @@ export interface FirstPaintDeps {
   logStreamingEvent: (ev: { kind: 'inbound_ack'; chatId: string; messageId: number; ackDelayMs: number }) => void
   /** Clock — defaults to Date.now in production; tests inject fake. */
   now?: () => number
+  /**
+   * Factory for the per-turn StatusReactionController. Defaults to constructing
+   * a real `StatusReactionController(cb)`. Tests inject a recording stub so
+   * the harness can decouple from the real controller's internal scheduling.
+   */
+  controllerFactory?: (cb: (emoji: string) => Promise<void>) => StatusReactionController
+  /**
+   * Sink for stderr-style error reporting from the seam. Defaults to writing
+   * to `process.stderr`. Tests inject a recorder.
+   */
+  logError?: (msg: string) => void
 }
 
 export interface FirstPaintResult {
@@ -165,7 +176,8 @@ export async function firstPaintTurn(
         }
         deps.suppressPtyPreview.delete(sKey)
 
-        const ctrl = new StatusReactionController(async (emoji) => {
+        const makeCtrl = deps.controllerFactory ?? ((cb) => new StatusReactionController(cb))
+        const ctrl = makeCtrl(async (emoji) => {
           await deps.bot.api.setMessageReaction(chatId, msgId, [
             { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
           ])
@@ -218,7 +230,8 @@ export async function firstPaintTurn(
         replyToMessageId: msgId != null ? msgId : undefined,
       })
     } catch (err) {
-      process.stderr.write(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
+      const log = deps.logError ?? ((m: string) => process.stderr.write(m))
+      log(`telegram gateway: progress-card startTurn failed: ${(err as Error).message}\n`)
     }
   }
 

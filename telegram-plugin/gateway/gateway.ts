@@ -4008,10 +4008,12 @@ async function handleInbound(
   const isSteering = firstPaintResult.isSteering
   const priorTurnStartedAt = firstPaintResult.priorTurnStartedAt
 
-  // Start a new progress card only for fresh turns (no prior turn in flight).
-  // (progressDriver.startTurn itself is now in firstPaintTurn; the pre-alloc
-  // path below stays inline — it depends on too much module-level state to
-  // include in the seam without ballooning the deps surface.)
+  // Fresh-turn-only block: progressDriver.startTurn already fired inside
+  // firstPaintTurn above. What stays inline here is the pre-alloc draft +
+  // forum-topic placeholder + heartbeat scheduling — gated by the same
+  // !isSteering && no-prior-turn condition because they're all "first
+  // visible signal" siblings of startTurn. They depend on too much
+  // module-level state to fold into the seam without ballooning deps.
   if (!isSteering && priorTurnStartedAt == null) {
     // Issue #416 — pre-allocate a sendMessageDraft for instant visual feedback
     // in DMs. The agent's first stream_reply consumes this draft id instead
