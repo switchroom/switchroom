@@ -3880,9 +3880,22 @@ async function handleInbound(
         const sKey = streamKey(chat_id, messageThreadId)
         const priorStream = activeDraftStreams.get(sKey)
         if (priorStream && !priorStream.isFinal()) {
-          void priorStream.finalize().catch(() => {})
+          // Closes #472 finding #17 — pre-fix this finalize was
+          // fire-and-forget. The new turn's reply tool would then create
+          // a fresh stream and send its first chunk while the prior
+          // stream's terminal sendMessage was still in flight. The
+          // late-materialise landed AFTER the new turn's content,
+          // visible to the user as a stale "Done" message followed by
+          // the new reply (or worse — duplicate content).
+          //
+          // Awaiting here costs the few hundred ms the final API call
+          // takes, but only on rapid follow-ups where the prior turn
+          // hadn't yet flushed. The latency hit beats the duplicate-
+          // content bug. Delete from the map FIRST so any concurrent
+          // reads can't see the stale stream while we await.
           activeDraftStreams.delete(sKey)
           activeDraftParseModes.delete(sKey)
+          await priorStream.finalize().catch(() => {})
         }
         suppressPtyPreview.delete(sKey)
 
