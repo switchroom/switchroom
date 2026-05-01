@@ -40,10 +40,28 @@ vi.mock("../setup/onboarding.js", () => ({
 
 vi.mock("../setup/telegram-api.js", () => ({
   pollForDmStart: vi.fn(),
+  // Stubbed so the BotFather walkthrough's fast path (existingToken
+  // supplied) doesn't hit the network in tests that don't inject a
+  // runBotFather override.
+  validateBotToken: vi.fn().mockResolvedValue({
+    id: 1,
+    is_bot: true,
+    first_name: "Bot",
+    username: "ken_bot",
+  }),
+  assertBotUsernameMatchesAgent: vi.fn(),
 }));
 
 import { addAgent, runFinalPreflight } from "./add-orchestrator.js";
 import { createAgent, completeCreation } from "./create-orchestrator.js";
+
+// Default BotFather walkthrough stub — every addAgent test injects this so
+// the orchestrator never reaches the real validateBotToken (no network).
+const fakeBotFather = (username = "ken_bot") =>
+  vi.fn().mockResolvedValue({
+    token: "fake:token",
+    bot: { username },
+  });
 
 function setupAgentDir(): { agentDir: string } {
   const root = mkdtempSync(join(tmpdir(), "agent-add-"));
@@ -121,6 +139,7 @@ describe("addAgent", () => {
       profile: "general",
       botToken: "fake:token",
       topology: "dm",
+      runBotFather: fakeBotFather(),
       readOAuthCode: async () => "browser-code",
       pollForPair,
       isUnitActive,
@@ -164,6 +183,7 @@ describe("addAgent", () => {
       profile: "general",
       botToken: "fake:token",
       topology: "dm",
+      runBotFather: fakeBotFather(),
       allowFromUserId: "9999",
       readOAuthCode: async () => "code",
       pollForPair,
@@ -238,6 +258,130 @@ describe("addAgent", () => {
         log: () => {},
       }),
     ).rejects.toThrow(/No OAuth code provided/);
+  });
+});
+
+describe("addAgent — BotFather walkthrough wiring (#188)", () => {
+  it("invokes the walkthrough with existingToken when --bot-token supplied", async () => {
+    const { agentDir } = setupAgentDir();
+    writeFileSync(
+      join(process.env.HOME!, ".config/systemd/user/switchroom-bot.service"),
+      "[Unit]\nExecStart=expect ...\n",
+    );
+
+    (createAgent as any).mockResolvedValue({
+      sessionName: "s",
+      agentDir,
+      loginUrl: undefined,
+    });
+    (completeCreation as any).mockResolvedValue({
+      outcome: { kind: "success" },
+      started: true,
+      instructions: [],
+    });
+
+    const runBotFather = vi.fn().mockResolvedValue({
+      token: "fake:token",
+      bot: { username: "bot_user" },
+    });
+
+    await addAgent({
+      name: "bot",
+      profile: "general",
+      botToken: "fake:token",
+      botUsername: "bot_user",
+      loose: false,
+      topology: "dm",
+      allowFromUserId: "1",
+      readOAuthCode: async () => "code",
+      isUnitActive: () => true,
+      log: () => {},
+      runBotFather,
+    });
+
+    expect(runBotFather).toHaveBeenCalledOnce();
+    const call = runBotFather.mock.calls[0]![0];
+    expect(call.agentSlug).toBe("bot");
+    expect(call.existingToken).toBe("fake:token");
+    expect(call.expectedUsername).toBe("bot_user");
+    expect(call.loose).toBe(false);
+  });
+
+  it("walkthrough resolves a token interactively when no --bot-token supplied", async () => {
+    const { agentDir } = setupAgentDir();
+    writeFileSync(
+      join(process.env.HOME!, ".config/systemd/user/switchroom-bot.service"),
+      "[Unit]\nExecStart=expect ...\n",
+    );
+
+    (createAgent as any).mockResolvedValue({
+      sessionName: "s",
+      agentDir,
+      loginUrl: undefined,
+    });
+    (completeCreation as any).mockResolvedValue({
+      outcome: { kind: "success" },
+      started: true,
+      instructions: [],
+    });
+
+    const runBotFather = vi.fn().mockResolvedValue({
+      token: "freshly-pasted:token",
+      bot: { username: "bot_walkthrough_bot" },
+    });
+
+    await addAgent({
+      name: "bot",
+      profile: "general",
+      // botToken intentionally omitted — wizard should fall through to
+      // the walkthrough.
+      topology: "dm",
+      allowFromUserId: "1",
+      readOAuthCode: async () => "code",
+      readLine: async () => "freshly-pasted:token",
+      isUnitActive: () => true,
+      log: () => {},
+      runBotFather,
+    });
+
+    expect(runBotFather).toHaveBeenCalledOnce();
+    const call = runBotFather.mock.calls[0]![0];
+    expect(call.existingToken).toBeUndefined();
+    expect(typeof call.readLine).toBe("function");
+
+    // The token returned by the walkthrough must be threaded into
+    // createAgent — otherwise the bot would scaffold without credentials.
+    expect((createAgent as any).mock.calls[0]![0].telegramBotToken).toBe(
+      "freshly-pasted:token",
+    );
+  });
+
+  it("aborts the wizard when the walkthrough throws", async () => {
+    const { agentDir } = setupAgentDir();
+    (createAgent as any).mockResolvedValue({
+      sessionName: "s",
+      agentDir,
+      loginUrl: undefined,
+    });
+    const runBotFather = vi
+      .fn()
+      .mockRejectedValue(new Error("Telegram rejected the token: Unauthorized"));
+
+    await expect(
+      addAgent({
+        name: "bot",
+        profile: "general",
+        botToken: "broken:token",
+        topology: "dm",
+        readOAuthCode: async () => "code",
+        log: () => {},
+        runBotFather,
+      }),
+    ).rejects.toThrow(/Telegram rejected the token/);
+
+    // createAgent must not be called when bot-token validation fails —
+    // otherwise we'd scaffold an agent we'd then have to roll back.
+    expect(createAgent).not.toHaveBeenCalled();
   });
 });
 

@@ -1860,7 +1860,15 @@ export function registerAgentCommand(program: Command): void {
     )
     .option(
       "--bot-token <token>",
-      "BotFather token for the new agent's bot (or set SWITCHROOM_BOT_TOKEN env var)",
+      "BotFather token for the new agent's bot. Omit to run the interactive @BotFather walkthrough (#188); or set SWITCHROOM_BOT_TOKEN env var to avoid leaking the token into shell history.",
+    )
+    .option(
+      "--bot-username <username>",
+      "Optional explicit bot username for exact-equality validation (use when the bot's username deliberately doesn't contain the agent slug).",
+    )
+    .option(
+      "--loose",
+      "Downgrade the slug-in-username assertion to a warning. Use when the bot is intentionally named without the agent slug.",
     )
     .option(
       "--allow-from <user_id>",
@@ -1877,21 +1885,19 @@ export function registerAgentCommand(program: Command): void {
           profile: string;
           topology: string;
           botToken?: string;
+          botUsername?: string;
+          loose?: boolean;
           allowFrom?: string;
           pairTimeoutMs?: string;
         },
       ) => {
         const configPath = getConfigPath(program);
 
+        // No bot-token? That's fine — the BotFather walkthrough (#188)
+        // will guide the operator through @BotFather and capture the
+        // token interactively. We only short-circuit when the operator
+        // already has a token (flag or env var).
         const botToken = opts.botToken ?? process.env.SWITCHROOM_BOT_TOKEN;
-        if (!botToken) {
-          console.error(
-            chalk.red(
-              "Error: --bot-token is required (or set SWITCHROOM_BOT_TOKEN env var to keep it out of shell history).",
-            ),
-          );
-          process.exit(1);
-        }
 
         if (opts.topology !== "dm" && opts.topology !== "forum") {
           console.error(
@@ -1919,15 +1925,11 @@ export function registerAgentCommand(program: Command): void {
 
         console.log(chalk.bold(`\nswitchroom agent add: ${name}\n`));
 
-        // Read OAuth code from stdin, mirroring bootstrap's terminal stub.
-        // (Foreman bot relay path is the future replacement — see #175.)
-        const readOAuthCode = async (loginUrl: string | undefined): Promise<string> => {
-          if (loginUrl) {
-            console.log(chalk.bold(`\n  Open this URL in your browser to authenticate:\n`));
-            console.log(chalk.cyan(`  ${loginUrl}\n`));
-          }
-          process.stdout.write(chalk.bold("  Paste the browser code here: "));
-          return new Promise<string>((resolveCode) => {
+        // Generic stdin line reader — shared between the BotFather
+        // walkthrough's "paste the token" step and the OAuth code prompt.
+        const readLine = (prompt: string): Promise<string> => {
+          process.stdout.write(chalk.bold(prompt));
+          return new Promise<string>((resolveLine) => {
             process.stdin.setEncoding("utf-8");
             let buf = "";
             const onData = (chunk: Buffer | string) => {
@@ -1935,11 +1937,19 @@ export function registerAgentCommand(program: Command): void {
               const newlineIdx = buf.indexOf("\n");
               if (newlineIdx !== -1) {
                 process.stdin.removeListener("data", onData);
-                resolveCode(buf.slice(0, newlineIdx).trim());
+                resolveLine(buf.slice(0, newlineIdx).trim());
               }
             };
             process.stdin.on("data", onData);
           });
+        };
+
+        const readOAuthCode = async (loginUrl: string | undefined): Promise<string> => {
+          if (loginUrl) {
+            console.log(chalk.bold(`\n  Open this URL in your browser to authenticate:\n`));
+            console.log(chalk.cyan(`  ${loginUrl}\n`));
+          }
+          return readLine("  Paste the browser code here: ");
         };
 
         try {
@@ -1947,11 +1957,14 @@ export function registerAgentCommand(program: Command): void {
             name,
             profile: opts.profile,
             botToken,
+            botUsername: opts.botUsername,
+            loose: opts.loose,
             topology,
             allowFromUserId: opts.allowFrom,
             pairTimeoutMs,
             configPath,
             readOAuthCode,
+            readLine,
           });
 
           if (result.preflightOk) {
