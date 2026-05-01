@@ -313,3 +313,119 @@ describe("createIssuesCardHandle", () => {
     expect(bot.sent).toHaveLength(1);
   });
 });
+
+// ─── Persistence (#472 #19) ──────────────────────────────────────────────────
+
+describe("createIssuesCardHandle — persistence (#472 #19)", () => {
+  // Use vitest's fs lifecycle since these are bun:test compatible too.
+  // (telegram-plugin/tests/issues-card.test.ts runs under both vitest and
+  // bun test via the package.json scripts.)
+  it("reads a prior gateway boot's messageId from disk and edits it on first refresh", async () => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "issues-card-persist-"));
+    const persistPath = join(dir, "issues-card.json");
+    try {
+      // Simulate a prior gateway run that posted message_id=42.
+      writeFileSync(persistPath, JSON.stringify({ messageId: 42 }) + "\n");
+
+      const bot = makeFakeBot();
+      const handle = createIssuesCardHandle({
+        agentName: "klanker",
+        chatId: "1",
+        bot,
+        persistPath,
+      });
+
+      // The handle should think it already has a card to edit, not send fresh.
+      expect(handle.messageId()).toBe(42);
+
+      await handle.refresh([makeEvent({ summary: "after restart" })]);
+      // Should edit the existing 42, NOT send a new card.
+      expect(bot.sent).toHaveLength(0);
+      expect(bot.edits).toHaveLength(1);
+      expect(bot.edits[0].messageId).toBe(42);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the messageId to disk after the first send", async () => {
+    const { mkdtempSync, rmSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "issues-card-persist-write-"));
+    const persistPath = join(dir, "issues-card.json");
+    try {
+      const bot = makeFakeBot();
+      const handle = createIssuesCardHandle({
+        agentName: "klanker",
+        chatId: "1",
+        bot,
+        persistPath,
+      });
+
+      await handle.refresh([makeEvent({})]);
+      expect(handle.messageId()).toBe(1000);
+
+      const persisted = JSON.parse(readFileSync(persistPath, "utf8"));
+      expect(persisted).toEqual({ messageId: 1000 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("clears the persisted messageId on delete", async () => {
+    const { mkdtempSync, rmSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "issues-card-persist-delete-"));
+    const persistPath = join(dir, "issues-card.json");
+    try {
+      const bot = makeFakeBot();
+      const handle = createIssuesCardHandle({
+        agentName: "klanker",
+        chatId: "1",
+        bot,
+        persistPath,
+      });
+
+      await handle.refresh([makeEvent({})]);
+      // Now go healthy → handle issues a deleteMessage and clears state.
+      await handle.refresh([]);
+      expect(bot.deletes).toHaveLength(1);
+
+      const persisted = JSON.parse(readFileSync(persistPath, "utf8"));
+      expect(persisted).toEqual({ messageId: null });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to fresh-card behavior when persist file is missing or malformed", async () => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "issues-card-persist-bad-"));
+    const persistPath = join(dir, "issues-card.json");
+    try {
+      writeFileSync(persistPath, "not json");
+
+      const bot = makeFakeBot();
+      const handle = createIssuesCardHandle({
+        agentName: "klanker",
+        chatId: "1",
+        bot,
+        persistPath,
+      });
+
+      // Malformed file → fall back to no prior card.
+      expect(handle.messageId()).toBeNull();
+      await handle.refresh([makeEvent({})]);
+      expect(bot.sent).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

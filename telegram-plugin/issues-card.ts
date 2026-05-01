@@ -16,6 +16,7 @@
  * reuse the same patterns.
  */
 
+import { readFileSync, writeFileSync } from "node:fs";
 import { escapeHtml } from "./card-format.js";
 import type { IssueEvent, IssueSeverity } from "../src/issues/index.js";
 
@@ -153,6 +154,19 @@ export interface CreateIssuesCardOpts {
   maxRows?: number;
   /** stderr-style log sink. Defaults to noop. */
   log?: (msg: string) => void;
+  /**
+   * Optional persistence path for the card's message_id (closes
+   * #472 finding #19). Without persistence, a gateway crashloop posts
+   * a fresh card on every restart — systemd's StartLimitBurst=10 cap
+   * means up to 10 unnecessary cards in 60s. With it, the next boot
+   * reads the prior message_id and edits-in-place instead.
+   *
+   * The file is a single-line JSON `{"messageId": N}`. Best-effort:
+   * read failures (missing file, malformed JSON, permission denied)
+   * fall back to fresh-card behavior; write failures are logged but
+   * don't block the refresh path.
+   */
+  persistPath?: string;
 }
 
 /**
@@ -175,17 +189,51 @@ function extractRetryAfterSecs(err: unknown): number | null {
 
 const COOLDOWN_JITTER_MS = 500;
 
+function readPersistedMessageId(path: string, log: (msg: string) => void): number | null {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = JSON.parse(raw) as { messageId?: unknown };
+    const v = parsed.messageId;
+    if (typeof v === "number" && Number.isInteger(v) && v > 0) return v;
+    return null;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    log(`issues-card: persist read failed (${code ?? (err as Error).message}) — fresh card`);
+    return null;
+  }
+}
+
+function writePersistedMessageId(
+  path: string,
+  messageId: number | null,
+  log: (msg: string) => void,
+): void {
+  try {
+    writeFileSync(path, JSON.stringify({ messageId }) + "\n", { mode: 0o600 });
+  } catch (err: unknown) {
+    log(`issues-card: persist write failed (${(err as Error).message})`);
+  }
+}
+
 export function createIssuesCardHandle(
   opts: CreateIssuesCardOpts,
 ): IssuesCardHandle {
-  let messageId: number | null = null;
+  const log = opts.log ?? (() => {});
+  // Closes #472 finding #19 — read any prior gateway boot's card
+  // message_id from disk so a fresh boot edits the existing pinned
+  // card instead of posting a duplicate. The map is the gateway's
+  // source of truth for the lifetime of one process; we just bridge
+  // across process boundaries.
+  let messageId: number | null = opts.persistPath
+    ? readPersistedMessageId(opts.persistPath, log)
+    : null;
   let lastBody: string | null = null;
   // Cooldown gate: when we hit a 429, suspend further refreshes until
   // retry_after elapses. The watcher polls every 2s; without this gate
   // we'd burn through grammY's auto-retry budget and risk a bot-wide
   // 24h ban under sustained issue-flapping. See #442.
   let cooldownUntil = 0;
-  const log = opts.log ?? (() => {});
   const nowFn = opts.now ?? Date.now;
 
   function noteRateLimited(err: unknown, label: string): void {
@@ -195,6 +243,18 @@ export function createIssuesCardHandle(
     log(
       `issues-card: ${label} 429 — backing off ${retryAfter}s (cooldown until ${cooldownUntil})`,
     );
+  }
+
+  /**
+   * Single mutation point for messageId so the persisted file always
+   * matches the in-memory state. Best-effort write — see persistPath
+   * docs for the failure-mode policy.
+   */
+  function setMessageId(next: number | null): void {
+    messageId = next;
+    if (opts.persistPath) {
+      writePersistedMessageId(opts.persistPath, next, log);
+    }
   }
 
   return {
@@ -222,7 +282,7 @@ export function createIssuesCardHandle(
             noteRateLimited(err, "delete");
             log(`issues-card: delete failed: ${(err as Error).message}`);
           }
-          messageId = null;
+          setMessageId(null);
           lastBody = null;
         }
         return;
@@ -241,7 +301,7 @@ export function createIssuesCardHandle(
       if (messageId == null) {
         try {
           const sent = await opts.bot.sendMessage(opts.chatId, body, sendOpts);
-          messageId = sent.message_id;
+          setMessageId(sent.message_id);
           lastBody = body;
         } catch (err) {
           noteRateLimited(err, "send");
@@ -258,7 +318,7 @@ export function createIssuesCardHandle(
         // The card's message_id is stale (manually deleted, edit window
         // expired, etc.). Re-post fresh on the next tick.
         log(`issues-card: edit failed, re-posting: ${(err as Error).message}`);
-        messageId = null;
+        setMessageId(null);
         lastBody = null;
         // If we've just been told to back off, don't double-down by
         // immediately re-posting — let the cooldown gate above pick
@@ -266,7 +326,7 @@ export function createIssuesCardHandle(
         if (nowFn() < cooldownUntil) return;
         try {
           const sent = await opts.bot.sendMessage(opts.chatId, body, sendOpts);
-          messageId = sent.message_id;
+          setMessageId(sent.message_id);
           lastBody = body;
         } catch (err2) {
           noteRateLimited(err2, "re-post");

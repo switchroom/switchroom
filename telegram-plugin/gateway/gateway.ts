@@ -1498,6 +1498,11 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     threadId,
     bot: botApi,
     log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+    // Closes #472 finding #19 — persist the card's message_id so a
+    // gateway crashloop edits the existing pinned card on every boot
+    // instead of posting a duplicate. Lives in the gateway's per-agent
+    // state dir alongside other ephemerals.
+    persistPath: join(stateDir, 'issues-card.json'),
   })
   activeIssuesWatcher = startIssuesWatcher({
     stateDir,
