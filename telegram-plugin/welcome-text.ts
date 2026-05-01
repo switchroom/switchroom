@@ -119,12 +119,12 @@ export function startText(agentName: string, dmDisabled: boolean): string {
     `1. DM me anything — you'll get a 6-char code`,
     `2. In Claude Code: <code>/telegram:access pair &lt;code&gt;</code>`,
     ``,
-    `After pairing, try <code>/status</code> or <code>/switchroomhelp</code>.`,
+    `After pairing, try <code>/status</code> or <code>/commands</code>.`,
   ].join("\n");
 }
 
 /**
- * Concise help — points at /switchroomhelp for the full catalogue.
+ * Concise help — points at /commands for the full catalogue.
  * Deliberately short because Telegram truncates /help popovers.
  */
 export function helpText(agentName: string): string {
@@ -137,7 +137,7 @@ export function helpText(agentName: string): string {
     ``,
     `<code>/start</code> — pairing instructions`,
     `<code>/status</code> — agent, model, auth`,
-    `<code>/switchroomhelp</code> — full command list`,
+    `<code>/commands</code> — full command list`,
   ].join("\n");
 }
 
@@ -197,8 +197,8 @@ export function statusUnpairedText(): string {
 }
 
 /**
- * The grouped /switchroomhelp command catalogue. Groups the commands
- * so the list is scannable rather than one flat 25-item dump.
+ * The grouped /commands catalogue. Groups the commands so the list is
+ * scannable rather than one flat 25-item dump.
  *
  * When this file changes, the switchroomCommands array in
  * registerSwitchroomBotCommands() (in both gateway.ts and server.ts)
@@ -210,15 +210,15 @@ export const switchroomHelpCommandNames = [
   // Session & approvals
   "new", "reset", "approve", "deny", "pending", "interrupt",
   // Agents
-  "agents", "switchroomstart", "stop", "restart", "logs", "memory",
+  "agents", "agentstart", "stop", "restart", "logs", "memory",
   // Auth & config
   "auth", "reauth", "authfallback",
   "topics", "update", "version",
   "permissions", "grant", "dangerous", "vault", "doctor",
-  "switchroomhelp",
+  "commands",
   // Note: "reconcile" is a deprecated alias still handled as a bot command
   // but intentionally omitted from this autocomplete/help array so it
-  // doesn't appear in /switchroomhelp or the Telegram command palette.
+  // doesn't appear in /commands or the Telegram command palette.
 ] as const;
 
 /**
@@ -229,7 +229,7 @@ export const switchroomHelpCommandNames = [
  * `switchroomHelpCommandNames` remains typable and working; the
  * autocomplete popup just doesn't clutter with ops primitives like
  * /vault, /grant, /dangerous, /permissions, /topics, /memory, and
- * /switchroomstart that are better driven from the terminal.
+ * /agentstart that are better driven from the terminal.
  *
  * Ordering matters — Telegram renders them in array order, so the
  * most-likely-to-be-used commands come first.
@@ -270,7 +270,7 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "reauth", description: "Re-auth Claude for this agent" },
   { command: "authfallback", description: "Manual quota check + fall back to next slot" },
   // Escape hatch — shows the full catalogue including CLI-only commands
-  { command: "switchroomhelp", description: "Full command list" },
+  { command: "commands", description: "Full command list" },
 ] as const;
 
 /**
@@ -296,7 +296,7 @@ export function switchroomHelpText(agentName: string): string {
     ``,
     `<b>Agents</b>`,
     `<code>/agents</code> — list all agents`,
-    `<code>/switchroomstart [name]</code> — start an agent`,
+    `<code>/agentstart [name]</code> — start an agent`,
     `<code>/stop [name]</code> — stop an agent`,
     `<code>/logs [name] [lines]</code> — show agent logs`,
     `<code>/memory &lt;query&gt;</code> — search agent memory`,
@@ -325,7 +325,7 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/vault grants [agent]</code> — list active capability grants (tap to revoke)`,
     `<code>/doctor</code> — health check (deps, services, MCP)`,
     `<code>/usage</code> — Pro/Max plan quota (5h + 7d windows)`,
-    `<code>/switchroomhelp</code> — this help`,
+    `<code>/commands</code> — this help`,
     ``,
     `<i>Tip: <code>/update</code> picks up new code; <code>/restart</code> bounces a stuck agent; <code>/version</code> checks what's running.</i>`,
   ].join("\n");

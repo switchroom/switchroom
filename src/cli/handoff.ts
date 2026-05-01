@@ -18,10 +18,10 @@ import {
  */
 export function registerHandoffCommand(program: Command): void {
   program
-    .command("handoff <agent>")
+    .command("handoff <agent>", { hidden: true })
     .description(
       "Summarize the agent's last session into a handoff briefing " +
-      "(.handoff.md) and topic line (.handoff-topic)",
+      "(.handoff.md) and topic line (.handoff-topic). [internal — used by Stop hook]",
     )
     .option("--timeout <secs>", "API call timeout in seconds", "30")
     .option("--max-turns <n>", "Max turns fed to the summarizer", String(DEFAULT_MAX_TURNS))

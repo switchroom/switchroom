@@ -280,7 +280,7 @@ Each plugin instance is bound to one agent (via `SWITCHROOM_AGENT_NAME` set by `
 | Command | Description |
 |---------|-------------|
 | `/agents` | List all agents and their status |
-| `/switchroomstart [name]` | Start an agent (default: this agent) |
+| `/agentstart [name]` | Start an agent (default: this agent) |
 | `/stop [name]` | Stop an agent (default: this agent) |
 | `/restart [name\|all]` | Restart an agent (default: this agent; pass `all` for every agent) |
 | `/auth` | Show auth/token status |
@@ -291,7 +291,7 @@ Each plugin instance is bound to one agent (via `SWITCHROOM_AGENT_NAME` set by `
 | `/permissions [agent]` | Show allow/deny list (default: this agent) |
 | `/grant <tool>` / `/grant <agent> <tool>` | Grant a tool permission and reconcile (default: this agent) |
 | `/dangerous [off]` / `/dangerous <agent> [off]` | Toggle full tool access (default: this agent) |
-| `/switchroomhelp` | List all available switchroom bot commands |
+| `/commands` | List all available switchroom bot commands |
 
 ### How it works
 
@@ -311,7 +311,7 @@ Commands are intercepted by Grammy's command handlers *before* reaching the gene
 
 ### Notes
 
-- `/switchroomstart` is used instead of `/start` to avoid conflicting with Telegram's built-in `/start` command (used for pairing).
+- `/agentstart` is used instead of `/start` to avoid conflicting with Telegram's built-in `/start` command (used for pairing).
 - Commands work in both DM and group/topic contexts.
 - In groups, only users in the group's allowlist can execute commands.
 - Commands are registered with BotFather automatically on startup.

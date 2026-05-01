@@ -35,7 +35,7 @@
  * Scope: ONLY fleet-management verbs (lifecycle, scaffolding, privileges,
  * secrets). Per-agent / per-chat ops — auth, interrupt, permission flow,
  * info commands (`/version`, `/doctor`, `/usage`), session reset (`/new`,
- * `/reset`), and `/switchroomhelp` — must always be gateway-handled
+ * `/reset`), and `/commands` — must always be gateway-handled
  * regardless of admin status, because they need to work even when the model
  * is unreachable (rate-limited, expired token, network down). Routing those
  * through Claude defeats the entire point of the slash-command UX.
@@ -48,7 +48,7 @@ export const ADMIN_COMMAND_NAMES = new Set<string>([
   'logs',
   'restart',
   'stop',
-  'switchroomstart',
+  'agentstart',
   'update',
   'reconcile',
   // Privileges + secrets
