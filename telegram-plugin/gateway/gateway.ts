@@ -3680,7 +3680,7 @@ async function handleInbound(
           return
         }
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
-        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
         await executeVaultOp(ctx, chat_id, pendingVault.op, pendingVault.key, passphrase, undefined)
       } else if (pendingVault.kind === 'unlock') {
         // Issue #158: passphrase for /vault unlock — sent directly to the
@@ -3690,7 +3690,7 @@ async function handleInbound(
           await switchroomReply(ctx, 'Passphrase cannot be empty. Try /vault unlock again.', { html: true })
           return
         }
-        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault unlock passphrase')
         const result = await unlockViaBroker(passphrase)
         if (result.ok) {
           await switchroomReply(ctx, '🔓 Vault broker unlocked.', { html: true })
@@ -3709,7 +3709,7 @@ async function handleInbound(
           return
         }
         vaultPassphraseCache.set(chat_id, { passphrase, expiresAt: Date.now() + VAULT_PASSPHRASE_TTL_MS })
-        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault passphrase')
         await executeDeferredSecretSave(ctx, pendingVault.deferKey, passphrase, pendingVault.cardMessageId)
       } else if (pendingVault.kind === 'grant-wizard' && pendingVault.awaitingCustomDuration) {
         // Issue #227: custom duration text reply for grant wizard
@@ -3730,7 +3730,7 @@ async function handleInbound(
         let value = text
         const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
         if (codeBlockMatch) value = codeBlockMatch[1]!
-        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
+        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'vault secret value')
         await executeVaultOp(ctx, chat_id, 'set', pendingVault.key, pendingVault.passphrase, value.trim())
       }
       return
@@ -3772,8 +3772,8 @@ async function handleInbound(
           return
         }
         secretStaging.delete(staged.chat_id, staged.message_id)
-        if (msgId != null) void bot.api.deleteMessage(chat_id, msgId).catch(() => {})
-        void bot.api.deleteMessage(chat_id, staged.message_id).catch(() => {})
+        if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'stash command')
+        await deleteSensitiveMessage(chat_id, staged.message_id, 'detected secret')
         await switchroomReply(ctx, `✅ stored as <code>vault:${slug}</code> (masked: <code>${maskToken(staged.detection.matched_text)}</code>)`, { html: true })
         return
       }
@@ -4346,6 +4346,45 @@ async function switchroomReply(
     ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
     ...(options.reply_markup ? { reply_markup: options.reply_markup } : {}),
   })
+}
+
+/**
+ * Best-effort delete of a message that contains a sensitive value
+ * (passphrase, vault secret, raw detected secret). Closes #472 finding
+ * #22 — pre-fix every site `void bot.api.deleteMessage(...).catch(() => {})`
+ * silently swallowed failures, leaving the secret visible in chat
+ * history forever with no operator signal.
+ *
+ * On failure: log loudly to stderr AND post an in-chat warning naming
+ * the message_id the user must delete manually. Awaited so the caller
+ * can rely on at-least-attempt + at-least-notify semantics.
+ */
+async function deleteSensitiveMessage(
+  chatId: string,
+  msgId: number,
+  reason: string,
+): Promise<void> {
+  try {
+    await bot.api.deleteMessage(chatId, msgId)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `telegram gateway: SECURITY: delete of ${reason} message ${msgId} in chat ${chatId} FAILED: ${msg}. ` +
+      `The sensitive value remains visible in chat history.\n`,
+    )
+    // In-chat warning so the user knows to delete manually. Best-effort
+    // — if this also fails (rare; same chat just rejected our delete),
+    // the stderr log is the audit trail.
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        `⚠️ <b>Could not auto-delete message containing your ${escapeHtmlForTg(reason)}.</b>\n\nPlease delete message <code>${msgId}</code> manually so the value is not retained in chat history.\n\n<i>Reason: ${escapeHtmlForTg(msg)}</i>`,
+        { parse_mode: 'HTML' },
+      )
+    } catch {
+      /* best-effort warning — primary signal already on stderr */
+    }
+  }
 }
 
 function getCommandArgs(ctx: Context): string {
