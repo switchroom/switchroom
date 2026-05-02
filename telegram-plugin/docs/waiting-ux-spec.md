@@ -95,12 +95,21 @@ do not gate CI yet.
 
 ## PR 2–5 — implementation roadmap
 
-| PR  | Scope                                                                | Un-skips                                            |
-| --- | -------------------------------------------------------------------- | --------------------------------------------------- |
-| 2   | Kill instant-draft placeholder; preserve early-ack 👀                | Class A no-placeholder, Class B no-placeholder      |
-| 3   | First-answer-text deadline implementation; tighten <Ns numbers       | Class A/B/C answer-text-deadline assertions         |
-| 4   | Card-gate rewrite to `(>=60s) OR (sub-agent appeared)`               | Class B no-card; Class C card-gate tests            |
-| 5   | Remove `🔵 thinking` / `📚 recalling memories` / `💭 thinking` strings; sub-agent header = list length | Remaining no-placeholder + sub-agent count tests    |
+| PR  | Scope                                                                | Un-skips                                            | Status   |
+| --- | -------------------------------------------------------------------- | --------------------------------------------------- | -------- |
+| 2   | Kill instant-draft placeholder; preserve early-ack 👀                | Class A no-placeholder, Class B no-placeholder      | shipped  |
+| 3   | First-answer-text deadline implementation; tighten <Ns numbers       | Class A/B/C answer-text-deadline assertions         | shipped  |
+| 4   | Card-gate rewrite to `(>=60s) OR (sub-agent appeared)`               | Class B no-card; Class C card-gate tests            | shipped  |
+| 5   | Remove `🔵 thinking` / `📚 recalling memories` / `💭 thinking` strings; sub-agent header = list length | Remaining no-placeholder + sub-agent count tests    | pending  |
+
+**PR 4 status (this PR):** ships the card-gate rewrite. Defaults change
+from `initialDelayMs=30_000, promoteAfterMs=5_000, promoteOnParentToolCount=3`
+to `initialDelayMs=60_000, promoteAfterMs=0 (disabled), promoteOnParentToolCount=0
+(disabled)`. The Class B "no card rendered" and Class C "card renders on
+sub-agent" / "card renders after 60s" tests are un-skipped. F3's late-card
+symptom (long single-tool turn shows no card) is now intentional spec
+behaviour rather than a bug — see `real-gateway-f3-late-card.test.ts`
+header for the reframe.
 
 ## Failure-mode history (F1–F4, fixed in earlier #553 PRs)
 

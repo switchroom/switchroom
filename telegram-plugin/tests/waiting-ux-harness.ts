@@ -285,7 +285,7 @@ export function createWaitingUxHarness(opts: CreateHarnessOpts = {}): HarnessHan
     },
     coalesceMs: opts.driverCoalesceMs ?? 400,
     minIntervalMs: opts.driverMinIntervalMs ?? 500,
-    initialDelayMs: opts.driverInitialDelayMs ?? 30000,
+    initialDelayMs: opts.driverInitialDelayMs ?? 60000,
     heartbeatMs: opts.driverHeartbeatMs,
   })
 

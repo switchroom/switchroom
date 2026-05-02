@@ -1443,11 +1443,11 @@ describe('forceCompleteTurn — external completion signal', () => {
     // initialDelayMs=30s elapses), and stream_reply(done=true) fires
     // forceCompleteTurn. The deferred first-emit timer must be cancelled
     // so it can't fire at +30s with a ghost card.
-    // Disable F3 time-based promotion (default 5s) so this test isolates
-    // the cusp-race behaviour pre-existed the F3 fix — forceCompleteTurn
-    // must cancel the deferred-first-emit timer regardless. With time-
-    // promotion enabled, the card would correctly emit at +5s; that's
-    // covered by the F3 tests, not this one.
+    // Disable F3 time-based promotion explicitly (it's now 0/disabled
+    // by default under v2 #553 PR 4, but pin it here for clarity) so
+    // this test isolates the cusp-race behaviour: forceCompleteTurn
+    // must cancel the deferred-first-emit timer regardless of any
+    // promotion path.
     const { driver, emits, advance } = harness(0, 0, {
       initialDelayMs: 30_000,
       promoteAfterMs: 999_999,

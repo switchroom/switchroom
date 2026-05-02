@@ -126,6 +126,80 @@ describe('v2 spec — PR 3: first-answer-text deadlines', () => {
   })
 })
 
+// ─── PR 4 — card-gate rewrite (Class B no-card; Class C card-gate) ────────
+//
+// Extracted from the Class B / Class C describe.skip blocks below and
+// un-skipped in #553 PR 4. The other tests in those blocks (no-placeholder,
+// ladder integrity, sub-agent header count) remain skipped pending PR 5.
+// Once PR 5 lands, the duplicates here can be folded back into the parent
+// describes.
+describe('v2 spec — PR 4: card gate (>=60s) OR (sub-agent appeared)', () => {
+  it('Class B — emits NO progress card (turn under 60s, no sub-agents)', async () => {
+    const h = createRealGatewayHarness({ gapMs: 0 })
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'short tool turn' })
+    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'short tool turn' })
+    await h.clock.advance(200)
+    h.feedSessionEvent({ kind: 'thinking' })
+    await h.clock.advance(300)
+    // Two tools, total turn ~10s — well under 60s, no sub-agents.
+    h.feedSessionEvent({ kind: 'tool_use', toolName: 'Read', toolUseId: 't1' })
+    await h.clock.advance(3_000)
+    h.feedSessionEvent({ kind: 'tool_result', toolUseId: 't1', toolName: 'Read' })
+    h.feedSessionEvent({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't2' })
+    await h.clock.advance(5_000)
+    h.feedSessionEvent({ kind: 'tool_result', toolUseId: 't2', toolName: 'Bash' })
+    await h.streamReply({ chat_id: CHAT, text: 'done', done: true })
+    h.feedSessionEvent({ kind: 'turn_end', durationMs: 9_000 })
+    await h.clock.advance(500)
+
+    expect(h.expectNoCardSent(CHAT)).toBeNull()
+    h.finalize()
+  })
+
+  it('Class C — progress card appears when a sub-agent dispatches (regardless of elapsed time)', async () => {
+    const h = createRealGatewayHarness({ gapMs: 0 })
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'spawn a worker' })
+    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'spawn a worker' })
+    await h.clock.advance(200)
+    h.feedSessionEvent({ kind: 'thinking' })
+    await h.clock.advance(300)
+    // Sub-agent appears well under the 60s elapsed threshold — the
+    // card MUST still render because of the sub-agent gate.
+    h.feedSessionEvent({ kind: 'sub_agent_started', agentId: 'a1', firstPromptText: 'do work' })
+    await h.clock.advance(2_000)
+    h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a1' })
+    await h.clock.advance(500)
+
+    expect(h.expectNoCardSent(CHAT), 'card MUST render when a sub-agent dispatches').not.toBeNull()
+
+    await h.streamReply({ chat_id: CHAT, text: 'done', done: true })
+    h.feedSessionEvent({ kind: 'turn_end', durationMs: 3_000 })
+    await h.clock.advance(500)
+    h.finalize()
+  })
+
+  it('Class C — progress card appears when elapsed >= 60s even without a sub-agent', async () => {
+    const h = createRealGatewayHarness({ gapMs: 0 })
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'long single tool' })
+    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'long single tool' })
+    await h.clock.advance(200)
+    h.feedSessionEvent({ kind: 'thinking' })
+    await h.clock.advance(300)
+    h.feedSessionEvent({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't1' })
+    // Cross the 60s threshold.
+    await h.clock.advance(61_000)
+    h.feedSessionEvent({ kind: 'tool_result', toolUseId: 't1', toolName: 'Bash' })
+    await h.clock.advance(500)
+
+    expect(h.expectNoCardSent(CHAT), 'card MUST render after 60s elapsed').not.toBeNull()
+
+    await h.streamReply({ chat_id: CHAT, text: 'done', done: true })
+    h.feedSessionEvent({ kind: 'turn_end', durationMs: 62_000 })
+    await h.clock.advance(500)
+    h.finalize()
+  })
+})
+
 // ─── Class A — instant (<2s, NO tools) ───────────────────────────────────
 //
 // TODO(#553-PR-2): un-skip after instant-draft placeholder removal +
@@ -221,9 +295,9 @@ describe.skip('v2 spec — Class A (instant, <2s, no tools)', () => {
 // ─── Class B — short (2–60s, tools, no sub-agents) ───────────────────────
 //
 // TODO(#553-PR-2): un-skip the no-placeholder + answer-text bits.
-// TODO(#553-PR-4): un-skip "no progress card" once the card gate
-// changes from "elapsed > initialDelayMs OR tool-count threshold" to
-// "elapsed >= 60s OR sub-agent appeared".
+// PR 4 (shipped): the "no progress card" assertion is exercised by the
+// PR-4-specific describe block above; the skipped variant here remains
+// pending PR 5 cleanup of the rest of the block.
 // TODO(#553-PR-5): ladder integrity is final-state RED only after PR 5
 // removes the placeholder fallback that currently masks the regression.
 describe.skip('v2 spec — Class B (short, 2–60s, tools, no sub-agents)', () => {
@@ -320,8 +394,9 @@ describe.skip('v2 spec — Class B (short, 2–60s, tools, no sub-agents)', () =
 
 // ─── Class C — long-running (>60s OR sub-agents/background workers) ───────
 //
-// TODO(#553-PR-4): un-skip the card-gate tests once the gate is
-// `(elapsed >= 60s) OR (sub-agent appeared)`.
+// PR 4 (shipped): card-gate tests are exercised by the PR-4-specific
+// describe block above; the skipped variants here remain pending PR 5
+// (no-placeholder, sub-agent count) cleanup.
 // TODO(#553-PR-5): un-skip the no-placeholder + sub-agent count tests.
 describe.skip('v2 spec — Class C (long-running OR sub-agents)', () => {
   it('progress card appears when a sub-agent dispatches (regardless of elapsed time)', async () => {

@@ -19,10 +19,12 @@
  *   - Specific text shapes that break `extractNarrativeLabel` (multi-
  *     line prose with the "real" label not on line 1)
  *
- * The test below pins the well-spaced multi-step contract — if a
- * future change regresses it (e.g., narratives stop being appended),
- * we'll catch it here. F4 still needs production observation to
- * surface the actual failure mode for a tighter test.
+ * Under v2 (#553 PR 4): the card is suppressed for tool-only turns
+ * under 60s (Class B). The original 7s tool-chain version of this test
+ * no longer renders a card by design — preamble text in Class B lives
+ * in the answer-text stream, not the card. To keep the F4 regression
+ * guard meaningful, the test now uses a sub-agent turn (Class C) so
+ * the card actually renders and we can inspect its preamble updates.
  *
  * Spec contract from `waiting-ux-spec.md`:
  *
@@ -44,9 +46,17 @@ afterEach(() => { vi.useRealTimers() })
 
 describe('F4 — preamble refresh on step transitions (regression guard)', () => {
   it('three well-spaced text → tool steps produce three distinct preamble updates in the rendered card', async () => {
+    // Class C turn (sub-agent present) so the card actually renders
+    // under the v2 gate. The sub-agent dispatches up front (promotes
+    // the card immediately), then three text → tool step transitions
+    // exercise the F4 narrative refresh path.
     const h = createRealGatewayHarness({ gapMs: 0 })
     h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'multi-step task' })
     h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'multi-step task' })
+    await h.clock.advance(200)
+
+    // Sub-agent dispatched — Class C, card renders.
+    h.feedSessionEvent({ kind: 'sub_agent_started', agentId: 'a1', firstPromptText: 'background work' })
     await h.clock.advance(200)
 
     // Step 1: text + tool
@@ -67,6 +77,7 @@ describe('F4 — preamble refresh on step transitions (regression guard)', () =>
     await h.clock.advance(2_000)
     h.feedSessionEvent({ kind: 'tool_result', toolUseId: 't3', toolName: 'Edit' })
 
+    h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a1' })
     await h.streamReply({ chat_id: CHAT, text: 'done', done: true })
     h.feedSessionEvent({ kind: 'turn_end', durationMs: 7_000 })
     await h.clock.advance(2_000)

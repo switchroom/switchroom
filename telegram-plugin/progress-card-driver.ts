@@ -187,7 +187,7 @@ export interface ProgressDriverConfig {
    * starts (see `promoteOnSubAgent`) — long-running tool work and
    * background dispatches stay visible without waiting the full delay.
    *
-   * Default 30000 (30 seconds). Set to 0 to disable.
+   * Default 60000 (60 seconds, #553 PR 4). Set to 0 to disable.
    */
   initialDelayMs?: number
   /**
@@ -212,10 +212,11 @@ export interface ProgressDriverConfig {
    * substantial turn that does parent-side work (Read/Grep/Bash/Edit)
    * but never dispatches a sub-agent.
    *
-   * Symmetric to `promoteOnSubAgent`. Default 3: a turn with ≥3 tool
-   * calls is not "short" by any reasonable definition, so the
-   * fast-turn suppression goal (no clutter on quick replies) still
-   * holds. Set to a large value (e.g. 999) to effectively disable.
+   * Symmetric to `promoteOnSubAgent`. **Default 0 (disabled, #553 PR 4):**
+   * under the v2 contract tools alone never trigger the card — only
+   * sub-agents or `elapsed >= 60s`. Values of 0 or non-finite (Infinity)
+   * are treated as "never promote on tool count". Set to a positive
+   * integer (e.g. 3) to opt back in to the pre-v2 behaviour.
    *
    * Fast-turn suppression in `flush()` is unchanged — if the turn
    * ends before promotion, the card still skips the emit.
@@ -234,8 +235,12 @@ export interface ProgressDriverConfig {
    * suppression in `flush()` is unchanged — sub-`promoteAfterMs` turns
    * still skip the card.
    *
-   * Default 5000 (5 seconds). Set to a large value (e.g. 999_999) to
-   * effectively disable.
+   * **Default 0 (disabled, #553 PR 4).** The PR #570 5s time-promote was
+   * a stop-gap when `initialDelayMs` defaulted to 30s; with the new
+   * 60s `initialDelayMs` and the sub-agent promote intact, time-based
+   * promotion is no longer needed. `ensureTimePromoteScheduled` no-ops
+   * when this is 0 so the timer never schedules. Set to a positive
+   * value to opt back in to the pre-v2 behaviour.
    */
   promoteAfterMs?: number
   /**
@@ -530,7 +535,7 @@ export interface ProgressDriver {
    * Begin a new turn synchronously — called from the inbound-message
    * handler the instant a user's message clears the gate, BEFORE any
    * session-tail event arrives. Creates a fresh progress card state; the
-   * first visible render is gated by `initialDelayMs` (default 30s) so
+   * first visible render is gated by `initialDelayMs` (default 60s) so
    * turns that finish before the delay produce no card at all and the
    * user only sees the final reply.
    *
@@ -668,10 +673,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const editBudgetThreshold = config.editBudgetThreshold ?? 18
   const editBudgetCoalesceMs = config.editBudgetCoalesceMs ?? 3000
   const maxIdleMs = config.maxIdleMs ?? 30 * 60_000
-  const initialDelayMs = config.initialDelayMs ?? 30_000
+  // v2 card-gate (#553 PR 4): card visibility is `(elapsed >= 60s) OR
+  // (any sub-agent appeared)`. Tools alone never trigger the card.
+  //   - initialDelayMs: 60s (was 30s) — pushes the time-based gate to
+  //     the spec value.
+  //   - promoteOnParentToolCount: 0 (was 3) — disabled. The check below
+  //     treats 0 (and Infinity) as "never promote on tool count".
+  //   - promoteAfterMs: 0 (was 5_000) — disabled. ensureTimePromoteScheduled
+  //     no-ops when this is 0, so the timer never schedules. The PR #570
+  //     time-promote was a stop-gap when initialDelayMs was 30s; with
+  //     initialDelayMs=60s and the sub-agent promote intact, it is no
+  //     longer needed.
+  //   - promoteOnSubAgent: true (unchanged) — sub-agents/background workers
+  //     break the suppression immediately.
+  const initialDelayMs = config.initialDelayMs ?? 60_000
   const promoteOnSubAgent = config.promoteOnSubAgent ?? true
-  const promoteOnParentToolCount = config.promoteOnParentToolCount ?? 3
-  const promoteAfterMs = config.promoteAfterMs ?? 5_000
+  const promoteOnParentToolCount = config.promoteOnParentToolCount ?? 0
+  const promoteAfterMs = config.promoteAfterMs ?? 0
   const maxConsecutive4xx = config.maxConsecutive4xx ?? 3
   const orphanPromotionMs = config.orphanPromotionMs ?? 5_000
   const coldSubAgentThresholdMs = config.coldSubAgentThresholdMs ?? 30_000
@@ -1649,16 +1667,17 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         promoteFirstEmit(chatState, 'sub_agent_started')
       }
 
-      // #478: promote the card when the agent has issued enough parent-
-      // side tool calls during the suppression window. The previous
-      // logic only promoted on sub-agent dispatch, so a turn that did
-      // 5 Read/Grep/Bash calls in 30s never showed a card — user saw
-      // typing-indicator-only and described it as "feels dead." A turn
-      // with ≥3 parent tools is not "short" by any reasonable
-      // definition, so this doesn't regress the fast-turn-suppression
-      // goal (which continues to fire in flush() for sub-3-tool turns).
+      // #478 / #553 PR 4: promote the card when the agent has issued
+      // enough parent-side tool calls during the suppression window.
+      // Disabled by default in v2 (promoteOnParentToolCount=0 / Infinity)
+      // — under the v2 contract tools alone never trigger the card. The
+      // check is preserved as a config knob for callers that want the
+      // old behaviour, but values of 0 or non-finite (Infinity) are
+      // treated as "never promote on tool count".
       if (
-        chatState.isFirstEmit
+        promoteOnParentToolCount > 0
+        && Number.isFinite(promoteOnParentToolCount)
+        && chatState.isFirstEmit
         && chatState.deferredFirstEmitTimer !== DELAY_ELAPSED
         && !chatState.apiFailures.terminal
         && chatState.state.items.length >= promoteOnParentToolCount
