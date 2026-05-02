@@ -208,7 +208,9 @@ describe('pendingReauthFlows intercept — deleteMessage sequencing (Blocker 1)'
     // the redaction call. Bounds the window so we don't accidentally
     // match a downstream auth-code path's redaction.
     const window = src.slice(interceptIdx, interceptIdx + 2000)
-    expect(window).toMatch(/redactAuthCodeMessage\(bot\.api,\s*chat_id,\s*msgId\)/)
+    // Allow the optional 4th `log` argument added in #561 (diagnostic
+     // sink for redaction failures) — required is the first three args.
+     expect(window).toMatch(/redactAuthCodeMessage\(bot\.api,\s*chat_id,\s*msgId(?:,\s*[^)]+)?\)/)
   })
 
   it('redaction lands AFTER the success/error reply renders', () => {
