@@ -7,6 +7,7 @@ import { tmpdir, homedir } from "node:os";
 import { withConfigError, getConfig } from "./helpers.js";
 import { reconcileAgent } from "../agents/scaffold.js";
 import { reconcileAllAgentDefaultMcps } from "../agents/reconcile-default-mcps.js";
+import { reconcileAllAgentDefaultSkills } from "../agents/reconcile-default-skills.js";
 import { restartAgent, writeRestartReasonMarker } from "../agents/lifecycle.js";
 import { installAllUnits } from "../agents/systemd.js";
 import { resolveAgentsDir } from "../config/loader.js";
@@ -487,6 +488,33 @@ async function runPostBuildPhase(opts: {
       }
     }
     if (mcpResults.length === 0) {
+      console.log(chalk.gray("    no agent directories found"));
+    }
+  }
+
+  // Reconcile bundled-default skills (anthropic-vendored + switchroom-core)
+  // into every agent on disk. Same model as the MCP reconcile above:
+  // additive symlinks only, never removes operator-placed real dirs/files,
+  // honours per-agent `bundled_skills: { <key>: false }` opt-outs.
+  {
+    console.log(chalk.bold(`\n  Reconciling bundled-default skills...`));
+    const agentOptOuts: Record<string, Record<string, unknown>> = {};
+    for (const [name, agentCfg] of Object.entries(config.agents)) {
+      const bundled = (agentCfg as { bundled_skills?: Record<string, boolean> } | null)
+        ?.bundled_skills;
+      if (bundled) agentOptOuts[name] = bundled as Record<string, unknown>;
+    }
+    const skillResults = reconcileAllAgentDefaultSkills(agentsDir, agentOptOuts);
+    for (const r of skillResults) {
+      if (r.added.length > 0) {
+        console.log(chalk.green(`    ${r.name}: added ${r.added.join(", ")}`));
+      } else if (r.optedOut.length > 0 && r.alreadyPresent.length === 0) {
+        console.log(chalk.gray(`    ${r.name}: opted out of ${r.optedOut.join(", ")}`));
+      } else {
+        console.log(chalk.gray(`    ${r.name}: already present`));
+      }
+    }
+    if (skillResults.length === 0) {
       console.log(chalk.gray("    no agent directories found"));
     }
   }

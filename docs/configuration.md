@@ -13,7 +13,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | Merge type | Fields | Behavior |
 |---|---|---|
 | **Union** | `tools.allow`, `tools.deny`, `skills` | Combine across layers, dedup |
-| **Per-key merge** | `mcp_servers`, `env`, `subagents` | Agent wins on key conflict |
+| **Per-key merge** | `mcp_servers`, `bundled_skills`, `env`, `subagents` | Agent wins on key conflict |
 | **Per-field merge** | `soul`, `memory`, `session`, `channels` | Agent wins per sub-field |
 | **Per-event concat** | `hooks` | Defaults first, then agent |
 | **Concatenate** | `schedule`, `system_prompt_append`, `claude_md_raw`, `cli_args` | Defaults prepended/joined |
@@ -34,6 +34,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `mcp_servers` | per-key | Additional MCP server configurations. Set a key to `false` to suppress a built-in default (e.g. `playwright: false`) |
 | `system_prompt_append` | concatenate | Appended to the system prompt via `--append-system-prompt` |
 | `skills` | union | Named skills from the global skills pool (`switchroom.skills_dir`) |
+| `bundled_skills` | per-key | Opt-out map for switchroom's bundled-default skills. Set a key to `false` to suppress (e.g. `pdf: false`). See [docs/skills.md](./skills.md). |
 | `subagents` | per-key | Sub-agent definitions rendered to `.claude/agents/<name>.md` |
 | `schedule` | concatenate | Cron-based scheduled tasks (systemd timers) |
 | `session.max_idle` | override | Fresh session after idle period (`2h`, `30m`) |

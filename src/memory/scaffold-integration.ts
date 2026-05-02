@@ -89,6 +89,67 @@ export function getBuiltinDefaultMcpEntries(): BuiltinMcpEntry[] {
   ];
 }
 
+/**
+ * Describes a single built-in default skill entry.
+ *
+ * - `key`: directory name in the bundled `skills/` pool (also the name
+ *   used inside `<agentDir>/.claude/skills/`).
+ * - `optOutKey`: key in `defaults.bundled_skills` (or per-agent
+ *   `bundled_skills`) that the operator sets to `false` to suppress
+ *   this default. Currently always equal to `key`, kept explicit so the
+ *   type self-documents and a future rename can stay backward-compatible.
+ * - `source`: where the skill was sourced from. "anthropic" entries are
+ *   vendored from anthropics/skills (see each skill's VENDORED.md);
+ *   "switchroom" entries are first-party operator skills bundled in this
+ *   repo under skills/switchroom-*.
+ */
+export interface BuiltinSkillEntry {
+  key: string;
+  optOutKey: string;
+  source: "anthropic" | "switchroom";
+}
+
+/**
+ * Built-in default skills that ship enabled on every Switchroom agent
+ * regardless of role, unless explicitly opted out via
+ * `defaults.bundled_skills: { <key>: false }` (or per-agent
+ * `bundled_skills`).
+ *
+ * Two source pools:
+ *
+ *   - **Anthropic vendored** (`source: "anthropic"`): MIT-licensed skills
+ *     from https://github.com/anthropics/skills, vendored under
+ *     `skills/<name>/` with a `VENDORED.md` recording the pin commit.
+ *   - **Switchroom core** (`source: "switchroom"`): the slim operator
+ *     surface every agent benefits from — log tailing, status checks,
+ *     "something is broken" diagnostics. The fuller operator set
+ *     (switchroom-install / switchroom-manage / switchroom-architecture)
+ *     stays foreman-only and is still gated inside `installSwitchroomSkills`.
+ *
+ * To add a new universal default: add an entry here. Both the scaffold
+ * path and the `switchroom update` reconcile path pick it up automatically.
+ */
+export function getBuiltinDefaultSkillEntries(): BuiltinSkillEntry[] {
+  const anthropic = [
+    "skill-creator",
+    "mcp-builder",
+    "webapp-testing",
+    "pdf",
+    "docx",
+    "xlsx",
+    "pptx",
+  ] as const;
+  const switchroomCore = [
+    "switchroom-cli",
+    "switchroom-status",
+    "switchroom-health",
+  ] as const;
+  return [
+    ...anthropic.map((key) => ({ key, optOutKey: key, source: "anthropic" as const })),
+    ...switchroomCore.map((key) => ({ key, optOutKey: key, source: "switchroom" as const })),
+  ];
+}
+
 // #235: getSwitchroomMcpSettingsEntry removed. The switchroom-mcp server's
 // 4 tools (switchroom_memory_*, workspace_memory_*) had zero production
 // callers and were subsumed by Hindsight's MCP (`mcp__hindsight__*`) +
