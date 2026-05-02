@@ -191,10 +191,89 @@ export function resolveAgentConfig(
   return mergeAgentConfig(layered as unknown as AgentDefaults, agent);
 }
 
+/**
+ * Fold deprecated root-level Telegram fields into the canonical
+ * `channels.telegram.*` location (#596). The schema move puts
+ * `voice_in`, `telegraph`, and `webhook_sources` under
+ * `channels.telegram.*` to inherit cascade behaviour like every
+ * adjacent feature; this helper migrates legacy switchroom.yaml
+ * files that still declare them at the root.
+ *
+ * Conflict resolution: if BOTH locations carry a value, the new
+ * (`channels.telegram.*`) wins — that's the operator's deliberate
+ * move; the root-level value is forgotten silently.
+ *
+ * Returns a tuple of `[migrated config, deprecation messages]`.
+ * Pure — no I/O. Caller decides what to do with the messages
+ * (typically log to stderr once per process).
+ */
+function foldDeprecatedTelegramFields(
+  config: AgentConfig | AgentDefaults,
+): { config: AgentConfig; deprecations: string[] } {
+  const c = config as AgentConfig;
+  const root: Record<string, unknown> = c as Record<string, unknown>;
+  const deprecations: string[] = [];
+
+  const hasRoot = root.voice_in !== undefined
+    || root.telegraph !== undefined
+    || root.webhook_sources !== undefined;
+  if (!hasRoot) return { config: c, deprecations };
+
+  // Build the migrated channels.telegram payload from a copy.
+  const channels = { ...(c.channels ?? {}) } as Record<string, unknown>;
+  const tg = { ...((channels.telegram as Record<string, unknown> | undefined) ?? {}) };
+
+  if (root.voice_in !== undefined) {
+    if (tg.voice_in === undefined) tg.voice_in = root.voice_in;
+    deprecations.push(
+      "voice_in at the agent root is deprecated; move under channels.telegram.voice_in (#596).",
+    );
+  }
+  if (root.telegraph !== undefined) {
+    if (tg.telegraph === undefined) tg.telegraph = root.telegraph;
+    deprecations.push(
+      "telegraph at the agent root is deprecated; move under channels.telegram.telegraph (#596).",
+    );
+  }
+  if (root.webhook_sources !== undefined) {
+    if (tg.webhook_sources === undefined) tg.webhook_sources = root.webhook_sources;
+    deprecations.push(
+      "webhook_sources at the agent root is deprecated; move under channels.telegram.webhook_sources (#596).",
+    );
+  }
+
+  channels.telegram = tg;
+  // Strip the deprecated root-level fields so downstream readers see
+  // only the canonical location.
+  const { voice_in: _vi, telegraph: _tg, webhook_sources: _ws, ...rest } = root;
+  return {
+    config: { ...rest, channels } as AgentConfig,
+    deprecations,
+  };
+}
+
 export function mergeAgentConfig(
-  defaults: AgentDefaults | undefined,
-  agent: AgentConfig,
+  defaultsIn: AgentDefaults | undefined,
+  agentIn: AgentConfig,
 ): AgentConfig {
+  // Migrate deprecated root-level fields BEFORE cascade so inheritance
+  // works against the canonical location. See #596.
+  const { config: agent, deprecations: agentDeprecations } =
+    foldDeprecatedTelegramFields(agentIn);
+  const defaultsMigration = defaultsIn
+    ? foldDeprecatedTelegramFields(defaultsIn)
+    : null;
+  const defaults = defaultsMigration?.config as AgentDefaults | undefined;
+  const allDeprecations = [
+    ...agentDeprecations,
+    ...(defaultsMigration?.deprecations ?? []),
+  ];
+  if (allDeprecations.length > 0 && !mergeAgentConfig.suppressDeprecationLogs) {
+    for (const msg of allDeprecations) {
+      console.warn(`[switchroom] DEPRECATION: ${msg}`);
+    }
+  }
+
   if (!defaults) return agent;
 
   const merged: AgentConfig = { ...agent };
@@ -469,4 +548,14 @@ export function mergeAgentConfig(
   }
 
   return merged;
+}
+
+/**
+ * Test-only escape hatch: when truthy, the deprecation warning side-
+ * effect inside `mergeAgentConfig` is suppressed. The CLI never sets
+ * this; tests use it to keep stderr clean.
+ */
+// eslint-disable-next-line @typescript-eslint/no-namespace
+export namespace mergeAgentConfig {
+  export let suppressDeprecationLogs = false;
 }

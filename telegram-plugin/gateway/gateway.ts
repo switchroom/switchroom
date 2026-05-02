@@ -606,6 +606,12 @@ function readAccessFile(): Access {
       statusReactions: parsed.statusReactions,
       historyEnabled: parsed.historyEnabled,
       historyRetentionDays: parsed.historyRetentionDays,
+      // #596: telegram features projected into access.json by scaffold.
+      // Without these passthroughs, gateway readers (`access.voice_in`,
+      // `access.telegraph`, `access.stickers`) silently see undefined.
+      stickers: parsed.stickers,
+      voice_in: parsed.voice_in,
+      telegraph: parsed.telegraph,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()

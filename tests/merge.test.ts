@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mergeAgentConfig,
   resolveAgentConfig,
@@ -467,6 +467,122 @@ describe("mergeAgentConfig channels block", () => {
   it("leaves channels undefined when neither side sets it", () => {
     const result = mergeAgentConfig({ model: "opus" }, baseAgent());
     expect(result.channels).toBeUndefined();
+  });
+});
+
+describe("mergeAgentConfig deprecated Telegram fields (#596)", () => {
+  // Suppress the console.warn deprecation log so test output stays clean.
+  // The warning behaviour is exercised in its own test below.
+  beforeEach(() => {
+    mergeAgentConfig.suppressDeprecationLogs = true;
+  });
+  afterEach(() => {
+    mergeAgentConfig.suppressDeprecationLogs = false;
+  });
+
+  it("folds root-level voice_in into channels.telegram.voice_in", () => {
+    const agent = baseAgent({
+      voice_in: { enabled: true, provider: "openai" },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(undefined, agent);
+    expect(result.channels?.telegram?.voice_in).toEqual({
+      enabled: true,
+      provider: "openai",
+    });
+    // Old root-level field is stripped after migration.
+    expect((result as Record<string, unknown>).voice_in).toBeUndefined();
+  });
+
+  it("folds root-level telegraph into channels.telegram.telegraph", () => {
+    const agent = baseAgent({
+      telegraph: { enabled: true, threshold: 1500 },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(undefined, agent);
+    expect(result.channels?.telegram?.telegraph).toEqual({
+      enabled: true,
+      threshold: 1500,
+    });
+    expect((result as Record<string, unknown>).telegraph).toBeUndefined();
+  });
+
+  it("folds root-level webhook_sources into channels.telegram.webhook_sources", () => {
+    const agent = baseAgent({
+      webhook_sources: ["github"],
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(undefined, agent);
+    expect(result.channels?.telegram?.webhook_sources).toEqual(["github"]);
+    expect((result as Record<string, unknown>).webhook_sources).toBeUndefined();
+  });
+
+  it("new channels.telegram.* location wins on conflict (operator's deliberate move)", () => {
+    const agent = baseAgent({
+      voice_in: { enabled: false },
+      channels: { telegram: { voice_in: { enabled: true, provider: "openai" } } },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(undefined, agent);
+    expect(result.channels?.telegram?.voice_in).toEqual({
+      enabled: true,
+      provider: "openai",
+    });
+  });
+
+  it("cascades the new location from defaults to a quiet agent", () => {
+    const defaults: AgentDefaults = {
+      channels: {
+        telegram: {
+          telegraph: { enabled: true, threshold: 2000 },
+          voice_in: { enabled: true, provider: "openai" },
+          webhook_sources: ["github"],
+        },
+      },
+    };
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.channels?.telegram?.telegraph?.enabled).toBe(true);
+    expect(result.channels?.telegram?.voice_in?.provider).toBe("openai");
+    expect(result.channels?.telegram?.webhook_sources).toEqual(["github"]);
+  });
+
+  it("cascades a defaults-level deprecated root field into the new location", () => {
+    // An operator with the OLD shape in `defaults:` should still see
+    // their preferences flow down to agents that don't override.
+    const defaults = {
+      voice_in: { enabled: true, provider: "openai" },
+    } as AgentDefaults;
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.channels?.telegram?.voice_in).toEqual({
+      enabled: true,
+      provider: "openai",
+    });
+  });
+
+  it("logs a deprecation warning when the old root location is used", () => {
+    mergeAgentConfig.suppressDeprecationLogs = false;
+    const original = console.warn;
+    const logs: string[] = [];
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+    try {
+      mergeAgentConfig(undefined, baseAgent({
+        voice_in: { enabled: true },
+      } as Partial<AgentConfig>));
+    } finally {
+      console.warn = original;
+    }
+    expect(logs.some((l) => l.includes("DEPRECATION") && l.includes("voice_in"))).toBe(true);
+  });
+
+  it("does not log when only the new canonical location is used", () => {
+    mergeAgentConfig.suppressDeprecationLogs = false;
+    const original = console.warn;
+    const logs: string[] = [];
+    console.warn = (msg: string) => { logs.push(String(msg)); };
+    try {
+      mergeAgentConfig(undefined, baseAgent({
+        channels: { telegram: { voice_in: { enabled: true } } },
+      }));
+    } finally {
+      console.warn = original;
+    }
+    expect(logs).toEqual([]);
   });
 });
 

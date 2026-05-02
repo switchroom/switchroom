@@ -485,6 +485,66 @@ export const TelegramChannelSchema = z
         "health-coach personas benefit; coding agents typically don't " +
         "configure any."
       ),
+    voice_in: z
+      .object({
+        enabled: z.boolean().optional().describe("Master switch for voice-message transcription."),
+        provider: z.enum(["openai"]).optional().describe(
+          "Transcription provider. Only 'openai' (Whisper API) supported in the spike (#578); " +
+          "Groq/Deepgram/local-whisper-cli are follow-up choices.",
+        ),
+        language: z.string().optional().describe(
+          "Optional ISO-639-1 language hint (e.g. 'en', 'fr'). Skips Whisper's auto-detection.",
+        ),
+      })
+      .optional()
+      .describe(
+        "Inbound voice-message transcription (#578). When enabled, voice/audio " +
+        "messages from allowlisted users are downloaded, transcribed via the " +
+        "configured provider, and surface to the agent as the user's text. " +
+        "API key read from ~/.switchroom/openai-api-key (mode 0600). Off by " +
+        "default — opt-in per agent. Cascades from defaults.channels.telegram.voice_in. " +
+        "(Migrated from per-agent root in #596 — see consistency unification.)"
+      ),
+    telegraph: z
+      .object({
+        enabled: z.boolean().optional().describe("Master switch for Telegraph Instant View publishing."),
+        threshold: z.number().int().positive().optional().describe(
+          "Char count above which a reply is published to Telegraph instead of " +
+          "HTML-chunked into multiple Telegram messages. Default 3000 (≈3 chunks).",
+        ),
+        short_name: z.string().optional().describe(
+          "Telegraph account display name. Defaults to the agent's slug. Used at " +
+          "first-publish to lazily create the account; cached thereafter.",
+        ),
+        author_name: z.string().optional().describe(
+          "Telegraph article byline. Defaults to soul.name when set.",
+        ),
+      })
+      .optional()
+      .describe(
+        "Long-reply publishing via Telegraph (#579). When enabled, replies " +
+        "above the threshold publish as a Telegraph article rendered in " +
+        "Telegram via native Instant View. Off by default — content " +
+        "residency is real for some personas (lawyer, health-coach with PHI). " +
+        "Cascades from defaults.channels.telegram.telegraph. " +
+        "(Migrated from per-agent root in #596.)"
+      ),
+    webhook_sources: z
+      .array(z.enum(["github", "generic"]))
+      .optional()
+      .describe(
+        "External webhook sources allowed to ingest events into this agent's " +
+        "log. POST /webhook/<agent>/<source> on the switchroom web server. " +
+        "Each source has its own signature verification ('github' = " +
+        "X-Hub-Signature-256 HMAC-SHA256, 'generic' = Bearer token). " +
+        "Per-source secret read from ~/.switchroom/webhook-secrets.json " +
+        "keyed by [agent][source]. Verified events append to " +
+        "<agent>/telegram/webhook-events.jsonl for the agent to read on " +
+        "demand. Off by default — webhook is the only untrusted-inbound " +
+        "surface in the system, so opt-in is mandatory. " +
+        "Cascades from defaults.channels.telegram.webhook_sources. " +
+        "(Migrated from per-agent root in #596 — see #577.)",
+      ),
   })
   .optional();
 
@@ -751,61 +811,43 @@ export const AgentSchema = z.object({
     .number()
     .optional()
     .describe("Telegram topic thread ID (auto-populated by switchroom topics sync)"),
+  // ─── Deprecated locations (#596) — read but migrate ──────────────────────
+  // These three fields originally lived at the per-agent root. They've
+  // moved under `channels.telegram.*` to inherit the cascade like every
+  // other adjacent feature. The root locations stay for backwards-compat
+  // but the resolved-config layer (mergeAgentConfig) folds them into the
+  // canonical channels.telegram.* spot and logs a deprecation warning.
+  // Remove these fields once no live switchroom.yaml uses them.
   webhook_sources: z
     .array(z.enum(["github", "generic"]))
     .optional()
     .describe(
-      "External webhook sources allowed to ingest events into this agent's " +
-      "log. POST /webhook/<agent>/<source> on the switchroom web server. " +
-      "Each source has its own signature verification ('github' = " +
-      "X-Hub-Signature-256 HMAC-SHA256, 'generic' = Bearer token). " +
-      "Per-source secret read from ~/.switchroom/webhook-secrets.json " +
-      "keyed by [agent][source]. Verified events append to " +
-      "<agent>/telegram/webhook-events.jsonl for the agent to read on " +
-      "demand. Off by default — webhook is the only untrusted-inbound " +
-      "surface in the system, so opt-in is mandatory. See #577.",
+      "[DEPRECATED — moved to channels.telegram.webhook_sources in #596] " +
+      "Old per-agent location. Still read but logs a deprecation warning. " +
+      "See channels.telegram.webhook_sources for the canonical spot."
     ),
   voice_in: z
     .object({
-      enabled: z.boolean().optional().describe("Master switch for voice-message transcription."),
-      provider: z.enum(["openai"]).optional().describe(
-        "Transcription provider. Only 'openai' (Whisper API) supported in the spike (#578); " +
-        "Groq/Deepgram/local-whisper-cli are follow-up choices.",
-      ),
-      language: z.string().optional().describe(
-        "Optional ISO-639-1 language hint (e.g. 'en', 'fr'). Skips Whisper's auto-detection.",
-      ),
+      enabled: z.boolean().optional(),
+      provider: z.enum(["openai"]).optional(),
+      language: z.string().optional(),
     })
     .optional()
     .describe(
-      "Inbound voice-message transcription (#578). When enabled, voice/audio " +
-      "messages from allowlisted users are downloaded, transcribed via the " +
-      "configured provider, and surface to the agent as the user's text. " +
-      "API key read from ~/.switchroom/openai-api-key (mode 0600). Off by " +
-      "default — opt-in per agent."
+      "[DEPRECATED — moved to channels.telegram.voice_in in #596] " +
+      "Old per-agent location. Still read but logs a deprecation warning."
     ),
   telegraph: z
     .object({
-      enabled: z.boolean().optional().describe("Master switch for Telegraph Instant View publishing."),
-      threshold: z.number().int().positive().optional().describe(
-        "Char count above which a reply is published to Telegraph instead of " +
-        "HTML-chunked into multiple Telegram messages. Default 3000 (≈3 chunks).",
-      ),
-      short_name: z.string().optional().describe(
-        "Telegraph account display name. Defaults to the agent's slug. Used at " +
-        "first-publish to lazily create the account; cached thereafter.",
-      ),
-      author_name: z.string().optional().describe(
-        "Telegraph article byline. Defaults to soul.name when set.",
-      ),
+      enabled: z.boolean().optional(),
+      threshold: z.number().int().positive().optional(),
+      short_name: z.string().optional(),
+      author_name: z.string().optional(),
     })
     .optional()
     .describe(
-      "Long-reply publishing via Telegraph (#579). When enabled, replies " +
-      "above the threshold publish as a Telegraph article rendered in " +
-      "Telegram via native Instant View. Off by default — content " +
-      "residency is real for some personas (lawyer, health-coach with PHI). " +
-      "Opt-in per agent."
+      "[DEPRECATED — moved to channels.telegram.telegraph in #596] " +
+      "Old per-agent location. Still read but logs a deprecation warning."
     ),
   soul: AgentSoulSchema,
   tools: AgentToolsSchema,
