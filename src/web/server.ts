@@ -22,6 +22,7 @@ import {
   handleGetTurns,
   handleGetSubagents,
 } from "./api.js";
+import { handleWebhookIngest } from "./webhook-handler.js";
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html",
@@ -207,6 +208,71 @@ function checkWsAuth(
   return presented !== null && constantTimeEqual(presented, token);
 }
 
+/**
+ * Webhook secrets file lives at ~/.switchroom/webhook-secrets.json.
+ * Shape:
+ *   {
+ *     "klanker": { "github": "<secret>", "generic": "<token>" },
+ *     "finn":    { "github": "<secret>" }
+ *   }
+ *
+ * One operator-managed file — no vault integration in this PR. Mode
+ * 0600 (read by switchroom user only). Future PR can swap for a
+ * vault-backed resolver if the operator burden becomes real.
+ */
+function loadWebhookSecrets(): Record<string, Record<string, string>> {
+  const path = join(homedir(), ".switchroom", "webhook-secrets.json");
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as Record<string, Record<string, string>>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (err) {
+    process.stderr.write(
+      `webhook-ingest: failed to parse ${path}: ${(err as Error).message} — webhooks will return 401 until fixed\n`,
+    );
+    return {};
+  }
+}
+
+async function handleWebhookRoute(
+  req: Request,
+  agent: string,
+  source: string,
+  config: SwitchroomConfig,
+): Promise<Response> {
+  const agentConfig = config.agents[agent];
+  const allowedSources = agentConfig?.webhook_sources ?? [];
+  const allSecrets = loadWebhookSecrets();
+  const agentSecrets = allSecrets[agent] ?? {};
+
+  let bodyBuf: Uint8Array;
+  try {
+    bodyBuf = new Uint8Array(await req.arrayBuffer());
+  } catch {
+    return new Response(JSON.stringify({ ok: false, error: "could not read body" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const result = await handleWebhookIngest(
+    {
+      agent,
+      source,
+      body: bodyBuf,
+      headers: req.headers,
+      allowedSources,
+      config: { secrets: agentSecrets as Partial<Record<"github" | "generic", string>> },
+      agentExists: agentConfig !== undefined,
+    },
+    {},
+  );
+  return new Response(result.body, {
+    status: result.status,
+    headers: { "Content-Type": result.contentType },
+  });
+}
+
 function parseRoute(
   pathname: string,
   method: string
@@ -276,6 +342,21 @@ export function startWebServer(
     fetch(req, server) {
       const url = new URL(req.url);
       const { pathname } = url;
+
+      // Webhook ingest (#577) sits BEFORE the origin gate + bearer-token
+      // gate because:
+      //   - The webhook brings its own auth (HMAC for github, Bearer for
+      //     generic) verified inside the handler.
+      //   - External services (GitHub, Sentry, custom) cannot send the
+      //     `Origin` header that isOriginAllowed expects, so the origin
+      //     gate would block them.
+      //   - The dashboard's web token has no business gating an external
+      //     webhook — wrong principle, wrong key.
+      // Path: POST /webhook/:agent/:source
+      const webhookMatch = pathname.match(/^\/webhook\/([^/]+)\/([^/]+)$/);
+      if (req.method === "POST" && webhookMatch) {
+        return handleWebhookRoute(req, webhookMatch[1], webhookMatch[2], config);
+      }
 
       // Cross-origin requests from any page the user happens to load in a
       // browser must not reach the privileged API. When bound to loopback,

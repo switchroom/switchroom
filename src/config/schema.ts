@@ -751,6 +751,20 @@ export const AgentSchema = z.object({
     .number()
     .optional()
     .describe("Telegram topic thread ID (auto-populated by switchroom topics sync)"),
+  webhook_sources: z
+    .array(z.enum(["github", "generic"]))
+    .optional()
+    .describe(
+      "External webhook sources allowed to ingest events into this agent's " +
+      "log. POST /webhook/<agent>/<source> on the switchroom web server. " +
+      "Each source has its own signature verification ('github' = " +
+      "X-Hub-Signature-256 HMAC-SHA256, 'generic' = Bearer token). " +
+      "Per-source secret read from ~/.switchroom/webhook-secrets.json " +
+      "keyed by [agent][source]. Verified events append to " +
+      "<agent>/telegram/webhook-events.jsonl for the agent to read on " +
+      "demand. Off by default — webhook is the only untrusted-inbound " +
+      "surface in the system, so opt-in is mandatory. See #577.",
+    ),
   soul: AgentSoulSchema,
   tools: AgentToolsSchema,
   memory: AgentMemorySchema,
