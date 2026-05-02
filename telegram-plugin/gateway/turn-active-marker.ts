@@ -126,6 +126,17 @@ export function sweepStaleTurnActiveMarker(
     idleSweepMs: number;
     hardTtlMs: number;
     now?: number;
+    /**
+     * Optional diagnostic callback invoked when the marker is removed.
+     * Best-effort: keeps the function pure (no logger coupling) while
+     * letting the caller emit a structured journalctl line. Must not
+     * throw — exceptions from this callback are swallowed.
+     */
+    onRemove?: (info: {
+      ageMs: number;
+      reason: "idle-stale" | "hard-ttl";
+      payload: string | null;
+    }) => void;
   },
 ): boolean {
   const path = join(stateDir, TURN_ACTIVE_MARKER_FILE);
@@ -137,16 +148,26 @@ export function sweepStaleTurnActiveMarker(
     const hardExpired = ageMs > opts.hardTtlMs;
     const idleExpired = !opts.turnInFlight && ageMs > opts.idleSweepMs;
     if (!hardExpired && !idleExpired) return false;
-    // Also drop if the writing process is gone (best-effort — the
-    // marker JSON doesn't include pid today, so this is a no-op stub
-    // unless extended later. Reading the file lets a future caller
-    // attach pid liveness without changing the signature.)
+    // Best-effort read so the diagnostic callback can include the
+    // payload (turnKey, chatId, startedAt) for forensic logging.
+    let payload: string | null = null;
     try {
-      readFileSync(path, "utf8");
+      payload = readFileSync(path, "utf8");
     } catch {
-      /* unreadable — fall through to unlink */
+      /* unreadable — still drop the marker */
     }
     unlinkSync(path);
+    if (opts.onRemove) {
+      try {
+        opts.onRemove({
+          ageMs,
+          reason: hardExpired ? "hard-ttl" : "idle-stale",
+          payload,
+        });
+      } catch {
+        /* swallow — diagnostics must never break the sweep */
+      }
+    }
     return true;
   } catch {
     // ENOENT race or stat failure — nothing actionable.

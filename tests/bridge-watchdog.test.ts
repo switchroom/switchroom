@@ -205,6 +205,22 @@ describe("bridge-watchdog.sh — static regression guards", () => {
     expect(script).toMatch(/stamp_restart_reason \\?\s*"\$\{gateway_state_dir\}\/clean-shutdown\.json"/);
     expect(script).toMatch(/stamp_restart_reason \\?\s*"\$\{agent_state_dir\}\/clean-shutdown\.json"/);
   });
+
+  it("defines a restart-rate-cap helper and gates every restart path through it", () => {
+    // Belt-and-suspenders for runaway restart loops — the script's three
+    // restart paths plus the service-inactive heal must all consult the
+    // rate cap before issuing a restart, so a single agent can't burn
+    // Claude quota by being restarted N times in a window.
+    expect(script).toMatch(/restart_rate_check\(\)/);
+    expect(script).toMatch(/restart_rate_record\(\)/);
+    expect(script).toMatch(/MAX_RESTARTS_PER_WINDOW/);
+    expect(script).toMatch(/RESTART_RATE_WINDOW_SECS/);
+    // Every restart path must call restart_rate_check before acting.
+    const restartCheckCalls = script.match(/restart_rate_check "\$agent"/g) ?? [];
+    expect(restartCheckCalls.length).toBeGreaterThanOrEqual(4);
+    const restartRecordCalls = script.match(/restart_rate_record "\$agent"/g) ?? [];
+    expect(restartRecordCalls.length).toBeGreaterThanOrEqual(4);
+  });
 });
 
 // ---------------------------------------------------------------
@@ -360,12 +376,18 @@ function runWatchdog(
   h: Harness,
   env: Record<string, string> = {},
 ): { stdout: string; stderr: string; code: number; audit: string } {
+  // Per-test isolation for the rate-cap state dir — without this, accumulated
+  // restarts across the suite would eventually trip the cap and produce
+  // confusing skip behaviour. controlDir is recreated per `makeHarness()`.
+  const wdState = join(h.controlDir, "wd-state");
+  mkdirSync(wdState, { recursive: true });
   const opts: ExecFileSyncOptions = {
     env: {
       PATH: `${h.binDir}:/usr/bin:/bin`,
       // HOME and USER sometimes matter for bash shell init.
       HOME: process.env.HOME ?? "/tmp",
       USER: process.env.USER ?? "nobody",
+      WATCHDOG_STATE_DIR: wdState,
       ...env,
     },
     encoding: "utf8",
@@ -609,6 +631,57 @@ describe("bridge-watchdog.sh — behavioural integration", () => {
     const longAgo = Math.floor(Date.now() / 1000) - 200;
     writeFileSync(join(h.stateDir, ".watchdog-disconnect-since"), String(longAgo));
     const r = runWatchdog(h, { DISCONNECT_GRACE_SECS: "120", LIVENESS_GRACE_SECS: "30" });
+    expect(r.code).toBe(0);
+    expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(true);
+  });
+
+  it("restart rate cap blocks the Nth+1 restart within the window", () => {
+    // Simulate that this agent has already been restarted N=MAX times
+    // within the rate-cap window. The next restart attempt should
+    // log-and-skip rather than proceed, even though every other guard
+    // (uptime, disconnect grace, progress) says "restart now".
+    setEstabCount(h, 0);
+    writeGatewayLog(h, ["telegram gateway: bridge registered"]);
+    const longAgo = Math.floor(Date.now() / 1000) - 200;
+    writeFileSync(join(h.stateDir, ".watchdog-disconnect-since"), String(longAgo));
+
+    // Pre-seed the rate-cap state with 5 recent timestamps (the default
+    // MAX_RESTARTS_PER_WINDOW).
+    const wdState = join(h.controlDir, "wd-state");
+    mkdirSync(wdState, { recursive: true });
+    const now = Math.floor(Date.now() / 1000);
+    const recent = [now - 60, now - 120, now - 300, now - 600, now - 900].join("\n") + "\n";
+    writeFileSync(join(wdState, "klanker.restarts"), recent);
+
+    const r = runWatchdog(h, {
+      DISCONNECT_GRACE_SECS: "120",
+      LIVENESS_GRACE_SECS: "30",
+    });
+    expect(r.code).toBe(0);
+    // The cap fired — no restart issued.
+    expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(false);
+    expect(r.stdout).toMatch(/restart-rate-capped/);
+  });
+
+  it("restart rate cap does NOT block when prior restart timestamps are outside the window", () => {
+    // Old timestamps (further back than RESTART_RATE_WINDOW_SECS) must
+    // be trimmed and not counted toward the cap.
+    setEstabCount(h, 0);
+    writeGatewayLog(h, ["telegram gateway: bridge registered"]);
+    const longAgo = Math.floor(Date.now() / 1000) - 200;
+    writeFileSync(join(h.stateDir, ".watchdog-disconnect-since"), String(longAgo));
+
+    const wdState = join(h.controlDir, "wd-state");
+    mkdirSync(wdState, { recursive: true });
+    // 5 timestamps, all OLDER than the default 1800s window.
+    const now = Math.floor(Date.now() / 1000);
+    const old = [now - 5000, now - 4500, now - 4000, now - 3500, now - 3000].join("\n") + "\n";
+    writeFileSync(join(wdState, "klanker.restarts"), old);
+
+    const r = runWatchdog(h, {
+      DISCONNECT_GRACE_SECS: "120",
+      LIVENESS_GRACE_SECS: "30",
+    });
     expect(r.code).toBe(0);
     expect(restartIssued(r.audit, "switchroom-klanker.service")).toBe(true);
   });

@@ -110,6 +110,10 @@ describe("generateGatewayUnit — cgroup kill semantics (issue #361)", () => {
   it("preserves Restart=always", () => {
     expect(svc).toContain("Restart=always");
   });
+
+  it("smears restart timing with RandomizedDelaySec to avoid thundering herd", () => {
+    expect(svc).toContain("RandomizedDelaySec=5");
+  });
 });
 
 // ─── Foreman unit ─────────────────────────────────────────────────────────────
@@ -140,6 +144,10 @@ describe("generateForemanUnit — cgroup kill semantics (issue #361)", () => {
 
   it("preserves Restart=always", () => {
     expect(svc).toContain("Restart=always");
+  });
+
+  it("smears restart timing with RandomizedDelaySec to avoid thundering herd", () => {
+    expect(svc).toContain("RandomizedDelaySec=5");
   });
 });
 

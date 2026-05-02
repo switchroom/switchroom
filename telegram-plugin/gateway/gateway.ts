@@ -172,6 +172,7 @@ import {
   loadLockout,
   nextLockout,
   saveLockout,
+  DEFAULT_FALLBACK_COOLDOWN_MS,
   type LockoutRecord,
   type LockoutPersistOps,
 } from '../auto-fallback.js'
@@ -1145,6 +1146,43 @@ const DEFERRED_SECRET_TTL_MS = 24 * 60 * 60_000 // 24 h — ignored one-tap card
 // restart (the `--force` SIGKILL fallback documented in the spec).
 const PENDING_RESTART_DRAIN_CAP_MS = 60_000
 
+/**
+ * Compact one-line summary of a turn-active marker payload, for the
+ * [markersweep] log line. Resilient to malformed JSON — returns
+ * `payload=unparseable` rather than throwing.
+ */
+function summariseMarkerPayload(payload: string | null): string {
+  if (!payload) return 'payload=missing'
+  try {
+    const parsed = JSON.parse(payload) as { turnKey?: unknown; chatId?: unknown; startedAt?: unknown }
+    const turnKey = typeof parsed.turnKey === 'string' ? parsed.turnKey : 'unknown'
+    const chatId = typeof parsed.chatId === 'string' ? parsed.chatId : 'unknown'
+    const startedAt = typeof parsed.startedAt === 'number' ? parsed.startedAt : 0
+    return `turnKey=${turnKey} chat=${chatId} started=${new Date(startedAt).toISOString()}`
+  } catch {
+    return 'payload=unparseable'
+  }
+}
+
+/**
+ * Returns true when the persisted auto-fallback lockout for this
+ * agent's directory shows we just rotated slots within the cooldown
+ * window. Used by the pending-restart drain cap to defer a forced
+ * restart that would otherwise stack on top of an in-flight slot
+ * rotation. Best-effort: any read error returns false (fail-open),
+ * matching the lockout's "noise filter, not a security boundary" role.
+ */
+function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean {
+  try {
+    const agentDir = resolveAgentDirFromEnv()
+    const persisted = loadLockout(agentDir, lockoutOps)
+    if (!persisted.lastTransitionedFrom) return false
+    return now - persisted.lastTransitionAt < DEFAULT_FALLBACK_COOLDOWN_MS
+  } catch {
+    return false
+  }
+}
+
 // 60-second sweep drops anything past its documented TTL.
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
@@ -1176,22 +1214,52 @@ const pendingStateReaper = setInterval(() => {
   // under the watchdog's TURN_HANG_SECS=300s threshold for the in-
   // flight case but generous enough that real long-running tool calls
   // (which touch mtime on every tool_use) won't trip the idle path.
+  //
+  // Logging: include agent name + age + reason + payload so a marker
+  // leak (or a real wedge) leaves enough breadcrumbs in journalctl to
+  // diagnose without needing to inspect the file (which is gone after
+  // the sweep). `journalctl -u switchroom-<agent>-gateway -g markersweep`
+  // is the audit trail.
   try {
-    const swept = sweepStaleTurnActiveMarker(STATE_DIR, {
+    sweepStaleTurnActiveMarker(STATE_DIR, {
       turnInFlight: currentTurnRegistryKey != null,
       idleSweepMs: 60_000,
       hardTtlMs: 10 * 60_000,
       now,
+      onRemove: ({ ageMs, reason, payload }) => {
+        const agent = getMyAgentName()
+        const ageSec = Math.round(ageMs / 1000)
+        const turnInFlight = currentTurnRegistryKey != null
+        const summary = summariseMarkerPayload(payload)
+        process.stderr.write(
+          `telegram gateway: [markersweep] removed agent=${agent} age=${ageSec}s reason=${reason} turn_in_flight=${turnInFlight} ${summary}\n`,
+        )
+      },
     })
-    if (swept) {
-      process.stderr.write(`telegram gateway: turn-active marker swept (stale, no live turn)\n`)
-    }
   } catch { /* best-effort */ }
   // Drain cap: if a scheduled restart has been waiting >60s for a turn
   // to complete, force it through anyway (spec: 60s cap → SIGKILL fallback).
+  //
+  // Auto-fallback cooldown gate: if the persisted lockout shows we just
+  // rotated this agent's slot inside the cooldown window, defer the
+  // forced restart by another tick. This closes a churn window where a
+  // 429-driven fallback already spawned a restart, and a parallel
+  // schedule_restart IPC sat in pendingRestarts — without this gate the
+  // drain cap would fire a SECOND restart 60s later. Bound: at most
+  // FALLBACK_COOLDOWN_MS / 60s extra deferrals per pending restart.
   for (const [agentName, requestedAt] of pendingRestarts.entries()) {
     if (now - requestedAt > PENDING_RESTART_DRAIN_CAP_MS) {
-      process.stderr.write(`telegram gateway: pending restart drain cap exceeded for ${agentName} (waited ${Math.round((now - requestedAt) / 1000)}s) — forcing restart\n`)
+      const waitedSec = Math.round((now - requestedAt) / 1000)
+      const cooldownActive = isAutoFallbackCooldownActive(agentName, now)
+      if (cooldownActive) {
+        process.stderr.write(
+          `telegram gateway: [restart-drain] deferred agent=${agentName} waited=${waitedSec}s reason=auto-fallback-cooldown-active\n`,
+        )
+        continue
+      }
+      process.stderr.write(
+        `telegram gateway: [restart-drain] forcing agent=${agentName} waited=${waitedSec}s threshold=${Math.round(PENDING_RESTART_DRAIN_CAP_MS / 1000)}s\n`,
+      )
       pendingRestarts.delete(agentName)
       try {
         spawn(
@@ -1205,7 +1273,7 @@ const pendingStateReaper = setInterval(() => {
           { detached: true, stdio: 'ignore' },
         ).unref()
       } catch (err) {
-        process.stderr.write(`telegram gateway: forced restart spawn failed for ${agentName}: ${err}\n`)
+        process.stderr.write(`telegram gateway: [restart-drain] forced restart spawn failed agent=${agentName}: ${err}\n`)
       }
     }
   }
@@ -5799,6 +5867,9 @@ type AutoFallbackCheckResult =
   | { kind: 'error'; message: string }
 
 async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): Promise<AutoFallbackCheckResult> {
+  // All log lines in this path use the `[autofallback]` tag so a single
+  // grep against journalctl reconstructs the full decision history of
+  // a slot rotation: `journalctl -u switchroom-<agent>-gateway -g autofallback`.
   try {
     const agentDir = resolveAgentDirFromEnv()
     const agentName = getMyAgentName()
@@ -5812,8 +5883,14 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
       lockout: autoFallbackLockout,
     })
     if (decision.action !== 'fallback') {
+      process.stderr.write(
+        `telegram gateway: [autofallback] noop trigger=${opts.trigger} agent=${agentName} active=${active ?? 'none'} reason=${decision.reason}\n`,
+      )
       return { kind: 'no-action', reason: decision.reason, decision: 'noop' }
     }
+    process.stderr.write(
+      `telegram gateway: [autofallback] decision=fallback trigger=${opts.trigger} agent=${agentName} active=${active ?? 'none'} reason=${decision.triggerReason} util=${decision.utilizationPct?.toFixed(1) ?? 'n/a'}%\n`,
+    )
     const plan = performAutoFallback({
       agentDir,
       agentName,
@@ -5826,12 +5903,13 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
       ownerChatId,
       plan,
       onError: (err) => {
-        process.stderr.write(`telegram gateway: auto-fallback notify failed (${opts.trigger}): ${err}\n`)
+        process.stderr.write(`telegram gateway: [autofallback] notify failed trigger=${opts.trigger} agent=${agentName}: ${err}\n`)
       },
     })
     if (plan.kind === 'executed') {
       try { assertSafeAgentName(plan.agentName) }
       catch {
+        process.stderr.write(`telegram gateway: [autofallback] invalid-agent-name agent=${plan.agentName}\n`)
         return { kind: 'error', message: `invalid agent name: ${plan.agentName}` }
       }
       try {
@@ -5843,20 +5921,26 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
         if (plan.triggerReason !== '429-response') {
           restartArgs.push('--graceful-restart')
         }
+        process.stderr.write(
+          `telegram gateway: [autofallback] executed agent=${plan.agentName} prev=${plan.previousSlot} next=${plan.newSlot} restart=${plan.triggerReason === '429-response' ? 'hard' : 'graceful'}\n`,
+        )
         switchroomExec(restartArgs)
       } catch (err) {
-        process.stderr.write(`telegram gateway: auto-fallback restart failed: ${err}\n`)
+        process.stderr.write(`telegram gateway: [autofallback] restart failed agent=${plan.agentName}: ${err}\n`)
       }
       autoFallbackLockout = nextLockout(plan.previousSlot, Date.now())
       persistLockout(agentDir)
       void refreshPinnedBanner('auto-fallback')
       return { kind: 'executed', previousSlot: plan.previousSlot, newSlot: plan.newSlot }
     }
+    process.stderr.write(
+      `telegram gateway: [autofallback] exhausted-all agent=${agentName} active=${plan.activeSlot}\n`,
+    )
     autoFallbackLockout = nextLockout(plan.activeSlot, Date.now())
     persistLockout(agentDir)
     return { kind: 'exhausted-all', activeSlot: plan.activeSlot }
   } catch (err) {
-    process.stderr.write(`telegram gateway: auto-fallback ${opts.trigger} poll error: ${err}\n`)
+    process.stderr.write(`telegram gateway: [autofallback] ${opts.trigger} poll error: ${err}\n`)
     return { kind: 'error', message: String((err as Error).message ?? err) }
   }
 }

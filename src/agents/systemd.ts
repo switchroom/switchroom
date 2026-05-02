@@ -267,6 +267,11 @@ StandardOutput=journal
 StandardError=journal
 Restart=always
 RestartSec=3
+# Spread restart attempts across a 5s window so a fleet-wide crash
+# doesn't produce a synchronized thundering herd of claude processes
+# coming back at the same instant. The [Unit] section's start-limit
+# above caps the absolute rate; this adds jitter inside that envelope.
+RandomizedDelaySec=5
 # Cgroup-wide kill so restart actually kills the gateway process (issue #361).
 # Same script PTY cgroup-escape issue as the agent unit — see generateUnit().
 KillMode=control-group
@@ -329,6 +334,10 @@ StandardOutput=journal
 StandardError=journal
 Restart=always
 RestartSec=3
+# Same jitter rationale as the gateway unit: smear restart timing within
+# the StartLimitBurst envelope so a host-wide crash doesn't produce a
+# synchronized restart wave.
+RandomizedDelaySec=5
 # Cgroup-wide kill so restart actually kills the foreman process (issue #361).
 # Same script PTY cgroup-escape issue as the agent unit — see generateUnit().
 KillMode=control-group

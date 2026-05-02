@@ -311,6 +311,76 @@ stamp_restart_reason() {
   fi
 }
 
+# ─── Restart rate cap ──────────────────────────────────────────────────
+#
+# Belt-and-suspenders for runaway restart loops (#550 follow-up). Even
+# with the in-flight detector + progress-fingerprint defences above,
+# there are pathological combinations (e.g. a stuck marker file the
+# sweep can't clear, a bridge that ESTAB-flaps once a minute) where
+# the watchdog could chew through Claude quota by restarting the same
+# agent N times an hour — every restart loads model context fresh.
+#
+# Rule: a single agent cannot be restarted by THIS watchdog more than
+# `MAX_RESTARTS_PER_WINDOW` times within `RESTART_RATE_WINDOW_SECS`.
+# When the cap trips, the restart is logged-and-skipped with a clear
+# `restart-rate-capped` reason so an operator can see the throttle
+# fired in `journalctl -t switchroom-watchdog | grep rate-capped`.
+#
+# The cap covers ALL three restart paths (bridge-disconnect, turn-hang,
+# journal-silence) plus the service-inactive heal — anything that
+# would cost a fresh `claude` startup. systemd's own
+# StartLimitBurst/IntervalSec is not enough on its own because each
+# `switchroom agent restart` resets that counter.
+#
+# State file: `${WATCHDOG_STATE_DIR}/${agent}.restarts` — newline-
+# separated epoch timestamps, trimmed to the window on every check.
+# tmpfs → cleared on logout, which is what we want (don't carry a
+# stale 30-min window across a reboot).
+: "${MAX_RESTARTS_PER_WINDOW:=5}"
+: "${RESTART_RATE_WINDOW_SECS:=1800}"
+
+# Returns 0 (allow) when the agent is under the cap. Returns 1 (block)
+# and emits a `[skip]` log line when the cap would be exceeded. Pure
+# read — does NOT record the restart; call restart_rate_record on the
+# allowed path.
+restart_rate_check() {
+  local agent="$1"
+  local reason_tag="$2"
+  local rate_file="${WATCHDOG_STATE_DIR}/${agent}.restarts"
+  [[ -f "$rate_file" ]] || return 0
+  local now cutoff count=0
+  now=$(now_epoch)
+  cutoff=$(( now - RESTART_RATE_WINDOW_SECS ))
+  while IFS= read -r ts; do
+    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+    (( ts >= cutoff )) && count=$(( count + 1 ))
+  done < "$rate_file"
+  if (( count >= MAX_RESTARTS_PER_WINDOW )); then
+    wd_log skip "agent=${agent} reason=${reason_tag} decision=restart-rate-capped recent=${count} max=${MAX_RESTARTS_PER_WINDOW} window=${RESTART_RATE_WINDOW_SECS}s (operator intervention required — investigate before clearing ${rate_file})"
+    return 1
+  fi
+  return 0
+}
+
+# Append a restart timestamp and trim to the window. Best-effort I/O.
+restart_rate_record() {
+  local agent="$1"
+  local rate_file="${WATCHDOG_STATE_DIR}/${agent}.restarts"
+  local now cutoff
+  now=$(now_epoch)
+  cutoff=$(( now - RESTART_RATE_WINDOW_SECS ))
+  local tmp="${rate_file}.tmp-$$"
+  {
+    if [[ -f "$rate_file" ]]; then
+      while IFS= read -r ts; do
+        [[ "$ts" =~ ^[0-9]+$ ]] || continue
+        (( ts >= cutoff )) && echo "$ts"
+      done < "$rate_file"
+    fi
+    echo "$now"
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$rate_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+}
+
 # Discover active gateway units. systemd's list-units output includes only
 # currently-loaded units; we filter to the switchroom-*-gateway.service
 # pattern and strip the prefix/suffix to get the agent name.
@@ -377,7 +447,11 @@ for gateway_svc in "${gateway_services[@]}"; do
       wd_log skip "agent=${agent} reason=service-failed decision=needs-operator-reset state=${state} $(agent_progress_snapshot "$agent") (unit in failed state; needs operator reset-failed)"
       continue
     fi
+    if ! restart_rate_check "$agent" "service-inactive"; then
+      continue
+    fi
     wd_log restart "agent=${agent} reason=service-inactive state=${state} action=start $(agent_progress_snapshot "$agent") (agent service is inactive)"
+    restart_rate_record "$agent"
     systemctl --user start "$agent_svc" || {
       wd_log error "agent=${agent} systemctl start failed"
     }
@@ -498,7 +572,11 @@ for gateway_svc in "${gateway_services[@]}"; do
   fi
 
   wd_log detect "agent=${agent} reason=bridge-disconnect disc_duration=${disc_duration}s threshold=${DISCONNECT_GRACE_SECS}s ${observation}"
+  if ! restart_rate_check "$agent" "bridge-disconnect"; then
+    continue
+  fi
   wd_log restart "agent=${agent} reason=bridge-disconnect disc_duration=${disc_duration}s threshold=${DISCONNECT_GRACE_SECS}s ${observation}"
+  restart_rate_record "$agent"
   # Clear the marker so post-restart we don't immediately re-trip on
   # the still-old tail. The uptime grace will cover the startup window
   # anyway, but removing the marker keeps state clean.
@@ -615,12 +693,16 @@ for agent_svc in "${agent_services[@]}"; do
           continue
         fi
         wd_log detect "agent=${agent} reason=turn-hang turn_age=${turn_age}s threshold=${TURN_HANG_SECS}s ${observation} (no progress fingerprints within ${JSONL_LIVENESS_SECS}s — wedged mid-turn)"
+        if ! restart_rate_check "$agent" "turn-hang"; then
+          continue
+        fi
         # Stamp the reason BEFORE the restart so the next greeting
         # card renders "Restarted  watchdog: …".
         stamp_restart_reason \
           "${agent_state_dir}/clean-shutdown.json" \
           "watchdog: turn-active marker stale ${turn_age}s with no JSONL activity"
         wd_log restart "agent=${agent} reason=turn-hang turn_age=${turn_age}s threshold=${TURN_HANG_SECS}s ${observation}"
+        restart_rate_record "$agent"
         # Resolve the switchroom CLI (same belt-and-suspenders as below)
         switchroom_cli=""
         for candidate in "${HOME}/.bun/bin/switchroom" "${HOME}/.local/bin/switchroom"; do
@@ -734,11 +816,15 @@ for agent_svc in "${agent_services[@]}"; do
   # This matches the production hang pattern (issue #116). Restart
   # via the switchroom CLI.
   wd_log detect "agent=${agent} reason=journal-silence journal_age=${journal_age}s silence_duration=${silence_duration}s threshold=${JOURNAL_SILENCE_HARD_SECS}s ${observation} (no progress fingerprints — wedged)"
+  if ! restart_rate_check "$agent" "journal-silence"; then
+    continue
+  fi
   agent_state_dir="${HOME}/.switchroom/agents/${agent}/telegram"
   stamp_restart_reason \
     "${agent_state_dir}/clean-shutdown.json" \
     "watchdog: journal silent for ${journal_age}s with no progress activity"
   wd_log restart "agent=${agent} reason=journal-silence journal_age=${journal_age}s silence_duration=${silence_duration}s threshold=${JOURNAL_SILENCE_HARD_SECS}s ${observation}"
+  restart_rate_record "$agent"
   rm -f "$silence_marker" 2>/dev/null || true
 
   # Use `switchroom agent restart` (not raw systemctl) — the project
