@@ -2321,14 +2321,279 @@ describe('progress-card multi-agent layout snapshots', () => {
       // Render `now` is 70_000ms after the last event (>60s SUBAGENT_STALL_MS).
       const html = render(st, 72_100)
 
-      // Stalled state surfaces in both the header summary and per-agent header.
-      expect(html).toContain('<b><u>🤖 Sub-agents</u></b> · ⚠️ 1')
+      // Per #553: stalled sub-agents still count toward the 🔄 running
+      // total in the header (so the count never drifts from the rendered
+      // row count), but the per-row header still surfaces ⚠️ stalled as a
+      // render-time annotation.
+      expect(html).toContain('<b><u>🤖 Sub-agents</u></b> · 🔄 1')
       expect(html).toContain('⚠️ stalled')
+      // The old separate ⚠️ N counter on the summary header is gone.
+      expect(html).not.toContain('<b><u>🤖 Sub-agents</u></b> · ⚠️')
 
       // The sub-agent's underlying state stays 'running' — stalled is a
       // render-time classification based on lastEventAt freshness, not a
       // separate state machine value.
       expect(st.subAgents.get('A')?.state).toBe('running')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+})
+
+// ── #553 PR 2: header count must equal rendered row count ───────────────────
+//
+// Bug: the summary header counted stalled sub-agents (running + no events for
+// 60s) under a separate ⚠️ bucket, so "1 sub agent working" appeared above 4
+// rendered rows. Fix: stalled folds into the running count, since the
+// underlying `state === 'running'` and the renderer enumerates all such
+// entries as full rows. The per-row ⚠️ glyph stays — it's row-level metadata,
+// not a state-machine value.
+describe('progress-card — #553 sub-agent header count parity', () => {
+  // Build a state with N sub-agents whose lastEventAt is `ageMs` in the past
+  // at render time `now`. Returns { state, now } ready to render.
+  function buildSubAgents(
+    specs: ReadonlyArray<{ id: string; ageMs: number; description: string }>,
+    now: number,
+  ): { state: ProgressCardState; now: number } {
+    const enqueueEvt = enqueue('parallel run')
+    const toolUseEvts: SessionEvent[] = specs.map((s) => ({
+      kind: 'tool_use',
+      toolName: 'Agent',
+      toolUseId: `toolu_${s.id}`,
+      input: { description: s.description, prompt: `P-${s.id}` },
+    }))
+    let st = fold([enqueueEvt, ...toolUseEvts])
+    // Walk each spec: started + one tool_use to set lastEventAt.
+    for (const s of specs) {
+      const lastEventAt = now - s.ageMs
+      st = reduce(st, { kind: 'sub_agent_started', agentId: s.id, firstPromptText: `P-${s.id}` }, lastEventAt - 1)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: s.id, toolUseId: `t-${s.id}`, toolName: 'Bash', input: { command: 'work' } },
+        lastEventAt,
+      )
+    }
+    return { state: st, now }
+  }
+
+  // Count rendered <blockquote expandable> blocks whose collapsed header
+  // shows the given status emoji + label. Independent of the summary header.
+  function countRenderedRows(html: string, statusFragment: string): number {
+    const blocks = html.split('<blockquote expandable>').slice(1)
+    return blocks.filter((b) => b.split('</blockquote>')[0].includes(statusFragment)).length
+  }
+
+  it('header_count_eq_rendered_running_rows: 1 fresh + 3 stalled-running → 🔄 4', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      const NOW = 200_000
+      const FRESH_MS = 5_000
+      const STALLED_MS = 90_000 // > SUBAGENT_STALL_MS (60s)
+      const { state, now } = buildSubAgents(
+        [
+          { id: 'A', ageMs: FRESH_MS, description: 'fresh worker' },
+          { id: 'B', ageMs: STALLED_MS, description: 'stalled one' },
+          { id: 'C', ageMs: STALLED_MS, description: 'stalled two' },
+          { id: 'D', ageMs: STALLED_MS, description: 'stalled three' },
+        ],
+        NOW,
+      )
+      const html = render(state, now)
+
+      // Header reports 4 running, no separate stalled bucket on the header.
+      expect(html).toContain('<b><u>🤖 Sub-agents</u></b> · 🔄 4')
+      expect(html).not.toMatch(/🤖 Sub-agents<\/u><\/b>[^\n]*⚠️/)
+
+      // Rendered rows: 1 row with `🔄 working` + 3 rows with `⚠️ stalled`.
+      // Header running count (4) == fresh (1) + stalled (3) == every row
+      // whose underlying state is 'running'.
+      expect(countRenderedRows(html, '🔄 working')).toBe(1)
+      expect(countRenderedRows(html, '⚠️ stalled')).toBe(3)
+      expect((html.match(/<blockquote expandable>/g) ?? []).length).toBe(4)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('header_count_excludes_terminal: done/failed are not in 🔄 count', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      let st = fold([
+        enqueue('mixed terminal'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'task A', prompt: 'P-A' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'task B', prompt: 'P-B' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_c', input: { description: 'task C', prompt: 'P-C' } },
+      ])
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P-A' }, 2000)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P-B' }, 2100)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'P-C' }, 2200)
+      // A → done, B → failed. C stays running.
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_a', toolName: 'Agent', isError: false }, 2300)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_b', toolName: 'Agent', isError: true, errorText: 'boom' }, 2400)
+      const html = render(st, 3000)
+
+      // Header: ✅ 1 · 🔄 1 · ❌ 1 — the running count excludes terminal entries.
+      expect(html).toContain('<b><u>🤖 Sub-agents</u></b> · ✅ 1 · 🔄 1 · ❌ 1')
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('header_count_eq_rendered_running_rows_mixed: 1 fresh + 1 stalled + 1 done + 1 failed', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      const NOW = 300_000
+      let st = fold([
+        enqueue('mixed everything'),
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_a', input: { description: 'fresh worker', prompt: 'P-A' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_b', input: { description: 'stalled worker', prompt: 'P-B' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_c', input: { description: 'done worker', prompt: 'P-C' } },
+        { kind: 'tool_use', toolName: 'Agent', toolUseId: 'toolu_d', input: { description: 'failed worker', prompt: 'P-D' } },
+      ])
+      // A: fresh running (recent event)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'A', firstPromptText: 'P-A' }, NOW - 10_000)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'A', toolUseId: 'ta', toolName: 'Bash', input: { command: 'work' } },
+        NOW - 5_000,
+      )
+      // B: stalled running (last event > 60s ago)
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'B', firstPromptText: 'P-B' }, NOW - 200_000)
+      st = reduce(
+        st,
+        { kind: 'sub_agent_tool_use', agentId: 'B', toolUseId: 'tb', toolName: 'Bash', input: { command: 'sleep' } },
+        NOW - 90_000,
+      )
+      // C: terminal done
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'C', firstPromptText: 'P-C' }, NOW - 50_000)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_c', toolName: 'Agent', isError: false }, NOW - 40_000)
+      // D: terminal failed
+      st = reduce(st, { kind: 'sub_agent_started', agentId: 'D', firstPromptText: 'P-D' }, NOW - 30_000)
+      st = reduce(st, { kind: 'tool_result', toolUseId: 'toolu_d', toolName: 'Agent', isError: true, errorText: 'x' }, NOW - 20_000)
+
+      const html = render(st, NOW)
+
+      // Header: ✅ 1 · 🔄 2 · ❌ 1 — fresh + stalled both count toward 🔄.
+      expect(html).toContain('<b><u>🤖 Sub-agents</u></b> · ✅ 1 · 🔄 2 · ❌ 1')
+
+      // Rendered rows: 1 working + 1 stalled + 1 done + 1 failed.
+      // The two running rows (1 fresh-working + 1 stalled) match the
+      // header 🔄 2 count exactly — which is the bug this PR fixes.
+      expect(countRenderedRows(html, '🔄 working')).toBe(1)
+      expect(countRenderedRows(html, '⚠️ stalled')).toBe(1)
+      expect(countRenderedRows(html, '✅ done')).toBe(1)
+      expect(countRenderedRows(html, '❌ failed')).toBe(1)
+      expect((html.match(/<blockquote expandable>/g) ?? []).length).toBe(4)
+    } finally {
+      delete process.env.PROGRESS_CARD_MULTI_AGENT
+    }
+  })
+
+  it('regression: header counts never drift from rendered rows (property-style)', () => {
+    process.env.PROGRESS_CARD_MULTI_AGENT = '1'
+    try {
+      // Sweep a matrix of (fresh_running, stalled_running, done, failed)
+      // tuples and assert the invariant: for every rendered card, the sum
+      // of header counts equals the number of expandable rows, and the
+      // 🔄 count equals the number of rows with state === 'running' (i.e.
+      // both fresh-working and stalled rows). If a future refactor ever
+      // re-introduces a separate stalled bucket on the header without
+      // also subtracting from running, this test will catch the drift.
+      const matrix: Array<[number, number, number, number]> = [
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [1, 1, 0, 0],
+        [1, 3, 0, 0], // the canonical bug shape from the user report
+        [2, 2, 1, 1],
+        [0, 0, 3, 0],
+        [0, 0, 0, 3],
+        [3, 0, 2, 1],
+      ]
+
+      for (const [nFresh, nStalled, nDone, nFailed] of matrix) {
+        const NOW = 500_000
+        const enqueueEvt = enqueue(`matrix ${nFresh}-${nStalled}-${nDone}-${nFailed}`)
+        const toolUseEvts: SessionEvent[] = []
+        const allIds: string[] = []
+        let idx = 0
+        const make = (n: number, prefix: string): string[] => {
+          const ids: string[] = []
+          for (let i = 0; i < n; i++) {
+            const id = `${prefix}${i}`
+            ids.push(id)
+            allIds.push(id)
+            toolUseEvts.push({
+              kind: 'tool_use',
+              toolName: 'Agent',
+              toolUseId: `toolu_${id}`,
+              input: { description: `${prefix} ${i}`, prompt: `P-${id}` },
+            })
+            idx++
+          }
+          return ids
+        }
+        const freshIds = make(nFresh, 'F')
+        const stalledIds = make(nStalled, 'S')
+        const doneIds = make(nDone, 'D')
+        const failedIds = make(nFailed, 'X')
+
+        let st = fold([enqueueEvt, ...toolUseEvts])
+
+        for (const id of freshIds) {
+          st = reduce(st, { kind: 'sub_agent_started', agentId: id, firstPromptText: `P-${id}` }, NOW - 10_000)
+          st = reduce(
+            st,
+            { kind: 'sub_agent_tool_use', agentId: id, toolUseId: `t-${id}`, toolName: 'Bash', input: { command: 'x' } },
+            NOW - 5_000,
+          )
+        }
+        for (const id of stalledIds) {
+          st = reduce(st, { kind: 'sub_agent_started', agentId: id, firstPromptText: `P-${id}` }, NOW - 200_000)
+          st = reduce(
+            st,
+            { kind: 'sub_agent_tool_use', agentId: id, toolUseId: `t-${id}`, toolName: 'Bash', input: { command: 'x' } },
+            NOW - 90_000,
+          )
+        }
+        for (const id of doneIds) {
+          st = reduce(st, { kind: 'sub_agent_started', agentId: id, firstPromptText: `P-${id}` }, NOW - 50_000)
+          st = reduce(st, { kind: 'tool_result', toolUseId: `toolu_${id}`, toolName: 'Agent', isError: false }, NOW - 40_000)
+        }
+        for (const id of failedIds) {
+          st = reduce(st, { kind: 'sub_agent_started', agentId: id, firstPromptText: `P-${id}` }, NOW - 30_000)
+          st = reduce(
+            st,
+            { kind: 'tool_result', toolUseId: `toolu_${id}`, toolName: 'Agent', isError: true, errorText: 'e' },
+            NOW - 20_000,
+          )
+        }
+
+        const html = render(st, NOW)
+
+        // Total expandable rows == total sub-agents.
+        const totalRows = (html.match(/<blockquote expandable>/g) ?? []).length
+        const totalSubAgents = nFresh + nStalled + nDone + nFailed
+        expect(totalRows, `tuple ${nFresh}/${nStalled}/${nDone}/${nFailed}`).toBe(totalSubAgents)
+
+        if (totalSubAgents === 0) continue
+
+        // Parse header counts from the summary line.
+        const headerMatch = html.match(/<b><u>🤖 Sub-agents<\/u><\/b>([^\n]*)/)
+        expect(headerMatch, `header missing for ${nFresh}/${nStalled}/${nDone}/${nFailed}`).toBeTruthy()
+        const headerLine = headerMatch![1]
+        const doneCount = Number(headerLine.match(/✅ (\d+)/)?.[1] ?? 0)
+        const runningCount = Number(headerLine.match(/🔄 (\d+)/)?.[1] ?? 0)
+        const failedCount = Number(headerLine.match(/❌ (\d+)/)?.[1] ?? 0)
+
+        // The invariant: 🔄 count === fresh + stalled (both have state === 'running').
+        expect(runningCount, `🔄 drift on ${nFresh}/${nStalled}/${nDone}/${nFailed}`).toBe(nFresh + nStalled)
+        expect(doneCount, `✅ drift on ${nFresh}/${nStalled}/${nDone}/${nFailed}`).toBe(nDone)
+        expect(failedCount, `❌ drift on ${nFresh}/${nStalled}/${nDone}/${nFailed}`).toBe(nFailed)
+        // Sum of header counts == total rendered rows.
+        expect(doneCount + runningCount + failedCount).toBe(totalRows)
+        // No separate ⚠️ bucket on the summary header (it would re-introduce drift).
+        expect(headerLine).not.toContain('⚠️')
+      }
     } finally {
       delete process.env.PROGRESS_CARD_MULTI_AGENT
     }

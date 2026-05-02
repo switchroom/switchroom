@@ -1378,40 +1378,56 @@ interface SubAgentCounts {
   running: number
   done: number
   failed: number
-  stalled: number
 }
 
+/**
+ * Count sub-agents by their underlying state. Stalled is NOT a separate
+ * bucket: a stalled sub-agent has `state === 'running'` (the ⚠️ glyph on
+ * the per-row header is purely a render-time annotation based on
+ * lastEventAt freshness — see `renderSubAgentExpandable`). Counting
+ * stalled separately on the summary header would let it drift from the
+ * rendered row count, which is what we render for running entries:
+ * `sortSubAgentsChrono` returns ALL entries regardless of staleness, so
+ * the header `🔄 N` must equal `state === 'running'` count to match what
+ * the user actually sees (see issue #553).
+ *
+ * The `now` parameter is retained for symmetry with the renderer (and to
+ * make a future "drift older than X" classification cheap to add) but is
+ * intentionally unused.
+ */
 function countSubAgentStates(
   subAgents: ReadonlyMap<string, SubAgentState>,
-  now: number,
+  _now: number,
 ): SubAgentCounts {
   let running = 0
   let done = 0
   let failed = 0
-  let stalled = 0
   for (const sa of subAgents.values()) {
-    if (sa.state === 'running') {
-      const isStalled = sa.lastEventAt != null && (now - sa.lastEventAt) >= SUBAGENT_STALL_MS
-      if (isStalled) stalled++
-      else running++
-    } else if (sa.state === 'done') done++
+    if (sa.state === 'running') running++
+    else if (sa.state === 'done') done++
     else if (sa.state === 'failed') failed++
   }
-  return { running, done, failed, stalled }
+  return { running, done, failed }
 }
 
 /**
- * Issue #352: always-visible summary header above per-agent expandables.
- * Format: `🤖 Sub-agents · ✅ N · 🔄 N · ❌ N · ⚠️ N`
- * Omits any emoji whose count is 0.
- * When all running (no done/failed/stalled): `🤖 Sub-agents · 🔄 N`
+ * Issue #352 / #553: always-visible summary header above per-agent
+ * expandables.
+ *
+ * Format: `🤖 Sub-agents · ✅ N · 🔄 N · ❌ N`
+ *
+ * Counts mirror sub-agent `state`, which is exactly what
+ * `sortSubAgentsChrono` enumerates as rendered rows — so the `🔄` count
+ * always equals the number of running rows the user sees. Stalled rows
+ * still get a ⚠️ glyph in their per-row header (see
+ * `renderSubAgentExpandable`), but they remain `state === 'running'` and
+ * therefore count toward `🔄`. Any emoji whose count is 0 is omitted.
  */
 function renderSubAgentSummaryHeader(c: SubAgentCounts): string {
   const parts: string[] = []
   if (c.done > 0) parts.push(`✅ ${c.done}`)
   if (c.running > 0) parts.push(`🔄 ${c.running}`)
   if (c.failed > 0) parts.push(`❌ ${c.failed}`)
-  if (c.stalled > 0) parts.push(`⚠️ ${c.stalled}`)
   const counters = parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
   return `<b><u>🤖 Sub-agents</u></b>${counters}`
 }
