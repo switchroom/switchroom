@@ -48,6 +48,7 @@ import {
   deriveTelegraphTitle,
   type TelegraphAccount,
 } from '../telegraph.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -1878,6 +1879,24 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
   let text = repairEscapedWhitespace(rawText)
   process.stderr.write(`telegram channel: reply: invoked chatId=${chat_id} charCount=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`)
+
+  // #546 dedup check: was this content just sent via turn-flush or
+  // a sibling reply path? Skip the actual send and return a
+  // plausible tool result so claude-code's retry loop closes
+  // cleanly. NOTE: only fires when content matches; legitimate
+  // late-replies with different content sail through.
+  {
+    const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    const dup = outboundDedup.check(chat_id, replyThreadId, text, Date.now())
+    if (dup != null) {
+      process.stderr.write(
+        `telegram gateway: reply: deduped (#546) chatId=${chat_id} ` +
+        `ageMs=${dup.ageMs} preview=${JSON.stringify(dup.preview)}\n`,
+      )
+      return { content: [{ type: 'text', text: 'sent (deduped — same content sent via earlier path)' }] }
+    }
+  }
+
   const files = (args.files as string[] | undefined) ?? []
   const quoteOptIn = args.quote !== false
   let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
@@ -2168,12 +2187,39 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
+  // #546 dedup record: future reply / stream_reply / turn-flush
+  // calls with this same content within DEFAULT_DEDUP_TTL_MS will
+  // be suppressed.
+  if (sentIds.length > 0) {
+    outboundDedup.record(chat_id, threadId, text, Date.now())
+  }
   return { content: [{ type: 'text', text: result }] }
 }
 
 async function executeStreamReply(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
+
+  // #546 dedup check: stream_reply done=true is the most-common
+  // retry shape — claude-code re-emits the final-text call when
+  // the previous bridge missed the ack. If turn-flush already sent
+  // the same content, swallow the retry and return success.
+  // Only check on done=true (the terminal call); intermediate
+  // streaming chunks are progress edits, not full sends.
+  if (args.done === true) {
+    const sChatId = args.chat_id as string
+    const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    const sText = args.text as string
+    const dup = outboundDedup.check(sChatId, sThreadId, sText, Date.now())
+    if (dup != null) {
+      process.stderr.write(
+        `telegram gateway: stream_reply: deduped (#546) chatId=${sChatId} ` +
+        `ageMs=${dup.ageMs} preview=${JSON.stringify(dup.preview)}\n`,
+      )
+      return { content: [{ type: 'text', text: 'sent (deduped — same content sent via earlier path)' }] }
+    }
+  }
+
   const access = loadAccess()
   // Detect chat type for draft-transport selection.
   // Private (DM) chats have positive numeric IDs; groups/channels are negative.
@@ -2282,6 +2328,14 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         Date.now(),
       )
     } catch { /* best-effort signal */ }
+  }
+  // #546 dedup record: capture the final stream_reply text on the
+  // terminal call so a subsequent retry (different bridge, same
+  // content) lands as a no-op instead of a second message.
+  if (args.done === true && result.messageId != null) {
+    const sChatId = args.chat_id as string
+    const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now())
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
@@ -3402,6 +3456,16 @@ function handleSessionEvent(ev: SessionEvent): void {
                 })
               } catch {}
             }
+            // #546 dedup: record what turn-flush just sent so a
+            // late-arriving reply / stream_reply with the same
+            // content gets suppressed (claude-code retries the
+            // un-acked tool_call after a bridge reconnect).
+            outboundDedup.record(
+              backstopChatId,
+              backstopThreadId,
+              capturedText,
+              Date.now(),
+            )
             if (backstopCtrl) backstopCtrl.setDone()
             unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
           } catch (err) {
