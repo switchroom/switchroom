@@ -222,6 +222,23 @@ export interface ProgressDriverConfig {
    */
   promoteOnParentToolCount?: number
   /**
+   * Time-based first-emit promotion (#553 F3): if the turn has been
+   * running this long with no tool/sub-agent that already triggered
+   * promotion, force the card to emit. Without this, single- or two-
+   * tool turns that take 5–30s never cross any existing promotion
+   * threshold and the card stays suppressed until `initialDelayMs`,
+   * at which point fast-turn-suppression cancels it on `turn_end`.
+   *
+   * Symmetric to `promoteOnParentToolCount`: pure additive promotion,
+   * never delays an emit that would otherwise fire. Fast-turn
+   * suppression in `flush()` is unchanged — sub-`promoteAfterMs` turns
+   * still skip the card.
+   *
+   * Default 5000 (5 seconds). Set to a large value (e.g. 999_999) to
+   * effectively disable.
+   */
+  promoteAfterMs?: number
+  /**
    * Number of consecutive 4xx Telegram API failures on card edits before
    * the card is marked terminal and all further edits are suppressed for
    * this turn. Transient (5xx/network) errors and "message is not modified"
@@ -365,6 +382,14 @@ interface PerChatState {
   isFirstEmit: boolean
   /** Timer for the deferred first emit (initial-delay suppression). */
   deferredFirstEmitTimer: unknown
+  /**
+   * F3 fix (#553): timer for the time-based first-emit promotion.
+   * Scheduled on the first ingest event; fires after `promoteAfterMs`
+   * to force-promote turns that don't trip parent-tool-count or
+   * sub-agent thresholds (e.g. one long Bash). Cleared on
+   * `promoteFirstEmit` or turn end.
+   */
+  timePromoteTimer: unknown
   /**
    * The Telegram message_id of the user's original inbound message that
    * triggered this turn. Set via startTurn({ replyToMessageId }). Passed
@@ -646,6 +671,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   const initialDelayMs = config.initialDelayMs ?? 30_000
   const promoteOnSubAgent = config.promoteOnSubAgent ?? true
   const promoteOnParentToolCount = config.promoteOnParentToolCount ?? 3
+  const promoteAfterMs = config.promoteAfterMs ?? 5_000
   const maxConsecutive4xx = config.maxConsecutive4xx ?? 3
   const orphanPromotionMs = config.orphanPromotionMs ?? 5_000
   const coldSubAgentThresholdMs = config.coldSubAgentThresholdMs ?? 30_000
@@ -822,6 +848,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     if (cs.deferredFirstEmitTimer != null) {
       clearT(cs.deferredFirstEmitTimer)
       cs.deferredFirstEmitTimer = null
+    }
+    if (cs.timePromoteTimer != null) {
+      clearT(cs.timePromoteTimer)
+      cs.timePromoteTimer = null
     }
     chats.delete(cs.turnKey)
     lastHeartbeatBucket.delete(cs.turnKey)
@@ -1321,11 +1351,46 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     if (cs.deferredFirstEmitTimer != null) {
       clearT(cs.deferredFirstEmitTimer)
     }
+    if (cs.timePromoteTimer != null) {
+      clearT(cs.timePromoteTimer)
+      cs.timePromoteTimer = null
+    }
     cs.deferredFirstEmitTimer = DELAY_ELAPSED
     process.stderr.write(
       `telegram gateway: progress-card: promoteFirstEmit turnKey=${cs.turnKey} reason=${reason}\n`,
     )
     flush(cs, /*forceDone*/ false)
+  }
+
+  /**
+   * F3 fix (#553): schedule a one-shot timer that force-promotes the
+   * card after `promoteAfterMs` if no other promotion path has fired
+   * by then. Idempotent — safe to call repeatedly. The timer is
+   * cleared by `promoteFirstEmit` (so the existing promotion paths
+   * still win when they fire first) and at turn end.
+   *
+   * Without this proactive timer, a long single-tool turn (e.g. one
+   * 10s Bash) never crosses any existing promotion threshold and
+   * the card stays suppressed until `initialDelayMs` (30s by
+   * default). Fast-turn-suppression then cancels it on `turn_end`.
+   */
+  function ensureTimePromoteScheduled(cs: PerChatState): void {
+    if (!cs.isFirstEmit) return
+    if (cs.deferredFirstEmitTimer === DELAY_ELAPSED) return
+    if (cs.apiFailures.terminal) return
+    if (cs.timePromoteTimer != null) return
+    if (promoteAfterMs <= 0) return
+    const elapsed = now() - cs.state.turnStartedAt
+    const remaining = Math.max(0, promoteAfterMs - elapsed)
+    const capturedTurnKey = cs.turnKey
+    cs.timePromoteTimer = setT(() => {
+      if (!chats.has(capturedTurnKey)) return
+      const cs2 = chats.get(capturedTurnKey)!
+      cs2.timePromoteTimer = null
+      // Idempotency belt-and-braces: promoteFirstEmit no-ops if already
+      // promoted by another path between scheduling and firing.
+      promoteFirstEmit(cs2, `time_${promoteAfterMs}ms`)
+    }, remaining)
   }
 
   /**
@@ -1482,6 +1547,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           pendingTimer: null,
           isFirstEmit: true,
           deferredFirstEmitTimer: null,
+          timePromoteTimer: null,
           lastEventAt: now(),
           pendingCompletion: false,
           completionFired: false,
@@ -1599,6 +1665,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       ) {
         promoteFirstEmit(chatState, `parent_tool_count_${chatState.state.items.length}`)
       }
+
+      // F3 fix (#553): schedule the time-based promotion timer on
+      // every ingest event (idempotent — only the first call schedules;
+      // subsequent calls are no-ops). Without this, a long single-tool
+      // turn never crossed parent_tool_count or sub_agent thresholds
+      // and the card stayed suppressed until initialDelayMs (30s).
+      ensureTimePromoteScheduled(chatState)
 
       // Issue #132: track whether the agent has called `reply` or
       // `stream_reply` at least once this turn so the renderer can

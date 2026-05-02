@@ -17,6 +17,8 @@ function harness(
     heartbeatMs?: number
     maxIdleMs?: number
     initialDelayMs?: number
+    /** F3 (#553): time-based first-emit promotion. Default 0 (disabled in tests). */
+    promoteAfterMs?: number
     onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
   },
 ) {
@@ -35,6 +37,10 @@ function harness(
     heartbeatMs: opts?.heartbeatMs,
     maxIdleMs: opts?.maxIdleMs,
     initialDelayMs: opts?.initialDelayMs ?? 0,
+    // F3 (#553): default to disabled in unit tests so existing
+    // initial-delay assertions stay isolated from time-based promotion.
+    // Tests that want to exercise it pass an explicit value.
+    promoteAfterMs: opts?.promoteAfterMs ?? 999_999,
     now: () => now,
     setTimeout: (fn, ms) => {
       const ref = nextRef++
@@ -1437,7 +1443,15 @@ describe('forceCompleteTurn — external completion signal', () => {
     // initialDelayMs=30s elapses), and stream_reply(done=true) fires
     // forceCompleteTurn. The deferred first-emit timer must be cancelled
     // so it can't fire at +30s with a ghost card.
-    const { driver, emits, advance } = harness(0, 0, { initialDelayMs: 30_000 })
+    // Disable F3 time-based promotion (default 5s) so this test isolates
+    // the cusp-race behaviour pre-existed the F3 fix — forceCompleteTurn
+    // must cancel the deferred-first-emit timer regardless. With time-
+    // promotion enabled, the card would correctly emit at +5s; that's
+    // covered by the F3 tests, not this one.
+    const { driver, emits, advance } = harness(0, 0, {
+      initialDelayMs: 30_000,
+      promoteAfterMs: 999_999,
+    })
 
     driver.startTurn({ chatId: 'c', userText: 'quick question' })
     advance(0)
@@ -3329,6 +3343,8 @@ describe('progress-card driver — promote-on-sub-agent', () => {
     initialDelayMs?: number
     promoteOnSubAgent?: boolean
     promoteOnParentToolCount?: number
+    /** F3 (#553): time-based first-emit promotion. Default disabled in tests. */
+    promoteAfterMs?: number
     maxConsecutive4xx?: number
     onTurnComplete?: (args: { chatId: string; threadId?: string; summary: string; taskIndex: number; taskTotal: number }) => void
   }) {
@@ -3345,6 +3361,9 @@ describe('progress-card driver — promote-on-sub-agent', () => {
       initialDelayMs: opts?.initialDelayMs ?? 30_000,
       promoteOnSubAgent: opts?.promoteOnSubAgent,
       promoteOnParentToolCount: opts?.promoteOnParentToolCount,
+      // F3 (#553): default disabled in unit tests so initial-delay assertions
+      // stay isolated from time-based promotion.
+      promoteAfterMs: opts?.promoteAfterMs ?? 999_999,
       maxConsecutive4xx: opts?.maxConsecutive4xx,
       now: () => now,
       setTimeout: (fn, ms) => {
@@ -3411,9 +3430,13 @@ describe('progress-card driver — promote-on-sub-agent', () => {
   })
 
   it('promoteOnSubAgent:false — sub-agent does NOT promote, card waits full delay', () => {
+    // Also disable F3 time-based promotion so this test cleanly isolates
+    // the promoteOnSubAgent flag (otherwise the time promote at +5s
+    // would fire before the sub-agent gate is exercised).
     const { driver, emits, advance } = promoHarness({
       initialDelayMs: 30_000,
       promoteOnSubAgent: false,
+      promoteAfterMs: 999_999,
     })
     driver.startTurn({ chatId: 'c', userText: 'q' })
     advance(5_000)
