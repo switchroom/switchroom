@@ -153,6 +153,14 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       // still bounding buffer growth from a runaway extractor.
       return typeof m.text === "string"
         && (m.text as string).length <= 8192;
+    case "update_placeholder":
+      // Legacy recall.py IPC. Accepted as a valid wire shape so the
+      // validator doesn't log "invalid IPC message shape" on every
+      // recall hook fire; dispatched to a no-op handler in
+      // `handleMessage` below. See `UpdatePlaceholderMessage` doc in
+      // ipc-protocol.ts for context.
+      return typeof m.chatId === "string" && (m.chatId as string).length > 0
+        && typeof m.text === "string" && (m.text as string).length <= 8192;
     default:
       return false;
   }
@@ -189,10 +197,15 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
   const agentIndex = new Map<string, IpcClient>();
   const topicIndex = new Map<number, IpcClient>();
 
+  /** Per-client dedup set for the legacy `update_placeholder` log line —
+   *  one log entry per connection, not per message. Cleared on disconnect. */
+  const loggedLegacyUpdatePlaceholder = new Set<string>();
+
   function removeClient(client: IpcClient & { _socket: ReturnType<typeof Bun.listen> extends infer S ? any : never }) {
     clients.delete(client);
     if (client.agentName) agentIndex.delete(client.agentName);
     if (client.topicId != null) topicIndex.delete(client.topicId);
+    loggedLegacyUpdatePlaceholder.delete(client.id);
     onClientDisconnected(client);
     log(`client disconnected: ${client.id} (agent=${client.agentName})`);
   }
@@ -249,6 +262,16 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "pty_partial":
         if (onPtyPartial) onPtyPartial(client, msg as PtyPartialForward);
+        break;
+      case "update_placeholder":
+        // Legacy recall.py IPC — placeholder UX was removed in #553 PR 5.
+        // Soft-accepted so recall.py keeps working without modifying
+        // vendored code; logged once per client connection so the gateway
+        // log doesn't fill with one line per hook fire.
+        if (!loggedLegacyUpdatePlaceholder.has(client.id)) {
+          loggedLegacyUpdatePlaceholder.add(client.id);
+          log(`legacy update_placeholder ignored (client=${client.id}, agent=${client.agentName ?? "anonymous"})`);
+        }
         break;
       default:
         log(`unknown IPC message type from client ${client.id}: ${(msg as any).type}`);

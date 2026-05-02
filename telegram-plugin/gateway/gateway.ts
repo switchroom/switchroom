@@ -162,6 +162,7 @@ import {
   clearActiveReactions,
 } from '../active-reactions.js'
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
+import { flushOnAgentDisconnect } from './disconnect-flush.js'
 import { fetchQuota, formatQuotaBlock } from '../quota-check.js'
 import {
   evaluateFallbackTrigger,
@@ -1608,29 +1609,31 @@ const ipcServer: IpcServer = createIpcServer({
   onClientDisconnected(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
 
-    // Flush all in-flight status reactions to 👍 so user messages don't stay
-    // stuck on intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
-    for (const [key, ctrl] of activeStatusReactions.entries()) {
-      ctrl.setDone()
-      activeStatusReactions.delete(key)
-      activeReactionMsgIds.delete(key)
-      activeTurnStartedAt.delete(key)
-    }
-    { const ad = resolveAgentDirFromEnv(); if (ad) clearActiveReactions(ad) }
-
-    // Stop coalesce timers that could emit into a finalized draft stream, but
-    // preserve chats with pendingCompletion=true — those have background
-    // sub-agents that legitimately outlive the parent bridge disconnect.
-    // The heartbeat continues for preserved chats so elapsed-time ticks and
-    // the deferred-completion-timeout path remain active. Fix for #393.
-    progressDriver?.dispose({ preservePending: true })
-
-    // Finalize any open draft streams so they don't hang mid-edit.
-    for (const [key, stream] of activeDraftStreams.entries()) {
-      if (!stream.isFinal()) void stream.finalize().catch(() => {})
-      activeDraftStreams.delete(key)
-      activeDraftParseModes.delete(key)
-    }
+    // Scope the flush to clients that actually registered as an agent.
+    // Anonymous one-shot connections (e.g. recall.py's legacy
+    // update_placeholder IPC handshake) close their socket as soon as the
+    // single JSON line is sent — firing this handler with agentName=null.
+    // The old code unconditionally flushed every active reaction to 👍 and
+    // disposed the progress driver, which fired the "premature 👍" UX bug
+    // mid-turn whenever recall.py ran. See `disconnect-flush.ts` for the
+    // gating policy and the test in
+    // `tests/gateway-disconnect-flush.test.ts` for the contract.
+    flushOnAgentDisconnect({
+      agentName: client.agentName,
+      activeStatusReactions,
+      activeReactionMsgIds,
+      activeTurnStartedAt,
+      activeDraftStreams,
+      activeDraftParseModes,
+      clearActiveReactions: () => {
+        const ad = resolveAgentDirFromEnv()
+        if (ad) clearActiveReactions(ad)
+      },
+      disposeProgressDriver: () => {
+        progressDriver?.dispose({ preservePending: true })
+      },
+      log: (msg) => process.stderr.write(`${msg}\n`),
+    })
   },
 
   async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> {

@@ -121,6 +121,24 @@ export interface PtyPartialForward {
   text: string;
 }
 
+/**
+ * Legacy `update_placeholder` IPC from `vendor/hindsight-memory`'s
+ * `recall.py` hook. The placeholder UX (`🔵 thinking`, `📚 recalling
+ * memories`, `💭 thinking`) was removed in PR #553 PR 5 — the gateway no
+ * longer registers a real handler for these. We still accept the wire
+ * shape so the validator does NOT reject + log "invalid IPC message
+ * shape" on every recall.py invocation, and so the message dispatches to
+ * a no-op stub instead of falling through to the default-case warning.
+ *
+ * Important: we cannot edit `vendor/hindsight-memory/scripts/recall.py`
+ * (vendored), so this soft-accept is the correct compatibility shim.
+ */
+export interface UpdatePlaceholderMessage {
+  type: "update_placeholder";
+  chatId: string;
+  text: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -129,4 +147,5 @@ export type ClientToGateway =
   | HeartbeatMessage
   | ScheduleRestartMessage
   | OperatorEventForward
-  | PtyPartialForward;
+  | PtyPartialForward
+  | UpdatePlaceholderMessage;
