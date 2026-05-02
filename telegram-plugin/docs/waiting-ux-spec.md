@@ -96,17 +96,42 @@ what every Telegram-only user sees: 👀 fires only after the coalesce
 window closes (default `gapMs=1500`), ~1500ms after their message landed
 — ~700ms over the F2 deadline.
 
-### F2 root cause hypothesis (now CI-observable)
+### F1, F2, F3 — fixed (commits in #553 PR series)
 
-- `gateway.ts`'s `handleInboundCoalesced` buffers messages for `gapMs`
-  and only on flush calls `handleInbound` → `firstPaintTurn` →
-  `controller.setQueued()` (👀).
-- That couples first-paint to the coalesce window. The fix is to fire
-  the reaction on raw arrival (before buffering) and let only the
-  Claude-side dispatch wait on the buffer.
-- `tests/real-gateway-f2-instant-draft.test.ts` pins this contract.
-  Currently `.skip`'d with a `TODO(#553-F2)` — un-skipped when the fix
-  lands.
+- **F2** (no instant draft): `handleInboundCoalesced` now fires 👀
+  directly on raw arrival via `bot.api.setMessageReaction` for paired
+  DM users on a fresh turn, before the coalesce buffer. Telegram
+  dedupes the duplicate emit when the controller's later `setQueued()`
+  runs post-flush. `tests/real-gateway-f2-instant-draft.test.ts` pins
+  the 800ms deadline.
+- **F1** (ladder collapse): `StatusReactionController.finishWithState`
+  now flushes a debounced-but-not-yet-enqueued pending emoji before
+  the terminal emoji emits. Sub-debounce turns (default 700ms) no
+  longer collapse to 👀 → 👍.
+  `tests/real-gateway-f1-ladder-integrity.test.ts` pins the contract.
+- **F3** (late progress card): `progress-card-driver` now schedules a
+  one-shot `timePromoteTimer` on the first ingest event that
+  force-promotes the card after `promoteAfterMs` (default 5s) when no
+  other promotion path has fired. Long single-/two-tool turns no
+  longer wait the full 30s `initialDelayMs`.
+  `tests/real-gateway-f3-late-card.test.ts` pins the deadline.
+
+### F4 — regression guard, no reproducible failure mode (yet)
+
+The deterministic harness CAN'T currently reproduce F4 with well-spaced
+text → tool steps. Each text event passes `extractNarrativeLabel`
+(any non-empty single line is a label), gets a new narrative entry, and
+the renderer's `branch=narratives` path picks them up.
+`tests/real-gateway-f4-interim-text.test.ts` pins the well-spaced
+multi-step contract as a regression guard.
+
+Where F4 may still manifest in production (needs observation to
+narrow down before a tighter test can land):
+  - Rapid text bursts within `coalesceMs` (~400ms) — only the latest
+    narrative may survive the coalesce flush
+  - `edit_budget_threshold` throttling — subsequent edits dropped
+  - Specific text shapes that break `extractNarrativeLabel`
+    (multi-line prose with the "real" label not on line 1)
 
 ## CI gate
 
