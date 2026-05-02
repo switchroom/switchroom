@@ -93,6 +93,9 @@ export default defineConfig({
       // ask-user.test.ts uses bun:test (#574 ask_user MCP tool) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/ask-user.test.ts",
+      // interrupt-marker.test.ts uses bun:test (#575 ! interrupt) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/interrupt-marker.test.ts",
     ],
     coverage: {
       provider: "v8",

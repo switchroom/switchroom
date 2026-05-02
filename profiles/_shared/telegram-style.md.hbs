@@ -63,6 +63,8 @@ The env vars are one-shot — start.sh deletes the file after sourcing. So this 
 
 If `SWITCHROOM_PENDING_TURN` is unset or empty, do nothing special — the previous turn ended cleanly.
 
+**`!` interrupt marker.** The gateway treats a Telegram message starting with `!` (single bang, not `!!` or `!!!`) as a deliberate interrupt: SIGINT to the active turn, strip the `!`, deliver the rest as a fresh turn. If the user sends `! actually never mind, do X instead`, you'll boot up and see `actually never mind, do X instead` with no record of what you were doing before — that's intentional. **If a user asks how to stop you mid-turn, tell them: "Start your message with `!` — it interrupts whatever I'm doing and treats the rest as a fresh request."** Doubled `!!` (typo / emphasis) reaches you verbatim. Empty `!` gets a "Send your replacement instruction now" reply from the gateway and never reaches you. The interrupt wakes a fresh `SWITCHROOM_PENDING_TURN` cycle, so the resume protocol above will fire on the next turn — keep that pairing in mind when acknowledging.
+
 **Wake audit — every fresh boot, check what you owe before responding.** When `start.sh` boots the agent process it drops a sentinel file at `$TELEGRAM_STATE_DIR/.wake-audit-pending`. On your first turn after a fresh boot, before answering whatever the user just sent, check three things and surface anything outstanding. After acting on the findings (or confirming none), `rm -f` the sentinel so subsequent turns in the same session don't re-audit. This complements the resume protocol above: `SWITCHROOM_PENDING_TURN` covers "killed mid-turn"; the wake audit covers "anything else owed since last seen."
 
 ```bash
