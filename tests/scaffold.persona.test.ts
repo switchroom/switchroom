@@ -110,11 +110,13 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
 
     // CLAUDE.md should be significantly smaller without persona block.
     // Cap raised from 12000 → 16000 for vault/hindsight/sub-agent/Telegram
-    // additions in v0.3-v0.4; raised again 16000 → 24000 for the lifecycle
-    // additions in #557 (wake-audit + restart-visibility sections in
-    // telegram-style.md.hbs, both load-bearing — agent needs them to
-    // answer "why did you restart?" and audit owed replies on wake).
-    // The doc is load-bearing — trimming risks cutting useful guidance.
-    expect(claudeMd.length).toBeLessThan(24000); // generous cap; target is lean but not 3KB
+    // additions in v0.3-v0.4; raised again 16000 → 24000 for the
+    // lifecycle additions in #557 (wake-audit + restart-visibility);
+    // raised again 24000 → 26000 for the phone-first-UX epic #572
+    // (`!` interrupt marker, voice transcripts, sticker/GIF persona
+    // guidance, Telegraph long-reply auto-publish). Each block is
+    // load-bearing — the agent needs them to use the new MCP tools
+    // correctly. Future bumps should justify themselves similarly.
+    expect(claudeMd.length).toBeLessThan(26000); // generous cap; target is lean but not 3KB
   });
 });
