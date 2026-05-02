@@ -373,8 +373,16 @@ export function buildCronScript(
   userId: string | undefined,
   secrets: string[] = [],
   brokerSocket?: string,
+  jobSlug?: string,
 ): string {
-  const wrappedPrompt = applyCronTelegramGuidance(prompt, { chatId });
+  // jobSlug is the stable identifier used for issue auto-resolve. Defaults
+  // to a dash if not supplied — tests covering the legacy 7-arg signature
+  // still pass, but production scaffold/reconcile call sites always pass
+  // `cron-<index>` so the trailer can target unresolved issues whose source
+  // is `cron:<jobSlug>`. See applyCronTelegramGuidance for the matching
+  // instruction on the prompt side.
+  const slug = jobSlug ?? "unknown";
+  const wrappedPrompt = applyCronTelegramGuidance(prompt, { chatId, jobSlug: slug });
   const secretsComment = secrets.length > 0
     ? `# Allowed vault keys for this cron (broker ACL): ${secrets.join(", ")}\n`
     : "";
@@ -416,10 +424,27 @@ fi
 # Stderr remains open so systemd captures auth/network/bad-prompt errors
 # via journalctl — silently swallowing those would make a broken cron job
 # invisible to operators.
-exec claude -p ${shellSingleQuote(wrappedPrompt)} \\
+#
+# We deliberately do NOT use \`exec\` here — the success-trailer below must
+# run after \`claude -p\` returns. Same reasoning as PR #565: when a cron
+# completes cleanly, any unresolved issues filed against this job's source
+# get auto-closed. Failure (non-zero exit) leaves issues open for the
+# Telegram surface to render, exactly as before.
+export TELEGRAM_STATE_DIR=${shellSingleQuote(join(agentDir, "telegram"))}
+claude -p ${shellSingleQuote(wrappedPrompt)} \\
   --model ${shellSingleQuote(model)} \\
   --no-session-persistence \\
   > /dev/null
+rc=$?
+if [ $rc -eq 0 ]; then
+  # Best-effort auto-resolve. Failure here (e.g. switchroom not on PATH in a
+  # weird environment) must NOT mask the cron's own success — hence the
+  # trailing \`|| true\`. PR #565 added bulk-close-by-source; we use the same
+  # source string the agent's own \`issues record\` calls should use.
+  switchroom issues resolve --source "cron:${slug}" --quiet \\
+    --state-dir "$TELEGRAM_STATE_DIR" >/dev/null 2>&1 || true
+fi
+exit $rc
 `;
 }
 
@@ -1895,7 +1920,7 @@ export function scaffoldAgent(
     for (let i = 0; i < agentConfig.schedule!.length; i++) {
       const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
-      const script = buildCronScript(agentDir, entry.prompt, model, telegramConfig.forum_chat_id, userId, entry.secrets ?? [], brokerSocket);
+      const script = buildCronScript(agentDir, entry.prompt, model, telegramConfig.forum_chat_id, userId, entry.secrets ?? [], brokerSocket, `cron-${i}`);
       const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
       writeFileSync(scriptPath, script, { encoding: "utf-8", mode: 0o700 });
     }
@@ -3035,6 +3060,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       const script = buildCronScript(
         agentDir, entry.prompt, model,
         telegramConfig.forum_chat_id, cronUserId, entry.secrets ?? [], reconBrokerSocket,
+        `cron-${i}`,
       );
       const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
       const before = existsSync(scriptPath) ? readFileSync(scriptPath, "utf-8") : "";

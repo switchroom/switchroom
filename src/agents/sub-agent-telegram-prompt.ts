@@ -90,7 +90,29 @@ export function applyTelegramProgressGuidance(
  */
 export function buildCronTelegramGuidance(args: {
   chatId: string
+  jobSlug?: string
 }): string {
+  // The cron wrapper auto-resolves any issue whose source is `cron:<jobSlug>`
+  // when this script exits 0. So if THIS task records an issue mid-run, it
+  // must use that exact source string — otherwise the auto-resolve trailer
+  // can't find it and the issue stays open forever even after a successful
+  // re-run. The block below is appended only when jobSlug is known
+  // (production scaffold/reconcile always supplies one).
+  const issuesBlock = args.jobSlug
+    ? `
+
+## If you need to record a transient issue
+
+If something half-broken happens during this run (e.g. an upstream API timed out, a vault key was missing, a non-fatal data gap), record it via:
+
+\`\`\`
+switchroom issues record --severity warn --source "cron:${args.jobSlug}" --code <stable-code> --summary "<one-line>"
+\`\`\`
+
+Use the EXACT \`--source "cron:${args.jobSlug}"\` shown above — the cron wrapper auto-resolves issues with that source on a clean run. Picking a different source means the issue persists across recoveries.
+`
+    : ""
+
   return `
 
 ## Delivery instructions (cron context)
@@ -108,7 +130,7 @@ The \`reply\` tool handles markdown→HTML conversion, chunking, and all formatt
 After calling \`reply\`, print \`HEARTBEAT_OK\` as your final stdout line and nothing else. This confirms successful execution to the cron watchdog.
 
 If you have nothing useful to say (data is dull, all signals are nominal), print \`HEARTBEAT_OK\` without calling \`reply\` — a silent heartbeat is correct behaviour, not an error.
-`
+${issuesBlock}`
 }
 
 /**
@@ -117,9 +139,9 @@ If you have nothing useful to say (data is dull, all signals are nominal), print
  */
 export function applyCronTelegramGuidance(
   body: string,
-  args: { chatId: string | undefined },
+  args: { chatId: string | undefined; jobSlug?: string },
 ): string {
   if (!args.chatId) return body
   const trimmed = body.replace(/\s+$/, '')
-  return trimmed + buildCronTelegramGuidance({ chatId: args.chatId })
+  return trimmed + buildCronTelegramGuidance({ chatId: args.chatId, jobSlug: args.jobSlug })
 }

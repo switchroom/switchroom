@@ -161,6 +161,7 @@ export function registerIssuesCommand(program: Command): void {
       "Compose fingerprint from --source + --code instead of passing one",
     )
     .option("--code <id>", "Used with --source")
+    .option("--quiet", "Suppress the resolved-count line on stdout", false)
     .action(
       (
         fingerprint: string | undefined,
@@ -169,6 +170,7 @@ export function registerIssuesCommand(program: Command): void {
           stateDir?: string;
           source?: string;
           code?: string;
+          quiet?: boolean;
         },
       ) => {
         try {
@@ -190,7 +192,9 @@ export function registerIssuesCommand(program: Command): void {
             );
             process.exit(2);
           }
-          process.stdout.write(`${flipped}\n`);
+          if (!opts.quiet) {
+            process.stdout.write(`${flipped}\n`);
+          }
         } catch (err) {
           process.stderr.write(`issues resolve: ${(err as Error).message}\n`);
           process.exit(1);

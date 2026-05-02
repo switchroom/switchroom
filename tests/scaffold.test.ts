@@ -2588,9 +2588,17 @@ describe("scheduled task cron script generation", () => {
       join(result.agentDir, "telegram", "cron-0.sh"),
       "utf-8",
     );
-    // MCP path: exec replaces the shell, stdout goes to /dev/null.
-    expect(content).toContain("exec claude -p");
+    // MCP path: claude runs as a child (not exec) so the success-trailer can
+    // run after it; stdout goes to /dev/null. The trailer auto-resolves any
+    // unresolved issues with source=cron:cron-<index> on a 0 exit (PR
+    // following #565). Stderr stays attached for journalctl.
+    expect(content).toContain("claude -p");
+    expect(content).not.toContain("exec claude -p");
     expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
+    // Success-trailer: bulk-resolve issues filed under this job's source.
+    expect(content).toContain('switchroom issues resolve --source "cron:cron-0"');
+    expect(content).toContain("--quiet");
+    expect(content).toContain("exit $rc");
     expect(content).not.toContain("> /dev/null 2>&1"); // don't swallow stderr
     expect(content).not.toContain("api.telegram.org");
     expect(content).not.toContain("OUTPUT=");
@@ -2613,7 +2621,8 @@ describe("scheduled task cron script generation", () => {
     scaffoldAgent("flip-cron", baseAgent, tmpDir, telegramConfig, switchroomConfig);
     const scriptPath = join(tmpDir, "flip-cron", "telegram", "cron-0.sh");
     // Both scripts are identical — MCP path always used
-    expect(readFileSync(scriptPath, "utf-8")).toContain("exec claude -p");
+    expect(readFileSync(scriptPath, "utf-8")).toContain("claude -p");
+    expect(readFileSync(scriptPath, "utf-8")).not.toContain("exec claude -p");
     expect(readFileSync(scriptPath, "utf-8")).not.toContain("api.telegram.org");
 
     const updated = makeAgentConfig({
@@ -2626,8 +2635,44 @@ describe("scheduled task cron script generation", () => {
     const result = reconcileAgent("flip-cron", updated, tmpDir, telegramConfig, updatedConfig);
     expect(result.changes).toContain(scriptPath);
     const updatedScript = readFileSync(scriptPath, "utf-8");
-    expect(updatedScript).toContain("exec claude -p");
+    expect(updatedScript).toContain("claude -p");
+    expect(updatedScript).not.toContain("exec claude -p");
     expect(updatedScript).not.toContain("api.telegram.org");
+  });
+
+  it("cron script appends success-trailer that auto-resolves issues by source", () => {
+    // PR following #565: when claude -p exits 0, the script bulk-resolves
+    // any unresolved issue whose source is `cron:cron-<index>`. The trailer
+    // is `|| true`-guarded so a missing CLI never masks a real failure.
+    const agentConfig = makeAgentConfig({
+      schedule: [
+        { cron: "0 8 * * *", prompt: "first" },
+        { cron: "0 9 * * *", prompt: "second" },
+      ],
+    });
+    const result = scaffoldAgent("trailer-cron", agentConfig, tmpDir, telegramConfig);
+
+    const c0 = readFileSync(join(result.agentDir, "telegram", "cron-0.sh"), "utf-8");
+    const c1 = readFileSync(join(result.agentDir, "telegram", "cron-1.sh"), "utf-8");
+
+    // Each script targets ITS OWN slug — cron-0 must not auto-resolve cron-1's issues.
+    expect(c0).toContain('switchroom issues resolve --source "cron:cron-0"');
+    expect(c0).not.toContain('"cron:cron-1"');
+    expect(c1).toContain('switchroom issues resolve --source "cron:cron-1"');
+    expect(c1).not.toContain('"cron:cron-0"');
+
+    // Required trailer shape: capture rc, gate on success, exit with rc.
+    expect(c0).toMatch(/rc=\$\?/);
+    expect(c0).toMatch(/if \[ \$rc -eq 0 \]; then/);
+    expect(c0).toContain("|| true");
+    expect(c0).toMatch(/exit \$rc/);
+
+    // State dir is exported so the CLI can find issues.jsonl.
+    expect(c0).toContain("export TELEGRAM_STATE_DIR=");
+
+    // Prompt-side guidance teaches the model the matching --source string
+    // so any issues it records during the run are auto-resolved on success.
+    expect(c0).toContain('--source "cron:cron-0"');
   });
 
   it("reconcile regenerates cron scripts when prompt changes", () => {
