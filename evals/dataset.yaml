@@ -107,7 +107,7 @@ evals:
   # ── switchroom-config ──────────────────────────────────────────────────────────────
   - id: "config-001"
     question: "What model is the assistant agent using?"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "model|configuration|config|settings"
     expected_not_contains:
@@ -116,35 +116,35 @@ evals:
 
   - id: "config-002"
     question: "Show me the full config for the scheduler agent"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "config|configuration|settings"
     tags: ["config"]
 
   - id: "config-003"
     question: "What tools does the assistant have access to?"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "tools|config|configuration|settings"
     tags: ["config", "tools"]
 
   - id: "config-004"
     question: "What's the system prompt for my agent?"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "system prompt|config|configuration"
     tags: ["config"]
 
   - id: "config-005"
     question: "Show the active settings for my switchroom agents"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "settings|config|configuration"
     tags: ["config"]
 
   - id: "config-006"
     question: "Which model am I running on?"
-    primary_skill: "switchroom-config"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "model|config|configuration"
     tags: ["config"]
@@ -152,7 +152,7 @@ evals:
   # ── switchroom-schedule ────────────────────────────────────────────────────────────
   - id: "schedule-001"
     question: "Show me all scheduled tasks"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "schedule|cron|timer|scheduled"
     expected_not_contains:
@@ -161,35 +161,35 @@ evals:
 
   - id: "schedule-002"
     question: "Create a cron job to run a digest every morning at 8am"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "cron|schedule|0 8|8:00|morning"
     tags: ["schedule", "cron"]
 
   - id: "schedule-003"
     question: "What timers are set up for the assistant?"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "timer|schedule|cron"
     tags: ["schedule"]
 
   - id: "schedule-004"
     question: "List all cron schedules"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "cron|schedule|list"
     tags: ["schedule", "cron"]
 
   - id: "schedule-005"
     question: "Delete the weekly report schedule"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "schedule|delete|remove|cron"
     tags: ["schedule"]
 
   - id: "schedule-006"
     question: "Add a trigger that runs every hour"
-    primary_skill: "switchroom-schedule"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "schedule|cron|trigger|every hour|0 \\*"
     tags: ["schedule", "cron"]
@@ -197,7 +197,7 @@ evals:
   # ── switchroom-restart ─────────────────────────────────────────────────────────────
   - id: "restart-001"
     question: "Restart the assistant agent"
-    primary_skill: "switchroom-restart"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "restart|confirm|are you sure|switchroom agent restart"
     expected_not_contains:
@@ -206,28 +206,28 @@ evals:
 
   - id: "restart-002"
     question: "Reboot the scheduler"
-    primary_skill: "switchroom-restart"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "restart|reboot|confirm"
     tags: ["restart"]
 
   - id: "restart-003"
     question: "My agent is frozen, restart it"
-    primary_skill: "switchroom-restart"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "restart|confirm|switchroom agent restart"
     tags: ["restart"]
 
   - id: "restart-004"
     question: "Do a hard restart of the monitor agent"
-    primary_skill: "switchroom-restart"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "restart|confirm|switchroom agent restart"
     tags: ["restart"]
 
   - id: "restart-005"
     question: "Bounce all agents"
-    primary_skill: "switchroom-restart"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "restart|bounce|confirm|all agents"
     tags: ["restart"]
@@ -235,7 +235,7 @@ evals:
   # ── switchroom-reconcile ───────────────────────────────────────────────────────────
   - id: "reconcile-001"
     question: "Re-apply my agent config"
-    primary_skill: "switchroom-reconcile"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "reconcile|apply|config|re-apply"
     expected_not_contains:
@@ -244,28 +244,28 @@ evals:
 
   - id: "reconcile-002"
     question: "I updated the CLAUDE.md, push the changes to the agent"
-    primary_skill: "switchroom-reconcile"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "reconcile|apply|update|config"
     tags: ["reconcile"]
 
   - id: "reconcile-003"
     question: "Sync the latest config to the running agent"
-    primary_skill: "switchroom-reconcile"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "reconcile|sync|apply|config"
     tags: ["reconcile"]
 
   - id: "reconcile-004"
     question: "Update the assistant agent settings without restarting"
-    primary_skill: "switchroom-reconcile"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "reconcile|update|settings|config"
     tags: ["reconcile"]
 
   - id: "reconcile-005"
     question: "Apply my profile changes to all agents"
-    primary_skill: "switchroom-reconcile"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "reconcile|apply|profile|config"
     tags: ["reconcile"]
@@ -273,7 +273,7 @@ evals:
   # ── switchroom-logs ────────────────────────────────────────────────────────────────
   - id: "logs-001"
     question: "Show me the logs for the assistant agent"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|log|output|switchroom"
     expected_not_contains:
@@ -282,35 +282,35 @@ evals:
 
   - id: "logs-002"
     question: "What did the scheduler agent do in the last hour?"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|log|output|history"
     tags: ["logs"]
 
   - id: "logs-003"
     question: "Tail the logs for the monitor agent"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|tail|log|output"
     tags: ["logs"]
 
   - id: "logs-004"
     question: "Show recent errors from my agents"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|error|log|output"
     tags: ["logs", "errors"]
 
   - id: "logs-005"
     question: "Get the last 100 lines of assistant logs"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|log|lines|output"
     tags: ["logs"]
 
   - id: "logs-006"
     question: "What was the last thing the agent did?"
-    primary_skill: "switchroom-logs"
+    primary_skill: "switchroom-cli"
     expected_contains:
       - "logs|log|recent|history|output"
     tags: ["logs"]

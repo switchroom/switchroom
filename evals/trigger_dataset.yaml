@@ -3,193 +3,199 @@ trigger_evals:
   - id: "t-status-001"
     query: "Are my agents running?"
     expected_skill: "switchroom-status"
-    expected_not_skills: ["switchroom-health", "switchroom-restart"]
+    expected_not_skills: ["switchroom-health", "switchroom-cli"]
     tags: ["routing", "status"]
 
   - id: "t-status-002"
     query: "What's the current state of all my agents?"
     expected_skill: "switchroom-status"
-    expected_not_skills: ["switchroom-health", "switchroom-logs"]
+    expected_not_skills: ["switchroom-health", "switchroom-cli"]
     tags: ["routing", "status"]
 
   - id: "t-status-003"
     query: "Show me agent uptime"
     expected_skill: "switchroom-status"
-    expected_not_skills: ["switchroom-health", "switchroom-logs"]
+    expected_not_skills: ["switchroom-health", "switchroom-cli"]
+    tags: ["routing", "status"]
+
+  - id: "t-status-004"
+    query: "Is the monitor agent online or offline?"
+    expected_skill: "switchroom-status"
+    expected_not_skills: ["switchroom-cli", "switchroom-health"]
     tags: ["routing", "status"]
 
   - id: "t-health-001"
     query: "Something is wrong with my agent, can you diagnose it?"
     expected_skill: "switchroom-health"
-    expected_not_skills: ["switchroom-status", "switchroom-restart"]
+    expected_not_skills: ["switchroom-status", "switchroom-cli"]
     tags: ["routing", "health"]
 
   - id: "t-health-002"
     query: "Run a diagnostic check on my setup"
     expected_skill: "switchroom-health"
-    expected_not_skills: ["switchroom-status", "switchroom-config"]
+    expected_not_skills: ["switchroom-status", "switchroom-cli"]
     tags: ["routing", "health"]
 
   - id: "t-health-003"
     query: "My agent keeps failing, what's wrong?"
     expected_skill: "switchroom-health"
-    expected_not_skills: ["switchroom-status", "switchroom-logs"]
+    expected_not_skills: ["switchroom-status", "switchroom-cli"]
     tags: ["routing", "health"]
 
-  # ── restart vs reconcile (both change agent state) ────────────────────────────
-  - id: "t-restart-001"
+  # ── cli operational verbs (logs/restart/update/version/config inspection) ────
+  # Post-consolidation: restart, reconcile, logs, config inspection, schedule
+  # listing all live in switchroom-cli. Disambiguation now is "this is a CLI
+  # operation, not status / not health / not architecture / not install".
+
+  - id: "t-cli-restart-001"
     query: "Restart the assistant agent"
-    expected_skill: "switchroom-restart"
-    expected_not_skills: ["switchroom-reconcile", "switchroom-status"]
-    tags: ["routing", "restart"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
+    tags: ["routing", "cli", "restart"]
 
-  - id: "t-restart-002"
+  - id: "t-cli-restart-002"
     query: "The agent is frozen, reboot it"
-    expected_skill: "switchroom-restart"
-    expected_not_skills: ["switchroom-reconcile", "switchroom-health"]
-    tags: ["routing", "restart"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-health", "switchroom-status"]
+    tags: ["routing", "cli", "restart"]
 
-  - id: "t-restart-003"
+  - id: "t-cli-restart-003"
     query: "Kill and restart all agents"
-    expected_skill: "switchroom-restart"
-    expected_not_skills: ["switchroom-reconcile", "switchroom-status"]
-    tags: ["routing", "restart"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-manage"]
+    tags: ["routing", "cli", "restart"]
 
-  - id: "t-reconcile-001"
+  - id: "t-cli-update-001"
     query: "I updated my CLAUDE.md, apply the new config"
-    expected_skill: "switchroom-reconcile"
-    expected_not_skills: ["switchroom-restart", "switchroom-config"]
-    tags: ["routing", "reconcile"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-manage"]
+    tags: ["routing", "cli", "update"]
 
-  - id: "t-reconcile-002"
-    query: "Sync my latest settings to the running agent without restarting"
-    expected_skill: "switchroom-reconcile"
-    expected_not_skills: ["switchroom-restart", "switchroom-config"]
-    tags: ["routing", "reconcile"]
+  - id: "t-cli-update-002"
+    query: "Pull the latest switchroom code and restart everything"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-install", "switchroom-manage"]
+    tags: ["routing", "cli", "update"]
 
-  - id: "t-reconcile-003"
+  - id: "t-cli-update-003"
     query: "Re-apply my agent profile"
-    expected_skill: "switchroom-reconcile"
-    expected_not_skills: ["switchroom-restart", "switchroom-schedule"]
-    tags: ["routing", "reconcile"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-manage"]
+    tags: ["routing", "cli", "update"]
 
-  # ── config vs architecture (both about how switchroom works) ───────────────────────
-  - id: "t-config-001"
+  - id: "t-cli-config-001"
     query: "What model is my agent using?"
-    expected_skill: "switchroom-config"
+    expected_skill: "switchroom-cli"
     expected_not_skills: ["switchroom-architecture", "switchroom-status"]
-    tags: ["routing", "config"]
+    tags: ["routing", "cli", "config"]
 
-  - id: "t-config-002"
+  - id: "t-cli-config-002"
     query: "Show the tools available to the assistant"
-    expected_skill: "switchroom-config"
+    expected_skill: "switchroom-cli"
     expected_not_skills: ["switchroom-architecture", "switchroom-status"]
-    tags: ["routing", "config"]
+    tags: ["routing", "cli", "config"]
 
-  - id: "t-config-003"
+  - id: "t-cli-config-003"
     query: "What's the active system prompt for my agent?"
-    expected_skill: "switchroom-config"
-    expected_not_skills: ["switchroom-architecture", "switchroom-logs"]
-    tags: ["routing", "config"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-status"]
+    tags: ["routing", "cli", "config"]
+
+  - id: "t-cli-logs-001"
+    query: "Show me the recent log output from the assistant"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
+    tags: ["routing", "cli", "logs"]
+
+  - id: "t-cli-logs-002"
+    query: "What did my agent do in the last 30 minutes?"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
+    tags: ["routing", "cli", "logs"]
+
+  - id: "t-cli-logs-003"
+    query: "Tail the logs for the monitor agent"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-health"]
+    tags: ["routing", "cli", "logs"]
+
+  - id: "t-cli-schedule-001"
+    query: "List my cron jobs"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-status", "switchroom-architecture"]
+    tags: ["routing", "cli", "schedule"]
+
+  - id: "t-cli-schedule-002"
+    query: "Show me what runs automatically and when"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-status"]
+    tags: ["routing", "cli", "schedule"]
+
+  - id: "t-cli-version-001"
+    query: "What version of switchroom is running?"
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-status"]
+    tags: ["routing", "cli", "version"]
+
+  # ── architecture vs cli (reference vs operational) ────────────────────────────
+  # Architecture explains *how it works*; cli config inspection shows *current
+  # state*. The router should route conceptual questions to architecture, not
+  # config-lookup ones.
 
   - id: "t-arch-001"
     query: "How does switchroom actually work under the hood?"
     expected_skill: "switchroom-architecture"
-    expected_not_skills: ["switchroom-config", "switchroom-status"]
+    expected_not_skills: ["switchroom-cli", "switchroom-status"]
     tags: ["routing", "architecture"]
 
   - id: "t-arch-002"
     query: "Explain the config cascade and how agents inherit settings"
     expected_skill: "switchroom-architecture"
-    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
+    expected_not_skills: ["switchroom-cli", "switchroom-manage"]
     tags: ["routing", "architecture"]
 
   - id: "t-arch-003"
     query: "What's the difference between a profile and an agent?"
     expected_skill: "switchroom-architecture"
-    expected_not_skills: ["switchroom-config", "switchroom-status"]
+    expected_not_skills: ["switchroom-cli", "switchroom-manage"]
     tags: ["routing", "architecture"]
 
-  # ── logs vs status (both about agent info) ────────────────────────────────────
-  - id: "t-logs-001"
-    query: "Show me the recent log output from the assistant"
-    expected_skill: "switchroom-logs"
-    expected_not_skills: ["switchroom-status", "switchroom-health"]
-    tags: ["routing", "logs"]
-
-  - id: "t-logs-002"
-    query: "What did my agent do in the last 30 minutes?"
-    expected_skill: "switchroom-logs"
-    expected_not_skills: ["switchroom-status", "switchroom-health"]
-    tags: ["routing", "logs"]
-
-  - id: "t-logs-003"
-    query: "Tail the logs for the monitor agent"
-    expected_skill: "switchroom-logs"
-    expected_not_skills: ["switchroom-status", "switchroom-health"]
-    tags: ["routing", "logs"]
-
-  - id: "t-status-004"
-    query: "Is the monitor agent online or offline?"
-    expected_skill: "switchroom-status"
-    expected_not_skills: ["switchroom-logs", "switchroom-health"]
-    tags: ["routing", "status"]
-
-  # ── schedule edge cases ────────────────────────────────────────────────────────
-  - id: "t-schedule-001"
-    query: "Set up a daily 9am digest"
-    expected_skill: "switchroom-schedule"
-    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
-    tags: ["routing", "schedule"]
-
-  - id: "t-schedule-002"
-    query: "List my cron jobs"
-    expected_skill: "switchroom-schedule"
-    expected_not_skills: ["switchroom-status", "switchroom-config"]
-    tags: ["routing", "schedule"]
-
-  - id: "t-schedule-003"
-    query: "Delete the weekly report trigger"
-    expected_skill: "switchroom-schedule"
-    expected_not_skills: ["switchroom-reconcile", "switchroom-restart"]
-    tags: ["routing", "schedule"]
+  - id: "t-arch-004"
+    query: "What's the switchroom plugin system and how do hooks work?"
+    expected_skill: "switchroom-architecture"
+    expected_not_skills: ["switchroom-cli", "switchroom-manage"]
+    tags: ["routing", "architecture", "near-miss"]
 
   # ── harder near-miss scenarios ─────────────────────────────────────────────────
   - id: "t-near-001"
     query: "The assistant crashed, what happened?"
-    expected_skill: "switchroom-logs"
-    expected_not_skills: ["switchroom-health", "switchroom-restart"]
-    tags: ["routing", "near-miss"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-health", "switchroom-status"]
+    tags: ["routing", "near-miss", "logs"]
 
   - id: "t-near-002"
     query: "Is switchroom healthy?"
     expected_skill: "switchroom-health"
-    expected_not_skills: ["switchroom-status", "switchroom-logs"]
+    expected_not_skills: ["switchroom-status", "switchroom-cli"]
     tags: ["routing", "near-miss"]
 
   - id: "t-near-003"
     query: "Apply my updated config file to the running agent"
-    expected_skill: "switchroom-reconcile"
-    expected_not_skills: ["switchroom-restart", "switchroom-config"]
+    expected_skill: "switchroom-cli"
+    expected_not_skills: ["switchroom-architecture", "switchroom-manage"]
     tags: ["routing", "near-miss"]
 
   - id: "t-near-004"
-    query: "What's the switchroom plugin system and how do hooks work?"
-    expected_skill: "switchroom-architecture"
-    expected_not_skills: ["switchroom-config", "switchroom-reconcile"]
-    tags: ["routing", "near-miss", "architecture"]
-
-  - id: "t-near-005"
     query: "Show agent info"
     expected_skill: "switchroom-status"
-    expected_not_skills: ["switchroom-logs", "switchroom-config"]
+    expected_not_skills: ["switchroom-cli", "switchroom-health"]
     tags: ["routing", "near-miss"]
 
-  # ── switchroom-install vs switchroom-manage / switchroom-health ──────────────────────────────
+  # ── switchroom-install vs switchroom-manage / switchroom-health ──────────────
   - id: "t-install-001"
     query: "Install switchroom on this machine"
     expected_skill: "switchroom-install"
-    expected_not_skills: ["switchroom-manage", "switchroom-health", "switchroom-reconcile"]
+    expected_not_skills: ["switchroom-manage", "switchroom-health", "switchroom-cli"]
     tags: ["routing", "install"]
 
   - id: "t-install-002"
@@ -201,26 +207,26 @@ trigger_evals:
   - id: "t-install-003"
     query: "Bootstrap switchroom from scratch"
     expected_skill: "switchroom-install"
-    expected_not_skills: ["switchroom-reconcile", "switchroom-manage"]
+    expected_not_skills: ["switchroom-cli", "switchroom-manage"]
     tags: ["routing", "install"]
 
   - id: "t-install-004"
     query: "Set up switchroom for the first time"
     expected_skill: "switchroom-install"
-    expected_not_skills: ["switchroom-manage", "switchroom-config"]
+    expected_not_skills: ["switchroom-manage", "switchroom-cli"]
     tags: ["routing", "install"]
 
   - id: "t-install-005"
     query: "I'm new to switchroom, where do I begin?"
     expected_skill: "switchroom-install"
-    expected_not_skills: ["switchroom-architecture", "switchroom-telegram-guide"]
+    expected_not_skills: ["switchroom-architecture", "switchroom-manage"]
     tags: ["routing", "install", "onboarding"]
 
   # Near-miss: "install a new agent" is NOT switchroom-install (that's switchroom-manage)
   - id: "t-install-near-001"
     query: "Add a new agent to my switchroom setup"
     expected_skill: "switchroom-manage"
-    expected_not_skills: ["switchroom-install"]
+    expected_not_skills: ["switchroom-install", "switchroom-cli"]
     tags: ["routing", "near-miss", "install"]
 
   - id: "t-install-near-002"
@@ -228,3 +234,24 @@ trigger_evals:
     expected_skill: "switchroom-manage"
     expected_not_skills: ["switchroom-install"]
     tags: ["routing", "near-miss", "install"]
+
+  # ── manage vs cli (lifecycle vs operational) ──────────────────────────────────
+  # Adding/removing agents is manage; restarting/inspecting/logging is cli.
+
+  - id: "t-manage-001"
+    query: "Remove the dev-bot agent from switchroom"
+    expected_skill: "switchroom-manage"
+    expected_not_skills: ["switchroom-cli", "switchroom-install"]
+    tags: ["routing", "manage"]
+
+  - id: "t-manage-002"
+    query: "Create a new agent called klanker"
+    expected_skill: "switchroom-manage"
+    expected_not_skills: ["switchroom-cli", "switchroom-install"]
+    tags: ["routing", "manage"]
+
+  - id: "t-manage-003"
+    query: "Store an API key in my vault"
+    expected_skill: "switchroom-manage"
+    expected_not_skills: ["switchroom-cli", "switchroom-architecture"]
+    tags: ["routing", "manage", "vault"]

@@ -26,11 +26,7 @@ ROUTABLE_SKILLS = [
     "switchroom-health",
     "switchroom-install",
     "switchroom-manage",
-    "switchroom-config",
-    "switchroom-schedule",
-    "switchroom-restart",
-    "switchroom-reconcile",
-    "switchroom-logs",
+    "switchroom-cli",
     "switchroom-architecture",
 ]
 
