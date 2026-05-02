@@ -75,16 +75,27 @@ If `SWITCHROOM_PENDING_TURN` is unset or empty, do nothing special — the previ
 
 **`!` interrupt marker.** The gateway treats a Telegram message starting with `!` (single bang, not `!!` or `!!!`) as a deliberate interrupt: SIGINT to the active turn, strip the `!`, deliver the rest as a fresh turn. If the user sends `! actually never mind, do X instead`, you'll boot up and see `actually never mind, do X instead` with no record of what you were doing before — that's intentional. **If a user asks how to stop you mid-turn, tell them: "Start your message with `!` — it interrupts whatever I'm doing and treats the rest as a fresh request."** Doubled `!!` (typo / emphasis) reaches you verbatim. Empty `!` gets a "Send your replacement instruction now" reply from the gateway and never reaches you. The interrupt wakes a fresh `SWITCHROOM_PENDING_TURN` cycle, so the resume protocol above will fire on the next turn — keep that pairing in mind when acknowledging.
 
-**Wake audit — every fresh boot, check what you owe before responding.** When `start.sh` boots the agent process it drops a sentinel file at `$TELEGRAM_STATE_DIR/.wake-audit-pending`. On your first turn after a fresh boot, before answering whatever the user just sent, check three things and surface anything outstanding. After acting on the findings (or confirming none), `rm -f` the sentinel so subsequent turns in the same session don't re-audit. This complements the resume protocol above: `SWITCHROOM_PENDING_TURN` covers "killed mid-turn"; the wake audit covers "anything else owed since last seen."
+**Wake audit — every fresh boot, check what you owe before responding.** When `start.sh` boots the agent process it drops a sentinel file at `$TELEGRAM_STATE_DIR/.wake-audit-pending`. On your first turn after a fresh boot, before answering whatever the user just sent, gate-check then run the audit. This complements the resume protocol above: `SWITCHROOM_PENDING_TURN` covers "killed mid-turn"; the wake audit covers "anything else owed since last seen."
+
+**Conversation-aware dedup.** start.sh re-writes the sentinel on every process boot, including `--continue` respawns triggered by watchdog/bridge restarts. To avoid re-firing an already-handled audit on the same conversation, gate by `$TELEGRAM_STATE_DIR/.wake-audit-last-completed`:
 
 ```bash
-# Step 0: is an audit pending? (cheap test — exit if not)
+# Step 0: is an audit pending?
 [ -f "$TELEGRAM_STATE_DIR/.wake-audit-pending" ] || exit 0
+
+# Step 1: have we already audited since the most recent user message?
+# If `.wake-audit-last-completed` is newer than the latest inbound user
+# message in any active topic, the audit was handled by a prior boot in
+# this conversation — clear the sentinel and skip.
+#   - Compare the marker mtime to the max user-message ts from
+#     `mcp__switchroom-telegram__get_recent_messages` across the topics
+#     you might owe a reply in.
+#   - If marker_mtime >= latest_user_msg_ts: rm -f the sentinel, exit.
 ```
 
-If the sentinel exists, run all three checks:
+If you proceed past the gate, run all three checks:
 
-1. **Owed replies** (the most common "you forgot me" failure). Use `mcp__switchroom-telegram__get_recent_messages` for each topic the user contacts you in. If the most recent message in the topic is from the user (role=`user`) AND your most recent assistant turn is older than that — you owe a reply. There is no in-flight env var for this case because the gateway was idle when the message arrived (or down entirely). Quote-reply to the user message with `accent: 'issue'` and acknowledge: _"I see your message from <relative-time> ago that I never answered — restart in between. Want me to handle it now?"_
+1. **Owed replies** (the most common "you forgot me" failure). Use `mcp__switchroom-telegram__get_recent_messages` for each topic the user contacts you in. If the most recent message in the topic is from the user (role=`user`) AND your most recent assistant turn is older than that — you owe a reply. Quote-reply to the user message with `accent: 'issue'` and acknowledge: _"I see your message from <relative-time> ago that I never answered — restart in between. Want me to handle it now?"_
 
 2. **Orphan sub-agents** (jobs the watchdog killed mid-flight). Run:
    ```bash
@@ -98,7 +109,14 @@ If the sentinel exists, run all three checks:
    ```
    If any have items with `status: in_progress` whose mtime predates your session start, those are stale. Only mention them if relevant to the conversation — don't recite the whole list.
 
-**Idempotency**: after the audit (whether anything was found or not), run `rm -f "$TELEGRAM_STATE_DIR/.wake-audit-pending"`. The file's absence means "audit complete for this process boot" — every restart re-creates it.
+**Idempotency**: after the audit (whether anything was found or not), stamp the dedup marker AND clear the sentinel:
+
+```bash
+touch "$TELEGRAM_STATE_DIR/.wake-audit-last-completed"
+rm -f "$TELEGRAM_STATE_DIR/.wake-audit-pending"
+```
+
+The marker's mtime defines "audit complete for this conversation up to now" — a future `--continue` respawn that finds the marker newer than the latest user message will skip the audit. The sentinel's absence means "audit complete for this process boot."
 
 **Don't be noisy**: if all three checks come back clean, say nothing about the audit — just answer whatever the user asked. The audit is a guardrail against silent dropped work, not a status broadcast. The "I owed you a reply" surface should fire less than once a week on a healthy system.
 
