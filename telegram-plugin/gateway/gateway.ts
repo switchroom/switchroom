@@ -28,6 +28,7 @@ import { redactAuthCodeMessage } from '../auth-code-redact.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
+import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
   startHeartbeat as startPlaceholderHeartbeatImpl,
   DEFAULT_INTERVAL_MS as HEARTBEAT_DEFAULT_INTERVAL_MS,
@@ -1335,19 +1336,38 @@ type AttachmentMeta = {
   name?: string
 }
 
-type CoalesceEntry = {
-  texts: string[]
+// CoalescePayload is what the InboundCoalescer carries per buffered message.
+// `ctx` must be the *latest* message's context (latest message_id, etc.) so
+// the merge function picks the last entry's ctx.
+//
+// Image/attachment-bearing messages bypass the coalescer entirely (see
+// handleInboundCoalesced), so those fields stay optional and unused on the
+// coalesce path; preserved for future use if we ever want to coalesce
+// image+text bursts.
+type CoalescePayload = {
+  text: string
   ctx: Context
   downloadImage?: () => Promise<string | undefined>
   attachment?: AttachmentMeta
-  timer: ReturnType<typeof setTimeout>
 }
 
-const coalesceBuffer = new Map<string, CoalesceEntry>()
-
-function coalesceKey(chatId: string, userId: string): string {
-  return `${chatId}:${userId}`
-}
+const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
+  // Read per-call from the access file so `/access set-coalesce N` takes
+  // effect on the next message without restarting the gateway.
+  gapMs: () => loadAccess().coalescingGapMs ?? 1500,
+  merge: (entries) => {
+    const last = entries[entries.length - 1]
+    return {
+      text: entries.map((e) => e.text).join('\n'),
+      ctx: last.ctx,
+      downloadImage: last.downloadImage,
+      attachment: last.attachment,
+    }
+  },
+  onFlush: (_key, merged) => {
+    void handleInbound(merged.ctx, merged.text, merged.downloadImage, merged.attachment)
+  },
+})
 
 /**
  * Gateway-side emission for an OperatorEvent — the single point where:
@@ -3555,38 +3575,15 @@ async function handleInboundCoalesced(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  // Image/attachment-bearing messages bypass coalescing — preserves the
+  // legacy invariant that media never gets merged with sibling text.
   if (downloadImage || attachment) return handleInbound(ctx, text, downloadImage, attachment)
-  const access = loadAccess()
-  const gapMs = access.coalescingGapMs ?? 1500
-  if (gapMs <= 0) return handleInbound(ctx, text, undefined, undefined)
 
   const from = ctx.from
   if (!from) return
-  const chatId = String(ctx.chat!.id)
-  const userId = String(from.id)
-  const key = coalesceKey(chatId, userId)
-
-  const existing = coalesceBuffer.get(key)
-  if (existing) {
-    clearTimeout(existing.timer)
-    existing.texts.push(text)
-    existing.ctx = ctx
-    existing.timer = setTimeout(() => flushCoalesce(key), gapMs)
-  } else {
-    const entry: CoalesceEntry = {
-      texts: [text],
-      ctx,
-      timer: setTimeout(() => flushCoalesce(key), gapMs),
-    }
-    coalesceBuffer.set(key, entry)
-  }
-}
-
-function flushCoalesce(key: string): void {
-  const entry = coalesceBuffer.get(key)
-  if (!entry) return
-  coalesceBuffer.delete(key)
-  void handleInbound(entry.ctx, entry.texts.join('\n'), entry.downloadImage, entry.attachment)
+  const key = inboundCoalesceKey(String(ctx.chat!.id), String(from.id))
+  const result = inboundCoalescer.enqueue(key, { text, ctx, downloadImage, attachment })
+  if (result.bypass) return handleInbound(ctx, text, undefined, undefined)
 }
 
 async function handleInbound(
@@ -7527,7 +7524,7 @@ function countInFlight(): number {
   return (
     pendingPermissions.size +
     pendingVaultOps.size +
-    coalesceBuffer.size +
+    inboundCoalescer.size() +
     pendingReauthFlows.size
   )
 }
@@ -7624,13 +7621,14 @@ async function shutdown(signal: string): Promise<void> {
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
   typingRetryTimers.clear()
 
-  for (const t of [...coalesceBuffer.values()].map((e) => e.timer)) clearTimeout(t)
-  // NOTE: don't clear coalesceBuffer yet — the drain wants to observe
-  // its size as in_flight. Caveat: clearTimeout cancels the timer but
-  // doesn't purge the entry (entries are normally removed by the timer
-  // callback itself), so countInFlight() may report phantom coalesce
-  // entries during drain. Benign: coalesceBuffer.clear() runs after
-  // drain completes, and the drain budget covers the wait.
+  // NOTE on coalesce timers: in the legacy implementation we clearTimeout()'d
+  // each pending timer here but kept the buffer entries so the drain could
+  // still see them in countInFlight(). The new InboundCoalescer doesn't
+  // expose individual timer handles — instead `reset()` does both at once
+  // (cancel timers + drop entries). For the drain pattern, we rely on
+  // post-drain `inboundCoalescer.reset()` below to do the cleanup, and let
+  // any timer-driven flushes during drain still call into handleInbound
+  // (which itself short-circuits when shuttingDown is true).
 
   clearInterval(pendingStateReaper)
   vaultPassphraseCache.clear()
@@ -7692,7 +7690,7 @@ async function shutdown(signal: string): Promise<void> {
   })
 
   // Now finish the cleanup the drain didn't touch.
-  coalesceBuffer.clear()
+  inboundCoalescer.reset()
   pendingReauthFlows.clear()
   pendingVaultOps.clear()
   pendingPermissions.clear()

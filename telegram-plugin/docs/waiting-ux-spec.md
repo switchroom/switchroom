@@ -82,6 +82,32 @@ A Phase 2 harness that drives the real gateway through a synthetic update
 stream is filed as a follow-up. Until then, integration-boundary regressions
 remain CI-invisible.
 
+## Phase 3 — real-gateway harness (#553)
+
+The Phase 1 harness called `controller.setQueued()` synchronously inside
+its `inbound()` helper, which is why the F2 deadline passed trivially —
+not because the production code was correct, but because the harness
+was lying about the inbound flow.
+
+Phase 3 introduces `tests/real-gateway-harness.ts` which composes the
+production `InboundCoalescer` (extracted to `gateway/inbound-coalesce.ts`)
+*before* the Phase 1 controller + driver stack. This faithfully reproduces
+what every Telegram-only user sees: 👀 fires only after the coalesce
+window closes (default `gapMs=1500`), ~1500ms after their message landed
+— ~700ms over the F2 deadline.
+
+### F2 root cause hypothesis (now CI-observable)
+
+- `gateway.ts`'s `handleInboundCoalesced` buffers messages for `gapMs`
+  and only on flush calls `handleInbound` → `firstPaintTurn` →
+  `controller.setQueued()` (👀).
+- That couples first-paint to the coalesce window. The fix is to fire
+  the reaction on raw arrival (before buffering) and let only the
+  Claude-side dispatch wait on the buffer.
+- `tests/real-gateway-f2-instant-draft.test.ts` pins this contract.
+  Currently `.skip`'d with a `TODO(#553-F2)` — un-skipped when the fix
+  lands.
+
 ## CI gate
 
 The harness runs as part of the root vitest suite via `npm test` →
