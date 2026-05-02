@@ -99,6 +99,9 @@ export default defineConfig({
       // telegraph.test.ts uses bun:test (#579 Telegraph Instant View) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/telegraph.test.ts",
+      // recent-outbound-dedup.test.ts uses bun:test (#546 dup fix) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/recent-outbound-dedup.test.ts",
     ],
     coverage: {
       provider: "v8",
