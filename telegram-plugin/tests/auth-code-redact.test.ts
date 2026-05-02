@@ -111,6 +111,105 @@ describe('redactAuthCodeMessage', () => {
 })
 
 /**
+ * Diagnostic logging (#561 follow-up). Before this commit the function
+ * silently swallowed every API failure — when an OAuth code paste stuck
+ * around in chat, operators had no way to tell whether deleteMessage
+ * failed on permissions, on a 48h-too-old message, or because msgId was
+ * null. The optional `log` sink emits one line per attempt (success or
+ * specific error message).
+ */
+describe('redactAuthCodeMessage — diagnostic logging', () => {
+  it('logs nothing when no log sink is provided (back-compat)', async () => {
+    const api = {
+      deleteMessage: vi.fn(async () => true as const),
+      setMessageReaction: vi.fn(async () => true as const),
+    }
+    // Just verify it doesn't crash without a sink.
+    expect(() => redactAuthCodeMessage(api, '12345', 999)).not.toThrow()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+
+  it('logs the no-message-id case so the silent skip is visible', () => {
+    const api = {
+      deleteMessage: vi.fn(async () => true as const),
+      setMessageReaction: vi.fn(async () => true as const),
+    }
+    const lines: string[] = []
+    redactAuthCodeMessage(api, '12345', null, line => lines.push(line))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/no message_id/)
+    expect(lines[0]).toMatch(/skipping/)
+  })
+
+  it('logs SUCCESS for both delete and reaction with msgId + chatId for grep-by', async () => {
+    const api = {
+      deleteMessage: vi.fn(async () => true as const),
+      setMessageReaction: vi.fn(async () => true as const),
+    }
+    const lines: string[] = []
+    redactAuthCodeMessage(api, '12345', 999, line => lines.push(line))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lines).toHaveLength(2)
+    // Order isn't guaranteed (independent dispatch). Assert content.
+    const joined = lines.join('\n')
+    expect(joined).toMatch(/deleted/)
+    expect(joined).toMatch(/reaction added/)
+    expect(joined).toMatch(/msgId=999/)
+    expect(joined).toMatch(/chatId=12345/)
+  })
+
+  it('logs FAILED with the actual error message on deleteMessage rejection', async () => {
+    const api = {
+      deleteMessage: vi.fn(async () => {
+        throw new Error('Bad Request: not enough rights to delete a message')
+      }),
+      setMessageReaction: vi.fn(async () => true as const),
+    }
+    const lines: string[] = []
+    redactAuthCodeMessage(api, '12345', 999, line => lines.push(line))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const failed = lines.find(l => l.includes('delete FAILED'))
+    expect(failed).toBeDefined()
+    // The actual Telegram error must be carried verbatim — that's the
+    // signal operators need to root-cause the redaction failure.
+    expect(failed).toMatch(/not enough rights to delete a message/)
+    // And the warning must mention the user-visible consequence so a
+    // reader of the journal understands why this matters.
+    expect(failed).toMatch(/may still be visible/)
+  })
+
+  it('logs FAILED with the actual error message on setMessageReaction rejection', async () => {
+    const api = {
+      deleteMessage: vi.fn(async () => true as const),
+      setMessageReaction: vi.fn(async () => {
+        throw new Error('Bad Request: REACTION_INVALID')
+      }),
+    }
+    const lines: string[] = []
+    redactAuthCodeMessage(api, '12345', 999, line => lines.push(line))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const failed = lines.find(l => l.includes('reaction FAILED'))
+    expect(failed).toBeDefined()
+    expect(failed).toMatch(/REACTION_INVALID/)
+  })
+
+  it('logs are independent — failure of one path does not suppress the other', async () => {
+    const api = {
+      deleteMessage: vi.fn(async () => {
+        throw new Error('boom')
+      }),
+      setMessageReaction: vi.fn(async () => true as const),
+    }
+    const lines: string[] = []
+    redactAuthCodeMessage(api, '12345', 999, line => lines.push(line))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(lines).toHaveLength(2)
+    expect(lines.some(l => l.includes('reaction added'))).toBe(true)
+    expect(lines.some(l => l.includes('delete FAILED'))).toBe(true)
+  })
+})
+
+/**
  * Architectural pin: every auth-code paste call site MUST go through
  * the helper. Greps the source — if a future PR adds a new auth-code
  * paste handler that forgets to call `redactAuthCodeMessage`, this
