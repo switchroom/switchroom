@@ -3362,5 +3362,23 @@ function buildAccessJson(
       },
     },
   };
+
+  // #596: project resolved telegram-channel features (stickers, voice_in,
+  // telegraph) into access.json so the gateway picks them up at runtime
+  // without re-reading switchroom.yaml. The cascade in mergeAgentConfig
+  // already folds the deprecated root-level fields into channels.telegram.*,
+  // so reading from the new canonical location covers both old and new
+  // switchroom.yaml shapes.
+  const tg = agentConfig.channels?.telegram;
+  if (tg?.stickers && Object.keys(tg.stickers).length > 0) {
+    access.stickers = tg.stickers;
+  }
+  if (tg?.voice_in) {
+    access.voice_in = tg.voice_in;
+  }
+  if (tg?.telegraph) {
+    access.telegraph = tg.telegraph;
+  }
+
   return JSON.stringify(access, null, 2) + "\n";
 }

@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { resolveAgentConfig } from "../config/merge.js";
 import {
   handleGetAgents,
   handleStartAgent,
@@ -240,8 +241,15 @@ async function handleWebhookRoute(
   source: string,
   config: SwitchroomConfig,
 ): Promise<Response> {
-  const agentConfig = config.agents[agent];
-  const allowedSources = agentConfig?.webhook_sources ?? [];
+  const agentConfigRaw = config.agents[agent];
+  const agentConfig = agentConfigRaw
+    ? resolveAgentConfig(config.defaults, config.profiles, agentConfigRaw)
+    : undefined;
+  // Canonical location is channels.telegram.webhook_sources (#596).
+  // The cascade resolver folds the deprecated root-level field into
+  // it, so reading from the new spot covers both old and new
+  // switchroom.yaml shapes.
+  const allowedSources = agentConfig?.channels?.telegram?.webhook_sources ?? [];
   const allSecrets = loadWebhookSecrets();
   const agentSecrets = allSecrets[agent] ?? {};
 
