@@ -33,6 +33,7 @@ import {
   type AskUserArgs,
   type AskUserOutcome,
 } from '../ask-user.js'
+import { parseInterruptMarker } from '../interrupt-marker.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
@@ -3731,6 +3732,17 @@ async function handleInboundCoalesced(
   // legacy invariant that media never gets merged with sibling text.
   if (downloadImage || attachment) return handleInbound(ctx, text, downloadImage, attachment)
 
+  // `!`-prefix interrupt (#575) ALSO bypasses coalescing. If we let an
+  // interrupt sit in the coalesce window, an earlier non-`!` message
+  // arriving in the same window would prepend itself and the marker
+  // would no longer be at position 0 — handleInbound's parser would
+  // miss it and the user's interrupt would silently get merged into a
+  // normal turn. Bypass to handleInbound directly so the marker
+  // stays at the start of the text.
+  if (parseInterruptMarker(text).isInterrupt) {
+    return handleInbound(ctx, text, undefined, undefined)
+  }
+
   const from = ctx.from
   if (!from) return
 
@@ -3824,6 +3836,63 @@ async function handleInbound(
   const msgId = ctx.message?.message_id
 
   if (messageThreadId != null) chatThreadMap.set(chat_id, messageThreadId)
+
+  // `!`-prefix interrupt (#575). Closes
+  // `reference/steer-or-queue-mid-flight.md`'s correction path.
+  //
+  // Behavior:
+  //   1. SIGINT the agent service. This kills any in-flight turn —
+  //      same primitive that powers `switchroom agent interrupt`.
+  //      It's heavy, but the user explicitly asked for it; correctness
+  //      beats elegance here.
+  //   2. Strip the `!` and forward the body as a fresh turn so the
+  //      agent sees clean intent. If the body is empty (just `!`),
+  //      send a clarifying reply instead — forwarding empty text
+  //      would just yield a tool-result-of-nothing.
+  //   3. React with ⚡ on the `!` message so the user has a visible
+  //      ack that the interrupt landed (separate from the 👀 the
+  //      coalescer-bypass path skipped).
+  //
+  // Authorization: same allowFrom gate as any inbound message —
+  // unauthorized senders never reach this code (gate() above).
+  // Interrupt requires the same trust as sending a normal message.
+  const interrupt = parseInterruptMarker(text)
+  if (interrupt.isInterrupt) {
+    const agentName = process.env.SWITCHROOM_AGENT_NAME
+    process.stderr.write(
+      `telegram gateway: interrupt-marker received chat_id=${chat_id} agent=${agentName ?? '-'} ` +
+      `body_len=${interrupt.body.length} empty=${interrupt.emptyBody}\n`,
+    )
+    if (msgId != null) {
+      void bot.api.setMessageReaction(chat_id, msgId, [
+        { type: 'emoji', emoji: '⚡' as ReactionTypeEmoji['emoji'] },
+      ]).catch(() => {})
+    }
+    if (agentName) {
+      try {
+        const { interruptAgent } = await import('../../src/agents/lifecycle.js')
+        const { pid } = interruptAgent(agentName)
+        process.stderr.write(`telegram gateway: interrupt-marker SIGINT sent agent=${agentName} pid=${pid}\n`)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: interrupt-marker SIGINT failed: ${(err as Error).message}\n`)
+      }
+    }
+    if (interrupt.emptyBody) {
+      try {
+        await bot.api.sendMessage(
+          chat_id,
+          '⚡ Interrupted. Send your replacement instruction now.',
+          messageThreadId != null ? { message_thread_id: messageThreadId } : {},
+        )
+      } catch {
+        /* swallow — the reaction already acked */
+      }
+      return
+    }
+    // Replace the inbound text with the body and continue normal
+    // processing. The agent receives a fresh turn with no `!` prefix.
+    text = interrupt.body
+  }
 
   // Issue #109: when the user has to ask "status?" mid-turn, the live progress
   // surface (pinned card + status reactions) has failed its job. Log the

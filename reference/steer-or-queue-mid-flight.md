@@ -55,6 +55,13 @@ user thinking they steered when they actually queued, or vice versa.
 - Treating "I changed my mind" as "I have a new request" or vice versa,
   with no way for the user to correct the classification.
 
+## How switchroom answers this today
+
+- **Steer** = no marker. Send a follow-up while a turn is in flight; the inbound coalescer (default 1500ms gap) merges rapid-fire messages so the agent receives a single combined turn with both signals visible. Slower follow-ups arrive as fresh turns the agent sees in its next iteration.
+- **Interrupt + new task** = `!`-prefix marker (#575, gateway-side). A message starting with `!` SIGINTs the agent, strips the marker, and forwards the body as a fresh turn. Empty `!` triggers a "send your replacement instruction now" reply rather than forwarding nothing. The CLAUDE.md template tells the agent the rule so it can teach the user when asked.
+- **What the user sees**: ⚡ reaction on the `!` message confirms the interrupt landed. The agent's normal first-turn protocol then runs against the new body — so the chosen path is visible, not inferred.
+- **Still open** if it surfaces in practice: the JTBD's "queue cleanly behind, with isolated context" sense (file a new task that runs strictly AFTER the current one finishes) isn't a first-class operation today. Today's coalescer-as-queue means second-message effectively becomes amendment context. If a real "queue this for after" workflow shows up, file an issue against this JTBD.
+
 ## UAT prompts
 
 - **Mid-task correction.** Start a long task, send a follow-up that
