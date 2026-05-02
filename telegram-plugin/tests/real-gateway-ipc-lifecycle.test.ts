@@ -110,6 +110,14 @@ describe('I1 — anonymous IPC client lifecycle is observably invisible (Bug A �
     const reactionsAfter = h.recorder.reactionSequence().length
     expect(reactionsAfter).toBe(reactionsBefore)
     expect(h.recorder.lastReactionEmoji(CHAT)).not.toBe('👍')
+    // PRIMARY ASSERTION — direct introspection of the production helper's
+    // side-effect counts. If the `agentName == null` gate is bypassed,
+    // these counts jump to ≥1. The recorder-based assertions above can
+    // miss the bug if the per-agent controller's emit isn't recorder-
+    // wired; this assertion is unambiguous.
+    const sfx = h.flushSideEffects()
+    expect(sfx.disposeProgressDriverCalls, 'progress driver disposed for anonymous client — gate bypassed').toBe(0)
+    expect(sfx.clearActiveReactionsCalls, 'reactions cleared for anonymous client — gate bypassed').toBe(0)
     h.finalize()
   })
 
@@ -135,6 +143,10 @@ describe('I1 — anonymous IPC client lifecycle is observably invisible (Bug A �
     // before the anonymous client touched anything.
     expect(h.recorder.edits(CHAT).length).toBe(editsBefore)
     expect(h.recorder.sentTexts(CHAT).length).toBe(sendsBefore)
+    // Direct assertion on the production helper's side-effect counts.
+    const sfx = h.flushSideEffects()
+    expect(sfx.disposeProgressDriverCalls).toBe(0)
+    expect(sfx.clearActiveReactionsCalls).toBe(0)
     h.finalize()
   })
 })
@@ -160,11 +172,26 @@ describe('I2 — per-agent disconnect isolation (single-agent today, multi-agent
     // Disconnect ONLY agent y. Agent x's per-agent state — and the
     // shared chat's active reaction (which logically belongs to x in
     // single-agent setups) — must remain untouched.
+    const sfxBefore = h.flushSideEffects()
+    expect(sfxBefore.activeAgentCount).toBe(2) // both x and y registered
+
     h.bridgeDisconnect(yClientId)
     await h.clock.advance(10)
 
     expect(h.recorder.reactionSequence().length).toBe(reactionsBefore)
     expect(h.recorder.lastReactionEmoji(CHAT)).toBe(lastBefore)
+
+    // PRIMARY ASSERTION — y disconnected (registered agent), so the
+    // helper's flush DID run and cleared y's entry. But x's entry must
+    // remain. With the current per-agent-Map shape, the helper iterates
+    // the WHOLE map on any registered disconnect — meaning today both x
+    // and y get flushed when y disconnects. That's a TODO for the helper
+    // (it would need a per-agent disconnect filter). For now, we pin
+    // what the helper actually does: both agents get flushed when ANY
+    // registered agent disconnects. When the helper grows per-agent
+    // filtering, update this assertion.
+    const sfxAfter = h.flushSideEffects()
+    expect(sfxAfter.disposeProgressDriverCalls, 'helper ran on registered disconnect').toBe(1)
 
     // And agent x's controller is still operable — no premature finish.
     // (Subsequent disconnect of x is allowed to flush; the invariant

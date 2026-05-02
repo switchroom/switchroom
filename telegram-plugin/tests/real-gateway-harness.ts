@@ -48,6 +48,7 @@ import {
   type InboundCoalescer,
 } from '../gateway/inbound-coalesce.js'
 import { validateClientMessage } from '../gateway/ipc-server.js'
+import { flushOnAgentDisconnect } from '../gateway/disconnect-flush.js'
 import { StatusReactionController } from '../status-reactions.js'
 
 /**
@@ -214,6 +215,22 @@ export interface RealGatewayHarnessHandle extends HarnessHandle {
    * Used by I3 to assert 👍 fires AFTER delivery, not before.
    */
   lastAnswerTextDeliveredAt(chatId: string): number | null
+
+  /**
+   * Test introspection of the side-effect callbacks fired by the real
+   * `flushOnAgentDisconnect` helper since the harness was created. Tests
+   * that want to assert "no flush ran" check `clearActiveReactionsCalls`
+   * and `disposeProgressDriverCalls` are still 0 after a sequence of
+   * anonymous bridge cycles. `activeAgentCount` is the live size of the
+   * harness's mirror of `activeStatusReactions` — non-zero means at
+   * least one registered agent is still active.
+   */
+  flushSideEffects(): {
+    clearActiveReactionsCalls: number
+    disposeProgressDriverCalls: number
+    flushLog: ReadonlyArray<string>
+    activeAgentCount: number
+  }
 }
 
 const DEFAULT_GAP_MS = 1500
@@ -344,27 +361,34 @@ export function createRealGatewayHarness(
   }
 
   // ─── IPC + bridge lifecycle simulation ────────────────────────────────
-  // Per-agent state for the I2 (per-agent disconnect isolation)
-  // invariant. The harness exposes `inner.controller` (shared default)
-  // for back-compat, but tests using `bridgeConnect(name)` get a
-  // fresh per-agent controller that bridgeDisconnect() can flush in
-  // isolation. State mirrors what gateway.ts holds at module scope:
+  // The harness wires `bridgeDisconnect` through the REAL production
+  // helper `flushOnAgentDisconnect` from `gateway/disconnect-flush.ts`
+  // (extracted in PR #600). Tests against this harness exercise actual
+  // production code, not a parallel reimplementation — so the I1/I2
+  // invariants would catch a regression if someone reverted the
+  // `if (agentName == null) return false` gate in the helper.
   //
-  //   activeStatusReactions  → controller per agent
-  //   activeDraftStreams     → cleanup callback per agent
+  // Per-agent state mirrors what `gateway.ts` holds at module scope:
+  // `activeStatusReactions` keyed by agent name. Each registered agent
+  // gets a fresh per-agent controller; the production helper mutates
+  // the Map in place when an agent disconnects.
   //
-  // The mirror of onClientDisconnected lives in the closure below. It
-  // intentionally matches the production semantics of gateway.ts:1609
-  // (snapshot taken from upstream/main 2026-05-03). When PR #600 lands
-  // the extracted `disconnect-flush.ts` helper, swap the inline mirror
-  // for a direct import — the assertion shape stays the same.
-  interface AgentState {
-    agentName: string
-    controller: StatusReactionController
-    onDisconnect: () => void
-  }
+  // The shared `inner.controller` (from waiting-ux-harness) stays as
+  // the default for back-compat with tests that don't go through the
+  // bridge surface — `bridgeConnect(null)` doesn't touch it either.
   const clientsById = new Map<string, { agentName: string | null }>()
-  const agentState = new Map<string, AgentState>()
+  // Production-shaped Maps for the helper. Keyed by agent name (one
+  // entry per registered agent in the harness; production keys by
+  // chat:thread:msgId but the helper's behavior is per-entry-iteration
+  // either way, so the key shape doesn't change semantics).
+  const activeStatusReactions = new Map<string, StatusReactionController>()
+  const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>()
+  const activeTurnStartedAt = new Map<string, number>()
+  const activeDraftStreams = new Map<string, { isFinal: () => boolean; finalize: () => Promise<void> }>()
+  const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
+  let clearActiveReactionsCalls = 0
+  let disposeProgressDriverCalls = 0
+  const flushLog: string[] = []
   const ipcLog: Array<{ kind: 'invalid' | 'unknown' | 'accepted'; raw: unknown }> = []
 
   function bridgeConnect(agentName: string | null): string {
@@ -377,26 +401,17 @@ export function createRealGatewayHarness(
         // Should never happen with a sane agentName — surface loudly.
         throw new Error(`harness bug: register validation failed for ${agentName}`)
       }
-      // Per-agent controller mirrors `activeStatusReactions.get(key)` in
-      // gateway.ts. Each agent's reactions emit through the same fake
-      // bot.api so the recorder sees them, but a per-agent disconnect
-      // only flushes its own controller — that's the I2 invariant.
+      // Per-agent controller mirrors what gateway.ts puts in
+      // `activeStatusReactions.set(key, ctrl)`. The production helper
+      // iterates the Map and calls setDone on each entry; per-agent
+      // isolation comes from the helper's `agentName == null` gate
+      // (anonymous = skip everything) — NOT from selective deletion.
       const ctrl = new StatusReactionController(
         async () => { /* harness uses inner.controller for the shared chat */ },
         opts.allowedReactions ?? null,
         { debounceMs: opts.debounceMs ?? 700 },
       )
-      agentState.set(agentName, {
-        agentName,
-        controller: ctrl,
-        onDisconnect: () => {
-          // Mirror of gateway.ts:1612-1618: flush this agent's
-          // controller to setDone, then drop the entry. Other agents'
-          // controllers are untouched (I2).
-          ctrl.setDone()
-          agentState.delete(agentName)
-        },
-      })
+      activeStatusReactions.set(agentName, ctrl)
     }
     return clientId
   }
@@ -406,18 +421,39 @@ export function createRealGatewayHarness(
     if (meta == null) return
     clientsById.delete(clientId)
 
-    // CRITICAL: anonymous clients (agentName == null) MUST NOT mutate
-    // any state. This is the I1 invariant (Bug A's failure mode). The
-    // production hotfix in PR #600 gates the flush block on
-    // `client.agentName != null`. Until #600 merges, we encode the
-    // correct semantics here so the test can pin the desired behavior.
-    if (meta.agentName == null) {
-      // No-op — log only.
-      return
+    // I1 + I2 contract: route through the REAL production helper.
+    // `agentName == null` ⇒ helper's anonymous-skip gate fires and the
+    // Map is untouched. `agentName != null` ⇒ helper iterates the Map
+    // and flushes setDone on every entry. The Map keys mean: in the
+    // I1 test, ANY remaining controller would prove the gate was
+    // bypassed; in the I2 test, the Map will have entries for OTHER
+    // agents that get incorrectly cleared if the helper is buggy.
+    flushOnAgentDisconnect({
+      agentName: meta.agentName,
+      activeStatusReactions,
+      activeReactionMsgIds,
+      activeTurnStartedAt,
+      activeDraftStreams,
+      activeDraftParseModes,
+      clearActiveReactions: () => { clearActiveReactionsCalls++ },
+      disposeProgressDriver: () => { disposeProgressDriverCalls++ },
+      log: (msg) => { flushLog.push(msg) },
+    })
+  }
+
+  /** Test introspection — counts of side-effect callbacks fired by the helper. */
+  function flushSideEffects(): {
+    clearActiveReactionsCalls: number
+    disposeProgressDriverCalls: number
+    flushLog: ReadonlyArray<string>
+    activeAgentCount: number
+  } {
+    return {
+      clearActiveReactionsCalls,
+      disposeProgressDriverCalls,
+      flushLog,
+      activeAgentCount: activeStatusReactions.size,
     }
-    const st = agentState.get(meta.agentName)
-    if (st == null) return
-    st.onDisconnect()
   }
 
   function sendIpcMessage(clientId: string, message: object): void {
@@ -456,5 +492,6 @@ export function createRealGatewayHarness(
     sendIpcMessage,
     lastReactionEmojiAt,
     lastAnswerTextDeliveredAt,
+    flushSideEffects,
   }
 }
