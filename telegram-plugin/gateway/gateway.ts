@@ -2187,6 +2187,23 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     } catch { /* best-effort signal */ }
     // #203: fresh sendMessage from reply tool is a user-visible signal.
     signalTracker.noteSignal(statusKey(chat_id, threadId), Date.now())
+    // PR #602 follow-up: fire the terminal 👍 here so plain `reply`-only
+    // turns get the same delivery-confirmed reaction as stream_reply
+    // (Bug Z). Pre-follow-up, the dedup-suppress branch in the gateway
+    // turn_end handler was the sole 👍 emitter for reply-tool-only
+    // turns; removing its setDone call (Bug D) left those turns with no
+    // 👍 at all. Mirror the stream_reply contract: only fire after at
+    // least one sendMessage has resolved successfully (sentIds.length>0
+    // guarantees this), so the emoji means "the reply landed in
+    // Telegram", not "the reply tool was invoked". The reply tool has
+    // no lane concept — every reply is the user-visible answer — so no
+    // lane gate is needed (unlike stream_reply where named lanes are
+    // internal driver emits).
+    try {
+      endStatusReaction(chat_id, threadId, 'done')
+    } catch (err) {
+      process.stderr.write(`telegram gateway: reply: endStatusReaction hook threw: ${err}\n`)
+    }
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
@@ -3425,7 +3442,24 @@ function handleSessionEvent(ev: SessionEvent): void {
               const recentCount = getRecentOutboundCount(backstopChatId, 2)
               if (recentCount > 0) {
                 process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
-                if (backstopCtrl) backstopCtrl.setDone()
+                // Bug D fix: do NOT fire setDone here. The previous code
+                // assumed `recentCount > 0` was sufficient proof of delivery
+                // — and it is, since recordOutbound is called synchronously
+                // after sendMessage success. But firing setDone here races
+                // with the stream_reply done=true callback (Bug Z) which now
+                // fires endStatusReaction after finalize() resolves (i.e.
+                // after the final edit lands in Telegram). Both racing on
+                // setDone is harmless (setDone is idempotent post-terminal),
+                // but the dedup branch firing FIRST means we'd be claiming
+                // delivery from a 500ms-lagged read of local history rather
+                // than from the actual API confirmation. Letting Bug Z's
+                // post-finalize callback own the 👍 transition keeps the
+                // emoji tied to true delivery. The plain `reply` tool path
+                // (PR #602 follow-up) now also fires endStatusReaction
+                // directly from executeReply after sendMessage resolves,
+                // mirroring this contract — so reply-only turns transition
+                // to terminal 👍 in their own success path rather than
+                // relying on this dedup heuristic.
                 purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
                 return
               }

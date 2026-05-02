@@ -489,10 +489,40 @@ export async function handleStreamReply(
     await stream.finalize()
     state.activeDraftStreams.delete(sKey)
     state.activeDraftParseModes?.delete(sKey)
-    // Intentionally NOT firing the terminal 👍 here. A turn can call
-    // stream_reply(done=true) mid-flight and then do more tool work or
-    // send additional replies. The 👍 now fires only from turn_end in
-    // server.ts, which is the true agent-idle boundary.
+    // Bug Z fix: fire the terminal 👍 here, gated to the default
+    // (unnamed) lane and only after finalize() resolves so the emoji is
+    // tied to the final edit actually landing in Telegram.
+    //
+    // History (see prior comment removed in this commit): we previously
+    // deferred the 👍 to turn_end on the theory that a turn might call
+    // stream_reply(done=true) mid-flight and continue working. In
+    // practice the dedup-suppress branch in turn_end was firing setDone
+    // off a 500ms-lagged read of local history rather than from a real
+    // delivery confirmation, and the disconnect-flush path was leaving
+    // 👍 firing on disconnect even when the final edit had failed.
+    // Wiring endStatusReaction at the post-finalize callback keeps the
+    // emoji honest — it now means "the final draft edit hit Telegram".
+    //
+    // Gated to the default lane: named lanes (lane:'progress',
+    // lane:'thinking', lane:'activity', etc.) are internal driver
+    // emits, not user-visible answers — they must not be allowed to
+    // claim turn-completion. A lane:'progress' emit firing setDone
+    // would race the actual answer.
+    //
+    // Mid-turn done=true tradeoff: a turn that calls
+    // stream_reply(done=true) on the default lane and then continues
+    // working will fire 👍 early; subsequent intermediate emojis become
+    // no-ops (setDone is terminal). This is the contract: done=true on
+    // the default lane is "the answer is delivered". Agents that need
+    // to continue should use additional `reply` calls or named lanes.
+    const isDefaultLaneForCompletion = args.lane == null || args.lane.length === 0
+    if (isDefaultLaneForCompletion && stream.getMessageId() != null) {
+      try {
+        deps.endStatusReaction(chat_id, threadId, 'done')
+      } catch (err) {
+        deps.writeError(`telegram channel: stream_reply: endStatusReaction hook threw: ${err}\n`)
+      }
+    }
 
     // Hard-fail surface: if the stream finalized without ever assigning
     // a message id, the initial send never landed (4096+ chars hits
