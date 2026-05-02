@@ -242,10 +242,27 @@ export class StatusReactionController {
   private finishWithState(state: ReactionState): void {
     if (this.finished) return
     this.finished = true
-    this.clearDebounceTimer()
     this.clearStallTimers()
+    // F1 fix (#553): if a non-terminal reaction is sitting in the
+    // debounce window when the turn ends, flush it BEFORE the terminal
+    // emoji emits. Pre-fix, `clearDebounceTimer()` here silently
+    // dropped the pending state — every Class B turn that completed in
+    // under `debounceMs` (default 700ms) collapsed to 👀 → 👍 with no
+    // intermediate signal that the agent did any work.
+    //
+    // Gate on `debounceTimer != null`: a `pendingEmoji` with no timer
+    // is already enqueued (immediate emit waiting on chainPromise) and
+    // re-enqueuing would produce a duplicate. Only debounced-but-not-
+    // yet-enqueued emojis need to be flushed here.
+    const flushPending = this.debounceTimer != null && this.pendingEmoji != null
+      ? this.pendingEmoji
+      : null
+    this.clearDebounceTimer()
+    if (flushPending != null && flushPending !== this.currentEmoji) {
+      this.enqueue(flushPending)
+    }
     const emoji = this.resolveEmoji(state)
-    if (emoji != null && emoji !== this.currentEmoji) {
+    if (emoji != null && emoji !== this.currentEmoji && emoji !== flushPending) {
       this.enqueue(emoji)
     }
   }
