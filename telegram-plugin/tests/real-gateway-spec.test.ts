@@ -59,14 +59,72 @@ const INBOUND_MSG = 100
 
 // First-answer-text deadlines per spec. Class A is pinned at 1500ms
 // (covers the 800ms 👀 deadline + token-stream first chunk). Class
-// B/C are TBD by PR 3 — placeholder values picked here as the upper
-// bound the implementer should beat; tighten when the real numbers
-// land.
+// B/C is pinned at 3000ms in #553 PR 3 — budget = 500ms inbound
+// coalesce + ~1s minInitialChars-driven first send + ~1.5s model
+// TTFT for short replies.
 const CLASS_A_ANSWER_TEXT_DEADLINE_MS = 1500
-const CLASS_BC_ANSWER_TEXT_DEADLINE_MS = 5_000 // TBD: PR 3
+const CLASS_BC_ANSWER_TEXT_DEADLINE_MS = 3_000
 
 beforeEach(() => { vi.useFakeTimers() })
 afterEach(() => { vi.useRealTimers() })
+
+// ─── PR 3 — first-answer-text deadlines (Class A & B) ─────────────────────
+//
+// These two tests are extracted from the Class A / Class B describe.skip
+// blocks below and un-skipped in #553 PR 3. The other tests in those
+// blocks (no-placeholder, no-card, ladder integrity) remain skipped
+// pending PRs 4 & 5. Once those land, the duplicates here can be
+// folded back into the parent describes.
+describe('v2 spec — PR 3: first-answer-text deadlines', () => {
+  it(`Class A — first answer text lands within ${CLASS_A_ANSWER_TEXT_DEADLINE_MS}ms of inbound`, async () => {
+    const h = createRealGatewayHarness({ gapMs: 0 })
+    const inboundAt = h.clock.now()
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'hi' })
+    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'hi' })
+    await h.clock.advance(200)
+    h.feedSessionEvent({ kind: 'thinking' })
+    await h.clock.advance(300)
+    await h.streamReply({ chat_id: CHAT, text: 'hello back', done: true })
+    await h.clock.advance(50)
+
+    const answerAt = h.firstAnswerTextMs(CHAT)
+    expect(answerAt, 'no answer text recorded').not.toBeNull()
+    expect((answerAt ?? Infinity) - inboundAt).toBeLessThan(CLASS_A_ANSWER_TEXT_DEADLINE_MS)
+    h.feedSessionEvent({ kind: 'turn_end', durationMs: 600 })
+    await h.clock.advance(500)
+    h.finalize()
+  })
+
+  it(`Class B — first answer text lands within ${CLASS_BC_ANSWER_TEXT_DEADLINE_MS}ms of inbound`, async () => {
+    // Use the production default gapMs (500ms after PR 3) so the
+    // deadline reflects what real users see, not a coalesce-disabled
+    // best-case.
+    const h = createRealGatewayHarness({ gapMs: 500 })
+    const inboundAt = h.clock.now()
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'short tool' })
+    // Coalesce window flush.
+    await h.clock.advance(500)
+    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'short tool' })
+    await h.clock.advance(200)
+    h.feedSessionEvent({ kind: 'thinking' })
+    await h.clock.advance(300)
+    h.feedSessionEvent({ kind: 'tool_use', toolName: 'Bash', toolUseId: 't1' })
+    await h.clock.advance(1_000)
+    h.feedSessionEvent({ kind: 'tool_result', toolUseId: 't1', toolName: 'Bash' })
+    // Answer text begins streaming as soon as the model resumes.
+    await h.streamReply({ chat_id: CHAT, text: 'partial...', done: false })
+    await h.clock.advance(50)
+
+    const answerAt = h.firstAnswerTextMs(CHAT)
+    expect(answerAt, 'no answer text recorded').not.toBeNull()
+    expect((answerAt ?? Infinity) - inboundAt).toBeLessThan(CLASS_BC_ANSWER_TEXT_DEADLINE_MS)
+
+    await h.streamReply({ chat_id: CHAT, text: 'partial... done', done: true })
+    h.feedSessionEvent({ kind: 'turn_end', durationMs: 3_000 })
+    await h.clock.advance(500)
+    h.finalize()
+  })
+})
 
 // ─── Class A — instant (<2s, NO tools) ───────────────────────────────────
 //

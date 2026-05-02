@@ -133,7 +133,7 @@ Default chunk limit: 4000 characters (configurable via `textChunkLimit` in `acce
 
 ### Inbound message coalescing
 
-Rapid consecutive messages from the same user/chat are buffered and combined into a single delivery (joined with `\n`). The buffer flushes after `coalescingGapMs` milliseconds of silence (default: 1500ms).
+Rapid consecutive messages from the same user/chat are buffered and combined into a single delivery (joined with `\n`). The buffer flushes after `coalescingGapMs` milliseconds of silence (default: 500ms — lowered from 1500ms in #553 PR 3 to shrink the silent gap before the agent's first text lands).
 
 This prevents fragmented context when users send multi-line thoughts across several quick messages. Non-text messages (photos, documents, etc.) bypass coalescing.
 
@@ -169,7 +169,7 @@ Link previews are disabled by default in outbound messages. Control via:
   "textChunkLimit": 4000,
   "parseMode": "html",
   "disableLinkPreview": true,
-  "coalescingGapMs": 1500
+  "coalescingGapMs": 500
 }
 ```
 
@@ -178,7 +178,7 @@ Link previews are disabled by default in outbound messages. Control via:
 | `textChunkLimit` | number | 4000 | Max chars per outbound message before splitting |
 | `parseMode` | `"html"` \| `"markdownv2"` \| `"text"` | `"html"` | Default parse mode for outbound messages |
 | `disableLinkPreview` | boolean | `true` | Disable link preview thumbnails |
-| `coalescingGapMs` | number | 1500 | Debounce gap for inbound message coalescing (0 = disabled) |
+| `coalescingGapMs` | number | 500 | Debounce gap for inbound message coalescing (0 = disabled) |
 
 ### Read receipt indicator
 

@@ -19,7 +19,7 @@ workers) are the single concept for parallel work.
 | Status reaction   | 👀 within 800ms of inbound. Terminates with 👍.                        |
 | Progress card     | **Never rendered.** Suppressed regardless of `initialDelayMs`.         |
 | Placeholder text  | **Never sent.** No `🔵 thinking` / `📚 recalling memories` / `💭 thinking`. |
-| Answer text       | First answer-text edit lands within **800ms** of inbound (TBD #553-PR-3). |
+| Answer text       | First answer-text edit lands within **1500ms** of inbound (Class A budget; pinned in #553 PR 3). |
 | Ladder            | 👀 → 👍. Optional 🤔 if the controller debounce window is crossed.    |
 
 User experience: feels like a chat partner typing back instantly.
@@ -31,7 +31,7 @@ User experience: feels like a chat partner typing back instantly.
 | Status reaction   | 👀 within 800ms. Ladder progresses through 🤔 / tool-glyphs (🔥/✍/👨‍💻/⚡) before 👍. **Must NOT collapse straight to 👍.** |
 | Progress card     | **Never rendered.** The card gate is `(elapsed >= 60s) OR (sub-agent appeared)` — tools alone do NOT trigger it. |
 | Placeholder text  | **Never sent.**                                                        |
-| Answer text       | First answer-text edit lands within **<Ns** of inbound (TBD #553-PR-3). Streams progressively as the model produces tokens. |
+| Answer text       | First answer-text edit lands within **3000ms** of inbound (Class B/C budget; pinned in #553 PR 3). Streams progressively as the model produces tokens. |
 | Final             | 👍 + locked stream answer.                                             |
 
 User experience: live ladder of tool reactions, answer text starts
@@ -61,8 +61,10 @@ the sub-agent stream.
 2. **Card gate** — `(elapsed >= 60s) OR (any sub-agent has appeared)`.
    Tool-use count, tool category, and parent narrative content are
    NOT inputs to the gate.
-3. **First-answer-text deadline** — Class A: <800ms. Class B/C: <Ns
-   (TBD by PR 3 once production measurement lands).
+3. **First-answer-text deadline** — Class A: <1500ms. Class B/C:
+   <3000ms (committed in #553 PR 3). Budget: 500ms inbound coalesce +
+   ~1s minInitialChars-driven first send + ~1.5s model TTFT for short
+   replies.
 4. **Sub-agent header == list length** — every render of the card.
 
 ## PR 1 — foundation: spec + harness extensions (this PR)

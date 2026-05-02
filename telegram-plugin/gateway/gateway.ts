@@ -1382,7 +1382,11 @@ type CoalescePayload = {
 const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
   // Read per-call from the access file so `/access set-coalesce N` takes
   // effect on the next message without restarting the gateway.
-  gapMs: () => loadAccess().coalescingGapMs ?? 1500,
+  //
+  // Default lowered 1500 → 500 in #553 PR 3 to shrink the gateway-side
+  // contribution to first-real-text latency. Operators can still tune
+  // higher via `/access set-coalesce N` or the access file.
+  gapMs: () => loadAccess().coalescingGapMs ?? 500,
   merge: (entries) => {
     const last = entries[entries.length - 1]
     return {
@@ -3795,6 +3799,12 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   void bot.api.setMessageReaction(chatId, msgId, [
     { type: 'emoji', emoji: '👀' as ReactionTypeEmoji['emoji'] },
   ]).catch(() => {})
+  // #553 PR 3: also fire the native "typing…" indicator. Bridges the
+  // visual gap between the early-ack 👀 reaction and the first real
+  // model text. No fake content — Telegram clients render this natively
+  // and it auto-expires after ~5s if not refreshed (the answer-lane
+  // first edit will land long before then under the new defaults).
+  void bot.api.sendChatAction(chatId, 'typing').catch(() => {})
 }
 
 async function handleInbound(

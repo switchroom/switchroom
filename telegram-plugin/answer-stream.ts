@@ -22,8 +22,10 @@ import {
  *   2. sendMessageDraft for DMs (detected by chatType='private'); regular
  *      sendMessage+editMessageText for groups/channels. Runtime fallback
  *      when draft API rejects (DRAFT_METHOD_UNAVAILABLE_RE / DRAFT_CHAT_UNSUPPORTED_RE).
- *   3. minInitialChars (~400) — don't open the answer lane until enough text
- *      has arrived. Short replies bypass the lane entirely.
+ *   3. minInitialChars (~50) — don't open the answer lane until enough text
+ *      has arrived. Lowered 400 → 50 in #553 PR 3 so short replies
+ *      ("yes", "done", "the answer is 42") become visible on the first
+ *      text event instead of waiting for `stream_reply` materialize.
  *   4. Turn-end materializes as a fresh sendMessage (push notification) NOT
  *      an edit-finalize — mirrors OpenClaw's materialize() pattern.
  *   5. Supersession protection — when a new turn starts while a prior
@@ -42,7 +44,7 @@ import {
  * existing callers that import from this module continue to work.
  */
 
-export const MIN_INITIAL_CHARS = 400
+export const MIN_INITIAL_CHARS = 50
 export const DEFAULT_THROTTLE_MS = 1000
 const TELEGRAM_MAX_CHARS = 4096
 
