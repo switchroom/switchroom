@@ -765,6 +765,25 @@ export const AgentSchema = z.object({
       "demand. Off by default — webhook is the only untrusted-inbound " +
       "surface in the system, so opt-in is mandatory. See #577.",
     ),
+  voice_in: z
+    .object({
+      enabled: z.boolean().optional().describe("Master switch for voice-message transcription."),
+      provider: z.enum(["openai"]).optional().describe(
+        "Transcription provider. Only 'openai' (Whisper API) supported in the spike (#578); " +
+        "Groq/Deepgram/local-whisper-cli are follow-up choices.",
+      ),
+      language: z.string().optional().describe(
+        "Optional ISO-639-1 language hint (e.g. 'en', 'fr'). Skips Whisper's auto-detection.",
+      ),
+    })
+    .optional()
+    .describe(
+      "Inbound voice-message transcription (#578). When enabled, voice/audio " +
+      "messages from allowlisted users are downloaded, transcribed via the " +
+      "configured provider, and surface to the agent as the user's text. " +
+      "API key read from ~/.switchroom/openai-api-key (mode 0600). Off by " +
+      "default — opt-in per agent."
+    ),
   soul: AgentSoulSchema,
   tools: AgentToolsSchema,
   memory: AgentMemorySchema,
