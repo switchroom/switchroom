@@ -3368,7 +3368,25 @@ function handleSessionEvent(ev: SessionEvent): void {
               const recentCount = getRecentOutboundCount(backstopChatId, 2)
               if (recentCount > 0) {
                 process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
-                if (backstopCtrl) backstopCtrl.setDone()
+                // Bug D fix: do NOT fire setDone here. The previous code
+                // assumed `recentCount > 0` was sufficient proof of delivery
+                // — and it is, since recordOutbound is called synchronously
+                // after sendMessage success. But firing setDone here races
+                // with the stream_reply done=true callback (Bug Z) which now
+                // fires endStatusReaction after finalize() resolves (i.e.
+                // after the final edit lands in Telegram). Both racing on
+                // setDone is harmless (setDone is idempotent post-terminal),
+                // but the dedup branch firing FIRST means we'd be claiming
+                // delivery from a 500ms-lagged read of local history rather
+                // than from the actual API confirmation. Letting Bug Z's
+                // post-finalize callback own the 👍 transition keeps the
+                // emoji tied to true delivery. Note: for the legacy `reply`
+                // tool path (which does not yet wire endStatusReaction),
+                // this leaves the controller in a non-terminal intermediate
+                // state until purgeReactionTracking removes it — meaning no
+                // 👍 will render on plain `reply` turns whose only outbound
+                // came from the reply tool. Tracked separately; the spec
+                // for this PR explicitly scopes Bug Z to stream_reply only.
                 purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
                 return
               }
