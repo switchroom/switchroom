@@ -241,9 +241,14 @@ fi
 #
 # Sentinel-file approach (rather than env var) keeps the signal
 # durable across the entire process lifetime: even if the agent
-# defers the audit by N turns, the file remains until handled. start.sh
-# can't track first-turn vs subsequent-turn boundaries, but the agent
-# can — `rm -f` after the first audit makes it idempotent.
+# defers the audit by N turns, the file remains until handled.
+#
+# We unconditionally re-write the sentinel on every boot — including
+# `--continue` respawns from watchdog/bridge restarts. Conversation-
+# level dedup (so the agent doesn't re-fire the same "owed reply"
+# audit twice on the same user message after a respawn) lives in the
+# agent's audit logic via `.wake-audit-last-completed`, not here. See
+# the "Conversation-aware dedup" block in telegram-style.md.hbs.
 mkdir -p "$TELEGRAM_STATE_DIR" 2>/dev/null || true
 : > "$TELEGRAM_STATE_DIR/.wake-audit-pending" 2>/dev/null || true
 
