@@ -68,6 +68,18 @@ describe('classifyRejection — benign Telegram 400s', () => {
     expect(classifyRejection(err)).toBe('log_only')
   })
 
+  it('returns "log_only" for "chat not found" (ziggy 2026-05-02 — stale group id in access.json crashed gateway)', () => {
+    // Boot-time pin sweep + various other checks call getChat against
+    // every allowlisted chat. Stale ids (bot removed from group, group
+    // deleted, leftover config from a prior bot pairing) return this
+    // 400. The wrapped sweep catches it visibly via boot-probe-failed,
+    // but a leaked rejection from the same family was still crashing
+    // the gateway into a restart loop. Don't restart-loop on
+    // unreachable chats — log them and move on.
+    const err = grammyError(400, 'Bad Request: chat not found')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
   it('case-insensitive description match', () => {
     const err = grammyError(400, 'Bad Request: MESSAGE IS NOT MODIFIED: blah')
     expect(classifyRejection(err)).toBe('log_only')
@@ -97,7 +109,10 @@ describe('classifyRejection — genuine errors still crash', () => {
   })
 
   it('returns "shutdown" for GrammyError 400 with NEW unknown description', () => {
-    const err = grammyError(400, 'Bad Request: chat not found')
+    // Use a description that's not in the benign list — the policy is
+    // intentionally narrow so genuinely new bug categories still crash
+    // (and surface via systemd restart) rather than silently masking.
+    const err = grammyError(400, 'Bad Request: PHOTO_INVALID_DIMENSIONS')
     expect(classifyRejection(err)).toBe('shutdown')
   })
 

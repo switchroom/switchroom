@@ -57,7 +57,20 @@ export function classifyRejection(
     // failure so we can fix the root cause, but don't crash the gateway
     // into a restart loop (issue #101).
     desc.includes("can't parse entities") ||
-    desc.includes('unsupported start tag')
+    desc.includes('unsupported start tag') ||
+    // 'chat not found' fires when an allowlisted chat id (typically a
+    // group in access.json/groups{}) is no longer reachable — bot was
+    // removed, group was deleted, or the id was stale config from a
+    // prior bot pairing. Boot-time pin sweep + various other checks
+    // call getChat against every allowlisted chat; a single unreachable
+    // entry was crashing the gateway into restart loops on ziggy
+    // (2026-05-02 12:05) even though boot-probe-failed already logged
+    // the failure structurally. The wrapped sweep handles the visible
+    // case; this policy entry covers any leaked rejection from the
+    // same family so a single bad chat id can't restart-loop the
+    // process. The visible boot-probe-failed log is the primary
+    // diagnostic; this is the can't-restart-loop guarantee.
+    desc.includes('chat not found')
   ) {
     return 'log_only'
   }
