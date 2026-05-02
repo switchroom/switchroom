@@ -3581,9 +3581,56 @@ async function handleInboundCoalesced(
 
   const from = ctx.from
   if (!from) return
+
+  // F2 fix (#553): fire 👀 reaction on RAW arrival, before the coalesce
+  // wait blocks first paint. Pre-fix, the controller's setQueued() inside
+  // handleInbound only ran AFTER the coalesce flush (default gapMs=1500),
+  // so the user perceived ~1.5s of silence after their message landed.
+  // The spec deadline is 800ms.
+  //
+  // The controller's later setQueued() in handleInbound still runs on
+  // flush; Telegram dedupes setMessageReaction calls with the same
+  // emoji, so the visible state is unchanged. The duplicate emit is
+  // one extra API call per coalesced burst — trivial cost vs. the UX win.
+  //
+  // Eligibility:
+  //   - PRIVATE chat only (group flow uses requireMention/allowFrom
+  //     checks that need the full gate; pre-acking those risks reacting
+  //     to messages we'd later drop).
+  //   - Sender already in access.allowFrom (paired) — unpaired senders
+  //     get the pairing-required reply via the full gate path.
+  //   - No active turn for this (chat, thread) — mid-turn messages
+  //     would otherwise flash 👀 over the current 🔥/🤔 state.
+  //   - msgId present (always true for `bot.on('message:*')` paths but
+  //     defensive against future routers that might call this without one).
+  maybeEarlyAckReaction(ctx, from)
+
   const key = inboundCoalesceKey(String(ctx.chat!.id), String(from.id))
   const result = inboundCoalescer.enqueue(key, { text, ctx, downloadImage, attachment })
   if (result.bypass) return handleInbound(ctx, text, undefined, undefined)
+}
+
+/**
+ * Fire the 👀 status reaction immediately for paired DM users sending
+ * a fresh-turn message. Returns silently for ineligible cases — the
+ * caller proceeds either way; this is a UX optimisation, not a gate.
+ *
+ * Fire-and-forget: failures are swallowed since the controller's
+ * setQueued() will retry the same emoji after the coalesce flush.
+ */
+function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>): void {
+  const msgId = ctx.message?.message_id
+  if (msgId == null) return
+  const chatType = ctx.chat?.type
+  if (chatType !== 'private') return
+  const chatId = String(ctx.chat!.id)
+  const threadId = ctx.message?.is_topic_message ? ctx.message.message_thread_id : undefined
+  if (activeTurnStartedAt.has(statusKey(chatId, threadId))) return
+  const access = loadAccess()
+  if (!access.allowFrom.includes(String(from.id))) return
+  void bot.api.setMessageReaction(chatId, msgId, [
+    { type: 'emoji', emoji: '👀' as ReactionTypeEmoji['emoji'] },
+  ]).catch(() => {})
 }
 
 async function handleInbound(

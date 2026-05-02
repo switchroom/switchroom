@@ -88,6 +88,12 @@ export function createRealGatewayHarness(
   // Phase 1 harness: controller + driver + recorder + clock.
   const inner = createWaitingUxHarness(opts)
 
+  // Track which (chatId) keys have an active turn — mirrors gateway.ts's
+  // `activeTurnStartedAt` for the F2 early-ack mid-turn check. Set on
+  // flush (when inner.inbound runs); cleared by the `turn_end` session
+  // event so subsequent fresh inbounds get the early-ack again.
+  const activeTurns = new Set<string>()
+
   // Wrap inner.inbound() with the real coalescer so the test surface
   // matches what production sees end-to-end.
   const coalescer = createInboundCoalescer<CoalescePayload>({
@@ -105,12 +111,26 @@ export function createRealGatewayHarness(
       // The flush is the moment first-paint runs in production —
       // controller.setQueued() (👀) and driver.startTurn(). Delegate
       // to the inner harness's inbound() which already wires both.
+      activeTurns.add(merged.chatId)
       inner.inbound({ chatId: merged.chatId, messageId: merged.messageId, text: merged.text })
     },
   })
 
   function inbound(args: { chatId: string; messageId: number; text?: string; userId?: string }): void {
     const userId = args.userId ?? '777' // matches update-factory's default sender
+
+    // F2 fix mirror: fire 👀 directly via bot.api on raw arrival, BEFORE
+    // the coalescer's gap window. Production runs `maybeEarlyAckReaction`
+    // here for paired DM users on a fresh turn. The harness skips the
+    // access/chatType checks (the harness has no access file) and gates
+    // only on "no active turn" so the mid-turn-flash case stays catchable.
+    const turnKey = args.chatId
+    if (!activeTurns.has(turnKey)) {
+      void inner.bot.api.setMessageReaction(args.chatId, args.messageId, [
+        { type: 'emoji', emoji: '👀' },
+      ])
+    }
+
     const payload: CoalescePayload = {
       chatId: args.chatId,
       messageId: args.messageId,
@@ -122,11 +142,19 @@ export function createRealGatewayHarness(
     if (result.bypass) {
       // gapMs <= 0 — production calls handleInbound directly; mirror
       // by calling the inner harness's first-paint immediately.
+      activeTurns.add(turnKey)
       inner.inbound({ chatId: args.chatId, messageId: args.messageId, text: args.text })
     }
   }
 
   function feedSessionEvent(ev: SessionEvent): void {
+    if (ev.kind === 'turn_end') {
+      // Turn complete — clear the active-turn marker so the next inbound
+      // gets the early-ack again. Mirrors gateway.ts clearing
+      // activeTurnStartedAt on turn-end (production tracks it per
+      // statusKey but the harness collapses to per-chat).
+      activeTurns.clear()
+    }
     inner.feedSessionEvent(ev)
   }
 

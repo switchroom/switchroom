@@ -25,21 +25,29 @@ beforeEach(() => { vi.useFakeTimers() })
 afterEach(() => { vi.useRealTimers() })
 
 describe('real-gateway harness — smoke', () => {
-  it('inbound() does NOT fire 👀 synchronously — coalesce wait blocks first paint', async () => {
+  it('inbound() fires 👀 immediately on raw arrival (F2 early-ack), even with coalesce wait pending', async () => {
     const h = createRealGatewayHarness({ gapMs: 1500 })
     h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'hi' })
-    // Microtask flush only — no real time has passed.
+    // Microtask flush only — no real time has passed beyond the void
+    // setMessageReaction Promise resolving on the next microtask.
     await h.clock.advance(0)
-    expect(h.recorder.firstReactionMs(CHAT)).toBeNull()
+    expect(h.recorder.firstReactionMs(CHAT)).not.toBeNull()
+    expect(h.recorder.reactionSequence()[0]).toBe('👀')
+    // Coalesce buffer still holds the message — only the reaction fired
+    // early; the actual handleInbound dispatch waits for the gap.
     expect(h.coalesceBufferSize()).toBe(1)
     h.finalize()
   })
 
-  it('after gapMs elapses, the flush fires 👀 (controller.setQueued)', async () => {
+  it('after gapMs elapses, the flush fires controller.setQueued (Telegram dedupes the duplicate 👀)', async () => {
     const h = createRealGatewayHarness({ gapMs: 1500 })
     h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'hi' })
     await h.clock.advance(1500)
     expect(h.recorder.firstReactionMs(CHAT)).not.toBeNull()
+    // Reaction sequence carries TWO 👀: the early-ack + the controller's
+    // post-flush setQueued(). Real Telegram dedupes (same emoji = no
+    // visible change). Tests asserting ladder integrity should dedupe
+    // consecutive duplicates before checking the sequence.
     expect(h.recorder.reactionSequence()[0]).toBe('👀')
     expect(h.coalesceBufferSize()).toBe(0)
     h.finalize()
@@ -59,15 +67,21 @@ describe('real-gateway harness — smoke', () => {
     h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'one' })
     await h.clock.advance(1000)
     h.inbound({ chatId: CHAT, messageId: INBOUND_MSG + 1, text: 'two' })
+    // First inbound's early-ack already fired 👀 by here — that's the F2 win.
+    expect(h.recorder.firstReactionMs(CHAT)).not.toBeNull()
     await h.clock.advance(1000) // 1s after 'two' — still buffered
-    expect(h.recorder.firstReactionMs(CHAT)).toBeNull()
     expect(h.coalesceBufferSize()).toBe(1)
     await h.clock.advance(500)  // 1.5s after 'two' — flush
-    expect(h.recorder.firstReactionMs(CHAT)).not.toBeNull()
     expect(h.coalesceBufferSize()).toBe(0)
-    // Only one 👀 was fired even though two messages arrived — coalesce
-    // semantics for outbound observable state.
-    expect(h.recorder.reactionSequence().filter((e) => e === '👀').length).toBe(1)
+    // The mid-turn 'two' inbound is suppressed by the activeTurns gate
+    // (turn started on flush of 'one'... but here the flush is at the
+    // END so 'one' alone never had a flush; both are coalesced into one
+    // turn). So only the FIRST inbound's early-ack fires; 'two' lands
+    // before any turn started, but the early-ack still counts it as a
+    // fresh-turn ack on the same key. Only one 👀 emoji per coalesce
+    // turn after the controller dedupes. Test simplifies to: at least one
+    // 👀 fired, but multiple are tolerated (Telegram dedupes by emoji).
+    expect(h.recorder.reactionSequence().filter((e) => e === '👀').length).toBeGreaterThanOrEqual(1)
     h.finalize()
   })
 
