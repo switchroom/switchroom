@@ -99,6 +99,9 @@ export default defineConfig({
       // sticker-aliases.test.ts uses bun:test (#576 sticker/gif) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/sticker-aliases.test.ts",
+      // voice-transcribe.test.ts uses bun:test (#578 voice-in spike) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/voice-transcribe.test.ts",
     ],
     coverage: {
       provider: "v8",

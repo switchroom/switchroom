@@ -40,6 +40,7 @@ import {
   type StickerSendArgs,
   type GifSendArgs,
 } from '../sticker-aliases.js'
+import { transcribeViaWhisper } from '../voice-transcribe.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
@@ -520,6 +521,16 @@ type Access = {
    *  in switchroom.yaml; reconcile writes the resolved map into
    *  access.json so the gateway has it without re-reading config. */
   stickers?: Record<string, string>
+  /** Voice-in transcription config (#578 spike). When `enabled` is
+   *  true and provider is 'openai', inbound voice/audio messages are
+   *  downloaded and transcribed via Whisper, then surface as the
+   *  user's inbound text. API key read from
+   *  ~/.switchroom/openai-api-key. Off by default. */
+  voice_in?: {
+    enabled?: boolean
+    provider?: 'openai'
+    language?: string
+  }
 }
 
 function defaultAccess(): Access {
@@ -7746,8 +7757,122 @@ bot.on('message:document', async ctx => {
 
 bot.on('message:voice', async ctx => {
   const voice = ctx.message.voice
+  // #578 spike: when voice_in is enabled in access.json, download
+  // the audio and transcribe via Whisper before surfacing to the
+  // agent. The transcript becomes the inbound text; the agent reads
+  // it like a typed message. Failure paths gracefully fall back to
+  // the legacy "(voice message)" envelope so the agent still gets
+  // SOMETHING — better than silent drops.
+  const access = loadAccess()
+  const voiceIn = access.voice_in
+  if (voiceIn?.enabled && voiceIn?.provider === 'openai') {
+    const transcript = await maybeTranscribeVoice(
+      voice.file_id,
+      voice.mime_type,
+      voiceIn.language,
+    )
+    if (transcript != null) {
+      const text = ctx.message.caption
+        ? `${ctx.message.caption}\n\n[voice transcript] ${transcript}`
+        : `[voice transcript] ${transcript}`
+      await handleInbound(ctx, text, undefined, {
+        kind: 'voice',
+        file_id: voice.file_id,
+        size: voice.file_size,
+        mime: voice.mime_type,
+      })
+      return
+    }
+    // Fall through to the legacy path on transcription failure.
+  }
   await handleInbound(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
 })
+
+/**
+ * Download a voice attachment from Telegram and transcribe it via
+ * the configured Whisper provider. Returns the transcript text on
+ * success, or null on any failure (caller falls back). All errors
+ * are logged to stderr but never thrown — voice-in is a UX
+ * enhancement, not a critical path.
+ */
+async function maybeTranscribeVoice(
+  fileId: string,
+  mimeType: string | undefined,
+  language: string | undefined,
+): Promise<string | null> {
+  // Read API key from the operator-managed file. Same pattern as
+  // webhook-secrets.json — simpler than vault integration for the
+  // spike. Future: resolve through vault once the abstraction
+  // matures.
+  let apiKey: string | null = null
+  try {
+    const path = require('path').join(require('os').homedir(), '.switchroom', 'openai-api-key')
+    if (existsSync(path)) {
+      apiKey = readFileSync(path, 'utf-8').trim()
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: voice-in: failed to read api key: ${(err as Error).message}\n`)
+    return null
+  }
+  if (!apiKey) {
+    process.stderr.write(`telegram gateway: voice-in: enabled but no api key at ~/.switchroom/openai-api-key — falling back\n`)
+    return null
+  }
+
+  // Download the audio bytes from Telegram. Same shape as
+  // executeDownloadAttachment but in-memory rather than to disk.
+  let audioBytes: Uint8Array
+  try {
+    const file = await bot.api.getFile(fileId)
+    if (!file.file_path) {
+      process.stderr.write(`telegram gateway: voice-in: getFile returned no file_path\n`)
+      return null
+    }
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+    if (!res.ok) {
+      process.stderr.write(`telegram gateway: voice-in: telegram download HTTP ${res.status}\n`)
+      return null
+    }
+    audioBytes = new Uint8Array(await res.arrayBuffer())
+  } catch (err) {
+    // Sanitize: never let the bot token leak into log lines via the
+    // download URL — strip anything that looks like a token.
+    const msg = (err as Error).message.replace(/bot[\w:-]+/g, 'bot[redacted]')
+    process.stderr.write(`telegram gateway: voice-in: download failed: ${msg}\n`)
+    return null
+  }
+
+  // Filename hint — Telegram voice is OGG/Opus; agents may also
+  // attach mp3/m4a/etc which arrive as message:audio (handled
+  // separately). Match the mime to give Whisper a usable extension.
+  const ext = mimeType?.includes('mp3') ? 'mp3'
+    : mimeType?.includes('m4a') ? 'm4a'
+    : mimeType?.includes('wav') ? 'wav'
+    : 'ogg'
+
+  const result = await transcribeViaWhisper({
+    apiKey,
+    audio: audioBytes,
+    filename: `voice.${ext}`,
+    language,
+  })
+
+  if (!result.ok) {
+    process.stderr.write(
+      `telegram gateway: voice-in: transcription failed reason=${result.reason}` +
+      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+      '\n',
+    )
+    return null
+  }
+
+  process.stderr.write(
+    `telegram gateway: voice-in: transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
+    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
+  )
+  return result.text
+}
 
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
