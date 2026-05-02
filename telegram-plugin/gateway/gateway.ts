@@ -3709,7 +3709,7 @@ async function handleInbound(
       // Single-use code so a third party can't replay it after exchange,
       // but plaintext OAuth tokens in chat history are still poor
       // hygiene. The helper handles delete + 🔑 reaction silently.
-      redactAuthCodeMessage(bot.api, chat_id, msgId)
+      redactAuthCodeMessage(bot.api, chat_id, msgId, line => process.stderr.write(line))
       return
     }
     pendingReauthFlows.delete(chat_id)
@@ -5761,7 +5761,7 @@ bot.command('auth', async ctx => {
     }
     pendingReauthFlows.delete(String(ctx.chat!.id))
     // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api, String(ctx.chat!.id), ctx.message?.message_id ?? null)
+    redactAuthCodeMessage(bot.api, String(ctx.chat!.id), ctx.message?.message_id ?? null, line => process.stderr.write(line))
     return
   }
   if (intent.kind === 'cancel') {
@@ -6835,7 +6835,7 @@ bot.command('reauth', async ctx => {
     }
     pendingReauthFlows.delete(chatId)
     // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api, chatId, ctx.message?.message_id ?? null)
+    redactAuthCodeMessage(bot.api, chatId, ctx.message?.message_id ?? null, line => process.stderr.write(line))
     return
   }
   // raw is treated as an agent name

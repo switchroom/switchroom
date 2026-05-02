@@ -116,14 +116,26 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
       summary: "needs first-time login — send /auth in this chat to start the flow",
     });
   } else if (!hasCreds) {
-    // .oauth-token alone is the legacy state — works for in-process
-    // claude (start.sh exports it) but `claude -p` from hooks needs
-    // .credentials.json to refresh. Warn rather than error.
-    findings.push({
-      code: "credentials_missing",
-      severity: "warn",
-      summary: "send /auth in this chat to refresh credentials (hooks need them)",
-    });
+    // `.oauth-token`-only IS switchroom's intended steady state. The
+    // auth flow (src/auth/manager.ts:writeOAuthToken + the deliberate
+    // `rmSync(credentialsPath(...))` at line 922) explicitly persists
+    // ONLY the bearer token; the temp `.credentials.json` written by
+    // `claude setup-token` is wiped to prevent state-drift incidents
+    // (gymbro 2026-04-25). Hooks that shell `claude -p` get the token
+    // via the `CLAUDE_CODE_OAUTH_TOKEN` env var injected at start.sh
+    // (and re-injected by `defaultClaudeCliRunner` when the parent
+    // strips it) — they never read `.credentials.json`.
+    //
+    // So `.credentials.json` absence is NOT a problem under
+    // switchroom's design. Earlier versions of this diagnoser
+    // (inherited from claude CLI's assumptions) flagged it as a warn
+    // and told users to `/auth` to fix — but `/auth` produces the
+    // same `.oauth-token`-only state, so the warning was unfixable
+    // and the user-facing message was a UX dead end. Suppress it.
+    //
+    // Token-expiry tracking lives in `.oauth-token.meta.json`
+    // (createdAt + expiresAt) — that's where any future "your token
+    // is about to expire" warning belongs, not in this branch.
   } else {
     let parsed:
       | { claudeAiOauth?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }

@@ -57,15 +57,22 @@ describe("diagnoseAuthState", () => {
     expect(r.recommendation.join("\n")).toContain("switchroom auth reauth");
   });
 
-  it("downgrades to warn when .oauth-token is present but creds missing", () => {
+  it("treats .oauth-token-only as OK — switchroom's intended steady state", () => {
+    // Regression for the unfixable-warning UX dead end (klanker
+    // screenshot 2026-05-02): the user followed the boot-self-test
+    // recommendation ("send /auth in this chat to refresh
+    // credentials"), the auth flow completed, and the warning still
+    // showed because `/auth` writes only `.oauth-token` (deliberate —
+    // see auth/manager.ts:922 rmSync of credentialsPath). Telling
+    // users to do something that won't fix the problem violates the
+    // docs-test principle. Switchroom's hooks get the token via
+    // CLAUDE_CODE_OAUTH_TOKEN env injection at start.sh, NOT via
+    // .credentials.json self-refresh.
     writeOauthToken("sk-ant-oat01-something");
     const r = diagnoseAuthState(configDir);
-    expect(r.severity).toBe("warn");
-    expect(r.findings[0]).toMatchObject({
-      code: "credentials_missing",
-      severity: "warn",
-    });
-    expect(r.findings[0].summary).toMatch(/\/auth/);
+    expect(r.severity).toBe("ok");
+    expect(r.findings).toHaveLength(0);
+    expect(r.recommendation).toHaveLength(0);
   });
 
   it("flags malformed JSON as error/credentials_malformed", () => {
