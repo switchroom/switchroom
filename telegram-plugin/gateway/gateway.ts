@@ -25,6 +25,14 @@ import { join, extname, sep, basename } from 'path'
 import { installPluginLogger } from '../plugin-logger.js'
 import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
+import {
+  validateAskUserArgs,
+  generateAskId,
+  encodeAskCallback,
+  decodeAskCallback,
+  type AskUserArgs,
+  type AskUserOutcome,
+} from '../ask-user.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
@@ -1145,6 +1153,25 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
 const PERMISSION_TTL_MS = 10 * 60_000
 
+// `ask_user` MCP tool — open prompts awaiting a user button-tap.
+// Keyed by askId (8 hex chars from generateAskId). Each entry holds
+// the deferred promise that resolves the originating tool call, the
+// option list (so the dispatcher can map the tapped index back to a
+// label), the chat we sent the prompt to (so timeout can edit the
+// message), the message_id of the question (so we can edit-in-place
+// on resolution / timeout), and the timer that fires the timeout.
+// Cleared on shutdown / chat-close (see clearAskUserPromptsForChat).
+interface PendingAskUser {
+  options: string[]
+  chatId: string
+  threadId?: number
+  messageId: number | null
+  resolve: (outcome: AskUserOutcome) => void
+  timer: ReturnType<typeof setTimeout>
+  startedAt: number
+}
+const pendingAskUser = new Map<string, PendingAskUser>()
+
 // Reauth flows
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
@@ -1893,6 +1920,7 @@ const ALLOWED_TOOLS = new Set([
   'edit_message', 'send_typing', 'pin_message', 'delete_message',
   'forward_message', 'get_recent_messages',
   'send_checklist', 'update_checklist',
+  'ask_user',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1926,6 +1954,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeSendChecklist(args)
     case 'update_checklist':
       return executeUpdateChecklist(args)
+    case 'ask_user':
+      return executeAskUser(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -2543,6 +2573,128 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
         text: JSON.stringify({ ok: true, message_id: sent.message_id }),
       },
     ],
+  }
+}
+
+/**
+ * `ask_user` MCP tool. Closes #574.
+ *
+ * The agent calls `ask_user({ chat_id, question, options[] })`; we
+ * post the question to Telegram with one inline-keyboard button per
+ * option, store the outstanding prompt in `pendingAskUser`, and
+ * return a Promise that resolves when the user taps a button (the
+ * callback dispatcher at the bottom of this file calls our resolve)
+ * or the TTL fires. Either way, the agent's `tool_call_result` is a
+ * structured `AskUserOutcome` it can branch on.
+ *
+ * Failure modes:
+ *   - assertAllowedChat throws → return error to agent, no message sent.
+ *   - sendMessage throws → reject the deferred immediately so the
+ *     agent doesn't sit forever; map to `{ kind: 'cancelled', reason }`.
+ *   - timeout → resolve `{ kind: 'timeout' }`, edit the message to
+ *     show "(no response)" so the user knows the prompt expired.
+ *   - gateway shutdown / chat-close → resolve `{ kind: 'cancelled' }`
+ *     for every outstanding ask in that chat (see
+ *     clearAskUserPromptsForChat below).
+ */
+async function executeAskUser(rawArgs: Record<string, unknown>): Promise<unknown> {
+  const args = validateAskUserArgs(rawArgs as unknown as AskUserArgs)
+  assertAllowedChat(args.chatId)
+
+  // Resolve thread + reply-to using the same auto-thread heuristic
+  // executeReply uses, so an agent that omits message_thread_id still
+  // routes into the right forum topic and quotes the user's last
+  // inbound message by default.
+  const threadId = resolveThreadId(args.chatId, args.threadId)
+  let replyTo: number | undefined = args.replyTo
+  if (replyTo == null && HISTORY_ENABLED) {
+    try {
+      const latest = getLatestInboundMessageId(args.chatId, threadId ?? null)
+      if (latest != null) replyTo = latest
+    } catch (err) {
+      process.stderr.write(`telegram gateway: ask_user quote lookup failed: ${(err as Error).message}\n`)
+    }
+  }
+
+  // Build inline keyboard — one button per option, stacked vertically
+  // so each label gets the full chat width on a phone. Telegram
+  // supports horizontal pairs, but vertical reads cleanly even on
+  // narrow screens.
+  const askId = generateAskId()
+  const keyboard = new InlineKeyboard()
+  for (let i = 0; i < args.options.length; i++) {
+    keyboard.text(args.options[i], encodeAskCallback(askId, i))
+    if (i < args.options.length - 1) keyboard.row()
+  }
+
+  // Send the question. We need the message_id back so we can edit-in-
+  // place on resolution / timeout — that's what makes the surface feel
+  // alive (button tap turns into "✅ <choice>" inline) rather than a
+  // graveyard of unanswered questions in the chat history.
+  const sendOpts: Record<string, unknown> = {
+    parse_mode: 'HTML',
+    reply_markup: keyboard,
+  }
+  if (threadId != null) sendOpts.message_thread_id = threadId
+  if (replyTo != null) sendOpts.reply_parameters = { message_id: replyTo }
+
+  let messageId: number | null = null
+  try {
+    const sent = await lockedBot.api.sendMessage(args.chatId, args.question, sendOpts)
+    messageId = sent.message_id
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return { content: [{ type: 'text', text: JSON.stringify({ kind: 'cancelled', reason: `send-failed: ${msg}` }) }] }
+  }
+
+  // Open the deferred. The promise resolves either:
+  //   1. via the callback dispatcher (user tap), or
+  //   2. via the timeout below.
+  return new Promise<unknown>((resolveTool) => {
+    const timer = setTimeout(() => {
+      const entry = pendingAskUser.get(askId)
+      pendingAskUser.delete(askId)
+      if (!entry) return
+      // Edit the question to remove buttons + show timeout state.
+      // Best-effort: a failed edit doesn't change the outcome.
+      void lockedBot.api.editMessageText(
+        args.chatId,
+        entry.messageId!,
+        `${args.question}\n\n<i>⏱ no response within ${Math.round(args.timeoutMs / 1000)}s</i>`,
+        { parse_mode: 'HTML' },
+      ).catch((e: unknown) => {
+        process.stderr.write(`telegram gateway: ask_user timeout-edit failed askId=${askId}: ${(e as Error).message}\n`)
+      })
+      resolveTool({ content: [{ type: 'text', text: JSON.stringify({ kind: 'timeout' } satisfies AskUserOutcome) }] })
+    }, args.timeoutMs)
+
+    pendingAskUser.set(askId, {
+      options: args.options,
+      chatId: args.chatId,
+      threadId,
+      messageId,
+      startedAt: Date.now(),
+      timer,
+      resolve: (outcome: AskUserOutcome) => {
+        // Caller already deleted from map + cleared timer.
+        resolveTool({ content: [{ type: 'text', text: JSON.stringify(outcome) }] })
+      },
+    })
+  })
+}
+
+/**
+ * Cancel every outstanding ask_user in a given chat. Called when the
+ * gateway shuts down or when a turn ends without the question being
+ * answered (the next user message implicitly invalidates pending
+ * prompts — they'd otherwise leak across turns, which is confusing).
+ */
+function clearAskUserPromptsForChat(chatId: string, reason: string): void {
+  for (const [askId, entry] of pendingAskUser.entries()) {
+    if (entry.chatId !== chatId) continue
+    clearTimeout(entry.timer)
+    pendingAskUser.delete(askId)
+    entry.resolve({ kind: 'cancelled', reason })
   }
 }
 
@@ -7267,6 +7419,55 @@ bot.on('callback_query:data', async ctx => {
   // vg:cancel:<id> — dismiss
   if (data.startsWith('vg:')) {
     await handleVaultGrantCallback(ctx, data)
+    return
+  }
+
+  // ask_user callback (#574). aq:<idx>:<askId>. Same authorization
+  // gate as permission buttons — only allowFrom users can answer.
+  // Tapped option resolves the originating ask_user tool call's
+  // deferred promise; the agent receives { kind: 'answered',
+  // choice, idx } as the tool result and continues.
+  const askMatch = decodeAskCallback(data)
+  if (askMatch != null) {
+    const accessCheck = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!accessCheck.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const entry = pendingAskUser.get(askMatch.askId)
+    if (entry == null) {
+      // Stale tap — TTL fired, prompt was cancelled, or chat closed
+      // before the user got back to it. Acknowledge politely so the
+      // user doesn't see the spinner stick.
+      await ctx.answerCallbackQuery({ text: 'This question expired.' }).catch(() => {})
+      return
+    }
+    if (askMatch.idx >= entry.options.length) {
+      // Encoded an out-of-bounds index — should be impossible from
+      // our own encoding, but defend against a hostile callback.
+      await ctx.answerCallbackQuery({ text: 'Invalid option.' }).catch(() => {})
+      return
+    }
+    const choice = entry.options[askMatch.idx]
+    clearTimeout(entry.timer)
+    pendingAskUser.delete(askMatch.askId)
+    entry.resolve({ kind: 'answered', choice, idx: askMatch.idx })
+
+    // Edit the question in place to remove the buttons + show the
+    // chosen option as a checkmarked line. Makes the chat surface
+    // self-documenting — no orphaned-buttons graveyard.
+    const sourceMsg = ctx.callbackQuery.message
+    if (sourceMsg && 'text' in sourceMsg && sourceMsg.text != null) {
+      try {
+        await ctx.editMessageText(`${sourceMsg.text}\n\n✅ <b>${escapeHtmlForTg(choice)}</b>`, {
+          parse_mode: 'HTML',
+        })
+      } catch {
+        /* edit-failed is fine — the answer-callback below still acks */
+      }
+    }
+    await ctx.answerCallbackQuery({ text: '✅ ' + choice.slice(0, 60) }).catch(() => {})
     return
   }
 

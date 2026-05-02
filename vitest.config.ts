@@ -90,6 +90,9 @@ export default defineConfig({
       // update-placeholder-handler.test.ts uses bun:test — excluded here,
       // run via test:bun.
       "**/telegram-plugin/tests/update-placeholder-handler.test.ts",
+      // ask-user.test.ts uses bun:test (#574 ask_user MCP tool) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/ask-user.test.ts",
     ],
     coverage: {
       provider: "v8",

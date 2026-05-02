@@ -269,6 +269,27 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'ask_user',
+    description:
+      'Pose a multiple-choice question to the user via inline-keyboard buttons. Use when you need a deterministic choice (yes/no, option-A/B/C, severity levels) rather than free-form prose — the user taps one of the options and you receive their selection as the tool result. Returns { kind: "answered", choice: "<exact option text>" } on tap, { kind: "timeout" } if the user does not respond within timeout_ms (default 300_000ms / 5min, capped at 1_800_000ms / 30min). Do NOT use for "what would you like me to do next" generic prompts — that defeats the persistent-conversation model. Use for forced choices.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat that should receive the question. Pass from inbound meta.' },
+        question: { type: 'string', description: 'The question text. Plain text or HTML. Keep it short — buttons render below.' },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Up to 8 button labels. Each label becomes one tappable button. Returned verbatim as `choice` on tap.',
+        },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+        timeout_ms: { type: 'integer', description: 'Cancel the prompt and return { kind: "timeout" } after this long. Default 300000 (5min). Max 1800000 (30min).' },
+        reply_to: { type: 'string', description: 'Message ID to thread the question under. Default: the inbound message that triggered this turn.' },
+      },
+      required: ['chat_id', 'question', 'options'],
+    },
+  },
+  {
     name: 'update_checklist',
     description:
       'Patch an existing native Telegram checklist. Supports updating the title, adding new tasks, removing tasks, or marking tasks done/undone. Tasks with an id target existing items; tasks without an id are appended. Preserves existing task ids across edits.',
