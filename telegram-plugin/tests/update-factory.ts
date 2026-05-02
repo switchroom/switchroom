@@ -197,6 +197,80 @@ export function makePhotoUpdate(opts: {
   } as unknown as Update
 }
 
+/** Build an `edited_message` Update — user edits an existing message. */
+export function makeEditedMessageUpdate(opts: {
+  message_id: number
+  text: string
+  chat?: Partial<ChatLike>
+  from?: Partial<UserLike>
+  message_thread_id?: number
+  /** Original send time. Defaults to "30 seconds ago" so edit_date > date stays plausible. */
+  date?: number
+  /** Edit time. Defaults to now. */
+  edit_date?: number
+  update_id?: number
+}): Update {
+  const chat: ChatLike = { ...DEFAULT_PRIVATE_CHAT, ...opts.chat }
+  const from: UserLike = { ...DEFAULT_USER, ...opts.from }
+  const update_id = opts.update_id ?? updateIdCounter++
+  const date = opts.date ?? nowSec() - 30
+  const edit_date = opts.edit_date ?? nowSec()
+  return {
+    update_id,
+    edited_message: {
+      message_id: opts.message_id,
+      chat,
+      from,
+      date,
+      edit_date,
+      text: opts.text,
+      ...(opts.message_thread_id != null ? { message_thread_id: opts.message_thread_id } : {}),
+    },
+  } as unknown as Update
+}
+
+/**
+ * Build a `message_reaction` Update — a user adds/removes a reaction
+ * to a message. Telegram delivers these only if the bot has reactions
+ * subscribed (allowed_updates includes "message_reaction").
+ *
+ * Shape: `old_reaction` and `new_reaction` are arrays of ReactionType
+ * objects (`{ type: 'emoji', emoji: '👍' }` for standard, or
+ * `{ type: 'custom_emoji', custom_emoji_id: '...' }` for custom).
+ *
+ * Common usage: a user reacts with 👍 (old=[], new=[👍]) or removes
+ * the reaction (old=[👍], new=[]).
+ */
+export function makeMessageReactionUpdate(opts: {
+  message_id: number
+  /** Emoji currently NOT yet on the message (transitioning to). Default: 👍. */
+  newEmoji?: string | null
+  /** Emoji previously on the message. Default: null (none). */
+  oldEmoji?: string | null
+  chat?: Partial<ChatLike>
+  user?: Partial<UserLike>
+  update_id?: number
+}): Update {
+  const chat: ChatLike = { ...DEFAULT_PRIVATE_CHAT, ...opts.chat }
+  const user: UserLike = { ...DEFAULT_USER, ...opts.user }
+  const update_id = opts.update_id ?? updateIdCounter++
+  const oldEmoji = opts.oldEmoji ?? null
+  const newEmoji = opts.newEmoji === undefined ? '👍' : opts.newEmoji
+  const old_reaction = oldEmoji == null ? [] : [{ type: 'emoji', emoji: oldEmoji }]
+  const new_reaction = newEmoji == null ? [] : [{ type: 'emoji', emoji: newEmoji }]
+  return {
+    update_id,
+    message_reaction: {
+      chat,
+      message_id: opts.message_id,
+      user,
+      date: nowSec(),
+      old_reaction,
+      new_reaction,
+    },
+  } as unknown as Update
+}
+
 /** Build a document-attachment Update. */
 export function makeDocumentUpdate(opts: {
   file_name: string

@@ -50,6 +50,7 @@ import {
 import { validateClientMessage } from '../gateway/ipc-server.js'
 import { flushOnAgentDisconnect } from '../gateway/disconnect-flush.js'
 import { StatusReactionController } from '../status-reactions.js'
+import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 
 /**
  * Literal placeholder strings the v2 spec contract forbids. Listed
@@ -96,6 +97,23 @@ export interface RealGatewayHarnessOpts extends CreateHarnessOpts {
    * coalescing entirely.
    */
   gapMs?: number
+
+  /**
+   * Wire the production `OutboundDedupCache` into the harness's
+   * `streamReply` path. When enabled, repeated streamReply calls with
+   * the same normalized content within the TTL are suppressed —
+   * mimicking the #546 fix in production. Default false (preserves
+   * back-compat with F1–F4 tests that don't care about dedup).
+   *
+   * When true, tests can introspect the cache via `harness.dedup`.
+   */
+  withDedup?: boolean
+
+  /**
+   * TTL for the wired-in dedup cache. Only used when `withDedup` is
+   * true. Default matches production (`DEFAULT_DEDUP_TTL_MS = 60_000`).
+   */
+  dedupTtlMs?: number
 }
 
 interface CoalescePayload {
@@ -231,6 +249,63 @@ export interface RealGatewayHarnessHandle extends HarnessHandle {
     flushLog: ReadonlyArray<string>
     activeAgentCount: number
   }
+
+  // ─── #546 dedup integration ─────────────────────────────────────────
+  /**
+   * Real `OutboundDedupCache` wired into the harness's `streamReply`
+   * path when `opts.withDedup === true`. Null otherwise. Tests assert
+   * on `harness.dedup.size(now)` to confirm a record landed; or invoke
+   * `harness.dedup.check(...)` directly to verify a hit before the
+   * second send is attempted.
+   */
+  dedup: OutboundDedupCache | null
+
+  /**
+   * Count of dedup-suppressed sends since harness creation. When the
+   * cache catches a retry, the harness records this so I6 / replay
+   * tests can assert "yes, dedup actually fired" without poking at
+   * counters in the cache.
+   */
+  dedupSuppressedCount(): number
+
+  /**
+   * Convenience scenario: simulate the #546 turn-flush + replay
+   * sequence end-to-end:
+   *   1. First send(text) — lands as a fresh sendMessage and records
+   *      into the dedup cache.
+   *   2. Bridge disconnects + a fresh agent reconnects. Disconnect is
+   *      REGISTERED (not anonymous) so `flushOnAgentDisconnect` actually
+   *      runs — proving dedup survives the production cleanup path.
+   *      Anonymous disconnects are a no-op (I1) and would let this
+   *      scenario pass even if dedup were broken in flush.
+   *   3. Second send(text) — claude-code's preserved tool_call replay.
+   *      Should be suppressed by dedup (no second outbound landed).
+   *
+   * Returns `{ firstMessageId, suppressedSecond, flushRan }`. Tests
+   * assert `suppressedSecond === true` AND `flushRan === true` so the
+   * full path is exercised, not a tautology.
+   */
+  simulateRetryDup(args: {
+    chat_id: string
+    text: string
+  }): Promise<{
+    firstMessageId: number | null
+    suppressedSecond: boolean
+    flushRan: boolean
+  }>
+
+  /**
+   * "Fresh send" — always issues a new `sendMessage` for `chat_id`,
+   * does NOT update the harness's stream-edit cache. Routes through
+   * the dedup cache when wired. Mirrors production's turn-flush
+   * backstop and the wake-audit greeting path: every fire is a
+   * fresh user-visible message, not a streaming edit. Use this in
+   * dedup tests where "the same content emitted twice" means two
+   * NEW messages, not a streaming edit-in-place.
+   *
+   * Returns the new `message_id`, or null if dedup suppressed the send.
+   */
+  send(args: { chat_id: string; text: string; parse_mode?: string }): Promise<number | null>
 }
 
 const DEFAULT_GAP_MS = 1500
@@ -358,6 +433,98 @@ export function createRealGatewayHarness(
         !isPlaceholderPayload(c.payload),
     )
     return hits.length === 0 ? null : hits[hits.length - 1].ts
+  }
+
+  // ─── #546 dedup wiring (opt-in) ───────────────────────────────────────
+  // When `withDedup` is set, wrap the inner harness's `streamReply` so
+  // the same content sent twice within the TTL only lands once. Mirrors
+  // the production fix at `gateway.ts:2233` (`executeStreamReply`) and
+  // `gateway.ts:1893` (`executeReply`): both check the cache, return
+  // early on hit (NOT calling setDone — the original send already
+  // finalized), and record after a successful send. F1–F4 tests don't
+  // care about dedup so it stays opt-in.
+  //
+  // INVARIANT MIRROR: production's dedup-hit branch returns
+  //   { content: [{ type: 'text', text: 'sent (deduped — ...)' }] }
+  // without firing setDone. The harness wrap matches this — the
+  // controller is left untouched on suppression. If production
+  // changes (e.g. fires setDone on suppression for some reason),
+  // update both sites together.
+  const dedup = opts.withDedup === true ? new OutboundDedupCache({ ttlMs: opts.dedupTtlMs }) : null
+  let dedupSuppressed = 0
+  const innerStreamReply = inner.streamReply
+  const streamReply = dedup == null
+    ? innerStreamReply
+    : async (args: { chat_id: string; text: string; done?: boolean }): Promise<void> => {
+        const now = Date.now()
+        const hit = dedup.check(args.chat_id, undefined, args.text, now)
+        if (hit != null) {
+          dedupSuppressed++
+          return
+        }
+        await innerStreamReply(args)
+        dedup.record(args.chat_id, undefined, args.text, Date.now())
+      }
+
+  /**
+   * Fresh-send wrapper. Routes through the dedup cache (if wired) and
+   * always calls `bot.api.sendMessage` directly — bypasses the inner
+   * harness's stream-edit cache. Returns the new message_id, or null
+   * if dedup suppressed the send.
+   */
+  async function send(args: {
+    chat_id: string
+    text: string
+    parse_mode?: string
+  }): Promise<number | null> {
+    const now = Date.now()
+    if (dedup != null) {
+      const hit = dedup.check(args.chat_id, undefined, args.text, now)
+      if (hit != null) {
+        dedupSuppressed++
+        return null
+      }
+    }
+    const result = (await inner.bot.api.sendMessage(args.chat_id, args.text, {
+      parse_mode: args.parse_mode ?? 'HTML',
+    })) as { message_id: number }
+    if (dedup != null) {
+      dedup.record(args.chat_id, undefined, args.text, Date.now())
+    }
+    return result.message_id
+  }
+
+  async function simulateRetryDup(args: {
+    chat_id: string
+    text: string
+  }): Promise<{
+    firstMessageId: number | null
+    suppressedSecond: boolean
+    flushRan: boolean
+  }> {
+    if (dedup == null) {
+      throw new Error(
+        'simulateRetryDup requires withDedup: true on createRealGatewayHarness',
+      )
+    }
+    const firstMessageId = await send(args)
+
+    // Bridge cycle with a REGISTERED agent so flushOnAgentDisconnect
+    // actually runs. Anonymous disconnects no-op (I1) — using one
+    // there would make the scenario a tautology (the bridge cycle
+    // wouldn't touch state at all). Production's #546 reproducer
+    // involves the claude-code bridge (registered) crashing, so the
+    // registered path is the one we need to prove dedup survives.
+    const flushBefore = disposeProgressDriverCalls
+    const cid = bridgeConnect('agent-claude')
+    bridgeDisconnect(cid)
+    const flushRan = disposeProgressDriverCalls > flushBefore
+
+    const suppressedBefore = dedupSuppressed
+    const secondMessageId = await send(args)
+    const suppressedSecond = dedupSuppressed > suppressedBefore && secondMessageId == null
+
+    return { firstMessageId, suppressedSecond, flushRan }
   }
 
   // ─── IPC + bridge lifecycle simulation ────────────────────────────────
@@ -493,5 +660,10 @@ export function createRealGatewayHarness(
     lastReactionEmojiAt,
     lastAnswerTextDeliveredAt,
     flushSideEffects,
+    streamReply,
+    dedup,
+    dedupSuppressedCount: () => dedupSuppressed,
+    simulateRetryDup,
+    send,
   }
 }

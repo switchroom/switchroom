@@ -162,4 +162,52 @@ describe('fake-bot-api', () => {
       expect(r.message_id).toBe(100) // counter reset to startMessageId
     })
   })
+
+  describe('holdNext', () => {
+    it('parks a call until release()', async () => {
+      const r = await bot.api.sendMessage('c', 'long enough seed text x')
+      const hold = bot.holdNext('editMessageText', 'c')
+      const editPromise = bot.api.editMessageText('c', r.message_id, 'updated text long')
+      await Promise.resolve()
+      expect(hold.triggered()).toBe(true)
+      // Edit hasn't landed yet.
+      expect(bot.textOf(r.message_id)).toBe('long enough seed text x')
+      hold.release()
+      await editPromise
+      expect(bot.textOf(r.message_id)).toBe('updated text long')
+    })
+
+    it('fail() rejects the held call without applying the mutation', async () => {
+      const r = await bot.api.sendMessage('c', 'long enough seed text y')
+      const hold = bot.holdNext('editMessageText', 'c')
+      const editPromise = bot.api.editMessageText('c', r.message_id, 'never lands here')
+      await Promise.resolve()
+      hold.fail(new Error('synthetic in-flight failure'))
+      await expect(editPromise).rejects.toThrow('synthetic in-flight failure')
+      // Original text intact.
+      expect(bot.textOf(r.message_id)).toBe('long enough seed text y')
+    })
+
+    it('fault wins over hold when both queued for same method (fault is checked first)', async () => {
+      // Pin the precedence rule documented in fake-bot-api.ts: fault
+      // checks happen synchronously before the hold gate is awaited.
+      // This matters because production code often combines retry-on-
+      // fault logic with timing tests — picking one or the other is
+      // the documented contract.
+      bot.faults.next('sendMessage', errors.floodWait(3))
+      const hold = bot.holdNext('sendMessage')
+      await expect(bot.api.sendMessage('c', 'will fail synchronously')).rejects.toBeInstanceOf(GrammyError)
+      // Hold was never entered — the fault threw before the await.
+      expect(hold.triggered()).toBe(false)
+    })
+
+    it('reset() rejects unreleased holds so a leaked hold cannot hang the next test', async () => {
+      const r = await bot.api.sendMessage('c', 'long enough seed text z')
+      bot.holdNext('editMessageText', 'c')
+      const editPromise = bot.api.editMessageText('c', r.message_id, 'parked then reset')
+      // Don't release — simulate a test that forgets cleanup.
+      bot.reset()
+      await expect(editPromise).rejects.toThrow(/reset/)
+    })
+  })
 })

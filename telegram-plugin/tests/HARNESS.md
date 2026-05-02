@@ -8,10 +8,31 @@ talks to Telegram. Use this when you're touching anything that calls
 
 | File | Purpose |
 |---|---|
-| [`fake-bot-api.ts`](./fake-bot-api.ts) | Full mock of `bot.api.*`. Tracks chat model (sent[], pinned, reactions, deleted), supports fault injection with real `GrammyError` shapes. **Use this for sequence/lifecycle tests.** |
+| [`fake-bot-api.ts`](./fake-bot-api.ts) | Full mock of `bot.api.*`. Tracks chat model (sent[], pinned, reactions, deleted), supports fault injection with real `GrammyError` shapes, optional `holdNext` for in-flight ordering tests, optional `validateParseMode` for catching malformed MarkdownV2. **Use this for sequence/lifecycle tests.** |
 | [`bot-api.harness.ts`](./bot-api.harness.ts) | Lighter mock — just `vi.fn()` stubs with sensible defaults. **Use this when you only need to assert on call shapes**, not chat-model state. |
-| [`update-factory.ts`](./update-factory.ts) | Typed factories for Telegram `Update` objects: text messages, callback queries, photos, documents, my_chat_member events, forum-topic messages. |
+| [`update-factory.ts`](./update-factory.ts) | Typed factories for Telegram `Update` objects: text messages, edited messages, message reactions, callback queries, photos, documents, my_chat_member events, forum-topic messages. |
+| [`waiting-ux-harness.ts`](./waiting-ux-harness.ts) | Phase 1: real `StatusReactionController` + real `ProgressDriver` + recording fake bot + fake clock. Pin the four waiting-UX deadlines (Class A/B/C/F1–F4) under `vi.useFakeTimers()`. |
+| [`real-gateway-harness.ts`](./real-gateway-harness.ts) | Phase 3: wraps `waiting-ux-harness` with the real production `InboundCoalescer` and real `flushOnAgentDisconnect`. IPC lifecycle simulation (`bridgeConnect`/`bridgeDisconnect`), opt-in `withDedup` for replay-suppression tests. **The default home for new lifecycle/timing tests.** |
 | [`fake-bot-api.test.ts`](./fake-bot-api.test.ts) | Self-test of the fake bot — if this ever breaks, every test that depends on it is suspect. |
+
+## Validation rule for new tests
+
+**Every regression test must carry a `// fails when:` comment**
+indicating the production change that would break the invariant. Then
+mentally `git stash` that change and confirm the test fails. Without
+this round-trip the test is theatre — it asserts what the code already
+does, not what it must continue to do.
+
+Example:
+
+```ts
+it('👍 fires AT-OR-AFTER last delivery', async () => {
+  // fails when: a future refactor moves setDone() from the streamReply
+  // post-await branch back to the JSONL turn_end handler — exactly
+  // Bug D's failure mode.
+  ...
+})
+```
 
 ## Decision: which mock?
 
@@ -147,6 +168,119 @@ case) and the pure tests honest (no accidental coupling to bot calls).
 - **Don't assert on the entire Telegram payload** — assert on the
   semantic fields (chat_id, text, parse_mode). Bot API adds optional
   fields over time and full-payload snapshots churn.
+
+## Pattern 7 — `holdNext`: park a call mid-flight
+
+Some bugs are about ordering between an in-flight outbound and an
+inbound event — the canonical example is Bug D (👍 fired while
+`editMessageText` was still pending). Asserting "X happens BEFORE Y
+resolves" with `vi.advanceTimersByTime` is fragile because the
+production code's await boundaries shift with refactors.
+
+`holdNext` parks the next matching call at a gate. The test fires the
+unrelated event while the call is parked, then explicitly releases:
+
+```ts
+import { createFakeBotApi } from './fake-bot-api.js'
+
+const bot = createFakeBotApi()
+const r = await bot.api.sendMessage('c1', 'long enough text content', {})
+
+// Park the next editMessageText call.
+const hold = bot.holdNext('editMessageText', 'c1')
+
+// Start the edit — promise pending until release.
+const editPromise = bot.api.editMessageText('c1', r.message_id, 'updated', {})
+await Promise.resolve() // let the call enter its await
+
+expect(hold.triggered()).toBe(true)
+
+// Fire the unrelated event while the edit is parked.
+await bot.api.setMessageReaction('c1', r.message_id, [{ type: 'emoji', emoji: '👍' }])
+expect(bot.state.reactions.length).toBe(1)
+// Edit hasn't landed yet:
+expect(bot.textOf(r.message_id)).toBe('long enough text content')
+
+// Release — edit completes.
+hold.release()
+await editPromise
+expect(bot.textOf(r.message_id)).toBe('updated')
+```
+
+`hold.release()` is the happy path; `hold.fail(err)` rejects the held
+call with `err` if the test wants to simulate an in-flight failure.
+`hold.triggered()` returns true once the held call enters its await —
+useful for confirming "yes, the call is parked here" before firing the
+follow-up event.
+
+Holds are FIFO per method, just like faults. `bot.reset()` rejects any
+unreleased holds so a leaked hold from one test doesn't hang the next.
+
+## Pattern 8 — wired-in `OutboundDedupCache` for replay tests
+
+The #546 bug class is "two paths emit the same content." The fix is
+`OutboundDedupCache` (`telegram-plugin/recent-outbound-dedup.ts`) — a
+process-wide cache keyed by `(chatId, threadId)` that suppresses
+duplicate normalized content within a TTL.
+
+The real-gateway harness wires this in opt-in:
+
+```ts
+import { createRealGatewayHarness } from './real-gateway-harness.js'
+
+const h = createRealGatewayHarness({ withDedup: true })
+const r1 = await h.send({ chat_id: CHAT, text: 'long content...' })
+const r2 = await h.send({ chat_id: CHAT, text: 'long content...' }) // suppressed
+expect(r2).toBeNull()
+expect(h.dedupSuppressedCount()).toBe(1)
+expect(h.dedup!.size(Date.now())).toBe(1)
+```
+
+`harness.send()` is the dedup-aware "fresh send" path — always issues
+a new `sendMessage`, never edits. Use it in replay-dup tests where
+"two messages with the same content" means two distinct user-visible
+messages, not a streaming edit-in-place. (For streaming-edit
+behavior, use `harness.streamReply()` as before.)
+
+`simulateRetryDup({ chat_id, text })` is a one-line scenario for the
+full #546 reproducer: send → bridge cycle → send again → assert
+suppressed. See `real-gateway-i6-turn-flush-replay-dedup.test.ts`.
+
+## Pattern 9 — opt-in `validateParseMode` lenient validator
+
+Real Telegram returns 400 on unbalanced MarkdownV2. The fake accepts
+any string by default to keep 167 existing tests passing. New tests
+opt in:
+
+```ts
+const bot = createFakeBotApi({ validateParseMode: 'lenient' })
+await expect(
+  bot.api.sendMessage('c1', '*unbalanced markdown', { parse_mode: 'MarkdownV2' }),
+).rejects.toMatchObject({ error_code: 400 })
+```
+
+Lenient mode catches the most common failure: unbalanced count of
+marker characters (`*`, `_`, `` ` ``, `[`). Backslash-escaped markers
+and content inside inline-code / fenced code blocks are exempt. It is
+NOT a full Telegram parser — corner cases like nested entities or
+custom emoji escapes won't trigger it. For those, use a real-DC
+nightly job (out of scope for the in-process fake).
+
+## Bug-class catalog
+
+Each shipped bug class has a regression home. When fixing a new bug,
+add the test next to its class. Update this table.
+
+| Class | Example | Test home |
+|---|---|---|
+| Reaction timing desync | Bug D (👍 before delivery) | `real-gateway-ipc-lifecycle.test.ts` I3, `harness-ordering-invariants.test.ts` INV-1/INV-2 |
+| IPC lifecycle leak | Bug A (anon disconnect flush) | `real-gateway-ipc-lifecycle.test.ts` I1, I2 |
+| Legacy IPC type lethality | Bug B (`update_placeholder` crash) | `real-gateway-ipc-lifecycle.test.ts` I4 |
+| Content-dup retry | #546 (turn-flush + replay) | `real-gateway-i6-turn-flush-replay-dedup.test.ts` |
+| Respawn dedup defense | Bug C (wake-audit) | `real-gateway-i6-turn-flush-replay-dedup.test.ts` I5(b); profile-side fix lives elsewhere |
+| Edit-on-deleted | latent | `harness-ordering-invariants.test.ts` INV-3 |
+| Parse-mode malformed | latent | `harness-parse-mode-validation.test.ts` |
+| Update factory shape | latent | `update-factory-edited-and-reactions.test.ts` |
 
 ## Pattern 6 — fixture-based integration tests for external-format parsers
 
