@@ -39,6 +39,7 @@ import {
   createWaitingUxHarness,
   type CreateHarnessOpts,
   type HarnessHandle,
+  type RecordedCall,
 } from './waiting-ux-harness.js'
 import type { SessionEvent } from '../session-tail.js'
 import {
@@ -46,6 +47,44 @@ import {
   inboundCoalesceKey,
   type InboundCoalescer,
 } from '../gateway/inbound-coalesce.js'
+
+/**
+ * Literal placeholder strings the v2 spec contract forbids. Listed
+ * centrally so the harness helpers and PR-5 removal sweep stay in
+ * sync. Must match the exact emoji + text used by production today —
+ * see `pre-alloc-decision.ts`, `placeholder-phase.ts`,
+ * `forum-topic-placeholder.ts`.
+ */
+export const PLACEHOLDER_STRINGS = [
+  '🔵 thinking',
+  '📚 recalling memories',
+  '💭 thinking',
+] as const
+
+function isPlaceholderPayload(payload: string | undefined): boolean {
+  if (payload == null) return false
+  for (const s of PLACEHOLDER_STRINGS) {
+    if (payload === s || payload === `${s}…` || payload.startsWith(`${s} `)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Mirror of the recorder's progress-card heuristic from
+ * `waiting-ux-harness.ts`. Kept in sync by hand — change both if the
+ * card text glyphs shift.
+ */
+function isCardPayload(text: string | undefined): boolean {
+  return (
+    text != null &&
+    (text.includes('Working') ||
+      text.includes('⚙') ||
+      text.includes('⏳') ||
+      text.includes('• '))
+  )
+}
 
 export interface RealGatewayHarnessOpts extends CreateHarnessOpts {
   /**
@@ -76,6 +115,46 @@ export interface RealGatewayHarnessHandle extends HarnessHandle {
    * that compute deadlines relative to the coalesce window.
    */
   gapMs: number
+
+  // ─── v2 spec helpers (PR 1 of #553 series) ──────────────────────────
+  // The waiting-UX v2 contract forbids placeholder-text edits ("🔵
+  // thinking", "📚 recalling memories", "💭 thinking"), suppresses the
+  // progress card for Class A/B turns, and pins a first-answer-text
+  // deadline. These three helpers expose those checks in a form that
+  // reads cleanly inside `expect(...)` assertions.
+
+  /**
+   * Returns recorded `sendMessage` and `editMessageText` calls for
+   * `chat_id` whose payload matches one of the literal placeholder
+   * strings the v2 spec bans. Class A and B tests assert
+   * `expect(h.recorder.expectNoPlaceholderEdits(CHAT)).toEqual([])`.
+   *
+   * NOTE: this name is a slight misnomer — it returns hits to
+   * inspect, not throws. A non-empty array IS the failure signal.
+   */
+  expectNoPlaceholderEdits(chatId: string): RecordedCall[]
+
+  /**
+   * Returns the timestamp of the first progress-card render for
+   * `chat_id`, or null if none. Thin wrapper around
+   * `recorder.progressCardSendMs` so spec tests can write
+   * `expect(h.recorder.expectNoCardSent(CHAT)).toBeNull()` for the
+   * Class A/B "no card" invariant without poking at the underlying
+   * recorder helper directly.
+   */
+  expectNoCardSent(chatId: string): number | null
+
+  /**
+   * Returns the timestamp of the first `sendMessage` or
+   * `editMessageText` for `chat_id` whose payload is plausibly
+   * answer text — i.e. NOT a progress-card payload (per
+   * `isCardPayload` heuristic) and NOT a placeholder string.
+   * Returns null if no such call has been recorded.
+   *
+   * Used to pin the v2 first-answer-text deadline (Class A: <800ms
+   * for 👀 and answer text bounded TBD by PR 3; Class B/C: TBD).
+   */
+  firstAnswerTextMs(chatId: string): number | null
 }
 
 const DEFAULT_GAP_MS = 1500
@@ -163,6 +242,30 @@ export function createRealGatewayHarness(
     inner.finalize()
   }
 
+  function expectNoPlaceholderEdits(chatId: string): RecordedCall[] {
+    return inner.recorder.calls.filter(
+      (c) =>
+        (c.kind === 'sendMessage' || c.kind === 'editMessageText') &&
+        c.chat_id === chatId &&
+        isPlaceholderPayload(c.payload),
+    )
+  }
+
+  function expectNoCardSent(chatId: string): number | null {
+    return inner.recorder.progressCardSendMs(chatId)
+  }
+
+  function firstAnswerTextMs(chatId: string): number | null {
+    const hit = inner.recorder.calls.find(
+      (c) =>
+        (c.kind === 'sendMessage' || c.kind === 'editMessageText') &&
+        c.chat_id === chatId &&
+        !isCardPayload(c.payload) &&
+        !isPlaceholderPayload(c.payload),
+    )
+    return hit ? hit.ts : null
+  }
+
   return {
     ...inner,
     inbound,
@@ -171,5 +274,8 @@ export function createRealGatewayHarness(
     coalescer,
     coalesceBufferSize: () => coalescer.size(),
     gapMs,
+    expectNoPlaceholderEdits,
+    expectNoCardSent,
+    firstAnswerTextMs,
   }
 }

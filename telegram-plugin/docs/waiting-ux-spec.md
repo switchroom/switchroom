@@ -1,141 +1,160 @@
-# Waiting-for-reply UX — deterministic time-sequence spec
+# Waiting-for-reply UX — v2 spec (three-class contract)
 
-Tracks: [#545](https://github.com/mekenthompson/switchroom/issues/545)
+Tracks: [#545](https://github.com/mekenthompson/switchroom/issues/545),
+[#553](https://github.com/mekenthompson/switchroom/issues/553) (PR series)
 
-This document codifies the user-perceived contract for what happens between
-"I sent a Telegram message" and "the agent's reply is locked in." The contract
-varies by **turn class**. Phase 1 of #545 lands an E2E harness
-(`tests/waiting-ux.e2e.test.ts`) that asserts these invariants in fake-timer
-deterministic time.
+This document codifies the user-perceived contract for what happens
+between "I sent a Telegram message" and "the agent's reply is locked
+in." The contract varies by **turn class**. The v2 rewrite (#553)
+sharpens the gates: tools alone never trigger the progress card,
+placeholder text is removed entirely, and sub-agents (= background
+workers) are the single concept for parallel work.
 
 ## Three turn classes
 
-### Class A — Instant reply (no tool calls, < ~2s of model time)
+### Class A — Instant (<2s, NO tools)
 
-| Surface              | Contract                                                                |
-| -------------------- | ----------------------------------------------------------------------- |
-| Status reaction      | 👀 lands within **800ms** of inbound. Terminates with 👍.               |
-| Progress card        | **Never rendered.** `initialDelayMs` (~30s) suppresses it entirely.     |
-| Draft answer         | Streams via `stream_reply` direct. No card scaffolding.                 |
-| Ladder               | 👀 → (optional 🤔 burst) → 👍. No tool reactions.                       |
+| Surface           | Contract                                                               |
+| ----------------- | ---------------------------------------------------------------------- |
+| Status reaction   | 👀 within 800ms of inbound. Terminates with 👍.                        |
+| Progress card     | **Never rendered.** Suppressed regardless of `initialDelayMs`.         |
+| Placeholder text  | **Never sent.** No `🔵 thinking` / `📚 recalling memories` / `💭 thinking`. |
+| Answer text       | First answer-text edit lands within **800ms** of inbound (TBD #553-PR-3). |
+| Ladder            | 👀 → 👍. Optional 🤔 if the controller debounce window is crossed.    |
 
-User experience: feels like a chat partner typing back.
+User experience: feels like a chat partner typing back instantly.
 
-### Class B — Short turn (1–3 tool calls, < ~15s)
+### Class B — Short (2–60s, tools, NO sub-agents)
 
-| Surface              | Contract                                                                |
-| -------------------- | ----------------------------------------------------------------------- |
-| Status reaction      | 👀 within 800ms. Ladder progresses through 🤔 / tool-glyphs (🔥/✍/👨‍💻/⚡) before 👍. **Must NOT collapse straight to 👍.** |
-| Progress card        | Optional. Renders if turn exceeds `initialDelayMs` threshold (configurable, default 30s) with live tool bullets. |
-| Pre-tool preamble    | Refreshes ≥1 time across step transitions (new tool category, or >Ns since last refresh). **Must NOT be a single static line for the entire turn.** |
-| Final                | 👍 + locked stream answer.                                              |
+| Surface           | Contract                                                               |
+| ----------------- | ---------------------------------------------------------------------- |
+| Status reaction   | 👀 within 800ms. Ladder progresses through 🤔 / tool-glyphs (🔥/✍/👨‍💻/⚡) before 👍. **Must NOT collapse straight to 👍.** |
+| Progress card     | **Never rendered.** The card gate is `(elapsed >= 60s) OR (sub-agent appeared)` — tools alone do NOT trigger it. |
+| Placeholder text  | **Never sent.**                                                        |
+| Answer text       | First answer-text edit lands within **<Ns** of inbound (TBD #553-PR-3). Streams progressively as the model produces tokens. |
+| Final             | 👍 + locked stream answer.                                             |
 
-### Class C — Long-running / multi-agent (sub-agents, background workers)
+User experience: live ladder of tool reactions, answer text starts
+streaming as soon as the model resumes, no fake "thinking" spacers.
 
-| Surface              | Contract                                                                |
-| -------------------- | ----------------------------------------------------------------------- |
-| Status reaction      | 👀 within 800ms. Settles to 👍 only after full quiescence (all sub-agents + workers terminal). |
-| Progress card        | Renders early — **before turn_end** — and stays stable. Each sub-agent + background worker has its own bullet. |
-| Card "Done" timestamp | Must be **≥ last sub-agent terminal timestamp**. Card does not mark Done while any worker is still in flight. |
-| Ladder               | Tool reactions throughout, settling to 👍 only after full quiescence.   |
+### Class C — Long-running (>60s OR sub-agents/background workers)
 
-## Failure modes the harness must catch
+| Surface           | Contract                                                               |
+| ----------------- | ---------------------------------------------------------------------- |
+| Status reaction   | 👀 within 800ms. Ladder throughout. Settles to 👍 only after full quiescence (all sub-agents terminal). |
+| Progress card     | Renders the moment the gate trips: `(elapsed >= 60s) OR (any sub-agent has appeared)`. Stays pinned-feel and stable. |
+| Card "Done" stamp | **≥ last sub-agent terminal timestamp.** Card never marks Done while a sub-agent is still in flight. |
+| Sub-agent header  | Header count == rendered-list-length. **No drift between summary and bullets.** |
+| Placeholder text  | **Never sent.**                                                        |
 
-These are the four observed regressions from the live demo on 2026-04-30:
+A "background worker" ≡ a sub-agent dispatched with
+`Agent({ run_in_background: true })`. There is no separate concept —
+the card gate, the bullet list, and the quiescence check all key on
+the sub-agent stream.
 
-| ID  | Symptom                                                                    | Class | Test                                            |
-| --- | -------------------------------------------------------------------------- | ----- | ----------------------------------------------- |
-| F1  | Ladder collapses straight to 👍 (skips 👀 → 🤔 → 🔥)                       | B     | `Class B — short turn > ladder integrity`       |
-| F2  | No instant draft / typing signal — chat sits silent "for ages"             | All   | `Class A > first-paint deadline`, `Class C > first-paint`         |
-| F3  | Progress card renders late (after turn_end, or never on long turns)        | C     | `Class C > progress card renders early`         |
-| F4  | Pre-tool interim text is static — one preamble then silence                | B     | `Class B > interim refresh`                     |
+## Key invariants (v2)
+
+1. **No placeholder strings** — `🔵 thinking`, `📚 recalling memories`,
+   and `💭 thinking` must never appear in any `sendMessage` /
+   `editMessageText` payload at any point in any turn class. PR 5
+   removes the production code that emits them.
+2. **Card gate** — `(elapsed >= 60s) OR (any sub-agent has appeared)`.
+   Tool-use count, tool category, and parent narrative content are
+   NOT inputs to the gate.
+3. **First-answer-text deadline** — Class A: <800ms. Class B/C: <Ns
+   (TBD by PR 3 once production measurement lands).
+4. **Sub-agent header == list length** — every render of the card.
+
+## PR 1 — foundation: spec + harness extensions (this PR)
+
+PR 1 ships:
+
+- This rewritten spec — supersedes the v1 four-failure-mode framing.
+- Three new helpers on `tests/real-gateway-harness.ts`:
+  - `expectNoPlaceholderEdits(chatId)` — returns recorded calls whose
+    payload matches a banned placeholder string. Tests assert
+    `toEqual([])`.
+  - `expectNoCardSent(chatId)` — wraps `progressCardSendMs` for
+    assertion-friendly use (`.toBeNull()`).
+  - `firstAnswerTextMs(chatId)` — first `sendMessage` /
+    `editMessageText` whose payload is neither a card payload nor a
+    placeholder string.
+- A new RED test file `tests/real-gateway-spec.test.ts` (all
+  `describe.skip`'d) pinning the three-class contract:
+  - Class A — 5 tests
+  - Class B — 4 tests
+  - Class C — 5 tests
+  Each carries a `// TODO(#553-PR-N)` marker for which subsequent PR
+  un-skips it.
+
+PR 1 does NOT change production code. The existing F1/F2/F3/F4
+regression tests stay green; the new spec tests are skipped, so they
+do not gate CI yet.
+
+## PR 2–5 — implementation roadmap
+
+| PR  | Scope                                                                | Un-skips                                            |
+| --- | -------------------------------------------------------------------- | --------------------------------------------------- |
+| 2   | Kill instant-draft placeholder; preserve early-ack 👀                | Class A no-placeholder, Class B no-placeholder      |
+| 3   | First-answer-text deadline implementation; tighten <Ns numbers       | Class A/B/C answer-text-deadline assertions         |
+| 4   | Card-gate rewrite to `(>=60s) OR (sub-agent appeared)`               | Class B no-card; Class C card-gate tests            |
+| 5   | Remove `🔵 thinking` / `📚 recalling memories` / `💭 thinking` strings; sub-agent header = list length | Remaining no-placeholder + sub-agent count tests    |
+
+## Failure-mode history (F1–F4, fixed in earlier #553 PRs)
+
+The v1 spec framed the rewrite around four observed regressions from
+the 2026-04-30 live demo. They are all fixed; the regression tests
+(`tests/real-gateway-f1-ladder-integrity.test.ts`,
+`real-gateway-f2-instant-draft.test.ts`, `real-gateway-f3-late-card.test.ts`,
+`real-gateway-f4-interim-text.test.ts`) stay in place to keep the gaps closed.
+
+| ID  | Symptom                                                                    | Class | Status                                            |
+| --- | -------------------------------------------------------------------------- | ----- | ------------------------------------------------- |
+| F1  | Ladder collapses straight to 👍 (skips 👀 → 🤔 → 🔥)                       | B     | Fixed — `StatusReactionController.finishWithState` flushes pending pre-terminal emoji. |
+| F2  | No instant draft / typing signal — chat sits silent "for ages"             | All   | Fixed — `handleInboundCoalesced` fires 👀 directly on raw arrival before the coalesce buffer. |
+| F3  | Progress card renders late (after turn_end, or never on long turns)        | C     | Fixed under v1 rules with a 5s time-promote in the driver; **superseded by PR 4**, which replaces the gate with `(>=60s) OR (sub-agent)`. |
+| F4  | Pre-tool preamble static — one preamble then silence                       | B     | Regression-guarded only; not reproducible deterministically. The v2 contract sidesteps F4 by tightening the first-answer-text deadline (Class B/C, PR 3). |
+
+The F1/F2/F3/F4 tests remain green throughout the v2 rewrite — they
+encode tighter invariants than the v2 spec relaxes. PR 4's gate
+change does not regress F3 (the F3 long-single-tool case crosses the
+60s threshold).
 
 ## Test methodology
 
-- **Time control**: `vi.useFakeTimers()` + `vi.setSystemTime` for deterministic
-  wall-clock assertions. The harness records every outbound `bot.api` call with
-  `Date.now()` at invocation, so first-paint and ladder deltas are
-  reproducibly measurable.
-- **Recorder**: a `Recorder` object exposes the helpers tests need
-  (`firstReactionMs`, `progressCardSendMs`, `reactionSequence`,
-  `lastReactionEmoji`, `edits`, `sentTexts`).
+- **Time control**: `vi.useFakeTimers()` + `vi.setSystemTime` for
+  deterministic wall-clock assertions. The harness records every
+  outbound `bot.api` call with `Date.now()` at invocation, so all
+  deadlines are reproducibly measurable.
+- **Recorder** (existing): `firstReactionMs`, `progressCardSendMs`,
+  `reactionSequence`, `lastReactionEmoji`, `edits`, `sentTexts`.
+- **Recorder** (PR 1 additions): `expectNoPlaceholderEdits`,
+  `expectNoCardSent`, `firstAnswerTextMs`.
 - **Production wiring**: the harness uses the actual
-  `StatusReactionController` and `createProgressDriver` from production —
-  not mocks. The bot.api layer below is a recording fake.
-- **Out of scope**: gateway message-coalescing, foreman queue, inbound update
-  handler, and IPC surfaces are not exercised by this harness. See
-  "Known limitation" below.
-
-## Known limitation (Phase 1)
-
-The harness drives `controller.*` and `driver.*` methods directly from a
-hand-written `feedSessionEvent` adapter that mirrors the relevant `case`
-branches in `gateway/gateway.ts`'s session-tail dispatcher. This means the
-harness asserts the contract is upheld **inside the controller + driver
-components** but does not catch failures introduced by:
-
-- Gateway-side message gating / queueing latency before the controller is constructed
-- Session-tail parser bugs (events dropped or mis-tagged before reaching dispatch)
-- IPC bridge dropouts that desynchronise the two halves of the system
-
-A Phase 2 harness that drives the real gateway through a synthetic update
-stream is filed as a follow-up. Until then, integration-boundary regressions
-remain CI-invisible.
-
-## Phase 3 — real-gateway harness (#553)
-
-The Phase 1 harness called `controller.setQueued()` synchronously inside
-its `inbound()` helper, which is why the F2 deadline passed trivially —
-not because the production code was correct, but because the harness
-was lying about the inbound flow.
-
-Phase 3 introduces `tests/real-gateway-harness.ts` which composes the
-production `InboundCoalescer` (extracted to `gateway/inbound-coalesce.ts`)
-*before* the Phase 1 controller + driver stack. This faithfully reproduces
-what every Telegram-only user sees: 👀 fires only after the coalesce
-window closes (default `gapMs=1500`), ~1500ms after their message landed
-— ~700ms over the F2 deadline.
-
-### F1, F2, F3 — fixed (commits in #553 PR series)
-
-- **F2** (no instant draft): `handleInboundCoalesced` now fires 👀
-  directly on raw arrival via `bot.api.setMessageReaction` for paired
-  DM users on a fresh turn, before the coalesce buffer. Telegram
-  dedupes the duplicate emit when the controller's later `setQueued()`
-  runs post-flush. `tests/real-gateway-f2-instant-draft.test.ts` pins
-  the 800ms deadline.
-- **F1** (ladder collapse): `StatusReactionController.finishWithState`
-  now flushes a debounced-but-not-yet-enqueued pending emoji before
-  the terminal emoji emits. Sub-debounce turns (default 700ms) no
-  longer collapse to 👀 → 👍.
-  `tests/real-gateway-f1-ladder-integrity.test.ts` pins the contract.
-- **F3** (late progress card): `progress-card-driver` now schedules a
-  one-shot `timePromoteTimer` on the first ingest event that
-  force-promotes the card after `promoteAfterMs` (default 5s) when no
-  other promotion path has fired. Long single-/two-tool turns no
-  longer wait the full 30s `initialDelayMs`.
-  `tests/real-gateway-f3-late-card.test.ts` pins the deadline.
-
-### F4 — regression guard, no reproducible failure mode (yet)
-
-The deterministic harness CAN'T currently reproduce F4 with well-spaced
-text → tool steps. Each text event passes `extractNarrativeLabel`
-(any non-empty single line is a label), gets a new narrative entry, and
-the renderer's `branch=narratives` path picks them up.
-`tests/real-gateway-f4-interim-text.test.ts` pins the well-spaced
-multi-step contract as a regression guard.
-
-Where F4 may still manifest in production (needs observation to
-narrow down before a tighter test can land):
-  - Rapid text bursts within `coalesceMs` (~400ms) — only the latest
-    narrative may survive the coalesce flush
-  - `edit_budget_threshold` throttling — subsequent edits dropped
-  - Specific text shapes that break `extractNarrativeLabel`
-    (multi-line prose with the "real" label not on line 1)
+  `StatusReactionController`, `createProgressDriver`, and
+  `createInboundCoalescer` from production — not mocks. The bot.api
+  layer below is a recording fake.
+- **Out of scope**: foreman queue, IPC bridge, auth, history. Those
+  do not influence the user-perceived waiting UX.
 
 ## CI gate
 
 The harness runs as part of the root vitest suite via `npm test` →
-`vitest run`. It picks up
-`telegram-plugin/tests/waiting-ux.e2e.test.ts` automatically — no separate
-config required.
+`vitest run`. PR 1's spec tests are `describe.skip`'d and do not
+fail CI; PRs 2–5 un-skip them as the production code lands.
+
+## Phase 1 / Phase 3 history (legacy)
+
+For posterity:
+
+- **Phase 1** (#547): `tests/waiting-ux.e2e.test.ts` — controller +
+  driver in isolation, hand-written `feedSessionEvent` adapter. F2
+  passed trivially because the harness called `setQueued()`
+  synchronously inside `inbound()`.
+- **Phase 3** (#553 PR 1, original): `tests/real-gateway-harness.ts`
+  composed the production `InboundCoalescer` before the Phase 1
+  controller stack, exposing the real F2 gap (👀 only fired after
+  the coalesce window). F2's fix landed against this harness.
+- **v2 rewrite** (this PR series, also numbered #553): same Phase 3
+  harness, plus three v2 helpers; new spec test file pins the
+  three-class contract.
