@@ -269,6 +269,37 @@ const TOOL_SCHEMAS = [
     },
   },
   {
+    name: 'send_sticker',
+    description:
+      'Send a Telegram sticker. Use sparingly to add warmth or emotional punctuation that text alone reads cold for — non-coding personas (assistant, health-coach, lawyer) benefit most. Pass either a raw Telegram file_id (echo one back from an inbound sticker the user sent you) OR an alias name declared by the operator in switchroom.yaml under telegram.stickers (e.g. "happy", "thinking"). Aliases are operator-curated; you cannot create them yourself. The error message lists available aliases when an unknown one is passed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string' },
+        sticker: { type: 'string', description: 'Telegram file_id OR alias name from telegram.stickers config.' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+        reply_to: { type: 'string', description: 'Message ID to thread the sticker under.' },
+      },
+      required: ['chat_id', 'sticker'],
+    },
+  },
+  {
+    name: 'send_gif',
+    description:
+      'Send an animated GIF / MP4 / WebM. Pass either a Telegram file_id (echoed from an inbound GIF you saw) or a public https URL ending in .mp4 / .gif / .webm. URLs from operator-trusted sources only — there is no built-in GIF search; you cannot synthesise URLs. Use even more sparingly than send_sticker; GIFs are noisy in chat and only serve specific moods (celebration, exasperation, "got it"). Caption optional, max 1024 chars.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string' },
+        gif: { type: 'string', description: 'Telegram file_id OR https URL ending in .mp4 / .gif / .webm.' },
+        caption: { type: 'string', description: 'Optional caption (max 1024 chars).' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+        reply_to: { type: 'string', description: 'Message ID to thread the gif under.' },
+      },
+      required: ['chat_id', 'gif'],
+    },
+  },
+  {
     name: 'ask_user',
     description:
       'Pose a multiple-choice question to the user via inline-keyboard buttons. Use when you need a deterministic choice (yes/no, option-A/B/C, severity levels) rather than free-form prose — the user taps one of the options and you receive their selection as the tool result. Returns { kind: "answered", choice: "<exact option text>" } on tap, { kind: "timeout" } if the user does not respond within timeout_ms (default 300_000ms / 5min, capped at 1_800_000ms / 30min). Do NOT use for "what would you like me to do next" generic prompts — that defeats the persistent-conversation model. Use for forced choices.',

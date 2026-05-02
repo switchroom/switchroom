@@ -471,6 +471,20 @@ export const TelegramChannelSchema = z
         "Increase if your gateway frequently bumps the Telegram edit-rate ceiling " +
         "with many parallel sub-agents; decrease for a more conservative buffer."
       ),
+    stickers: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        "Sticker aliases for the `send_sticker` MCP tool (#576). Maps a " +
+        "short alias name (e.g. 'happy', 'thinking') to a Telegram file_id. " +
+        "Operator-curated — capture file_ids from inbound stickers the user " +
+        "sends and add them here. The agent calls send_sticker(chat_id, " +
+        "alias='happy') and the gateway resolves to the file_id at send " +
+        "time. Aliases enable persona-flavored expressiveness without " +
+        "exposing raw file_ids in the agent prompt. Personal-assistant / " +
+        "health-coach personas benefit; coding agents typically don't " +
+        "configure any."
+      ),
   })
   .optional();
 

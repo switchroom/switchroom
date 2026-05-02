@@ -96,6 +96,9 @@ export default defineConfig({
       // interrupt-marker.test.ts uses bun:test (#575 ! interrupt) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/interrupt-marker.test.ts",
+      // sticker-aliases.test.ts uses bun:test (#576 sticker/gif) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/sticker-aliases.test.ts",
     ],
     coverage: {
       provider: "v8",

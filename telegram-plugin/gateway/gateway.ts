@@ -34,6 +34,12 @@ import {
   type AskUserOutcome,
 } from '../ask-user.js'
 import { parseInterruptMarker } from '../interrupt-marker.js'
+import {
+  resolveStickerSendArgs,
+  resolveGifSendArgs,
+  type StickerSendArgs,
+  type GifSendArgs,
+} from '../sticker-aliases.js'
 import { decideShouldPreAlloc, PRE_ALLOC_PLACEHOLDER_TEXT } from '../pre-alloc-decision.js'
 import { sendForumTopicPlaceholder, clearForumTopicPlaceholder } from '../forum-topic-placeholder.js'
 import { handleUpdatePlaceholder } from '../update-placeholder-handler.js'
@@ -509,6 +515,11 @@ type Access = {
   statusReactions?: boolean
   historyEnabled?: boolean
   historyRetentionDays?: number
+  /** Per-agent sticker aliases for the `send_sticker` MCP tool (#576).
+   *  Operator declares a name → file_id map under telegram.stickers
+   *  in switchroom.yaml; reconcile writes the resolved map into
+   *  access.json so the gateway has it without re-reading config. */
+  stickers?: Record<string, string>
 }
 
 function defaultAccess(): Access {
@@ -1922,6 +1933,7 @@ const ALLOWED_TOOLS = new Set([
   'forward_message', 'get_recent_messages',
   'send_checklist', 'update_checklist',
   'ask_user',
+  'send_sticker', 'send_gif',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1957,6 +1969,10 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeUpdateChecklist(args)
     case 'ask_user':
       return executeAskUser(args)
+    case 'send_sticker':
+      return executeSendSticker(args)
+    case 'send_gif':
+      return executeSendGif(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -2696,6 +2712,97 @@ function clearAskUserPromptsForChat(chatId: string, reason: string): void {
     clearTimeout(entry.timer)
     pendingAskUser.delete(askId)
     entry.resolve({ kind: 'cancelled', reason })
+  }
+}
+
+/**
+ * `send_sticker` MCP tool (#576). Send a Telegram sticker, resolving
+ * either a raw file_id or an operator-curated alias from
+ * `access.stickers`. Validation lives in the pure
+ * `resolveStickerSendArgs` helper; this function is just glue.
+ */
+async function executeSendSticker(rawArgs: Record<string, unknown>): Promise<unknown> {
+  const access = loadAccess()
+  const args = resolveStickerSendArgs(rawArgs as unknown as StickerSendArgs, access.stickers ?? {})
+  assertAllowedChat(args.chatId)
+
+  // Same auto-thread + auto-reply heuristic as executeReply, so the
+  // sticker lands in the right forum topic and quotes the user's
+  // last inbound when not explicitly overridden.
+  const threadId = resolveThreadId(args.chatId, args.threadId)
+  let replyTo: number | undefined = args.replyTo
+  if (replyTo == null && HISTORY_ENABLED) {
+    try {
+      const latest = getLatestInboundMessageId(args.chatId, threadId ?? null)
+      if (latest != null) replyTo = latest
+    } catch (err) {
+      process.stderr.write(`telegram gateway: send_sticker quote lookup failed: ${(err as Error).message}\n`)
+    }
+  }
+
+  const sendOpts: Record<string, unknown> = {}
+  if (threadId != null) sendOpts.message_thread_id = threadId
+  if (replyTo != null) sendOpts.reply_parameters = { message_id: replyTo }
+
+  const sent = await lockedBot.api.sendSticker(args.chatId, args.fileId, sendOpts)
+  process.stderr.write(
+    `telegram gateway [outbound] ${new Date().toISOString()} path=sticker ` +
+    `chat=${args.chatId} msg_id=${sent.message_id} ` +
+    `resolution=${args.resolution}${args.aliasName ? ` alias=${args.aliasName}` : ''}\n`,
+  )
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        kind: 'sent',
+        message_id: sent.message_id,
+        resolution: args.resolution,
+        ...(args.aliasName ? { alias: args.aliasName } : {}),
+      }),
+    }],
+  }
+}
+
+/**
+ * `send_gif` MCP tool (#576). Send an animated GIF / MP4 / WebM via
+ * Telegram's sendAnimation. Accepts file_id or operator-trusted https
+ * URL — there is no GIF search; agents pass references they've seen
+ * or that the user has shared.
+ */
+async function executeSendGif(rawArgs: Record<string, unknown>): Promise<unknown> {
+  const args = resolveGifSendArgs(rawArgs as unknown as GifSendArgs)
+  assertAllowedChat(args.chatId)
+
+  const threadId = resolveThreadId(args.chatId, args.threadId)
+  let replyTo: number | undefined = args.replyTo
+  if (replyTo == null && HISTORY_ENABLED) {
+    try {
+      const latest = getLatestInboundMessageId(args.chatId, threadId ?? null)
+      if (latest != null) replyTo = latest
+    } catch (err) {
+      process.stderr.write(`telegram gateway: send_gif quote lookup failed: ${(err as Error).message}\n`)
+    }
+  }
+
+  const sendOpts: Record<string, unknown> = {}
+  if (args.caption != null) sendOpts.caption = args.caption
+  if (threadId != null) sendOpts.message_thread_id = threadId
+  if (replyTo != null) sendOpts.reply_parameters = { message_id: replyTo }
+
+  const sent = await lockedBot.api.sendAnimation(args.chatId, args.animationRef, sendOpts)
+  process.stderr.write(
+    `telegram gateway [outbound] ${new Date().toISOString()} path=gif ` +
+    `chat=${args.chatId} msg_id=${sent.message_id} ref_kind=${args.refKind}\n`,
+  )
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        kind: 'sent',
+        message_id: sent.message_id,
+        ref_kind: args.refKind,
+      }),
+    }],
   }
 }
 
@@ -7650,8 +7757,36 @@ bot.on('message:video_note', async ctx => {
 
 bot.on('message:sticker', async ctx => {
   const sticker = ctx.message.sticker
-  const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
-  await handleInbound(ctx, `(sticker${emoji})`, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
+  // Render to a clearer text envelope so the agent has signal to
+  // respond to. Includes the emoji (semantic anchor — what mood the
+  // sticker maps to) and the set name (so the agent can say "that's
+  // from your <set>" if relevant). Both optional. The file_id flows
+  // through the attachment field as before, so the agent can echo it
+  // back via send_sticker if it wants to mirror the sticker.
+  const parts: string[] = []
+  if (sticker.emoji) parts.push(sticker.emoji)
+  if (sticker.set_name) parts.push(`from "${sticker.set_name}"`)
+  const text = parts.length > 0 ? `(sticker — ${parts.join(' ')})` : '(sticker)'
+  await handleInbound(ctx, text, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
+})
+
+bot.on('message:animation', async ctx => {
+  // Animation = Telegram's GIF type (MP4-encoded looping clips).
+  // Caption is optional; if present it carries the user's intent
+  // (e.g. "perfect 👌"); if absent, the GIF itself is the message.
+  // Surfaces to the agent so it can respond in kind via send_gif —
+  // mirroring is fine for assistant-style personas, less so for
+  // coding ones.
+  const animation = ctx.message.animation
+  const caption = ctx.message.caption
+  const text = caption ? `(gif) ${caption}` : '(gif)'
+  await handleInbound(ctx, text, undefined, {
+    kind: 'animation',
+    file_id: animation.file_id,
+    size: animation.file_size,
+    mime: animation.mime_type,
+    name: safeName(animation.file_name),
+  })
 })
 
 // ─── Checklist service message handlers ──────────────────────────────────
