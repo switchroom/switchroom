@@ -16,6 +16,7 @@ import {
   readAll,
   record,
   resolve,
+  resolveAllBySource,
 } from "../src/issues/index.js";
 
 let tmp: string;
@@ -197,6 +198,43 @@ describe("resolve", () => {
 
   it("returns 0 for unknown fingerprint", () => {
     expect(resolve(tmp, "nope::no")).toBe(0);
+  });
+});
+
+describe("resolveAllBySource", () => {
+  it("flips only unresolved entries whose source matches", () => {
+    record(
+      tmp,
+      { agent: "a", severity: "error", source: "src-a", code: "c1", summary: "x" },
+      tick,
+    );
+    record(
+      tmp,
+      { agent: "a", severity: "error", source: "src-a", code: "c2", summary: "y" },
+      tick,
+    );
+    record(
+      tmp,
+      { agent: "a", severity: "error", source: "src-b", code: "c1", summary: "z" },
+      tick,
+    );
+    record(
+      tmp,
+      { agent: "a", severity: "error", source: "src-b", code: "c2", summary: "w" },
+      tick,
+    );
+
+    expect(resolveAllBySource(tmp, "src-a", tick)).toBe(2);
+
+    const all = readAll(tmp);
+    const bySource = (s: string) => all.filter((e) => e.source === s);
+    expect(bySource("src-a").every((e) => e.resolved_at != null)).toBe(true);
+    expect(bySource("src-b").every((e) => e.resolved_at == null)).toBe(true);
+
+    // Idempotent.
+    expect(resolveAllBySource(tmp, "src-a", tick)).toBe(0);
+    // Unknown source.
+    expect(resolveAllBySource(tmp, "nope", tick)).toBe(0);
   });
 });
 

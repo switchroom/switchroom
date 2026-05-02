@@ -15,6 +15,7 @@ export {
   readAll,
   record,
   resolve,
+  resolveAllBySource,
   ISSUES_FILE,
   ISSUES_LOCK,
   type ListOptions,

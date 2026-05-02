@@ -7,6 +7,7 @@ import {
   prune as pruneStore,
   record as recordStore,
   resolve as resolveStore,
+  resolveAllBySource,
   SEVERITY_RANK,
   type IssueSeverity,
 } from "../issues/index.js";
@@ -172,18 +173,23 @@ export function registerIssuesCommand(program: Command): void {
       ) => {
         try {
           const stateDir = resolveStateDir(opts);
-          let fp: string;
+          let flipped: number;
           if (opts.source && opts.code) {
-            fp = computeFingerprint(opts.source, opts.code);
+            flipped = resolveStore(
+              stateDir,
+              computeFingerprint(opts.source, opts.code),
+            );
+          } else if (opts.source && !fingerprint) {
+            // Bulk-close: every unresolved entry whose source matches.
+            flipped = resolveAllBySource(stateDir, opts.source);
           } else if (fingerprint) {
-            fp = fingerprint;
+            flipped = resolveStore(stateDir, fingerprint);
           } else {
             process.stderr.write(
-              "issues resolve: need either <fingerprint> or --source + --code\n",
+              "issues resolve: need either <fingerprint>, --source, or --source + --code\n",
             );
             process.exit(2);
           }
-          const flipped = resolveStore(stateDir, fp);
           process.stdout.write(`${flipped}\n`);
         } catch (err) {
           process.stderr.write(`issues resolve: ${(err as Error).message}\n`);

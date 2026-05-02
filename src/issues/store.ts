@@ -204,6 +204,36 @@ export function resolve(
 }
 
 /**
+ * Mark all unresolved entries with this `source` resolved, regardless
+ * of code/fingerprint. No-op (and idempotent) if none exist or all are
+ * already resolved. Returns the number of entries flipped.
+ *
+ * Mirrors `resolve()` above but matches on `source` rather than
+ * `fingerprint` — useful when a whole class of issues from one source
+ * has been remediated and the operator wants a bulk close.
+ */
+export function resolveAllBySource(
+  stateDir: string,
+  source: string,
+  nowFn: () => number = Date.now,
+): number {
+  if (!existsSync(join(stateDir, ISSUES_FILE))) return 0;
+  return withLock(stateDir, () => {
+    const all = readAll(stateDir);
+    const now = nowFn();
+    let flipped = 0;
+    for (const e of all) {
+      if (e.source === source && e.resolved_at == null) {
+        e.resolved_at = now;
+        flipped++;
+      }
+    }
+    if (flipped > 0) writeAll(stateDir, all);
+    return flipped;
+  });
+}
+
+/**
  * Drop entries per the retention rules. Resolved entries older than
  * `resolvedOlderThanMs` always go. Unresolved entries are kept by
  * default (silence on a stuck issue would defeat the sink's purpose).
