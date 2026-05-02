@@ -47,6 +47,9 @@ import {
   inboundCoalesceKey,
   type InboundCoalescer,
 } from '../gateway/inbound-coalesce.js'
+import { validateClientMessage } from '../gateway/ipc-server.js'
+import { flushOnAgentDisconnect } from '../gateway/disconnect-flush.js'
+import { StatusReactionController } from '../status-reactions.js'
 
 /**
  * Literal placeholder strings the v2 spec contract forbids. Listed
@@ -155,6 +158,79 @@ export interface RealGatewayHarnessHandle extends HarnessHandle {
    * for 👀 and answer text bounded TBD by PR 3; Class B/C: TBD).
    */
   firstAnswerTextMs(chatId: string): number | null
+
+  // ─── IPC + bridge lifecycle helpers (ships with PR for I1–I5) ───────
+  // The IPC lifecycle (clients connecting, registering, sending typed
+  // messages, disconnecting) is invisible to the existing waiting-UX
+  // helpers above. Production bugs in this layer (Bug A premature 👍 on
+  // anonymous disconnect, Bug B `update_placeholder` lethality, Bug D
+  // 👍-before-delivery) all share a root cause: the harness had no way
+  // to express "a client just connected/sent/disconnected." These
+  // helpers route through PRODUCTION code paths where possible —
+  // `validateClientMessage` is the real validator from
+  // `gateway/ipc-server.ts`; the disconnect handler is mirrored from
+  // `gateway.ts`'s `onClientDisconnected` (extracted helper landing in
+  // PR #600 — until that merges, the harness mirror keeps the same
+  // semantics so the invariants are testable now).
+
+  /**
+   * Simulate a client opening an IPC connection. If `agentName` is
+   * provided, the harness immediately routes a `register` message
+   * through the production validator so subsequent
+   * `bridgeDisconnect()` cleans up the right per-agent state. If
+   * `agentName == null`, the connection stays anonymous (recall.py-
+   * style one-shot caller). Returns the synthetic `clientId`.
+   */
+  bridgeConnect(agentName: string | null): string
+
+  /**
+   * Simulate a client closing its IPC connection. Routes through the
+   * harness's mirror of `onClientDisconnected` — flushes per-agent
+   * status reactions to setDone() and disposes that agent's draft
+   * streams. **Crucially: anonymous clients (agentName=null) flow
+   * through the same handler but MUST NOT mutate any active state.**
+   * That's invariant I1 (Bug A's failure mode).
+   */
+  bridgeDisconnect(clientId: string): void
+
+  /**
+   * Simulate a client sending an IPC message. The payload is run
+   * through the production `validateClientMessage` validator — if it
+   * fails validation (e.g. legacy `update_placeholder` type), the
+   * harness logs and discards, mirroring `processBuffer`'s loop. The
+   * connection stays open; no state is mutated. That's invariant I4.
+   */
+  sendIpcMessage(clientId: string, message: object): void
+
+  /**
+   * Timestamp of the last `setMessageReaction` for `chatId`, or null.
+   * Used by I3 to compare reaction-fired-at against
+   * answer-text-delivered-at.
+   */
+  lastReactionEmojiAt(chatId: string): number | null
+
+  /**
+   * Timestamp of the LAST `sendMessage` / `editMessageText` whose
+   * payload looks like real model text (not card, not placeholder).
+   * Used by I3 to assert 👍 fires AFTER delivery, not before.
+   */
+  lastAnswerTextDeliveredAt(chatId: string): number | null
+
+  /**
+   * Test introspection of the side-effect callbacks fired by the real
+   * `flushOnAgentDisconnect` helper since the harness was created. Tests
+   * that want to assert "no flush ran" check `clearActiveReactionsCalls`
+   * and `disposeProgressDriverCalls` are still 0 after a sequence of
+   * anonymous bridge cycles. `activeAgentCount` is the live size of the
+   * harness's mirror of `activeStatusReactions` — non-zero means at
+   * least one registered agent is still active.
+   */
+  flushSideEffects(): {
+    clearActiveReactionsCalls: number
+    disposeProgressDriverCalls: number
+    flushLog: ReadonlyArray<string>
+    activeAgentCount: number
+  }
 }
 
 const DEFAULT_GAP_MS = 1500
@@ -266,6 +342,140 @@ export function createRealGatewayHarness(
     return hit ? hit.ts : null
   }
 
+  function lastReactionEmojiAt(chatId: string): number | null {
+    const hits = inner.recorder.calls.filter(
+      (c) => c.kind === 'setMessageReaction' && c.chat_id === chatId,
+    )
+    return hits.length === 0 ? null : hits[hits.length - 1].ts
+  }
+
+  function lastAnswerTextDeliveredAt(chatId: string): number | null {
+    const hits = inner.recorder.calls.filter(
+      (c) =>
+        (c.kind === 'sendMessage' || c.kind === 'editMessageText') &&
+        c.chat_id === chatId &&
+        !isCardPayload(c.payload) &&
+        !isPlaceholderPayload(c.payload),
+    )
+    return hits.length === 0 ? null : hits[hits.length - 1].ts
+  }
+
+  // ─── IPC + bridge lifecycle simulation ────────────────────────────────
+  // The harness wires `bridgeDisconnect` through the REAL production
+  // helper `flushOnAgentDisconnect` from `gateway/disconnect-flush.ts`
+  // (extracted in PR #600). Tests against this harness exercise actual
+  // production code, not a parallel reimplementation — so the I1/I2
+  // invariants would catch a regression if someone reverted the
+  // `if (agentName == null) return false` gate in the helper.
+  //
+  // Per-agent state mirrors what `gateway.ts` holds at module scope:
+  // `activeStatusReactions` keyed by agent name. Each registered agent
+  // gets a fresh per-agent controller; the production helper mutates
+  // the Map in place when an agent disconnects.
+  //
+  // The shared `inner.controller` (from waiting-ux-harness) stays as
+  // the default for back-compat with tests that don't go through the
+  // bridge surface — `bridgeConnect(null)` doesn't touch it either.
+  const clientsById = new Map<string, { agentName: string | null }>()
+  // Production-shaped Maps for the helper. Keyed by agent name (one
+  // entry per registered agent in the harness; production keys by
+  // chat:thread:msgId but the helper's behavior is per-entry-iteration
+  // either way, so the key shape doesn't change semantics).
+  const activeStatusReactions = new Map<string, StatusReactionController>()
+  const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>()
+  const activeTurnStartedAt = new Map<string, number>()
+  const activeDraftStreams = new Map<string, { isFinal: () => boolean; finalize: () => Promise<void> }>()
+  const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
+  let clearActiveReactionsCalls = 0
+  let disposeProgressDriverCalls = 0
+  const flushLog: string[] = []
+  const ipcLog: Array<{ kind: 'invalid' | 'unknown' | 'accepted'; raw: unknown }> = []
+
+  function bridgeConnect(agentName: string | null): string {
+    const clientId = `client-${Math.random().toString(36).slice(2, 10)}`
+    clientsById.set(clientId, { agentName })
+    if (agentName != null) {
+      // Validate the synthetic register message through the real validator.
+      const reg = { type: 'register', agentName }
+      if (!validateClientMessage(reg)) {
+        // Should never happen with a sane agentName — surface loudly.
+        throw new Error(`harness bug: register validation failed for ${agentName}`)
+      }
+      // Per-agent controller mirrors what gateway.ts puts in
+      // `activeStatusReactions.set(key, ctrl)`. The production helper
+      // iterates the Map and calls setDone on each entry; per-agent
+      // isolation comes from the helper's `agentName == null` gate
+      // (anonymous = skip everything) — NOT from selective deletion.
+      const ctrl = new StatusReactionController(
+        async () => { /* harness uses inner.controller for the shared chat */ },
+        opts.allowedReactions ?? null,
+        { debounceMs: opts.debounceMs ?? 700 },
+      )
+      activeStatusReactions.set(agentName, ctrl)
+    }
+    return clientId
+  }
+
+  function bridgeDisconnect(clientId: string): void {
+    const meta = clientsById.get(clientId)
+    if (meta == null) return
+    clientsById.delete(clientId)
+
+    // I1 + I2 contract: route through the REAL production helper.
+    // `agentName == null` ⇒ helper's anonymous-skip gate fires and the
+    // Map is untouched. `agentName != null` ⇒ helper iterates the Map
+    // and flushes setDone on every entry. The Map keys mean: in the
+    // I1 test, ANY remaining controller would prove the gate was
+    // bypassed; in the I2 test, the Map will have entries for OTHER
+    // agents that get incorrectly cleared if the helper is buggy.
+    flushOnAgentDisconnect({
+      agentName: meta.agentName,
+      activeStatusReactions,
+      activeReactionMsgIds,
+      activeTurnStartedAt,
+      activeDraftStreams,
+      activeDraftParseModes,
+      clearActiveReactions: () => { clearActiveReactionsCalls++ },
+      disposeProgressDriver: () => { disposeProgressDriverCalls++ },
+      log: (msg) => { flushLog.push(msg) },
+    })
+  }
+
+  /** Test introspection — counts of side-effect callbacks fired by the helper. */
+  function flushSideEffects(): {
+    clearActiveReactionsCalls: number
+    disposeProgressDriverCalls: number
+    flushLog: ReadonlyArray<string>
+    activeAgentCount: number
+  } {
+    return {
+      clearActiveReactionsCalls,
+      disposeProgressDriverCalls,
+      flushLog,
+      activeAgentCount: activeStatusReactions.size,
+    }
+  }
+
+  function sendIpcMessage(clientId: string, message: object): void {
+    if (!clientsById.has(clientId)) {
+      throw new Error(`harness: unknown clientId ${clientId} (was bridgeConnect called?)`)
+    }
+    // I4: legacy IPC types must be tolerated — the validator returns
+    // false, processBuffer logs+continues, the connection stays open.
+    // The harness records the outcome so tests can assert "logged and
+    // discarded, not thrown."
+    if (!validateClientMessage(message)) {
+      ipcLog.push({ kind: 'invalid', raw: message })
+      return
+    }
+    // Validated messages would normally route to the gateway's
+    // per-type handler. The harness doesn't replay every dispatch —
+    // tests that exercise the full session-event path use
+    // `feedSessionEvent` directly. This helper exists to exercise the
+    // VALIDATOR boundary, which is where the lethality lives.
+    ipcLog.push({ kind: 'accepted', raw: message })
+  }
+
   return {
     ...inner,
     inbound,
@@ -277,5 +487,11 @@ export function createRealGatewayHarness(
     expectNoPlaceholderEdits,
     expectNoCardSent,
     firstAnswerTextMs,
+    bridgeConnect,
+    bridgeDisconnect,
+    sendIpcMessage,
+    lastReactionEmojiAt,
+    lastAnswerTextDeliveredAt,
+    flushSideEffects,
   }
 }

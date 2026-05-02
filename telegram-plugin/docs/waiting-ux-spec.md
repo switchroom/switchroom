@@ -123,6 +123,56 @@ ignores the unknown message type. Hindsight (`vendor/hindsight-memory/`)
 is untouched. The Class A/B/C no-placeholder assertions and the Class C
 sub-agent-header-equals-list-length assertion are un-skipped.
 
+## IPC + bridge lifecycle invariants
+
+Pinned by `tests/real-gateway-ipc-lifecycle.test.ts`. These five
+invariants codify behaviors that the user-perceived waiting-UX spec
+above implicitly relies on but which live one layer down — at the
+IPC server / bridge connect-disconnect boundary. Multiple production
+bugs in 2026-05 traced back to the absence of test coverage at this
+layer; this section is the canonical write-up of what the gateway
+must guarantee.
+
+- **I1 — Anonymous IPC client lifecycle is observably invisible.**
+  A client that connects but never registers an agent (e.g. recall.py
+  sending a one-shot legacy IPC message) MUST NOT mutate any active
+  status reactions, MUST NOT dispose the progress driver, and MUST
+  NOT close any draft streams. The disconnect path of an unregistered
+  client is a no-op on user-visible state. (Bug A — premature 👍 on
+  recall.py disconnect, fixed in PR #600.)
+
+- **I2 — Per-agent disconnect isolation.** When agent X's bridge
+  disconnects, only X's status reactions get flushed to `setDone()`.
+  Agent Y's active reactions stay untouched. Switchroom is single-
+  agent-per-gateway today, but the invariant pins the right
+  semantics so multi-agent gateways cannot regress silently.
+
+- **I3 — 👍 fires AFTER real delivery, not after JSONL `turn_end`.**
+  For any reply tool path (`reply`, `stream_reply done=true`), the
+  controller's `setDone()` MUST happen at-or-after the timestamp of
+  the final outbound to Telegram for that reply. Firing on the
+  JSONL `turn_end` event before the round-trip completes produces a
+  visible flash of 👍 with no reply text. (Bug D + Bug Z.)
+
+- **I4 — Legacy IPC types are tolerated, not lethal.** Any message
+  type the gateway no longer handles (e.g. `update_placeholder`
+  after #553 PR 5) MUST be soft-accepted: the validator returns
+  false, `processBuffer` logs and continues, the connection stays
+  open, and no active state is mutated. (Bug B — gateway crash on
+  recall.py's `update_placeholder` after PR 5; fixed in PR #600.)
+
+- **I5 — Wake-audit dedup.** The `.wake-audit-pending` sentinel and
+  audit cycle MUST NOT re-fire mid-conversation under `--continue`
+  respawn. (Bug C — duplicate greeting reply on respawn. The actual
+  fix lives in profiles, not in the gateway, but the regression
+  surface is observable here as "duplicate outbound for the same
+  logical turn" and so the test invariant lives in this file.)
+
+The test file documents which invariants currently have green tests,
+which depend on in-flight PRs to land first, and which are `.skip`'d
+pending the matching fix branch. See the file header for the
+bug-to-PR map.
+
 ## Failure-mode history (F1–F4, fixed in earlier #553 PRs)
 
 The v1 spec framed the rewrite around four observed regressions from
