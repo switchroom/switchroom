@@ -3453,10 +3453,10 @@ describe("installSwitchroomSkills", () => {
     expect(switchroomEntries.length).toBeGreaterThan(0);
   });
 
-  it("scaffoldAgent does NOT install switchroom skills for default-role assistant agents", () => {
-    // Role gate: assistant agents (the default) get no operator skills.
-    // The .claude/skills/ directory still gets created (other skill paths
-    // may use it), but no switchroom-* entries should land there.
+  it("scaffoldAgent does NOT install foreman-only switchroom skills for default-role assistant agents", () => {
+    // Role gate split: assistant agents (the default) get the bundled-default
+    // switchroom-core trio (cli/status/health) via the universal bundled-skills
+    // path, but never the foreman-only operator skills (install/manage/architecture).
     const result = scaffoldAgent(
       "auto-skills-assistant",
       makeAgentConfig(),
@@ -3466,8 +3466,13 @@ describe("installSwitchroomSkills", () => {
     const claudeSkillsDir = join(result.agentDir, ".claude", "skills");
     expect(existsSync(claudeSkillsDir)).toBe(true);
     const entries = require("node:fs").readdirSync(claudeSkillsDir) as string[];
-    const switchroomEntries = entries.filter((e: string) => e.startsWith("switchroom-"));
-    expect(switchroomEntries).toEqual([]);
+    const switchroomEntries = entries.filter((e: string) => e.startsWith("switchroom-")).sort();
+    // Universal bundled-default trio is present.
+    expect(switchroomEntries).toEqual(["switchroom-cli", "switchroom-health", "switchroom-status"]);
+    // Foreman-only trio is absent.
+    for (const op of ["switchroom-install", "switchroom-manage", "switchroom-architecture"]) {
+      expect(entries).not.toContain(op);
+    }
   });
 
   it("reconcileAgent installs switchroom skills when role: foreman", () => {
@@ -3491,8 +3496,9 @@ describe("installSwitchroomSkills", () => {
     expect(switchroomEntries.length).toBeGreaterThan(0);
   });
 
-  it("reconcileAgent retracts switchroom skills when role flips foreman → assistant", () => {
-    // Setup: scaffold as foreman, confirm operator skills present.
+  it("reconcileAgent retracts foreman-only skills when role flips foreman → assistant", () => {
+    // Setup: scaffold as foreman, confirm both bundled-defaults and foreman-only
+    // operator skills are present.
     const foremanCfg = makeAgentConfig({ role: "foreman" });
     const switchroomConfig: SwitchroomConfig = {
       switchroom: { version: 1, agents_dir: tmpDir },
@@ -3502,16 +3508,28 @@ describe("installSwitchroomSkills", () => {
     scaffoldAgent("role-flip", foremanCfg, tmpDir, telegramConfig, switchroomConfig);
     const claudeSkillsDir = join(tmpDir, "role-flip", ".claude", "skills");
     let entries = require("node:fs").readdirSync(claudeSkillsDir) as string[];
-    expect(entries.filter((e: string) => e.startsWith("switchroom-")).length).toBeGreaterThan(0);
+    // Foreman gets foreman-only operator skills...
+    expect(entries).toContain("switchroom-install");
+    expect(entries).toContain("switchroom-manage");
+    expect(entries).toContain("switchroom-architecture");
+    // ...as well as the universal bundled-default trio.
+    expect(entries).toContain("switchroom-cli");
 
-    // Flip role to assistant and reconcile — operator skills should retract.
+    // Flip role to assistant and reconcile — only foreman-only skills retract.
+    // The bundled-default trio (cli/status/health) stays because it's universal.
     const assistantCfg = makeAgentConfig(); // role omitted = assistant default
     reconcileAgent("role-flip", assistantCfg, tmpDir, telegramConfig, {
       ...switchroomConfig,
       agents: { "role-flip": assistantCfg },
     } as SwitchroomConfig);
     entries = require("node:fs").readdirSync(claudeSkillsDir) as string[];
-    expect(entries.filter((e: string) => e.startsWith("switchroom-"))).toEqual([]);
+    for (const op of ["switchroom-install", "switchroom-manage", "switchroom-architecture"]) {
+      expect(entries).not.toContain(op);
+    }
+    // Universal bundled-default trio stays.
+    expect(entries).toContain("switchroom-cli");
+    expect(entries).toContain("switchroom-status");
+    expect(entries).toContain("switchroom-health");
   });
 });
 

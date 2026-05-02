@@ -615,6 +615,16 @@ const profileFields = {
   env: z.record(z.string(), z.string()).optional(),
   system_prompt_append: z.string().optional(),
   skills: z.array(z.string()).optional(),
+  bundled_skills: z
+    .record(z.string(), z.boolean())
+    .optional()
+    .describe(
+      "Opt-out map for switchroom's bundled-default skills " +
+      "(e.g. skill-creator, mcp-builder, webapp-testing, pdf, docx, " +
+      "xlsx, pptx, switchroom-cli, switchroom-status, switchroom-health). " +
+      "Set a key to `false` to suppress that default for this agent. " +
+      "Cascades from defaults.bundled_skills.",
+    ),
   subagents: z
     .record(z.string(), SubagentSchema)
     .optional()
@@ -792,6 +802,15 @@ export const AgentSchema = z.object({
     .describe(
       "Names of skills from switchroom.skills_dir to symlink into this " +
       "agent's skills/ directory. Unioned with defaults.skills.",
+    ),
+  bundled_skills: z
+    .record(z.string(), z.boolean())
+    .optional()
+    .describe(
+      "Per-agent override of switchroom's bundled-default skills " +
+      "(skill-creator, mcp-builder, webapp-testing, pdf, docx, xlsx, " +
+      "pptx, switchroom-cli/status/health). Set a key to `false` to " +
+      "opt out for this agent. Per-agent value wins over defaults.bundled_skills.",
     ),
   humanizer_voice_file: z
     .string()

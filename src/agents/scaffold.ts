@@ -35,6 +35,7 @@ import {
   renderProfileClaudeTemplate,
 } from "./profiles.js";
 import { getHindsightSettingsEntry, getBuiltinDefaultMcpEntries } from "../memory/scaffold-integration.js";
+import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
 import { createBank, updateBankMissions, ensureUserProfileMentalModel, DEFAULT_RETAIN_MISSION } from "../memory/hindsight.js";
@@ -605,8 +606,18 @@ export function installSwitchroomSkills(
   } catch {
     return;
   }
+  // Universal-default switchroom-* skills (cli/status/health) flow through
+  // the new bundled-defaults path (`reconcileAgentDefaultSkills`) for ALL
+  // roles, with per-key opt-out. Exclude them here so the foreman-gate
+  // logic only owns the operator-only trio (install/manage/architecture).
+  const universalDefaultSkills = new Set([
+    "switchroom-cli",
+    "switchroom-status",
+    "switchroom-health",
+  ]);
   const switchroomSkillNames = entries.filter((name) => {
     if (!name.startsWith("switchroom-")) return false;
+    if (universalDefaultSkills.has(name)) return false;
     const src = join(builtinSkillsDir, name);
     try {
       const st = lstatSync(src);
@@ -1922,6 +1933,14 @@ export function scaffoldAgent(
   // ones that may exist from before this gate landed.
   installSwitchroomSkills(agentDir, { role: agentConfig.role });
 
+  // --- Install bundled default skills (anthropic + switchroom-core) ---
+  // Universal — every agent gets these regardless of role, with per-key
+  // opt-out via `defaults.bundled_skills` or per-agent `bundled_skills`.
+  reconcileAgentDefaultSkills(
+    agentDir,
+    (agentConfig.bundled_skills ?? {}) as Record<string, unknown>,
+  );
+
   // --- Set up plugin symlinks ---
   setupPlugins(agentDir, usesSwitchroomTelegramPlugin(agentConfig));
 
@@ -3039,6 +3058,13 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
   // ways: assistant → foreman installs the symlinks; foreman →
   // assistant retracts them.
   installSwitchroomSkills(agentDir, { role: agentConfig.role });
+
+  // --- Reconcile bundled default skills (anthropic + switchroom-core) ---
+  // Mirrors scaffoldAgent — additive, idempotent, honours opt-outs.
+  reconcileAgentDefaultSkills(
+    agentDir,
+    (agentConfig.bundled_skills ?? {}) as Record<string, unknown>,
+  );
 
   // --- Reconcile .mcp.json (switchroom-telegram plugin agents only) ---
   if (usesSwitchroomTelegramPlugin(agentConfig)) {

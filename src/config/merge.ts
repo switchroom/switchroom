@@ -295,6 +295,19 @@ export function mergeAgentConfig(
     };
   }
 
+  // --- bundled_skills: per-key shallow merge, agent wins on conflict ---
+  // Same shape + semantics as mcp_servers above. `false` opts out of a
+  // bundled-default skill; agent-level value overrides defaults so an
+  // agent can re-enable a skill the operator opted out globally.
+  const dBundled = (defaults as { bundled_skills?: Record<string, boolean> }).bundled_skills;
+  const mBundled = (merged as { bundled_skills?: Record<string, boolean> }).bundled_skills;
+  if (dBundled || mBundled) {
+    (merged as { bundled_skills?: Record<string, boolean> }).bundled_skills = {
+      ...(dBundled ?? {}),
+      ...(mBundled ?? {}),
+    };
+  }
+
   // --- hooks: per-event concat (defaults first, agent extends) ---
   //
   // Unlike tools.allow we do NOT dedup hook entries — two identical

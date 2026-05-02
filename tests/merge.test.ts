@@ -186,6 +186,25 @@ describe("mergeAgentConfig", () => {
     );
   });
 
+  it("per-key merges bundled_skills with agent winning on conflict", () => {
+    // bundled_skills is the opt-out map for switchroom's bundled-default
+    // skills (skill-creator, mcp-builder, pdf, ...). Same shape as
+    // mcp_servers: defaults declare global opt-outs, per-agent values win.
+    const defaults: AgentDefaults = {
+      bundled_skills: { pdf: false, "mcp-builder": false },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      // Agent re-enables mcp-builder for itself; pdf opt-out flows through.
+      bundled_skills: { "mcp-builder": true, "skill-creator": false },
+    } as Parameters<typeof baseAgent>[0]);
+    const result = mergeAgentConfig(defaults, agent) as { bundled_skills?: Record<string, boolean> };
+    expect(result.bundled_skills).toEqual({
+      pdf: false,
+      "mcp-builder": true,        // agent overrides defaults
+      "skill-creator": false,
+    });
+  });
+
   it("shallow-merges soul field-by-field", () => {
     const defaults: AgentDefaults = {
       soul: { style: "warm, concise", boundaries: "no medical advice" },
