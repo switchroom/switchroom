@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+## v0.6.2 — 2026-05-03
+
+### Added
+
+- **Account-level buttons on the `/auth` Telegram dashboard
+  (#637).** The dashboard now renders one row per Anthropic account
+  with a `✓` marker (enabled on this agent) or `○` marker (account
+  exists, not enabled here). Tapping kicks off a two-stage confirm
+  → `auth enable / disable <label> <agent>` → restart, mirroring
+  the existing `rm`/`confirm-rm` pattern. Health-affix glyphs
+  (`⌛` expired/no-refresh, `⚠️` quota-exhausted, `❌`
+  missing-credentials) flag accounts that need attention without
+  opening the CLI.
+- **"🌐 Share to fleet" bootstrap button.** When zero accounts
+  exist but this agent has slot credentials we can promote, the
+  dashboard surfaces a one-tap `auth share default --from-agent
+  <agent>` button. New users go from "fresh OAuth" to
+  "shared-across-fleet" in one tap.
+- **`switchroom auth account list --json`.** Sorted, deterministic
+  account inventory (label, health, subscriptionType, expiresAt,
+  quotaExhaustedUntil, email, agents) the gateway probes to
+  populate the dashboard. Mirrors `auth refresh-accounts --json`'s
+  emission style.
+
+### Behaviour notes
+
+- Dashboard degrades gracefully when the CLI is older than v0.6.x
+  (no `--json` flag) — the accounts section just hides; per-slot
+  buttons keep working.
+- Render-time guard caps callback_data at Telegram's 64-byte limit:
+  pathological agent + label lengths fall back to a `noop` button
+  labelled `⚠ <label> (use CLI)` rather than overflowing.
+- More than 5 accounts in the inventory truncates with a `…
+  N more (use CLI)` row.
+
 ## v0.6.1 — 2026-05-03
 
 ### Fixed
