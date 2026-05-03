@@ -362,4 +362,158 @@ describe("usageText", () => {
       expect(u).toContain(`/auth ${v}`);
     }
   });
+
+  it("lists the new account-shaped verbs", () => {
+    const u = usageText();
+    expect(u).toContain("/auth account add");
+    expect(u).toContain("/auth account list");
+    expect(u).toContain("/auth account rm");
+    expect(u).toContain("/auth enable");
+    expect(u).toContain("/auth disable");
+  });
+});
+
+describe("parseAuthSubCommand — account-shaped verbs", () => {
+  it("/auth account add <label> defaults --from-agent to currentAgent", () => {
+    const intent = parseAuthSubCommand(["account", "add", "work-pro"], "clerk");
+    expect(intent.kind).toBe("account-add");
+    if (intent.kind === "account-add") {
+      expect(intent.account).toBe("work-pro");
+      expect(intent.fromAgent).toBe("clerk");
+      expect(intent.cliArgs).toEqual(["auth", "account", "add", "work-pro", "--from-agent", "clerk"]);
+    }
+  });
+
+  it("/auth account add <label> --from-agent <name> uses explicit agent", () => {
+    const intent = parseAuthSubCommand(
+      ["account", "add", "work-pro", "--from-agent", "klanker"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("account-add");
+    if (intent.kind === "account-add") {
+      expect(intent.fromAgent).toBe("klanker");
+      expect(intent.cliArgs).toContain("--from-agent");
+      expect(intent.cliArgs).toContain("klanker");
+    }
+  });
+
+  it("/auth account add without label is a usage error", () => {
+    const intent = parseAuthSubCommand(["account", "add"], "clerk");
+    expect(intent.kind).toBe("usage");
+  });
+
+  it("/auth account add rejects invalid labels", () => {
+    const intent = parseAuthSubCommand(["account", "add", "../etc"], "clerk");
+    expect(intent.kind).toBe("error");
+  });
+
+  it("/auth account add accepts dotted account labels (email-style)", () => {
+    const intent = parseAuthSubCommand(
+      ["account", "add", "ken.example.com"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("account-add");
+  });
+
+  it("/auth account add rejects --from-agent with shell metacharacters", () => {
+    const intent = parseAuthSubCommand(
+      ["account", "add", "work", "--from-agent", "foo;ls"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("error");
+  });
+
+  it("/auth account list maps to the CLI list verb", () => {
+    const intent = parseAuthSubCommand(["account", "list"], "clerk");
+    expect(intent.kind).toBe("account-list");
+    if (intent.kind === "account-list") {
+      expect(intent.cliArgs).toEqual(["auth", "account", "list"]);
+    }
+  });
+
+  it("/auth account rm <label>", () => {
+    const intent = parseAuthSubCommand(["account", "rm", "old-account"], "clerk");
+    expect(intent.kind).toBe("account-rm");
+    if (intent.kind === "account-rm") {
+      expect(intent.account).toBe("old-account");
+      expect(intent.cliArgs).toEqual(["auth", "account", "rm", "old-account"]);
+    }
+  });
+
+  it("/auth account rm without label is a usage error", () => {
+    const intent = parseAuthSubCommand(["account", "rm"], "clerk");
+    expect(intent.kind).toBe("usage");
+  });
+
+  it("/auth account with no subverb defaults to list", () => {
+    const intent = parseAuthSubCommand(["account"], "clerk");
+    expect(intent.kind).toBe("account-list");
+  });
+});
+
+describe("parseAuthSubCommand — enable / disable", () => {
+  it("/auth enable <label> defaults agents to currentAgent", () => {
+    const intent = parseAuthSubCommand(["enable", "work-pro"], "clerk");
+    expect(intent.kind).toBe("enable");
+    if (intent.kind === "enable") {
+      expect(intent.account).toBe("work-pro");
+      expect(intent.agents).toEqual(["clerk"]);
+      expect(intent.cliArgs).toEqual(["auth", "enable", "work-pro", "clerk"]);
+      expect(intent.restartAgentsAfter).toBe(true);
+    }
+  });
+
+  it("/auth enable <label> <a> <b> wires multiple agents", () => {
+    const intent = parseAuthSubCommand(
+      ["enable", "work-pro", "foo", "bar"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("enable");
+    if (intent.kind === "enable") {
+      expect(intent.agents).toEqual(["foo", "bar"]);
+      expect(intent.cliArgs).toEqual(["auth", "enable", "work-pro", "foo", "bar"]);
+    }
+  });
+
+  it("/auth enable without label is a usage error", () => {
+    const intent = parseAuthSubCommand(["enable"], "clerk");
+    expect(intent.kind).toBe("usage");
+  });
+
+  it("/auth enable rejects invalid agent names", () => {
+    const intent = parseAuthSubCommand(
+      ["enable", "work-pro", "foo;ls"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("error");
+  });
+
+  it("/auth disable <label> mirrors enable shape", () => {
+    const intent = parseAuthSubCommand(["disable", "work-pro"], "clerk");
+    expect(intent.kind).toBe("disable");
+    if (intent.kind === "disable") {
+      expect(intent.account).toBe("work-pro");
+      expect(intent.agents).toEqual(["clerk"]);
+      expect(intent.cliArgs).toEqual(["auth", "disable", "work-pro", "clerk"]);
+    }
+  });
+
+  it("/auth disable <label> <a> <b> for explicit agents", () => {
+    const intent = parseAuthSubCommand(
+      ["disable", "work-pro", "foo", "bar"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("disable");
+    if (intent.kind === "disable") {
+      expect(intent.agents).toEqual(["foo", "bar"]);
+    }
+  });
+});
+
+describe("AUTH_VERBS includes the new account-shaped verbs", () => {
+  it("exports account / enable / disable in the verb list", () => {
+    expect(AUTH_VERBS).toContain("account");
+    expect(AUTH_VERBS).toContain("enable");
+    expect(AUTH_VERBS).toContain("disable");
+  });
 });

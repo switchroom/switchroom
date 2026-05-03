@@ -18,6 +18,19 @@ export function assertSafeSlotName(slot: string): void {
   }
 }
 
+/** Pattern used by global account labels — matches validateAccountLabel
+ *  in src/auth/account-store.ts ([A-Za-z0-9._-]+, max 64 chars). */
+const ACCOUNT_LABEL_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+export function assertSafeAccountLabel(label: string): void {
+  if (label === '.' || label === '..') {
+    throw new Error(`invalid account label: ${label}`);
+  }
+  if (!ACCOUNT_LABEL_RE.test(label)) {
+    throw new Error(`invalid account label: ${label}`);
+  }
+}
+
 /** Agent-name check mirrored from gateway.ts so the parser doesn't
  *  need to import gateway.ts (which has top-level side effects). */
 const AGENT_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -36,6 +49,12 @@ export type AuthIntent =
   | { kind: 'use'; agent: string; slot: string; force: boolean; label: string; cliArgs: string[]; restartAgentAfter: true }
   | { kind: 'list'; agent: string; label: string; cliArgs: string[] }
   | { kind: 'rm'; agent: string; slot: string; force: boolean; label: string; cliArgs: string[] }
+  // ── New account-shaped verbs (see reference/share-auth-across-the-fleet.md) ──
+  | { kind: 'account-add'; account: string; fromAgent: string; label: string; cliArgs: string[] }
+  | { kind: 'account-list'; label: string; cliArgs: string[] }
+  | { kind: 'account-rm'; account: string; label: string; cliArgs: string[] }
+  | { kind: 'enable'; account: string; agents: string[]; label: string; cliArgs: string[]; restartAgentsAfter: true }
+  | { kind: 'disable'; account: string; agents: string[]; label: string; cliArgs: string[] }
   | { kind: 'usage'; message: string }
   | { kind: 'error'; message: string };
 
@@ -43,6 +62,8 @@ export const AUTH_VERBS = [
   'login', 'reauth', 'link',
   'code', 'cancel', 'status',
   'add', 'use', 'list', 'rm',
+  // New account-shaped verbs
+  'account', 'enable', 'disable',
 ] as const;
 
 /** Help/usage string shown for unknown subcommands. Keep wording close
@@ -51,15 +72,24 @@ export const AUTH_VERBS = [
 export function usageText(): string {
   return [
     'Usage:',
-    '/auth',
-    '/auth login [agent]',
-    '/auth reauth [agent]',
-    '/auth code [agent] <browser-code>',
-    '/auth cancel [agent]',
-    '/auth add [agent] [--slot <name>]',
-    '/auth use [agent] <slot> [--force]',
-    '/auth list [agent]',
-    '/auth rm [agent] <slot> [--force]',
+    '/auth                                       — status dashboard',
+    '',
+    'Per-agent (legacy slot model):',
+    '/auth login [agent]                         — start OAuth for agent',
+    '/auth reauth [agent]                        — re-auth from scratch',
+    '/auth code [agent] <browser-code>           — finish OAuth flow',
+    '/auth cancel [agent]                        — cancel pending flow',
+    '/auth add [agent] [--slot <name>]           — add another slot',
+    '/auth use [agent] <slot> [--force]          — switch active slot',
+    '/auth list [agent]                          — list slots',
+    '/auth rm [agent] <slot> [--force]           — remove a slot',
+    '',
+    'Anthropic accounts (shared across agents):',
+    '/auth account add <label> [--from-agent <name>]  — promote slot to global account',
+    '/auth account list                          — accounts + agents using each',
+    '/auth account rm <label>                    — remove (refused if enabled)',
+    '/auth enable <label> [agents...]            — wire account to agent(s)',
+    '/auth disable <label> [agents...]           — unwire account from agent(s)',
   ].join('\n');
 }
 
@@ -185,6 +215,118 @@ export function parseAuthSubCommand(
       kind: 'rm', agent, slot, force,
       label: `auth rm ${agent} ${slot}`,
       cliArgs: ['auth', 'rm', agent, slot],
+    };
+  }
+
+  // --- Account-shaped verbs (see reference/share-auth-across-the-fleet.md) ---
+
+  if (sub === 'account') {
+    const accountSub = (parts[1] ?? 'list').toLowerCase();
+
+    if (accountSub === 'add') {
+      // /auth account add <label> [--from-agent <name>]
+      // Default --from-agent to the current agent — that's the common case
+      // for a Telegram-only operator who just /auth login'd this agent.
+      const rest = parts.slice(2);
+      const { flags, positional } = splitFlags(rest, ['--from-agent']);
+      const account = positional[0];
+      if (!account) {
+        return {
+          kind: 'usage',
+          message: 'Usage: /auth account add <label> [--from-agent <name>]',
+        };
+      }
+      try { assertSafeAccountLabel(account); }
+      catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._-], 1-64 chars.' }; }
+      const fromAgentRaw = flags['--from-agent'];
+      const fromAgent = typeof fromAgentRaw === 'string' ? fromAgentRaw : currentAgent;
+      try { assertSafeAgentNameForParser(fromAgent); }
+      catch { return { kind: 'error', message: 'Invalid --from-agent value.' }; }
+      return {
+        kind: 'account-add',
+        account,
+        fromAgent,
+        label: `auth account add ${account}`,
+        cliArgs: ['auth', 'account', 'add', account, '--from-agent', fromAgent],
+      };
+    }
+
+    if (accountSub === 'list') {
+      return {
+        kind: 'account-list',
+        label: 'auth account list',
+        cliArgs: ['auth', 'account', 'list'],
+      };
+    }
+
+    if (accountSub === 'rm') {
+      // /auth account rm <label>
+      const account = parts[2];
+      if (!account) {
+        return { kind: 'usage', message: 'Usage: /auth account rm <label>' };
+      }
+      try { assertSafeAccountLabel(account); }
+      catch { return { kind: 'error', message: 'Invalid account label.' }; }
+      return {
+        kind: 'account-rm',
+        account,
+        label: `auth account rm ${account}`,
+        cliArgs: ['auth', 'account', 'rm', account],
+      };
+    }
+
+    return {
+      kind: 'usage',
+      message: 'Usage: /auth account add | list | rm  (see /auth)',
+    };
+  }
+
+  if (sub === 'enable') {
+    // /auth enable <label> [agents...] — defaults to the current agent.
+    const rest = parts.slice(1);
+    const account = rest[0];
+    if (!account) {
+      return { kind: 'usage', message: 'Usage: /auth enable <label> [agents...]' };
+    }
+    try { assertSafeAccountLabel(account); }
+    catch { return { kind: 'error', message: 'Invalid account label.' }; }
+    const agents = rest.slice(1);
+    if (agents.length === 0) agents.push(currentAgent);
+    for (const a of agents) {
+      try { assertSafeAgentNameForParser(a); }
+      catch { return { kind: 'error', message: `Invalid agent name: ${a}` }; }
+    }
+    return {
+      kind: 'enable',
+      account,
+      agents,
+      label: `auth enable ${account} ${agents.join(' ')}`,
+      cliArgs: ['auth', 'enable', account, ...agents],
+      restartAgentsAfter: true,
+    };
+  }
+
+  if (sub === 'disable') {
+    // /auth disable <label> [agents...] — defaults to the current agent.
+    const rest = parts.slice(1);
+    const account = rest[0];
+    if (!account) {
+      return { kind: 'usage', message: 'Usage: /auth disable <label> [agents...]' };
+    }
+    try { assertSafeAccountLabel(account); }
+    catch { return { kind: 'error', message: 'Invalid account label.' }; }
+    const agents = rest.slice(1);
+    if (agents.length === 0) agents.push(currentAgent);
+    for (const a of agents) {
+      try { assertSafeAgentNameForParser(a); }
+      catch { return { kind: 'error', message: `Invalid agent name: ${a}` }; }
+    }
+    return {
+      kind: 'disable',
+      account,
+      agents,
+      label: `auth disable ${account} ${agents.join(' ')}`,
+      cliArgs: ['auth', 'disable', account, ...agents],
     };
   }
 

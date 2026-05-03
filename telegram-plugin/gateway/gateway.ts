@@ -6316,6 +6316,52 @@ bot.command('auth', async ctx => {
     return
   }
 
+  // --- New account-shaped verbs (see reference/share-auth-across-the-fleet.md) ---
+
+  if (intent.kind === 'account-add') {
+    // /auth account add <label> [--from-agent <name>]
+    // Lifts an already-authenticated agent's credentials into a global
+    // account so other agents can share the same Anthropic subscription
+    // without each running its own OAuth flow.
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
+  if (intent.kind === 'account-list') {
+    // /auth account list — table of accounts + which agents use each.
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
+  if (intent.kind === 'account-rm') {
+    // /auth account rm <label> — refused if any agent is still enabled.
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
+  if (intent.kind === 'enable') {
+    // /auth enable <label> [agents...] — wires the account to those agents
+    // (defaults to the current agent), then restarts each so claude picks
+    // up the freshly fanned-out credentials.
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    if (intent.restartAgentsAfter) {
+      for (const a of intent.agents) {
+        try { assertSafeAgentName(a) } catch { continue }
+        await runSwitchroomCommand(ctx, ['agent', 'restart', a], `restart ${a}`)
+      }
+    }
+    void refreshPinnedBanner('auth-enable')
+    return
+  }
+
+  if (intent.kind === 'disable') {
+    // /auth disable <label> [agents...] — unwires the account from those
+    // agents. Doesn't auto-restart: the operator may want to drain the
+    // current credential first. The CLI hint already says "restart now".
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
   // intent.kind === 'status' — render the inline-keyboard dashboard.
   // For the dashboard we're the bot-bound agent: we don't list every
   // agent in the switchroom config; we show THIS bot's agent with its
