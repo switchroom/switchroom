@@ -45,6 +45,16 @@ export interface SlotMeta {
   quotaExhaustedUntil?: number;
   /** Free-form note about the last quota event. */
   quotaReason?: string;
+  /**
+   * Human-readable account identifier (e.g. "ken@example.com") for
+   * operator display. Anthropic doesn't expose a profile endpoint, so
+   * this is set explicitly via `setSlotLabel` and survives reauths.
+   * Bridges to the new global-account model in
+   * `reference/share-auth-across-the-fleet.md`: a label of "work-pro"
+   * here matches up with the global account at
+   * `~/.switchroom/accounts/work-pro/`.
+   */
+  accountLabel?: string;
 }
 
 export type SlotHealth =
@@ -60,6 +70,8 @@ export interface SlotInfo {
   health: SlotHealth;
   expiresAt?: number;
   quotaExhaustedUntil?: number;
+  /** Human-readable account identifier set via `setSlotLabel`. */
+  accountLabel?: string;
 }
 
 /* ── Path helpers ────────────────────────────────────────────────────── */
@@ -194,7 +206,12 @@ export function readSlotToken(agentDir: string, slot: string): string | null {
   }
 }
 
-/** Write a token + fresh meta into a slot. */
+/** Write a token + fresh meta into a slot.
+ *
+ * Preserves any pre-existing `accountLabel` on the slot — labels are
+ * operator-set and shouldn't be silently dropped on reauth (the new
+ * token is for the same human-identified account).
+ */
 export function writeSlotToken(
   agentDir: string,
   slot: string,
@@ -209,21 +226,46 @@ export function writeSlotToken(
   const now = Date.now();
   const expiresAt = opts.expiresAtMs ?? now + 365 * 24 * 60 * 60_000;
 
+  // Carry the operator-set accountLabel across the rewrite if present.
+  const existingLabel = readSlotMeta(agentDir, slot)?.accountLabel;
+
   writeFileSync(tokenPath, token.trim() + "\n", { mode: 0o600 });
-  writeFileSync(
-    metaPath,
-    JSON.stringify(
-      {
-        createdAt: now,
-        expiresAt,
-        source: opts.source ?? "claude-setup-token",
-      } satisfies SlotMeta,
-      null,
-      2,
-    ) + "\n",
-    { mode: 0o600 },
-  );
+  const meta: SlotMeta = {
+    createdAt: now,
+    expiresAt,
+    source: opts.source ?? "claude-setup-token",
+    ...(existingLabel ? { accountLabel: existingLabel } : {}),
+  };
+  writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n", { mode: 0o600 });
   return { tokenPath, metaPath };
+}
+
+/**
+ * Attach (or clear) a human-readable label on a slot.
+ *
+ * Trims whitespace; an empty / whitespace-only / undefined value clears
+ * the label. Creates a placeholder meta with `source: "unknown"` if no
+ * meta exists yet, so an operator can label a slot before it has a
+ * token (e.g. when planning the slot pool).
+ */
+export function setSlotLabel(
+  agentDir: string,
+  slot: string,
+  label: string | undefined,
+): void {
+  validateSlotName(slot);
+  const trimmed = typeof label === "string" ? label.trim() : "";
+  const meta = readSlotMeta(agentDir, slot) ?? {
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 365 * 24 * 60 * 60_000,
+    source: "unknown",
+  };
+  if (trimmed.length > 0) {
+    meta.accountLabel = trimmed;
+  } else {
+    delete meta.accountLabel;
+  }
+  writeSlotMeta(agentDir, slot, meta);
 }
 
 /* ── Legacy mirror ───────────────────────────────────────────────────── */
@@ -388,6 +430,7 @@ export function getSlotInfos(
       health,
       expiresAt: meta?.expiresAt,
       quotaExhaustedUntil: meta?.quotaExhaustedUntil,
+      accountLabel: meta?.accountLabel,
     };
   });
 }
