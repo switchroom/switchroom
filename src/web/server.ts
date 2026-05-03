@@ -22,6 +22,9 @@ import {
   handleGetLogs,
   handleGetTurns,
   handleGetSubagents,
+  handleGetAccounts,
+  handleGetAgentAccounts,
+  handleGetAgentConfig,
 } from "./api.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 
@@ -326,6 +329,23 @@ function parseRoute(
     return { handler: "getSubagents", params: { name: subagentsMatch[1] } };
   }
 
+  // GET /api/accounts
+  if (method === "GET" && pathname === "/api/accounts") {
+    return { handler: "getAccounts", params: {} };
+  }
+
+  // GET /api/agents/:name/accounts
+  const agentAccountsMatch = pathname.match(/^\/api\/agents\/([^/]+)\/accounts$/);
+  if (method === "GET" && agentAccountsMatch) {
+    return { handler: "getAgentAccounts", params: { name: agentAccountsMatch[1] } };
+  }
+
+  // GET /api/agents/:name/config
+  const agentConfigMatch = pathname.match(/^\/api\/agents\/([^/]+)\/config$/);
+  if (method === "GET" && agentConfigMatch) {
+    return { handler: "getAgentConfig", params: { name: agentConfigMatch[1] } };
+  }
+
   return null;
 }
 
@@ -474,6 +494,25 @@ export function startWebServer(
               return jsonResponse({ ok: false, error: result.error }, 500);
             }
             return jsonResponse(result.subagents);
+          }
+
+          case "getAccounts":
+            return jsonResponse(handleGetAccounts());
+
+          case "getAgentAccounts": {
+            const agentName = route.params.name;
+            if (!config.agents[agentName]) {
+              return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
+            }
+            return jsonResponse(handleGetAgentAccounts(config, agentName));
+          }
+
+          case "getAgentConfig": {
+            const agentName = route.params.name;
+            if (!config.agents[agentName]) {
+              return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
+            }
+            return jsonResponse(handleGetAgentConfig(config, agentName));
           }
         }
       }

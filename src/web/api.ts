@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
-import type { SwitchroomConfig } from "../config/schema.js";
+import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import {
   getAllAgentStatuses,
   startAgent,
@@ -11,6 +11,8 @@ import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent } from "../memory/hindsight.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentConfig } from "../config/merge.js";
+import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import { openTurnsDb, listTurnsForAgent, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
 import { applySubagentsSchema, listSubagents, type Subagent } from "../../telegram-plugin/registry/subagents-schema.js";
 
@@ -159,4 +161,39 @@ export function handleGetSubagents(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+export function handleGetAccounts(home?: string): AccountInfo[] {
+  return getAccountInfos(Date.now(), home);
+}
+
+export interface AgentAccountsResponse {
+  /** Account labels declared in `agents.<name>.auth.accounts` (cascaded). */
+  assigned: string[];
+  /** AccountInfo for each label in `assigned` that exists in the global store, in order. */
+  details: AccountInfo[];
+}
+
+export function handleGetAgentAccounts(
+  config: SwitchroomConfig,
+  agentName: string,
+  home?: string,
+): AgentAccountsResponse {
+  const agent = config.agents[agentName];
+  const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
+  const assigned = resolved.auth?.accounts ?? [];
+  const allInfos = getAccountInfos(Date.now(), home);
+  const byLabel = new Map(allInfos.map((info) => [info.label, info]));
+  const details = assigned
+    .map((label) => byLabel.get(label))
+    .filter((info): info is AccountInfo => info !== undefined);
+  return { assigned, details };
+}
+
+export function handleGetAgentConfig(
+  config: SwitchroomConfig,
+  agentName: string,
+): AgentConfig {
+  const agent = config.agents[agentName];
+  return resolveAgentConfig(config.defaults, config.profiles, agent);
 }

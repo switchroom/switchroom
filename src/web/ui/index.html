@@ -199,11 +199,114 @@
       color: var(--text-dim);
     }
 
+    nav.tabs {
+      display: flex;
+      gap: 0.25rem;
+      padding: 0 2rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    nav.tabs button {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      padding: 0.75rem 1rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+
+    nav.tabs button.active {
+      color: var(--text);
+      border-bottom-color: var(--blue);
+    }
+
+    nav.tabs button:hover { color: var(--text); }
+
+    .card-detail {
+      display: none;
+      border-top: 1px solid var(--border);
+      padding: 0.75rem 1.25rem;
+      font-size: 0.8rem;
+    }
+
+    .card-detail.open { display: block; }
+
+    .card-detail h4 {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      margin-bottom: 0.4rem;
+      margin-top: 0.75rem;
+    }
+    .card-detail h4:first-child { margin-top: 0; }
+
+    .chip {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      background: var(--surface-hover);
+      font-size: 0.72rem;
+      color: var(--text);
+      margin-right: 0.25rem;
+      margin-bottom: 0.25rem;
+    }
+
+    .chip.missing { color: var(--yellow); border: 1px solid rgba(251,191,36,0.4); background: rgba(251,191,36,0.05); }
+
+    .config-pre {
+      background: rgba(0,0,0,0.3);
+      padding: 0.6rem;
+      border-radius: 6px;
+      max-height: 240px;
+      overflow: auto;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      white-space: pre;
+    }
+
+    table.accounts-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+
+    table.accounts-table th, table.accounts-table td {
+      padding: 0.6rem 0.75rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    table.accounts-table th {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+
+    .health-badge {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 500;
+    }
+    .health-badge.healthy { color: var(--green); background: rgba(52,211,153,0.12); }
+    .health-badge.expired,
+    .health-badge.missing-credentials,
+    .health-badge.missing-refresh-token { color: var(--red); background: rgba(248,113,113,0.12); }
+    .health-badge.quota-exhausted { color: var(--yellow); background: rgba(251,191,36,0.12); }
+
     @media (max-width: 600px) {
       header { padding: 1rem; }
       main { padding: 1rem; }
       .agents-grid { grid-template-columns: 1fr; }
       .card-meta { gap: 0.3rem 1rem; }
+      nav.tabs { padding: 0 1rem; overflow-x: auto; }
     }
   </style>
 </head>
@@ -212,9 +315,14 @@
     <h1>Switchroom <span>Fleet</span></h1>
     <div class="refresh-info">Refreshes every 10s</div>
   </header>
+  <nav class="tabs">
+    <button id="tab-agents" class="active" onclick="switchTab('agents')">Agents</button>
+    <button id="tab-accounts" onclick="switchTab('accounts')">Accounts</button>
+  </nav>
   <main>
     <div id="error"></div>
     <div id="agents" class="loading">Loading agents...</div>
+    <div id="accounts" style="display:none"></div>
   </main>
 
   <script>
@@ -222,6 +330,9 @@
     const TOKEN = new URLSearchParams(window.location.search).get('token');
     let agents = [];
     let openLogs = new Set();
+    let openDetails = new Set();
+    let agentDetails = {};
+    let accounts = [];
     let ws = null;
 
     function authHeaders() {
@@ -240,6 +351,44 @@
       } catch (err) {
         showError(`Failed to fetch agents: ${err.message}`);
       }
+    }
+
+    async function fetchAccounts() {
+      try {
+        const res = await fetch(`${API}/api/accounts`, { headers: authHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        accounts = await res.json();
+        renderAccounts();
+        clearError();
+      } catch (err) {
+        showError(`Failed to fetch accounts: ${err.message}`);
+      }
+    }
+
+    async function fetchAgentDetail(name) {
+      try {
+        const [accRes, subRes, cfgRes] = await Promise.all([
+          fetch(`${API}/api/agents/${encodeURIComponent(name)}/accounts`, { headers: authHeaders() }),
+          fetch(`${API}/api/agents/${encodeURIComponent(name)}/subagents`, { headers: authHeaders() }),
+          fetch(`${API}/api/agents/${encodeURIComponent(name)}/config`, { headers: authHeaders() }),
+        ]);
+        agentDetails[name] = {
+          accounts: accRes.ok ? await accRes.json() : null,
+          subagents: subRes.ok ? await subRes.json() : null,
+          config: cfgRes.ok ? await cfgRes.json() : null,
+        };
+        render();
+      } catch (err) {
+        showError(`Failed to load detail for ${name}: ${err.message}`);
+      }
+    }
+
+    function switchTab(tab) {
+      document.getElementById('tab-agents').classList.toggle('active', tab === 'agents');
+      document.getElementById('tab-accounts').classList.toggle('active', tab === 'accounts');
+      document.getElementById('agents').style.display = tab === 'agents' ? '' : 'none';
+      document.getElementById('accounts').style.display = tab === 'accounts' ? '' : 'none';
+      if (tab === 'accounts') fetchAccounts();
     }
 
     function showError(msg) {
@@ -309,6 +458,10 @@
             <button class="btn btn-start" onclick="agentAction('${escapeHtml(a.name)}','start')" ${a.active === 'active' ? 'disabled' : ''}>Start</button>
             <button class="btn btn-stop" onclick="agentAction('${escapeHtml(a.name)}','stop')" ${a.active !== 'active' ? 'disabled' : ''}>Stop</button>
             <button class="btn btn-restart" onclick="agentAction('${escapeHtml(a.name)}','restart')" ${a.active !== 'active' ? 'disabled' : ''}>Restart</button>
+            <button class="btn" onclick="toggleDetails('${escapeHtml(a.name)}')">${openDetails.has(a.name) ? 'Hide' : 'Details'}</button>
+          </div>
+          <div class="card-detail ${openDetails.has(a.name) ? 'open' : ''}" id="detail-${escapeHtml(a.name)}">
+            ${renderAgentDetail(a.name)}
           </div>
           <div class="card-logs ${openLogs.has(a.name) ? 'open' : ''}" id="logs-${escapeHtml(a.name)}">
             <div class="logs-header">
@@ -319,6 +472,94 @@
           </div>
         </div>
       `).join('');
+    }
+
+    function renderAgentDetail(name) {
+      const d = agentDetails[name];
+      if (!d) return '<div style="color:var(--text-dim)">Loading…</div>';
+      const accounts = d.accounts;
+      const subagents = d.subagents;
+      const config = d.config;
+
+      let accountsHtml;
+      if (!accounts || accounts.assigned.length === 0) {
+        accountsHtml = '<div style="color:var(--text-dim)">No accounts assigned (falls back to <code>default</code>).</div>';
+      } else {
+        const byLabel = new Map((accounts.details || []).map(d => [d.label, d]));
+        accountsHtml = accounts.assigned.map((label, i) => {
+          const info = byLabel.get(label);
+          if (!info) return `<span class="chip missing" title="not in ~/.switchroom/accounts/">${escapeHtml(label)} · missing</span>`;
+          const tag = i === 0 ? ' · primary' : '';
+          return `<span class="chip"><span class="health-badge ${escapeHtml(info.health)}" style="margin-right:0.4rem">${escapeHtml(info.health)}</span>${escapeHtml(label)}${tag}</span>`;
+        }).join('');
+      }
+
+      let subHtml;
+      if (!subagents || subagents.length === 0) {
+        subHtml = '<div style="color:var(--text-dim)">No sub-agents tracked.</div>';
+      } else {
+        subHtml = subagents.map(s => `<span class="chip">${escapeHtml(s.name || s.id || '?')}${s.status ? ' · ' + escapeHtml(s.status) : ''}</span>`).join('');
+      }
+
+      const configText = config ? JSON.stringify(config, null, 2) : '(unavailable)';
+
+      return `
+        <h4>Accounts</h4>${accountsHtml}
+        <h4>Sub-agents</h4>${subHtml}
+        <h4>Resolved config</h4><pre class="config-pre">${escapeHtml(configText)}</pre>
+      `;
+    }
+
+    function renderAccounts() {
+      const container = document.getElementById('accounts');
+      if (!accounts || accounts.length === 0) {
+        container.innerHTML = '<div class="loading">No accounts. Run <code>switchroom auth account add &lt;label&gt;</code>.</div>';
+        return;
+      }
+      const rows = accounts.map(a => `
+        <tr>
+          <td>${escapeHtml(a.label)}</td>
+          <td><span class="health-badge ${escapeHtml(a.health)}">${escapeHtml(a.health)}</span></td>
+          <td>${escapeHtml(a.subscriptionType || '—')}</td>
+          <td>${escapeHtml(a.email || '—')}</td>
+          <td>${formatTimestamp(a.expiresAt)}</td>
+          <td>${formatTimestamp(a.lastRefreshedAt)}</td>
+          <td>${a.quotaExhaustedUntil ? formatTimestamp(a.quotaExhaustedUntil) : '—'}</td>
+        </tr>
+      `).join('');
+      container.innerHTML = `
+        <table class="accounts-table">
+          <thead><tr>
+            <th>Label</th><th>Health</th><th>Sub</th><th>Email</th><th>Expires</th><th>Refreshed</th><th>Quota reset</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    function formatTimestamp(ms) {
+      if (!ms) return '—';
+      const d = new Date(ms);
+      if (isNaN(d.getTime())) return '—';
+      const diff = ms - Date.now();
+      const abs = Math.abs(diff);
+      const mins = Math.floor(abs / 60000);
+      if (mins < 60) return diff < 0 ? `${mins}m ago` : `in ${mins}m`;
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return diff < 0 ? `${hrs}h ago` : `in ${hrs}h`;
+      const days = Math.floor(hrs / 24);
+      return diff < 0 ? `${days}d ago` : `in ${days}d`;
+    }
+
+    function toggleDetails(name) {
+      if (openDetails.has(name)) {
+        openDetails.delete(name);
+        render();
+      } else {
+        openDetails.add(name);
+        render();
+        if (!agentDetails[name]) fetchAgentDetail(name);
+      }
     }
 
     async function toggleLogs(name) {
