@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## v0.6.4 — 2026-05-03
+
+### Fixed
+
+- **Bundle UTF-8 mojibake (#643, follow-up to #642).** Bun's parser
+  misreads raw UTF-8 source bytes as Latin-1 past ~172kB into a large
+  bundle, expanding each multi-byte char into multiple JS code units.
+  When re-emitted to stdout / `writeFileSync`, those code units get
+  UTF-8 encoded a second time → classic double-UTF-8 mojibake. v0.6.3
+  symptoms: boot cards rendered as `â AgentName back up Â· v0.6.3`,
+  `switchroom agent list` "Uptime" column rendered as garbage, systemd
+  unit em-dashes written as `c3 a2 c2 80 c2 94`. Fix: post-build pass
+  (`scripts/escape-bundle-non-ascii.mjs`) that ASCII-escapes every
+  code unit > 0x7F in built bundles to `\uHHHH` — same defence
+  esbuild's `--charset=ascii` flag provides; bun build doesn't expose
+  one. Wired into both bundle builders. Regression test asserts all 5
+  built bundles contain zero bytes > 0x7F.
+
+### Added
+
+- **dm_only agent flag — suppress noisy boot probe for DM-only bots
+  (#644).** Agents marked `dm_only: true` skip the forum-topic
+  presence probe at boot, which was producing red boot cards on
+  agents that legitimately have no group/topic to monitor. The
+  scaffold-time default is `false` so existing behavior is preserved.
+
 ## v0.6.3 — 2026-05-03
 
 ### Fixed
