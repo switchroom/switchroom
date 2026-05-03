@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+
+## v0.6.0 — 2026-05-03
+
+### Fixed
+
+- **Multiple status messages emitted during single turn (#626).** The
+  progress-card emit lifecycle had a structural failure mode: when
+  `stream_reply(done=true)` finalized the lane, it deleted
+  `activeDraftStreams[sKey]` — and any subsequent emit on the same
+  lane+turnKey created a fresh `sendMessage` instead of editing the
+  pinned card. The 2026-04-23 sub-agent fix covered ONE path; the RCA
+  on this issue identified 7 more (deferred completion, zombie close,
+  forceDone, dedup-key mismatch, etc.). All collapse to the same
+  symptom: the user sees multiple separate status messages where one
+  anchor message edited in place was expected.
+
+  Root-cause-shaped fix: a new `lookupExistingMessageId` hook in
+  `stream-reply-handler.ts` lets the gateway feed back the anchor
+  message id from the pin manager. When the handler is about to create
+  a fresh stream because `activeDraftStreams[sKey]` was deleted, it
+  consults the hook; if the pin manager already knows the id for this
+  turnKey, the new stream initializes with that id so the very next
+  update fires `editMessageText` instead of `sendMessage`. Stale ids
+  fall back gracefully via the existing not-found path.
+
+  Closes the bug class structurally — every previously-known path now
+  collapses to "edit the existing anchor."
+
+### Added
+
+- **`anchorMessageCount(chatId, threadId?)`** harness invariant in
+  `real-gateway-harness.ts` — returns the count of fresh `sendMessage`
+  calls (NOT edits) for a chat. Anything > 1 across a single logical
+  turn IS the duplicate-status-message bug class. New I7 describe
+  block in `real-gateway-i6-...` pins the invariant. Catches ANY
+  future regression in any of the 8 RCA paths the moment a second
+  anchor lands — verified to flag 5/6 historical dup-message bugs
+  (#546, #251, #549, #371, #489) and all 8 paths.
+
+- **`initialMessageId`** optional config on `createDraftStream` and
+  `createStreamController`. Plumbing for the lookup hook above.
+  Purely additive — back-compat verified.
 ## v0.5.1 — 2026-05-03
 
 ### Fixed
