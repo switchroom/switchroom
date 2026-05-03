@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## v0.6.3 — 2026-05-03
+
+### Fixed
+
+- **Bundle no longer breaks under bun runtime (#640).** Released
+  bundle was inlining `node-fetch@2` (grammy's HTTP dep) when built
+  with `--target node`. Under bun runtime that inlined CJS
+  node-fetch broke grammy's `getMe`/`sendMessage` calls with a
+  generic `HttpError: Network request failed!` — the fleet was
+  unresponsive on every restart (👀 reaction succeeded, no replies
+  landed). Fix: `--external node-fetch` in the plugin bundle so
+  the fetch impl is resolved at runtime (bun's native shim under
+  bun, real node-fetch from node_modules under node).
+
+### Added
+
+- **Issue cards render remediation hints (#633).** When an issue's
+  `--detail` field starts with `Fix:` or `→`, the pinned issue card
+  surfaces it as a `→ <hint>` line under the summary. The cron
+  prompt template (`src/agents/sub-agent-telegram-prompt.ts`) now
+  teaches agents to record remediation alongside transient issues
+  (e.g. `Fix: switchroom vault unlock` when the broker is locked).
+  Multi-line stderr-tail details are excluded from the card to
+  keep the layout tight; full detail still visible via `/issues`.
+- **First-message-after-restart picks up reaction filter (#641,
+  closes #613).** Gateway now warms `chatAvailableReactions` for
+  every chat in `access.allowFrom` at boot so the very first turn
+  in a restricted-reactions supergroup gets the proper filter
+  instead of the lazy-on-first-message safety net (which couldn't
+  help the first message itself).
+
+### Engineering
+
+- **Telegram-plugin source is now strict-tsc clean (#641, closes
+  #623).** `npm run lint` previously filtered tsc output to four
+  "dangerous-class" error codes because 52 pre-existing type-debt
+  errors would have drowned the signal. All 52 are now fixed
+  (possibly-undefined narrowing, discriminated-union narrowing,
+  dead-code removal, boundary casts at grammy interfaces). The
+  lint check now fails on any tsc error in plugin source — going
+  forward, type bugs in `telegram-plugin/` are caught at lint time
+  the same as `src/`.
+
 ## v0.6.2 — 2026-05-03
 
 ### Added
