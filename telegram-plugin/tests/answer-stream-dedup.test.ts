@@ -266,3 +266,87 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     expect(result).toBeUndefined()
   })
 })
+
+// ─── Tests for #648 — recordOutbound callback ─────────────────────────────────
+
+describe('answer-stream materialize() — recordOutbound callback (#648)', () => {
+  it('recordOutbound is called with messageId and text on successful materialize', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const recordOutbound = vi.fn()
+
+    const stream = createAnswerStream({
+      chatId: 'chat648',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      recordOutbound,
+    })
+
+    stream.update(LONG_TEXT)
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    const result = await stream.materialize()
+
+    expect(result).toBeTypeOf('number')
+    expect(recordOutbound).toHaveBeenCalledOnce()
+    expect(recordOutbound).toHaveBeenCalledWith({ messageId: result, text: LONG_TEXT })
+  })
+
+  it('recordOutbound is NOT called when materialize is suppressed by checkDedup', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const checkDedup = vi.fn(() => true)
+    const recordOutbound = vi.fn()
+
+    const stream = createAnswerStream({
+      chatId: 'chat648',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      checkDedup,
+      recordOutbound,
+    })
+
+    stream.update(LONG_TEXT)
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    const result = await stream.materialize()
+
+    expect(result).toBeUndefined()
+    expect(recordOutbound).not.toHaveBeenCalled()
+  })
+
+  it('recordOutbound is NOT called when sendMessage throws', async () => {
+    const sendMessage = vi.fn(async () => {
+      throw new Error('Telegram 500 Internal Server Error')
+    })
+    const editMessageText = makeEditMessageText()
+    const recordOutbound = vi.fn()
+
+    const stream = createAnswerStream({
+      chatId: 'chat648',
+      isPrivateChat: false,
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage: sendMessage as never,
+      editMessageText,
+      recordOutbound,
+    })
+
+    stream.update(LONG_TEXT)
+    vi.advanceTimersByTime(500)
+    await flushMicrotasks()
+
+    const result = await stream.materialize()
+
+    expect(result).toBeUndefined()
+    expect(recordOutbound).not.toHaveBeenCalled()
+  })
+})

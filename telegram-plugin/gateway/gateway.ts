@@ -3470,6 +3470,22 @@ function handleSessionEvent(ev: SessionEvent): void {
               if (cid == null) return
               outboundDedup.record(cid, currentSessionThreadId, text, Date.now())
             },
+            // #648 — write answer-stream materializations into the SQLite
+            // history buffer so get_recent_messages can surface them. Guard
+            // with HISTORY_ENABLED, matching the turn-flush pattern at ~3783.
+            recordOutbound: ({ messageId, text }: { messageId: number; text: string }) => {
+              if (!HISTORY_ENABLED) return
+              const cid = currentSessionChatId
+              if (cid == null) return
+              try {
+                recordOutbound({
+                  chat_id: cid,
+                  thread_id: currentSessionThreadId ?? null,
+                  message_ids: [messageId],
+                  texts: [text],
+                })
+              } catch {}
+            },
           })
         }
         // #549 fix: route the chunk through the preamble suppressor
