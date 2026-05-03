@@ -447,6 +447,15 @@ interface PerChatState {
    */
   completionFired: boolean
   /**
+   * Set to true when an external code path has assumed ownership of
+   * the pinned card message (e.g. turn-flush rewriting the card with
+   * the user-facing answer — see #654). Once true, `flush()`
+   * short-circuits at the top so the driver never edits the card
+   * again for this turn. The external owner is responsible for
+   * issuing the final edit/unpin via pinMgr.
+   */
+  cardTakenOver: boolean
+  /**
    * Tracks consecutive Telegram 4xx failures on card edits. Once
    * `terminal` is true, flush() and the heartbeat tick skip all edits
    * for this card (message deleted / bot blocked / stale message_id).
@@ -577,6 +586,38 @@ export interface ProgressDriver {
    * normal flush+unpin path runs via onTurnComplete.
    */
   forceCompleteTurn(args: { chatId: string; threadId?: string }): void
+  /**
+   * #654 deterministic double-message fix. Hand off ownership of the
+   * pinned progress card for an active turn so an external code path
+   * (specifically the turn-flush backstop in gateway.ts) can rewrite
+   * the card message with the user-facing answer instead of issuing a
+   * fresh sendMessage that lands as a second Telegram message.
+   *
+   * Effects:
+   *   - cancels the deferred-first-emit timer if pending (no late
+   *     card emission can race the takeover)
+   *   - sets `cardTakenOver = true` — `flush()` short-circuits at the
+   *     top, so no further edits go out from the driver for this turn
+   *   - sets `completionFired = true` — guards against double-firing
+   *     `completeTurnFully` if a deferred-completion path also runs
+   *
+   * Returns:
+   *   - `wasEmitted`: true iff the card has already been published to
+   *     Telegram (i.e. the deferred-emit timer fired or pinning has
+   *     occurred). Caller can use this to decide between editMessageText
+   *     vs sendMessage.
+   *   - `turnKey`: the active turn's full key (chatId:threadId?:seq)
+   *     so the caller can look up the pinned messageId via pinMgr.
+   *     Null only when no active card exists for (chatId, threadId).
+   *
+   * Idempotent — safe to call multiple times for the same turn; the
+   * second call returns the same shape with timer-cancellation already
+   * complete.
+   */
+  takeOverCard(args: { chatId: string; threadId?: string }): {
+    wasEmitted: boolean
+    turnKey: string | null
+  }
   /** Current state for a chat (for tests / inspection). */
   peek(chatId: string, threadId?: string): ProgressCardState | undefined
   /**
@@ -1285,6 +1326,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     // any more edits. Avoids log spam and pointless retries for deleted
     // messages / blocked bots.
     if (chatState.apiFailures.terminal) return
+    // External takeover (e.g. turn-flush rewriting the card with the
+    // user-facing answer text — see #654). Once handed off, the driver
+    // must never issue another edit for this card; the new owner has
+    // full control of the message until they call pinMgr.completeTurn.
+    if (chatState.cardTakenOver) return
     // Suppress the card entirely if the turn ends before the initial
     // delay has elapsed — no point flashing a "Working…" card for a
     // turn that completed in under initialDelayMs.
@@ -1622,6 +1668,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           lastEventAt: now(),
           pendingCompletion: false,
           completionFired: false,
+          cardTakenOver: false,
           apiFailures: { consecutive4xx: 0, lastError: null, terminal: false },
           replyToolCalled: false,
           outboundDeliveredCount: 0,
@@ -1987,6 +2034,49 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         return
       }
       completeTurnFully(target)
+    },
+
+    takeOverCard({ chatId, threadId }) {
+      // Mirror the (chatId, threadId) lookup used by forceCompleteTurn
+      // — prefer the currentTurnKey-pinned target so concurrent fresh
+      // turns can't get clobbered.
+      let target: PerChatState | undefined
+      if (currentTurnKey != null) {
+        const cs = chats.get(currentTurnKey)
+        if (cs != null && cs.chatId === chatId && cs.threadId === threadId) {
+          target = cs
+        }
+      }
+      if (target == null) {
+        for (const cs of chats.values()) {
+          if (cs.chatId === chatId && cs.threadId === threadId) {
+            target = cs
+            break
+          }
+        }
+      }
+      if (target == null) return { wasEmitted: false, turnKey: null }
+
+      // Cancel any pending deferred-first-emit timer so no card emits
+      // late, AFTER the external owner takes over. If the timer has
+      // already fired (DELAY_ELAPSED sentinel), nothing to clear.
+      if (target.deferredFirstEmitTimer != null && target.deferredFirstEmitTimer !== DELAY_ELAPSED) {
+        clearT(target.deferredFirstEmitTimer)
+        target.deferredFirstEmitTimer = null
+      }
+      // The card has been emitted iff the deferred-emit timer fired
+      // (driver's own indicator) or `isFirstEmit === false` (an emit
+      // path other than the deferred one already ran).
+      const wasEmitted =
+        target.deferredFirstEmitTimer === DELAY_ELAPSED || !target.isFirstEmit
+
+      target.cardTakenOver = true
+      target.completionFired = true
+
+      process.stderr.write(
+        `telegram gateway: progress-card: takeOverCard turnKey=${target.turnKey} wasEmitted=${wasEmitted}\n`,
+      )
+      return { wasEmitted, turnKey: target.turnKey }
     },
 
     peek(chatId, threadId) {

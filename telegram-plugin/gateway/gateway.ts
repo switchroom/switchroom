@@ -1609,6 +1609,13 @@ const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 let progressDriver: ProgressDriver | null = null
 let unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
+// #654: expose pinMgr lookups + completion to the turn-flush block
+// (defined upstream of where pinMgr is constructed). Set inside
+// startGatewayServer right after pinMgr is created.
+let getPinnedProgressCardMessageId: ((turnKey: string, agentId?: string) => number | null) | null = null
+let completeProgressCardTurn:
+  | ((args: { chatId: string; threadId: number | undefined; turnKey: string }) => void)
+  | null = null
 let subagentWatcher: SubagentWatcherHandle | null = null
 
 // ─── IPC server ───────────────────────────────────────────────────────────
@@ -3751,6 +3758,23 @@ function handleSessionEvent(ev: SessionEvent): void {
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
 
+        // #654 deterministic double-message fix. Hand off the pinned
+        // progress card BEFORE state reset so the driver doesn't keep
+        // editing it while turn-flush is rewriting it with the answer.
+        // `wasEmitted` tells us whether the card has already been
+        // published; `turnKey` lets us look up the pinned messageId
+        // via pinMgr below. Idempotent — calling later in the IIFE
+        // would be no-op against the same chatState.
+        const cardTakeover = progressDriver?.takeOverCard({
+          chatId: backstopChatId,
+          threadId: backstopThreadId != null ? String(backstopThreadId) : undefined,
+        }) ?? { wasEmitted: false, turnKey: null }
+        const backstopCardMessageId =
+          cardTakeover.wasEmitted && cardTakeover.turnKey != null
+            ? (getPinnedProgressCardMessageId?.(cardTakeover.turnKey) ?? null)
+            : null
+        const backstopCardTurnKey = cardTakeover.turnKey
+
         currentSessionChatId = null
         currentSessionThreadId = undefined
         currentTurnReplyCalled = false
@@ -3793,7 +3817,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           }
 
           process.stderr.write(
-            `telegram gateway: turn-flush firing — ${capturedText.length} chars without reply tool (chat=${backstopChatId})\n`,
+            `telegram gateway: turn-flush firing — ${capturedText.length} chars without reply tool ` +
+            `(chat=${backstopChatId} cardMsgId=${backstopCardMessageId ?? 'none'})\n`,
           )
           const sendOpts = {
             parse_mode: 'HTML' as const,
@@ -3805,7 +3830,35 @@ function handleSessionEvent(ev: SessionEvent): void {
           const htmlChunks = splitHtmlChunks(renderedText, limit)
           const sentIds: number[] = []
           try {
-            for (const c of htmlChunks) {
+            // #654 deterministic double-message fix. If the progress
+            // card is on screen (60s timer fired before turn_end), edit
+            // it in place with the first chunk of the answer instead of
+            // posting a fresh message — avoids the user seeing both the
+            // pinned card AND a separate text bubble for the same turn.
+            // Multi-chunk answers (>4000 chars) edit chunk[0] into the
+            // card and send chunks[1..] fresh. If the edit fails (e.g.
+            // user deleted the card, parse-mode conflict), fall back to
+            // a fresh send for chunk[0] — accepts a 2-message outcome
+            // for that edge case rather than dropping the answer.
+            let firstSendUsedEdit = false
+            if (backstopCardMessageId != null && htmlChunks.length > 0) {
+              try {
+                await bot.api.editMessageText(
+                  backstopChatId,
+                  backstopCardMessageId,
+                  htmlChunks[0],
+                  sendOpts,
+                )
+                sentIds.push(backstopCardMessageId)
+                firstSendUsedEdit = true
+              } catch (err) {
+                process.stderr.write(
+                  `telegram gateway: turn-flush card-takeover edit failed: ${(err as Error).message} — falling back to sendMessage\n`,
+                )
+              }
+            }
+            const remainingChunks = firstSendUsedEdit ? htmlChunks.slice(1) : htmlChunks
+            for (const c of remainingChunks) {
               const sent = await bot.api.sendMessage(backstopChatId, c, sendOpts)
               sentIds.push(sent.message_id)
             }
@@ -3830,7 +3883,19 @@ function handleSessionEvent(ev: SessionEvent): void {
               Date.now(),
             )
             if (backstopCtrl) backstopCtrl.setDone()
-            unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
+            // Unpin the card. completeTurn cleans up pinMgr's per-turn
+            // state and unpins via the API. If we didn't take over a
+            // turn (cardTakeover.turnKey == null), fall back to the
+            // legacy unpinForChat sweep.
+            if (backstopCardTurnKey != null) {
+              completeProgressCardTurn?.({
+                chatId: backstopChatId,
+                threadId: backstopThreadId,
+                turnKey: backstopCardTurnKey,
+              })
+            } else {
+              unpinProgressCardForChat?.(backstopChatId, backstopThreadId)
+            }
           } catch (err) {
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
             if (backstopCtrl) backstopCtrl.setError()
@@ -8819,6 +8884,20 @@ if (streamMode === 'checklist') {
 
   unpinProgressCardForChat = (chatId: string, threadId: number | undefined): void => {
     pinMgr.unpinForChat(chatId, threadId)
+  }
+
+  // #654 expose pinMgr to the turn-flush block (which lives upstream of
+  // where pinMgr is constructed). Two narrow callbacks instead of the
+  // whole manager so the contract stays explicit.
+  getPinnedProgressCardMessageId = (turnKey: string, agentId?: string): number | null => {
+    return pinMgr.pinnedMessageId(turnKey, agentId) ?? null
+  }
+  completeProgressCardTurn = (args: { chatId: string; threadId: number | undefined; turnKey: string }): void => {
+    pinMgr.completeTurn({
+      chatId: args.chatId,
+      threadId: args.threadId != null ? String(args.threadId) : undefined,
+      turnKey: args.turnKey,
+    })
   }
 
   /**
