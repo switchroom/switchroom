@@ -811,6 +811,19 @@ export const AgentSchema = z.object({
       "Account routing for switchroom-auth-broker. See " +
       "reference/share-auth-across-the-fleet.md for the unit-of-authentication model.",
     ),
+  dm_only: z
+    .boolean()
+    .optional()
+    .describe(
+      "Mark this agent as a DM-only bot — has its own bot_token and lives " +
+      "exclusively in a private chat with the operator. Suppresses " +
+      "scaffolding's default behavior of inheriting the global " +
+      "telegram.forum_chat_id into the agent's access.json `groups` entry " +
+      "(the forum chat the bot isn't a member of, which would otherwise " +
+      "trigger a 'boot-probe-failed: 400 chat not found' warning every " +
+      "restart). topic_name is still schema-required but unused — set it " +
+      "to a display label like 'DM' for /switchroom status output.",
+    ),
   topic_name: z.string().describe("Telegram forum topic display name"),
   topic_emoji: z
     .string()

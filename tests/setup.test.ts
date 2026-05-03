@@ -121,6 +121,33 @@ describe("buildAccessJson", () => {
 
     expect(parsed).not.toHaveProperty("topic_id");
   });
+
+  it("dmOnly=true omits the groups entry entirely (suppresses noisy boot probe)", () => {
+    // DM-only bots have their own bot_token and live in a private chat.
+    // The default scaffold inherits the global telegram.forum_chat_id
+    // into access.json's groups, but the DM bot isn't a member of that
+    // chat — the boot probe correctly emits
+    // "boot-probe-failed: 400 Bad Request: chat not found" every restart
+    // plus a misleading user-facing notification. Setting dmOnly drops
+    // the groups entry; the probe sweeps nothing it can't reach.
+    const json = buildAccessJson("12345", "-100987654321", undefined, { dmOnly: true });
+    const parsed = JSON.parse(json);
+    expect(parsed.dmPolicy).toBe("allowlist");
+    expect(parsed.allowFrom).toEqual(["12345"]);
+    expect(parsed).not.toHaveProperty("groups");
+  });
+
+  it("dmOnly=false (default) keeps the legacy groups shape for back-compat", () => {
+    const json = buildAccessJson("12345", "-100987654321", undefined, { dmOnly: false });
+    const parsed = JSON.parse(json);
+    expect(parsed.groups["-100987654321"]).toBeDefined();
+  });
+
+  it("opts omitted entirely behaves identically to dmOnly=false", () => {
+    const a = JSON.parse(buildAccessJson("12345", "-100987654321"));
+    const b = JSON.parse(buildAccessJson("12345", "-100987654321", undefined, {}));
+    expect(a).toEqual(b);
+  });
 });
 
 // ─── findExistingClaudeJson ──────────────────────────────────────────────────

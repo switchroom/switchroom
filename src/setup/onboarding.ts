@@ -68,23 +68,38 @@ export function copyOnboardingState(
 /**
  * Build an access.json for an agent's telegram directory.
  * Uses the official Telegram plugin format with dmPolicy, allowFrom,
- * and groups sections.
+ * and (optionally) groups sections.
+ *
+ * When `dmOnly` is true, the `groups` entry is omitted entirely. This
+ * is the right shape for bots that only ever live in a private DM with
+ * the operator and have no business in the fleet's forum supergroup.
+ * Without this opt-out, scaffold inherits the global `forum_chat_id`
+ * into the access list, and the boot probe correctly reports it as
+ * unreachable (the bot isn't a member) — surfacing as a noisy
+ * "boot-probe-failed: 400 Bad Request: chat not found" warning every
+ * restart, with a notification to the operator's DM chat. The warning
+ * is accurate but the chat isn't actually used for routing — the right
+ * fix is to not put unreachable chats in the access list. (#carrie /
+ * issue surfaced 2026-05-03.)
  */
 export function buildAccessJson(
   userId: string,
   forumChatId: string,
   topicId?: number,
+  opts: { dmOnly?: boolean } = {},
 ): string {
   const access: Record<string, unknown> = {
     dmPolicy: "allowlist",
     allowFrom: [userId],
-    groups: {
+  };
+  if (!opts.dmOnly) {
+    access.groups = {
       [forumChatId]: {
         requireMention: false,
         allowFrom: [],
       },
-    },
-  };
+    };
+  }
 
   return JSON.stringify(access, null, 2) + "\n";
 }
@@ -130,12 +145,13 @@ export function writeAccessJson(
   userId: string,
   forumChatId: string,
   topicId?: number,
+  opts: { dmOnly?: boolean } = {},
 ): void {
   const telegramDir = join(agentDir, "telegram");
   mkdirSync(telegramDir, { recursive: true });
 
   const accessPath = join(telegramDir, "access.json");
-  writeFileSync(accessPath, buildAccessJson(userId, forumChatId, topicId), {
+  writeFileSync(accessPath, buildAccessJson(userId, forumChatId, topicId, opts), {
     encoding: "utf-8",
     mode: 0o600,
   });

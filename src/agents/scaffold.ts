@@ -3355,13 +3355,20 @@ function buildAccessJson(
   const access: Record<string, unknown> = {
     dmPolicy: "allowlist",
     allowFrom,
-    groups: {
+  };
+  // DM-only bots opt out of inheriting the global forum_chat_id into the
+  // access list. Without this, the boot probe sweeps a chat the bot isn't
+  // a member of and emits a noisy "boot-probe-failed: 400 chat not found"
+  // every restart (plus a misleading user-facing notification). See the
+  // schema doc on `dm_only` for the design rationale.
+  if (!agentConfig.dm_only) {
+    access.groups = {
       [telegramConfig.forum_chat_id]: {
         requireMention: false,
         allowFrom,
       },
-    },
-  };
+    };
+  }
 
   // #596: project resolved telegram-channel features (stickers, voice_in,
   // telegraph) into access.json so the gateway picks them up at runtime
