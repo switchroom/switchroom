@@ -165,6 +165,23 @@ function registerAccountAdd(account: Command, program: Command): void {
             const remaining = creds.claudeAiOauth.expiresAt - Date.now();
             console.log(`  Token life:   ${formatDuration(remaining)}`);
           }
+          // Real UX cliff: an access token without a refresh token works
+          // until expiry, then dies silently. The broker's refresh tick
+          // can't recover (skipped-no-refresh-token), and the operator
+          // only learns at the next 401. Warn loudly at import time.
+          const hasRefreshToken =
+            typeof creds.claudeAiOauth?.refreshToken === "string" &&
+            creds.claudeAiOauth.refreshToken.length > 0;
+          if (!hasRefreshToken) {
+            console.log();
+            console.log(
+              chalk.yellow(
+                "  ⚠ No refreshToken in the imported credentials. The token will work " +
+                  "until it expires, then this account will need a manual re-auth — " +
+                  "the broker can't refresh without a refresh token.",
+              ),
+            );
+          }
           console.log();
           console.log(
             `Next: enable on agents with 'switchroom auth enable ${label} <agent>'`,
