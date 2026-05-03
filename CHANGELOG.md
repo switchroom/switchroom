@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+## v0.5.1 — 2026-05-03
+
+### Fixed
+
+- **v0.5.0 release packaging — gateway service unit pointed at
+  unshipped paths.** v0.5.0 introduced a split `claude` + `gateway`
+  systemd-unit architecture whose `ExecStart` references
+  `~/.bun/install/global/node_modules/switchroom-ai/telegram-plugin/gateway/gateway.ts`
+  and `~/.bun/install/global/node_modules/switchroom-ai/bin/autoaccept.exp`,
+  but the `package.json` `files` array only included `dist`,
+  `profiles`, `skills`, `README.md`, `LICENSE`. Result: every
+  agent's gateway service failed at boot with
+  `Module not found "...telegram-plugin/gateway/gateway.ts"` until
+  systemd hit the start-limit. Agents went silent on Telegram.
+- **Telegram-plugin runtime deps not in root `dependencies`.**
+  `@grammyjs/runner`, `@modelcontextprotocol/sdk`, `@secretlint/*`,
+  `@xterm/headless`, `grammy` were declared on the workspace
+  package only — not on `switchroom-ai`. Fresh consumer installs
+  couldn't resolve these imports from the gateway. Promoted them to
+  root `dependencies` so `npm i -g switchroom-ai` pulls them.
+
+### Migration
+
+`bun add -g switchroom-ai@0.5.1` (or `npm i -g switchroom-ai@0.5.1`)
+then `switchroom agent restart all` — units pick up the now-shipped
+source. v0.5.0 outboundDedup hotfix (#625) and per-agent card
+foundations (#624, #627) are inherited from v0.5.0 unchanged.
+
 ## v0.5.0 — 2026-05-03
 
 ### Added

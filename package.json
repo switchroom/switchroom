@@ -1,6 +1,6 @@
 {
   "name": "switchroom-ai",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys, no Docker.",
   "type": "module",
   "bin": {
@@ -11,6 +11,8 @@
     "dist",
     "profiles",
     "skills",
+    "telegram-plugin",
+    "bin",
     "README.md",
     "LICENSE"
   ],
@@ -27,9 +29,16 @@
     "prepublishOnly": "npm run build && npm run lint && npm test"
   },
   "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@secretlint/core": "^12.2.0",
+    "@secretlint/secretlint-rule-preset-recommend": "^12.2.0",
+    "@secretlint/types": "^12.2.0",
+    "@xterm/headless": "^6.0.0",
     "bcryptjs": "^3.0.3",
     "chalk": "^5.4.0",
     "commander": "^13.1.0",
+    "grammy": "^1.21.0",
     "handlebars": "^4.7.8",
     "posthog-node": "^5.29.2",
     "yaml": "^2.7.0",
