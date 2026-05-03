@@ -55,6 +55,7 @@ export type AuthIntent =
   | { kind: 'account-rm'; account: string; label: string; cliArgs: string[] }
   | { kind: 'enable'; account: string; agents: string[]; label: string; cliArgs: string[]; restartAgentsAfter: true }
   | { kind: 'disable'; account: string; agents: string[]; label: string; cliArgs: string[] }
+  | { kind: 'share'; account: string; fromAgent: string; label: string; cliArgs: string[]; restartAgentsAfter: true }
   | { kind: 'usage'; message: string }
   | { kind: 'error'; message: string };
 
@@ -63,7 +64,7 @@ export const AUTH_VERBS = [
   'code', 'cancel', 'status',
   'add', 'use', 'list', 'rm',
   // New account-shaped verbs
-  'account', 'enable', 'disable',
+  'account', 'enable', 'disable', 'share',
 ] as const;
 
 /** Help/usage string shown for unknown subcommands. Keep wording close
@@ -88,8 +89,9 @@ export function usageText(): string {
     '/auth account add <label> [--from-agent <name>]  — promote slot to global account',
     '/auth account list                          — accounts + agents using each',
     '/auth account rm <label>                    — remove (refused if enabled)',
-    '/auth enable <label> [agents...]            — wire account to agent(s)',
-    '/auth disable <label> [agents...]           — unwire account from agent(s)',
+    '/auth enable <label> [agents...|all]        — wire account to agent(s); "all" = every agent',
+    '/auth disable <label> [agents...|all]       — unwire account from agent(s); "all" = every agent',
+    '/auth share <label> [--from-agent <name>]   — account add + enable on every agent in one step',
   ].join('\n');
 }
 
@@ -327,6 +329,32 @@ export function parseAuthSubCommand(
       agents,
       label: `auth disable ${account} ${agents.join(' ')}`,
       cliArgs: ['auth', 'disable', account, ...agents],
+    };
+  }
+
+  if (sub === 'share') {
+    // /auth share <label> [--from-agent <name>] — one-shot: account add + enable
+    // on every agent. Defaults --from-agent to the current agent (same shape as
+    // /auth account add).
+    const rest = parts.slice(1);
+    const { flags, positional } = splitFlags(rest, ['--from-agent']);
+    const account = positional[0];
+    if (!account) {
+      return { kind: 'usage', message: 'Usage: /auth share <label> [--from-agent <name>]' };
+    }
+    try { assertSafeAccountLabel(account); }
+    catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._-], 1-64 chars.' }; }
+    const fromAgentRaw = flags['--from-agent'];
+    const fromAgent = typeof fromAgentRaw === 'string' ? fromAgentRaw : currentAgent;
+    try { assertSafeAgentNameForParser(fromAgent); }
+    catch { return { kind: 'error', message: 'Invalid --from-agent value.' }; }
+    return {
+      kind: 'share',
+      account,
+      fromAgent,
+      label: `auth share ${account}`,
+      cliArgs: ['auth', 'share', account, '--from-agent', fromAgent],
+      restartAgentsAfter: true,
     };
   }
 

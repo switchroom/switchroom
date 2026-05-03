@@ -516,4 +516,82 @@ describe("AUTH_VERBS includes the new account-shaped verbs", () => {
     expect(AUTH_VERBS).toContain("enable");
     expect(AUTH_VERBS).toContain("disable");
   });
+
+  it("exports share in the verb list", () => {
+    expect(AUTH_VERBS).toContain("share");
+  });
+});
+
+describe("parseAuthSubCommand — `all` keyword for enable/disable", () => {
+  it("/auth enable <label> all parses with agents=['all']", () => {
+    const intent = parseAuthSubCommand(["enable", "work-pro", "all"], "clerk");
+    expect(intent.kind).toBe("enable");
+    if (intent.kind === "enable") {
+      expect(intent.agents).toEqual(["all"]);
+      expect(intent.cliArgs).toEqual(["auth", "enable", "work-pro", "all"]);
+      expect(intent.restartAgentsAfter).toBe(true);
+    }
+  });
+
+  it("/auth disable <label> all is symmetric", () => {
+    const intent = parseAuthSubCommand(["disable", "work-pro", "all"], "clerk");
+    expect(intent.kind).toBe("disable");
+    if (intent.kind === "disable") {
+      expect(intent.agents).toEqual(["all"]);
+      expect(intent.cliArgs).toEqual(["auth", "disable", "work-pro", "all"]);
+    }
+  });
+});
+
+describe("parseAuthSubCommand — /auth share", () => {
+  it("/auth share <label> defaults --from-agent to currentAgent", () => {
+    const intent = parseAuthSubCommand(["share", "work-pro"], "clerk");
+    expect(intent.kind).toBe("share");
+    if (intent.kind === "share") {
+      expect(intent.account).toBe("work-pro");
+      expect(intent.fromAgent).toBe("clerk");
+      expect(intent.cliArgs).toEqual(["auth", "share", "work-pro", "--from-agent", "clerk"]);
+      expect(intent.restartAgentsAfter).toBe(true);
+    }
+  });
+
+  it("/auth share <label> --from-agent <name> honors explicit value", () => {
+    const intent = parseAuthSubCommand(
+      ["share", "work-pro", "--from-agent", "klanker"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("share");
+    if (intent.kind === "share") {
+      expect(intent.fromAgent).toBe("klanker");
+      expect(intent.cliArgs).toEqual([
+        "auth", "share", "work-pro", "--from-agent", "klanker",
+      ]);
+    }
+  });
+
+  it("/auth share without label is a usage error", () => {
+    const intent = parseAuthSubCommand(["share"], "clerk");
+    expect(intent.kind).toBe("usage");
+  });
+
+  it("/auth share rejects invalid labels", () => {
+    const intent = parseAuthSubCommand(["share", "../etc"], "clerk");
+    expect(intent.kind).toBe("error");
+  });
+
+  it("/auth share rejects --from-agent with shell metacharacters", () => {
+    const intent = parseAuthSubCommand(
+      ["share", "work-pro", "--from-agent", "foo;ls"],
+      "clerk",
+    );
+    expect(intent.kind).toBe("error");
+  });
+});
+
+describe("usageText — `all` keyword and share verb", () => {
+  it("documents the `all` keyword on enable/disable and `/auth share`", () => {
+    const u = usageText();
+    expect(u).toContain("/auth share");
+    expect(u).toMatch(/all/);
+  });
 });

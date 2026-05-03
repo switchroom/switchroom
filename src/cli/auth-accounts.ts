@@ -60,7 +60,44 @@ export function registerAuthAccountSubcommands(
 
   registerEnable(authParent, program);
   registerDisable(authParent, program);
+  registerShare(authParent, program);
   registerRefreshAccounts(authParent, program);
+}
+
+/* ── helpers: `all` agent expansion ──────────────────────────────────── */
+
+/**
+ * Expand the special `all` keyword into the list of every claude-enabled agent
+ * declared in switchroom.yaml. If `agents` is anything other than the
+ * single-element list `['all']`, returns it unchanged.
+ *
+ * Edge case: a literal agent named "all" in switchroom.yaml. The keyword
+ * still wins (matches the parser's whitelisting of "all"); we log a warning
+ * to stderr so the operator notices the collision.
+ */
+function expandAllAgents(
+  agents: string[],
+  config: ReturnType<typeof getConfig>,
+): string[] {
+  if (agents.length !== 1 || agents[0] !== "all") return agents;
+  if (config.agents["all"]) {
+    console.error(
+      chalk.yellow(
+        "  ⚠ An agent named 'all' is declared in switchroom.yaml — preferring " +
+          "the `all` keyword (every agent). Rename the agent to disambiguate.",
+      ),
+    );
+  }
+  const expanded = Object.entries(config.agents)
+    .filter(([, a]) => (a as { claude?: boolean }).claude !== false)
+    .map(([n]) => n)
+    .sort();
+  if (expanded.length === 0) {
+    throw new Error(
+      "no agents configured (or all agents have claude disabled)",
+    );
+  }
+  return expanded;
 }
 
 /* ── account add ─────────────────────────────────────────────────────── */
@@ -299,6 +336,9 @@ function registerEnable(authParent: Command, program: Command): void {
           );
         }
         const config = getConfig(program);
+        // Expand `all` BEFORE the per-agent guard so the friendly empty-config
+        // error fires correctly and unknown-agent checks run on real names.
+        agents = expandAllAgents(agents, config);
         const agentsDir = resolveAgentsDir(config);
         for (const name of agents) {
           if (!config.agents[name]) {
@@ -371,6 +411,8 @@ function registerDisable(authParent: Command, program: Command): void {
     .action(
       withConfigError(async (label: string, agents: string[]) => {
         validateAccountLabel(label);
+        const config = getConfig(program);
+        agents = expandAllAgents(agents, config);
         const yamlPath = getConfigPath(program);
         const before = readFileSync(yamlPath, "utf-8");
 
@@ -411,6 +453,169 @@ function registerDisable(authParent: Command, program: Command): void {
         }
         console.log();
       }),
+    );
+}
+
+/* ── share (one-shot: account add + enable on every agent) ──────────── */
+
+function registerShare(authParent: Command, program: Command): void {
+  authParent
+    .command("share <label>")
+    .description(
+      "One-shot: register an Anthropic account from an authenticated agent and " +
+        "enable it on every claude-enabled agent in switchroom.yaml. Equivalent " +
+        "to `auth account add` + `auth enable <label> all` but with a single " +
+        "merged YAML write.",
+    )
+    .option(
+      "--from-agent <name>",
+      "Seed credentials from an existing agent's .credentials.json (defaults " +
+        "to the only agent if there is exactly one)",
+    )
+    .action(
+      withConfigError(
+        async (label: string, opts: { fromAgent?: string }) => {
+          validateAccountLabel(label);
+
+          if (accountExists(label)) {
+            throw new Error(
+              `account ${label} already exists — use 'switchroom auth enable ${label} all' instead`,
+            );
+          }
+
+          const config = getConfig(program);
+          const agentNames = Object.keys(config.agents);
+
+          let fromAgent = opts.fromAgent;
+          if (!fromAgent) {
+            if (agentNames.length === 1) {
+              fromAgent = agentNames[0];
+            } else {
+              throw new Error(
+                "--from-agent is required when more than one agent is configured. " +
+                  `Pick one of: ${agentNames.sort().join(", ")}`,
+              );
+            }
+          }
+          if (!config.agents[fromAgent]) {
+            throw new Error(
+              `agent '${fromAgent}' is not declared in switchroom.yaml`,
+            );
+          }
+
+          // Load credentials from the source agent (mirrors `account add`).
+          const agentsDir = resolveAgentsDir(config);
+          const credPath = resolve(
+            agentsDir,
+            fromAgent,
+            ".claude",
+            ".credentials.json",
+          );
+          if (!existsSync(credPath)) {
+            throw new Error(
+              `agent '${fromAgent}' has no .credentials.json at ${credPath}. ` +
+                `Run 'switchroom auth login ${fromAgent}' first.`,
+            );
+          }
+          const creds = parseCredentialsFile(credPath);
+          assertCredentialsHaveAccessToken(creds);
+
+          // Expand "all" target list (claude-enabled agents only).
+          const targets = expandAllAgents(["all"], config);
+
+          // Write account artefacts first (account dir is its own write).
+          writeAccountCredentials(label, creds);
+          patchAccountMeta(label, {
+            createdAt: Date.now(),
+            subscriptionType: creds.claudeAiOauth?.subscriptionType,
+          });
+
+          // ONE merged YAML write: append the new label to every target agent
+          // in-memory, then a single writeFileSync.
+          const yamlPath = getConfigPath(program);
+          const before = readFileSync(yamlPath, "utf-8");
+          let after = before;
+          const changed: string[] = [];
+          for (const name of targets) {
+            const next = appendAccountToAgent(after, name, label);
+            if (next !== after) changed.push(name);
+            after = next;
+          }
+          if (after !== before) {
+            writeFileSync(yamlPath, after);
+          }
+
+          // Immediate fanout to every target.
+          const fanTargets = targets.map((name) => ({
+            name,
+            agentDir: resolve(agentsDir, name),
+          }));
+          const outcomes = fanoutAccountToAgents(label, fanTargets);
+
+          // Log expanded agent list (also visible to the gateway-stderr path
+          // when invoked via Telegram).
+          console.error(
+            `share: expanded 'all' to ${targets.length} agent(s): ${targets.join(", ")}`,
+          );
+
+          console.log();
+          console.log(
+            `${chalk.green("✓")} Account ${chalk.bold(label)} created at ${accountDir(label)}`,
+          );
+          console.log(`  Seeded from: agent '${fromAgent}'`);
+          if (creds.claudeAiOauth?.subscriptionType) {
+            console.log(
+              `  Subscription: ${creds.claudeAiOauth.subscriptionType}`,
+            );
+          }
+          if (creds.claudeAiOauth?.expiresAt) {
+            const remaining = creds.claudeAiOauth.expiresAt - Date.now();
+            console.log(`  Token life:   ${formatDuration(remaining)}`);
+          }
+          const hasRefreshToken =
+            typeof creds.claudeAiOauth?.refreshToken === "string" &&
+            creds.claudeAiOauth.refreshToken.length > 0;
+          if (!hasRefreshToken) {
+            console.log();
+            console.log(
+              chalk.yellow(
+                "  ⚠ No refreshToken in the imported credentials. The token " +
+                  "will work until it expires, then this account will need a " +
+                  "manual re-auth — the broker can't refresh without a refresh token.",
+              ),
+            );
+          }
+          console.log();
+          if (changed.length === 0) {
+            console.log(
+              `No yaml change — ${chalk.bold(label)} already enabled on: ${targets.join(", ")}`,
+            );
+          } else {
+            console.log(
+              `${chalk.green("✓")} Enabled ${chalk.bold(label)} on: ${changed.join(", ")}`,
+            );
+          }
+          const fanned = outcomes
+            .filter((o) => o.kind === "fanned-out")
+            .map((o) => o.agent);
+          const fanFails = outcomes.filter((o) => o.kind === "fanout-failed");
+          if (fanned.length > 0) {
+            console.log(`  Credentials fanned out to: ${fanned.join(", ")}`);
+          }
+          for (const f of fanFails) {
+            if (f.kind === "fanout-failed") {
+              console.log(
+                chalk.yellow(`  ⚠ Fanout failed for ${f.agent}: ${f.error}`),
+              );
+            }
+          }
+          console.log();
+          console.log(
+            `Next: 'switchroom agent restart ${targets.join(" ")}' to load the new credentials.`,
+          );
+          console.log();
+        },
+      ),
     );
 }
 

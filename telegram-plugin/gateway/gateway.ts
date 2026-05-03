@@ -4975,6 +4975,19 @@ function assertSafeAgentName(name: string): void {
   }
 }
 
+/**
+ * Expand the special `all` keyword into the real agent list for restart-
+ * driving. The CLI handles its own expansion for the YAML mutation; this
+ * helper exists so the gateway's post-CLI restart loop knows whom to
+ * bounce. Returns `agents` unchanged when `all` is not present.
+ */
+async function resolveAgentsForRestart(agents: string[]): Promise<string[]> {
+  if (!(agents.length === 1 && agents[0] === 'all')) return agents
+  type AgentListResp = { agents: Array<{ name: string }> }
+  const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+  return data?.agents?.map(a => a.name).filter(Boolean) ?? []
+}
+
 function getMyAgentName(): string {
   const fromEnv = process.env.SWITCHROOM_AGENT_NAME
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv.trim()
@@ -6353,12 +6366,15 @@ bot.command('auth', async ctx => {
   }
 
   if (intent.kind === 'enable') {
-    // /auth enable <label> [agents...] — wires the account to those agents
+    // /auth enable <label> [agents...|all] — wires the account to those agents
     // (defaults to the current agent), then restarts each so claude picks
-    // up the freshly fanned-out credentials.
+    // up the freshly fanned-out credentials. The CLI accepts the `all`
+    // keyword verbatim and expands it itself; we expand here too so the
+    // restart loop knows the real agent names.
     await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
     if (intent.restartAgentsAfter) {
-      for (const a of intent.agents) {
+      const restartTargets = await resolveAgentsForRestart(intent.agents)
+      for (const a of restartTargets) {
         try { assertSafeAgentName(a) } catch { continue }
         await runSwitchroomCommand(ctx, ['agent', 'restart', a], `restart ${a}`)
       }
@@ -6368,10 +6384,24 @@ bot.command('auth', async ctx => {
   }
 
   if (intent.kind === 'disable') {
-    // /auth disable <label> [agents...] — unwires the account from those
+    // /auth disable <label> [agents...|all] — unwires the account from those
     // agents. Doesn't auto-restart: the operator may want to drain the
     // current credential first. The CLI hint already says "restart now".
     await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    return
+  }
+
+  if (intent.kind === 'share') {
+    // /auth share <label> [--from-agent <name>] — one-shot account-add +
+    // enable on every claude-enabled agent. The CLI does the merged YAML
+    // write; we restart every agent it touched so credentials load.
+    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
+    const restartTargets = await resolveAgentsForRestart(['all'])
+    for (const a of restartTargets) {
+      try { assertSafeAgentName(a) } catch { continue }
+      await runSwitchroomCommand(ctx, ['agent', 'restart', a], `restart ${a}`)
+    }
+    void refreshPinnedBanner('auth-share')
     return
   }
 
