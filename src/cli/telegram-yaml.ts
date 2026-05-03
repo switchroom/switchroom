@@ -10,7 +10,7 @@
  * created on demand.
  */
 
-import { parseDocument, type Document, isMap, type YAMLMap } from "yaml";
+import { parseDocument, type Document, isMap, isSeq, type YAMLMap, type YAMLSeq } from "yaml";
 
 export type TelegramFeature = "voice_in" | "telegraph" | "webhook_sources";
 
@@ -79,4 +79,76 @@ function pruneEmptyMap(doc: Document, path: string[]): void {
   if (isMap(node) && (node as YAMLMap).items.length === 0) {
     doc.deleteIn(path);
   }
+}
+
+/**
+ * Add a webhook source (string) to `agents.<agent>.channels.telegram.webhook_sources`.
+ *
+ * webhook_sources is an array, not a single value — each element names a
+ * source whose secret lives in vault at `vault:webhook/<agent>/<source>`.
+ * The runtime joins on this array to know which inbound webhook payloads
+ * to accept; appending is the common case ("add github webhook to klanker"
+ * shouldn't blow away an existing 'generic' source).
+ *
+ * Idempotent: appending an already-present source returns the YAML
+ * unchanged (so a re-run after an interrupted enable doesn't produce
+ * duplicate entries).
+ */
+export function addWebhookSource(
+  yamlText: string,
+  agentName: string,
+  source: string,
+): string {
+  const doc = parseDocument(yamlText);
+  ensureAgent(doc, agentName);
+  const existing = doc.getIn(["agents", agentName, "channels", "telegram", "webhook_sources"]);
+  if (isSeq(existing)) {
+    const seq = existing as YAMLSeq;
+    for (const item of seq.items) {
+      // YAML seq items are Scalar nodes; .value is the string.
+      const v = (item as { value?: unknown }).value ?? item;
+      if (v === source) return yamlText; // idempotent
+    }
+    seq.add(source);
+  } else {
+    doc.setIn(
+      ["agents", agentName, "channels", "telegram", "webhook_sources"],
+      [source],
+    );
+  }
+  return String(doc);
+}
+
+/**
+ * Remove a webhook source from the array. No-op when the source isn't
+ * present. When the array becomes empty, the parent webhook_sources
+ * entry is dropped (and empty parent maps pruned) so the YAML doesn't
+ * accumulate `webhook_sources: []` debris.
+ */
+export function removeWebhookSource(
+  yamlText: string,
+  agentName: string,
+  source: string,
+): string {
+  const doc = parseDocument(yamlText);
+  if (!hasAgent(doc, agentName)) return yamlText;
+  const existing = doc.getIn(["agents", agentName, "channels", "telegram", "webhook_sources"]);
+  if (!isSeq(existing)) return yamlText;
+  const seq = existing as YAMLSeq;
+  const beforeLen = seq.items.length;
+  // Iterate from the end so splice indices remain stable. yaml's
+  // YAMLSeq doesn't expose indexOf for primitive values cleanly, so
+  // walk the array.
+  for (let i = seq.items.length - 1; i >= 0; i--) {
+    const item = seq.items[i];
+    const v = (item as { value?: unknown })?.value ?? item;
+    if (v === source) seq.delete(i);
+  }
+  if (seq.items.length === beforeLen) return yamlText; // no change
+  if (seq.items.length === 0) {
+    doc.deleteIn(["agents", agentName, "channels", "telegram", "webhook_sources"]);
+    pruneEmptyMap(doc, ["agents", agentName, "channels", "telegram"]);
+    pruneEmptyMap(doc, ["agents", agentName, "channels"]);
+  }
+  return String(doc);
 }
