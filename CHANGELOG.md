@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## v0.6.1 — 2026-05-03
+
+### Fixed
+
+- **Strategic packaging fix — telegram-plugin now ships as a
+  self-contained bundle.** The `telegram-plugin/gateway/gateway.ts`
+  (and server, bridge, foreman) entry points reach across into `src/`
+  for auth, config, vault-broker, build-info — modules that the npm
+  package's `files` array does not ship and that .gitignore excluded
+  from `dist/`. Result: a fresh `bun add -g switchroom-ai@0.5.x`
+  install crashloop'd at gateway boot with `Cannot find module
+  '../../src/auth/accounts.js'`. Operators only stayed running by
+  having a `bun link` overlay of the dev workspace shadowing the
+  npm install.
+
+  The fix bundles each plugin entry point with `bun build` (resolving
+  all cross-imports inline) into `telegram-plugin/dist/`. The systemd
+  gateway unit + foreman unit + .mcp.json server entry now prefer the
+  bundled JS, falling back to the .ts source for dev workspaces that
+  haven't built yet. The npm package ships `telegram-plugin/dist/` so
+  fresh installs run without any source-tree dependency.
+
+  Closes the same packaging class as v0.5.1's fix at the strategic
+  level — instead of patching `files` to ship more `src/` (which
+  spreads the cross-import surface further), the plugin becomes a true
+  library with no upstream reach.
+
+### Added
+
+- **`bun run build` now builds telegram-plugin too.** Root
+  `scripts/build.mjs` invokes `telegram-plugin/scripts/build.mjs`
+  after the CLI bundle. Single command, both targets.
+- **`telegram-plugin/start.js` shim.** MCP launchers `bun run start`
+  through this — picks dist if present, falls back to .ts source.
+  Preserves the legacy "edit + restart" dev loop while making the
+  installed-package path the production default.
+- **Foreman bundled.** `foreman/foreman.ts` now in the plugin build
+  alongside server/gateway/bridge.
+
 ## v0.6.0 — 2026-05-03
 
 ### Added

@@ -15,7 +15,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "start": "bun server.ts",
+    "start": "bun start.js",
+    "start:source": "bun server.ts",
+    "start:dist": "bun dist/server.js",
     "build": "node scripts/build.mjs",
     "prepublishOnly": "npm run build"
   },

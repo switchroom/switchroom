@@ -23,6 +23,7 @@ const entries = [
   { src: "server.ts", out: "server.js", label: "server (legacy + dual-mode shim)" },
   { src: "gateway/gateway.ts", out: "gateway/gateway.js", label: "gateway (persistent service)" },
   { src: "bridge/bridge.ts", out: "bridge/bridge.js", label: "bridge (MCP proxy)" },
+  { src: "foreman/foreman.ts", out: "foreman/foreman.js", label: "foreman (admin bot)" },
 ];
 
 for (const { src, out, label } of entries) {

@@ -102,4 +102,17 @@ if (src.startsWith("#!/usr/bin/env node")) {
 }
 chmodSync(outFile, 0o755);
 
+// Build the telegram-plugin self-contained dist (#634 strategic
+// packaging fix). The plugin's gateway / server / bridge entry points
+// reach across into `src/` (auth, config, vault-broker, build-info).
+// Direct .ts execution from the npm package fails because the root
+// package's `files` array doesn't ship `src/` and .gitignore excludes
+// `dist/`. Bundling here resolves all cross-imports into a single
+// dist/ tree per entry; combined with the explicit
+// `telegram-plugin/dist` files-array entry below, the published
+// tarball ships ready-to-run gateway/server/bridge JS.
+const pluginScript = resolve(root, "telegram-plugin/scripts/build.mjs");
+console.log("[build] bundling telegram-plugin/{server,gateway,bridge} -> telegram-plugin/dist/");
+execSync(`node ${JSON.stringify(pluginScript)}`, { stdio: "inherit", cwd: root });
+
 console.log("[build] done");
