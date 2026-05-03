@@ -177,6 +177,22 @@ export interface RealGatewayHarnessHandle extends HarnessHandle {
    */
   firstAnswerTextMs(chatId: string): number | null
 
+  /**
+   * Issue #626 invariant — exactly one anchor `sendMessage` per
+   * (chatId, threadId, turnKey?). Returns the count of fresh
+   * `sendMessage` calls (NOT edits) for the chat. The anchor is the
+   * single message that subsequent edits target. Multiple anchors for
+   * the same logical turn = the duplicate-status-message bug.
+   *
+   * Usage: `expect(h.anchorMessageCount(CHAT)).toBe(1)` after a
+   * complete turn. Pass `threadId` to disambiguate forum topics.
+   *
+   * Returns -1 if the recorder isn't tracking calls (defensive — the
+   * harness shouldn't reach this state, but a -1 is more actionable
+   * than a silent 0 if it does).
+   */
+  anchorMessageCount(chatId: string, threadId?: number): number
+
   // ─── IPC + bridge lifecycle helpers (ships with PR for I1–I5) ───────
   // The IPC lifecycle (clients connecting, registering, sending typed
   // messages, disconnecting) is invisible to the existing waiting-UX
@@ -417,6 +433,19 @@ export function createRealGatewayHarness(
     return hit ? hit.ts : null
   }
 
+  function anchorMessageCount(chatId: string, threadId?: number): number {
+    if (!Array.isArray(inner.recorder.calls)) return -1
+    return inner.recorder.calls.filter((c) => {
+      if (c.kind !== 'sendMessage') return false
+      if (c.chat_id !== chatId) return false
+      if (threadId == null) return true
+      // RecordedCall payload may carry message_thread_id when the
+      // production code passed one — match if requested.
+      const opts = (c as { opts?: { message_thread_id?: number } }).opts
+      return opts?.message_thread_id === threadId
+    }).length
+  }
+
   function lastReactionEmojiAt(chatId: string): number | null {
     const hits = inner.recorder.calls.filter(
       (c) => c.kind === 'setMessageReaction' && c.chat_id === chatId,
@@ -653,6 +682,7 @@ export function createRealGatewayHarness(
     gapMs,
     expectNoPlaceholderEdits,
     expectNoCardSent,
+    anchorMessageCount,
     firstAnswerTextMs,
     bridgeConnect,
     bridgeDisconnect,

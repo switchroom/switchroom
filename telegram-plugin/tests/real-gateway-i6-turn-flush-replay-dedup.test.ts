@@ -233,6 +233,81 @@ describe('I5(b) — wake-audit respawn duplicate suppressed by dedup defense in 
 
     expect(h.recorder.sentTexts(CHAT).filter((t) => t === greeting).length).toBe(1)
     expect(h.dedupSuppressedCount()).toBeGreaterThanOrEqual(1)
+    // I7 invariant: even across the wake-audit respawn, the chat
+    // sees exactly ONE anchor sendMessage. (#626 — duplicate status
+    // messages bug class.)
+    expect(h.anchorMessageCount(CHAT)).toBe(1)
+    h.finalize()
+  })
+})
+
+// ─── I7 — duplicate-status-message regression (issue #626) ──────────────
+//
+// The progress-card driver / stream-reply-handler interaction has a
+// failure mode where `done=true` finalizes + deletes the active draft
+// stream entry, and a subsequent emit on the same lane+turn creates
+// a fresh `sendMessage` instead of editing the pinned card. User sees
+// multiple separate status messages where one anchor message edited
+// in place was expected.
+//
+// The fix is the `lookupExistingMessageId` hook in
+// `stream-reply-handler.ts` (wired in `gateway.ts`'s progress-card
+// emit callback to consult `pinMgr.pinnedMessageId(turnKey, agentId)`).
+// Detailed unit-level coverage lives in
+// `stream-reply-handler.test.ts` and `draft-stream.test.ts`.
+//
+// At the harness layer, the invariant is:
+//
+//   I7 — For any (chatId, threadId, turnKey?), the recorder shows
+//        exactly one `sendMessage` call (the anchor). All subsequent
+//        renders for the same logical turn are `editMessageText` on
+//        that anchor's `message_id`.
+//
+// This test pins the invariant for the simplest happy-path scenario
+// (one inbound, one outbound). The full progress-card lifecycle
+// scenario (first emit → done=true → post-done emit) is exercised at
+// the unit level — wiring the production progress driver through the
+// real-gateway harness is its own followup. What we lock in here is
+// the assertion shape so future regressions in the OTHER 7 paths the
+// RCA identified are caught the moment a second anchor lands.
+describe('I7 — exactly-one-anchor-message invariant (#626)', () => {
+  it('happy-path single send — anchorMessageCount equals 1', async () => {
+    // fails when: any handler regression causes a single send() call
+    // to land as TWO sendMessage invocations (e.g. preamble dedup
+    // path and main reply path both firing).
+    const h = createRealGatewayHarness({ gapMs: 0, withDedup: true })
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'q' })
+    h.feedSessionEvent({
+      kind: 'enqueue',
+      chatId: CHAT,
+      messageId: '1',
+      threadId: null,
+      rawContent: 'q',
+    })
+    const id1 = await h.send({ chat_id: CHAT, text: REPLY_TEXT })
+    expect(id1).not.toBeNull()
+    expect(h.anchorMessageCount(CHAT)).toBe(1)
+    h.finalize()
+  })
+
+  it('dedup-suppressed second send does NOT add a second anchor', async () => {
+    // The combo invariant: dedup catching a duplicate AND the anchor
+    // count staying at 1. Both must hold for #626 to be considered
+    // closed at the harness layer.
+    const h = createRealGatewayHarness({ gapMs: 0, withDedup: true })
+    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'q' })
+    h.feedSessionEvent({
+      kind: 'enqueue',
+      chatId: CHAT,
+      messageId: '1',
+      threadId: null,
+      rawContent: 'q',
+    })
+    await h.send({ chat_id: CHAT, text: REPLY_TEXT })
+    const id2 = await h.send({ chat_id: CHAT, text: REPLY_TEXT }) // same content
+    expect(id2).toBeNull()
+    expect(h.anchorMessageCount(CHAT)).toBe(1)
+    expect(h.dedupSuppressedCount()).toBeGreaterThanOrEqual(1)
     h.finalize()
   })
 })
