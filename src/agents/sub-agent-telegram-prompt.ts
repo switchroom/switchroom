@@ -106,8 +106,16 @@ export function buildCronTelegramGuidance(args: {
 If something half-broken happens during this run (e.g. an upstream API timed out, a vault key was missing, a non-fatal data gap), record it via:
 
 \`\`\`
-switchroom issues record --severity warn --source "cron:${args.jobSlug}" --code <stable-code> --summary "<one-line>"
+switchroom issues record --severity warn --source "cron:${args.jobSlug}" --code <stable-code> --summary "<one-line>" --detail "Fix: <one-line remediation, e.g. exact command the user can run>"
 \`\`\`
+
+The \`--detail\` field is rendered as a "→ Fix: ..." line under the issue on the user's Telegram card. Make it actionable — a copy-pastable command or a one-line action, not a description of the problem. Examples:
+
+- \`--detail "Fix: switchroom vault unlock"\` (when the vault broker is locked)
+- \`--detail "Fix: re-run \`claude setup-token\` for ken@example.com"\` (when an account is unauthenticated)
+- \`--detail "Fix: \\\`switchroom auth heal --account=<name>\\\`"\` (when an OAuth token expired)
+
+Skip \`--detail\` if there's no clean one-line fix — leaving it empty means the card shows just the summary, which is fine.
 
 Use the EXACT \`--source "cron:${args.jobSlug}"\` shown above — the cron wrapper auto-resolves issues with that source on a clean run. Picking a different source means the issue persists across recoveries.
 `

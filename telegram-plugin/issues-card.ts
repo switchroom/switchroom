@@ -103,7 +103,14 @@ export function renderIssuesCard(opts: RenderIssuesCardOpts): string | null {
     const emoji = SEVERITY_EMOJI[e.severity];
     const occ = e.occurrences > 1 ? ` <i>(×${e.occurrences})</i>` : "";
     const ago = relTime(now - e.last_seen);
-    return `${emoji} <code>${escapeHtml(e.fingerprint)}</code>  ${escapeHtml(e.summary)}${occ} — <i>${ago}</i>`;
+    const head = `${emoji} <code>${escapeHtml(e.fingerprint)}</code>  ${escapeHtml(e.summary)}${occ} — <i>${ago}</i>`;
+    // Render the `detail` line below the summary when present and short
+    // enough to be a remediation hint (not a multi-line stderr tail).
+    // Convention from the cron prompt template: agents put "Fix: <cmd>"
+    // or "→ <cmd>" in detail. Long stderr details are omitted from the
+    // card to keep the layout tight; users can run /issues to see them.
+    const remediation = formatRemediation(e.detail);
+    return remediation == null ? head : `${head}\n  → <i>${escapeHtml(remediation)}</i>`;
   });
 
   const lines = [header, "", ...rows];
@@ -112,6 +119,32 @@ export function renderIssuesCard(opts: RenderIssuesCardOpts): string | null {
     lines.push(`<i>+${overflow} more not shown — run <code>/issues</code></i>`);
   }
   return lines.join("\n");
+}
+
+/**
+ * Extract a remediation hint from the `detail` field, or null if the
+ * detail is missing / not remediation-shaped.
+ *
+ * Convention: agents (and CLI callers) put a short, single-line
+ * remediation in `--detail` prefixed with "Fix:" or "→". Multi-line
+ * stderr tails are not surfaced here — too noisy for the card, and
+ * `/issues` shows the full detail anyway.
+ *
+ * Cap at REMEDIATION_MAX_CHARS so a stray-detail issue doesn't blow
+ * up the card layout.
+ */
+const REMEDIATION_MAX_CHARS = 140;
+function formatRemediation(detail: string | undefined): string | null {
+  if (!detail) return null;
+  // Strip leading whitespace and the conventional prefixes ("Fix:", "→").
+  const trimmed = detail.replace(/^[\s ]+/, "");
+  const m = trimmed.match(/^(?:fix:|→)\s*(.+?)(?:\n|$)/i);
+  if (!m) return null;
+  const hint = m[1].trim();
+  if (hint.length === 0) return null;
+  return hint.length > REMEDIATION_MAX_CHARS
+    ? hint.slice(0, REMEDIATION_MAX_CHARS - 1) + "…"
+    : hint;
 }
 
 function relTime(deltaMs: number): string {

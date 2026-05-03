@@ -44,6 +44,70 @@ describe("renderIssuesCard", () => {
     expect(out).toContain("3 issues");
   });
 
+  // ─── Remediation rendering (the "Fix:" → arrow under the issue) ─────
+  describe("remediation hint from detail field", () => {
+    it("renders a 'Fix:' detail as a → line under the issue", () => {
+      const events = [
+        makeEvent({
+          summary: "Morning brief skipped — vault locked",
+          detail: "Fix: switchroom vault unlock",
+        }),
+      ];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).toContain("→ <i>switchroom vault unlock</i>");
+      // Summary still rendered above the remediation.
+      expect(out).toContain("Morning brief skipped");
+    });
+
+    it("renders a → prefixed detail (no 'Fix:' literal needed)", () => {
+      const events = [
+        makeEvent({
+          detail: "→ run `switchroom auth heal --account=ken`",
+        }),
+      ];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).toMatch(/→ <i>run.*auth heal/);
+    });
+
+    it("ignores multi-line detail (likely stderr tail, not remediation)", () => {
+      // A common pattern: --detail "stderr line 1\nstderr line 2".
+      // Card omits these to keep layout tight; /issues shows full detail.
+      const events = [
+        makeEvent({
+          summary: "claude -p exited 1",
+          detail: "Traceback (most recent call last):\n  File '/x.py'...",
+        }),
+      ];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).not.toContain("→");
+      expect(out).not.toContain("Traceback");
+    });
+
+    it("ignores empty detail", () => {
+      const events = [makeEvent({ detail: "" })];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).not.toContain("→");
+    });
+
+    it("truncates remediation longer than 140 chars", () => {
+      const longFix = "Fix: " + "a".repeat(200);
+      const events = [makeEvent({ detail: longFix })];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).toContain("…");
+      // Issue card shouldn't carry a 200-char single line.
+      expect((out ?? "").split("\n").every((line) => line.length < 600)).toBe(true);
+    });
+
+    it("escapes HTML in remediation hints", () => {
+      const events = [
+        makeEvent({ detail: "Fix: <script>alert('xss')</script>" }),
+      ];
+      const out = renderIssuesCard({ agentName: "kengpt", events });
+      expect(out).not.toContain("<script>");
+      expect(out).toContain("&lt;script&gt;");
+    });
+  });
+
   it("uses singular 'issue' for one event", () => {
     const events = [makeEvent({})];
     const out = renderIssuesCard({ agentName: "klanker", events });
