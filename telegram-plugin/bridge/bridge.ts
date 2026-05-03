@@ -172,10 +172,29 @@ const TOOL_SCHEMAS = [
   },
   {
     name: 'send_typing',
-    description: 'Send a typing indicator to a chat. The indicator auto-expires after ~5 seconds. Call repeatedly during long operations.',
+    description: 'Send a chat-status indicator. Default "typing" matches the legacy behavior; pass `action` to surface upload_document, record_voice, etc. so the indicator matches what the agent is actually doing. The indicator auto-refreshes every 4s for 30s; call again for longer operations.',
     inputSchema: {
       type: 'object',
-      properties: { chat_id: { type: 'string' } },
+      properties: {
+        chat_id: { type: 'string' },
+        action: {
+          type: 'string',
+          enum: [
+            'typing',
+            'upload_photo',
+            'record_video',
+            'upload_video',
+            'record_voice',
+            'upload_voice',
+            'upload_document',
+            'choose_sticker',
+            'find_location',
+            'record_video_note',
+            'upload_video_note',
+          ],
+          description: 'Telegram Bot API chat action. Defaults to "typing".',
+        },
+      },
       required: ['chat_id'],
     },
   },

@@ -1064,10 +1064,32 @@ const typingRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let typingBackoffMs = 0
 const TYPING_BACKOFF_MAX = 5 * 60 * 1000
 
-function startTypingLoop(chat_id: string): void {
+/**
+ * Telegram Bot API allowed chat actions. Each describes a different
+ * "the bot is doing X" indicator the client renders next to the chat
+ * title — far more informative than a generic "typing…" when the
+ * agent is uploading a document or recording a voice note. See
+ * https://core.telegram.org/bots/api#sendchataction.
+ */
+const CHAT_ACTION_WHITELIST = new Set([
+  'typing',
+  'upload_photo',
+  'record_video',
+  'upload_video',
+  'record_voice',
+  'upload_voice',
+  'upload_document',
+  'choose_sticker',
+  'find_location',
+  'record_video_note',
+  'upload_video_note',
+] as const)
+type ChatAction = typeof CHAT_ACTION_WHITELIST extends Set<infer T> ? T : never
+
+function startTypingLoop(chat_id: string, action: ChatAction = 'typing'): void {
   stopTypingLoop(chat_id)
   const send = () => {
-    bot.api.sendChatAction(chat_id, 'typing').then(
+    bot.api.sendChatAction(chat_id, action).then(
       () => { typingBackoffMs = 0 },
       (err) => {
         const msg = err instanceof Error ? err.message : String(err)
@@ -1076,7 +1098,7 @@ function startTypingLoop(chat_id: string): void {
           stopTypingLoop(chat_id)
           const retry = setTimeout(() => {
             typingRetryTimers.delete(chat_id)
-            startTypingLoop(chat_id)
+            startTypingLoop(chat_id, action)
           }, typingBackoffMs)
           typingRetryTimers.set(chat_id, retry)
         }
@@ -3048,12 +3070,29 @@ async function executeSendTyping(args: Record<string, unknown>): Promise<unknown
   if (!args.chat_id) throw new Error('send_typing: chat_id is required')
   const stChatId = args.chat_id as string
   assertAllowedChat(stChatId)
-  startTypingLoop(stChatId)
+  // #273: granular chat actions. Default 'typing' preserves the
+  // existing tool semantics; agents can opt in to upload_document,
+  // record_voice, etc. so the indicator the user sees matches what
+  // the agent is actually doing. Reject unsupported strings up front
+  // — a silent passthrough would surface as 400 BAD_REQUEST in
+  // sendChatAction, which is harder to diagnose.
+  const rawAction = args.action
+  let action: ChatAction = 'typing'
+  if (typeof rawAction === 'string' && rawAction.length > 0) {
+    if (!CHAT_ACTION_WHITELIST.has(rawAction as ChatAction)) {
+      throw new Error(
+        `send_typing: action="${rawAction}" is not in Telegram's chat-action whitelist. ` +
+        `Allowed: ${Array.from(CHAT_ACTION_WHITELIST).join(', ')}`,
+      )
+    }
+    action = rawAction as ChatAction
+  }
+  startTypingLoop(stChatId, action)
   setTimeout(() => stopTypingLoop(stChatId), 30000)
   for (const [key, ctrl] of activeStatusReactions.entries()) {
     if (key.startsWith(`${stChatId}:`)) ctrl.setTool()
   }
-  return { content: [{ type: 'text', text: 'typing indicator sent (auto-refreshes every 4s, stops after 30s or next reply)' }] }
+  return { content: [{ type: 'text', text: `${action} indicator sent (auto-refreshes every 4s, stops after 30s or next reply)` }] }
 }
 
 async function executePinMessage(args: Record<string, unknown>): Promise<unknown> {
