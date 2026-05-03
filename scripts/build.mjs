@@ -5,6 +5,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, chmodSync, mkdirSync, rmSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { escapeBundleNonAscii } from "./escape-bundle-non-ascii.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = resolve(root, "dist/cli");
@@ -101,6 +102,16 @@ if (src.startsWith("#!/usr/bin/env node")) {
   writeFileSync(outFile, src);
 }
 chmodSync(outFile, 0o755);
+
+// Bun parser bug workaround — see scripts/escape-bundle-non-ascii.mjs.
+// Without this, raw UTF-8 in string literals past ~172kB into the bundle
+// gets read as Latin-1 at runtime, producing double-UTF-8 mojibake in
+// stdout (agent-list "Uptime" column) and on-disk files (systemd unit
+// em-dash → `c3 a2 c2 80 c2 94`).
+const cliEscape = escapeBundleNonAscii(outFile);
+if (cliEscape.changed) {
+  console.log(`[build] ASCII-escaped ${cliEscape.nonAsciiCount} non-ASCII code units in dist/cli/switchroom.js`);
+}
 
 // Build the telegram-plugin self-contained dist (#634 strategic
 // packaging fix). The plugin's gateway / server / bridge entry points

@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, chmodSync, mkdirSync, rmSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { escapeBundleNonAscii } from "../../scripts/escape-bundle-non-ascii.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = resolve(root, "dist");
@@ -62,6 +63,16 @@ for (const { src, out, label } of entries) {
     writeFileSync(outPath, content);
   }
   chmodSync(outPath, 0o755);
+
+  // Bun parser bug workaround — see scripts/escape-bundle-non-ascii.mjs.
+  // Required for the gateway bundle: without it, the boot card's `✅`
+  // and the inline `·` separator in the ack-line template literal get
+  // double-UTF-8 encoded on the wire (#642 follow-up; mojibake reported
+  // as `â LawGPT back up Â· v0.6.3`).
+  const escResult = escapeBundleNonAscii(outPath);
+  if (escResult.changed) {
+    console.log(`[build] ASCII-escaped ${escResult.nonAsciiCount} non-ASCII code units in dist/${out}`);
+  }
 }
 
 console.log("[build] done");
