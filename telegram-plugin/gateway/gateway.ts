@@ -123,6 +123,10 @@ import {
   type AnyButton,
 } from '../telegram-button-constraints.js'
 import {
+  wrapAgentCallbacks,
+  parseAgentCallback,
+} from '../inline-keyboard-callbacks.js'
+import {
   startText as buildStartText,
   helpText as buildHelpText,
   statusPairedText as buildStatusPairedText,
@@ -2175,11 +2179,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     : chunk(effectiveText, limit, access.chunkMode ?? 'length')
   const sentIds: number[] = []
 
-  // #271 (URL-button half): validate and build reply_markup. Attached
-  // to the LAST chunk only so buttons appear on the final visible message.
-  // Mirrors the pattern in server.ts — see buttons-validator for the
-  // accepted shapes (URL buttons land here; callback_data buttons require
-  // separate IPC routing for callback_query that is not yet wired).
+  // #271: validate inline_keyboard and namespace any callback_data with
+  // the `agent:` prefix so the gateway's callback_query dispatcher can
+  // round-trip taps back to this agent without colliding with
+  // infrastructure prefixes (auth:/op:/vd:/vg:/aq:/perm:). URL buttons
+  // pass through unchanged. Attached to the LAST chunk only so buttons
+  // appear on the final visible message.
   let replyMarkup: { inline_keyboard: AnyButton[][] } | undefined
   const rawKeyboard = args.inline_keyboard as AnyButton[][] | undefined
   if (rawKeyboard != null) {
@@ -2190,7 +2195,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         .join('; ')
       throw new Error(`inline_keyboard validation failed: ${summary}`)
     }
-    replyMarkup = { inline_keyboard: rawKeyboard }
+    replyMarkup = { inline_keyboard: wrapAgentCallbacks(rawKeyboard) }
   }
 
   const replySKey = streamKey(chat_id, threadId)
@@ -2444,9 +2449,11 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // path has been retired along with the placeholder text it was
   // designed to overwrite cleanly.
 
-  // #271 (URL-button half): validate inline_keyboard for stream_reply.
-  // Only attached on done=true so buttons land on the final answer
-  // message, not on intermediate draft edits.
+  // #271: validate + namespace callback_data for stream_reply. Same
+  // wrapping as executeReply — URL buttons pass through, callback_data
+  // gets the `agent:` prefix so the dispatcher can route taps back to
+  // this agent. Only attached on done=true so buttons land on the
+  // final answer message, not on intermediate draft edits.
   let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
   const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
   if (rawStreamKeyboard != null && Boolean(args.done)) {
@@ -2457,7 +2464,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         .join('; ')
       throw new Error(`inline_keyboard validation failed: ${summary}`)
     }
-    streamReplyMarkup = { inline_keyboard: rawStreamKeyboard }
+    streamReplyMarkup = { inline_keyboard: wrapAgentCallbacks(rawStreamKeyboard) }
   }
 
   const result = await handleStreamReply(
@@ -7719,6 +7726,92 @@ bot.on('callback_query:data', async ctx => {
       }
     }
     await ctx.answerCallbackQuery({ text: '✅ ' + choice.slice(0, 60) }).catch(() => {})
+    return
+  }
+
+  // #271: agent-emitted inline_keyboard callbacks. Namespaced with
+  // an `agent:` prefix in inline-keyboard-callbacks.ts so they can
+  // round-trip without colliding with infrastructure prefixes above.
+  // Strip the prefix and forward the raw payload to the connected
+  // bridge as an InboundMessage with meta.button_callback_data set.
+  // The agent treats it like any other inbound channel event — same
+  // queue, same steer/queue classification rules.
+  const agentCb = parseAgentCallback(data)
+  if (agentCb != null) {
+    // Authorization gate — same allowlist as inbound text messages.
+    // Without this any random Telegram user who could see a button
+    // could trigger an action on the agent's behalf.
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    // Ack the spinner FIRST so the user doesn't see it stick if the
+    // forward path takes a moment.
+    await ctx.answerCallbackQuery().catch(() => {})
+    const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
+    const cbMessageId = ctx.callbackQuery.message?.message_id
+    const buttonText = (() => {
+      // Best-effort: pull the tapped button's label from the source
+      // message's keyboard so the agent gets a human-readable echo.
+      const msg = ctx.callbackQuery.message
+      const kb = (msg && 'reply_markup' in msg ? msg.reply_markup : undefined) as
+        | { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>> }
+        | undefined
+      if (!kb?.inline_keyboard) return undefined
+      for (const row of kb.inline_keyboard) {
+        for (const btn of row) {
+          if (btn.callback_data === data && typeof btn.text === 'string') return btn.text
+        }
+      }
+      return undefined
+    })()
+    const cbThreadId = (() => {
+      const msg = ctx.callbackQuery.message
+      if (msg && 'is_topic_message' in msg && msg.is_topic_message && 'message_thread_id' in msg) {
+        const tid = (msg as { message_thread_id?: number }).message_thread_id
+        return typeof tid === 'number' ? tid : undefined
+      }
+      return undefined
+    })()
+    const inboundText = buttonText
+      ? `[user tapped button: ${JSON.stringify(buttonText)} → ${agentCb.raw}]`
+      : `[user tapped button: ${agentCb.raw}]`
+    const inboundMsg: InboundMessage = {
+      type: 'inbound',
+      chatId: cbChatId,
+      ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+      messageId: cbMessageId ?? 0,
+      user: ctx.from.username ?? String(ctx.from.id),
+      userId: ctx.from.id,
+      ts: Math.floor(Date.now() / 1000),
+      text: inboundText,
+      meta: {
+        chat_id: cbChatId,
+        ...(cbMessageId != null ? { message_id: String(cbMessageId) } : {}),
+        user: ctx.from.username ?? String(ctx.from.id),
+        user_id: String(ctx.from.id),
+        ts: new Date().toISOString(),
+        ...(cbThreadId != null ? { message_thread_id: String(cbThreadId) } : {}),
+        button_callback: 'true',
+        button_callback_data: agentCb.raw,
+        ...(buttonText != null ? { button_text: buttonText } : {}),
+      },
+    }
+    process.stderr.write(
+      `telegram gateway: button_callback chatId=${cbChatId} user=${ctx.from.id} data=${JSON.stringify(agentCb.raw)} btnText=${JSON.stringify(buttonText ?? null)}\n`,
+    )
+    ipcServer.broadcast(inboundMsg)
+    if (ipcServer.clientCount() === 0) {
+      // No bridge connected — the agent's gone. Tell the user so they
+      // don't think the button silently swallowed their tap.
+      void bot.api.sendMessage(
+        cbChatId,
+        '⏳ Agent is restarting — your button tap was queued but won\'t be processed until it comes back.',
+        cbThreadId != null ? { message_thread_id: cbThreadId } : {},
+      ).catch(() => {})
+    }
     return
   }
 

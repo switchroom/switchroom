@@ -94,7 +94,7 @@ const TOOL_SCHEMAS = [
   {
     name: 'reply',
     description:
-      'Reply on Telegram. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents.',
+      'Reply on Telegram. Pass chat_id from the inbound message. By default the reply is a quote-reply to the latest inbound user message in this chat+thread — pass quote:false to opt out, or pass an explicit reply_to to thread under a specific earlier message. message_thread_id routes to a forum topic; files (absolute paths) attach images or documents. inline_keyboard adds tappable buttons (URL or callback) under the message — single-tap actions beat asking the user to type YES.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -108,6 +108,22 @@ const TOOL_SCHEMAS = [
         disable_web_page_preview: { type: 'boolean', description: 'Disable link preview thumbnails. Default: true.' },
         protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
         quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
+        inline_keyboard: {
+          type: 'array',
+          description: 'Optional 2D array of tappable buttons rendered under the message. Outer array = rows; inner array = buttons in each row (max 8 per row, 8 rows). Each button needs a `text` (label, max 64 chars) plus EXACTLY ONE of: `url` (opens link in browser; must start with http(s):// or tg://) or `callback_data` (string, max 58 chars; tap is delivered to this agent as an inbound channel event with meta.button_callback_data=<the data> and the original button_text). Use buttons for single-tap approval/triage flows like [Approve] [Hold]; one tap on mobile beats asking the user to type YES/NO.',
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                text: { type: 'string', description: 'Button label visible to the user. Max 64 chars.' },
+                url: { type: 'string', description: 'Open this URL when tapped. Mutually exclusive with callback_data.' },
+                callback_data: { type: 'string', description: 'Opaque tag delivered back to the agent on tap. Max 58 chars (gateway prepends an `agent:` prefix to the 64-byte Telegram limit). Mutually exclusive with url.' },
+              },
+              required: ['text'],
+            },
+          },
+        },
       },
       required: ['chat_id', 'text'],
     },
@@ -115,7 +131,7 @@ const TOOL_SCHEMAS = [
   {
     name: 'stream_reply',
     description:
-      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface).',
+      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface). inline_keyboard adds tappable buttons under the final message — see `reply` for shape and constraints.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -128,6 +144,22 @@ const TOOL_SCHEMAS = [
         quote: { type: 'boolean', description: 'Opt out of the default quote-reply behavior. Default: true. Ignored when reply_to is explicitly set.' },
         protect_content: { type: 'boolean', description: 'When true, Telegram prevents the message from being forwarded or saved.' },
         quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
+        inline_keyboard: {
+          type: 'array',
+          description: '2D array of tappable buttons under the final message. Same shape and constraints as `reply.inline_keyboard` — each button has `text` and EXACTLY ONE of `url` or `callback_data`. Tap on a callback_data button is delivered to this agent as an inbound channel event with meta.button_callback_data set.',
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                text: { type: 'string' },
+                url: { type: 'string' },
+                callback_data: { type: 'string' },
+              },
+              required: ['text'],
+            },
+          },
+        },
       },
       required: ['chat_id', 'text'],
     },
