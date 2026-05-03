@@ -37,6 +37,12 @@ export interface RetryCallOpts {
    */
   threadId?: number
   chat_id?: string
+  /**
+   * Optional caller-supplied label for the API call (e.g. "sendMessage",
+   * "editMessageText"). Currently informational only — accepted to allow
+   * call sites to self-document. Future: surface in retry logs / metrics.
+   */
+  verb?: string
 }
 
 export interface RetryObserver {

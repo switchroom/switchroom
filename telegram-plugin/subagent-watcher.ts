@@ -49,14 +49,20 @@ import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
 /**
  * Minimal DB interface needed by the watcher for Phase 3 liveness writes.
- * Typed as a structural duck-type so tests can pass an in-memory stub
- * without importing bun:sqlite directly.
+ * Structurally compatible with the wider `SqliteDatabase` shape used by
+ * `registry/subagents-schema.ts` so call sites can pass either without
+ * casting. Tests can implement just the subset they need (TypeScript's
+ * structural typing handles the rest).
  */
 export interface SubagentLivenessDb {
+  exec(sql: string): void
   prepare(sql: string): {
     run(...params: unknown[]): unknown
+    all(...params: unknown[]): unknown[]
     get(...params: unknown[]): unknown
   }
+  transaction(fn: (...args: unknown[]) => unknown): (...args: unknown[]) => unknown
+  close(): void
 }
 
 export type WorkerState = 'running' | 'done' | 'failed'

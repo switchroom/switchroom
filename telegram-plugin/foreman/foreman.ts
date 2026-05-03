@@ -278,9 +278,12 @@ bot.command('auth', async ctx => {
   let agentNames: string[]
 
   if (rawArgs) {
-    // User specified an agent name
-    const parsed = parseAuthSubCommand(rawArgs)
-    const agentArg = parsed.agent || rawArgs.split(/\s+/)[0]
+    // User specified an agent name. parseAuthSubCommand needs the
+    // arguments split into parts and a fallback agent name. The 'status'
+    // intent kind has no `agent` field — narrow before reading it.
+    const parts = rawArgs.split(/\s+/)
+    const parsed = parseAuthSubCommand(parts, parts[0] ?? '')
+    const agentArg = ('agent' in parsed ? parsed.agent : undefined) || parts[0] || ''
     try { assertSafeAgentName(agentArg) } catch {
       await switchroomReply(ctx, 'Invalid agent name.', { html: true })
       return

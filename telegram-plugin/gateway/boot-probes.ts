@@ -714,7 +714,11 @@ export async function probeCronTimers(
     } catch (err: unknown) {
       // systemctl exits non-zero when no units match
       const msg = (err as NodeJS.ErrnoException)?.message ?? String(err)
-      if (msg.includes('No timers found') || (err as NodeJS.ErrnoException)?.code === 1) {
+      // child_process exec errors have `code` typed as string in
+      // NodeJS.ErrnoException, but at runtime it's numeric for shell
+      // exit codes. Stringify to avoid the type-system mismatch and
+      // the comparison "looks unintentional" warning.
+      if (msg.includes('No timers found') || String((err as NodeJS.ErrnoException)?.code) === '1') {
         return { status: 'ok', label: 'Crons', detail: '0 timers' }
       }
       return { status: 'fail', label: 'Crons', detail: `systemctl failed: ${msg}` }

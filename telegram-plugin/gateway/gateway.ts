@@ -1306,6 +1306,7 @@ function summariseMarkerPayload(payload: string | null): string {
 function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean {
   try {
     const agentDir = resolveAgentDirFromEnv()
+    if (!agentDir) return false // No state dir → no persisted lockout to check.
     const persisted = loadLockout(agentDir, lockoutOps)
     if (!persisted.lastTransitionedFrom) return false
     return now - persisted.lastTransitionAt < DEFAULT_FALLBACK_COOLDOWN_MS
@@ -1565,10 +1566,13 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)\n`,
   )
   for (const chat_id of access.allowFrom) {
-    void bot.api.sendMessage(chat_id, renderedText, {
-      parse_mode: 'HTML',
+    // grammy's Other<...> opts type is generated and stricter than our
+    // call shape; runtime accepts both. Cast through unknown.
+    const opts = {
+      parse_mode: 'HTML' as const,
       ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
-    }).catch(e => {
+    }
+    void bot.api.sendMessage(chat_id, renderedText, opts as never).catch(e => {
       process.stderr.write(
         `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
       )
@@ -2323,7 +2327,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 
       try {
         const sent = await robustApiCall(
-          () => lockedBot.api.sendMessage(chat_id, chunks[i], sendOpts),
+          () => lockedBot.api.sendMessage(chat_id, chunks[i], sendOpts as never),
           { threadId, chat_id },
         )
         sentIds.push(sent.message_id)
@@ -2333,7 +2337,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           threadId = undefined
           const retryOpts = { ...sendOpts }
           delete (retryOpts as any).message_thread_id
-          const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts)
+          const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts as never)
           sentIds.push(sent.message_id)
         } else {
           throw err
@@ -2518,7 +2522,11 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     },
     { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
     {
-      bot: lockedBot,
+      // grammy's Bot<Context, Api<RawApi>> has a wider api shape than the
+      // local StreamBotApi interface, but is structurally compatible at
+      // runtime (StreamBotApi is a subset). Cast through unknown to
+      // bypass the structural-typing strictness.
+      bot: lockedBot as unknown as { api: import('../stream-controller.js').StreamBotApi },
       retry: robustApiCall,
       markdownToHtml,
       escapeMarkdownV2,
@@ -2697,7 +2705,7 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   }
 
   const sent = await robustApiCall(
-    () => lockedBot.api.sendMessage(chat_id, effectiveText, sendOpts),
+    () => lockedBot.api.sendMessage(chat_id, effectiveText, sendOpts as never),
     { verb: 'sendMessage', chat_id, threadId },
   )
 
@@ -3892,7 +3900,9 @@ function handlePtyPartial(text: string): void {
     lastPtyPreviewByChat,
   }
   handlePtyPartialPure(text, state, {
-    bot,
+    // grammy's Bot has a wider api shape than the local StreamBotApi
+    // interface; runtime-compatible. Cast through never.
+    bot: bot as never,
     retry: robustApiCall,
     renderText: markdownToHtml,
     logEvent: logStreamingEvent,
@@ -3927,7 +3937,8 @@ function handlePtyActivity(text: string): void {
     },
     { activeDraftStreams, activeDraftParseModes },
     {
-      bot,
+      // See StreamBotApi cast comment above (line ~2522 area).
+      bot: bot as never,
       retry: robustApiCall,
       markdownToHtml,
       escapeMarkdownV2,
@@ -4324,7 +4335,7 @@ async function handleInbound(
       // Single-use code so a third party can't replay it after exchange,
       // but plaintext OAuth tokens in chat history are still poor
       // hygiene. The helper handles delete + 🔑 reaction silently.
-      redactAuthCodeMessage(bot.api, chat_id, msgId, line => process.stderr.write(line))
+      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
     pendingReauthFlows.delete(chat_id)
@@ -4391,7 +4402,7 @@ async function handleInbound(
       } else if (pendingVault.kind === 'grant-wizard') {
         // Text received mid-wizard but not awaiting custom duration — ignore and re-set
         pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-      } else {
+      } else if (pendingVault.kind === 'value') {
         let value = text
         const codeBlockMatch = /^```[\w]*\n?([\s\S]*?)```$/m.exec(text)
         if (codeBlockMatch) value = codeBlockMatch[1]!
@@ -4643,12 +4654,9 @@ async function handleInbound(
         // #203: time-to-ack metric — measure gateway-receive → ack-post delta.
         logStreamingEvent({ kind: 'inbound_ack', chatId: chat_id, messageId: msgId, ackDelayMs: Date.now() - inboundReceivedAt })
       } else {
-        // Fresh turn (no prior turn in flight): cancel any stale controller
-        // and start a new one for this message.
-        if (priorActive) {
-          priorActive.cancel()
-          purgeReactionTracking(key)
-        }
+        // Fresh turn — priorTurnInFlight is false, so priorActive is
+        // provably undefined. Earlier `if (priorActive)` block was dead
+        // code (mirrors first-paint.ts cleanup).
         const sKey = streamKey(chat_id, messageThreadId)
         const priorStream = activeDraftStreams.get(sKey)
         if (priorStream && !priorStream.isFinal()) {
@@ -5848,7 +5856,7 @@ function flushAgentHandoff(agentDir: string): number {
 
 async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
   if (!isAuthorizedSender(ctx)) return
-  const name = (ctx.match ?? '').trim() || getMyAgentName()
+  const name = (typeof ctx.match === "string" ? ctx.match : "").trim() || getMyAgentName()
   try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
   // N1: `all` passes isSelfTargetingCommand (for /restart), but /new and
   // /reset semantically require flushing each agent's handoff before
@@ -5956,7 +5964,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
     await switchroomReply(ctx, 'Not authorized to answer permission prompts.')
     return
   }
-  const raw = (ctx.match ?? '').trim()
+  const raw = (typeof ctx.match === "string" ? ctx.match : "").trim()
   let request_id = raw
   if (!request_id) {
     // Default to most-recently created pending permission. Map preserves
@@ -6080,6 +6088,7 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
     const ownerChatId = loadAccess().allowFrom[0]
     if (!ownerChatId) return
     const agentDir = resolveAgentDirFromEnv()
+    if (!agentDir) return // No TELEGRAM_STATE_DIR — banner has no slot context.
     const agentName = getMyAgentName()
     const slot = currentActiveSlot(agentDir)
     pinnedBannerState = await refreshBanner({
@@ -6110,6 +6119,9 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
   // a slot rotation: `journalctl -u switchroom-<agent>-gateway -g autofallback`.
   try {
     const agentDir = resolveAgentDirFromEnv()
+    if (!agentDir) {
+      return { kind: 'no-action', reason: 'no agent dir', decision: 'noop' }
+    }
     const agentName = getMyAgentName()
     seedAutoFallbackLockoutIfNeeded(agentDir)
     const active = currentActiveSlot(agentDir)
@@ -6197,6 +6209,7 @@ async function runAutoFallbackCheck(opts: { trigger: 'scheduled' | 'manual' }): 
  */
 async function runCreditWatch(): Promise<void> {
   const agentDir = resolveAgentDirFromEnv()
+  if (!agentDir) return // No TELEGRAM_STATE_DIR — no agent context to watch.
   const agentName = getMyAgentName()
   const claudeConfigDir = join(agentDir, '.claude')
   const stateDir = STATE_DIR
@@ -6284,7 +6297,7 @@ bot.command('auth', async ctx => {
     }
     pendingReauthFlows.delete(String(ctx.chat!.id))
     // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api, String(ctx.chat!.id), ctx.message?.message_id ?? null, line => process.stderr.write(line))
+    redactAuthCodeMessage(bot.api as never, String(ctx.chat!.id), ctx.message?.message_id ?? null, line => process.stderr.write(line))
     return
   }
   if (intent.kind === 'cancel') {
@@ -6412,8 +6425,9 @@ bot.command('auth', async ctx => {
   // intent.kind === 'status' — render the inline-keyboard dashboard.
   // For the dashboard we're the bot-bound agent: we don't list every
   // agent in the switchroom config; we show THIS bot's agent with its
-  // slots and actions.
-  await sendAuthDashboard(ctx, intent.agent ?? currentAgent)
+  // slots and actions. The 'status' branch of AuthIntent has no
+  // `agent` field; use currentAgent as the dashboard target.
+  await sendAuthDashboard(ctx, currentAgent)
 })
 
 /**
@@ -6659,7 +6673,7 @@ async function handleVaultDeferCallback(ctx: Context, data: string): Promise<voi
   }
 
   const cardChatId = String(ctx.chat?.id ?? '')
-  const cardMessageId = ctx.callbackQuery.message?.message_id
+  const cardMessageId = ctx.callbackQuery?.message?.message_id
 
   if (action === 'cancel') {
     deferredSecrets.delete(deferKey)
@@ -6786,7 +6800,7 @@ async function startGrantWizardStep1(ctx: Context, chatId: string): Promise<void
   }
   const kb = buildGrantAgentKeyboard(agents)
   const sent = await switchroomReply(ctx, '<b>Grant capability token — Step 1/3</b>\n\nWhich agent?', { html: true, reply_markup: kb })
-  const wizardMsgId = (sent as { message_id?: number })?.message_id
+  const wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
   pendingVaultOps.set(chatId, {
     kind: 'grant-wizard',
     step: 'agent',
@@ -6815,7 +6829,7 @@ async function grantWizardStep2(ctx: Context, chatId: string, agent: string, wiz
     await ctx.api.editMessageText(chatId, wizardMsgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
-    wizardMsgId = (sent as { message_id?: number })?.message_id
+    wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
   }
   pendingVaultOps.set(chatId, {
     kind: 'grant-wizard',
@@ -6838,7 +6852,7 @@ async function grantWizardStep3(ctx: Context, chatId: string, state: Extract<Pen
     await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
-    state.wizardMsgId = (sent as { message_id?: number })?.message_id
+    state.wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
   }
   pendingVaultOps.set(chatId, { ...state, step: 'duration' })
 }
@@ -6862,7 +6876,7 @@ async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<P
     await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
-    state.wizardMsgId = (sent as { message_id?: number })?.message_id
+    state.wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
   }
   pendingVaultOps.set(chatId, { ...state, step: 'confirm', expiresLabel })
 }
@@ -6962,7 +6976,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
       reply_markup: confirmKeyboard,
     }).catch(async () => {
       const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
-      const threadId = ctx.callbackQuery.message?.message_thread_id
+      const threadId = ctx.callbackQuery?.message?.message_thread_id
       if (chatId) {
         await bot.api.sendMessage(chatId, cardText, {
           parse_mode: 'HTML',
@@ -7018,7 +7032,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
   // Cancel at any wizard step
   if (data === 'vg:cancel') {
     pendingVaultOps.delete(chatId)
-    const msg = ctx.callbackQuery.message
+    const msg = ctx.callbackQuery?.message
     if (msg && 'text' in msg) {
       await ctx.editMessageText('❌ Grant wizard cancelled.').catch(() => {})
     }
@@ -7036,7 +7050,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
   // vg:agent:<name> — step 1 selection
   if (data.startsWith('vg:agent:')) {
     const agent = data.slice('vg:agent:'.length)
-    const msgId = (ctx.callbackQuery.message as { message_id?: number })?.message_id ?? state.wizardMsgId
+    const msgId = (ctx.callbackQuery?.message as { message_id?: number })?.message_id ?? state.wizardMsgId
     await grantWizardStep2(ctx, chatId, agent, msgId)
     await ackSilently()
     return
@@ -7081,7 +7095,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     if (dur === 'custom') {
       // Ask for text reply with n d|h format
       pendingVaultOps.set(chatId, { ...state, awaitingCustomDuration: true })
-      const msg = ctx.callbackQuery.message
+      const msg = ctx.callbackQuery?.message
       if (msg && 'text' in msg && msg.text) {
         await ctx.editMessageText(
           msg.text + '\n\n<i>Send a duration like <code>30d</code> or <code>12h</code>:</i>',
@@ -7423,6 +7437,10 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
     case 'usage': {
       await ctx.answerCallbackQuery({ text: 'Fetching quota…' }).catch(() => {})
       const agentDir = resolveAgentDirFromEnv()
+      if (!agentDir) {
+        await switchroomReply(ctx, 'Quota lookup unavailable: no agent directory.')
+        return
+      }
       try {
         const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
         if (!quota.ok) {
@@ -7538,7 +7556,7 @@ bot.command('reauth', async ctx => {
     }
     pendingReauthFlows.delete(chatId)
     // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api, chatId, ctx.message?.message_id ?? null, line => process.stderr.write(line))
+    redactAuthCodeMessage(bot.api as never, chatId, ctx.message?.message_id ?? null, line => process.stderr.write(line))
     return
   }
   // raw is treated as an agent name
@@ -7550,7 +7568,7 @@ bot.command('reauth', async ctx => {
 bot.command('vault', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const chatId = String(ctx.chat!.id)
-  const args = (ctx.match ?? '').trim().split(/\s+/).filter(Boolean)
+  const args = (typeof ctx.match === "string" ? ctx.match : "").trim().split(/\s+/).filter(Boolean)
   const sub = args[0]?.toLowerCase()
   const key = args[1]
   if (!sub || sub === 'help') {
@@ -7710,7 +7728,7 @@ bot.command('memory', async ctx => {
 
 bot.command('issues', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const arg = (ctx.match ?? '').trim()
+  const arg = (typeof ctx.match === "string" ? ctx.match : "").trim()
   // /issues resolve <fp> | /issues clear | /issues — these subcommands
   // shell out to the issues CLI verb (#426). The verb itself enforces
   // the dedup / fingerprint logic; we just relay output.
@@ -7837,7 +7855,7 @@ bot.command('dangerous', async ctx => {
 
 bot.command('permissions', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const agentName = (ctx.match ?? '').trim() || getMyAgentName()
+  const agentName = (typeof ctx.match === "string" ? ctx.match : "").trim() || getMyAgentName()
   try { assertSafeAgentName(agentName) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
   await runSwitchroomCommand(ctx, ['agent', 'permissions', agentName], `permissions ${agentName}`)
 })
@@ -7964,7 +7982,7 @@ bot.on('callback_query:data', async ctx => {
     // Edit the question in place to remove the buttons + show the
     // chosen option as a checkmarked line. Makes the chat surface
     // self-documenting — no orphaned-buttons graveyard.
-    const sourceMsg = ctx.callbackQuery.message
+    const sourceMsg = ctx.callbackQuery?.message
     if (sourceMsg && 'text' in sourceMsg && sourceMsg.text != null) {
       try {
         await ctx.editMessageText(`${sourceMsg.text}\n\n✅ <b>${escapeHtmlForTg(choice)}</b>`, {
@@ -8000,11 +8018,11 @@ bot.on('callback_query:data', async ctx => {
     // forward path takes a moment.
     await ctx.answerCallbackQuery().catch(() => {})
     const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
-    const cbMessageId = ctx.callbackQuery.message?.message_id
+    const cbMessageId = ctx.callbackQuery?.message?.message_id
     const buttonText = (() => {
       // Best-effort: pull the tapped button's label from the source
       // message's keyboard so the agent gets a human-readable echo.
-      const msg = ctx.callbackQuery.message
+      const msg = ctx.callbackQuery?.message
       const kb = (msg && 'reply_markup' in msg ? msg.reply_markup : undefined) as
         | { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>> }
         | undefined
@@ -8017,7 +8035,7 @@ bot.on('callback_query:data', async ctx => {
       return undefined
     })()
     const cbThreadId = (() => {
-      const msg = ctx.callbackQuery.message
+      const msg = ctx.callbackQuery?.message
       if (msg && 'is_topic_message' in msg && msg.is_topic_message && 'message_thread_id' in msg) {
         const tid = (msg as { message_thread_id?: number }).message_thread_id
         return typeof tid === 'number' ? tid : undefined
@@ -8094,7 +8112,7 @@ bot.on('callback_query:data', async ctx => {
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
-  const msg = ctx.callbackQuery.message
+  const msg = ctx.callbackQuery?.message
   if (msg && 'text' in msg && msg.text) {
     await ctx.editMessageText(`${msg.text}\n\n${label}`).catch(() => {})
   }
@@ -8848,7 +8866,8 @@ if (streamMode === 'checklist') {
       const draftFlagOn = process.env.PROGRESS_CARD_DRAFT_TRANSPORT === '1'
       const draftEligible = draftFlagOn && isDmChatId(chatId) && threadId == null
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
-        bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
+        // grammy Bot vs local StreamBotApi — see cast pattern above.
+        bot: lockedBot as never, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
         takeHandoffPrefix: () => '', assertAllowedChat, resolveThreadId, disableLinkPreview: true,
         defaultFormat: 'html', logStreamingEvent, endStatusReaction,
         historyEnabled: false, recordOutbound: () => {},
@@ -9145,6 +9164,33 @@ void (async () => {
       if (!didOneTimeSetup) {
         didOneTimeSetup = true
         void registerSwitchroomBotCommands().catch(() => {})
+
+        // #613 fix: pre-warm the chatAvailableReactions cache for every
+        // chat in access.allowFrom. Without this, the FIRST inbound
+        // message to a restricted-reactions supergroup after a gateway
+        // restart still hits the original #542 bug (controller created
+        // with `null` filter → intermediate emojis 400 → only 👍 lands).
+        // The lazy-probe path (gateway.ts:~4681) populates the cache
+        // for subsequent messages but can't help the first one.
+        //
+        // Fire-and-forget per chat. Failures (rate limit, no permission,
+        // network) leave the cache unset so the lazy path retries on
+        // first message — preserves today's behaviour as a safety net.
+        try {
+          const accessAtBoot = loadAccess()
+          for (const chatId of accessAtBoot.allowFrom) {
+            probeAvailableReactions(chatId)
+          }
+          if (accessAtBoot.allowFrom.length > 0) {
+            process.stderr.write(
+              `telegram gateway: probed available_reactions for ${accessAtBoot.allowFrom.length} configured chat(s)\n`,
+            )
+          }
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: boot-probe of available_reactions failed (continuing): ${(err as Error).message}\n`,
+          )
+        }
 
         // #412 boot-cleanup: clear any pre-existing turn-active marker.
         // By definition no turn can be in flight when the gateway just

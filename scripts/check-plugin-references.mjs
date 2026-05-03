@@ -66,6 +66,10 @@ const tmpConfigBody = {
     'dist',
     'telegram-plugin/tests/**/*',
     'telegram-plugin/dist/**/*',
+    // Plugin tests also live as `*.test.ts` co-located in non-tests
+    // dirs (e.g. gateway/access-validator.test.ts). Same type-debt
+    // exclusion rationale as telegram-plugin/tests/.
+    'telegram-plugin/**/*.test.ts',
   ],
 }
 
@@ -85,24 +89,38 @@ try {
 }
 
 const lines = out.split('\n')
-const dangerous = lines.filter((l) =>
-  DANGEROUS_CODES.some((code) => l.includes(`error ${code}`))
-)
+const allErrors = lines.filter((l) => l.includes('error TS'))
 
-if (dangerous.length > 0) {
-  console.error('plugin-references: found dangerous-class type errors:\n')
-  for (const line of dangerous) console.error('  ' + line)
-  console.error(
-    `\nThese errors mean a reference, invocation, or property is wrong — ` +
-    `the kind of bug that ships to production undetected because tsc doesn't ` +
-    `cover telegram-plugin/. See scripts/check-plugin-references.mjs for context.`
+// As of #623, all 52 pre-existing type-debt errors in plugin source
+// have been cleaned up. The check now fails on ANY tsc error — not
+// just the four "dangerous-class" codes that were originally filtered.
+// If you hit a new error here, fix it (don't broaden the filter
+// again). DANGEROUS_CODES kept for backwards-compat / diagnostic
+// labelling.
+if (allErrors.length > 0) {
+  const dangerous = allErrors.filter((l) =>
+    DANGEROUS_CODES.some((code) => l.includes(`error ${code}`))
   )
+  if (dangerous.length > 0) {
+    console.error('plugin-references: found dangerous-class type errors:\n')
+    for (const line of dangerous) console.error('  ' + line)
+    console.error(
+      `\nThese errors mean a reference, invocation, or property is wrong — ` +
+      `the kind of bug that ships to production undetected because tsc doesn't ` +
+      `cover telegram-plugin/. See scripts/check-plugin-references.mjs for context.\n`
+    )
+  }
+  const other = allErrors.filter((l) => !dangerous.includes(l))
+  if (other.length > 0) {
+    console.error('plugin-references: tsc errors in plugin source:\n')
+    for (const line of other) console.error('  ' + line)
+    console.error(
+      `\nThe lint check now enforces a fully clean tsc over plugin source ` +
+      `(see #623). Fix the error rather than re-introducing a filter.`
+    )
+  }
   process.exit(1)
 }
 
-const totalErrors = lines.filter((l) => l.includes('error TS')).length
-console.log(
-  `plugin-references: clean (no TS2304/TS2552/TS2722/TS2561 errors in plugin source). ` +
-  `${totalErrors} other type-debt errors ignored — tracked separately.`
-)
+console.log('plugin-references: clean (no tsc errors in plugin source — strict since #623).')
 process.exit(0)

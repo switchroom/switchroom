@@ -170,11 +170,9 @@ export async function firstPaintTurn(
           ackDelayMs: now() - inboundReceivedAt,
         })
       } else {
-        // Fresh turn
-        if (priorActive) {
-          priorActive.cancel()
-          deps.purgeReactionTracking(key)
-        }
+        // Fresh turn — `priorTurnInFlight` is false here, so `priorActive`
+        // is provably undefined (priorTurnInFlight = priorActive != null).
+        // The earlier `if (priorActive)` block was dead code; removed.
         const sKey = deps.streamKey(chatId, messageThreadId)
         const priorStream = deps.activeDraftStreams.get(sKey)
         if (priorStream && !priorStream.isFinal()) {

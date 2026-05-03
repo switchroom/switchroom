@@ -1814,8 +1814,10 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
       // Fire immediately on terminal state — no coalesce delay when the
       // turn finishes. The user sees the final card the instant turn_end
-      // lands.
-      if (event.kind === 'turn_end' || event.kind === 'enqueue' || stageChanged) {
+      // lands. (Note: `enqueue` events are handled upstream by startTurn,
+      // not ingested here, so the prior `event.kind === 'enqueue'` check
+      // was dead code per the SessionEvent union.)
+      if (event.kind === 'turn_end' || stageChanged) {
         if (event.kind === 'turn_end') {
           process.stderr.write(`telegram gateway: progress-card: turn_end flush chatId=${chatState.chatId} threadId=${chatState.threadId ?? '-'} turnKey=${chatState.turnKey}\n`)
           // Only fire silent-end prep when we're actually about to complete —

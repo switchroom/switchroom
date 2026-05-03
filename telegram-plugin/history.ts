@@ -277,8 +277,10 @@ export function recordOutbound(args: RecordOutboundArgs): void {
     VALUES (?, ?, ?, 'assistant', NULL, NULL, ?, ?, ?, ?)
   `)
   // bun:sqlite has a transaction() helper. Cheap insurance against partial
-  // writes if the process dies mid-loop.
-  const tx = requireDb().transaction((rows: Array<[number, string, string | null]>) => {
+  // writes if the process dies mid-loop. The transaction signature is
+  // typed as variadic-unknown for genericity; cast the typed callback
+  // through the wider shape.
+  const tx = requireDb().transaction(((rows: Array<[number, string, string | null]>) => {
     for (const [msgId, text, attachKind] of rows) {
       stmt.run(
         args.chat_id,
@@ -290,7 +292,7 @@ export function recordOutbound(args: RecordOutboundArgs): void {
         groupId,
       )
     }
-  })
+  }) as (...args: unknown[]) => unknown)
   const rows: Array<[number, string, string | null]> = args.message_ids.map((id, i) => [
     id,
     args.texts[i] ?? '',

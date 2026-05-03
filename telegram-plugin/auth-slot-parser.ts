@@ -152,7 +152,11 @@ export function parseAuthSubCommand(
     const rest = parts.slice(1);
     const { flags, positional } = splitFlags(rest, ['--slot']);
     const agent = positional[0] ?? currentAgent;
-    const slot = flags['--slot'];
+    // splitFlags returns `string | true | undefined` for value flags
+    // (true when the flag is present without a value). For `--slot` we
+    // expect a string value; reject the bare-flag form.
+    const rawSlot = flags['--slot'];
+    const slot = typeof rawSlot === 'string' ? rawSlot : undefined;
     try { assertSafeAgentNameForParser(agent); }
     catch { return { kind: 'error', message: 'Invalid agent name.' }; }
     if (slot !== undefined) {

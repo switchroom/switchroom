@@ -649,7 +649,10 @@ async function main(): Promise<void> {
   // will keep retrying in the background.
   ipc = await createIpcClient({
     socketPath: SOCKET_PATH,
-    agentName: AGENT_NAME,
+    // Non-null asserted: the early process.exit at module top guards
+    // this — TS can't narrow across the exit (returns `never` but the
+    // compiler doesn't know).
+    agentName: AGENT_NAME!,
     topicId: TOPIC_ID,
     onInbound,
     onPermission,
