@@ -791,6 +791,26 @@ export const AgentSchema = z.object({
       "email/account cannot be read locally; the user declares it here. Appears in the Auth " +
       "row as '✓ max · <label> · expires ...'."
     ),
+  auth: z
+    .object({
+      accounts: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Ordered list of Anthropic account labels (from `~/.switchroom/accounts/`) " +
+          "this agent can use. The first non-quota-exhausted account is the active one; " +
+          "subsequent entries are auto-fallback targets. switchroom-auth-broker keeps " +
+          "`<agentDir>/.claude/credentials.json` in sync with the active account on " +
+          "every refresh and on every quota event. When unset, the agent falls back to " +
+          "a single 'default' account; if no `default` account exists, the boot self-test " +
+          "surfaces a one-line nudge to run `switchroom auth account add`.",
+        ),
+    })
+    .optional()
+    .describe(
+      "Account routing for switchroom-auth-broker. See " +
+      "reference/share-auth-across-the-fleet.md for the unit-of-authentication model.",
+    ),
   topic_name: z.string().describe("Telegram forum topic display name"),
   topic_emoji: z
     .string()
