@@ -311,3 +311,274 @@ describe("escapeHtml", () => {
     expect(escapeHtml('<foo bar="baz">&')).toBe("&lt;foo bar=&quot;baz&quot;&gt;&amp;");
   });
 });
+
+// ─── Account-level dashboard ──────────────────────────────────────────
+
+import {
+  buildAccountConfirmKeyboard,
+  ACCOUNTS_DISPLAY_CAP,
+  CALLBACK_BUDGET_BYTES,
+  isSafeAccountLabel,
+  type AccountSummary,
+  type AccountHealth,
+} from "../auth-dashboard";
+
+function mkAccount(overrides: Partial<AccountSummary> = {}): AccountSummary {
+  return {
+    label: "default",
+    health: "healthy",
+    enabledHere: false,
+    ...overrides,
+  };
+}
+
+function mkState(overrides: Partial<DashboardState> = {}): DashboardState {
+  return {
+    agent: "clerk",
+    bankId: "clerk",
+    plan: "max",
+    rateLimitTier: null,
+    slots: [mkSlot({ active: true, health: "active" })],
+    quotaHot: false,
+    generatedAt: "2026-05-03T12:00:00Z",
+    pendingSessionSlot: null,
+    ...overrides,
+  };
+}
+
+describe("isSafeAccountLabel", () => {
+  it("accepts the CLI-validated regex including '.' for labels like acme.team", () => {
+    expect(isSafeAccountLabel("default")).toBe(true);
+    expect(isSafeAccountLabel("acme.team")).toBe(true);
+    expect(isSafeAccountLabel("ken_personal")).toBe(true);
+    expect(isSafeAccountLabel("co-2024")).toBe(true);
+    expect(isSafeAccountLabel("a")).toBe(true);
+    expect(isSafeAccountLabel("a".repeat(64))).toBe(true);
+  });
+
+  it("rejects empty, oversized, and dangerous characters", () => {
+    expect(isSafeAccountLabel("")).toBe(false);
+    expect(isSafeAccountLabel("a".repeat(65))).toBe(false);
+    expect(isSafeAccountLabel("with space")).toBe(false);
+    expect(isSafeAccountLabel("a/b")).toBe(false);
+    expect(isSafeAccountLabel("a:b")).toBe(false); // colon would corrupt callback parsing
+    expect(isSafeAccountLabel("a;rm -rf")).toBe(false);
+    expect(isSafeAccountLabel("../escape")).toBe(false);
+  });
+});
+
+describe("encodeCallbackData / parseCallbackData — account verbs", () => {
+  it("account-enable round-trips with a simple label", () => {
+    const action = { kind: "account-enable" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:ae:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("account-disable round-trips", () => {
+    const action = { kind: "account-disable" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:ad:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("confirm-account-enable round-trips", () => {
+    const action = { kind: "confirm-account-enable" as const, agent: "klanker", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:cae:klanker:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("confirm-account-disable round-trips", () => {
+    const action = { kind: "confirm-account-disable" as const, agent: "klanker", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:cad:klanker:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("share-fleet round-trips (no label segment)", () => {
+    const action = { kind: "share-fleet" as const, agent: "clerk" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:sf:clerk");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("preserves labels with '.' through the round-trip (acme.team)", () => {
+    const action = { kind: "account-enable" as const, agent: "clerk", label: "acme.team" };
+    const encoded = encodeCallbackData(action);
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("rejects malformed account labels (parses to noop)", () => {
+    expect(parseCallbackData("auth:ae:clerk:bad label")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:ae:clerk:..")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:ae:clerk:")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:ae:clerk")).toEqual({ kind: "noop" }); // missing label segment
+  });
+
+  it("rejects malformed agent in account verbs", () => {
+    expect(parseCallbackData("auth:ae:bad agent:work")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:ae::work")).toEqual({ kind: "noop" });
+  });
+
+  it("rejects payloads beyond the 64-byte cap as noop", () => {
+    const oversize = "auth:ae:" + "a".repeat(80) + ":" + "b".repeat(80);
+    expect(parseCallbackData(oversize)).toEqual({ kind: "noop" });
+  });
+});
+
+describe("buildDashboardKeyboard — accounts section", () => {
+  function rows(state: DashboardState): Array<Array<{ text: string; callback_data?: string }>> {
+    return buildDashboardKeyboard(state).inline_keyboard as unknown as Array<
+      Array<{ text: string; callback_data?: string }>
+    >;
+  }
+
+  function flatTexts(state: DashboardState): string[] {
+    return rows(state).flat().map((b) => b.text);
+  }
+
+  it("renders nothing when accounts is undefined (degraded fallback)", () => {
+    const state = mkState({ accounts: undefined });
+    const texts = flatTexts(state);
+    expect(texts.find((t) => t.startsWith("✓") || t.startsWith("○"))).toBeUndefined();
+    expect(texts).not.toContain("🌐 Share to fleet");
+  });
+
+  it("renders the bootstrap button when accounts is empty AND canBootstrapShare is true", () => {
+    const state = mkState({ accounts: [], canBootstrapShare: true });
+    const texts = flatTexts(state);
+    expect(texts).toContain("🌐 Share to fleet");
+  });
+
+  it("hides the bootstrap button when canBootstrapShare is false", () => {
+    const state = mkState({ accounts: [], canBootstrapShare: false });
+    const texts = flatTexts(state);
+    expect(texts).not.toContain("🌐 Share to fleet");
+  });
+
+  it("renders ✓ for an account enabled here, with a disable callback", () => {
+    const state = mkState({
+      accounts: [mkAccount({ label: "work", enabledHere: true })],
+    });
+    const allButtons = rows(state).flat();
+    const acctBtn = allButtons.find((b) => b.text.includes("work"));
+    expect(acctBtn?.text).toBe("✓ work");
+    expect(acctBtn?.callback_data).toBe("auth:ad:clerk:work");
+  });
+
+  it("renders ○ for an account NOT enabled here, with an enable callback", () => {
+    const state = mkState({
+      accounts: [mkAccount({ label: "work", enabledHere: false })],
+    });
+    const allButtons = rows(state).flat();
+    const acctBtn = allButtons.find((b) => b.text.includes("work"));
+    expect(acctBtn?.text).toBe("○ work");
+    expect(acctBtn?.callback_data).toBe("auth:ae:clerk:work");
+  });
+
+  it("appends a health suffix for non-healthy accounts", () => {
+    const state = mkState({
+      accounts: [
+        mkAccount({ label: "expired-acct", health: "expired", enabledHere: true }),
+        mkAccount({ label: "quota-acct", health: "quota-exhausted", enabledHere: false }),
+      ],
+    });
+    const texts = flatTexts(state);
+    expect(texts.some((t) => t.startsWith("✓ expired-acct ⌛"))).toBe(true);
+    expect(texts.some((t) => t.startsWith("○ quota-acct ⚠️"))).toBe(true);
+  });
+
+  it("caps visible accounts at ACCOUNTS_DISPLAY_CAP and adds a truncated noop row", () => {
+    const tooMany: AccountSummary[] = [];
+    for (let i = 0; i < ACCOUNTS_DISPLAY_CAP + 2; i++) {
+      tooMany.push(mkAccount({ label: `acct-${i}`, enabledHere: false }));
+    }
+    const state = mkState({ accounts: tooMany, accountsTruncated: true });
+    const allButtons = rows(state).flat();
+    const acctBtns = allButtons.filter((b) => /^[✓○]/.test(b.text));
+    expect(acctBtns).toHaveLength(ACCOUNTS_DISPLAY_CAP);
+    expect(allButtons.find((b) => b.text.startsWith("…"))?.callback_data).toBe(
+      "auth:noop",
+    );
+  });
+
+  it("hides the bootstrap button once accounts exist (per-account toggles take over)", () => {
+    const state = mkState({
+      accounts: [mkAccount({ label: "work", enabledHere: false })],
+      canBootstrapShare: true,
+    });
+    const texts = flatTexts(state);
+    expect(texts).not.toContain("🌐 Share to fleet");
+  });
+
+  it("falls back to a noop button when the synthesised callback exceeds the 64-byte cap", () => {
+    // Pathological: 60-char label + 40-char agent → "auth:ad:" (8) +
+    // 40 + ":" + 60 = 109 bytes, well over the 64-byte cap.
+    const longLabel = "a".repeat(60);
+    const state = mkState({
+      agent: "x".repeat(40),
+      accounts: [mkAccount({ label: longLabel, enabledHere: true })],
+    });
+    const allButtons = rows(state).flat();
+    const noopBtn = allButtons.find((b) => b.text.startsWith("⚠"));
+    expect(noopBtn?.callback_data).toBe("auth:noop");
+    expect(noopBtn?.text).toMatch(/use CLI/);
+  });
+
+  it("non-account verbs still encode under the 64-byte budget for typical names", () => {
+    expect(
+      Buffer.byteLength(
+        encodeCallbackData({ kind: "account-enable", agent: "clerk", label: "work" }),
+        "utf8",
+      ),
+    ).toBeLessThanOrEqual(CALLBACK_BUDGET_BYTES);
+  });
+});
+
+describe("buildAccountConfirmKeyboard", () => {
+  it("emits an enable confirm + cancel row", () => {
+    const kb = buildAccountConfirmKeyboard("clerk", "work", "enable");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].text).toBe("⚠️ Confirm enable: work");
+    expect(buttons[0].callback_data).toBe("auth:cae:clerk:work");
+    expect(buttons[1].text).toBe("↩️ Cancel");
+    expect(buttons[1].callback_data).toBe("auth:refresh:clerk");
+  });
+
+  it("emits a disable confirm with the disable callback", () => {
+    const kb = buildAccountConfirmKeyboard("clerk", "work", "disable");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    expect(buttons[0].text).toBe("⚠️ Confirm disable: work");
+    expect(buttons[0].callback_data).toBe("auth:cad:clerk:work");
+  });
+});
+
+describe("buildDashboardText — accounts summary line", () => {
+  it("omits the line when accounts is undefined", () => {
+    const text = buildDashboardText(mkState({ accounts: undefined }));
+    expect(text).not.toMatch(/Accounts:/);
+  });
+
+  it("omits the line when accounts is an empty array (no totals to summarise)", () => {
+    const text = buildDashboardText(mkState({ accounts: [] }));
+    expect(text).not.toMatch(/Accounts:/);
+  });
+
+  it("renders <enabledHere>/<total> when accounts exist", () => {
+    const text = buildDashboardText(
+      mkState({
+        accounts: [
+          mkAccount({ label: "work", enabledHere: true }),
+          mkAccount({ label: "home", enabledHere: false }),
+          mkAccount({ label: "test", enabledHere: false }),
+        ],
+      }),
+    );
+    expect(text).toMatch(/Accounts: <b>1\/3<\/b> shared on this agent/);
+  });
+});
+
+const _AccountHealthCheck: AccountHealth = "healthy"; // type-import smoke
+void _AccountHealthCheck;

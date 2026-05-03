@@ -235,21 +235,14 @@ function registerAccountList(account: Command, program: Command): void {
   account
     .command("list")
     .description("List Anthropic accounts and which agents use each")
+    .option(
+      "--json",
+      "Emit account inventory as JSON (used by the Telegram /auth dashboard to render account-level buttons)",
+    )
     .action(
-      withConfigError(async () => {
+      withConfigError(async (opts: { json?: boolean }) => {
         const config = getConfig(program);
         const labels = listAccounts();
-        if (labels.length === 0) {
-          console.log();
-          console.log(
-            "No accounts yet. Add one with 'switchroom auth account add <label>'.",
-          );
-          console.log(`  Storage: ${accountsRoot()}`);
-          console.log();
-          return;
-        }
-
-        const infos = getAccountInfos();
         const enabledMap = new Map<string, string[]>();
         for (const label of labels) {
           enabledMap.set(
@@ -261,6 +254,43 @@ function registerAccountList(account: Command, program: Command): void {
           );
         }
 
+        if (opts.json) {
+          // Stable, sorted-by-label JSON for the Telegram dashboard.
+          // Empty array (not null) when no accounts exist — keeps the
+          // gateway's null-check shape consistent with "old CLI without
+          // --json" vs "new CLI, zero accounts."
+          const infos = labels.length === 0 ? [] : getAccountInfos();
+          const payload = infos
+            .slice()
+            .sort((a, b) => a.label.localeCompare(b.label))
+            .map((info) => ({
+              label: info.label,
+              health: info.health,
+              ...(info.subscriptionType
+                ? { subscriptionType: info.subscriptionType }
+                : {}),
+              ...(info.expiresAt != null ? { expiresAt: info.expiresAt } : {}),
+              ...(info.quotaExhaustedUntil != null
+                ? { quotaExhaustedUntil: info.quotaExhaustedUntil }
+                : {}),
+              ...(info.email ? { email: info.email } : {}),
+              agents: enabledMap.get(info.label) ?? [],
+            }));
+          console.log(JSON.stringify(payload));
+          return;
+        }
+
+        if (labels.length === 0) {
+          console.log();
+          console.log(
+            "No accounts yet. Add one with 'switchroom auth account add <label>'.",
+          );
+          console.log(`  Storage: ${accountsRoot()}`);
+          console.log();
+          return;
+        }
+
+        const infos = getAccountInfos();
         console.log();
         for (const info of infos) {
           const agents = enabledMap.get(info.label) ?? [];

@@ -84,12 +84,16 @@ import {
 import {
   buildDashboard,
   buildRemoveConfirmKeyboard,
+  buildAccountConfirmKeyboard,
   parseCallbackData,
   encodeCallbackData,
   isQuotaHot,
+  ACCOUNTS_DISPLAY_CAP,
   type DashboardState,
   type DashboardSlot,
   type SlotHealth,
+  type AccountSummary,
+  type AccountHealth,
 } from '../auth-dashboard.js'
 import {
   initHistory, recordInbound, recordOutbound, recordEdit,
@@ -6494,6 +6498,51 @@ function fetchDashboardState(agent: string): DashboardState | null {
   // only fires on actual PKCE challenge drift).
   const pendingSessionSlot = readPendingSessionSlot(agent)
 
+  // Account-level state for the dashboard's accounts section. The CLI
+  // emits a sorted, JSON array via `auth account list --json` (added
+  // in v0.6.x). We map it to the dashboard's `AccountSummary` shape,
+  // computing `enabledHere` from the per-account `agents` list.
+  //
+  // Wrapped in try/catch so an older CLI without --json (or any other
+  // failure) leaves `accounts` undefined — the renderer hides the
+  // section gracefully.
+  type AccountListItem = {
+    label: string
+    health: AccountHealth
+    subscriptionType?: string
+    expiresAt?: number
+    quotaExhaustedUntil?: number
+    email?: string
+    agents: string[]
+  }
+  let accounts: AccountSummary[] | undefined
+  let accountsTruncated = false
+  try {
+    const raw = switchroomExecJson<AccountListItem[]>([
+      'auth', 'account', 'list', '--json',
+    ])
+    if (Array.isArray(raw)) {
+      accounts = raw.map((a) => ({
+        label: a.label,
+        health: a.health,
+        enabledHere: Array.isArray(a.agents) && a.agents.includes(agent),
+        ...(a.subscriptionType ? { subscriptionType: a.subscriptionType } : {}),
+        ...(a.expiresAt != null ? { expiresAt: a.expiresAt } : {}),
+      }))
+      accountsTruncated = accounts.length > ACCOUNTS_DISPLAY_CAP
+    }
+  } catch {
+    /* leave accounts undefined */
+  }
+
+  // `canBootstrapShare` decides whether to surface the "🌐 Share to
+  // fleet" button when zero accounts exist. We only show it when this
+  // agent has slot creds we could promote — otherwise the share verb
+  // would fail at the credentials lookup.
+  const canBootstrapShare = slots.some(
+    (s) => s.health === 'healthy' || s.health === 'active',
+  )
+
   return {
     agent,
     bankId,
@@ -6503,6 +6552,9 @@ function fetchDashboardState(agent: string): DashboardState | null {
     quotaHot: isQuotaHot(slots),
     generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     pendingSessionSlot,
+    accounts,
+    accountsTruncated,
+    canBootstrapShare,
   }
 }
 
@@ -7381,6 +7433,75 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       } catch (err) {
         await switchroomReply(ctx, `Quota fetch failed: ${escapeHtmlForTg(String(err))}`, { html: true })
       }
+      return
+    }
+    // Account-level toggles (#share-auth-across-the-fleet). Two-stage
+    // confirm pattern mirrors `rm`/`confirm-rm` so a stray tap doesn't
+    // re-shuffle credentials. The CLI verb is the one source of truth
+    // for the YAML mutation + fanout; we only translate the tap into
+    // a `runSwitchroomCommand` call and refresh the dashboard.
+    case 'account-enable': {
+      await ctx.answerCallbackQuery({ text: `Confirm enable ${action.label}?` }).catch(() => {})
+      try {
+        await ctx.editMessageReplyMarkup({
+          reply_markup: buildAccountConfirmKeyboard(action.agent, action.label, 'enable'),
+        })
+      } catch { /* ignore */ }
+      return
+    }
+    case 'account-disable': {
+      await ctx.answerCallbackQuery({ text: `Confirm disable ${action.label}?` }).catch(() => {})
+      try {
+        await ctx.editMessageReplyMarkup({
+          reply_markup: buildAccountConfirmKeyboard(action.agent, action.label, 'disable'),
+        })
+      } catch { /* ignore */ }
+      return
+    }
+    case 'confirm-account-enable': {
+      await ctx.answerCallbackQuery({ text: `Enabling ${action.label}…` }).catch(() => {})
+      try { assertSafeAgentName(action.agent) } catch { return }
+      // CLI does the YAML mutation + per-agent credential fanout. The
+      // restart afterwards is what actually loads the new credentials
+      // into the running claude process.
+      await runSwitchroomCommand(
+        ctx,
+        ['auth', 'enable', action.label, action.agent],
+        `auth enable ${action.label} ${action.agent}`,
+      )
+      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'confirm-account-disable': {
+      await ctx.answerCallbackQuery({ text: `Disabling ${action.label}…` }).catch(() => {})
+      try { assertSafeAgentName(action.agent) } catch { return }
+      await runSwitchroomCommand(
+        ctx,
+        ['auth', 'disable', action.label, action.agent],
+        `auth disable ${action.label} ${action.agent}`,
+      )
+      // Force restart so claude drops the stale credentials immediately.
+      // The CLI's `disable` doesn't auto-restart (it expects the operator
+      // to drain manually); the dashboard tap is implicit "I'm done with
+      // this account on this agent now," so we restart on their behalf.
+      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'share-fleet': {
+      // Bootstrap one-tap: zero accounts exist, this agent has healthy
+      // slot creds. Synthesise label="default" so the user gets a
+      // sensible starting state in one tap; rename via CLI later.
+      await ctx.answerCallbackQuery({ text: 'Sharing to fleet…' }).catch(() => {})
+      try { assertSafeAgentName(action.agent) } catch { return }
+      await runSwitchroomCommand(
+        ctx,
+        ['auth', 'share', 'default', '--from-agent', action.agent],
+        `auth share default --from-agent ${action.agent}`,
+      )
+      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
     case 'noop':

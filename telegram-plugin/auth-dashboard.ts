@@ -83,6 +83,46 @@ export interface DashboardState {
    * start over BEFORE the challenge actually drifts.
    */
   pendingSessionSlot?: string | null;
+  /**
+   * Per-account summaries derived from `switchroom auth account list
+   * --json`. Optional: undefined when the gateway can't reach the CLI
+   * or the CLI is older than v0.6.x (no --json flag). When present
+   * (even as an empty array), the dashboard renders the accounts
+   * section. The `enabledHere` flag drives the ✓/○ marker — `agents`
+   * field from the JSON, with `agents.includes(state.agent)` mapped
+   * into this struct by the gateway.
+   */
+  accounts?: ReadonlyArray<AccountSummary>;
+  /** True when more accounts exist than `ACCOUNTS_DISPLAY_CAP` — the
+   *  render appends a noop "more accounts (use CLI)" row. */
+  accountsTruncated?: boolean;
+  /**
+   * True when this agent has slot credentials we could promote into a
+   * shared account via `auth share`. Drives the bootstrap "🌐 Share to
+   * fleet" button visibility — only useful when no accounts exist yet.
+   */
+  canBootstrapShare?: boolean;
+}
+
+/**
+ * Per-account summary for the inline-keyboard dashboard's accounts
+ * section. Mirrors the JSON shape `auth account list --json` emits,
+ * collapsed to the fields the renderer needs. Pure data — no behaviour.
+ */
+export type AccountHealth =
+  | "healthy"
+  | "quota-exhausted"
+  | "expired"
+  | "missing-credentials"
+  | "missing-refresh-token";
+
+export interface AccountSummary {
+  readonly label: string;
+  readonly health: AccountHealth;
+  /** True when this agent appears in the account's `agents` list. */
+  readonly enabledHere: boolean;
+  readonly subscriptionType?: string;
+  readonly expiresAt?: number;
 }
 
 /**
@@ -96,6 +136,15 @@ export interface DashboardState {
  */
 export const QUOTA_HOT_THRESHOLD_PCT = 90;
 
+/** Max account rows rendered inline. Beyond this, the dashboard adds a
+ *  truncated-noop row pointing the user to the CLI for the rest. Five
+ *  is enough for typical fleets without overflowing a mobile screen. */
+export const ACCOUNTS_DISPLAY_CAP = 5;
+
+/** Telegram caps callback_data at 64 bytes. Render-time guard rejects
+ *  encoded payloads beyond this and renders a noop fallback button. */
+export const CALLBACK_BUDGET_BYTES = 64;
+
 export type CallbackAction =
   | { kind: "refresh"; agent: string }
   | { kind: "reauth"; agent: string; slot?: string }
@@ -106,6 +155,14 @@ export type CallbackAction =
   | { kind: "fallback"; agent: string }
   | { kind: "usage"; agent: string }
   | { kind: "restart-flow"; agent: string; slot: string }
+  // Account-level (#per-agent-cards / #share-auth-across-the-fleet).
+  // Single-character verbs (ae/ad/cae/cad/sf) maximise label headroom
+  // inside the 64-byte callback_data cap.
+  | { kind: "account-enable"; agent: string; label: string }
+  | { kind: "account-disable"; agent: string; label: string }
+  | { kind: "confirm-account-enable"; agent: string; label: string }
+  | { kind: "confirm-account-disable"; agent: string; label: string }
+  | { kind: "share-fleet"; agent: string }
   | { kind: "noop" };
 
 const CALLBACK_PREFIX = "auth:";
@@ -135,6 +192,16 @@ export function encodeCallbackData(action: CallbackAction): string {
       return `${CALLBACK_PREFIX}usage:${action.agent}`;
     case "restart-flow":
       return `${CALLBACK_PREFIX}restart-flow:${action.agent}:${action.slot}`;
+    case "account-enable":
+      return `${CALLBACK_PREFIX}ae:${action.agent}:${action.label}`;
+    case "account-disable":
+      return `${CALLBACK_PREFIX}ad:${action.agent}:${action.label}`;
+    case "confirm-account-enable":
+      return `${CALLBACK_PREFIX}cae:${action.agent}:${action.label}`;
+    case "confirm-account-disable":
+      return `${CALLBACK_PREFIX}cad:${action.agent}:${action.label}`;
+    case "share-fleet":
+      return `${CALLBACK_PREFIX}sf:${action.agent}`;
     case "noop":
       return `${CALLBACK_PREFIX}noop`;
   }
@@ -145,10 +212,33 @@ export function encodeCallbackData(action: CallbackAction): string {
  *  caller should still answerCallbackQuery() but otherwise drop. */
 export function parseCallbackData(data: string): CallbackAction {
   if (!data.startsWith(CALLBACK_PREFIX)) return { kind: "noop" };
+  // Reject payloads beyond Telegram's 64-byte cap. Telegram itself
+  // refuses to deliver those, but the parser stays defensive in case
+  // a test or fuzzer hands us one.
+  if (Buffer.byteLength(data, "utf8") > CALLBACK_BUDGET_BYTES) {
+    return { kind: "noop" };
+  }
   const rest = data.slice(CALLBACK_PREFIX.length);
   const parts = rest.split(":");
-  const [verb, agent, slot] = parts;
+  const [verb, agent, third] = parts;
+  // Account-level verbs (single-char) accept a label as the third
+  // segment instead of a slot. We branch on verb first so each segment
+  // is validated against its own regex.
+  if (verb === "ae" || verb === "ad" || verb === "cae" || verb === "cad") {
+    if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
+    if (!third || !isSafeAccountLabel(third)) return { kind: "noop" };
+    const label = third;
+    if (verb === "ae") return { kind: "account-enable", agent, label };
+    if (verb === "ad") return { kind: "account-disable", agent, label };
+    if (verb === "cae") return { kind: "confirm-account-enable", agent, label };
+    return { kind: "confirm-account-disable", agent, label };
+  }
+  if (verb === "sf") {
+    if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
+    return { kind: "share-fleet", agent };
+  }
   if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
+  const slot = third;
   switch (verb) {
     case "refresh":
       return { kind: "refresh", agent };
@@ -185,6 +275,23 @@ function isSafeAgentName(name: string): boolean {
 
 function isSafeSlotName(name: string): boolean {
   return /^[a-zA-Z0-9_-]{1,32}$/.test(name);
+}
+
+/**
+ * Account labels match the CLI's `validateAccountLabel` regex
+ * (`src/auth/account-store.ts`): `[A-Za-z0-9._-]{1,64}`. The `.` is
+ * the only delta from `isSafeSlotName` and is what makes labels like
+ * `acme.team` legal. Dashboard-side validator so the parser doesn't
+ * need to import from `src/`.
+ *
+ * The `.` and `..` reservations match the CLI's defensive guards
+ * — those tokens are valid characters but are reserved as filesystem
+ * lookalikes and would create ambiguous on-disk paths under
+ * `~/.switchroom/accounts/`.
+ */
+export function isSafeAccountLabel(name: string): boolean {
+  if (name === "." || name === "..") return false;
+  return /^[A-Za-z0-9._-]{1,64}$/.test(name);
 }
 
 /**
@@ -233,6 +340,20 @@ export function buildDashboardText(state: DashboardState): string {
     );
     const detail = slotDetailLine(slot);
     if (detail) lines.push(`  └ ${detail}`);
+  }
+
+  // Accounts summary — one line under the slot list when the gateway
+  // surfaced account state. Hidden when accounts == null (older CLI
+  // without --json) so the dashboard degrades gracefully.
+  if (state.accounts != null) {
+    const total = state.accounts.length;
+    const enabledHere = state.accounts.filter((a) => a.enabledHere).length;
+    if (total > 0) {
+      lines.push("");
+      lines.push(
+        `Accounts: <b>${enabledHere}/${total}</b> shared on this agent`,
+      );
+    }
   }
 
   lines.push("");
@@ -314,6 +435,52 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   }
   if (removableSlots.length > 0) kb.row();
 
+  // Row 3.5 (NEW): account-level toggles. One row per account so
+  // labels stay readable on mobile and the per-button callback_data
+  // stays well under the 64-byte budget. Only renders when the
+  // gateway successfully fetched account state (`accounts != null`).
+  // Empty `accounts` falls through to the bootstrap branch below.
+  if (state.accounts != null && state.accounts.length > 0) {
+    const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
+    for (const acc of visible) {
+      const action: CallbackAction = acc.enabledHere
+        ? { kind: "account-disable", agent: state.agent, label: acc.label }
+        : { kind: "account-enable", agent: state.agent, label: acc.label };
+      const encoded = encodeCallbackData(action);
+      // Render-time guard: if the synthesised payload exceeds the
+      // 64-byte cap (pathological agent + label lengths), fall back
+      // to a noop button labelled with the raw account name so the
+      // row is visible-but-inert. Operator can fall back to the CLI.
+      if (Buffer.byteLength(encoded, "utf8") > CALLBACK_BUDGET_BYTES) {
+        kb.text(
+          `⚠ ${truncateLabel(acc.label)} (use CLI)`,
+          encodeCallbackData({ kind: "noop" }),
+        );
+      } else {
+        const marker = acc.enabledHere ? "✓" : "○";
+        kb.text(`${marker} ${acc.label}${healthSuffix(acc.health)}`, encoded);
+      }
+      kb.row();
+    }
+    if (state.accountsTruncated) {
+      kb.text(
+        `… ${state.accounts.length - ACCOUNTS_DISPLAY_CAP} more (use CLI)`,
+        encodeCallbackData({ kind: "noop" }),
+      );
+      kb.row();
+    }
+  } else if (state.canBootstrapShare) {
+    // Bootstrap one-tap: zero accounts exist, but this agent has
+    // healthy slot creds we could promote. Synthesises label="default"
+    // at the gateway so the user gets a reasonable starting state in
+    // one tap; rename via CLI later if "default" doesn't suit.
+    kb.text(
+      "🌐 Share to fleet",
+      encodeCallbackData({ kind: "share-fleet", agent: state.agent }),
+    );
+    kb.row();
+  }
+
   // Row 4: pending-flow recovery. Shown ONLY when an auth flow is
   // pending (session meta file on disk). Lets the user explicitly
   // kill + restart the flow. Pairs with the automatic stale-session
@@ -385,4 +552,54 @@ export function buildRemoveConfirmKeyboard(agent: string, slot: string): InlineK
     .text(`⚠️ Confirm remove: ${slot}`, encodeCallbackData({ kind: "confirm-rm", agent, slot }))
     .row()
     .text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
+}
+
+/**
+ * Two-stage confirmation for account toggles. Mirrors
+ * `buildRemoveConfirmKeyboard`'s shape — one confirm row + a cancel
+ * that re-renders the dashboard. `kind` selects enable vs disable so
+ * one helper covers both directions.
+ */
+export function buildAccountConfirmKeyboard(
+  agent: string,
+  label: string,
+  kind: "enable" | "disable",
+): InlineKeyboard {
+  const action: CallbackAction = kind === "enable"
+    ? { kind: "confirm-account-enable", agent, label }
+    : { kind: "confirm-account-disable", agent, label };
+  const verb = kind === "enable" ? "enable" : "disable";
+  return new InlineKeyboard()
+    .text(`⚠️ Confirm ${verb}: ${label}`, encodeCallbackData(action))
+    .row()
+    .text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
+}
+
+/**
+ * Health affix for the account button label. Keeps healthy accounts
+ * unadorned (the ✓/○ marker carries the enabled-here signal) and
+ * surfaces the failure modes that need operator attention. Quota and
+ * expiry use distinct icons so the user can tell which boundary the
+ * account hit.
+ */
+function healthSuffix(health: AccountHealth): string {
+  switch (health) {
+    case "quota-exhausted":
+      return " ⚠️";
+    case "expired":
+    case "missing-refresh-token":
+      return " ⌛";
+    case "missing-credentials":
+      return " ❌";
+    case "healthy":
+    default:
+      return "";
+  }
+}
+
+/** Trim long labels in the noop fallback button so the row stays
+ *  readable on a narrow mobile screen. */
+function truncateLabel(label: string): string {
+  if (label.length <= 32) return label;
+  return label.slice(0, 31) + "…";
 }
