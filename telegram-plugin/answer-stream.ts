@@ -135,6 +135,16 @@ export interface AnswerStreamConfig {
    */
   checkDedup?: (text: string) => boolean
   recordDedup?: (text: string) => void
+
+  /**
+   * #648 — write answer-stream materializations to the SQLite history buffer
+   * so `mcp__switchroom-telegram__get_recent_messages` surfaces them. Without
+   * this, materialized messages were visible in Telegram but invisible to
+   * MCP forensics — that's the gap that let #646 slip past triage.
+   *
+   * Optional — when absent, behaviour is unchanged (no buffer write).
+   */
+  recordOutbound?: (args: { messageId: number; text: string }) => void
 }
 
 export interface AnswerStreamHandle {
@@ -194,6 +204,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     onMetric,
     checkDedup,
     recordDedup,
+    recordOutbound,
   } = config
 
   const effectiveThrottle = Math.max(250, throttleMs)
@@ -483,6 +494,9 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
           // gets suppressed. Mirrors the record call in gateway.ts
           // turn-flush at line ~3795.
           recordDedup?.(textToSend)
+          // #648 — mirror turn-flush's recordOutbound so this send shows up
+          // in get_recent_messages / SQLite history.
+          recordOutbound?.({ messageId: sentId, text: textToSend })
           onMetric?.({ kind: 'answer_lane_materialized', chatId, messageId: streamMsgId })
           return sentId
         }
