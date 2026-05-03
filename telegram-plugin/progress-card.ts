@@ -1209,7 +1209,11 @@ export function render(
       bodyLines.push(`<i>(+${visible.overflowCount} earlier)</i>`)
     }
     for (const item of visible.items) {
-      bodyLines.push(renderMainItem(item, now, multiAgentActive, state.subAgents))
+      // #378 sub-issue 1: renderMainItem returns '' for Agent/Task items
+      // whose sub-agent is alive in the expandable below — skip those
+      // empty lines so we don't leave blank rows in the rendered card.
+      const line = renderMainItem(item, now, multiAgentActive, state.subAgents)
+      if (line.length > 0) bodyLines.push(line)
     }
   }
 
@@ -1240,10 +1244,12 @@ export function render(
   // expandable blocks so the user sees status counts at a glance.
   const expandableParts: string[] = []
   if (multiAgentActive && state.subAgents.size > 0) {
-    const counts = countSubAgentStates(state.subAgents, now)
+    // #378 sub-issue 6: dropped the "🤖 Sub-agents · 🔄 N · ✅ N · ❌ N"
+    // rollup header. Per-row icons + state labels already convey the same
+    // info, and a header above three rows that each say "✅ done" was
+    // redundant noise.
     expandableParts.push('')
-    expandableParts.push(renderSubAgentSummaryHeader(counts))
-    for (const sa of sortSubAgentsChrono(state.subAgents)) {
+    for (const sa of sortSubAgentsChrono(state.subAgents, now)) {
       const cached = expandableCache?.get(sa.agentId)
       let expandableHtml: string
       if (cached && cached.milestoneVersion === sa.milestoneVersion) {
@@ -1326,9 +1332,32 @@ function renderMainItem(
 
   const humanAuthored = item.humanAuthored ?? false
 
+  // #378 sub-issue 1: when an Agent/Task item has a correlated, still-
+  // alive sub-agent and the multi-agent renderer is active (i.e. the
+  // sub-agent's expandable WILL be drawn below), the Main row would be
+  // a duplicate (same 🤖 emoji, same description, same elapsed). Return
+  // empty so the outer render loop skips this row. With multiAgentActive
+  // off, the sub-agent expandable does NOT render — fall through to the
+  // normal Main-row render so the user still sees something.
+  //
+  // The "Main · N tools" header count is intentionally NOT decremented —
+  // it reflects "N tool calls happened this turn" as a lifetime count,
+  // not visible rows.
+  if (
+    multiAgentActive
+    && isAgent
+    && item.kind !== 'rollup'
+    && item.state === 'running'
+    && item.spawnedAgentId
+    && subAgents.has(item.spawnedAgentId)
+  ) {
+    return ''
+  }
+
   if (isAgent && item.state === 'running' && multiAgentActive) {
-    // Hold the 🤖 emoji while the sub-agent (if correlated) is alive.
-    // Show elapsed since the parent's tool_use fired.
+    // Pre-correlation (or sub-agent already terminal), hold the 🤖
+    // emoji on the Main row. Show elapsed since the parent's tool_use
+    // fired.
     const dur = formatDuration(now - item.startedAt)
     return `${indent}🤖 ${renderItemCore(item.tool, item.label, /*bold*/ true, humanAuthored)} <i>(${dur})</i>`
   }
@@ -1364,73 +1393,38 @@ function renderMainItem(
  * transition. We deliberately do NOT bucket by state (failed-first /
  * done-first) because state changes mid-turn would cause visible
  * reorder.
+ *
+ * #378 sub-issue 3: hide running sub-agents whose `lastEventAt` predates
+ * `SUBAGENT_ARCHIVE_MS` (default 10 min). Live card = live work — a
+ * sub-agent that hasn't emitted in 10 min is either truly hung
+ * (operator already saw the ⚠️ stalled glyph cross the 60s threshold
+ * and made a decision) or completed without a clean turn_end. Either
+ * way it's noise on the live card. Terminal states (done/failed) are
+ * never hidden — they're explicit user-relevant outcomes.
  */
 function sortSubAgentsChrono(
   subAgents: ReadonlyMap<string, SubAgentState>,
+  now: number,
 ): SubAgentState[] {
-  return Array.from(subAgents.values()).sort((a, b) => a.startedAt - b.startedAt)
+  return Array.from(subAgents.values())
+    .filter(sa => {
+      if (sa.state !== 'running') return true
+      if (sa.lastEventAt == null) return true
+      return (now - sa.lastEventAt) < SUBAGENT_ARCHIVE_MS
+    })
+    .sort((a, b) => a.startedAt - b.startedAt)
 }
 
 /** Stall threshold: sub-agent is ⚠️ stalled if running with no events for this long. */
 const SUBAGENT_STALL_MS = 60_000
 
-interface SubAgentCounts {
-  running: number
-  done: number
-  failed: number
-}
-
 /**
- * Count sub-agents by their underlying state. Stalled is NOT a separate
- * bucket: a stalled sub-agent has `state === 'running'` (the ⚠️ glyph on
- * the per-row header is purely a render-time annotation based on
- * lastEventAt freshness — see `renderSubAgentExpandable`). Counting
- * stalled separately on the summary header would let it drift from the
- * rendered row count, which is what we render for running entries:
- * `sortSubAgentsChrono` returns ALL entries regardless of staleness, so
- * the header `🔄 N` must equal `state === 'running'` count to match what
- * the user actually sees (see issue #553).
- *
- * The `now` parameter is retained for symmetry with the renderer (and to
- * make a future "drift older than X" classification cheap to add) but is
- * intentionally unused.
+ * Auto-archive threshold: a running sub-agent whose `lastEventAt` is
+ * older than this is filtered out of the rendered card (#378 sub-issue 3).
+ * Picked at 10× SUBAGENT_STALL_MS so the user has 9 min after the ⚠️
+ * stalled glyph appears to act before the row disappears.
  */
-function countSubAgentStates(
-  subAgents: ReadonlyMap<string, SubAgentState>,
-  _now: number,
-): SubAgentCounts {
-  let running = 0
-  let done = 0
-  let failed = 0
-  for (const sa of subAgents.values()) {
-    if (sa.state === 'running') running++
-    else if (sa.state === 'done') done++
-    else if (sa.state === 'failed') failed++
-  }
-  return { running, done, failed }
-}
-
-/**
- * Issue #352 / #553: always-visible summary header above per-agent
- * expandables.
- *
- * Format: `🤖 Sub-agents · ✅ N · 🔄 N · ❌ N`
- *
- * Counts mirror sub-agent `state`, which is exactly what
- * `sortSubAgentsChrono` enumerates as rendered rows — so the `🔄` count
- * always equals the number of running rows the user sees. Stalled rows
- * still get a ⚠️ glyph in their per-row header (see
- * `renderSubAgentExpandable`), but they remain `state === 'running'` and
- * therefore count toward `🔄`. Any emoji whose count is 0 is omitted.
- */
-function renderSubAgentSummaryHeader(c: SubAgentCounts): string {
-  const parts: string[] = []
-  if (c.done > 0) parts.push(`✅ ${c.done}`)
-  if (c.running > 0) parts.push(`🔄 ${c.running}`)
-  if (c.failed > 0) parts.push(`❌ ${c.failed}`)
-  const counters = parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
-  return `<b><u>🤖 Sub-agents</u></b>${counters}`
-}
+const SUBAGENT_ARCHIVE_MS = 10 * 60_000
 
 /**
  * Render a sub-agent block. Two lines while running (header + current
@@ -1450,10 +1444,19 @@ function renderSubAgentSummaryHeader(c: SubAgentCounts): string {
  * Description fallback chain for a sub-agent, in priority order:
  *   1. correlated description (from parent Agent/Task tool_use input)
  *   2. subagentType (when correlation failed but the sub-agent type is known)
- *   3. first narrative text the sub-agent emitted
+ *   3. firstPromptText (the dispatch text the parent agent wrote — stable,
+ *      pre-execution, identical to the description in most cases)
  *   4. generic 'sub-agent'
+ *
  * "(uncorrelated)" is a debug-log string and never appears in this chain —
  * surfacing that to the user was the original UX bug.
+ *
+ * #378 sub-issue 2: dropped the firstNarrativeText fallback. Letting the
+ * LLM's first emission set the row's title produced unstable identities —
+ * the same sub-agent could be rendered as "🤖 sub-agent" early, then
+ * flip to "🤖 I'll start by getting the PR details…" once it spoke.
+ * The dispatch text (firstPromptText) is the source of truth for what
+ * the user asked for; later narration is not.
  */
 function subAgentDisplayDescription(sa: SubAgentState): string {
   if (sa.description && sa.description.length > 0 && sa.description !== '(uncorrelated)') {
@@ -1462,10 +1465,9 @@ function subAgentDisplayDescription(sa: SubAgentState): string {
   if (sa.subagentType && sa.subagentType.length > 0) {
     return sa.subagentType
   }
-  if (sa.firstNarrativeText && sa.firstNarrativeText.length > 0) {
-    // Extract first line, cap length — same shape as toolLabel preambles.
-    const line = sa.firstNarrativeText.split('\n')[0].trim()
-    if (line.length > 0) return line
+  if (sa.firstPromptText && sa.firstPromptText.length > 0) {
+    const line = sa.firstPromptText.split('\n')[0].trim()
+    if (line.length > 0) return truncate(line, 80)
   }
   return 'sub-agent'
 }
@@ -1477,8 +1479,11 @@ function subAgentDisplayDescription(sa: SubAgentState): string {
  *   🤖 <description> <status-emoji> <state-label> · <duration>
  *
  * Inside the expandable: last 2-3 recent actions.
- *   - Completed actions: `<s>action label</s>` (strikethrough)
- *   - Current in-flight action: `↳ action label` (no strikethrough)
+ *   - Completed actions: plain text (no leading symbol). Per #320 we
+ *     dropped strikethrough entirely — Telegram desktop renders <s> as
+ *     a salmon/red strike-line that reads as "deleted/failed" in both
+ *     themes, which is wrong semantics for "done".
+ *   - Current in-flight action: `↳ action label`
  *
  * Status emoji: 🔄 working · ✅ done · ❌ failed · ⚠️ stalled
  *

@@ -502,14 +502,13 @@ describe('v2 spec — Class C (long-running OR sub-agents)', () => {
     )
     expect(cardEdits.length, 'no card render captured').toBeGreaterThan(0)
     const last = cardEdits[cardEdits.length - 1].payload ?? ''
-    // The summary header is `🤖 Sub-agents · 🔄 N` (running count).
-    // Per-agent rows render as `<blockquote expandable>...</blockquote>`
-    // — one per sub-agent.
-    const headerMatch = last.match(/🔄\s*(\d+)/)
-    expect(headerMatch, 'card payload missing running-count header').not.toBeNull()
-    const headerCount = Number(headerMatch?.[1] ?? -1)
+    // #378 sub-issue 6: the rollup `🤖 Sub-agents · 🔄 N` header was
+    // dropped — per-row icons + state labels carry the same info. The
+    // invariant now asserted is row count == sub-agent count: each sub-
+    // agent renders as exactly one `<blockquote expandable>` block.
+    expect(last).not.toContain('🤖 Sub-agents</u></b>')
     const blockCount = (last.match(/<blockquote\s+expandable>/gi) ?? []).length
-    expect(headerCount).toBe(blockCount)
+    expect(blockCount).toBe(3)
 
     h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a1' })
     h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a2' })
