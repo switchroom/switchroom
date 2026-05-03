@@ -43,6 +43,7 @@ import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentEnd, reapStuckRunningRows } from './registry/subagents-schema.js'
+import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -132,6 +133,19 @@ export interface SubagentWatcherConfig {
    * Passing `null` or omitting this field disables DB writes entirely.
    */
   db?: SubagentLivenessDb | null
+  /**
+   * Parent agent's state directory — the directory containing the parent's
+   * `turn-active.json` marker (issue #412). When provided, every time a
+   * **foreground** sub-agent's JSONL grows, the watcher touches the parent
+   * marker's mtime so the watchdog (`bin/bridge-watchdog.sh`) doesn't read
+   * the parent as wedged just because all the in-turn activity is happening
+   * inside a sub-agent that hasn't emitted a JSONL line for a while
+   * (issue #501). Background sub-agents are EXCLUDED — they have their own
+   * lifecycle decoupled from the parent's turn boundary, and refreshing the
+   * parent's marker on background activity would mask real parent-side hangs.
+   * If unset, the touch is skipped (preserves pre-#501 behaviour).
+   */
+  parentStateDir?: string | null
   /** Optional logger for debug output. */
   log?: (msg: string) => void
   /**
@@ -288,6 +302,7 @@ function readSubTail(
   fs: FsLike,
   log?: (msg: string) => void,
   db?: SubagentLivenessDb | null,
+  parentStateDir?: string | null,
 ): void {
   try {
     const stat = fs.statSync(entry.filePath)
@@ -312,18 +327,43 @@ function readSubTail(
     // the row by jsonl_agent_id and bump using the actual tool_use_id PK.
     // If the row doesn't exist yet (Phase 2 Pre hook hasn't fired), the UPDATE
     // is a no-op — log and continue, don't INSERT here.
+    //
+    // Issue #501: also use the row to decide whether the sub-agent is
+    // foreground; if so, refresh the PARENT's `turn-active.json` mtime so the
+    // watchdog doesn't kill the parent during a long-running foreground
+    // sub-agent that the parent is awaiting. Background sub-agents are
+    // excluded — they have their own lifecycle and shouldn't mask
+    // parent-side hangs.
+    let isForeground = false
     if (db != null) {
       try {
         const existing = db
-          .prepare('SELECT id FROM subagents WHERE jsonl_agent_id = ?')
-          .get(entry.agentId) as { id: string } | null
+          .prepare('SELECT id, background FROM subagents WHERE jsonl_agent_id = ?')
+          .get(entry.agentId) as { id: string; background: number } | null
         if (existing == null) {
           log?.(`subagent-watcher: liveness skip ${entry.agentId} — row not in DB yet (Phase 2 Pre hook pending)`)
         } else {
           bumpSubagentActivity(db, { id: existing.id, ts: now })
+          isForeground = existing.background === 0
         }
       } catch (dbErr) {
         log?.(`subagent-watcher: liveness write error ${entry.agentId}: ${(dbErr as Error).message}`)
+      }
+    }
+
+    // Issue #501 fix: foreground sub-agent activity refreshes the parent's
+    // turn-active marker. Without this, a foreground sub-agent doing pure
+    // computation or waiting on a slow API for >300s would let the marker
+    // age past TURN_HANG_SECS, and the watchdog would kill the parent even
+    // though real work is happening. The watchdog's multi-signal progress
+    // gate (PR #557) already protects most cases via JSONL liveness, but a
+    // sub-agent that goes silent for the threshold window is the one
+    // remaining gap this fix closes.
+    if (isForeground && parentStateDir) {
+      try {
+        touchTurnActiveMarker(parentStateDir)
+      } catch (touchErr) {
+        log?.(`subagent-watcher: parent marker touch error ${entry.agentId}: ${(touchErr as Error).message}`)
       }
     }
 
@@ -389,6 +429,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
   const rescanMs = config.rescanMs ?? DEFAULT_RESCAN_MS
   const log = config.log
   const db = config.db ?? null
+  const parentStateDir = config.parentStateDir ?? null
   const nowFn = config.now ?? (() => Date.now())
 
   const setI = config.setInterval ?? ((fn, ms) => {
@@ -498,7 +539,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // Initial read
     readSubTail(entry, tail, n, (desc) => {
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-    }, fs, log, db)
+    }, fs, log, db, parentStateDir)
 
     // If the JSONL already contained a turn_end at registration time
     // (file written-then-watched), fire the state-transition + completion
@@ -529,7 +570,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         if (!entry || !t) return
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log, db)
+        }, fs, log, db, parentStateDir)
         maybySendStateTransition(agentId)
       })
     } catch (err) {
@@ -743,7 +784,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (!tail) continue
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      }, fs, log, db)
+      }, fs, log, db, parentStateDir)
       maybySendStateTransition(agentId)
     }
 

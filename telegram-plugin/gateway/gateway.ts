@@ -8875,6 +8875,14 @@ void (async () => {
               // write liveness/stall/turn_end updates to the registry DB.
               // Liveness writes are now persisted across the gateway lifetime.
               db: turnsDb,
+              // Issue #501: parent state dir so foreground sub-agent activity
+              // refreshes the parent's `turn-active.json` mtime. Without this
+              // a foreground sub-agent silent for >TURN_HANG_SECS (default
+              // 300s) lets the parent's marker age out and the watchdog
+              // restarts the parent — even though real work is happening
+              // inside the sub-agent. Belt-and-braces with PR #557's
+              // multi-signal progress gate.
+              parentStateDir: STATE_DIR,
               sendNotification: (text: string) => {
                 const ownerChatId = loadAccess().allowFrom[0]
                 if (!ownerChatId) return
