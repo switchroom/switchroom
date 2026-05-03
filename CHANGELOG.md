@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## v0.6.5 — 2026-05-04
+
+### Added
+
+- **Web dashboard trusts Tailscale peer source IPs (#651).** Requests
+  whose source IP falls in `100.64.0.0/10` (IPv4 tailnet allocation)
+  or `fd7a:115c:a1e0::/48` (IPv6 tailnet ULA) bypass the bearer-token
+  gate. Tailscale's WireGuard layer already authenticates every peer
+  against the tailnet, so a phone bookmarking
+  `http://<host>.taildXXXX.ts.net:8080/` now works with zero token
+  ceremony.
+  - Bonus while in here: `?token=X` URL → httpOnly cookie redirect.
+    Non-tailnet users can bookmark a one-time URL and never need the
+    token in a URL afterwards.
+  - **Operator override** — set `SWITCHROOM_WEB_REQUIRE_TOKEN=1` to
+    disable the implicit-trust path. Use when sharing a tailnet with
+    untrusted machines or running a multi-tenant tailnet ACL setup.
+
+### Migration
+
+```
+bun add -g switchroom-ai@0.6.5     # or npm i -g
+systemctl --user restart switchroom-web   # if running as a unit
+```
+
+The bearer-token, cookie, and `Tailscale-User-Login` paths are
+unchanged — existing CLI / WebSocket / `tailscale serve` setups keep
+working.
+
 ## v0.6.4 — 2026-05-03
 
 ### Fixed
