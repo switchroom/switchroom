@@ -23,8 +23,13 @@ Run these diagnostics with Bash:
 # Check switchroom CLI version
 switchroom --version 2>/dev/null || echo "FAIL: switchroom not found"
 
-# Check auth status
+# Check auth status (per-agent legacy view)
 switchroom auth status 2>/dev/null || echo "FAIL: auth check failed"
+
+# Check Anthropic accounts (new model — see reference/share-auth-across-the-fleet.md)
+# Shows accounts at ~/.switchroom/accounts/<label>/, which agents use each,
+# and per-account health (healthy / quota-exhausted / expired / missing-refresh-token).
+switchroom auth account list 2>/dev/null || echo "INFO: no Anthropic accounts configured (legacy per-agent slot model in use)"
 
 # Check systemd units
 systemctl --user list-units "switchroom-*" --no-pager 2>/dev/null || echo "no switchroom systemd units"
@@ -85,7 +90,9 @@ For common failures, give the exact fix:
 | Problem | Fix |
 |---------|-----|
 | `switchroom: command not found` | `npm install -g switchroom-ai` |
-| Auth expired | `switchroom auth login` |
+| Per-agent auth expired (slot model) | `switchroom auth login <agent>` |
+| Account expired (new model — `auth account list` shows red ✗) | `switchroom auth refresh-accounts` (one tick); if no refresh-token, the account needs re-adding |
+| Account quota-exhausted (yellow ⊘ in `auth account list`) | Auto-fallback handles it if the agent has multiple accounts; otherwise wait for the reset window or `switchroom auth enable <other-account> <agent>` |
 | Unit failed | `systemctl --user reset-failed switchroom-<name>`, then restart |
 | Missing .mcp.json | `switchroom update` (full reconcile + restart) or `switchroom agent reconcile <name>` (targeted) |
 | Bot token unresolved | Check vault: `switchroom vault list` |

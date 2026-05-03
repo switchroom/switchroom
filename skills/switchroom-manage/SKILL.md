@@ -25,6 +25,8 @@ When the user invokes `/switchroom` or asks to add, create, remove, reinstall, r
 | `/switchroom memory <query> --agent <name>` | `switchroom memory search "<query>" --agent <name>` |
 | `/switchroom vault list` | `switchroom vault list` |
 | `/switchroom topics` | `switchroom topics list` |
+| `/switchroom accounts` or "list anthropic accounts" | `switchroom auth account list` |
+| "share my Pro subscription across agents" / "add an Anthropic account" | See **Anthropic accounts** below |
 
 ### Add / create a new agent
 
@@ -33,6 +35,34 @@ When the user says "add a new agent", "add an agent to my switchroom setup", or 
 ### Reinstall / reprovision agents
 
 "Reinstall my agents" is a fleet-level reprovisioning operation, **not** a fresh switchroom install. It means: pull the latest code, re-apply `switchroom.yaml`, and restart the agents. Run `switchroom update` for the full fleet. Ask the user to confirm before running if the scope is ambiguous.
+
+### Anthropic accounts (one OAuth, many agents)
+
+The new auth model treats the Anthropic account as the unit of authentication: one `claude setup-token` per account, then enable the account on however many agents you want. See `reference/share-auth-across-the-fleet.md` for the full design.
+
+**Bootstrap flow when the user wants to share one Pro/Max subscription across agents:**
+
+1. Make sure at least one agent is already authenticated the per-agent way (existing `switchroom auth login <agent>` flow). This gives you a valid `.credentials.json` to lift from.
+2. **Create the global account** by lifting the agent's credentials:
+   ```bash
+   switchroom auth account add work-pro --from-agent <existing-agent>
+   ```
+3. **Enable** the account on every agent that should share it:
+   ```bash
+   switchroom auth enable work-pro <agent-1> <agent-2> ...
+   ```
+   This appends to `agents.<name>.auth.accounts` in `switchroom.yaml` and immediately fans out the credentials to each agent's `.claude/credentials.json`.
+4. **Restart** the affected agents so claude picks up the new credentials.
+
+Verify with `switchroom auth account list` — shows accounts, which agents use each, health, and expiry. Account-level quota and refresh state replaces the per-agent view: when one account hits its 5-hour cap, every agent on it is failed over together.
+
+**Telegram parity** — the same flow works from inside a chat:
+
+```
+/auth login                          # current agent, existing slot flow
+/auth account add work-pro           # lifts current agent → global account
+/auth enable work-pro <other-agent>  # wires another agent to the same account
+```
 
 ## Behavior
 
@@ -47,7 +77,8 @@ Switchroom commands:
   /switchroom start <name>   Start an agent
   /switchroom stop <name>    Stop an agent
   /switchroom restart <name> Restart an agent (drain by default)
-  /switchroom status         Show auth status
+  /switchroom status         Show per-agent auth status
+  /switchroom accounts       List Anthropic accounts + which agents use each
   /switchroom memory <query> Search agent memory
   /switchroom vault list     List vault secrets
   /switchroom topics         List Telegram topics
@@ -55,4 +86,5 @@ Switchroom commands:
 Fleet operations (run directly, not via /switchroom <sub>):
   switchroom update          Pull latest + reconcile + restart everything
   switchroom version         Show versions + running agent health summary
+  switchroom auth refresh-accounts  Refresh OAuth tokens + fan out (cron entrypoint)
 ```

@@ -104,6 +104,10 @@ switchroom agent list
 
 If `switchroom doctor` reports healthy and at least one agent is listed, installation is complete. Offer to invoke the `switchroom-status` or `switchroom-health` skill for a deeper look.
 
+### Optional follow-up: share one Anthropic account across multiple agents
+
+Once the first agent is up and authenticated, the user can promote that agent's auth to a global Anthropic account so additional agents share the same Pro/Max subscription without each running its own OAuth flow. See `switchroom-manage` (Anthropic accounts section) for the bootstrap flow. This is the path most users want when they add a second agent — flag it as soon as they ask "how do I add another agent?".
+
 ## What not to do
 
 - **Do not** run `switchroom setup` non-interactively or pipe input to it — it's designed for a human.

@@ -155,6 +155,75 @@ Agent config resolves through `defaults → extends profile → agent-specific`,
 
 ---
 
+## Auth — "share my Pro account across agents", "auth verbs", "who's logged into what"
+
+Two layers coexist. **Use the new account model when an operator wants one OAuth flow to drive multiple agents.** The legacy per-agent slot model still works for first-time agent auth.
+
+### Per-agent (slot model) — first-time agent auth + the existing Telegram /auth flow
+
+```bash
+switchroom auth login <agent>          # interactive OAuth, writes to <agent>/.claude/.credentials.json
+switchroom auth status                 # one row per agent
+switchroom auth list <agent>           # show the agent's slot pool
+switchroom auth use <agent> <slot>     # switch the agent's active slot
+switchroom auth refresh-tick           # cron entrypoint for the legacy refresh loop
+```
+
+### Anthropic accounts (new model — see `reference/share-auth-across-the-fleet.md`)
+
+The Anthropic account is the unit of authentication. One account → many agents. Storage at `~/.switchroom/accounts/<label>/`. Per-agent `.credentials.json` becomes a passive mirror that the broker keeps in sync.
+
+```bash
+# Lift an already-authenticated agent's credentials into a global account
+switchroom auth account add <label> --from-agent <agent>
+
+# Or import from a credentials.json file you already have
+switchroom auth account add <label> --from-credentials <path>
+
+switchroom auth account list           # accounts + which agents use each + health
+switchroom auth account rm <label>     # refused while any agent is enabled
+
+# Wire an account to one or more agents (writes agents.<name>.auth.accounts in switchroom.yaml + immediate fanout)
+switchroom auth enable <label> <agent...>
+switchroom auth disable <label> <agent...>
+
+# Single account-refresh tick: refresh expiring tokens, fan out to enabled agents
+switchroom auth refresh-accounts [--json]
+```
+
+### Schema
+
+```yaml
+agents:
+  foo:
+    auth:
+      accounts: [work-pro, personal-max]   # ordered priority — first non-quota-exhausted wins
+```
+
+When unset, the agent uses the legacy per-agent slot path. The two are not mutually exclusive during the transition.
+
+### Telegram parity
+
+Every CLI verb above has a Telegram twin:
+
+```
+/auth account add <label> [--from-agent <name>]
+/auth account list
+/auth account rm <label>
+/auth enable <label> [agents...]    — defaults to the current agent
+/auth disable <label> [agents...]   — defaults to the current agent
+```
+
+`/auth login`, `/auth code`, `/auth list <agent>` etc. continue to work for the per-agent path.
+
+### When auth-related questions come in
+
+- "I want one Pro/Max subscription on multiple agents" → account model. Walk them through the bootstrap (`auth login` first agent → `auth account add --from-agent` → `auth enable` others).
+- "An agent's auth expired" → check `switchroom auth account list` first. If the account is healthy but the agent isn't getting it, the broker fanout may be stale — `switchroom auth refresh-accounts` forces a tick.
+- "I hit a quota" → `switchroom auth account list` shows quota-exhausted accounts; auto-fallback handles it if the agent has multiple accounts in priority order.
+
+---
+
 ## Scheduled tasks — "what cron runs", "show me the timers"
 
 List cron jobs and scheduled tasks.
@@ -194,7 +263,8 @@ Additional features:
 - **SQLite history** — enables quote-reply defaults
 - **PI-safe envelope** — inbound text wrapped in `<channel source="telegram">` for prompt-injection safety
 - **Inline approvals** — tool permissions surface as ✅/❌ buttons or via `/approve` `/deny` `/pending`
-- **Slash commands** — `/new`, `/reset`, `/approve`, `/deny`, `/pending`, `/restart`, `/update`, `/version`, `/logs`, `/doctor`, `/switchroomhelp` (see `TELEGRAM_MENU_COMMANDS` in `telegram-plugin/welcome-text.ts`)
+- **Slash commands** — `/new`, `/reset`, `/approve`, `/deny`, `/pending`, `/restart`, `/update`, `/version`, `/logs`, `/doctor`, `/auth`, `/switchroomhelp` (see `TELEGRAM_MENU_COMMANDS` in `telegram-plugin/welcome-text.ts`)
+- **`/auth`** — full auth surface inside Telegram: per-agent slot verbs (`login`/`reauth`/`code`/`add`/`use`/`list`/`rm`) AND account-shaped verbs (`account add`/`account list`/`account rm`/`enable`/`disable`). The account verbs implement the new "one Pro account, many agents" model — see the **Auth** section above.
 - **Access control** — `dmPolicy: pairing | allowlist | disabled` per agent
 
 ---
