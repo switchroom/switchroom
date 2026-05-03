@@ -8476,12 +8476,47 @@ if (streamMode === 'checklist') {
           ? { reply_to: String(replyToMessageId) }
           : {}),
       }
+      // #354 spike: opt-in draft transport for the pinned card body.
+      // The agent's stream_reply tool already uses sendMessageDraft in
+      // DMs (continuous trailing-edge bouncing-dots animation, no edit
+      // budget burn). The progress card's emit doesn't, so the pinned
+      // card never gets the same liveness signal between explicit
+      // tool_use events. Wiring it on here passes `isPrivateChat` +
+      // `sendMessageDraft` into handleStreamReply — the existing draft
+      // transport selection in stream-reply-handler picks it up.
+      //
+      // Default OFF pending operator validation of the spike unknowns
+      // documented in #354:
+      //   1. Can a draft message be PINNED? `pinMgr.considerPin` runs
+      //      after handleStreamReply returns a messageId — if drafts
+      //      can't be pinned, pin would silently fail and the card
+      //      wouldn't pin until materialize on turn_end (UX shift).
+      //   2. What happens if the bot dies mid-draft? Telegram may
+      //      orphan the draft visibly, leaving a half-rendered card.
+      //   3. Group/forum chats fall through to the legacy edit path
+      //      (isPrivateChat=false → resolvedTransport='message' in
+      //      stream-reply-handler.ts). Forum topics in DMs don't exist;
+      //      we still defend against future shape changes by guarding
+      //      on threadId presence.
+      //
+      // To enable: PROGRESS_CARD_DRAFT_TRANSPORT=1. Run for a day on a
+      // single agent, watch journalctl for "progress-card emit failed"
+      // bursts and confirm cards pin correctly. If clean, flip the
+      // default in a follow-up PR.
+      const draftFlagOn = process.env.PROGRESS_CARD_DRAFT_TRANSPORT === '1'
+      const draftEligible = draftFlagOn && isDmChatId(chatId) && threadId == null
       handleStreamReply(args, { activeDraftStreams, activeDraftParseModes, suppressPtyPreview }, {
         bot: lockedBot, retry: robustApiCall, markdownToHtml, escapeMarkdownV2, repairEscapedWhitespace,
         takeHandoffPrefix: () => '', assertAllowedChat, resolveThreadId, disableLinkPreview: true,
         defaultFormat: 'html', logStreamingEvent, endStatusReaction,
         historyEnabled: false, recordOutbound: () => {},
         writeError: (line) => process.stderr.write(line),
+        ...(draftEligible
+          ? {
+              isPrivateChat: true,
+              ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
+            }
+          : {}),
       }).then((result) => {
         // Successful API call — reset the consecutive-4xx counter.
         progressDriver?.reportApiSuccess(turnKey)
