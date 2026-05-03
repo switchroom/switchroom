@@ -142,6 +142,18 @@ export interface StreamControllerConfig {
    * sendMessage is posted for push notification and the draft is cleared.
    */
   sendMessageDraft?: StreamDraftFn
+  /**
+   * If set, the controller is initialized as if a previous send had
+   * landed with this `message_id`. The first `update()` invokes
+   * `editMessageText` against this id rather than `sendMessage`.
+   * Threads through to `createDraftStream`'s `initialMessageId`. Used
+   * by callers that know the anchor message id from an external source
+   * (e.g. the gateway's pin manager) to guarantee subsequent emits
+   * edit in place rather than create a fresh sendMessage. Closes the
+   * "done=true → activeDraftStreams entry deleted → next emit creates
+   * fresh sendMessage" duplicate-message class (issue #626).
+   */
+  initialMessageId?: number | null
 }
 
 /**
@@ -171,6 +183,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     previewTransport,
     isPrivateChat,
     sendMessageDraft,
+    initialMessageId,
   } = cfg
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
@@ -219,6 +232,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       ...(previewTransport != null ? { previewTransport } : {}),
       ...(isPrivateChat != null ? { isPrivateChat } : {}),
       ...(sendMessageDraft != null ? { sendMessageDraft } : {}),
+      ...(initialMessageId != null ? { initialMessageId } : {}),
       chatId,
     },
   )

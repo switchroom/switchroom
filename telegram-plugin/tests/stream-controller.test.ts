@@ -224,4 +224,39 @@ describe('createStreamController', () => {
     // harden error handling later, this test flips to expect a thrown
     // error or a status-reaction signal — whichever we decide.
   })
+
+  it('initialMessageId — first update edits the supplied id, no sendMessage fires (#626)', async () => {
+    // The full-stack proof of the gateway-emit idempotency hook: the
+    // pin manager hands us an existing message id, the controller
+    // initializes its state to that id, and the very first update
+    // routes to bot.api.editMessageText against id 7777 — NEVER to
+    // bot.api.sendMessage. This is the invariant that makes "multiple
+    // status messages per turn" structurally impossible when the pin
+    // manager has tracked a card for the current turnKey.
+    const stream = createStreamController({
+      bot,
+      chatId: '999',
+      threadId: 7,
+      parseMode: 'HTML',
+      throttleMs: 1000,
+      initialMessageId: 7777,
+    })
+    void stream.update('<b>edit-only</b>')
+    await microtaskFlush()
+    expect(bot.api.sendMessage).not.toHaveBeenCalled()
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    const [chat_id, id, text, opts] = bot.api.editMessageText.mock.calls[0]
+    expect(chat_id).toBe('999')
+    expect(id).toBe(7777)
+    expect(text).toBe('<b>edit-only</b>')
+    expect(opts).toMatchObject({
+      parse_mode: 'HTML',
+      message_thread_id: 7,
+      link_preview_options: { is_disabled: true },
+    })
+    // The handle reports the supplied id immediately so the gateway
+    // can chain pinManager.considerPin with the right id even on the
+    // first edit.
+    expect(stream.getMessageId()).toBe(7777)
+  })
 })

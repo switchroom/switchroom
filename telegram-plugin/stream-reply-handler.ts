@@ -244,6 +244,32 @@ export interface StreamReplyDeps {
    */
   sendMessageDraft?: StreamDraftFn
   /**
+   * Idempotency hook for the duplicate-message class (issue #626).
+   *
+   * On every call where the handler would CREATE a new stream (no entry
+   * in `state.activeDraftStreams[sKey]`), this callback is consulted to
+   * see whether an external authority already knows the anchor message
+   * id for this lane+turn. If it returns a number, the new stream is
+   * initialized as if a previous send had landed with that id — the
+   * very next update fires `editMessageText` instead of `sendMessage`.
+   *
+   * Wired by the gateway to `pinMgr.pinnedMessageId(turnKey, agentId)`
+   * for the progress card. Without this hook, a `done=true` finalize
+   * deletes `activeDraftStreams[sKey]`, and the next emit on the same
+   * turn creates a fresh sendMessage — visible to the user as a second
+   * "status message" landing instead of an edit. The not-found
+   * fallback in draft-stream gracefully handles a stale id.
+   *
+   * Safe to omit. Optional. Returns null/undefined to fall through to
+   * the standard "first call sends" behavior.
+   */
+  lookupExistingMessageId?: (key: {
+    chatId: string
+    threadId: number | undefined
+    lane: string | undefined
+    turnKey: string | undefined
+  }) => number | null | undefined
+  /**
    * True when the current chat is a private DM. Passed to the stream
    * controller so "auto" transport activates draft in DMs only.
    */
@@ -433,6 +459,32 @@ export async function handleStreamReply(
         ? 'message'
         : 'auto'
 
+    // Idempotency hook (#626): if an external authority (e.g. the
+    // gateway's pin manager) already knows the anchor message id for
+    // this lane+turn, initialize the stream with it so the next update
+    // edits in place rather than creating a fresh sendMessage. This
+    // closes the "done=true → activeDraftStreams entry deleted → next
+    // emit creates fresh sendMessage" path that produced multiple
+    // status messages per turn.
+    let initialMessageId: number | undefined
+    if (deps.lookupExistingMessageId != null) {
+      try {
+        const looked = deps.lookupExistingMessageId({
+          chatId: chat_id,
+          threadId,
+          lane: args.lane,
+          turnKey: args.turnKey,
+        })
+        if (typeof looked === 'number' && Number.isFinite(looked)) {
+          initialMessageId = looked
+        }
+      } catch (err) {
+        deps.writeError(
+          `telegram channel: stream_reply lookupExistingMessageId failed: ${err}\n`,
+        )
+      }
+    }
+
     stream = createStreamController({
       bot: deps.bot,
       chatId: chat_id,
@@ -448,6 +500,7 @@ export async function handleStreamReply(
       previewTransport: resolvedTransport,
       isPrivateChat: deps.isPrivateChat === true,
       ...(deps.sendMessageDraft != null ? { sendMessageDraft: deps.sendMessageDraft } : {}),
+      ...(initialMessageId != null ? { initialMessageId } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
       onEdit: (messageId, charCount) =>

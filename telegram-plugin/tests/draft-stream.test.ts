@@ -667,6 +667,63 @@ describe('createDraftStream — draft transport', () => {
     expect(m.sendCalls.length).toBe(1)
   })
 
+  it('initialMessageId — first update edits in place instead of sendMessage (#626)', async () => {
+    // Closes the duplicate-status-message regression: when a previous
+    // done=true finalized + deleted activeDraftStreams[sKey], the next
+    // emit creates a fresh stream. With initialMessageId, that fresh
+    // stream is initialized as if a previous send had landed with the
+    // given id, so the very first update fires editMessageText
+    // instead of sendMessage. No new "anchor message" lands.
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 200,
+      initialMessageId: 999,
+    })
+    void stream.update('Edit-only payload')
+    await stream.finalize()
+    expect(m.sendCalls.length).toBe(0)
+    expect(m.editCalls.length).toBe(1)
+    expect(m.editCalls[0].id).toBe(999)
+    expect(m.editCalls[0].text).toBe('Edit-only payload')
+  })
+
+  it('initialMessageId — stale id falls back to sendMessage on not-found error', async () => {
+    // Defense in depth: if the externally-supplied id no longer exists
+    // (message deleted, chat moved, race), the edit returns
+    // "message to edit not found" and the draft stream re-sends. The
+    // user sees one fresh anchor — degraded but never silent failure.
+    const m = makeMock()
+    let editAttempts = 0
+    m.edit = async (_id: number, _text: string) => {
+      editAttempts++
+      throw new Error('Bad Request: message to edit not found')
+    }
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 200,
+      initialMessageId: 99999,
+    })
+    void stream.update('Recovery text')
+    await stream.finalize()
+    expect(editAttempts).toBeGreaterThanOrEqual(1)
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.sendCalls[0].text).toBe('Recovery text')
+  })
+
+  it('initialMessageId — null/undefined behaves identically to omitted (back-compat)', async () => {
+    // The hook is opt-in. A caller that doesn't supply it (or supplies
+    // null) must observe identical behavior to the legacy path:
+    // first update sends, subsequent updates edit.
+    const m = makeMock()
+    const stream = createDraftStream(m.send, m.edit, {
+      throttleMs: 200,
+      initialMessageId: null,
+    })
+    void stream.update('First call')
+    await stream.finalize()
+    expect(m.sendCalls.length).toBe(1)
+    expect(m.editCalls.length).toBe(0)
+  })
+
   it('draft-clear failure is swallowed (best-effort)', async () => {
     const m = makeMock()
     let callCount = 0

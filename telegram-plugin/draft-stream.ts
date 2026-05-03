@@ -115,6 +115,20 @@ export interface DraftStreamConfig {
   log?: (msg: string) => void
   /** Optional warning logger. Used for transport fallback notices. */
   warn?: (msg: string) => void
+  /**
+   * If set, the stream is initialized as if a previous send had landed
+   * with this `message_id` — the FIRST update() call invokes `edit`
+   * against this id rather than `send`. Used by callers (notably the
+   * gateway's progress-card emit) that know the anchor message id from
+   * an external source (e.g. the pin manager) and want to guarantee a
+   * subsequent emit edits in place rather than creating a fresh
+   * sendMessage. This closes the "done=true → activeDraftStreams entry
+   * deleted → next emit creates fresh sendMessage" duplicate-message
+   * class (issue #626). The not-found fallback at the edit site
+   * (line ~280: re-send on `MESSAGE_ID_INVALID`) gracefully handles a
+   * stale id — the bad edit fails once, then a fresh send fires.
+   */
+  initialMessageId?: number | null
 }
 
 export interface DraftStreamHandle {
@@ -193,7 +207,7 @@ export function createDraftStream(
     warn?.('draft-stream: sendMessageDraft unavailable; falling back to sendMessage/editMessageText')
   }
 
-  let messageId: number | null = null
+  let messageId: number | null = config.initialMessageId ?? null
   let pendingText: string | null = null
   let lastSentText: string | null = null
   let lastSentAt = 0

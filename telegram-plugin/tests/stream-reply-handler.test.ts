@@ -1113,4 +1113,180 @@ describe('handleStreamReply', () => {
       expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBeUndefined()
     })
   })
+
+  describe('lookupExistingMessageId hook (#626 — multiple status messages regression)', () => {
+    it('reuses an externally-known messageId on stream creation — first emit edits, no sendMessage', async () => {
+      // The pin manager already knows the anchor message id for this
+      // turnKey from a previous emit cycle (e.g. before done=true wiped
+      // activeDraftStreams[sKey]). The hook hands that id back; the
+      // new stream initializes with it, so the FIRST update edits in
+      // place. No fresh sendMessage = no extra "status message" lands.
+      const state = makeState()
+      const deps = makeDeps(bot, {
+        lookupExistingMessageId: ({ turnKey, lane }) => {
+          if (turnKey === 'turn-A' && lane === 'progress') return 4242
+          return null
+        },
+      })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'second emit', lane: 'progress', turnKey: 'turn-A' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      const result = await pending
+
+      expect(bot.api.sendMessage).not.toHaveBeenCalled()
+      expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+      const [, id] = bot.api.editMessageText.mock.calls[0]
+      expect(id).toBe(4242)
+      expect(result.messageId).toBe(4242)
+    })
+
+    it('hook returns null → falls through to legacy sendMessage path', async () => {
+      // Back-compat sanity: a hook that returns null on every call
+      // produces identical behavior to omitting the hook entirely.
+      const state = makeState()
+      const deps = makeDeps(bot, {
+        lookupExistingMessageId: () => null,
+      })
+
+      const pending = handleStreamReply(
+        { chat_id: '1', text: 'fresh send', lane: 'progress', turnKey: 'turn-X' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      await pending
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.editMessageText).not.toHaveBeenCalled()
+    })
+
+    it('hook NOT consulted when an active draft stream already exists for the lane+turn', async () => {
+      // Lifecycle invariant: the hook only fires on stream creation.
+      // If activeDraftStreams[sKey] is already populated (turn in
+      // progress, no done=true yet), the existing stream handles
+      // edits — the hook is never consulted, so it can't disturb the
+      // running stream's state.
+      const state = makeState()
+      let lookupCalls = 0
+      const deps = makeDeps(bot, {
+        lookupExistingMessageId: () => {
+          lookupCalls++
+          return 9999
+        },
+      })
+
+      // First emit creates the stream (lookup IS called, returns
+      // 9999 → first edit goes to 9999).
+      await handleStreamReply(
+        { chat_id: '1', text: 'first', lane: 'progress', turnKey: 'turn-B' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      vi.advanceTimersByTime(1000)
+      expect(lookupCalls).toBe(1)
+      expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+
+      // Second emit on the same lane+turn reuses the existing stream
+      // — the lookup is NOT called again. Edits still target 9999.
+      await handleStreamReply(
+        { chat_id: '1', text: 'second', lane: 'progress', turnKey: 'turn-B' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      expect(lookupCalls).toBe(1)
+      expect(bot.api.editMessageText).toHaveBeenCalledTimes(2)
+    })
+
+    it('hook throws → error logged, handler falls through to fresh sendMessage', async () => {
+      // Defensive contract: a buggy lookup must never break the
+      // outbound path. Caller's writeError gets the diagnostic; the
+      // emit lands as a fresh send.
+      const state = makeState()
+      const writeError = vi.fn()
+      const deps = makeDeps(bot, {
+        writeError,
+        lookupExistingMessageId: () => {
+          throw new Error('lookup blew up')
+        },
+      })
+
+      await handleStreamReply(
+        { chat_id: '1', text: 'after-fault', lane: 'progress', turnKey: 'turn-C' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(writeError).toHaveBeenCalled()
+      const errLine = (writeError.mock.calls[0]?.[0] as string) ?? ''
+      expect(errLine).toContain('lookupExistingMessageId failed')
+    })
+
+    it('full #626 lifecycle scenario — done=true → activeDraftStreams cleared → next emit edits via hook (one anchor message total)', async () => {
+      // The end-to-end repro of #626. Sequence:
+      //   1. First progress-card emit (isFirstEmit=true) → fresh
+      //      sendMessage on the 'progress' lane for turn-A. Pin
+      //      manager records messageId=500.
+      //   2. done=true emit (e.g. the parent turn_end fires before
+      //      sub-agents finish) → handler finalizes + DELETES
+      //      activeDraftStreams[sKey].
+      //   3. A subsequent sub-agent event triggers a fresh progress-
+      //      card emit on the SAME turn-A. Without the hook, the
+      //      handler would create a new stream → fresh sendMessage →
+      //      a SECOND status message lands in the chat.
+      //   4. With the hook returning the pin-manager's messageId 500,
+      //      the new stream initializes with 500. The next update
+      //      hits editMessageText against 500. Total Telegram surface
+      //      = ONE message.
+      const state = makeState()
+      const knownMessageId = { value: null as number | null }
+      const deps = makeDeps(bot, {
+        lookupExistingMessageId: () => knownMessageId.value,
+      })
+
+      // 1. First emit, no known messageId yet → fresh sendMessage
+      await handleStreamReply(
+        { chat_id: '1', text: 'tool 1...', lane: 'progress', turnKey: 'turn-A' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      // The pin manager records id=500 (mock bot's first id).
+      knownMessageId.value = 500
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.editMessageText).not.toHaveBeenCalled()
+
+      // 2. done=true → finalize + clear sKey
+      vi.advanceTimersByTime(1000)
+      await handleStreamReply(
+        { chat_id: '1', text: 'tool 1, tool 2 ✓', lane: 'progress', turnKey: 'turn-A', done: true },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+      expect(state.activeDraftStreams.size).toBe(0)
+
+      // 3. Subsequent sub-agent emit on the SAME turn-A — without
+      //    the hook this would land as sendMessage #2 (the bug).
+      await handleStreamReply(
+        { chat_id: '1', text: 'tool 1, tool 2 ✓, sub-agent...', lane: 'progress', turnKey: 'turn-A' },
+        state,
+        deps,
+      )
+      await microtaskFlush()
+
+      // Invariant: total fresh sendMessages on this chat = 1.
+      // Anything > 1 is the #626 bug class.
+      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      // The post-done emit was an edit against id 500.
+      expect(bot.api.editMessageText.mock.calls.some((c) => c[1] === 500)).toBe(true)
+    })
+  })
 })

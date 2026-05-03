@@ -8702,6 +8702,20 @@ if (streamMode === 'checklist') {
         defaultFormat: 'html', logStreamingEvent, endStatusReaction,
         historyEnabled: false, recordOutbound: () => {},
         writeError: (line) => process.stderr.write(line),
+        // #626 idempotency hook: when a previous done=true finalize
+        // deleted the activeDraftStreams entry for this lane+turn,
+        // a subsequent emit would normally create a fresh sendMessage
+        // (= a NEW status message, the user-visible bug). The pin
+        // manager already knows the anchor message id for this turn
+        // (set on the FIRST successful send via considerPin below);
+        // route it back into the handler so the new stream initializes
+        // its messageId and the very next update fires editMessageText
+        // instead of sendMessage. Stale ids fall back gracefully via
+        // the not-found path in draft-stream.
+        lookupExistingMessageId: (key) => {
+          if (key.turnKey == null) return null
+          return pinMgr.pinnedMessageId(key.turnKey, agentId)
+        },
         ...(draftEligible
           ? {
               isPrivateChat: true,
