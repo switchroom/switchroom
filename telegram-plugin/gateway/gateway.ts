@@ -1856,7 +1856,10 @@ const ipcServer: IpcServer = createIpcServer({
         if (ad) clearActiveReactions(ad)
       },
       disposeProgressDriver: () => {
-        progressDriver?.dispose({ preservePending: true })
+        // dispose is optional on the ProgressDriver interface — chain
+        // through both possibly-undefined hops. Caught by
+        // scripts/check-plugin-references.mjs (TS2722).
+        progressDriver?.dispose?.({ preservePending: true })
       },
       log: (msg) => process.stderr.write(`${msg}\n`),
     })
@@ -2694,13 +2697,16 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
     { verb: 'sendMessage', chat_id, threadId },
   )
 
-  // Record in sent-message history
+  // Record in sent-message history. RecordOutboundArgs uses `texts`
+  // (parallel array to message_ids), not `text` — the singular-name
+  // typo silently omitted progress_update outbounds from the history
+  // DB. Caught by scripts/check-plugin-references.mjs (TS2561).
   if (HISTORY_ENABLED) {
     recordOutbound({
       chat_id,
       thread_id: threadId ?? null,
       message_ids: [sent.message_id],
-      text,
+      texts: [text],
     })
   }
 
