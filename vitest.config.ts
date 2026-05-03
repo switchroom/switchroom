@@ -9,11 +9,25 @@ if (process.env.BUILDKITE_ANALYTICS_TOKEN) {
   reporters.push("buildkite-test-collector/vitest/reporter");
 }
 
+// Cap the worker pool. Default is one fork per CPU (16 on this box), and each
+// fork can hold ~900MB. Six agents simultaneously running `npm test` at the
+// default would demand ~80GB of RAM — enough to OOM a 60GB box even with
+// generous swap. 4 forks/run keeps a single test run snappy while letting the
+// fleet share the machine safely.
+const VITEST_MAX_FORKS = Number(process.env.VITEST_MAX_FORKS ?? 4);
+
 export default defineConfig({
   test: {
     globals: true,
     environment: "node",
     reporters,
+    pool: "forks",
+    poolOptions: {
+      forks: {
+        maxForks: VITEST_MAX_FORKS,
+        minForks: 1,
+      },
+    },
     // Required by the Buildkite collector so it can record per-test
     // file/line locations. Harmless when the collector is off.
     includeTaskLocation: true,
