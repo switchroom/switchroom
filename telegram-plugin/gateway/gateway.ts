@@ -104,6 +104,10 @@ import {
   type OperatorEventKind,
 } from '../operator-events.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
+import {
+  formatModelUnavailableCard,
+  resolveModelUnavailableFromOperatorEvent,
+} from '../model-unavailable.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
 
@@ -1388,14 +1392,38 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     )
   }
 
-  let rendered: ReturnType<typeof renderOperatorEvent>
-  try {
-    rendered = renderOperatorEvent(event)
-  } catch (err) {
+  // Issue #394 Fix 2: when the failure is model-unavailable (quota out,
+  // overloaded, or the network can't even reach Anthropic), suppress the
+  // raw stderr/detail and post the actionable ⚠️ card instead. The card
+  // points at the three commands that move the needle (`/authfallback`,
+  // `/auth add`, `/usage`) so the user isn't left staring at "You're out
+  // of extra usage · resets May 3, 11am" with no idea what to do.
+  //
+  // Two routes match:
+  //   - kind already classified as quota-exhausted / rate-limited / unknown-5xx
+  //     by the upstream classifier
+  //   - detail string contains one of the model-unavailable text patterns
+  //     (covers raw stderr that slipped past structured classification)
+  const modelUnavailable = resolveModelUnavailableFromOperatorEvent(event)
+  let renderedText: string
+  let renderedKeyboard: ReturnType<typeof renderOperatorEvent>['keyboard'] | undefined
+  if (modelUnavailable) {
     process.stderr.write(
-      `telegram gateway: renderOperatorEvent failed agent=${agent} kind=${kind}: ${(err as Error).message}\n`,
+      `telegram gateway: operator-event suppressing-raw-stderr-for-model-unavailable agent=${agent} kind=${kind} detected=${modelUnavailable.kind}\n`,
     )
-    return
+    renderedText = formatModelUnavailableCard(modelUnavailable, agent)
+    renderedKeyboard = undefined
+  } else {
+    try {
+      const r = renderOperatorEvent(event)
+      renderedText = r.text
+      renderedKeyboard = r.keyboard
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: renderOperatorEvent failed agent=${agent} kind=${kind}: ${(err as Error).message}\n`,
+      )
+      return
+    }
   }
 
   const access = loadAccess()
@@ -1410,9 +1438,9 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)\n`,
   )
   for (const chat_id of access.allowFrom) {
-    void bot.api.sendMessage(chat_id, rendered.text, {
+    void bot.api.sendMessage(chat_id, renderedText, {
       parse_mode: 'HTML',
-      reply_markup: rendered.keyboard,
+      ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
     }).catch(e => {
       process.stderr.write(
         `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
