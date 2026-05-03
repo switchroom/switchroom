@@ -33,8 +33,26 @@ for (const { src, out, label } of entries) {
   mkdirSync(outDirForEntry, { recursive: true });
 
   console.log(`[build] bundling ${src} -> dist/${out}`);
+  // `--external node-fetch`: grammy depends on node-fetch@2 which is a
+  // CJS package using node's `http`/`stream` directly. When bundled with
+  // `--target node`, bun's bundler INLINES node-fetch as the fetch
+  // implementation. Under bun runtime that inlined node-fetch breaks
+  // grammy's API calls with a generic "Network request failed!" — the
+  // gateway boot then loops 8x retrying getMe and exits, rendering the
+  // entire fleet unresponsive (every reply path fails, agent thumbs-up
+  // works but no message lands).
+  //
+  // Externalizing node-fetch keeps the bundle target-node compatible
+  // for npm-i-g users on a node runtime (grammy declares node-fetch as
+  // a dep so it'll be present in node_modules) AND lets bun's native
+  // fetch shim take over when the bundle runs under bun (the actual
+  // production deployment via `systemd ExecStart=bun gateway.js`).
+  //
+  // Verified: the un-externalized bundle reproducibly fails under bun
+  // with "HttpError: Network request for 'getMe' failed!" within 1s of
+  // boot. The externalized bundle boots cleanly and polls successfully.
   execSync(
-    `bun build ${JSON.stringify(srcPath)} --outdir ${JSON.stringify(outDirForEntry)} --target node`,
+    `bun build ${JSON.stringify(srcPath)} --outdir ${JSON.stringify(outDirForEntry)} --target node --external node-fetch`,
     { stdio: "inherit", cwd: root }
   );
 
