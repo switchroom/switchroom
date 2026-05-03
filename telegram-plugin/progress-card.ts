@@ -1334,7 +1334,12 @@ export function render(
   // Issue #352: prepend an always-visible summary header before the per-agent
   // expandable blocks so the user sees status counts at a glance.
   const expandableParts: string[] = []
-  if (multiAgentActive && state.subAgents.size > 0) {
+  // Per-agent cards (#per-agent-cards): when the env flag is on each
+  // sub-agent gets its own pinned card — the parent's expandable block
+  // becomes redundant and is suppressed entirely. Off by default so the
+  // legacy stacked-card behaviour persists during soft rollout.
+  const skipSubAgentExpandables = process.env.PROGRESS_CARD_PER_AGENT_PINS === '1'
+  if (!skipSubAgentExpandables && multiAgentActive && state.subAgents.size > 0) {
     // #378 sub-issue 6: dropped the "🤖 Sub-agents · 🔄 N · ✅ N · ❌ N"
     // rollup header. Per-row icons + state labels already convey the same
     // info, and a header above three rows that each say "✅ done" was

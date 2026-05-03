@@ -8649,7 +8649,7 @@ if (streamMode === 'checklist') {
   }
 
   progressDriver = createProgressDriver({
-    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit, replyToMessageId }) => {
+    emit: ({ chatId, threadId, turnKey, html, done, isFirstEmit, replyToMessageId, agentId }) => {
       const args = {
         chat_id: chatId, text: html, done, message_thread_id: threadId,
         lane: 'progress', format: 'html', turnKey,
@@ -8714,21 +8714,33 @@ if (streamMode === 'checklist') {
         // #203: progress-card edit is a user-visible signal.
         signalTracker.noteSignal(statusKey(chatId, threadId != null ? Number(threadId) : undefined), Date.now())
         if (!result?.messageId) return
+        // Per-agent cards (#per-agent-cards): thread `agentId` through to
+        // the pin manager so each sub-agent card pins under its own
+        // composite key. Absent for parent-card emits — the manager
+        // defaults to the parent sentinel.
         pinMgr.considerPin({
           chatId,
           threadId,
           turnKey,
           messageId: result.messageId,
           isFirstEmit,
+          ...(agentId != null ? { agentId } : {}),
         })
         // Heartbeat watchdog: after the initial pin has been recorded,
         // every subsequent (non-final) emit probes Telegram to confirm
         // our pin is still the one on display. Rate-limited internally.
         if (!isFirstEmit && !done) {
-          const expectedId = pinMgr.pinnedMessageId(turnKey)
+          const expectedId = pinMgr.pinnedMessageId(turnKey, agentId)
           if (expectedId != null) {
             void pinWatchdog.verify({ chatId, turnKey, expectedMessageId: expectedId })
           }
+        }
+        // Sub-agent card finalize: when an emit comes through with both
+        // `agentId` and `done`, that's the registry's terminal frame for
+        // this card. Unpin its message; the parent's onTurnComplete
+        // path covers the parent-card case.
+        if (done && agentId != null) {
+          pinMgr.completeTurn({ chatId, threadId, turnKey, agentId })
         }
       }).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err)
