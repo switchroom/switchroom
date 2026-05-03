@@ -12,24 +12,47 @@
  * progress-card-pin-manager.test.ts):
  *
  *   considerPin(candidate)
- *     - On `isFirstEmit === true` for a turnKey not yet pinned:
+ *     - On `isFirstEmit === true` for a (turnKey, agentId) pair not yet
+ *       pinned:
  *         records the pinned message id
  *         records an active-pin sidecar entry (if addPin is wired)
  *         calls bot.pin(chatId, messageId, { disable_notification: true })
  *         on pin rejection: calls removePin to keep the sidecar consistent
- *     - On subsequent emits for the same turnKey: no-op (idempotent).
+ *     - On subsequent emits for the same (turnKey, agentId): no-op
+ *       (idempotent).
  *
- *   completeTurn({ chatId, threadId, turnKey })
- *     - Looks up pinnedMessageId for turnKey; if present:
+ *   completeTurn({ chatId, threadId, turnKey, agentId? })
+ *     - Looks up pinnedMessageId for (turnKey, agentId); if present:
  *         unpins exactly once (duplicate completeTurn calls are safe)
  *         calls removePin to clear the sidecar
- *     - The unpinnedTurnKeys set is cleared on completeTurn so a future
- *       re-use of the same key (unlikely but cheap) starts fresh.
+ *     - The unpinned set entry is cleared so a future re-use of the same
+ *       composite key (unlikely but cheap) starts fresh.
+ *
+ *   completeAllForTurn({ turnKey })
+ *     - Catastrophic-cleanup helper. Unpins every pinned card for a turn,
+ *       across all agentIds. Used on bridge-disconnect / forced shutdown
+ *       paths where individual sub_agent_turn_end events may never land.
  *
  *   unpinForChat(chatId, threadId)
  *     - External hook for context-exhaustion / /restart: unpins every
- *       currently-pinned turn matching the chat+thread prefix.
+ *       currently-pinned (turnKey, agentId) matching the chat+thread
+ *       prefix.
+ *
+ * Per-agent cards (#per-agent-cards): the manager keys pin state on the
+ * composite (turnKey, agentId) so a parent card and its sub-agent cards
+ * can co-exist independently in the same turn. Callers that don't yet
+ * thread agentId through (e.g. legacy single-card-per-turn callers) get
+ * a stable default sentinel — see `PARENT_AGENT_ID` below — so existing
+ * behaviour is preserved without modification.
  */
+
+/**
+ * Sentinel agent id for the "parent" / single-card-per-turn case. Used
+ * as the default when callers don't yet pass an explicit agentId, so the
+ * composite-key bookkeeping degrades to the original turnKey-only
+ * behaviour for legacy call sites.
+ */
+export const PARENT_AGENT_ID = '__parent__'
 
 export interface PinCandidate {
   readonly chatId: string
@@ -37,6 +60,12 @@ export interface PinCandidate {
   readonly turnKey: string
   readonly messageId: number
   readonly isFirstEmit: boolean
+  /**
+   * Per-agent identity. Defaults to {@link PARENT_AGENT_ID} when omitted
+   * — callers that haven't yet been threaded for per-agent cards behave
+   * as before (one pin per turnKey).
+   */
+  readonly agentId?: string
 }
 
 export interface ActivePinEntry {
@@ -44,6 +73,12 @@ export interface ActivePinEntry {
   readonly messageId: number
   readonly turnKey: string
   readonly pinnedAt: number
+  /**
+   * Stored verbatim alongside the entry. Existing sidecar files written
+   * before the per-agent split have no agentId; readers should treat a
+   * missing field as {@link PARENT_AGENT_ID}.
+   */
+  readonly agentId?: string
 }
 
 export interface TimerHandle {
@@ -88,15 +123,37 @@ export interface PinManagerDeps {
   scheduleTimer?: (fn: () => void, ms: number) => TimerHandle
 }
 
+export interface CompleteTurnArgs {
+  chatId: string
+  threadId?: string
+  turnKey: string
+  /** Defaults to {@link PARENT_AGENT_ID}. */
+  agentId?: string
+}
+
 export interface PinManager {
   /** Decide whether to pin based on an emit's metadata. Idempotent. */
   considerPin(candidate: PinCandidate): void
-  /** Called from `onTurnComplete` — unpins the turn's pinned card. */
-  completeTurn(args: { chatId: string; threadId?: string; turnKey: string }): void
   /**
-   * External hook. Unpins every currently-pinned turn matching the chat
-   * (and optional thread). Used by context-exhaustion / external
-   * cancellation paths that need to clear all active pins for a chat.
+   * Called from `onTurnComplete` (parent) or from `sub_agent_turn_end`
+   * (per-agent) — unpins the (turnKey, agentId) composite's pinned card.
+   * `agentId` defaults to {@link PARENT_AGENT_ID} for legacy single-card
+   * call sites.
+   */
+  completeTurn(args: CompleteTurnArgs): void
+  /**
+   * Catastrophic-cleanup helper. Unpins every pinned card under a turnKey
+   * — across all agentIds. Used when a parent turn ends without per-agent
+   * sub_agent_turn_end events arriving (bridge disconnect, gateway crash,
+   * forced shutdown). Distinct from `completeTurn`, which targets a single
+   * card.
+   */
+  completeAllForTurn(args: { chatId: string; threadId?: string; turnKey: string }): void
+  /**
+   * External hook. Unpins every currently-pinned (turnKey, agentId)
+   * matching the chat (and optional thread). Used by
+   * context-exhaustion / external cancellation paths that need to clear
+   * all active pins for a chat.
    */
   unpinForChat(chatId: string, threadId: number | undefined): void
   /**
@@ -126,16 +183,37 @@ export interface PinManager {
    * doesn't keep a stale reference. Idempotent.
    */
   untrackExternalPin(chatId: string, messageId: number): void
-  /** Test-only: snapshot the currently-pinned turnKeys. */
+  /**
+   * Test-only: snapshot the unique turnKeys that currently have at
+   * least one pinned card. With per-agent cards this may collapse
+   * multiple composite entries down to a single turnKey.
+   */
   pinnedTurnKeys(): ReadonlyArray<string>
-  /** Test-only: look up the pinned message id for a turnKey. */
-  pinnedMessageId(turnKey: string): number | undefined
+  /**
+   * Test-only: snapshot the agentIds currently pinned under a turnKey.
+   * Empty array when nothing is pinned for that turn.
+   */
+  pinnedAgentIds(turnKey: string): ReadonlyArray<string>
+  /**
+   * Test-only: look up the pinned message id for a (turnKey, agentId).
+   * `agentId` defaults to {@link PARENT_AGENT_ID} for backward compat.
+   */
+  pinnedMessageId(turnKey: string, agentId?: string): number | undefined
   /**
    * Test hook to await all in-flight pin/unpin promises. Production
    * callers don't need this; tests can call it to drain the fire-and-
    * forget `.catch()` chains before asserting on side effects.
    */
   drainInFlight(): Promise<void>
+}
+
+/**
+ * Composite key for the per-agent pin maps. Uses a `::` separator that
+ * cannot appear in a turnKey (which is `${chatId}:${threadId}:${seq}`)
+ * or in any agentId (JSONL filename stems are slug-safe).
+ */
+function pinKey(turnKey: string, agentId: string): string {
+  return `${turnKey}::${agentId}`
 }
 
 export function createPinManager(deps: PinManagerDeps): PinManager {
@@ -149,22 +227,21 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       return { cancel: () => clearTimeout(t) }
     })
 
-  // Turn -> pinned message id. Populated only after a successful pin
-  // call returns; cleared on completeTurn.
+  // (turnKey, agentId) -> pinned message id. Populated only after a
+  // successful pin call returns; cleared on completeTurn for that
+  // composite.
   const pinned = new Map<string, number>()
-  // Turn -> pending pin state. Holds the candidate + timer handle while
-  // we wait pinDelayMs before actually calling the Telegram pin API. If
-  // completeTurn fires before the timer, we cancel and never pin — fast
-  // turns stay silent. Removed when the timer fires (moved to `pinned`)
-  // or when completeTurn cancels it.
+  // (turnKey, agentId) -> pending pin state. Holds the candidate +
+  // timer handle while we wait pinDelayMs before actually calling the
+  // Telegram pin API. If completeTurn fires before the timer, we cancel
+  // and never pin — fast turns stay silent. Removed when the timer
+  // fires (moved to `pinned`) or when completeTurn cancels it.
   const pendingPins = new Map<
     string,
-    { chatId: string; messageId: number; timer: TimerHandle }
+    { chatId: string; messageId: number; turnKey: string; agentId: string; timer: TimerHandle }
   >()
-  // Turns whose unpin has already fired. Guards against duplicate
-  // completeTurn calls causing a second unpin (the gateway fires
-  // onTurnComplete exactly once today, but the reducer's zombie path
-  // can also land on the same turnKey).
+  // Composite keys whose unpin has already fired. Guards against
+  // duplicate completeTurn calls causing a second unpin.
   const unpinned = new Set<string>()
   // `${chatId}:${pinnedMessageId}` -> service-message id. Populated when
   // the grammY `pinned_message` update handler forwards the wrapper
@@ -205,26 +282,27 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     )
   }
 
-  function doUnpin(turnKey: string, chatId: string, pinnedId: number): void {
-    if (unpinned.has(turnKey)) return
-    unpinned.add(turnKey)
-    log(`telegram gateway: progress-card: unpin turnKey=${turnKey} msgId=${pinnedId}\n`)
-    pinned.delete(turnKey)
-    const key = serviceKey(chatId, pinnedId)
-    const svcId = serviceMessages.get(key)
+  function doUnpin(turnKey: string, agentId: string, chatId: string, pinnedId: number): void {
+    const key = pinKey(turnKey, agentId)
+    if (unpinned.has(key)) return
+    unpinned.add(key)
+    log(`telegram gateway: progress-card: unpin turnKey=${turnKey} agentId=${agentId} msgId=${pinnedId}\n`)
+    pinned.delete(key)
+    const svcKey = serviceKey(chatId, pinnedId)
+    const svcId = serviceMessages.get(svcKey)
     if (svcId != null) {
-      serviceMessages.delete(key)
+      serviceMessages.delete(svcKey)
       deleteServiceMessage(chatId, svcId)
     }
     const unpinStart = now()
     const p = deps.unpin(chatId, pinnedId)
       .then(() => {
         const ms = now() - unpinStart
-        log(`telegram gateway: progress-card: unpin OK turnKey=${turnKey} msgId=${pinnedId} durationMs=${ms}\n`)
+        log(`telegram gateway: progress-card: unpin OK turnKey=${turnKey} agentId=${agentId} msgId=${pinnedId} durationMs=${ms}\n`)
       })
       .catch((err: Error) => {
         const ms = now() - unpinStart
-        log(`telegram gateway: progress-card unpin failed turnKey=${turnKey} msgId=${pinnedId} durationMs=${ms} error="${err?.message ?? err}"\n`)
+        log(`telegram gateway: progress-card unpin failed turnKey=${turnKey} agentId=${agentId} msgId=${pinnedId} durationMs=${ms} error="${err?.message ?? err}"\n`)
       })
       .finally(() => {
         // Keep the sidecar consistent whether the API call succeeded
@@ -236,36 +314,38 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     track(p)
   }
 
-  function firePin(turnKey: string, chatId: string, messageId: number): void {
+  function firePin(turnKey: string, agentId: string, chatId: string, messageId: number): void {
     // Called when the pin-delay timer fires. Promote from pendingPins
     // into pinned, then issue the Telegram pin API call.
-    pendingPins.delete(turnKey)
-    if (pinned.has(turnKey) || unpinned.has(turnKey)) {
+    const key = pinKey(turnKey, agentId)
+    pendingPins.delete(key)
+    if (pinned.has(key) || unpinned.has(key)) {
       // Either we already pinned (shouldn't happen — timer is the only
       // path that sets `pinned`) or the turn completed between scheduling
       // and firing and the pending entry was cleared elsewhere. Bail.
       return
     }
-    pinned.set(turnKey, messageId)
-    log(`telegram gateway: progress-card: pinned turnKey=${turnKey} msgId=${messageId}\n`)
+    pinned.set(key, messageId)
+    log(`telegram gateway: progress-card: pinned turnKey=${turnKey} agentId=${agentId} msgId=${messageId}\n`)
     if (deps.addPin) {
       deps.addPin({
         chatId,
         messageId,
         turnKey,
         pinnedAt: now(),
+        agentId,
       })
     }
     const pinStart = now()
     const p = deps.pin(chatId, messageId, { disable_notification: true })
       .then(() => {
         const ms = now() - pinStart
-        log(`telegram gateway: progress-card: pin OK turnKey=${turnKey} msgId=${messageId} durationMs=${ms}\n`)
+        log(`telegram gateway: progress-card: pin OK turnKey=${turnKey} agentId=${agentId} msgId=${messageId} durationMs=${ms}\n`)
       })
       .catch(
         (err: Error) => {
           const ms = now() - pinStart
-          log(`telegram gateway: progress-card pin failed turnKey=${turnKey} msgId=${messageId} durationMs=${ms} error="${err?.message ?? err}"\n`)
+          log(`telegram gateway: progress-card pin failed turnKey=${turnKey} agentId=${agentId} msgId=${messageId} durationMs=${ms} error="${err?.message ?? err}"\n`)
           if (deps.removePin) deps.removePin(chatId, messageId)
         },
       )
@@ -275,8 +355,10 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   return {
     considerPin(c) {
       if (!c.isFirstEmit) return
-      if (pinned.has(c.turnKey)) return
-      if (pendingPins.has(c.turnKey)) return
+      const agentId = c.agentId ?? PARENT_AGENT_ID
+      const key = pinKey(c.turnKey, agentId)
+      if (pinned.has(key)) return
+      if (pendingPins.has(key)) return
       // Schedule the pin via the injected timer. Fast-turn suppression is
       // owned upstream by the driver's `initialDelayMs` — by the time
       // considerPin sees isFirstEmit=true the card has already been
@@ -284,29 +366,70 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // The indirection remains so tests and callers can still override
       // with a positive value if they want a pre-pin visual buffer.
       const timer = scheduleTimer(() => {
-        firePin(c.turnKey, c.chatId, c.messageId)
+        firePin(c.turnKey, agentId, c.chatId, c.messageId)
       }, pinDelayMs)
-      pendingPins.set(c.turnKey, {
+      pendingPins.set(key, {
         chatId: c.chatId,
         messageId: c.messageId,
+        turnKey: c.turnKey,
+        agentId,
         timer,
       })
     },
 
-    completeTurn({ chatId, turnKey }) {
+    completeTurn({ chatId, turnKey, agentId }) {
+      const aid = agentId ?? PARENT_AGENT_ID
+      const key = pinKey(turnKey, aid)
       // Fast-turn path: if the pin is still pending, cancel the timer
       // and we're done — no pin ever landed, no unpin needed.
-      const pending = pendingPins.get(turnKey)
+      const pending = pendingPins.get(key)
       if (pending != null) {
         pending.timer.cancel()
-        pendingPins.delete(turnKey)
+        pendingPins.delete(key)
       }
-      const pinnedId = pinned.get(turnKey)
-      if (pinnedId != null) doUnpin(turnKey, chatId, pinnedId)
-      // Once the turn is complete we never see the same turnKey again
-      // (driver generates a fresh sequence). Clearing the flag keeps
-      // the set from growing unbounded over a long-running gateway.
-      unpinned.delete(turnKey)
+      const pinnedId = pinned.get(key)
+      if (pinnedId != null) doUnpin(turnKey, aid, chatId, pinnedId)
+      // Once the turn is complete we never see the same composite again
+      // (driver generates a fresh sequence for the turn, agentIds are
+      // stable per agent lifetime). Clearing the flag keeps the set from
+      // growing unbounded over a long-running gateway.
+      unpinned.delete(key)
+    },
+
+    completeAllForTurn({ chatId, turnKey }) {
+      // Snapshot composites for this turn before mutating — pendingPins
+      // and pinned will both shrink as we go.
+      const matchingPending: Array<{ key: string; agentId: string }> = []
+      for (const [key, entry] of pendingPins) {
+        if (entry.turnKey === turnKey) matchingPending.push({ key, agentId: entry.agentId })
+      }
+      for (const { key } of matchingPending) {
+        const pending = pendingPins.get(key)
+        if (pending != null) {
+          pending.timer.cancel()
+          pendingPins.delete(key)
+        }
+      }
+      const matchingPinned: Array<{ agentId: string; pinnedId: number }> = []
+      for (const [key, pinnedId] of pinned) {
+        // Composite keys are `${turnKey}::${agentId}` — split on `::`.
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        const tk = key.slice(0, sep)
+        if (tk !== turnKey) continue
+        const agentId = key.slice(sep + 2)
+        matchingPinned.push({ agentId, pinnedId })
+      }
+      for (const { agentId, pinnedId } of matchingPinned) {
+        doUnpin(turnKey, agentId, chatId, pinnedId)
+      }
+      // Mirror completeTurn's housekeeping: clear unpinned-set entries
+      // for this turn so a future reuse (unlikely) starts fresh.
+      for (const key of [...unpinned]) {
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        if (key.slice(0, sep) === turnKey) unpinned.delete(key)
+      }
     },
 
     unpinForChat(chatId, threadId) {
@@ -314,23 +437,30 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // Cancel any pending (not-yet-fired) timers for this chat/thread
       // first — otherwise they'd pin after we thought we cleaned up.
       const pendingMatching: string[] = []
-      for (const [turnKey] of pendingPins) {
-        if (turnKey.startsWith(`${base}:`)) pendingMatching.push(turnKey)
+      for (const [key, entry] of pendingPins) {
+        if (entry.turnKey.startsWith(`${base}:`)) pendingMatching.push(key)
       }
-      for (const turnKey of pendingMatching) {
-        const pending = pendingPins.get(turnKey)
+      for (const key of pendingMatching) {
+        const pending = pendingPins.get(key)
         if (pending != null) {
           pending.timer.cancel()
-          pendingPins.delete(turnKey)
+          pendingPins.delete(key)
         }
       }
-      // Snapshot the keys so doUnpin's map mutation doesn't invalidate
+      // Snapshot the entries so doUnpin's map mutation doesn't invalidate
       // iteration mid-loop.
-      const matching: Array<[string, number]> = []
-      for (const [turnKey, pinnedId] of pinned) {
-        if (turnKey.startsWith(`${base}:`)) matching.push([turnKey, pinnedId])
+      const matching: Array<{ turnKey: string; agentId: string; pinnedId: number }> = []
+      for (const [key, pinnedId] of pinned) {
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        const tk = key.slice(0, sep)
+        if (!tk.startsWith(`${base}:`)) continue
+        const agentId = key.slice(sep + 2)
+        matching.push({ turnKey: tk, agentId, pinnedId })
       }
-      for (const [turnKey, pinnedId] of matching) doUnpin(turnKey, chatId, pinnedId)
+      for (const { turnKey, agentId, pinnedId } of matching) {
+        doUnpin(turnKey, agentId, chatId, pinnedId)
+      }
     },
 
     captureServiceMessage({ chatId, pinnedMessageId, serviceMessageId }) {
@@ -369,11 +499,28 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     },
 
     pinnedTurnKeys() {
-      return [...pinned.keys()]
+      const seen = new Set<string>()
+      for (const key of pinned.keys()) {
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        seen.add(key.slice(0, sep))
+      }
+      return [...seen]
     },
 
-    pinnedMessageId(turnKey) {
-      return pinned.get(turnKey)
+    pinnedAgentIds(turnKey) {
+      const out: string[] = []
+      for (const key of pinned.keys()) {
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        if (key.slice(0, sep) !== turnKey) continue
+        out.push(key.slice(sep + 2))
+      }
+      return out
+    },
+
+    pinnedMessageId(turnKey, agentId) {
+      return pinned.get(pinKey(turnKey, agentId ?? PARENT_AGENT_ID))
     },
 
     async drainInFlight() {

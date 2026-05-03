@@ -28,6 +28,13 @@ export interface ActivePin {
   messageId: number;
   turnKey: string;
   pinnedAt: number;
+  /**
+   * Per-agent identity for the pin. Optional in the on-disk shape so
+   * sidecars written before per-agent cards (#per-agent-cards) still
+   * parse cleanly — readers should treat a missing field as the parent
+   * sentinel (`__parent__`).
+   */
+  agentId?: string;
 }
 
 function pinsPath(agentDir: string): string {
@@ -67,7 +74,11 @@ export function readActivePins(agentDir: string): ActivePin[] {
       typeof (item as ActivePin).turnKey === "string" &&
       typeof (item as ActivePin).pinnedAt === "number"
     ) {
-      out.push(item as ActivePin);
+      const aid = (item as ActivePin).agentId;
+      const entry: ActivePin = aid != null && typeof aid === "string"
+        ? (item as ActivePin)
+        : { ...(item as ActivePin), agentId: undefined };
+      out.push(entry);
     }
   }
   return out;

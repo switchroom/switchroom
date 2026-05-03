@@ -111,7 +111,7 @@ describe('createPinManager', () => {
       expect(h.deps.pin).toHaveBeenCalledTimes(1)
       // Sidecar recorded the pin with the injected clock.
       expect(h.sidecar).toEqual([
-        { chatId: 'chat-1', messageId: 500, turnKey: 'chat-1:42:1', pinnedAt: 10_000 },
+        { chatId: 'chat-1', messageId: 500, turnKey: 'chat-1:42:1', pinnedAt: 10_000, agentId: '__parent__' },
       ])
       // In-memory index reflects the pin.
       expect(h.mgr.pinnedTurnKeys()).toEqual(['chat-1:42:1'])
@@ -644,6 +644,123 @@ describe('createPinManager', () => {
       h.fireTimers()
       await h.mgr.drainInFlight()
       expect(h.deps.pin).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('per-agent composite key — one pin per (turnKey, agentId)', () => {
+    it('distinct agentIds under the same turnKey pin independently', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true, agentId: 'parent' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 501, isFirstEmit: true, agentId: 'sub-a' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 502, isFirstEmit: true, agentId: 'sub-b' })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.pin).toHaveBeenCalledTimes(3)
+      expect(h.mgr.pinnedTurnKeys()).toEqual(['c:1'])
+      expect(h.mgr.pinnedAgentIds('c:1').sort()).toEqual(['parent', 'sub-a', 'sub-b'])
+      expect(h.mgr.pinnedMessageId('c:1', 'parent')).toBe(500)
+      expect(h.mgr.pinnedMessageId('c:1', 'sub-a')).toBe(501)
+      expect(h.mgr.pinnedMessageId('c:1', 'sub-b')).toBe(502)
+    })
+
+    it('idempotent within a (turnKey, agentId) — second considerPin is a no-op', async () => {
+      const h = mkHarness()
+      const c = { chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true, agentId: 'sub-a' }
+      h.mgr.considerPin(c)
+      h.mgr.considerPin({ ...c, messageId: 999 })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.pin).toHaveBeenCalledTimes(1)
+      expect(h.deps.pin).toHaveBeenCalledWith('c', 500, { disable_notification: true })
+      expect(h.mgr.pinnedMessageId('c:1', 'sub-a')).toBe(500)
+    })
+
+    it('completeTurn for one agentId leaves siblings under the same turnKey untouched', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true, agentId: 'parent' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 501, isFirstEmit: true, agentId: 'sub-a' })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      h.mgr.completeTurn({ chatId: 'c', turnKey: 'c:1', agentId: 'sub-a' })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.unpin).toHaveBeenCalledTimes(1)
+      expect(h.deps.unpin).toHaveBeenCalledWith('c', 501)
+      expect(h.mgr.pinnedAgentIds('c:1')).toEqual(['parent'])
+      expect(h.mgr.pinnedMessageId('c:1', 'parent')).toBe(500)
+    })
+
+    it('legacy callers (no agentId) get the parent-sentinel default', async () => {
+      const h = mkHarness()
+      // Old call shape: no agentId. Uses PARENT_AGENT_ID under the hood.
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      expect(h.mgr.pinnedAgentIds('c:1')).toEqual(['__parent__'])
+      // pinnedMessageId without agentId resolves the parent sentinel.
+      expect(h.mgr.pinnedMessageId('c:1')).toBe(500)
+      // completeTurn without agentId targets the parent sentinel too.
+      h.mgr.completeTurn({ chatId: 'c', turnKey: 'c:1' })
+      await h.mgr.drainInFlight()
+      expect(h.deps.unpin).toHaveBeenCalledWith('c', 500)
+    })
+
+    it('parent and a sub-agent for the legacy turnKey pin under different sentinels', async () => {
+      // Mixed call shape: parent uses no agentId (sentinel), sub-agent
+      // passes an explicit one. They must not collide.
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 501, isFirstEmit: true, agentId: 'sub-a' })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.pin).toHaveBeenCalledTimes(2)
+      expect(h.mgr.pinnedAgentIds('c:1').sort()).toEqual(['__parent__', 'sub-a'])
+    })
+  })
+
+  describe('completeAllForTurn — catastrophic cleanup', () => {
+    it('unpins every agentId pinned under a turnKey', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true, agentId: 'parent' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 501, isFirstEmit: true, agentId: 'sub-a' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 502, isFirstEmit: true, agentId: 'sub-b' })
+      // A different turn — must not be affected.
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:2', messageId: 600, isFirstEmit: true, agentId: 'parent' })
+      h.fireTimers()
+      await h.mgr.drainInFlight()
+
+      h.mgr.completeAllForTurn({ chatId: 'c', turnKey: 'c:1' })
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.unpin).toHaveBeenCalledTimes(3)
+      const unpinnedIds = h.deps.unpin.mock.calls.map((args) => args[1]).sort((a, b) => Number(a) - Number(b))
+      expect(unpinnedIds).toEqual([500, 501, 502])
+      expect(h.mgr.pinnedTurnKeys()).toEqual(['c:2'])
+    })
+
+    it('cancels pending (not-yet-fired) timers under the turnKey', async () => {
+      const h = mkHarness()
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 500, isFirstEmit: true, agentId: 'parent' })
+      h.mgr.considerPin({ chatId: 'c', turnKey: 'c:1', messageId: 501, isFirstEmit: true, agentId: 'sub-a' })
+      // Timers scheduled but not fired yet.
+      h.mgr.completeAllForTurn({ chatId: 'c', turnKey: 'c:1' })
+      h.fireTimers() // noop — both timers were cancelled
+      await h.mgr.drainInFlight()
+
+      expect(h.deps.pin).not.toHaveBeenCalled()
+      expect(h.deps.unpin).not.toHaveBeenCalled()
+    })
+
+    it('safe on a turnKey with no pins', async () => {
+      const h = mkHarness()
+      h.mgr.completeAllForTurn({ chatId: 'c', turnKey: 'c:never' })
+      await h.mgr.drainInFlight()
+      expect(h.deps.unpin).not.toHaveBeenCalled()
     })
   })
 })

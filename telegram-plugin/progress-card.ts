@@ -71,6 +71,29 @@ export interface ChecklistItem {
 export type Stage = 'plan' | 'run' | 'done'
 
 /**
+ * Task-list item, mirroring the Claude Code `TodoWrite` tool's atomic
+ * todo schema. Populated by `tool_use` (or `sub_agent_tool_use`) events
+ * with `toolName === 'TodoWrite'`. Used by the per-agent card render to
+ * draw the ◼ / ◻ / ✔ block under the status row.
+ *
+ * `content` is the imperative subject ("Refactor pin manager"); the
+ * card renders `activeForm` ("Refactoring pin manager") for the
+ * in-progress task and `content` for everything else.
+ *
+ * Token-count, thinking-duration, and the per-task elapsed counter are
+ * intentionally not tracked here — those signals require ingestion
+ * changes (token counts aren't in the JSONL today; thinking is a
+ * boolean) and are deferred to a follow-up.
+ */
+export type TaskState = 'pending' | 'in_progress' | 'completed'
+
+export interface TaskItem {
+  readonly content: string
+  readonly activeForm: string
+  readonly state: TaskState
+}
+
+/**
  * Multi-agent foundation (gated by PROGRESS_CARD_MULTI_AGENT=1):
  *
  * Per-sub-agent state, populated by the new `sub_agent_*` events. Today
@@ -182,6 +205,13 @@ export interface SubAgentState {
    * `sub_agent_turn_end` so the deferred-completion path can proceed.
    */
   readonly lastEventAt?: number
+  /**
+   * TodoWrite-driven task list for the per-agent card render. Atomic
+   * replacement: each `sub_agent_tool_use` with `toolName === 'TodoWrite'`
+   * overwrites the slice with the parsed `input.todos` array. Empty
+   * until the sub-agent calls TodoWrite at least once.
+   */
+  readonly tasks: ReadonlyArray<TaskItem>
 }
 
 /**
@@ -266,6 +296,13 @@ export interface ProgressCardState {
    * to correlate with. Keyed by the parent's `toolUseId`.
    */
   readonly pendingAgentSpawns: ReadonlyMap<string, PendingAgentSpawn>
+  /**
+   * Parent-agent TodoWrite-driven task list for the per-agent card
+   * render. Atomic replacement: each `tool_use` with `toolName ===
+   * 'TodoWrite'` overwrites the slice with the parsed `input.todos`
+   * array. Empty until the parent calls TodoWrite at least once.
+   */
+  readonly tasks: ReadonlyArray<TaskItem>
 }
 
 /**
@@ -300,7 +337,39 @@ export function initialState(): ProgressCardState {
     thinking: false,
     subAgents: new Map(),
     pendingAgentSpawns: new Map(),
+    tasks: [],
   }
+}
+
+/**
+ * Parse a `TodoWrite` tool_use input into a `TaskItem[]`. Returns null
+ * when the input shape doesn't match (no array, malformed entries) so
+ * the caller can leave the existing tasks slice unchanged. Callers
+ * should treat null as "not a recognised TodoWrite payload" rather than
+ * "empty list" — TodoWrite never legitimately fires with no todos
+ * (it's an atomic-replace tool).
+ */
+export function parseTodoWriteInput(
+  input: Record<string, unknown> | undefined,
+): TaskItem[] | null {
+  if (input == null) return null
+  const raw = (input as { todos?: unknown }).todos
+  if (!Array.isArray(raw)) return null
+  const out: TaskItem[] = []
+  for (const item of raw) {
+    if (item == null || typeof item !== 'object') continue
+    const o = item as Record<string, unknown>
+    const content = typeof o.content === 'string' ? o.content : null
+    const activeForm = typeof o.activeForm === 'string' ? o.activeForm : null
+    const status = typeof o.status === 'string' ? o.status : null
+    if (content == null || activeForm == null) continue
+    const state: TaskState =
+      status === 'in_progress' ? 'in_progress'
+        : status === 'completed' ? 'completed'
+          : 'pending'
+    out.push({ content, activeForm, state })
+  }
+  return out
 }
 
 /**
@@ -533,6 +602,17 @@ export function reduce(
         appended.length > ITEM_HISTORY_CAP
           ? appended.slice(appended.length - ITEM_HISTORY_CAP)
           : appended
+      // TodoWrite is the atomic-replace task-list tool — its input.todos
+      // is the canonical task-list state at this point in the turn. Lift
+      // it into a state slice so the per-agent card can render the
+      // ◼ / ◻ / ✔ block. When the input shape doesn't match (older
+      // event shapes, synthetic test events without input) we leave the
+      // existing tasks slice untouched.
+      let tasks = state.tasks
+      if (event.toolName === 'TodoWrite') {
+        const parsed = parseTodoWriteInput(event.input)
+        if (parsed != null) tasks = parsed
+      }
       return {
         ...state,
         items: boundedItems,
@@ -542,6 +622,7 @@ export function reduce(
         pendingAgentSpawns,
         subAgents,
         pendingPreamble: null,
+        tasks,
       }
     }
 
@@ -653,6 +734,7 @@ export function reduce(
         milestoneVersion: 1,
         lastEventAt: now,
         recentCompletedTools: [],
+        tasks: [],
       }
       const subAgents = new Map(state.subAgents)
       subAgents.set(event.agentId, sub)
@@ -732,6 +814,14 @@ export function reduce(
       // sub_agent_text pairs with it; sibling tool_uses in the same
       // assistant message fall back to filename/pattern.
       const preamble = sa.pendingPreamble ?? undefined
+      // Mirror the parent tool_use TodoWrite handling: a sub-agent's
+      // TodoWrite atomically replaces its tasks slice for the per-agent
+      // card render.
+      let tasks = sa.tasks
+      if (event.toolName === 'TodoWrite') {
+        const parsed = parseTodoWriteInput(event.input)
+        if (parsed != null) tasks = parsed
+      }
       const next = new Map(state.subAgents)
       next.set(event.agentId, {
         ...sa,
@@ -749,6 +839,7 @@ export function reduce(
           : sa.currentTool,
         pendingPreamble: null,
         lastEventAt: now,
+        tasks,
       })
       return { ...state, subAgents: next }
     }
@@ -1675,4 +1766,287 @@ export function compactItems(items: ReadonlyArray<ChecklistItem>): RolledItem[] 
   }
   flush()
   return out
+}
+
+// ─── Per-agent card renderer ────────────────────────────────────────────────
+//
+// Each active agent (parent + each sub-agent) gets its own pinned card,
+// driven by a slim CLI-style status row + a TodoWrite-driven task list.
+// The legacy `render()` above stays the single entry point for the
+// parent-card-with-sub-agent-expandables path; `renderAgentCard()` is
+// the per-agent-card path. They co-exist while the driver migration to
+// per-agent cards lands incrementally — see plan §2 / §4.
+
+/**
+ * Braille spinner frames cycled by glyph tick. Same set Claude Code's
+ * own status line uses, so the Telegram pin reads as a faithful
+ * mirror of the CLI experience.
+ */
+export const STATUS_GLYPHS = [
+  '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
+] as const
+
+export const STATUS_GLYPH_DONE = '❄'
+export const STATUS_GLYPH_FAILED = '⛔'
+
+/**
+ * Pick a frame for the spinner. Tick advances per render call by the
+ * driver — never advanced by render itself, so unit tests with frozen
+ * `tick` see deterministic output.
+ */
+export function glyphForTick(tick: number): string {
+  const idx = ((tick % STATUS_GLYPHS.length) + STATUS_GLYPHS.length) % STATUS_GLYPHS.length
+  return STATUS_GLYPHS[idx]
+}
+
+/**
+ * Symbol for a task-list line. Mirrors the CLI's `◼` / `◻` / `✔`
+ * convention that the user explicitly cited as the target experience.
+ */
+export const TASK_SYMBOL: Record<TaskState, string> = {
+  pending: '◻',
+  in_progress: '◼',
+  completed: '✔',
+}
+
+/**
+ * Snapshot a sub-agent's "current activity verb" for the status row.
+ * Falls back through: in-flight tool → most-recent narrative → first
+ * narrative text → description → 'starting'.
+ */
+function subAgentVerb(sa: SubAgentState): string {
+  if (sa.state === 'done') return 'done'
+  if (sa.state === 'failed') return 'failed'
+  if (sa.currentTool) {
+    const { tool, label, humanAuthored } = sa.currentTool
+    if (humanAuthored && label) return label
+    if (label) return `${tool} ${label}`
+    return tool
+  }
+  if (sa.currentNarrative) return sa.currentNarrative
+  if (sa.firstNarrativeText) return sa.firstNarrativeText
+  if (sa.description && sa.description !== '(uncorrelated)') return sa.description
+  return 'starting'
+}
+
+/**
+ * Snapshot the parent agent's "current activity verb" for the status
+ * row. Falls back through: most-recent running item → most-recent
+ * completed item → latest text → 'starting'.
+ */
+function parentVerb(state: ProgressCardState): string {
+  if (state.stage === 'done') return 'done'
+  // Walk items newest first looking for a running tool, else the last
+  // tool we saw fly past.
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const it = state.items[i]
+    if (it.state === 'running') {
+      if (it.humanAuthored && it.label) return it.label
+      if (it.label) return `${it.tool} ${it.label}`
+      return it.tool
+    }
+  }
+  if (state.items.length > 0) {
+    const last = state.items[state.items.length - 1]
+    if (last.humanAuthored && last.label) return last.label
+    if (last.label) return `${last.tool} ${last.label}`
+    return last.tool
+  }
+  if (state.thinking) return 'thinking'
+  if (state.latestText) {
+    const line = extractNarrativeLabel(state.latestText)
+    if (line) return line
+  }
+  return 'starting'
+}
+
+/**
+ * Pure render input for a single per-agent card. The driver builds one
+ * of these per (turnKey, agentId) on each flush — see `projectAgentSlice`.
+ *
+ * `tokens` and `thinkingMs` are optional placeholders: the JSONL
+ * doesn't expose `usage` today and `thinking` is captured as a boolean
+ * with no start/end timestamps, so the renderer emits `↓?` / `—` until
+ * those signals land in a follow-up.
+ */
+export interface AgentCardRenderInput {
+  /** Card kind. Parent and sub-agents share the same template. */
+  readonly kind: 'parent' | 'sub'
+  /** Stable agent identity (parent's JSONL stem or sub-agent's). */
+  readonly agentId: string
+  /** Headline shown next to "Agent k of n —". */
+  readonly title: string
+  /** Activity verb shown after the spinner glyph. */
+  readonly verb: string
+  /** Terminal state for glyph + header text. */
+  readonly state: ItemState
+  /** Wall-clock ms when this card's clock starts (for elapsed). */
+  readonly startedAt: number
+  /** 1-based position among active cards in the chat+thread. */
+  readonly k: number
+  /** Total active cards in the chat+thread (incl. this one). */
+  readonly n: number
+  /** Glyph rotation tick. Driver bumps; render is deterministic. */
+  readonly glyphTick: number
+  /** Render time, in wall-clock ms. */
+  readonly now: number
+  /** Task-list block. Empty = no block rendered. */
+  readonly tasks: ReadonlyArray<TaskItem>
+  /** Optional cumulative input tokens for the turn. Undefined → `↓?`. */
+  readonly tokens?: number
+  /** Optional cumulative thinking duration in ms. Undefined → `—`. */
+  readonly thinkingMs?: number
+  /** Optional latest narrative line shown below the status row. */
+  readonly narrative?: string
+}
+
+/**
+ * Project a slice of `ProgressCardState` into render input for a given
+ * agent. The parent card reads top-level fields; sub-agent cards pull
+ * from `state.subAgents.get(agentId)`.
+ *
+ * Returns null when the requested agentId isn't present in the state
+ * (e.g. a sub-agent already cleaned up). Callers should drop the card.
+ */
+export function projectAgentSlice(args: {
+  state: ProgressCardState
+  agentId: string
+  /** Distinguishes the parent slice from a sub-agent slice. */
+  kind: 'parent' | 'sub'
+  k: number
+  n: number
+  glyphTick: number
+  now: number
+  /**
+   * Override startedAt for the parent — pass the driver's per-card
+   * clock origin (turn start). For sub-agents, taken from
+   * SubAgentState.startedAt.
+   */
+  parentStartedAt?: number
+}): AgentCardRenderInput | null {
+  const { state, agentId, kind, k, n, glyphTick, now, parentStartedAt } = args
+  if (kind === 'parent') {
+    return {
+      kind: 'parent',
+      agentId,
+      title: 'Main',
+      verb: parentVerb(state),
+      state:
+        state.stage === 'done'
+          ? 'done'
+          : 'running',
+      startedAt: parentStartedAt ?? state.turnStartedAt,
+      k,
+      n,
+      glyphTick,
+      now,
+      tasks: state.tasks,
+      ...(state.latestText ? { narrative: extractNarrativeLabel(state.latestText) } : {}),
+    }
+  }
+  const sa = state.subAgents.get(agentId)
+  if (!sa) return null
+  const title = subAgentDisplayDescription(sa)
+  return {
+    kind: 'sub',
+    agentId,
+    title,
+    verb: subAgentVerb(sa),
+    state: sa.state,
+    startedAt: sa.startedAt,
+    k,
+    n,
+    glyphTick,
+    now,
+    tasks: sa.tasks,
+    ...(sa.currentNarrative
+      ? { narrative: sa.currentNarrative }
+      : sa.firstNarrativeText
+        ? { narrative: sa.firstNarrativeText }
+        : {}),
+  }
+}
+
+/**
+ * Pick the spinner glyph for a card's render frame.
+ */
+function glyphForCard(input: AgentCardRenderInput): string {
+  if (input.state === 'failed') return STATUS_GLYPH_FAILED
+  if (input.state === 'done') return STATUS_GLYPH_DONE
+  return glyphForTick(input.glyphTick)
+}
+
+/**
+ * Format the status row's elapsed segment as `m:ss` (or `s` under 60s).
+ */
+function formatElapsedShort(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  if (total < 60) return `${total}s`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function formatTokensShort(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`
+  return `${tokens}`
+}
+
+/**
+ * Render the task-list block (◼/◻/✔). Returns the empty string when
+ * there are no tasks — caller should not insert leading/trailing
+ * whitespace based on this. The block always shows in_progress tasks
+ * first, then pending, then completed (most useful at top).
+ */
+export function renderTaskList(tasks: ReadonlyArray<TaskItem>): string {
+  if (tasks.length === 0) return ''
+  // Stable sort: in_progress, pending, completed. Within each bucket,
+  // preserve TodoWrite's input order — that's the agent's intent.
+  const order: Record<TaskState, number> = { in_progress: 0, pending: 1, completed: 2 }
+  const sorted = [...tasks].sort((a, b) => order[a.state] - order[b.state])
+  const lines = sorted.map((t) => {
+    const sym = TASK_SYMBOL[t.state]
+    // Show `activeForm` for the in-progress line ("Refactoring pin
+    // manager"); use `content` for the others. Strikethrough on
+    // completed items mirrors the CLI experience.
+    const text = t.state === 'in_progress' ? t.activeForm : t.content
+    const safe = escapeHtml(text)
+    if (t.state === 'completed') return `${sym} <s>${safe}</s>`
+    if (t.state === 'in_progress') return `${sym} <b>${safe}</b>`
+    return `${sym} ${safe}`
+  })
+  return lines.join('\n')
+}
+
+/**
+ * Render the per-agent status card body — the CLI-style status row, an
+ * optional narrative line, and the TaskList block.
+ *
+ * Output is HTML for Telegram's `parse_mode=HTML`. Pure: no side
+ * effects, no clock reads (`now` is supplied), no globals.
+ */
+export function renderAgentCard(input: AgentCardRenderInput): string {
+  const glyph = glyphForCard(input)
+  const elapsed = formatElapsedShort(input.now - input.startedAt)
+  const tokens = input.tokens != null
+    ? `↓${formatTokensShort(input.tokens)}`
+    : '↓?'
+  const thinking = input.thinkingMs != null
+    ? `thought ${formatElapsedShort(input.thinkingMs)}`
+    : 'thought —'
+  const verbHtml = escapeHtml(input.verb || 'idle')
+  // Header:  Agent 2 of 4 — research
+  const header = `<b>Agent ${input.k} of ${input.n}</b> — ${escapeHtml(input.title)}`
+  // Status row:  ⠋ <i>verb</i> · 0:42 · ↓? · thought —
+  const statusRow = `${glyph} <i>${verbHtml}</i> · ${elapsed} · ${tokens} · ${thinking}`
+  const out: string[] = [header, statusRow]
+  if (input.narrative) {
+    out.push(`<blockquote>${escapeHtml(input.narrative)}</blockquote>`)
+  }
+  const taskBlock = renderTaskList(input.tasks)
+  if (taskBlock) {
+    out.push(taskBlock)
+  }
+  return out.join('\n')
 }
