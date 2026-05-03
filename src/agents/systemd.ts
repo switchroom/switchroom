@@ -243,7 +243,17 @@ function hasNodeOnPath(): boolean {
 
 export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
-  const gatewayEntry = resolve(pluginDir, "gateway/gateway.ts");
+  // Prefer the bundled `dist/gateway/gateway.js` (#634 strategic
+  // packaging fix) — it has all `src/` cross-imports inlined, so a
+  // fresh `npm i -g switchroom-ai` install runs without needing the
+  // workspace's `src/` tree on disk. Falls back to the .ts source for
+  // dev workspaces that haven't built yet (or the rare stale-dist
+  // race where `dist/` was wiped without a rebuild). The fallback
+  // matches today's behavior.
+  const builtGateway = resolve(pluginDir, "dist/gateway/gateway.js");
+  const gatewayEntry = existsSync(builtGateway)
+    ? builtGateway
+    : resolve(pluginDir, "gateway/gateway.ts");
   const logFile = resolve(stateDir, "gateway.log");
   const homeDir = process.env.HOME ?? "/root";
   const bunBin = resolve(homeDir, ".bun/bin/bun");
@@ -310,7 +320,11 @@ WantedBy=default.target
  */
 export function generateForemanUnit(): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
-  const foremanEntry = resolve(pluginDir, "foreman/foreman.ts");
+  // Prefer bundled dist (#634); fall back to .ts source for dev workspaces.
+  const builtForeman = resolve(pluginDir, "dist/foreman/foreman.js");
+  const foremanEntry = existsSync(builtForeman)
+    ? builtForeman
+    : resolve(pluginDir, "foreman/foreman.ts");
   const homeDir = process.env.HOME ?? "/root";
   const foremanDir = resolve(homeDir, ".switchroom", "foreman");
   const logFile = resolve(foremanDir, "foreman.log");

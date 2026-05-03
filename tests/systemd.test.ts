@@ -258,9 +258,20 @@ describe("generateGatewayUnit", () => {
     expect(unit).toContain("Environment=TELEGRAM_STATE_DIR=/home/user/.claude/channels/telegram");
   });
 
-  it("references gateway entry point", () => {
+  it("references the bundled gateway dist when present, .ts fallback otherwise (#634)", () => {
+    // Strategic packaging fix: the systemd unit prefers
+    // `telegram-plugin/dist/gateway/gateway.js` because the npm package
+    // ships dist (so a fresh `bun add -g switchroom-ai` install runs
+    // without needing the workspace's `src/` tree). Falls back to the
+    // .ts source for dev workspaces that haven't built yet.
+    //
+    // This test asserts whichever path the local workspace currently
+    // exposes — both shapes are valid; the unit just needs to point
+    // at one of them.
     const unit = generateGatewayUnit("/tmp/telegram", "assistant");
-    expect(unit).toContain("gateway/gateway.ts");
+    const matchesDist = unit.includes("dist/gateway/gateway.js");
+    const matchesSource = unit.includes("gateway/gateway.ts");
+    expect(matchesDist || matchesSource).toBe(true);
   });
 
   it("includes rate limiting", () => {
