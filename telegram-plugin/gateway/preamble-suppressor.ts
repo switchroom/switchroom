@@ -110,13 +110,21 @@ export class PreambleSuppressor {
     this.emitAnswer(this.answerTextOnly)
   }
 
-  /** Drop pending text without flushing. Idempotent. */
+  /**
+   * Drop pending text without flushing. Idempotent. Also clears
+   * `answerTextOnly` to prevent cross-turn contamination — the
+   * silent-marker / turn-flush teardown sites use dropNow because
+   * the text is being handed off to other paths (currentTurnCapturedText
+   * → turn-flush; silent suppression). Leaving stale answer text in
+   * the suppressor would prepend it to the next turn's first flush.
+   */
   dropNow(): void {
     if (this.pendingTimer != null) {
       this.clearTimer(this.pendingTimer)
       this.pendingTimer = null
     }
     this.pendingBuffer = ''
+    this.answerTextOnly = ''
   }
 
   /**

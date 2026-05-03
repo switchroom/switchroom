@@ -244,6 +244,35 @@ describe('PreambleSuppressor', () => {
     expect(emits).toEqual([])
   })
 
+  // ─── Cross-turn isolation (regression: dropNow used to leak answerTextOnly) ───
+
+  it('dropNow clears answerTextOnly so next turn does not inherit stale text', () => {
+    // Turn-flush silent-marker / context-exhaust teardown calls dropNow().
+    // If dropNow left `answerTextOnly` populated, the next turn's first
+    // flush would prepend the previous turn's content.
+    //
+    // fails when: dropNow goes back to clearing only the pending buffer.
+    const emits: string[] = []
+    const sup = new PreambleSuppressor({
+      emitAnswer: (t) => emits.push(t),
+      bufferMs: 150,
+    })
+    sup.onText('Turn 1 answer.')
+    vi.advanceTimersByTime(200)
+    expect(emits).toEqual(['Turn 1 answer.'])
+    expect(sup.currentAnswerText()).toBe('Turn 1 answer.')
+
+    // Silent-marker teardown — drop without flushing.
+    sup.dropNow()
+    expect(sup.currentAnswerText()).toBe('')
+
+    // Turn 2 begins. Without the clear, the next flush would emit
+    // "Turn 1 answer.Turn 2 answer." — which is wrong.
+    sup.onText('Turn 2 answer.')
+    vi.advanceTimersByTime(200)
+    expect(emits[emits.length - 1]).toBe('Turn 2 answer.')
+  })
+
   it('default bufferMs (150) is used when not specified', () => {
     const emits: string[] = []
     const sup = new PreambleSuppressor({ emitAnswer: (t) => emits.push(t) })

@@ -100,6 +100,14 @@ export interface FirstPaintDeps {
    */
   controllerFactory?: (cb: (emoji: string) => Promise<void>) => StatusReactionController
   /**
+   * #542 fix: per-chat allowed-reactions filter sourced from getChat probe.
+   * Optional — when omitted, the controller is constructed without a filter
+   * (current behavior, possibly buggy if the chat restricts reactions).
+   * The default `controllerFactory` consults this getter; custom factories
+   * (e.g. test harnesses) may ignore it.
+   */
+  getAllowedReactions?: (chatId: string) => Set<string> | null
+  /**
    * Sink for stderr-style error reporting from the seam. Defaults to writing
    * to `process.stderr`. Tests inject a recorder.
    */
@@ -176,7 +184,8 @@ export async function firstPaintTurn(
         }
         deps.suppressPtyPreview.delete(sKey)
 
-        const makeCtrl = deps.controllerFactory ?? ((cb) => new StatusReactionController(cb))
+        const allowed = deps.getAllowedReactions?.(chatId) ?? null
+        const makeCtrl = deps.controllerFactory ?? ((cb) => new StatusReactionController(cb, allowed))
         const ctrl = makeCtrl(async (emoji) => {
           await deps.bot.api.setMessageReaction(chatId, msgId, [
             { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },

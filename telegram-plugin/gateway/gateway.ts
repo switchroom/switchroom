@@ -962,19 +962,25 @@ function probeAvailableReactions(chatId: string): void {
   chatProbesInFlight.add(chatId)
   void (async () => {
     try {
-      const chat = await bot.api.getChat(chatId) as { available_reactions?: Array<{ type: string; emoji?: string }> }
+      const chat = await bot.api.getChat(chatId)
       // Telegram convention: `available_reactions` undefined ⇒ "all
       // emoji reactions allowed" (no filter). Explicit array ⇒ this
       // exact set is permitted; everything else is rejected.
-      if (chat.available_reactions == null) {
-        // Cache an empty-marker `null` to mean "all allowed". The
-        // controller treats null = no filter, which matches Telegram's
-        // semantics here.
+      //
+      // Cache `null` for the "no filter" case. The controller also
+      // treats null as "no filter" — both meanings converge to the
+      // same call site behaviour, which is intentional. `has(chatId)`
+      // distinguishes "probed and got null" from "never probed" so
+      // we don't re-probe forever.
+      const reactions = chat.available_reactions
+      if (reactions == null) {
         chatAvailableReactions.set(chatId, null)
       } else {
         const allowed = new Set<string>()
-        for (const r of chat.available_reactions) {
-          if (r.type === 'emoji' && typeof r.emoji === 'string') allowed.add(r.emoji)
+        for (const r of reactions) {
+          if (r.type === 'emoji') allowed.add(r.emoji)
+          // ReactionTypeCustomEmoji and ReactionTypePaid are skipped —
+          // the StatusReactionController only emits standard emoji.
         }
         chatAvailableReactions.set(chatId, allowed)
         process.stderr.write(
@@ -3274,15 +3280,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       // stream buffer so the same text doesn't also land in chat as a
       // standalone message. Telegram-surface tools (reply / stream_reply)
       // are EXCEPTIONS: their text IS the answer, so we flush instead
-      // of dropping. (Practically the answer-stream's own dedup will
-      // handle the overlap with the reply tool's payload, but flushing
-      // here ensures the user-visible text path is consistent.)
-      const toolName = ev.toolName
-      if (isTelegramSurfaceTool(toolName)) {
-        preambleSuppressor.onTool({ isReplyTool: true })
-      } else {
-        preambleSuppressor.onTool({ isReplyTool: false })
-      }
+      // of dropping. The answer-stream's own dedup handles overlap
+      // with the reply tool's payload.
+      preambleSuppressor.onTool({ isReplyTool: isTelegramSurfaceTool(ev.toolName) })
       const ctrl = activeStatusReactions.get(statusKey(currentSessionChatId, currentSessionThreadId))
       const name = ev.toolName
       // Phase tracking removed in #553 PR 5 — phases only fed the
@@ -3428,6 +3428,13 @@ function handleSessionEvent(ev: SessionEvent): void {
         clearTimeout(orphanedReplyTimeoutId)
         orphanedReplyTimeoutId = null
       }
+      // #549 fix — flush any pending preamble BEFORE activeAnswerStream is
+      // nulled below. Text emitted immediately before turn_end (no tool
+      // followed) is the answer; the suppressor's emitAnswer callback
+      // would no-op against a nulled stream, silently dropping the text
+      // (regression for short no-tool replies). Order matters here: this
+      // call must come before the materialize/null block.
+      preambleSuppressor.flushNow()
       // Issue #195: materialize the answer-lane stream as a fresh
       // sendMessage so the user's device gets a push notification on
       // turn completion (edits don't fire pushes).
@@ -3774,12 +3781,9 @@ function handleSessionEvent(ev: SessionEvent): void {
       currentTurnLastAssistantMsgId = null
       currentTurnLastAssistantDone = false
       currentTurnToolCallCount = 0
-      // #549 fix — normal turn_end. Any pending preamble that hasn't
-      // been claimed by a tool was actually answer text. Flush it to
-      // the answer stream so it lands. This is the path that catches
-      // "agent emitted text, no tools, turn ended" — that text IS the
-      // user's reply.
-      preambleSuppressor.flushNow()
+      // #549 fix — preamble flush already happened at the TOP of this
+      // turn_end handler (before activeAnswerStream is nulled). See
+      // comment near line 3431.
       return
     }
   }
