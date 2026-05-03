@@ -172,7 +172,13 @@ export function formatQuotaLine(q: QuotaUtilization): string {
   return `${fmt(q.fiveHourUtilizationPct)} / 5h · ${fmt(q.sevenDayUtilizationPct)} / 7d`;
 }
 
-function formatResetRelative(target: Date | null, now: Date = new Date()): string {
+/**
+ * Render a human-friendly "resets in …" countdown for a Date target.
+ * Exported so other surfaces (model-unavailable card, auth dashboard,
+ * banner helpers) speak the same dialect as `/usage`. Returns "—" for
+ * null targets and "resets now" once the target is in the past.
+ */
+export function formatResetRelative(target: Date | null, now: Date = new Date()): string {
   if (!target) return "—";
   const deltaMs = target.getTime() - now.getTime();
   if (deltaMs <= 0) return "resets now";
