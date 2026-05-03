@@ -23,6 +23,7 @@ import {
 } from "../auth/token-refresh.js";
 import { getAgentStatus, restartAgent } from "../agents/lifecycle.js";
 import { withConfigError, getConfig } from "./helpers.js";
+import { registerAuthAccountSubcommands } from "./auth-accounts.js";
 
 function printAuthTable(
   headers: string[],
@@ -286,6 +287,12 @@ export function registerAuthCommand(program: Command): void {
   const auth = program
     .command("auth")
     .description("Manage OAuth authentication per agent");
+
+  // Account-shaped verbs (new auth model — see
+  // reference/share-auth-across-the-fleet.md). Registered first so the
+  // `auth account ...` subcommand tree exists before the per-agent
+  // legacy verbs hang off the same parent.
+  registerAuthAccountSubcommands(program, auth);
 
   // switchroom auth login <name>
   auth
