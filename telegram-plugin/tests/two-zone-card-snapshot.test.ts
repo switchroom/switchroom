@@ -95,7 +95,7 @@ describe('two-zone-card snapshots', () => {
       ['b', fm({ agentId: 'bbbbbb02', role: 'background', status: 'background', toolCount: 12, lastActivityAt: NOW - 1000, lastTool: { name: 'Bash', sanitisedArg: 'long-job.sh' } })],
     ])
     const out = renderTwoZoneCard({
-      state: st({ stage: 'done', turnStartedAt: NOW - 60_000 }),
+      state: st({ stage: 'done', turnStartedAt: NOW - 90_000 }),
       fleet,
       now: NOW,
     })

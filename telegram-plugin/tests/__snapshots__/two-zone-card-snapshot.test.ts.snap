@@ -1,8 +1,6 @@
-// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`two-zone-card snapshots empty fleet — clean clerk-style card 1`] = `"⚙️ <b>Working…</b> · ⏱ 00:05 · 0t"`;
-
-exports[`two-zone-card snapshots 3 members mixed 1`] = `
+exports[`two-zone-card snapshots > 3 members mixed 1`] = `
 "⚙️ <b>Working…</b> · ⏱ 00:30 · 14t · 3s
 
 <b>FLEET (3)</b>
@@ -11,7 +9,7 @@ exports[`two-zone-card snapshots 3 members mixed 1`] = `
 ⚠ reviewer <code>cccccc</code> · 2t · idle 1m10s ago"
 `;
 
-exports[`two-zone-card snapshots all-done with completed receipts 1`] = `
+exports[`two-zone-card snapshots > all-done with completed receipts 1`] = `
 "✅ <b>Done</b> · ⏱ 00:20 · 8t · 2s
 
 <b>FLEET (2)</b>
@@ -19,7 +17,7 @@ exports[`two-zone-card snapshots all-done with completed receipts 1`] = `
 ✓ worker <code>aaaaaa</code> · 5t · done 10s ago"
 `;
 
-exports[`two-zone-card snapshots all-stuck 1`] = `
+exports[`two-zone-card snapshots > all-stuck 1`] = `
 "⚠ <b>Stalled</b> · ⏱ 01:35 · 2t · 2s
 
 <b>FLEET (2)</b>
@@ -27,4 +25,12 @@ exports[`two-zone-card snapshots all-stuck 1`] = `
 ⚠ worker <code>aaaaaa</code> · 1t · idle 1m30s ago"
 `;
 
-exports[`two-zone-card snapshots background — parent done, background sub still running 1`] = `"⏳ Waiting…"`;
+exports[`two-zone-card snapshots > background — parent done, background sub still running 1`] = `
+"⏸ <b>Background</b> · ⏱ 01:30 · 17t · 2s
+
+<b>FLEET (2)</b>
+⏸ background <code>bbbbbb</code> · 12t · Bash <code>long-job.sh</code> (1s ago)
+✓ worker <code>aaaaaa</code> · 5t · done 30s ago"
+`;
+
+exports[`two-zone-card snapshots > empty fleet — clean clerk-style card 1`] = `"⚙️ <b>Working…</b> · ⏱ 00:05 · 0t"`;
