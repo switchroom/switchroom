@@ -665,6 +665,13 @@ export interface ProgressDriver {
    */
   peekFleet(chatId: string, threadId?: string): Map<string, FleetMember> | undefined
   /**
+   * P2 of #662 — debug/test hook returning every live PerChatState's
+   * fleet keyed by turnKey. Used by cross-turn background tests to
+   * verify routing landed on the originating turn rather than the
+   * currently-active one. Not part of the production driver contract.
+   */
+  peekAllFleets(): Array<{ turnKey: string; chatId: string | null; fleet: Map<string, FleetMember> }>
+  /**
    * True when the driver is still managing an active card for this chat+
    * thread — either a normal turn or a deferred-completion turn waiting on
    * in-flight sub-agents. Used by the gateway's `closeProgressLane`
