@@ -416,6 +416,103 @@ describe("mergeAgentConfig subagents", () => {
     );
     expect(result.subagents?.w?.description).toBe("d");
   });
+
+  it("field-merges sub-agent definitions on name conflict (#682)", () => {
+    // Pre-#682 this was a whole-def replacement and the override below
+    // would have silently dropped description + model. The coding-profile
+    // refactor in #682 needs single-field overrides to compose with the
+    // defaults' worker definition.
+    const defaults: AgentDefaults = {
+      subagents: {
+        worker: {
+          description: "default worker",
+          model: "sonnet",
+          maxTurns: 100,
+        },
+      },
+    };
+    const agent = baseAgent({
+      subagents: {
+        worker: { isolation: "worktree" },
+      },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.subagents?.worker?.description).toBe("default worker");
+    expect(result.subagents?.worker?.model).toBe("sonnet");
+    expect(result.subagents?.worker?.maxTurns).toBe(100);
+    expect(result.subagents?.worker?.isolation).toBe("worktree");
+  });
+});
+
+describe("coding profile resolution (#682)", () => {
+  it("agents extending `coding` get worktree-isolated workers", () => {
+    // Mirrors the inline profile shape shipped in examples/switchroom.yaml
+    // after #682. The coding profile contributes only isolation; the
+    // worker's description/model/maxTurns flow from defaults.
+    const defaults: AgentDefaults = {
+      subagents: {
+        worker: {
+          description: "default worker",
+          model: "sonnet",
+          maxTurns: 100,
+        },
+      },
+    };
+    const profiles: Record<string, Profile> = {
+      coding: {
+        subagents: {
+          worker: { isolation: "worktree" },
+        },
+      },
+    };
+    const agent = baseAgent({ extends: "coding" });
+    const result = resolveAgentConfig(defaults, profiles, agent);
+    expect(result.subagents?.worker?.isolation).toBe("worktree");
+    expect(result.subagents?.worker?.description).toBe("default worker");
+    expect(result.subagents?.worker?.model).toBe("sonnet");
+  });
+
+  it("emits a one-time NOTICE when legacy defaults.subagents.worker.isolation is present", () => {
+    mergeAgentConfig.notifiedWorkerIsolationMove = false;
+    const warns: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (msg: string) => warns.push(msg);
+    try {
+      const defaults: AgentDefaults = {
+        subagents: {
+          worker: { description: "default worker", isolation: "worktree" },
+        },
+      };
+      resolveAgentConfig(defaults, undefined, baseAgent());
+      // Second call should NOT re-emit
+      resolveAgentConfig(defaults, undefined, baseAgent());
+    } finally {
+      console.warn = originalWarn;
+    }
+    const notices = warns.filter((m) => m.includes("#682"));
+    expect(notices.length).toBe(1);
+    expect(notices[0]).toMatch(/coding.*profile/i);
+    // Reset so it doesn't bleed into other tests
+    mergeAgentConfig.notifiedWorkerIsolationMove = true;
+  });
+
+  it("agents NOT extending `coding` do not get worktree isolation by default", () => {
+    const defaults: AgentDefaults = {
+      subagents: {
+        worker: { description: "default worker", model: "sonnet" },
+      },
+    };
+    const profiles: Record<string, Profile> = {
+      coding: {
+        subagents: {
+          worker: { isolation: "worktree" },
+        },
+      },
+    };
+    const agent = baseAgent(); // no extends
+    const result = resolveAgentConfig(defaults, profiles, agent);
+    expect(result.subagents?.worker?.isolation).toBeUndefined();
+  });
 });
 
 describe("mergeAgentConfig session policy", () => {
