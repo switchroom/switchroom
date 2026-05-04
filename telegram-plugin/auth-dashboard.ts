@@ -720,6 +720,11 @@ export function buildAccountRemoveConfirmKeyboard(agent: string, label: string):
     )
     .text(
       "✗ Cancel",
-      encodeCallbackData({ kind: "account-view", agent, label }),
+      (() => {
+        const cancelEncoded = encodeCallbackData({ kind: "account-view", agent, label });
+        return Buffer.byteLength(cancelEncoded, "utf8") <= CALLBACK_BUDGET_BYTES
+          ? cancelEncoded
+          : encodeCallbackData({ kind: "noop" });
+      })(),
     );
 }
