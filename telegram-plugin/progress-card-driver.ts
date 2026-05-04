@@ -738,6 +738,19 @@ export interface ProgressDriver {
    * No-op if no card is currently tracking this `agentId`.
    */
   onSubAgentStall(agentId: string, idleMs: number, description: string): void
+  /**
+   * Test-only accessor exposing the driver's internal Maps so unit tests
+   * can assert TTL eviction and outer-base-key cleanup actually drop
+   * entries. Not part of the supported runtime API — gated behind the
+   * leading-underscore name.
+   */
+  _debugGetMaps?(): {
+    chats: Map<string, unknown>
+    seenEnqueueMsgIds: Map<string, number>
+    pendingSyncEchoes: Map<string, number>
+    chatRunningSubagents: Map<string, Map<string, unknown>>
+    baseTurnSeqs: Map<string, number>
+  }
 }
 
 export function createProgressDriver(config: ProgressDriverConfig): ProgressDriver {
@@ -859,6 +872,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   /** Full turn key (chatId:threadId:seq) for the currently active turn. */
   let currentTurnKey: string | null = null
   let heartbeatHandle: { ref: unknown } | null = null
+  // Throttled inline TTL eviction for `seenEnqueueMsgIds` and
+  // `pendingSyncEchoes`. Previously eviction lived inside the heartbeat tick,
+  // but the heartbeat stops when `chats.size === 0`, leaving these maps to
+  // grow unbounded across idle periods. The inline path runs at the top of
+  // every public ingress (ingest / startTurn) but is rate-limited to once
+  // every `evictThrottleMs` so it stays effectively free in the hot path.
+  let lastEvictedAt = 0
+  const evictThrottleMs = 30_000
   // Tracks the last elapsed-seconds bucket we emitted for each chat so
   // the heartbeat can coalesce — if the HTML hasn't changed AND the
   // header elapsed counter (rounded to the heartbeat cadence) would
@@ -974,6 +995,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     lastHeartbeatBucket.delete(cs.turnKey)
     lastSubAgentTickBucket.delete(cs.turnKey)
     editTimestamps.delete(cs.turnKey)
+    // Drop the outer base-key entries if no other chat shares the same base.
+    // Covers all 3 close paths since they all funnel through here:
+    // completeTurnFully (turn_end), closeZombie (abandonment), and the
+    // stalled-close branch in the heartbeat. Prevents unbounded growth of
+    // `chatRunningSubagents` / `baseTurnSeqs` across idle periods.
+    cleanupBaseKeyIfUnused(baseKey(cs.chatId, cs.threadId), parseTurnSeq(cs.turnKey))
     if (currentTurnKey === cs.turnKey) {
       currentChatId = null
       currentThreadId = undefined
@@ -1053,6 +1080,92 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     flush(cs, /*forceDone*/ true)
     completeTurnFully(cs)
     // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
+  }
+
+  /**
+   * TTL-evict stale entries from the messageId-dedup map and the sync-echo
+   * marker map. Same TTLs as the (now-removed) heartbeat eviction:
+   *   - `seenEnqueueMsgIds`: 60s (matches the dedup window in `ingest`).
+   *   - `pendingSyncEchoes`: 30s (matches the consumer in `ingest`).
+   */
+  function evictStaleDedup(nowMs: number): void {
+    const t60 = nowMs - 60_000
+    for (const [k, ts] of seenEnqueueMsgIds) {
+      if (ts <= t60) seenEnqueueMsgIds.delete(k)
+    }
+    const t30 = nowMs - 30_000
+    for (const [k, ts] of pendingSyncEchoes) {
+      if (ts <= t30) pendingSyncEchoes.delete(k)
+    }
+  }
+
+  /**
+   * Throttled wrapper. Cheap when not due — a single timestamp compare and
+   * branch. Called at the top of every public ingress so eviction runs
+   * regardless of whether any chats are currently live.
+   */
+  function maybeEvict(nowMs: number): void {
+    if (nowMs - lastEvictedAt < evictThrottleMs) return
+    lastEvictedAt = nowMs
+    evictStaleDedup(nowMs)
+  }
+
+  /**
+   * Best-effort outer-base-key cleanup, called after a chat is removed from
+   * the `chats` map. Only drops entries that are *safe* to drop:
+   *
+   *   - `chatRunningSubagents[base]`: deleted iff (a) no surviving chat
+   *     shares the same base AND (b) the inner map is empty. Background
+   *     sub-agents intentionally outlive their parent turn (cross-turn
+   *     carry-over for `Agent({run_in_background:true})`), so we never
+   *     drop a non-empty inner map — that would erase the next turn's
+   *     seed list. The empty-map case is the unbounded-growth path the
+   *     caller cares about: a chat that ran but never spawned anything
+   *     still got a `Map` allocated (or, more importantly, the entry
+   *     remains after natural sub-agent completion).
+   *
+   *   - `baseTurnSeqs[base]`: deleted iff no surviving chat shares the
+   *     same base AND no in-flight enqueue has just allocated a new turn
+   *     for this base via `allocateTurnSlot` (signalled by
+   *     `currentTurnKey` whose prefix matches `base`). The latter guard
+   *     matters because the new-enqueue path runs
+   *     `allocateTurnSlot -> closeZombie(old)` before registering the
+   *     new chat in `chats`; a naive delete here would clobber the
+   *     just-allocated seq, causing the next allocation to reset to 1
+   *     and collide with the still-live new turn.
+   */
+  function cleanupBaseKeyIfUnused(base: string, closingTurnSeq?: number): void {
+    for (const cs of chats.values()) {
+      if (baseKey(cs.chatId, cs.threadId) === base) return
+    }
+    const inner = chatRunningSubagents.get(base)
+    if (inner == null || inner.size === 0) {
+      chatRunningSubagents.delete(base)
+    }
+    // Skip `baseTurnSeqs` cleanup if `allocateTurnSlot` has just bumped the
+    // seq past the turn we are closing. That happens in the new-enqueue
+    // path: `allocateTurnSlot` runs BEFORE `closeZombie(old)` and BEFORE
+    // the new PerChatState is registered in `chats`, so the new turn is
+    // invisible to the iteration above. Detecting that via the seq diff
+    // avoids clobbering the just-allocated counter (would reset numbering
+    // to 1 and cause turnKey collisions with the still-live new turn).
+    const currentSeq = baseTurnSeqs.get(base)
+    if (
+      currentSeq != null
+      && closingTurnSeq != null
+      && currentSeq > closingTurnSeq
+    ) {
+      return
+    }
+    baseTurnSeqs.delete(base)
+  }
+
+  /** Parse the trailing `:N` from a turnKey. Returns undefined if absent. */
+  function parseTurnSeq(turnKey: string): number | undefined {
+    const idx = turnKey.lastIndexOf(':')
+    if (idx < 0) return undefined
+    const n = Number(turnKey.slice(idx + 1))
+    return Number.isFinite(n) ? n : undefined
   }
 
   function startHeartbeatIfNeeded(): void {
@@ -1292,15 +1405,12 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         flush(cs, /*forceDone*/ true, /*stalledClose*/ true)
         completeTurnFully(cs)
       }
-      // Evict stale dedup entries to prevent unbounded map growth.
-      const t60 = now() - 60_000
-      for (const [k, ts] of seenEnqueueMsgIds) {
-        if (ts <= t60) seenEnqueueMsgIds.delete(k)
-      }
-      const t30 = now() - 30_000
-      for (const [k, ts] of pendingSyncEchoes) {
-        if (ts <= t30) pendingSyncEchoes.delete(k)
-      }
+      // Dedup-map TTL eviction has moved to `maybeEvict` (called from
+      // every public ingress). Keeping it here was unsafe because the
+      // heartbeat stops when `chats.size === 0`, which let
+      // `seenEnqueueMsgIds` / `pendingSyncEchoes` grow unbounded across
+      // idle periods.
+      //
       // If every chat has ended, stop the heartbeat to avoid an
       // always-on timer.
       if (chats.size === 0) stopHeartbeat()
@@ -1674,6 +1784,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
 
   return {
     ingest(event, chatIdMaybe, threadId) {
+      // Throttled inline TTL sweep — see `maybeEvict` for rationale.
+      maybeEvict(now())
       // An `enqueue` event carries its own chatId (extracted from the XML
       // channel wrapper). Everything else falls back to the caller-provided
       // chatIdMaybe, which the session-tail supervisor tracks.
@@ -2499,6 +2611,21 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // preserve-pending, but check defensively), start it.
         if (chats.size > 0) startHeartbeatIfNeeded()
         break
+      }
+    },
+
+    /**
+     * Test-only accessor. Returns the live internal Maps so tests can
+     * assert TTL eviction and outer-base-key cleanup actually drop
+     * entries. Not part of the supported API — naming reflects that.
+     */
+    _debugGetMaps() {
+      return {
+        chats,
+        seenEnqueueMsgIds,
+        pendingSyncEchoes,
+        chatRunningSubagents,
+        baseTurnSeqs,
       }
     },
   }
