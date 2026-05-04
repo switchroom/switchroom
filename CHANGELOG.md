@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Worker worktree isolation moved from global defaults to the `coding`
+  profile (#682).** `examples/switchroom.yaml` previously shipped
+  `defaults.subagents.worker.isolation: worktree`, which hard-failed
+  every agent whose cwd was not a git repo (most switchroom agents,
+  which run from `~/.switchroom/agents/<name>`). The default now lives
+  in an inline `profiles.coding` block; agents pick it up via
+  `extends: coding`. Sub-agent merge is now field-level on name
+  conflict (a profile or agent overriding one field no longer drops the
+  rest of the worker definition). Operators whose existing yaml still
+  carries the old global default see a one-time NOTICE on the next
+  config load — no auto-rewrite. Migration: add `extends: coding` to
+  coding-shaped agents, or paste the two-line override directly under
+  those agents.
+
 ## v0.6.5 — 2026-05-04
 
 ### Added

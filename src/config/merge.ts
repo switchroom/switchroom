@@ -170,6 +170,25 @@ export function resolveAgentConfig(
   profiles: Record<string, Profile> | undefined,
   agent: AgentConfig,
 ): AgentConfig {
+  // #682: surface the worker-isolation move once per process. The check
+  // lives here (not inside mergeAgentConfig) because mergeAgentConfig
+  // gets called recursively with synthesized "defaults" derived from
+  // profiles, and we'd false-positive on those. resolveAgentConfig sees
+  // only the operator-supplied root defaults.
+  if (
+    !mergeAgentConfig.suppressDeprecationLogs
+    && !mergeAgentConfig.notifiedWorkerIsolationMove
+    && defaults?.subagents?.worker?.isolation === "worktree"
+  ) {
+    mergeAgentConfig.notifiedWorkerIsolationMove = true;
+    console.warn(
+      "[switchroom] NOTICE: defaults.subagents.worker.isolation moved to the "
+      + "`coding` profile in switchroom 0.6.6 (#682). Agents extending coding "
+      + "still get worktree-isolated workers; other agents would have hard-failed "
+      + "the first time they delegated. See CHANGELOG.",
+    );
+  }
+
   const name = agent.extends;
   const profile = name && profiles ? profiles[name] : undefined;
 
@@ -418,16 +437,33 @@ export function mergeAgentConfig(
     };
   }
 
-  // --- subagents: per-key merge, agent wins on name conflict ---
+  // --- subagents: per-key merge, with field-level merge on conflict ---
   //
-  // A default sub-agent "worker" can be overridden entirely by an
-  // agent-level "worker" definition. No field-level merge within a
-  // single sub-agent — if you override, you replace the whole def.
+  // When the same sub-agent name (e.g. "worker") appears in both layers,
+  // we merge field-by-field (override wins per field, undefined fields
+  // fall through). This lets a profile add a single field — e.g. the
+  // coding profile setting `subagents.worker.isolation: worktree` — without
+  // having to re-declare the worker's description, model, maxTurns, etc
+  // from the defaults block. Pre-#682 this was a whole-def replacement,
+  // which made the inline coding profile's one-line override silently drop
+  // every other worker field.
   if (defaults.subagents || merged.subagents) {
-    merged.subagents = {
-      ...(defaults.subagents ?? {}),
-      ...(merged.subagents ?? {}),
-    };
+    const dSub = defaults.subagents ?? {};
+    const mSub = merged.subagents ?? {};
+    const out: Record<string, unknown> = { ...dSub };
+    for (const [name, override] of Object.entries(mSub)) {
+      const base = (dSub as Record<string, unknown>)[name];
+      if (base && typeof base === "object" && override && typeof override === "object") {
+        const combined: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+        for (const [k, v] of Object.entries(override as Record<string, unknown>)) {
+          if (v !== undefined) combined[k] = v;
+        }
+        out[name] = combined;
+      } else {
+        out[name] = override;
+      }
+    }
+    merged.subagents = out as AgentConfig["subagents"];
   }
 
   // --- session: shallow field merge, agent wins ---
@@ -558,4 +594,12 @@ export function mergeAgentConfig(
 // eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace mergeAgentConfig {
   export let suppressDeprecationLogs = false;
+  /**
+   * One-shot guard for the #682 worker-isolation migration notice. Reset
+   * to `false` in tests that exercise the notice path so the emission
+   * is observable; left `true` in tests that don't care, to keep stderr
+   * clean. Production code never resets it — the notice fires once per
+   * process by design.
+   */
+  export let notifiedWorkerIsolationMove = false;
 }

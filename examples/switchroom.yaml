@@ -67,7 +67,12 @@ defaults:
       description: "Handles implementation tasks: writing, editing, building, testing. Use for any task that takes more than a few seconds."
       model: sonnet
       background: true
-      isolation: worktree
+      # NOTE: `isolation: worktree` used to live here as a global default
+      # but moved to the `coding` profile in switchroom 0.6.6 (#682). It
+      # hard-failed for any agent whose cwd was not a git repo — i.e. the
+      # majority of switchroom agents, which run from
+      # `~/.switchroom/agents/<name>` with no git init. Worktree isolation
+      # is opt-in via `extends: coding` now. See CHANGELOG and #682.
       # 100 turns is a comfortable budget for most worker tasks; if a
       # worker exhausts this mid-flow, it'll be reported as #423-style
       # ceiling. Bump to 200 for genuinely long PR-shipping flows or
@@ -113,6 +118,19 @@ defaults:
 # Inline profiles here take priority over filesystem profiles/<name>/
 # (which can additionally bundle CLAUDE.md.hbs + skills/).
 profiles:
+  # The `coding` profile pairs with `profiles/coding/` on disk (which
+  # ships the CLAUDE.md template and skills). Its inline counterpart
+  # here carries the YAML-level defaults that the filesystem assets
+  # advertise — worktree-isolated workers chief among them. Agents
+  # whose cwd IS a git checkout (a real code repo) should
+  # `extends: coding` to pick this up. Agents whose cwd is the default
+  # `~/.switchroom/agents/<name>` (no git) should NOT — Claude Code
+  # cannot create a worktree off a non-repo and the worker will fail.
+  coding:
+    subagents:
+      worker:
+        isolation: worktree
+
   coder:
     tools:
       allow: [Bash, Read, Write, Edit, Grep, Glob]
