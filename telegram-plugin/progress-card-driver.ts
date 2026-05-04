@@ -36,6 +36,7 @@ import {
   applyToolUse as fleetApplyToolUse,
   applyTurnEnd as fleetApplyTurnEnd,
   createFleetMember,
+  markStuck as fleetMarkStuck,
   roleFromDispatch,
   type FleetMember,
 } from './fleet-state.js'
@@ -1095,6 +1096,23 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       // Gap 8: cards where the deferred-completion timeout has expired.
       const stalledCards: PerChatState[] = []
       for (const [, cs] of chats) {
+        // P3 of #662 — per-member stuck escalation runs FIRST, before any
+        // skip gate. This is pure data plumbing on the fleet shadow map;
+        // it must happen even when the chat is in the initial-delay window
+        // or budget-hot (the renderer's job is gated by those conditions
+        // separately). markStuck is idempotent and a no-op for non-running
+        // members, so running it every tick is cheap.
+        {
+          const fleet = cs.fleet
+          if (fleet.size > 0) {
+            const tNow = now()
+            for (const [agentId, m] of fleet) {
+              const next = fleetMarkStuck(m, tNow, 60_000)
+              if (next !== m) fleet.set(agentId, next)
+            }
+          }
+        }
+
         // Skip only when TRULY done. During the deferred-completion
         // window (parent turn_end fired but sub-agents — correlated or
         // orphan — are still running), reducer stage is 'done' but the
@@ -1198,6 +1216,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // bypass above, this guarantees the elapsed counter advances at most
         // `subAgentTickIntervalMs` apart while a sub-agent is running.
         if (html === cs.lastEmittedHtml && bucket === prevBucket && !elapsedTickDue) continue
+
         lastHeartbeatBucket.set(cs.turnKey, bucket)
         cs.lastEmittedHtml = html
         cs.lastEmittedAt = now()
@@ -1620,12 +1639,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   function reconcileFleetWithSubAgents(cs: PerChatState): void {
     for (const [agentId, sa] of cs.state.subAgents) {
       if (!cs.fleet.has(agentId)) {
+        // P0 follow-up (#662 reviewer items 1+2): preserve `startedAt`
+        // from the legacy SubAgentState when present so the synthesised
+        // carry-over entry doesn't reset the clock and immediately mask
+        // a stuck condition. `originatingTurnKey` has no legacy
+        // counterpart — fall back to the current/active turn.
+        const startedAt = sa.startedAt > 0 ? sa.startedAt : now()
         cs.fleet.set(
           agentId,
           createFleetMember({
             agentId,
             role: sa.description ?? 'agent',
-            startedAt: now(),
+            startedAt,
             originatingTurnKey: currentTurnKey ?? cs.turnKey,
           }),
         )
