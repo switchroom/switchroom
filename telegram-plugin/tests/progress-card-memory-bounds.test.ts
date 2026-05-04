@@ -72,9 +72,13 @@ describe('PR-C2: end-to-end memory bounds across 100 turn cycles', () => {
       advance(65_000)
     }
 
-    // chats may hold the originating bg-pending state OR have rolled it
-    // forward; either way the count is small and bounded — NOT 50+.
-    expect(maps.chats.size).toBeLessThanOrEqual(2)
+    // After 50 clean surrounding turns each followed by `advance(65_000)`
+    // (well past TTL + eviction throttle), every chatState — including
+    // the originating one whose bg sub-agent never finished — has been
+    // rolled forward and evicted. Empty is the correct steady state, not
+    // the "≤ 2" the original PR shipped. What this test really proves
+    // is that `chats` doesn't grow with cycle count.
+    expect(maps.chats.size).toBe(0)
     expect(maps.baseTurnSeqs.size).toBeLessThanOrEqual(1)
   })
 })

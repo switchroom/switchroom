@@ -51,10 +51,11 @@ describe('PR-C2: editTimestamps stays bounded under sustained emit burst', () =>
     const sizes = [...maps.editTimestamps.values()].map((a) => a.length)
     expect(sizes.length).toBeGreaterThan(0)
     const max = Math.max(...sizes)
-    // 60s window / 3s spacing = 20 entries. Allow generous slack (up to
-    // 30) for boundary timestamps recorded by the harness's setup
-    // (initial enqueue, heartbeat ticks, etc.).
-    expect(max).toBeLessThanOrEqual(30)
+    // 60s window / 3s spacing = 20 entries. Allow tight slack (<= 22)
+    // for one or two boundary timestamps recorded by the harness's
+    // setup (initial enqueue, etc.) — anything looser fails to catch
+    // off-by-N regressions in the sliding-window cleanup.
+    expect(max).toBeLessThanOrEqual(22)
     // And critically, NOT 100+ — that would mean cleanup never ran.
     expect(max).toBeLessThan(100)
   })
