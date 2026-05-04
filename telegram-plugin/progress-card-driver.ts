@@ -31,6 +31,14 @@ import {
   type SubAgentCardRegistry,
 } from './subagent-card.js'
 import { isTelegramReplyTool } from './tool-names.js'
+import {
+  applyToolResult as fleetApplyToolResult,
+  applyToolUse as fleetApplyToolUse,
+  applyTurnEnd as fleetApplyTurnEnd,
+  createFleetMember,
+  roleFromDispatch,
+  type FleetMember,
+} from './fleet-state.js'
 
 /**
  * Classification of a Telegram API error for failure-escalation purposes.
@@ -534,6 +542,13 @@ interface PerChatState {
    * double-registration if a real `sub_agent_started` arrives later.
    */
   promotedSpawnIds: Set<string>
+  /**
+   * P0 of #662 — shadow fleet map updated alongside `state.subAgents` at
+   * every sub_agent_* event. Coexists with the legacy map; P1/P2/P3 build
+   * the v2 two-zone status card on this without disturbing the existing
+   * renderer. See fleet-state.ts for the pure transitions.
+   */
+  fleet: Map<string, FleetMember>
 }
 
 export interface ProgressDriver {
@@ -620,6 +635,12 @@ export interface ProgressDriver {
   }
   /** Current state for a chat (for tests / inspection). */
   peek(chatId: string, threadId?: string): ProgressCardState | undefined
+  /**
+   * P0 of #662 — fetch the shadow fleet map for a chat. Used by tests
+   * and (eventually) by the v2 renderer. Same lookup semantics as
+   * `peek`. Returns undefined when no active card exists.
+   */
+  peekFleet(chatId: string, threadId?: string): Map<string, FleetMember> | undefined
   /**
    * True when the driver is still managing an active card for this chat+
    * thread — either a normal turn or a deferred-completion turn waiting on
@@ -1547,6 +1568,79 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     return false
   }
 
+  // P0 of #662 — shadow fleet maintenance. Mutates cs.fleet in place
+  // by replacing entries with new immutable FleetMember objects from the
+  // pure transition functions in fleet-state.ts.
+  function updateFleetForEvent(cs: PerChatState, event: SessionEvent): void {
+    switch (event.kind) {
+      case 'sub_agent_started': {
+        // Idempotent — late duplicates of the same agentId keep the
+        // original startedAt + originatingTurnKey snapshot.
+        if (cs.fleet.has(event.agentId)) return
+        const role = roleFromDispatch(undefined, event.subagentType, event.firstPromptText)
+        cs.fleet.set(
+          event.agentId,
+          createFleetMember({
+            agentId: event.agentId,
+            role,
+            startedAt: now(),
+            originatingTurnKey: currentTurnKey ?? cs.turnKey,
+          }),
+        )
+        return
+      }
+      case 'sub_agent_tool_use': {
+        const m = cs.fleet.get(event.agentId)
+        if (m == null) return
+        cs.fleet.set(event.agentId, fleetApplyToolUse(m, event.toolName, event.input, now()))
+        return
+      }
+      case 'sub_agent_tool_result': {
+        const m = cs.fleet.get(event.agentId)
+        if (m == null) return
+        cs.fleet.set(event.agentId, fleetApplyToolResult(m, event.isError))
+        return
+      }
+      case 'sub_agent_turn_end': {
+        const m = cs.fleet.get(event.agentId)
+        if (m == null) return
+        cs.fleet.set(event.agentId, fleetApplyTurnEnd(m, now()))
+        return
+      }
+      default:
+        return
+    }
+  }
+
+  // Cardinality reconciler: the legacy state.subAgents map can grow
+  // through paths the fleet shadow doesn't know about (parent Agent
+  // tool_use synthesised correlations, heartbeat orphan promotions,
+  // cross-turn carry-over). Mirror those into fleet so the invariant
+  // that `fleet` is a superset-or-equal of `subAgents` (by key) holds.
+  function reconcileFleetWithSubAgents(cs: PerChatState): void {
+    for (const [agentId, sa] of cs.state.subAgents) {
+      if (!cs.fleet.has(agentId)) {
+        cs.fleet.set(
+          agentId,
+          createFleetMember({
+            agentId,
+            role: sa.description ?? 'agent',
+            startedAt: now(),
+            originatingTurnKey: currentTurnKey ?? cs.turnKey,
+          }),
+        )
+      }
+    }
+    // Drop fleet entries the legacy map no longer tracks (rare — only
+    // when a parent tool_result correlation prunes a sub-agent before
+    // any sub_agent_turn_end arrived).
+    for (const agentId of [...cs.fleet.keys()]) {
+      if (!cs.state.subAgents.has(agentId)) {
+        cs.fleet.delete(agentId)
+      }
+    }
+  }
+
   return {
     ingest(event, chatIdMaybe, threadId) {
       // An `enqueue` event carries its own chatId (extracted from the XML
@@ -1678,6 +1772,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           parentTurnEndAt: null,
           parentDoneRendered: false,
           promotedSpawnIds: new Set(),
+          fleet: new Map<string, FleetMember>(),
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1741,6 +1836,19 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       const prev = chatState.state
       chatState.state = reduce(chatState.state, event, now())
       chatState.lastEventAt = now()
+
+      // P0 of #662 — shadow fleet map. Mirror sub_agent_* events into
+      // the parallel FleetMember map using the pure transitions from
+      // fleet-state.ts. Legacy state.subAgents is unchanged; P1/P2/P3
+      // build on `fleet` without touching the existing renderer.
+      updateFleetForEvent(chatState, event)
+      // Reconcile shadow with legacy map: any sub-agent that appears in
+      // state.subAgents (e.g. via parent-tool-result correlation, the
+      // heartbeat orphan-promotion path, or carry-over) but is missing
+      // from fleet gets a synthetic FleetMember so the cardinality
+      // invariant holds. Conversely, drop fleet entries that legacy
+      // dropped (these are already terminal in the watcher's view).
+      reconcileFleetWithSubAgents(chatState)
       const stageChanged = chatState.state.stage !== prev.stage
       const visibleChanged = visibleDiff(prev, chatState.state)
 
@@ -2077,6 +2185,19 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         `telegram gateway: progress-card: takeOverCard turnKey=${target.turnKey} wasEmitted=${wasEmitted}\n`,
       )
       return { wasEmitted, turnKey: target.turnKey }
+    },
+
+    peekFleet(chatId, threadId) {
+      if (currentTurnKey != null) {
+        const cs = chats.get(currentTurnKey)
+        if (cs != null && cs.chatId === chatId && cs.threadId === threadId) {
+          return cs.fleet
+        }
+      }
+      for (const cs of chats.values()) {
+        if (cs.chatId === chatId && cs.threadId === threadId) return cs.fleet
+      }
+      return undefined
     },
 
     peek(chatId, threadId) {
