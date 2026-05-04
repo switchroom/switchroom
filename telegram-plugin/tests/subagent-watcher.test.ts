@@ -30,6 +30,7 @@ function makeEntry(overrides: Partial<WorkerEntry> = {}): WorkerEntry {
     stallNotified: false,
     completionNotified: false,
     lastSummaryLine: '',
+    lastTool: null,
     historical: false,
     ...overrides,
   }
