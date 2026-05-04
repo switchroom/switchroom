@@ -1,0 +1,28 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`two-zone-card snapshots empty fleet — clean clerk-style card 1`] = `"⚙️ <b>Working…</b> · ⏱ 00:05 · 0t"`;
+
+exports[`two-zone-card snapshots 3 members mixed 1`] = `
+"⚙️ <b>Working…</b> · ⏱ 00:30 · 14t · 3s
+
+<b>FLEET (3)</b>
+↻ researcher <code>aaaaaa</code> · 4t · Grep <code>TODO</code> (2s ago)
+✓ worker <code>bbbbbb</code> · 8t · done 10s ago
+⚠ reviewer <code>cccccc</code> · 2t · idle 1m10s ago"
+`;
+
+exports[`two-zone-card snapshots all-done with completed receipts 1`] = `
+"✅ <b>Done</b> · ⏱ 00:20 · 8t · 2s
+
+<b>FLEET (2)</b>
+✓ reviewer <code>bbbbbb</code> · 3t · done 5s ago
+✓ worker <code>aaaaaa</code> · 5t · done 10s ago"
+`;
+
+exports[`two-zone-card snapshots all-stuck 1`] = `
+"⚠ <b>Stalled</b> · ⏱ 01:35 · 2t · 2s
+
+<b>FLEET (2)</b>
+⚠ worker <code>bbbbbb</code> · 1t · idle 1m20s ago
+⚠ worker <code>aaaaaa</code> · 1t · idle 1m30s ago"
+`;
