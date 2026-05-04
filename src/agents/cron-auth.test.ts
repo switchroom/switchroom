@@ -69,6 +69,17 @@ describe("buildCronScript: OAuth-only auth", () => {
     expect(script).toContain("--model 'claude-haiku-4-5-20251001'");
   });
 
+  it("exports SWITCHROOM_AGENT_NAME derived from agentDir basename", () => {
+    // Required so in-prompt `switchroom issues record` calls without an
+    // explicit --agent flag attribute correctly, and so the vault broker
+    // client can resolve a default agent. Mirrors the gateway unit's
+    // Environment=SWITCHROOM_AGENT_NAME= setting in src/agents/systemd.ts.
+    const script = buildCronScript(
+      SAMPLE_AGENT_DIR, SAMPLE_PROMPT, SAMPLE_MODEL, SAMPLE_CHAT, undefined,
+    );
+    expect(script).toContain("export SWITCHROOM_AGENT_NAME='sample'");
+  });
+
   it("auth setup happens after cd into agent dir, before claude invocation", () => {
     const script = buildCronScript(
       SAMPLE_AGENT_DIR, SAMPLE_PROMPT, SAMPLE_MODEL, SAMPLE_CHAT, undefined,
