@@ -105,6 +105,20 @@ export function markStuck(member: FleetMember, now: number, idleMs: number = 60_
   return { ...member, status: 'stuck' }
 }
 
+/**
+ * P2 of #662 / fixes #64 — true if any fleet member is in
+ * `status: 'background'` AND has not yet reached terminal state. Used by
+ * the driver's dispose path to keep a PerChatState alive past parent
+ * turn_end while background sub-agents are still running, and by the v2
+ * renderer's phase resolver to choose ⏸ Background vs ✅ Done.
+ */
+export function hasLiveBackground(fleet: ReadonlyMap<string, FleetMember>): boolean {
+  for (const m of fleet.values()) {
+    if (m.status === 'background' && m.terminalAt == null) return true
+  }
+  return false
+}
+
 export function cap(
   members: readonly FleetMember[],
   n: number = 5,

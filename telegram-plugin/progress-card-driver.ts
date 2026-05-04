@@ -36,6 +36,7 @@ import {
   applyToolUse as fleetApplyToolUse,
   applyTurnEnd as fleetApplyTurnEnd,
   createFleetMember,
+  hasLiveBackground,
   markStuck as fleetMarkStuck,
   roleFromDispatch,
   type FleetMember,
@@ -550,6 +551,27 @@ interface PerChatState {
    * renderer. See fleet-state.ts for the pure transitions.
    */
   fleet: Map<string, FleetMember>
+  /**
+   * P2 of #662 — set of parent toolUseIds whose Agent/Task tool_use was
+   * dispatched with `input.run_in_background === true`. When the
+   * matching `sub_agent_started` correlates and writes
+   * `parentToolUseId` into the freshly-created subagent state, the
+   * fleet reducer flips that member's `status` from `running` to
+   * `background`. Entry stays around for the life of the turn so a
+   * reverse-race adoption (sub_agent_started arriving before tool_use)
+   * still matches.
+   */
+  backgroundParentToolUseIds: Set<string>
+  /**
+   * P2 of #662 / fixes #64 — set true when `completeTurnFully` was
+   * called but at least one fleet member was still in `status:
+   * 'background'` and not terminal. The chats-map entry is preserved
+   * (instead of deleted) and the original card stays pinned so updates
+   * can continue to land. When the last live background member reaches
+   * a terminal status, `finalizeBackgroundCarryIfReady` triggers the
+   * deferred completion.
+   */
+  backgroundCarry: boolean
 }
 
 export interface ProgressDriver {
@@ -642,6 +664,13 @@ export interface ProgressDriver {
    * `peek`. Returns undefined when no active card exists.
    */
   peekFleet(chatId: string, threadId?: string): Map<string, FleetMember> | undefined
+  /**
+   * P2 of #662 — debug/test hook returning every live PerChatState's
+   * fleet keyed by turnKey. Used by cross-turn background tests to
+   * verify routing landed on the originating turn rather than the
+   * currently-active one. Not part of the production driver contract.
+   */
+  peekAllFleets(): Array<{ turnKey: string; chatId: string | null; fleet: Map<string, FleetMember> }>
   /**
    * True when the driver is still managing an active card for this chat+
    * thread — either a normal turn or a deferred-completion turn waiting on
@@ -1592,20 +1621,41 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   // pure transition functions in fleet-state.ts.
   function updateFleetForEvent(cs: PerChatState, event: SessionEvent): void {
     switch (event.kind) {
+      case 'tool_use': {
+        // P2 of #662 — capture the run_in_background flag from parent
+        // Agent/Task dispatches. The flag is keyed by parentToolUseId
+        // so the matching sub_agent_started (which gets the same id
+        // wired in via the reducer's pendingAgentSpawns adoption) can
+        // look it up when creating the fleet member.
+        if (
+          (event.toolName === 'Agent' || event.toolName === 'Task') &&
+          event.toolUseId &&
+          event.input?.run_in_background === true
+        ) {
+          cs.backgroundParentToolUseIds.add(event.toolUseId)
+        }
+        return
+      }
       case 'sub_agent_started': {
         // Idempotent — late duplicates of the same agentId keep the
         // original startedAt + originatingTurnKey snapshot.
         if (cs.fleet.has(event.agentId)) return
         const role = roleFromDispatch(undefined, event.subagentType, event.firstPromptText)
-        cs.fleet.set(
-          event.agentId,
-          createFleetMember({
-            agentId: event.agentId,
-            role,
-            startedAt: now(),
-            originatingTurnKey: currentTurnKey ?? cs.turnKey,
-          }),
-        )
+        // P2: derive background status from the parent dispatch flag.
+        // The reducer at progress-card.ts:706 already correlated the
+        // matching pendingAgentSpawn and wrote parentToolUseId into the
+        // fresh subagent state — read it back here so the fleet reflects
+        // the dispatch's run_in_background flag.
+        const parentToolUseId = cs.state.subAgents.get(event.agentId)?.parentToolUseId ?? null
+        const isBackground =
+          parentToolUseId != null && cs.backgroundParentToolUseIds.has(parentToolUseId)
+        const member = createFleetMember({
+          agentId: event.agentId,
+          role,
+          startedAt: now(),
+          originatingTurnKey: currentTurnKey ?? cs.turnKey,
+        })
+        cs.fleet.set(event.agentId, isBackground ? { ...member, status: 'background' } : member)
         return
       }
       case 'sub_agent_tool_use': {
@@ -1707,12 +1757,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           }
 
           // Guard 1: active card exists for this chat+thread.
+          // P2 of #662 / fixes #64 — except when the active card is a
+          // background-carry state (turn ended, fleet still has live bg
+          // members). The new enqueue is a real follow-up turn that must
+          // create a fresh PerChatState; the bg carry stays alive in
+          // parallel under its own turnKey.
           if (currentTurnKey != null) {
             const existing = chats.get(currentTurnKey)
             if (
               existing != null &&
               existing.chatId === chatId &&
-              existing.threadId === threadId
+              existing.threadId === threadId &&
+              !hasLiveBackground(existing.fleet)
             ) {
               return
             }
@@ -1747,10 +1803,26 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // correct path for "new turn replacing old" even when the old
         // turn was in pendingCompletion state (background sub-agent
         // hadn't reported done yet).
+        // P2 of #662 / fixes #64 — if the in-flight turn has live
+        // background fleet members, do NOT closeZombie it. Detach it
+        // from currentTurnKey instead so the new turn takes over the
+        // active slot while turn A's PerChatState stays alive in `chats`
+        // to receive cross-turn sub_agent_* events. Mark it with
+        // backgroundCarry so completion fires once the last live bg
+        // member reaches terminal status.
+        let bgCarryActive = false
         if (currentTurnKey != null) {
           const existing = chats.get(currentTurnKey)
           if (existing != null && (existing.chatId === chatId || !existing.chatId)) {
-            closeZombie(existing)
+            if (hasLiveBackground(existing.fleet)) {
+              existing.backgroundCarry = true
+              bgCarryActive = true
+              process.stderr.write(
+                `telegram gateway: progress-card: bg-carry preserving turnKey=${existing.turnKey} (live background fleet members) on new enqueue\n`,
+              )
+            } else {
+              closeZombie(existing)
+            }
           }
         }
         currentChatId = chatId
@@ -1761,7 +1833,11 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // background sub-agents dispatched in a prior turn for this chat.
         const initialTurnState = reduce(initialState(), event, now())
         const cBaseKey = baseKey(chatId, threadId)
-        const carriedOver = chatRunningSubagents.get(cBaseKey)
+        // P2 of #662 — when bg carry is active, the originating PerChatState
+        // still owns the running sub-agents. Don't re-seed turn B with them
+        // (would duplicate the fleet entries and cause turn B to defer its
+        // own completion waiting for sub-agents that don't belong to it).
+        const carriedOver = bgCarryActive ? undefined : chatRunningSubagents.get(cBaseKey)
         const seededState: ProgressCardState = (carriedOver != null && carriedOver.size > 0)
           ? {
               ...initialTurnState,
@@ -1798,6 +1874,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
           parentDoneRendered: false,
           promotedSpawnIds: new Set(),
           fleet: new Map<string, FleetMember>(),
+          backgroundParentToolUseIds: new Set<string>(),
+          backgroundCarry: false,
         }
         chats.set(slot.turnKey, chatState)
         if (event.isSync) {
@@ -1843,20 +1921,46 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }
       if (chatId == null) return
 
+      // P2 of #662 / fixes #64 — sub_agent_* events for an agentId whose
+      // fleet member lives on a non-current PerChatState (background
+      // carry) must route to the originating turn, not currentTurnKey.
+      // Without this, a background sub-agent that emits tool_use after
+      // its parent turn ended (and a new turn took over) would either
+      // be dropped or update the wrong turn's card.
+      let chatState: PerChatState | undefined
+      if (
+        (event.kind === 'sub_agent_tool_use' ||
+          event.kind === 'sub_agent_tool_result' ||
+          event.kind === 'sub_agent_turn_end' ||
+          event.kind === 'sub_agent_started') &&
+        'agentId' in event
+      ) {
+        const agentId = (event as { agentId: string }).agentId
+        for (const candidate of chats.values()) {
+          if (candidate.chatId !== chatId) continue
+          if (candidate.fleet.has(agentId)) {
+            chatState = candidate
+            break
+          }
+        }
+      }
+
       // Route to the current active turn key. Drop late events for a turn
       // that already ended — without this, a stray tool_result after turn_end
       // would resurrect the card. currentTurnKey is cleared on turn_end.
-      const k = currentTurnKey
-      if (k == null) {
-        if (event.kind.startsWith('sub_agent_')) {
-          process.stderr.write(
-            `telegram gateway: progress-card: late-sub-agent-event-dropped kind=${event.kind} agentId=${'agentId' in event ? (event as { agentId: string }).agentId : 'n/a'} chatId=${chatId}\n`,
-          )
+      if (chatState == null) {
+        const k = currentTurnKey
+        if (k == null) {
+          if (event.kind.startsWith('sub_agent_')) {
+            process.stderr.write(
+              `telegram gateway: progress-card: late-sub-agent-event-dropped kind=${event.kind} agentId=${'agentId' in event ? (event as { agentId: string }).agentId : 'n/a'} chatId=${chatId}\n`,
+            )
+          }
+          return
         }
-        return
+        chatState = chats.get(k)
+        if (chatState == null) return
       }
-      let chatState = chats.get(k)
-      if (chatState == null) return
 
       const prev = chatState.state
       chatState.state = reduce(chatState.state, event, now())
@@ -2210,6 +2314,20 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         `telegram gateway: progress-card: takeOverCard turnKey=${target.turnKey} wasEmitted=${wasEmitted}\n`,
       )
       return { wasEmitted, turnKey: target.turnKey }
+    },
+
+    /**
+     * P2 of #662 — debug/test hook returning every live PerChatState's
+     * fleet keyed by turnKey. Used by cross-turn background tests to
+     * verify routing landed on the originating turn rather than the
+     * currently-active one. Not part of the production driver contract.
+     */
+    peekAllFleets() {
+      const out: Array<{ turnKey: string; chatId: string | null; fleet: Map<string, FleetMember> }> = []
+      for (const cs of chats.values()) {
+        out.push({ turnKey: cs.turnKey, chatId: cs.chatId, fleet: cs.fleet })
+      }
+      return out
     },
 
     peekFleet(chatId, threadId) {
