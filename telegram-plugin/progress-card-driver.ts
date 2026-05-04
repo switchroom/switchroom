@@ -51,6 +51,18 @@ import {
 export type ApiFailureKind = 'permanent_4xx' | 'transient' | 'benign'
 
 /**
+ * Reason a per-chat card is being closed. Used by the unified
+ * `closePerChat` helper to drive the small set of behavioural deltas
+ * between paths (sub-agent force-close, stalled-render flag).
+ *
+ *   - 'turn-end' : normal completion — no in-flight sub-agents.
+ *   - 'zombie'   : abandonment via heartbeat maxIdle ceiling or
+ *                  new-enqueue force-close.
+ *   - 'stalled'  : Gap-8 deferred-completion timeout expired.
+ */
+export type CloseReason = 'turn-end' | 'zombie' | 'stalled'
+
+/**
  * Failure descriptor reported back to the driver after an async emit fails.
  * The outer layer (server.ts) inspects the raw Telegram error and classifies
  * it before calling `reportApiFailure`.
@@ -1025,61 +1037,97 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     // `maxIdleMs` heartbeat ceiling.
     if (hasAnyRunningSubAgent(cs.state)) return
     process.stderr.write(`telegram gateway: progress-card: deferred completion firing turnKey=${cs.turnKey} (last sub-agent finished)\n`)
-    // Set silentEndSuppressed BEFORE the outer flush so the rendered card
-    // already excludes the "🙊 Ended without reply" header when a retry is
-    // queued. Otherwise the outer flush would queue a warning-card edit
-    // and a follow-up correction edit could race or land as a second msg.
-    prepareSilentEndSuppression(cs)
-    flush(cs, /*forceDone*/ true)
-    completeTurnFully(cs)
+    // Route through the unified close path (turn-end reason) so the
+    // prelude (silentEnd suppression, final flush, tail cleanup) matches
+    // every other completion site.
+    closePerChat(cs, 'turn-end')
   }
 
   /**
-   * Force-close a card regardless of sub-agent state. Used by the
-   * heartbeat zombie ceiling (idle > maxIdleMs) and by the enqueue
-   * force-close path when a new turn arrives while the old card is
-   * still alive. Synthesizes a `turn_end` through the reducer, then
-   * explicitly abandons any still-running sub-agents (they won't
-   * receive their own sub_agent_turn_end because we're giving up on
-   * them) so the final render shows them as done, then runs the
-   * shared completion path. Must not re-enter ingest.
+   * Unified per-chat close path. Called by every site that finalises a
+   * card so the prelude (timer cleanup, sub-agent force-close where the
+   * reason demands it, silentEnd preparation, final flush) is applied
+   * consistently. The cleanup tail (chats.delete, baseKey cleanup,
+   * heartbeat-stop-if-last) lives in `completeTurnFully` and runs at the
+   * end of every reason path.
+   *
+   * Reasons:
+   *   - 'turn-end'  : normal completion (parent turn_end fired with no
+   *                   in-flight sub-agents, or the deferred-completion
+   *                   gate cleared). Sub-agents are NOT force-closed
+   *                   because by definition none are running.
+   *   - 'zombie'    : abandonment (heartbeat maxIdle ceiling, or new
+   *                   enqueue force-closing the previous card). Force-
+   *                   closes running sub-agents because we are giving
+   *                   up on them. Preserves `pendingSyncEchoes` because
+   *                   the echo for the previous turn may still arrive.
+   *   - 'stalled'   : Gap-8 deferred-completion timeout expired. Force-
+   *                   closes running sub-agents and passes
+   *                   `stalledClose=true` to flush so the renderer shows
+   *                   "⚠️ Stalled — forced close".
+   *
+   * Must not re-enter ingest.
    */
-  function closeZombie(cs: PerChatState): void {
+  function closePerChat(cs: PerChatState, reason: CloseReason): void {
+    // Clear pending coalesce timer for every reason — we are about to
+    // emit the final render synchronously.
     if (cs.pendingTimer != null) {
       clearT(cs.pendingTimer)
       cs.pendingTimer = null
     }
-    const durationMs = Math.max(0, now() - cs.state.turnStartedAt)
-    cs.state = reduce(cs.state, { kind: 'turn_end', durationMs }, now())
-    // turn_end no longer force-closes running sub-agents (background
-    // agents may legitimately outlive parent turn_end). But closeZombie
-    // IS the abandonment path — we ARE giving up on them here. Close
-    // ALL running sub-agents explicitly (including orphans) so the final
-    // render shows all work accounted for.
-    if (hasAnyRunningSubAgent(cs.state)) {
-      const prevStateForSync = cs.state
-      const closed = new Map(cs.state.subAgents)
-      const nowMs = now()
-      for (const [k, sa] of closed) {
-        if (sa.state === 'running') {
-          closed.set(k, { ...sa, state: 'done', finishedAt: nowMs, pendingPreamble: null })
-        }
+
+    if (reason === 'zombie' || reason === 'stalled') {
+      // Both reasons synthesise a turn_end (zombie) or have already had
+      // one fire (stalled — parentTurnEndAt is set) and then explicitly
+      // close every running sub-agent so the render accounts for all
+      // work. zombie: reduce now; stalled: reducer already saw turn_end.
+      if (reason === 'zombie') {
+        const durationMs = Math.max(0, now() - cs.state.turnStartedAt)
+        cs.state = reduce(cs.state, { kind: 'turn_end', durationMs }, now())
       }
-      cs.state = { ...cs.state, subAgents: closed }
-      // Issue #399: sync the chat-scoped running-sub-agent registry so
-      // stale entries don't carry over into the next turn's progress card.
-      syncChatRunningSubagents(
-        prevStateForSync,
-        cs.state,
-        baseKey(cs.chatId, cs.threadId),
-        chatRunningSubagents,
-      )
+      if (hasAnyRunningSubAgent(cs.state)) {
+        const prevStateForSync = cs.state
+        const closed = new Map(cs.state.subAgents)
+        const nowMs = now()
+        for (const [k, sa] of closed) {
+          if (sa.state === 'running') {
+            closed.set(k, { ...sa, state: 'done', finishedAt: nowMs, pendingPreamble: null })
+          }
+        }
+        cs.state = { ...cs.state, subAgents: closed }
+        // Issue #399: sync the chat-scoped running-sub-agent registry so
+        // stale entries don't carry into the next turn's progress card.
+        syncChatRunningSubagents(
+          prevStateForSync,
+          cs.state,
+          baseKey(cs.chatId, cs.threadId),
+          chatRunningSubagents,
+        )
+      }
     }
-    // Set silentEndSuppressed BEFORE the outer flush — see deferred path.
+
+    // Set silentEndSuppressed BEFORE the outer flush so the rendered
+    // card already excludes the "🙊 Ended without reply" header when a
+    // retry is queued. Otherwise the outer flush would queue a warning-
+    // card edit and a follow-up correction edit could race.
     prepareSilentEndSuppression(cs)
-    flush(cs, /*forceDone*/ true)
+    // zombie passes stalledClose=false — we abandoned the card but did
+    // NOT exceed the deferred-completion timeout. Promoting it to
+    // stalled would mis-render the close header.
+    flush(cs, /*forceDone*/ true, /*stalledClose*/ reason === 'stalled')
     completeTurnFully(cs)
-    // Don't clear pendingSyncEchoes — the echo may arrive after zombie close.
+    // Note: zombie deliberately preserves `pendingSyncEchoes` because
+    // the echo for the closed turn may still arrive after close. The
+    // dedup map's TTL eviction (maybeEvict) will reap it eventually.
+  }
+
+  /**
+   * Backwards-compatible alias for the zombie close path. Retained as a
+   * thin wrapper so call sites read clearly ("close the zombie") without
+   * needing to know about the reason taxonomy.
+   */
+  function closeZombie(cs: PerChatState): void {
+    closePerChat(cs, 'zombie')
   }
 
   /**
@@ -1373,37 +1421,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       }
 
       // Gap 8: force-close cards whose deferred-completion timeout has expired.
+      // The unified `closePerChat('stalled')` path applies the same prelude
+      // (sub-agent sync, prepareSilentEndSuppression) and renders the
+      // "⚠️ Stalled — forced close" header via stalledClose=true.
       for (const cs of stalledCards) {
         process.stderr.write(
           `telegram gateway: progress-card: deferred-completion-timeout-expired turnKey=${cs.turnKey} deferredCompletionTimeoutMs=${deferredCompletionTimeoutMs} (Gap 8 #313)\n`,
         )
-        // Mark all still-running sub-agents as done first so that the emit's
-        // `done` flag is true (the notification-spam guard suppresses done=true
-        // while sub-agents are running). The renderer still shows
-        // "⚠️ Stalled — forced close" because stalledClose=true now overrides
-        // trulyDone in progress-card.ts.
-        if (hasAnyRunningSubAgent(cs.state)) {
-          const prevStateGap8 = cs.state
-          const closed = new Map(cs.state.subAgents)
-          const nowMs = now()
-          for (const [k, sa] of closed) {
-            if (sa.state === 'running') {
-              closed.set(k, { ...sa, state: 'done', finishedAt: nowMs, pendingPreamble: null })
-            }
-          }
-          cs.state = { ...cs.state, subAgents: closed }
-          // Issue #399: sync the chat-scoped running-sub-agent registry so
-          // stale entries from this force-close don't carry into the next turn.
-          syncChatRunningSubagents(
-            prevStateGap8,
-            cs.state,
-            baseKey(cs.chatId, cs.threadId),
-            chatRunningSubagents,
-          )
-        }
-        prepareSilentEndSuppression(cs)
-        flush(cs, /*forceDone*/ true, /*stalledClose*/ true)
-        completeTurnFully(cs)
+        closePerChat(cs, 'stalled')
       }
       // Dedup-map TTL eviction has moved to `maybeEvict` (called from
       // every public ingress). Keeping it here was unsafe because the
@@ -2188,7 +2213,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
             process.stderr.write(`telegram gateway: progress-card: turn_end deferred turnKey=${chatState.turnKey} reason=in-flight-sub-agents correlated=${correlated.length} orphans=${orphans.length} correlatedAgentIds=[${correlated.join(',')}] orphanAgentIds=[${orphans.join(',')}]\n`)
             return
           }
-          completeTurnFully(chatState)
+          closePerChat(chatState, 'turn-end')
         }
         return
       }
@@ -2316,7 +2341,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         process.stderr.write(`telegram gateway: progress-card: forceCompleteTurn deferred turnKey=${target.turnKey} reason=in-flight-sub-agents correlated=${correlated.length} orphans=${orphans.length} correlatedAgentIds=[${correlated.join(',')}] orphanAgentIds=[${orphans.join(',')}]\n`)
         return
       }
-      completeTurnFully(target)
+      closePerChat(target, 'turn-end')
     },
 
     takeOverCard({ chatId, threadId }) {
