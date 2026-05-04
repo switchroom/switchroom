@@ -26,3 +26,5 @@ exports[`two-zone-card snapshots all-stuck 1`] = `
 ⚠ worker <code>bbbbbb</code> · 1t · idle 1m20s ago
 ⚠ worker <code>aaaaaa</code> · 1t · idle 1m30s ago"
 `;
+
+exports[`two-zone-card snapshots background — parent done, background sub still running 1`] = `"⏳ Waiting…"`;

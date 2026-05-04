@@ -94,7 +94,10 @@ export function phaseFor(
     return { icon: '⏸', label: 'Background' }
   }
 
-  // Stalled: parent idle + every running fleet member is idle > 60s
+  // Stalled: every running-or-stuck member is past the idle threshold.
+  // Members already terminal (done/failed) are excluded from this check —
+  // a fleet of [done, stuck] still surfaces as Stalled because the only
+  // member that could still make progress is no longer doing so.
   if (fleet.size > 0 && fleetAllStuck && !parentDone) {
     return { icon: '⚠', label: 'Stalled' }
   }

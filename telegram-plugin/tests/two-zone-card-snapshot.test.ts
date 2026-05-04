@@ -88,4 +88,17 @@ describe('two-zone-card snapshots', () => {
     })
     expect(out).toMatchSnapshot()
   })
+
+  it('background — parent done, background sub still running', () => {
+    const fleet = new Map([
+      ['a', fm({ agentId: 'aaaaaa01', role: 'worker', status: 'done', toolCount: 5, lastActivityAt: NOW - 30_000, terminalAt: NOW - 30_000 })],
+      ['b', fm({ agentId: 'bbbbbb02', role: 'background', status: 'background', toolCount: 12, lastActivityAt: NOW - 1000, lastTool: { name: 'Bash', sanitisedArg: 'long-job.sh' } })],
+    ])
+    const out = renderTwoZoneCard({
+      state: st({ stage: 'done', turnStartedAt: NOW - 60_000 }),
+      fleet,
+      now: NOW,
+    })
+    expect(out).toMatchSnapshot()
+  })
 })
