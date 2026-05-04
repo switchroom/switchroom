@@ -163,6 +163,12 @@ export type CallbackAction =
   | { kind: "confirm-account-enable"; agent: string; label: string }
   | { kind: "confirm-account-disable"; agent: string; label: string }
   | { kind: "share-fleet"; agent: string }
+  // v3a: per-account drill-down sub-view (accounts-first redesign).
+  // Short verbs (av/arm/armc/ara) preserve label headroom in 64-byte cap.
+  | { kind: "account-view"; agent: string; label: string }
+  | { kind: "account-rm"; agent: string; label: string }
+  | { kind: "account-rm-confirm"; agent: string; label: string }
+  | { kind: "account-reauth"; agent: string; label: string }
   | { kind: "noop" };
 
 const CALLBACK_PREFIX = "auth:";
@@ -202,6 +208,14 @@ export function encodeCallbackData(action: CallbackAction): string {
       return `${CALLBACK_PREFIX}cad:${action.agent}:${action.label}`;
     case "share-fleet":
       return `${CALLBACK_PREFIX}sf:${action.agent}`;
+    case "account-view":
+      return `${CALLBACK_PREFIX}av:${action.agent}:${action.label}`;
+    case "account-rm":
+      return `${CALLBACK_PREFIX}arm:${action.agent}:${action.label}`;
+    case "account-rm-confirm":
+      return `${CALLBACK_PREFIX}armc:${action.agent}:${action.label}`;
+    case "account-reauth":
+      return `${CALLBACK_PREFIX}ara:${action.agent}:${action.label}`;
     case "noop":
       return `${CALLBACK_PREFIX}noop`;
   }
@@ -224,14 +238,20 @@ export function parseCallbackData(data: string): CallbackAction {
   // Account-level verbs (single-char) accept a label as the third
   // segment instead of a slot. We branch on verb first so each segment
   // is validated against its own regex.
-  if (verb === "ae" || verb === "ad" || verb === "cae" || verb === "cad") {
+  if (verb === "ae" || verb === "ad" || verb === "cae" || verb === "cad" ||
+      verb === "av" || verb === "arm" || verb === "armc" || verb === "ara") {
     if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
     if (!third || !isSafeAccountLabel(third)) return { kind: "noop" };
     const label = third;
     if (verb === "ae") return { kind: "account-enable", agent, label };
     if (verb === "ad") return { kind: "account-disable", agent, label };
     if (verb === "cae") return { kind: "confirm-account-enable", agent, label };
-    return { kind: "confirm-account-disable", agent, label };
+    if (verb === "cad") return { kind: "confirm-account-disable", agent, label };
+    if (verb === "av") return { kind: "account-view", agent, label };
+    if (verb === "arm") return { kind: "account-rm", agent, label };
+    if (verb === "armc") return { kind: "account-rm-confirm", agent, label };
+    // verb === "ara"
+    return { kind: "account-reauth", agent, label };
   }
   if (verb === "sf") {
     if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
@@ -326,33 +346,44 @@ export function buildDashboardText(state: DashboardState): string {
   lines.push(planLine);
   lines.push("");
 
+  // v3a: accounts appear above slots — accounts are first-class, slots
+  // are an implementation detail of how credentials attach to a process.
+  if (state.accounts != null && state.accounts.length > 0) {
+    lines.push(`<b>Anthropic accounts (${state.accounts.length})</b>`);
+    const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
+    for (const acc of visible) {
+      const badge = accountHealthBadge(acc.health);
+      const suffix = healthSuffix(acc.health);
+      lines.push(`  • <code>${escapeHtml(acc.label)}</code>  ${badge}${suffix}`);
+    }
+    if (state.accountsTruncated) {
+      lines.push(`  … ${state.accounts.length - ACCOUNTS_DISPLAY_CAP} more (use CLI)`);
+    }
+    lines.push("");
+  }
+
   if (state.slots.length === 0) {
     lines.push("<i>No account slots. Tap [➕ Add slot] to attach a subscription.</i>");
-    return lines.join("\n");
-  }
-
-  for (const slot of state.slots) {
-    const marker = slot.active ? "●" : "○";
-    const badge = healthBadge(slot.health);
-    const label = healthLabel(slot.health);
-    lines.push(
-      `${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
-    );
-    const detail = slotDetailLine(slot);
-    if (detail) lines.push(`  └ ${detail}`);
-  }
-
-  // Accounts summary — one line under the slot list when the gateway
-  // surfaced account state. Hidden when accounts == null (older CLI
-  // without --json) so the dashboard degrades gracefully.
-  if (state.accounts != null) {
-    const total = state.accounts.length;
-    const enabledHere = state.accounts.filter((a) => a.enabledHere).length;
-    if (total > 0) {
-      lines.push("");
+  } else {
+    lines.push(`<b>Slots (${state.slots.length})</b>`);
+    for (const slot of state.slots) {
+      const marker = slot.active ? "●" : "○";
+      const badge = healthBadge(slot.health);
+      const label = healthLabel(slot.health);
       lines.push(
-        `Accounts: <b>${enabledHere}/${total}</b> shared on this agent`,
+        `  ${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
       );
+      const detail = slotDetailLine(slot);
+      if (detail) lines.push(`    └ ${detail}`);
+    }
+  }
+
+  // Pool / fallback summary — show when accounts exist, so the user
+  // understands how slots and accounts relate.
+  if (state.accounts != null && state.accounts.length > 0 && state.slots.length > 0) {
+    const activeSlot = state.slots.find((s) => s.active);
+    if (activeSlot) {
+      lines.push(`  Pool: slot <code>${escapeHtml(activeSlot.slot)}</code> is active`);
     }
   }
 
@@ -368,6 +399,21 @@ export function buildDashboardText(state: DashboardState): string {
   }
 
   return lines.join("\n");
+}
+
+/** Health badge for an account (not a slot). */
+function accountHealthBadge(health: AccountHealth): string {
+  switch (health) {
+    case "healthy":
+      return "✓";
+    case "quota-exhausted":
+      return "⚠️";
+    case "expired":
+    case "missing-refresh-token":
+      return "⌛";
+    case "missing-credentials":
+      return "✗";
+  }
 }
 
 function slotDetailLine(slot: DashboardSlot): string | null {
@@ -410,42 +456,14 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   const kb = new InlineKeyboard();
   const activeSlot = state.slots.find((s) => s.active);
 
-  // Row 1: primary auth actions. Reauth the active slot; add a new one.
-  if (activeSlot) {
-    kb.text(`🔄 Reauth ${activeSlot.slot}`, encodeCallbackData({ kind: "reauth", agent: state.agent, slot: activeSlot.slot }));
-  } else {
-    kb.text("🔄 Reauth", encodeCallbackData({ kind: "reauth", agent: state.agent }));
-  }
-  kb.text("➕ Add slot", encodeCallbackData({ kind: "add", agent: state.agent }));
-  kb.row();
-
-  // Row 2: non-active slots — one "Use" button per, up to 3 to avoid
-  // runaway rows. Over 3 slots, user sees an overflow message.
-  const nonActiveSlots = state.slots.filter((s) => !s.active).slice(0, 3);
-  for (const slot of nonActiveSlots) {
-    kb.text(`Use: ${slot.slot}`, encodeCallbackData({ kind: "use", agent: state.agent, slot: slot.slot }));
-  }
-  if (nonActiveSlots.length > 0) kb.row();
-
-  // Row 3: remove buttons (only for non-active slots; removing the
-  // active slot is blocked by auth-slot-parser's checkRemoveSafety).
-  const removableSlots = state.slots.filter((s) => !s.active).slice(0, 3);
-  for (const slot of removableSlots) {
-    kb.text(`🗑 Remove: ${slot.slot}`, encodeCallbackData({ kind: "rm", agent: state.agent, slot: slot.slot }));
-  }
-  if (removableSlots.length > 0) kb.row();
-
-  // Row 3.5 (NEW): account-level toggles. One row per account so
-  // labels stay readable on mobile and the per-button callback_data
-  // stays well under the 64-byte budget. Only renders when the
-  // gateway successfully fetched account state (`accounts != null`).
-  // Empty `accounts` falls through to the bootstrap branch below.
+  // v3a: Row 1+ — account rows. Each account is a tappable button that
+  // drills into the per-account sub-view. No inline ✓/○ toggles on the
+  // main board — the toggles are an implementation detail; the sub-view
+  // surface is the right place for per-account actions.
   if (state.accounts != null && state.accounts.length > 0) {
     const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
     for (const acc of visible) {
-      const action: CallbackAction = acc.enabledHere
-        ? { kind: "account-disable", agent: state.agent, label: acc.label }
-        : { kind: "account-enable", agent: state.agent, label: acc.label };
+      const action: CallbackAction = { kind: "account-view", agent: state.agent, label: acc.label };
       const encoded = encodeCallbackData(action);
       // Render-time guard: if the synthesised payload exceeds the
       // 64-byte cap (pathological agent + label lengths), fall back
@@ -457,8 +475,7 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
           encodeCallbackData({ kind: "noop" }),
         );
       } else {
-        const marker = acc.enabledHere ? "✓" : "○";
-        kb.text(`${marker} ${acc.label}${healthSuffix(acc.health)}`, encoded);
+        kb.text(`${acc.label}${healthSuffix(acc.health)}`, encoded);
       }
       kb.row();
     }
@@ -469,7 +486,7 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
       );
       kb.row();
     }
-  } else if (state.canBootstrapShare) {
+  } else if (state.accounts != null && state.accounts.length === 0 && state.canBootstrapShare) {
     // Bootstrap one-tap: zero accounts exist, but this agent has
     // healthy slot creds we could promote. Synthesises label="default"
     // at the gateway so the user gets a reasonable starting state in
@@ -481,12 +498,38 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
     kb.row();
   }
 
-  // Row 4: pending-flow recovery. Shown ONLY when an auth flow is
+  // Slot rows — existing Reauth/Add/Use/Remove behavior, unchanged.
+  // Slots are still real and operators still need to manage them;
+  // they're just demoted below accounts in the v3a layout.
+
+  // Slot row A: primary auth actions. Reauth the active slot; add a new one.
+  if (activeSlot) {
+    kb.text(`🔄 Reauth ${activeSlot.slot}`, encodeCallbackData({ kind: "reauth", agent: state.agent, slot: activeSlot.slot }));
+  } else {
+    kb.text("🔄 Reauth", encodeCallbackData({ kind: "reauth", agent: state.agent }));
+  }
+  kb.text("➕ Add slot", encodeCallbackData({ kind: "add", agent: state.agent }));
+  kb.row();
+
+  // Slot row B: non-active slots — one "Use" button per, up to 3 to
+  // avoid runaway rows. Over 3 slots, user sees an overflow message.
+  const nonActiveSlots = state.slots.filter((s) => !s.active).slice(0, 3);
+  for (const slot of nonActiveSlots) {
+    kb.text(`Use: ${slot.slot}`, encodeCallbackData({ kind: "use", agent: state.agent, slot: slot.slot }));
+  }
+  if (nonActiveSlots.length > 0) kb.row();
+
+  // Slot row C: remove buttons (only for non-active slots; removing the
+  // active slot is blocked by auth-slot-parser's checkRemoveSafety).
+  const removableSlots = state.slots.filter((s) => !s.active).slice(0, 3);
+  for (const slot of removableSlots) {
+    kb.text(`🗑 Remove: ${slot.slot}`, encodeCallbackData({ kind: "rm", agent: state.agent, slot: slot.slot }));
+  }
+  if (removableSlots.length > 0) kb.row();
+
+  // Pending-flow recovery. Shown ONLY when an auth flow is
   // pending (session meta file on disk). Lets the user explicitly
-  // kill + restart the flow. Pairs with the automatic stale-session
-  // detection in startAuthSession — catches the case where the user
-  // wants to start over BEFORE the PKCE challenge actually drifts
-  // (e.g. they closed the browser tab before pasting).
+  // kill + restart the flow.
   if (state.pendingSessionSlot) {
     kb.text(
       `♻️ Restart ${state.pendingSessionSlot} flow`,
@@ -495,15 +538,15 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
     kb.row();
   }
 
-  // Row 5: quota actions. [Fall back now] only when the dashboard
-  // flagged quotaHot; always show [Full quota] as the escape hatch.
+  // Quota row. [Fall back now] only when the dashboard flagged
+  // quotaHot; always show [Full quota] as the escape hatch.
   if (state.quotaHot) {
     kb.text("⚠️ Fall back now", encodeCallbackData({ kind: "fallback", agent: state.agent }));
   }
   kb.text("📊 Full quota", encodeCallbackData({ kind: "usage", agent: state.agent }));
   kb.row();
 
-  // Row 6: refresh
+  // Refresh
   kb.text("🔁 Refresh", encodeCallbackData({ kind: "refresh", agent: state.agent }));
 
   return kb;
@@ -602,4 +645,81 @@ function healthSuffix(health: AccountHealth): string {
 function truncateLabel(label: string): string {
   if (label.length <= 32) return label;
   return label.slice(0, 31) + "…";
+}
+
+// ─── v3a: Per-account sub-view ────────────────────────────────────────────
+
+/**
+ * Build the per-account drill-down sub-view text. Shown when the user
+ * taps an account row on the main dashboard.
+ */
+export function buildAccountSubViewText(agent: string, acc: AccountSummary): string {
+  const lines: string[] = [];
+  lines.push(`━━━ <b>Account • ${escapeHtml(acc.label)}</b> ━━━`);
+  lines.push(`Agent: <code>${escapeHtml(agent)}</code>`);
+  const badge = accountHealthBadge(acc.health);
+  const suffix = healthSuffix(acc.health);
+  lines.push(`Health: ${badge} ${acc.health}${suffix}`);
+  if (acc.subscriptionType) {
+    lines.push(`Type: <b>${escapeHtml(acc.subscriptionType)}</b>`);
+  }
+  if (acc.expiresAt) {
+    const expiresDate = new Date(acc.expiresAt).toISOString().slice(0, 10);
+    lines.push(`Expires: <code>${escapeHtml(expiresDate)}</code>`);
+  }
+  lines.push("━━━━━━━━━━━━━━━━━━━");
+  return lines.join("\n");
+}
+
+/**
+ * Build the per-account drill-down keyboard.
+ *
+ * Reauth is visible-but-inert in v3a — no `auth account reauth` CLI
+ * verb exists yet. The button is surfaced so the layout is complete;
+ * the gateway handler returns a toast noting it'll land in v3b.
+ */
+export function buildAccountSubViewKeyboard(agent: string, label: string): InlineKeyboard {
+  const reauthAction: CallbackAction = { kind: "account-reauth", agent, label };
+  const rmAction: CallbackAction = { kind: "account-rm", agent, label };
+  const reauthEncoded = encodeCallbackData(reauthAction);
+  const rmEncoded = encodeCallbackData(rmAction);
+  const kb = new InlineKeyboard();
+  // Reauth — inert in v3a (no CLI verb). Still wired so the layout is
+  // complete; the gateway emits a "coming in v3b" toast.
+  if (Buffer.byteLength(reauthEncoded, "utf8") <= CALLBACK_BUDGET_BYTES) {
+    kb.text("🔁 Reauth", reauthEncoded);
+  } else {
+    kb.text("🔁 Reauth (use CLI)", encodeCallbackData({ kind: "noop" }));
+  }
+  kb.row();
+  // Remove — triggers confirm sub-view.
+  if (Buffer.byteLength(rmEncoded, "utf8") <= CALLBACK_BUDGET_BYTES) {
+    kb.text("🗑 Remove", rmEncoded);
+  } else {
+    kb.text("🗑 Remove (use CLI)", encodeCallbackData({ kind: "noop" }));
+  }
+  kb.row();
+  // Back to main dashboard.
+  kb.text("← Accounts", encodeCallbackData({ kind: "refresh", agent }));
+  return kb;
+}
+
+/**
+ * Build the remove-confirm sub-view for a per-account removal.
+ * Ports the slot-remove confirm pattern.
+ */
+export function buildAccountRemoveConfirmKeyboard(agent: string, label: string): InlineKeyboard {
+  const confirmAction: CallbackAction = { kind: "account-rm-confirm", agent, label };
+  const confirmEncoded = encodeCallbackData(confirmAction);
+  return new InlineKeyboard()
+    .text(
+      `✓ Yes, remove`,
+      Buffer.byteLength(confirmEncoded, "utf8") <= CALLBACK_BUDGET_BYTES
+        ? confirmEncoded
+        : encodeCallbackData({ kind: "noop" }),
+    )
+    .text(
+      "✗ Cancel",
+      encodeCallbackData({ kind: "account-view", agent, label }),
+    );
 }

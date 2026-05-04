@@ -85,6 +85,9 @@ import {
   buildDashboard,
   buildRemoveConfirmKeyboard,
   buildAccountConfirmKeyboard,
+  buildAccountSubViewText,
+  buildAccountSubViewKeyboard,
+  buildAccountRemoveConfirmKeyboard,
   parseCallbackData,
   encodeCallbackData,
   isQuotaHot,
@@ -7559,6 +7562,53 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         `auth share default --from-agent ${action.agent}`,
       )
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    // v3a: per-account drill-down sub-view handlers.
+    case 'account-view': {
+      // Drill into the per-account sub-view. Fetch current account state
+      // so the sub-view reflects live health, then edit-in-place.
+      await ctx.answerCallbackQuery().catch(() => {})
+      const state = fetchDashboardState(action.agent)
+      const acc = state?.accounts?.find((a) => a.label === action.label)
+      if (!acc || !state) {
+        await ctx.answerCallbackQuery({ text: `Account "${action.label}" not found.` }).catch(() => {})
+        await sendAuthDashboard(ctx, action.agent, { edit: true })
+        return
+      }
+      const text = buildAccountSubViewText(action.agent, acc)
+      const keyboard = buildAccountSubViewKeyboard(action.agent, action.label)
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard, link_preview_options: { is_disabled: true } })
+      } catch { /* ignore MESSAGE_NOT_MODIFIED */ }
+      return
+    }
+    case 'account-reauth': {
+      // Reauth by account is not wired to a CLI verb in v3a.
+      // Surface a toast so the button is visible-but-inert; the full
+      // flow lands in v3b when `auth account reauth <label>` exists.
+      await ctx.answerCallbackQuery({ text: 'Reauth not yet wired — coming in v3b' }).catch(() => {})
+      return
+    }
+    case 'account-rm': {
+      // Two-step confirm — swap sub-view keyboard for remove confirm.
+      await ctx.answerCallbackQuery({ text: `Remove ${action.label}?` }).catch(() => {})
+      try {
+        await ctx.editMessageReplyMarkup({
+          reply_markup: buildAccountRemoveConfirmKeyboard(action.agent, action.label),
+        })
+      } catch { /* ignore */ }
+      return
+    }
+    case 'account-rm-confirm': {
+      await ctx.answerCallbackQuery({ text: `Removing ${action.label}…` }).catch(() => {})
+      try { assertSafeAgentName(action.agent) } catch { return }
+      await runSwitchroomCommand(
+        ctx,
+        ['auth', 'account', 'rm', action.label],
+        `auth account rm ${action.label}`,
+      )
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }

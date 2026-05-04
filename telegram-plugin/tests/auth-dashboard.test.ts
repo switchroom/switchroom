@@ -457,24 +457,26 @@ describe("buildDashboardKeyboard — accounts section", () => {
     expect(texts).not.toContain("🌐 Share to fleet");
   });
 
-  it("renders ✓ for an account enabled here, with a disable callback", () => {
+  it("renders an account button with a drill-down (account-view) callback", () => {
+    // v3a: account buttons on the main board open the sub-view, not a
+    // toggle. The ✓/○ markers are gone from the main board buttons.
     const state = mkState({
       accounts: [mkAccount({ label: "work", enabledHere: true })],
     });
     const allButtons = rows(state).flat();
     const acctBtn = allButtons.find((b) => b.text.includes("work"));
-    expect(acctBtn?.text).toBe("✓ work");
-    expect(acctBtn?.callback_data).toBe("auth:ad:clerk:work");
+    expect(acctBtn?.text).toBe("work");
+    expect(acctBtn?.callback_data).toBe("auth:av:clerk:work");
   });
 
-  it("renders ○ for an account NOT enabled here, with an enable callback", () => {
+  it("renders account button for a disabled account — still uses account-view callback", () => {
     const state = mkState({
       accounts: [mkAccount({ label: "work", enabledHere: false })],
     });
     const allButtons = rows(state).flat();
     const acctBtn = allButtons.find((b) => b.text.includes("work"));
-    expect(acctBtn?.text).toBe("○ work");
-    expect(acctBtn?.callback_data).toBe("auth:ae:clerk:work");
+    expect(acctBtn?.text).toBe("work");
+    expect(acctBtn?.callback_data).toBe("auth:av:clerk:work");
   });
 
   it("appends a health suffix for non-healthy accounts", () => {
@@ -485,8 +487,8 @@ describe("buildDashboardKeyboard — accounts section", () => {
       ],
     });
     const texts = flatTexts(state);
-    expect(texts.some((t) => t.startsWith("✓ expired-acct ⌛"))).toBe(true);
-    expect(texts.some((t) => t.startsWith("○ quota-acct ⚠️"))).toBe(true);
+    expect(texts.some((t) => t.startsWith("expired-acct ⌛"))).toBe(true);
+    expect(texts.some((t) => t.startsWith("quota-acct ⚠️"))).toBe(true);
   });
 
   it("caps visible accounts at ACCOUNTS_DISPLAY_CAP and adds a truncated noop row", () => {
@@ -496,7 +498,8 @@ describe("buildDashboardKeyboard — accounts section", () => {
     }
     const state = mkState({ accounts: tooMany, accountsTruncated: true });
     const allButtons = rows(state).flat();
-    const acctBtns = allButtons.filter((b) => /^[✓○]/.test(b.text));
+    // v3a: account buttons no longer have ✓/○ prefix; filter by account-view callback
+    const acctBtns = allButtons.filter((b) => b.callback_data?.startsWith("auth:av:"));
     expect(acctBtns).toHaveLength(ACCOUNTS_DISPLAY_CAP);
     expect(allButtons.find((b) => b.text.startsWith("…"))?.callback_data).toBe(
       "auth:noop",
@@ -513,7 +516,7 @@ describe("buildDashboardKeyboard — accounts section", () => {
   });
 
   it("falls back to a noop button when the synthesised callback exceeds the 64-byte cap", () => {
-    // Pathological: 60-char label + 40-char agent → "auth:ad:" (8) +
+    // Pathological: 60-char label + 40-char agent → "auth:av:" (8) +
     // 40 + ":" + 60 = 109 bytes, well over the 64-byte cap.
     const longLabel = "a".repeat(60);
     const state = mkState({
@@ -526,10 +529,10 @@ describe("buildDashboardKeyboard — accounts section", () => {
     expect(noopBtn?.text).toMatch(/use CLI/);
   });
 
-  it("non-account verbs still encode under the 64-byte budget for typical names", () => {
+  it("account-view encodes under the 64-byte budget for typical names", () => {
     expect(
       Buffer.byteLength(
-        encodeCallbackData({ kind: "account-enable", agent: "clerk", label: "work" }),
+        encodeCallbackData({ kind: "account-view", agent: "clerk", label: "work" }),
         "utf8",
       ),
     ).toBeLessThanOrEqual(CALLBACK_BUDGET_BYTES);
@@ -566,7 +569,11 @@ describe("buildDashboardText — accounts summary line", () => {
     expect(text).not.toMatch(/Accounts:/);
   });
 
-  it("renders <enabledHere>/<total> when accounts exist", () => {
+  it("renders account list with labels when accounts exist (v3a: accounts-first layout)", () => {
+    // v3a: the summary line "Accounts: N/M shared" is replaced by a
+    // proper section header + per-account rows. The text now shows each
+    // account label. The old "N/M shared" summary is gone — sub-views
+    // carry the per-account detail instead.
     const text = buildDashboardText(
       mkState({
         accounts: [
@@ -576,9 +583,145 @@ describe("buildDashboardText — accounts summary line", () => {
         ],
       }),
     );
-    expect(text).toMatch(/Accounts: <b>1\/3<\/b> shared on this agent/);
+    expect(text).toMatch(/Anthropic accounts \(3\)/);
+    expect(text).toContain("<code>work</code>");
+    expect(text).toContain("<code>home</code>");
+    expect(text).toContain("<code>test</code>");
   });
 });
 
 const _AccountHealthCheck: AccountHealth = "healthy"; // type-import smoke
 void _AccountHealthCheck;
+
+// ─── v3a: new callback kinds ──────────────────────────────────────────────
+
+import {
+  buildAccountSubViewText,
+  buildAccountSubViewKeyboard,
+  buildAccountRemoveConfirmKeyboard,
+} from "../auth-dashboard";
+
+describe("encodeCallbackData / parseCallbackData — v3a account sub-view verbs", () => {
+  it("account-view round-trips", () => {
+    const action = { kind: "account-view" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:av:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("account-rm round-trips", () => {
+    const action = { kind: "account-rm" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:arm:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("account-rm-confirm round-trips", () => {
+    const action = { kind: "account-rm-confirm" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:armc:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("account-reauth round-trips", () => {
+    const action = { kind: "account-reauth" as const, agent: "clerk", label: "work" };
+    const encoded = encodeCallbackData(action);
+    expect(encoded).toBe("auth:ara:clerk:work");
+    expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("rejects malformed agent in v3a verbs", () => {
+    expect(parseCallbackData("auth:av:bad agent:work")).toEqual({ kind: "noop" });
+  });
+
+  it("rejects malformed label in v3a verbs", () => {
+    expect(parseCallbackData("auth:av:clerk:bad label")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:arm:clerk:..")).toEqual({ kind: "noop" });
+    expect(parseCallbackData("auth:armc:clerk:")).toEqual({ kind: "noop" });
+  });
+
+  it("v3a verbs fit within 64-byte cap for typical names", () => {
+    for (const kind of ["account-view", "account-rm", "account-rm-confirm", "account-reauth"] as const) {
+      const encoded = encodeCallbackData({ kind, agent: "clerk", label: "work" });
+      expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(CALLBACK_BUDGET_BYTES);
+    }
+  });
+});
+
+describe("buildAccountSubViewText", () => {
+  it("includes label, agent, and health in the sub-view body", () => {
+    const acc: AccountSummary = { label: "work", health: "healthy", enabledHere: true };
+    const text = buildAccountSubViewText("clerk", acc);
+    expect(text).toContain("work");
+    expect(text).toContain("clerk");
+    expect(text).toContain("healthy");
+  });
+
+  it("escapes HTML in label and agent", () => {
+    const acc: AccountSummary = { label: "a&b", health: "healthy", enabledHere: false };
+    const text = buildAccountSubViewText("<evil>", acc);
+    expect(text).toContain("&amp;");
+    expect(text).toContain("&lt;evil&gt;");
+    expect(text).not.toContain("<evil>");
+  });
+
+  it("shows subscriptionType when present", () => {
+    const acc: AccountSummary = { label: "work", health: "healthy", enabledHere: true, subscriptionType: "max_5x" };
+    const text = buildAccountSubViewText("clerk", acc);
+    expect(text).toContain("max_5x");
+  });
+});
+
+describe("buildAccountSubViewKeyboard", () => {
+  it("has Reauth, Remove, and back-to-Accounts buttons", () => {
+    const kb = buildAccountSubViewKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    expect(buttons.find((b) => b.text === "🔁 Reauth")).toBeTruthy();
+    expect(buttons.find((b) => b.text === "🗑 Remove")).toBeTruthy();
+    expect(buttons.find((b) => b.text === "← Accounts")).toBeTruthy();
+  });
+
+  it("Reauth uses account-reauth callback", () => {
+    const kb = buildAccountSubViewKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "🔁 Reauth");
+    expect(btn?.callback_data).toBe("auth:ara:clerk:work");
+  });
+
+  it("Remove uses account-rm callback", () => {
+    const kb = buildAccountSubViewKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "🗑 Remove");
+    expect(btn?.callback_data).toBe("auth:arm:clerk:work");
+  });
+
+  it("back button returns to main dashboard via refresh", () => {
+    const kb = buildAccountSubViewKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "← Accounts");
+    expect(btn?.callback_data).toBe("auth:refresh:clerk");
+  });
+});
+
+describe("buildAccountRemoveConfirmKeyboard", () => {
+  it("has Yes-remove and Cancel buttons", () => {
+    const kb = buildAccountRemoveConfirmKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    expect(buttons.find((b) => b.text === "✓ Yes, remove")).toBeTruthy();
+    expect(buttons.find((b) => b.text === "✗ Cancel")).toBeTruthy();
+  });
+
+  it("Yes button uses account-rm-confirm callback", () => {
+    const kb = buildAccountRemoveConfirmKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "✓ Yes, remove");
+    expect(btn?.callback_data).toBe("auth:armc:clerk:work");
+  });
+
+  it("Cancel button returns to account sub-view via account-view callback", () => {
+    const kb = buildAccountRemoveConfirmKeyboard("clerk", "work");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "✗ Cancel");
+    expect(btn?.callback_data).toBe("auth:av:clerk:work");
+  });
+});
