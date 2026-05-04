@@ -65,7 +65,7 @@ describe('PR-C2: two-zone card snapshot extras', () => {
       opts: { silentEnd: true },
     })
     expect(out).toBe(
-      '🙊 <b>Ended without reply</b> · ⏱ 00:30 · 7t · 1s\n' +
+      '🙊 <b>Ended without reply</b> · ⏱ 00:30 · 🔧 7 · 🤖 1\n' +
       '\n' +
       '<b>FLEET (1)</b>\n' +
       '⏸ background <code>aaaaaa</code> · 7t · Bash <code>long.sh</code> (2s ago)',
@@ -104,5 +104,40 @@ describe('PR-C2: two-zone card snapshot extras', () => {
     expect(out).toContain('<code>f4.ts</code>')
     // f3 (the latest hidden) must not appear as a bullet code block.
     expect(out).not.toContain('<code>f3.ts</code>')
+  })
+
+  it('parent zone: in-flight last bullet uses ◉ <b>tool</b>; earlier use ● tool', () => {
+    const items = [
+      { tool: 'Read', label: 'a.ts' },
+      { tool: 'Read', label: 'b.ts' },
+      { tool: 'Bash', label: 'ls' },
+    ]
+    const out = renderTwoZoneCard({
+      state: st({ stage: 'run', turnStartedAt: NOW - 5000, items }),
+      fleet: new Map(),
+      now: NOW,
+    })
+    // last item active
+    expect(out).toContain('◉ <b>Bash</b> <code>ls</code>')
+    // earlier items plain
+    expect(out).toContain('● Read <code>a.ts</code>')
+    expect(out).toContain('● Read <code>b.ts</code>')
+    // last item is NOT plain
+    expect(out).not.toContain('● Bash <code>ls</code>')
+  })
+
+  it('parent zone: when stage=done all bullets render as ● (no active marker)', () => {
+    const items = [
+      { tool: 'Read', label: 'a.ts' },
+      { tool: 'Bash', label: 'ls' },
+    ]
+    const out = renderTwoZoneCard({
+      state: st({ stage: 'done', turnStartedAt: NOW - 5000, items }),
+      fleet: new Map(),
+      now: NOW,
+    })
+    expect(out).toContain('● Read <code>a.ts</code>')
+    expect(out).toContain('● Bash <code>ls</code>')
+    expect(out).not.toContain('◉')
   })
 })

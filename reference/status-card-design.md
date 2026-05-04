@@ -27,17 +27,26 @@ from active work, and from done.
 ## Layout
 
 ```
-<icon> <label> · ⏱ <elapsed> · <tools>t · <subs>s
+<icon> <label> · ⏱ <elapsed> · 🔧 <tools> · 🤖 <subs>
 
 PARENT
 ● <main-agent tool> [...]
 ● <main-agent tool> [...]
+◉ <b><active tool></b> [...]    ← last bullet while in flight
 
 FLEET (N)
 <icon> <role> <id6> · <tools>t · <last activity>
 <icon> <role> <id6> · <tools>t · <last activity>
 + N more
 ```
+
+The header counters are emoji-prefixed (🔧 = tool calls, 🤖 = sub-agents)
+rather than the cryptic `Nt` / `Ns` shorthand. The `🤖 <subs>` segment is
+omitted entirely when the fleet is empty. The parent zone's LAST bullet
+is rendered with `◉ <b>tool</b>` while the parent turn is still in
+flight (`stage !== 'done'`), so the active step is visibly distinct from
+completed history; once the parent reaches `done` every bullet renders
+plain (`●`).
 
 `PARENT` is omitted if the main agent has emitted no tool calls this
 turn. `FLEET` is omitted when no sub-agents have ever participated in
@@ -58,9 +67,10 @@ and yields exactly one of:
 | 🙊 | Ended without reply | Parent terminal AND no reply tool fired AND no captured text |
 | ⚠ | Forced close | Watchdog-driven turn close; supersedes all others |
 
-Counters: `Nt` total tool calls across all contributors (cap `99+`),
-`Ns` total sub-agents that ever participated this turn (running +
-terminal). Elapsed measured from parent `turn_start`.
+Counters: `🔧 N` total tool calls across all contributors (cap `99+`),
+`🤖 N` total sub-agents that ever participated this turn (running +
+terminal; segment omitted when fleet is empty). Elapsed measured from
+parent `turn_start`.
 
 ## Parent zone
 
