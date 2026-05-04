@@ -41,10 +41,14 @@ import { createRetryApiCall } from '../retry-api-call.js'
  *
  * Log shape (one line per POST, on both success and failure):
  *
- *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|err> err=<class-or-->
+ *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|err> err=<class-or--> code=<http-or--> desc=<short|-->
  *
  * Body content is never logged — only its length and a 12-char sha1 prefix
- * so we can recognise repeated identical sends without leaking PII.
+ * so we can recognise repeated identical sends without leaking PII. The
+ * `code` field carries the Telegram error_code (400/403/429/etc.) on
+ * failure and the short `desc` is the first ~80 chars of the API
+ * description — together these let us correlate "duplicate message"
+ * reports with the precise rejection reason (issue #657).
  *
  * Pure observability: no behaviour change, no error swallowing, no retry
  * effects. The transformer always re-throws after logging.
@@ -63,15 +67,25 @@ export function installTgPostLogger(bot: Bot): void {
     try {
       const res = await prev(method, payload, signal)
       process.stderr.write(
-        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=-\n`,
+        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=- code=- desc=-\n`,
       )
       return res
     } catch (err) {
       const errClass = err instanceof GrammyError
         ? `grammy_${(err as GrammyError).error_code}`
         : (err as { constructor?: { name?: string } } | null)?.constructor?.name ?? 'Error'
+      const code = err instanceof GrammyError ? String((err as GrammyError).error_code) : '-'
+      const rawDesc = err instanceof GrammyError
+        ? (err as GrammyError).description
+        : (err instanceof Error ? err.message : '')
+      // Sanitise the description for single-line log output — collapse
+      // whitespace, strip newlines, cap at 80 chars. PII-safe: Telegram
+      // error descriptions are server-generated and don't echo body.
+      const desc = rawDesc
+        ? rawDesc.replace(/\s+/g, ' ').slice(0, 80).replace(/[\r\n]/g, ' ') || '-'
+        : '-'
       process.stderr.write(
-        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=err err=${errClass}\n`,
+        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=err err=${errClass} code=${code} desc=${desc}\n`,
       )
       throw err
     }

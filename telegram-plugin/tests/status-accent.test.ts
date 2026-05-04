@@ -51,7 +51,7 @@ function makeDeps(
 ): StreamReplyDeps {
   return {
     bot,
-    markdownToHtml: (t) => `<html>${t}</html>`,
+    markdownToHtml: (t) => `<b>${t}</b>`,
     escapeMarkdownV2: (t) => `\\${t}\\`,
     repairEscapedWhitespace: (t) => t,
     takeHandoffPrefix: () => '',
@@ -90,7 +90,7 @@ describe('handleStreamReply accent integration', () => {
 
     const sent = bot.api.sendMessage.mock.calls[0][1] as string
     expect(sent).toMatch(/^🔵 <i>In progress…<\/i>\n\n/)
-    expect(sent).toBe('🔵 <i>In progress…</i>\n\n<html>Still working...</html>')
+    expect(sent).toBe('🔵 <i>In progress…</i>\n\n<b>Still working...</b>')
   })
 
   it("accent='done' prepends the checkmark header before the body", async () => {
@@ -106,7 +106,7 @@ describe('handleStreamReply accent integration', () => {
     await pending
 
     const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('✅ <b>Done</b>\n\n<html>Task complete.</html>')
+    expect(sent).toBe('✅ <b>Done</b>\n\n<b>Task complete.</b>')
   })
 
   it("accent='issue' prepends the warning header before the body", async () => {
@@ -122,7 +122,7 @@ describe('handleStreamReply accent integration', () => {
     await pending
 
     const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('⚠️ <b>Issue</b>\n\n<html>Blocked on X.</html>')
+    expect(sent).toBe('⚠️ <b>Issue</b>\n\n<b>Blocked on X.</b>')
   })
 
   it('no accent — output is unchanged from today (regression guard)', async () => {
@@ -138,7 +138,7 @@ describe('handleStreamReply accent integration', () => {
     await pending
 
     const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('<html>Hello world</html>')
+    expect(sent).toBe('<b>Hello world</b>')
   })
 
   it('invalid accent is silently ignored — output equals no-accent path', async () => {
@@ -154,7 +154,7 @@ describe('handleStreamReply accent integration', () => {
     await pending
 
     const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('<html>Hello world</html>')
+    expect(sent).toBe('<b>Hello world</b>')
   })
 
   it('accent header is included on every call that passes it (full-text replace model)', async () => {
@@ -181,6 +181,6 @@ describe('handleStreamReply accent integration', () => {
     await p2
 
     const edited = bot.api.editMessageText.mock.calls[0][2] as string
-    expect(edited).toBe('🔵 <i>In progress…</i>\n\n<html>Part one Part two</html>')
+    expect(edited).toBe('🔵 <i>In progress…</i>\n\n<b>Part one Part two</b>')
   })
 })

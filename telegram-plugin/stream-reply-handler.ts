@@ -22,6 +22,7 @@ import {
   type StreamBotApi,
   type RetryPolicy,
 } from './stream-controller.js'
+import { sanitizeTelegramHtml } from './html-sanitize.js'
 
 /**
  * Builds the inline status-accent header line for `reply` / `stream_reply`.
@@ -342,7 +343,11 @@ export async function handleStreamReply(
   let effectiveText: string
   if (format === 'html') {
     parseMode = 'HTML'
-    effectiveText = deps.markdownToHtml(rawText)
+    // Pre-validate the rendered HTML against Telegram's tag allowlist
+    // before send. The sanitizer escapes unknown tags, drops disallowed
+    // attributes, and auto-closes unbalanced tags so we don't trip
+    // Telegram's `400 Bad Request: can't parse entities` (issue #657).
+    effectiveText = sanitizeTelegramHtml(deps.markdownToHtml(rawText))
   } else if (format === 'markdownv2') {
     parseMode = 'MarkdownV2'
     effectiveText = deps.escapeMarkdownV2(rawText)
@@ -360,7 +365,14 @@ export async function handleStreamReply(
   // Unrecognised values are silently ignored (empty string returned).
   if (args.accent != null) {
     const accentHeader = buildAccentHeader(args.accent)
-    if (accentHeader.length > 0) effectiveText = accentHeader + effectiveText
+    if (accentHeader.length > 0) {
+      effectiveText = accentHeader + effectiveText
+      // Re-sanitize after prepending the HTML header so the combined
+      // body is still guaranteed parse-mode=HTML safe.
+      if (parseMode === 'HTML') {
+        effectiveText = sanitizeTelegramHtml(effectiveText)
+      }
+    }
   }
 
   // Over-limit pre-check. Throws BEFORE touching stream state so that
