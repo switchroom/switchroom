@@ -32,7 +32,7 @@ function makeDeps(
 ): StreamReplyDeps {
   return {
     bot,
-    markdownToHtml: (t) => `<html>${t}</html>`,
+    markdownToHtml: (t) => `<b>${t}</b>`,
     escapeMarkdownV2: (t) => `\\${t}\\`,
     repairEscapedWhitespace: (t) => t,
     takeHandoffPrefix: () => '',
@@ -68,7 +68,7 @@ describe('handleStreamReply', () => {
     expect(result.status).toBe('updated')
     expect(result.messageId).toBe(500)
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>hi</html>')
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>hi</b>')
     expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBe('HTML')
     expect(state.activeDraftStreams.size).toBe(1)
   })
@@ -117,14 +117,14 @@ describe('handleStreamReply', () => {
     await p1
     // Prefix is prepended AFTER format rendering (it's already format-safe
     // because takeHandoffPrefix takes the format tag).
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('↩️ <html>first</html>')
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('↩️ <b>first</b>')
 
     // Second call: handoff not consumed again
     vi.advanceTimersByTime(1000)
     const p2 = handleStreamReply({ chat_id: '1', text: 'second' }, state, deps)
     await microtaskFlush()
     await p2
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>second</html>')
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>second</b>')
     expect(deps.takeHandoffPrefix).toHaveBeenCalledTimes(1)
   })
 
@@ -341,7 +341,7 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText.mock.calls[0][1]).toBe(500) // same id
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>step 2</html>')
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>step 2</b>')
   })
 
   it('passes repairEscapedWhitespace through before rendering', async () => {
@@ -355,7 +355,7 @@ describe('handleStreamReply', () => {
     await pending
 
     // repair happens first; then markdownToHtml wraps the repaired text
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>a\nb</html>')
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>a\nb</b>')
   })
 
   it('different lanes for same chat produce independent Telegram messages', async () => {
@@ -408,7 +408,7 @@ describe('handleStreamReply', () => {
 
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>step 1 — step 2</html>')
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>step 1 — step 2</b>')
   })
 
   it('done=true on one lane does not affect other lanes', async () => {
@@ -477,8 +477,8 @@ describe('handleStreamReply', () => {
     expect(state.activeDraftStreams.has('1:_:progress:1:_:2')).toBe(true)
 
     // Each message carried its own turn's text.
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>turn A step 1</html>')
-    expect(bot.api.sendMessage.mock.calls[1][1]).toBe('<html>turn B step 1</html>')
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>turn A step 1</b>')
+    expect(bot.api.sendMessage.mock.calls[1][1]).toBe('<b>turn B step 1</b>')
   })
 
   it('subsequent updates with same turnKey reuse the stream (edit in place)', async () => {
@@ -507,7 +507,7 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText.mock.calls[0][1]).toBe(500)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<html>A first + second</html>')
+    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>A first + second</b>')
     expect(state.activeDraftStreams.size).toBe(1)
     expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(true)
   })
@@ -563,8 +563,8 @@ describe('handleStreamReply', () => {
 
     // And each edit carries its own turn's text — no cross-contamination.
     const editTexts = bot.api.editMessageText.mock.calls.map((c) => c[2])
-    expect(editTexts).toContain('<html>A step 1 + 2</html>')
-    expect(editTexts).toContain('<html>B step 1 + 2</html>')
+    expect(editTexts).toContain('<b>A step 1 + 2</b>')
+    expect(editTexts).toContain('<b>B step 1 + 2</b>')
   })
 
   it('done=true on one turnKey does not close the other concurrent turn', async () => {
@@ -849,7 +849,7 @@ describe('handleStreamReply', () => {
       const result = await pending
 
       expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>working...</html>')
+      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>working...</b>')
       expect(result.status).toBe('updated')
       // PTY-preview slot is claimed because the model is now the
       // answer-lane surface owner — late PTY partials should defer to
@@ -872,7 +872,7 @@ describe('handleStreamReply', () => {
       const result = await pending
 
       expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<html>final answer</html>')
+      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>final answer</b>')
       expect(result.status).toBe('finalized')
       expect(result.messageId).toBe(500)
     })

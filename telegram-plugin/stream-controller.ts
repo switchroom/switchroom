@@ -17,6 +17,28 @@
  */
 
 import { createDraftStream, type DraftStreamHandle, type StreamDraftFn } from './draft-stream.js'
+import { htmlToPlainText } from './html-sanitize.js'
+
+/**
+ * Telegram returns `400 Bad Request: can't parse entities: …` when the
+ * body contains malformed HTML / MarkdownV2 / nested unbalanced tags.
+ * Detect that specific error class so we can fall back to plain text
+ * without confusing it with other 400s (rate-limit, message-not-found,
+ * thread-not-found, etc.).
+ */
+function isParseEntitiesError(err: unknown): boolean {
+  const msg =
+    typeof err === 'string'
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof err === 'object' && err != null && 'description' in err
+          ? typeof (err as { description: unknown }).description === 'string'
+            ? (err as { description: string }).description
+            : ''
+          : ''
+  return /can't parse entities|can't find end of the entity|unsupported start tag|unmatched end tag/i.test(msg)
+}
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
@@ -208,21 +230,71 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     ...(protectContent === true ? { protect_content: true } : {}),
   }
 
+  // Strip parse_mode from a copy of opts — used for the parse-entities
+  // fallback path. We keep thread/preview/reply markup untouched.
+  const sendOptsPlain: StreamSendOpts = { ...sendOpts }
+  delete sendOptsPlain.parse_mode
+  const baseOptsPlain: StreamSendOpts = { ...baseOpts }
+  delete baseOptsPlain.parse_mode
+
   return createDraftStream(
     async (text) => {
-      const sent = await retry(
-        () => bot.api.sendMessage(chatId, text, sendOpts),
-        { threadId, chat_id: chatId },
-      )
-      onSend?.(sent.message_id, text.length)
-      return sent.message_id
+      try {
+        const sent = await retry(
+          () => bot.api.sendMessage(chatId, text, sendOpts),
+          { threadId, chat_id: chatId },
+        )
+        onSend?.(sent.message_id, text.length)
+        return sent.message_id
+      } catch (err) {
+        if (parseMode != null && isParseEntitiesError(err)) {
+          // First send rejected for parse_mode error. There is no
+          // message_id to edit (the send 400'd before any message was
+          // created), so a single fresh send in plain-text is the
+          // correct recovery — see issue #657. Strip tags from the
+          // body so the user sees readable prose, not raw markup.
+          warn?.(
+            `stream-controller: sendMessage parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
+          )
+          const plainText = htmlToPlainText(text)
+          const sent = await retry(
+            () => bot.api.sendMessage(chatId, plainText, sendOptsPlain),
+            { threadId, chat_id: chatId },
+          )
+          onSend?.(sent.message_id, plainText.length)
+          return sent.message_id
+        }
+        throw err
+      }
     },
     async (id, text) => {
-      await retry(
-        () => bot.api.editMessageText(chatId, id, text, baseOpts),
-        { threadId, chat_id: chatId },
-      )
-      onEdit?.(id, text.length)
+      try {
+        await retry(
+          () => bot.api.editMessageText(chatId, id, text, baseOpts),
+          { threadId, chat_id: chatId },
+        )
+        onEdit?.(id, text.length)
+      } catch (err) {
+        if (parseMode != null && isParseEntitiesError(err)) {
+          // Edit rejected for parse_mode error — DO NOT send a fresh
+          // message. The whole point of issue #657 is that the previous
+          // implementation sent a duplicate plain-text message every
+          // time HTML rejection fired. Retry the edit on the SAME
+          // message_id with parse_mode stripped and the body
+          // tag-stripped to plain text.
+          warn?.(
+            `stream-controller: editMessageText parse-entities rejected — retrying same id=${id} as plain text (${err instanceof Error ? err.message : String(err)})`,
+          )
+          const plainText = htmlToPlainText(text)
+          await retry(
+            () => bot.api.editMessageText(chatId, id, plainText, baseOptsPlain),
+            { threadId, chat_id: chatId },
+          )
+          onEdit?.(id, plainText.length)
+          return
+        }
+        throw err
+      }
     },
     {
       ...(throttleMs != null ? { throttleMs } : {}),
