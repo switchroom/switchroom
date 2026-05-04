@@ -2,8 +2,8 @@
  * P1 of #662 — `renderTwoZoneCard` pure renderer.
  *
  * Two-zone status card: PARENT bullets + FLEET rows. Replaces the v1
- * expandable-blockquote-per-sub-agent layout (still live behind the
- * default codepath; gated on `TWO_ZONE_CARD=1` for now).
+ * expandable-blockquote-per-sub-agent layout. Default on as of P4a;
+ * operators can opt out with `TWO_ZONE_CARD=0` for a no-deploy rollback.
  *
  * Pure: no IO, no globals, no clock except the caller-supplied `now`.
  * All sanitisation happens upstream in `fleet-state.ts`; this module

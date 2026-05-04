@@ -21,6 +21,10 @@ export default defineConfig({
     globals: true,
     environment: "node",
     reporters,
+    // P4a of #662 — pin TWO_ZONE_CARD=0 by default for tests so legacy
+    // renderer coverage keeps passing until P4b deletes the legacy path.
+    // Production default is ON; tests opt in explicitly per-suite.
+    setupFiles: ["./telegram-plugin/tests/setup-env.ts"],
     pool: "forks",
     poolOptions: {
       forks: {

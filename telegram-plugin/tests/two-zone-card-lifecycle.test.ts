@@ -1,8 +1,8 @@
 /**
- * P1 of #662 — lifecycle integration. Drive the real driver with
- * TWO_ZONE_CARD=1 set; assert the rendered HTML for a turn with 2
- * fleet members contains expected substrings (header phase, parent
- * bullets, fleet rows, fleet count).
+ * P1 of #662 — lifecycle integration. Drive the real driver (two-zone
+ * renderer is the default as of P4a; opt-out is TWO_ZONE_CARD=0); assert
+ * the rendered HTML for a turn with 2 fleet members contains expected
+ * substrings (header phase, parent bullets, fleet rows, fleet count).
  *
  * Uses the same lightweight harness pattern as
  * progress-card-driver-fleet-shadow.test.ts — no Telegram bot, just
@@ -83,9 +83,13 @@ const enqueue = (chatId: string): SessionEvent => ({
   rawContent: `<channel chat_id="${chatId}">go</channel>`,
 })
 
-describe('two-zone-card lifecycle (TWO_ZONE_CARD=1)', () => {
+describe('two-zone-card lifecycle (default on as of P4a)', () => {
   let prevFlag: string | undefined
   beforeEach(() => {
+    // Two-zone is the default in production as of P4a. The shared vitest
+    // setup file pins TWO_ZONE_CARD=0 so legacy-path tests keep passing
+    // until P4b deletes the legacy renderer; this test explicitly opts
+    // back into the new default to exercise the production code path.
     prevFlag = process.env.TWO_ZONE_CARD
     process.env.TWO_ZONE_CARD = '1'
   })
@@ -94,7 +98,7 @@ describe('two-zone-card lifecycle (TWO_ZONE_CARD=1)', () => {
     else process.env.TWO_ZONE_CARD = prevFlag
   })
 
-  it('renders two-zone card with fleet rows when flag is on', () => {
+  it('renders two-zone card with fleet rows by default', () => {
     const { driver, emits, advance } = harness()
     const CHAT = 'c1'
     driver.ingest(enqueue(CHAT), null)

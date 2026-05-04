@@ -1188,9 +1188,9 @@ export function render(
   expandableCache?: ExpandableCache,
   fleet?: ReadonlyMap<string, FleetMember>,
 ): string {
-  // P1 of #662 — opt-in two-zone renderer. Default off; legacy path is
-  // unchanged when the flag is unset.
-  if (process.env.TWO_ZONE_CARD === '1') {
+  // P4a of #662 — two-zone renderer is the default. Operators can opt out
+  // with TWO_ZONE_CARD=0 to fall back to the legacy path without a deploy.
+  if (process.env.TWO_ZONE_CARD !== '0') {
     return renderTwoZoneCard({ state, fleet: fleet ?? new Map(), now, taskNum, opts })
   }
   if (state.turnStartedAt === 0) {
