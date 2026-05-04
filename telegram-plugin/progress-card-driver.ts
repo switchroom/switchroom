@@ -762,6 +762,7 @@ export interface ProgressDriver {
     pendingSyncEchoes: Map<string, number>
     chatRunningSubagents: Map<string, Map<string, unknown>>
     baseTurnSeqs: Map<string, number>
+    editTimestamps: Map<string, number[]>
   }
 }
 
@@ -2651,6 +2652,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         pendingSyncEchoes,
         chatRunningSubagents,
         baseTurnSeqs,
+        editTimestamps,
       }
     },
   }

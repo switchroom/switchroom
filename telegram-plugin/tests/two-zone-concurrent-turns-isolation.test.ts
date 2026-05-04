@@ -52,6 +52,14 @@ const enqueue = (chatId: string): SessionEvent => ({
   rawContent: `<channel chat_id="${chatId}">go</channel>`,
 })
 
+const enqueueWithThread = (chatId: string, threadId: string, msgId: string): SessionEvent => ({
+  kind: 'enqueue',
+  chatId,
+  messageId: msgId,
+  threadId,
+  rawContent: `<channel chat_id="${chatId}" thread_id="${threadId}">go</channel>`,
+})
+
 describe('P2: concurrent-chat fleet isolation', () => {
   it('two chats with their own background sub-agents do not cross-pollinate', () => {
     const { driver } = harness()
@@ -90,5 +98,58 @@ describe('P2: concurrent-chat fleet isolation', () => {
     expect(fleetB.has('saA')).toBe(false)
     expect(fleetA.get('saA')!.status).toBe('background')
     expect(fleetB.get('saB')!.status).toBe('background')
+  })
+
+  it('PR-C2: two threads in the SAME chat (different threadId, shared chatId) — no cross-talk in per-chat state maps', () => {
+    // Two forum-topic threads in the same Telegram chat. Same chatId,
+    // distinct threadId. The driver must key per-turn state on the
+    // composite (chatId, threadId) base — closing one thread's turn
+    // must not touch the other's, and bg sub-agents must not bleed
+    // between threads.
+    const { driver } = harness()
+
+    driver.ingest(enqueueWithThread('cShared', 'tA', '1'), null)
+    driver.ingest(
+      {
+        kind: 'tool_use', toolName: 'Agent', toolUseId: 'tuA',
+        input: { prompt: 'pA', run_in_background: true },
+      },
+      'cShared',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'saA', firstPromptText: 'pA' }, 'cShared')
+
+    driver.ingest(enqueueWithThread('cShared', 'tB', '2'), null)
+    driver.ingest(
+      {
+        kind: 'tool_use', toolName: 'Agent', toolUseId: 'tuB',
+        input: { prompt: 'pB', run_in_background: true },
+      },
+      'cShared',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'saB', firstPromptText: 'pB' }, 'cShared')
+
+    // peekFleet keys on (chatId, threadId).
+    const fleetA = driver.peekFleet('cShared', 'tA')!
+    const fleetB = driver.peekFleet('cShared', 'tB')!
+    expect(fleetA).toBeDefined()
+    expect(fleetB).toBeDefined()
+    expect(fleetA.has('saA')).toBe(true)
+    expect(fleetA.has('saB')).toBe(false)
+    expect(fleetB.has('saB')).toBe(true)
+    expect(fleetB.has('saA')).toBe(false)
+
+    // baseTurnSeqs must have distinct entries for the two threads.
+    const maps = (driver as unknown as {
+      _debugGetMaps?: () => { baseTurnSeqs: Map<string, number>; chats: Map<string, unknown> }
+    })._debugGetMaps!()
+    const baseKeys = [...maps.baseTurnSeqs.keys()]
+    // The two threads MUST resolve to distinct base keys (proves the
+    // composite (chatId, threadId) is honoured). The exact base-key
+    // format is (chatId:threadId) — assert distinctness without
+    // hard-coding the format.
+    expect(baseKeys.length).toBe(2)
+    expect(new Set(baseKeys).size).toBe(2)
+    // chats map: 2 in-flight turns.
+    expect(maps.chats.size).toBe(2)
   })
 })
