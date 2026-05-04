@@ -1620,12 +1620,18 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   function reconcileFleetWithSubAgents(cs: PerChatState): void {
     for (const [agentId, sa] of cs.state.subAgents) {
       if (!cs.fleet.has(agentId)) {
+        // P0 follow-up (#662 reviewer items 1+2): preserve `startedAt`
+        // from the legacy SubAgentState when present so the synthesised
+        // carry-over entry doesn't reset the clock and immediately mask
+        // a stuck condition. `originatingTurnKey` has no legacy
+        // counterpart — fall back to the current/active turn.
+        const startedAt = sa.startedAt > 0 ? sa.startedAt : now()
         cs.fleet.set(
           agentId,
           createFleetMember({
             agentId,
             role: sa.description ?? 'agent',
-            startedAt: now(),
+            startedAt,
             originatingTurnKey: currentTurnKey ?? cs.turnKey,
           }),
         )
