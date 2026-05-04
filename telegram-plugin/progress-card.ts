@@ -22,6 +22,8 @@ import {
   truncate as sharedTruncate,
 } from './card-format.js'
 import { isBenignToolError } from './tool-error-filter.js'
+import { renderTwoZoneCard } from './two-zone-card.js'
+import type { FleetMember } from './fleet-state.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -1184,7 +1186,13 @@ export function render(
   taskNum?: TaskNum,
   opts?: RenderOptions,
   expandableCache?: ExpandableCache,
+  fleet?: ReadonlyMap<string, FleetMember>,
 ): string {
+  // P1 of #662 — opt-in two-zone renderer. Default off; legacy path is
+  // unchanged when the flag is unset.
+  if (process.env.TWO_ZONE_CARD === '1') {
+    return renderTwoZoneCard({ state, fleet: fleet ?? new Map(), now, taskNum, opts })
+  }
   if (state.turnStartedAt === 0) {
     return `${STEP_PENDING} Waiting…`
   }

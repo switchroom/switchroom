@@ -19,7 +19,12 @@ function harness() {
   let nextRef = 0
   const emits: Array<{ chatId: string; payload: string }> = []
   const driver = createProgressDriver({
-    emit: (chatId, payload) => emits.push({ chatId, payload: typeof payload === 'string' ? payload : payload.html }),
+    emit: (args) => {
+      // Parent card emits only — sub-agent per-agent cards carry agentId.
+      if ((args as { agentId?: string }).agentId == null) {
+        emits.push({ chatId: args.chatId, payload: args.html })
+      }
+    },
     minIntervalMs: 0,
     coalesceMs: 0,
     initialDelayMs: 0,
@@ -90,7 +95,7 @@ describe('two-zone-card lifecycle (TWO_ZONE_CARD=1)', () => {
   })
 
   it('renders two-zone card with fleet rows when flag is on', () => {
-    const { driver, emits } = harness()
+    const { driver, emits, advance } = harness()
     const CHAT = 'c1'
     driver.ingest(enqueue(CHAT), null)
 
@@ -101,6 +106,10 @@ describe('two-zone-card lifecycle (TWO_ZONE_CARD=1)', () => {
       { kind: 'sub_agent_tool_use', agentId: 'sa1', toolUseId: 't1', toolName: 'Grep', input: { pattern: 'TODO' } },
     ]
     for (const ev of events) driver.ingest(ev, CHAT)
+    // Drain the coalesce/min-interval setTimeout queue so deferred
+    // sub-agent emits flush. Each ingest schedules a 0-delay timer
+    // that is only invoked when fake time advances.
+    advance(0)
 
     // Find the most recent emitted payload — it should be a two-zone card.
     const last = emits[emits.length - 1]

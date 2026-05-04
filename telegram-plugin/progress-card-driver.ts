@@ -1206,7 +1206,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         const replyNotDelivered = cs.replyToolCalled && cs.outboundDeliveredCount === 0
         // Gap 8: pass parentDone to renderer during the deferred-unpin window.
         const parentDone = cs.parentTurnEndAt != null && hasAnyRunningSubAgent(cs.state)
-        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered, parentDone })
+        const html = render(cs.state, now(), undefined, { stuckMs, silentEnd, replyNotDelivered, parentDone }, undefined, cs.fleet)
         const bucket = Math.floor(now() / heartbeatMs)
         const prevBucket = lastHeartbeatBucket.get(cs.turnKey)
 
@@ -1418,6 +1418,8 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       now(),
       taskNum.total > 1 ? taskNum : undefined,
       { stuckMs, silentEnd, replyNotDelivered, parentDone, stalledClose },
+      undefined,
+      chatState.fleet,
     )
     // Issue #81 diagnostic: which checklist branch is the renderer taking?
     // The card prefers `narratives` (human preambles) over `items` (raw
