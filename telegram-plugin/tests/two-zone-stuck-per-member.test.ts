@@ -72,7 +72,7 @@ function harness(opts: { heartbeatMs?: number } = {}) {
     }
     now = target
   }
-  return { driver, advance, getNow: () => now }
+  return { driver, advance, getNow: () => now, timers }
 }
 
 const enqueue = (chatId: string): SessionEvent => ({

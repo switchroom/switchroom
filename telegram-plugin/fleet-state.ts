@@ -69,8 +69,13 @@ export function applyToolUse(
   input: Record<string, unknown> | undefined,
   now: number,
 ): FleetMember {
+  // P3 of #662 — recovery from stuck. A live tool event proves the
+  // sub-agent is alive again, so flip status back to running. Terminal
+  // statuses (done/failed/killed) are sticky and never reset here.
+  const status: FleetStatus = member.status === 'stuck' ? 'running' : member.status
   return {
     ...member,
+    status,
     toolCount: member.toolCount + 1,
     lastActivityAt: now,
     lastTool: { name: toolName, sanitisedArg: sanitiseToolArg(toolName, input ?? {}) },
@@ -96,7 +101,7 @@ export function applyTurnEnd(member: FleetMember, now: number): FleetMember {
 
 export function markStuck(member: FleetMember, now: number, idleMs: number = 60_000): FleetMember {
   if (member.status !== 'running') return member
-  if (now - member.lastActivityAt <= idleMs) return member
+  if (now - member.lastActivityAt < idleMs) return member
   return { ...member, status: 'stuck' }
 }
 
