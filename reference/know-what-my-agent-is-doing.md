@@ -39,8 +39,10 @@ a specific UI.
 - When the agent pivots, hits a wall, or finishes a chunk, the user hears
   about it in plain language, not by inferring it from the absence of
   updates.
-- Sub-agent work is visible in the same place as parent work. The user
-  never has to hunt for it.
+- Sub-agent work is visible in the same place as parent work — including
+  background sub-agents that outlive the turn that spawned them. The user
+  never has to hunt for it, and never loses sight of a background member
+  just because the parent turn replied (the #64 fix).
 - When a turn fails (crash, out of context, whatever), the user gets a
   real message explaining what happened. Failure modes are never silent.
 - When the agent comes back up after a restart, the user knows it came
@@ -49,6 +51,25 @@ a specific UI.
   "still there?", "any update?". If they do, the product is failing at
   its core job. Any time this happens it is a product-defect signal, not
   a feature request, and it should be captured as one.
+
+## Status card v2
+
+The current Telegram implementation of these signals is the two-zone
+pinned status card. See `reference/status-card-design.md` for the spec.
+
+The card maps directly onto the three signal types named above:
+
+- **Header line** carries the ambient signal — one glance tells the user
+  whether the turn is acknowledged, working, paused on a background
+  sub-agent, stalled, or done.
+- **Parent zone** carries the structured signal — the parent turn's tool
+  ring buffer and current step, in a stable shape the user can scan.
+- **Fleet zone** carries the narrative signal — one row per sub-agent,
+  each with its own short label of what that member thinks it's doing.
+
+Background sub-agents stay pinned to the originating turn's card after
+the parent replies, so the user never loses the thread when a member
+outlives the turn that spawned it.
 
 ## Anti-patterns: don't build this
 
@@ -113,3 +134,16 @@ experience, not just the reply.
   the user types "status?", "what are you doing?", "still there?", or
   anything similar. Trend should be near zero. Any non-zero rate is a
   debug-worthy signal that the progress surfaces failed that session.
+- **Background dispatch + continue.** Send a request that spawns a
+  background sub-agent, then immediately send a different request. The
+  original card must keep updating with the background member's progress
+  after the second turn replies and unpins its own card.
+- **Heavy fleet.** Send a request that spawns 6+ sub-agents in parallel.
+  Header counters tick. Fleet zone caps at 5 rows + `N more`. No
+  `<blockquote>` 400 in the gateway log (verify via `tg-post` from #659).
+- **Stuck detection.** Pause a sub-agent. Within 90s the row glyph flips
+  to ⚠ and the label shows `idle <duration>`. If it's the only running
+  member, header escalates to ⚠ Stalled.
+- **Done semantics.** Parent reply lands but a background sub-agent is
+  still running. Header MUST be ⏸ Background, never ✅ Done. After the
+  background sub-agent completes, header flips to ✅ Done.
