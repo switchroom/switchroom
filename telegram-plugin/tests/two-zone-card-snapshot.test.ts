@@ -1,5 +1,9 @@
 /**
- * P1 of #662 — golden snapshots for 4 canonical card states.
+ * P1 of #662 — golden output for 5 canonical card states.
+ *
+ * Uses explicit `toBe()` rather than `toMatchSnapshot()` so the same
+ * test file passes under both vitest (Core tests CI step) and bun
+ * (Plugin tests CI step) — the two snapshot formats are incompatible.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -46,7 +50,7 @@ describe('two-zone-card snapshots', () => {
       fleet: new Map(),
       now: NOW,
     })
-    expect(out).toMatchSnapshot()
+    expect(out).toBe('⚙️ <b>Working…</b> · ⏱ 00:05 · 0t')
   })
 
   it('3 members mixed', () => {
@@ -60,7 +64,14 @@ describe('two-zone-card snapshots', () => {
       fleet,
       now: NOW,
     })
-    expect(out).toMatchSnapshot()
+    expect(out).toBe(
+      '⚙️ <b>Working…</b> · ⏱ 00:30 · 14t · 3s\n' +
+      '\n' +
+      '<b>FLEET (3)</b>\n' +
+      '↻ researcher <code>aaaaaa</code> · 4t · Grep <code>TODO</code> (2s ago)\n' +
+      '✓ worker <code>bbbbbb</code> · 8t · done 10s ago\n' +
+      '⚠ reviewer <code>cccccc</code> · 2t · idle 1m10s ago',
+    )
   })
 
   it('all-done with completed receipts', () => {
@@ -73,7 +84,13 @@ describe('two-zone-card snapshots', () => {
       fleet,
       now: NOW,
     })
-    expect(out).toMatchSnapshot()
+    expect(out).toBe(
+      '✅ <b>Done</b> · ⏱ 00:20 · 8t · 2s\n' +
+      '\n' +
+      '<b>FLEET (2)</b>\n' +
+      '✓ reviewer <code>bbbbbb</code> · 3t · done 5s ago\n' +
+      '✓ worker <code>aaaaaa</code> · 5t · done 10s ago',
+    )
   })
 
   it('all-stuck', () => {
@@ -86,7 +103,13 @@ describe('two-zone-card snapshots', () => {
       fleet,
       now: NOW,
     })
-    expect(out).toMatchSnapshot()
+    expect(out).toBe(
+      '⚠ <b>Stalled</b> · ⏱ 01:35 · 2t · 2s\n' +
+      '\n' +
+      '<b>FLEET (2)</b>\n' +
+      '⚠ worker <code>bbbbbb</code> · 1t · idle 1m20s ago\n' +
+      '⚠ worker <code>aaaaaa</code> · 1t · idle 1m30s ago',
+    )
   })
 
   it('background — parent done, background sub still running', () => {
@@ -99,6 +122,12 @@ describe('two-zone-card snapshots', () => {
       fleet,
       now: NOW,
     })
-    expect(out).toMatchSnapshot()
+    expect(out).toBe(
+      '⏸ <b>Background</b> · ⏱ 01:30 · 17t · 2s\n' +
+      '\n' +
+      '<b>FLEET (2)</b>\n' +
+      '⏸ background <code>bbbbbb</code> · 12t · Bash <code>long-job.sh</code> (1s ago)\n' +
+      '✓ worker <code>aaaaaa</code> · 5t · done 30s ago',
+    )
   })
 })
