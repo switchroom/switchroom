@@ -177,7 +177,7 @@ describe('createPinManager', () => {
   })
 
   describe('considerPin — failure rollback', () => {
-    it('pin rejection: removePin fires, pinned map entry stays (see invariant doc)', async () => {
+    it('firePin API rejection deletes from pinned map and clears sidecar', async () => {
       const h = mkHarness()
       h.deps.pin.mockRejectedValueOnce(errors.forbidden('pinChatMessage'))
 
@@ -190,16 +190,23 @@ describe('createPinManager', () => {
       h.fireTimers()
       await h.mgr.drainInFlight()
 
-      // Sidecar was rolled back when the pin rejected.
+      // Sidecar rolled back.
       expect(h.deps.removePin).toHaveBeenCalledWith('c', 500)
       expect(h.sidecar).toEqual([])
       // Log captured the failure.
       expect(h.deps.log).toHaveBeenCalledWith(
         expect.stringMatching(/progress-card pin failed/),
       )
-      // In-memory entry is retained so a later completeTurn still attempts
-      // an unpin — on the off-chance the pin partially landed on Telegram.
-      expect(h.mgr.pinnedMessageId('c:1')).toBe(500)
+      // In-memory entry is dropped — the pin never landed, so a later
+      // completeTurn must not issue an unpin against a non-existent pin.
+      expect(h.mgr.pinnedTurnKeys()).toEqual([])
+      expect(h.mgr.pinnedMessageId('c:1')).toBeUndefined()
+
+      // Trigger an unpin and assert deps.unpin was NOT called — the key
+      // was already removed from `pinned`, so completeTurn is a no-op.
+      h.mgr.completeTurn({ chatId: 'c', turnKey: 'c:1' })
+      await h.mgr.drainInFlight()
+      expect(h.deps.unpin).not.toHaveBeenCalled()
     })
 
     it('pin rejection with 429: log line still fires, no retry', async () => {
