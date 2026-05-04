@@ -53,7 +53,6 @@ export type AuthIntent =
   | { kind: 'account-add'; account: string; fromAgent: string; label: string; cliArgs: string[] }
   | { kind: 'account-list'; label: string; cliArgs: string[] }
   | { kind: 'account-rm'; account: string; label: string; cliArgs: string[] }
-  | { kind: 'account-rename'; oldAccount: string; newAccount: string; label: string; cliArgs: string[] }
   | { kind: 'enable'; account: string; agents: string[]; label: string; cliArgs: string[]; restartAgentsAfter: true }
   | { kind: 'disable'; account: string; agents: string[]; label: string; cliArgs: string[] }
   | { kind: 'share'; account: string; fromAgent: string; label: string; cliArgs: string[]; restartAgentsAfter: true }
@@ -90,7 +89,6 @@ export function usageText(): string {
     '/auth account add <label> [--from-agent <name>]  — promote slot to global account',
     '/auth account list                          — accounts + agents using each',
     '/auth account rm <label>                    — remove (refused if enabled)',
-    '/auth account rename <old> <new>            — rename account + rewrite agents.<name>.auth.accounts lists',
     '/auth enable <label> [agents...|all]        — wire account to agent(s); "all" = every agent',
     '/auth disable <label> [agents...|all]       — unwire account from agent(s); "all" = every agent',
     '/auth share <label> [--from-agent <name>]   — account add + enable on every agent in one step',
@@ -283,33 +281,9 @@ export function parseAuthSubCommand(
       };
     }
 
-    if (accountSub === 'rename') {
-      // /auth account rename <oldLabel> <newLabel>
-      const oldAccount = parts[2];
-      const newAccount = parts[3];
-      if (!oldAccount || !newAccount) {
-        return {
-          kind: 'usage',
-          message: 'Usage: /auth account rename <oldLabel> <newLabel>',
-        };
-      }
-      try { assertSafeAccountLabel(oldAccount); assertSafeAccountLabel(newAccount); }
-      catch { return { kind: 'error', message: 'Invalid account label.' }; }
-      if (oldAccount === newAccount) {
-        return { kind: 'error', message: `Account "${oldAccount}" already has that name — nothing to do.` };
-      }
-      return {
-        kind: 'account-rename',
-        oldAccount,
-        newAccount,
-        label: `auth account rename ${oldAccount} ${newAccount}`,
-        cliArgs: ['auth', 'account', 'rename', oldAccount, newAccount],
-      };
-    }
-
     return {
       kind: 'usage',
-      message: 'Usage: /auth account add | list | rm | rename  (see /auth)',
+      message: 'Usage: /auth account add | list | rm  (see /auth)',
     };
   }
 

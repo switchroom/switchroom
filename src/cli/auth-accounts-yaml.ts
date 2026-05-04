@@ -91,50 +91,6 @@ export function getAccountsForAgent(
     .filter((v): v is string => typeof v === "string");
 }
 
-/**
- * Rewrite every `agents.<agent>.auth.accounts` list in the YAML,
- * swapping every occurrence of `oldLabel` for `newLabel`. Returns
- * the updated YAML string + the list of agents that were touched.
- *
- * Idempotent: agents whose list doesn't contain `oldLabel` are left
- * alone. The order of remaining labels in each list is preserved.
- *
- * Used by `switchroom auth account rename` to keep the per-agent
- * preference lists pointing at the renamed account without touching
- * any other config.
- */
-export function renameAccountInAllAgents(
-  yamlText: string,
-  oldLabel: string,
-  newLabel: string,
-): { yaml: string; touched: string[] } {
-  const doc = parseDocument(yamlText);
-  const agents = doc.get("agents");
-  if (!isMap(agents)) return { yaml: yamlText, touched: [] };
-  const touched: string[] = [];
-  for (const item of (agents as YAMLMap).items) {
-    const agentName = String((item.key as { value?: unknown }).value ?? item.key);
-    const accountsNode = doc.getIn(["agents", agentName, "auth", "accounts"]);
-    if (!isSeq(accountsNode)) continue;
-    const seq = accountsNode as YAMLSeq;
-    let mutated = false;
-    for (let i = 0; i < seq.items.length; i++) {
-      const v = (seq.items[i] as { value?: unknown }).value ?? seq.items[i];
-      if (v === oldLabel) {
-        seq.set(i, newLabel);
-        mutated = true;
-      }
-    }
-    if (mutated) touched.push(agentName);
-  }
-  // Return the original yaml string verbatim when no edits happened —
-  // serializing through parseDocument can normalize whitespace
-  // (e.g. drop a leading newline), which would surprise callers
-  // checking for byte-equality to detect "no change".
-  if (touched.length === 0) return { yaml: yamlText, touched };
-  return { yaml: String(doc), touched };
-}
-
 function ensureAgent(doc: Document, agentName: string): void {
   if (!hasAgent(doc, agentName)) {
     throw new Error(

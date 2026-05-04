@@ -15,7 +15,6 @@ import {
   readAccountCredentials,
   readAccountMeta,
   removeAccount,
-  renameAccount,
   validateAccountLabel,
   writeAccountCredentials,
   writeAccountMeta,
@@ -335,61 +334,5 @@ describe("atomic write — no tempfile remnants on success", () => {
     writeAccountMeta("clean", { createdAt: 1 }, home);
     const entries = readdirSync(accountDir("clean", home)).sort();
     expect(entries).toEqual(["credentials.json", "meta.json"]);
-  });
-});
-
-describe("renameAccount", () => {
-  it("moves the account directory + preserves credentials and meta", () => {
-    writeAccountCredentials(
-      "old-label",
-      { claudeAiOauth: { accessToken: "sk-ant-oat01-keep" } },
-      home,
-    );
-    writeAccountMeta(
-      "old-label",
-      { createdAt: 12345, email: "ken@example.com" },
-      home,
-    );
-    renameAccount("old-label", "new-label", home);
-    expect(accountExists("old-label", home)).toBe(false);
-    expect(accountExists("new-label", home)).toBe(true);
-    expect(readAccountCredentials("new-label", home)?.claudeAiOauth?.accessToken).toBe(
-      "sk-ant-oat01-keep",
-    );
-    expect(readAccountMeta("new-label", home)?.email).toBe("ken@example.com");
-  });
-
-  it("refuses when source does not exist", () => {
-    expect(() => renameAccount("ghost", "anything", home)).toThrow(/does not exist/);
-  });
-
-  it("refuses when destination already exists (no silent merge)", () => {
-    writeAccountCredentials(
-      "src",
-      { claudeAiOauth: { accessToken: "src-tok" } },
-      home,
-    );
-    writeAccountCredentials(
-      "dest",
-      { claudeAiOauth: { accessToken: "dest-tok" } },
-      home,
-    );
-    expect(() => renameAccount("src", "dest", home)).toThrow(
-      /an account with that label already exists/,
-    );
-    // Both untouched.
-    expect(readAccountCredentials("src", home)?.claudeAiOauth?.accessToken).toBe("src-tok");
-    expect(readAccountCredentials("dest", home)?.claudeAiOauth?.accessToken).toBe("dest-tok");
-  });
-
-  it("refuses no-op rename (same label)", () => {
-    writeAccountCredentials("same", { claudeAiOauth: { accessToken: "x" } }, home);
-    expect(() => renameAccount("same", "same", home)).toThrow(/already has that name/);
-  });
-
-  it("validates both labels", () => {
-    writeAccountCredentials("legit", { claudeAiOauth: { accessToken: "x" } }, home);
-    expect(() => renameAccount("../etc", "legit", home)).toThrow();
-    expect(() => renameAccount("legit", "foo bar", home)).toThrow();
   });
 });

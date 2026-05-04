@@ -27,7 +27,6 @@ import {
   listAccounts,
   patchAccountMeta,
   removeAccount,
-  renameAccount,
   validateAccountLabel,
   writeAccountCredentials,
   type AccountCredentials,
@@ -40,7 +39,6 @@ import {
   appendAccountToAgent,
   getAccountsForAgent,
   removeAccountFromAgent,
-  renameAccountInAllAgents,
 } from "./auth-accounts-yaml.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 
@@ -59,7 +57,6 @@ export function registerAuthAccountSubcommands(
   registerAccountAdd(account, program);
   registerAccountList(account, program);
   registerAccountRm(account, program);
-  registerAccountRename(account, program);
 
   registerEnable(authParent, program);
   registerDisable(authParent, program);
@@ -347,86 +344,6 @@ function registerAccountRm(account: Command, program: Command): void {
         removeAccount(label);
         console.log();
         console.log(`${chalk.green("✓")} Account ${chalk.bold(label)} removed.`);
-        console.log();
-      }),
-    );
-}
-
-/* ── account rename ──────────────────────────────────────────────────── */
-
-function registerAccountRename(account: Command, program: Command): void {
-  account
-    .command("rename <oldLabel> <newLabel>")
-    .description(
-      "Rename an Anthropic account on disk + update every agent's auth.accounts list in switchroom.yaml. " +
-        "No agent restart required — per-agent credentials.json mirrors are content-equivalent under the new label.",
-    )
-    .action(
-      withConfigError(async (oldLabel: string, newLabel: string) => {
-        validateAccountLabel(oldLabel);
-        validateAccountLabel(newLabel);
-        if (oldLabel === newLabel) {
-          throw new Error(
-            `Account "${oldLabel}" already has that name — nothing to do.`,
-          );
-        }
-        if (!accountExists(oldLabel)) {
-          throw new Error(`Account "${oldLabel}" does not exist`);
-        }
-        if (accountExists(newLabel)) {
-          throw new Error(
-            `Cannot rename to "${newLabel}" — an account with that label already exists.`,
-          );
-        }
-
-        // 1. Rename the global account directory.
-        renameAccount(oldLabel, newLabel);
-
-        // 2. Rewrite agents.<name>.auth.accounts lists in switchroom.yaml.
-        const yamlPath = getConfigPath(program);
-        const before = readFileSync(yamlPath, "utf-8");
-        const { yaml: after, touched } = renameAccountInAllAgents(
-          before,
-          oldLabel,
-          newLabel,
-        );
-        if (after !== before) {
-          writeFileSync(yamlPath, after);
-        }
-
-        // 3. Re-fanout under the new label so the broker's view is
-        //    consistent. Per-agent credentials.json content is identical
-        //    (the file was untouched by the directory rename), but we
-        //    re-mirror to update the legacy .oauth-token meta `source`
-        //    field from "account:<old>" to "account:<new>".
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        const targets = touched.map((name) => ({
-          name,
-          agentDir: resolve(agentsDir, name),
-        }));
-        const outcomes =
-          targets.length > 0
-            ? fanoutAccountToAgents(newLabel, targets)
-            : [];
-
-        console.log();
-        console.log(
-          `${chalk.green("✓")} Renamed account ${chalk.bold(oldLabel)} → ${chalk.bold(newLabel)}.`,
-        );
-        if (touched.length > 0) {
-          console.log(
-            `  Updated ${touched.length} agent${touched.length === 1 ? "" : "s"} in switchroom.yaml: ${touched.join(", ")}`,
-          );
-        } else {
-          console.log(
-            `  No agents had ${chalk.bold(oldLabel)} in their auth.accounts list — only the global directory was renamed.`,
-          );
-        }
-        const fanned = outcomes.filter((o) => o.kind === "fanned-out").length;
-        if (fanned > 0) {
-          console.log(`  Re-fanned credentials to ${fanned} agent${fanned === 1 ? "" : "s"} (no restart required).`);
-        }
         console.log();
       }),
     );

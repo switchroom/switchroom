@@ -3,7 +3,6 @@ import {
   appendAccountToAgent,
   getAccountsForAgent,
   removeAccountFromAgent,
-  renameAccountInAllAgents,
 } from "../src/cli/auth-accounts-yaml.js";
 
 const baseYaml = `
@@ -109,70 +108,5 @@ describe("getAccountsForAgent", () => {
   });
   it("returns [] when agent missing", () => {
     expect(getAccountsForAgent(baseYaml, "ghost")).toEqual([]);
-  });
-});
-
-describe("renameAccountInAllAgents", () => {
-  const yaml = `
-agents:
-  foo:
-    topic_name: Foo
-    auth:
-      accounts: [work-pro, personal]
-  bar:
-    topic_name: Bar
-    auth:
-      accounts: [work-pro]
-  baz:
-    topic_name: Baz
-    auth:
-      accounts: [personal]
-  qux:
-    topic_name: Qux
-`;
-
-  it("swaps the label in every agent's list, preserves order, returns touched agents", () => {
-    const { yaml: out, touched } = renameAccountInAllAgents(yaml, "work-pro", "ken-pro");
-    expect(touched.sort()).toEqual(["bar", "foo"]);
-    expect(getAccountsForAgent(out, "foo")).toEqual(["ken-pro", "personal"]);
-    expect(getAccountsForAgent(out, "bar")).toEqual(["ken-pro"]);
-    // Untouched agents unchanged.
-    expect(getAccountsForAgent(out, "baz")).toEqual(["personal"]);
-    expect(getAccountsForAgent(out, "qux")).toEqual([]);
-  });
-
-  it("idempotent — renaming a label that no agent uses returns yaml unchanged", () => {
-    const { yaml: out, touched } = renameAccountInAllAgents(yaml, "missing", "anything");
-    expect(touched).toEqual([]);
-    expect(out).toBe(yaml);
-  });
-
-  it("preserves comments and unrelated structure", () => {
-    const yamlWithComment = `
-# top-level
-agents:
-  foo:
-    topic_name: Foo  # the foo
-    auth:
-      accounts: [old-name]
-`;
-    const { yaml: out } = renameAccountInAllAgents(yamlWithComment, "old-name", "new-name");
-    expect(out).toContain("# top-level");
-    expect(out).toContain("# the foo");
-    expect(getAccountsForAgent(out, "foo")).toEqual(["new-name"]);
-  });
-
-  it("touches an agent only once even if the label appears multiple times in its list", () => {
-    // Real configs would never have this, but the helper should be defensive.
-    const dupYaml = `
-agents:
-  foo:
-    topic_name: Foo
-    auth:
-      accounts: [work, work, work]
-`;
-    const { yaml: out, touched } = renameAccountInAllAgents(dupYaml, "work", "renamed");
-    expect(touched).toEqual(["foo"]);
-    expect(getAccountsForAgent(out, "foo")).toEqual(["renamed", "renamed", "renamed"]);
   });
 });

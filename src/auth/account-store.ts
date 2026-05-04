@@ -285,49 +285,6 @@ export function removeAccount(label: string, home: string = homedir()): void {
   rmSync(accountDir(label, home), { recursive: true, force: true });
 }
 
-/* ── Rename ──────────────────────────────────────────────────────────── */
-
-/**
- * Rename an account on disk by moving its directory.
- *
- * Both labels are validated. Refuses when the source doesn't exist or
- * the destination already does (to avoid silent merges that would
- * lose the destination's credentials).
- *
- * Atomic at the filesystem level: rename(2) is atomic within a single
- * filesystem, and accounts always live under one parent dir.
- *
- * The caller is responsible for downstream side effects:
- *   1. Rewriting `agents.<name>.auth.accounts` lists in switchroom.yaml
- *      to swap the old label for the new one.
- *   2. Re-fanning out credentials to enabled agents (the per-agent
- *      mirror at `<agentDir>/.claude/credentials.json` is unchanged
- *      content-wise — just the source-of-truth label moved — so a
- *      restart isn't strictly required, but a fanout pass keeps the
- *      broker's view consistent).
- */
-export function renameAccount(
-  oldLabel: string,
-  newLabel: string,
-  home: string = homedir(),
-): void {
-  validateAccountLabel(oldLabel);
-  validateAccountLabel(newLabel);
-  if (oldLabel === newLabel) {
-    throw new Error(`Account "${oldLabel}" already has that name — nothing to do`);
-  }
-  if (!accountExists(oldLabel, home)) {
-    throw new Error(`Account "${oldLabel}" does not exist`);
-  }
-  if (existsSync(accountDir(newLabel, home))) {
-    throw new Error(
-      `Cannot rename to "${newLabel}" — an account with that label already exists. ` +
-      `Remove it first with 'switchroom auth account rm ${newLabel}' or pick a different label.`,
-    );
-  }
-  renameSync(accountDir(oldLabel, home), accountDir(newLabel, home));
-}
-
 /* ── Atomic write helper ─────────────────────────────────────────────── */
 
 /**

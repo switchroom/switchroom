@@ -449,49 +449,6 @@ describe("parseAuthSubCommand — account-shaped verbs", () => {
     const intent = parseAuthSubCommand(["account"], "clerk");
     expect(intent.kind).toBe("account-list");
   });
-
-  it("/auth account rename <old> <new> produces account-rename intent with both labels", () => {
-    const intent = parseAuthSubCommand(
-      ["account", "rename", "ken-pro", "work-pro"],
-      "clerk",
-    );
-    expect(intent.kind).toBe("account-rename");
-    if (intent.kind === "account-rename") {
-      expect(intent.oldAccount).toBe("ken-pro");
-      expect(intent.newAccount).toBe("work-pro");
-      expect(intent.cliArgs).toEqual([
-        "auth",
-        "account",
-        "rename",
-        "ken-pro",
-        "work-pro",
-      ]);
-    }
-  });
-
-  it("/auth account rename without both labels is a usage error", () => {
-    expect(parseAuthSubCommand(["account", "rename"], "clerk").kind).toBe("usage");
-    expect(parseAuthSubCommand(["account", "rename", "only-one"], "clerk").kind).toBe(
-      "usage",
-    );
-  });
-
-  it("/auth account rename rejects same-name no-op as an error (not silent)", () => {
-    const intent = parseAuthSubCommand(
-      ["account", "rename", "same", "same"],
-      "clerk",
-    );
-    expect(intent.kind).toBe("error");
-  });
-
-  it("/auth account rename rejects invalid labels", () => {
-    expect(
-      parseAuthSubCommand(["account", "rename", "../etc", "ok"], "clerk").kind,
-    ).toBe("error");
-    expect(
-      parseAuthSubCommand(["account", "rename", "ok", "foo bar"], "clerk").kind,
-    ).toBe("error");
-  });
 });
 
 describe("parseAuthSubCommand — enable / disable", () => {
