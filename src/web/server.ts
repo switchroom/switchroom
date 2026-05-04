@@ -134,68 +134,6 @@ export function isTailscaleIdentified(req: Request, server: { requestIP(req: Req
 }
 
 /**
- * True when the request's source IP falls inside the Tailscale CGNAT
- * ranges:
- *   - IPv4 `100.64.0.0/10` (Tailscale's tailnet allocation).
- *   - IPv6 `fd7a:115c:a1e0::/48` (Tailscale's tailnet ULA).
- *   - IPv4-mapped IPv6 of the same v4 range.
- *
- * Tailscale's WireGuard layer guarantees that only peers
- * authenticated against this tailnet can route packets from these
- * source addresses to a node on the tailnet. So a request arriving
- * with one of those source IPs has *already been authenticated* by
- * Tailscale itself — no further bearer-token gate is needed for the
- * dashboard's "manage my fleet" use case.
- *
- * This is the path that lets a phone bookmark
- * `http://<host>.tailXXXX.ts.net:8080/` and have the dashboard work
- * with zero token-juggling, matching the user expectation that "I'm
- * on my tailnet, I'm me."
- *
- * Caveat: anyone on your tailnet gets in. If you share a tailnet with
- * untrusted nodes (or run a multi-tenant tailnet), you want the
- * bearer token path instead — set `SWITCHROOM_WEB_REQUIRE_TOKEN=1`
- * to disable this implicit-trust path entirely.
- *
- * Exported for unit-testing.
- */
-export function isTailscalePeer(addr: string | null | undefined): boolean {
-  if (!addr) return false;
-  // IPv4 100.64.0.0/10 → 100.64.0.0 through 100.127.255.255.
-  // The second octet is the tightest test (64–127 inclusive). Anchor
-  // to end-of-string so an attacker-supplied hostname like
-  // `100.64.0.1.evil.com` (which won't legitimately come from
-  // `requestIP`, but cheap to harden against) doesn't slip through.
-  const v4Match = /^100\.(\d+)\.\d+\.\d+$/.exec(addr);
-  if (v4Match) {
-    const second = Number(v4Match[1]);
-    if (second >= 64 && second <= 127) return true;
-  }
-  // IPv4-mapped IPv6 — same range, prefixed with `::ffff:`.
-  const v4MappedMatch = /^::ffff:100\.(\d+)\.\d+\.\d+$/i.exec(addr);
-  if (v4MappedMatch) {
-    const second = Number(v4MappedMatch[1]);
-    if (second >= 64 && second <= 127) return true;
-  }
-  // Tailscale ULA: fd7a:115c:a1e0::/48.
-  if (/^fd7a:115c:a1e0:/i.test(addr)) return true;
-  return false;
-}
-
-/**
- * Operator override: setting `SWITCHROOM_WEB_REQUIRE_TOKEN=1`
- * disables the Tailscale-peer implicit-trust path. Useful when:
- *   - You share a tailnet with untrusted machines.
- *   - You're embedding switchroom in a multi-tenant Tailnet ACL setup.
- *   - You want bearer-token-only auth for compliance reasons.
- *
- * Defaults to OFF (Tailscale peers are trusted). Exported for tests.
- */
-export function tailscaleImplicitTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.SWITCHROOM_WEB_REQUIRE_TOKEN !== "1";
-}
-
-/**
  * Reject requests whose Origin doesn't belong to our own localhost-bound
  * server. Prevents a malicious page the user happens to load in a browser
  * from issuing same-site-ish requests to 127.0.0.1:<port> and piggy-backing
@@ -227,16 +165,6 @@ export function isOriginAllowed(req: Request, port: number, localhostOnly: boole
   return allowed.includes(origin);
 }
 
-/**
- * Cookie name used for the dashboard's persisted bearer token. Set by
- * the `?token=<X>` URL exchange (see {@link maybeRedirectQueryToken})
- * so a phone/tablet visiting the dashboard URL once with the token
- * picks up an httpOnly cookie and never needs the token in a URL
- * again. The token query param is stripped immediately on the
- * redirect; only the cookie persists.
- */
-const TOKEN_COOKIE_NAME = "switchroom_web_token";
-
 function extractBearerToken(req: Request): string | null {
   const authHeader = req.headers.get("Authorization");
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -250,81 +178,7 @@ function extractBearerToken(req: Request): string | null {
     const idx = parts.indexOf("bearer");
     if (idx >= 0 && idx + 1 < parts.length) return parts[idx + 1];
   }
-  // Cookie fallback for browser GETs (the headline use case: phone /
-  // tablet bookmarking the dashboard over Tailscale). Set by the
-  // first-visit `?token=` redirect — see maybeRedirectQueryToken.
-  const cookieHeader = req.headers.get("Cookie");
-  if (cookieHeader) {
-    const fromCookie = readCookie(cookieHeader, TOKEN_COOKIE_NAME);
-    if (fromCookie) return fromCookie;
-  }
-  // Query-string fallback for the very first visit (and CLI / curl
-  // smoke-tests). The redirect handler upgrades this to a cookie on
-  // arrival so the token doesn't linger in browser history.
-  const url = new URL(req.url);
-  const fromQuery = url.searchParams.get("token");
-  if (fromQuery) return fromQuery;
   return null;
-}
-
-/**
- * Parse a Cookie header for a single named value. Defensive: handles
- * the standard `name=value; name=value` shape and ignores attributes
- * (Path, Secure, etc.) that should never appear on inbound requests
- * but might if a misbehaving client echoes Set-Cookie back.
- */
-function readCookie(header: string, name: string): string | null {
-  const parts = header.split(/;\s*/);
-  for (const part of parts) {
-    const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    const k = part.slice(0, eq).trim();
-    if (k !== name) continue;
-    return decodeURIComponent(part.slice(eq + 1).trim());
-  }
-  return null;
-}
-
-/**
- * If the URL contains `?token=<X>`, set the token as an httpOnly
- * cookie and 302-redirect to the same URL with the param stripped.
- * Returns null when no `?token` is present (handler chain continues).
- *
- * Why: phones / tablets can't reliably attach `Authorization: Bearer`
- * headers to plain GETs. Bookmarking the URL with `?token=` works
- * once but leaks the token into browser history + Referer headers.
- * Trading the token for an httpOnly cookie on first visit gives the
- * user a one-time bookmark that becomes a clean URL afterwards.
- *
- * Cookie shape:
- *   - HttpOnly (no JS access — defends against XSS exfil).
- *   - SameSite=Lax (allows top-level navigation but blocks
- *     cross-site requests; appropriate for a tailnet-only
- *     dashboard).
- *   - Path=/ (whole site).
- *   - No Max-Age — session cookie. The token persists at
- *     `~/.switchroom/web-token` so re-visiting via `?token=` restores
- *     the cookie at any time.
- *   - No Secure — on a plain-HTTP tailnet the dashboard isn't HTTPS.
- *     Adding Secure would silently break the cookie set; tailnet
- *     traffic is already encrypted at the WireGuard layer.
- */
-function maybeRedirectQueryToken(req: Request): Response | null {
-  if (req.method !== "GET" && req.method !== "HEAD") return null;
-  const url = new URL(req.url);
-  const token = url.searchParams.get("token");
-  if (!token) return null;
-  // Strip the param from the redirect target.
-  url.searchParams.delete("token");
-  const cleanPath = url.pathname + (url.search || "") + (url.hash || "");
-  const cookie = `${TOKEN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax`;
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: cleanPath,
-      "Set-Cookie": cookie,
-    },
-  });
 }
 
 function checkAuth(
@@ -336,16 +190,6 @@ function checkAuth(
   // This allows tailnet-authenticated browser sessions (proxied via
   // `tailscale serve`) to use the dashboard without needing the bearer token.
   if (isTailscaleIdentified(req, server)) return null;
-
-  // Tailscale-peer source IP — implicit trust. The user is already
-  // authenticated by Tailscale's WireGuard layer; we don't double-gate
-  // with a bearer token unless the operator opted into strict mode
-  // via SWITCHROOM_WEB_REQUIRE_TOKEN=1. This is the headline path for
-  // phone/tablet bookmarks of `http://<host>.taildXXXX.ts.net:8080/`.
-  if (tailscaleImplicitTrustEnabled()) {
-    const ipInfo = server.requestIP(req);
-    if (ipInfo && isTailscalePeer(ipInfo.address)) return null;
-  }
 
   const presented = extractBearerToken(req);
   if (!presented || !constantTimeEqual(presented, token)) {
@@ -364,11 +208,6 @@ function checkWsAuth(
 ): boolean {
   // Tailscale identity header from loopback is sufficient for WebSocket auth too.
   if (isTailscaleIdentified(req, server)) return true;
-  // Tailscale-peer source IP — implicit trust (parity with checkAuth).
-  if (tailscaleImplicitTrustEnabled()) {
-    const ipInfo = server.requestIP(req);
-    if (ipInfo && isTailscalePeer(ipInfo.address)) return true;
-  }
   const presented = extractBearerToken(req);
   return presented !== null && constantTimeEqual(presented, token);
 }
@@ -531,15 +370,6 @@ export function startWebServer(
     fetch(req, server) {
       const url = new URL(req.url);
       const { pathname } = url;
-
-      // First-visit `?token=` exchange: redirect to a clean URL with
-      // an httpOnly cookie set. Runs before everything else so the
-      // very first GET from a phone bookmark establishes the cookie
-      // without ever reaching the auth check (which would 401).
-      // Subsequent GETs use the cookie via extractBearerToken's
-      // cookie path. See maybeRedirectQueryToken for the rationale.
-      const tokenRedirect = maybeRedirectQueryToken(req);
-      if (tokenRedirect) return tokenRedirect;
 
       // Webhook ingest (#577) sits BEFORE the origin gate + bearer-token
       // gate because:

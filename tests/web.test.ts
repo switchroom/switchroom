@@ -33,12 +33,7 @@ import {
   handleGetLogs,
   type AgentInfo,
 } from "../src/web/api.js";
-import {
-  isOriginAllowed,
-  isTailscaleIdentified,
-  isTailscalePeer,
-  tailscaleImplicitTrustEnabled,
-} from "../src/web/server.js";
+import { isOriginAllowed, isTailscaleIdentified } from "../src/web/server.js";
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { execFileSync } from "node:child_process";
@@ -368,81 +363,5 @@ describe("isTailscaleIdentified", () => {
     const req = makeTsRequest();
     const server = makeServerStub(null);
     expect(isTailscaleIdentified(req, server)).toBe(false);
-  });
-});
-
-describe("isTailscalePeer — implicit trust by source IP", () => {
-  it("accepts the full IPv4 100.64.0.0/10 range", () => {
-    expect(isTailscalePeer("100.64.0.1")).toBe(true);
-    expect(isTailscalePeer("100.111.61.6")).toBe(true);
-    expect(isTailscalePeer("100.127.255.255")).toBe(true);
-    expect(isTailscalePeer("100.65.10.20")).toBe(true);
-  });
-
-  it("rejects IPs just outside the CGNAT range", () => {
-    expect(isTailscalePeer("100.63.255.255")).toBe(false);
-    expect(isTailscalePeer("100.128.0.0")).toBe(false);
-    expect(isTailscalePeer("100.200.1.1")).toBe(false);
-  });
-
-  it("rejects unrelated public + private addresses", () => {
-    expect(isTailscalePeer("8.8.8.8")).toBe(false);
-    expect(isTailscalePeer("192.168.1.10")).toBe(false);
-    expect(isTailscalePeer("10.0.0.1")).toBe(false);
-    expect(isTailscalePeer("172.16.0.1")).toBe(false);
-    expect(isTailscalePeer("127.0.0.1")).toBe(false);
-    expect(isTailscalePeer("::1")).toBe(false);
-  });
-
-  it("accepts the IPv4-mapped IPv6 form", () => {
-    expect(isTailscalePeer("::ffff:100.64.0.1")).toBe(true);
-    expect(isTailscalePeer("::ffff:100.111.61.6")).toBe(true);
-    expect(isTailscalePeer("::FFFF:100.100.1.1")).toBe(true); // case-insensitive prefix
-  });
-
-  it("rejects IPv4-mapped addresses outside the range", () => {
-    expect(isTailscalePeer("::ffff:100.63.0.1")).toBe(false);
-    expect(isTailscalePeer("::ffff:192.168.1.1")).toBe(false);
-  });
-
-  it("accepts the Tailscale ULA fd7a:115c:a1e0::/48", () => {
-    expect(isTailscalePeer("fd7a:115c:a1e0::1")).toBe(true);
-    expect(isTailscalePeer("fd7a:115c:a1e0:2e36:3d06::1")).toBe(true);
-    expect(isTailscalePeer("FD7A:115C:A1E0::1")).toBe(true); // case-insensitive
-  });
-
-  it("rejects similar-looking IPv6 addresses outside the ULA prefix", () => {
-    expect(isTailscalePeer("fd7a:115c:a1e1::1")).toBe(false); // off-by-one in third hextet
-    expect(isTailscalePeer("fe80::1")).toBe(false); // link-local
-    expect(isTailscalePeer("2001:db8::1")).toBe(false); // documentation prefix
-  });
-
-  it("rejects null / undefined / empty input defensively", () => {
-    expect(isTailscalePeer(null)).toBe(false);
-    expect(isTailscalePeer(undefined)).toBe(false);
-    expect(isTailscalePeer("")).toBe(false);
-  });
-
-  it("rejects strings that contain Tailscale octets but aren't IPs", () => {
-    expect(isTailscalePeer("100.64.0.1.evil.com")).toBe(false); // would-be hostname
-    expect(isTailscalePeer("not an ip")).toBe(false);
-    expect(isTailscalePeer("100")).toBe(false);
-  });
-});
-
-describe("tailscaleImplicitTrustEnabled — operator opt-out", () => {
-  it("defaults to true (implicit trust on)", () => {
-    expect(tailscaleImplicitTrustEnabled({})).toBe(true);
-    expect(tailscaleImplicitTrustEnabled({ SWITCHROOM_WEB_REQUIRE_TOKEN: "" })).toBe(true);
-    expect(tailscaleImplicitTrustEnabled({ SWITCHROOM_WEB_REQUIRE_TOKEN: "0" })).toBe(true);
-  });
-
-  it("turns off when SWITCHROOM_WEB_REQUIRE_TOKEN=1", () => {
-    expect(tailscaleImplicitTrustEnabled({ SWITCHROOM_WEB_REQUIRE_TOKEN: "1" })).toBe(false);
-  });
-
-  it("only treats the literal '1' as the opt-out signal (no truthy coercion)", () => {
-    expect(tailscaleImplicitTrustEnabled({ SWITCHROOM_WEB_REQUIRE_TOKEN: "true" })).toBe(true);
-    expect(tailscaleImplicitTrustEnabled({ SWITCHROOM_WEB_REQUIRE_TOKEN: "yes" })).toBe(true);
   });
 });
