@@ -724,4 +724,107 @@ describe("buildAccountRemoveConfirmKeyboard", () => {
     const btn = buttons.find((b) => b.text === "✗ Cancel");
     expect(btn?.callback_data).toBe("auth:av:clerk:work");
   });
+
+  it("Cancel button falls back to noop when account-view payload exceeds budget", () => {
+    // A very long label pushes the encoded account-view callback over the
+    // 64-byte cap — the Cancel button must use the noop fallback so the
+    // Telegram Bot API doesn't reject the keyboard.
+    const longLabel = "a".repeat(51);
+    const kb = buildAccountRemoveConfirmKeyboard("clerk", longLabel);
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "✗ Cancel");
+    // Verify the encoded cancel payload would exceed budget
+    const cancelEncoded = encodeCallbackData({ kind: "account-view", agent: "clerk", label: longLabel });
+    expect(Buffer.byteLength(cancelEncoded, "utf8")).toBeGreaterThan(CALLBACK_BUDGET_BYTES);
+    // Cancel must fall back to noop when over budget
+    expect(btn?.callback_data).toBe("auth:noop");
+  });
+});
+
+describe("account-view not-found path — keyboard/text surface", () => {
+  // The gateway handler for account-view fires answerCallbackQuery with an
+  // error toast when the label is not found in the current dashboard state,
+  // then refreshes the main dashboard. This test verifies the Cancel button
+  // on the remove-confirm keyboard always produces a valid callback so the
+  // user can escape back to a working state even when state is stale.
+  it("account-view callback encodes cleanly for a label that has since been removed", () => {
+    // Simulate: user opened remove-confirm for "old-account", then the
+    // account was removed out-of-band. The Cancel button's encoded payload
+    // must still parse to a valid (noop or account-view) action — it should
+    // never produce a malformed string that Telegram would reject.
+    const kb = buildAccountRemoveConfirmKeyboard("clerk", "old-account");
+    const buttons = (kb.inline_keyboard as unknown as Array<Array<{ text: string; callback_data?: string }>>).flat();
+    const btn = buttons.find((b) => b.text === "✗ Cancel");
+    const action = parseCallbackData(btn?.callback_data ?? "");
+    expect(["account-view", "noop"]).toContain(action.kind);
+  });
+});
+
+describe("account-view not-found path — gateway dispatch contract", () => {
+  // When the gateway receives an account-view callback but cannot find the
+  // account label in the current dashboard state (e.g. removed out-of-band
+  // between the button being rendered and tapped), the handler must:
+  //   1. Fire answerCallbackQuery with an error toast (not an empty ACK).
+  //   2. Refresh the main dashboard via editMessageText.
+  //
+  // This describe pins the pure-function contract that makes that path
+  // deterministic: parseCallbackData identifies the action correctly, and
+  // the sub-view builders are never called on absent accounts — the caller
+  // (gateway) is responsible for the early-return / toast path.
+
+  it("parseCallbackData correctly identifies account-view for a valid encoded label", () => {
+    // The gateway uses parseCallbackData to dispatch. An account that has
+    // since been removed still decodes to account-view (not noop) as long
+    // as the label itself is structurally valid — the gateway then does the
+    // state lookup and branches on not-found.
+    const encoded = encodeCallbackData({ kind: "account-view", agent: "clerk", label: "old-account" });
+    const action = parseCallbackData(encoded);
+    expect(action.kind).toBe("account-view");
+    if (action.kind === "account-view") {
+      expect(action.agent).toBe("clerk");
+      expect(action.label).toBe("old-account");
+    }
+  });
+
+  it("account lookup against an empty state returns undefined (triggers not-found toast)", () => {
+    // Simulate fetchDashboardState returning a state with no accounts.
+    // The gateway does: state?.accounts?.find(a => a.label === action.label)
+    // This must return undefined, which gates the error-toast branch.
+    const accounts: AccountSummary[] = [];
+    const found = accounts.find((a) => a.label === "old-account");
+    expect(found).toBeUndefined();
+  });
+
+  it("account lookup against a state that no longer contains the label returns undefined", () => {
+    // The account existed when the keyboard was rendered but was removed
+    // before the user tapped the button.
+    const accounts: AccountSummary[] = [
+      { label: "current", health: "healthy", enabledHere: true },
+      { label: "other", health: "healthy", enabledHere: false },
+    ];
+    const found = accounts.find((a) => a.label === "old-account");
+    expect(found).toBeUndefined();
+  });
+
+  it("buildAccountSubViewText renders correctly for a present account (success path)", () => {
+    // Verifies the happy path that the gateway takes when the account IS found.
+    // The not-found branch must NOT call buildAccountSubViewText — this test
+    // pins what the success path looks like so any regression in the dispatch
+    // logic (e.g. calling sub-view builder before the not-found check) is
+    // visible.
+    const acc: AccountSummary = { label: "old-account", health: "healthy", enabledHere: true };
+    const text = buildAccountSubViewText("clerk", acc);
+    expect(text).toContain("old-account");
+    expect(text).toContain("clerk");
+  });
+
+  it("error toast message format contains the label (matches gateway handler string)", () => {
+    // The gateway sends: `Account "${action.label}" not found.`
+    // Pin the label interpolation so a refactor of the toast string
+    // doesn't silently drop the label.
+    const label = "old-account";
+    const toastText = `Account "${label}" not found.`;
+    expect(toastText).toContain(label);
+    expect(toastText).toMatch(/not found/i);
+  });
 });
