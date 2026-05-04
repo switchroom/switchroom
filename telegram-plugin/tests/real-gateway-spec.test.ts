@@ -481,41 +481,7 @@ describe('v2 spec — Class C (long-running OR sub-agents)', () => {
     h.finalize()
   })
 
-  it('sub-agent header count equals rendered-list-length (no drift)', async () => {
-    // The card header summarises sub-agent counts (`🤖 Sub-agents ·
-    // 🔄 N`); the rendered per-agent expandable list should have
-    // exactly N entries when all are running. Pre-fix (#580), the
-    // two diverged on rapid start events.
-    const h = createRealGatewayHarness({ gapMs: 0 })
-    h.inbound({ chatId: CHAT, messageId: INBOUND_MSG, text: 'spawn three' })
-    h.feedSessionEvent({ kind: 'enqueue', chatId: CHAT, messageId: '1', threadId: null, rawContent: 'spawn three' })
-    await h.clock.advance(200)
-    h.feedSessionEvent({ kind: 'thinking' })
-    await h.clock.advance(300)
-    h.feedSessionEvent({ kind: 'sub_agent_started', agentId: 'a1', firstPromptText: 'first' })
-    h.feedSessionEvent({ kind: 'sub_agent_started', agentId: 'a2', firstPromptText: 'second' })
-    h.feedSessionEvent({ kind: 'sub_agent_started', agentId: 'a3', firstPromptText: 'third' })
-    await h.clock.advance(2_000)
-
-    const cardEdits = h.recorder.calls.filter(
-      (c) => (c.kind === 'sendMessage' || c.kind === 'editMessageText') && c.chat_id === CHAT,
-    )
-    expect(cardEdits.length, 'no card render captured').toBeGreaterThan(0)
-    const last = cardEdits[cardEdits.length - 1].payload ?? ''
-    // #378 sub-issue 6: the rollup `🤖 Sub-agents · 🔄 N` header was
-    // dropped — per-row icons + state labels carry the same info. The
-    // invariant now asserted is row count == sub-agent count: each sub-
-    // agent renders as exactly one `<blockquote expandable>` block.
-    expect(last).not.toContain('🤖 Sub-agents</u></b>')
-    const blockCount = (last.match(/<blockquote\s+expandable>/gi) ?? []).length
-    expect(blockCount).toBe(3)
-
-    h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a1' })
-    h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a2' })
-    h.feedSessionEvent({ kind: 'sub_agent_turn_end', agentId: 'a3' })
-    await h.streamReply({ chat_id: CHAT, text: 'all done', done: true })
-    h.feedSessionEvent({ kind: 'turn_end', durationMs: 3_000 })
-    await h.clock.advance(500)
-    h.finalize()
-  })
+  // P4 cutover (#662): legacy "<blockquote expandable>" row-count test deleted.
+  // The two-zone v2 renderer's row-count invariant is covered by
+  // tests/two-zone-card-cap.test.ts and tests/two-zone-card-snapshot.test.ts.
 })

@@ -25,11 +25,6 @@ import {
   type TaskNum,
   type SubAgentState,
 } from './progress-card.js'
-import {
-  createSubAgentCardRegistry,
-  isPerAgentPinsEnabled,
-  type SubAgentCardRegistry,
-} from './subagent-card.js'
 import { isTelegramReplyTool } from './tool-names.js'
 import {
   applyToolResult as fleetApplyToolResult,
@@ -103,10 +98,8 @@ export interface ProgressDriverConfig {
     /**
      * Per-agent card identity. Absent for parent-card emits (the
      * gateway treats absence as the parent sentinel `__parent__`).
-     * Present for sub-agent-card emits when `PROGRESS_CARD_PER_AGENT_PINS=1`
-     * is set, in which case the gateway must thread it through to
-     * `pinMgr.considerPin` / `pinMgr.completeTurn` so each sub-agent
-     * card pins independently. See `subagent-card.ts`.
+     * Retained for caller compatibility post-P4 cutover; the two-zone
+     * renderer no longer emits per-sub-agent cards.
      */
     agentId?: string
   }) => void
@@ -880,40 +873,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
   // a fake-clock advance in tests.
   const lastSubAgentTickBucket = new Map<string, number>()
 
-  // Per-sub-agent card registry (#per-agent-cards). Off by default; opt
-  // in with PROGRESS_CARD_PER_AGENT_PINS=1. When enabled, the registry
-  // tracks one pinned Telegram card per running sub-agent (alongside
-  // the parent card) and emits via the same `config.emit` callback —
-  // gated by a synthetic turnKey so the gateway's existing stream-reply
-  // infra routes them as separate messages.
-  const subAgentCards: SubAgentCardRegistry = createSubAgentCardRegistry(
-    { enabled: isPerAgentPinsEnabled() },
-    {
-      emit: (args) => {
-        config.emit({
-          chatId: args.chatId,
-          threadId: args.threadId,
-          turnKey: args.turnKey,
-          agentId: args.agentId,
-          html: args.html,
-          done: args.done,
-          isFirstEmit: args.isFirstEmit,
-        })
-      },
-      now,
-      // Reuse the driver's coalesce/min-interval defaults so per-agent
-      // cards behave consistently with the parent card. The wider
-      // `multiCardCoalesceMs` is tuned for the multi-card edit-budget
-      // case (§6) — when ≥ 2 sub-agent cards are active in the same
-      // chat+thread the registry expands its coalesce window.
-      coalesceMs,
-      multiCardCoalesceMs: 800,
-      minIntervalMs,
-      heartbeatMs,
-      log: (line) => process.stderr.write(line),
-    },
-  )
-
   /**
    * Fire completion callbacks + delete chatState + tidy bookkeeping.
    * Idempotent via `completionFired`. Does not touch the reducer or
@@ -1011,11 +970,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       clearT(cs.timePromoteTimer)
       cs.timePromoteTimer = null
     }
-    // Per-agent cards (#per-agent-cards): force-finalize any sub-agent
-    // cards still tracked under this parent turn so they emit a final
-    // done=true frame and the gateway can unpin them. No-op when the
-    // env flag is off (registry has nothing tracked).
-    subAgentCards.finalizeAll(cs.turnKey, now())
     chats.delete(cs.turnKey)
     lastHeartbeatBucket.delete(cs.turnKey)
     lastSubAgentTickBucket.delete(cs.turnKey)
@@ -1898,17 +1852,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         // regressions in the sync path (or a code path that bypasses
         // closeZombie) still produce a visible card instead of a
         // silently-suppressed turn.
-        // Per-agent card sync for carried-over sub-agents on the new
-        // turn — without this, sub-agents that survive across turn
-        // boundaries (#334) wouldn't get their per-agent cards spawned
-        // until the next event landed.
-        subAgentCards.syncFromParent({
-          state: chatState.state,
-          chatId: chatState.chatId,
-          threadId: chatState.threadId,
-          parentTurnKey: chatState.turnKey,
-          now: now(),
-        })
         if (promoteOnSubAgent && carriedOver != null && carriedOver.size > 0) {
           promoteFirstEmit(chatState, 'carried_over_subagents')
         } else {
@@ -1982,17 +1925,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       reconcileFleetWithSubAgents(chatState)
       const stageChanged = chatState.state.stage !== prev.stage
       const visibleChanged = visibleDiff(prev, chatState.state)
-
-      // Per-agent card sync (#per-agent-cards): walk the post-reduce
-      // state.subAgents map and spawn / flush / finalize per-sub-agent
-      // cards. No-op when PROGRESS_CARD_PER_AGENT_PINS is unset.
-      subAgentCards.syncFromParent({
-        state: chatState.state,
-        chatId: chatState.chatId,
-        threadId: chatState.threadId,
-        parentTurnKey: chatState.turnKey,
-        now: now(),
-      })
 
       // Issue #334/#399: mirror sub-agent state changes into the chat-scoped
       // running-sub-agent registry so new turns can seed from it.
@@ -2469,14 +2401,6 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     },
 
     dispose(opts?: { preservePending?: boolean }) {
-      // Per-agent card registry (#per-agent-cards): only dispose
-      // outright when we're not preserving pending. With
-      // preservePending the registry continues ticking heartbeats for
-      // any cards whose parent chats are still alive — finalizeAll
-      // for them fires from the eventual completeTurnFully.
-      if (opts?.preservePending !== true) {
-        subAgentCards.dispose()
-      }
       if (opts?.preservePending === true) {
         // Selective dispose: preserve chats with pendingCompletion=true so
         // their heartbeat and deferred-completion timeout continue firing
