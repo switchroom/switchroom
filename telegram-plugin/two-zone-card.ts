@@ -64,8 +64,14 @@ export function renderTwoZoneCard(input: TwoZoneCardInput): string {
 
 /**
  * Maps (parent state, fleet, opts) to a single header phase. Truth
- * table from `reference/status-card-design.md` §Header. Order matters:
- * forced-close > silent-end > done > background > stalled > working.
+ * table from `reference/status-card-design.md` §Header. Precedence:
+ * forced-close > silent-end (gated on parent terminal) > stalled >
+ * background > done > working.
+ *
+ * SilentEnd is lifted ABOVE the background/done checks so that a fleet
+ * still running can't suppress the silent-end label once the parent has
+ * terminated without a reply. It IS gated on `parentDone || stage===done`
+ * to prevent firing prematurely while the parent is still in flight.
  */
 export function phaseFor(
   state: ProgressCardState,
@@ -79,19 +85,14 @@ export function phaseFor(
 
   if (stalledClose) return { icon: '⚠', label: 'Forced close' }
 
-  const fleetTerminal = allFleetTerminal(fleet)
   const fleetRunning = anyFleetActive(fleet)
   const fleetAllStuck = fleet.size > 0 && [...fleet.values()].filter((m) => m.status === 'running' || m.status === 'stuck').every((m) => isStuck(m, now))
 
-  // Done: parent terminal + every fleet member terminal (or empty fleet)
-  if (state.stage === 'done' && fleetTerminal && !fleetRunning) {
-    if (silentEnd) return { icon: '🙊', label: 'Ended without reply' }
-    return { icon: '✅', label: 'Done' }
-  }
-
-  // Background: parentDone but at least one fleet member still running
-  if (parentDone && fleetRunning) {
-    return { icon: '⏸', label: 'Background' }
+  // SilentEnd: parent terminated without a reply. Lifted above the
+  // background/done branches so a still-running fleet can't mask it,
+  // but gated on parentDone so we don't fire while parent is in flight.
+  if (silentEnd && parentDone) {
+    return { icon: '🙊', label: 'Ended without reply' }
   }
 
   // Stalled: every running-or-stuck member is past the idle threshold.
@@ -102,15 +103,18 @@ export function phaseFor(
     return { icon: '⚠', label: 'Stalled' }
   }
 
+  // Background: parentDone but at least one fleet member still running
+  if (parentDone && fleetRunning) {
+    return { icon: '⏸', label: 'Background' }
+  }
+
+  // Done: parent terminal + no fleet still running
+  if (parentDone && !fleetRunning) {
+    return { icon: '✅', label: 'Done' }
+  }
+
   // Default: active work
   return { icon: '⚙️', label: 'Working…' }
-}
-
-function allFleetTerminal(fleet: ReadonlyMap<string, FleetMember>): boolean {
-  for (const m of fleet.values()) {
-    if (m.status === 'running' || m.status === 'background' || m.status === 'stuck') return false
-  }
-  return true
 }
 
 function anyFleetActive(fleet: ReadonlyMap<string, FleetMember>): boolean {
