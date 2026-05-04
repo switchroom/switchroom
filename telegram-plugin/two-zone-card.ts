@@ -140,8 +140,8 @@ function renderHeader(
 ): string {
   const tools = totalTools >= 100 ? '99+' : String(totalTools)
   const elapsed = formatDuration(elapsedMs)
-  const parts = [`${phase.icon} <b>${escapeHtml(phase.label)}</b>`, `⏱ ${elapsed}`, `${tools}t`]
-  if (subCount > 0) parts.push(`${subCount}s`)
+  const parts = [`${phase.icon} <b>${escapeHtml(phase.label)}</b>`, `⏱ ${elapsed}`, `🔧 ${tools}`]
+  if (subCount > 0) parts.push(`🤖 ${subCount}`)
   if (taskNum && taskNum.total > 1) parts.push(`#${taskNum.index}/${taskNum.total}`)
   return parts.join(' · ')
 }
@@ -155,10 +155,17 @@ function renderParentZone(state: ProgressCardState): string {
   const visible = items.slice(-PARENT_BULLET_CAP)
   const earlier = items.length - visible.length
   if (earlier > 0) lines.push(`(+${earlier} earlier)`)
-  for (const it of visible) {
+  const inFlight = state.stage !== 'done'
+  const lastIdx = visible.length - 1
+  for (let i = 0; i < visible.length; i++) {
+    const it = visible[i]
     const tool = escapeHtml(it.tool || '')
     const label = it.label ? ` <code>${escapeHtml(truncate(it.label, 80))}</code>` : ''
-    lines.push(`● ${tool}${label}`)
+    if (inFlight && i === lastIdx) {
+      lines.push(`◉ <b>${tool}</b>${label}`)
+    } else {
+      lines.push(`● ${tool}${label}`)
+    }
   }
   return lines.join('\n')
 }
