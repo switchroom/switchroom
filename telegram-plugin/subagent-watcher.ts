@@ -41,6 +41,7 @@ import {
 import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine } from './session-tail.js'
+import { sanitiseToolArg } from './fleet-state.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentEnd, reapStuckRunningRows } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
@@ -86,6 +87,13 @@ export interface WorkerEntry {
   completionNotified: boolean
   /** Short summary from last completed tool / narrative, for completion message. */
   lastSummaryLine: string
+  /**
+   * Most recent tool call observed on this sub-agent's JSONL tail —
+   * tool name + sanitised arg for fleet-row display (P0 of #662). Null
+   * before any `sub_agent_tool_use` event has been seen. Replace-on-write;
+   * the renderer only ever shows the latest.
+   */
+  lastTool: { name: string; sanitisedArg: string } | null
   /**
    * True if the underlying JSONL file existed before the watcher started.
    * Historical entries are tracked for late state transitions but are
@@ -385,6 +393,14 @@ function readSubTail(
         entry.lastActivityAt = now
         if (ev.kind === 'sub_agent_tool_use') {
           entry.toolCount++
+          // P0 of #662: surface the most recent tool name + sanitised
+          // arg so the driver's fleet-state shadow can render the
+          // last-tool column on the v2 status card. Sanitiser lives in
+          // fleet-state.ts to keep the watcher dependency surface small.
+          entry.lastTool = {
+            name: ev.toolName,
+            sanitisedArg: sanitiseToolArg(ev.toolName, ev.input ?? {}),
+          }
         } else if (ev.kind === 'sub_agent_text') {
           // Do NOT overwrite description with narrative text — description is
           // set at dispatch time (from the parent Agent/Task tool_use input)
@@ -516,6 +532,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       stallNotified: false,
       completionNotified: false,
       lastSummaryLine: '',
+      lastTool: null,
       historical: isHistorical,
     }
     registry.set(agentId, entry)
