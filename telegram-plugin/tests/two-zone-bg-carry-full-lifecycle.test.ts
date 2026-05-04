@@ -20,7 +20,7 @@ import { makeHarness, enqueue } from './_progress-card-harness.js'
 
 describe('PR-C2: two-zone bg-carry full lifecycle (turn A → turn B → bg done)', () => {
   it('phase transitions A=Background, B=Working, B-after-bg-done=Done', () => {
-    const { driver, advance, getNow } = makeHarness({
+    const { driver, advance, getNow, completions } = makeHarness({
       minIntervalMs: 500,
       coalesceMs: 400,
       promoteAfterMs: 999_999,
@@ -59,6 +59,10 @@ describe('PR-C2: two-zone bg-carry full lifecycle (turn A → turn B → bg done
       const a = all.find((e) => e.turnKey.endsWith(':1'))
       expect(a).toBeDefined()
     }
+    // Capture A's turnKey for the deferred-completion assertion below.
+    const turnKeyA = (driver as unknown as {
+      peekAllFleets?: () => Array<{ turnKey: string; fleet: Map<string, unknown> }>
+    }).peekAllFleets!().find((e) => e.fleet.has('saBG'))!.turnKey
 
     // ── Turn B: fresh enqueue. The bg member carries forward. ─────────
     advance(50)
@@ -119,5 +123,9 @@ describe('PR-C2: two-zone bg-carry full lifecycle (turn A → turn B → bg done
       // Whichever turn still holds saBG, it must be terminal (done/failed/killed)
       expect(['done', 'failed', 'killed']).toContain(m.status)
     }
+    // Critical: A's deferred completion MUST have fired now that saBG
+    // reached sub_agent_turn_end. Without this assertion the loop above
+    // trivially passes when allAfter is empty.
+    expect(completions).toContain(turnKeyA)
   })
 })

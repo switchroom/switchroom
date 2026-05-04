@@ -39,7 +39,7 @@ function makeHarness() {
   let unpinReject: Error | null = null
 
   const mgr = createPinManager({
-    pin: async (chatId, messageId) => {
+    pin: async (_chatId, _messageId) => {
       pinCalls++
       if (pinReject) {
         const e = pinReject
@@ -48,7 +48,7 @@ function makeHarness() {
       }
       return true
     },
-    unpin: async (chatId, messageId) => {
+    unpin: async (_chatId, _messageId) => {
       unpinCalls++
       if (unpinReject) {
         const e = unpinReject
