@@ -3572,56 +3572,22 @@ function handleSessionEvent(ev: SessionEvent): void {
       // followed) is the answer; the suppressor's emitAnswer callback
       // would no-op against a nulled stream, silently dropping the text
       // (regression for short no-tool replies). Order matters here: this
-      // call must come before the materialize/null block.
+      // call must come before the retract/null block.
       preambleSuppressor.flushNow()
-      // Issue #195: materialize the answer-lane stream as a fresh
-      // sendMessage so the user's device gets a push notification on
-      // turn completion (edits don't fire pushes).
-      //
-      // Guard with !currentTurnReplyCalled: the existing reply path is
-      // authoritative for the user-visible answer text. The agent normally
-      // calls reply/stream_reply during the turn, which posts the canonical
-      // message. Materializing the answer-lane on top of that produces a
-      // duplicate. Only materialize when no reply tool was invoked — which
-      // covers the case where the model emitted text but the agent never
-      // committed it via a tool call (rare, but the JTBD wants the user to
-      // see SOMETHING in that case rather than nothing).
-      //
-      // Either way we stop+null the stream — even when the reply path won,
-      // we don't want a leaked stream lingering past turn_end.
+      // #656: always retract the answer-lane stream at turn_end. Turn-flush
+      // (gateway.ts ~3475) is the sole canonical emitter for no-reply turns —
+      // it runs markdownToHtml and records to outboundDedup. Materializing
+      // here would race turn-flush and post raw model text (no HTML conv).
       if (activeAnswerStream != null) {
         const stream = activeAnswerStream
         activeAnswerStream = null
-        if (!currentTurnReplyCalled) {
-          void stream
-            .materialize()
-            .catch((err) => {
-              process.stderr.write(
-                `telegram gateway: answer-stream materialize failed: ${
-                  err instanceof Error ? err.message : String(err)
-                }\n`,
-              )
-            })
-            .finally(() => {
-              stream.stop()
-            })
-        } else {
-          // Reply path won — retract any preliminary answer-lane message
-          // so the user sees only the canonical stream_reply output.
-          // Issue #251: without retraction the answer-stream's raw-markdown
-          // preview (sent when captured text hit the minInitialChars threshold)
-          // coexists with the properly-rendered stream_reply message, producing
-          // a duplicate ~26 s apart with different formatting.
-          // retract() is best-effort: if deleteMessage fails the preliminary
-          // message lingers but no exception escapes to break turn_end.
-          void stream.retract().catch((err) => {
-            process.stderr.write(
-              `telegram gateway: answer-stream retract failed: ${
-                err instanceof Error ? err.message : String(err)
-              }\n`,
-            )
-          })
-        }
+        void stream.retract().catch((err) => {
+          process.stderr.write(
+            `telegram gateway: answer-stream retract failed: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          )
+        })
       }
       if (currentSessionChatId == null) return
       const chatId = currentSessionChatId
