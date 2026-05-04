@@ -24,8 +24,59 @@
 import { GrammyError, type Bot, type Context } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import { execFileSync, spawnSync } from 'child_process'
+import { createHash } from 'crypto'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
+
+// ─── tg-post observability transformer ────────────────────────────────────
+
+/**
+ * Installs an API transformer on the bot that emits one stderr line per
+ * outbound Telegram Bot API POST. This is the single catchment point for
+ * correlating user-visible duplicate-message reports (switchroom #656,
+ * #657) against the actual outbound calls — the transformer runs inside
+ * grammY immediately before each HTTP POST and again on the response, so
+ * it sees every call regardless of whether it was routed through the
+ * `robustApiCall` retry helper or made directly via `bot.api.*`.
+ *
+ * Log shape (one line per POST, on both success and failure):
+ *
+ *   tg-post method=<m> chat=<id> thread=<id|-> parse_mode=<HTML|MarkdownV2|none> bytes=<n> hash=<sha1-12> status=<ok|err> err=<class-or-->
+ *
+ * Body content is never logged — only its length and a 12-char sha1 prefix
+ * so we can recognise repeated identical sends without leaking PII.
+ *
+ * Pure observability: no behaviour change, no error swallowing, no retry
+ * effects. The transformer always re-throws after logging.
+ */
+export function installTgPostLogger(bot: Bot): void {
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    const p = (payload ?? {}) as Record<string, unknown>
+    const chat = p.chat_id != null ? String(p.chat_id) : '-'
+    const thread = p.message_thread_id != null ? String(p.message_thread_id) : '-'
+    const parseMode = (p.parse_mode as string | undefined) ?? 'none'
+    const text = typeof p.text === 'string' ? p.text : ''
+    const bytes = text.length
+    const hash = bytes > 0
+      ? createHash('sha1').update(text).digest('hex').slice(0, 12)
+      : '-'
+    try {
+      const res = await prev(method, payload, signal)
+      process.stderr.write(
+        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=ok err=-\n`,
+      )
+      return res
+    } catch (err) {
+      const errClass = err instanceof GrammyError
+        ? `grammy_${(err as GrammyError).error_code}`
+        : (err as { constructor?: { name?: string } } | null)?.constructor?.name ?? 'Error'
+      process.stderr.write(
+        `tg-post method=${method} chat=${chat} thread=${thread} parse_mode=${parseMode} bytes=${bytes} hash=${hash} status=err err=${errClass}\n`,
+      )
+      throw err
+    }
+  })
+}
 
 // ─── robustApiCall factory ────────────────────────────────────────────────
 

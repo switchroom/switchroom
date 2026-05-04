@@ -31,6 +31,7 @@ import { listWorktrees } from '../../src/worktree/list.js'
 import { installPluginLogger } from '../plugin-logger.js'
 import {
   escapeHtmlForTg,
+  installTgPostLogger,
   isAllowedSender,
   makeSwitchroomExec,
   makeSwitchroomExecCombined,
@@ -143,6 +144,7 @@ const switchroomExecJson = makeSwitchroomExecJson()
 
 // ─── Bot ──────────────────────────────────────────────────────────────────
 const bot = new Bot(TOKEN)
+installTgPostLogger(bot)
 
 // No forum-topic routing in foreman — it's always a DM.
 const switchroomReply = makeSwitchroomReply(() => undefined)

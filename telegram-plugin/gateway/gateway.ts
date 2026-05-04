@@ -58,6 +58,7 @@ import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handl
 import { handleStreamReply } from '../stream-reply-handler.js'
 import { createChatLock } from '../chat-lock.js'
 import { createRetryApiCall } from '../retry-api-call.js'
+import { installTgPostLogger } from '../shared/bot-runtime.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
 import { createPinManager } from '../progress-card-pin-manager.js'
 import { createPinWatchdog } from '../progress-card-pin-watchdog.js'
@@ -366,6 +367,7 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 
 // ─── Bot + chat lock ──────────────────────────────────────────────────────
 const bot = new Bot(TOKEN)
+installTgPostLogger(bot)
 
 // ─── sendMessageDraft boot probe ──────────────────────────────────────────
 // grammY 1.x exposes all Telegram Bot API methods through bot.api.raw.
