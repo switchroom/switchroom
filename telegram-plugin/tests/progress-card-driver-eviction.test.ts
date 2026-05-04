@@ -175,4 +175,41 @@ describe('progress-card-driver: TTL eviction off the heartbeat', () => {
     expect(maps.baseTurnSeqs.has('chatB')).toBe(false)
     expect(maps.chats.size).toBe(0)
   })
+
+  it('PR-C2 follow-up: bg-subagent-carry guard — chatRunningSubagents inner map survives turn_end while a sub-agent is still in flight', () => {
+    // When parent turn_end fires but a sub-agent is still running, the
+    // chatState enters pendingCompletion and the per-base
+    // `chatRunningSubagents` inner map MUST NOT be cleaned up — the
+    // next turn's enqueue will clone it back into the new fleet
+    // (issue #334 / #64). Cleanup on close is gated on the inner map
+    // being empty.
+    const { driver } = harness()
+    const maps = driver._debugGetMaps!()
+
+    driver.ingest(enqueue('chatA'), null)
+    driver.ingest(
+      {
+        kind: 'tool_use', toolName: 'Agent', toolUseId: 'tu1',
+        input: { prompt: 'bg', run_in_background: true },
+      },
+      'chatA',
+    )
+    driver.ingest({ kind: 'sub_agent_started', agentId: 'saBG', firstPromptText: 'bg' }, 'chatA')
+    driver.ingest({ kind: 'tool_use', toolName: 'mcp__switchroom-telegram__reply' }, 'chatA')
+    driver.recordOutboundDelivered('chatA')
+    driver.ingest({ kind: 'turn_end', durationMs: 100 }, 'chatA')
+
+    // Pending — chats.size==1 (originating bg-pending state survives).
+    expect(maps.chats.size).toBe(1)
+    // Critical: the running-subagents inner map for 'chatA' must still
+    // contain saBG. If cleanupBaseKeyIfUnused regressed and ran here,
+    // the next turn would lose the bg carry.
+    expect(maps.chatRunningSubagents.get('chatA')?.has('saBG')).toBe(true)
+
+    // Resolve the bg sub-agent; now full close should also drain the
+    // sync registry inner map.
+    driver.ingest({ kind: 'sub_agent_turn_end', agentId: 'saBG' }, 'chatA')
+    expect(maps.chats.size).toBe(0)
+    expect(maps.chatRunningSubagents.has('chatA')).toBe(false)
+  })
 })

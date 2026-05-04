@@ -101,4 +101,17 @@ describe('phaseFor precedence — (parentDone, silentEnd, fleetRunning, stalledC
       expect(phase.label).toBe(expected)
     },
   )
+
+  // PR-C2 reviewer follow-up: add an explicit row for FleetMember.status=
+  // 'background'. The truth-table above uses status='running' to model
+  // "fleet still running"; `anyFleetActive` also returns true for
+  // 'background' status, so a parentDone+background-only fleet should
+  // resolve to "Background" rather than "Done".
+  it('parentDone=true + fleet=[background-only] → Background (not Done)', () => {
+    const fleet = new Map<string, FleetMember>([
+      ['bg', fm('bg', 'background', NOW)],
+    ])
+    const phase = phaseFor(st('done'), fleet, NOW, { parentDone: true })
+    expect(phase.label).toBe('Background')
+  })
 })
