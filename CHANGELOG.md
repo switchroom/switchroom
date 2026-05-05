@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## v0.6.9 — 2026-05-05
+
+### Added
+
+- **Auth card v3b (#699)** — Telegram `/auth` answers three operator
+  questions in one glance:
+  - Which account is driving traffic right now? `▶ pixsoul@gmail.com`
+    + inline mini-bars (`5h ██░░░░ 47%  ·  7d ░░░░░░ 12%`).
+  - Which accounts are failover targets? Indented under
+    `Fallback ↓:`, in YAML-list order (the actual failover order,
+    load-bearing post-#697).
+  - How do I switch primary without leaving Telegram? `⤴ Promote`
+    button under each fallback, two-stage confirm.
+- **`switchroom auth promote <label> <agents...>`** — moves a label
+  to position 0 of each agent's `auth.accounts:`. Refuses when not
+  already enabled (promote reorders; enable enables). Idempotent at
+  the already-primary boundary.
+- **`auth account list --json`** gains `primaryForAgents: string[]`
+  so the dashboard can mark each agent's active account.
+
+### Fixed
+
+- **Slots + Pool sections hide when the active account is known
+  (#699)** — under the new account model the Slots row and Pool line
+  duplicate the `▶ <label>` active-account row 1:1, just with an
+  internal slot ID like "default" instead of the operator's email.
+  Both sections are now suppressed when an active-account signal is
+  present, leaving a single source of truth for "what's active."
+  Bootstrap state (no accounts yet) and older CLIs without
+  `primaryForAgents` keep the legacy Slots layout for graceful
+  degradation.
+
 ## v0.6.8 — 2026-05-05
 
 ### Added
