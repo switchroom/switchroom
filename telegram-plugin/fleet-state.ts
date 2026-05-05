@@ -19,7 +19,7 @@
 const ROLE_FALLBACK_LEN = 20
 const SANITISE_MAX_LEN = 120
 
-export type FleetStatus = 'running' | 'background' | 'done' | 'failed' | 'stuck' | 'killed'
+export type FleetStatus = 'running' | 'background' | 'done' | 'failed' | 'stuck' | 'killed' | 'capped'
 
 export interface FleetMember {
   agentId: string
@@ -94,6 +94,26 @@ export function applyTurnEnd(member: FleetMember, now: number): FleetMember {
   return {
     ...member,
     status: member.errorSeen ? 'failed' : 'done',
+    terminalAt: now,
+    lastActivityAt: now,
+  }
+}
+
+/**
+ * Transition a fleet member to `capped` terminal state.
+ *
+ * Called when session-tail detects a truncated sub-agent transcript:
+ * >= CAP_TOOL_USE_THRESHOLD tool_uses recorded with no `type:result` /
+ * `subtype:end` / `type:final` terminal record. The sub-agent was killed
+ * mid-flight (parent restart, watchdog SIGTERM, etc.) before it could
+ * write its completion record. Idempotent — already-terminal members
+ * are left unchanged.
+ */
+export function applyCapped(member: FleetMember, now: number): FleetMember {
+  if (member.terminalAt != null) return member
+  return {
+    ...member,
+    status: 'capped',
     terminalAt: now,
     lastActivityAt: now,
   }
