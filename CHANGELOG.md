@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+## v0.6.6 — 2026-05-05
+
+### Added
+
+- **Two-zone status card v2 (#662, multi-PR rollup).** Reworked the
+  pinned progress card into a clearer top-zone (`Main` agent state)
+  and bottom-zone (sub-agents) layout. Includes background sub-agent
+  persistence (closes #64), per-fleet-member stuck escalation, fleet
+  state + watcher exposure, and the cutover off the legacy renderer
+  (`TWO_ZONE_CARD=1` shipped to default-on). PRs: #663, #664, #665,
+  #666, #670; design doc at `reference/status-card-design.md` (#661,
+  #667).
+- **`/auth` v3a — accounts-first dashboard layout (#669).** Telegram
+  `/auth` now leads with the account inventory and drills into
+  per-account detail on tap, replacing the slot-first nav.
+- **`/auth` account rename (#653).** Telegram-native rotation of an
+  account's display label without dropping/re-adding.
+- **Verbose `tg-post` logging for outbound API calls (#659).**
+  Operator-side debugging hook for the gateway's Telegram traffic.
+
+### Fixed
+
+- **Deterministic double-message fix via card takeover (#654/#655).**
+  When a long turn (>60s) ended without `reply` / `stream_reply` and
+  fell back to turn-flush, the user saw both the pinned progress card
+  AND a fresh turn-flush bubble. New `progressDriver.takeOverCard`
+  hook lets the gateway preempt the driver's "Done" edit and rewrite
+  the pinned card with the answer text in place — single message in
+  the chat, no race window. Regression test pins all three branches
+  (card not yet posted / card posted / edit failure fallback).
+- **`stream_reply` HTML parse failures now edit, not duplicate
+  (#657/#685).** Stream-reply's HTML-parse error path was emitting a
+  fresh `sendMessage` instead of editing the existing draft, doubling
+  up answers when the parser tripped on bad markup.
+- **Drop materialize on no-reply turn_end; turn-flush owns the emit
+  (#656/#660).** Removed the legacy materialize-on-turn_end that was
+  competing with the turn-flush safety net.
+- **Boot-time orphan progress card reaper (#689/#692).** Pinned cards
+  abandoned by a previous gateway crash get reaped at the next boot
+  instead of lingering until the next turn on that chat.
+- **Flush progress cards on SIGTERM (#689/#690).** Graceful shutdown
+  now closes any in-flight cards so `systemctl --user restart` doesn't
+  leave "Working…" pinned forever.
+- **Unfreeze progress card timer + surface pin failures (#687).**
+  Card heartbeat couldn't recover from a single transient API failure;
+  now retries cleanly and surfaces persistent failures to the operator.
+- **Emoji header counters + active-in-flight bullet (#684).**
+  Status card header counters render correctly on Telegram clients
+  that don't support combining-character sequences; in-flight tasks
+  get an explicit bullet glyph.
+- **Move TTL eviction off the heartbeat (#674).** Old chat states
+  were piling up in driver memory because TTL eviction only ran when
+  the heartbeat fired — heartbeat dies → memory leak.
+- **`firePin` leak and `phaseFor` silent-end precedence (#673).**
+  Two narrow correctness bugs in the pin lifecycle.
+- **Export `SWITCHROOM_AGENT_NAME` in cron-N.sh template (#676).**
+  Cron-spawned turns previously couldn't self-target via slash
+  commands because the agent-name env var was missing from the
+  scaffolded cron wrappers.
+
 ### Changed
 
 - **Worker worktree isolation moved from global defaults to the `coding`
@@ -17,6 +77,22 @@
   config load — no auto-rewrite. Migration: add `extends: coding` to
   coding-shaped agents, or paste the two-line override directly under
   those agents.
+
+### Engineering
+
+- **Unified progress-card close path + convergence test (#677).**
+  Refactored the four divergent close paths (turn_end, force-complete,
+  zombie-close, abandon) into one helper, with a convergence test
+  asserting they all reach the same final state.
+- **Backfill 10 missing test cases for progress-card driver (#678,
+  #681).** Closes coverage gaps in the driver's edge cases:
+  cross-turn carry-over, orphan sub-agents, deferred completion
+  races.
+- **`beginTurnEnd` helper + native `console.warn` cleanup (#688).**
+  Internal: extract the turn-end ceremony into a single helper.
+- **Bridge-watchdog test isolation (#691/#693).** Watchdog tests
+  now run with HOME isolated from real agent JSONLs so they can't
+  read live state.
 
 ## v0.6.5 — 2026-05-04
 
