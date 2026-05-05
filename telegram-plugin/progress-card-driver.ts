@@ -2326,6 +2326,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
       if (target.completionFired) return
       process.stderr.write(`telegram gateway: progress-card: forceCompleteTurn turnKey=${target.turnKey} (external completion signal, e.g. stream_reply done=true)\n`)
       const durationMs = Math.max(0, now() - target.state.turnStartedAt)
+      target.parentTurnEndAt = now()
       target.state = reduce(target.state, { kind: 'turn_end', durationMs }, now())
       target.lastEventAt = now()
       flush(target, /*forceDone*/ true)
