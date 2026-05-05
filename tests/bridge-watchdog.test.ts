@@ -384,8 +384,14 @@ function runWatchdog(
   const opts: ExecFileSyncOptions = {
     env: {
       PATH: `${h.binDir}:/usr/bin:/bin`,
-      // HOME and USER sometimes matter for bash shell init.
-      HOME: process.env.HOME ?? "/tmp",
+      // Isolate HOME to the per-test tmpdir so the progress gate added in
+      // PR #557 (agent_progress_snapshot reads
+      // ${HOME}/.switchroom/agents/${name}/.claude/{projects,tasks}) does
+      // NOT see live JSONL from the real agent running on the dev host.
+      // Without this, every test on the dev box would log
+      // `decision=defer-progress-fresh` against the running klanker agent
+      // and skip the restart we're asserting on. See switchroom#691.
+      HOME: h.root,
       USER: process.env.USER ?? "nobody",
       WATCHDOG_STATE_DIR: wdState,
       ...env,
