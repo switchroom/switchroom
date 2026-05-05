@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Reggie review-only mode for webhook dispatch (#716)** — when reggie is
+  spawned via the #715 webhook dispatch path, it now operates in review-only
+  mode: it posts its verdict + citations to Telegram but never calls
+  `gh pr merge` or enables auto-merge.
+  - `spawnAgentOneShot()` in `src/web/webhook-dispatch.ts` now injects
+    `WEBHOOK_DISPATCH=1` into the spawned process environment.
+  - `~/.switchroom/agents/reggie/.claude/skills/code-review-merge/SKILL.md`
+    gains an **Operating modes** section that explains the two modes,
+    detection logic (`if [ "${WEBHOOK_DISPATCH:-}" = "1" ]`), and the
+    inline-keyboard "Approve & merge" button pattern for human authorization.
+  - `~/.switchroom/agents/reggie/SOUL.md` notes the cautious-external
+    policy for code shipping.
+  - One new unit test (`src/web/webhook-dispatch.test.ts`) asserts that
+    `WEBHOOK_DISPATCH=1` is present in the env passed to the spawn function.
+
 - **Webhook dispatch (#715)** — verified webhook events now trigger fresh
   `claude -p` invocations so agents can react in Telegram without polling
   `webhook-events.jsonl` manually.
