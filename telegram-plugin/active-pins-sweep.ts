@@ -26,12 +26,28 @@
 import { readActivePins, clearActivePins, type ActivePin } from "./active-pins.js";
 
 export type UnpinFn = (chatId: string, messageId: number) => Promise<unknown>;
+/**
+ * Optional pre-unpin hook. Called once per sidecar entry before the
+ * unpin fires. Used by the boot-time orphan-pin reaper (#689) to edit
+ * the message body to a "Restart interrupted this work" banner, so the
+ * user sees WHY the card stopped updating rather than silently losing
+ * the pin.
+ *
+ * Hook errors are logged and swallowed: a banner edit failing must
+ * never block the unpin (frozen card is worse than no card).
+ */
+export type EditBeforeUnpinFn = (pin: ActivePin) => Promise<unknown>;
 
 export interface SweepOptions {
   /** Upper bound on how long to wait for all unpin calls before returning. */
   timeoutMs?: number;
   /** Optional log hook — called with human-readable progress/error lines. */
   log?: (msg: string) => void;
+  /**
+   * Optional per-pin edit hook fired BEFORE the unpin. Failures are
+   * caught and logged; the unpin still runs. See {@link EditBeforeUnpinFn}.
+   */
+  editBeforeUnpin?: EditBeforeUnpinFn;
 }
 
 export interface SweepResult {
@@ -57,9 +73,22 @@ export async function sweepActivePins(
   if (pins.length === 0) return { swept: [], timedOut: false };
 
   log(`sweeping ${pins.length} active pin(s)`);
+  const editBeforeUnpin = options.editBeforeUnpin;
   const attempts = pins.map((pin) =>
     Promise.resolve()
-      .then(() => unpin(pin.chatId, pin.messageId))
+      .then(async () => {
+        if (editBeforeUnpin != null) {
+          try {
+            await editBeforeUnpin(pin);
+          } catch (err) {
+            // Banner edits are best-effort — message may already be gone
+            // or the bot may have lost edit rights. Don't block unpin.
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`banner edit failed for ${pin.chatId}/${pin.messageId}: ${msg}`);
+          }
+        }
+        return unpin(pin.chatId, pin.messageId);
+      })
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         log(`unpin failed for ${pin.chatId}/${pin.messageId}: ${msg}`);

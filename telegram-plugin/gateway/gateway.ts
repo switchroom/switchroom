@@ -8879,10 +8879,37 @@ process.on('SIGINT', () => void shutdown('SIGINT'))
 if (streamMode === 'checklist') {
   const startupAgentDir = resolveAgentDirFromEnv()
   if (startupAgentDir != null) {
+    // #689: boot-time orphan-pin reaper. Backstop for SIGKILL/OOM/panic
+    // where the SIGTERM handler (PR #690) never ran. For each pin still
+    // recorded in the sidecar, edit the message body to a "Restart
+    // interrupted this work" banner BEFORE unpinning so the user sees
+    // why the card stopped updating instead of a silent disappearance.
+    //
+    // Banner subtitle is sourced from clean-shutdown.json when fresh
+    // (<CLEAN_SHUTDOWN_MAX_AGE_MS) — for an OOM/panic that wrote no
+    // marker, we fall back to a generic "previous process exited
+    // unexpectedly" line. The sweep is bounded by ~5s so a wedged
+    // Telegram API can't block boot.
+    const cleanMarker = readCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
+    const markerFresh =
+      cleanMarker != null && Date.now() - cleanMarker.ts < CLEAN_SHUTDOWN_MAX_AGE_MS
+    const subtitle =
+      markerFresh && cleanMarker?.reason != null && cleanMarker.reason.length > 0
+        ? `${cleanMarker.signal}: ${cleanMarker.reason}`
+        : markerFresh && cleanMarker != null
+          ? cleanMarker.signal
+          : 'previous process exited unexpectedly'
+    const banner = `⚠️ <b>Restart interrupted this work</b>\n<i>${escapeHtmlForTg(subtitle)}</i>`
     void sweepActivePins(
       startupAgentDir,
       (chatId, messageId) => lockedBot.api.unpinChatMessage(chatId, messageId),
-      { log: (msg) => process.stderr.write(`telegram gateway: startup pin sweep — ${msg}\n`) },
+      {
+        log: (msg) => process.stderr.write(`telegram gateway: startup pin sweep — ${msg}\n`),
+        timeoutMs: 5_000,
+        editBeforeUnpin: async (pin) => {
+          await lockedBot.api.editMessageText(pin.chatId, pin.messageId, banner, { parse_mode: 'HTML' })
+        },
+      },
     )
   }
 
