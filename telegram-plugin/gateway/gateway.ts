@@ -1621,6 +1621,13 @@ let getPinnedProgressCardMessageId: ((turnKey: string, agentId?: string) => numb
 let completeProgressCardTurn:
   | ((args: { chatId: string; threadId: number | undefined; turnKey: string }) => void)
   | null = null
+// #689: SIGTERM-time flush. For each currently-pinned progress card, edit
+// the message body to a "Restart interrupted this work" banner and unpin.
+// Returns when every entry has either resolved or the budget elapses.
+// Set inside startGatewayServer right after pinMgr is created.
+let flushProgressCardsForShutdown:
+  | ((opts: { signal: string; reason?: string; budgetMs: number }) => Promise<void>)
+  | null = null
 let subagentWatcher: SubagentWatcherHandle | null = null
 
 // ─── IPC server ───────────────────────────────────────────────────────────
@@ -8638,6 +8645,10 @@ bot.catch(err => {
 // systemd's TimeoutStopSec is set to 45s in generateGatewayUnit so we
 // have headroom.
 const SHUTDOWN_DRAIN_BUDGET_MS = 35_000
+// #689: time budget for the SIGTERM-time progress-card flush. Sits inside
+// the broader drain budget — if Telegram's API can't ack edits + unpins
+// within this window we log and exit anyway rather than block shutdown.
+const SHUTDOWN_PROGRESS_FLUSH_BUDGET_MS = 1_500
 
 /** Best-effort in-flight counter for the drain loop. Sums the maps that
  * track outstanding side-effects: permission prompts the user hasn't
@@ -8719,6 +8730,30 @@ async function shutdown(signal: string): Promise<void> {
       process.stderr.write(`telegram gateway: shutdown.turn_stamp_failed turnKey=${currentTurnRegistryKey} err=${(err as Error).message}\n`)
     }
     currentTurnRegistryKey = null
+  }
+
+  // #689: flush every pinned progress card with a "Restart interrupted"
+  // banner before drain begins. Bounded by SHUTDOWN_PROGRESS_FLUSH_BUDGET_MS
+  // so a wedged Telegram API can't block shutdown. Reads the same reason
+  // we just stamped into clean-shutdown.json so the banner mirrors the
+  // marker.
+  if (flushProgressCardsForShutdown != null) {
+    let bannerReason: string | undefined
+    try {
+      const m = readCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
+      if (m?.reason != null && m.reason.length > 0) bannerReason = m.reason
+    } catch {
+      // best-effort — banner just falls back to signal-only
+    }
+    try {
+      await flushProgressCardsForShutdown({
+        signal,
+        ...(bannerReason != null ? { reason: bannerReason } : {}),
+        budgetMs: SHUTDOWN_PROGRESS_FLUSH_BUDGET_MS,
+      })
+    } catch (err) {
+      process.stderr.write(`telegram gateway: shutdown.flush_progress_cards_failed err=${(err as Error).message}\n`)
+    }
   }
 
   // Stop the long-poll health check before draining so it doesn't trigger
@@ -8916,6 +8951,53 @@ if (streamMode === 'checklist') {
       threadId: args.threadId != null ? String(args.threadId) : undefined,
       turnKey: args.turnKey,
     })
+  }
+
+  // #689: flush every pinned progress card with a "Restart interrupted"
+  // banner before shutdown completes. Without this, cards freeze forever
+  // on "Working…" — the gateway re-bootstraps with a fresh turn counter
+  // that can collide with the abandoned turnKey, so the next-boot orphan
+  // sweep can't reliably reattach them either.
+  flushProgressCardsForShutdown = async ({ signal, reason, budgetMs }): Promise<void> => {
+    const entries = pinMgr.pinnedEntries()
+    if (entries.length === 0) return
+    const reasonLine = reason != null && reason.length > 0
+      ? `<i>${escapeHtmlForTg(`${signal}: ${reason}`)}</i>`
+      : `<i>${escapeHtmlForTg(signal)}</i>`
+    const banner = `⚠️ <b>Restart interrupted this work</b>\n${reasonLine}`
+    process.stderr.write(`telegram gateway: shutdown.flush_progress_cards count=${entries.length} signal=${signal}\n`)
+
+    const editOps = entries.map(({ chatId, threadId, turnKey, agentId, messageId }) =>
+      lockedBot.api.editMessageText(chatId, messageId, banner, { parse_mode: 'HTML' })
+        .then(() => {
+          process.stderr.write(`telegram gateway: shutdown.flush_progress_card_edit ok turnKey=${turnKey} agentId=${agentId} msgId=${messageId}\n`)
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err)
+          process.stderr.write(`telegram gateway: shutdown.flush_progress_card_edit failed turnKey=${turnKey} agentId=${agentId} msgId=${messageId} err=${msg}\n`)
+        })
+        .finally(() => {
+          // Unpin regardless of whether the edit succeeded — a stale
+          // pinned card with the old "Working…" body is still better
+          // off unpinned than left frozen.
+          const tid = threadId != null ? Number(threadId) : undefined
+          pinMgr.unpinForChat(chatId, tid)
+        }),
+    )
+
+    let timedOut = false
+    const budget = new Promise<void>((resolve) => {
+      const t = setTimeout(() => { timedOut = true; resolve() }, budgetMs)
+      // unref so the timer alone can't keep the process alive past exit().
+      ;(t as unknown as { unref?: () => void }).unref?.()
+    })
+    await Promise.race([
+      Promise.allSettled(editOps).then(async () => { await pinMgr.drainInFlight() }),
+      budget,
+    ])
+    if (timedOut) {
+      process.stderr.write(`telegram gateway: shutdown.flush_progress_cards budget_exceeded budgetMs=${budgetMs}\n`)
+    }
   }
 
   /**

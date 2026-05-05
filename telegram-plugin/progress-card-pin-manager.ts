@@ -200,6 +200,20 @@ export interface PinManager {
    */
   pinnedMessageId(turnKey: string, agentId?: string): number | undefined
   /**
+   * Snapshot of every pinned card currently tracked by the manager.
+   * Used by the gateway shutdown path (#689) to render a final
+   * "Restart interrupted" frame on each pinned card and unpin it
+   * synchronously, so cards don't freeze on "Working…" forever after
+   * a SIGTERM mid-turn.
+   */
+  pinnedEntries(): ReadonlyArray<{
+    turnKey: string
+    agentId: string
+    chatId: string
+    threadId?: string
+    messageId: number
+  }>
+  /**
    * Test hook to await all in-flight pin/unpin promises. Production
    * callers don't need this; tests can call it to drain the fire-and-
    * forget `.catch()` chains before asserting on side effects.
@@ -231,6 +245,11 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   // successful pin call returns; cleared on completeTurn for that
   // composite.
   const pinned = new Map<string, number>()
+  // Parallel to `pinned`: (turnKey, agentId) -> {chatId, threadId?}. Lets
+  // the shutdown flush (#689) reconstruct the chat coordinates without
+  // parsing the turnKey (which is ambiguous when no threadId is present:
+  // `chatId:seq` vs `chatId:threadId:seq`).
+  const pinnedMeta = new Map<string, { chatId: string; threadId?: string }>()
   // (turnKey, agentId) -> pending pin state. Holds the candidate +
   // timer handle while we wait pinDelayMs before actually calling the
   // Telegram pin API. If completeTurn fires before the timer, we cancel
@@ -238,7 +257,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
   // fires (moved to `pinned`) or when completeTurn cancels it.
   const pendingPins = new Map<
     string,
-    { chatId: string; messageId: number; turnKey: string; agentId: string; timer: TimerHandle }
+    { chatId: string; threadId?: string; messageId: number; turnKey: string; agentId: string; timer: TimerHandle }
   >()
   // Composite keys whose unpin has already fired. Guards against
   // duplicate completeTurn calls causing a second unpin.
@@ -288,6 +307,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     unpinned.add(key)
     log(`telegram gateway: progress-card: unpin turnKey=${turnKey} agentId=${agentId} msgId=${pinnedId}\n`)
     pinned.delete(key)
+    pinnedMeta.delete(key)
     const svcKey = serviceKey(chatId, pinnedId)
     const svcId = serviceMessages.get(svcKey)
     if (svcId != null) {
@@ -314,7 +334,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
     track(p)
   }
 
-  function firePin(turnKey: string, agentId: string, chatId: string, messageId: number): void {
+  function firePin(turnKey: string, agentId: string, chatId: string, threadId: string | undefined, messageId: number): void {
     // Called when the pin-delay timer fires. Promote from pendingPins
     // into pinned, then issue the Telegram pin API call.
     const key = pinKey(turnKey, agentId)
@@ -326,6 +346,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       return
     }
     pinned.set(key, messageId)
+    pinnedMeta.set(key, threadId != null ? { chatId, threadId } : { chatId })
     log(`telegram gateway: progress-card: pinned turnKey=${turnKey} agentId=${agentId} msgId=${messageId}\n`)
     if (deps.addPin) {
       deps.addPin({
@@ -354,6 +375,7 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
           // never actually pinned. Do NOT add to `unpinned` — we never
           // issued an unpin. Sidecar is also cleared for consistency.
           pinned.delete(key)
+          pinnedMeta.delete(key)
           if (deps.removePin) deps.removePin(chatId, messageId)
         },
       )
@@ -374,10 +396,11 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
       // The indirection remains so tests and callers can still override
       // with a positive value if they want a pre-pin visual buffer.
       const timer = scheduleTimer(() => {
-        firePin(c.turnKey, agentId, c.chatId, c.messageId)
+        firePin(c.turnKey, agentId, c.chatId, c.threadId, c.messageId)
       }, pinDelayMs)
       pendingPins.set(key, {
         chatId: c.chatId,
+        ...(c.threadId != null ? { threadId: c.threadId } : {}),
         messageId: c.messageId,
         turnKey: c.turnKey,
         agentId,
@@ -529,6 +552,32 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
 
     pinnedMessageId(turnKey, agentId) {
       return pinned.get(pinKey(turnKey, agentId ?? PARENT_AGENT_ID))
+    },
+
+    pinnedEntries() {
+      const out: Array<{
+        turnKey: string
+        agentId: string
+        chatId: string
+        threadId?: string
+        messageId: number
+      }> = []
+      for (const [key, messageId] of pinned) {
+        const sep = key.lastIndexOf('::')
+        if (sep < 0) continue
+        const turnKey = key.slice(0, sep)
+        const agentId = key.slice(sep + 2)
+        const meta = pinnedMeta.get(key)
+        if (meta == null) continue
+        out.push({
+          turnKey,
+          agentId,
+          chatId: meta.chatId,
+          ...(meta.threadId != null ? { threadId: meta.threadId } : {}),
+          messageId,
+        })
+      }
+      return out
     },
 
     async drainInFlight() {
