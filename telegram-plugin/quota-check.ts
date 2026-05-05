@@ -54,8 +54,19 @@ export type QuotaResult =
   | { ok: false; reason: string };
 
 export type FetchQuotaOptions = {
-  /** Path to the agent's Claude config dir (contains `.oauth-token`). */
-  claudeConfigDir: string;
+  /**
+   * Path to the agent's Claude config dir (contains `.oauth-token`).
+   * Mutually exclusive with `accessToken`. One of the two must be set.
+   */
+  claudeConfigDir?: string;
+  /**
+   * OAuth access token to probe with directly. Use this from the
+   * account-level path (`~/.switchroom/accounts/<label>/credentials.json`)
+   * where the credentials live in the new account model rather than
+   * a legacy `.oauth-token` file. Mutually exclusive with
+   * `claudeConfigDir`.
+   */
+  accessToken?: string;
   /** Override probe model. Defaults to haiku-4-5. */
   model?: string;
   /** Abort after this many ms. Defaults to 10s. */
@@ -114,7 +125,27 @@ export function parseQuotaHeaders(headers: Headers): QuotaResult {
 }
 
 export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> {
-  const token = readOauthToken(opts.claudeConfigDir);
+  // Resolve the bearer token from either an explicit accessToken
+  // (account-level path) or by reading `.oauth-token` from a Claude
+  // config dir (legacy per-agent path). Reject if neither is set or
+  // both are — keep the API contract narrow.
+  let token: string | null;
+  if (opts.accessToken && opts.claudeConfigDir) {
+    return {
+      ok: false,
+      reason: "pass only one of `accessToken` or `claudeConfigDir`, not both",
+    };
+  }
+  if (opts.accessToken) {
+    token = opts.accessToken.trim().length > 0 ? opts.accessToken : null;
+  } else if (opts.claudeConfigDir) {
+    token = readOauthToken(opts.claudeConfigDir);
+  } else {
+    return {
+      ok: false,
+      reason: "fetchQuota requires `accessToken` or `claudeConfigDir`",
+    };
+  }
   if (!token) {
     return { ok: false, reason: "no OAuth token at .oauth-token" };
   }
@@ -216,4 +247,152 @@ export function formatQuotaBlock(q: QuotaUtilization, now: Date = new Date()): s
     lines.push(`<i>Overage: ${q.overageStatus}${reason}</i>`);
   }
   return lines.join("\n");
+}
+
+/* ── Account-level quota probe + short-lived cache ───────────────────── */
+
+/**
+ * Resolve an account's OAuth access token from
+ * `~/.switchroom/accounts/<label>/credentials.json` (new account model
+ * — see `reference/share-auth-across-the-fleet.md`). Returns null when
+ * the file is missing, malformed, or has no accessToken — caller
+ * surfaces a graceful "missing credentials" badge.
+ *
+ * Exported for unit testing; production callers go through
+ * {@link fetchAccountQuota}.
+ */
+export function readAccountAccessToken(
+  label: string,
+  home: string = (process.env.HOME ?? "/root"),
+): string | null {
+  const credPath = join(home, ".switchroom", "accounts", label, "credentials.json");
+  if (!existsSync(credPath)) return null;
+  try {
+    const raw = readFileSync(credPath, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      claudeAiOauth?: { accessToken?: string };
+    };
+    const token = parsed.claudeAiOauth?.accessToken?.trim();
+    return token && token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cache key per account label. The cached entry holds the result and
+ * the wall-clock timestamp it was fetched at, so the dashboard tap
+ * pattern (refresh-on-tap) doesn't trigger a fresh API call within the
+ * TTL window. Quota numbers don't move within a few seconds anyway.
+ */
+type AccountQuotaCacheEntry = {
+  fetchedAt: number;
+  result: QuotaResult;
+};
+
+/** TTL for the per-account quota cache. 30s balances "dashboard
+ *  refresh feels live" against "stop hammering the Anthropic API on
+ *  every tap." Shared cache across the gateway process. */
+export const ACCOUNT_QUOTA_CACHE_TTL_MS = 30_000;
+
+const accountQuotaCache = new Map<string, AccountQuotaCacheEntry>();
+
+/**
+ * Fetch quota for a global account by label. Wraps {@link fetchQuota}
+ * with token-resolution (`~/.switchroom/accounts/<label>/credentials.json`)
+ * and a short-lived in-process cache so repeat dashboard taps within
+ * the TTL don't re-hit the Anthropic API.
+ *
+ * Pass `force: true` to bypass the cache (used when the user
+ * explicitly taps "📊 Full quota" — they expect a live read).
+ */
+export async function fetchAccountQuota(
+  label: string,
+  opts: {
+    home?: string;
+    force?: boolean;
+    now?: () => number;
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+  } = {},
+): Promise<QuotaResult> {
+  const now = opts.now?.() ?? Date.now();
+  if (!opts.force) {
+    const cached = accountQuotaCache.get(label);
+    if (cached && now - cached.fetchedAt < ACCOUNT_QUOTA_CACHE_TTL_MS) {
+      return cached.result;
+    }
+  }
+
+  const token = readAccountAccessToken(label, opts.home);
+  if (!token) {
+    const result: QuotaResult = {
+      ok: false,
+      reason: "no credentials.json or accessToken for account",
+    };
+    accountQuotaCache.set(label, { fetchedAt: now, result });
+    return result;
+  }
+
+  const result = await fetchQuota({
+    accessToken: token,
+    fetchImpl: opts.fetchImpl,
+    timeoutMs: opts.timeoutMs,
+  });
+  accountQuotaCache.set(label, { fetchedAt: now, result });
+  return result;
+}
+
+/** Test/utility helper — wipe the per-account quota cache. The
+ *  gateway calls this on auth-account-level mutations (account add,
+ *  account rm, account rename, refresh-accounts tick) so a stale
+ *  pre-rename label doesn't survive into the dashboard. */
+export function clearAccountQuotaCache(label?: string): void {
+  if (label == null) {
+    accountQuotaCache.clear();
+    return;
+  }
+  accountQuotaCache.delete(label);
+}
+
+/**
+ * Sync read of the account quota cache. Returns `null` when there's
+ * no entry (the dashboard renders the row without a quota line) or
+ * when the entry is older than the TTL (treats it as a miss to keep
+ * the dashboard's view fresh).
+ *
+ * Used by `fetchDashboardState` (which is sync) so the dashboard can
+ * render with cached quota without awaiting an async probe. The
+ * background prefetch path warms the cache for the next render.
+ */
+export function getCachedAccountQuota(
+  label: string,
+  now: number = Date.now(),
+): QuotaResult | null {
+  const cached = accountQuotaCache.get(label);
+  if (!cached) return null;
+  if (now - cached.fetchedAt >= ACCOUNT_QUOTA_CACHE_TTL_MS) return null;
+  return cached.result;
+}
+
+/**
+ * Fire-and-forget background prefetch — kicks off
+ * `fetchAccountQuota` if the cache is cold/stale and discards the
+ * promise. Safe to call on every dashboard render: the cache TTL
+ * keeps the API call rate bounded to ~1 per account per 30s
+ * regardless of how many times the user taps /auth.
+ *
+ * Errors are swallowed (the next tap re-tries via the cache miss
+ * path); the dashboard's empty quota row is the user-visible
+ * "didn't probe yet" signal.
+ */
+export function prefetchAccountQuotaIfStale(
+  label: string,
+  opts: { home?: string; now?: () => number; fetchImpl?: typeof fetch } = {},
+): void {
+  const now = opts.now?.() ?? Date.now();
+  const cached = accountQuotaCache.get(label);
+  if (cached && now - cached.fetchedAt < ACCOUNT_QUOTA_CACHE_TTL_MS) return;
+  // Don't await — background warm.
+  void fetchAccountQuota(label, opts).catch(() => {});
 }

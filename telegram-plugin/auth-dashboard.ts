@@ -123,6 +123,31 @@ export interface AccountSummary {
   readonly enabledHere: boolean;
   readonly subscriptionType?: string;
   readonly expiresAt?: number;
+  /**
+   * Per-account 5h-window utilization, 0–100. Populated by the
+   * gateway's account-level quota probe — mirrored from the
+   * `anthropic-ratelimit-unified-5h-utilization` header on the
+   * Anthropic API response. Undefined means "not probed yet" (the
+   * dashboard renders a placeholder rather than 0%).
+   */
+  readonly fiveHourPct?: number;
+  /**
+   * Per-account 7d-window utilization. Same source as
+   * {@link fiveHourPct} — `anthropic-ratelimit-unified-7d-utilization`.
+   */
+  readonly sevenDayPct?: number;
+  /** Unix ms when the 5h cap resets, when known. */
+  readonly fiveHourResetAt?: number;
+  /** Unix ms when the 7d cap resets, when known. */
+  readonly sevenDayResetAt?: number;
+  /**
+   * Unix ms when the account is expected to come back from a
+   * quota-exhausted state. Populated when the cached probe says the
+   * account is exhausted (server-side `quota-exhausted` or local
+   * 5h utilization == 100%). Render shows "exhausted · resets in
+   * Nh Mm" rather than the percentage row.
+   */
+  readonly quotaExhaustedUntil?: number;
 }
 
 /**
@@ -362,6 +387,14 @@ export function buildDashboardText(state: DashboardState): string {
       const badge = accountHealthBadge(acc.health);
       const suffix = healthSuffix(acc.health);
       lines.push(`  • <code>${escapeHtml(acc.label)}</code>  ${badge}${suffix}`);
+      // Per-account quota row: "5h: 47%  · 7d: 12%" when the gateway
+      // probed the account. Hidden until at least one of the two
+      // values is known so we don't show "5h: -  · 7d: -" on a
+      // freshly-added account whose probe hasn't run yet — the
+      // operator sees a clean account-only row first, then the
+      // numbers populate on the next refresh tap.
+      const quotaLine = formatAccountQuotaLine(acc);
+      if (quotaLine) lines.push(`    └ ${quotaLine}`);
     }
     if (state.accountsTruncated) {
       lines.push(`  … ${state.accounts.length - ACCOUNTS_DISPLAY_CAP} more (use CLI)`);
@@ -568,6 +601,81 @@ export function isQuotaHot(slots: DashboardSlot[]): boolean {
     if ((s.sevenDayPct ?? 0) >= QUOTA_HOT_THRESHOLD_PCT) return true;
   }
   return false;
+}
+
+/**
+ * Account-level analogue: derive the `quotaHot` flag from the
+ * accounts section of the dashboard. Under the new auth framework
+ * accounts (not slots) are the unit of quota, so the [Fall back now]
+ * affordance should fire when ANY account in the agent's list is
+ * approaching the cap — not just the slot that happens to be the
+ * active mirror.
+ *
+ * Combine with `isQuotaHot(slots)` via `||` at the call site so
+ * legacy slot setups still get the warning.
+ */
+export function isAccountQuotaHot(
+  accounts: ReadonlyArray<AccountSummary> | undefined,
+): boolean {
+  if (!accounts) return false;
+  for (const a of accounts) {
+    if (a.health === "quota-exhausted") return true;
+    if ((a.fiveHourPct ?? 0) >= QUOTA_HOT_THRESHOLD_PCT) return true;
+    if ((a.sevenDayPct ?? 0) >= QUOTA_HOT_THRESHOLD_PCT) return true;
+  }
+  return false;
+}
+
+/**
+ * Render the per-account quota line shown under each account row in
+ * the dashboard. Returns null when no quota data is available — the
+ * caller skips the row entirely so a freshly-added (un-probed)
+ * account doesn't show a placeholder.
+ *
+ * Format priority:
+ *   - quota-exhausted (server-side or 100% utilization) →
+ *     "exhausted · resets in Nh Mm"
+ *   - both percentages known → "5h: 47%  · 7d: 12%"
+ *   - one percentage known   → that one
+ *   - nothing                → null
+ *
+ * Reset times come straight from the Anthropic response headers via
+ * `parseQuotaHeaders` (`fiveHourResetAt`, `sevenDayResetAt` epoch ms).
+ */
+export function formatAccountQuotaLine(
+  acc: AccountSummary,
+  now: number = Date.now(),
+): string | null {
+  if (acc.quotaExhaustedUntil != null && acc.quotaExhaustedUntil > now) {
+    const reset = formatRelativeMs(acc.quotaExhaustedUntil - now);
+    return `<i>exhausted · resets in ${reset}</i>`;
+  }
+  const parts: string[] = [];
+  if (acc.fiveHourPct != null) {
+    parts.push(`<i>5h:</i> ${formatQuotaPct(acc.fiveHourPct)}`);
+  }
+  if (acc.sevenDayPct != null) {
+    parts.push(`<i>7d:</i> ${formatQuotaPct(acc.sevenDayPct)}`);
+  }
+  if (parts.length === 0) return null;
+  return parts.join("  · ");
+}
+
+function formatQuotaPct(pct: number): string {
+  // Round to integer % for the dashboard. Show "<1%" when the value
+  // is positive but rounds to zero, so "0%" is reserved for genuine
+  // idle accounts.
+  const rounded = Math.round(pct);
+  if (pct > 0 && rounded === 0) return "&lt;1%";
+  return `${rounded}%`;
+}
+
+function formatRelativeMs(ms: number): string {
+  const totalMin = Math.max(1, Math.floor(ms / 60_000));
+  if (totalMin < 60) return `${totalMin}m`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
 }
 
 /**

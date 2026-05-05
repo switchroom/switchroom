@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'fs'
+import { describe, it, expect, beforeEach } from 'vitest'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -7,6 +7,12 @@ import {
   formatQuotaBlock,
   formatQuotaLine,
   parseQuotaHeaders,
+  readAccountAccessToken,
+  fetchAccountQuota,
+  getCachedAccountQuota,
+  prefetchAccountQuotaIfStale,
+  clearAccountQuotaCache,
+  ACCOUNT_QUOTA_CACHE_TTL_MS,
 } from '../quota-check.js'
 
 function makeTempClaudeDir(token: string | null): string {
@@ -180,5 +186,321 @@ describe('fetchQuota', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+// ─── Account-level helpers ────────────────────────────────────────────
+
+/** Build a fake $HOME with `~/.switchroom/accounts/<label>/credentials.json`. */
+function makeAccountHome(
+  accounts: Record<string, { accessToken?: string }>,
+): string {
+  const home = mkdtempSync(join(tmpdir(), 'quota-acct-test-'))
+  for (const [label, creds] of Object.entries(accounts)) {
+    const dir = join(home, '.switchroom', 'accounts', label)
+    mkdirSync(dir, { recursive: true })
+    if (creds.accessToken !== undefined) {
+      writeFileSync(
+        join(dir, 'credentials.json'),
+        JSON.stringify({ claudeAiOauth: { accessToken: creds.accessToken } }),
+      )
+    }
+  }
+  return home
+}
+
+describe('readAccountAccessToken', () => {
+  it('returns the access token from credentials.json', () => {
+    const home = makeAccountHome({
+      'pixsoul@gmail.com': { accessToken: 'sk-ant-oat01-fake' },
+    })
+    try {
+      expect(readAccountAccessToken('pixsoul@gmail.com', home)).toBe(
+        'sk-ant-oat01-fake',
+      )
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when the account dir is missing', () => {
+    const home = makeAccountHome({})
+    try {
+      expect(readAccountAccessToken('absent', home)).toBeNull()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when accessToken is empty', () => {
+    const home = makeAccountHome({
+      'empty@example.com': { accessToken: '' },
+    })
+    try {
+      expect(readAccountAccessToken('empty@example.com', home)).toBeNull()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when credentials.json is malformed', () => {
+    const home = mkdtempSync(join(tmpdir(), 'quota-acct-bad-'))
+    const dir = join(home, '.switchroom', 'accounts', 'broken')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'credentials.json'), '{not json')
+    try {
+      expect(readAccountAccessToken('broken', home)).toBeNull()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('fetchAccountQuota — cache + token resolution', () => {
+  beforeEach(() => {
+    clearAccountQuotaCache()
+  })
+
+  it('fetches once, returns cached on subsequent calls within TTL', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    let callCount = 0
+    const fakeFetch = async () => {
+      callCount++
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.42',
+          'anthropic-ratelimit-unified-7d-utilization': '0.17',
+        },
+      })
+    }
+    try {
+      const r1 = await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+      })
+      const r2 = await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+      })
+      expect(r1.ok).toBe(true)
+      expect(r2.ok).toBe(true)
+      expect(callCount).toBe(1) // cache hit on the second call
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('force=true bypasses the cache', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    let callCount = 0
+    const fakeFetch = async () => {
+      callCount++
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.5',
+          'anthropic-ratelimit-unified-7d-utilization': '0.5',
+        },
+      })
+    }
+    try {
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+      })
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+        force: true,
+      })
+      expect(callCount).toBe(2)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('caches missing-credentials failures so the API is not pinged', async () => {
+    const home = makeAccountHome({})
+    let callCount = 0
+    const fakeFetch = async () => {
+      callCount++
+      return new Response('{}')
+    }
+    const r1 = await fetchAccountQuota('absent', {
+      home,
+      fetchImpl: fakeFetch as typeof fetch,
+    })
+    const r2 = await fetchAccountQuota('absent', {
+      home,
+      fetchImpl: fakeFetch as typeof fetch,
+    })
+    expect(r1.ok).toBe(false)
+    expect(r2.ok).toBe(false)
+    expect(callCount).toBe(0) // never reached fetch — token resolution failed first
+  })
+
+  it('cache miss after TTL triggers a fresh fetch', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    let callCount = 0
+    const fakeFetch = async () => {
+      callCount++
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.3',
+          'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        },
+      })
+    }
+    let nowVal = 1_000_000
+    const now = () => nowVal
+    try {
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+        now,
+      })
+      // Step time past the TTL.
+      nowVal += ACCOUNT_QUOTA_CACHE_TTL_MS + 1
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: fakeFetch as typeof fetch,
+        now,
+      })
+      expect(callCount).toBe(2)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('getCachedAccountQuota + prefetchAccountQuotaIfStale', () => {
+  beforeEach(() => {
+    clearAccountQuotaCache()
+  })
+
+  it('returns null on a cold cache, populates after a fetch', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    try {
+      expect(getCachedAccountQuota('work@example.com')).toBeNull()
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: (async () =>
+          new Response('{}', {
+            status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.42',
+              'anthropic-ratelimit-unified-7d-utilization': '0.17',
+            },
+          })) as typeof fetch,
+      })
+      const cached = getCachedAccountQuota('work@example.com')
+      expect(cached?.ok).toBe(true)
+      if (cached?.ok) {
+        expect(Math.round(cached.data.fiveHourUtilizationPct)).toBe(42)
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('treats stale entries as a cache miss', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    try {
+      let nowVal = 1_000_000
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: (async () =>
+          new Response('{}', {
+            status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.42',
+              'anthropic-ratelimit-unified-7d-utilization': '0.17',
+            },
+          })) as typeof fetch,
+        now: () => nowVal,
+      })
+      // Within TTL — cached.
+      expect(getCachedAccountQuota('work@example.com', nowVal)).not.toBeNull()
+      // Past TTL — treated as miss.
+      const after = nowVal + ACCOUNT_QUOTA_CACHE_TTL_MS + 1
+      expect(getCachedAccountQuota('work@example.com', after)).toBeNull()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('prefetchAccountQuotaIfStale is a noop when cache is fresh', async () => {
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    let callCount = 0
+    const fakeFetch = (async () => {
+      callCount++
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.42',
+          'anthropic-ratelimit-unified-7d-utilization': '0.17',
+        },
+      })
+    }) as typeof fetch
+    try {
+      await fetchAccountQuota('work@example.com', { home, fetchImpl: fakeFetch })
+      expect(callCount).toBe(1)
+      // Fresh cache — prefetch should not fire.
+      prefetchAccountQuotaIfStale('work@example.com', { home, fetchImpl: fakeFetch })
+      // Yield once to let any spurious microtasks settle.
+      await Promise.resolve()
+      expect(callCount).toBe(1)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('fetchQuota — accessToken parameter', () => {
+  it('accepts a direct accessToken instead of a config dir', async () => {
+    const fakeFetch = async (_url: unknown, init?: RequestInit) => {
+      const auth = (init?.headers as Record<string, string> | undefined)
+        ?.authorization
+      expect(auth).toBe('Bearer direct-token')
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.5',
+          'anthropic-ratelimit-unified-7d-utilization': '0.5',
+        },
+      })
+    }
+    const r = await fetchQuota({
+      accessToken: 'direct-token',
+      fetchImpl: fakeFetch as typeof fetch,
+    })
+    expect(r.ok).toBe(true)
+  })
+
+  it('rejects when both accessToken and claudeConfigDir are passed', async () => {
+    const r = await fetchQuota({
+      accessToken: 'tok',
+      claudeConfigDir: '/tmp/whatever',
+    })
+    expect(r.ok).toBe(false)
+  })
+
+  it('rejects when neither is passed', async () => {
+    const r = await fetchQuota({})
+    expect(r.ok).toBe(false)
   })
 })
