@@ -70,9 +70,10 @@ describe('buildGithubContext', () => {
     expect(ctx.event).toBe('pull_request')
   })
 
-  it('extracts push fields', () => {
+  it('extracts push fields including first commit message as title', () => {
     const ctx = buildGithubContext('push', pushPayload)
     expect(ctx.repo).toBe('acme/myrepo')
+    expect(ctx.title).toBe('Update README')
     expect(ctx.action).toBe('')
     expect(ctx.event).toBe('push')
   })
