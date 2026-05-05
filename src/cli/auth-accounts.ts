@@ -67,6 +67,43 @@ export function registerAuthAccountSubcommands(
   registerRefreshAccounts(authParent, program);
 }
 
+/* ── helpers: per-agent primary-preserving fanout grouping ──────────── */
+
+/**
+ * Group a list of agents by the account label that should be fanned
+ * out to each — namely the FIRST entry in each agent's
+ * `auth.accounts:` list (the primary). Used by `auth enable` so a new
+ * account added as a fallback doesn't overwrite the existing
+ * primary's runtime fanout.
+ *
+ * Pure function: takes the post-mutation YAML text and the list of
+ * agents being enabled, returns a Map<primaryLabel, agents[]>. Caller
+ * iterates and calls `fanoutAccountToAgents(primaryLabel, agents)`
+ * once per group.
+ *
+ * Defensive fallback: if an agent's account list is somehow empty
+ * post-append (shouldn't happen — `appendAccountToAgent` always
+ * leaves at least the just-added label), the agent gets grouped
+ * under `defaultLabel` so the fanout still authenticates it.
+ *
+ * Exported for unit testing.
+ */
+export function groupAgentsByPrimaryAccount(
+  yamlText: string,
+  agents: ReadonlyArray<string>,
+  defaultLabel: string,
+): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const name of agents) {
+    const list = getAccountsForAgent(yamlText, name);
+    const primary = list[0] ?? defaultLabel;
+    const arr = out.get(primary) ?? [];
+    arr.push(name);
+    out.set(primary, arr);
+  }
+  return out;
+}
+
 /* ── helpers: `all` agent expansion ──────────────────────────────────── */
 
 /**
@@ -474,13 +511,58 @@ function registerEnable(authParent: Command, program: Command): void {
           writeFileSync(yamlPath, after);
         }
 
-        // Immediate fanout — don't wait for the next refresh tick to push
-        // credentials into the just-enabled agents' .claude/ dirs.
-        const targets = agents.map((name) => ({
-          name,
-          agentDir: resolve(agentsDir, name),
-        }));
-        const outcomes = fanoutAccountToAgents(label, targets);
+        // Per-agent immediate fanout — preserve the YAML-list primary
+        // as the active fanout. The first entry in `auth.accounts:` is
+        // the agent's preferred (primary) account; subsequent entries
+        // are failover targets. `appendAccountToAgent` always appends,
+        // so the existing primary stays first when this enable adds a
+        // fallback. We therefore fan whatever the post-mutation first
+        // entry is on each agent — which is:
+        //   - the existing primary (when this enable adds a fallback)
+        //   - the just-enabled account (when this is the agent's first
+        //     account, i.e. fresh-fleet bootstrap)
+        // Result: enabling a fallback no longer hot-swaps the runtime
+        // active credentials. Fixes the polish gap discovered while
+        // wiring `me@kenthompson.com.au` and `ken.thompson@outlook.com.au`
+        // alongside `pixsoul@gmail.com` — `enable` of either fallback
+        // was overwriting the active fanout with the new account's
+        // creds, leaking primary→fallback under the operator's feet.
+        //
+        // Group agents by the label that should be fanned to them so
+        // we still call `fanoutAccountToAgents` once per label rather
+        // than once per agent. See `groupAgentsByPrimaryAccount` for
+        // the pure-function explanation.
+        const groups = groupAgentsByPrimaryAccount(after, agents, label);
+        type FanTarget = { name: string; agentDir: string };
+        const fanoutByLabel = new Map<string, FanTarget[]>();
+        for (const [primary, names] of groups) {
+          fanoutByLabel.set(
+            primary,
+            names.map((name) => ({
+              name,
+              agentDir: resolve(agentsDir, name),
+            })),
+          );
+        }
+        const allOutcomes: Array<{
+          kind: string;
+          agent: string;
+          fannedLabel: string;
+          error?: string;
+        }> = [];
+        for (const [fanLabel, fanTargets] of fanoutByLabel) {
+          const out = fanoutAccountToAgents(fanLabel, fanTargets);
+          for (const o of out) {
+            allOutcomes.push({
+              kind: o.kind,
+              agent: o.agent,
+              fannedLabel: fanLabel,
+              ...((o as { error?: string }).error
+                ? { error: (o as { error?: string }).error }
+                : {}),
+            });
+          }
+        }
 
         console.log();
         if (changed.length === 0) {
@@ -492,24 +574,53 @@ function registerEnable(authParent: Command, program: Command): void {
             `${chalk.green("✓")} Enabled ${chalk.bold(label)} on: ${changed.join(", ")}`,
           );
         }
-        const fanned = outcomes
-          .filter((o) => o.kind === "fanned-out")
+        // Distinguish "now active" (just-enabled label became the
+        // agent's primary because there was nothing earlier in the
+        // list) from "added as fallback" (existing primary preserved,
+        // no runtime change). The two paths have different restart
+        // semantics — a fallback add doesn't need a restart at all.
+        const fannedAsPrimary = allOutcomes
+          .filter((o) => o.kind === "fanned-out" && o.fannedLabel === label)
           .map((o) => o.agent);
-        const fanFails = outcomes.filter((o) => o.kind === "fanout-failed");
-        if (fanned.length > 0) {
-          console.log(`  Credentials fanned out to: ${fanned.join(", ")}`);
+        const fannedPreservingPrimary = allOutcomes
+          .filter((o) => o.kind === "fanned-out" && o.fannedLabel !== label)
+          .map((o) => ({ agent: o.agent, primary: o.fannedLabel }));
+        const fanFails = allOutcomes.filter((o) => o.kind === "fanout-failed");
+        if (fannedAsPrimary.length > 0) {
+          console.log(
+            `  Credentials fanned out (now active) to: ${fannedAsPrimary.join(", ")}`,
+          );
         }
-        for (const f of fanFails) {
-          if (f.kind === "fanout-failed") {
+        if (fannedPreservingPrimary.length > 0) {
+          const byPrimary = new Map<string, string[]>();
+          for (const { agent, primary } of fannedPreservingPrimary) {
+            const arr = byPrimary.get(primary) ?? [];
+            arr.push(agent);
+            byPrimary.set(primary, arr);
+          }
+          for (const [primary, ags] of byPrimary) {
             console.log(
-              chalk.yellow(`  ⚠ Fanout failed for ${f.agent}: ${f.error}`),
+              `  Added as fallback (active stays ${chalk.bold(primary)}) on: ${ags.join(", ")}`,
             );
           }
         }
+        for (const f of fanFails) {
+          console.log(
+            chalk.yellow(`  ⚠ Fanout failed for ${f.agent}${f.error ? ": " + f.error : ""}`),
+          );
+        }
         console.log();
-        console.log(
-          `Next: 'switchroom agent restart ${agents.join(" ")}' to load the new credentials.`,
-        );
+        // Restart hint only meaningful when runtime creds actually
+        // changed. Pure-fallback adds don't need a restart.
+        if (fannedAsPrimary.length > 0) {
+          console.log(
+            `Next: 'switchroom agent restart ${fannedAsPrimary.join(" ")}' to load the new credentials.`,
+          );
+        } else if (changed.length > 0) {
+          console.log(
+            `No restart needed — ${chalk.bold(label)} is wired as a fallback; runtime active stays the same.`,
+          );
+        }
         console.log();
       }),
     );
