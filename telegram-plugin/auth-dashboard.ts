@@ -214,6 +214,12 @@ export type CallbackAction =
   // agent + label ≤ 64).
   | { kind: "account-promote"; agent: string; label: string }
   | { kind: "confirm-account-promote"; agent: string; label: string }
+  // v3c: switch-primary picker. Replaces the per-fallback `⤴ Promote`
+  // buttons that flooded the main board with a single `🔀 Switch
+  // primary →` button. Tapping it edits the keyboard in-place to a
+  // picker view (one row per fallback → tap → confirm-account-promote).
+  // Cancel returns to the main dashboard via a refresh.
+  | { kind: "switch-primary-view"; agent: string }
   | { kind: "noop" };
 
 const CALLBACK_PREFIX = "auth:";
@@ -265,6 +271,8 @@ export function encodeCallbackData(action: CallbackAction): string {
       return `${CALLBACK_PREFIX}apr:${action.agent}:${action.label}`;
     case "confirm-account-promote":
       return `${CALLBACK_PREFIX}cpr:${action.agent}:${action.label}`;
+    case "switch-primary-view":
+      return `${CALLBACK_PREFIX}spv:${action.agent}`;
     case "noop":
       return `${CALLBACK_PREFIX}noop`;
   }
@@ -308,6 +316,10 @@ export function parseCallbackData(data: string): CallbackAction {
   if (verb === "sf") {
     if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
     return { kind: "share-fleet", agent };
+  }
+  if (verb === "spv") {
+    if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
+    return { kind: "switch-primary-view", agent };
   }
   if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
   const slot = third;
@@ -608,57 +620,28 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   const kb = new InlineKeyboard();
   const activeSlot = state.slots.find((s) => s.active);
 
-  // v3a: Row 1+ — account rows. Each account is a tappable button that
-  // drills into the per-account sub-view. No inline ✓/○ toggles on the
-  // main board — the toggles are an implementation detail; the sub-view
-  // surface is the right place for per-account actions.
-  // v3b: each non-active account also gets a `⤴ Promote` button on the
-  // row beneath it. Active rows are unchanged (already at primary —
-  // promoting them is a no-op). The promote button uses the same
-  // 64-byte render-time guard as the drill-down button.
+  // v3c: single `🔀 Switch primary →` entry replaces the v3b
+  // per-fallback `⤴ Promote` buttons + per-account drill-downs that
+  // flooded the main board. The text already names every account
+  // (`▶ active` + indented `↳ fallback` rows), so the keyboard's job
+  // is *actions*, not navigation. One button, one tap → picker.
+  //
+  // Visibility rules:
+  //   - hidden when there are no fallbacks (single account = nothing
+  //     to switch to)
+  //   - hidden when no account claims active (older CLI without
+  //     primaryForAgents — picker target would be ambiguous)
+  //   - shown otherwise
   if (state.accounts != null && state.accounts.length > 0) {
     const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
-    const haveActiveSignal = visible.some(
-      (a) => a.activeForThisAgent === true,
-    );
-    for (const acc of visible) {
-      const action: CallbackAction = { kind: "account-view", agent: state.agent, label: acc.label };
-      const encoded = encodeCallbackData(action);
-      // Render-time guard: if the synthesised payload exceeds the
-      // 64-byte cap (pathological agent + label lengths), fall back
-      // to a noop button labelled with the raw account name so the
-      // row is visible-but-inert. Operator can fall back to the CLI.
-      const labelPrefix = acc.activeForThisAgent ? "▶ " : "";
-      if (Buffer.byteLength(encoded, "utf8") > CALLBACK_BUDGET_BYTES) {
-        kb.text(
-          `⚠ ${truncateLabel(acc.label)} (use CLI)`,
-          encodeCallbackData({ kind: "noop" }),
-        );
-      } else {
-        kb.text(`${labelPrefix}${acc.label}${healthSuffix(acc.health)}`, encoded);
-      }
+    const active = visible.find((a) => a.activeForThisAgent === true);
+    const fallbacks = visible.filter((a) => a !== active);
+    if (active != null && fallbacks.length > 0) {
+      kb.text(
+        "🔀 Switch primary →",
+        encodeCallbackData({ kind: "switch-primary-view", agent: state.agent }),
+      );
       kb.row();
-      // v3b promote row — only meaningful when we know which account is
-      // active (so we can suppress the button on it). Without that
-      // signal (older CLI), we skip every promote button rather than
-      // ambiguously offer "promote" on every row.
-      if (haveActiveSignal && !acc.activeForThisAgent) {
-        const promoteAction: CallbackAction = {
-          kind: "account-promote",
-          agent: state.agent,
-          label: acc.label,
-        };
-        const promoteEncoded = encodeCallbackData(promoteAction);
-        if (Buffer.byteLength(promoteEncoded, "utf8") > CALLBACK_BUDGET_BYTES) {
-          kb.text(
-            `⤴ Promote ${truncateLabel(acc.label)} (use CLI)`,
-            encodeCallbackData({ kind: "noop" }),
-          );
-        } else {
-          kb.text(`⤴ Promote ${acc.label}`, promoteEncoded);
-        }
-        kb.row();
-      }
     }
     if (state.accountsTruncated) {
       kb.text(
@@ -876,6 +859,54 @@ export function buildRemoveConfirmKeyboard(agent: string, slot: string): InlineK
     .text(`⚠️ Confirm remove: ${slot}`, encodeCallbackData({ kind: "confirm-rm", agent, slot }))
     .row()
     .text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
+}
+
+/**
+ * Build the switch-primary picker keyboard. One row per non-active
+ * account (the candidates the user might promote). Each row is a
+ * direct `confirm-account-promote` — single tap fires the change, no
+ * second confirm screen, since the picker itself is already an
+ * intentional drill-down ("I tapped Switch primary, then I tapped
+ * the new primary").
+ *
+ * Why skip the two-stage confirm here when enable/disable have one:
+ *   - The picker IS the confirmation surface. Showing a second
+ *     "Confirm promote: foo?" screen on top of "tap the one you
+ *     want" is mobile UX cruft.
+ *   - The action is reversible — operators can re-promote at will.
+ *
+ * Cancel returns to the main dashboard via a refresh callback.
+ *
+ * Signature mirrors `buildAccountConfirmKeyboard` for consistency:
+ * `agent` first, then the picker-specific data (the candidates).
+ */
+export function buildSwitchPrimaryKeyboard(
+  agent: string,
+  candidates: ReadonlyArray<{ label: string; health: AccountHealth }>,
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const cand of candidates) {
+    const action: CallbackAction = {
+      kind: "confirm-account-promote",
+      agent,
+      label: cand.label,
+    };
+    const encoded = encodeCallbackData(action);
+    if (Buffer.byteLength(encoded, "utf8") > CALLBACK_BUDGET_BYTES) {
+      // Pathological agent + label combo. Render the row inert so the
+      // operator falls back to the CLI rather than us silently
+      // dropping the candidate.
+      kb.text(
+        `⚠ ${truncateLabel(cand.label)} (use CLI)`,
+        encodeCallbackData({ kind: "noop" }),
+      );
+    } else {
+      kb.text(`⤴ ${cand.label}${healthSuffix(cand.health)}`, encoded);
+    }
+    kb.row();
+  }
+  kb.text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
+  return kb;
 }
 
 /**

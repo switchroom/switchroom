@@ -87,6 +87,7 @@ import {
   buildRemoveConfirmKeyboard,
   buildAccountConfirmKeyboard,
   buildAccountPromoteConfirmKeyboard,
+  buildSwitchPrimaryKeyboard,
   buildAccountSubViewText,
   buildAccountSubViewKeyboard,
   buildAccountRemoveConfirmKeyboard,
@@ -6577,6 +6578,34 @@ async function sendAuthDashboard(
   await switchroomReply(ctx, text, { html: true, reply_markup: keyboard })
 }
 
+/**
+ * Drop the cached per-account quota and immediately schedule a
+ * background re-probe for every known account. Used after auth-mutating
+ * dashboard taps (enable/disable/promote/share/account-rm-confirm) so
+ * the next `/auth` render shows fresh quota rather than a 30s-stale
+ * snapshot from before the change.
+ *
+ * Fire-and-forget: probes complete in ~hundreds of ms; the user's
+ * follow-up dashboard render reads whatever's cached at that moment,
+ * usually the freshly-warmed value. Errors (network, rate limit) are
+ * absorbed by `prefetchAccountQuotaIfStale`.
+ */
+function clearAndRewarmAccountQuotas(): void {
+  clearAccountQuotaCache()
+  try {
+    const accounts = switchroomExecJson<Array<{ label: string }>>([
+      'auth', 'account', 'list', '--json',
+    ])
+    if (Array.isArray(accounts)) {
+      for (const a of accounts) {
+        if (typeof a?.label === 'string') prefetchAccountQuotaIfStale(a.label)
+      }
+    }
+  } catch {
+    /* clear-only fallback — next dashboard render's lazy prefetch will warm */
+  }
+}
+
 function fetchDashboardState(agent: string): DashboardState | null {
   // Slots come from switchroom auth list --json.
   let slots: DashboardSlot[] = []
@@ -7643,7 +7672,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // Account roster changed — drop cached quota so the next
       // dashboard render kicks a fresh probe instead of showing
       // stale numbers (or a zero row for a label that just got added).
-      clearAccountQuotaCache()
+      clearAndRewarmAccountQuotas()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7660,20 +7689,46 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // to drain manually); the dashboard tap is implicit "I'm done with
       // this account on this agent now," so we restart on their behalf.
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAccountQuotaCache()
+      clearAndRewarmAccountQuotas()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
     case 'account-promote': {
       // Two-stage confirm — same UX as enable/disable, just a different
       // verb on the confirm row's callback. The CLI verb does the
-      // YAML reorder + fanout.
+      // YAML reorder + fanout. Reachable via the legacy v3b per-row
+      // `⤴ Promote` button (callback verb `apr`) — kept for any
+      // already-pinned messages that still have it.
       await ctx.answerCallbackQuery({ text: `Confirm promote ${action.label}?` }).catch(() => {})
       try {
         await ctx.editMessageReplyMarkup({
           reply_markup: buildAccountPromoteConfirmKeyboard(action.agent, action.label),
         })
       } catch { /* ignore */ }
+      return
+    }
+    case 'switch-primary-view': {
+      // v3c picker: open a sub-keyboard that lists every non-active
+      // account as a one-tap promote target. Direct
+      // `confirm-account-promote` callbacks (no second confirm) — the
+      // picker IS the confirmation surface.
+      await ctx.answerCallbackQuery().catch(() => {})
+      const state = fetchDashboardState(action.agent)
+      const candidates = (state?.accounts ?? [])
+        .filter((a) => a.activeForThisAgent !== true)
+        .map((a) => ({ label: a.label, health: a.health }))
+      if (candidates.length === 0) {
+        // No fallbacks to switch to — return to the main board with a
+        // toast explaining why.
+        await ctx.answerCallbackQuery({ text: 'No fallback accounts to switch to.' }).catch(() => {})
+        await sendAuthDashboard(ctx, action.agent, { edit: true })
+        return
+      }
+      try {
+        await ctx.editMessageReplyMarkup({
+          reply_markup: buildSwitchPrimaryKeyboard(action.agent, candidates),
+        })
+      } catch { /* ignore MESSAGE_NOT_MODIFIED */ }
       return
     }
     case 'confirm-account-promote': {
@@ -7687,7 +7742,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // Promotion changes the active credential — must restart so
       // claude reloads the new primary's tokens.
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAccountQuotaCache()
+      clearAndRewarmAccountQuotas()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7703,7 +7758,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         `auth share default --from-agent ${action.agent}`,
       )
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAccountQuotaCache()
+      clearAndRewarmAccountQuotas()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7754,7 +7809,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // Removed account label is gone — drop its cache entry (and any
       // siblings, since `enabledHere` shifts when an agent's account
       // list changes).
-      clearAccountQuotaCache()
+      clearAndRewarmAccountQuotas()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -9603,6 +9658,36 @@ void (async () => {
         } catch (err) {
           process.stderr.write(
             `telegram gateway: boot-probe of available_reactions failed (continuing): ${(err as Error).message}\n`,
+          )
+        }
+
+        // v0.6.10 boot-warm: kick off a background per-account quota
+        // probe for every account in the new auth framework. Without
+        // this, the FIRST `/auth` after a restart shows no mini-bars
+        // because the in-process cache is cold — the dashboard's lazy
+        // prefetch fires the probe but the operator's already-rendered
+        // message has empty quota rows. Pre-warming fills the cache
+        // before the user can tap.
+        //
+        // Fire-and-forget per label. Failures (rate limit, network,
+        // expired token) leave the cache unset so the dashboard's lazy
+        // path retries on the next render — same safety-net contract
+        // as available_reactions above.
+        try {
+          const accountsAtBoot = switchroomExecJson<Array<{ label: string }>>([
+            'auth', 'account', 'list', '--json',
+          ])
+          if (Array.isArray(accountsAtBoot) && accountsAtBoot.length > 0) {
+            for (const a of accountsAtBoot) {
+              if (typeof a?.label === 'string') prefetchAccountQuotaIfStale(a.label)
+            }
+            process.stderr.write(
+              `telegram gateway: boot-warmed quota cache for ${accountsAtBoot.length} account(s)\n`,
+            )
+          }
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: boot-warm of account quota cache failed (continuing): ${(err as Error).message}\n`,
           )
         }
 

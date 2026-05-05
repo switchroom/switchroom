@@ -242,12 +242,15 @@ describe("v3b: buildDashboardText — active-row marking", () => {
   });
 });
 
-describe("v3b: buildDashboardKeyboard — promote button row", () => {
+describe("v3c: buildDashboardKeyboard — single Switch primary button", () => {
+  // v3c replaces the v3b per-fallback `⤴ Promote` flood with a single
+  // `🔀 Switch primary →` entry that opens a picker sub-keyboard.
+  // Pin the visibility rules + the picker behaviour so a refactor can't
+  // silently re-surface the v3b button explosion.
   const renderRows = (
     accounts: AccountSummary[],
   ): Array<Array<{ text: string; data: string }>> => {
     const kb = buildDashboardKeyboard({ ...baseState, accounts });
-    // grammY's InlineKeyboard exposes its internal layout via `inline_keyboard`.
     const raw = (kb as unknown as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> })
       .inline_keyboard;
     return raw.map((row) =>
@@ -255,64 +258,135 @@ describe("v3b: buildDashboardKeyboard — promote button row", () => {
     );
   };
 
-  it("emits a `⤴ Promote <label>` button under each non-active account", () => {
+  it("emits exactly ONE `🔀 Switch primary →` button when fallbacks exist", () => {
     const rows = renderRows([
       acc("pixsoul@gmail.com", { activeForThisAgent: true }),
       acc("me@kenthompson.com.au"),
       acc("ken.thompson@outlook.com.au"),
     ]);
-    const promoteRows = rows.flat().filter((b) => b.text.startsWith("⤴ Promote"));
-    expect(promoteRows.length).toBe(2); // me@ + ken@
-    const labels = promoteRows.map((b) => b.text.replace("⤴ Promote ", ""));
-    expect(labels.sort()).toEqual(
-      ["ken.thompson@outlook.com.au", "me@kenthompson.com.au"].sort(),
-    );
-    // Promote callbacks dispatch to account-promote (verb apr).
-    for (const b of promoteRows) {
-      expect(b.data.startsWith("auth:apr:clerk:")).toBe(true);
-    }
+    const switchButtons = rows
+      .flat()
+      .filter((b) => b.text.includes("Switch primary"));
+    expect(switchButtons.length).toBe(1);
+    expect(switchButtons[0].data).toBe("auth:spv:clerk");
   });
 
-  it("does NOT emit a promote button for the active row", () => {
+  it("hides the Switch primary button when no fallback exists", () => {
+    // Only one account, and it's already active → nothing to switch to.
     const rows = renderRows([
       acc("pixsoul@gmail.com", { activeForThisAgent: true }),
-      acc("me@kenthompson.com.au"),
     ]);
-    const promoteRows = rows.flat().filter((b) => b.text.startsWith("⤴ Promote"));
-    // Only one — the fallback. The active row gets none.
-    expect(promoteRows.length).toBe(1);
-    expect(promoteRows[0].text).toBe("⤴ Promote me@kenthompson.com.au");
+    const switchButtons = rows
+      .flat()
+      .filter((b) => b.text.includes("Switch primary"));
+    expect(switchButtons.length).toBe(0);
   });
 
-  it("emits NO promote buttons when no account claims active (older CLI)", () => {
-    // Without a distinguished active row we can't tell which one to
-    // suppress, so we suppress all of them rather than offer ambiguous
-    // "promote" actions on every row.
+  it("hides the Switch primary button when no account claims active", () => {
+    // Older CLI without primaryForAgents → activeForThisAgent unset
+    // everywhere → can't tell which account to keep, so no picker.
     const rows = renderRows([
       acc("pixsoul@gmail.com"),
       acc("me@kenthompson.com.au"),
     ]);
-    const promoteRows = rows.flat().filter((b) => b.text.startsWith("⤴ Promote"));
+    const switchButtons = rows
+      .flat()
+      .filter((b) => b.text.includes("Switch primary"));
+    expect(switchButtons.length).toBe(0);
+  });
+
+  it("does NOT emit per-fallback ⤴ Promote buttons on the main board", () => {
+    // The whole point of v3c — kill the button flood.
+    const rows = renderRows([
+      acc("pixsoul@gmail.com", { activeForThisAgent: true }),
+      acc("me@kenthompson.com.au"),
+      acc("ken.thompson@outlook.com.au"),
+    ]);
+    const promoteRows = rows.flat().filter((b) => b.text.includes("⤴ Promote"));
     expect(promoteRows.length).toBe(0);
   });
 
-  it("renders a noop fallback when the promote payload would exceed 64 bytes", () => {
-    // Pathological agent + label lengths. Guard renders the row inert
-    // rather than letting Telegram reject the message.
-    const longAgent = "a".repeat(50);
-    const longLabel = "b".repeat(50);
-    const kb = buildDashboardKeyboard({
-      ...baseState,
-      agent: longAgent,
-      accounts: [
-        acc(longLabel, { activeForThisAgent: false }),
-        acc("pixsoul", { activeForThisAgent: true }),
-      ],
+  it("does NOT emit per-account drilldown buttons on the main board", () => {
+    // v3c also drops the per-account `account-view` drilldown buttons
+    // (av verb) — the text already names every account, the sub-views
+    // are reachable via Switch primary / Reauth / Add buttons.
+    const rows = renderRows([
+      acc("pixsoul@gmail.com", { activeForThisAgent: true }),
+      acc("me@kenthompson.com.au"),
+    ]);
+    const drilldownRows = rows
+      .flat()
+      .filter((b) => b.data.startsWith("auth:av:"));
+    expect(drilldownRows.length).toBe(0);
+  });
+});
+
+describe("v3c: buildSwitchPrimaryKeyboard — picker", () => {
+  it("emits one row per candidate, each fires confirm-account-promote", async () => {
+    const { buildSwitchPrimaryKeyboard } = await import("../auth-dashboard.js");
+    const kb = buildSwitchPrimaryKeyboard("clerk", [
+      { label: "me@kenthompson.com.au", health: "healthy" },
+      { label: "ken.thompson@outlook.com.au", health: "healthy" },
+    ]);
+    const raw = (kb as unknown as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard;
+    // 2 candidate rows + 1 cancel row.
+    expect(raw.length).toBe(3);
+    expect(raw[0][0].callback_data).toBe(
+      "auth:cpr:clerk:me@kenthompson.com.au",
+    );
+    expect(raw[1][0].callback_data).toBe(
+      "auth:cpr:clerk:ken.thompson@outlook.com.au",
+    );
+    // Cancel returns to the main board via refresh.
+    expect(raw[2][0].text).toContain("Cancel");
+    expect(raw[2][0].callback_data).toBe("auth:refresh:clerk");
+  });
+
+  it("renders a noop fallback when a candidate's payload exceeds 64 bytes", async () => {
+    const { buildSwitchPrimaryKeyboard } = await import("../auth-dashboard.js");
+    const kb = buildSwitchPrimaryKeyboard("a".repeat(50), [
+      { label: "b".repeat(50), health: "healthy" },
+    ]);
+    const raw = (kb as unknown as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard;
+    const guarded = raw[0][0];
+    expect(guarded.text).toContain("(use CLI)");
+    expect(guarded.callback_data).toBe("auth:noop");
+  });
+
+  it("appends health suffix to each candidate row", async () => {
+    const { buildSwitchPrimaryKeyboard } = await import("../auth-dashboard.js");
+    const kb = buildSwitchPrimaryKeyboard("clerk", [
+      { label: "expired@x.com", health: "expired" },
+      { label: "good@x.com", health: "healthy" },
+    ]);
+    const raw = (kb as unknown as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    }).inline_keyboard;
+    expect(raw[0][0].text).toContain("⌛");
+    expect(raw[1][0].text).not.toContain("⌛");
+    expect(raw[1][0].text).not.toContain("⚠");
+  });
+});
+
+describe("v3c: switch-primary-view callback round-trip", () => {
+  it("encodes and decodes (verb spv)", () => {
+    const encoded = encodeCallbackData({
+      kind: "switch-primary-view",
+      agent: "clerk",
     });
-    const raw = (kb as unknown as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }).inline_keyboard;
-    const guarded = raw.flat().find((b) => b.text.includes("⤴ Promote") && b.text.includes("(use CLI)"));
-    expect(guarded).toBeDefined();
-    expect(guarded?.callback_data).toBe("auth:noop");
+    expect(encoded).toBe("auth:spv:clerk");
+    expect(parseCallbackData(encoded)).toEqual({
+      kind: "switch-primary-view",
+      agent: "clerk",
+    });
+  });
+
+  it("rejects unsafe agent names", () => {
+    expect(parseCallbackData("auth:spv:bad/agent")).toEqual({ kind: "noop" });
   });
 });
 
