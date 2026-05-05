@@ -316,6 +316,59 @@ describe("v3b: buildDashboardKeyboard — promote button row", () => {
   });
 });
 
+describe("v3b: slot row uses account label, not slot ID, when active is known", () => {
+  // Real-world wedge: the slot ID ("default") is a meaningless
+  // implementation detail for operators who reason in account labels.
+  // Pin the substitution so a refactor can't silently re-surface
+  // "default" in the operator-facing slot row.
+  const slotRowState = (
+    activeAccountLabel: string | null,
+  ): DashboardState => ({
+    ...baseState,
+    slots: [
+      {
+        slot: "default",
+        active: true,
+        health: "active",
+      },
+    ],
+    accounts:
+      activeAccountLabel != null
+        ? [
+            acc(activeAccountLabel, { activeForThisAgent: true }),
+            acc("ken.thompson@outlook.com.au"),
+          ]
+        : [acc("ken.thompson@outlook.com.au")],
+  });
+
+  it("substitutes the account label for the slot ID in the active slot row", () => {
+    const text = buildDashboardText(slotRowState("pixsoul@gmail.com"));
+    // Slots section shows the email wrapped in <code>, NOT "default".
+    expect(text).toContain("<code>pixsoul@gmail.com</code> (active)");
+    // The literal slot ID "default" should NOT appear in the rendered
+    // slot section. (We do still need it as the data identity inside
+    // the gateway, but it's not for the operator's eyes.)
+    const slotsSection = text.split("Slots (")[1] ?? "";
+    expect(slotsSection).not.toContain("<code>default</code>");
+  });
+
+  it("falls back to the slot ID when no account claims active (older CLI)", () => {
+    const text = buildDashboardText(slotRowState(null));
+    // Without an active signal we can't tell which label to substitute,
+    // so the legacy slot ID is preserved.
+    expect(text).toContain("<code>default</code> (active)");
+  });
+
+  it("uses the account label in the Pool line too", () => {
+    const text = buildDashboardText(slotRowState("pixsoul@gmail.com"));
+    expect(text).toContain("Pool:");
+    expect(text).toContain("pixsoul@gmail.com");
+    // Pool line specifically must not still say "slot default is active"
+    // — the user filed this complaint by name.
+    expect(text).not.toMatch(/Pool:[^\n]*default/);
+  });
+});
+
 describe("v3b: buildAccountPromoteConfirmKeyboard", () => {
   it("emits a confirm row whose callback dispatches confirm-account-promote", () => {
     const kb = buildAccountPromoteConfirmKeyboard("clerk", "pixsoul@gmail.com");

@@ -438,6 +438,16 @@ export function buildDashboardText(state: DashboardState): string {
     lines.push("");
   }
 
+  // Slot ID lookup: under the new account model, slot IDs (`default`,
+  // etc.) are an internal mount-point identifier — not what the
+  // operator authorized. When we know which account is the post-fanout
+  // active for THIS agent, surface its label in place of the slot ID
+  // in the slot row + Pool line. The slot ID itself ("default" or
+  // whatever was synthesised) carries zero information for the
+  // operator; the account label is the identity they recognize.
+  const activeAccountLabel =
+    state.accounts?.find((a) => a.activeForThisAgent === true)?.label ?? null;
+
   if (state.slots.length === 0) {
     lines.push("<i>No account slots. Tap [➕ Add slot] to attach a subscription.</i>");
   } else {
@@ -446,8 +456,16 @@ export function buildDashboardText(state: DashboardState): string {
       const marker = slot.active ? "●" : "○";
       const badge = healthBadge(slot.health);
       const label = healthLabel(slot.health);
+      // Display name: account label for the active slot when we know
+      // it; otherwise the raw slot ID. Non-active slots also use the
+      // raw ID — there's no account-label to substitute since we only
+      // know the ACTIVE account's identity from the cascade head.
+      const displayName =
+        slot.active && activeAccountLabel != null
+          ? activeAccountLabel
+          : slot.slot;
       lines.push(
-        `  ${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
+        `  ${marker} <code>${escapeHtml(displayName)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
       );
       const detail = slotDetailLine(slot);
       if (detail) lines.push(`    └ ${detail}`);
@@ -455,11 +473,13 @@ export function buildDashboardText(state: DashboardState): string {
   }
 
   // Pool / fallback summary — show when accounts exist, so the user
-  // understands how slots and accounts relate.
+  // understands how slots and accounts relate. Pool line uses the
+  // account label too when we know it (parity with the slot row).
   if (state.accounts != null && state.accounts.length > 0 && state.slots.length > 0) {
     const activeSlot = state.slots.find((s) => s.active);
     if (activeSlot) {
-      lines.push(`  Pool: slot <code>${escapeHtml(activeSlot.slot)}</code> is active`);
+      const poolDisplayName = activeAccountLabel ?? activeSlot.slot;
+      lines.push(`  Pool: <code>${escapeHtml(poolDisplayName)}</code> is active`);
     }
   }
 
