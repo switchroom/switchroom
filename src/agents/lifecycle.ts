@@ -485,6 +485,14 @@ export function resolveAgentPid(unitName: string, useTmux: boolean): number | nu
       nonWrapper.sort((a, b) => b.rss - a.rss);
       return nonWrapper[0].pid;
     }
+    // We enumerated candidates but every one was a wrapper (tmux/expect/
+    // script/bash/sh) — no claude pid yet. Emit a single-line breadcrumb
+    // so operators can correlate "PID looks wrong" with this state via
+    // journalctl. We DO NOT log when the cgroup walk found zero processes
+    // (the legitimate boot-window race) — that path returns earlier.
+    process.stderr.write(
+      `[switchroom] resolveAgentPid: cgroup walk found ${candidates.length} processes, no claude match — falling back to MainPID for unit=${unitName}\n`,
+    );
     return mainPidFromSystemd();
   } catch {
     return mainPidFromSystemd();

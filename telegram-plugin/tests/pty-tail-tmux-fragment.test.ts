@@ -11,6 +11,22 @@
  * Fixture: small synthesized Ink-style fragment containing a
  * `● switchroom-telegram - reply (MCP)(... text: "...")` marker.
  * Kept ≤2KB.
+ *
+ * Recapture procedure (for future maintainers):
+ *
+ *   To regenerate this fixture from a live tmux-supervised agent:
+ *     1. tail -c 250 "$AGENT_DIR/service.log" \
+ *          > telegram-plugin/tests/fixtures/pty-tail-tmux-fragment.bin
+ *        (adjust byte count as needed; aim for the smallest tail that
+ *        still contains a complete `● switchroom-telegram - reply (MCP)`
+ *        block including the `text: "..."` argument).
+ *     2. Run this test; it should still parse the marker.
+ *
+ *   If the parse breaks after Ink rendering changes upstream (Claude
+ *   updates how MCP tool calls are rendered, terminal width changes,
+ *   etc.), recapture from a known-good agent and confirm the
+ *   `V1Extractor` still finds `● switchroom-telegram - reply (MCP)`
+ *   in the rendered terminal output.
  */
 
 import { describe, expect, it } from 'vitest'
