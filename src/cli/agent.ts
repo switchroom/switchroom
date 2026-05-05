@@ -1296,6 +1296,56 @@ export function registerAgentCommand(program: Command): void {
       })
     );
 
+  // switchroom agent send <name> <slashCommand>
+  // #725 Phase 2 — inject a Claude Code REPL slash command into the agent's
+  // tmux pane and print the captured output. Allowlist-only (see inject.ts).
+  agent
+    .command("send <name> <slashCommand>")
+    .description("Inject a Claude Code slash command into the agent's tmux pane (requires experimental.tmux_supervisor)")
+    .option("--timeout <ms>", "Hard timeout in milliseconds (default 5000)", "5000")
+    .option("--settle <ms>", "Pane-settle window in milliseconds (default 2000)", "2000")
+    .action(
+      withConfigError(async (name: string, slashCommand: string, opts: { timeout: string; settle: string }) => {
+        const config = getConfig(program);
+        if (!config.agents[name]) {
+          console.error(chalk.red(`Agent "${name}" is not defined in switchroom.yaml`));
+          process.exit(1);
+        }
+        const resolved = resolveAgentConfig(config.defaults, config.profiles, config.agents[name]);
+        if (resolved.experimental?.tmux_supervisor !== true) {
+          console.error(
+            chalk.red(
+              `Agent "${name}" is not running under the tmux supervisor.\n` +
+                `Set experimental.tmux_supervisor: true in switchroom.yaml and reconcile/restart the agent.`,
+            ),
+          );
+          process.exit(1);
+        }
+        // Lazy import so the CLI doesn't pay for it on every invocation.
+        const { injectSlashCommand, InjectError } = await import("../agents/inject.js");
+        try {
+          const { output, truncated } = await injectSlashCommand(name, slashCommand, {
+            timeoutMs: parseInt(opts.timeout, 10) || 5000,
+            settleMs: parseInt(opts.settle, 10) || 2000,
+          });
+          if (output.trim().length === 0) {
+            console.log(chalk.dim("(no new output captured)"));
+          } else {
+            console.log(output);
+          }
+          if (truncated) {
+            console.log(chalk.yellow("\n... (output truncated to 3000 bytes)"));
+          }
+        } catch (err) {
+          if (err instanceof InjectError) {
+            console.error(chalk.red(`inject failed (${err.code}): ${err.message}`));
+            process.exit(2);
+          }
+          throw err;
+        }
+      }),
+    );
+
   // switchroom agent logs <name>
   agent
     .command("logs <name>")

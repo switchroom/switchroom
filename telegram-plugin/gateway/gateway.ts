@@ -208,6 +208,8 @@ import {
 } from '../auto-fallback.js'
 import { markSlotQuotaExhausted, DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { fallbackToNextSlot, currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
+import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/inject.js'
+import { handleInjectCommand } from './inject-handler.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { dispatchFallbackNotification } from '../auto-fallback-dispatcher.js'
@@ -5935,6 +5937,21 @@ bot.command('agents', async ctx => {
       lines.push(`    <i>${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}</i>`)
     }
     return lines.join('\n')
+  })
+})
+
+// /inject — #725 Phase 2 slash-command bridge. Implementation in
+// inject-handler.ts so it's unit-testable without booting the bot.
+bot.command('inject', async ctx => {
+  await handleInjectCommand(ctx, {
+    isAuthorized: isAuthorizedSender,
+    inject: injectSlashCommandImpl,
+    reply: switchroomReply,
+    getAgentName: getMyAgentName,
+    getArgs: getCommandArgs,
+    escapeHtml: escapeHtmlForTg,
+    preBlock,
+    formatOutput: formatSwitchroomOutput,
   })
 })
 

@@ -259,6 +259,10 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "version", description: "Show versions + running agent health" },
   // Quick diagnostic
   { command: "logs", description: "Show recent agent logs" },
+  // #725 Phase 2 — inject a Claude Code REPL slash command into the agent's
+  // tmux pane (allowlisted: /cost, /status, /model, /clear, /compact,
+  // /memory, /hooks). Requires experimental.tmux_supervisor on the agent.
+  { command: "inject", description: "Inject a Claude Code slash command (e.g. /cost)" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
   // Vault — secrets + capability grants. /vault is a top-level command
