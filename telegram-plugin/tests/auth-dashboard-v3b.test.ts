@@ -316,11 +316,13 @@ describe("v3b: buildDashboardKeyboard — promote button row", () => {
   });
 });
 
-describe("v3b: slot row uses account label, not slot ID, when active is known", () => {
-  // Real-world wedge: the slot ID ("default") is a meaningless
-  // implementation detail for operators who reason in account labels.
-  // Pin the substitution so a refactor can't silently re-surface
-  // "default" in the operator-facing slot row.
+describe("v3b: Slots + Pool sections hide when active-account signal is present", () => {
+  // The slot row was rendering `● pixsoul@gmail.com (active) ✓ healthy`
+  // when the active label was known — a 1:1 duplicate of the
+  // `▶ pixsoul@gmail.com  ✓` active-account row above. Same for the
+  // `Pool: pixsoul@gmail.com is active` line. So we hide both sections
+  // entirely under the new account model. Pin the visibility rules so
+  // a refactor can't silently re-surface the duplication.
   const slotRowState = (
     activeAccountLabel: string | null,
   ): DashboardState => ({
@@ -341,31 +343,37 @@ describe("v3b: slot row uses account label, not slot ID, when active is known", 
         : [acc("ken.thompson@outlook.com.au")],
   });
 
-  it("substitutes the account label for the slot ID in the active slot row", () => {
+  it("hides the Slots section entirely when an active-account signal is present", () => {
     const text = buildDashboardText(slotRowState("pixsoul@gmail.com"));
-    // Slots section shows the email wrapped in <code>, NOT "default".
-    expect(text).toContain("<code>pixsoul@gmail.com</code> (active)");
-    // The literal slot ID "default" should NOT appear in the rendered
-    // slot section. (We do still need it as the data identity inside
-    // the gateway, but it's not for the operator's eyes.)
-    const slotsSection = text.split("Slots (")[1] ?? "";
-    expect(slotsSection).not.toContain("<code>default</code>");
-  });
-
-  it("falls back to the slot ID when no account claims active (older CLI)", () => {
-    const text = buildDashboardText(slotRowState(null));
-    // Without an active signal we can't tell which label to substitute,
-    // so the legacy slot ID is preserved.
-    expect(text).toContain("<code>default</code> (active)");
-  });
-
-  it("uses the account label in the Pool line too", () => {
-    const text = buildDashboardText(slotRowState("pixsoul@gmail.com"));
-    expect(text).toContain("Pool:");
+    // No "Slots (N)" header, no "default" leaking out, no Pool line.
+    expect(text).not.toContain("Slots (");
+    expect(text).not.toContain("default");
+    expect(text).not.toMatch(/Pool:/);
+    // The ▶ active row is the single source of truth for what's active.
+    expect(text).toContain("▶");
     expect(text).toContain("pixsoul@gmail.com");
-    // Pool line specifically must not still say "slot default is active"
-    // — the user filed this complaint by name.
-    expect(text).not.toMatch(/Pool:[^\n]*default/);
+  });
+
+  it("keeps the legacy Slots + Pool layout when accounts have no active signal", () => {
+    // Older CLIs don't emit primaryForAgents → no activeForThisAgent
+    // is set on any account → slots section is the only signal of
+    // "what's active." Preserve it for graceful degradation.
+    const text = buildDashboardText(slotRowState(null));
+    expect(text).toContain("Slots (");
+    expect(text).toContain("<code>default</code> (active)");
+    expect(text).toContain("Pool:");
+  });
+
+  it("keeps the Slots section visible when no accounts exist (fresh-fleet bootstrap)", () => {
+    // Bootstrap path: no accounts yet, the operator's only handle is
+    // the slot — they need [➕ Add slot] / [🔄 Reauth] to work.
+    const text = buildDashboardText({
+      ...baseState,
+      slots: [{ slot: "default", active: true, health: "active" }],
+      accounts: [],
+    });
+    expect(text).toContain("Slots (");
+    expect(text).toContain("default");
   });
 });
 

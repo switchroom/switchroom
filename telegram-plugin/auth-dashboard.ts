@@ -441,45 +441,48 @@ export function buildDashboardText(state: DashboardState): string {
   // Slot ID lookup: under the new account model, slot IDs (`default`,
   // etc.) are an internal mount-point identifier — not what the
   // operator authorized. When we know which account is the post-fanout
-  // active for THIS agent, surface its label in place of the slot ID
-  // in the slot row + Pool line. The slot ID itself ("default" or
-  // whatever was synthesised) carries zero information for the
-  // operator; the account label is the identity they recognize.
+  // active for THIS agent, the active slot row would render as
+  // `● pixsoul@gmail.com (active) ✓ healthy` and the Pool line would
+  // say `Pool: pixsoul@gmail.com is active` — both 1:1 duplicates of
+  // the ▶ active-account row above. So we hide both sections when an
+  // active-account signal is present. Keep them visible only when:
+  //   - No accounts data at all (older CLI without --json), OR
+  //   - Accounts exist but no entry has activeForThisAgent set (older
+  //     CLI without primaryForAgents), OR
+  //   - Empty fleet (no accounts) — slots are still the bootstrap
+  //     surface for the operator's first reauth/add taps.
   const activeAccountLabel =
     state.accounts?.find((a) => a.activeForThisAgent === true)?.label ?? null;
+  const slotsSectionRedundant =
+    activeAccountLabel != null &&
+    state.accounts != null &&
+    state.accounts.length > 0;
 
-  if (state.slots.length === 0) {
-    lines.push("<i>No account slots. Tap [➕ Add slot] to attach a subscription.</i>");
-  } else {
-    lines.push(`<b>Slots (${state.slots.length})</b>`);
-    for (const slot of state.slots) {
-      const marker = slot.active ? "●" : "○";
-      const badge = healthBadge(slot.health);
-      const label = healthLabel(slot.health);
-      // Display name: account label for the active slot when we know
-      // it; otherwise the raw slot ID. Non-active slots also use the
-      // raw ID — there's no account-label to substitute since we only
-      // know the ACTIVE account's identity from the cascade head.
-      const displayName =
-        slot.active && activeAccountLabel != null
-          ? activeAccountLabel
-          : slot.slot;
-      lines.push(
-        `  ${marker} <code>${escapeHtml(displayName)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
-      );
-      const detail = slotDetailLine(slot);
-      if (detail) lines.push(`    └ ${detail}`);
+  if (!slotsSectionRedundant) {
+    if (state.slots.length === 0) {
+      lines.push("<i>No account slots. Tap [➕ Add slot] to attach a subscription.</i>");
+    } else {
+      lines.push(`<b>Slots (${state.slots.length})</b>`);
+      for (const slot of state.slots) {
+        const marker = slot.active ? "●" : "○";
+        const badge = healthBadge(slot.health);
+        const label = healthLabel(slot.health);
+        lines.push(
+          `  ${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
+        );
+        const detail = slotDetailLine(slot);
+        if (detail) lines.push(`    └ ${detail}`);
+      }
     }
-  }
 
-  // Pool / fallback summary — show when accounts exist, so the user
-  // understands how slots and accounts relate. Pool line uses the
-  // account label too when we know it (parity with the slot row).
-  if (state.accounts != null && state.accounts.length > 0 && state.slots.length > 0) {
-    const activeSlot = state.slots.find((s) => s.active);
-    if (activeSlot) {
-      const poolDisplayName = activeAccountLabel ?? activeSlot.slot;
-      lines.push(`  Pool: <code>${escapeHtml(poolDisplayName)}</code> is active`);
+    // Pool / fallback summary — show when accounts exist, so the user
+    // understands how slots and accounts relate. Suppressed alongside
+    // the slots section when the active-account row already says it.
+    if (state.accounts != null && state.accounts.length > 0 && state.slots.length > 0) {
+      const activeSlot = state.slots.find((s) => s.active);
+      if (activeSlot) {
+        lines.push(`  Pool: slot <code>${escapeHtml(activeSlot.slot)}</code> is active`);
+      }
     }
   }
 
