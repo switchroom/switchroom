@@ -26,6 +26,7 @@ import {
   generateTimerServiceUnit,
   generateBrokerUnit,
   generateForemanUnit,
+  generateAgentTmuxConf,
 } from "../src/agents/systemd.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -212,6 +213,95 @@ describe("kill directives placement — must be in [Service] not [Unit]", () => 
 //   - The test runner to have permission to start/stop user services
 //
 // Enable in CI by setting RUN_SYSTEMD_INTEGRATION_TESTS=1.
+
+// ─── tmux supervisor variants (issue #725 pre-fanout hardening) ──────────────
+//
+// When experimental.tmux_supervisor=true, the unit shape is materially
+// different: ExecStart is `tmux ... new-session -A -d`, Type=forking,
+// Delegate=yes, and ExecStop=-/usr/bin/tmux ... kill-session (with a
+// leading dash to silence the FAILURE log on the migration restart). These
+// tests assert the tmux shape survives unit re-renders so a future template
+// edit can't silently revert the supervisor opt-in.
+
+describe("generateUnit — tmux supervisor shape survives re-renders (#725)", () => {
+  it("uses tmux new-session ExecStart when tmuxSupervisor=true", () => {
+    const unit = generateUnit("clerk", "/tmp/clerk", false, undefined, undefined, true);
+    expect(unit).toContain("/usr/bin/tmux -L switchroom-clerk");
+    expect(unit).toContain("new-session -A -d -s clerk");
+    // legacy script -qfc must NOT be the ExecStart under tmux supervisor
+    const execStartLine = unit.split("\n").find((l) => l.startsWith("ExecStart=")) ?? "";
+    expect(execStartLine).not.toContain("/usr/bin/script -qfc");
+  });
+
+  it("ExecStop has a leading dash to silence migration FAILURE", () => {
+    const unit = generateUnit("clerk", "/tmp/clerk", false, undefined, undefined, true);
+    // Critical: the dash makes systemd ignore non-zero exit when stopping
+    // the OLD (script-wrapped) unit which has no tmux socket. Without it
+    // the script→tmux migration restart logs FAILURE.
+    expect(unit).toContain("ExecStop=-/usr/bin/tmux");
+    expect(unit).toContain("kill-session -t clerk");
+  });
+
+  it("uses Type=forking + Delegate=yes for tmux supervisor", () => {
+    const unit = generateUnit("clerk", "/tmp/clerk", false, undefined, undefined, true);
+    const svc = serviceSection(unit);
+    expect(svc).toContain("Type=forking");
+    expect(svc).toContain("Delegate=yes");
+  });
+
+  it("includes ExecStartPost pipe-pane wiring to service.log", () => {
+    const unit = generateUnit("klanker", "/tmp/klanker", false, undefined, undefined, true);
+    expect(unit).toContain("ExecStartPost=/usr/bin/tmux");
+    expect(unit).toContain("pipe-pane -o -t klanker");
+  });
+
+  it("preserves cgroup-kill semantics under tmux supervisor", () => {
+    const unit = generateUnit("clerk", "/tmp/clerk", false, undefined, undefined, true);
+    const svc = serviceSection(unit);
+    expect(svc).toContain("KillMode=control-group");
+    expect(svc).toContain("SendSIGKILL=yes");
+    expect(svc).toContain("TimeoutStopSec=15");
+  });
+
+  it("identical input produces identical output across re-renders (deterministic)", () => {
+    const u1 = generateUnit("ziggy", "/tmp/ziggy", true, "ziggy-gateway", "Australia/Sydney", true);
+    const u2 = generateUnit("ziggy", "/tmp/ziggy", true, "ziggy-gateway", "Australia/Sydney", true);
+    expect(u1).toBe(u2);
+  });
+
+  it("legacy path (tmuxSupervisor=false) still uses script -qfc", () => {
+    const unit = generateUnit("clerk", "/tmp/clerk", false, undefined, undefined, false);
+    expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
+    expect(unit).not.toContain("ExecStart=/usr/bin/tmux");
+    expect(unit).not.toContain("ExecStop=-/usr/bin/tmux");
+  });
+});
+
+describe("generateAgentTmuxConf — config regeneration is deterministic (#725)", () => {
+  it("emits xterm-256color, history-limit, status off, remain-on-exit off", () => {
+    const conf = generateAgentTmuxConf();
+    expect(conf).toContain('default-terminal "xterm-256color"');
+    expect(conf).toContain("history-limit 100000");
+    expect(conf).toContain("status off");
+    expect(conf).toContain("remain-on-exit off");
+  });
+
+  it("regenerates byte-identical content across calls (re-render safe)", () => {
+    expect(generateAgentTmuxConf()).toBe(generateAgentTmuxConf());
+  });
+});
+
+describe("generateGatewayUnit — tmux supervisor env propagation (#725)", () => {
+  it("stamps SWITCHROOM_TMUX_SUPERVISOR=1 when flag is true", () => {
+    const unit = generateGatewayUnit("/tmp/clerk/telegram", "clerk", false, true);
+    expect(unit).toContain("Environment=SWITCHROOM_TMUX_SUPERVISOR=1");
+  });
+
+  it("omits SWITCHROOM_TMUX_SUPERVISOR when flag is false", () => {
+    const unit = generateGatewayUnit("/tmp/clerk/telegram", "clerk", false, false);
+    expect(unit).not.toContain("SWITCHROOM_TMUX_SUPERVISOR");
+  });
+});
 
 const runIntegration = process.env.RUN_SYSTEMD_INTEGRATION_TESTS === "1";
 
