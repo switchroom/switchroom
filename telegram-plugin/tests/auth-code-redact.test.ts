@@ -215,10 +215,16 @@ describe('redactAuthCodeMessage — diagnostic logging', () => {
  * paste handler that forgets to call `redactAuthCodeMessage`, this
  * test fails and points at the right pattern.
  *
- * The current 6 call sites:
- *   1. gateway.ts — bare-code paste during pending reauth
+ * The current 2 call sites (post-v0.6.13):
+ *   1. gateway.ts — bare-code paste during pending reauth (the
+ *      generic message intercept that watches `pendingReauthFlows`)
  *   2. gateway.ts — /auth code intent dispatch
- *   3. gateway.ts — /reauth <code> shortcut
+ *
+ * Removed in v0.6.13:
+ *   - /reauth <code> typed-command shortcut (the entire `bot.command(
+ *     'reauth', ...)` handler removed; the dashboard's Reauth button
+ *     fires the same flow and the generic intercept catches the
+ *     paste-back).
  *
  * #235 Wave 3 F4: server.ts monolith removed; the 3 server.ts call
  * sites previously listed (bare paste / /auth code / /reauth <code>)
@@ -234,7 +240,9 @@ describe('auth-code paste call-site coverage (architectural pin)', () => {
       'utf-8',
     )
     const matches = text.match(/redactAuthCodeMessage\s*\(/g) ?? []
-    // 3 call sites + 1 import statement = ≥4. Floor at 3 to be safe.
-    expect(matches.length).toBeGreaterThanOrEqual(3)
+    // 2 call sites + 1 import statement = ≥3. Floor at 2 to be safe.
+    // (Pre-v0.6.13 was floor=3 with three call sites including
+    // the now-removed /reauth typed handler.)
+    expect(matches.length).toBeGreaterThanOrEqual(2)
   })
 })
