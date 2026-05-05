@@ -1,0 +1,10 @@
+{
+  "ref": "refs/heads/main",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "abc1234def5678",
+  "repository": { "full_name": "acme/myrepo" },
+  "pusher": { "name": "alice" },
+  "commits": [
+    { "id": "abc1234def5678", "message": "Update README", "author": { "name": "Alice" } }
+  ]
+}
