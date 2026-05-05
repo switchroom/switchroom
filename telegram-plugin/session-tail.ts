@@ -100,6 +100,16 @@ export type SessionEvent =
   | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean; errorText?: string }
   | { kind: 'sub_agent_turn_end'; agentId: string }
   | { kind: 'sub_agent_nested_spawn'; agentId: string }
+  /**
+   * Emitted when a sub-agent JSONL has >= CAP_TOOL_USE_THRESHOLD tool_use
+   * records but no terminal record (no `type:result`, `subtype:end`, or
+   * `type:final`). This indicates the sub-agent was killed mid-flight
+   * (parent restart, watchdog SIGTERM, etc.) before writing its completion.
+   * The progress-card driver transitions the fleet member to `capped` state
+   * so the card surface shows a terminal "capped" row instead of hanging
+   * "running" forever.
+   */
+  | { kind: 'sub_agent_capped'; agentId: string; toolUseCount: number }
 
 /**
  * Parse the inbound channel XML wrapper to pull out chat_id, message_id,
@@ -614,6 +624,15 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
   // pattern from PR #25 protects against re-attach truncation.
   const multiAgent = isMultiAgentEnabled()
 
+  /**
+   * Minimum tool_use count that — combined with a missing terminal record —
+   * classifies a sub-agent transcript as truncated/capped rather than merely
+   * in-flight. The triage report (#650) observed truncation at 31–294 tool
+   * uses; 30 is chosen as the lower bound to avoid false-positives on short
+   * sub-agents that are still legitimately running when first reaped.
+   */
+  const CAP_TOOL_USE_THRESHOLD = 30
+
   interface SubTail {
     agentId: string
     file: string
@@ -629,6 +648,12 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
      * grows again. See MEM2 in the overnight forensic audit on #472.
      */
     lastActivityAt: number
+    /** Running count of tool_use records observed in this sub-agent's JSONL. */
+    toolUseCount: number
+    /** True once a terminal record (type:result / subtype:end / type:final) is seen. */
+    hasSeenTerminal: boolean
+    /** True once we have emitted sub_agent_capped for this sub-agent. */
+    cappedEmitted: boolean
   }
   const subTails = new Map<string, SubTail>() // keyed by absolute file path
 
@@ -665,8 +690,34 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       const startState = { hasEmittedStart: t.hasEmittedStart }
       for (const line of lines) {
         if (!line) continue
+        // Track terminal record presence: a sub-agent JSONL terminal line
+        // has type=result, subtype=end, or type=final. These indicate the
+        // harness wrote a proper completion record, so the sub-agent is NOT
+        // capped even if tool_use count is high.
+        if (!t.hasSeenTerminal) {
+          try {
+            const raw = JSON.parse(line) as Record<string, unknown>
+            if (
+              raw.type === 'result' ||
+              raw.type === 'final' ||
+              (raw.type === 'system' && raw.subtype === 'end') ||
+              raw.subtype === 'end'
+            ) {
+              t.hasSeenTerminal = true
+            }
+          } catch { /* ignore parse errors — projectSubagentLine will handle */ }
+        }
         const events = projectSubagentLine(line, t.agentId, startState)
         for (const ev of events) {
+          // Count tool_use events for capped-detection heuristic.
+          if (ev.kind === 'sub_agent_tool_use') {
+            t.toolUseCount++
+          }
+          // sub_agent_turn_end is a synthetic terminal — the parent saw a
+          // system:turn_duration line, meaning the harness completed normally.
+          if (ev.kind === 'sub_agent_turn_end') {
+            t.hasSeenTerminal = true
+          }
           try {
             onEvent(ev)
           } catch (err) {
@@ -698,6 +749,9 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       hasEmittedStart: false,
       watcher: null,
       lastActivityAt: Date.now(),
+      toolUseCount: 0,
+      hasSeenTerminal: false,
+      cappedEmitted: false,
     }
     void cursor
     try {
@@ -726,6 +780,20 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     const cutoff = Date.now() - IDLE_FSWATCH_TTL_MS
     for (const [file, t] of subTails) {
       if (t.lastActivityAt < cutoff) {
+        // Before reaping: check whether this looks like a capped transcript.
+        // A sub-agent with >= CAP_TOOL_USE_THRESHOLD tool_uses and no terminal
+        // record was most likely killed mid-flight. Emit sub_agent_capped once
+        // so the progress-card driver can transition the fleet member to a
+        // terminal "capped" state rather than leaving it stuck at "running".
+        if (!t.hasSeenTerminal && !t.cappedEmitted && t.toolUseCount >= CAP_TOOL_USE_THRESHOLD) {
+          t.cappedEmitted = true
+          try {
+            onEvent({ kind: 'sub_agent_capped', agentId: t.agentId, toolUseCount: t.toolUseCount })
+          } catch (err) {
+            log?.(`session-tail: sub_agent_capped onEvent threw: ${(err as Error).message}`)
+          }
+          log?.(`session-tail: sub ${t.agentId} capped (${t.toolUseCount} tool_uses, no terminal record)`)
+        }
         if (t.watcher) {
           try { t.watcher.close() } catch { /* ignore */ }
           t.watcher = null

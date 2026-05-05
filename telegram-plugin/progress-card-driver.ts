@@ -27,6 +27,7 @@ import {
 } from './progress-card.js'
 import { isTelegramReplyTool } from './tool-names.js'
 import {
+  applyCapped as fleetApplyCapped,
   applyToolResult as fleetApplyToolResult,
   applyToolUse as fleetApplyToolUse,
   applyTurnEnd as fleetApplyTurnEnd,
@@ -1779,6 +1780,20 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         cs.fleet.set(event.agentId, fleetApplyTurnEnd(m, now()))
         return
       }
+      case 'sub_agent_capped': {
+        // The sub-agent transcript was truncated mid-flight: >= threshold
+        // tool_uses with no terminal record. Transition the fleet member to
+        // `capped` so the progress card shows a terminal "capped" row instead
+        // of hanging "running" indefinitely. Also drive the legacy reducer via
+        // sub_agent_turn_end so the subAgents map stays consistent.
+        const m = cs.fleet.get(event.agentId)
+        if (m != null) {
+          cs.fleet.set(event.agentId, fleetApplyCapped(m, now()))
+        }
+        // Mirror into the legacy reducer so render() sees the agent as done.
+        cs.state = reduce(cs.state, { kind: 'sub_agent_turn_end', agentId: event.agentId }, now())
+        return
+      }
       default:
         return
     }
@@ -2026,6 +2041,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         (event.kind === 'sub_agent_tool_use' ||
           event.kind === 'sub_agent_tool_result' ||
           event.kind === 'sub_agent_turn_end' ||
+          event.kind === 'sub_agent_capped' ||
           event.kind === 'sub_agent_started') &&
         'agentId' in event
       ) {
