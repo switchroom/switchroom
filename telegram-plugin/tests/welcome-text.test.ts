@@ -319,6 +319,27 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     }
   });
 
+  it("does NOT register /authfallback (removed in v0.6.12)", () => {
+    // The /authfallback typed command duplicated the work of the
+    // dashboard's Switch primary picker (operator-facing surface) and
+    // the auto-fallback poller (transparent on-quota-wall case). It
+    // was removed from the slash-menu, the autocomplete helper-list,
+    // AND the help text. If any of those re-surface the command, this
+    // test catches the regression.
+    const menuNames = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    expect(menuNames, "/authfallback must not be in the slash menu").not.toContain(
+      "authfallback",
+    );
+    expect(
+      switchroomHelpCommandNames as readonly string[],
+      "/authfallback must not be in the autocomplete name list",
+    ).not.toContain("authfallback");
+    const helpDoc = switchroomHelpText("clerk");
+    expect(helpDoc, "/authfallback must not appear in help text").not.toContain(
+      "/authfallback",
+    );
+  });
+
   it("menu is short enough for a mobile keyboard (<= 20 entries)", () => {
     // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
     // without scrolling. 20 is a generous upper bound.

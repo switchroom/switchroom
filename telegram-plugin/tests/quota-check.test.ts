@@ -486,6 +486,106 @@ describe('getCachedAccountQuota + prefetchAccountQuotaIfStale', () => {
   })
 })
 
+describe('regression: boot-warm + delayed sync-read (v0.6.11)', () => {
+  // The bug: gateway boot-warm fills the cache; cache TTL elapses;
+  // dashboard's sync read returns null; operator sees empty quota
+  // rows on first /auth tap of the session past TTL. Fix: sync read
+  // returns last-known data regardless of staleness; prefetch path
+  // owns the freshness contract. Pin both legs so a future TTL
+  // tweak can't silently re-introduce the bug.
+  it('returns last-known data even after multiple TTL windows have elapsed', async () => {
+    clearAccountQuotaCache()
+    const home = makeAccountHome({
+      'pixsoul@gmail.com': { accessToken: 'tok' },
+    })
+    try {
+      const t0 = 1_000_000
+      // Boot-warm: probe completes at t0.
+      await fetchAccountQuota('pixsoul@gmail.com', {
+        home,
+        fetchImpl: (async () =>
+          new Response('{}', {
+            status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.04',
+              'anthropic-ratelimit-unified-7d-utilization': '0.78',
+            },
+          })) as typeof fetch,
+        now: () => t0,
+      })
+      // 8.5 minutes later (the screenshot-reproduction window): the
+      // dashboard fetches state. Sync read returns the boot-warmed
+      // values rather than null.
+      const tDashboard = t0 + 8.5 * 60_000
+      const cached = getCachedAccountQuota('pixsoul@gmail.com', tDashboard)
+      expect(cached).not.toBeNull()
+      if (cached?.ok) {
+        expect(cached.data.fiveHourUtilizationPct).toBe(4)
+        expect(cached.data.sevenDayUtilizationPct).toBe(78)
+      } else {
+        throw new Error('expected ok=true cached entry')
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('prefetchAccountQuotaIfStale re-probes once the TTL has elapsed', async () => {
+    clearAccountQuotaCache()
+    const home = makeAccountHome({
+      'work@example.com': { accessToken: 'tok' },
+    })
+    try {
+      const t0 = 1_000_000
+      let fetchCount = 0
+      const counterFetch: typeof fetch = async () => {
+        fetchCount++
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.10',
+            'anthropic-ratelimit-unified-7d-utilization': '0.20',
+          },
+        })
+      }
+      // First probe seeds the cache.
+      await fetchAccountQuota('work@example.com', {
+        home,
+        fetchImpl: counterFetch,
+        now: () => t0,
+      })
+      expect(fetchCount).toBe(1)
+      // Within TTL: prefetch is a no-op.
+      prefetchAccountQuotaIfStale('work@example.com', {
+        home,
+        fetchImpl: counterFetch,
+        now: () => t0 + 60_000,
+      })
+      // Give microtask queue a chance — should still be 1.
+      await new Promise((r) => setTimeout(r, 5))
+      expect(fetchCount).toBe(1)
+      // Past TTL: prefetch fires a fresh probe.
+      prefetchAccountQuotaIfStale('work@example.com', {
+        home,
+        fetchImpl: counterFetch,
+        now: () => t0 + ACCOUNT_QUOTA_CACHE_TTL_MS + 1,
+      })
+      // Wait for the fire-and-forget probe to complete.
+      await new Promise((r) => setTimeout(r, 20))
+      expect(fetchCount).toBe(2)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('cache TTL is at least 1 minute — short TTLs cause empty-row regressions', () => {
+    // Pre-v0.6.11 was 30s, which made the boot-warm useless. If a
+    // future PR drops it below 60s, this test catches it before the
+    // empty-row regression hits production.
+    expect(ACCOUNT_QUOTA_CACHE_TTL_MS).toBeGreaterThanOrEqual(60_000)
+  })
+})
+
 describe('fetchQuota — accessToken parameter', () => {
   it('accepts a direct accessToken instead of a config dir', async () => {
     const fakeFetch = async (_url: unknown, init?: RequestInit) => {

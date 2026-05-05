@@ -1538,9 +1538,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // Issue #394 Fix 2: when the failure is model-unavailable (quota out,
   // overloaded, or the network can't even reach Anthropic), suppress the
   // raw stderr/detail and post the actionable ⚠️ card instead. The card
-  // points at the three commands that move the needle (`/authfallback`,
-  // `/auth add`, `/usage`) so the user isn't left staring at "You're out
-  // of extra usage · resets May 3, 11am" with no idea what to do.
+  // points at the commands that move the needle (`/auth` Switch
+  // primary picker, `/auth add`, `/usage`) so the user isn't left
+  // staring at "You're out of extra usage · resets May 3, 11am" with
+  // no idea what to do.
   //
   // Two routes match:
   //   - kind already classified as quota-exhausted / rate-limited / unknown-5xx
@@ -6142,8 +6143,8 @@ bot.command('interrupt', async ctx => {
 })
 
 // Shared auto-fallback state. `lockout` is a per-process in-memory
-// guard against rapid re-fire between the scheduled poll and a
-// manual /authfallback trigger (see telegram-plugin/auto-fallback.ts).
+// guard against rapid re-fire between the scheduled poll and any
+// manual trigger (see telegram-plugin/auto-fallback.ts).
 //
 // Pre-#417 fix this was always emptyLockout() at process start, so a
 // gateway restart inside the cooldown window reset the timer and a
@@ -6345,23 +6346,14 @@ async function runCreditWatch(): Promise<void> {
   }
 }
 
-bot.command('authfallback', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const result = await runAutoFallbackCheck({ trigger: 'manual' })
-  if (result.kind === 'executed') {
-    await switchroomReply(ctx, `✅ Switched slot <code>${escapeHtmlForTg(result.previousSlot)}</code> → <code>${escapeHtmlForTg(result.newSlot)}</code>. Agent restarted.`, { html: true })
-    return
-  }
-  if (result.kind === 'exhausted-all') {
-    await switchroomReply(ctx, `🚨 All slots quota-exhausted. Run <code>/auth add</code> to attach another subscription.`, { html: true })
-    return
-  }
-  if (result.kind === 'error') {
-    await switchroomReply(ctx, `❌ /authfallback error: ${escapeHtmlForTg(result.message)}`, { html: true })
-    return
-  }
-  await switchroomReply(ctx, `No action: ${escapeHtmlForTg(result.reason)}`, { html: true })
-})
+// /authfallback was removed in v0.6.12 — it duplicated the work of
+// the dashboard's Switch primary picker (operator-facing surface) and
+// the auto-fallback poller (transparent on-quota-wall case).
+// Operators who want to manually shuffle the active credential now
+// use the picker. The `runAutoFallbackCheck` function and the
+// `case 'fallback':` callback dispatch stay in the codebase: any
+// pinned messages from earlier versions still work, and the
+// auto-fallback poller still calls runAutoFallbackCheck directly.
 
 bot.command('auth', async ctx => {
   if (!isAuthorizedSender(ctx)) return
@@ -9905,7 +9897,9 @@ void (async () => {
         //
         // Default poll cadence: every 60 minutes. Set
         // SWITCHROOM_AUTO_FALLBACK_POLL_MS=0 to disable the background
-        // poller (users can still trigger a check via /authfallback).
+        // poller. Pre-v0.6.12 a manual `/authfallback` typed command
+        // also ran the same check; that command was removed in favour
+        // of the `/auth` dashboard's Switch primary picker.
         const AUTO_FALLBACK_POLL_MS = Number(process.env.SWITCHROOM_AUTO_FALLBACK_POLL_MS ?? 60 * 60_000)
         if (AUTO_FALLBACK_POLL_MS > 0) {
           setInterval(() => { void runAutoFallbackCheck({ trigger: 'scheduled' }) }, AUTO_FALLBACK_POLL_MS).unref()

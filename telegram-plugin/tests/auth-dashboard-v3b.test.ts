@@ -461,3 +461,99 @@ describe("v3b: buildAccountPromoteConfirmKeyboard", () => {
     expect(cancel?.callback_data).toBe("auth:refresh:clerk");
   });
 });
+
+describe("regression: button count cap on the main board", () => {
+  // Real-world wedge: a screenshot from /auth showed 8 buttons stacked
+  // vertically on a three-account fleet (the v3b explosion). v3c
+  // collapsed everything into a Switch primary picker. Pin the cap so
+  // a future "let's add one more affordance" PR can't bring it back.
+  const renderRows = (accounts: AccountSummary[]): number => {
+    const kb = buildDashboardKeyboard({ ...baseState, accounts });
+    return (
+      kb as unknown as {
+        inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+      }
+    ).inline_keyboard.length;
+  };
+
+  it("renders <=6 keyboard rows with three accounts (down from 8 in v3b)", () => {
+    // pixsoul (active) + 2 fallbacks. Expected layout:
+    //   row 1: 🔀 Switch primary →
+    //   row 2: 🔄 Reauth + ➕ Add slot  (2 buttons, 1 row)
+    //   row 3: 📊 Full quota
+    //   row 4: 🔁 Refresh
+    // = 4 rows. Cap at 6 leaves room for a future row without letting
+    // the v3b explosion return.
+    expect(
+      renderRows([
+        acc("pixsoul@gmail.com", { activeForThisAgent: true }),
+        acc("me@kenthompson.com.au"),
+        acc("ken.thompson@outlook.com.au"),
+      ]),
+    ).toBeLessThanOrEqual(6);
+  });
+
+  it("never emits a Promote button targeting the active account", () => {
+    // The original screenshot bug: ⤴ Promote pixsoul@gmail.com
+    // appeared even when pixsoul was the active row. Pin that no
+    // promote callback (apr/cpr verbs) targets the active label.
+    const kb = buildDashboardKeyboard({
+      ...baseState,
+      accounts: [
+        acc("pixsoul@gmail.com", { activeForThisAgent: true }),
+        acc("me@kenthompson.com.au"),
+      ],
+    });
+    const allButtons = (
+      kb as unknown as {
+        inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+      }
+    ).inline_keyboard.flat();
+    for (const btn of allButtons) {
+      const m = btn.callback_data.match(/^auth:(?:apr|cpr):[^:]+:(.+)$/);
+      if (m) {
+        expect(m[1], "active label found in promote callback").not.toBe(
+          "pixsoul@gmail.com",
+        );
+      }
+    }
+  });
+});
+
+describe("regression: [⚠️ Fall back now] button stays gone (v0.6.11)", () => {
+  // Removed when the Switch primary picker became the operator-facing
+  // surface for the same outcome. Two paths to the same action
+  // confused operators. If quotaHot ever re-surfaces the button, this
+  // test catches it.
+  it("absent regardless of quotaHot, slot health, or accounts shape", () => {
+    const cases: Array<Parameters<typeof buildDashboardKeyboard>[0]> = [
+      { ...baseState, quotaHot: false },
+      { ...baseState, quotaHot: true },
+      {
+        ...baseState,
+        quotaHot: true,
+        slots: [{ slot: "default", active: true, health: "quota-exhausted" }],
+      },
+      {
+        ...baseState,
+        accounts: [
+          acc("pixsoul", { activeForThisAgent: true, fiveHourPct: 99 }),
+        ],
+      },
+    ];
+    for (const state of cases) {
+      const kb = buildDashboardKeyboard(state);
+      const labels = (
+        kb as unknown as {
+          inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+        }
+      ).inline_keyboard
+        .flat()
+        .map((b) => b.text);
+      expect(
+        labels.some((t) => /fall.?back/i.test(t)),
+        `Fall back surfaced under quotaHot=${state.quotaHot}, slots=${state.slots?.length}`,
+      ).toBe(false);
+    }
+  });
+});

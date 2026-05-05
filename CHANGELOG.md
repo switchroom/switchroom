@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## v0.6.12 — 2026-05-05
+
+### Removed
+
+- **`/authfallback` typed Telegram command gone.** Duplicated the
+  work of the dashboard's Switch primary picker (operator-facing) and
+  the auto-fallback poller (transparent on-quota-wall case). Two
+  paths to the same outcome confused operators. The
+  `runAutoFallbackCheck` function and the `case 'fallback':` callback
+  dispatch stay in the codebase: any pinned messages from earlier
+  versions still work, and the auto-fallback poller still calls
+  `runAutoFallbackCheck` directly.
+  - Slash-menu entry, autocomplete name list, and help-text line
+    all dropped.
+  - Doc comments updated to point at `/auth` Switch primary instead.
+
+### Tests (regression coverage for v0.6.10–v0.6.12)
+
+- `welcome-text` — pin that `/authfallback` is absent from the slash
+  menu, autocomplete list, AND help text (3 separate surfaces).
+- `auth-dashboard-v3b` — main board renders ≤6 keyboard rows with
+  three accounts (catches the v3b 8-button explosion); no Promote
+  callback ever targets the active label (catches the screenshot
+  bug); `[⚠️ Fall back now]` button stays absent under every quotaHot
+  / slot-health / accounts-shape combination.
+- `quota-check` — boot-warm + delayed sync-read sequence returns
+  last-known data after 8.5min (the screenshot reproduction window);
+  `prefetchAccountQuotaIfStale` re-probes once past TTL but no-ops
+  while fresh; cache TTL pinned ≥60s so a future PR can't re-create
+  the empty-row bug.
+
 ## v0.6.11 — 2026-05-05
 
 ### Fixed
