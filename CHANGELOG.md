@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## v0.6.8 — 2026-05-05
+
+### Added
+
+- **Per-account quota utilization on `/auth` (#696)** — the Telegram
+  auth dashboard now renders 5h + 7d quota under each account row
+  alongside the existing per-slot probe (`5h: 47% · 7d: 12%`, or
+  `exhausted · resets in Nh Mm`). Wired through a new
+  `fetchAccountQuota(label)` helper that probes Anthropic's
+  `anthropic-ratelimit-unified-*` headers using the account's stored
+  access token, with a 30 s in-process cache and background prefetch.
+  Cache is invalidated on `enable` / `disable` / `share` / `rm` so
+  the dashboard stays consistent with the YAML cascade.
+
+### Fixed
+
+- **`auth enable <fallback>` no longer hot-swaps the active fanout
+  (#697)** — adding an account as a fallback used to overwrite each
+  agent's runtime credentials with the just-enabled label, silently
+  flipping the primary. Now `enable` preserves the YAML-list primary
+  on each agent (the first entry in `auth.accounts:`) and only fans
+  out the just-enabled label when an agent has no prior accounts
+  (fresh-fleet bootstrap). Console output distinguishes
+  `fanned out (now active)` from `added as fallback (active stays X)`,
+  and the restart hint is suppressed when no runtime change occurred.
+  New helper `groupAgentsByPrimaryAccount` unit-tested across 7
+  cases. Matters whenever an operator runs a multi-account fleet —
+  the bug was invisible on a single-account install.
+
 ## v0.6.7 — 2026-05-05
 
 ### Added
