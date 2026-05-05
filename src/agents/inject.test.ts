@@ -190,3 +190,48 @@ describe("injectSlashCommand (default runner — validation only)", () => {
     });
   });
 });
+
+import { describe as describeAnchor, it as itAnchor, expect as expectAnchor } from "vitest";
+import { diffPane as diffPaneFn } from "./inject";
+
+describeAnchor("diffPane — command-anchor diff (regression for repeated-call empty-output bug)", () => {
+  itAnchor("returns response below the LAST command-echo line in `after`", () => {
+    const before = `❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.50
+  Esc to cancel`;
+    const after = `❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.50
+  Esc to cancel
+some-narrative
+❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.75
+  Esc to cancel`;
+    const out = diffPaneFn(before, after, "/usage");
+    expectAnchor(out).toContain("Status   Config   Usage   Stats");
+    expectAnchor(out).toContain("$0.75");
+    // The trailing affordance should be stripped
+    expectAnchor(out).not.toContain("Esc to cancel");
+  });
+
+  itAnchor("falls back to line-set diff when command anchor is absent", () => {
+    const before = "old line A\nold line B";
+    const after = "old line A\nold line B\nnew line C\nnew line D";
+    const out = diffPaneFn(before, after, "/cost");
+    expectAnchor(out).toContain("new line C");
+    expectAnchor(out).toContain("new line D");
+    expectAnchor(out).not.toContain("old line A");
+  });
+
+  itAnchor("works without a command argument (legacy line-set diff)", () => {
+    const before = "x\ny";
+    const after = "x\ny\nz";
+    const out = diffPaneFn(before, after);
+    expectAnchor(out).toBe("z");
+  });
+});
