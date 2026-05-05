@@ -970,6 +970,11 @@ export function reduce(
       // No-op — we key off enqueue + turn_end for the turn boundary.
       return state
   }
+  // Defensive: tsc can't prove exhaustiveness across the SessionEvent
+  // discriminated union when new kinds are added incrementally (#623
+  // strict-tsc enforcement on plugin source). Fall back to current
+  // state on any future unknown kind.
+  return state
 }
 
 // ─── Renderer ───────────────────────────────────────────────────────────────
