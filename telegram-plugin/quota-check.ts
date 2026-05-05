@@ -17,6 +17,11 @@
 
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
+import {
+  readAccountQuota,
+  snapshotFromQuotaUtilization,
+  writeAccountQuota,
+} from "../src/auth/account-quota-store.js";
 
 /**
  * OAuth beta flag — proves the request is coming from a subscription client.
@@ -345,7 +350,59 @@ export async function fetchAccountQuota(
     timeoutMs: opts.timeoutMs,
   });
   accountQuotaCache.set(label, { fetchedAt: now, result });
+  // Persist the snapshot to disk so a future gateway restart can
+  // re-hydrate its in-process cache without an API call. Best-effort
+  // (write errors swallowed inside writeAccountQuota). Issue #708.
+  if (result.ok) {
+    try {
+      writeAccountQuota(
+        label,
+        snapshotFromQuotaUtilization(result.data, new Date(now)),
+      );
+    } catch {
+      /* best-effort */
+    }
+  }
   return result;
+}
+
+/**
+ * Re-hydrate the in-process account-quota cache from on-disk
+ * snapshots written by previous gateway lifetimes (issue #708).
+ * Called once at gateway boot so the boot card and the first /auth
+ * tap have data instantly — no need to wait for the background
+ * prefetch tick.
+ *
+ * Safe to call repeatedly: each label is set to the disk snapshot's
+ * `capturedAt` timestamp so a fresher live probe still wins on
+ * `now - fetchedAt < TTL` comparisons. When the disk snapshot is
+ * older than the TTL, the cache entry is still seeded — the background
+ * prefetch will replace it on the next tap.
+ */
+export function hydrateAccountQuotaCacheFromDisk(
+  labels: ReadonlyArray<string>,
+  home?: string,
+): void {
+  for (const label of labels) {
+    if (accountQuotaCache.has(label)) continue;
+    const snap = readAccountQuota(label, home);
+    if (!snap) continue;
+    const fetchedAt = Date.parse(snap.capturedAt);
+    if (!Number.isFinite(fetchedAt)) continue;
+    const result: QuotaResult = {
+      ok: true,
+      data: {
+        fiveHourUtilizationPct: snap.fiveHourPct ?? 0,
+        sevenDayUtilizationPct: snap.sevenDayPct ?? 0,
+        fiveHourResetAt: snap.fiveHourResetAt ? new Date(snap.fiveHourResetAt) : null,
+        sevenDayResetAt: snap.sevenDayResetAt ? new Date(snap.sevenDayResetAt) : null,
+        representativeClaim: null,
+        overageStatus: null,
+        overageDisabledReason: null,
+      },
+    };
+    accountQuotaCache.set(label, { fetchedAt, result });
+  }
 }
 
 /** Test/utility helper — wipe the per-account quota cache. The

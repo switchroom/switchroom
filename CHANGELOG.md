@@ -4,6 +4,44 @@
 
 ### Added
 
+- **tmux supervisor opt-in flag (#725 Phase 1)** — new per-agent
+  `experimental.tmux_supervisor` boolean (default `false`). When `true`,
+  the systemd unit replaces `script -qfc` with `tmux new-session` so
+  external `tmux send-keys` can drive the running Claude REPL (foundation
+  for #163 `/remotecontrol` and broader slash-command passthrough). Ships
+  a managed `tmux.conf` per agent (`default-terminal xterm-256color`,
+  `history-limit 100000`, `status off`, `remain-on-exit off`).
+  Patches `bin/autoaccept.exp` with `set timeout 30` and `interact { eof
+  exit }` so external send-keys reaches Claude. `switchroom agent attach`
+  now actually attaches to the tmux session when the flag is on.
+- **Webhook dispatch (#715)** — verified webhook events now trigger fresh
+  `claude -p` invocations so agents can react in Telegram without polling
+  `webhook-events.jsonl` manually.
+  - New module `src/web/webhook-dispatch.ts`:
+    - **Static matcher** (`event`, `actions`, `labels_any`, `labels_all`,
+      `exclude_authors`) — no CEL/expression parser; fully JSON-Schema-validatable.
+    - **`{{field}}` template rendering** against a flat helper bag:
+      `repo`, `number`, `title`, `html_url`, `author`, `labels`, `action`, `event`.
+    - **Cooldown** — same `(event, repo, number, rule-index)` combination
+      coalesces within the window. State on disk per-agent at
+      `<agent>/telegram/webhook-cooldown.json`.
+    - **Quiet hours** — wraps midnight when `start > end`. Skips dispatch
+      entirely (event still in JSONL for manual review).
+    - **`spawnAgentOneShot()`** — same env setup as `buildCronScript` in
+      `scaffold.ts`: OAuth forced, `ANTHROPIC_API_KEY` unset, token injected
+      from `.oauth-token`, `CLAUDE_CONFIG_DIR` and `SWITCHROOM_AGENT_NAME` set.
+  - `WebhookHandlerArgs` gains optional `dispatchConfig` field; handler
+    calls `evaluateDispatch()` after JSONL append (non-fatal — dispatch
+    errors never downgrade the 202).
+  - `webhook_dispatch` added to `TelegramChannelSchema` in
+    `src/config/schema.ts`; cascades via existing channels deep-merge.
+  - **CLI**: `switchroom telegram dispatch test --agent <name> --payload
+    <file.json> --event <type>` — dry-runs matchers offline, prints which
+    rules match and the rendered prompt without spawning.
+  - Test fixtures in `tests/fixtures/` (GitHub PR opened/labeled/dependabot/push).
+  - 35 unit tests covering all matcher combinations, template rendering,
+    cooldown state machine, quiet hours, and `evaluateDispatch` integration.
+
 - **Webhook ingest hardening (#714)** — two defenses added to
   `src/web/webhook-handler.ts` before auto-dispatch ships:
   - **Dedup by `X-GitHub-Delivery`**: per-agent LRU (1000 entries, 24h

@@ -27,6 +27,7 @@ import {
 } from './progress-card.js'
 import { isTelegramReplyTool } from './tool-names.js'
 import {
+  applyCapped as fleetApplyCapped,
   applyToolResult as fleetApplyToolResult,
   applyToolUse as fleetApplyToolUse,
   applyTurnEnd as fleetApplyTurnEnd,
@@ -1041,7 +1042,13 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
     // user sees the background work. Closes #87. Historical ghost-pin
     // risk (#31/#43) is bounded by `closeZombie` on new enqueue +
     // `maxIdleMs` heartbeat ceiling.
+    // Also gate on fleet background members: a bg sub-agent that hasn't
+    // yet emitted any events will be absent from state.subAgents but
+    // present in fleet with status:'background'. Without this gate the
+    // deferred completion would fire immediately and close the card.
+    // Fixes #713 and #709.
     if (hasAnyRunningSubAgent(cs.state)) return
+    if (hasLiveBackground(cs.fleet)) return
     process.stderr.write(`telegram gateway: progress-card: deferred completion firing turnKey=${cs.turnKey} (last sub-agent finished)\n`)
     // Route through the unified close path (turn-end reason) so the
     // prelude (silentEnd suppression, final flush, tail cleanup) matches
@@ -1773,6 +1780,20 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         cs.fleet.set(event.agentId, fleetApplyTurnEnd(m, now()))
         return
       }
+      case 'sub_agent_capped': {
+        // The sub-agent transcript was truncated mid-flight: >= threshold
+        // tool_uses with no terminal record. Transition the fleet member to
+        // `capped` so the progress card shows a terminal "capped" row instead
+        // of hanging "running" indefinitely. Also drive the legacy reducer via
+        // sub_agent_turn_end so the subAgents map stays consistent.
+        const m = cs.fleet.get(event.agentId)
+        if (m != null) {
+          cs.fleet.set(event.agentId, fleetApplyCapped(m, now()))
+        }
+        // Mirror into the legacy reducer so render() sees the agent as done.
+        cs.state = reduce(cs.state, { kind: 'sub_agent_turn_end', agentId: event.agentId }, now())
+        return
+      }
       default:
         return
     }
@@ -2020,6 +2041,7 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         (event.kind === 'sub_agent_tool_use' ||
           event.kind === 'sub_agent_tool_result' ||
           event.kind === 'sub_agent_turn_end' ||
+          event.kind === 'sub_agent_capped' ||
           event.kind === 'sub_agent_started') &&
         'agentId' in event
       ) {
@@ -2197,7 +2219,14 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
         }
         flush(chatState, /*forceDone*/ event.kind === 'turn_end')
         if (event.kind === 'turn_end') {
-          if (hasAnyRunningSubAgent(chatState.state)) {
+          // Gate on BOTH the legacy subAgents map AND the fleet's background
+          // members. Background sub-agents (dispatched with run_in_background:true)
+          // are tagged in cs.fleet with status:'background' by updateFleetForEvent
+          // at sub_agent_started time. If the parent turn_end fires before the
+          // background sub-agent has produced any events, state.subAgents may
+          // still be empty for that agent — hasAnyRunningSubAgent alone would
+          // miss it and close the card prematurely. Fixes #713 and #709.
+          if (hasAnyRunningSubAgent(chatState.state) || hasLiveBackground(chatState.fleet)) {
             // Parent turn ended but at least one sub-agent is still running.
             // Keep the card alive so the sub-agent work stays visible; defer
             // completion until the last running sub-agent reports done via
@@ -2210,13 +2239,17 @@ export function createProgressDriver(config: ProgressDriverConfig): ProgressDriv
             chatState.pendingCompletion = true
             const correlated: string[] = []
             const orphans: string[] = []
+            const background: string[] = []
             for (const [k, sa] of chatState.state.subAgents) {
               if (sa.state === 'running') {
                 if (sa.parentToolUseId != null) correlated.push(k)
                 else orphans.push(k)
               }
             }
-            process.stderr.write(`telegram gateway: progress-card: turn_end deferred turnKey=${chatState.turnKey} reason=in-flight-sub-agents correlated=${correlated.length} orphans=${orphans.length} correlatedAgentIds=[${correlated.join(',')}] orphanAgentIds=[${orphans.join(',')}]\n`)
+            for (const [k, m] of chatState.fleet) {
+              if (m.status === 'background' && m.terminalAt == null) background.push(k)
+            }
+            process.stderr.write(`telegram gateway: progress-card: turn_end deferred turnKey=${chatState.turnKey} reason=in-flight-sub-agents correlated=${correlated.length} orphans=${orphans.length} background=${background.length} correlatedAgentIds=[${correlated.join(',')}] orphanAgentIds=[${orphans.join(',')}] backgroundAgentIds=[${background.join(',')}]\n`)
             return
           }
           closePerChat(chatState, 'turn-end')

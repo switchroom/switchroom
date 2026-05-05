@@ -561,6 +561,79 @@ export const TelegramChannelSchema = z
         "<agent>/telegram/issues.jsonl. " +
         "Cascades from defaults.channels.telegram.webhook_rate_limit.",
       ),
+    webhook_dispatch: z
+      .object({
+        github: z
+          .array(
+            z.object({
+              description: z.string().optional().describe(
+                "Human-readable description of what this rule does.",
+              ),
+              match: z.object({
+                event: z.string().describe(
+                  "GitHub event name (e.g. 'pull_request', 'push'). Required.",
+                ),
+                actions: z.array(z.string()).optional().describe(
+                  "Allowed action values (e.g. ['opened', 'synchronize']). " +
+                  "If absent, all actions match.",
+                ),
+                labels_any: z.array(z.string()).optional().describe(
+                  "At least one of these labels must be present on the PR/issue.",
+                ),
+                labels_all: z.array(z.string()).optional().describe(
+                  "All of these labels must be present on the PR/issue.",
+                ),
+                exclude_authors: z.array(z.string()).optional().describe(
+                  "If the PR/issue author login is in this list, skip dispatch.",
+                ),
+              }).describe("Static matcher constraints. All fields optional except 'event'."),
+              prompt: z.string().describe(
+                "Prompt template for the claude -p invocation. " +
+                "Supports {{field}} interpolation: repo, number, title, " +
+                "html_url, author, labels, action, event.",
+              ),
+              cooldown: z.string().optional().describe(
+                "Cooldown duration before the same (repo, number, rule) " +
+                "combination can fire again. Duration string: '5m', '1h', " +
+                "'30s'. Defaults to no cooldown.",
+              ),
+              quiet_hours: z
+                .object({
+                  start: z.number().int().min(0).max(23).describe(
+                    "Hour (0-23) when quiet period starts (inclusive).",
+                  ),
+                  end: z.number().int().min(0).max(23).describe(
+                    "Hour (0-23) when quiet period ends (exclusive).",
+                  ),
+                  tz: z.string().optional().describe(
+                    "IANA timezone string (e.g. 'Australia/Melbourne'). Defaults to UTC.",
+                  ),
+                })
+                .optional()
+                .describe(
+                  "When the current wall clock is inside this window, dispatch is " +
+                  "skipped entirely (events still land in webhook-events.jsonl). " +
+                  "Wraps midnight when start > end (e.g. start=22, end=8).",
+                ),
+              model: z.string().optional().describe(
+                "Model for the dispatched claude -p invocation. " +
+                "Defaults to claude-sonnet-4-6.",
+              ),
+            }),
+          )
+          .optional()
+          .describe("Dispatch rules for GitHub webhook events."),
+      })
+      .optional()
+      .describe(
+        "Webhook dispatch rules (#715). After an event is verified and " +
+        "recorded to webhook-events.jsonl, each rule is evaluated against " +
+        "the event. On a match, a fresh `claude -p` process is spawned " +
+        "against this agent. Supports static matchers (event/action/label/" +
+        "author), {{field}} prompt templates, per-rule cooldown, and " +
+        "quiet hours. Only the 'github' source is supported for dispatch. " +
+        "Cascades from defaults.channels.telegram.webhook_dispatch.",
+      ),
   })
   .optional();
 

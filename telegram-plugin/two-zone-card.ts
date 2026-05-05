@@ -222,6 +222,7 @@ export function glyphForFleetStatus(status: FleetStatus): string {
     case 'failed': return '✗'
     case 'stuck': return '⚠'
     case 'killed': return '✗'
+    case 'capped': return '⚠'
   }
 }
 

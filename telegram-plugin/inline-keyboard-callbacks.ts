@@ -45,9 +45,35 @@ export const AGENT_CALLBACK_PREFIX = 'agent:'
 export const AGENT_CALLBACK_DATA_MAX = 64 - AGENT_CALLBACK_PREFIX.length
 
 /**
+ * Per-button agent-supplied metadata that controls post-tap UX (#710).
+ * These fields are stripped before the keyboard is sent to Telegram —
+ * they are NOT part of the Bot API. The gateway extracts and stores
+ * them via {@link extractAgentButtonMeta} so the callback handler can
+ * honor them when the user taps.
+ */
+export interface AgentButtonMeta {
+  /** Toast text shown via answerCallbackQuery on tap. Default `'✓ received'`. */
+  ack_text?: string
+  /**
+   * When false, the button keyboard is preserved after tap (re-tappable).
+   * When true (default), tapping ANY single_use button on the message
+   * removes the entire keyboard to prevent double-fire.
+   */
+  single_use?: boolean
+}
+
+/** Fields the gateway adds to button objects — not valid Telegram API fields. */
+const AGENT_META_FIELDS: ReadonlyArray<keyof AgentButtonMeta> = ['ack_text', 'single_use']
+
+/**
  * Wrap every callback_data field in a 2D inline-keyboard with the
  * gateway's `agent:` namespace prefix. URL-only buttons pass through
  * unchanged. Returns a fresh array — does not mutate the input.
+ *
+ * Also strips agent-only meta fields (`ack_text`, `single_use`) so they
+ * don't leak into the Telegram API request. Use
+ * {@link extractAgentButtonMeta} on the raw keyboard BEFORE wrapping to
+ * recover those fields for the callback handler.
  *
  * Throws when an agent-supplied callback_data exceeds the effective
  * 58-byte budget (so the operator sees a clear error, not a silent
@@ -56,7 +82,9 @@ export const AGENT_CALLBACK_DATA_MAX = 64 - AGENT_CALLBACK_PREFIX.length
 export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
   return keyboard.map((row) =>
     row.map((btn) => {
-      if (typeof btn.callback_data !== 'string') return btn
+      const cleaned: AnyButton = { ...btn }
+      for (const f of AGENT_META_FIELDS) delete cleaned[f]
+      if (typeof btn.callback_data !== 'string') return cleaned
       const raw = btn.callback_data
       const rawBytes = new TextEncoder().encode(raw).byteLength
       if (rawBytes > AGENT_CALLBACK_DATA_MAX) {
@@ -65,9 +93,50 @@ export function wrapAgentCallbacks(keyboard: AnyButton[][]): AnyButton[][] {
           `(actual=${rawBytes}, raw="${raw.slice(0, 32)}${raw.length > 32 ? '…' : ''}")`,
         )
       }
-      return { ...btn, callback_data: `${AGENT_CALLBACK_PREFIX}${raw}` }
+      cleaned.callback_data = `${AGENT_CALLBACK_PREFIX}${raw}`
+      return cleaned
     }),
   )
+}
+
+/**
+ * Extract per-button {@link AgentButtonMeta} from a raw (pre-wrap)
+ * keyboard. Returns a map keyed by the raw (unprefixed) callback_data
+ * string. Buttons without callback_data or without any meta fields are
+ * omitted. Used by the gateway to remember post-tap UX preferences for
+ * each button on a sent message.
+ */
+export function extractAgentButtonMeta(
+  keyboard: AnyButton[][],
+): Map<string, AgentButtonMeta> {
+  const out = new Map<string, AgentButtonMeta>()
+  for (const row of keyboard) {
+    for (const btn of row) {
+      if (typeof btn.callback_data !== 'string') continue
+      const meta: AgentButtonMeta = {}
+      if (typeof btn.ack_text === 'string') meta.ack_text = btn.ack_text
+      if (typeof btn.single_use === 'boolean') meta.single_use = btn.single_use
+      if (meta.ack_text != null || meta.single_use != null) {
+        out.set(btn.callback_data, meta)
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * Aggregate the message-level "should we strip the keyboard after a tap"
+ * decision (#710). Default policy is single-use=true. The keyboard is
+ * preserved only when at least one button on the message explicitly opts
+ * out via `single_use: false`.
+ */
+export function keyboardIsSingleUse(
+  metaByRawData: Map<string, AgentButtonMeta>,
+): boolean {
+  for (const meta of metaByRawData.values()) {
+    if (meta.single_use === false) return false
+  }
+  return true
 }
 
 /**

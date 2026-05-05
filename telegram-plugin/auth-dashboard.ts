@@ -787,7 +787,43 @@ export function formatAccountQuotaLine(
     parts.push(`<i>7d:</i> ${formatQuotaPct(acc.sevenDayPct)}`);
   }
   if (parts.length === 0) return null;
+  // Append a "<window> resets in <duration>" suffix when reset
+  // timestamps are available (issue #708). Picks whichever window
+  // resets sooner (5h preferred on tie). Hidden once the reset is in
+  // the past — the percent column already shows whether the cap is
+  // free again.
+  const resetSuffix = formatNearestAccountResetSuffix(acc, now);
+  if (resetSuffix) parts.push(resetSuffix);
   return parts.join("  · ");
+}
+
+/**
+ * Render the "5h resets in 2h 14m" / "7d resets in 1d 3h" suffix
+ * appended to per-account quota lines (issue #708). Returns "" when
+ * neither timestamp is present or both are in the past — the parent
+ * caller decides whether to push it.
+ *
+ * Exported for the boot card so the two surfaces share one dialect.
+ */
+export function formatNearestAccountResetSuffix(
+  acc: Pick<AccountSummary, "fiveHourResetAt" | "sevenDayResetAt">,
+  now: number = Date.now(),
+): string {
+  const five = acc.fiveHourResetAt;
+  const seven = acc.sevenDayResetAt;
+  let target: number | null = null;
+  let label: "5h" | "7d" | null = null;
+  if (five != null && (seven == null || five <= seven)) {
+    target = five;
+    label = "5h";
+  } else if (seven != null) {
+    target = seven;
+    label = "7d";
+  }
+  if (target == null || label == null) return "";
+  const delta = target - now;
+  if (delta <= 0) return "";
+  return `<i>${label} resets in</i> ${formatRelativeMs(delta)}`;
 }
 
 function formatQuotaPct(pct: number): string {
