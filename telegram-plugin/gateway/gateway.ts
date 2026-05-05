@@ -189,6 +189,7 @@ import {
   formatQuotaBlock,
   getCachedAccountQuota,
   prefetchAccountQuotaIfStale,
+  hydrateAccountQuotaCacheFromDisk,
   clearAccountQuotaCache,
 } from '../quota-check.js'
 import {
@@ -1853,6 +1854,7 @@ const ipcServer: IpcServer = createIpcServer({
             gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
             restartReason: reason,
             restartAgeMs: markerAgeMs,
+            loadAccounts: () => loadAccountsForBootCard(agentSlug),
           }, ackMsgId).then(handle => {
             activeBootCard = handle
           }).catch((err: Error) => {
@@ -6746,6 +6748,43 @@ function fetchDashboardState(agent: string): DashboardState | null {
 }
 
 /**
+ * Build the per-account list rendered on the boot/health card (issue
+ * #708). Reuses `fetchDashboardState` so the data source matches
+ * `/auth` exactly — same cache, same shape. Returns null on any
+ * failure so the boot card silently omits the section.
+ */
+function loadAccountsForBootCard(agent: string): ReadonlyArray<AccountSummary> | null {
+  try {
+    // Re-hydrate the in-process cache from on-disk snapshots
+    // captured by previous gateway lifetimes. Without this, a fresh
+    // boot would render the accounts section with empty quota rows
+    // until the background prefetch ticks. Best-effort.
+    try {
+      const labels = switchroomExecJson<Array<{ label?: string }>>([
+        'auth', 'account', 'list', '--json',
+      ])
+      if (Array.isArray(labels)) {
+        hydrateAccountQuotaCacheFromDisk(
+          labels.map((l) => l?.label).filter((s): s is string => typeof s === 'string'),
+        )
+      }
+    } catch {
+      /* hydrate is best-effort; fall through to live state */
+    }
+
+    const state = fetchDashboardState(agent)
+    if (!state || !state.accounts) return null
+    // Show only accounts enabled on this agent — fallback rows on the
+    // dashboard are useful, but on the boot card "accounts I'm using"
+    // is the right scope.
+    const enabled = state.accounts.filter((a) => a.enabledHere)
+    return enabled.length > 0 ? enabled : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Read the pending auth session's target slot from the agent's
  * `.setup-token.session.json` meta file. Returns null when no session
  * is pending.
@@ -9839,6 +9878,7 @@ void (async () => {
                       gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
                       restartReason: reason,
                       restartAgeMs: markerAgeMs,
+                      loadAccounts: () => loadAccountsForBootCard(agentSlug),
                     }, ackMsgId)
                     activeBootCard = handle
                   } catch (err) {

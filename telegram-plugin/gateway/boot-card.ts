@@ -33,6 +33,8 @@
  */
 
 import type { ProbeResult, GatewayRuntimeInfo } from './boot-probes.js'
+import type { AccountSummary } from '../auth-dashboard.js'
+import { formatAccountQuotaLine } from '../auth-dashboard.js'
 import {
   probeAccount,
   probeAgentProcess,
@@ -236,6 +238,21 @@ export interface RenderBootCardOpts {
   restartReason?: RestartReason
   /** Age of the restart marker in ms — shown in the crash row. */
   restartAgeMs?: number
+  /**
+   * Per-account quota snapshots to render below the probe rows.
+   * One line per enabled account showing 5h % / 7d % and the
+   * nearest reset countdown so users see headroom without running
+   * `/auth` or `/usage` after every restart.
+   *
+   * Empty / undefined hides the section entirely — preserves the
+   * silent-when-healthy contract for callers that don't pass account
+   * data (tests, harnesses, gateways without the auth model).
+   *
+   * Closes #708.
+   */
+  accounts?: ReadonlyArray<AccountSummary>
+  /** Clock injection point for tests; defaults to `new Date()`. */
+  now?: Date
 }
 
 /**
@@ -276,8 +293,44 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     }
   }
 
-  if (degradedRows.length === 0) return ack
-  return [ack, '', ...degradedRows].join('\n')
+  // Per-account quota section (issue #708) — one line per enabled
+  // account showing 5h % / 7d % / nearest reset, with the active
+  // account marked. Renders alongside the ack line so users see
+  // headroom without running /auth or /usage.
+  const accountRows = renderAccountRows(opts.accounts, opts.now ?? new Date())
+
+  const sections: string[] = [ack]
+  if (degradedRows.length > 0) sections.push('', ...degradedRows)
+  if (accountRows.length > 0) sections.push('', ...accountRows)
+  if (sections.length === 1) return ack
+  return sections.join('\n')
+}
+
+/**
+ * Render the per-account quota rows. Returns an empty array when no
+ * accounts are passed — keeping the boot card's silent-when-healthy
+ * default for callers that don't supply account data.
+ *
+ * Reuses the dashboard's `formatAccountQuotaLine` so the two surfaces
+ * speak with one voice.
+ */
+export function renderAccountRows(
+  accounts: ReadonlyArray<AccountSummary> | undefined,
+  now: Date,
+): string[] {
+  if (!accounts || accounts.length === 0) return []
+  const rows: string[] = []
+  rows.push(`<b>Accounts (${accounts.length})</b>`)
+  const nowMs = now.getTime()
+  for (const a of accounts) {
+    const marker = a.activeForThisAgent ? '▶' : '↳'
+    const labelHtml = `<code>${escapeHtml(a.label)}</code>`
+    // formatAccountQuotaLine returns HTML (with <i> tags) so we don't
+    // re-escape — pass it through verbatim.
+    const quotaLine = formatAccountQuotaLine(a, nowMs)
+    rows.push(quotaLine ? `${marker} ${labelHtml}  ${quotaLine}` : `${marker} ${labelHtml}`)
+  }
+  return rows
 }
 
 // ─── Probe orchestration ─────────────────────────────────────────────────────
@@ -323,6 +376,17 @@ export interface RunProbesOpts {
   agentLiveExecFileImpl?: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
   /** Override for tests — replaces real delays in the live loop. */
   agentLiveSleepImpl?: (ms: number) => Promise<void>
+  /**
+   * Loader for the per-account rows that get appended below the probe
+   * rows on the boot card (issue #708). Returns the account list
+   * synchronously or via a Promise; an empty array / null disables
+   * the section. Skipped on the immediate ack post — only consulted
+   * during the post-settle re-render so the first paint stays fast.
+   */
+  loadAccounts?: () =>
+    | ReadonlyArray<AccountSummary>
+    | null
+    | Promise<ReadonlyArray<AccountSummary> | null>
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -407,6 +471,22 @@ export async function startBootCard(
         // start the live watch (Phase 2) to keep updating the card.
         const probes = await runAllProbes(opts)
 
+        // Per-account rows (issue #708). Loaded best-effort
+        // alongside probes; failures are swallowed so the card still
+        // renders correctly with no accounts section.
+        let accountRows: ReadonlyArray<AccountSummary> | null = null
+        if (opts.loadAccounts) {
+          try {
+            accountRows = await opts.loadAccounts()
+          } catch (loadErr: unknown) {
+            logger(
+              `telegram gateway: boot-card: loadAccounts failed: ${
+                (loadErr as Error)?.message ?? String(loadErr)
+              }\n`,
+            )
+          }
+        }
+
         // Render with current probe state and edit if anything changed.
         let currentText = renderBootCard({
           agentName: opts.agentName,
@@ -414,6 +494,7 @@ export async function startBootCard(
           probes,
           restartReason: opts.restartReason,
           restartAgeMs: opts.restartAgeMs,
+          ...(accountRows ? { accounts: accountRows } : {}),
         })
 
         if (currentText !== ackText) {
@@ -457,6 +538,7 @@ export async function startBootCard(
             probes: updatedProbes,
             restartReason: opts.restartReason,
             restartAgeMs: opts.restartAgeMs,
+            ...(accountRows ? { accounts: accountRows } : {}),
           })
 
           if (updatedText === currentText) continue
