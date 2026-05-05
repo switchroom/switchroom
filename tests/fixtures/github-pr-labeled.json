@@ -1,0 +1,13 @@
+{
+  "action": "labeled",
+  "number": 99,
+  "pull_request": {
+    "html_url": "https://github.com/acme/myrepo/pull/99",
+    "title": "Refactor auth module",
+    "user": { "login": "bob" },
+    "labels": [
+      { "name": "needs-review" }
+    ]
+  },
+  "repository": { "full_name": "acme/myrepo" }
+}

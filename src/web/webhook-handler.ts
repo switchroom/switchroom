@@ -50,6 +50,11 @@ import {
   renderGenericEvent,
   type WebhookSource,
 } from './webhook-verify.js'
+import {
+  evaluateDispatch,
+  type WebhookDispatchConfig,
+  type EvaluateDispatchDeps,
+} from './webhook-dispatch.js'
 
 export interface WebhookConfig {
   /** Per-source secrets, declared in vault under
@@ -72,6 +77,9 @@ export interface WebhookHandlerDeps {
   dedupStore?: DedupStore
   /** Injectable rate limiter (for testing). Falls back to module-global. */
   rateLimiter?: RateLimiter
+  /** Injectable dispatch deps (for testing). When absent, production
+   *  defaults are used inside evaluateDispatch. */
+  dispatchDeps?: EvaluateDispatchDeps
 }
 
 export interface WebhookHandlerArgs {
@@ -86,6 +94,9 @@ export interface WebhookHandlerArgs {
   config: WebhookConfig
   /** True iff `agent` is a known agent in switchroom.yaml. */
   agentExists: boolean
+  /** Optional dispatch config from switchroom.yaml
+   *  channels.telegram.webhook_dispatch. When absent, no dispatch runs. */
+  dispatchConfig?: WebhookDispatchConfig
 }
 
 export interface WebhookHandlerResult {
@@ -410,6 +421,35 @@ export async function handleWebhookIngest(
   }
 
   log(`webhook-ingest: agent='${args.agent}' source='${source}' event='${eventType}' recorded ts=${now}\n`)
+
+  // ── Webhook dispatch (#715) ───────────────────────────────────────────────
+  // After recording, evaluate dispatch rules. Fires are async (detached
+  // processes) — we don't await them and don't let failures affect the 202.
+  if (args.dispatchConfig) {
+    try {
+      const fired = evaluateDispatch(
+        {
+          agent: args.agent,
+          source,
+          eventType,
+          payload,
+          dispatchConfig: args.dispatchConfig,
+        },
+        {
+          ...(deps.dispatchDeps ?? {}),
+          resolveAgentDir,
+          log,
+        },
+      )
+      if (fired > 0) {
+        log(`webhook-dispatch: agent='${args.agent}' source='${source}' event='${eventType}' fired=${fired}\n`)
+      }
+    } catch (err) {
+      // Non-fatal: a dispatch failure must not downgrade the 202.
+      log(`webhook-dispatch: agent='${args.agent}' source='${source}' event='${eventType}' dispatch error: ${(err as Error).message}\n`)
+    }
+  }
+
   return jsonReply(202, { ok: true, recorded: true, ts: now })
 }
 

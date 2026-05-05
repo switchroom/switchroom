@@ -13,6 +13,14 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  evaluateDispatch,
+  matchesRule,
+  buildGithubContext,
+  renderTemplate,
+  parseDurationMs,
+  isQuietHour,
+} from "../web/webhook-dispatch.js";
 import { createInterface } from "node:readline";
 import { resolvePath, loadConfig } from "../config/loader.js";
 import { createVault, setStringSecret } from "../vault/vault.js";
@@ -35,6 +43,7 @@ export function registerTelegramCommand(program: Command): void {
   registerStatusVerb(tg, program);
   registerEnableVerb(tg, program);
   registerDisableVerb(tg, program);
+  registerDispatchVerb(tg, program);
 }
 
 // ─── status ──────────────────────────────────────────────────────────────────
@@ -462,6 +471,115 @@ async function getVaultPassphrase(): Promise<string> {
   const passphrase = await promptHidden("Vault passphrase: ");
   if (!passphrase) throw new Error("Vault passphrase cannot be empty");
   return passphrase;
+}
+
+// ─── dispatch ────────────────────────────────────────────────────────────────
+
+function registerDispatchVerb(tg: Command, _program: Command): void {
+  const dispatch = tg
+    .command("dispatch")
+    .description("Webhook dispatch utilities.");
+
+  dispatch
+    .command("test")
+    .description(
+      "Dry-run dispatch rule matching against a captured payload file. " +
+      "Prints which rules would match and the rendered prompt, without " +
+      "spawning a claude -p process.",
+    )
+    .requiredOption("--agent <name>", "Agent name (must exist in switchroom.yaml)")
+    .requiredOption("--payload <file>", "Path to a JSON payload file")
+    .requiredOption("--event <type>", "GitHub event type (e.g. 'pull_request', 'push')")
+    .option("--source <name>", "Webhook source (default: github)", "github")
+    .action(
+      withConfigError(async (opts: DispatchTestOpts) => {
+        const config = getConfig(_program);
+        const agentRaw = config.agents[opts.agent];
+        if (!agentRaw) {
+          fail(`Unknown agent '${opts.agent}'. Check switchroom.yaml.`);
+        }
+        const resolved = resolveAgentConfig(config.defaults, config.profiles, agentRaw);
+        const dispatchConfig = resolved.channels?.telegram?.webhook_dispatch;
+        if (!dispatchConfig) {
+          console.log(
+            chalk.yellow(`No webhook_dispatch config found for agent '${opts.agent}'.`),
+          );
+          return;
+        }
+
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(readFileSync(opts.payload, "utf-8")) as Record<string, unknown>;
+        } catch (err) {
+          fail(`Could not read payload file '${opts.payload}': ${(err as Error).message}`);
+        }
+
+        // Collect matches without spawning
+        const rules = opts.source === "github" ? (dispatchConfig.github ?? []) : [];
+        if (rules.length === 0) {
+          console.log(chalk.yellow(`No dispatch rules for source '${opts.source}'.`));
+          return;
+        }
+
+        let matchCount = 0;
+        const now = new Date();
+
+        for (let i = 0; i < rules.length; i++) {
+          const rule = rules[i];
+          const matched = matchesRule(opts.event, payload, rule.match);
+          const prefix = matched ? chalk.green("✓ MATCH") : chalk.dim("✗ no match");
+          const desc = rule.description ? ` — ${rule.description}` : ` — rule ${i}`;
+          console.log(`${prefix}  rule ${i}${desc}`);
+
+          if (!matched) continue;
+          matchCount++;
+
+          // Quiet hours status
+          if (rule.quiet_hours) {
+            const quiet = isQuietHour(rule.quiet_hours, now);
+            console.log(
+              `  quiet hours: ${quiet ? chalk.yellow("ACTIVE (would skip)") : chalk.green("inactive")}`,
+            );
+          }
+
+          // Cooldown note
+          if (rule.cooldown) {
+            const ms = parseDurationMs(rule.cooldown);
+            console.log(
+              `  cooldown: ${rule.cooldown} (${ms}ms) — state tracked in webhook-cooldown.json`,
+            );
+          }
+
+          // Rendered prompt
+          const ctx = buildGithubContext(opts.event, payload);
+          const rendered = renderTemplate(rule.prompt, ctx);
+          console.log(chalk.bold("  rendered prompt:"));
+          for (const line of rendered.split("\n")) {
+            console.log(`    ${line}`);
+          }
+          console.log(`  model: ${rule.model ?? "claude-sonnet-4-6"}`);
+        }
+
+        console.log();
+        if (matchCount === 0) {
+          console.log(chalk.yellow("No rules matched — no dispatch would fire."));
+        } else {
+          console.log(
+            chalk.green(
+              `${matchCount} rule(s) matched. ` +
+              `Run without --dry-run in production to spawn claude -p.`,
+            ),
+          );
+        }
+      }),
+    );
+}
+
+interface DispatchTestOpts {
+  agent: string;
+  payload: string;
+  event: string;
+  source: string;
 }
 
 function promptHidden(prompt: string): Promise<string> {
