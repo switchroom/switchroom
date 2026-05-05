@@ -136,6 +136,9 @@ import {
 import {
   wrapAgentCallbacks,
   parseAgentCallback,
+  extractAgentButtonMeta,
+  keyboardIsSingleUse,
+  type AgentButtonMeta,
 } from '../inline-keyboard-callbacks.js'
 import {
   startText as buildStartText,
@@ -1212,6 +1215,32 @@ const pendingAskUser = new Map<string, PendingAskUser>()
 const pendingReauthFlows = new Map<string, { agent: string; startedAt: number }>()
 const REAUTH_INTERCEPT_TTL_MS = 10 * 60_000
 
+// #710: per-message agent-button metadata (ack_text / single_use). Keyed by
+// `${chatId}:${messageId}` → Map<rawCallbackData, AgentButtonMeta>. Populated
+// when an agent-emitted inline_keyboard is sent; consumed by the
+// callback_query handler to honor agent-specified post-tap UX. Bounded by
+// AGENT_BUTTON_META_MAX (LRU-ish — oldest insertion deleted when over cap)
+// so a long-lived gateway can't grow the map unbounded. Restart-safe by
+// design: when this map is empty (e.g. fresh process) the defaults apply
+// (`'✓ received'` toast + strip keyboard) — the agent only loses any
+// custom ack_text override.
+const agentButtonMeta = new Map<string, Map<string, AgentButtonMeta>>()
+const AGENT_BUTTON_META_MAX = 1000
+function rememberAgentButtonMeta(
+  chatId: string | number,
+  messageId: number,
+  meta: Map<string, AgentButtonMeta>,
+): void {
+  if (meta.size === 0) return
+  const key = `${chatId}:${messageId}`
+  agentButtonMeta.set(key, meta)
+  while (agentButtonMeta.size > AGENT_BUTTON_META_MAX) {
+    const oldest = agentButtonMeta.keys().next().value
+    if (oldest === undefined) break
+    agentButtonMeta.delete(oldest)
+  }
+}
+
 // Vault
 const vaultPassphraseCache = new Map<string, { passphrase: string; expiresAt: number }>()
 const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
@@ -2271,6 +2300,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // pass through unchanged. Attached to the LAST chunk only so buttons
   // appear on the final visible message.
   let replyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+  let replyButtonMeta: Map<string, AgentButtonMeta> | undefined
   const rawKeyboard = args.inline_keyboard as AnyButton[][] | undefined
   if (rawKeyboard != null) {
     const validationErrors = validateInlineKeyboard(rawKeyboard)
@@ -2280,6 +2310,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         .join('; ')
       throw new Error(`inline_keyboard validation failed: ${summary}`)
     }
+    replyButtonMeta = extractAgentButtonMeta(rawKeyboard)
     replyMarkup = { inline_keyboard: wrapAgentCallbacks(rawKeyboard) }
   }
 
@@ -2394,6 +2425,16 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
   } finally {
     stopTypingLoop(chat_id)
+  }
+
+  // #710: remember per-button agent meta (ack_text / single_use) keyed
+  // by the message that actually carries the keyboard — that's the last
+  // text chunk, since the keyboard is attached only on isLastChunk.
+  if (replyButtonMeta != null && replyButtonMeta.size > 0 && sentIds.length >= chunks.length) {
+    const keyboardMsgId = sentIds[chunks.length - 1]
+    if (typeof keyboardMsgId === 'number') {
+      rememberAgentButtonMeta(chat_id, keyboardMsgId, replyButtonMeta)
+    }
   }
 
   // #273: when files is 2-10 photos, batch them into a single
@@ -2540,6 +2581,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // this agent. Only attached on done=true so buttons land on the
   // final answer message, not on intermediate draft edits.
   let streamReplyMarkup: { inline_keyboard: AnyButton[][] } | undefined
+  let streamButtonMeta: Map<string, AgentButtonMeta> | undefined
   const rawStreamKeyboard = args.inline_keyboard as AnyButton[][] | undefined
   if (rawStreamKeyboard != null && Boolean(args.done)) {
     const validationErrors = validateInlineKeyboard(rawStreamKeyboard)
@@ -2549,6 +2591,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         .join('; ')
       throw new Error(`inline_keyboard validation failed: ${summary}`)
     }
+    streamButtonMeta = extractAgentButtonMeta(rawStreamKeyboard)
     streamReplyMarkup = { inline_keyboard: wrapAgentCallbacks(rawStreamKeyboard) }
   }
 
@@ -2636,6 +2679,16 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         Date.now(),
       )
     } catch { /* best-effort signal */ }
+  }
+  // #710: stash agent-button meta keyed by the final message id so the
+  // callback handler can honor ack_text / single_use on tap.
+  if (
+    args.done === true
+    && result.messageId != null
+    && streamButtonMeta != null
+    && streamButtonMeta.size > 0
+  ) {
+    rememberAgentButtonMeta(args.chat_id as string, result.messageId, streamButtonMeta)
   }
   // #546 dedup record: capture the final stream_reply text on the
   // terminal call so a subsequent retry (different bridge, same
@@ -8273,11 +8326,21 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
       return
     }
-    // Ack the spinner FIRST so the user doesn't see it stick if the
-    // forward path takes a moment.
-    await ctx.answerCallbackQuery().catch(() => {})
     const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
     const cbMessageId = ctx.callbackQuery?.message?.message_id
+    // #710: look up agent-supplied per-button meta (ack_text / single_use)
+    // stashed at send time. Empty map after a gateway restart — defaults
+    // still give the user-visible toast + keyboard removal.
+    const metaForMessage = cbMessageId != null
+      ? agentButtonMeta.get(`${cbChatId}:${cbMessageId}`)
+      : undefined
+    const tapMeta = metaForMessage?.get(agentCb.raw)
+    const ackText = (typeof tapMeta?.ack_text === 'string' && tapMeta.ack_text.length > 0)
+      ? tapMeta.ack_text
+      : '✓ received'
+    // Ack the spinner FIRST with a visible toast so the user knows the
+    // tap registered (#710 — empty ack showed nothing, users re-tapped).
+    await ctx.answerCallbackQuery({ text: ackText }).catch(() => {})
     const buttonText = (() => {
       // Best-effort: pull the tapped button's label from the source
       // message's keyboard so the agent gets a human-readable echo.
@@ -8337,6 +8400,21 @@ bot.on('callback_query:data', async ctx => {
         '⏳ Agent is restarting — your button tap was queued but won\'t be processed until it comes back.',
         cbThreadId != null ? { message_thread_id: cbThreadId } : {},
       ).catch(() => {})
+    }
+    // #710: strip the keyboard after tap so the buttons can't be
+    // double-fired. Default policy is single-use — preserve the
+    // keyboard only if at least one button on the message explicitly
+    // opts out via `single_use: false`. With no stashed meta (e.g.
+    // gateway restarted between send and tap) the default fires too,
+    // which is the desired UX.
+    const stripKeyboard = metaForMessage == null || keyboardIsSingleUse(metaForMessage)
+    if (stripKeyboard && cbMessageId != null) {
+      await ctx.editMessageReplyMarkup({
+        reply_markup: { inline_keyboard: [] },
+      }).catch(() => {})
+      if (metaForMessage != null) {
+        agentButtonMeta.delete(`${cbChatId}:${cbMessageId}`)
+      }
     }
     return
   }

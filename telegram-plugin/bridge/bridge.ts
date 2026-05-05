@@ -110,7 +110,7 @@ const TOOL_SCHEMAS = [
         quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
         inline_keyboard: {
           type: 'array',
-          description: 'Optional 2D array of tappable buttons rendered under the message. Outer array = rows; inner array = buttons in each row (max 8 per row, 8 rows). Each button needs a `text` (label, max 64 chars) plus EXACTLY ONE of: `url` (opens link in browser; must start with http(s):// or tg://) or `callback_data` (string, max 58 chars; tap is delivered to this agent as an inbound channel event with meta.button_callback_data=<the data> and the original button_text). Use buttons for single-tap approval/triage flows like [Approve] [Hold]; one tap on mobile beats asking the user to type YES/NO.',
+          description: 'Optional 2D array of tappable buttons rendered under the message. Outer array = rows; inner array = buttons in each row (max 8 per row, 8 rows). Each button needs a `text` (label, max 64 chars) plus EXACTLY ONE of: `url` (opens link in browser; must start with http(s):// or tg://) or `callback_data` (string, max 58 chars; tap is delivered to this agent as an inbound channel event with meta.button_callback_data=<the data> and the original button_text). Use buttons for single-tap approval/triage flows like [Approve] [Hold]; one tap on mobile beats asking the user to type YES/NO. By default a tap shows a brief "✓ received" toast and removes the entire keyboard so the user can\'t double-fire — override per-button via `ack_text` (custom toast text, max 200 chars) and `single_use: false` (preserve the keyboard so e.g. a [Refresh] button stays tappable).',
           items: {
             type: 'array',
             items: {
@@ -119,6 +119,8 @@ const TOOL_SCHEMAS = [
                 text: { type: 'string', description: 'Button label visible to the user. Max 64 chars.' },
                 url: { type: 'string', description: 'Open this URL when tapped. Mutually exclusive with callback_data.' },
                 callback_data: { type: 'string', description: 'Opaque tag delivered back to the agent on tap. Max 58 chars (gateway prepends an `agent:` prefix to the 64-byte Telegram limit). Mutually exclusive with url.' },
+                ack_text: { type: 'string', description: 'Toast text shown to the user the instant they tap this button (#710). Default "✓ received". Max ~200 chars (Telegram answerCallbackQuery limit). Has no effect on URL buttons.' },
+                single_use: { type: 'boolean', description: 'When true (default) tapping any single_use button on the message removes the entire keyboard so the user can\'t double-fire. Set false on buttons that should stay tappable (e.g. a "Refresh" button). If ANY button on the message has single_use:false the keyboard is preserved on tap.' },
               },
               required: ['text'],
             },
@@ -146,7 +148,7 @@ const TOOL_SCHEMAS = [
         quote_text: { type: 'string', description: 'Surgical quote: specific text to highlight from the reply_to message. Requires reply_to.' },
         inline_keyboard: {
           type: 'array',
-          description: '2D array of tappable buttons under the final message. Same shape and constraints as `reply.inline_keyboard` — each button has `text` and EXACTLY ONE of `url` or `callback_data`. Tap on a callback_data button is delivered to this agent as an inbound channel event with meta.button_callback_data set.',
+          description: '2D array of tappable buttons under the final message. Same shape and constraints as `reply.inline_keyboard` — each button has `text` and EXACTLY ONE of `url` or `callback_data`, plus optional `ack_text` (custom tap-toast; default "✓ received") and `single_use` (default true; set false to keep the keyboard tappable after a tap). Tap on a callback_data button is delivered to this agent as an inbound channel event with meta.button_callback_data set.',
           items: {
             type: 'array',
             items: {
@@ -155,6 +157,8 @@ const TOOL_SCHEMAS = [
                 text: { type: 'string' },
                 url: { type: 'string' },
                 callback_data: { type: 'string' },
+                ack_text: { type: 'string', description: 'Toast text shown on tap. Default "✓ received".' },
+                single_use: { type: 'boolean', description: 'Default true. Set false to keep the keyboard tappable after this button is tapped.' },
               },
               required: ['text'],
             },
