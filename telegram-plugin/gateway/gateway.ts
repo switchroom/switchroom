@@ -86,6 +86,7 @@ import {
   buildDashboard,
   buildRemoveConfirmKeyboard,
   buildAccountConfirmKeyboard,
+  buildAccountPromoteConfirmKeyboard,
   buildAccountSubViewText,
   buildAccountSubViewKeyboard,
   buildAccountRemoveConfirmKeyboard,
@@ -6618,6 +6619,11 @@ function fetchDashboardState(agent: string): DashboardState | null {
     quotaExhaustedUntil?: number
     email?: string
     agents: string[]
+    /** v0.6.9+: agents for which this label is at index 0 of
+     *  auth.accounts: (i.e. the post-fanout active for that agent).
+     *  Optional — older CLIs without the field cause the dashboard to
+     *  fall back to the v3a unmarked render. */
+    primaryForAgents?: string[]
   }
   let accounts: AccountSummary[] | undefined
   let accountsTruncated = false
@@ -6636,6 +6642,9 @@ function fetchDashboardState(agent: string): DashboardState | null {
           label: a.label,
           health: a.health,
           enabledHere: Array.isArray(a.agents) && a.agents.includes(agent),
+          ...(Array.isArray(a.primaryForAgents)
+            ? { activeForThisAgent: a.primaryForAgents.includes(agent) }
+            : {}),
           ...(a.subscriptionType ? { subscriptionType: a.subscriptionType } : {}),
           ...(a.expiresAt != null ? { expiresAt: a.expiresAt } : {}),
           ...(a.quotaExhaustedUntil != null
@@ -7634,6 +7643,33 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // The CLI's `disable` doesn't auto-restart (it expects the operator
       // to drain manually); the dashboard tap is implicit "I'm done with
       // this account on this agent now," so we restart on their behalf.
+      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      clearAccountQuotaCache()
+      await sendAuthDashboard(ctx, action.agent, { edit: true })
+      return
+    }
+    case 'account-promote': {
+      // Two-stage confirm — same UX as enable/disable, just a different
+      // verb on the confirm row's callback. The CLI verb does the
+      // YAML reorder + fanout.
+      await ctx.answerCallbackQuery({ text: `Confirm promote ${action.label}?` }).catch(() => {})
+      try {
+        await ctx.editMessageReplyMarkup({
+          reply_markup: buildAccountPromoteConfirmKeyboard(action.agent, action.label),
+        })
+      } catch { /* ignore */ }
+      return
+    }
+    case 'confirm-account-promote': {
+      await ctx.answerCallbackQuery({ text: `Promoting ${action.label}…` }).catch(() => {})
+      try { assertSafeAgentName(action.agent) } catch { return }
+      await runSwitchroomCommand(
+        ctx,
+        ['auth', 'promote', action.label, action.agent],
+        `auth promote ${action.label} ${action.agent}`,
+      )
+      // Promotion changes the active credential — must restart so
+      // claude reloads the new primary's tokens.
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
       clearAccountQuotaCache()
       await sendAuthDashboard(ctx, action.agent, { edit: true })

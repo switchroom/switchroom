@@ -73,6 +73,55 @@ export function removeAccountFromAgent(
 }
 
 /**
+ * Move `label` to position 0 in `agents.<agent>.auth.accounts` so it
+ * becomes the agent's primary on the next fanout. Used by
+ * `switchroom auth promote`. Pure: returns the new YAML string.
+ *
+ * Behaviour:
+ *   - Label not in the list → throws (caller validates first; reaching
+ *     this branch is a bug, not a no-op the operator should silently
+ *     accept).
+ *   - Label already at position 0 → returns yamlText unchanged
+ *     (byte-identical, no parseDocument round-trip).
+ *   - Label at any other position → moved to head; relative order of
+ *     the other entries preserved.
+ *   - Agent not declared → throws (same contract as appendAccountToAgent).
+ *
+ * Why a pure-string short-circuit on already-primary: parseDocument
+ * normalizes whitespace and can drop a leading newline, surprising
+ * callers that diff the file to detect "did anything change?". The
+ * `enable` polish (#697) hit this exact corner.
+ */
+export function promoteAccountForAgent(
+  yamlText: string,
+  agentName: string,
+  label: string,
+): string {
+  const doc = parseDocument(yamlText);
+  ensureAgent(doc, agentName);
+  const existing = doc.getIn(["agents", agentName, "auth", "accounts"]);
+  if (!isSeq(existing)) {
+    throw new Error(
+      `agent '${agentName}' has no auth.accounts list — enable '${label}' first.`,
+    );
+  }
+  const seq = existing as YAMLSeq;
+  const labels = seq.items.map(
+    (item) => (item as { value?: unknown }).value ?? item,
+  );
+  const idx = labels.indexOf(label);
+  if (idx === -1) {
+    throw new Error(
+      `account '${label}' is not enabled on agent '${agentName}' — enable it first.`,
+    );
+  }
+  if (idx === 0) return yamlText; // already primary — no-op
+  const moved = seq.items.splice(idx, 1)[0];
+  seq.items.unshift(moved);
+  return String(doc);
+}
+
+/**
  * Read the current `agents.<agent>.auth.accounts` list without mutating.
  * Returns [] if absent or shape-mismatched. Useful for the `list` verb +
  * the rm-refusal logic.
