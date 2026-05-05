@@ -1115,7 +1115,7 @@ export const AgentSchema = z.object({
     .optional()
     .describe(
       "Per-agent feature flags for unstable / canary behaviour. Each " +
-      "field is a booleam opt-in; the default for every flag is the " +
+      "field is a boolean opt-in; the default for every flag is the " +
       "current production behaviour. Flags graduate out of `experimental` " +
       "once they're known-stable across the fleet.",
     ),
