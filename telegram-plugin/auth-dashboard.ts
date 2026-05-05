@@ -702,11 +702,16 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
     kb.row();
   }
 
-  // Quota row. [Fall back now] only when the dashboard flagged
-  // quotaHot; always show [Full quota] as the escape hatch.
-  if (state.quotaHot) {
-    kb.text("⚠️ Fall back now", encodeCallbackData({ kind: "fallback", agent: state.agent }));
-  }
+  // Quota row. [📊 Full quota] is the escape hatch when the
+  // operator wants the live numbers behind the cached mini-bars.
+  // The legacy `[⚠️ Fall back now]` button (manual auto-fallback at
+  // the slot level) was removed in v0.6.11 — the Switch primary
+  // picker is the operator-facing surface for "active is hot, swap
+  // to a fallback," and the auto-fallback poller still handles the
+  // automatic case when the active hits its quota wall. The
+  // `fallback` callback verb stays in the parser/dispatcher for
+  // legacy reachability of any pinned messages still bearing the
+  // pre-v0.6.11 button, but no new buttons emit it.
   kb.text("📊 Full quota", encodeCallbackData({ kind: "usage", agent: state.agent }));
   kb.row();
 

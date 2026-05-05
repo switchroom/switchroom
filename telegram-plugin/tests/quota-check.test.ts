@@ -413,12 +413,18 @@ describe('getCachedAccountQuota + prefetchAccountQuotaIfStale', () => {
     }
   })
 
-  it('treats stale entries as a cache miss', async () => {
+  it("returns stale entries verbatim — staleness is the prefetch path's concern, not the read path's (v0.6.11)", async () => {
+    // The dashboard renders sync. Pre-v0.6.11 this function treated
+    // stale cache as a miss → the boot-warmed cache vanished after
+    // 30s and the operator saw empty quota rows on the first /auth
+    // tap of any session past that window. Now stale-but-present
+    // entries are returned; the background prefetch keeps the cache
+    // fresh across renders.
     const home = makeAccountHome({
       'work@example.com': { accessToken: 'tok' },
     })
     try {
-      let nowVal = 1_000_000
+      const nowVal = 1_000_000
       await fetchAccountQuota('work@example.com', {
         home,
         fetchImpl: (async () =>
@@ -432,13 +438,23 @@ describe('getCachedAccountQuota + prefetchAccountQuotaIfStale', () => {
         now: () => nowVal,
       })
       // Within TTL — cached.
-      expect(getCachedAccountQuota('work@example.com', nowVal)).not.toBeNull()
-      // Past TTL — treated as miss.
+      const fresh = getCachedAccountQuota('work@example.com', nowVal)
+      expect(fresh).not.toBeNull()
+      // Past TTL — STILL returned, identical to the within-TTL read.
       const after = nowVal + ACCOUNT_QUOTA_CACHE_TTL_MS + 1
-      expect(getCachedAccountQuota('work@example.com', after)).toBeNull()
+      const stale = getCachedAccountQuota('work@example.com', after)
+      expect(stale).not.toBeNull()
+      expect(stale).toEqual(fresh)
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
+  })
+
+  it('returns null when the label has never been probed', async () => {
+    // The only "no data" path: the cache map has no entry. After
+    // the first probe the entry persists for the lifetime of the
+    // gateway process, regardless of staleness.
+    expect(getCachedAccountQuota('never-probed@example.com')).toBeNull()
   })
 
   it('prefetchAccountQuotaIfStale is a noop when cache is fresh', async () => {

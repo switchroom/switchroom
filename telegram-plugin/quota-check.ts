@@ -290,10 +290,15 @@ type AccountQuotaCacheEntry = {
   result: QuotaResult;
 };
 
-/** TTL for the per-account quota cache. 30s balances "dashboard
- *  refresh feels live" against "stop hammering the Anthropic API on
- *  every tap." Shared cache across the gateway process. */
-export const ACCOUNT_QUOTA_CACHE_TTL_MS = 30_000;
+/** TTL for the per-account quota cache — controls when
+ *  `prefetchAccountQuotaIfStale` re-probes Anthropic and when
+ *  `fetchAccountQuota`'s cache-bypass kicks in. 5 min: quota numbers
+ *  don't move within a few minutes for human-scale usage; the
+ *  prefetch fires on every dashboard render so the cache stays fresh
+ *  whenever the operator interacts. The dashboard's sync read
+ *  (`getCachedAccountQuota`) returns last-known data regardless of
+ *  staleness — see that function's docstring for why. */
+export const ACCOUNT_QUOTA_CACHE_TTL_MS = 5 * 60_000;
 
 const accountQuotaCache = new Map<string, AccountQuotaCacheEntry>();
 
@@ -356,22 +361,36 @@ export function clearAccountQuotaCache(label?: string): void {
 }
 
 /**
- * Sync read of the account quota cache. Returns `null` when there's
- * no entry (the dashboard renders the row without a quota line) or
- * when the entry is older than the TTL (treats it as a miss to keep
- * the dashboard's view fresh).
+ * Sync read of the account quota cache. Returns whatever's cached for
+ * this label — `null` only when there's NO entry at all. Stale-but-
+ * present cache entries are returned on purpose:
  *
- * Used by `fetchDashboardState` (which is sync) so the dashboard can
- * render with cached quota without awaiting an async probe. The
- * background prefetch path warms the cache for the next render.
+ *   - The dashboard renders sync; awaiting a fresh probe would block
+ *     the user-visible message (and a probe can stall on Anthropic
+ *     latency or network).
+ *   - Showing yesterday's number is dramatically better UX than
+ *     showing nothing — quota changes slowly enough that "the cached
+ *     value" is almost always close to truth.
+ *   - The background prefetch (`prefetchAccountQuotaIfStale`) keeps
+ *     the cache fresh across renders. Within the 5-min TTL it
+ *     no-ops; past the TTL it kicks off a fresh probe whose result
+ *     is visible on the operator's NEXT render (refresh tap or
+ *     auto-refresh after an action).
+ *
+ * Pre-v0.6.11 this function treated stale entries as a miss, which
+ * meant the boot-warmed cache vanished after 30s and the operator
+ * saw empty quota rows on the first /auth tap of any day after the
+ * gateway restart. That's the bug this docstring exists to keep
+ * fixed.
  */
 export function getCachedAccountQuota(
-  label: string,
-  now: number = Date.now(),
+  _label: string,
+  _now: number = Date.now(),
 ): QuotaResult | null {
-  const cached = accountQuotaCache.get(label);
+  // Note the unused params — we keep the signature stable for callers
+  // that pass `now` (test helpers) even though we no longer use it.
+  const cached = accountQuotaCache.get(_label);
   if (!cached) return null;
-  if (now - cached.fetchedAt >= ACCOUNT_QUOTA_CACHE_TTL_MS) return null;
   return cached.result;
 }
 

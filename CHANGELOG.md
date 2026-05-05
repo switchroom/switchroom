@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## v0.6.11 — 2026-05-05
+
+### Fixed
+
+- **Per-account quota mini-bars now persist past the cache TTL.**
+  Pre-v0.6.11 `getCachedAccountQuota` treated stale entries as a
+  miss, which meant the boot-warmed cache vanished after 30s and the
+  operator saw empty quota rows on the first `/auth` tap of any
+  session past that window. Now the sync read returns whatever's
+  cached regardless of staleness; the background prefetch
+  (`prefetchAccountQuotaIfStale`) keeps the cache fresh on every
+  dashboard render. Cache TTL also bumped from 30s → 5min — quota
+  doesn't move that fast, and the prefetch path keeps it fresh
+  whenever the operator interacts.
+
+### Removed
+
+- **`[⚠️ Fall back now]` button gone from `/auth`.** The Switch
+  primary picker (v0.6.10) is the operator-facing surface for "active
+  is hot, swap to a fallback"; the auto-fallback poller still handles
+  the automatic case when the active hits its quota wall. Two paths
+  doing the same thing was confusing. The `fallback` callback verb
+  stays in the parser/dispatcher for legacy reachability of any
+  pinned messages bearing the pre-v0.6.11 button.
+
 ## v0.6.10 — 2026-05-05
 
 ### Changed
