@@ -266,6 +266,7 @@ import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
 import { summarizeToolForTitle } from '../permission-title.js'
+import { resolveAlwaysAllowRule } from '../permission-rule.js'
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
@@ -1933,10 +1934,25 @@ const ipcServer: IpcServer = createIpcServer({
     // approve at a glance — e.g. `Skill (mail)` instead of bare `Skill`.
     // See #186.
     const text = `🔐 Permission: ${summarizeToolForTitle(toolName, inputPreview)}`
+    // Build the keyboard. The "🔁 Always" button only appears when we
+    // can synthesize a meaningful allow-rule for this tool — for an
+    // unknown tool we'd write a useless rule (or worse, a rule that
+    // expanded to too much). resolveAlwaysAllowRule returns null in
+    // that case and we fall back to the legacy 3-button layout.
+    const alwaysRule = resolveAlwaysAllowRule(toolName, inputPreview)
     const keyboard = new InlineKeyboard()
       .text('See more', `perm:more:${requestId}`)
       .text('✅ Allow', `perm:allow:${requestId}`)
       .text('❌ Deny', `perm:deny:${requestId}`)
+    if (alwaysRule != null) {
+      // Second row — full-width label like "🔁 Always allow Skill(mail)"
+      // so the operator sees exactly what rule they're whitelisting
+      // before tapping. Truncate at Telegram's 64-byte callback_data
+      // ceiling defensively (long MCP tool names can push past it).
+      keyboard
+        .row()
+        .text(`🔁 Always allow ${alwaysRule.label}`, `perm:always:${requestId}`)
+    }
     for (const chat_id of access.allowFrom) {
       void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
@@ -8303,7 +8319,7 @@ bot.on('callback_query:data', async ctx => {
   }
 
   // Permission request buttons.
-  const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
+  const m = /^perm:(allow|deny|more|always):([a-km-z]{5})$/.exec(data)
   if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
   const access = loadAccess()
   const senderId = String(ctx.from.id)
@@ -8317,9 +8333,71 @@ bot.on('callback_query:data', async ctx => {
     let prettyInput: string
     try { prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2) } catch { prettyInput = input_preview }
     const expanded = `🔐 Permission: ${tool_name}\n\ntool_name: ${tool_name}\ndescription: ${description}\ninput_preview:\n${prettyInput}`
-    const keyboard = new InlineKeyboard().text('✅ Allow', `perm:allow:${request_id}`).text('❌ Deny', `perm:deny:${request_id}`)
-    await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+    const expandedRule = resolveAlwaysAllowRule(tool_name, input_preview)
+    const expandedKeyboard = new InlineKeyboard()
+      .text('✅ Allow', `perm:allow:${request_id}`)
+      .text('❌ Deny', `perm:deny:${request_id}`)
+    if (expandedRule != null) {
+      expandedKeyboard.row().text(`🔁 Always allow ${expandedRule.label}`, `perm:always:${request_id}`)
+    }
+    await ctx.editMessageText(expanded, { reply_markup: expandedKeyboard }).catch(() => {})
     await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  if (behavior === 'always') {
+    // "🔁 Always allow" — write the resolved rule into the agent's
+    // tools.allow in switchroom.yaml via the existing `agent grant`
+    // CLI verb, then approve the in-flight request. Reconcile updates
+    // settings.json so future SESSIONS skip the popup; the in-flight
+    // turn already has its settings.json loaded so the rule won't
+    // suppress later prompts on this same turn — operator restarts
+    // the agent if they want full immediate effect.
+    const details = pendingPermissions.get(request_id)
+    if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
+    const rule = resolveAlwaysAllowRule(details.tool_name, details.input_preview)
+    if (rule == null) {
+      await ctx.answerCallbackQuery({ text: 'Cannot synthesize an always-allow rule for this tool.' }).catch(() => {})
+      return
+    }
+    const agentName = process.env.SWITCHROOM_AGENT_NAME
+    if (!agentName) {
+      await ctx.answerCallbackQuery({ text: 'Always-allow needs SWITCHROOM_AGENT_NAME — gateway is misconfigured.' }).catch(() => {})
+      return
+    }
+    let grantOk = false
+    try {
+      // --no-restart: settings.json gets the new entry on the next
+      // reconcile but we don't bounce the agent mid-turn. Operator
+      // can restart manually if they want this rule live in this
+      // session; otherwise it kicks in next session.
+      switchroomExec(['agent', 'grant', agentName, rule.rule, '--no-restart'])
+      grantOk = true
+      process.stderr.write(
+        `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
+      )
+    } catch (err) {
+      process.stderr.write(`telegram gateway: always-allow grant failed: ${(err as Error).message}\n`)
+    }
+
+    // Forward approval for the in-flight request regardless — even if
+    // the yaml edit failed, the operator clearly meant "yes" so we
+    // honour the immediate decision and surface the failure as a
+    // hint in the chat.
+    ipcServer.broadcast({ type: 'permission', requestId: request_id, behavior: 'allow' })
+    pendingPermissions.delete(request_id)
+
+    const ackText = grantOk
+      ? `🔁 Always allow ${rule.label} for ${agentName}`
+      : `✅ Allowed (always-allow yaml edit failed; check gateway log)`
+    await ctx.answerCallbackQuery({ text: ackText.slice(0, 200) }).catch(() => {})
+    const sourceMsg = ctx.callbackQuery?.message
+    if (sourceMsg && 'text' in sourceMsg && sourceMsg.text) {
+      const editLabel = grantOk
+        ? `🔁 <b>Always allow ${rule.label}</b> for ${agentName} — restart agent for full effect`
+        : `✅ <b>Allowed</b> (always-allow rule edit failed; see logs)`
+      await ctx.editMessageText(`${sourceMsg.text}\n\n${editLabel}`, { parse_mode: 'HTML' }).catch(() => {})
+    }
     return
   }
 

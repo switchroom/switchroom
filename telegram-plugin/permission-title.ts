@@ -32,7 +32,18 @@ export function summarizeToolForTitle(
 
   switch (toolName) {
     case "Skill": {
-      const skill = readString(input, "skill");
+      // Claude Code's Skill tool input shape has shifted across versions
+      // and skill flavours. Read defensively from every known field
+      // before falling back to the bare tool name — the user reported
+      // a popup that rendered as `🔐 Permission: Skill` (no brackets)
+      // because we'd only checked `skill`. The skill name is the most
+      // identifying field of the prompt; never drop it silently.
+      const skill =
+        readString(input, "skill") ??
+        readString(input, "skill_name") ??
+        readString(input, "skillName") ??
+        readString(input, "name") ??
+        skillBasenameFromPath(input);
       return skill ? `${toolName} (${skill})` : toolName;
     }
     case "Bash": {
@@ -80,6 +91,23 @@ function parseInput(raw: string | undefined): Record<string, unknown> | null {
 function readString(input: Record<string, unknown>, key: string): string | null {
   const value = input[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Some Skill tool variants pass the skill as a directory path (e.g.
+ * `skills/mail/SKILL.md` or `~/.switchroom/skills/mail`). Lift the
+ * skill name out of the path so the popup still says `Skill (mail)`
+ * instead of dumping the full path or bare `Skill`.
+ */
+function skillBasenameFromPath(input: Record<string, unknown>): string | null {
+  const path = readString(input, "path") ?? readString(input, "skill_path");
+  if (!path) return null;
+  // Strip a trailing /SKILL.md or filename so we land on the directory
+  // basename — that's the canonical skill name in switchroom's layout.
+  const trimmed = path.replace(/\/SKILL\.md$/i, "").replace(/\/$/, "");
+  const lastSlash = trimmed.lastIndexOf("/");
+  const basename = lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
+  return basename.length > 0 ? basename : null;
 }
 
 function truncate(text: string, max: number): string {

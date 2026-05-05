@@ -68,4 +68,39 @@ describe('summarizeToolForTitle (#186)', () => {
       'NotebookEdit: analysis.ipynb',
     )
   })
+
+  // Skill-name fallbacks — the user reported a `🔐 Permission: Skill`
+  // popup with no brackets. Pre-fix only `input.skill` was checked;
+  // these tests pin the wider field set so the skill name lands in
+  // brackets even when Claude Code passes the input in a different
+  // shape.
+  test('Skill: falls back to skill_name field', () => {
+    const input = JSON.stringify({ skill_name: 'calendar' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (calendar)')
+  })
+
+  test('Skill: falls back to skillName field', () => {
+    const input = JSON.stringify({ skillName: 'garmin' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (garmin)')
+  })
+
+  test('Skill: falls back to bare name field', () => {
+    const input = JSON.stringify({ name: 'home-assistant' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (home-assistant)')
+  })
+
+  test('Skill: lifts basename out of a path field', () => {
+    const input = JSON.stringify({ path: 'skills/coolify/SKILL.md' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (coolify)')
+  })
+
+  test('Skill: lifts basename out of a skill_path directory', () => {
+    const input = JSON.stringify({ skill_path: '/x/.switchroom/skills/mail' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
+  })
+
+  test('Skill: original `skill` field still wins when multiple are present', () => {
+    const input = JSON.stringify({ skill: 'mail', name: 'wrong' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
+  })
 })
