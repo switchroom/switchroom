@@ -615,6 +615,65 @@ for gateway_svc in "${gateway_services[@]}"; do
   fi
 done
 
+# ─── Auth refresh tick ───────────────────────────────────────────────────────
+#
+# Wire `switchroom auth refresh-tick` into every watchdog cycle (issue #429
+# Phase 1). The command is idempotent and cheap when tokens are healthy, so
+# it's safe to run once per watchdog tick (≈60s).
+#
+# Two independently-tunable knobs (both default to 600, but for different
+# reasons — coincidence, not coupling):
+#
+#   AUTH_REFRESH_INTERVAL_SECS — how often the watchdog runs the CLI at all.
+#     Gated by a state-file timestamp; the CLI is skipped entirely until this
+#     many seconds have passed since the last run. Default 600s (10 min).
+#
+#   AUTH_REFRESH_THRESHOLD_MS — how close to expiry a token must be before
+#     the CLI actually contacts the OAuth endpoint to refresh it. Passed as
+#     --threshold-ms. Default 600000 ms (10 min). Operators who want earlier
+#     proactive refreshes (e.g. 1800000 ms = 30 min) can raise this without
+#     touching the run cadence, and vice-versa.
+#
+# Disabled by setting WATCHDOG_REFRESH_AUTH=0 (default on).
+: "${WATCHDOG_REFRESH_AUTH:=1}"
+: "${AUTH_REFRESH_INTERVAL_SECS:=600}"
+: "${AUTH_REFRESH_THRESHOLD_MS:=600000}"
+
+if [[ "${WATCHDOG_REFRESH_AUTH}" == "1" ]]; then
+  auth_refresh_marker="${WATCHDOG_STATE_DIR}/.auth-refresh-last"
+  last_refresh=0
+  if [[ -f "$auth_refresh_marker" ]]; then
+    last_refresh="$(cat "$auth_refresh_marker" 2>/dev/null || echo 0)"
+    [[ "$last_refresh" =~ ^[0-9]+$ ]] || last_refresh=0
+  fi
+  now_for_auth="$(now_epoch)"
+  auth_age=$(( now_for_auth - last_refresh ))
+  if [[ "$auth_age" -ge "$AUTH_REFRESH_INTERVAL_SECS" ]]; then
+    # Resolve the switchroom CLI (same pattern as restart paths above).
+    switchroom_cli_auth=""
+    for candidate in "${HOME}/.bun/bin/switchroom" "${HOME}/.local/bin/switchroom"; do
+      if [[ -x "$candidate" ]]; then
+        switchroom_cli_auth="$candidate"
+        break
+      fi
+    done
+    if [[ -z "$switchroom_cli_auth" ]] && command -v switchroom >/dev/null 2>&1; then
+      switchroom_cli_auth="$(command -v switchroom)"
+    fi
+    if [[ -n "$switchroom_cli_auth" ]]; then
+      wd_log detect "auth-refresh age=${auth_age}s threshold=${AUTH_REFRESH_INTERVAL_SECS}s decision=run-refresh-tick"
+      if "$switchroom_cli_auth" auth refresh-tick --threshold-ms "${AUTH_REFRESH_THRESHOLD_MS}" >/dev/null 2>&1; then
+        echo "$now_for_auth" > "$auth_refresh_marker"
+        wd_log skip "auth-refresh decision=tick-complete threshold_ms=${AUTH_REFRESH_THRESHOLD_MS}"
+      else
+        wd_log error "auth-refresh switchroom auth refresh-tick exited non-zero (partial failures are logged by the CLI; state file not updated)"
+      fi
+    else
+      wd_log error "auth-refresh switchroom CLI not on PATH; skipping refresh tick"
+    fi
+  fi
+fi
+
 # ─── Journal-silence check ───────────────────────────────────────────────────
 #
 # Independent of the bridge-disconnect check above. For each active
