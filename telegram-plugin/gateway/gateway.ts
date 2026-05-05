@@ -7813,40 +7813,16 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
   }
 }
 
-bot.command('reauth', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const raw = getCommandArgs(ctx).trim()
-  const name = getMyAgentName()
-  const chatId = String(ctx.chat!.id)
-  if (!raw) {
-    await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', name], `auth reauth ${name}`)
-    pendingReauthFlows.set(chatId, { agent: name, startedAt: Date.now() })
-    return
-  }
-  if (raw.startsWith('http') || looksLikeAuthCode(raw)) {
-    const { result, errorText } = execAuthCode(name, raw)
-    if (errorText) {
-      await switchroomReply(ctx, `<b>auth code ${escapeHtmlForTg(name)} failed:</b>\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
-    } else if (result) {
-      const outcomeMsg = renderAuthCodeOutcome(result.outcome)
-      if (outcomeMsg) {
-        await switchroomReply(ctx, outcomeMsg, { html: true })
-      } else {
-        const output = result.instructions.join('\n')
-        const formatted = formatAuthOutputForTelegram(output)
-        await switchroomReply(ctx, formatted.text, { html: true })
-      }
-    }
-    pendingReauthFlows.delete(chatId)
-    // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api as never, chatId, ctx.message?.message_id ?? null, line => process.stderr.write(line))
-    return
-  }
-  // raw is treated as an agent name
-  try { assertSafeAgentName(raw) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
-  await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', raw], `auth reauth ${raw}`)
-  pendingReauthFlows.set(chatId, { agent: raw, startedAt: Date.now() })
-})
+// /reauth was removed in v0.6.13 — the `/auth` dashboard's
+// `🔄 Reauth default` button fires the same flow (the `case 'reauth':`
+// callback dispatch calls `runSwitchroomAuthCommand` and seeds
+// `pendingReauthFlows`). The OAuth code paste-back is caught by the
+// generic message intercept that watches `pendingReauthFlows` —
+// pasting the code into chat now Just Works without a typed entry
+// point. Removed surfaces in this PR:
+//   - bot.command('reauth', ...)              → use /auth → 🔄 Reauth
+//   - /reauth <code|url>  paste-back          → paste into chat
+//   - /reauth <other-agent> targeting         → use that agent's /auth
 
 bot.command('vault', async ctx => {
   if (!isAuthorizedSender(ctx)) return
