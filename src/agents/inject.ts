@@ -149,9 +149,20 @@ function makeTmuxRunner(tmuxBin: string): TmuxRunner {
       }
     },
     send(socket, session, args) {
-      execFileSync(tmuxBin, ["-L", socket, ...args, "-t", session], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      // tmux send-keys grammar: `send-keys [-l] [-t target] keys...`. The -t
+      // flag must come BEFORE the keys, otherwise -l treats `-t session` as
+      // additional literal text and types it into the pane (e.g. `/cost`
+      // becomes `/cost-tgymbro` keystrokes). Splice -t after the subcommand
+      // name and any leading flags, before the positional key args.
+      const [subcmd, ...rest] = args;
+      const flagEnd = rest.findIndex((a) => !a.startsWith("-"));
+      const flagsBeforeKeys = flagEnd === -1 ? rest : rest.slice(0, flagEnd);
+      const keys = flagEnd === -1 ? [] : rest.slice(flagEnd);
+      execFileSync(
+        tmuxBin,
+        ["-L", socket, subcmd, ...flagsBeforeKeys, "-t", session, ...keys],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
     },
     hasSession(socket, session) {
       try {
