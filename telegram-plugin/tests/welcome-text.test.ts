@@ -340,6 +340,33 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     );
   });
 
+  it("does NOT register /reauth (removed in v0.6.13)", () => {
+    // /reauth was a typed entry point for the same flow the `/auth`
+    // dashboard's `🔄 Reauth` button fires. Two paths to the same
+    // outcome confused operators; the dashboard button is the right
+    // surface (one-tap from the same place quota / promote / add
+    // live). OAuth code paste-back still works without a typed
+    // command — the generic message intercept watches
+    // `pendingReauthFlows` and exchanges any code-shaped paste
+    // automatically.
+    const menuNames = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    expect(menuNames, "/reauth must not be in the slash menu").not.toContain(
+      "reauth",
+    );
+    expect(
+      switchroomHelpCommandNames as readonly string[],
+      "/reauth must not be in the autocomplete name list",
+    ).not.toContain("reauth");
+    const helpDoc = switchroomHelpText("clerk");
+    // The /auth description string still mentions "reauth" as a
+    // dashboard verb — that's intentional, not a registered command.
+    // Pin that there's no top-level <code>/reauth ...</code> entry.
+    expect(
+      helpDoc,
+      "/reauth must not appear as a top-level command in help text",
+    ).not.toMatch(/<code>\/reauth\b/);
+  });
+
   it("menu is short enough for a mobile keyboard (<= 20 entries)", () => {
     // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
     // without scrolling. 20 is a generous upper bound.

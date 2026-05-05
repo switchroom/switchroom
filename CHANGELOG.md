@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## v0.6.13 — 2026-05-05
+
+### Removed
+
+- **`/reauth` typed Telegram command gone.** Same consolidation
+  rationale as `/authfallback` in v0.6.12: the `/auth` dashboard's
+  `🔄 Reauth default` button fires the identical flow (calls
+  `runSwitchroomAuthCommand` with `auth reauth <agent>` and seeds
+  `pendingReauthFlows`). Two paths to the same outcome made the auth
+  surface confusing.
+  - The OAuth code paste-back still works without a typed command —
+    the generic message intercept watches `pendingReauthFlows` and
+    exchanges any code-shaped paste automatically.
+  - Slash-menu entry, autocomplete name list, and help-text line all
+    dropped.
+  - The `/auth` slash-menu description updated to reflect the
+    consolidated surface ("Auth dashboard — accounts, quota, reauth,
+    switch primary").
+
+### Tests
+
+- `welcome-text` regression test pinning that `/reauth` is absent
+  from the menu, autocomplete, and as a top-level help entry — same
+  shape as the `/authfallback` regression test from v0.6.12.
+
 ## v0.6.12 — 2026-05-05
 
 ### Removed

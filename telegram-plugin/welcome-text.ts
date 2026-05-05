@@ -211,11 +211,15 @@ export const switchroomHelpCommandNames = [
   "new", "reset", "approve", "deny", "pending", "interrupt",
   // Agents
   "agents", "agentstart", "stop", "restart", "logs", "memory",
-  // Auth & config. /authfallback was removed in v0.6.12 — the
-  // dashboard's Switch primary picker is the only operator-facing
-  // surface; the auto-fallback poller still handles the
-  // automatic-on-quota-wall case transparently.
-  "auth", "reauth",
+  // Auth & config. The auth surface consolidated onto the `/auth`
+  // dashboard:
+  //   - /authfallback removed in v0.6.12 (Switch primary picker
+  //     handles the operator case; auto-fallback poller handles the
+  //     transparent on-quota-wall case)
+  //   - /reauth removed in v0.6.13 (dashboard's `🔄 Reauth` button
+  //     fires the same flow; paste-back of the OAuth code is caught
+  //     by the generic message intercept on `pendingReauthFlows`)
+  "auth",
   "topics", "update", "version",
   "permissions", "grant", "dangerous", "vault", "doctor",
   "commands",
@@ -269,8 +273,7 @@ export const TELEGRAM_MENU_COMMANDS = [
   // ("keep my subscription the only thing I'm paying for" JTBD: "the
   // user can state in one sentence what they're paying for"). A one-tap
   // menu entry for each action is the mobile-native behaviour.
-  { command: "auth", description: "Auth status (add/list/use/rm/reauth/code)" },
-  { command: "reauth", description: "Re-auth Claude for this agent" },
+  { command: "auth", description: "Auth dashboard — accounts, quota, reauth, switch primary" },
   // Escape hatch — shows the full catalogue including CLI-only commands
   { command: "commands", description: "Full command list" },
 ] as const;
@@ -314,7 +317,6 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/auth list [agent]</code> — list account slots and health`,
     `<code>/auth use [agent] &lt;slot&gt;</code> — switch active slot and restart`,
     `<code>/auth rm [agent] &lt;slot&gt; [--force]</code> — remove a slot`,
-    `<code>/reauth [agent]</code> — start Claude browser auth`,
     `<code>/topics</code> — topic-to-agent mappings`,
     `<code>/permissions [agent]</code> — show agent permissions`,
     `<code>/grant &lt;tool&gt;</code> — grant a tool permission`,
