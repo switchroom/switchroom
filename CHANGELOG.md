@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Webhook dispatch: inject `WEBHOOK_DISPATCH=1` into spawned env (#716)** —
+  producer-side plumbing for reggie's review-only policy.
+  - `spawnAgentOneShot()` in `src/web/webhook-dispatch.ts` now injects
+    `WEBHOOK_DISPATCH=1` into the spawned process environment so the
+    invoked agent can detect the webhook trigger context.
+  - One new unit test (`src/web/webhook-dispatch.test.ts`) asserts that
+    `WEBHOOK_DISPATCH=1` is present in the env passed to the spawn function.
+  - Consumer-side changes (reggie `code-review-merge` SKILL.md gating
+    `gh pr merge` on `WEBHOOK_DISPATCH != "1"`, inline-keyboard "Approve &
+    merge" button) are tracked as a follow-up once #715 lands in `main`.
+
 - **Webhook dispatch (#715)** — verified webhook events now trigger fresh
   `claude -p` invocations so agents can react in Telegram without polling
   `webhook-events.jsonl` manually.

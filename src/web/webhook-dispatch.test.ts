@@ -414,6 +414,34 @@ describe('evaluateDispatch', () => {
     expect(count2).toBe(0)
   })
 
+  it('sets WEBHOOK_DISPATCH=1 in spawn env (#716)', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const capturedEnvs: Array<NodeJS.ProcessEnv> = []
+    const config: WebhookDispatchConfig = { github: [baseRule] }
+
+    evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+      },
+      {
+        resolveAgentDir,
+        now: () => 1_000_000,
+        log: () => {},
+        spawnFn: (_cmd, _args, opts) => {
+          capturedEnvs.push(opts.env)
+          return { on: () => {}, pid: 42 }
+        },
+      },
+    )
+
+    expect(capturedEnvs).toHaveLength(1)
+    expect(capturedEnvs[0].WEBHOOK_DISPATCH).toBe('1')
+  })
+
   it('fires multiple matching rules', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
     const spawned: Array<unknown> = []

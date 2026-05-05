@@ -372,6 +372,10 @@ export function spawnAgentOneShot(
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     SWITCHROOM_AGENT_NAME: agent,
     TELEGRAM_STATE_DIR: telegramStateDir,
+    // Signal to the invoked agent that it was triggered by webhook dispatch.
+    // Used by skills (e.g. code-review-merge) to enforce review-only policies
+    // on untrusted inbound events. (#716)
+    WEBHOOK_DISPATCH: '1',
   }
 
   // Unset ANTHROPIC_API_KEY to force OAuth auth (mirrors cron script pattern).
