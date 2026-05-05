@@ -189,8 +189,6 @@ function createFileDedupStore(resolveAgentDir: (agent: string) => string): Dedup
 
 // ─── Rate limiter ─────────────────────────────────────────────────────────────
 
-const DEFAULT_RPM = 60
-
 interface TokenBucket {
   tokens: number
   lastRefill: number
@@ -355,9 +353,8 @@ export async function handleWebhookIngest(
   // ── Rate limit check ──────────────────────────────────────────────────────
   // Rate limiting only activates when `config.rateLimit` is explicitly
   // configured (channels.telegram.webhook_rate_limit in switchroom.yaml).
-  // When absent, no rate limit is applied. DEFAULT_RPM is the default
-  // value the config layer injects when the operator enables the feature
-  // without specifying a custom rpm.
+  // When absent, no rate limit is applied — the operator opts in by
+  // setting an explicit `rpm` value.
   const rpm = args.config.rateLimit?.rpm
   const retryAfter = rpm !== undefined ? rateLimiter.check(args.agent, source, rpm, now) : null
   if (retryAfter !== null) {

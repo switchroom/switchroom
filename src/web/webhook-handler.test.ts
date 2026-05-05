@@ -247,6 +247,33 @@ describe('dedup by X-GitHub-Delivery', () => {
     expect(stored.deliveries['new-delivery']).toBe(now)
   })
 
+  it('corrupt webhook-dedup.json on disk — handler degrades to empty state, does not crash', async () => {
+    const { root, resolveAgentDir } = makeTmpResolveAgentDir()
+    const agentName = `corrupt-dedup-${Date.now()}`
+    const agentTgDir = join(root, agentName, 'telegram')
+    mkdirSync(agentTgDir, { recursive: true })
+    // Write garbage that JSON.parse will reject.
+    writeFileSync(join(agentTgDir, 'webhook-dedup.json'), 'not-json-{{{', { mode: 0o600 })
+
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'first-after-corrupt')
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), agent: agentName },
+      {
+        resolveAgentDir,
+        now: () => 7000,
+        log: () => {},
+        rateLimiter: makeRateLimiter(),
+      },
+    )
+    expect(result.status).toBe(202)
+    // File rewritten cleanly.
+    const stored = JSON.parse(
+      readFileSync(join(agentTgDir, 'webhook-dedup.json'), 'utf-8'),
+    ) as { deliveries: Record<string, number> }
+    expect(stored.deliveries['first-after-corrupt']).toBe(7000)
+  })
+
   it('generic source skips dedup entirely — no error on missing delivery header', async () => {
     const { resolveAgentDir } = makeTmpResolveAgentDir()
     const body = makeBody({ text: 'hello' })
