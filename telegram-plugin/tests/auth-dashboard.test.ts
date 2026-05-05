@@ -200,7 +200,7 @@ describe("buildDashboardKeyboard", () => {
     expect(useButtons[1].text).toContain("work");
   });
 
-  it("shows [Fall back now] only when quotaHot is true", () => {
+  it("never shows [Fall back now] (removed in v0.6.11 — Switch primary is the operator-facing surface; the auto-fallback poller handles the automatic case)", () => {
     const cold = buildDashboardKeyboard({
       agent: "clerk",
       bankId: "a",
@@ -216,7 +216,7 @@ describe("buildDashboardKeyboard", () => {
     const coldTexts = cold.inline_keyboard.flat().map((b) => b.text);
     const hotTexts = hot.inline_keyboard.flat().map((b) => b.text);
     expect(coldTexts.some((t) => t.includes("Fall back"))).toBe(false);
-    expect(hotTexts.some((t) => t.includes("Fall back"))).toBe(true);
+    expect(hotTexts.some((t) => t.includes("Fall back"))).toBe(false);
   });
 
   it("always ends with a Refresh button", () => {
