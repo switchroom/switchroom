@@ -39,6 +39,7 @@ export const INJECT_ALLOWLIST: ReadonlySet<string> = new Set([
   "/compact",
   "/memory",
   "/hooks",
+  "/usage",
 ]);
 
 /**
