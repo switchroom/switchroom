@@ -192,15 +192,68 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Diff two pane captures: return lines present in `after` that don't
- * appear (in any position) in `before`. The pane is a ring buffer so
- * line-level set diff is the right primitive — exact-line presence is
- * what changes when new output prints.
+ * Extract the response to a slash command from a post-inject pane
+ * capture. We anchor on the LAST occurrence of Claude's prompt-echo
+ * line for the command (`❯ <command>` — Ink renders the user's input
+ * with that arrow glyph) and return everything below it, trimming
+ * trailing modal-affordance lines like `Esc to cancel`.
  *
- * Trailing/leading whitespace-only lines are ignored so a re-render
- * that shifts content up doesn't produce phantom "new" empty lines.
+ * Why anchor instead of line-set diff against the pre-snapshot? When
+ * the same slash command has been issued recently, the prior render's
+ * lines are still in pane scrollback. A line-set diff filters those
+ * "duplicate" lines out and returns empty — even though the user just
+ * fired the command and got a fresh response. Anchoring on the
+ * command-echo line in the post-capture is positional and immune to
+ * scrollback pollution.
+ *
+ * The pre-snapshot is now used only as a fallback signal: if no
+ * command-echo anchor is found in the post-capture, fall back to
+ * line-set diff so unusual TUI shapes still surface something.
  */
-export function diffPane(before: string, after: string): string {
+export function diffPane(before: string, after: string, command?: string): string {
+  if (command) {
+    // Build a regex that tolerates Ink's right-arrow input prefix and
+    // any leading whitespace; match exact command verb plus optional
+    // args (we already validated allowlist/blocklist upstream).
+    const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const lines = after.split("\n");
+    let anchorIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      // Match `❯ /command` or `> /command` (some terminals render it
+      // differently). Allow trailing args. Strict-anchor at end of
+      // line to avoid catching the prompt that contains the command
+      // as a substring inside narrative text.
+      if (/[❯>]\s+/.test(lines[i]) && lines[i].includes(escaped)) {
+        anchorIdx = i;
+        break;
+      }
+    }
+    if (anchorIdx >= 0) {
+      const tail = lines.slice(anchorIdx + 1);
+      // Trim leading and trailing blank lines, and drop common
+      // modal-affordance footers that aren't part of the response.
+      const trimmed: string[] = [];
+      for (const raw of tail) {
+        const line = raw.trimEnd();
+        if (line.length === 0 && trimmed.length === 0) continue;
+        trimmed.push(line);
+      }
+      while (trimmed.length > 0 && trimmed[trimmed.length - 1].length === 0) {
+        trimmed.pop();
+      }
+      // Drop trailing affordance lines (case-insensitive). These are
+      // Ink modal hints that aren't part of the slash output.
+      const affordances = /^(esc to cancel|press any key|↵ select)/i;
+      while (trimmed.length > 0 && affordances.test(trimmed[trimmed.length - 1].trim())) {
+        trimmed.pop();
+      }
+      if (trimmed.length > 0) {
+        return trimmed.join("\n");
+      }
+      // Anchor found but tail is empty — fall through to set-diff.
+    }
+  }
+  // Fallback: line-set diff against pre-snapshot.
   const beforeSet = new Set(before.split("\n").map((l) => l.trimEnd()));
   const newLines: string[] = [];
   for (const raw of after.split("\n")) {
@@ -309,7 +362,7 @@ export async function injectSlashCommandWith(
     }
   }
 
-  let output = diffPane(before, last);
+  let output = diffPane(before, last, command);
   let truncated = false;
   const bytes = Buffer.byteLength(output, "utf-8");
   if (bytes > OUTPUT_BYTE_CAP) {
