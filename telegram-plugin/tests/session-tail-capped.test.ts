@@ -99,6 +99,8 @@ function simulateSubTailReads(
       if (
         raw.type === 'result' ||
         raw.type === 'final' ||
+        raw.type === 'error' ||
+        raw.type === 'cancel' ||
         (raw.type === 'system' && raw.subtype === 'end') ||
         raw.subtype === 'end'
       ) {
@@ -207,6 +209,55 @@ describe('sub_agent_capped detection heuristic', () => {
       expect(event.agentId).toBe('agent-abc123')
       expect(event.toolUseCount).toBe(42)
     })
+  })
+})
+
+// ─── Reap-path and error-terminal tests ───────────────────────────────────────
+
+/**
+ * Simulate the idle reap path: build SubTail-like state from projectSubagentLine
+ * and then manually invoke the capped-detection predicate, mirroring what
+ * reapIdleSubTails does internally. This lets us assert the exact capped event
+ * shape without requiring access to the unexported reapIdleSubTails function.
+ */
+function simulateReapAndCheck(
+  agentId: string,
+  toolUseCount: number,
+  terminalLine: string | null,
+): { cappedEvent: SessionEvent | null; hasSeenTerminal: boolean } {
+  const { toolUseCount: tc, hasSeenTerminal } = simulateSubTailReads(agentId, toolUseCount, terminalLine)
+
+  // Mirror reapIdleSubTails predicate: emit capped iff no terminal + >= threshold
+  let cappedEvent: SessionEvent | null = null
+  if (!hasSeenTerminal && tc >= 30) {
+    cappedEvent = { kind: 'sub_agent_capped', agentId, toolUseCount: tc }
+  }
+  return { cappedEvent, hasSeenTerminal }
+}
+
+describe('reap-path: sub_agent_capped emission', () => {
+  it('emits sub_agent_capped exactly once for >= 30 tool_uses with no terminal', () => {
+    const { cappedEvent, hasSeenTerminal } = simulateReapAndCheck('agent-reap-1', 35, null)
+    expect(hasSeenTerminal).toBe(false)
+    expect(cappedEvent).not.toBeNull()
+    expect(cappedEvent?.kind).toBe('sub_agent_capped')
+    expect(cappedEvent?.agentId).toBe('agent-reap-1')
+    expect(cappedEvent?.toolUseCount).toBeGreaterThanOrEqual(30)
+  })
+
+  it('does NOT emit sub_agent_capped when type:error terminal is present', () => {
+    const errorLine = JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'overloaded' } })
+    const { cappedEvent, hasSeenTerminal } = simulateReapAndCheck('agent-reap-err', 35, errorLine)
+    // type:error must be recognised as a terminal, so capped should NOT fire
+    expect(hasSeenTerminal).toBe(true)
+    expect(cappedEvent).toBeNull()
+  })
+
+  it('does NOT emit sub_agent_capped when type:cancel terminal is present', () => {
+    const cancelLine = JSON.stringify({ type: 'cancel', reason: 'user_cancelled' })
+    const { cappedEvent, hasSeenTerminal } = simulateReapAndCheck('agent-reap-cancel', 40, cancelLine)
+    expect(hasSeenTerminal).toBe(true)
+    expect(cappedEvent).toBeNull()
   })
 })
 

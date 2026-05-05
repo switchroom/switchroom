@@ -700,6 +700,8 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
             if (
               raw.type === 'result' ||
               raw.type === 'final' ||
+              raw.type === 'error' ||
+              raw.type === 'cancel' ||
               (raw.type === 'system' && raw.subtype === 'end') ||
               raw.subtype === 'end'
             ) {
