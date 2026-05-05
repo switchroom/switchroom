@@ -19,8 +19,12 @@ export function assertSafeSlotName(slot: string): void {
 }
 
 /** Pattern used by global account labels — matches validateAccountLabel
- *  in src/auth/account-store.ts ([A-Za-z0-9._-]+, max 64 chars). */
-const ACCOUNT_LABEL_RE = /^[A-Za-z0-9._-]{1,64}$/;
+ *  in src/auth/account-store.ts. Allows email-shaped labels
+ *  (`pixsoul@gmail.com`) and gmail-tag forms (`ken+work@example.com`).
+ *  Excludes `:` (callback_data separator), path separators, shell
+ *  metas, and whitespace. Max 64 chars. Keep in sync with `LABEL_RE`
+ *  in account-store.ts and `isSafeAccountLabel` in auth-dashboard.ts. */
+const ACCOUNT_LABEL_RE = /^[A-Za-z0-9._@+-]{1,64}$/;
 
 export function assertSafeAccountLabel(label: string): void {
   if (label === '.' || label === '..') {
@@ -245,7 +249,7 @@ export function parseAuthSubCommand(
         };
       }
       try { assertSafeAccountLabel(account); }
-      catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._-], 1-64 chars.' }; }
+      catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._@+-], 1-64 chars (email shape OK).' }; }
       const fromAgentRaw = flags['--from-agent'];
       const fromAgent = typeof fromAgentRaw === 'string' ? fromAgentRaw : currentAgent;
       try { assertSafeAgentNameForParser(fromAgent); }
@@ -373,7 +377,7 @@ export function parseAuthSubCommand(
       return { kind: 'usage', message: 'Usage: /auth share <label> [--from-agent <name>]' };
     }
     try { assertSafeAccountLabel(account); }
-    catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._-], 1-64 chars.' }; }
+    catch { return { kind: 'error', message: 'Invalid account label. Use [A-Za-z0-9._@+-], 1-64 chars (email shape OK).' }; }
     const fromAgentRaw = flags['--from-agent'];
     const fromAgent = typeof fromAgentRaw === 'string' ? fromAgentRaw : currentAgent;
     try { assertSafeAgentNameForParser(fromAgent); }

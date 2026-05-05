@@ -356,14 +356,35 @@ describe("isSafeAccountLabel", () => {
     expect(isSafeAccountLabel("a".repeat(64))).toBe(true);
   });
 
+  it("accepts email-shaped labels (@ + . _ - allowed)", () => {
+    // Mirror of the CLI's regex expansion — labels can be the
+    // operator's actual Anthropic email so the JTBD's "the user
+    // manages accounts" reads as the identities they already know.
+    expect(isSafeAccountLabel("pixsoul@gmail.com")).toBe(true);
+    expect(isSafeAccountLabel("ken+work@example.com")).toBe(true);
+    expect(isSafeAccountLabel("a@b")).toBe(true);
+    expect(isSafeAccountLabel("user.name+tag@subdomain.example.co")).toBe(true);
+  });
+
   it("rejects empty, oversized, and dangerous characters", () => {
     expect(isSafeAccountLabel("")).toBe(false);
     expect(isSafeAccountLabel("a".repeat(65))).toBe(false);
     expect(isSafeAccountLabel("with space")).toBe(false);
     expect(isSafeAccountLabel("a/b")).toBe(false);
-    expect(isSafeAccountLabel("a:b")).toBe(false); // colon would corrupt callback parsing
+    // `:` is the callback_data separator — must never be allowed in a
+    // label or the dashboard parser splits the wrong way.
+    expect(isSafeAccountLabel("a:b")).toBe(false);
     expect(isSafeAccountLabel("a;rm -rf")).toBe(false);
     expect(isSafeAccountLabel("../escape")).toBe(false);
+    expect(isSafeAccountLabel('foo"bar')).toBe(false);
+    expect(isSafeAccountLabel("foo'bar")).toBe(false);
+    expect(isSafeAccountLabel("foo|bar")).toBe(false);
+    expect(isSafeAccountLabel("foo&bar")).toBe(false);
+    expect(isSafeAccountLabel("foo<bar")).toBe(false);
+    expect(isSafeAccountLabel("foo>bar")).toBe(false);
+    // Unicode keeps out — labels stay ASCII for filesystem sanity.
+    expect(isSafeAccountLabel("fooébar")).toBe(false);
+    expect(isSafeAccountLabel("ken@gmaіl.com")).toBe(false); // Cyrillic і
   });
 });
 
@@ -407,6 +428,22 @@ describe("encodeCallbackData / parseCallbackData — account verbs", () => {
     const action = { kind: "account-enable" as const, agent: "clerk", label: "acme.team" };
     const encoded = encodeCallbackData(action);
     expect(parseCallbackData(encoded)).toEqual(action);
+  });
+
+  it("preserves email-shaped labels through the round-trip", () => {
+    // Headline use case of the regex expansion — operators want the
+    // dashboard's `✓ pixsoul@gmail.com` button to round-trip cleanly
+    // when tapped. The `@` and `+` chars must survive the colon-split
+    // parser without being mistaken for a separator.
+    const cases = [
+      { kind: "account-enable" as const, agent: "clerk", label: "pixsoul@gmail.com" },
+      { kind: "account-disable" as const, agent: "klanker", label: "ken+work@example.com" },
+      { kind: "confirm-account-enable" as const, agent: "finn", label: "name.tag+filter@subdomain.co" },
+    ];
+    for (const action of cases) {
+      const encoded = encodeCallbackData(action);
+      expect(parseCallbackData(encoded)).toEqual(action);
+    }
   });
 
   it("rejects malformed account labels (parses to noop)", () => {
