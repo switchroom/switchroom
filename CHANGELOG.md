@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Webhook ingest hardening (#714)** — two defenses added to
+  `src/web/webhook-handler.ts` before auto-dispatch ships:
+  - **Dedup by `X-GitHub-Delivery`**: per-agent LRU (1000 entries, 24h
+    retention) backed by `~/.switchroom/agents/<agent>/telegram/webhook-dedup.json`.
+    Replay returns 200 `{ok:true,deduped:true}` and skips JSONL append.
+    Generic source has no delivery header — dedup is skipped silently.
+  - **Per-source token-bucket rate limit**: default 60 rpm (burst 60),
+    configurable via `channels.telegram.webhook_rate_limit.rpm` in
+    switchroom.yaml. Exceeding the limit returns 429 with `Retry-After`.
+    First throttle event per `(agent, source)` per 60s window is written
+    to `<agent>/telegram/issues.jsonl` for Telegram visibility.
+  - `webhook_rate_limit` added to `TelegramChannelSchema` in
+    `src/config/schema.ts`; cascades via the existing channels deep-merge.
+
 ## v0.6.7 — 2026-05-05
 
 ### Added

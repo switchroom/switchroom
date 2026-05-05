@@ -9,10 +9,12 @@
  *
  * Response shape (always JSON):
  *   - 202 Accepted on verified + recorded.
+ *   - 200 OK with {ok:true, deduped:true} when delivery already seen (github only).
  *   - 400 if the path / body / config is malformed.
  *   - 401 if the signature/token is invalid (no detail leaked).
  *   - 403 if the agent doesn't allow this source.
  *   - 404 if the agent name is unknown.
+ *   - 429 Too Many Requests when per-source rate limit exceeded.
  *
  * MVP behavior (#577):
  *   - Verify signature.
@@ -20,6 +22,13 @@
  *     `webhook-verify.ts`.
  *   - Append a JSON line to `~/.switchroom/agents/<agent>/telegram/webhook-events.jsonl`.
  *   - Log the receipt to stderr for operator visibility.
+ *
+ * Hardening (#714):
+ *   - Dedup by X-GitHub-Delivery (github source only): LRU per agent,
+ *     1000 entries, 24h retention, persisted to webhook-dedup.json.
+ *   - Per-(agent, source) token-bucket rate limit: default 60 rpm,
+ *     configurable via channels.telegram.webhook_rate_limit.rpm.
+ *     First throttle in a 60s window writes to issues.jsonl.
  *
  * Out of scope (deferred to a follow-up):
  *   - Posting the rendered text directly to the agent's Telegram
@@ -31,7 +40,7 @@
  *     envelope contract.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import {
@@ -47,6 +56,8 @@ export interface WebhookConfig {
    *  `webhook/<agent>/<source>`. The verifier expects the secret as
    *  the operator typed it (no per-key encoding). */
   secrets: Partial<Record<WebhookSource, string>>
+  /** Rate limit config from channels.telegram.webhook_rate_limit. */
+  rateLimit?: { rpm: number }
 }
 
 export interface WebhookHandlerDeps {
@@ -57,6 +68,10 @@ export interface WebhookHandlerDeps {
   now?: () => number
   /** Log sink — stderr in production. */
   log?: (line: string) => void
+  /** Injectable dedup store (for testing). Falls back to file-backed. */
+  dedupStore?: DedupStore
+  /** Injectable rate limiter (for testing). Falls back to module-global. */
+  rateLimiter?: RateLimiter
 }
 
 export interface WebhookHandlerArgs {
@@ -77,17 +92,200 @@ export interface WebhookHandlerResult {
   status: number
   body: string
   contentType: string
+  headers?: Record<string, string>
 }
 
 const KNOWN_SOURCES: WebhookSource[] = ['github', 'generic']
 
-function jsonReply(status: number, body: Record<string, unknown>): WebhookHandlerResult {
+function jsonReply(
+  status: number,
+  body: Record<string, unknown>,
+  extraHeaders?: Record<string, string>,
+): WebhookHandlerResult {
   return {
     status,
     body: JSON.stringify(body),
     contentType: 'application/json',
+    headers: extraHeaders,
   }
 }
+
+// ─── Dedup store ──────────────────────────────────────────────────────────────
+
+const DEDUP_MAX = 1000
+const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+
+interface DedupFileShape {
+  deliveries: Record<string, number>
+}
+
+export interface DedupStore {
+  /** Returns the original ts if already seen, undefined otherwise.
+   *  Stores the delivery on miss. */
+  check(agent: string, deliveryId: string, now: number): number | undefined
+}
+
+function loadDedupFile(path: string): Record<string, number> {
+  try {
+    if (!existsSync(path)) return {}
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as DedupFileShape
+    return typeof raw.deliveries === 'object' && raw.deliveries !== null
+      ? raw.deliveries
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveDedupFile(path: string, deliveries: Record<string, number>, now: number): void {
+  // Prune entries older than 24h
+  const pruned: Record<string, number> = {}
+  for (const [id, ts] of Object.entries(deliveries)) {
+    if (now - ts < DEDUP_TTL_MS) pruned[id] = ts
+  }
+  // Enforce cap: keep most-recent 1000
+  const sorted = Object.entries(pruned).sort((a, b) => b[1] - a[1]).slice(0, DEDUP_MAX)
+  const final: Record<string, number> = Object.fromEntries(sorted)
+  writeFileSync(path, JSON.stringify({ deliveries: final } satisfies DedupFileShape), {
+    mode: 0o600,
+  })
+}
+
+/** In-memory cache of per-agent deliveries, backed by disk. */
+const agentDedupCache = new Map<string, Record<string, number>>()
+
+function createFileDedupStore(resolveAgentDir: (agent: string) => string): DedupStore {
+  return {
+    check(agent: string, deliveryId: string, now: number): number | undefined {
+      const telegramDir = join(resolveAgentDir(agent), 'telegram')
+      const filePath = join(telegramDir, 'webhook-dedup.json')
+
+      // Load from disk if not in memory cache
+      if (!agentDedupCache.has(agent)) {
+        agentDedupCache.set(agent, loadDedupFile(filePath))
+      }
+
+      const deliveries = agentDedupCache.get(agent)!
+
+      if (deliveries[deliveryId] !== undefined) {
+        return deliveries[deliveryId]
+      }
+
+      // New delivery — store it
+      deliveries[deliveryId] = now
+
+      // Persist to disk
+      try {
+        mkdirSync(telegramDir, { recursive: true })
+        saveDedupFile(filePath, deliveries, now)
+      } catch {
+        // Non-fatal: if we can't persist, we still accept the event
+      }
+
+      return undefined
+    },
+  }
+}
+
+// ─── Rate limiter ─────────────────────────────────────────────────────────────
+
+const DEFAULT_RPM = 60
+
+interface TokenBucket {
+  tokens: number
+  lastRefill: number
+}
+
+export interface RateLimiter {
+  /** Returns null if allowed, or seconds-until-next-token if throttled. */
+  check(agent: string, source: string, rpm: number, now: number): number | null
+}
+
+/** Per-(agent, source) token buckets. Module-global for production. */
+const tokenBuckets = new Map<string, TokenBucket>()
+
+export const defaultRateLimiter: RateLimiter = {
+  check(agent: string, source: string, rpm: number, now: number): number | null {
+    const key = `${agent}\0${source}`
+    const refillRate = rpm / 60 // tokens per second
+    const maxTokens = rpm
+
+    let bucket = tokenBuckets.get(key)
+    if (!bucket) {
+      bucket = { tokens: maxTokens, lastRefill: now }
+      tokenBuckets.set(key, bucket)
+    }
+
+    // Refill based on elapsed time
+    const elapsedSecs = (now - bucket.lastRefill) / 1000
+    bucket.tokens = Math.min(maxTokens, bucket.tokens + elapsedSecs * refillRate)
+    bucket.lastRefill = now
+
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1
+      return null
+    }
+
+    // Calculate seconds until next token
+    const secsUntilToken = (1 - bucket.tokens) / refillRate
+    return Math.ceil(secsUntilToken)
+  },
+}
+
+// ─── Throttle issue suppression ───────────────────────────────────────────────
+
+/** Track first throttle event per (agent, source) per 60s window. */
+const throttleIssueWindow = new Map<string, number>()
+const THROTTLE_WINDOW_MS = 60_000
+
+export function shouldWriteThrottleIssue(
+  agent: string,
+  source: string,
+  now: number,
+  windowMap?: Map<string, number>,
+): boolean {
+  const map = windowMap ?? throttleIssueWindow
+  const key = `${agent}\0${source}`
+  const lastWritten = map.get(key)
+  if (lastWritten !== undefined && now - lastWritten < THROTTLE_WINDOW_MS) {
+    return false
+  }
+  map.set(key, now)
+  return true
+}
+
+// ─── issues.jsonl writer ──────────────────────────────────────────────────────
+
+function writeThrottleIssue(
+  agent: string,
+  source: string,
+  now: number,
+  telegramDir: string,
+  log: (line: string) => void,
+): void {
+  const issuesPath = join(telegramDir, 'issues.jsonl')
+  try {
+    mkdirSync(telegramDir, { recursive: true })
+    // Format mirrors src/issues/types.ts IssueEvent
+    const record = {
+      ts: now,
+      agent,
+      severity: 'warn',
+      source: `webhook:${source}`,
+      code: 'webhook_rate_limit',
+      summary: `Webhook rate limit hit for source '${source}'`,
+      fingerprint: `webhook:${source}:webhook_rate_limit`,
+      occurrences: 1,
+      first_seen: now,
+      last_seen: now,
+    }
+    appendFileSync(issuesPath, JSON.stringify(record) + '\n', { mode: 0o600 })
+  } catch (err) {
+    log(`webhook-ingest: agent='${agent}' source='${source}' issues.jsonl write failed: ${(err as Error).message}\n`)
+  }
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 /**
  * Pure-ish handler: takes everything it needs as args (no module
@@ -102,6 +300,8 @@ export async function handleWebhookIngest(
   const now = (deps.now ?? Date.now)()
   const resolveAgentDir =
     deps.resolveAgentDir ?? ((a) => join(homedir(), '.switchroom', 'agents', a))
+  const rateLimiter = deps.rateLimiter ?? defaultRateLimiter
+  const dedupStore = deps.dedupStore ?? createFileDedupStore(resolveAgentDir)
 
   if (!args.agentExists) {
     log(`webhook-ingest: agent='${args.agent}' source='${args.source}' rejected: unknown agent\n`)
@@ -138,6 +338,40 @@ export async function handleWebhookIngest(
   if (!verifyResult.ok) {
     log(`webhook-ingest: agent='${args.agent}' source='${source}' rejected: ${verifyResult.reason}\n`)
     return jsonReply(401, { ok: false, error: 'unauthorized' })
+  }
+
+  // ── Dedup check (github only — generic has no delivery ID) ────────────────
+  if (source === 'github') {
+    const deliveryId = args.headers.get('x-github-delivery')
+    if (deliveryId) {
+      const originalTs = dedupStore.check(args.agent, deliveryId, now)
+      if (originalTs !== undefined) {
+        log(`webhook-ingest: agent='${args.agent}' source='${source}' deduped delivery='${deliveryId}'\n`)
+        return jsonReply(200, { ok: true, deduped: true, ts: originalTs })
+      }
+    }
+  }
+
+  // ── Rate limit check ──────────────────────────────────────────────────────
+  // Rate limiting only activates when `config.rateLimit` is explicitly
+  // configured (channels.telegram.webhook_rate_limit in switchroom.yaml).
+  // When absent, no rate limit is applied. DEFAULT_RPM is the default
+  // value the config layer injects when the operator enables the feature
+  // without specifying a custom rpm.
+  const rpm = args.config.rateLimit?.rpm
+  const retryAfter = rpm !== undefined ? rateLimiter.check(args.agent, source, rpm, now) : null
+  if (retryAfter !== null) {
+    const agentDir = resolveAgentDir(args.agent)
+    const telegramDir = join(agentDir, 'telegram')
+    if (shouldWriteThrottleIssue(args.agent, source, now)) {
+      writeThrottleIssue(args.agent, source, now, telegramDir, log)
+    }
+    log(`webhook-ingest: agent='${args.agent}' source='${source}' rate limited retry-after=${retryAfter}s\n`)
+    return jsonReply(
+      429,
+      { ok: false, error: 'rate limited' },
+      { 'Retry-After': String(retryAfter) },
+    )
   }
 
   // Parse JSON body. We require JSON across both sources today; if a

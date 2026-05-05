@@ -545,6 +545,20 @@ export const TelegramChannelSchema = z
         "Cascades from defaults.channels.telegram.webhook_sources. " +
         "(Migrated from per-agent root in #596 — see #577.)",
       ),
+    webhook_rate_limit: z
+      .object({
+        rpm: z.number().int().positive(),
+      })
+      .optional()
+      .describe(
+        "Per-source rate limit for the webhook ingest path (#714). " +
+        "Token-bucket per (agent, source). Default: 60 requests/minute, " +
+        "burst 60. Shape: { rpm: 60 } — integer requests-per-minute. " +
+        "Beyond cap: 429 with Retry-After header; first throttle event " +
+        "per (agent, source) per 60s window is written to " +
+        "<agent>/telegram/issues.jsonl. " +
+        "Cascades from defaults.channels.telegram.webhook_rate_limit.",
+      ),
   })
   .optional();
 
