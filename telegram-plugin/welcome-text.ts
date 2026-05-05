@@ -332,6 +332,7 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/vault grants [agent]</code> — list active capability grants (tap to revoke)`,
     `<code>/doctor</code> — health check (deps, services, MCP)`,
     `<code>/usage</code> — Pro/Max plan quota (5h + 7d windows)`,
+    `<code>/inject &lt;slash&gt;</code> — inject a Claude Code REPL slash command (e.g. <code>/inject /cost</code>; allowlisted)`,
     `<code>/commands</code> — this help`,
     ``,
     `<i>Tip: <code>/update</code> picks up new code; <code>/restart</code> bounces a stuck agent; <code>/version</code> checks what's running.</i>`,
