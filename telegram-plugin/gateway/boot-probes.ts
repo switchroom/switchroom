@@ -252,6 +252,80 @@ type ExecFileFnType = (
 ) => Promise<ExecFileResult>
 
 /**
+ * Resolve the "real" agent PID under tmux supervisor by walking the
+ * unit's cgroup and picking the heaviest-RSS claude/node process.
+ *
+ * Returns null on any failure — caller should fall back to MainPID.
+ *
+ * Mirrors `resolveAgentPid()` in `src/agents/lifecycle.ts` and
+ * `agent_main_pid()` in `bin/bridge-watchdog.sh`. Kept duplicated rather
+ * than imported because the gateway runs in a separate package and we
+ * don't want a cross-package import for a 30-line helper.
+ */
+async function resolveTmuxSupervisorPid(
+  agentName: string,
+  execFileImpl: ExecFileFnType,
+): Promise<number | null> {
+  try {
+    const { stdout: cgOut } = await execFileImpl('systemctl', [
+      '--user', 'show', `switchroom-${agentName}.service`,
+      '-p', 'ControlGroup', '--value',
+    ])
+    const cgroup = cgOut.trim()
+    if (!cgroup) return null
+    const procsPath = `/sys/fs/cgroup${cgroup}/cgroup.procs`
+    if (!existsSync(procsPath)) return null
+    const pidsRaw = readFileSync(procsPath, 'utf-8')
+    const pids = pidsRaw.split('\n').map(s => s.trim()).filter(Boolean)
+    if (pids.length === 0) return null
+
+    type Candidate = { pid: number; rss: number; comm: string }
+    const candidates: Candidate[] = []
+    for (const pidStr of pids) {
+      const pid = parseInt(pidStr, 10)
+      if (!Number.isFinite(pid) || pid <= 0) continue
+      let rss = 0
+      let comm = ''
+      try {
+        const status = readFileSync(`/proc/${pid}/status`, 'utf-8')
+        const rssLine = status.split('\n').find(l => l.startsWith('VmRSS:'))
+        if (rssLine) {
+          const m = rssLine.match(/(\d+)/)
+          if (m) rss = parseInt(m[1], 10) || 0
+        }
+      } catch {
+        continue
+      }
+      try {
+        comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim()
+      } catch { /* ignore */ }
+      candidates.push({ pid, rss, comm })
+    }
+    if (candidates.length === 0) return null
+
+    const isAgent = (c: Candidate): boolean => c.comm === 'claude' || c.comm === 'node'
+    const isWrapper = (c: Candidate): boolean =>
+      c.comm === 'tmux' || c.comm.startsWith('tmux:') ||
+      c.comm === 'expect' || c.comm === 'script' ||
+      c.comm === 'bash' || c.comm === 'sh'
+
+    const agentMatches = candidates.filter(isAgent)
+    if (agentMatches.length > 0) {
+      agentMatches.sort((a, b) => b.rss - a.rss)
+      return agentMatches[0].pid
+    }
+    const nonWrapper = candidates.filter(c => !isWrapper(c))
+    if (nonWrapper.length > 0) {
+      nonWrapper.sort((a, b) => b.rss - a.rss)
+      return nonWrapper[0].pid
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Query systemctl for the agent service and return a snapshot of its state.
  * Extracted so the re-probe loop can call it multiple times.
  */
@@ -286,6 +360,9 @@ export async function probeAgentProcess(
     sleepImpl?: (ms: number) => Promise<void>
     /** Override for tests — replaces real execFile calls */
     execFileImpl?: ExecFileFnType
+    /** When true, resolve PID via cgroup walk (heaviest claude/node) — under
+     *  tmux supervisor MainPID is the tmux server (~2MB) which is misleading. */
+    tmuxSupervisor?: boolean
   } = {},
 ): Promise<ProbeResult> {
   const retryIntervalMs = opts.retryIntervalMs ?? AGENT_RETRY_INTERVAL_MS
@@ -310,7 +387,11 @@ export async function probeAgentProcess(
       const { state, kv } = snapshot
 
       if (state === 'active') {
-        const pid = kv['MainPID'] ?? '?'
+        let pid: string = kv['MainPID'] ?? '?'
+        if (opts.tmuxSupervisor) {
+          const resolved = await resolveTmuxSupervisorPid(agentName, execFileFn)
+          if (resolved && resolved > 0) pid = String(resolved)
+        }
         const uptime = formatUptime(kv['ActiveEnterTimestamp'] ?? '')
         const mem = formatMemory(kv['MemoryCurrent'] ?? '')
         const parts = [`PID ${pid}`, uptime, mem].filter(Boolean)
@@ -378,6 +459,8 @@ export async function* watchAgentProcess(
      * real sleeps.
      */
     nowImpl?: () => number
+    /** When true, resolve PID via cgroup walk (heaviest claude/node). */
+    tmuxSupervisor?: boolean
   } = {},
 ): AsyncGenerator<ProbeResult> {
   const liveWindowMs = opts.liveWindowMs ?? AGENT_LIVE_WINDOW_MS
@@ -396,13 +479,17 @@ export async function* watchAgentProcess(
    * deactivating are all 🟡 "starting" — we don't know they're stuck yet.
    * Only `failed` is immediately 🔴. Everything else (unknown) is also 🔴.
    */
-  function toProbeResult(
+  async function toProbeResult(
     state: string,
     kv: Record<string, string>,
     withinWindow: boolean,
-  ): ProbeResult {
+  ): Promise<ProbeResult> {
     if (state === 'active') {
-      const pid = kv['MainPID'] ?? '?'
+      let pid: string = kv['MainPID'] ?? '?'
+      if (opts.tmuxSupervisor) {
+        const resolved = await resolveTmuxSupervisorPid(agentName, execFileFn)
+        if (resolved && resolved > 0) pid = String(resolved)
+      }
       const uptime = formatUptime(kv['ActiveEnterTimestamp'] ?? '')
       const mem = formatMemory(kv['MemoryCurrent'] ?? '')
       const parts = [`PID ${pid}`, uptime, mem].filter(Boolean)
@@ -437,7 +524,7 @@ export async function* watchAgentProcess(
       return
     }
 
-    const result = toProbeResult(snapshot.state, snapshot.kv, withinWindow)
+    const result = await toProbeResult(snapshot.state, snapshot.kv, withinWindow)
 
     // Only yield when the result detail actually changed — avoids
     // redundant card edits ("service starting" → "service starting").
@@ -468,7 +555,7 @@ export async function* watchAgentProcess(
       // Only yield on a state we DIDN'T see before — silently no-op if the
       // agent is still inactive/activating/etc., to avoid card flapping.
       if (followup.state !== 'active') return
-      const okResult = toProbeResult(followup.state, followup.kv, false)
+      const okResult = await toProbeResult(followup.state, followup.kv, false)
       if (okResult.detail !== lastYieldedDetail) {
         yield okResult
       }

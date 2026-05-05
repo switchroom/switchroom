@@ -387,6 +387,9 @@ export interface RunProbesOpts {
     | ReadonlyArray<AccountSummary>
     | null
     | Promise<ReadonlyArray<AccountSummary> | null>
+  /** When true, resolve the agent PID via cgroup walk instead of MainPID
+   *  (which is the tmux server pid under tmux supervisor). */
+  tmuxSupervisor?: boolean
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -401,7 +404,7 @@ export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
 
   await Promise.allSettled([
     probeAccount(opts.agentDir).then(r => { probes.account = r }),
-    probeAgentProcess(slug, { execFileImpl: opts.probeExecFileImpl }).then(r => { probes.agent = r }),
+    probeAgentProcess(slug, { execFileImpl: opts.probeExecFileImpl, tmuxSupervisor: opts.tmuxSupervisor }).then(r => { probes.agent = r }),
     probeGateway(opts.gatewayInfo).then(r => { probes.gateway = r }),
     probeQuota(claudeDir, opts.agentDir, opts.fetchImpl).then(r => { probes.quota = r }),
     probeHindsight(opts.bankName, opts.fetchImpl).then(r => { probes.hindsight = r }),
@@ -526,6 +529,7 @@ export async function startBootCard(
           pollIntervalMs: opts.agentLivePollIntervalMs,
           sleepImpl: opts.agentLiveSleepImpl,
           execFileImpl: opts.agentLiveExecFileImpl,
+          tmuxSupervisor: opts.tmuxSupervisor,
         })
 
         for await (const agentResult of watcher) {

@@ -4,6 +4,12 @@
 
 ### Added
 
+- **tmux supervisor pre-fanout hardening (#725)** — PID resolver walks
+  the unit cgroup to pick the heaviest-RSS claude/node process, so
+  boot cards and `getAgentStatus` no longer report the ~2 MB tmux
+  server PID under `Type=forking`. Mirrors `agent_main_pid()` in
+  `bin/bridge-watchdog.sh`. Companion runbook for the canary fanout
+  lives at [`docs/tmux-supervisor-fanout.md`](docs/tmux-supervisor-fanout.md).
 - **tmux supervisor opt-in flag (#725 Phase 1)** — new per-agent
   `experimental.tmux_supervisor` boolean (default `false`). When `true`,
   the systemd unit replaces `script -qfc` with `tmux new-session` so

@@ -1886,6 +1886,7 @@ const ipcServer: IpcServer = createIpcServer({
             restartReason: reason,
             restartAgeMs: markerAgeMs,
             loadAccounts: () => loadAccountsForBootCard(agentSlug),
+            tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
           }, ackMsgId).then(handle => {
             activeBootCard = handle
           }).catch((err: Error) => {
@@ -9974,6 +9975,7 @@ void (async () => {
                       restartReason: reason,
                       restartAgeMs: markerAgeMs,
                       loadAccounts: () => loadAccountsForBootCard(agentSlug),
+                      tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
                     }, ackMsgId)
                     activeBootCard = handle
                   } catch (err) {

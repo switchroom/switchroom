@@ -383,7 +383,115 @@ export function getAgentStartSha(name: string): string | null {
   }
 }
 
-export function getAgentStatus(name: string): AgentStatus {
+/**
+ * Resolve the "real" agent PID for a given systemd unit.
+ *
+ * Under the legacy ExecStart (`script -qfc claude ...`), MainPID points
+ * at the script wrapper which immediately re-execs into claude — so for
+ * status display purposes MainPID is "good enough" (claude is the same
+ * process).
+ *
+ * Under `experimental.tmux_supervisor=true`, MainPID points at the
+ * tmux server (~2MB RSS) which spawns claude inside a session — that's
+ * misleading for an operator looking at "how much memory is the agent
+ * using?". Walk the cgroup and pick the heaviest-RSS pid; that's
+ * reliably claude. Mirrors `agent_main_pid()` in
+ * `bin/bridge-watchdog.sh:187-208`.
+ *
+ * Falls back to MainPID if cgroup walk fails (boot window, cgroup v2
+ * not at `/sys/fs/cgroup`, or no resolvable claude process yet).
+ */
+export function resolveAgentPid(unitName: string, useTmux: boolean): number | null {
+  const mainPidFromSystemd = (): number | null => {
+    try {
+      const out = execFileSync(
+        "systemctl",
+        ["--user", "show", unitName, "-p", "MainPID", "--value"],
+        { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+      ).trim();
+      const parsed = parseInt(out, 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  if (!useTmux) {
+    return mainPidFromSystemd();
+  }
+
+  // tmux supervisor path — walk the unit's cgroup and pick the
+  // heaviest-RSS process whose comm matches `claude` (or `node`,
+  // since claude-cli is a node script). Prefer claude/node; fall back
+  // to plain heaviest-RSS.
+  try {
+    const cgroup = execFileSync(
+      "systemctl",
+      ["--user", "show", unitName, "-p", "ControlGroup", "--value"],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+    ).trim();
+    if (!cgroup) return mainPidFromSystemd();
+    const procsPath = `/sys/fs/cgroup${cgroup}/cgroup.procs`;
+    if (!existsSync(procsPath)) return mainPidFromSystemd();
+    const pidsRaw = readFileSync(procsPath, "utf-8");
+    const pids = pidsRaw.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (pids.length === 0) return mainPidFromSystemd();
+
+    type Candidate = { pid: number; rss: number; comm: string };
+    const candidates: Candidate[] = [];
+    for (const pidStr of pids) {
+      const pid = parseInt(pidStr, 10);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      let rss = 0;
+      let comm = "";
+      try {
+        const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+        const rssLine = status.split("\n").find((l) => l.startsWith("VmRSS:"));
+        if (rssLine) {
+          const m = rssLine.match(/(\d+)/);
+          if (m) rss = parseInt(m[1], 10) || 0;
+        }
+      } catch {
+        continue;
+      }
+      try {
+        comm = readFileSync(`/proc/${pid}/comm`, "utf-8").trim();
+      } catch {
+        // ignore
+      }
+      candidates.push({ pid, rss, comm });
+    }
+    if (candidates.length === 0) return mainPidFromSystemd();
+
+    // Prefer claude/node; exclude tmux/expect/script wrappers.
+    const isAgent = (c: Candidate): boolean =>
+      c.comm === "claude" || c.comm === "node";
+    const isWrapper = (c: Candidate): boolean =>
+      c.comm === "tmux" ||
+      c.comm.startsWith("tmux:") ||
+      c.comm === "expect" ||
+      c.comm === "script" ||
+      c.comm === "bash" ||
+      c.comm === "sh";
+
+    const agentCandidates = candidates.filter(isAgent);
+    if (agentCandidates.length > 0) {
+      agentCandidates.sort((a, b) => b.rss - a.rss);
+      return agentCandidates[0].pid;
+    }
+    // No claude/node yet — return the heaviest non-wrapper, else fall back.
+    const nonWrapper = candidates.filter((c) => !isWrapper(c));
+    if (nonWrapper.length > 0) {
+      nonWrapper.sort((a, b) => b.rss - a.rss);
+      return nonWrapper[0].pid;
+    }
+    return mainPidFromSystemd();
+  } catch {
+    return mainPidFromSystemd();
+  }
+}
+
+export function getAgentStatus(name: string, tmuxSupervisor = false): AgentStatus {
   const service = serviceName(name);
 
   let active = "unknown";
@@ -432,6 +540,15 @@ export function getAgentStatus(name: string): AgentStatus {
     // Status details unavailable — return what we have
   }
 
+  // Under tmux supervisor, MainPID is the tmux server (~2MB) — resolve
+  // the heavier claude pid via cgroup walk for an honest status line.
+  if (tmuxSupervisor && active === "active") {
+    const resolved = resolveAgentPid(service, true);
+    if (resolved && resolved > 0) {
+      pid = resolved;
+    }
+  }
+
   return { active, uptime, memory, pid };
 }
 
@@ -440,7 +557,9 @@ export function getAllAgentStatuses(
 ): Record<string, AgentStatus> {
   const statuses: Record<string, AgentStatus> = {};
   for (const agentName of Object.keys(config.agents)) {
-    statuses[agentName] = getAgentStatus(agentName);
+    const tmuxSupervisor =
+      config.agents[agentName]?.experimental?.tmux_supervisor === true;
+    statuses[agentName] = getAgentStatus(agentName, tmuxSupervisor);
   }
   return statuses;
 }

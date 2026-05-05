@@ -307,7 +307,7 @@ function hasNodeOnPath(): boolean {
   }
 }
 
-export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false): string {
+export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false, tmuxSupervisor = false): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   // Prefer the bundled `dist/gateway/gateway.js` (#634 strategic
   // packaging fix) — it has all `src/` cross-imports inlined, so a
@@ -369,7 +369,7 @@ Environment=PATH=${unitPath}
 Environment=SWITCHROOM_CLI_PATH=${switchroomCli}
 Environment=TELEGRAM_STATE_DIR=${stateDir}
 Environment=SWITCHROOM_AGENT_NAME=${agentName}
-${adminEnabled ? `Environment=SWITCHROOM_AGENT_ADMIN=true\n` : ''}
+${adminEnabled ? `Environment=SWITCHROOM_AGENT_ADMIN=true\n` : ''}${tmuxSupervisor ? `Environment=SWITCHROOM_TMUX_SUPERVISOR=1\n` : ''}
 [Install]
 WantedBy=default.target
 `;
@@ -575,7 +575,7 @@ export function installAllUnits(config: SwitchroomConfig): void {
       // when the agent is configured with admin:true. The gateway reads this env
       // var to decide whether to intercept slash commands before forwarding to Claude.
       const adminEnabled = resolveAgentConfig(config.defaults, config.profiles, agent).admin === true;
-      const gatewayContent = generateGatewayUnit(stateDir, agentName, adminEnabled);
+      const gatewayContent = generateGatewayUnit(stateDir, agentName, adminEnabled, tmuxSupervisor);
       installUnit(gwName, gatewayContent);
       installedAgents.push(unitName(gwName));
     }
