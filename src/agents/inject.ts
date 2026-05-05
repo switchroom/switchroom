@@ -130,13 +130,22 @@ function defaultSocketName(agentName: string): string {
   return `switchroom-${agentName}`;
 }
 
-interface TmuxRunner {
+export interface TmuxRunner {
   capture(socket: string, session: string): string | null;
   send(socket: string, session: string, args: string[]): void;
   hasSession(socket: string, session: string): boolean;
 }
 
-function makeTmuxRunner(tmuxBin: string): TmuxRunner {
+/**
+ * Build a TmuxRunner backed by the real `tmux` binary at `tmuxBin`.
+ *
+ * Exported (vs the original module-private factory) so integration
+ * tests can drive the same splice logic as production rather than
+ * hand-constructing argv via `spawnSync`. A regression of the #728
+ * splice fix should be observable through `runner.send` — the unit
+ * test mocks the runner, so it can't see that.
+ */
+export function makeTmuxRunner(tmuxBin: string): TmuxRunner {
   return {
     capture(socket, session) {
       try {

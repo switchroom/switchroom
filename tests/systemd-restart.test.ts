@@ -303,31 +303,7 @@ describe("generateGatewayUnit — tmux supervisor env propagation (#725)", () =>
   });
 });
 
-const runIntegration = process.env.RUN_SYSTEMD_INTEGRATION_TESTS === "1";
-
-describe.skipIf(!runIntegration)(
-  "integration: restart actually changes claude PID (issue #361) [requires RUN_SYSTEMD_INTEGRATION_TESTS=1]",
-  () => {
-    it(
-      "claude PID after restart differs from claude PID before restart",
-      async () => {
-        // This test body intentionally left as a stub.
-        // Full implementation requires:
-        //   1. scaffoldAgent() + installUnit() for a test agent
-        //   2. systemctl --user start switchroom-<agent>.service
-        //   3. pgrep -f "claude.*<agent>" to capture PID
-        //   4. systemctl --user restart switchroom-<agent>.service
-        //   5. pgrep again — assert new PID !== old PID
-        //   6. systemctl --user stop + uninstall cleanup
-        //
-        // Until a full harness is wired up, skip with a descriptive error
-        // so anyone who sets the env var gets a clear signal to implement.
-        throw new Error(
-          "Integration test stub: implement the PID-change assertion described in the comment above. " +
-          "Set RUN_SYSTEMD_INTEGRATION_TESTS=1 to run."
-        );
-      },
-      60_000,
-    );
-  },
-);
+// Removed: a long-broken stub gated on RUN_SYSTEMD_INTEGRATION_TESTS=1
+// that threw unconditionally rather than implementing the PID-change
+// assertion. Real systemd-interaction coverage now lives in
+// `tests/cgroup-kill.integration.test.ts`.

@@ -319,6 +319,14 @@ async function resolveTmuxSupervisorPid(
       nonWrapper.sort((a, b) => b.rss - a.rss)
       return nonWrapper[0].pid
     }
+    // Candidates enumerated but every one was a wrapper (tmux/expect/
+    // script/bash/sh). Emit a breadcrumb mirroring the one in
+    // src/agents/lifecycle.ts:resolveAgentPid so journalctl shows the
+    // same state on both sides. The boot-window race (zero pids) returns
+    // earlier without logging, by design.
+    process.stderr.write(
+      `[switchroom] resolveTmuxSupervisorPid: cgroup walk found ${candidates.length} processes, no claude match — falling back to MainPID for unit=switchroom-${agentName}.service\n`,
+    )
     return null
   } catch {
     return null
