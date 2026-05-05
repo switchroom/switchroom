@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## v0.6.14 — 2026-05-05
+
+Bundle re-release. v0.6.13's /reauth removal is in this version too —
+v0.6.13 was tagged on GitHub but the npm publish was rejected by
+prepublishOnly (the architectural-pin test for `redactAuthCodeMessage`
+call sites needed its floor lowered after the /reauth handler was
+removed). v0.6.14 ships both:
+
+- **#705** — remove /reauth typed Telegram command
+- **#706** — update redactAuthCodeMessage call-site pin (test floor
+  3 → 2; docstring updated to reflect the 2 remaining call sites:
+  generic intercept + /auth code intent)
+
+The v0.6.13 git tag stays for historical accuracy; npm consumers
+should install v0.6.14.
+
 ## v0.6.13 — 2026-05-05
 
 ### Removed
