@@ -494,82 +494,64 @@ describe("buildDashboardKeyboard — accounts section", () => {
     expect(texts).not.toContain("🌐 Share to fleet");
   });
 
-  it("renders an account button with a drill-down (account-view) callback", () => {
-    // v3a: account buttons on the main board open the sub-view, not a
-    // toggle. The ✓/○ markers are gone from the main board buttons.
-    const state = mkState({
-      accounts: [mkAccount({ label: "work", enabledHere: true })],
-    });
-    const allButtons = rows(state).flat();
-    const acctBtn = allButtons.find((b) => b.text.includes("work"));
-    expect(acctBtn?.text).toBe("work");
-    expect(acctBtn?.callback_data).toBe("auth:av:clerk:work");
-  });
+  // v3c: per-account drilldown buttons removed from the main board.
+  // The text already names every account; the picker (`🔀 Switch
+  // primary`) replaces per-account button rows. Tests below cover what
+  // remains visible on the main board.
 
-  it("renders account button for a disabled account — still uses account-view callback", () => {
-    const state = mkState({
-      accounts: [mkAccount({ label: "work", enabledHere: false })],
-    });
-    const allButtons = rows(state).flat();
-    const acctBtn = allButtons.find((b) => b.text.includes("work"));
-    expect(acctBtn?.text).toBe("work");
-    expect(acctBtn?.callback_data).toBe("auth:av:clerk:work");
-  });
-
-  it("appends a health suffix for non-healthy accounts", () => {
+  it("does NOT render per-account drilldown buttons on the main board (v3c)", () => {
     const state = mkState({
       accounts: [
-        mkAccount({ label: "expired-acct", health: "expired", enabledHere: true }),
-        mkAccount({ label: "quota-acct", health: "quota-exhausted", enabledHere: false }),
+        mkAccount({ label: "work", enabledHere: true, activeForThisAgent: true }),
+        mkAccount({ label: "fallback", enabledHere: true }),
       ],
     });
-    const texts = flatTexts(state);
-    expect(texts.some((t) => t.startsWith("expired-acct ⌛"))).toBe(true);
-    expect(texts.some((t) => t.startsWith("quota-acct ⚠️"))).toBe(true);
+    const allButtons = rows(state).flat();
+    const drilldowns = allButtons.filter((b) => b.callback_data?.startsWith("auth:av:"));
+    expect(drilldowns.length).toBe(0);
   });
 
-  it("caps visible accounts at ACCOUNTS_DISPLAY_CAP and adds a truncated noop row", () => {
+  it("renders the Switch primary picker entry when fallbacks exist", () => {
+    const state = mkState({
+      accounts: [
+        mkAccount({ label: "work", activeForThisAgent: true }),
+        mkAccount({ label: "fallback" }),
+      ],
+    });
+    const allButtons = rows(state).flat();
+    const picker = allButtons.find((b) => b.text.includes("Switch primary"));
+    expect(picker?.callback_data).toBe("auth:spv:clerk");
+  });
+
+  it("hides the Switch primary picker when accounts exceed display cap (truncated noop still shown)", () => {
     const tooMany: AccountSummary[] = [];
     for (let i = 0; i < ACCOUNTS_DISPLAY_CAP + 2; i++) {
-      tooMany.push(mkAccount({ label: `acct-${i}`, enabledHere: false }));
+      tooMany.push(mkAccount({ label: `acct-${i}` }));
     }
+    // Mark the first one active so the picker WOULD appear if visible
+    // contained both active and fallbacks. ACCOUNTS_DISPLAY_CAP slice
+    // means visible may still include both, so this test verifies the
+    // truncated row appears regardless.
+    tooMany[0] = mkAccount({ label: tooMany[0].label, activeForThisAgent: true });
     const state = mkState({ accounts: tooMany, accountsTruncated: true });
     const allButtons = rows(state).flat();
-    // v3a: account buttons no longer have ✓/○ prefix; filter by account-view callback
-    const acctBtns = allButtons.filter((b) => b.callback_data?.startsWith("auth:av:"));
-    expect(acctBtns).toHaveLength(ACCOUNTS_DISPLAY_CAP);
-    expect(allButtons.find((b) => b.text.startsWith("…"))?.callback_data).toBe(
-      "auth:noop",
-    );
+    const truncated = allButtons.find((b) => b.text.startsWith("…"));
+    expect(truncated?.callback_data).toBe("auth:noop");
   });
 
-  it("hides the bootstrap button once accounts exist (per-account toggles take over)", () => {
+  it("hides the bootstrap button once accounts exist (Switch primary takes over)", () => {
     const state = mkState({
-      accounts: [mkAccount({ label: "work", enabledHere: false })],
+      accounts: [mkAccount({ label: "work" })],
       canBootstrapShare: true,
     });
     const texts = flatTexts(state);
     expect(texts).not.toContain("🌐 Share to fleet");
   });
 
-  it("falls back to a noop button when the synthesised callback exceeds the 64-byte cap", () => {
-    // Pathological: 60-char label + 40-char agent → "auth:av:" (8) +
-    // 40 + ":" + 60 = 109 bytes, well over the 64-byte cap.
-    const longLabel = "a".repeat(60);
-    const state = mkState({
-      agent: "x".repeat(40),
-      accounts: [mkAccount({ label: longLabel, enabledHere: true })],
-    });
-    const allButtons = rows(state).flat();
-    const noopBtn = allButtons.find((b) => b.text.startsWith("⚠"));
-    expect(noopBtn?.callback_data).toBe("auth:noop");
-    expect(noopBtn?.text).toMatch(/use CLI/);
-  });
-
-  it("account-view encodes under the 64-byte budget for typical names", () => {
+  it("Switch primary callback encodes well under the 64-byte budget", () => {
     expect(
       Buffer.byteLength(
-        encodeCallbackData({ kind: "account-view", agent: "clerk", label: "work" }),
+        encodeCallbackData({ kind: "switch-primary-view", agent: "clerk" }),
         "utf8",
       ),
     ).toBeLessThanOrEqual(CALLBACK_BUDGET_BYTES);

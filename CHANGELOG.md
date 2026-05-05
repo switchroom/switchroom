@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## v0.6.10 — 2026-05-05
+
+### Changed
+
+- **Auth card v3c — Switch primary picker replaces button flood.**
+  v3b's per-fallback `⤴ Promote` rows + per-account drilldowns
+  produced 6+ buttons stacked vertically with three accounts. v3c
+  collapses them into a single `🔀 Switch primary →` entry that
+  opens a picker sub-keyboard listing fallbacks as one-tap promote
+  targets. The picker IS the confirmation surface (no second confirm
+  screen). Cancel returns to the main dashboard via refresh.
+  Result: ~4 buttons on the main board instead of 8 with three
+  accounts, scaling cleanly to 5+. Legacy `apr`/`cpr` callback verbs
+  preserved for messages already pinned with the v3b layout.
+
+### Fixed
+
+- **Per-account quota mini-bars now appear on first `/auth` after
+  agent restart** — the gateway boot path eager-warms the in-process
+  quota cache for every account. Without this, the cache was cold on
+  first render → no mini-bars → operator had to tap Refresh.
+- **Cache re-warm after every auth-mutating dashboard tap** — every
+  enable / disable / promote / share / account-rm now schedules a
+  background quota probe alongside the existing cache invalidation,
+  so the post-action dashboard render sees fresh quota.
+
 ## v0.6.9 — 2026-05-05
 
 ### Added
