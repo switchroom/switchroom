@@ -299,19 +299,26 @@ function isSafeSlotName(name: string): boolean {
 
 /**
  * Account labels match the CLI's `validateAccountLabel` regex
- * (`src/auth/account-store.ts`): `[A-Za-z0-9._-]{1,64}`. The `.` is
- * the only delta from `isSafeSlotName` and is what makes labels like
- * `acme.team` legal. Dashboard-side validator so the parser doesn't
- * need to import from `src/`.
+ * (`src/auth/account-store.ts`): `[A-Za-z0-9._@+-]{1,64}`. The label
+ * accepts email-shaped strings (`pixsoul@gmail.com`) and gmail-tag
+ * forms (`ken+work@example.com`) so operators can label accounts by
+ * the Anthropic email they signed up with — the JTBD's "the user
+ * manages accounts" works best when the labels read like the
+ * identities the user already knows.
  *
- * The `.` and `..` reservations match the CLI's defensive guards
- * — those tokens are valid characters but are reserved as filesystem
- * lookalikes and would create ambiguous on-disk paths under
- * `~/.switchroom/accounts/`.
+ * Dashboard-side validator so the parser doesn't need to import
+ * from `src/`. Keep in sync with `LABEL_RE` in account-store.ts and
+ * `ACCOUNT_LABEL_RE` in auth-slot-parser.ts.
+ *
+ * The `.` and `..` reservations match the CLI's defensive guards —
+ * those tokens are valid characters but reserved as filesystem
+ * lookalikes that would create ambiguous on-disk paths under
+ * `~/.switchroom/accounts/`. `:` is omitted on purpose because it
+ * would corrupt callback_data parsing in the Telegram dashboard.
  */
 export function isSafeAccountLabel(name: string): boolean {
   if (name === "." || name === "..") return false;
-  return /^[A-Za-z0-9._-]{1,64}$/.test(name);
+  return /^[A-Za-z0-9._@+-]{1,64}$/.test(name);
 }
 
 /**

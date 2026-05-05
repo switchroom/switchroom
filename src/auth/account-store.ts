@@ -42,7 +42,19 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 const LABEL_MAX = 64;
-const LABEL_RE = /^[A-Za-z0-9._-]+$/;
+// Account labels accept email-friendly characters so operators can
+// label accounts by the Anthropic email they signed up with — e.g.
+// `pixsoul@gmail.com`, `ken+work@example.com`. The character set is
+// the existing slug set (`A-Z a-z 0-9 . _ -`) plus `@` (email
+// separator) and `+` (gmail-style tag separator). We deliberately do
+// NOT allow:
+//   - `:` would corrupt callback_data parsing in the Telegram dashboard.
+//   - `/` `\` are path-traversal risks under `~/.switchroom/accounts/`.
+//   - whitespace, quotes, shell metas — YAML / shell injection surface.
+//   - Unicode lookalikes — keep ASCII for filesystem + regex sanity.
+// Filesystem-safe on Linux/macOS/Windows; YAML-safe (the `yaml` library
+// quotes when needed); Telegram-callback-safe (no `:` collision).
+const LABEL_RE = /^[A-Za-z0-9._@+-]+$/;
 
 /** Subset of Claude Code's credentials.json shape we read + rewrite. */
 export interface AccountCredentials {
@@ -136,7 +148,9 @@ export function validateAccountLabel(label: string): void {
   }
   if (!LABEL_RE.test(label)) {
     throw new Error(
-      "Account label must match [A-Za-z0-9._-]+ (letters, digits, dot, underscore, dash)",
+      "Account label must match [A-Za-z0-9._@+-]+ (letters, digits, dot, " +
+        "underscore, dash, @, +). The @ and + chars let you label accounts " +
+        "by Anthropic email — e.g. 'pixsoul@gmail.com', 'ken+work@example.com'.",
     );
   }
 }

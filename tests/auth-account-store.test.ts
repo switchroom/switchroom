@@ -45,6 +45,15 @@ describe("validateAccountLabel", () => {
     expect(() => validateAccountLabel("a")).not.toThrow();
   });
 
+  it("accepts email-shaped labels (@ + . _ - allowed)", () => {
+    // The headline reason for allowing @: operators want to label
+    // accounts by the Anthropic email they signed up with.
+    expect(() => validateAccountLabel("pixsoul@gmail.com")).not.toThrow();
+    expect(() => validateAccountLabel("ken+work@example.com")).not.toThrow();
+    expect(() => validateAccountLabel("a@b")).not.toThrow();
+    expect(() => validateAccountLabel("user.name+tag@subdomain.example.co")).not.toThrow();
+  });
+
   it("rejects empty / overlong", () => {
     expect(() => validateAccountLabel("")).toThrow();
     expect(() => validateAccountLabel("a".repeat(65))).toThrow();
@@ -59,9 +68,20 @@ describe("validateAccountLabel", () => {
 
   it("rejects invalid characters", () => {
     expect(() => validateAccountLabel("foo bar")).toThrow();
-    expect(() => validateAccountLabel("foo@bar")).toThrow();
+    // `:` would corrupt callback_data parsing in the Telegram dashboard.
     expect(() => validateAccountLabel("foo:bar")).toThrow();
     expect(() => validateAccountLabel("foo!")).toThrow();
+    // Quotes / shell metas / control chars stay out.
+    expect(() => validateAccountLabel("foo\"bar")).toThrow();
+    expect(() => validateAccountLabel("foo'bar")).toThrow();
+    expect(() => validateAccountLabel("foo;rm -rf")).toThrow();
+    expect(() => validateAccountLabel("foo|bar")).toThrow();
+    expect(() => validateAccountLabel("foo&bar")).toThrow();
+    expect(() => validateAccountLabel("foo<bar")).toThrow();
+    expect(() => validateAccountLabel("foo>bar")).toThrow();
+    // Unicode lookalikes — keep ASCII for filesystem + regex sanity.
+    expect(() => validateAccountLabel("fooébar")).toThrow(); // é
+    expect(() => validateAccountLabel("ken@gmaіl.com")).toThrow(); // Cyrillic і
   });
 });
 
