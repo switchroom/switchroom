@@ -123,7 +123,8 @@ export function buildGithubContext(
   const obj = pr ?? issue
 
   const number = String(payload.number ?? obj?.number ?? '')
-  const title = String(obj?.title ?? (payload.commits as unknown[] | undefined)?.[0] ?? '')
+  const firstCommit = (payload.commits as Array<Record<string, unknown>> | undefined)?.[0]
+  const title = String(obj?.title ?? firstCommit?.message ?? '')
   const html_url = String(obj?.html_url ?? payload.html_url ?? '')
   const author = String(
     (obj?.user as Record<string, unknown> | undefined)?.login ??
@@ -251,6 +252,10 @@ export interface CooldownStore {
 export function createFileCooldownStore(
   resolveAgentDir: (agent: string) => string,
 ): CooldownStore {
+  // In-memory cache: loaded once per agent per process lifetime.
+  // Safe because the webhook handler runs in a single-process gateway;
+  // if this ever moves to a multi-worker deployment, the cache layer
+  // would need a cross-process invalidation mechanism (or removal).
   const cache = new Map<string, Record<string, number>>()
   return {
     isCoolingDown(agent: string, key: string, cooldownMs: number, now: number): boolean {
@@ -396,9 +401,21 @@ export function spawnAgentOneShot(
 
   log(`webhook-dispatch: agent='${agent}' model='${model}' pid=${child.pid ?? '?'} spawned\n`)
 
+  // Drain stderr to prevent the OS pipe buffer (~64KB) from blocking
+  // the child process. We log the last few lines on failure so operators
+  // can debug a broken dispatch without attaching a PTY.
+  let stderrTail = ''
+  const stderrStream = (child as unknown as { stderr?: { on: (e: string, cb: (d: Buffer) => void) => void } }).stderr
+  if (stderrStream) {
+    stderrStream.on('data', (d: Buffer) => {
+      stderrTail = (stderrTail + d.toString('utf-8')).slice(-2048)
+    })
+  }
+
   child.on('close', (code) => {
     if (code !== 0) {
-      log(`webhook-dispatch: agent='${agent}' claude -p exited with code ${code}\n`)
+      const tail = stderrTail.trim().split('\n').slice(-3).join(' | ')
+      log(`webhook-dispatch: agent='${agent}' claude -p exited with code ${code}${tail ? `: ${tail}` : ''}\n`)
     }
   })
 }
