@@ -36,13 +36,44 @@ export function generateUnit(
   useAutoaccept = false,
   gatewayUnitName?: string,
   timezone?: string,
+  tmuxSupervisor = false,
 ): string {
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
+  const tmuxConfPath = resolve(agentDir, "tmux.conf");
+  const tmuxSocket = `switchroom-${name}`;
 
-  const execStart = useAutoaccept
-    ? `/usr/bin/script -qfc "/usr/bin/expect -f ${autoacceptExp} ${agentDir}/start.sh" ${logFile}`
-    : `/usr/bin/script -qfc "/bin/bash -l ${agentDir}/start.sh" ${logFile}`;
+  // Phase 1 of #725 — opt-in tmux supervisor. The legacy `script -qfc`
+  // path stays the default; only agents with experimental.tmux_supervisor=true
+  // get the new ExecStart shape. See docs in #725 epic.
+  //
+  // Type=forking + Delegate=yes is the systemd contract for tmux:
+  // `tmux new-session -d` daemonises (forks) and we want systemd to leave
+  // the cgroup alone so tmux can manage its own children. KillMode stays
+  // `control-group` so a `systemctl stop` cgroup-kills the whole tree
+  // (matches today's behaviour with the script wrapper).
+  let execStart: string;
+  let extraStartPost = "";
+  let extraStop = "";
+  let serviceType = "simple";
+  let delegateLine = "";
+
+  if (tmuxSupervisor) {
+    serviceType = "forking";
+    delegateLine = "Delegate=yes\n";
+    const inner = useAutoaccept
+      ? `expect -f ${autoacceptExp} ${agentDir}/start.sh`
+      : `bash -l ${agentDir}/start.sh`;
+    execStart = `/usr/bin/tmux -L ${tmuxSocket} -f ${tmuxConfPath} new-session -A -d -s ${name} -x 400 -y 50 '${inner}'`;
+    // pipe-pane proxies the tmux pane's stdout to service.log so existing
+    // log consumers (pty-tail, journald followers) keep working unchanged.
+    extraStartPost = `ExecStartPost=/usr/bin/tmux -L ${tmuxSocket} pipe-pane -o -t ${name} 'cat >> ${logFile}'\n`;
+    extraStop = `ExecStop=/usr/bin/tmux -L ${tmuxSocket} kill-session -t ${name}\n`;
+  } else {
+    execStart = useAutoaccept
+      ? `/usr/bin/script -qfc "/usr/bin/expect -f ${autoacceptExp} ${agentDir}/start.sh" ${logFile}`
+      : `/usr/bin/script -qfc "/bin/bash -l ${agentDir}/start.sh" ${logFile}`;
+  }
 
   const afterDeps = ["network-online.target"];
   if (useAutoaccept) afterDeps.push(`${unitName(gatewayUnitName ?? GATEWAY_UNIT_NAME)}.service`);
@@ -82,9 +113,9 @@ StartLimitBurst=5
 StartLimitIntervalSec=120
 
 [Service]
-Type=simple
-ExecStart=${execStart}
-StandardOutput=journal
+Type=${serviceType}
+${delegateLine}ExecStart=${execStart}
+${extraStartPost}${extraStop}StandardOutput=journal
 StandardError=journal
 Restart=on-failure
 RestartSec=5
@@ -122,6 +153,32 @@ ${tzEnv}${shaEnv}
 [Install]
 WantedBy=default.target
 `;
+}
+
+/**
+ * Generate the per-agent tmux.conf used by the #725 Phase 1 supervisor.
+ *
+ * Required settings:
+ *   - default-terminal: tmux 3.x ignores `-e TERM=…` for the pane TERM, so
+ *     this is the only way to pin xterm-256color into the spawned shell.
+ *   - history-limit: 100k lines so `tmux capture-pane -p -S -` returns
+ *     plenty of REPL scrollback when an operator attaches.
+ *   - status off: hide tmux's status bar so attach is visually identical
+ *     to today's `tail -f` UX.
+ *   - remain-on-exit off: when claude exits we want the session to die
+ *     so systemd's Restart=on-failure kicks in (not a stale session).
+ */
+export function generateAgentTmuxConf(): string {
+  return `set -g default-terminal "xterm-256color"
+set -g history-limit 100000
+set -g status off
+set -g remain-on-exit off
+`;
+}
+
+export function writeAgentTmuxConf(agentDir: string): void {
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(resolve(agentDir, "tmux.conf"), generateAgentTmuxConf(), { mode: 0o644 });
 }
 
 export function installUnit(name: string, unitContent: string): void {
@@ -489,8 +546,17 @@ export function installAllUnits(config: SwitchroomConfig): void {
     // `defaults.timezone` being set once for the fleet.
     const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
     const timezone = resolveTimezone(config, resolved);
+    const tmuxSupervisor = resolved.experimental?.tmux_supervisor === true;
 
-    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone);
+    // When opted in to the tmux supervisor (#725 Phase 1), drop a managed
+    // tmux.conf alongside start.sh. tmux 3.x ignores `-e TERM=…` for the
+    // pane's TERM under default-terminal selection — pinning it in conf
+    // is the only reliable way to get xterm-256color into the agent shell.
+    if (tmuxSupervisor) {
+      writeAgentTmuxConf(agentDir);
+    }
+
+    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone, tmuxSupervisor);
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
 

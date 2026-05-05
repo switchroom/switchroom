@@ -23,11 +23,17 @@
 #
 # Usage: autoaccept.exp <start-script>
 
-set timeout -1
+set timeout 30
 set start_sh [lindex $argv 0]
 spawn /bin/bash -l $start_sh
 
 expect {
+    timeout {
+        # Bounded autoaccept window — fall through to interact below so
+        # external `tmux send-keys` (epic #725 Phase 2) can reach the
+        # spawned shell. Without this the loop hangs forever and expect
+        # owns stdin, dropping any injected keystrokes.
+    }
     -re {I.{0,5}accept.{0,80}development.{0,10}channels} {
         # Dev-channels acknowledgement — shown once per machine when
         # --dangerously-load-development-channels is first used. Tightly
@@ -64,4 +70,12 @@ expect {
         exp_continue
     }
     eof
+}
+
+# After the autoaccept window closes, proxy stdin↔spawned process so
+# external `tmux send-keys` reaches Claude's REPL (epic #725 Phase 2).
+# Without `interact`, expect keeps stdin captured and any keystrokes
+# tmux pipes into the pane are silently dropped.
+interact {
+    eof exit
 }
