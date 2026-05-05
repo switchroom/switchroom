@@ -346,9 +346,9 @@ export function createPinManager(deps: PinManagerDeps): PinManager {
         (err: Error) => {
           const ms = now() - pinStart
           const errMsg = err?.message ?? String(err)
-          const line = `telegram gateway: progress-card pin failed [WARN] chatId=${chatId} msgId=${messageId} turnKey=${turnKey} agentId=${agentId} durationMs=${ms} error="${errMsg}"\n`
+          const line = `telegram gateway: progress-card pin failed chatId=${chatId} msgId=${messageId} turnKey=${turnKey} agentId=${agentId} durationMs=${ms} error="${errMsg}"\n`
           log(line)
-          process.stderr.write(line)
+          console.warn(line.replace(/\n$/, ''))
           // Pin API failed — drop from the in-memory map so a later
           // unpin attempt doesn't fire `deps.unpin` for a message we
           // never actually pinned. Do NOT add to `unpinned` — we never
