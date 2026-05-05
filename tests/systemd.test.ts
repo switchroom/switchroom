@@ -188,7 +188,10 @@ describe("generateUnit", () => {
       expect(unit).toContain("ExecStart=/usr/bin/tmux -L switchroom-gymbro -f /tmp/gymbro/tmux.conf new-session -A -d -s gymbro -x 400 -y 50 'expect -f");
       expect(unit).toContain("/tmp/gymbro/start.sh");
       expect(unit).toContain("ExecStartPost=/usr/bin/tmux -L switchroom-gymbro pipe-pane -o -t gymbro 'cat >> /tmp/gymbro/service.log'");
-      expect(unit).toContain("ExecStop=/usr/bin/tmux -L switchroom-gymbro kill-session -t gymbro");
+      // Leading `-` on ExecStop = ignore non-zero exit. See systemd.ts
+      // comment — silences the script→tmux transition's first restart.
+      expect(unit).toContain("ExecStop=-/usr/bin/tmux -L switchroom-gymbro kill-session -t gymbro");
+      expect(unit).not.toContain("ExecStop=/usr/bin/tmux");
       // No script -qfc anywhere when flag=true
       expect(unit).not.toContain("/usr/bin/script -qfc");
     });
@@ -569,6 +572,10 @@ describe("generateAgentTmuxConf", () => {
 
   it("disables remain-on-exit so claude exit fires Restart=on-failure", () => {
     expect(generateAgentTmuxConf()).toContain("set -g remain-on-exit off");
+  });
+
+  it("enables focus-events so the pane reports focus to the spawned shell (Phase 1.x)", () => {
+    expect(generateAgentTmuxConf()).toContain("set -g focus-events on");
   });
 });
 

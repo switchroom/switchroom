@@ -68,7 +68,15 @@ export function generateUnit(
     // pipe-pane proxies the tmux pane's stdout to service.log so existing
     // log consumers (pty-tail, journald followers) keep working unchanged.
     extraStartPost = `ExecStartPost=/usr/bin/tmux -L ${tmuxSocket} pipe-pane -o -t ${name} 'cat >> ${logFile}'\n`;
-    extraStop = `ExecStop=/usr/bin/tmux -L ${tmuxSocket} kill-session -t ${name}\n`;
+    // Leading `-` on ExecStop tells systemd to ignore non-zero exits from
+    // the kill-session call. Without it, the script→tmux supervisor
+    // transition's first restart logs FAILURE because the OLD unit (still
+    // running script -qfc) has no tmux socket on stop, so kill-session
+    // exits non-zero and the unit is marked failed even though everything
+    // worked. The dash silences that one-shot transition without changing
+    // anything in steady state — kill-session against a real session
+    // succeeds, so the dash is a no-op there.
+    extraStop = `ExecStop=-/usr/bin/tmux -L ${tmuxSocket} kill-session -t ${name}\n`;
   } else {
     execStart = useAutoaccept
       ? `/usr/bin/script -qfc "/usr/bin/expect -f ${autoacceptExp} ${agentDir}/start.sh" ${logFile}`
@@ -173,6 +181,7 @@ export function generateAgentTmuxConf(): string {
 set -g history-limit 100000
 set -g status off
 set -g remain-on-exit off
+set -g focus-events on
 `;
 }
 
