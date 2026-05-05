@@ -865,3 +865,199 @@ describe("account-view not-found path — gateway dispatch contract", () => {
     expect(toastText).toMatch(/not found/i);
   });
 });
+
+// ─── Per-account quota render ─────────────────────────────────────────
+
+import {
+  formatAccountQuotaLine,
+  isAccountQuotaHot,
+} from "../auth-dashboard";
+
+describe("formatAccountQuotaLine", () => {
+  function acc(extra: Partial<AccountSummary> = {}): AccountSummary {
+    return {
+      label: "x@example.com",
+      health: "healthy",
+      enabledHere: true,
+      ...extra,
+    };
+  }
+
+  it("returns null when neither percentage is present", () => {
+    expect(formatAccountQuotaLine(acc())).toBeNull();
+  });
+
+  it("renders both percentages joined with ' · '", () => {
+    const line = formatAccountQuotaLine(
+      acc({ fiveHourPct: 47, sevenDayPct: 12 }),
+    );
+    expect(line).toContain("5h:");
+    expect(line).toContain("47%");
+    expect(line).toContain("7d:");
+    expect(line).toContain("12%");
+    expect(line).toMatch(/·/);
+  });
+
+  it("rounds percentages but reserves '0%' for genuine idle (positives < 0.5% render as <1%)", () => {
+    const line = formatAccountQuotaLine(
+      acc({ fiveHourPct: 0.3, sevenDayPct: 0 }),
+    );
+    expect(line).toContain("&lt;1%");
+    expect(line).toContain("0%");
+  });
+
+  it("renders only the known percentage when the other is missing", () => {
+    const line5 = formatAccountQuotaLine(acc({ fiveHourPct: 20 }));
+    expect(line5).toContain("5h:");
+    expect(line5).not.toContain("7d:");
+    const line7 = formatAccountQuotaLine(acc({ sevenDayPct: 8 }));
+    expect(line7).toContain("7d:");
+    expect(line7).not.toContain("5h:");
+  });
+
+  it("shows the exhausted-state line with reset time when quotaExhaustedUntil is in the future", () => {
+    const now = 1_000_000;
+    const line = formatAccountQuotaLine(
+      acc({
+        quotaExhaustedUntil: now + 90 * 60_000,
+        fiveHourPct: 100,
+        sevenDayPct: 30,
+      }),
+      now,
+    );
+    expect(line).toContain("exhausted");
+    expect(line).toContain("1h 30m");
+    // Exhausted line takes priority — no percentage row.
+    expect(line).not.toContain("5h:");
+  });
+
+  it("falls through to percentages when quotaExhaustedUntil is in the past", () => {
+    const now = 1_000_000;
+    const line = formatAccountQuotaLine(
+      acc({
+        quotaExhaustedUntil: now - 60_000,
+        fiveHourPct: 25,
+        sevenDayPct: 8,
+      }),
+      now,
+    );
+    expect(line).toContain("5h:");
+    expect(line).not.toContain("exhausted");
+  });
+});
+
+describe("isAccountQuotaHot", () => {
+  function acc(extra: Partial<AccountSummary> = {}): AccountSummary {
+    return {
+      label: "x@example.com",
+      health: "healthy",
+      enabledHere: true,
+      ...extra,
+    };
+  }
+
+  it("returns false on undefined / empty accounts", () => {
+    expect(isAccountQuotaHot(undefined)).toBe(false);
+    expect(isAccountQuotaHot([])).toBe(false);
+  });
+
+  it("returns false when all accounts are below threshold", () => {
+    expect(
+      isAccountQuotaHot([
+        acc({ fiveHourPct: 50, sevenDayPct: 20 }),
+        acc({ label: "y", fiveHourPct: 80, sevenDayPct: 30 }),
+      ]),
+    ).toBe(false);
+  });
+
+  it("returns true when any account crosses the 5h threshold", () => {
+    expect(
+      isAccountQuotaHot([
+        acc({ fiveHourPct: 50, sevenDayPct: 20 }),
+        acc({ label: "y", fiveHourPct: 95, sevenDayPct: 30 }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("returns true when any account crosses the 7d threshold", () => {
+    expect(
+      isAccountQuotaHot([acc({ fiveHourPct: 30, sevenDayPct: 91 })]),
+    ).toBe(true);
+  });
+
+  it("returns true when any account is server-side quota-exhausted", () => {
+    expect(isAccountQuotaHot([acc({ health: "quota-exhausted" })])).toBe(true);
+  });
+});
+
+describe("buildDashboardText — per-account quota line", () => {
+  function mkAcctState(accounts: AccountSummary[]): DashboardState {
+    return {
+      agent: "clerk",
+      bankId: "clerk",
+      plan: "max",
+      rateLimitTier: null,
+      slots: [mkSlot({ active: true, health: "active" })],
+      quotaHot: false,
+      generatedAt: "2026-05-05T12:00:00Z",
+      pendingSessionSlot: null,
+      accounts,
+    };
+  }
+
+  it("hides the quota row for accounts with no quota data", () => {
+    const text = buildDashboardText(
+      mkAcctState([
+        { label: "fresh@example.com", health: "healthy", enabledHere: true },
+      ]),
+    );
+    expect(text).toContain("fresh@example.com");
+    expect(text).not.toMatch(/5h:|7d:/);
+  });
+
+  it("renders the quota row under each account that has data", () => {
+    const text = buildDashboardText(
+      mkAcctState([
+        {
+          label: "warm@example.com",
+          health: "healthy",
+          enabledHere: true,
+          fiveHourPct: 47,
+          sevenDayPct: 12,
+        },
+      ]),
+    );
+    expect(text).toContain("warm@example.com");
+    expect(text).toContain("47%");
+    expect(text).toContain("12%");
+  });
+
+  it("renders mixed cold + warm accounts: only the warm one gets a quota row", () => {
+    const text = buildDashboardText(
+      mkAcctState([
+        {
+          label: "warm@example.com",
+          health: "healthy",
+          enabledHere: true,
+          fiveHourPct: 12,
+          sevenDayPct: 3,
+        },
+        {
+          label: "cold@example.com",
+          health: "healthy",
+          enabledHere: false,
+        },
+      ]),
+    );
+    // Two account labels.
+    expect(text).toContain("warm@example.com");
+    expect(text).toContain("cold@example.com");
+    // One quota row (warm@); cold@ has no 5h/7d/percent string after it.
+    const warmIdx = text.indexOf("warm@example.com");
+    const coldIdx = text.indexOf("cold@example.com");
+    const between = text.slice(warmIdx, coldIdx);
+    expect(between).toMatch(/5h:/);
+    const after = text.slice(coldIdx);
+    expect(after).not.toMatch(/5h:/);
+  });
+});

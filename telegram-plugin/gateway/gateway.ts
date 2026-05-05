@@ -92,6 +92,7 @@ import {
   parseCallbackData,
   encodeCallbackData,
   isQuotaHot,
+  isAccountQuotaHot,
   ACCOUNTS_DISPLAY_CAP,
   type DashboardState,
   type DashboardSlot,
@@ -181,7 +182,13 @@ import {
 import { sweepActiveReactions } from '../active-reactions-sweep.js'
 import { flushOnAgentDisconnect } from './disconnect-flush.js'
 import { PreambleSuppressor } from './preamble-suppressor.js'
-import { fetchQuota, formatQuotaBlock } from '../quota-check.js'
+import {
+  fetchQuota,
+  formatQuotaBlock,
+  getCachedAccountQuota,
+  prefetchAccountQuotaIfStale,
+  clearAccountQuotaCache,
+} from '../quota-check.js'
 import {
   evaluateFallbackTrigger,
   performAutoFallback,
@@ -6619,13 +6626,42 @@ function fetchDashboardState(agent: string): DashboardState | null {
       'auth', 'account', 'list', '--json',
     ])
     if (Array.isArray(raw)) {
-      accounts = raw.map((a) => ({
-        label: a.label,
-        health: a.health,
-        enabledHere: Array.isArray(a.agents) && a.agents.includes(agent),
-        ...(a.subscriptionType ? { subscriptionType: a.subscriptionType } : {}),
-        ...(a.expiresAt != null ? { expiresAt: a.expiresAt } : {}),
-      }))
+      accounts = raw.map((a) => {
+        // Layer per-account quota onto the summary from the in-process
+        // cache (warmed by `prefetchAccountQuotaIfStale` below). Sync
+        // read keeps `fetchDashboardState` itself sync; the cache TTL
+        // (30s) keeps the API-call rate bounded.
+        const cached = getCachedAccountQuota(a.label)
+        const summary: AccountSummary = {
+          label: a.label,
+          health: a.health,
+          enabledHere: Array.isArray(a.agents) && a.agents.includes(agent),
+          ...(a.subscriptionType ? { subscriptionType: a.subscriptionType } : {}),
+          ...(a.expiresAt != null ? { expiresAt: a.expiresAt } : {}),
+          ...(a.quotaExhaustedUntil != null
+            ? { quotaExhaustedUntil: a.quotaExhaustedUntil }
+            : {}),
+          ...(cached?.ok
+            ? {
+                fiveHourPct: cached.data.fiveHourUtilizationPct,
+                sevenDayPct: cached.data.sevenDayUtilizationPct,
+                ...(cached.data.fiveHourResetAt
+                  ? { fiveHourResetAt: cached.data.fiveHourResetAt.getTime() }
+                  : {}),
+                ...(cached.data.sevenDayResetAt
+                  ? { sevenDayResetAt: cached.data.sevenDayResetAt.getTime() }
+                  : {}),
+              }
+            : {}),
+        }
+        // Fire a background probe if the cache is cold/stale. The
+        // current render uses whatever's already cached; the *next*
+        // tap of /auth (after the probe completes) sees the fresh
+        // numbers. Swallowed errors keep the dashboard responsive even
+        // when Anthropic is slow or returns a transient 5xx.
+        prefetchAccountQuotaIfStale(a.label)
+        return summary
+      })
       accountsTruncated = accounts.length > ACCOUNTS_DISPLAY_CAP
     }
   } catch {
@@ -6640,13 +6676,21 @@ function fetchDashboardState(agent: string): DashboardState | null {
     (s) => s.health === 'healthy' || s.health === 'active',
   )
 
+  // `quotaHot` now considers BOTH per-slot percentages (legacy slot
+  // model) and per-account percentages (new account model). Either
+  // path lighting up flips the [Fall back now] affordance, so the
+  // operator sees the warning whether they're on the legacy or new
+  // framework.
+  const slotQuotaHot = isQuotaHot(slots)
+  const accountQuotaHot = isAccountQuotaHot(accounts)
+
   return {
     agent,
     bankId,
     plan,
     rateLimitTier,
     slots,
-    quotaHot: isQuotaHot(slots),
+    quotaHot: slotQuotaHot || accountQuotaHot,
     generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     pendingSessionSlot,
     accounts,
@@ -7571,6 +7615,10 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         `auth enable ${action.label} ${action.agent}`,
       )
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      // Account roster changed — drop cached quota so the next
+      // dashboard render kicks a fresh probe instead of showing
+      // stale numbers (or a zero row for a label that just got added).
+      clearAccountQuotaCache()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7587,6 +7635,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       // to drain manually); the dashboard tap is implicit "I'm done with
       // this account on this agent now," so we restart on their behalf.
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      clearAccountQuotaCache()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7602,6 +7651,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         `auth share default --from-agent ${action.agent}`,
       )
       await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
+      clearAccountQuotaCache()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
@@ -7649,6 +7699,10 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
         ['auth', 'account', 'rm', action.label],
         `auth account rm ${action.label}`,
       )
+      // Removed account label is gone — drop its cache entry (and any
+      // siblings, since `enabledHere` shifts when an agent's account
+      // list changes).
+      clearAccountQuotaCache()
       await sendAuthDashboard(ctx, action.agent, { edit: true })
       return
     }
