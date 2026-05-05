@@ -32,6 +32,7 @@ import {
   writeAccountCredentials,
   type AccountCredentials,
 } from "../auth/account-store.js";
+import { readAccountQuota } from "../auth/account-quota-store.js";
 import {
   fanoutAccountToAgents,
   refreshAllAccounts,
@@ -317,20 +318,39 @@ function registerAccountList(account: Command, program: Command): void {
           const payload = infos
             .slice()
             .sort((a, b) => a.label.localeCompare(b.label))
-            .map((info) => ({
-              label: info.label,
-              health: info.health,
-              ...(info.subscriptionType
-                ? { subscriptionType: info.subscriptionType }
-                : {}),
-              ...(info.expiresAt != null ? { expiresAt: info.expiresAt } : {}),
-              ...(info.quotaExhaustedUntil != null
-                ? { quotaExhaustedUntil: info.quotaExhaustedUntil }
-                : {}),
-              ...(info.email ? { email: info.email } : {}),
-              agents: enabledMap.get(info.label) ?? [],
-              primaryForAgents: primaryForMap.get(info.label) ?? [],
-            }));
+            .map((info) => {
+              // Surface the most-recent persisted quota snapshot
+              // (issue #708) so consumers without access to the live
+              // gateway in-memory cache (e.g. CLI scripts, the boot
+              // card hydration step on a fresh gateway lifetime) see
+              // the same numbers /auth shows.
+              const snap = readAccountQuota(info.label);
+              return {
+                label: info.label,
+                health: info.health,
+                ...(info.subscriptionType
+                  ? { subscriptionType: info.subscriptionType }
+                  : {}),
+                ...(info.expiresAt != null ? { expiresAt: info.expiresAt } : {}),
+                ...(info.quotaExhaustedUntil != null
+                  ? { quotaExhaustedUntil: info.quotaExhaustedUntil }
+                  : {}),
+                ...(info.email ? { email: info.email } : {}),
+                agents: enabledMap.get(info.label) ?? [],
+                primaryForAgents: primaryForMap.get(info.label) ?? [],
+                ...(snap
+                  ? {
+                      quota: {
+                        capturedAt: snap.capturedAt,
+                        fiveHourPct: snap.fiveHourPct,
+                        sevenDayPct: snap.sevenDayPct,
+                        fiveHourResetAt: snap.fiveHourResetAt,
+                        sevenDayResetAt: snap.sevenDayResetAt,
+                      },
+                    }
+                  : {}),
+              };
+            });
           console.log(JSON.stringify(payload));
           return;
         }
