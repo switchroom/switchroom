@@ -148,6 +148,19 @@ export interface AccountSummary {
    * Nh Mm" rather than the percentage row.
    */
   readonly quotaExhaustedUntil?: number;
+  /**
+   * True when this account sits at index 0 of THIS agent's
+   * `auth.accounts:` list — i.e. it's the post-fanout active for this
+   * agent. Drives the `▶` glyph + "Active" framing in the dashboard
+   * render and suppresses the per-account `⤴ Promote` button (you
+   * can't promote what's already primary).
+   *
+   * Populated by the gateway from the new `primaryForAgents` field on
+   * `auth account list --json` (added v0.6.9). Optional: undefined
+   * means "old CLI without the field" — render falls back to the
+   * pre-v3 unmarked layout.
+   */
+  readonly activeForThisAgent?: boolean;
 }
 
 /**
@@ -194,6 +207,13 @@ export type CallbackAction =
   | { kind: "account-rm"; agent: string; label: string }
   | { kind: "account-rm-confirm"; agent: string; label: string }
   | { kind: "account-reauth"; agent: string; label: string }
+  // v3b: in-place promote — moves a fallback to primary without leaving
+  // the dashboard. Two-stage confirm mirrors enable/disable. Verbs `apr`
+  // / `cpr` are 3 chars max so a 40-char agent + 64-char label still
+  // fits the 64-byte callback_data cap (auth:cpr:agent:label = 12 +
+  // agent + label ≤ 64).
+  | { kind: "account-promote"; agent: string; label: string }
+  | { kind: "confirm-account-promote"; agent: string; label: string }
   | { kind: "noop" };
 
 const CALLBACK_PREFIX = "auth:";
@@ -241,6 +261,10 @@ export function encodeCallbackData(action: CallbackAction): string {
       return `${CALLBACK_PREFIX}armc:${action.agent}:${action.label}`;
     case "account-reauth":
       return `${CALLBACK_PREFIX}ara:${action.agent}:${action.label}`;
+    case "account-promote":
+      return `${CALLBACK_PREFIX}apr:${action.agent}:${action.label}`;
+    case "confirm-account-promote":
+      return `${CALLBACK_PREFIX}cpr:${action.agent}:${action.label}`;
     case "noop":
       return `${CALLBACK_PREFIX}noop`;
   }
@@ -264,7 +288,8 @@ export function parseCallbackData(data: string): CallbackAction {
   // segment instead of a slot. We branch on verb first so each segment
   // is validated against its own regex.
   if (verb === "ae" || verb === "ad" || verb === "cae" || verb === "cad" ||
-      verb === "av" || verb === "arm" || verb === "armc" || verb === "ara") {
+      verb === "av" || verb === "arm" || verb === "armc" || verb === "ara" ||
+      verb === "apr" || verb === "cpr") {
     if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
     if (!third || !isSafeAccountLabel(third)) return { kind: "noop" };
     const label = third;
@@ -275,8 +300,10 @@ export function parseCallbackData(data: string): CallbackAction {
     if (verb === "av") return { kind: "account-view", agent, label };
     if (verb === "arm") return { kind: "account-rm", agent, label };
     if (verb === "armc") return { kind: "account-rm-confirm", agent, label };
-    // verb === "ara"
-    return { kind: "account-reauth", agent, label };
+    if (verb === "ara") return { kind: "account-reauth", agent, label };
+    if (verb === "apr") return { kind: "account-promote", agent, label };
+    // verb === "cpr"
+    return { kind: "confirm-account-promote", agent, label };
   }
   if (verb === "sf") {
     if (!isSafeAgentName(agent ?? "")) return { kind: "noop" };
@@ -380,27 +407,46 @@ export function buildDashboardText(state: DashboardState): string {
 
   // v3a: accounts appear above slots — accounts are first-class, slots
   // are an implementation detail of how credentials attach to a process.
+  // v3b: active account (the one at this agent's auth.accounts[0])
+  // floats to the top with a `▶` glyph; remaining rows render under a
+  // "Fallback:" subhead in agent-list order. When `activeForThisAgent`
+  // is unset on every entry (older CLI without primaryForAgents in
+  // --json), we fall back to the v3a layout — bullets only, no header.
   if (state.accounts != null && state.accounts.length > 0) {
     lines.push(`<b>Anthropic accounts (${state.accounts.length})</b>`);
     const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
-    for (const acc of visible) {
-      const badge = accountHealthBadge(acc.health);
-      const suffix = healthSuffix(acc.health);
-      lines.push(`  • <code>${escapeHtml(acc.label)}</code>  ${badge}${suffix}`);
-      // Per-account quota row: "5h: 47%  · 7d: 12%" when the gateway
-      // probed the account. Hidden until at least one of the two
-      // values is known so we don't show "5h: -  · 7d: -" on a
-      // freshly-added account whose probe hasn't run yet — the
-      // operator sees a clean account-only row first, then the
-      // numbers populate on the next refresh tap.
-      const quotaLine = formatAccountQuotaLine(acc);
-      if (quotaLine) lines.push(`    └ ${quotaLine}`);
+    const active = visible.find((a) => a.activeForThisAgent === true);
+    const fallbacks = visible.filter((a) => a !== active);
+    const haveActiveSignal = active != null;
+    if (haveActiveSignal && active != null) {
+      lines.push(renderActiveAccountRow(active));
+    }
+    if (fallbacks.length > 0) {
+      // Only emit the subhead when there's a distinguished active row;
+      // otherwise the list is just "all accounts, no opinion" and a
+      // header would be misleading.
+      if (haveActiveSignal) lines.push(`  <i>Fallback ↓:</i>`);
+      for (const acc of fallbacks) {
+        lines.push(renderFallbackAccountRow(acc, haveActiveSignal));
+        const quotaLine = formatAccountQuotaLine(acc);
+        if (quotaLine) lines.push(`    └ ${quotaLine}`);
+      }
     }
     if (state.accountsTruncated) {
       lines.push(`  … ${state.accounts.length - ACCOUNTS_DISPLAY_CAP} more (use CLI)`);
     }
     lines.push("");
   }
+
+  // Slot ID lookup: under the new account model, slot IDs (`default`,
+  // etc.) are an internal mount-point identifier — not what the
+  // operator authorized. When we know which account is the post-fanout
+  // active for THIS agent, surface its label in place of the slot ID
+  // in the slot row + Pool line. The slot ID itself ("default" or
+  // whatever was synthesised) carries zero information for the
+  // operator; the account label is the identity they recognize.
+  const activeAccountLabel =
+    state.accounts?.find((a) => a.activeForThisAgent === true)?.label ?? null;
 
   if (state.slots.length === 0) {
     lines.push("<i>No account slots. Tap [➕ Add slot] to attach a subscription.</i>");
@@ -410,8 +456,16 @@ export function buildDashboardText(state: DashboardState): string {
       const marker = slot.active ? "●" : "○";
       const badge = healthBadge(slot.health);
       const label = healthLabel(slot.health);
+      // Display name: account label for the active slot when we know
+      // it; otherwise the raw slot ID. Non-active slots also use the
+      // raw ID — there's no account-label to substitute since we only
+      // know the ACTIVE account's identity from the cascade head.
+      const displayName =
+        slot.active && activeAccountLabel != null
+          ? activeAccountLabel
+          : slot.slot;
       lines.push(
-        `  ${marker} <code>${escapeHtml(slot.slot)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
+        `  ${marker} <code>${escapeHtml(displayName)}</code>${slot.active ? " (active)" : ""}  ${badge} ${label}`,
       );
       const detail = slotDetailLine(slot);
       if (detail) lines.push(`    └ ${detail}`);
@@ -419,11 +473,13 @@ export function buildDashboardText(state: DashboardState): string {
   }
 
   // Pool / fallback summary — show when accounts exist, so the user
-  // understands how slots and accounts relate.
+  // understands how slots and accounts relate. Pool line uses the
+  // account label too when we know it (parity with the slot row).
   if (state.accounts != null && state.accounts.length > 0 && state.slots.length > 0) {
     const activeSlot = state.slots.find((s) => s.active);
     if (activeSlot) {
-      lines.push(`  Pool: slot <code>${escapeHtml(activeSlot.slot)}</code> is active`);
+      const poolDisplayName = activeAccountLabel ?? activeSlot.slot;
+      lines.push(`  Pool: <code>${escapeHtml(poolDisplayName)}</code> is active`);
     }
   }
 
@@ -439,6 +495,59 @@ export function buildDashboardText(state: DashboardState): string {
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Render the active account row — the post-fanout primary for this
+ * agent. Uses the `▶` glyph + bold label + an inline quota summary
+ * carrying mini-bars when both percentages are known. Falls back to
+ * the plain `formatAccountQuotaLine` text on the next line if quota
+ * isn't probed yet — keeps the row honest about uncertainty.
+ */
+function renderActiveAccountRow(acc: AccountSummary): string {
+  const badge = accountHealthBadge(acc.health);
+  const suffix = healthSuffix(acc.health);
+  const head = `▶ <b><code>${escapeHtml(acc.label)}</code></b>  ${badge}${suffix}`;
+  const inline = formatActiveQuotaInline(acc);
+  return inline ? `${head}\n    ${inline}` : head;
+}
+
+/**
+ * Render an indented fallback account row. `haveActiveSignal` controls
+ * the bullet vs. tree-prefix character — when there's a distinguished
+ * active row above, we use `↳` to imply ordering; without one we fall
+ * back to a plain `•` bullet so the layout matches v3a for older CLIs.
+ */
+function renderFallbackAccountRow(
+  acc: AccountSummary,
+  haveActiveSignal: boolean,
+): string {
+  const badge = accountHealthBadge(acc.health);
+  const suffix = healthSuffix(acc.health);
+  const prefix = haveActiveSignal ? "  ↳" : "  •";
+  return `${prefix} <code>${escapeHtml(acc.label)}</code>  ${badge}${suffix}`;
+}
+
+/**
+ * Inline quota summary for the active row. When BOTH 5h and 7d are
+ * known, emit the mini-bar form (`5h ████░░ 47%  ·  7d █░░░░░ 12%`).
+ * When the account is exhausted, defer to the existing
+ * `formatAccountQuotaLine` (it has the reset-time copy). Otherwise
+ * return null and let the caller skip the line.
+ */
+function formatActiveQuotaInline(acc: AccountSummary): string | null {
+  if (acc.quotaExhaustedUntil != null && acc.quotaExhaustedUntil > Date.now()) {
+    return formatAccountQuotaLine(acc);
+  }
+  if (acc.fiveHourPct == null || acc.sevenDayPct == null) {
+    return formatAccountQuotaLine(acc);
+  }
+  const fiveBar = formatQuotaBar(acc.fiveHourPct);
+  const sevenBar = formatQuotaBar(acc.sevenDayPct);
+  return (
+    `<i>5h</i> <code>${fiveBar}</code> ${formatQuotaPct(acc.fiveHourPct)}  ` +
+    `·  <i>7d</i> <code>${sevenBar}</code> ${formatQuotaPct(acc.sevenDayPct)}`
+  );
 }
 
 /** Health badge for an account (not a slot). */
@@ -500,8 +609,15 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
   // drills into the per-account sub-view. No inline ✓/○ toggles on the
   // main board — the toggles are an implementation detail; the sub-view
   // surface is the right place for per-account actions.
+  // v3b: each non-active account also gets a `⤴ Promote` button on the
+  // row beneath it. Active rows are unchanged (already at primary —
+  // promoting them is a no-op). The promote button uses the same
+  // 64-byte render-time guard as the drill-down button.
   if (state.accounts != null && state.accounts.length > 0) {
     const visible = state.accounts.slice(0, ACCOUNTS_DISPLAY_CAP);
+    const haveActiveSignal = visible.some(
+      (a) => a.activeForThisAgent === true,
+    );
     for (const acc of visible) {
       const action: CallbackAction = { kind: "account-view", agent: state.agent, label: acc.label };
       const encoded = encodeCallbackData(action);
@@ -509,15 +625,37 @@ export function buildDashboardKeyboard(state: DashboardState): InlineKeyboard {
       // 64-byte cap (pathological agent + label lengths), fall back
       // to a noop button labelled with the raw account name so the
       // row is visible-but-inert. Operator can fall back to the CLI.
+      const labelPrefix = acc.activeForThisAgent ? "▶ " : "";
       if (Buffer.byteLength(encoded, "utf8") > CALLBACK_BUDGET_BYTES) {
         kb.text(
           `⚠ ${truncateLabel(acc.label)} (use CLI)`,
           encodeCallbackData({ kind: "noop" }),
         );
       } else {
-        kb.text(`${acc.label}${healthSuffix(acc.health)}`, encoded);
+        kb.text(`${labelPrefix}${acc.label}${healthSuffix(acc.health)}`, encoded);
       }
       kb.row();
+      // v3b promote row — only meaningful when we know which account is
+      // active (so we can suppress the button on it). Without that
+      // signal (older CLI), we skip every promote button rather than
+      // ambiguously offer "promote" on every row.
+      if (haveActiveSignal && !acc.activeForThisAgent) {
+        const promoteAction: CallbackAction = {
+          kind: "account-promote",
+          agent: state.agent,
+          label: acc.label,
+        };
+        const promoteEncoded = encodeCallbackData(promoteAction);
+        if (Buffer.byteLength(promoteEncoded, "utf8") > CALLBACK_BUDGET_BYTES) {
+          kb.text(
+            `⤴ Promote ${truncateLabel(acc.label)} (use CLI)`,
+            encodeCallbackData({ kind: "noop" }),
+          );
+        } else {
+          kb.text(`⤴ Promote ${acc.label}`, promoteEncoded);
+        }
+        kb.row();
+      }
     }
     if (state.accountsTruncated) {
       kb.text(
@@ -670,6 +808,31 @@ function formatQuotaPct(pct: number): string {
   return `${rounded}%`;
 }
 
+/**
+ * Render a Unicode mini-bar for a 0–100 percentage. Six cells wide —
+ * the active row carries two of these (5h + 7d) and they need to fit
+ * one mobile line alongside the labels and percentages.
+ *
+ *   formatQuotaBar(0)   → ░░░░░░
+ *   formatQuotaBar(47)  → ███░░░
+ *   formatQuotaBar(99)  → █████░  (clamps below full so 99% reads
+ *                                  visibly different from 100%)
+ *   formatQuotaBar(100) → ██████
+ *
+ * Used only on the active-account row (the one running quota right
+ * now). Fallback rows still render plain percentages because the bars
+ * eat horizontal space the indented "↳" rows don't have.
+ */
+export function formatQuotaBar(pct: number, cells: number = 6): string {
+  if (cells <= 0) return "";
+  const clamped = Math.max(0, Math.min(100, pct));
+  // Math.floor for the filled cell count — 100% gets all cells, 99%
+  // gets cells-1, anything below the per-cell threshold gets 0.
+  const filled =
+    clamped >= 100 ? cells : Math.floor((clamped / 100) * cells);
+  return "█".repeat(filled) + "░".repeat(cells - filled);
+}
+
 function formatRelativeMs(ms: number): string {
   const totalMin = Math.max(1, Math.floor(ms / 60_000));
   if (totalMin < 60) return `${totalMin}m`;
@@ -708,6 +871,27 @@ export function escapeHtml(text: string): string {
 export function buildRemoveConfirmKeyboard(agent: string, slot: string): InlineKeyboard {
   return new InlineKeyboard()
     .text(`⚠️ Confirm remove: ${slot}`, encodeCallbackData({ kind: "confirm-rm", agent, slot }))
+    .row()
+    .text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
+}
+
+/**
+ * Two-stage confirmation for the account promote action — mirrors
+ * `buildAccountConfirmKeyboard` but with the promote-specific verb so
+ * the confirm row's callback dispatches to `confirm-account-promote`.
+ *
+ * Why a separate helper instead of extending the existing one's `kind`
+ * parameter: the `enable | disable` discriminant is already in widely-
+ * used callsites; threading a third value through them would force
+ * cascading test updates. A dedicated helper is cleaner.
+ */
+export function buildAccountPromoteConfirmKeyboard(
+  agent: string,
+  label: string,
+): InlineKeyboard {
+  const action: CallbackAction = { kind: "confirm-account-promote", agent, label };
+  return new InlineKeyboard()
+    .text(`⚠️ Confirm promote: ${label}`, encodeCallbackData(action))
     .row()
     .text("↩️ Cancel", encodeCallbackData({ kind: "refresh", agent }));
 }

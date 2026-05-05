@@ -39,6 +39,7 @@ import {
 import {
   appendAccountToAgent,
   getAccountsForAgent,
+  promoteAccountForAgent,
   removeAccountFromAgent,
   renameAccountInAllAgents,
 } from "./auth-accounts-yaml.js";
@@ -63,6 +64,7 @@ export function registerAuthAccountSubcommands(
 
   registerEnable(authParent, program);
   registerDisable(authParent, program);
+  registerPromote(authParent, program);
   registerShare(authParent, program);
   registerRefreshAccounts(authParent, program);
 }
@@ -284,11 +286,23 @@ function registerAccountList(account: Command, program: Command): void {
         const config = getConfig(program);
         const labels = listAccounts();
         const enabledMap = new Map<string, string[]>();
+        // primaryForMap[label] = [agents whose auth.accounts:[0] === label].
+        // Mirrors enabledMap but only counts agents where this label sits
+        // at position 0 — the post-fanout active for that agent. Used by
+        // the Telegram dashboard's `▶ Active` row.
+        const primaryForMap = new Map<string, string[]>();
         for (const label of labels) {
           enabledMap.set(
             label,
             Object.entries(config.agents)
               .filter(([, a]) => (a.auth?.accounts ?? []).includes(label))
+              .map(([n]) => n)
+              .sort(),
+          );
+          primaryForMap.set(
+            label,
+            Object.entries(config.agents)
+              .filter(([, a]) => (a.auth?.accounts ?? [])[0] === label)
               .map(([n]) => n)
               .sort(),
           );
@@ -315,6 +329,7 @@ function registerAccountList(account: Command, program: Command): void {
                 : {}),
               ...(info.email ? { email: info.email } : {}),
               agents: enabledMap.get(info.label) ?? [],
+              primaryForAgents: primaryForMap.get(info.label) ?? [],
             }));
           console.log(JSON.stringify(payload));
           return;
@@ -676,6 +691,134 @@ function registerDisable(authParent: Command, program: Command): void {
           );
         }
         console.log();
+      }),
+    );
+}
+
+/* ── promote (move an enabled account to position 0 → new primary) ─── */
+
+/**
+ * `switchroom auth promote <label> <agents...>` — move an already-enabled
+ * label to position 0 of each agent's `auth.accounts:` list, making it
+ * the agent's new primary, and immediately fan out fresh credentials.
+ *
+ * Why this verb exists separately from `enable`:
+ *   - `enable` of an already-enabled label is a no-op (idempotent
+ *     append). Operators have no way to say "I want this one to be
+ *     active now" without manually editing YAML.
+ *   - The Telegram dashboard's `⤴ Promote` button maps 1:1 to this
+ *     verb. Single source of truth for the YAML mutation + fanout.
+ *
+ * Refuses (throws) when the label isn't already enabled on the agent —
+ * promotion only reorders; it doesn't enable. This avoids "promote
+ * silently enabled it" confusion.
+ *
+ * Idempotent at the `already-primary` boundary: if the label is
+ * already at position 0, the YAML stays byte-identical and we skip
+ * the fanout (no point rewriting unchanged credentials).
+ */
+function registerPromote(authParent: Command, program: Command): void {
+  authParent
+    .command("promote <label> <agents...>")
+    .description(
+      "Move an already-enabled account to position 0 (primary) on the listed agents — re-fans credentials and tells you what to restart.",
+    )
+    .action(
+      withConfigError(async (label: string, agents: string[]) => {
+        validateAccountLabel(label);
+        if (!accountExists(label)) {
+          throw new Error(
+            `Account "${label}" does not exist. Add it first with 'switchroom auth account add ${label}'.`,
+          );
+        }
+        const config = getConfig(program);
+        agents = expandAllAgents(agents, config);
+        const agentsDir = resolveAgentsDir(config);
+        for (const name of agents) {
+          if (!config.agents[name]) {
+            throw new Error(
+              `agent '${name}' is not declared in switchroom.yaml`,
+            );
+          }
+        }
+
+        const yamlPath = getConfigPath(program);
+        const before = readFileSync(yamlPath, "utf-8");
+        // Pre-validate every agent has the label in its list. Fail
+        // before mutating so we don't half-promote across the fleet.
+        for (const name of agents) {
+          const current = getAccountsForAgent(before, name);
+          if (!current.includes(label)) {
+            throw new Error(
+              `account '${label}' is not enabled on agent '${name}' — enable it first with 'switchroom auth enable ${label} ${name}'.`,
+            );
+          }
+        }
+
+        let after = before;
+        const promoted: string[] = [];
+        const alreadyPrimary: string[] = [];
+        for (const name of agents) {
+          const current = getAccountsForAgent(after, name);
+          if (current[0] === label) {
+            alreadyPrimary.push(name);
+            continue;
+          }
+          after = promoteAccountForAgent(after, name, label);
+          promoted.push(name);
+        }
+        if (after !== before) {
+          writeFileSync(yamlPath, after);
+        }
+
+        // Fan the (now-primary) label only to the agents we moved. The
+        // already-primary set is a no-op — their on-disk credentials
+        // already match the YAML head.
+        const fanTargets = promoted.map((name) => ({
+          name,
+          agentDir: resolve(agentsDir, name),
+        }));
+        const outcomes =
+          fanTargets.length > 0
+            ? fanoutAccountToAgents(label, fanTargets)
+            : [];
+        const fanned = outcomes
+          .filter((o) => o.kind === "fanned-out")
+          .map((o) => o.agent);
+        const fanFails = outcomes.filter((o) => o.kind === "fanout-failed");
+
+        console.log();
+        if (promoted.length === 0) {
+          console.log(
+            `No change — ${chalk.bold(label)} is already primary on: ${alreadyPrimary.join(", ")}`,
+          );
+        } else {
+          console.log(
+            `${chalk.green("✓")} Promoted ${chalk.bold(label)} to primary on: ${promoted.join(", ")}`,
+          );
+          if (alreadyPrimary.length > 0) {
+            console.log(
+              `  Already primary on: ${alreadyPrimary.join(", ")}`,
+            );
+          }
+        }
+        if (fanned.length > 0) {
+          console.log(`  Credentials fanned out to: ${fanned.join(", ")}`);
+        }
+        for (const f of fanFails) {
+          if (f.kind === "fanout-failed") {
+            console.log(
+              chalk.yellow(`  ⚠ Fanout failed for ${f.agent}: ${f.error}`),
+            );
+          }
+        }
+        console.log();
+        if (promoted.length > 0) {
+          console.log(
+            `Next: 'switchroom agent restart ${promoted.join(" ")}' to load the new active credentials.`,
+          );
+          console.log();
+        }
       }),
     );
 }
