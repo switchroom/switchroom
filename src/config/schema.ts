@@ -1170,6 +1170,28 @@ export const AgentSchema = z.object({
       "claim_worktree accepts the alias as the repo argument. " +
       "Absolute paths may always be passed regardless of this list.",
     ),
+  experimental: z
+    .object({
+      tmux_supervisor: z
+        .boolean()
+        .optional()
+        .describe(
+          "Phase 1 of issue #725. When true, the systemd unit launches the " +
+          "agent inside a per-agent tmux session (Type=forking, " +
+          "Delegate=yes) instead of wrapping start.sh in `script -qfc`. " +
+          "Enables `switchroom agent attach` to drop into the live REPL " +
+          "and (in later phases) external slash-command injection via " +
+          "`tmux send-keys`. Default false — opt in per agent so we can " +
+          "canary on a single agent before fleet rollout.",
+        ),
+    })
+    .optional()
+    .describe(
+      "Per-agent feature flags for unstable / canary behaviour. Each " +
+      "field is a boolean opt-in; the default for every flag is the " +
+      "current production behaviour. Flags graduate out of `experimental` " +
+      "once they're known-stable across the fleet.",
+    ),
   repos: z
     .record(
       z.string().regex(

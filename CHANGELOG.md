@@ -4,6 +4,16 @@
 
 ### Added
 
+- **tmux supervisor opt-in flag (#725 Phase 1)** — new per-agent
+  `experimental.tmux_supervisor` boolean (default `false`). When `true`,
+  the systemd unit replaces `script -qfc` with `tmux new-session` so
+  external `tmux send-keys` can drive the running Claude REPL (foundation
+  for #163 `/remotecontrol` and broader slash-command passthrough). Ships
+  a managed `tmux.conf` per agent (`default-terminal xterm-256color`,
+  `history-limit 100000`, `status off`, `remain-on-exit off`).
+  Patches `bin/autoaccept.exp` with `set timeout 30` and `interact { eof
+  exit }` so external send-keys reaches Claude. `switchroom agent attach`
+  now actually attaches to the tmux session when the flag is on.
 - **Webhook dispatch (#715)** — verified webhook events now trigger fresh
   `claude -p` invocations so agents can react in Telegram without polling
   `webhook-events.jsonl` manually.

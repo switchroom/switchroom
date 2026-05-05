@@ -1275,7 +1275,7 @@ export function registerAgentCommand(program: Command): void {
   // switchroom agent attach <name>
   agent
     .command("attach <name>")
-    .description("Attach to an agent's tmux session")
+    .description("Attach to an agent's REPL (tmux session, when supervisor enabled) or service log")
     .action(
       withConfigError(async (name: string) => {
         const config = getConfig(program);
@@ -1285,8 +1285,14 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
 
+        // #725 Phase 1 — opt-in tmux supervisor changes attach from
+        // `tail -f service.log` to `tmux attach`. Read the resolved
+        // (cascade-merged) config so the flag can be set at any layer.
+        const resolved = resolveAgentConfig(config.defaults, config.profiles, config.agents[name]);
+        const tmuxSupervisor = resolved.experimental?.tmux_supervisor === true;
+
         // attachAgent must exec (replace process), so this won't return on success
-        attachAgent(name);
+        attachAgent(name, tmuxSupervisor);
       })
     );
 

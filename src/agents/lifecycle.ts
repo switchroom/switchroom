@@ -445,8 +445,26 @@ export function getAllAgentStatuses(
   return statuses;
 }
 
-export function attachAgent(name: string): void {
+export function attachAgent(name: string, tmuxSupervisor = false): void {
   const agentsDir = process.env.SWITCHROOM_AGENTS_DIR ?? resolveStatePath("agents");
+
+  // #725 Phase 1 — when the agent opted into the tmux supervisor, attach
+  // means "drop into the live REPL inside tmux", not "tail a log". The
+  // legacy tail path stays the default for unflagged agents so existing
+  // operators see no behaviour change.
+  if (tmuxSupervisor) {
+    const tmuxSocket = `switchroom-${name}`;
+    const result = spawnSync(
+      "/usr/bin/tmux",
+      ["-L", tmuxSocket, "attach", "-t", name],
+      { stdio: "inherit" },
+    );
+    if (result.error) {
+      throw new Error(`Failed to tmux-attach to agent "${name}": ${result.error.message}`);
+    }
+    return;
+  }
+
   const logFile = resolve(agentsDir, name, "service.log");
 
   if (!existsSync(logFile)) {

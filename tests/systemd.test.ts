@@ -1,7 +1,10 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   generateUnit,
   generateGatewayUnit,
+  generateAgentTmuxConf,
   cronToOnCalendar,
   generateTimerUnit,
   generateTimerServiceUnit,
@@ -159,6 +162,56 @@ describe("generateUnit", () => {
     // the file being absent. Without it, systemd refuses to start
     // units on fresh installs where vault init hasn't run yet.
     expect(unit).toMatch(/EnvironmentFile=-/);
+  });
+
+  // ─── #725 Phase 1: opt-in tmux supervisor ───────────────────────────
+  describe("tmux supervisor (issue #725 Phase 1)", () => {
+    it("legacy script -qfc ExecStart is unchanged when flag is false", () => {
+      const unit = generateUnit("legacy", "/tmp/legacy", false, undefined, undefined, false);
+      expect(unit).toContain("Type=simple");
+      expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
+      expect(unit).not.toContain("/usr/bin/tmux");
+      expect(unit).not.toContain("Delegate=yes");
+    });
+
+    it("legacy autoaccept ExecStart is unchanged when flag is false", () => {
+      const unit = generateUnit("legacy", "/tmp/legacy", true, "legacy-gateway", undefined, false);
+      expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
+      expect(unit).toContain("autoaccept.exp");
+      expect(unit).not.toContain("/usr/bin/tmux");
+    });
+
+    it("emits tmux ExecStart with autoaccept inside the session when flag=true and useAutoaccept=true", () => {
+      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway", undefined, true);
+      expect(unit).toContain("Type=forking");
+      expect(unit).toContain("Delegate=yes");
+      expect(unit).toContain("ExecStart=/usr/bin/tmux -L switchroom-gymbro -f /tmp/gymbro/tmux.conf new-session -A -d -s gymbro -x 400 -y 50 'expect -f");
+      expect(unit).toContain("/tmp/gymbro/start.sh");
+      expect(unit).toContain("ExecStartPost=/usr/bin/tmux -L switchroom-gymbro pipe-pane -o -t gymbro 'cat >> /tmp/gymbro/service.log'");
+      expect(unit).toContain("ExecStop=/usr/bin/tmux -L switchroom-gymbro kill-session -t gymbro");
+      // No script -qfc anywhere when flag=true
+      expect(unit).not.toContain("/usr/bin/script -qfc");
+    });
+
+    it("emits tmux ExecStart with bash -l when flag=true and useAutoaccept=false", () => {
+      const unit = generateUnit("plain", "/tmp/plain", false, undefined, undefined, true);
+      expect(unit).toContain("Type=forking");
+      expect(unit).toContain("Delegate=yes");
+      expect(unit).toContain("new-session -A -d -s plain -x 400 -y 50 'bash -l /tmp/plain/start.sh'");
+      expect(unit).not.toContain("autoaccept.exp");
+      expect(unit).not.toContain("/usr/bin/script -qfc");
+    });
+
+    it("preserves cgroup kill semantics and memory ceilings under tmux supervisor", () => {
+      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway", undefined, true);
+      expect(unit).toContain("KillMode=control-group");
+      expect(unit).toContain("KillSignal=SIGTERM");
+      expect(unit).toContain("SendSIGKILL=yes");
+      expect(unit).toContain("TimeoutStopSec=15");
+      expect(unit).toContain("Restart=on-failure");
+      expect(unit).toContain("MemoryMax=8G");
+      expect(unit).toContain("MemoryHigh=6G");
+    });
   });
 });
 
@@ -497,5 +550,42 @@ describe("shouldInstallBrokerUnit (#207)", () => {
       },
     } as unknown as SwitchroomConfig;
     expect(shouldInstallBrokerUnit(cfg)).toBe(true);
+  });
+});
+
+// ─── #725 Phase 1: managed tmux.conf + autoaccept interact block ─────────
+describe("generateAgentTmuxConf", () => {
+  it("pins default-terminal to xterm-256color (tmux 3.x ignores -e TERM)", () => {
+    expect(generateAgentTmuxConf()).toContain('set -g default-terminal "xterm-256color"');
+  });
+
+  it("declares a generous history-limit so capture-pane returns scrollback", () => {
+    expect(generateAgentTmuxConf()).toContain("set -g history-limit 100000");
+  });
+
+  it("disables the status bar so attach matches today's tail UX", () => {
+    expect(generateAgentTmuxConf()).toContain("set -g status off");
+  });
+
+  it("disables remain-on-exit so claude exit fires Restart=on-failure", () => {
+    expect(generateAgentTmuxConf()).toContain("set -g remain-on-exit off");
+  });
+});
+
+describe("autoaccept.exp (#725 Phase 1)", () => {
+  const expPath = resolve(__dirname, "../bin/autoaccept.exp");
+  const content = readFileSync(expPath, "utf-8");
+
+  it("bounds the autoaccept loop with a 30s timeout", () => {
+    expect(content).toContain("set timeout 30");
+    expect(content).not.toContain("set timeout -1");
+  });
+
+  it("includes a timeout {} arm so the expect block falls through cleanly", () => {
+    expect(content).toMatch(/timeout\s*\{/);
+  });
+
+  it("ends with an interact block so external tmux send-keys reaches the spawned shell", () => {
+    expect(content).toMatch(/interact\s*\{[^}]*eof\s+exit[^}]*\}/);
   });
 });
