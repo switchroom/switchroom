@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## v0.6.7 — 2026-05-05
+
+### Added
+
+- **Account labels accept `@` and `+`** (#694) — operators can now
+  label Anthropic accounts by the email they signed up with, e.g.
+  `pixsoul@gmail.com`, `ken+work@example.com`. Regex expanded from
+  `[A-Za-z0-9._-]+` to `[A-Za-z0-9._@+-]+` (max 64 chars) in all
+  three places that must stay in sync — CLI canonical
+  (`account-store.ts:LABEL_RE`), Telegram verb parser
+  (`auth-slot-parser.ts:ACCOUNT_LABEL_RE`), and dashboard
+  callback-data validator (`auth-dashboard.ts:isSafeAccountLabel`).
+  - **Still rejected:** `:` (callback_data separator), `/` `\\`
+    (path-traversal), whitespace, quotes, shell metas, non-ASCII.
+  - Use `switchroom auth account rename <old> <new>` (PR #653) to
+    relabel an existing account into the email-shape form.
+
 ## v0.6.6 — 2026-05-05
 
 ### Added
