@@ -14,7 +14,6 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import {
-  evaluateDispatch,
   matchesRule,
   buildGithubContext,
   renderTemplate,
