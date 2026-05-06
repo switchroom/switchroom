@@ -991,3 +991,5 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
+<!-- reggie smoke test 2 2026-05-06T20:28:41+10:00 -->
