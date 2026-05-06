@@ -294,3 +294,95 @@ describe("injectSlashCommand (default runner — validation only)", () => {
     });
   });
 });
+
+import {
+  describe as descAllow,
+  it as itAllow,
+  expect as expectAllow,
+} from "vitest";
+import {
+  INJECT_BLOCKED,
+  INJECT_COMMANDS,
+  injectSlashCommandWith,
+  type TmuxRunner,
+} from "./inject";
+
+/**
+ * Per-allowlist-entry coverage: every command in INJECT_COMMANDS must
+ * round-trip through injectSlashCommandWith and produce the expected
+ * outcome shape, with the right metadata wired through. Catches drift
+ * between the metadata map and the classifier.
+ *
+ * Mirrors the response-shape contract per command:
+ *  - expectsOutput=true + we return realistic pane bytes → outcome=ok
+ *  - expectsOutput=true + we return empty pane → outcome=ok_no_output
+ *  - expectsOutput=false + we return empty pane → outcome=ok_no_output
+ *    (with silentNote propagating through meta when present)
+ */
+function makeFakeRunner(paneAfter: string): TmuxRunner {
+  const sent: string[][] = [];
+  let captures = 0;
+  const runner: TmuxRunner = {
+    capture: () => {
+      captures++;
+      // First capture (before send) returns empty; subsequent (after
+      // send) return the simulated post-inject pane.
+      return captures === 1 ? "" : paneAfter;
+    },
+    send: (_socket, _session, args) => {
+      sent.push(args);
+    },
+    hasSession: () => true,
+  };
+  // expose for assertions if needed
+  (runner as unknown as { __sent: string[][] }).__sent = sent;
+  return runner;
+}
+
+descAllow("INJECT_COMMANDS — per-entry classifier coverage (#725)", () => {
+  for (const [verb, meta] of INJECT_COMMANDS.entries()) {
+    itAllow(`${verb} (expectsOutput=${meta.expectsOutput}) classifies ok when capture has output`, async () => {
+      const paneAfter = `❯ ${verb}\n  rendered output line 1\n  rendered output line 2\n`;
+      const runner = makeFakeRunner(paneAfter);
+      const r = await injectSlashCommandWith(runner, {
+        socket: "test", session: "test", command: verb,
+        settleMs: 50, timeoutMs: 200,
+      });
+      expectAllow(r.outcome, `expected ok for ${verb}`).toBe("ok");
+      expectAllow(r.command).toBe(verb);
+      expectAllow(r.meta).not.toBeNull();
+      expectAllow(r.meta?.description).toBe(meta.description);
+      expectAllow(r.meta?.expectsOutput).toBe(meta.expectsOutput);
+      expectAllow(r.output.length, `output for ${verb}`).toBeGreaterThan(0);
+    });
+
+    itAllow(`${verb} classifies ok_no_output when capture is empty`, async () => {
+      const runner = makeFakeRunner("");
+      const r = await injectSlashCommandWith(runner, {
+        socket: "test", session: "test", command: verb,
+        settleMs: 50, timeoutMs: 200,
+      });
+      expectAllow(r.outcome).toBe("ok_no_output");
+      expectAllow(r.command).toBe(verb);
+      // silentNote propagates verbatim when the metadata declares one.
+      expectAllow(r.meta?.silentNote).toBe(meta.silentNote);
+      expectAllow(r.output).toBe("");
+    });
+  }
+});
+
+descAllow("INJECT_BLOCKED — per-entry coverage (#725)", () => {
+  for (const [verb, meta] of INJECT_BLOCKED.entries()) {
+    itAllow(`${verb} returns failed:blocked with the configured reason`, async () => {
+      const runner = makeFakeRunner("");
+      const r = await injectSlashCommandWith(runner, {
+        socket: "test", session: "test", command: verb,
+        settleMs: 50, timeoutMs: 200,
+      });
+      expectAllow(r.outcome).toBe("failed");
+      expectAllow(r.errorCode).toBe("blocked");
+      // The user-facing error message should mention the configured reason.
+      expectAllow(r.errorMessage).toContain(meta.reason);
+    });
+  }
+});
