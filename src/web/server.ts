@@ -275,6 +275,7 @@ async function handleWebhookRoute(
       allowedSources,
       config: { secrets: agentSecrets as Partial<Record<"github" | "generic", string>> },
       agentExists: agentConfig !== undefined,
+      dispatchConfig: agentConfig?.channels?.telegram?.webhook_dispatch,
     },
     {},
   );
