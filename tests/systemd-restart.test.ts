@@ -75,8 +75,10 @@ describe("generateUnit — cgroup kill semantics (issue #361)", () => {
     expect(autoSvc).toContain("KillMode=control-group");
     expect(autoSvc).toContain("SendSIGKILL=yes");
     expect(autoSvc).toContain("TimeoutStopSec=15");
-    // PTY wrapper still present
-    expect(autoUnit).toContain("autoaccept.exp");
+    // #725 PR-4 — autoaccept is now a TS pane-poller fired from
+    // ExecStartPost; the expect wrapper is opt-in only.
+    expect(autoUnit).not.toContain("autoaccept.exp");
+    expect(autoUnit).toContain("autoaccept-poll.ts");
   });
 });
 

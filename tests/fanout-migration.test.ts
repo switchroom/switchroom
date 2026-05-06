@@ -51,11 +51,16 @@ describe("default-flip: tmux supervisor is the default", () => {
     expect(execStop(legacy)).toBe("");
   });
 
-  it("autoaccept default → legacy: ExecStart wraps autoaccept.exp under both shapes", () => {
+  it("autoaccept default (PR-4): ExecStart no longer wraps autoaccept.exp; legacy_pty path does", () => {
+    // #725 PR-4 — under the tmux supervisor (default) the expect wrapper
+    // is gone; first-run prompts are dispatched by the TS pane-poller
+    // fired from ExecStartPost. Legacy_pty path (no tmux) still uses
+    // expect because there's no pane to poll.
     const def = generateUnit("clerk", "/tmp/clerk", true, "clerk-gateway");
     const legacy = generateUnit("clerk", "/tmp/clerk", true, "clerk-gateway", undefined, true);
-    expect(execStart(def)).toContain("autoaccept.exp");
+    expect(execStart(def)).not.toContain("autoaccept.exp");
     expect(execStart(def)).toContain("/usr/bin/tmux -L switchroom-clerk");
+    expect(execStart(def)).toContain("bash -l /tmp/clerk/start.sh");
     expect(execStart(legacy)).toContain("autoaccept.exp");
     expect(execStart(legacy)).toContain("/usr/bin/script -qfc");
   });

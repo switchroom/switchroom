@@ -735,6 +735,16 @@ export const ExperimentalSchema = z
         "`tmux_supervisor: true` migrates to `legacy_pty: false`. A " +
         "one-time deprecation warning is emitted to stderr per process.",
       ),
+    legacy_autoaccept_expect: z
+      .boolean()
+      .optional()
+      .describe(
+        "Use the legacy `expect`-based autoaccept wrapper for first-run " +
+        "TUI prompts (theme picker, MCP trust, dev-channels). Default " +
+        "false (new TS pane-poller introduced in #725 PR-4). Set true to " +
+        "roll back during stabilisation; this rollback knob is kept for " +
+        "one release.",
+      ),
   })
   .optional()
   .transform((val) => {
