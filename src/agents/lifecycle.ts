@@ -4,6 +4,7 @@ import { resolve, join } from "node:path";
 import { connect } from "node:net";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveStatePath } from "../config/paths.js";
+import { resolveAgentConfig } from "../config/merge.js";
 
 /**
  * Resolve the per-agent gateway clean-shutdown marker path.
@@ -391,7 +392,7 @@ export function getAgentStartSha(name: string): string | null {
  * status display purposes MainPID is "good enough" (claude is the same
  * process).
  *
- * Under `experimental.tmux_supervisor=true`, MainPID points at the
+ * Under the tmux supervisor (the default as of #725 PR-1), MainPID points at the
  * tmux server (~2MB RSS) which spawns claude inside a session — that's
  * misleading for an operator looking at "how much memory is the agent
  * using?". Walk the cgroup and pick the heaviest-RSS pid; that's
@@ -401,7 +402,7 @@ export function getAgentStartSha(name: string): string | null {
  * Falls back to MainPID if cgroup walk fails (boot window, cgroup v2
  * not at `/sys/fs/cgroup`, or no resolvable claude process yet).
  */
-export function resolveAgentPid(unitName: string, useTmux: boolean): number | null {
+export function resolveAgentPid(unitName: string, useTmux: boolean = true): number | null {
   const mainPidFromSystemd = (): number | null => {
     try {
       const out = execFileSync(
@@ -499,7 +500,7 @@ export function resolveAgentPid(unitName: string, useTmux: boolean): number | nu
   }
 }
 
-export function getAgentStatus(name: string, tmuxSupervisor = false): AgentStatus {
+export function getAgentStatus(name: string, tmuxSupervisor = true): AgentStatus {
   const service = serviceName(name);
 
   let active = "unknown";
@@ -565,14 +566,22 @@ export function getAllAgentStatuses(
 ): Record<string, AgentStatus> {
   const statuses: Record<string, AgentStatus> = {};
   for (const agentName of Object.keys(config.agents)) {
-    const tmuxSupervisor =
-      config.agents[agentName]?.experimental?.tmux_supervisor === true;
+    // Cascade through profile/defaults so the legacy_pty flag can be set
+    // at any layer. The Zod transform on `experimental` (schema.ts) has
+    // already normalised any deprecated `tmux_supervisor` keys into
+    // `legacy_pty`, so this is the single read site.
+    const resolved = resolveAgentConfig(
+      config.defaults,
+      config.profiles,
+      config.agents[agentName],
+    );
+    const tmuxSupervisor = resolved.experimental?.legacy_pty !== true;
     statuses[agentName] = getAgentStatus(agentName, tmuxSupervisor);
   }
   return statuses;
 }
 
-export function attachAgent(name: string, tmuxSupervisor = false): void {
+export function attachAgent(name: string, tmuxSupervisor = true): void {
   const agentsDir = process.env.SWITCHROOM_AGENTS_DIR ?? resolveStatePath("agents");
 
   // #725 Phase 1 — when the agent opted into the tmux supervisor, attach

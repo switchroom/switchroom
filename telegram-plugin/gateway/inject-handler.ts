@@ -105,7 +105,7 @@ function shapeReply(
   }
   if (code === 'session_missing') {
     return {
-      body: 'tmux session not found — agent needs <code>experimental.tmux_supervisor=true</code>',
+      body: 'tmux session not found — agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.',
       accent: 'issue',
     }
   }

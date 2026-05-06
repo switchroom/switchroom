@@ -189,7 +189,7 @@ describe('handleInjectCommand — outcome=failed', () => {
     expect(replies[0].text).toContain('blocked: would mutate auth state')
   })
 
-  it('session_missing: hints at experimental.tmux_supervisor', async () => {
+  it('session_missing: hints at experimental.legacy_pty', async () => {
     const inject = vi
       .fn()
       .mockResolvedValue(failedResult('/cost', 'session_missing', 'session not found'))
@@ -197,7 +197,7 @@ describe('handleInjectCommand — outcome=failed', () => {
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('issue')
     expect(replies[0].text).toContain('tmux session not found')
-    expect(replies[0].text).toContain('experimental.tmux_supervisor=true')
+    expect(replies[0].text).toContain('experimental.legacy_pty')
   })
 
   it('tmux_failed: surfaces escaped error message', async () => {

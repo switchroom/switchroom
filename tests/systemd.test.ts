@@ -37,8 +37,22 @@ describe("generateUnit", () => {
     expect(unit).toContain("Description=switchroom agent: health-coach");
   });
 
-  it("uses script -qfc for PTY provision", () => {
+  it("uses tmux new-session by default (#725 PR-1)", () => {
     const unit = generateUnit("health-coach", "/home/user/.switchroom/agents/health-coach");
+    expect(unit).toContain("ExecStart=/usr/bin/tmux -L switchroom-health-coach");
+    expect(unit).toContain("new-session -A -d -s health-coach");
+    expect(unit).toContain("/home/user/.switchroom/agents/health-coach/start.sh");
+  });
+
+  it("uses script -qfc when legacy_pty=true (rollback)", () => {
+    const unit = generateUnit(
+      "health-coach",
+      "/home/user/.switchroom/agents/health-coach",
+      false,
+      undefined,
+      undefined,
+      true,
+    );
     expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
     expect(unit).toContain("/home/user/.switchroom/agents/health-coach/start.sh");
   });
@@ -112,8 +126,13 @@ describe("generateUnit", () => {
     expect(serviceSection).not.toContain("StartLimitIntervalSec");
   });
 
-  it("sets Type=simple for script-based execution", () => {
+  it("sets Type=forking for tmux-based execution by default (#725 PR-1)", () => {
     const unit = generateUnit("test", "/tmp/test");
+    expect(unit).toContain("Type=forking");
+  });
+
+  it("sets Type=simple under legacy_pty (script-based execution)", () => {
+    const unit = generateUnit("test", "/tmp/test", false, undefined, undefined, true);
     expect(unit).toContain("Type=simple");
   });
 
@@ -130,7 +149,7 @@ describe("generateUnit", () => {
 
   it("uses expect autoaccept wrapper when useAutoaccept=true", () => {
     const unit = generateUnit("fork", "/tmp/fork", true);
-    expect(unit).toContain("/usr/bin/expect");
+    expect(unit).toContain("expect -f");
     expect(unit).toContain("autoaccept.exp");
     expect(unit).toContain("/tmp/fork/start.sh");
     // Should NOT reference the old Python autoaccept script
@@ -138,11 +157,12 @@ describe("generateUnit", () => {
     expect(unit).not.toContain("/usr/bin/python3");
   });
 
-  it("does not use expect wrapper by default", () => {
+  it("does not use expect wrapper when useAutoaccept=false", () => {
     const unit = generateUnit("plain", "/tmp/plain", false);
     expect(unit).not.toContain("autoaccept.exp");
-    expect(unit).not.toContain("/usr/bin/expect");
-    expect(unit).toContain("/bin/bash");
+    expect(unit).not.toContain("expect -f");
+    // Default supervisor wraps `bash -l ...start.sh` inside tmux.
+    expect(unit).toContain("bash -l /tmp/plain/start.sh");
   });
 
   // Regression: Ken had been hand-patching EnvironmentFile=- into
@@ -164,40 +184,47 @@ describe("generateUnit", () => {
     expect(unit).toMatch(/EnvironmentFile=-/);
   });
 
-  // ─── #725 Phase 1: opt-in tmux supervisor ───────────────────────────
-  describe("tmux supervisor (issue #725 Phase 1)", () => {
-    it("legacy script -qfc ExecStart is unchanged when flag is false", () => {
-      const unit = generateUnit("legacy", "/tmp/legacy", false, undefined, undefined, false);
+  // ─── #725 PR-1: tmux supervisor is default; legacy_pty rollback ─────
+  describe("tmux supervisor (default) and legacy_pty rollback (#725 PR-1)", () => {
+    it("default: tmux ExecStart, no script -qfc", () => {
+      const unit = generateUnit("legacy", "/tmp/legacy");
+      expect(unit).toContain("Type=forking");
+      expect(unit).toContain("Delegate=yes");
+      expect(unit).toContain("ExecStart=/usr/bin/tmux -L switchroom-legacy");
+      expect(unit).not.toContain("ExecStart=/usr/bin/script -qfc");
+    });
+
+    it("legacy_pty=true: script -qfc ExecStart, Type=simple, no Delegate", () => {
+      const unit = generateUnit("legacy", "/tmp/legacy", false, undefined, undefined, true);
       expect(unit).toContain("Type=simple");
       expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
       expect(unit).not.toContain("/usr/bin/tmux");
       expect(unit).not.toContain("Delegate=yes");
     });
 
-    it("legacy autoaccept ExecStart is unchanged when flag is false", () => {
-      const unit = generateUnit("legacy", "/tmp/legacy", true, "legacy-gateway", undefined, false);
+    it("legacy_pty=true with autoaccept: script -qfc wraps autoaccept.exp", () => {
+      const unit = generateUnit("legacy", "/tmp/legacy", true, "legacy-gateway", undefined, true);
       expect(unit).toContain("ExecStart=/usr/bin/script -qfc");
       expect(unit).toContain("autoaccept.exp");
       expect(unit).not.toContain("/usr/bin/tmux");
     });
 
-    it("emits tmux ExecStart with autoaccept inside the session when flag=true and useAutoaccept=true", () => {
-      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway", undefined, true);
+    it("default + autoaccept: tmux ExecStart wraps autoaccept inside the session", () => {
+      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway");
       expect(unit).toContain("Type=forking");
       expect(unit).toContain("Delegate=yes");
       expect(unit).toContain("ExecStart=/usr/bin/tmux -L switchroom-gymbro -f /tmp/gymbro/tmux.conf new-session -A -d -s gymbro -x 400 -y 50 'expect -f");
       expect(unit).toContain("/tmp/gymbro/start.sh");
       expect(unit).toContain("ExecStartPost=/usr/bin/tmux -L switchroom-gymbro pipe-pane -o -t gymbro 'cat >> /tmp/gymbro/service.log'");
-      // Leading `-` on ExecStop = ignore non-zero exit. See systemd.ts
-      // comment — silences the script→tmux transition's first restart.
+      // Leading `-` on ExecStop = ignore non-zero exit (silences the
+      // script→tmux migration FAILURE on the first restart).
       expect(unit).toContain("ExecStop=-/usr/bin/tmux -L switchroom-gymbro kill-session -t gymbro");
       expect(unit).not.toContain("ExecStop=/usr/bin/tmux");
-      // No script -qfc anywhere when flag=true
       expect(unit).not.toContain("/usr/bin/script -qfc");
     });
 
-    it("emits tmux ExecStart with bash -l when flag=true and useAutoaccept=false", () => {
-      const unit = generateUnit("plain", "/tmp/plain", false, undefined, undefined, true);
+    it("default + no autoaccept: tmux ExecStart wraps `bash -l start.sh`", () => {
+      const unit = generateUnit("plain", "/tmp/plain");
       expect(unit).toContain("Type=forking");
       expect(unit).toContain("Delegate=yes");
       expect(unit).toContain("new-session -A -d -s plain -x 400 -y 50 'bash -l /tmp/plain/start.sh'");
@@ -205,8 +232,8 @@ describe("generateUnit", () => {
       expect(unit).not.toContain("/usr/bin/script -qfc");
     });
 
-    it("preserves cgroup kill semantics and memory ceilings under tmux supervisor", () => {
-      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway", undefined, true);
+    it("preserves cgroup kill semantics and memory ceilings under default tmux supervisor", () => {
+      const unit = generateUnit("gymbro", "/tmp/gymbro", true, "gymbro-gateway");
       expect(unit).toContain("KillMode=control-group");
       expect(unit).toContain("KillSignal=SIGTERM");
       expect(unit).toContain("SendSIGKILL=yes");
@@ -484,11 +511,11 @@ describe("autoaccept detection via usesSwitchroomTelegramPlugin", () => {
 
     const autoUnit = generateUnit("dev", "/tmp/dev", usesSwitchroomTelegramPlugin(defaultAgent));
     expect(autoUnit).toContain("autoaccept.exp");
-    expect(autoUnit).toContain("/usr/bin/expect");
+    expect(autoUnit).toContain("expect -f");
 
     const plainUnit = generateUnit("plain", "/tmp/plain", usesSwitchroomTelegramPlugin(officialAgent));
     expect(plainUnit).not.toContain("autoaccept.exp");
-    expect(plainUnit).toContain("/bin/bash");
+    expect(plainUnit).toContain("bash -l");
   });
 });
 
