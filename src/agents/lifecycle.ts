@@ -5,6 +5,8 @@ import { connect } from "node:net";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveStatePath } from "../config/paths.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { loadConfig } from "../config/loader.js";
+import { sendAgentInterrupt } from "./tmux.js";
 
 /**
  * Resolve the per-agent gateway clean-shutdown marker path.
@@ -322,15 +324,80 @@ export function gracefulRestartAgent(name: string): Promise<{ restartedImmediate
   });
 }
 
-export function interruptAgent(name: string): { pid: number } {
+/**
+ * Send a SIGINT to the agent currently running its turn. Used by the
+ * `!`-prefix Telegram interrupt marker and the `switchroom agent
+ * interrupt` CLI.
+ *
+ * Dual-path policy (since #725 PR-3):
+ *   - tmux supervisor (default): prefer `tmux send-keys C-c` to the
+ *     agent's pane. This delivers Ctrl-C to whatever is currently
+ *     foregrounded — typically the claude REPL, but if claude has
+ *     spawned a child Bash tool that's now runaway, the child gets the
+ *     C-c. That matches operator intent ("interrupt the thing I see
+ *     spinning"), where `systemctl kill --signal=INT` over the cgroup
+ *     would also wake the tmux server and supervisor wrappers, and may
+ *     not always reach grandchildren cleanly.
+ *   - legacy_pty (`experimental.legacy_pty: true`): unchanged — fire
+ *     `systemctl --user kill --signal=INT <unit>` over the cgroup.
+ *   - Safety net: if send-keys fails for any reason on a tmux agent
+ *     (no session, socket missing, timeout), we fall back to the
+ *     cgroup kill so the operator always gets *some* interrupt.
+ *
+ * Public signature unchanged; the optional `opts.config` is provided
+ * for tests that want to skip the on-disk config load.
+ */
+export function interruptAgent(
+  name: string,
+  opts: { config?: SwitchroomConfig } = {},
+): { pid: number } {
   const status = getAgentStatus(name);
   if (!status.pid) {
     throw new Error(
       `Agent "${name}" has no running PID (status: ${status.active})`
     );
   }
+
+  // Resolve legacy_pty so we know which path to take. Best-effort:
+  // if config can't be loaded for any reason, fall through to the
+  // historical cgroup path.
+  let useTmuxSendKeys = false;
+  try {
+    const config = opts.config ?? loadConfig();
+    const agentDef = config.agents[name];
+    if (agentDef) {
+      const resolved = resolveAgentConfig(
+        config.defaults,
+        config.profiles,
+        agentDef,
+      );
+      useTmuxSendKeys = resolved.experimental?.legacy_pty !== true;
+    }
+  } catch {
+    // Config unreadable — keep the legacy cgroup path.
+    useTmuxSendKeys = false;
+  }
+
+  if (useTmuxSendKeys) {
+    const sendResult = sendAgentInterrupt({ agentName: name });
+    if ("ok" in sendResult) {
+      console.log(
+        `[interrupt] ${name}: delivered SIGINT via tmux send-keys C-c`,
+      );
+      return { pid: status.pid };
+    }
+    console.error(
+      `[interrupt] ${name}: tmux send-keys failed (${sendResult.error}); ` +
+        `falling back to systemctl kill --signal=INT`,
+    );
+    // fall through to cgroup path
+  }
+
   try {
     systemctl(["kill", "--signal=INT", serviceName(name)]);
+    console.log(
+      `[interrupt] ${name}: delivered SIGINT via systemctl kill --signal=INT`,
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(

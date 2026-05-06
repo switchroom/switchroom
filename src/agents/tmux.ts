@@ -127,6 +127,70 @@ function sanitizeReason(reason: string): string {
   return slug || "unknown";
 }
 
+export interface SendInterruptOptions {
+  agentName: string;
+  /** how many milliseconds to wait between two send-keys attempts (default 100). */
+  retryDelayMs?: number;
+  /** total attempts (default 1, no retry). */
+  attempts?: number;
+}
+
+export type SendInterruptResult = { ok: true } | { error: string };
+
+/**
+ * Deliver a Ctrl-C to whatever is currently foregrounded in the agent's
+ * tmux pane via `tmux send-keys C-c`.
+ *
+ * Why this exists separately from the cgroup-wide
+ * `systemctl kill --signal=INT` path: under the tmux supervisor, claude
+ * may have spawned a child process for a Bash tool call, and an operator
+ * typing `!` in chat almost always means "interrupt whatever's currently
+ * running" — which is the foreground thing in the pane, not necessarily
+ * claude proper. send-keys hits the pane's foreground process; cgroup
+ * SIGINT hits the whole tree (including the supervisor itself).
+ *
+ * Soft-fail contract: returns `{ error }` on any tmux failure (no session,
+ * socket missing, timeout, exec error). Never throws. Callers can fall
+ * back to the cgroup path on `{ error }`.
+ */
+export function sendAgentInterrupt(opts: SendInterruptOptions): SendInterruptResult {
+  const { agentName } = opts;
+  const attempts = typeof opts.attempts === "number" && opts.attempts > 0 ? opts.attempts : 1;
+  const retryDelayMs =
+    typeof opts.retryDelayMs === "number" && opts.retryDelayMs >= 0 ? opts.retryDelayMs : 100;
+
+  const socket = `switchroom-${agentName}`;
+  const args = ["-L", socket, "send-keys", "-t", agentName, "C-c"];
+
+  let lastError: string | null = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      execFileSync("tmux", args, {
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { ok: true };
+    } catch (err) {
+      lastError = `tmux send-keys C-c failed: ${(err as Error).message}`;
+      console.error(`[tmux-interrupt] ${agentName}: ${lastError}`);
+    }
+    if (i < attempts - 1 && retryDelayMs > 0) {
+      sleepSync(retryDelayMs);
+    }
+  }
+
+  return { error: lastError ?? "tmux send-keys C-c failed" };
+}
+
+function sleepSync(ms: number): void {
+  // Atomics.wait on a fresh SharedArrayBuffer is a portable synchronous
+  // sleep — keeps the helper self-contained and testable without forcing
+  // callers/tests to manage fake timers.
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, ms);
+}
+
 function pruneOldReports(dir: string, retain: number): void {
   let entries: string[];
   try {
