@@ -12,6 +12,14 @@
  * blocklist exists purely to give a more specific error message for
  * those four — anything else outside the allowlist returns `not_allowed`.
  *
+ * UX upgrade (epic #725): rather than throwing on every non-happy path,
+ * `injectSlashCommandWith` now returns a tagged `InjectResult` whose
+ * `outcome` field is one of `ok | ok_no_output | failed`. Validation
+ * still throws (it's a programming error to pass an unvalidated cmd
+ * down the seam) — but the runtime classification is data, not
+ * exceptions, so callers (Telegram handler, CLI) can fan out without
+ * re-implementing try/catch dispatch trees.
+ *
  * FUTURE GAP — turn-lifecycle idle gate. This implementation always
  * sends keys immediately. If the agent is mid-tool-call (e.g. running
  * a long bash command) the slash inject lands in claude's input buffer
@@ -27,20 +35,52 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 /**
+ * Per-command metadata for the inject allowlist. `expectsOutput` is a
+ * hint used to decide whether an empty capture is suspicious (warn) or
+ * expected (silent). `silentNote` overrides the empty-capture display
+ * for verbs that intentionally render nothing on success.
+ */
+export interface InjectCommandMeta {
+  description: string;
+  expectsOutput: boolean;
+  silentNote?: string;
+}
+
+/**
  * Hard-coded set of injectable slash commands. Read-only commands that
  * render information without mutating Claude's auth/session state. Add
  * with care — every entry expands the surface area of inject calls.
  */
-export const INJECT_ALLOWLIST: ReadonlySet<string> = new Set([
-  "/cost",
-  "/status",
-  "/model",
-  "/clear",
-  "/compact",
-  "/memory",
-  "/hooks",
-  "/usage",
+export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
+  ["/cost", { description: "Show session cost", expectsOutput: true }],
+  ["/status", { description: "Show session status", expectsOutput: true }],
+  ["/usage", { description: "Show plan quota", expectsOutput: true }],
+  ["/hooks", { description: "List configured hooks", expectsOutput: true }],
+  ["/memory", { description: "Open memory picker", expectsOutput: true }],
+  ["/model", { description: "Open model picker", expectsOutput: true }],
+  [
+    "/clear",
+    { description: "Clear session screen", expectsOutput: false },
+  ],
+  [
+    "/compact",
+    {
+      description: "Compact conversation history",
+      expectsOutput: false,
+      silentNote: "compaction runs silently",
+    },
+  ],
 ]);
+
+/**
+ * Backwards-compat: a few callers (and tests) still want a plain Set of
+ * allowed verbs. Derived from `INJECT_COMMANDS` so the two never drift.
+ */
+export const INJECT_ALLOWLIST: ReadonlySet<string> = new Set(INJECT_COMMANDS.keys());
+
+export interface InjectBlockedMeta {
+  reason: string;
+}
 
 /**
  * Commands explicitly refused with a `blocked` (vs `not_allowed`) error
@@ -48,12 +88,17 @@ export const INJECT_ALLOWLIST: ReadonlySet<string> = new Set([
  * destructive / session-ending commands an operator must never trigger
  * from a remote surface.
  */
-export const INJECT_BLOCKLIST: ReadonlySet<string> = new Set([
-  "/login",
-  "/logout",
-  "/exit",
-  "/quit",
+export const INJECT_BLOCKED: ReadonlyMap<string, InjectBlockedMeta> = new Map([
+  ["/login", { reason: "would mutate auth state" }],
+  ["/logout", { reason: "would terminate the agent's auth session" }],
+  ["/exit", { reason: "would kill the agent process" }],
+  ["/quit", { reason: "would kill the agent process" }],
 ]);
+
+/**
+ * Backwards-compat Set view over the blocklist keys.
+ */
+export const INJECT_BLOCKLIST: ReadonlySet<string> = new Set(INJECT_BLOCKED.keys());
 
 export type InjectErrorCode =
   | "not_allowed"
@@ -89,9 +134,39 @@ export interface InjectOpts {
   timeoutMs?: number;
 }
 
+/**
+ * Three outcomes only:
+ *  - `ok` — non-empty capture; render output to the user.
+ *  - `ok_no_output` — send-keys completed, capture empty. Could be
+ *    expected (e.g. `/clear`) or suspicious (`/cost` with no output).
+ *  - `failed` — validation rejected, session missing, or send-keys
+ *    threw. `errorCode` and `errorMessage` carry the reason.
+ *
+ * Classification is derived from runtime capture, not from
+ * `expectsOutput` — that field is a UX hint only.
+ */
+export type InjectOutcome = "ok" | "ok_no_output" | "failed";
+
+export type InjectDiagnostic =
+  | "anchor_missing"
+  | "truncated_output"
+  | "timeout"
+  | "modal_partial";
+
 export interface InjectResult {
+  outcome: InjectOutcome;
+  /** Empty for `ok_no_output` and `failed`. */
   output: string;
   truncated: boolean;
+  /** Bare verb (e.g. `/cost`). Empty for `failed` w/ invalid input. */
+  command: string;
+  /** Allowlist metadata; null when the call failed before validation. */
+  meta: InjectCommandMeta | null;
+  diagnostic?: InjectDiagnostic;
+  /** Set on `failed` outcomes. */
+  errorCode?: InjectErrorCode;
+  /** Short user-facing message for `failed` outcomes. */
+  errorMessage?: string;
 }
 
 const POLL_INTERVAL_MS = 150;
@@ -111,16 +186,18 @@ export function validateInjectCommand(command: string): string {
   }
   const bare = trimmed.split(/\s+/, 1)[0].toLowerCase();
   // Block first so /login etc. get the more specific message.
-  if (INJECT_BLOCKLIST.has(bare)) {
+  const blockedMeta = INJECT_BLOCKED.get(bare);
+  if (blockedMeta) {
     throw new InjectError(
       "blocked",
-      `${bare} is explicitly blocked from inject (would mutate session/auth state).`,
+      `${bare} is explicitly blocked from inject (${blockedMeta.reason}).`,
     );
   }
-  if (!INJECT_ALLOWLIST.has(bare)) {
+  if (!INJECT_COMMANDS.has(bare)) {
+    const allowed = [...INJECT_COMMANDS.keys()].sort().join(", ");
     throw new InjectError(
       "not_allowed",
-      `${bare} is not in the inject allowlist. Allowed: ${[...INJECT_ALLOWLIST].sort().join(", ")}`,
+      `${bare} is not in the inject allowlist. Allowed: ${allowed}`,
     );
   }
   return bare;
@@ -192,6 +269,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Result of {@link diffPane}. `anchored` is true when the diff was
+ * computed against the command-echo line in the post-capture; false
+ * when the function fell back to line-set diff against `before`.
+ * Callers use the flag to set the `anchor_missing` diagnostic when
+ * the fallback also yielded no output.
+ */
+export interface DiffPaneResult {
+  output: string;
+  anchored: boolean;
+}
+
+/**
  * Extract the response to a slash command from a post-inject pane
  * capture. We anchor on the LAST occurrence of Claude's prompt-echo
  * line for the command (`❯ <command>` — Ink renders the user's input
@@ -210,19 +299,12 @@ function sleep(ms: number): Promise<void> {
  * command-echo anchor is found in the post-capture, fall back to
  * line-set diff so unusual TUI shapes still surface something.
  */
-export function diffPane(before: string, after: string, command?: string): string {
+export function diffPane(before: string, after: string, command?: string): DiffPaneResult {
   if (command) {
-    // Build a regex that tolerates Ink's right-arrow input prefix and
-    // any leading whitespace; match exact command verb plus optional
-    // args (we already validated allowlist/blocklist upstream).
     const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const lines = after.split("\n");
     let anchorIdx = -1;
     for (let i = lines.length - 1; i >= 0; i--) {
-      // Match `❯ /command` or `> /command` (some terminals render it
-      // differently). Allow trailing args. Strict-anchor at end of
-      // line to avoid catching the prompt that contains the command
-      // as a substring inside narrative text.
       if (/[❯>]\s+/.test(lines[i]) && lines[i].includes(escaped)) {
         anchorIdx = i;
         break;
@@ -230,8 +312,6 @@ export function diffPane(before: string, after: string, command?: string): strin
     }
     if (anchorIdx >= 0) {
       const tail = lines.slice(anchorIdx + 1);
-      // Trim leading and trailing blank lines, and drop common
-      // modal-affordance footers that aren't part of the response.
       const trimmed: string[] = [];
       for (const raw of tail) {
         const line = raw.trimEnd();
@@ -241,14 +321,12 @@ export function diffPane(before: string, after: string, command?: string): strin
       while (trimmed.length > 0 && trimmed[trimmed.length - 1].length === 0) {
         trimmed.pop();
       }
-      // Drop trailing affordance lines (case-insensitive). These are
-      // Ink modal hints that aren't part of the slash output.
       const affordances = /^(esc to cancel|press any key|↵ select)/i;
       while (trimmed.length > 0 && affordances.test(trimmed[trimmed.length - 1].trim())) {
         trimmed.pop();
       }
       if (trimmed.length > 0) {
-        return trimmed.join("\n");
+        return { output: trimmed.join("\n"), anchored: true };
       }
       // Anchor found but tail is empty — fall through to set-diff.
     }
@@ -262,12 +340,14 @@ export function diffPane(before: string, after: string, command?: string): strin
     if (beforeSet.has(line)) continue;
     newLines.push(line);
   }
-  return newLines.join("\n");
+  return { output: newLines.join("\n"), anchored: false };
 }
 
 /**
- * Inject a slash command into an agent's tmux pane. Returns the diff
- * of new lines that appeared in the pane after the inject.
+ * Inject a slash command into an agent's tmux pane. Returns an
+ * `InjectResult` describing the outcome — never throws for runtime
+ * problems (session missing, send-keys failure). Validation errors
+ * still throw `InjectError` because they indicate a caller bug.
  *
  * Suitable execution states: agent prompt is idle (not mid-tool-call).
  * See FUTURE GAP comment at the top of this file.
@@ -297,6 +377,11 @@ export async function injectSlashCommand(
 /**
  * Test seam. Same logic as `injectSlashCommand` but takes a pre-built
  * `TmuxRunner` so unit tests can fake the tmux subprocess.
+ *
+ * Classification rules:
+ *   - validation/session/send-keys failure  → outcome=`failed`
+ *   - non-empty captured output             → outcome=`ok`
+ *   - empty output, send-keys completed     → outcome=`ok_no_output`
  */
 export async function injectSlashCommandWith(
   runner: TmuxRunner,
@@ -310,11 +395,39 @@ export async function injectSlashCommandWith(
 ): Promise<InjectResult> {
   const { socket, session, command, settleMs, timeoutMs } = args;
 
+  // Re-validate so the seam itself enforces the contract. The bare
+  // verb is what we'll surface in `result.command` / lookup metadata.
+  let bareVerb: string;
+  try {
+    bareVerb = validateInjectCommand(command);
+  } catch (err) {
+    if (err instanceof InjectError) {
+      return {
+        outcome: "failed",
+        output: "",
+        truncated: false,
+        command: command.trim().split(/\s+/, 1)[0]?.toLowerCase() ?? "",
+        meta: null,
+        errorCode: err.code,
+        errorMessage: err.message,
+      };
+    }
+    throw err;
+  }
+  const meta = INJECT_COMMANDS.get(bareVerb) ?? null;
+
   if (!runner.hasSession(socket, session)) {
-    throw new InjectError(
-      "session_missing",
-      `tmux session "${session}" on socket "${socket}" not found. Is the agent running with experimental.tmux_supervisor=true?`,
-    );
+    return {
+      outcome: "failed",
+      output: "",
+      truncated: false,
+      command: bareVerb,
+      meta,
+      errorCode: "session_missing",
+      errorMessage:
+        `tmux session "${session}" on socket "${socket}" not found. ` +
+        `Is the agent running with experimental.tmux_supervisor=true?`,
+    };
   }
 
   const before = runner.capture(socket, session) ?? "";
@@ -326,10 +439,15 @@ export async function injectSlashCommandWith(
     runner.send(socket, session, ["send-keys", "-l", command]);
     runner.send(socket, session, ["send-keys", "Enter"]);
   } catch (err) {
-    throw new InjectError(
-      "tmux_failed",
-      `tmux send-keys failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    return {
+      outcome: "failed",
+      output: "",
+      truncated: false,
+      command: bareVerb,
+      meta,
+      errorCode: "tmux_failed",
+      errorMessage: `tmux send-keys failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 
   // Poll capture-pane every POLL_INTERVAL_MS until two consecutive
@@ -346,8 +464,6 @@ export async function injectSlashCommandWith(
       if (stableSince === null) {
         stableSince = Date.now();
       } else if (Date.now() - stableSince >= POLL_INTERVAL_MS) {
-        // Two consecutive equal captures past the first stable mark —
-        // good enough.
         last = cur;
         break;
       }
@@ -356,25 +472,40 @@ export async function injectSlashCommandWith(
     }
     last = cur;
     if (Date.now() - start >= settleMs && cur !== before) {
-      // Past the settle window with at least one change — return what
-      // we have rather than burning to the hard timeout.
       break;
     }
   }
 
-  let output = diffPane(before, last, command);
+  const { output: rawOutput, anchored } = diffPane(before, last, command);
+  let output = rawOutput;
   let truncated = false;
   const bytes = Buffer.byteLength(output, "utf-8");
   if (bytes > OUTPUT_BYTE_CAP) {
-    // Trim from the front; the tail is more interesting (the result of
-    // the command, not the echoed prompt).
     while (Buffer.byteLength(output, "utf-8") > OUTPUT_BYTE_CAP) {
       output = output.slice(Math.floor(output.length * 0.1) + 1);
     }
     truncated = true;
   }
 
-  return { output, truncated };
+  if (output.trim().length === 0) {
+    return {
+      outcome: "ok_no_output",
+      output: "",
+      truncated: false,
+      command: bareVerb,
+      meta,
+      ...(anchored ? {} : { diagnostic: "anchor_missing" as const }),
+    };
+  }
+
+  return {
+    outcome: "ok",
+    output,
+    truncated,
+    command: bareVerb,
+    meta,
+    ...(truncated ? { diagnostic: "truncated_output" as const } : {}),
+  };
 }
 
 // Avoid unused-import warning when execFileAsync is reserved for

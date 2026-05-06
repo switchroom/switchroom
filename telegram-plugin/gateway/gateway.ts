@@ -5947,7 +5947,9 @@ bot.command('inject', async ctx => {
   await handleInjectCommand(ctx, {
     isAuthorized: isAuthorizedSender,
     inject: injectSlashCommandImpl,
-    reply: switchroomReply,
+    // accent is already inlined into the body by the handler via
+    // buildAccentHeader; switchroomReply doesn't need to know about it.
+    reply: async (ctx, text, opts) => switchroomReply(ctx, text, { html: opts?.html }),
     getAgentName: getMyAgentName,
     getArgs: getCommandArgs,
     escapeHtml: escapeHtmlForTg,

@@ -3,15 +3,15 @@
  *
  * The real tmux process is faked via the TmuxRunner test seam — these
  * tests assert the validation rules, the session-existence check, the
- * pane-diff logic, and the basic happy-path output capture.
+ * pane-diff logic, and outcome classification.
  *
  * Run: npx vitest run src/agents/inject.test.ts
  */
 
 import { describe, it, expect } from "vitest";
 import {
-  INJECT_ALLOWLIST,
-  INJECT_BLOCKLIST,
+  INJECT_COMMANDS,
+  INJECT_BLOCKED,
   InjectError,
   diffPane,
   injectSlashCommand,
@@ -21,7 +21,7 @@ import {
 
 describe("validateInjectCommand", () => {
   it("accepts every command in the allowlist", () => {
-    for (const cmd of INJECT_ALLOWLIST) {
+    for (const cmd of INJECT_COMMANDS.keys()) {
       expect(validateInjectCommand(cmd)).toBe(cmd);
     }
   });
@@ -35,7 +35,7 @@ describe("validateInjectCommand", () => {
   });
 
   it("throws blocked for /login, /logout, /exit, /quit", () => {
-    for (const cmd of INJECT_BLOCKLIST) {
+    for (const cmd of INJECT_BLOCKED.keys()) {
       const err = (() => {
         try {
           validateInjectCommand(cmd);
@@ -71,25 +71,82 @@ describe("validateInjectCommand", () => {
   });
 });
 
+describe("INJECT_COMMANDS metadata", () => {
+  it("provides expected metadata shape for every entry", () => {
+    for (const [verb, meta] of INJECT_COMMANDS) {
+      expect(verb.startsWith("/")).toBe(true);
+      expect(typeof meta.description).toBe("string");
+      expect(typeof meta.expectsOutput).toBe("boolean");
+    }
+  });
+
+  it("/compact carries a silentNote", () => {
+    expect(INJECT_COMMANDS.get("/compact")?.silentNote).toBe(
+      "compaction runs silently",
+    );
+  });
+
+  it("/clear has expectsOutput=false and no silentNote", () => {
+    const meta = INJECT_COMMANDS.get("/clear");
+    expect(meta?.expectsOutput).toBe(false);
+    expect(meta?.silentNote).toBeUndefined();
+  });
+});
+
 describe("diffPane", () => {
-  it("returns lines in after that aren't in before", () => {
+  it("returns lines in after that aren't in before (set-diff fallback)", () => {
     const before = "line one\nline two\n";
     const after = "line one\nline two\nline three\n";
-    expect(diffPane(before, after)).toBe("line three");
+    const r = diffPane(before, after);
+    expect(r.output).toBe("line three");
+    expect(r.anchored).toBe(false);
   });
 
   it("ignores empty lines", () => {
     const before = "a\nb\n";
     const after = "\n\na\nb\nc\n\n";
-    expect(diffPane(before, after)).toBe("c");
+    expect(diffPane(before, after).output).toBe("c");
   });
 
   it("returns empty string when nothing new", () => {
-    expect(diffPane("a\nb", "a\nb")).toBe("");
+    expect(diffPane("a\nb", "a\nb").output).toBe("");
+  });
+
+  it("anchors on the LAST command-echo line in `after`", () => {
+    const before = `❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.50
+  Esc to cancel`;
+    const after = `❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.50
+  Esc to cancel
+some-narrative
+❯ /usage
+   Status   Config   Usage   Stats
+  Session
+  Total cost: $0.75
+  Esc to cancel`;
+    const r = diffPane(before, after, "/usage");
+    expect(r.output).toContain("Status   Config   Usage   Stats");
+    expect(r.output).toContain("$0.75");
+    expect(r.output).not.toContain("Esc to cancel");
+    expect(r.anchored).toBe(true);
+  });
+
+  it("falls back to line-set diff when command anchor is absent", () => {
+    const before = "old line A\nold line B";
+    const after = "old line A\nold line B\nnew line C\nnew line D";
+    const r = diffPane(before, after, "/cost");
+    expect(r.output).toContain("new line C");
+    expect(r.output).toContain("new line D");
+    expect(r.anchored).toBe(false);
   });
 });
 
-// ─── injectSlashCommandWith — happy path + error paths via fake runner ─────
+// ─── injectSlashCommandWith — outcome classification ───────────────────────
 
 interface FakeRunner {
   hasSession: (s: string, n: string) => boolean;
@@ -99,8 +156,9 @@ interface FakeRunner {
 
 function makeFake(opts: {
   hasSession?: boolean;
-  captures?: string[]; // sequence returned in order
+  captures?: string[];
   onSend?: (args: string[]) => void;
+  sendThrows?: Error;
 }): FakeRunner {
   let i = 0;
   const captures = opts.captures ?? [];
@@ -112,31 +170,51 @@ function makeFake(opts: {
       return v;
     },
     send: (_s, _n, args) => {
+      if (opts.sendThrows) throw opts.sendThrows;
       opts.onSend?.(args);
     },
   };
 }
 
-describe("injectSlashCommandWith", () => {
-  it("throws session_missing when has-session returns false", async () => {
+describe("injectSlashCommandWith — outcomes", () => {
+  it("outcome=failed (session_missing) when has-session returns false", async () => {
     const runner = makeFake({ hasSession: false });
-    await expect(
-      injectSlashCommandWith(runner, {
-        socket: "switchroom-x",
-        session: "x",
-        command: "/cost",
-        settleMs: 50,
-        timeoutMs: 100,
-      }),
-    ).rejects.toMatchObject({ code: "session_missing" });
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/cost",
+      settleMs: 50,
+      timeoutMs: 100,
+    });
+    expect(r.outcome).toBe("failed");
+    expect(r.errorCode).toBe("session_missing");
+    expect(r.command).toBe("/cost");
+    expect(r.meta).not.toBeNull();
   });
 
-  it("captures diff between before and after pane snapshots", async () => {
+  it("outcome=failed (tmux_failed) when send-keys throws", async () => {
+    const runner = makeFake({
+      hasSession: true,
+      captures: ["before\n"],
+      sendThrows: new Error("connection refused"),
+    });
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/cost",
+      settleMs: 50,
+      timeoutMs: 100,
+    });
+    expect(r.outcome).toBe("failed");
+    expect(r.errorCode).toBe("tmux_failed");
+    expect(r.errorMessage).toContain("connection refused");
+  });
+
+  it("outcome=ok with non-empty capture", async () => {
     const before = "$ \n";
     const after = "$ /cost\n\nTotal cost: $0.42\n$ \n";
     const runner = makeFake({
       hasSession: true,
-      // returns: 1) before-snapshot, 2..) after-snapshots (stable)
       captures: [before, after, after, after, after],
     });
     const sent: string[][] = [];
@@ -154,26 +232,52 @@ describe("injectSlashCommandWith", () => {
       ["send-keys", "-l", "/cost"],
       ["send-keys", "Enter"],
     ]);
+    expect(result.outcome).toBe("ok");
     expect(result.output).toContain("Total cost: $0.42");
     expect(result.truncated).toBe(false);
+    expect(result.command).toBe("/cost");
+    expect(result.meta?.expectsOutput).toBe(true);
   });
 
-  it("flags truncated when output exceeds 3000 bytes", async () => {
+  it("outcome=ok with diagnostic=truncated_output when over byte cap", async () => {
     const before = "";
     const big = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
     const runner = makeFake({
       hasSession: true,
       captures: [before, big, big, big, big],
     });
-    const result = await injectSlashCommandWith(runner, {
+    const r = await injectSlashCommandWith(runner, {
       socket: "switchroom-x",
       session: "x",
       command: "/cost",
       settleMs: 50,
       timeoutMs: 1000,
     });
-    expect(result.truncated).toBe(true);
-    expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(3000);
+    expect(r.outcome).toBe("ok");
+    expect(r.truncated).toBe(true);
+    expect(r.diagnostic).toBe("truncated_output");
+    expect(Buffer.byteLength(r.output, "utf-8")).toBeLessThanOrEqual(3000);
+  });
+
+  it("outcome=ok_no_output with diagnostic=anchor_missing when capture is empty", async () => {
+    // Pre and post identical (no anchor, no new lines) → empty output.
+    const buf = "$ \n";
+    const runner = makeFake({
+      hasSession: true,
+      captures: [buf, buf, buf, buf, buf],
+    });
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-x",
+      session: "x",
+      command: "/clear",
+      settleMs: 30,
+      timeoutMs: 200,
+    });
+    expect(r.outcome).toBe("ok_no_output");
+    expect(r.output).toBe("");
+    expect(r.diagnostic).toBe("anchor_missing");
+    expect(r.command).toBe("/clear");
+    expect(r.meta?.expectsOutput).toBe(false);
   });
 });
 
@@ -188,50 +292,5 @@ describe("injectSlashCommand (default runner — validation only)", () => {
     await expect(injectSlashCommand("any", "/foo")).rejects.toMatchObject({
       code: "not_allowed",
     });
-  });
-});
-
-import { describe as describeAnchor, it as itAnchor, expect as expectAnchor } from "vitest";
-import { diffPane as diffPaneFn } from "./inject";
-
-describeAnchor("diffPane — command-anchor diff (regression for repeated-call empty-output bug)", () => {
-  itAnchor("returns response below the LAST command-echo line in `after`", () => {
-    const before = `❯ /usage
-   Status   Config   Usage   Stats
-  Session
-  Total cost: $0.50
-  Esc to cancel`;
-    const after = `❯ /usage
-   Status   Config   Usage   Stats
-  Session
-  Total cost: $0.50
-  Esc to cancel
-some-narrative
-❯ /usage
-   Status   Config   Usage   Stats
-  Session
-  Total cost: $0.75
-  Esc to cancel`;
-    const out = diffPaneFn(before, after, "/usage");
-    expectAnchor(out).toContain("Status   Config   Usage   Stats");
-    expectAnchor(out).toContain("$0.75");
-    // The trailing affordance should be stripped
-    expectAnchor(out).not.toContain("Esc to cancel");
-  });
-
-  itAnchor("falls back to line-set diff when command anchor is absent", () => {
-    const before = "old line A\nold line B";
-    const after = "old line A\nold line B\nnew line C\nnew line D";
-    const out = diffPaneFn(before, after, "/cost");
-    expectAnchor(out).toContain("new line C");
-    expectAnchor(out).toContain("new line D");
-    expectAnchor(out).not.toContain("old line A");
-  });
-
-  itAnchor("works without a command argument (legacy line-set diff)", () => {
-    const before = "x\ny";
-    const after = "x\ny\nz";
-    const out = diffPaneFn(before, after);
-    expectAnchor(out).toBe("z");
   });
 });
