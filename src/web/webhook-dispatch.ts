@@ -37,10 +37,84 @@
  * ```
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import { spawn } from 'child_process'
+
+/**
+ * When the parent process (typically the systemd-launched switchroom-web)
+ * was started without nvm in PATH, `node` won't resolve for spawned
+ * children — so any agent hook that uses `node /path/to/hook.mjs` exits
+ * 127 and the agent's issue sink lights up. This is invisible to the
+ * operator until the first webhook fires.
+ *
+ * Detect an nvm install (in priority order: `NVM_DIR`, `~/.nvm`) and
+ * resolve a node bin directory by reading `alias/default` first, then
+ * falling back to the lexicographically newest version directory. Returns
+ * undefined when no usable nvm install is found, in which case the caller
+ * leaves PATH untouched.
+ *
+ * Exported for tests.
+ */
+export function resolveNvmNodeBin(env: NodeJS.ProcessEnv): string | undefined {
+  const nvmDir = env.NVM_DIR ?? join(env.HOME ?? homedir(), '.nvm')
+  if (!existsSync(nvmDir)) return undefined
+
+  const versionsDir = join(nvmDir, 'versions', 'node')
+  if (!existsSync(versionsDir)) return undefined
+
+  const tryVersion = (v: string): string | undefined => {
+    const bin = join(versionsDir, v, 'bin')
+    return existsSync(join(bin, 'node')) ? bin : undefined
+  }
+
+  // Prefer the user's default alias if set.
+  const defaultAliasPath = join(nvmDir, 'alias', 'default')
+  try {
+    if (existsSync(defaultAliasPath)) {
+      const aliased = readFileSync(defaultAliasPath, 'utf-8').trim()
+      if (aliased) {
+        const bin = tryVersion(aliased.startsWith('v') ? aliased : `v${aliased}`)
+        if (bin) return bin
+      }
+    }
+  } catch {
+    // Fall through to dir scan
+  }
+
+  // Otherwise: lexicographic max across installed versions.
+  try {
+    const versions = readdirSync(versionsDir).filter((v) => v.startsWith('v')).sort()
+    for (let i = versions.length - 1; i >= 0; i--) {
+      const bin = tryVersion(versions[i])
+      if (bin) return bin
+    }
+  } catch {
+    return undefined
+  }
+
+  return undefined
+}
+
+/**
+ * Returns a copy of `env` with `node` guaranteed to be on PATH where
+ * possible. No-op when `node` already resolves via the inherited PATH or
+ * when no nvm install is present.
+ *
+ * Exported for tests.
+ */
+export function ensureNodeOnPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const path = env.PATH ?? ''
+  // Cheap pre-check: if any PATH entry already contains a node binary, no-op.
+  const existing = path.split(':').some((dir) => dir && existsSync(join(dir, 'node')))
+  if (existing) return env
+
+  const nvmBin = resolveNvmNodeBin(env)
+  if (!nvmBin) return env
+
+  return { ...env, PATH: path ? `${nvmBin}:${path}` : nvmBin }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -365,14 +439,14 @@ export function spawnAgentOneShot(
   const claudeConfigDir = join(agentDir, '.claude')
   const telegramStateDir = join(agentDir, 'telegram')
 
-  const env: NodeJS.ProcessEnv = {
+  const env: NodeJS.ProcessEnv = ensureNodeOnPath({
     ...process.env,
     FORCE_COLOR: '0',
     NO_COLOR: '1',
     CLAUDE_CONFIG_DIR: claudeConfigDir,
     SWITCHROOM_AGENT_NAME: agent,
     TELEGRAM_STATE_DIR: telegramStateDir,
-  }
+  })
 
   // Unset ANTHROPIC_API_KEY to force OAuth auth (mirrors cron script pattern).
   delete env.ANTHROPIC_API_KEY
