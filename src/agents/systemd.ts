@@ -37,9 +37,11 @@ export function generateUnit(
   gatewayUnitName?: string,
   timezone?: string,
   legacyPty = false,
+  legacyAutoacceptExpect = false,
 ): string {
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
+  const autoacceptPollEntry = resolve(import.meta.dirname, "../cli/autoaccept-poll.ts");
   const tmuxConfPath = resolve(agentDir, "tmux.conf");
   const tmuxSocket = `switchroom-${name}`;
 
@@ -62,13 +64,34 @@ export function generateUnit(
   if (!legacyPty) {
     serviceType = "forking";
     delegateLine = "Delegate=yes\n";
-    const inner = useAutoaccept
-      ? `expect -f ${autoacceptExp} ${agentDir}/start.sh`
-      : `bash -l ${agentDir}/start.sh`;
+    // #725 PR-4 — under the tmux supervisor, default to launching claude
+    // directly via `bash -l start.sh` (no expect wrapper). The first-run
+    // TUI prompts are dispatched by the TS pane-poller fired from
+    // ExecStartPost below. Operators can roll back to the legacy expect
+    // wrapper for one release by setting
+    // `experimental.legacy_autoaccept_expect: true`.
+    let inner: string;
+    if (useAutoaccept && legacyAutoacceptExpect) {
+      inner = `expect -f ${autoacceptExp} ${agentDir}/start.sh`;
+    } else {
+      inner = `bash -l ${agentDir}/start.sh`;
+    }
     execStart = `/usr/bin/tmux -L ${tmuxSocket} -f ${tmuxConfPath} new-session -A -d -s ${name} -x 400 -y 50 '${inner}'`;
     // pipe-pane proxies the tmux pane's stdout to service.log so existing
     // log consumers (pty-tail, journald followers) keep working unchanged.
     extraStartPost = `ExecStartPost=/usr/bin/tmux -L ${tmuxSocket} pipe-pane -o -t ${name} 'cat >> ${logFile}'\n`;
+    // #725 PR-4 — fire the TS autoaccept pane-poller in the background.
+    // ExecStartPost commands run synchronously, so wrap the bun invocation
+    // in `bash -c '... &'` to detach. The poller itself exits cleanly after
+    // ~30s of pane idle (no prompt match), so it doesn't linger past the
+    // first-run window. Soft-fail throughout — the wrapper exits 0 even
+    // if bun is missing or the script throws, keeping the unit healthy.
+    // Skipped when the operator opted into the legacy expect wrapper.
+    if (useAutoaccept && !legacyAutoacceptExpect) {
+      const homeDir = process.env.HOME ?? "/root";
+      const bunBin = resolve(homeDir, ".bun/bin/bun");
+      extraStartPost += `ExecStartPost=/bin/bash -c '${bunBin} ${autoacceptPollEntry} ${name} >> ${logFile} 2>&1 &'\n`;
+    }
     // Leading `-` on ExecStop tells systemd to ignore non-zero exits from
     // the kill-session call. Without it, the script→tmux supervisor
     // transition's first restart logs FAILURE because the OLD unit (still
@@ -563,6 +586,8 @@ export function installAllUnits(config: SwitchroomConfig): void {
     const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
     const timezone = resolveTimezone(config, resolved);
     const legacyPty = resolved.experimental?.legacy_pty === true;
+    const legacyAutoacceptExpect =
+      resolved.experimental?.legacy_autoaccept_expect === true;
 
     // tmux is the default supervisor (#725 PR-1) — drop a managed tmux.conf
     // alongside start.sh unless this agent has opted out via legacy_pty.
@@ -573,7 +598,15 @@ export function installAllUnits(config: SwitchroomConfig): void {
       writeAgentTmuxConf(agentDir);
     }
 
-    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone, legacyPty);
+    const content = generateUnit(
+      agentName,
+      agentDir,
+      useAutoaccept,
+      gwName,
+      timezone,
+      legacyPty,
+      legacyAutoacceptExpect,
+    );
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
 

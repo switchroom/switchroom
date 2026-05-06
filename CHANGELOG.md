@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **First-run autoaccept now uses a TS pane-poller instead of `expect`
+  (#725 PR-4)** — the small set of first-run claude TUI prompts (theme
+  picker, MCP trust, dev-channels acknowledgement, API provider) are
+  now dispatched by a `tmux capture-pane` + `tmux send-keys` poller
+  fired from the agent unit's `ExecStartPost=`. Soft-fail throughout;
+  exits cleanly after ~30s of pane idle. The legacy `expect` wrapper
+  (`bin/autoaccept.exp`) is preserved as a one-release rollback knob:
+  set `experimental.legacy_autoaccept_expect: true` per-agent to revert
+  to the historical wrapper while the new path stabilises.
 - **`!` interrupt marker now delivers SIGINT via `tmux send-keys C-c`
   for tmux-supervised agents (#725 PR-3)**, falling back to
   `systemctl kill --signal=INT` on send-keys failure. Better signal

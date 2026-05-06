@@ -88,4 +88,27 @@ describe("ExperimentalSchema — Zod transform (#725 PR-1)", () => {
     expect(out).not.toHaveProperty("tmux_supervisor");
     warn.mockRestore();
   });
+
+  // #725 PR-4 — legacy_autoaccept_expect rollback flag.
+  it("legacy_autoaccept_expect: true is preserved as-is", () => {
+    const out = ExperimentalSchema.parse({ legacy_autoaccept_expect: true });
+    expect(out).toEqual({
+      legacy_pty: false,
+      legacy_autoaccept_expect: true,
+    });
+  });
+
+  it("legacy_autoaccept_expect: false is preserved as-is", () => {
+    const out = ExperimentalSchema.parse({ legacy_autoaccept_expect: false });
+    expect(out).toEqual({
+      legacy_pty: false,
+      legacy_autoaccept_expect: false,
+    });
+  });
+
+  it("omitted legacy_autoaccept_expect → undefined (treated as false at use site)", () => {
+    const out = ExperimentalSchema.parse({});
+    expect(out).toEqual({ legacy_pty: false });
+    expect(out).not.toHaveProperty("legacy_autoaccept_expect");
+  });
 });
