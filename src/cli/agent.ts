@@ -1323,23 +1323,47 @@ export function registerAgentCommand(program: Command): void {
         }
         // Lazy import so the CLI doesn't pay for it on every invocation.
         const { injectSlashCommand, InjectError } = await import("../agents/inject.js");
+        // Exit-code contract:
+        //   0  — outcome=ok, OR outcome=ok_no_output (the inject did run).
+        //   1  — outcome=failed (validation, session missing, tmux error).
+        // Output routing:
+        //   ok                          → captured output to stdout.
+        //   ok_no_output (silentNote)   → "✓ <verb> — <silentNote>" to stdout.
+        //   ok_no_output (expects out)  → "⚠ <verb> — empty capture" to stderr.
+        //   ok_no_output (silent verb)  → bare "✓ <verb>" to stdout.
+        //   failed                      → error message to stderr, exit 1.
         try {
-          const { output, truncated } = await injectSlashCommand(name, slashCommand, {
+          const result = await injectSlashCommand(name, slashCommand, {
             timeoutMs: parseInt(opts.timeout, 10) || 5000,
             settleMs: parseInt(opts.settle, 10) || 2000,
           });
-          if (output.trim().length === 0) {
-            console.log(chalk.dim("(no new output captured)"));
-          } else {
-            console.log(output);
+          if (result.outcome === "ok") {
+            console.log(result.output);
+            if (result.truncated) {
+              console.log(chalk.yellow("\n... (output truncated to 3000 bytes)"));
+            }
+            return;
           }
-          if (truncated) {
-            console.log(chalk.yellow("\n... (output truncated to 3000 bytes)"));
+          if (result.outcome === "ok_no_output") {
+            const meta = result.meta;
+            if (meta?.silentNote) {
+              console.log(chalk.green(`✓ ${result.command} — ${meta.silentNote}`));
+            } else if (meta?.expectsOutput) {
+              console.error(chalk.yellow(`⚠ ${result.command} — empty capture`));
+            } else {
+              console.log(chalk.green(`✓ ${result.command}`));
+            }
+            return;
           }
+          // outcome === 'failed'
+          const code = result.errorCode ?? "tmux_failed";
+          const msg = result.errorMessage ?? "unknown error";
+          console.error(chalk.red(`inject failed (${code}): ${msg}`));
+          process.exit(1);
         } catch (err) {
           if (err instanceof InjectError) {
             console.error(chalk.red(`inject failed (${err.code}): ${err.message}`));
-            process.exit(2);
+            process.exit(1);
           }
           throw err;
         }
