@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`!` interrupt marker now delivers SIGINT via `tmux send-keys C-c`
+  for tmux-supervised agents (#725 PR-3)**, falling back to
+  `systemctl kill --signal=INT` on send-keys failure. Better signal
+  delivery to runaway tool children — send-keys hits the pane's
+  foreground process (claude or whatever child Bash is currently
+  spinning), where the cgroup-wide kill also wakes the tmux server
+  and supervisor wrappers and may not always reach grandchildren
+  cleanly. `experimental.legacy_pty: true` agents continue to use
+  the cgroup path unchanged.
 - **tmux supervisor is now the default (#725 PR-1)** — `script -qfc`
   PTY wrapping is replaced by per-agent `tmux new-session` for all
   agents by default. The user-facing flag rename is
