@@ -426,7 +426,8 @@ export async function injectSlashCommandWith(
       errorCode: "session_missing",
       errorMessage:
         `tmux session "${session}" on socket "${socket}" not found. ` +
-        `Is the agent running with experimental.tmux_supervisor=true?`,
+        `Is the agent running under the tmux supervisor (the default)? ` +
+        `If experimental.legacy_pty=true is set, inject is unsupported.`,
     };
   }
 

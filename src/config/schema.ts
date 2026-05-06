@@ -693,6 +693,95 @@ export const ChannelsSchema = z
  */
 const TIMEZONE_REGEX = /^UTC$|^[A-Z][A-Za-z0-9_+-]+(\/[A-Z][A-Za-z0-9_+-]+){1,2}$/;
 
+// One-shot deprecation warning for legacy `experimental.tmux_supervisor`.
+// Module-level boolean so a noisy fleet config doesn't spam stderr per agent.
+let _tmuxSupervisorDeprecationWarned = false;
+
+/**
+ * `experimental.*` per-agent feature flags. As of #725 PR-1 the tmux
+ * supervisor is the default; this schema preserves the legacy
+ * `tmux_supervisor` key for one release for backward compatibility and
+ * normalises everything to a single forward-looking `legacy_pty` boolean
+ * via a Zod transform. Downstream consumers should read `legacy_pty`
+ * only — `tmux_supervisor` is deleted from the parsed output.
+ *
+ * Migration semantics (transform):
+ *   - `legacy_pty` set                       → use it as-is, drop tmux_supervisor.
+ *   - `tmux_supervisor: false` (and no legacy_pty)
+ *                                            → `legacy_pty = true`  (one-time warn).
+ *   - `tmux_supervisor: true`  (and no legacy_pty)
+ *                                            → `legacy_pty = false` (one-time warn).
+ *   - neither set                            → `legacy_pty = false` (default).
+ */
+export const ExperimentalSchema = z
+  .object({
+    legacy_pty: z
+      .boolean()
+      .optional()
+      .describe(
+        "Opt out of the default tmux supervisor; kept for hosts without " +
+        "tmux available, or as a rollback knob during stabilisation. " +
+        "When true, the systemd unit reverts to the legacy `script -qfc` " +
+        "PTY wrapper. Default false — tmux is the production default as " +
+        "of #725 PR-1.",
+      ),
+    tmux_supervisor: z
+      .boolean()
+      .optional()
+      .describe(
+        "DEPRECATED. Use `legacy_pty` (inverted) instead. Kept parseable " +
+        "for one release so existing configs don't break. " +
+        "`tmux_supervisor: false` migrates to `legacy_pty: true`; " +
+        "`tmux_supervisor: true` migrates to `legacy_pty: false`. A " +
+        "one-time deprecation warning is emitted to stderr per process.",
+      ),
+  })
+  .optional()
+  .transform((val) => {
+    if (val === undefined) return undefined;
+    const { legacy_pty, tmux_supervisor, ...rest } = val;
+    let resolvedLegacy: boolean;
+    if (legacy_pty !== undefined) {
+      resolvedLegacy = legacy_pty;
+    } else if (tmux_supervisor === false) {
+      if (!_tmuxSupervisorDeprecationWarned) {
+        _tmuxSupervisorDeprecationWarned = true;
+        console.warn(
+          "[switchroom] DEPRECATED: experimental.tmux_supervisor is " +
+          "replaced by experimental.legacy_pty (inverted). " +
+          "`tmux_supervisor: false` → set `legacy_pty: true` instead. " +
+          "Compatibility shim will be removed next release.",
+        );
+      }
+      resolvedLegacy = true;
+    } else if (tmux_supervisor === true) {
+      if (!_tmuxSupervisorDeprecationWarned) {
+        _tmuxSupervisorDeprecationWarned = true;
+        console.warn(
+          "[switchroom] DEPRECATED: experimental.tmux_supervisor is " +
+          "now the default; remove the flag. " +
+          "`tmux_supervisor: true` → omit (or set `legacy_pty: false`). " +
+          "Compatibility shim will be removed next release.",
+        );
+      }
+      resolvedLegacy = false;
+    } else {
+      resolvedLegacy = false;
+    }
+    return { ...rest, legacy_pty: resolvedLegacy };
+  })
+  .describe(
+    "Per-agent feature flags for unstable / canary behaviour. Each " +
+    "field is a boolean opt-in; the default for every flag is the " +
+    "current production behaviour. Flags graduate out of `experimental` " +
+    "once they're known-stable across the fleet.",
+  );
+
+/** Test-only — reset the one-shot deprecation warning gate. */
+export function _resetTmuxSupervisorDeprecationGate(): void {
+  _tmuxSupervisorDeprecationWarned = false;
+}
+
 const profileFields = {
   extends: z.string().optional(),
   bot_token: z.string().optional(),
@@ -1170,28 +1259,7 @@ export const AgentSchema = z.object({
       "claim_worktree accepts the alias as the repo argument. " +
       "Absolute paths may always be passed regardless of this list.",
     ),
-  experimental: z
-    .object({
-      tmux_supervisor: z
-        .boolean()
-        .optional()
-        .describe(
-          "Phase 1 of issue #725. When true, the systemd unit launches the " +
-          "agent inside a per-agent tmux session (Type=forking, " +
-          "Delegate=yes) instead of wrapping start.sh in `script -qfc`. " +
-          "Enables `switchroom agent attach` to drop into the live REPL " +
-          "and (in later phases) external slash-command injection via " +
-          "`tmux send-keys`. Default false — opt in per agent so we can " +
-          "canary on a single agent before fleet rollout.",
-        ),
-    })
-    .optional()
-    .describe(
-      "Per-agent feature flags for unstable / canary behaviour. Each " +
-      "field is a boolean opt-in; the default for every flag is the " +
-      "current production behaviour. Flags graduate out of `experimental` " +
-      "once they're known-stable across the fleet.",
-    ),
+  experimental: ExperimentalSchema,
   repos: z
     .record(
       z.string().regex(

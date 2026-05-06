@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **tmux supervisor is now the default (#725 PR-1)** — `script -qfc`
+  PTY wrapping is replaced by per-agent `tmux new-session` for all
+  agents by default. The user-facing flag rename is
+  `experimental.tmux_supervisor` → `experimental.legacy_pty` (inverted
+  meaning). New default behaviour materialises on the next agent
+  restart (`switchroom systemd reconcile && switchroom agent
+  restart <name>`); units are not auto-restarted by the upgrade. tmux
+  is now a hard prereq (`install.sh` enforces); hosts without tmux
+  must opt agents into legacy via `experimental.legacy_pty: true`.
+  See `docs/tmux-supervisor-fanout.md` for the rollback runbook.
+- **`experimental.tmux_supervisor` deprecated** — still parseable for
+  one release with a one-time stderr warning. Migration is automatic:
+  `tmux_supervisor: false` → `legacy_pty: true`; `tmux_supervisor:
+  true` → omit (or `legacy_pty: false`). Compatibility shim will be
+  removed in the next minor release.
+- **`SWITCHROOM_TMUX_SUPERVISOR` env var unchanged** — the user-facing
+  flag was renamed but the gateway/boot-probes/boot-card env-var
+  contract is preserved. The gateway unit stamps `=1` in the default
+  (tmux) configuration; `legacy_pty: true` omits the var.
+
 ### Added
 
 - **tmux supervisor pre-fanout hardening (#725)** — PID resolver walks

@@ -61,6 +61,13 @@ else
   ok "apt packages already present"
 fi
 
+# tmux is the default agent supervisor as of #725 PR-1 — a hard prereq.
+# Hosts that genuinely cannot run tmux can opt agents into the legacy
+# PTY supervisor per-agent via `experimental.legacy_pty: true` in
+# switchroom.yaml, but the binary itself is required for the default
+# install path and to keep the unit template renderable.
+have tmux || die "tmux is required (or set experimental.legacy_pty: true per agent)"
+
 # ---- bun ----
 
 if have bun; then

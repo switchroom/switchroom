@@ -36,29 +36,30 @@ export function generateUnit(
   useAutoaccept = false,
   gatewayUnitName?: string,
   timezone?: string,
-  tmuxSupervisor = false,
+  legacyPty = false,
 ): string {
   const logFile = resolve(agentDir, "service.log");
   const autoacceptExp = resolve(import.meta.dirname, "../../bin/autoaccept.exp");
   const tmuxConfPath = resolve(agentDir, "tmux.conf");
   const tmuxSocket = `switchroom-${name}`;
 
-  // Phase 1 of #725 — opt-in tmux supervisor. The legacy `script -qfc`
-  // path stays the default; only agents with experimental.tmux_supervisor=true
-  // get the new ExecStart shape. See docs in #725 epic.
+  // #725 PR-1 — tmux supervisor is the default. Agents opt OUT via
+  // `experimental.legacy_pty: true` to fall back to the historical
+  // `script -qfc` PTY wrapper (kept for hosts without tmux, or as a
+  // rollback knob during stabilisation). See docs/tmux-supervisor-fanout.md.
   //
   // Type=forking + Delegate=yes is the systemd contract for tmux:
   // `tmux new-session -d` daemonises (forks) and we want systemd to leave
   // the cgroup alone so tmux can manage its own children. KillMode stays
   // `control-group` so a `systemctl stop` cgroup-kills the whole tree
-  // (matches today's behaviour with the script wrapper).
+  // (matches the legacy script-wrapper behaviour).
   let execStart: string;
   let extraStartPost = "";
   let extraStop = "";
   let serviceType = "simple";
   let delegateLine = "";
 
-  if (tmuxSupervisor) {
+  if (!legacyPty) {
     serviceType = "forking";
     delegateLine = "Delegate=yes\n";
     const inner = useAutoaccept
@@ -307,7 +308,13 @@ function hasNodeOnPath(): boolean {
   }
 }
 
-export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false, tmuxSupervisor = false): string {
+// #725 PR-1 asymmetry: the user-facing flag rename is `tmux_supervisor` →
+// `legacy_pty` (inverted), but the env var name `SWITCHROOM_TMUX_SUPERVISOR`
+// is INTENTIONALLY unchanged. The gateway / boot-probes / boot-card all
+// read that env var to know whether the agent is tmux-driven; renaming
+// would require a synchronized cross-package change. Stamping `=1` when
+// NOT legacy keeps the existing readers correct without code edits.
+export function generateGatewayUnit(stateDir: string, agentName: string, adminEnabled = false, legacyPty = false): string {
   const pluginDir = resolve(import.meta.dirname, "../../telegram-plugin");
   // Prefer the bundled `dist/gateway/gateway.js` (#634 strategic
   // packaging fix) — it has all `src/` cross-imports inlined, so a
@@ -369,7 +376,7 @@ Environment=PATH=${unitPath}
 Environment=SWITCHROOM_CLI_PATH=${switchroomCli}
 Environment=TELEGRAM_STATE_DIR=${stateDir}
 Environment=SWITCHROOM_AGENT_NAME=${agentName}
-${adminEnabled ? `Environment=SWITCHROOM_AGENT_ADMIN=true\n` : ''}${tmuxSupervisor ? `Environment=SWITCHROOM_TMUX_SUPERVISOR=1\n` : ''}
+${adminEnabled ? `Environment=SWITCHROOM_AGENT_ADMIN=true\n` : ''}${!legacyPty ? `Environment=SWITCHROOM_TMUX_SUPERVISOR=1\n` : ''}
 [Install]
 WantedBy=default.target
 `;
@@ -555,17 +562,18 @@ export function installAllUnits(config: SwitchroomConfig): void {
     // `defaults.timezone` being set once for the fleet.
     const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
     const timezone = resolveTimezone(config, resolved);
-    const tmuxSupervisor = resolved.experimental?.tmux_supervisor === true;
+    const legacyPty = resolved.experimental?.legacy_pty === true;
 
-    // When opted in to the tmux supervisor (#725 Phase 1), drop a managed
-    // tmux.conf alongside start.sh. tmux 3.x ignores `-e TERM=…` for the
-    // pane's TERM under default-terminal selection — pinning it in conf
-    // is the only reliable way to get xterm-256color into the agent shell.
-    if (tmuxSupervisor) {
+    // tmux is the default supervisor (#725 PR-1) — drop a managed tmux.conf
+    // alongside start.sh unless this agent has opted out via legacy_pty.
+    // tmux 3.x ignores `-e TERM=…` for the pane's TERM under default-terminal
+    // selection — pinning it in conf is the only reliable way to get
+    // xterm-256color into the agent shell.
+    if (!legacyPty) {
       writeAgentTmuxConf(agentDir);
     }
 
-    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone, tmuxSupervisor);
+    const content = generateUnit(agentName, agentDir, useAutoaccept, gwName, timezone, legacyPty);
     installUnit(agentName, content);
     installedAgents.push(unitName(agentName));
 
@@ -575,7 +583,7 @@ export function installAllUnits(config: SwitchroomConfig): void {
       // when the agent is configured with admin:true. The gateway reads this env
       // var to decide whether to intercept slash commands before forwarding to Claude.
       const adminEnabled = resolveAgentConfig(config.defaults, config.profiles, agent).admin === true;
-      const gatewayContent = generateGatewayUnit(stateDir, agentName, adminEnabled, tmuxSupervisor);
+      const gatewayContent = generateGatewayUnit(stateDir, agentName, adminEnabled, legacyPty);
       installUnit(gwName, gatewayContent);
       installedAgents.push(unitName(gwName));
     }

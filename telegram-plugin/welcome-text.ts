@@ -261,7 +261,8 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "logs", description: "Show recent agent logs" },
   // #725 Phase 2 — inject a Claude Code REPL slash command into the agent's
   // tmux pane (allowlisted: /cost, /status, /model, /clear, /compact,
-  // /memory, /hooks). Requires experimental.tmux_supervisor on the agent.
+  // /memory, /hooks). Requires the tmux supervisor (the default — refused
+  // when the agent has experimental.legacy_pty=true).
   { command: "inject", description: "Inject a Claude Code slash command (e.g. /cost)" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },

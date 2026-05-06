@@ -1285,11 +1285,13 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
 
-        // #725 Phase 1 — opt-in tmux supervisor changes attach from
-        // `tail -f service.log` to `tmux attach`. Read the resolved
-        // (cascade-merged) config so the flag can be set at any layer.
+        // #725 PR-1 — tmux is the default supervisor; attach drops into
+        // the live REPL via `tmux attach`. Agents that opt out via
+        // `experimental.legacy_pty: true` fall back to `tail -f
+        // service.log`. Read the resolved (cascade-merged) config so
+        // the flag can be set at any layer.
         const resolved = resolveAgentConfig(config.defaults, config.profiles, config.agents[name]);
-        const tmuxSupervisor = resolved.experimental?.tmux_supervisor === true;
+        const tmuxSupervisor = resolved.experimental?.legacy_pty !== true;
 
         // attachAgent must exec (replace process), so this won't return on success
         attachAgent(name, tmuxSupervisor);
@@ -1301,7 +1303,7 @@ export function registerAgentCommand(program: Command): void {
   // tmux pane and print the captured output. Allowlist-only (see inject.ts).
   agent
     .command("send <name> <slashCommand>")
-    .description("Inject a Claude Code slash command into the agent's tmux pane (requires experimental.tmux_supervisor)")
+    .description("Inject a Claude Code slash command into the agent's tmux pane (refused if experimental.legacy_pty=true)")
     .option("--timeout <ms>", "Hard timeout in milliseconds (default 5000)", "5000")
     .option("--settle <ms>", "Pane-settle window in milliseconds (default 2000)", "2000")
     .action(
@@ -1312,11 +1314,11 @@ export function registerAgentCommand(program: Command): void {
           process.exit(1);
         }
         const resolved = resolveAgentConfig(config.defaults, config.profiles, config.agents[name]);
-        if (resolved.experimental?.tmux_supervisor !== true) {
+        if (resolved.experimental?.legacy_pty === true) {
           console.error(
             chalk.red(
-              `Agent "${name}" is not running under the tmux supervisor.\n` +
-                `Set experimental.tmux_supervisor: true in switchroom.yaml and reconcile/restart the agent.`,
+              `Agent "${name}" is running under the legacy PTY supervisor (experimental.legacy_pty=true).\n` +
+                `inject requires the tmux supervisor (the default). Remove the legacy_pty flag and reconcile/restart the agent.`,
             ),
           );
           process.exit(1);
