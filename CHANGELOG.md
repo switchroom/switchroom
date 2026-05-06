@@ -26,6 +26,19 @@
 
 ### Added
 
+- **Watchdog crash-time pane capture (#725 PR-2)** — before triggering
+  any restart (bridge-disconnect, turn-hang, journal-silence), the
+  watchdog now snapshots the agent's tmux pane scrollback to
+  `~/.switchroom/agents/<agent>/crash-reports/<ISO8601>-<reason>.txt`
+  so RCA has the live screen state at the moment of the kill.
+  Retention: 20 most recent files per agent. Size cap: 10 MB per
+  file. Capture is best-effort — a missing tmux/socket/file-write
+  failure never blocks the restart. Operator-initiated restarts
+  (`switchroom agent restart`) skip capture; only watchdog-triggered
+  restarts produce reports. New helper module `src/agents/tmux.ts`
+  exposes `captureAgentPane()` for code paths already in TS;
+  `bin/bridge-watchdog.sh` uses an inline bash mirror in the hot
+  path. See `docs/crash-reports.md`.
 - **tmux supervisor pre-fanout hardening (#725)** — PID resolver walks
   the unit cgroup to pick the heaviest-RSS claude/node process, so
   boot cards and `getAgentStatus` no longer report the ~2 MB tmux
