@@ -502,6 +502,65 @@ describe.skipIf(!imagesOk)(
         const finishedAt = Date.now();
         const ok = results.filter((r) => r.ok).length;
         const drops = TOTAL_REQUESTS - ok;
+
+        // Topology-stability snapshot — captured BEFORE the kernel
+        // restart-after-add step below, since that step is a deliberate
+        // bump (broker/scheduler must still be restartless).
+        const stabilityCounts = {
+          broker: getRestartCount("switchroom-vault-broker"),
+          kernel: getRestartCount("switchroom-approval-kernel"),
+          scheduler: getRestartCount("switchroom-cron"),
+        };
+
+        // Phase 3c F-#811 — split newbie-readiness from topology-stability.
+        //
+        // Topology stability (existing assertions): broker/scheduler/kernel
+        // RestartCount unchanged across the agent-add window. The original
+        // test conflated "first SUCCESSFUL alice lookup after newbie up" with
+        // "newbie is ready" — those are different things. Alice's IPC running
+        // through alice's pre-existing socket only proves the topology change
+        // didn't disrupt the existing fleet.
+        //
+        // Newbie readiness (new): newbie's OWN kernel socket is bound and
+        // newbie's first lookup against newbie's socket succeeds. The kernel
+        // server enumerates agents from the config + filesystem at boot, so
+        // it MUST be restarted after newbie's compose entry is added for its
+        // socket to exist. Broker + scheduler stay restartless — kernel
+        // RestartCount is allowed to bump by exactly 1.
+        let newbieReadyAt: number | null = null;
+        let newbieReadyLatencyMs: number | null = null;
+        if (newbieUpAt !== null) {
+          const readinessStart = Date.now();
+          try {
+            execSync(
+              `docker compose -p ${PROJECT} -f ${ctx.composePath} restart approval-kernel`,
+              { stdio: "pipe", cwd: ctx.workdir },
+            );
+            // Give kernel up to 30s to bind newbie's per-agent socket.
+            const deadline = Date.now() + 30_000;
+            while (Date.now() < deadline) {
+              const probe = spawnSync(
+                "docker",
+                ["exec", "switchroom-newbie", "ls", "/run/switchroom/kernel/sock"],
+                { encoding: "utf8", timeout: 4000 },
+              );
+              if (probe.status === 0 && probe.stdout.includes("/run/switchroom/kernel/sock")) {
+                // Socket bound — issue newbie's first real lookup against
+                // newbie's OWN kernel socket.
+                const r = kernelLookup("newbie", "switchroom-newbie");
+                if (r.ok) {
+                  newbieReadyAt = Date.now();
+                  newbieReadyLatencyMs = newbieReadyAt - readinessStart;
+                  break;
+                }
+              }
+              await new Promise((res) => setTimeout(res, 1000));
+            }
+          } catch (e) {
+            process.stderr.write(`[race-test] kernel restart-after-add failed: ${(e as Error).message}\n`);
+          }
+        }
+
         const endCounts = {
           broker: getRestartCount("switchroom-vault-broker"),
           kernel: getRestartCount("switchroom-approval-kernel"),
@@ -516,25 +575,43 @@ describe.skipIf(!imagesOk)(
           successful: ok,
           drops,
           duration_ms: finishedAt - startedAt,
-          newbie_first_reply_latency_ms:
+          // Old "first alice reply after newbie up" — kept for log
+          // continuity but no longer used as the readiness signal.
+          alice_first_reply_after_newbie_up_ms:
             newbieFirstReplyAt && newbieUpAt ? newbieFirstReplyAt - newbieUpAt : null,
+          // New: newbie's own socket reachable + first real lookup.
+          newbie_ready_latency_ms: newbieReadyLatencyMs,
           start_restart_counts: startCounts,
+          stability_restart_counts: stabilityCounts,
           end_restart_counts: endCounts,
           long_mode: LONG_MODE,
           first_5_failures: results.filter((r) => !r.ok).slice(0, 5),
         }));
 
-        // Assertion 1: zero drops.
+        // ── Topology stability ────────────────────────────────────────
+        // Assertion 1: zero IPC drops on alice's pre-existing socket.
         expect(drops).toBe(0);
-        // Assertion 2: broker/kernel/scheduler RestartCount unchanged.
-        expect(endCounts.broker).toBe(startCounts.broker);
-        expect(endCounts.kernel).toBe(startCounts.kernel);
-        expect(endCounts.scheduler).toBe(startCounts.scheduler);
-        // Assertion 3: newbie first reply within 60s budget.
+        // Assertion 2: broker / kernel / scheduler RestartCount unchanged
+        // across the agent-add window itself (kernel restart-after-add
+        // is a separate, deliberate step measured below).
+        expect(stabilityCounts.broker).toBe(startCounts.broker);
+        expect(stabilityCounts.kernel).toBe(startCounts.kernel);
+        expect(stabilityCounts.scheduler).toBe(startCounts.scheduler);
+
+        // ── Newbie readiness ──────────────────────────────────────────
+        // Assertion 3a: newbie reached "own socket bound + first lookup
+        // answered" within the budget. This requires the kernel
+        // restart-after-add — broker + scheduler MUST stay restartless.
         expect(newbieUpAt).not.toBeNull();
-        expect(newbieFirstReplyAt).not.toBeNull();
-        const newbieLatency = newbieFirstReplyAt! - newbieUpAt!;
-        expect(newbieLatency).toBeLessThan(NEWBIE_FIRST_REPLY_BUDGET_MS);
+        expect(newbieReadyAt).not.toBeNull();
+        expect(newbieReadyLatencyMs).not.toBeNull();
+        expect(newbieReadyLatencyMs!).toBeLessThan(NEWBIE_FIRST_REPLY_BUDGET_MS);
+        // Assertion 3b: broker + scheduler RestartCount STILL unchanged
+        // even after the kernel restart. Kernel is allowed to bump by
+        // exactly 1 (the deliberate restart-after-add).
+        expect(endCounts.broker).toBe(startCounts.broker);
+        expect(endCounts.scheduler).toBe(startCounts.scheduler);
+        expect(endCounts.kernel).toBe(startCounts.kernel + 1);
       },
       LONG_MODE ? 240_000 : 120_000,
     );
