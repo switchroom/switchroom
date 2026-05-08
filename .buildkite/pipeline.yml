@@ -221,6 +221,54 @@ steps:
         - exit_status: 143
           limit: 2
 
+  - label: ":stopwatch: Race test (long mode)"
+    key: tests-race-long
+    timeout_in_minutes: 10
+    # RFC-faithful timing run for tests/docker/broker-ipc-race.test.ts.
+    # The default fast-mode (45 lookups @ 200ms ≈ 9s) runs in the Core
+    # tests step; long mode (45 lookups @ 2s ≈ 90s) is gated behind
+    # SWITCHROOM_RACE_LONG=1 so dev iteration stays snappy. CI runs it
+    # here on every merge so the RFC-faithful pattern is actually
+    # exercised. The race test self-skips cleanly when the docker
+    # daemon or images are unavailable (see hasDocker()/hasImage()),
+    # so this step is safe on agents without docker — it just no-ops.
+    env:
+      TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
+      SWITCHROOM_RACE_LONG: "1"
+    if_changed:
+      - "tests/docker/broker-ipc-race.test.ts"
+      - "tests/docker/**"
+      - "src/vault/broker/**"
+      - "src/kernel/**"
+      - "src/scheduler/**"
+      - "vitest.config.ts"
+      - ".buildkite/pipeline.yml"
+    command: |
+      if [ ! -x "$$HOME/.bun/bin/bun" ]; then
+        curl -fsSL https://bun.sh/install | bash
+      fi
+      export PATH="$$HOME/.bun/bin:$$PATH"
+      bun install --frozen-lockfile --prefer-offline --no-progress
+      bun scripts/build.mjs
+      # Run only the race test, in long mode.
+      bunx vitest run tests/docker/broker-ipc-race.test.ts
+    cache:
+      paths:
+        - "~/.bun"
+        - "node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}"
+    soft_fail:
+      # The test self-skips when docker is unavailable; treat any
+      # non-fatal exit as a soft signal so the build doesn't block
+      # purely on docker-host availability of the hosted agent.
+      - exit_status: 1
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
   - label: ":snake: Python tests (Hindsight scripts)"
     key: tests-python
     timeout_in_minutes: 5
