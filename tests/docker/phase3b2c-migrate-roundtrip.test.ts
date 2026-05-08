@@ -214,10 +214,29 @@ describe("phase3b2c migrate round-trip (host → docker → host)", () => {
         return { stdout: "", stderr: "unexpected cmd via fake", exitCode: 1 };
       };
 
-      // Compound runner: real docker, fake systemctl.
+      // Phase 3c F-new-1 — observability of the watchdog pause sentinel.
+      // We don't run the watchdog process itself (too coupled for an
+      // in-test boot); instead we trace whether the sentinel was
+      // present at the moment each docker command fired. The contract
+      // is: sentinel exists for the entire docker-touching window of
+      // the migration, and is gone by the time the executor returns.
+      const sentinelObservations: Array<{ phase: string; cmd: string; sentinelPresent: boolean }> = [];
+      let currentPhase = "to-docker";
+      const observeSentinel = (cmd: string): void => {
+        sentinelObservations.push({
+          phase: currentPhase,
+          cmd,
+          sentinelPresent: existsSync(WATCHDOG_PAUSE_PATH),
+        });
+      };
+
+      // Compound runner: real docker, fake systemctl. Records sentinel
+      // state at each docker invocation so we can assert the watchdog
+      // would have stayed paused for the whole compose-touching window.
       const runCommand: RunCommand = async (cmd, args) => {
         if (cmd === "systemctl") return fakeSystemctl(cmd, args);
         if (cmd === "docker") {
+          observeSentinel(`docker ${args.slice(0, 3).join(" ")}`);
           try {
             const out = execSync(
               `docker ${args.map((a) => JSON.stringify(a)).join(" ")}`,
@@ -263,6 +282,16 @@ describe("phase3b2c migrate round-trip (host → docker → host)", () => {
       expect(toDockerResult.completed.length).toBe(toDockerPlan.steps.length);
       expect(readFileSync(RUNTIME_MODE_PATH, "utf8").trim()).toBe("docker");
 
+      // Phase 3c F-new-1 — sentinel was present during every docker
+      // call of the to-docker migration, and is gone now that the
+      // executor returned (watchdog-resume is the final step).
+      const toDockerObs = sentinelObservations.filter((o) => o.phase === "to-docker");
+      expect(toDockerObs.length).toBeGreaterThan(0);
+      expect(toDockerObs.every((o) => o.sentinelPresent)).toBe(true);
+      expect(existsSync(WATCHDOG_PAUSE_PATH)).toBe(false);
+
+      currentPhase = "to-host";
+
       // Verify the test container is up under our scoped project.
       const psOut = execSync(
         `docker ps --filter label=switchroom.test.run=${RUN_ID} --format '{{.Names}}'`,
@@ -302,6 +331,12 @@ describe("phase3b2c migrate round-trip (host → docker → host)", () => {
       expect(toHostResult.ok).toBe(true);
       expect(toHostResult.completed.length).toBe(toHostPlan.steps.length);
       expect(readFileSync(RUNTIME_MODE_PATH, "utf8").trim()).toBe("host");
+
+      // Phase 3c F-new-1 — same sentinel contract on the reverse leg.
+      const toHostObs = sentinelObservations.filter((o) => o.phase === "to-host");
+      expect(toHostObs.length).toBeGreaterThan(0);
+      expect(toHostObs.every((o) => o.sentinelPresent)).toBe(true);
+      expect(existsSync(WATCHDOG_PAUSE_PATH)).toBe(false);
 
       // Container should be gone (compose down scoped to our project).
       const psAfter = execSync(
