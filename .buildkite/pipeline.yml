@@ -343,8 +343,6 @@ steps:
       - "src/vault/broker/**"
       - "src/kernel/**"
       - "src/scheduler/**"
-      - "src/watchdog/**"
-      - "src/cli/migrate/**"
       - ".buildkite/pipeline.yml"
       - ".buildkite/docker-snapshot-gate.sh"
     command: |
