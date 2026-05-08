@@ -321,6 +321,52 @@ steps:
         - exit_status: 143
           limit: 2
 
+  - label: ":whale: Docker tests + snapshot gate"
+    key: tests-docker-snapshot
+    timeout_in_minutes: 15
+    # Phase 3c F3 — top-level pre/post `docker ps` snapshot gate around
+    # the entire `tests/docker/**` slice. The per-test `expectNoProdDrift`
+    # assertions in `afterAll()` only fire when vitest reaches afterAll;
+    # a crash mid-run (OOM, segfault, watchdog kill) would silently leak
+    # drift onto the host. This step traps the pre-snapshot, runs the
+    # suite, then ALWAYS compares post-snapshot regardless of vitest
+    # exit code.
+    #
+    # Self-skips cleanly when docker is unavailable (the snapshot script
+    # falls back to empty output and the suite's own skip logic kicks
+    # in). Soft-fail intentionally OFF — drift is a hard fail.
+    env:
+      TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
+    if_changed:
+      - "tests/docker/**"
+      - "src/agents/**"
+      - "src/vault/broker/**"
+      - "src/kernel/**"
+      - "src/scheduler/**"
+      - "src/watchdog/**"
+      - "src/cli/migrate/**"
+      - ".buildkite/pipeline.yml"
+      - ".buildkite/docker-snapshot-gate.sh"
+    command: |
+      if [ ! -x "$$HOME/.bun/bin/bun" ]; then
+        curl -fsSL https://bun.sh/install | bash
+      fi
+      export PATH="$$HOME/.bun/bin:$$PATH"
+      bun install --frozen-lockfile --prefer-offline --no-progress
+      bun scripts/build.mjs
+      bash .buildkite/docker-snapshot-gate.sh
+    cache:
+      paths:
+        - "~/.bun"
+        - "node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}"
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
   - wait
 
   # ---------------------------------------------------------------------------
