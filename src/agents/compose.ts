@@ -169,7 +169,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`  vault-broker:`);
   lines.push(`    image: ${brokerImage}`);
   lines.push(`    container_name: switchroom-vault-broker`);
-  // Phase 3b-1: fleet labels for the watchdog (selects on switchroom.role).
+  // Fleet labels for ad-hoc selection (e.g. `docker ps --filter label=switchroom.role=agent`).
   lines.push(`    labels:`);
   lines.push(`      switchroom.role: "broker"`);
   lines.push(`      switchroom.fleet: "switchroom"`);
