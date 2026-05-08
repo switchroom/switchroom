@@ -8,6 +8,22 @@ source: research output for issue #793, "Option 3" of the comparison
 
 # RFC: one container per agent, docker compose for the fleet
 
+## Status (post-v0.6)
+
+- **Phase 0** (peercred spike) — shipped (#801).
+- **Phase 1** (compose generator + per-agent containers) — shipped (#802, #804, #807).
+- **Phase 2** (broker IPC port + approval kernel IPC port + integration suite) — shipped (#813, #814, #815).
+- **Phase 3a** (entry-guard hardening + HARD RULES + `_prod-snapshot.ts` helper) — shipped (#816, #817).
+- **Phase 3c** (CI snapshot gate + real `switchroom add agent` codepath in race test + newbie-readiness split) — shipped (#824).
+- **Phase 3d** (Linux-only declaration) — shipped via PR #825.
+- **Phase 3a-3** (GHCR publishing workflow + compose digest-pin mode) — REMOVED in PR #825.
+- **Phase 3b-1** (Docker fleet watchdog port) — DEFERRED indefinitely. `bin/bridge-watchdog.sh` continues to supervise the legacy systemd path; Docker fleets self-restart via compose `restart: unless-stopped`.
+- **Phase 3b-2** (`switchroom migrate to-docker/to-host` CLI) — REMOVED in PR #825. Single-host personal tool doesn't need an in-place migration mechanism; fresh installs only.
+- **Phase 3b-3** (default flip + advisory + doctor coexistence) — REMOVED in PR #825. `switchroom up` defaults Docker on Linux; `--legacy` is a plain branch selector.
+- **Phase 4** (CLI shim + log abstraction + update flow) — OUT OF SCOPE for v1.0; not currently planned.
+- **Phase 5** (migration tooling + e2e) — REMOVED.
+- **Phase 3.5** (Mac/Docker-Desktop validation) — deferred to next week.
+
 ## Summary
 
 Switchroom today is a Linux-only host install. Multi-OS reach is the point of #793 and Docker is the obvious substrate. This RFC picks Option 3 from the comparison: **one container per agent, plus a small set of shared-service containers (vault broker, approval kernel, telegram bridge), all wired together by a generated `docker-compose.yml`**. The user-visible end state is `switchroom setup` produces a compose file, `docker compose up -d` brings the fleet alive, and the README install path is one block of shell on Linux and Mac. Windows-WSL2, Synology, Unraid, and RasPi work in principle on the same compose file, but they aren't formally validated for v1.0 — best-effort, community-tested, no support promise. The host-native install stays supported on Linux alongside Docker. Both deliver the same product promise.
@@ -446,6 +462,8 @@ Abort: if peercred-in-Docker requires user namespace remapping that breaks rootl
 
 ### Phase 3 — watchdog port, agent-minutes ≈ 750
 
+> **Status (post-v0.6):** DEFERRED / REMOVED in PR #825 — see Status block at top.
+
 Files: `src/watchdog/` from scratch, fixture suite under `src/watchdog/__fixtures__/`. Source: Docker events stream (`docker events --filter type=container`) for restart triggers, `docker logs --since` + `docker stats` for liveness probes, `docker inspect` for config sanity.
 
 **Log-driver decision (committed, Linux hosts only): `--log-driver=journald` for every container.** On Linux hosts (the production target — bare-metal, RasPi, Linux servers), all container stdout/stderr forwards to the host journal under a `CONTAINER_NAME=` selector. This preserves the bash watchdog's existing `journalctl` queries verbatim during the parallel dry-run window and keeps `journalctl -t switchroom-watchdog` working for operators after cutover. Compose snippet:
@@ -486,6 +504,8 @@ Abort: if porting introduces regressions we can't catch in tests because they're
 
 ### Phase 4 — CLI shim + log abstraction + update flow, agent-minutes ≈ 360
 
+> **Status (post-v0.6):** DEFERRED / REMOVED in PR #825 — see Status block at top.
+
 Files: `src/cli/*.ts` for every command that today shells to systemctl, `src/logs/` (new — stdout-tailing shim for non-Linux). Detect runtime mode at startup. Map verbs:
 
 - `switchroom agent restart klanker` → `docker compose restart agent-klanker`
@@ -520,6 +540,8 @@ Success: every documented switchroom CLI verb works identically in both modes. D
 Abort: if a verb has no Docker equivalent, write the missing command. Don't paper over.
 
 ### Phase 5 — migration tooling + e2e, agent-minutes ≈ 400
+
+> **Status (post-v0.6):** DEFERRED / REMOVED in PR #825 — see Status block at top.
 
 Files: `src/cli/migrate-to-docker.ts`, `src/cli/migrate-to-host.ts`, e2e suite. Migration tool reads the existing `~/.switchroom/`, generates compose, validates, performs UID alignment, prompts user to switch.
 
@@ -569,6 +591,8 @@ The `!` interrupt arrives at the gateway process. Gateway and claude REPL are **
 Validate in Phase 0. If this doesn't work, the design is wrong and we restart.
 
 ### Watchdog rewrite — porting bash logic to TS without losing fidelity
+
+> **Status (post-v0.6):** DEFERRED / REMOVED in PR #825 — see Status block at top.
 
 `bin/bridge-watchdog.sh` has 967 lines of accumulated edge-case handling. Rewriting it from scratch is a translation problem, and translations introduce bugs.
 
@@ -687,39 +711,16 @@ In Docker, the file crosses the container boundary. The threat surface widens in
 
 A compromised container reading its own agent's token is no worse than a compromised host process reading the host file — the threat model is unchanged for that case. A compromised broker or kernel container reading agent tokens **would** be a regression; the per-agent-only mount discipline prevents it.
 
-## Migration story
+## Migration story (v0.6)
 
-Existing host-native install. Both paths deliver the same product promise, so migration is opt-in — no pressure to move, no deprecation timer. Operators move when they want to (new box, want per-agent cgroup limits, want one install script across Mac/Linux/Pi). Steps below are for operators who've decided to switch.
+There is no in-place migration tool. Operators on the legacy systemd installation perform a clean re-install:
 
-```bash
-# 1. Take a backup. Always.
-tar -czf ~/switchroom-backup-$(date +%F).tar.gz ~/.switchroom ~/.claude/projects
+1. Stop existing systemd units: `systemctl --user stop 'switchroom-*'`.
+2. Disable: `systemctl --user disable 'switchroom-*'`.
+3. Run `switchroom up` (defaults to Docker on Linux).
+4. To roll back: stop the Docker fleet (`docker compose down`), re-enable + start the systemd units, OR run `switchroom up --legacy` if you've kept the legacy units installed.
 
-# 2. Install Docker (Linux: convenience script; Mac/Windows: Docker Desktop).
-curl -fsSL https://get.docker.com | sh   # Linux only
-# or: install Docker Desktop from docker.com on Mac/Windows
-
-# 3. Stop host-native fleet.
-switchroom stop --all
-
-# 4. Run the migration tool.
-switchroom migrate to-docker
-#  - reads ~/.switchroom/, generates compose, validates
-#  - prints a diff of what will change
-#  - on confirm: writes compose, pulls images, brings fleet up
-#  - on first message in Telegram: confirms each agent end-to-end
-
-# 5. Verify.
-switchroom doctor
-switchroom status
-
-# 6. (Optional) Clean up host-native artifacts.
-systemctl --user disable --now 'switchroom-*'
-```
-
-Rollback: `switchroom migrate to-host` reverses it. systemd units regenerated, agents restarted on host. State is preserved on the volumes; nothing is destroyed during migration.
-
-Estimated migration time for a 5-agent fleet: 10 minutes including the image pull on first run. Subsequent restarts: seconds.
+No marker file, no advisory, no `switchroom migrate` command. The `--legacy` flag on `switchroom up` is a plain branch selector that runs the systemd path.
 
 ## Alternatives considered
 
