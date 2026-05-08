@@ -51,6 +51,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync, rmdirSync, statSync } fr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateCompose } from "../../src/agents/compose.js";
+import { bringUpAgentService } from "../../src/agents/docker-fleet.js";
 import type { SwitchroomConfig } from "../../src/config/schema.js";
 import {
   newRunId,
@@ -447,11 +448,35 @@ describe.skipIf(!imagesOk)(
               ].join("\n"),
             );
             newbieUpAt = Date.now();
+            // Phase 3c F2 (#810): exercise the real CLI codepath rather
+            // than a bespoke `docker compose up`. `bringUpAgentService`
+            // is the same helper that `switchroom agent add` calls in
+            // its docker-runtime branch — extracted from `cli/agent.ts`
+            // for reuse from tests. We pass the pre-built test compose
+            // via `generateComposeContent` (the test's compose YAML has
+            // test-specific volume rewrites the production generator
+            // doesn't emit), and isolate writes to a per-test
+            // `switchroomHome` so the operator's real ~/.switchroom is
+            // never touched. The compose project label is preserved by
+            // setting the compose path to the existing test composePath.
             try {
-              execSync(
-                `docker compose -p ${PROJECT} -f ${ctx.composePath} up -d --no-deps agent-newbie`,
-                { stdio: "pipe", cwd: ctx.workdir },
-              );
+              // The helper writes compose into <switchroomHome>/compose;
+              // we point that at the test workdir so the file we already
+              // wrote in the bespoke path is identical to what the
+              // helper would emit, and so the helper's `docker compose
+              // -f <path> up -d --no-deps agent-newbie` resolves to the
+              // same compose file the rest of this test has been using.
+              // We override the project name via env to match PROJECT.
+              const composeContent = compose2;
+              process.env.COMPOSE_PROJECT_NAME = PROJECT;
+              bringUpAgentService({
+                config: makeConfig(["alice", "bob", "carol", "newbie"]),
+                agentName: "newbie",
+                switchroomHome: ctx.workdir,
+                generateComposeContent: () => composeContent,
+                stdio: "pipe",
+              });
+              delete process.env.COMPOSE_PROJECT_NAME;
             } catch (e) {
               // newbie may fail to start (read_only + sleep CMD pattern is
               // fine on linux, but image-pull race etc). Don't fail the

@@ -46,9 +46,8 @@ import {
 } from "../agents/status.js";
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
 import { addAgent, type AgentTopology } from "../agents/add-orchestrator.js";
-import { generateCompose } from "../agents/compose.js";
+import { bringUpAgentService } from "../agents/docker-fleet.js";
 import { execFileSync as dockerExecFile } from "node:child_process";
-import { mkdirSync as dockerMkdir } from "node:fs";
 import { renameAgent, type HindsightMode } from "../agents/rename-orchestrator.js";
 import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
 import { registerAgentPerfCommand } from "./perf.js";
@@ -2281,18 +2280,21 @@ export function registerAgentCommand(program: Command): void {
           // and only fires when SWITCHROOM_RUNTIME=docker.
           if (process.env.SWITCHROOM_RUNTIME === "docker") {
             const cfg = getConfig(program);
-            const compose = generateCompose({ config: cfg });
-            const composeDir = resolve(process.env.HOME ?? "", ".switchroom", "compose");
-            dockerMkdir(composeDir, { recursive: true, mode: 0o755 });
-            const composePath = resolve(composeDir, "docker-compose.yml");
-            writeFileSync(composePath, compose, { mode: 0o644 });
-            console.log(chalk.gray(`  Wrote compose: ${composePath}`));
+            let composePath: string;
             try {
-              dockerExecFile("docker", [
-                "compose", "-f", composePath,
-                "up", "-d", "--no-deps", `agent-${name}`,
-              ], { stdio: "inherit" });
+              const upRes = bringUpAgentService({
+                config: cfg,
+                agentName: name,
+              });
+              composePath = upRes.composePath;
+              console.log(chalk.gray(`  Wrote compose: ${composePath}`));
             } catch (err) {
+              composePath = resolve(
+                process.env.SWITCHROOM_HOME ??
+                  resolve(process.env.HOME ?? "", ".switchroom"),
+                "compose",
+                "docker-compose.yml",
+              );
               console.error(chalk.red(`  docker compose up failed: ${(err as Error).message}`));
               // Rollback — the host-native addAgent above has already
               // scaffolded the agent dir + (in non-Docker fleets) the
