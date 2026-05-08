@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.0 — Docker substrate (Linux), single-host
+
+**Adds:**
+- `switchroom up` runs the fleet under Docker Compose by default on Linux (per-agent containers, broker + approval kernel IPC ported to host-UID sockets).
+- `switchroom up --legacy` keeps the systemd path for operators who want it.
+- CI snapshot gate guarantees test runs leak zero containers onto host docker.
+
+**Removes (vs the original RFC):**
+- No `switchroom migrate to-docker/to-host` command. Fresh installs only.
+- No Docker fleet watchdog port — `bin/bridge-watchdog.sh` continues to supervise the legacy systemd path; Docker fleets self-restart via compose `restart: unless-stopped`.
+- No GHCR digest-pin workflow. Images build locally on `switchroom up`.
+
+**Scope:** Linux only. Mac (Docker Desktop) validation tracked separately as Phase 3.5.
+
 ## v0.5.2 — 2026-05-07
 
 Patch release. Unblocks `npm publish` (the v0.5.1 prepublish hook
