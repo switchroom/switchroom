@@ -178,6 +178,22 @@ export function resolveChannelTarget(
   };
 }
 
+/**
+ * Park the process indefinitely without exiting. Used by main() when the
+ * config is unusable (missing forum chat or zero resolved entries) — see
+ * #907 root cause: exiting in those cases burns the start.sh supervisor's
+ * restart budget and the scheduler silently disappears. Wakes on SIGTERM
+ * so container shutdown still proceeds cleanly.
+ */
+async function idle(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const onSignal = () => resolve();
+    process.on("SIGTERM", onSignal);
+    process.on("SIGINT", onSignal);
+  });
+  process.exit(0);
+}
+
 export async function main(): Promise<void> {
   const agentName = process.env.SWITCHROOM_AGENT_NAME;
   if (!agentName) {
@@ -215,20 +231,45 @@ export async function main(): Promise<void> {
   const allEntries = collectScheduleEntries(config);
   const entries = allEntries.filter((e) => e.agent === agentName);
 
+  // Startup self-check (#907 regression visibility): always log the
+  // registered timer set up-front. Before this, a silent "0 entries
+  // resolved" looked identical to "scheduler running fine but no fires
+  // are due" — the May 8 cutover regression went unnoticed for two days
+  // for exactly this reason. Now the log line names every entry's cron
+  // expression so an operator can grep `agent-scheduler.log` and see
+  // immediately whether the cascade resolved their schedule at all.
+  const summary = entries.length === 0
+    ? "(none)"
+    : entries
+        .map((e) => `[idx=${e.scheduleIndex} cron="${e.cron}" key=${e.promptKey}]`)
+        .join(" ");
+  process.stdout.write(
+    `agent-scheduler: ${agentName} startup self-check — ` +
+    `${entries.length} entry(ies) resolved from ${configPath}: ${summary}\n`,
+  );
+
   const channel = resolveChannelTarget(config, agentName);
   if (channel === null) {
     process.stderr.write(
       `agent-scheduler: ${agentName} has no resolvable chat target ` +
-      `(missing telegram.forum_chat_id) — exiting\n`,
+      `(missing telegram.forum_chat_id) — sleeping (no exit, avoid supervisor restart-burn)\n`,
     );
-    process.exit(78); // EX_CONFIG
+    // Idle-sleep instead of exit. Exiting non-zero would burn the
+    // start.sh supervisor's 10-restart-in-60s budget and the scheduler
+    // would silently disappear — exactly the #907 failure mode. An
+    // idle process is observable (`ps` shows it) and recovers on the
+    // next container restart after the operator fixes the config.
+    await idle();
+    return;
   }
 
   if (entries.length === 0) {
     process.stdout.write(
-      `agent-scheduler: ${agentName} has no schedule entries — exiting cleanly\n`,
+      `agent-scheduler: ${agentName} has no schedule entries — sleeping ` +
+      `(no exit, avoid supervisor restart-burn)\n`,
     );
-    process.exit(0);
+    await idle();
+    return;
   }
 
   const sink: AuditSink = new JsonlAuditSink(resolve(jsonlPath));

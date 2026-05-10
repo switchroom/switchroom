@@ -700,6 +700,20 @@ function syncGlobalSkills(
     }
     try {
       symlinkSync(src, dest);
+      // Container-aware sanity (#907): the symlink target is an absolute
+      // host path that must also be reachable inside the agent container.
+      // Compose now bind-mounts ~/.switchroom/skills at the same host
+      // path so the link resolves identically in both worlds. Verify the
+      // target is readable post-create — a broken link surfaces here as
+      // a loud warning rather than a silent skill-missing failure
+      // discovered only when a cron prompt fires inside the sandbox.
+      if (!existsSync(dest)) {
+        console.warn(
+          `  WARNING: skill "${name}" symlink dangles after create ` +
+          `(src=${src} dest=${dest}). Skill will appear missing inside ` +
+          `the agent container.`,
+        );
+      }
     } catch (err) {
       console.warn(
         `  WARNING: failed to symlink skill "${name}": ${(err as Error).message}`,

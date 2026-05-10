@@ -247,6 +247,11 @@ describe("generateCompose", () => {
     expect(out).toContain("/home/op/.switchroom/logs/a:/home/op/.switchroom/logs/a");
     expect(out).toContain("/home/op/.claude/projects/a:/state/.claude");
     expect(out).toContain("/home/op/.claude/projects/a:/home/op/.claude/projects/a");
+    // Shared pools (#907): skills + credentials bind-mounted read-only at
+    // their canonical host paths so prompts and env vars resolve identically
+    // inside the container.
+    expect(out).toContain("/home/op/.switchroom/skills:/home/op/.switchroom/skills:ro");
+    expect(out).toContain("/home/op/.switchroom/credentials:/home/op/.switchroom/credentials:ro");
     expect(out).not.toContain("${HOME}");
   });
 

@@ -20,6 +20,7 @@
 
 import { createHash } from "node:crypto";
 import type { ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
+import { resolveAgentConfig } from "../config/merge.js";
 
 export interface SchedulerEntry {
   agent: string;
@@ -43,7 +44,19 @@ export function collectScheduleEntries(
   const out: SchedulerEntry[] = [];
   const agentNames = Object.keys(config.agents).sort();
   for (const agent of agentNames) {
-    const schedule: ScheduleEntry[] = config.agents[agent]?.schedule ?? [];
+    // #907 root cause: resolve through the cascade so schedule entries
+    // declared in `defaults.schedule` or in a profile's `extends`-chain
+    // are visible to the in-agent scheduler. Walking the raw
+    // `config.agents[name].schedule` skipped them entirely, so
+    // collectScheduleEntries returned 0 for every agent that inherited
+    // its cron from a profile, the agent-scheduler exited 0 with "no
+    // schedule entries — exiting cleanly", and the start.sh supervisor
+    // burned its 10-restarts-in-60s budget then gave up. From the
+    // operator's perspective: scheduler vanished, no fires.
+    const agentDef = config.agents[agent];
+    if (!agentDef) continue;
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentDef);
+    const schedule: ScheduleEntry[] = resolved.schedule ?? [];
     for (let i = 0; i < schedule.length; i++) {
       const entry = schedule[i]!;
       out.push({

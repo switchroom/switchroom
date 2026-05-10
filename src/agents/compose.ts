@@ -586,6 +586,20 @@ function emitAgentService(
     lines.push(`      - ${switchroomConfigPath}:/state/config/switchroom.yaml:ro`);
   }
   lines.push(`      - ${homePrefix}/.switchroom/logs/${a.name}:${homePrefix}/.switchroom/logs/${a.name}`);
+  // Shared host directories the agent needs read-only access to. Without
+  // these the v0.6 → v0.7 cutover broke any prompt that shells out to a
+  // bundled skill script (e.g. `python3 ~/.switchroom/skills/calendar/...`)
+  // or reads filesystem-resident credentials (Garmin token dir, HA SSH
+  // key). Vault-resident secrets continued working because the broker
+  // socket is bound; the asymmetry was the smoking gun in #907.
+  //
+  // Both paths are bind-mounted at their canonical host path so absolute
+  // paths baked into prompts / env vars (GARMIN_TOKEN_DIR, HA_SSH_KEY,
+  // skill symlink targets under .claude/skills/) resolve identically
+  // inside the container as they do on the host. Read-only — agents
+  // never write to either pool.
+  lines.push(`      - ${homePrefix}/.switchroom/skills:${homePrefix}/.switchroom/skills:ro`);
+  lines.push(`      - ${homePrefix}/.switchroom/credentials:${homePrefix}/.switchroom/credentials:ro`);
   lines.push(``);
   void imageTag;
 }
