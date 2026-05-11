@@ -1158,7 +1158,12 @@ export const AgentSchema = z.object({
   skip_permission_prompt: z
     .boolean()
     .optional()
-    .describe("If true, add skipDangerousModePermissionPrompt to settings.json"),
+    .describe(
+      "DEPRECATED no-op (accepted for backwards compatibility). Claude Code " +
+      "ignores skipDangerousModePermissionPrompt at project scope; autoaccept " +
+      "(src/agents/autoaccept.ts) handles the bypass-mode prompt instead. " +
+      "Safe to remove from switchroom.yaml.",
+    ),
   admin: z
     .boolean()
     .optional()

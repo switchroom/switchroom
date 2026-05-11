@@ -949,9 +949,7 @@ function buildHumanizerEnvVars(
 const SWITCHROOM_OWNED_SETTINGS_KEYS = new Set<string>([
   "permissions",
   "mcpServers",
-  "enabledPlugins",
   "autoMemoryEnabled",
-  "skipDangerousModePermissionPrompt",
   "hooks",
   "model",
 ]);

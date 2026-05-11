@@ -1,15 +1,24 @@
+{{!--
+  Two keys deliberately omitted from this template (do not re-add):
+
+  * `skipDangerousModePermissionPrompt` — real key, but Claude Code IGNORES it
+    in project-level .claude/settings.json as a security measure (only user
+    or local scope is honored). It also belongs under `permissions.`, not
+    top-level. autoaccept (src/agents/autoaccept.ts) handles the prompt instead.
+
+  * `enabledPlugins` — managed-settings-only (org policy distribution), no
+    effect at user or project scope. Plugin selection is correctly driven
+    by CLI flags in profiles/_base/start.sh.hbs (--channels / --plugin-dir).
+
+  See https://code.claude.com/docs/en/settings for the settings reference.
+--}}
 {
   "permissions": {
     "allow": {{{json permissionAllow}}},
     "deny": {{{json toolsDeny}}}{{#if defaultModeAcceptEdits}},
     "defaultMode": "acceptEdits"{{/if}}
-  },
-  "enabledPlugins": {
-    "telegram@claude-plugins-official": {{#if useSwitchroomPlugin}}false{{else}}true{{/if}}
   }{{#if hindsightEnabled}},
   "autoMemoryEnabled": false{{/if}}{{#if mcpServers}},
   "mcpServers": {{{json mcpServers}}}
-  {{/if}}{{#if skipPermissionPrompt}},
-  "skipDangerousModePermissionPrompt": true
   {{/if}}
 }
