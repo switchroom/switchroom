@@ -5,12 +5,18 @@
     in project-level .claude/settings.json as a security measure (only user
     or local scope is honored). It also belongs under `permissions.`, not
     top-level. autoaccept (src/agents/autoaccept.ts) handles the prompt instead.
+    See https://code.claude.com/docs/en/settings (permissions section).
 
-  * `enabledPlugins` — managed-settings-only (org policy distribution), no
-    effect at user or project scope. Plugin selection is correctly driven
-    by CLI flags in profiles/_base/start.sh.hbs (--channels / --plugin-dir).
+  * `enabledPlugins` — REDUNDANT, not nonfunctional. Plugin selection is
+    driven at the CLI by profiles/_base/start.sh.hbs (`--channels
+    plugin:telegram@claude-plugins-official` in vanilla mode, or
+    `--dangerously-load-development-channels server:switchroom-telegram` in
+    vendored-plugin mode). Re-adding an `enabledPlugins` block here would
+    work but duplicate state with the CLI flag and risk drift.
 
-  See https://code.claude.com/docs/en/settings for the settings reference.
+  A `settings_raw` block in switchroom.yaml CAN still inject either key via
+  the deep-merge escape hatch (src/config/merge.ts) — that's intentional
+  power-user territory, not a regression.
 --}}
 {
   "permissions": {

@@ -899,24 +899,23 @@ async function stepDangerousMode(
         const agentNames = Object.keys(config.agents);
 
         for (const name of agentNames) {
-          // Add dangerous_mode and skip_permission_prompt to each agent block
-          // Look for the agent's top-level key and add after it
+          // Add dangerous_mode to each agent block. (Prior versions also added
+          // skip_permission_prompt: true here — dropped as of the dead-settings
+          // cleanup since it's now a no-op; autoaccept handles the boot prompt.)
           const agentPattern = new RegExp(`(^  ${name}:\\s*\\n)`, "m");
           if (agentPattern.test(content)) {
-            // Check if dangerous_mode already exists for this agent
             const blockPattern = new RegExp(`^  ${name}:[\\s\\S]*?(?=^  [a-z]|\\Z)`, "m");
             const blockMatch = content.match(blockPattern);
             if (blockMatch && !blockMatch[0].includes("dangerous_mode")) {
               content = content.replace(
                 agentPattern,
-                `$1    dangerous_mode: true\n    skip_permission_prompt: true\n`,
+                `$1    dangerous_mode: true\n`,
               );
             }
           }
 
           // Also update the in-memory config
           config.agents[name].dangerous_mode = true;
-          config.agents[name].skip_permission_prompt = true;
         }
 
         writeFileSync(configPath, content, "utf-8");

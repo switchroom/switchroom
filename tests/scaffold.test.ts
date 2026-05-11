@@ -1168,6 +1168,27 @@ describe("reconcileAgent", () => {
     expect(settings.permissions.allow).not.toContain("Write");
   });
 
+  it("retracts stale enabledPlugins / skipDangerousModePermissionPrompt on reconcile (one-shot migration)", () => {
+    // Pre-PR switchroom emitted both keys from settings.json.hbs to every
+    // scaffolded agent. They were never tracked in _switchroomManagedRawKeys
+    // (template-emitted, not settings_raw-injected), so the standard Phase-5
+    // retraction loop doesn't catch them. The one-shot migration in
+    // reconcileAgent must explicitly delete them.
+    const agentConfig = makeAgentConfig();
+    const scaffolded = scaffoldAgent("stale", agentConfig, tmpDir, telegramConfig);
+    const settingsPath = join(scaffolded.agentDir, ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    // Simulate a pre-PR agent: hand-inject both stale keys.
+    settings.enabledPlugins = { "telegram@claude-plugins-official": true };
+    settings.skipDangerousModePermissionPrompt = true;
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+
+    reconcileAgent("stale", agentConfig, tmpDir, telegramConfig, buildSwitchroomConfig(agentConfig));
+    const reconciled = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(reconciled.enabledPlugins).toBeUndefined();
+    expect(reconciled.skipDangerousModePermissionPrompt).toBeUndefined();
+  });
+
   it("re-seeds workspace bootstrap files on reconcile (covers profile template additions)", () => {
     // Regression for Sprint 1 review finding #7: reconcileAgent did not
     // call seedWorkspaceBootstrapFiles, so new profile templates added
