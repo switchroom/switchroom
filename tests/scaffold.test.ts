@@ -541,8 +541,10 @@ describe("scaffoldAgent", () => {
     }
   });
 
-  it("never emits enabledPlugins — managed-settings-only, no effect at project scope", () => {
-    // Regression guard: plugin selection is driven by CLI flags in start.sh, not settings.json.
+  it("never emits enabledPlugins — redundant with start.sh CLI flag pathway", () => {
+    // Regression guard: plugin selection is driven by --channels / --plugin-dir
+    // in profiles/_base/start.sh.hbs. The settings.json block would work but
+    // duplicate state with the CLI flag and risk drift.
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-enabled-plugins", config, tmpDir, telegramConfig);
     const settings = JSON.parse(
