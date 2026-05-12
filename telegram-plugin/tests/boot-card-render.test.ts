@@ -167,6 +167,51 @@ describe('renderBootCard — degraded conditions', () => {
     expect(out).toContain('↳ Tail logs: <code>journalctl --user -u switchroom-lawgpt -n 100</code>')
   })
 
+  it('crash row uses agentSlug for the systemd unit when provided', () => {
+    const out = renderBootCard({
+      agentName: 'LawGPT',
+      agentSlug: 'lawgpt',
+      version: 'v1',
+      restartReason: 'crash',
+    })
+    expect(out).toContain('switchroom-lawgpt')
+    expect(out).not.toContain('switchroom-LawGPT')
+  })
+
+  it('renderNextStep escapes HTML inside backtick-quoted commands', () => {
+    const out = renderBootCard({
+      agentName: 'a',
+      version: 'v',
+      probes: {
+        account: {
+          status: 'fail',
+          label: 'Account',
+          detail: 'expired',
+          nextStep: 'Run `foo <bar> "baz"` to fix',
+        },
+      },
+    })
+    expect(out).toContain('<code>foo &lt;bar&gt; &quot;baz&quot;</code>')
+    expect(out).not.toContain('<bar>')
+  })
+
+  it('unpaired backticks in nextStep fall back to plain escaped text', () => {
+    const out = renderBootCard({
+      agentName: 'a',
+      version: 'v',
+      probes: {
+        account: {
+          status: 'fail',
+          label: 'Account',
+          detail: 'expired',
+          nextStep: 'Run `switchroom foo to fix',
+        },
+      },
+    })
+    expect(out).toContain('↳ Run `switchroom foo to fix')
+    expect(out).not.toContain('<code>')
+  })
+
   it('degraded rows without nextStep render unchanged (backwards compat)', () => {
     const out = renderBootCard({
       agentName: 'a',

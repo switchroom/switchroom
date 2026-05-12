@@ -243,6 +243,10 @@ const REASON_LABEL: Record<RestartReason, string> = {
 
 export interface RenderBootCardOpts {
   agentName: string
+  /** Lowercase slug used for systemd unit names. Falls back to
+   *  `agentName` when omitted — matches the same fallback used by
+   *  `runAllProbes` for systemd targets. */
+  agentSlug?: string
   /** Pre-formatted version string, e.g. "v0.3.0+44" or "v0.3.0 · #143 · 2h ago". */
   version: string
   /** Probe results (only present after the settle window). When absent or
@@ -288,11 +292,16 @@ export interface RenderBootCardOpts {
  */
 function renderNextStep(text: string): string {
   const parts = text.split('`')
+  // Odd-count backticks means an unterminated <code> span — fall back to
+  // plain-escaped text rather than rendering the trailing tail inside a
+  // code block. Author error, not user-input, but defensive is cheap.
+  if (parts.length % 2 === 0) return escapeHtml(text)
   return parts.map((p, i) => (i % 2 === 0 ? escapeHtml(p) : `<code>${escapeHtml(p)}</code>`)).join('')
 }
 
 export function renderBootCard(opts: RenderBootCardOpts): string {
   const { agentName, version, probes, restartReason, restartAgeMs } = opts
+  const agentSlug = opts.agentSlug ?? agentName
   const ackEmoji = restartReason ? REASON_EMOJI[restartReason] : '✅'
   const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}`
 
@@ -309,7 +318,7 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     degradedRows.push(`⚠️ <b>Restart</b>  ${escapeHtml(REASON_LABEL.crash)}${ageStr}`)
     // Principle 1: every failure carries its next step. The crash row
     // tells the user how to inspect why.
-    degradedRows.push(`    ↳ Tail logs: <code>journalctl --user -u switchroom-${escapeHtml(agentName)} -n 100</code>`)
+    degradedRows.push(`    ↳ Tail logs: <code>journalctl --user -u switchroom-${escapeHtml(agentSlug)} -n 100</code>`)
   }
 
   // Probe rows — only those that surfaced as degraded/fail. Healthy
@@ -482,6 +491,7 @@ export async function startBootCard(
   // confirmation that the agent is back without waiting on probes.
   const ackText = renderBootCard({
     agentName: opts.agentName,
+    agentSlug: opts.agentSlug,
     version: opts.version,
     restartReason: opts.restartReason,
     restartAgeMs: opts.restartAgeMs,
@@ -538,6 +548,7 @@ export async function startBootCard(
         // Render with current probe state and edit if anything changed.
         let currentText = renderBootCard({
           agentName: opts.agentName,
+          agentSlug: opts.agentSlug,
           version: opts.version,
           probes,
           restartReason: opts.restartReason,
@@ -584,6 +595,7 @@ export async function startBootCard(
           const updatedProbes: ProbeMap = { ...probes, agent: agentResult }
           const updatedText = renderBootCard({
             agentName: opts.agentName,
+            agentSlug: opts.agentSlug,
             version: opts.version,
             probes: updatedProbes,
             restartReason: opts.restartReason,

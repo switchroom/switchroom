@@ -167,9 +167,9 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
     }
 
     const nextStep = status === 'fail'
-      ? 'OAuth token expired. Run `switchroom auth login <agent>` to re-authenticate.'
+      ? 'OAuth token expired — run `switchroom auth login <agent>` to re-authenticate'
       : status === 'degraded'
-        ? 'Token expiring soon. Run `switchroom auth login <agent>` before it lapses.'
+        ? 'Token expiring soon — run `switchroom auth login <agent>` before it lapses'
         : undefined
     return {
       status,
