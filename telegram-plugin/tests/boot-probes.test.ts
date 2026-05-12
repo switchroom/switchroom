@@ -1012,4 +1012,118 @@ describe('uptimeMsForStarttime', () => {
     expect(uptimeMsForStarttime(99999999, fs)).toBeNull()
   })
 })
+
+// ── nextStep remediation hints on degraded/fail probe branches ──────────────
+// Every fail/degraded result must carry an actionable `nextStep` per
+// reference/principles.md principle 1. These tests pin the hints across
+// the probes covered by the boot-card-dedup-and-next-steps PR so we don't
+// silently lose the hint on a future refactor.
+
+describe('nextStep — agent systemd states', () => {
+  it('attaches a journalctl hint when the unit is failed', async () => {
+    const exec = makeSequence([makeSystemctlOutput('failed')])
+    const r = await probeAgentProcess('klanker', {
+      execFileImpl: exec as unknown as (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>,
+      sleepImpl: async () => {},
+      retryIntervalMs: 1,
+      retryMaxMs: 0,
+    })
+    expect(r.status).toBe('fail')
+    expect(r.nextStep).toMatch(/journalctl/)
+    expect(r.nextStep).toMatch(/switchroom-klanker/)
+  })
+
+  it('attaches a transient-state hint when the unit is activating after retry budget', async () => {
+    const exec = makeSequence([makeSystemctlOutput('activating')])
+    const r = await probeAgentProcess('klanker', {
+      execFileImpl: exec as unknown as (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>,
+      sleepImpl: async () => {},
+      retryIntervalMs: 1,
+      retryMaxMs: 0,
+    })
+    expect(r.status).toBe('degraded')
+    expect(r.nextStep).toMatch(/transient/)
+    expect(r.nextStep).toMatch(/`activating`/)
+  })
+
+  it('attaches a docker-restart hint when no claude process is found in container', async () => {
+    const r = await probeAgentProcess('klanker', {
+      dockerMode: true,
+      dockerProbeImpl: () => ({ status: 'fail', label: 'Agent', detail: 'claude process not found' }),
+    })
+    // The default dockerProbeImpl attaches the nextStep; the test override
+    // doesn't, so re-exercise the production path:
+    const r2 = await probeAgentProcess('klanker', { dockerMode: true })
+    // r2 will likely fail with "claude process not found" in test env.
+    expect(r2.status).toBe('fail')
+    expect(r2.nextStep).toBeDefined()
+    expect(r2.nextStep!).toMatch(/docker/i)
+    // Sanity check on the override path too:
+    expect(r.status).toBe('fail')
+  })
+})
+
+describe('nextStep — quota / hindsight / broker / kernel / scheduler', () => {
+  it('quota: no OAuth token → degraded with login hint', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quota-nextstep-'))
+    const oldCachePath = process.env.SWITCHROOM_QUOTA_CACHE_PATH
+    process.env.SWITCHROOM_QUOTA_CACHE_PATH = join(dir, 'cache.json')
+    try {
+      const r = await probeQuota(dir, dir, (async () => new Response('{}')) as unknown as typeof fetch)
+      expect(r.status).toBe('degraded')
+      expect(r.nextStep).toMatch(/switchroom auth login/)
+    } finally {
+      if (oldCachePath) process.env.SWITCHROOM_QUOTA_CACHE_PATH = oldCachePath
+      else delete process.env.SWITCHROOM_QUOTA_CACHE_PATH
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('broker: socket missing → fail with docker compose hint', async () => {
+    const r = await probeBroker('/nonexistent/sock', { dockerMode: true })
+    expect(r.status).toBe('fail')
+    expect(r.nextStep).toMatch(/docker compose/)
+    expect(r.nextStep).toMatch(/vault-broker/)
+  })
+
+  it('kernel: socket missing → fail with docker compose hint', async () => {
+    const r = await probeKernel('/nonexistent/sock', { dockerMode: true })
+    expect(r.status).toBe('fail')
+    expect(r.nextStep).toMatch(/docker compose/)
+    expect(r.nextStep).toMatch(/approval-kernel/)
+  })
+
+  it('scheduler: no lockfile → fail with restart hint (or settling hint inside fresh-boot window)', async () => {
+    const fs: SchedulerFsImpl = { exists: () => false, readFile: () => '', mtimeMs: () => 0 }
+    const r = await probeScheduler('klanker', {
+      dockerMode: true,
+      fs,
+      lockPath: '/state/agent/scheduler.lock',
+      jsonlPath: '/state/agent/scheduler.jsonl',
+      now: () => Date.now(),
+      containerBootTimeMs: null, // disable softening
+    })
+    expect(r.status).toBe('fail')
+    expect(r.nextStep).toMatch(/restart/)
+  })
+
+  it('scheduler: lockfile holder pid dead → degraded with re-check hint', async () => {
+    const fs: SchedulerFsImpl = {
+      exists: (p) => p === '/state/agent/scheduler.lock',
+      readFile: () => '99999\n',
+      mtimeMs: () => 0,
+    }
+    const r = await probeScheduler('klanker', {
+      dockerMode: true,
+      fs,
+      lockPath: '/state/agent/scheduler.lock',
+      jsonlPath: '/state/agent/scheduler.jsonl',
+      isAlive: () => false,
+      now: () => Date.now(),
+      containerBootTimeMs: null,
+    })
+    expect(r.status).toBe('degraded')
+    expect(r.nextStep).toMatch(/re-check/i)
+  })
+})
 })
