@@ -28,6 +28,13 @@ export interface ProbeResult {
   status: ProbeStatus
   label: string
   detail: string
+  /** Plain-text remediation hint shown beneath the degraded row in the
+   *  boot card. Per `reference/principles.md` principle 1, every failure
+   *  should tell the user what to do next — naming the failure without a
+   *  next step is the explicit ❌ Bad pattern. Omitted on ok rows (they
+   *  don't render) and on degraded rows where no actionable hint exists.
+   */
+  nextStep?: string
   /** True when a 429 caused the probe to skip the live check. Used by
    *  writeQuotaCache to select the short RATE_LIMIT_TTL_MS instead of the
    *  default 5-min TTL. Keying off this boolean avoids matching on the
@@ -125,7 +132,12 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
 
     const acc = cfg.oauthAccount
     if (!acc?.emailAddress) {
-      return { status: 'degraded', label: 'Account', detail: 'not signed in' }
+      return {
+        status: 'degraded',
+        label: 'Account',
+        detail: 'not signed in',
+        nextStep: 'Run `switchroom auth login <agent>` to start the OAuth flow',
+      }
     }
 
     const plan = mapPlan(acc.billingType, acc.hasExtraUsageEnabled)
@@ -154,10 +166,16 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
       }
     }
 
+    const nextStep = status === 'fail'
+      ? 'OAuth token expired. Run `switchroom auth login <agent>` to re-authenticate.'
+      : status === 'degraded'
+        ? 'Token expiring soon. Run `switchroom auth login <agent>` before it lapses.'
+        : undefined
     return {
       status,
       label: 'Account',
       detail: `${acc.emailAddress} · ${plan}${tokenStr}`,
+      ...(nextStep ? { nextStep } : {}),
     }
   })())
 }
@@ -1236,7 +1254,7 @@ export async function probeKernel(
  */
 export async function probeSkills(
   agentDir: string,
-  opts: { fs?: SkillsFsImpl; maxNamesShown?: number } = {},
+  opts: { fs?: SkillsFsImpl; maxNamesShown?: number; agentName?: string } = {},
 ): Promise<ProbeResult> {
   return withTimeout('Skills', (async (): Promise<ProbeResult> => {
     const fs = opts.fs ?? realSkillsFs
@@ -1282,10 +1300,12 @@ export async function probeSkills(
     }
     const named = dangling.slice(0, max).join(', ')
     const more = dangling.length > max ? ` +${dangling.length - max} more` : ''
+    const reconcileTarget = opts.agentName ? ` ${opts.agentName}` : ''
     return {
       status: 'degraded',
       label: 'Skills',
       detail: `${dangling.length}/${entries.length} dangling: ${named}${more}`,
+      nextStep: `Run \`switchroom agent reconcile${reconcileTarget}\` to rebuild symlinks, or remove unused entries from switchroom.yaml`,
     }
   })())
 }

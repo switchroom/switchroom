@@ -279,6 +279,18 @@ export interface RenderBootCardOpts {
  * user only needs to know the agent came back up. Anything red catches
  * the eye; everything else stays out of the way.
  */
+/**
+ * Render a probe's `nextStep` hint as Telegram HTML. The hint is
+ * authored as plain text with backtick-quoted commands (one shell idiom
+ * across the codebase — search "Run `switchroom"). We translate those
+ * to <code> spans and escape everything else, so commands stay tap-to-
+ * copy on mobile without bleeding raw HTML through.
+ */
+function renderNextStep(text: string): string {
+  const parts = text.split('`')
+  return parts.map((p, i) => (i % 2 === 0 ? escapeHtml(p) : `<code>${escapeHtml(p)}</code>`)).join('')
+}
+
 export function renderBootCard(opts: RenderBootCardOpts): string {
   const { agentName, version, probes, restartReason, restartAgeMs } = opts
   const ackEmoji = restartReason ? REASON_EMOJI[restartReason] : '✅'
@@ -295,10 +307,16 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
       ? ` · ${(restartAgeMs / 1000).toFixed(1)}s ago`
       : ''
     degradedRows.push(`⚠️ <b>Restart</b>  ${escapeHtml(REASON_LABEL.crash)}${ageStr}`)
+    // Principle 1: every failure carries its next step. The crash row
+    // tells the user how to inspect why.
+    degradedRows.push(`    ↳ Tail logs: <code>journalctl --user -u switchroom-${escapeHtml(agentName)} -n 100</code>`)
   }
 
   // Probe rows — only those that surfaced as degraded/fail. Healthy
-  // (`ok`) probes don't render at all.
+  // (`ok`) probes don't render at all. When a probe carries a nextStep,
+  // it renders as an indented continuation line beneath the row — see
+  // `reference/principles.md` principle 1 ("If they need the docs, we've
+  // failed"): every failure surface tells the user what to run.
   if (probes) {
     for (const key of PROBE_KEYS) {
       const r = probes[key]
@@ -306,6 +324,9 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
       if (r.status === 'ok') continue
       const dot = DOT[r.status] ?? DOT.fail
       degradedRows.push(`${dot} <b>${PROBE_LABELS[key]}</b>  ${escapeHtml(r.detail)}`)
+      if (r.nextStep) {
+        degradedRows.push(`    ↳ ${renderNextStep(r.nextStep)}`)
+      }
     }
   }
 
@@ -432,7 +453,7 @@ export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
     probeScheduler(slug, { dockerMode: opts.dockerMode }).then(r => { probes.scheduler = r }),
     probeBroker(undefined, { dockerMode: opts.dockerMode }).then(r => { probes.broker = r }),
     probeKernel(undefined, { dockerMode: opts.dockerMode }).then(r => { probes.kernel = r }),
-    probeSkills(opts.agentDir).then(r => { probes.skills = r }),
+    probeSkills(opts.agentDir, { agentName: opts.agentSlug ?? opts.agentName }).then(r => { probes.skills = r }),
   ])
 
   return probes
