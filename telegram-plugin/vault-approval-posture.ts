@@ -29,7 +29,11 @@ export interface ResolvedPosture {
 export function resolveVaultApprovalPosture(
   broker: VaultBrokerPostureConfig | undefined,
   reader: (path: string) => string,
-  env: { HOME?: string } = process.env,
+  // Accept the wider `NodeJS.ProcessEnv` shape so callers can pass
+  // `process.env` directly. The narrow `{ HOME?: string }` shape this
+  // had before tripped tsc (TS2559 — no overlap with ProcessEnv) under
+  // the strict plugin-references lint check.
+  env: NodeJS.ProcessEnv | { HOME?: string } = process.env,
 ): ResolvedPosture {
   if (broker?.approvalAuth !== 'telegram-id') {
     return { mode: 'passphrase', passphrase: null }

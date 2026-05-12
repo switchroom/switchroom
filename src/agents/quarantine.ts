@@ -53,7 +53,17 @@ export const QUARANTINE_FILENAME = "quarantine.json";
  * the operator remediation) when extending quarantine to new failure
  * modes — e.g. "vault permanently sealed", "agent UID mismatch".
  */
-export type QuarantineReason = "startup.unauthorized";
+export type QuarantineReason =
+  | "startup.unauthorized"
+  // Config-class refusal-to-boot. Added 2026-05-13 — the gateway
+  // can now exit EX_CONFIG (78) on a vault-posture config error
+  // (telegram-id posture declared but auto-unlock blob missing /
+  // unreadable / empty). The supervisor in start.sh quarantines on
+  // exit 78 (see _switchroom_supervise's exit-78 short-circuit).
+  // Operator remediation: run `switchroom vault broker
+  // enable-auto-unlock`, OR remove `vault.broker.approvalAuth:
+  // telegram-id` from switchroom.yaml.
+  | "startup.config_error";
 
 export interface QuarantineMarker {
   /** Schema version for forward-compat. Bump if shape changes. */

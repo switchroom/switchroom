@@ -24,7 +24,17 @@ import { join } from 'node:path'
 
 export const QUARANTINE_FILENAME = 'quarantine.json'
 
-export type QuarantineReason = 'startup.unauthorized'
+export type QuarantineReason =
+  | 'startup.unauthorized'
+  // Config-class refusal-to-boot. Added 2026-05-13 after the
+  // vault-posture init started throwing as an unhandled rejection
+  // when the operator declared telegram-id posture but the auto-
+  // unlock blob couldn't be read. Pre-fix that path produced a tight
+  // restart loop ($n/60s -> hit supervisor cap -> stop) and posted
+  // an "agent-crashed" event per restart. The right outcome is a
+  // single EX_CONFIG exit at the first failure → supervisor
+  // quarantines → operator sees one clean error.
+  | 'startup.config_error'
 
 export interface QuarantineMarker {
   v: 1

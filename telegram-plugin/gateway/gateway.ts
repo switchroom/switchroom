@@ -12390,7 +12390,33 @@ void (async () => {
   // blob and holds the plaintext passphrase in memory for silent
   // fallback when the operator taps Approve. Default-passphrase mode is
   // a no-op.
-  initVaultApprovalPosture()
+  try {
+    initVaultApprovalPosture()
+  } catch (err) {
+    // Config-class refusal-to-boot: the operator declared
+    // `vault.broker.approvalAuth: telegram-id` in switchroom.yaml but
+    // the machine-bound auto-unlock blob is missing / unreadable /
+    // empty. Pre-fix (#1115 follow-up, 2026-05-13) this throw bubbled
+    // up as an unhandled rejection — the supervisor treated it as a
+    // tight crash loop and posted an "agent-crashed" event on every
+    // restart until the 10-in-60s cap kicked in. The right outcome is
+    // EX_CONFIG (78) on the first failure so the supervisor
+    // quarantines (see _switchroom_supervise's exit-78 short-circuit
+    // in profiles/_base/start.sh.hbs) and the operator sees ONE
+    // clean error in the log + the quarantine marker.
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `telegram gateway: vault-posture-init-config-error — refusing to boot. ${msg}\n`,
+    )
+    try {
+      writeQuarantineMarker(STATE_DIR, 'startup.config_error', msg)
+    } catch (qerr) {
+      process.stderr.write(
+        `telegram gateway: failed to write quarantine marker: ${(qerr as Error).message}\n`,
+      )
+    }
+    process.exit(78)
+  }
 
   for (let attempt = 1; ; attempt++) {
     try {
