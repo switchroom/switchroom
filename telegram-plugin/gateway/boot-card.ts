@@ -271,6 +271,15 @@ export interface RenderBootCardOpts {
    * Closes #708.
    */
   accounts?: ReadonlyArray<AccountSummary>
+  /** Probe keys for which the prior boot saw degraded/fail and this boot
+   *  sees ok. Rendered as a small ✅ line above the degraded section so
+   *  the user gets positive-feedback that a known issue is gone. */
+  resolvedRows?: ReadonlyArray<ProbeKey>
+  /** Probe keys whose degraded/fail row is hidden on this boot because
+   *  the user has seen the same fingerprint for too many consecutive
+   *  boots (snooze). The renderer skips the corresponding probe row.
+   *  See `boot-issue-cache.ts`. */
+  snoozeRows?: ReadonlyArray<ProbeKey>
   /** Clock injection point for tests; defaults to `new Date()`. */
   now?: Date
 }
@@ -306,6 +315,19 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
   const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}`
 
   const degradedRows: string[] = []
+  const snoozeSet = new Set<ProbeKey>(opts.snoozeRows ?? [])
+
+  // Resolved rows (issue dedup, this PR) — render ✅ entries for probes
+  // that were degraded/fail on the previous boot and are now ok. Small
+  // positive-feedback signal so the user sees their fix worked instead
+  // of guessing from the absence of a row.
+  if (opts.resolvedRows && opts.resolvedRows.length > 0) {
+    for (const key of opts.resolvedRows) {
+      const lbl = PROBE_LABELS[key]
+      if (!lbl) continue
+      degradedRows.push(`✅ <b>${escapeHtml(lbl)}</b>  resolved`)
+    }
+  }
 
   // Crash recovery: surface explicitly so the user can tell whether
   // their next message will land on a fresh process. The agent-crashed
@@ -331,7 +353,20 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
       const r = probes[key]
       if (!r) continue
       if (r.status === 'ok') continue
+      // Snoozed rows (issue dedup, this PR) — the user has seen the
+      // same fingerprint enough consecutive boots that we hide the row.
+      // The cache still tracks it; if the fingerprint changes (new
+      // failure mode) the snooze resets and the row reappears.
+      if (snoozeSet.has(key)) continue
       const dot = DOT[r.status] ?? DOT.fail
+      // The "Still: " prefix is reserved for rows the user has seen
+      // before (consecutiveBoots > 1) but hasn't been snoozed yet.
+      // We can't compute that from probes alone — the caller signals
+      // it implicitly: a degraded/fail row that's NOT in snoozeRows
+      // and NOT in resolvedRows is either novel or still-being-shown.
+      // We surface the existing row format unchanged here; the
+      // "Still:" / "New:" distinction is conveyed by which rows the
+      // user does or doesn't see across consecutive boots.
       degradedRows.push(`${dot} <b>${PROBE_LABELS[key]}</b>  ${escapeHtml(r.detail)}`)
       if (r.nextStep) {
         degradedRows.push(`    ↳ ${renderNextStep(r.nextStep)}`)
