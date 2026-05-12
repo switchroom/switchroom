@@ -404,10 +404,36 @@ export function uptimeMsForStarttime(
   }
 }
 
+/**
+ * Compute a remediation hint for a non-active agent systemd state. Returns
+ * `undefined` when no actionable hint applies. Per `reference/principles.md`
+ * principle 1, every degraded/fail row should tell the user what to do next.
+ * Hints share a common journalctl shape so they're greppable across
+ * agents.
+ */
+function nextStepForAgentState(agentName: string, state: string): string | undefined {
+  if (state === 'failed') {
+    return `Service failed — inspect with \`journalctl --user -u switchroom-${agentName} -n 100\` then \`switchroom agent restart ${agentName}\``
+  }
+  if (state === 'inactive') {
+    return `Service inactive — start with \`switchroom agent start ${agentName}\` (or \`systemctl --user start switchroom-${agentName}\`)`
+  }
+  if (state === 'deactivating' || state === 'activating' || state === 'auto-restart') {
+    return `Service is in a transient \`${state}\` state — re-check with \`switchroom agent status ${agentName}\` in a few seconds`
+  }
+  // Unknown state — keep the door open with a generic hint.
+  return `Inspect with \`journalctl --user -u switchroom-${agentName} -n 100\``
+}
+
 function probeAgentProcessDocker(): ProbeResult {
   const found = findAgentProcessInContainer()
   if (!found) {
-    return { status: 'fail', label: 'Agent', detail: 'claude process not found' }
+    return {
+      status: 'fail',
+      label: 'Agent',
+      detail: 'claude process not found',
+      nextStep: 'No claude process in container — check container logs with `docker logs <container>` and restart with `switchroom agent restart <agent>`',
+    }
   }
   const uptimeMs = uptimeMsForStarttime(found.starttime)
   const mb = Math.round(found.rssKb / 1024)
@@ -596,7 +622,8 @@ export async function probeAgentProcess(
           state === 'activating' ||
           state === 'auto-restart'
         const status = isTransient ? 'degraded' : 'fail'
-        return { status, label: 'Agent', detail: `service ${state}` }
+        const nextStep = nextStepForAgentState(agentName, state)
+        return { status, label: 'Agent', detail: `service ${state}`, ...(nextStep ? { nextStep } : {}) }
       }
 
       // Still within retry budget — wait and try again.
@@ -707,7 +734,8 @@ export async function* watchAgentProcess(
       state === 'auto-restart' ||
       state === 'inactive'
     const status = isTransient ? 'degraded' : 'fail'
-    return { status, label: 'Agent', detail: `service ${state}` }
+    const nextStep = nextStepForAgentState(agentName, state)
+    return { status, label: 'Agent', detail: `service ${state}`, ...(nextStep ? { nextStep } : {}) }
   }
 
   while (true) {
@@ -824,7 +852,12 @@ export async function probeQuota(
       }
     }
     if (!token) {
-      return { status: 'degraded', label: 'Quota', detail: 'no OAuth token' }
+      return {
+        status: 'degraded',
+        label: 'Quota',
+        detail: 'no OAuth token',
+        nextStep: 'No OAuth token on disk — run `switchroom auth login <agent>` to authenticate',
+      }
     }
 
     let resp: Response
@@ -868,7 +901,15 @@ export async function probeQuota(
       return rateLimitResult
     }
     if (!resp.ok) {
-      return { status: 'degraded', label: 'Quota', detail: `HTTP ${resp.status}` }
+      const nextStep = resp.status === 401 || resp.status === 403
+        ? 'Auth rejected by Anthropic — re-authenticate with `switchroom auth login <agent>`'
+        : 'Anthropic quota endpoint returned an error — re-check after a minute; if persistent, `switchroom auth login <agent>`'
+      return {
+        status: 'degraded',
+        label: 'Quota',
+        detail: `HTTP ${resp.status}`,
+        nextStep,
+      }
     }
 
     let body: unknown
@@ -948,7 +989,12 @@ export async function probeHindsight(
     }
 
     if (!resp || !resp.ok) {
-      return { status: 'fail', label: 'Hindsight', detail: 'unreachable' }
+      return {
+        status: 'fail',
+        label: 'Hindsight',
+        detail: 'unreachable',
+        nextStep: 'Hindsight server not responding on 127.0.0.1:18888 — start it with `hindsight serve` or check `systemctl --user status hindsight`',
+      }
     }
 
     const bankSuffix = bankName ? ` · bank=${bankName}` : ''
@@ -1108,6 +1154,9 @@ export async function probeScheduler(
         status: stillSettling ? 'degraded' : 'fail',
         label: 'Scheduler',
         detail: `sidecar not running (no lockfile)${settlingNote}`,
+        nextStep: stillSettling
+          ? 'Scheduler sidecar still starting — re-check in 30s'
+          : 'Scheduler sidecar not running — restart the agent with `switchroom agent restart <agent>` so the supervisor relaunches it',
       }
     }
     let holderPid: number | null = null
@@ -1116,16 +1165,27 @@ export async function probeScheduler(
       const parsed = Number.parseInt(raw, 10)
       if (Number.isInteger(parsed) && parsed > 0) holderPid = parsed
     } catch {
-      return { status: 'degraded', label: 'Scheduler', detail: 'lockfile unreadable' }
+      return {
+        status: 'degraded',
+        label: 'Scheduler',
+        detail: 'lockfile unreadable',
+        nextStep: `Inspect with \`cat ${lockPath}\` — if corrupt, remove it and restart the agent so the supervisor recreates the sidecar`,
+      }
     }
     if (holderPid == null) {
-      return { status: 'degraded', label: 'Scheduler', detail: 'lockfile contents invalid' }
+      return {
+        status: 'degraded',
+        label: 'Scheduler',
+        detail: 'lockfile contents invalid',
+        nextStep: `Inspect with \`cat ${lockPath}\` — if corrupt, remove it and restart the agent so the supervisor recreates the sidecar`,
+      }
     }
     if (!isAlive(holderPid)) {
       return {
         status: 'degraded',
         label: 'Scheduler',
         detail: `lock holder pid ${holderPid} not alive (supervisor restart in progress?)`,
+        nextStep: 'Supervisor should relaunch the sidecar shortly — re-check in 30s; if still stale, restart the agent',
       }
     }
 
@@ -1173,14 +1233,24 @@ async function probeUds(
     return { status: 'ok', label, detail: 'n/a (non-docker)' }
   }
   if (!socketPath) {
-    return { status: 'fail', label, detail: 'socket path not configured' }
+    return {
+      status: 'fail',
+      label,
+      detail: 'socket path not configured',
+      nextStep: udsNextStep(label, 'unconfigured'),
+    }
   }
   return withTimeout(label, (async (): Promise<ProbeResult> => {
     if (!opts.connectImpl) {
       // Cheap pre-check: stat the file. Saves the connect round-trip on
       // the common "broker container down → bind mount empty" case.
       if (!existsSync(socketPath)) {
-        return { status: 'fail', label, detail: `socket missing: ${socketPath}` }
+        return {
+          status: 'fail',
+          label,
+          detail: `socket missing: ${socketPath}`,
+          nextStep: udsNextStep(label, 'missing'),
+        }
       }
     }
     const connect = opts.connectImpl ?? defaultUdsConnect
@@ -1190,11 +1260,29 @@ async function probeUds(
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException)?.code
       const msg = (err as Error)?.message ?? String(err)
-      if (code === 'ENOENT') return { status: 'fail', label, detail: 'socket missing' }
-      if (code === 'ECONNREFUSED') return { status: 'fail', label, detail: 'connection refused' }
-      return { status: 'fail', label, detail: `connect failed: ${msg}` }
+      if (code === 'ENOENT') return { status: 'fail', label, detail: 'socket missing', nextStep: udsNextStep(label, 'missing') }
+      if (code === 'ECONNREFUSED') return { status: 'fail', label, detail: 'connection refused', nextStep: udsNextStep(label, 'refused') }
+      return { status: 'fail', label, detail: `connect failed: ${msg}`, nextStep: udsNextStep(label, 'other') }
     }
   })())
+}
+
+/**
+ * Remediation hints for the UDS (vault-broker / approval-kernel) probe.
+ * Both services are run by docker-compose alongside agents; recovery is
+ * almost always the same shape ("the service container isn't up"), so we
+ * surface the right `docker compose` target per label.
+ */
+function udsNextStep(label: string, kind: 'missing' | 'refused' | 'unconfigured' | 'other'): string {
+  const svc = label.toLowerCase() === 'broker' ? 'vault-broker' : 'approval-kernel'
+  if (kind === 'unconfigured') {
+    return `${label} socket path not set — check the compose mount for the agent container`
+  }
+  if (kind === 'refused') {
+    return `${label} socket present but not accepting connections — restart with \`docker compose restart ${svc}\``
+  }
+  // missing | other: most common case is the daemon container isn't running.
+  return `${label} socket not reachable — bring up the daemon with \`docker compose up -d ${svc}\` (or check \`docker compose ps\`)`
 }
 
 /**
