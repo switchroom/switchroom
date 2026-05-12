@@ -4,10 +4,14 @@
 #   buildkite-agent pipeline upload
 # so this file is loaded on every build.
 #
-# Runs on Buildkite-hosted agents (queue: hosted, LINUX_AMD64_2X4 shape) so
-# no self-hosted infrastructure is required. Bun is bootstrapped per-step
-# because the default hosted image doesn't include it; we cache it under
-# ~/.bun across builds via the hosted-agent built-in cache.
+# Most steps run on Buildkite-hosted agents (queue: hosted,
+# LINUX_AMD64_2X4 shape). The `:robot: UAT fuzz` step is the only
+# exception — it targets the self-hosted `uat-host` queue because it
+# drives a real mtcute MTProto session against a live test-harness
+# Docker agent (see `.buildkite/README.md` § "UAT fuzz step"). Bun is
+# bootstrapped per-step because the default hosted image doesn't
+# include it; we cache it under ~/.bun across builds via the
+# hosted-agent built-in cache.
 #
 # Auth for the eval stages:
 #   The eval steps fetch CLAUDE_CODE_OAUTH_TOKEN from the cluster secret

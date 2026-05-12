@@ -133,22 +133,35 @@ Buildkite Cluster API or web UI → Cluster → Secrets):
 To provision (one-time, then per-rotation):
 
 ```bash
-# Read the live vault values (run on the UAT host, in the test-harness
-# container's ACL — see telegram-plugin/uat/SETUP.md §6).
-ID=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-api-id)
-HASH=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-api-hash)
-SESSION=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-driver-session)
-
-# Push to Buildkite cluster secret store.
-# (Use the BK API or web UI; do NOT echo the SESSION value to a shell
-# history or log line.)
-buildkite-agent secret create --cluster <cluster> TELEGRAM_API_ID "$ID"
-buildkite-agent secret create --cluster <cluster> TELEGRAM_API_HASH "$HASH"
-buildkite-agent secret create --cluster <cluster> TELEGRAM_UAT_DRIVER_SESSION "$SESSION"
-buildkite-agent secret create --cluster <cluster> TELEGRAM_TEST_BOT_USERNAME "meken_switchroom_test_bot"
-
-unset ID HASH SESSION
+# 1. Read the live vault values on the UAT host, in the test-harness
+#    container's ACL (see telegram-plugin/uat/SETUP.md §6).
+docker exec switchroom-test-harness switchroom vault get telegram-uat-api-id
+docker exec switchroom-test-harness switchroom vault get telegram-uat-api-hash
+docker exec switchroom-test-harness switchroom vault get telegram-uat-driver-session
+# Bot username is the BotFather username without `@`, e.g.
+# `meken_switchroom_test_bot`.
 ```
+
+Then push each value to the Buildkite cluster secret store via the
+**REST API** or the **Web UI** — the `buildkite-agent secret`
+subcommand on the agent only exposes `get`, not `create`. REST API
+example (one secret; repeat for each of the four keys):
+
+```bash
+BUILDKITE_API_TOKEN=$(switchroom vault get buildkite-api-token)
+ORG="<your-org-slug>"
+CLUSTER_ID="<your-cluster-uuid>"
+curl -fsSL -X POST \
+  -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"TELEGRAM_API_ID","value":"…","description":"UAT fuzz"}' \
+  "https://api.buildkite.com/v2/organizations/$ORG/clusters/$CLUSTER_ID/secrets"
+```
+
+Existing secrets are updated via `PATCH` against the same path with
+the secret's UUID. Do not echo `TELEGRAM_UAT_DRIVER_SESSION` to
+terminal history or copy/paste it through a chat-style channel —
+it is bearer-equivalent to the driver Telegram user account.
 
 If any of the four secrets is missing at build time the step posts a
 warning annotation and exits 0 (soft-skip), so a rotation in flight
