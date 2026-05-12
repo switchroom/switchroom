@@ -7,11 +7,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
 import {
+  probeAccount,
   probeAgentProcess,
   probeScheduler,
   probeBroker,
@@ -852,6 +853,67 @@ describe('probeSkills', () => {
     const result = await probeSkills(agentDir, { fs: wrappedFs })
     expect(result.status).toBe('ok')
     expect(result.detail).toBe('0 skills')
+  })
+})
+
+// ── probeAccount nextStep interpolation (PR #1081 reviewer follow-up) ─────
+
+describe('probeAccount — nextStep agent-name interpolation', () => {
+  let tmpDir: string
+
+  function setupAgentDir(claudeJson: Record<string, unknown>, tokenMeta?: { expiresAt: number }): string {
+    const agentDir = mkdtempSync(join(tmpdir(), 'probe-account-'))
+    const claudeDir = join(agentDir, '.claude')
+    mkdirSync(claudeDir, { recursive: true })
+    writeFileSync(join(claudeDir, '.claude.json'), JSON.stringify(claudeJson))
+    if (tokenMeta) {
+      writeFileSync(join(claudeDir, '.oauth-token.meta.json'), JSON.stringify(tokenMeta))
+    }
+    return agentDir
+  }
+
+  afterEach(() => {
+    if (tmpDir) {
+      try { rmSync(tmpDir, { recursive: true, force: true }) } catch {}
+    }
+  })
+
+  it('not-signed-in hint interpolates agentName instead of <agent>', async () => {
+    tmpDir = setupAgentDir({})
+    const result = await probeAccount(tmpDir, { agentName: 'finn' })
+    expect(result.status).toBe('degraded')
+    expect(result.detail).toBe('not signed in')
+    expect(result.nextStep).toBeDefined()
+    expect(result.nextStep).toContain('switchroom auth login finn')
+    expect(result.nextStep).not.toContain('<agent>')
+  })
+
+  it('expired-token hint interpolates agentName', async () => {
+    tmpDir = setupAgentDir(
+      { oauthAccount: { emailAddress: 'me@example.com', billingType: 'max' } },
+      { expiresAt: Date.now() - 86_400_000 }, // expired yesterday
+    )
+    const result = await probeAccount(tmpDir, { agentName: 'klanker' })
+    expect(result.status).toBe('fail')
+    expect(result.nextStep).toContain('switchroom auth login klanker')
+    expect(result.nextStep).not.toContain('<agent>')
+  })
+
+  it('expiring-soon hint interpolates agentName', async () => {
+    tmpDir = setupAgentDir(
+      { oauthAccount: { emailAddress: 'me@example.com', billingType: 'max' } },
+      { expiresAt: Date.now() + 3 * 86_400_000 }, // 3 days left (< 7)
+    )
+    const result = await probeAccount(tmpDir, { agentName: 'lawgpt' })
+    expect(result.status).toBe('degraded')
+    expect(result.nextStep).toContain('switchroom auth login lawgpt')
+    expect(result.nextStep).not.toContain('<agent>')
+  })
+
+  it('falls back to <agent> placeholder when no agentName provided (backwards-compat)', async () => {
+    tmpDir = setupAgentDir({})
+    const result = await probeAccount(tmpDir)
+    expect(result.nextStep).toContain('<agent>')
   })
 })
 

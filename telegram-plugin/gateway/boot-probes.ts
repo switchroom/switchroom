@@ -118,10 +118,18 @@ const TOKEN_EXPIRING_SOON_DAYS = 7
  * Read account info from the agent's .claude.json.
  * agentDir: e.g. /home/user/.switchroom/agents/clerk
  */
-export async function probeAccount(agentDir: string): Promise<ProbeResult> {
+export async function probeAccount(
+  agentDir: string,
+  opts: { agentName?: string } = {},
+): Promise<ProbeResult> {
   return withTimeout('Account', (async (): Promise<ProbeResult> => {
     const claudeDir = join(agentDir, '.claude')
     const claudeJsonPath = join(claudeDir, '.claude.json')
+    // Fall back to the literal placeholder only when no agentName is plumbed
+    // through — the renderer's <code> escape will keep that safe in Telegram
+    // HTML, but real call sites should always pass the name so users can
+    // tap-to-copy a working command.
+    const agentRef = opts.agentName ?? '<agent>'
     let cfg: ClaudeJson = {}
     try {
       const raw = readFileSync(claudeJsonPath, 'utf8')
@@ -136,7 +144,7 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
         status: 'degraded',
         label: 'Account',
         detail: 'not signed in',
-        nextStep: 'Run `switchroom auth login <agent>` to start the OAuth flow',
+        nextStep: `Run \`switchroom auth login ${agentRef}\` to start the OAuth flow`,
       }
     }
 
@@ -167,9 +175,9 @@ export async function probeAccount(agentDir: string): Promise<ProbeResult> {
     }
 
     const nextStep = status === 'fail'
-      ? 'OAuth token expired — run `switchroom auth login <agent>` to re-authenticate'
+      ? `OAuth token expired — run \`switchroom auth login ${agentRef}\` to re-authenticate`
       : status === 'degraded'
-        ? 'Token expiring soon — run `switchroom auth login <agent>` before it lapses'
+        ? `Token expiring soon — run \`switchroom auth login ${agentRef}\` before it lapses`
         : undefined
     return {
       status,
