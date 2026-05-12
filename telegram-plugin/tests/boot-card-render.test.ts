@@ -307,3 +307,60 @@ describe('resolvePersonaName — persona name over slug (#169)', () => {
     expect(out).not.toContain('<b>finn</b>')
   })
 })
+
+// ── Issue dedup rendering ──────────────────────────────────────────────────
+// Resolved rows render at the top of the degraded section; snoozed rows
+// suppress the matching probe row entirely.
+
+describe('renderBootCard — resolved / snooze rendering', () => {
+  it('renders a ✅ "resolved" row for each entry in resolvedRows above the degraded section', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      probes: {
+        broker: { status: 'fail', label: 'Broker', detail: 'socket missing' },
+      },
+      resolvedRows: ['hindsight'],
+    })
+    expect(out).toContain('✅ <b>Hindsight</b>  resolved')
+    expect(out).toContain('🔴 <b>Broker</b>  socket missing')
+    // Resolved appears BEFORE Broker.
+    expect(out.indexOf('Hindsight')).toBeLessThan(out.indexOf('Broker'))
+  })
+
+  it('skips a degraded row when its probe key is in snoozeRows', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      probes: {
+        broker: { status: 'fail', label: 'Broker', detail: 'socket missing' },
+        kernel: { status: 'fail', label: 'Kernel', detail: 'socket missing' },
+      },
+      snoozeRows: ['broker'],
+    })
+    expect(out).not.toContain('Broker')
+    expect(out).toContain('Kernel')
+  })
+
+  it('snoozed everything → output is the bare ack line (silent-when-snoozed)', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v0.1',
+      probes: {
+        broker: { status: 'fail', label: 'Broker', detail: 'socket missing' },
+      },
+      snoozeRows: ['broker'],
+    })
+    expect(out).toBe('✅ <b>k</b> back up · v0.1')
+  })
+
+  it('resolvedRows alone (no probes degraded) renders the resolved row beneath the ack', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      resolvedRows: ['skills', 'broker'],
+    })
+    expect(out).toContain('✅ <b>Skills</b>  resolved')
+    expect(out).toContain('✅ <b>Broker</b>  resolved')
+  })
+})
