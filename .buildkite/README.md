@@ -98,6 +98,19 @@ bot in a real supergroup — it cannot run on the stock hosted queue.
   random agents in parallel would interfere with itself and with the
   manual UAT workflow.
 
+### Cluster env opt-in
+
+The UAT step is gated on a cluster env var so it doesn't hang every
+PR while you're still provisioning the agent + secrets:
+
+```
+SWITCHROOM_UAT_GATE_ENABLED=true
+```
+
+Set this **last** — only after the agent is online and the four
+secrets exist. Before that, the step's `if:` condition evaluates to
+false and the step is omitted entirely.
+
 ### Setting up the `uat-host` self-hosted agent (one-time)
 
 On the box that already runs `test-harness` + `switchroom-vault-broker`:
