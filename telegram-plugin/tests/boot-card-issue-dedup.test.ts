@@ -193,7 +193,7 @@ describe('loadCache / applyAndSave — persistence', () => {
     const diff = diffProbes(probes, empty, { now: () => 1000 })
     applyAndSave(path, empty, diff)
     expect(existsSync(path)).toBe(true)
-    const loaded = loadCache(path)
+    const loaded = loadCache(path, () => 1000) // same clock as the diff
     expect(loaded.probes.broker?.fingerprint).toBe(diff.broker?.fingerprint)
   })
 
@@ -206,11 +206,12 @@ describe('loadCache / applyAndSave — persistence', () => {
       },
     }
     writeFileSync(path, JSON.stringify(seed))
-    const loaded = loadCache(path)
+    const loaded = loadCache(path, () => 1000)
+    expect(loaded.probes.broker).toBeDefined()
     const probes: ProbeMap = { broker: { status: 'ok', label: 'Broker', detail: 'reachable' } }
     const diff = diffProbes(probes, loaded, { now: () => 1000 })
     applyAndSave(path, loaded, diff)
-    const reloaded = loadCache(path)
+    const reloaded = loadCache(path, () => 1000)
     expect(reloaded.probes.broker).toBeUndefined()
   })
 
