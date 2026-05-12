@@ -187,11 +187,11 @@ describe('renderBootCard — degraded conditions', () => {
           status: 'fail',
           label: 'Account',
           detail: 'expired',
-          nextStep: 'Run `foo <bar> "baz"` to fix',
+          nextStep: 'Run `foo <bar> & baz` to fix',
         },
       },
     })
-    expect(out).toContain('<code>foo &lt;bar&gt; &quot;baz&quot;</code>')
+    expect(out).toContain('<code>foo &lt;bar&gt; &amp; baz</code>')
     expect(out).not.toContain('<bar>')
   })
 
