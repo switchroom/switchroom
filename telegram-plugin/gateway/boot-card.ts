@@ -50,6 +50,12 @@ import {
   AGENT_LIVE_POLL_INTERVAL_MS,
 } from './boot-probes.js'
 import { escapeHtml } from '../card-format.js'
+import {
+  loadCache as loadBootIssueCache,
+  diffProbes as diffBootProbes,
+  applyAndSave as saveBootIssueCache,
+  type ProbeDiffMap,
+} from './boot-issue-cache.js'
 import { join } from 'path'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
 
@@ -471,6 +477,15 @@ export interface RunProbesOpts {
   /** When true, resolve the agent PID via cgroup walk instead of MainPID
    *  (which is the tmux server pid under tmux supervisor). */
   tmuxSupervisor?: boolean
+  /** Path to the per-agent boot-issue cache file. When set, the
+   *  post-settle render applies snooze + resolved-row dedup against
+   *  prior boots (see `boot-issue-cache.ts`). Omit to disable dedup
+   *  entirely (legacy behaviour). */
+  bootIssueCachePath?: string
+  /** Override snoozeBoots threshold for tests. */
+  snoozeBoots?: number
+  /** Override snoozeMs threshold for tests. */
+  snoozeMs?: number
   /** When true, the gateway is running inside an agent docker container.
    *  Probes that depend on systemctl (Agent, Crons) switch to /proc walks
    *  and externally-managed surface text instead of execing systemctl
@@ -580,6 +595,38 @@ export async function startBootCard(
           }
         }
 
+        // Issue-dedup diff: when a cache path is configured, compare this
+        // boot's probe outcomes against the cached fingerprints to derive
+        // resolvedRows (was bad, now ok) and snoozeRows (same fingerprint
+        // shown too many consecutive boots). One disk read up-front, one
+        // disk write on the way out — no second write from the live-watch
+        // loop below (which reuses the same masks).
+        let diff: ProbeDiffMap = {}
+        let resolvedRows: import('./boot-card.js').ProbeKey[] = []
+        let snoozeRows: import('./boot-card.js').ProbeKey[] = []
+        if (opts.bootIssueCachePath) {
+          try {
+            const cache = loadBootIssueCache(opts.bootIssueCachePath)
+            diff = diffBootProbes(probes, cache, {
+              snoozeBoots: opts.snoozeBoots,
+              snoozeMs: opts.snoozeMs,
+            })
+            for (const [k, d] of Object.entries(diff) as [import('./boot-card.js').ProbeKey, NonNullable<ProbeDiffMap[import('./boot-card.js').ProbeKey]>][]) {
+              if (d.resolved) resolvedRows.push(k)
+              if (d.snoozed) snoozeRows.push(k)
+            }
+            // Persist once. The live-watch loop reuses the same mask in
+            // memory; it does NOT re-write the cache.
+            saveBootIssueCache(opts.bootIssueCachePath, cache, diff)
+          } catch (diffErr: unknown) {
+            logger(
+              `telegram gateway: boot-card: issue-dedup diff failed: ${
+                (diffErr as Error)?.message ?? String(diffErr)
+              }\n`,
+            )
+          }
+        }
+
         // Render with current probe state and edit if anything changed.
         let currentText = renderBootCard({
           agentName: opts.agentName,
@@ -589,6 +636,8 @@ export async function startBootCard(
           restartReason: opts.restartReason,
           restartAgeMs: opts.restartAgeMs,
           ...(accountRows ? { accounts: accountRows } : {}),
+          ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
+          ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
         })
 
         if (currentText !== ackText) {
@@ -636,6 +685,10 @@ export async function startBootCard(
             restartReason: opts.restartReason,
             restartAgeMs: opts.restartAgeMs,
             ...(accountRows ? { accounts: accountRows } : {}),
+            // Reuse the same masks computed once above — no second
+            // cache write from the live-watch loop.
+            ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
+            ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
           })
 
           if (updatedText === currentText) continue
