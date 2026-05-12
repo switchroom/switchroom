@@ -297,7 +297,37 @@ as a long-lived secret.
 When all three are checked, the env block above + `bun run test:uat`
 is safe to run.
 
-## 8. Port allocator vs unix sockets (Phase 1 scaffold note)
+## 8. CI gate — `:robot: UAT fuzz` Buildkite step
+
+Since the buildkite gate landed, the fuzz subset of scenarios
+(`fuzz-random-prompts-dm.test.ts`, `fuzz-extended-dm.test.ts`,
+`fuzz-human-style-dm.test.ts`) runs automatically on every PR that
+touches `telegram-plugin/`, `src/agents/`, or `telegram-plugin/uat/`.
+
+The step runs on a self-hosted Buildkite agent tagged
+`queue=uat-host` that lives on the same box as the `test-harness`
+agent. Secrets come from the Buildkite cluster secret store, not
+from local vault. See `.buildkite/README.md` § "UAT fuzz step" for
+agent setup + secret rotation.
+
+**Scope (CI):**
+
+| Scenario | In CI? | Why |
+|---|---|---|
+| `fuzz-random-prompts-dm` | ✅ gates PRs | JTBD-floor invariants; PR #1132. |
+| `fuzz-extended-dm` | ✅ gates PRs | Second-pass categories; PR #1134. |
+| `fuzz-human-style-dm` | ✅ gates PRs | Human-shape inbounds + meaningful-reply floor. |
+| `silent-end-recovery-dm` | ❌ local only | Passes, but the 5-min worst-case budget makes it costly to run every PR. Run nightly + ad-hoc. |
+| `jtbd-status-query-dm` | ❌ local only | Passes; defer to a follow-up that batches the cheap JTBD scenarios. |
+| `jtbd-soft-commit-dm` | ❌ local only | Already budget-tuned but real-Telegram timing flake risk; defer until we have flake telemetry. |
+| `jtbd-interrupt-marker-dm` | ❌ `describe.skip` | Suspected real bug per #1132 overnight. Investigate before unskipping. |
+| `jtbd-rapid-followup-dm` | ❌ `describe.skip` | Suspected real classification bug per #1132 overnight. Investigate before unskipping. |
+| vault / secret-redaction / voice / location / reactions / progress-card | ❌ local only | Need specific surfaces / config overrides not wired into the gate yet. |
+
+A local `bun run test:uat` runs the full include glob minus the two
+`describe.skip`'d JTBDs.
+
+## 9. Port allocator vs unix sockets (Phase 1 scaffold note)
 
 The Phase 1 `port-allocator.ts` is held in reserve for Phase 2b's
 child-process flow — Phase 2a (standard-runtime agent) doesn't need

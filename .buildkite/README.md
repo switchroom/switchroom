@@ -43,6 +43,7 @@ The agent box needs:
 | Type check | `bun lint` (= `tsc --noEmit`) | Any `*.ts`, `tsconfig.json`, package/lockfile |
 | Core tests | `bun run test:vitest` | `src/`, `tests/`, `telegram-plugin/**/*.ts`, vitest config, lockfiles |
 | Plugin tests | `cd telegram-plugin && bun test` | `telegram-plugin/**` |
+| UAT fuzz | `bun run test:uat fuzz-` (self-hosted `uat-host` queue) | `telegram-plugin/**`, `src/agents/**`, `telegram-plugin/uat/**`, `vitest.uat.config.ts` |
 | Trigger evals | `python3 evals/run_trigger.py --parallel 5` | `skills/**/SKILL.md`, eval framework, profile CLAUDE.md |
 | Quality evals | `python3 evals/run_quality.py --parallel 5` | `skills/**/SKILL.md`, eval framework, dataset |
 | Eval summary | `annotate-evals.sh` | Always (after eval steps); no-ops if no result files |
@@ -76,3 +77,81 @@ switchroom vault get buildkite-api-token
 Use it for any `bk` CLI calls that need API access (creating pipelines,
 triggering builds, listing agents). It is **not** needed by the pipeline
 itself — Buildkite agents authenticate via their own per-agent token.
+
+## UAT fuzz step
+
+The `:robot: UAT fuzz (real Telegram)` step gates every PR that touches
+`telegram-plugin/`, `src/agents/`, or `telegram-plugin/uat/` against the
+second-pass fuzz harness (PR #1132 / #1134 / #1136 human-style). The
+harness drives a real mtcute MTProto user session against a real test
+bot in a real supergroup — it cannot run on the stock hosted queue.
+
+### Why a self-hosted agent
+
+- The test-harness switchroom agent is a long-lived Docker container
+  with its own state, vault ACL, and bot ACL; ephemeral hosted agents
+  can't host it.
+- `TELEGRAM_UAT_DRIVER_SESSION` is bearer-equivalent to the driver
+  Telegram user account. We don't want it in the build env of a
+  hosted Buildkite worker that may be shared across orgs.
+- Telegram per-bot rate limits are global; running fuzz from multiple
+  random agents in parallel would interfere with itself and with the
+  manual UAT workflow.
+
+### Setting up the `uat-host` self-hosted agent (one-time)
+
+On the box that already runs `test-harness` + `switchroom-vault-broker`:
+
+```bash
+# 1. Install the buildkite-agent (Linux x86_64; see buildkite docs).
+# 2. Tag the agent queue:
+#    /etc/buildkite-agent/buildkite-agent.cfg
+#      tags="queue=uat-host,host=switchroom-prod"
+# 3. Ensure bun is on PATH for the buildkite-agent user.
+# 4. Ensure the test-harness container is running:
+switchroom agent status test-harness
+# 5. Restart the buildkite-agent service so it picks up the new tags.
+sudo systemctl restart buildkite-agent
+```
+
+The agent runs as a Linux user that needs read access to whatever bun
+install is on PATH and (via `bun run test:uat`) the ability to make
+outbound MTProto / HTTPS connections to Telegram.
+
+### Cluster secrets
+
+Four secrets must exist in the cluster secret store (set via the
+Buildkite Cluster API or web UI → Cluster → Secrets):
+
+| Key | Source | Rotation |
+|---|---|---|
+| `TELEGRAM_API_ID` | `my.telegram.org/apps` → API id | Stable; only rotate when re-issued. |
+| `TELEGRAM_API_HASH` | `my.telegram.org/apps` → API hash | Stable; rotate alongside `API_ID`. |
+| `TELEGRAM_UAT_DRIVER_SESSION` | `bun uat:login` output | Rotate whenever the driver account 2FA/devices change — see `telegram-plugin/uat/SETUP.md` §4. |
+| `TELEGRAM_TEST_BOT_USERNAME` | BotFather (no leading `@`) | Stable. |
+
+To provision (one-time, then per-rotation):
+
+```bash
+# Read the live vault values (run on the UAT host, in the test-harness
+# container's ACL — see telegram-plugin/uat/SETUP.md §6).
+ID=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-api-id)
+HASH=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-api-hash)
+SESSION=$(docker exec switchroom-test-harness switchroom vault get telegram-uat-driver-session)
+
+# Push to Buildkite cluster secret store.
+# (Use the BK API or web UI; do NOT echo the SESSION value to a shell
+# history or log line.)
+buildkite-agent secret create --cluster <cluster> TELEGRAM_API_ID "$ID"
+buildkite-agent secret create --cluster <cluster> TELEGRAM_API_HASH "$HASH"
+buildkite-agent secret create --cluster <cluster> TELEGRAM_UAT_DRIVER_SESSION "$SESSION"
+buildkite-agent secret create --cluster <cluster> TELEGRAM_TEST_BOT_USERNAME "meken_switchroom_test_bot"
+
+unset ID HASH SESSION
+```
+
+If any of the four secrets is missing at build time the step posts a
+warning annotation and exits 0 (soft-skip), so a rotation in flight
+doesn't block all PRs. A hard failure inside the test run is **not**
+soft-skipped — fuzz invariant violations are real signals (a single
+flake retries via `retry.automatic` on -1 / 143 only).

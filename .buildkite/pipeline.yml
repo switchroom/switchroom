@@ -415,6 +415,80 @@ steps:
         - exit_status: 143
           limit: 2
 
+  - label: ":robot: UAT fuzz (real Telegram)"
+    key: uat-fuzz
+    timeout_in_minutes: 35
+    # Promotes the second-pass UAT fuzz harness (PR #1132 / #1134 / human-style)
+    # from manual to a PR gate. The harness drives a real mtcute MTProto user
+    # session against the live test-harness bot in a real supergroup, so it
+    # CANNOT run on the hosted queue — there's no test-harness container, no
+    # vault, no broker, and the bearer-equivalent driver session string must
+    # not land on shared hosted agents. The `uat-host` self-hosted queue is
+    # tagged on the box that already runs test-harness + switchroom-vault-broker.
+    # See .buildkite/README.md § "UAT fuzz step" for one-time agent setup
+    # and the four cluster secrets (TELEGRAM_API_ID, TELEGRAM_API_HASH,
+    # TELEGRAM_UAT_DRIVER_SESSION, TELEGRAM_TEST_BOT_USERNAME).
+    #
+    # Sequential per concurrency_group: the test-harness agent is a singleton,
+    # and Telegram's per-bot rate limits are global. Two parallel PR builds
+    # would interleave inbounds on the same chat and corrupt each other.
+    #
+    # Scope: only `fuzz-*.test.ts` runs in CI. The other UAT scenarios
+    # (vault grant, secret redaction, voice/location inbound, reactions,
+    # progress card, JTBD interrupt/rapid-followup) need surfaces or carry
+    # known-flaky behaviour that hasn't been classified yet; they remain
+    # runnable locally via `bun run test:uat`. The fragile JTBD scenarios
+    # (interrupt-marker, rapid-followup) are `describe.skip`ped in source
+    # so a full local UAT run isn't blocked on suspected bugs either.
+    agents:
+      queue: "uat-host"
+    concurrency: 1
+    concurrency_group: "switchroom/uat-fuzz"
+    if_changed:
+      - "telegram-plugin/**"
+      - "src/agents/**"
+      - "telegram-plugin/uat/**"
+      - "vitest.uat.config.ts"
+      - ".buildkite/pipeline.yml"
+    command: |
+      if [ ! -x "$$HOME/.bun/bin/bun" ]; then
+        curl -fsSL https://bun.sh/install | bash
+      fi
+      export PATH="$$HOME/.bun/bin:$$PATH"
+      bun install --frozen-lockfile --prefer-offline --no-progress
+      # Pull the 4 UAT secrets from the BK cluster secret store. If ANY
+      # are missing the step soft-skips with a warning annotation — this
+      # lets the pipeline change land before/independent of the secret
+      # provisioning rollout, and gives a clear failure mode when a
+      # secret is rotated out without replacement.
+      export TELEGRAM_API_ID="$$(buildkite-agent secret get TELEGRAM_API_ID 2>/dev/null || true)"
+      export TELEGRAM_API_HASH="$$(buildkite-agent secret get TELEGRAM_API_HASH 2>/dev/null || true)"
+      export TELEGRAM_UAT_DRIVER_SESSION="$$(buildkite-agent secret get TELEGRAM_UAT_DRIVER_SESSION 2>/dev/null || true)"
+      export TELEGRAM_TEST_BOT_USERNAME="$$(buildkite-agent secret get TELEGRAM_TEST_BOT_USERNAME 2>/dev/null || true)"
+      if [[ -z "$$TELEGRAM_API_ID" || -z "$$TELEGRAM_API_HASH" || -z "$$TELEGRAM_UAT_DRIVER_SESSION" || -z "$$TELEGRAM_TEST_BOT_USERNAME" ]]; then
+        buildkite-agent annotate --style warning --context uat-fuzz \
+          "UAT fuzz step skipped: one or more cluster secrets missing (TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_UAT_DRIVER_SESSION / TELEGRAM_TEST_BOT_USERNAME). See .buildkite/README.md § \"UAT fuzz step\"." || true
+        echo "UAT secrets unavailable — skipping fuzz run."
+        exit 0
+      fi
+      cd telegram-plugin
+      # Positional filter narrows vitest collection to fuzz-*.test.ts only.
+      # The vitest.uat.config.ts include glob picks up every scenario file;
+      # we don't want vault/voice/reactions scenarios in the PR gate yet.
+      bun run test:uat fuzz-
+    cache:
+      paths:
+        - "~/.bun"
+        - "node_modules/"
+        - "telegram-plugin/node_modules/"
+      key: "v1-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 2
+        - exit_status: 143
+          limit: 2
+
   - wait
 
   # ---------------------------------------------------------------------------
