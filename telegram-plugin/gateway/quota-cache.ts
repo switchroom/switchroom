@@ -37,9 +37,14 @@ export const DEFAULT_TTL_MS = 5 * 60 * 1000  // 5 min
  * next scheduled boot gets a live result.
  */
 export const RATE_LIMIT_TTL_MS = 30 * 1000  // 30 s
-export const DEFAULT_CACHE_PATH =
-  process.env.SWITCHROOM_QUOTA_CACHE_PATH
+
+// Resolved lazily so tests can set SWITCHROOM_QUOTA_CACHE_PATH per-test
+// (the env var was previously read at module-import time, which made the
+// override in test setUp a no-op once the module was cached).
+export function defaultCachePath(): string {
+  return process.env.SWITCHROOM_QUOTA_CACHE_PATH
     ?? join(process.env.HOME ?? '/tmp', '.switchroom', 'quota-cache.json')
+}
 
 /**
  * Read a cached probe result if one exists and is still within TTL.
@@ -54,7 +59,7 @@ export function readQuotaCache(opts: {
   path?: string
   now?: number
 } = {}): ProbeResult | null {
-  const path = opts.path ?? DEFAULT_CACHE_PATH
+  const path = opts.path ?? defaultCachePath()
   const now = opts.now ?? Date.now()
 
   if (!existsSync(path)) return null
@@ -102,7 +107,7 @@ export function writeQuotaCache(
   // Don't cache hard failures — let the next boot retry clean.
   if (result.status === 'fail') return
 
-  const path = opts.path ?? DEFAULT_CACHE_PATH
+  const path = opts.path ?? defaultCachePath()
   // Rate-limit results use a shorter TTL: long enough to absorb a fleet
   // restart burst, short enough that subsequent boots get a live probe.
   // Use the structured `rateLimited` field rather than string-matching on
