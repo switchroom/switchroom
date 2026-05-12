@@ -98,18 +98,22 @@ bot in a real supergroup — it cannot run on the stock hosted queue.
   random agents in parallel would interfere with itself and with the
   manual UAT workflow.
 
-### Cluster env opt-in
+### Pipeline env opt-in
 
-The UAT step is gated on a cluster env var so it doesn't hang every
-PR while you're still provisioning the agent + secrets:
+The UAT step is gated on a pipeline-level env var so it doesn't hang
+every PR while you're still provisioning the agent + secrets. Add it
+via **Pipeline Settings → Environment Variables** in the Buildkite
+web UI (same surface that hosts `ANTHROPIC_API_KEY` — see step 3 of
+"One-time setup in Buildkite" above):
 
 ```
 SWITCHROOM_UAT_GATE_ENABLED=true
 ```
 
 Set this **last** — only after the agent is online and the four
-secrets exist. Before that, the step's `if:` condition evaluates to
-false and the step is omitted entirely.
+secrets exist. Before that, `build.env("SWITCHROOM_UAT_GATE_ENABLED")`
+returns `null`, the step's `if:` condition evaluates to false, and
+the step is omitted entirely from the build plan.
 
 ### Setting up the `uat-host` self-hosted agent (one-time)
 

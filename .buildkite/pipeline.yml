@@ -444,12 +444,15 @@ steps:
     # runnable locally via `bun run test:uat`. The fragile JTBD scenarios
     # (interrupt-marker, rapid-followup) are `describe.skip`ped in source
     # so a full local UAT run isn't blocked on suspected bugs either.
-    # Opt-in via cluster env. Without SWITCHROOM_UAT_GATE_ENABLED=true
-    # in the cluster env the step is omitted entirely — protects against
-    # the step queueing forever waiting for an unprovisioned `uat-host`
-    # agent. Operator flips this to "true" once (a) the self-hosted
-    # agent is installed and tagged, (b) the four cluster secrets are
-    # provisioned. See `.buildkite/README.md` § "UAT fuzz step".
+    # Opt-in via a pipeline-level env var (Pipeline Settings →
+    # Environment Variables in the BK web UI — same surface the
+    # ANTHROPIC_API_KEY var uses). Without
+    # SWITCHROOM_UAT_GATE_ENABLED=true set there, the step is omitted
+    # entirely — protects against the step queueing forever waiting
+    # for an unprovisioned `uat-host` agent. Operator flips this to
+    # "true" once (a) the self-hosted agent is installed and tagged,
+    # (b) the four cluster secrets are provisioned. See
+    # `.buildkite/README.md` § "UAT fuzz step".
     if: build.env("SWITCHROOM_UAT_GATE_ENABLED") == "true"
     agents:
       queue: "uat-host"
