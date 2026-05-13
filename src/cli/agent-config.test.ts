@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   registerAgentConfigCommands,
   resolveTargetAgent,
+  isContainerContext,
   stripSecretValues,
   appendAudit,
   readAuditTail,
@@ -73,9 +74,65 @@ describe("resolveTargetAgent", () => {
     ).toThrow(/cross-agent read denied/);
   });
 
-  it("operator context (no env) requires explicit --agent", () => {
-    expect(() => resolveTargetAgent(undefined, {} as any)).toThrow(/agent name required/);
-    expect(resolveTargetAgent("a", {} as any)).toBe("a");
+  it("host operator context (no env, no container marker) requires explicit --agent", () => {
+    // Use a /.dockerenv probe path that does NOT exist so we're host-context.
+    const opts = { dockerEnvPath: "/tmp/__never_exists_dockerenv__" };
+    expect(() => resolveTargetAgent(undefined, {} as any, opts)).toThrow(/agent name required/);
+    expect(resolveTargetAgent("a", {} as any, opts)).toBe("a");
+  });
+
+  it("DENIES when in container with no env var (no fall-through to operator)", () => {
+    // SWITCHROOM_CONTAINER=1 simulates running inside an agent container.
+    expect(() =>
+      resolveTargetAgent("a", { SWITCHROOM_CONTAINER: "1" } as any),
+    ).toThrow(/identity missing in container context/);
+    expect(() =>
+      resolveTargetAgent(undefined, { SWITCHROOM_CONTAINER: "1" } as any),
+    ).toThrow(/identity missing in container context/);
+  });
+
+  it("DENIES when /.dockerenv exists but env var is missing", () => {
+    // Force the docker-env probe to a file we know exists.
+    const probe = join(tmpdir(), `dockerenv-probe-${Date.now()}`);
+    writeFileSync(probe, "");
+    try {
+      expect(() =>
+        resolveTargetAgent("a", {} as any, { dockerEnvPath: probe }),
+      ).toThrow(/identity missing in container context/);
+    } finally {
+      rmSync(probe, { force: true });
+    }
+  });
+
+  it("allows env-pinned access even inside container", () => {
+    expect(
+      resolveTargetAgent(undefined, {
+        SWITCHROOM_AGENT_NAME: "a",
+        SWITCHROOM_CONTAINER: "1",
+      } as any),
+    ).toBe("a");
+  });
+});
+
+describe("isContainerContext", () => {
+  it("returns true when SWITCHROOM_CONTAINER=1", () => {
+    expect(isContainerContext({ SWITCHROOM_CONTAINER: "1" } as any)).toBe(true);
+  });
+
+  it("returns false on host (no marker, no /.dockerenv)", () => {
+    expect(
+      isContainerContext({} as any, { dockerEnvPath: "/tmp/__nope__" }),
+    ).toBe(false);
+  });
+
+  it("returns true when /.dockerenv probe exists", () => {
+    const probe = join(tmpdir(), `dockerenv-probe2-${Date.now()}`);
+    writeFileSync(probe, "");
+    try {
+      expect(isContainerContext({} as any, { dockerEnvPath: probe })).toBe(true);
+    } finally {
+      rmSync(probe, { force: true });
+    }
   });
 });
 

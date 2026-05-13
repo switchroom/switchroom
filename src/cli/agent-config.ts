@@ -3,12 +3,17 @@
  * "agent-config-broker" CLI surface that backs the per-agent MCP shim
  * (see `src/mcp/agent-config/server.ts`).
  *
- * Design (peer-cred-by-construction):
+ * Design (env-pinned identity inside containers; explicit operator flag
+ * on the host):
  *   The agent's own container process runs `switchroom <cmd>` and its
  *   identity is taken from `$SWITCHROOM_AGENT_NAME` (scaffold sets this
  *   per agent). All commands here refuse to read across agents — if
- *   `--agent` is passed and doesn't match the env, exit 7. The operator
- *   context (no env var set) is allowed to read any agent.
+ *   `--agent` is passed and doesn't match the env, exit 7. Inside a
+ *   container, a MISSING env var is also a denial — an env var alone is
+ *   not a security boundary, so we will not fall through to "operator
+ *   may read any agent" when there's no proof we're on the host. The
+ *   operator context is gated on running OUTSIDE the container (no
+ *   `/.dockerenv`, no `SWITCHROOM_CONTAINER=1`).
  *
  *   Every invocation appends one JSON line to
  *   `~/.switchroom/audit/agent-config.jsonl` so we can trace which agent
@@ -27,8 +32,15 @@ import {
 import { withConfigError, getConfig } from "./helpers.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
-const AUDIT_DIR = join(homedir(), ".switchroom", "audit");
-const AUDIT_LOG = join(AUDIT_DIR, "agent-config.jsonl");
+// Per-agent audit path. We deliberately do NOT share one log file across
+// all agents — that would let any agent read every other agent's audit
+// trail when the dir is bind-mounted into containers. Each agent gets
+// its own dir at ~/.switchroom/audit/<agent>/, and scaffold mounts only
+// the agent's own dir into its container (not the parent).
+const AUDIT_ROOT = join(homedir(), ".switchroom", "audit");
+export function auditPathFor(agent: string): string {
+  return join(AUDIT_ROOT, agent, "agent-config.jsonl");
+}
 
 export interface AuditRow {
   ts: string;
@@ -59,10 +71,8 @@ export function appendAudit(
     exit,
     peer_uid: typeof process.getuid === "function" ? process.getuid() : -1,
   };
-  const path = opts.auditPath ?? AUDIT_LOG;
-  const dir = path.endsWith(".jsonl")
-    ? path.slice(0, path.lastIndexOf("/"))
-    : AUDIT_DIR;
+  const path = opts.auditPath ?? auditPathFor(agent);
+  const dir = path.slice(0, path.lastIndexOf("/"));
   try {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -75,17 +85,53 @@ export function appendAudit(
 }
 
 /**
+ * Detect whether we're running inside an agent container. Used to deny
+ * "operator-context" fallthrough when the identity env var is missing —
+ * an in-container process could unset SWITCHROOM_AGENT_NAME, so we
+ * cannot trust its absence as proof of operator context.
+ */
+export function isContainerContext(
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { dockerEnvPath?: string } = {},
+): boolean {
+  if (env.SWITCHROOM_CONTAINER === "1") return true;
+  const probe = opts.dockerEnvPath ?? "/.dockerenv";
+  try {
+    if (existsSync(probe)) return true;
+  } catch {
+    // ignore — treat probe failure as not-in-container
+  }
+  return false;
+}
+
+/**
  * Determine the target agent for a request and reject cross-agent
  * reads. Returns the resolved agent name, or throws on a denial that
  * the caller should surface as exit 7.
+ *
+ * Inside a container, a missing env var is a denial — not a fall-
+ * through to operator context. On the host, the operator must pass
+ * `--agent` explicitly.
  */
 export function resolveTargetAgent(
   requested: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  opts: { dockerEnvPath?: string } = {},
 ): string {
   const fromEnv = env.SWITCHROOM_AGENT_NAME;
+  const inContainer = isContainerContext(env, opts);
+
   if (!fromEnv) {
-    // Operator context — no env-pinned identity. Must pass --agent.
+    if (inContainer) {
+      // Container context with no env-pinned identity. The scaffold-
+      // wired MCP shim always sets SWITCHROOM_AGENT_NAME; a process
+      // that reaches us without it is either misconfigured or
+      // probing. Deny.
+      throw new Error(
+        "agent identity missing in container context: refuse to serve",
+      );
+    }
+    // Host / operator context — must pass --agent explicitly.
     if (!requested) {
       throw new Error(
         "agent name required (pass --agent, or set SWITCHROOM_AGENT_NAME)",
@@ -154,9 +200,14 @@ export function readAuditTail(
   limit: number,
   opts: { auditPath?: string } = {},
 ): AuditRow[] {
-  const path = opts.auditPath ?? AUDIT_LOG;
+  const path = opts.auditPath ?? auditPathFor(agent);
   if (!existsSync(path)) return [];
-  const raw = readFileSync(path, "utf-8");
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return [];
+  }
   const rows: AuditRow[] = [];
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
