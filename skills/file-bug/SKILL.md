@@ -2,11 +2,24 @@
 name: file-bug
 version: 0.1.0
 description: |
-  File a high-quality bug report against switchroom (or another configured
-  repo). Pulls the right log files automatically, forces a root-cause
-  section with citations, flags logging gaps when RCA can't be pinned, and
-  files via `gh issue create`. Use when a user asks "file a bug",
-  "open an issue", or describes a symptom that needs a real ticket.
+  Use when the user wants to file a bug, open a GitHub issue, raise a ticket,
+  or otherwise create a tracked record of a symptom against switchroom (or
+  another configured repo). Pulls the right log files automatically, forces
+  a root-cause section with citations, flags logging gaps when RCA can't be
+  pinned, and files via `gh issue create`.
+  Triggers on natural phrasings including "Can you report this issue on
+  GitHub?", "Please raise a ticket.", "I need to this needs a real ticket.",
+  "I need to file a bug.", "Report this issue on GitHub, please.",
+  "Please file a bug.", "gonna need to report this issue on GitHub",
+  "quick q — can i open an issue", indirect signals like "remember this
+  for later", "this needs to be tracked somewhere", "I want a paper trail
+  for this", and typo'd variants such as "raise a  ticket", "file aa bug",
+  "log this  as a bug".
+  Do NOT use for troubleshooting the fleet, rebooting an agent, running a
+  health check, or updating agents — those are `switchroom-health` /
+  `switchroom-manage`. Do NOT use for asking why the agent restarted or
+  whether it crashed — that's `switchroom-runtime` (which may then *offer*
+  to invoke this skill).
 license: MIT
 compatibility: claude-code
 allowed-tools:

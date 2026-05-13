@@ -1,18 +1,25 @@
 ---
 name: buildkite-cli
 description: >
-  This skill should be used when the user asks to "trigger a build",
-  "check build status", "watch a build", "view build logs", "retry a build",
-  "cancel a build", "list builds", "download artifacts", "upload artifacts",
-  "manage secrets", "create a pipeline", "list pipelines", or
-  "interact with Buildkite from the command line".
-  Also use when the user mentions bk commands, bk build, bk job, bk pipeline,
-  bk secret, bk artifact, bk cluster, bk package, bk auth, bk configure,
-  bk use, bk init, bk api, or asks about Buildkite CLI installation,
-  terminal-based Buildkite workflows, or command-line CI/CD operations.
-  Do NOT use when authoring `.buildkite/pipeline.yml` — that's
-  `buildkite-pipelines`; or for scripted programmatic access — that's
-  `buildkite-api`.
+  Use when the user wants to drive Buildkite from the terminal via the `bk`
+  CLI — triggering, retrying, cancelling, watching, or listing builds;
+  uploading or downloading artifacts; managing pipeline secrets; or
+  creating and listing pipelines from the command line.
+  Triggers on natural phrasings including: "Help me retry a build.",
+  "List builds, please.", "Let's upload artifacts.", "Let's manage secrets.",
+  "Help me upload artifacts.", "Could you create a pipeline for me?",
+  "hey, cancel a build?", "pls list builds", "quick q — can i manage secrets",
+  "I want to do this from the terminal", "scripting it locally would be easier",
+  "I'd rather not click around the UI", and typo'd variants like
+  "list bbuilds", "list pieplines", "retry  abuild".
+  Also fires on `bk`, `bk build`, `bk job`, `bk pipeline`, `bk secret`,
+  `bk artifact`, `bk cluster`, `bk package`, `bk auth`, `bk configure`,
+  `bk use`, `bk init`, `bk api`, Buildkite CLI install, terminal-based
+  Buildkite workflows, or command-line CI/CD operations.
+  Do NOT use when authoring `.buildkite/pipeline.yml`, standardizing pipelines
+  across teams, adding plugins, or showing test failures on the build page —
+  those are `buildkite-pipelines`. Do NOT use for scripted programmatic access
+  or REST/GraphQL calls — that's `buildkite-api`.
 ---
 
 # Buildkite CLI

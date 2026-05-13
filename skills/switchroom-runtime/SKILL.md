@@ -1,21 +1,29 @@
 ---
 name: switchroom-runtime
 description: |
-  Runtime operational protocols for switchroom Telegram agents — the conditional
-  procedures that only fire on specific boot signals or user phrases. Invoke when:
-  (1) the env var SWITCHROOM_PENDING_TURN=true is set on boot (interrupted-turn
-  resume protocol); (2) the sentinel file $TELEGRAM_STATE_DIR/.wake-audit-pending
-  exists (wake audit: check for owed replies, orphan sub-agents, stale todos
-  before answering); (3) the user asks why you restarted or what happened
-  ("why did you restart?", "did you crash?", "you went away") — surface the
-  audit trail from clean-shutdown.json + container/journal logs; (4) the user
-  asks how to stop you mid-turn ("how do I interrupt", "can I stop you",
-  "how do I cancel") and you need the implementation detail beyond the
-  one-line answer; (5) the user sends a short status check ("status?",
-  "still there?", "any update?") — treat as UX-failure signal, offer to file
-  RCA via /file-bug. Do NOT invoke for normal Telegram conversation,
-  formatting questions, voice/sticker/Telegraph behavior, MCP tool questions,
-  or persona / voice / Execution-Bias rules — those live in your always-loaded
+  Use when the user is asking about the agent's own runtime state — why it
+  restarted, whether it crashed, whether it's still there, how to interrupt
+  it mid-turn, or sending a terse status check that signals a UX-failure
+  the runtime protocols should handle. Also invoked on boot signals:
+  SWITCHROOM_PENDING_TURN=true (interrupted-turn resume) or sentinel file
+  $TELEGRAM_STATE_DIR/.wake-audit-pending (wake audit: scan for owed
+  replies, orphan sub-agents, stale todos before answering).
+  Triggers on natural phrasings including "Why did you restart, please.",
+  "I'd like to you went away.", "Let's can I stop you mid-turn.",
+  "I'd like to why did you restart.", "Can you still there??",
+  "how do I interrupt you", "gonna need to still there?",
+  "gonna need to how do I interrupt you", "gonna need to any update?",
+  indirect signals like "the switchroom-runtime thing is weird",
+  "something is going on with switchroom-runtime", and typo'd variants
+  such as "anyupdate?", "stil there?". Surface the audit trail from
+  clean-shutdown.json + container/journal logs; offer RCA via /file-bug
+  when status checks indicate a UX failure.
+  Do NOT use for filing a bug or reporting an issue on GitHub — that's
+  `file-bug`. Do NOT use for applying config changes or asking what
+  version is running — those are `switchroom-cli` / `switchroom-status`.
+  Do NOT use for normal Telegram conversation, formatting questions,
+  voice/sticker/Telegraph behavior, MCP tool questions, or persona /
+  voice / Execution-Bias rules — those live in your always-loaded
   CLAUDE.md.
 allowed-tools: Bash Read Grep
 ---

@@ -1,6 +1,6 @@
 ---
 name: mcp-builder
-description: Guide for creating high-quality MCP (Model Context Protocol) servers that enable LLMs to interact with external services through well-designed tools. Use when building MCP servers to integrate external APIs or services, whether in Python (FastMCP) or Node/TypeScript (MCP SDK). Do NOT use for skill authoring (that's `skill-creator`) or client-side MCP wiring.
+description: Use when the user wants to build, write, or scaffold a new MCP (Model Context Protocol) server — wrapping an external API or service as MCP tools an LLM can call, in Python (FastMCP) or Node/TypeScript (MCP SDK). Triggers on natural phrasings including "Let's write an MCP server for.", "Please integrate an external API as MCP.", "Use the MCP SDK in TypeScript, please.", "Write an MCP server for, please.", "I'd like to create a new MCP server.", "I need to use the MCP SDK in TypeScript.", "pls create a new MCP server", "pls build an MCP server", "gonna need to build an MCP server", indirect signals like "the mcp-builder thing is weird", "something is going on with mcp-builder", "can you take a look at the mcp-builder situation", and typo'd variants such as "create  new MCP server", "write an MCPP server for", "use the MCP SD Kin TypeScript". Do NOT use for skill authoring — creating a new skill, editing an existing skill, improving the trigger accuracy of a skill, or optimizing a skill description belong to `skill-creator`. Do NOT use for client-side MCP wiring or configuring MCP clients.
 license: Complete terms in LICENSE.txt
 ---
 

@@ -1,18 +1,27 @@
 ---
 name: buildkite-secure-delivery
 description: >
-  This skill should be used when the user asks to "publish to package registry",
-  "push a Docker image", "set up OIDC authentication", "request an OIDC token",
-  "authenticate without static credentials", "set up SLSA provenance",
-  "generate attestation", "sign pipelines", "verify pipeline signatures",
-  or "secure the supply chain".
-  Also use when the user mentions OIDC, SLSA, provenance, attestation, cosign,
+  Use when the user wants to *set up* the secure-delivery side of Buildkite —
+  publishing to a package registry, pushing Docker images, configuring OIDC
+  authentication, generating SLSA provenance / attestations, or signing and
+  verifying pipelines with JWKS. Triggers on natural phrasings including
+  "Please secure the supply chain.", "I'd like to push a Docker image.",
+  "Can you sign pipelines?", "I need to verify pipeline signatures.",
+  "Could you sign pipelines for me?", "Set up SLSA provenance, please.",
+  "gonna need to verify pipeline signatures", "gonna need to sign pipelines",
+  "pls authenticate without static credentials", indirect signals like
+  "something is going on with buildkite-secure-delivery", "the
+  buildkite-secure-delivery thing is weird", and typo'd variants such as
+  "generate attestation", "set up LSA provenance", "verify ppeline
+  signatures". Also fires on OIDC, SLSA, provenance, attestation, cosign,
   JWKS, pipeline signing, pipeline verification, packages.buildkite.com,
-  Package Registry, artifact signing, or asks about credential-free publishing,
-  supply chain security, or secure delivery in Buildkite.
+  Package Registry, artifact signing, credential-free publishing, supply
+  chain security.
   Do NOT use for in-step `buildkite-agent oidc request-token` — that's
-  `buildkite-agent-runtime`. Use this for *setting up* OIDC trust, signing
-  infrastructure, and SLSA provenance.
+  `buildkite-agent-runtime`. Do NOT use for writing pipelines, uploading
+  pipelines dynamically, or adding caching/plugins — those are
+  `buildkite-pipelines`. Do NOT use for distributed locks — that's
+  `buildkite-agent-runtime`.
 ---
 
 # Buildkite Secure Delivery
