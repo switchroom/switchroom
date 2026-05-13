@@ -5,7 +5,10 @@ description: |
   Build a personal voice template for the humanizer skill from the user's
   recent Telegram messages. Reads the local message buffer, summarises
   vocabulary / sentence shape / formatting habits, writes a markdown
-  template the humanizer will match against.
+  template the humanizer will match against. Use when the user says "build
+  my voice template", "calibrate humanizer to my style", or "fresh voice
+  profile from my Telegram". Do NOT use for one-shot rewrites — that's
+  `humanizer`.
 license: MIT
 compatibility: claude-code
 allowed-tools:

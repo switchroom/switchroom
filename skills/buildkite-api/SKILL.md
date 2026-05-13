@@ -9,6 +9,9 @@ description: >
   Also use when the user mentions api.buildkite.com, graphql.buildkite.com,
   Buildkite REST endpoints, GraphQL mutations, webhook payloads,
   API tokens, or asks about programmatic access to Buildkite data.
+  Do NOT use for interactive `bk` CLI usage — that's `buildkite-cli`. Prefer
+  this skill for one-shot terminal CI ops via curl/GraphQL/scripts rather
+  than `bk` subcommands.
 ---
 
 # Buildkite API

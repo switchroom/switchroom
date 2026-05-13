@@ -10,6 +10,9 @@ description: >
   bk secret, bk artifact, bk cluster, bk package, bk auth, bk configure,
   bk use, bk init, bk api, or asks about Buildkite CLI installation,
   terminal-based Buildkite workflows, or command-line CI/CD operations.
+  Do NOT use when authoring `.buildkite/pipeline.yml` — that's
+  `buildkite-pipelines`; or for scripted programmatic access — that's
+  `buildkite-api`.
 ---
 
 # Buildkite CLI

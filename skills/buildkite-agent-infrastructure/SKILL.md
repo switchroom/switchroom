@@ -12,6 +12,10 @@ description: >
   SSO/SAML providers, queue wait time, agent lifecycle hooks, or asks about
   Buildkite CI infrastructure provisioning, platform governance, or
   organization-level configuration.
+  Do NOT use when the user is calling `buildkite-agent <subcommand>` from
+  inside a running step (token use, artifact upload, annotate) — that's
+  `buildkite-agent-runtime`; or when the user just wants cluster CLI
+  shortcuts like `bk cluster ...` — that's `buildkite-cli`.
 ---
 
 # Buildkite Platform Engineering

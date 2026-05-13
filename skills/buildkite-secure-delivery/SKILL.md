@@ -10,6 +10,9 @@ description: >
   JWKS, pipeline signing, pipeline verification, packages.buildkite.com,
   Package Registry, artifact signing, or asks about credential-free publishing,
   supply chain security, or secure delivery in Buildkite.
+  Do NOT use for in-step `buildkite-agent oidc request-token` — that's
+  `buildkite-agent-runtime`. Use this for *setting up* OIDC trust, signing
+  infrastructure, and SLSA provenance.
 ---
 
 # Buildkite Secure Delivery

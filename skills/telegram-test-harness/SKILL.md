@@ -11,6 +11,9 @@ description: >
   bot-api.harness, GrammyError, e2e telegram, telegram regression
   test, or asks how to add a test for code that calls bot.api.* or
   handles incoming Telegram updates.
+  Do NOT use for live progress-card behavior or telegram-plugin runtime
+  questions — this is strictly for writing Bun tests under
+  `telegram-plugin/tests/`.
 ---
 
 # Telegram test harness (switchroom)

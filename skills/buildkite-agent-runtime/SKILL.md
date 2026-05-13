@@ -12,6 +12,10 @@ description: >
   buildkite-agent env, buildkite-agent secret get, buildkite-agent redactor add,
   buildkite-agent tool sign/verify, or any buildkite-agent subcommand used inside
   a running job step.
+  Do NOT use when the user is provisioning or configuring rather than calling
+  from inside a running step — cluster/queue/token provisioning belongs to
+  `buildkite-agent-infrastructure`, and OIDC trust setup (vs in-step
+  `oidc request-token`) belongs to `buildkite-secure-delivery`.
 ---
 
 # Buildkite Agent Runtime

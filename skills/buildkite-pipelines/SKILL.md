@@ -10,6 +10,8 @@ description: >
   buildkite-agent pipeline upload, step types (command, wait, block, trigger,
   group, input), if_changed, notify, concurrency, or asks about Buildkite CI
   configuration.
+  Do NOT use when the user is invoking `buildkite-agent <subcommand>` inside
+  a step — that's `buildkite-agent-runtime`.
 ---
 
 # Buildkite Pipelines
