@@ -78,7 +78,11 @@ describe("auth status settling (#171 / #176)", () => {
     expect(status.inaccessible).toBeUndefined();
   });
 
-  it("flags inaccessible=true when credentials/token files exist but are unreadable from this UID (EACCES)", async () => {
+  it.skipIf(process.getuid?.() === 0)("flags inaccessible=true when credentials/token files exist but are unreadable from this UID (EACCES)", async () => {
+    // Skipped when running as root (uid=0) — chmod 0o000 doesn't block
+    // root reads, so the EACCES branch is unreachable. Hosted Buildkite
+    // agents run as root; this test is exercised locally and in any
+    // non-root CI environment.
     // Reproduce the 2026-05-10 doctor false-positive: per-agent
     // state files are mode 0600 owned by the agent UID
     // (compose.ts allocates 10001-10999), and `switchroom doctor`
