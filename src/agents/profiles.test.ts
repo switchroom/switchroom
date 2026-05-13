@@ -171,13 +171,16 @@ describe("renderProfileClaudeTemplate", () => {
   });
 });
 
-describe("status? RCA-offer guidance (#162)", () => {
-  // The status? RCA-offer procedure was hoisted out of the always-loaded
-  // telegram-style partial into the switchroom-runtime skill in v0.8.0
-  // (#1178). The partial keeps a short trigger pointer; the skill holds
-  // the procedural detail. Tests now check both layers.
+describe("telegram-style partial — status? RCA-offer guidance (#162)", () => {
+  // PR #1178 hoisted the inline RCA-flow mechanics (JTBD link, /file-bug
+  // wiring, auto-file anti-pattern, offer-then-confirm flow) out of this
+  // partial into the `switchroom-runtime` skill, so the partial stays
+  // small and the procedural detail lives where the model can fetch it
+  // on demand. The partial's job is now (a) name the UX-failure signal,
+  // (b) route to the skill. The detailed mechanics are pinned against
+  // the skill below.
 
-  it("trigger pointer remains in the always-loaded telegram-style partial", () => {
+  it("instructs the agent to treat 'status?' as a UX-failure signal and routes to /switchroom-runtime", () => {
     const REPO_ROOT = resolve(__dirname, "..", "..");
     const partial = readFileSync(
       join(REPO_ROOT, "profiles", "_shared", "telegram-style.md.hbs"),
@@ -185,42 +188,22 @@ describe("status? RCA-offer guidance (#162)", () => {
     );
     expect(partial).toContain("status?");
     expect(partial).toContain("UX-failure signal");
+    // Routes to the runtime skill instead of inlining the offer-RCA flow.
     expect(partial).toContain("/switchroom-runtime");
   });
 
-  it("instructs the agent to treat 'status?' as a UX-failure signal (skill body)", () => {
+  it("switchroom-runtime skill carries the RCA-offer mechanics moved from the partial", () => {
     const REPO_ROOT = resolve(__dirname, "..", "..");
     const skill = readFileSync(
       join(REPO_ROOT, "skills", "switchroom-runtime", "SKILL.md"),
       "utf-8",
     );
-    expect(skill).toContain("status?");
-    expect(skill).toContain("UX-failure signal");
-    // Must reference the JTBD source for context
+    // JTBD reference, /file-bug skill wiring, and the auto-file
+    // anti-pattern guard all live in the skill now.
     expect(skill).toContain("know-what-my-agent-is-doing.md");
-  });
-
-  it("offers to file an RCA via the /file-bug skill (skill body)", () => {
-    const REPO_ROOT = resolve(__dirname, "..", "..");
-    const skill = readFileSync(
-      join(REPO_ROOT, "skills", "switchroom-runtime", "SKILL.md"),
-      "utf-8",
-    );
     expect(skill).toContain("/file-bug");
     expect(skill).toContain("incident-rca");
-  });
-
-  it("warns against auto-filing on every status? (offer-then-confirm pattern)", () => {
-    const REPO_ROOT = resolve(__dirname, "..", "..");
-    const skill = readFileSync(
-      join(REPO_ROOT, "skills", "switchroom-runtime", "SKILL.md"),
-      "utf-8",
-    );
-    // The "auto-file from a single status?" anti-pattern is explicitly
-    // called out so the agent doesn't invoke /file-bug immediately on
-    // every "status?".
     expect(skill.toLowerCase()).toContain("auto-file");
-    expect(skill.toLowerCase()).toContain("offer-then-confirm");
   });
 });
 

@@ -21,6 +21,24 @@ export default defineConfig({
   // { type: "text" }` works under Vite/vitest. Bun's compile-time text
   // imports already handle this; this line keeps vitest aligned.
   assetsInclude: ["**/*.yaml"],
+  // Force-deduplicate `@mtcute/node` (and its transitive `@mtcute/core`)
+  // to a single physical resolution.
+  //
+  // Bun's workspace installer creates a per-workspace symlink at
+  // `telegram-plugin/node_modules/@mtcute/node` → `node_modules/.bun/...`
+  // alongside the hoisted `node_modules/@mtcute/node` (also a path into
+  // the same `.bun` store). Node-style resolution from
+  // `telegram-plugin/uat/driver.ts` walks up and lands on the closer
+  // symlink path; resolution from `tests/uat-driver.test.ts` lands on
+  // the root path. vitest's `vi.mock("@mtcute/node")` keys on the
+  // resolved module spec — two different resolved paths means two
+  // distinct module instances, the driver's import escapes the mock,
+  // and every `Driver.connect()` blows up with "Invalid session
+  // string". `dedupe` makes vite pick a single resolution per package
+  // name across the whole graph.
+  resolve: {
+    dedupe: ["@mtcute/node", "@mtcute/core", "@mtcute/tl", "@mtcute/tl-runtime", "@mtcute/wasm"],
+  },
   test: {
     globals: true,
     environment: "node",
@@ -95,6 +113,10 @@ export default defineConfig({
       "**/telegram-plugin/tests/foreman-state.test.ts",
       "**/telegram-plugin/tests/boot-card-dedupe.test.ts",
       "**/telegram-plugin/tests/boot-card-reason.test.ts",
+      // boot-card-reason-to-render.test.ts (#1153) imports bun:test — run via test:bun.
+      "**/telegram-plugin/tests/boot-card-reason-to-render.test.ts",
+      // boot-version-string.test.ts (#1170) imports bun:test — run via test:bun.
+      "**/telegram-plugin/tests/boot-version-string.test.ts",
       "**/telegram-plugin/tests/progress-update.test.ts",
       "**/telegram-plugin/tests/quota-cache.test.ts",
       "**/telegram-plugin/tests/silent-reply-guard.test.ts",

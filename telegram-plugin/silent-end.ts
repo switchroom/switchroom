@@ -62,7 +62,17 @@ function resolveStateDir(deps?: SilentEndDeps): string {
   // path → no state file ever appeared → hook always read "no
   // silent-end pending" → silent-end recovery never engaged. The
   // hook + writer have to agree on the path.
-  return join(homedir(), '.claude', 'channels', 'telegram')
+  //
+  // Prefer `process.env.HOME` over `node:os` `homedir()` so the
+  // fallback is overridable in tests. Bun's `os.homedir()` reads
+  // the system home once at startup and ignores subsequent
+  // `process.env.HOME` mutations, which breaks the bun-test pass
+  // of `silent-end.test.ts` even though the vitest pass is fine
+  // (Node's `os.homedir()` documents `HOME` as the first source).
+  // In production both branches yield the same path — `HOME` is
+  // always set under the agent's tini-supervised process tree.
+  const home = process.env.HOME ?? homedir()
+  return join(home, '.claude', 'channels', 'telegram')
 }
 
 function resolveStatePath(deps?: SilentEndDeps): string {

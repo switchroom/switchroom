@@ -330,7 +330,19 @@ steps:
       export PATH="$$HOME/.bun/bin:$$PATH"
       cd telegram-plugin
       bun install --frozen-lockfile --prefer-offline --no-progress
-      bun test
+      # Scope `bun test` to the unit-test directories. The default
+      # invocation `bun test` (no args) recursively discovers every
+      # `*.test.ts` in cwd — including `uat/scenarios/`. Those are
+      # real-Telegram UAT scenarios that call `fail()` from the harness
+      # when `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` aren't set, so
+      # running them under the unit-test step produces 100+ false
+      # failures. UAT scenarios are invoked separately via
+      # `bun run test:uat` (vitest with a dedicated config + real
+      # credentials). Listing the dirs explicitly keeps the unit
+      # surface and skips the UAT one.
+      bun test \
+        admin-commands gateway registry secret-detect tests \
+        channel-envelope-safety.test.ts
     cache:
       paths:
         - "~/.bun"
