@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import chalk from "chalk";
 import type { Command } from "commander";
@@ -6,7 +7,10 @@ import { ensurePythonEnv, PythonEnvError } from "../deps/python.js";
 import { ensureNodeEnv, NodeEnvError } from "../deps/node.js";
 
 function builtinSkillsRoot(): string {
-  return resolve(import.meta.dirname, "../../skills");
+  // Mirrors getBundledSkillsPoolDir() in reconcile-default-skills.ts —
+  // `switchroom update` syncs the shipped skills/ payload to this
+  // location so resolution is host-stable (RCA: #1164).
+  return resolve(homedir(), ".switchroom/skills/_bundled");
 }
 
 export function registerDepsCommand(program: Command): void {
@@ -20,7 +24,16 @@ export function registerDepsCommand(program: Command): void {
     .option("-p, --python", "Rebuild only the Python env")
     .option("-n, --node", "Rebuild only the Node env")
     .action(async (skill: string, opts: { python?: boolean; node?: boolean }) => {
-      const skillDir = join(builtinSkillsRoot(), skill);
+      const skillsRoot = builtinSkillsRoot();
+      if (!existsSync(skillsRoot)) {
+        console.error(
+          chalk.red(
+            `Bundled skills pool dir not found at ${skillsRoot} — run \`switchroom update\` to install it.`,
+          ),
+        );
+        process.exit(1);
+      }
+      const skillDir = join(skillsRoot, skill);
       if (!existsSync(skillDir)) {
         console.error(chalk.red(`Unknown skill: ${skill} (no dir at ${skillDir})`));
         process.exit(1);

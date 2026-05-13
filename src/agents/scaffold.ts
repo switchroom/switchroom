@@ -775,7 +775,10 @@ function syncGlobalSkills(
 
   // Clean up stale symlinks — ones that point into the skills pool but
   // aren't in the current declared set. Real files and symlinks that
-  // point elsewhere are left untouched.
+  // point elsewhere are left untouched. Bundled-default symlinks
+  // (targets under `~/.switchroom/skills/_bundled/`) are owned by the
+  // reconcile-default-skills path; skip them here so we don't prune
+  // them as orphans (RCA: #1164).
   const declaredSet = new Set(declared);
   for (const entry of readdirSync(agentSkillsDir)) {
     if (declaredSet.has(entry)) continue;
@@ -785,6 +788,9 @@ function syncGlobalSkills(
       linkTarget = readlinkSync(entryPath);
     } catch {
       continue; // not a symlink
+    }
+    if (linkTarget && linkTarget.includes("/.switchroom/skills/_bundled/")) {
+      continue; // owned by reconcile-default-skills
     }
     if (linkTarget && linkTarget.startsWith(skillsPool)) {
       rmSync(entryPath, { force: true });
@@ -818,8 +824,13 @@ export function installSwitchroomSkills(
   agentDir: string,
   opts: { role?: "assistant" | "foreman" } = {},
 ): void {
-  const builtinSkillsDir = resolve(import.meta.dirname, "../../skills");
-  if (!existsSync(builtinSkillsDir)) return;
+  const builtinSkillsDir = resolve(homedir(), ".switchroom/skills/_bundled");
+  if (!existsSync(builtinSkillsDir)) {
+    process.stderr.write(
+      `switchroom: bundled skills pool dir not found at ${builtinSkillsDir} — run \`switchroom update\` to install it.\n`,
+    );
+    return;
+  }
 
   const targetDir = join(agentDir, ".claude", "skills");
   mkdirSync(targetDir, { recursive: true });

@@ -23,8 +23,20 @@
  */
 
 import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getBuiltinDefaultSkillEntries, type BuiltinSkillEntry } from "../memory/scaffold-integration.js";
+
+/** Track which missing-pool-dir warnings we've already emitted so the
+ *  stderr line fires once per process rather than once per agent. */
+const warnedMissingPool = new Set<string>();
+function warnMissingPoolDir(poolDir: string): void {
+  if (warnedMissingPool.has(poolDir)) return;
+  warnedMissingPool.add(poolDir);
+  process.stderr.write(
+    `switchroom: bundled skills pool dir not found at ${poolDir} — run \`switchroom update\` to install it.\n`,
+  );
+}
 
 /**
  * Result for a single agent processed by reconcileAgentDefaultSkills.
@@ -45,16 +57,31 @@ export interface AgentSkillReconcileResult {
 }
 
 /**
- * Resolve the path to the bundled skills pool inside the installed
- * Switchroom package. The pool is shipped alongside the dist/ output —
- * see `package.json` "files" — so this resolves correctly whether
- * Switchroom is running from source (`bun run dev`) or from a
- * globally installed copy under `node_modules/switchroom/`.
+ * Resolve the path to the bundled skills pool. Switchroom now mirrors
+ * the shipped skill set into `~/.switchroom/skills/_bundled/` on each
+ * `switchroom update`, so the runtime resolution is host-stable and
+ * works identically across dev checkouts, packaged installs, and
+ * docker containers (where the in-image path `/opt/switchroom/skills/`
+ * is the wrong answer for an HOME-bind-mounted state dir).
  *
  * Exposed for tests so they can override the pool location with a tmpdir.
  */
 export function getBundledSkillsPoolDir(): string {
-  return resolve(import.meta.dirname, "../../skills");
+  return resolve(homedir(), ".switchroom/skills/_bundled");
+}
+
+/**
+ * Predicate: is `target` a stale symlink that switchroom installed
+ * under a previous resolver — and therefore safe to delete and
+ * recreate? Matches the current pool dir AND legacy prefixes (any
+ * path containing `/switchroom/skills/` — dev-checkout or packaged —
+ * plus the `/opt/skills/` baked-image path used by pre-fix containers).
+ */
+function isOwnedStaleLink(target: string, poolDir: string): boolean {
+  if (target.startsWith(poolDir)) return true;
+  if (target.includes("/switchroom/skills/")) return true;
+  if (target.startsWith("/opt/skills/")) return true;
+  return false;
 }
 
 /**
@@ -100,6 +127,11 @@ export function reconcileAgentDefaultSkills(
   const targetDir = join(claudeDir, "skills");
   mkdirSync(targetDir, { recursive: true });
 
+  if (!existsSync(poolDir)) {
+    warnMissingPoolDir(poolDir);
+    return result;
+  }
+
   for (const entry of defaults) {
     if (optOuts[entry.optOutKey] === false) {
       result.optedOut.push(entry.key);
@@ -130,10 +162,14 @@ export function reconcileAgentDefaultSkills(
           result.alreadyPresent.push(entry.key);
           continue;
         }
-        // Stale symlink — refresh only if it points inside the pool dir.
-        // A foreign symlink (e.g. operator pointed to a custom location)
+        // Stale symlink — refresh if it points inside the current pool
+        // OR matches a legacy switchroom-owned prefix (dev-checkout
+        // `*/switchroom/skills/*` or packaged `/opt/skills/*`). This
+        // is the migration path that heals broken symlinks on user
+        // machines after the pool-dir relocation (RCA: #1164). A
+        // foreign symlink (operator pointed to a custom location)
         // is left alone.
-        if (currentTarget && currentTarget.startsWith(poolDir)) {
+        if (currentTarget && isOwnedStaleLink(currentTarget, poolDir)) {
           try { rmSync(dest, { force: true }); } catch { /* best effort */ }
         } else {
           result.conflicts.push(entry.key);
