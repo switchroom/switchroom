@@ -25,6 +25,8 @@ import { registerUpCommand } from "./deprecated.js";
 import { registerApplyCommand } from "./apply.js";
 import { registerSecretDetectCommand } from "./secret-detect.js";
 import { registerStatusAskCommand } from "./status-ask.js";
+import { registerAgentConfigCommands } from "./agent-config.js";
+import { registerAgentConfigMcpCommand } from "./mcp-agent-config.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -74,3 +76,5 @@ registerUpCommand(program);
 registerApplyCommand(program);
 registerSecretDetectCommand(program);
 registerStatusAskCommand(program);
+registerAgentConfigCommands(program);
+registerAgentConfigMcpCommand(program);
