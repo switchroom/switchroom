@@ -27,6 +27,7 @@ import { registerSecretDetectCommand } from "./secret-detect.js";
 import { registerStatusAskCommand } from "./status-ask.js";
 import { registerAgentConfigCommands } from "./agent-config.js";
 import { registerAgentConfigMcpCommand } from "./mcp-agent-config.js";
+import { registerMigrateCommand } from "./migrate.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -78,3 +79,4 @@ registerSecretDetectCommand(program);
 registerStatusAskCommand(program);
 registerAgentConfigCommands(program);
 registerAgentConfigMcpCommand(program);
+registerMigrateCommand(program);

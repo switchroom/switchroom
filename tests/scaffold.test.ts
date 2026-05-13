@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills } from "../src/agents/scaffold.js";
 import { renderTemplate, renderProfileClaudeTemplate } from "../src/agents/profiles.js";
+import { cronScriptFilename, cronUnitName } from "../src/agents/cron-unit-name.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 
 const telegramConfig: TelegramConfig = {
@@ -2876,8 +2877,8 @@ describe("scheduled task cron script generation", () => {
       telegramConfig,
     );
 
-    const script0 = join(result.agentDir, "telegram", "cron-0.sh");
-    const script1 = join(result.agentDir, "telegram", "cron-1.sh");
+    const script0 = join(result.agentDir, "telegram", cronScriptFilename("0 8 * * *", "Morning briefing"));
+    const script1 = join(result.agentDir, "telegram", cronScriptFilename("0 20 * * 0", "Weekly review"));
     expect(existsSync(script0)).toBe(true);
     expect(existsSync(script1)).toBe(true);
 
@@ -2903,7 +2904,7 @@ describe("scheduled task cron script generation", () => {
     );
 
     const content = readFileSync(
-      join(result.agentDir, "telegram", "cron-0.sh"),
+      join(result.agentDir, "telegram", cronScriptFilename("0 9 * * *", "Important analysis")),
       "utf-8",
     );
     expect(content).toContain("claude-opus-4-7");
@@ -2919,8 +2920,9 @@ describe("scheduled task cron script generation", () => {
       schedule: [{ cron: "0 8 * * *", prompt: "default-route" }],
     });
     const result = scaffoldAgent("default-cron", agentConfig, tmpDir, telegramConfig);
+    const stem0 = cronUnitName("0 8 * * *", "default-route");
     const content = readFileSync(
-      join(result.agentDir, "telegram", "cron-0.sh"),
+      join(result.agentDir, "telegram", `${stem0}.sh`),
       "utf-8",
     );
     // MCP path: claude runs as a child (not exec) so the success-trailer can
@@ -2931,7 +2933,7 @@ describe("scheduled task cron script generation", () => {
     expect(content).not.toContain("exec claude -p");
     expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
     // Success-trailer: bulk-resolve issues filed under this job's source.
-    expect(content).toContain('switchroom issues resolve --source "cron:cron-0"');
+    expect(content).toContain(`switchroom issues resolve --source "cron:${stem0}"`);
     expect(content).toContain("--quiet");
     expect(content).toContain("exit $rc");
     expect(content).not.toContain("> /dev/null 2>&1"); // don't swallow stderr
@@ -2954,7 +2956,7 @@ describe("scheduled task cron script generation", () => {
       agents: { "flip-cron": baseAgent },
     } as SwitchroomConfig;
     scaffoldAgent("flip-cron", baseAgent, tmpDir, telegramConfig, switchroomConfig);
-    const scriptPath = join(tmpDir, "flip-cron", "telegram", "cron-0.sh");
+    const scriptPath = join(tmpDir, "flip-cron", "telegram", cronScriptFilename("0 6 * * *", "test"));
     // Both scripts are identical — MCP path always used
     expect(readFileSync(scriptPath, "utf-8")).toContain("claude -p");
     expect(readFileSync(scriptPath, "utf-8")).not.toContain("exec claude -p");
@@ -2968,8 +2970,12 @@ describe("scheduled task cron script generation", () => {
       agents: { "flip-cron": updated },
     } as SwitchroomConfig;
     const result = reconcileAgent("flip-cron", updated, tmpDir, telegramConfig, updatedConfig);
-    expect(result.changes).toContain(scriptPath);
-    const updatedScript = readFileSync(scriptPath, "utf-8");
+    // Phase D: prompt change ⇒ new hash filename. The old file is removed
+    // by the cleanup pass and a new file is written.
+    const newScriptPath = join(tmpDir, "flip-cron", "telegram", cronScriptFilename("0 6 * * *", "test updated prompt"));
+    expect(result.changes).toContain(newScriptPath);
+    expect(existsSync(scriptPath)).toBe(false);
+    const updatedScript = readFileSync(newScriptPath, "utf-8");
     expect(updatedScript).toContain("claude -p");
     expect(updatedScript).not.toContain("exec claude -p");
     expect(updatedScript).not.toContain("api.telegram.org");
@@ -2987,14 +2993,16 @@ describe("scheduled task cron script generation", () => {
     });
     const result = scaffoldAgent("trailer-cron", agentConfig, tmpDir, telegramConfig);
 
-    const c0 = readFileSync(join(result.agentDir, "telegram", "cron-0.sh"), "utf-8");
-    const c1 = readFileSync(join(result.agentDir, "telegram", "cron-1.sh"), "utf-8");
+    const stem0 = cronUnitName("0 8 * * *", "first");
+    const stem1 = cronUnitName("0 9 * * *", "second");
+    const c0 = readFileSync(join(result.agentDir, "telegram", `${stem0}.sh`), "utf-8");
+    const c1 = readFileSync(join(result.agentDir, "telegram", `${stem1}.sh`), "utf-8");
 
-    // Each script targets ITS OWN slug — cron-0 must not auto-resolve cron-1's issues.
-    expect(c0).toContain('switchroom issues resolve --source "cron:cron-0"');
-    expect(c0).not.toContain('"cron:cron-1"');
-    expect(c1).toContain('switchroom issues resolve --source "cron:cron-1"');
-    expect(c1).not.toContain('"cron:cron-0"');
+    // Each script targets ITS OWN slug — c0 must not auto-resolve c1's issues.
+    expect(c0).toContain(`switchroom issues resolve --source "cron:${stem0}"`);
+    expect(c0).not.toContain(`"cron:${stem1}"`);
+    expect(c1).toContain(`switchroom issues resolve --source "cron:${stem1}"`);
+    expect(c1).not.toContain(`"cron:${stem0}"`);
 
     // Required trailer shape: capture rc, gate on success, exit with rc.
     expect(c0).toMatch(/rc=\$\?/);
@@ -3007,7 +3015,7 @@ describe("scheduled task cron script generation", () => {
 
     // Prompt-side guidance teaches the model the matching --source string
     // so any issues it records during the run are auto-resolved on success.
-    expect(c0).toContain('--source "cron:cron-0"');
+    expect(c0).toContain(`--source "cron:${stem0}"`);
   });
 
   it("reconcile regenerates cron scripts when prompt changes", () => {
@@ -3021,7 +3029,7 @@ describe("scheduled task cron script generation", () => {
     } as SwitchroomConfig;
     scaffoldAgent("cron-rec", initial, tmpDir, telegramConfig, switchroomConfig);
 
-    const scriptPath = join(tmpDir, "cron-rec", "telegram", "cron-0.sh");
+    const scriptPath = join(tmpDir, "cron-rec", "telegram", cronScriptFilename("0 8 * * *", "v1 prompt"));
     expect(readFileSync(scriptPath, "utf-8")).toContain("v1 prompt");
 
     const updated = makeAgentConfig({
@@ -3033,8 +3041,11 @@ describe("scheduled task cron script generation", () => {
     } as SwitchroomConfig;
     const result = reconcileAgent("cron-rec", updated, tmpDir, telegramConfig, updatedConfig);
 
-    expect(result.changes).toContain(scriptPath);
-    expect(readFileSync(scriptPath, "utf-8")).toContain("v2 prompt updated");
+    // Phase D: prompt change ⇒ new hash filename. Old file removed, new file written.
+    const newScriptPath = join(tmpDir, "cron-rec", "telegram", cronScriptFilename("0 8 * * *", "v2 prompt updated"));
+    expect(result.changes).toContain(newScriptPath);
+    expect(readFileSync(newScriptPath, "utf-8")).toContain("v2 prompt updated");
+    expect(existsSync(scriptPath)).toBe(false);
   });
 
   it("schedule entries from defaults cascade into cron scripts", () => {
@@ -3058,16 +3069,16 @@ describe("scheduled task cron script generation", () => {
       switchroomConfig,
     );
 
-    // Defaults schedule is prepended — cron-0 is the global entry
+    // Defaults schedule is prepended — global entry first
     const script0 = readFileSync(
-      join(result.agentDir, "telegram", "cron-0.sh"),
+      join(result.agentDir, "telegram", cronScriptFilename("0 8 * * *", "Global morning briefing")),
       "utf-8",
     );
     expect(script0).toContain("Global morning briefing");
 
-    // cron-1 is the agent's own entry
+    // Agent's own entry
     const script1 = readFileSync(
-      join(result.agentDir, "telegram", "cron-1.sh"),
+      join(result.agentDir, "telegram", cronScriptFilename("0 17 * * *", "Agent evening check")),
       "utf-8",
     );
     expect(script1).toContain("Agent evening check");

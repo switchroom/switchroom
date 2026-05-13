@@ -681,7 +681,13 @@ export type ChangeKind = "cron" | "skill" | "settings" | "hooks" | "infra" | "ot
 export function classifyChangeKind(path: string): ChangeKind {
   // Use substring matches so callers don't have to pass paths relative
   // to agentDir — scaffold.ts pushes absolute paths into `changes`.
-  if (/\/telegram\/cron-\d+\.sh$/.test(path)) return "cron";
+  // Phase D: cron scripts now use a content-hash basename
+  // (`cron-<12hex>.sh`). The legacy index-based form (`cron-<digits>.sh`)
+  // is matched too as a belt-and-braces guard for unmigrated hosts —
+  // `switchroom migrate cron-unit-names` renames them, after which only
+  // the new form remains on disk. The shared regex lives in
+  // `cron-unit-name.ts` so all classifiers stay in lockstep.
+  if (/\/telegram\/cron-(?:\d+|[0-9a-f]{12})\.sh$/.test(path)) return "cron";
   if (path.includes("/.claude/skills/")) return "skill";
   if (path.endsWith("/.claude/settings.json")) return "settings";
   if (path.endsWith("/.mcp.json")) return "settings";

@@ -12,6 +12,7 @@ import {
   statSync,
   lstatSync,
   readlinkSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { execSync, execFileSync } from "node:child_process";
@@ -19,6 +20,8 @@ import { basename, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import chalk from "chalk";
 import type { AgentConfig, QuotaConfig, SwitchroomConfig, TelegramConfig } from "../config/schema.js";
+import { cronScriptFilename, CRON_SCRIPT_BASENAME_RE, LEGACY_CRON_SCRIPT_BASENAME_RE } from "./cron-unit-name.js";
+import { OVERLAY_SOURCE } from "../config/overlay-loader.js";
 
 // Repo root for referencing bin/ scripts in hooks
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -2289,9 +2292,19 @@ export function scaffoldAgent(
     for (let i = 0; i < agentConfig.schedule!.length; i++) {
       const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
-      const script = buildCronScript(agentDir, entry.prompt, model, cronChatId, userId, entry.secrets ?? [], brokerSocket, `cron-${i}`);
-      const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
+      const filename = cronScriptFilename(entry.cron, entry.prompt);
+      const stem = filename.replace(/\.sh$/, "");
+      const script = buildCronScript(agentDir, entry.prompt, model, cronChatId, userId, entry.secrets ?? [], brokerSocket, stem);
+      const scriptPath = join(agentDir, "telegram", filename);
       writeFileSync(scriptPath, script, { encoding: "utf-8", mode: 0o700 });
+      // Phase B/D: write the .source sidecar attributing each cron script
+      // to its origin (main switchroom.yaml vs an overlay fragment under
+      // schedule.d/). Downstream tools (audit, operator approval) read
+      // the sidecar to decide whether an entry can be edited in place or
+      // requires touching an overlay file. The OVERLAY_SOURCE symbol is
+      // stamped by overlay-loader.ts on appended entries.
+      const source = (entry as Record<symbol, unknown>)[OVERLAY_SOURCE] ? "overlay" : "main";
+      writeFileSync(join(agentDir, "telegram", `${stem}.source`), `${source}\n`, { encoding: "utf-8", mode: 0o600 });
     }
   }
 
@@ -3551,19 +3564,53 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       ? resolveDualPath(switchroomConfig.vault.broker.socket)
       : resolveDualPath("~/.switchroom/vault-broker.sock");
     const reconCronChatId = cronUserId ?? telegramConfig.forum_chat_id;
+    const canonicalFilenames = new Set<string>();
     for (let i = 0; i < agentConfig.schedule!.length; i++) {
       const entry = agentConfig.schedule![i];
       const model = entry.model ?? "claude-sonnet-4-6";
+      const filename = cronScriptFilename(entry.cron, entry.prompt);
+      canonicalFilenames.add(filename);
       const script = buildCronScript(
         agentDir, entry.prompt, model,
         reconCronChatId, cronUserId, entry.secrets ?? [], reconBrokerSocket,
-        `cron-${i}`,
+        filename.replace(/\.sh$/, ""),
       );
-      const scriptPath = join(agentDir, "telegram", `cron-${i}.sh`);
+      const scriptPath = join(agentDir, "telegram", filename);
       const before = existsSync(scriptPath) ? readFileSync(scriptPath, "utf-8") : "";
       if (script !== before) {
         writeFileSync(scriptPath, script, { encoding: "utf-8", mode: 0o700 });
         changes.push(scriptPath);
+      }
+      // Phase D: .source sidecar attribution (main vs overlay).
+      const source = (entry as Record<symbol, unknown>)[OVERLAY_SOURCE] ? "overlay" : "main";
+      const stem = filename.replace(/\.sh$/, "");
+      const sidecarPath = join(agentDir, "telegram", `${stem}.source`);
+      const sidecarBody = `${source}\n`;
+      const sidecarBefore = existsSync(sidecarPath) ? readFileSync(sidecarPath, "utf-8") : "";
+      if (sidecarBody !== sidecarBefore) {
+        writeFileSync(sidecarPath, sidecarBody, { encoding: "utf-8", mode: 0o600 });
+        changes.push(sidecarPath);
+      }
+    }
+    // Cleanup: remove stale cron scripts not in the canonical set,
+    // including any legacy `cron-<digits>.sh` files left over from the
+    // pre-Phase-D index-based scheme. Idempotent: re-running with the
+    // same config produces no further deletions.
+    const telegramDir = join(agentDir, "telegram");
+    if (existsSync(telegramDir)) {
+      const files = readdirSync(telegramDir);
+      for (const file of files) {
+        const isCron = CRON_SCRIPT_BASENAME_RE.test(file) || LEGACY_CRON_SCRIPT_BASENAME_RE.test(file);
+        if (isCron && !canonicalFilenames.has(file)) {
+          const staleScript = join(telegramDir, file);
+          unlinkSync(staleScript);
+          changes.push(staleScript);
+          const sourceSidecar = staleScript.replace(/\.sh$/, ".source");
+          if (existsSync(sourceSidecar)) {
+            unlinkSync(sourceSidecar);
+            changes.push(sourceSidecar);
+          }
+        }
       }
     }
   }
