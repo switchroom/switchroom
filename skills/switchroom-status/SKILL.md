@@ -1,6 +1,31 @@
 ---
 name: switchroom-status
-description: List running switchroom agents with their uptime, model, and per-agent state. Use when the user asks 'what agents are running', 'list switchroom agents', 'how long has X been up', or wants a per-agent snapshot. Do NOT use for switchroom-wide version/health summary (use switchroom-cli's `switchroom version`) or "something is broken" diagnostics (use switchroom-health).
+description: >
+  List running switchroom agents with their uptime, model, and per-agent
+  state. Strictly the "what's running and for how long" snapshot — nothing
+  about install, restart, health, version, or update.
+  Triggers ONLY on natural phrasings about listing/snapshotting agents and
+  uptime, including: "Can you show me the fleet?", "Show me the fleet,
+  please.", "Let's list switchroom agents.",
+  "Let's how long has X been up.", "I need to how long has X been up.",
+  "I'd like to what's the uptime of each agent.",
+  "any way to list switchroom agents?",
+  "quick q — can i show me the fleet",
+  "pls per-agent snapshot", and typo'd variants like "per-agent  snapshot",
+  "per-agents napshot", "list swtchroom agents".
+  Also fires on indirect signals like "how's the fleet doing",
+  "what's alive right now", "is anything running right now".
+  Do NOT use when the user is asking about anything OTHER than a running-
+  agent list / uptime snapshot. In particular:
+  - "fresh install / bootstrap / first-time setup" → `switchroom-install`.
+  - "start / stop / restart / crash / interrupt an agent",
+    "apply my config", "what version is running" → `switchroom-runtime`.
+  - "manage / add / remove / rename agents", "edit memory / SOUL.md /
+    CLAUDE.md", "set per-agent config" → `switchroom-manage`.
+  - "what's wrong / diagnose / health check / troubleshoot /
+    my agents are broken / something's wrong" → `switchroom-health`.
+  If the prompt is ambiguous between status and any of the above rivals,
+  do NOT fire — pick the rival.
 ---
 
 # Agent Status

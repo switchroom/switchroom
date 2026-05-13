@@ -1,6 +1,23 @@
 ---
 name: webapp-testing
-description: Toolkit for interacting with and testing local web applications using Playwright. Supports verifying frontend functionality, debugging UI behavior, capturing browser screenshots, and viewing browser logs. Use when the user says "click through my UI", "automate this dashboard", "snapshot the frontend", "test local web app", or mentions Playwright. Do NOT use for Bot-API tests (`telegram-test-harness`), CLI tests (vitest under `tests/`), or non-web UI testing.
+description: >
+  Toolkit for interacting with and testing local web applications using
+  Playwright. Supports verifying frontend functionality, debugging UI
+  behavior, capturing browser screenshots, and viewing browser logs.
+  Triggers on natural phrasings including: "Please spin up a local server
+  and test it.", "Help me spin up a local server and test it.",
+  "Let's spin up a local server and test it.", "I'd like to run a
+  Playwright test.", "Can you run a Playwright test?", "Help me view
+  browser logs.", "any way to test the frontend?", "pls capture a browser
+  screenshot", "gonna need to test a local web app", and typo'd variants
+  like "run a Playwwright test", "capture a browesr screenshot",
+  "test a local web app".
+  Also fires when the user says "click through my UI", "automate this
+  dashboard", "snapshot the frontend", or mentions Playwright, headless
+  Chromium, browser automation, frontend e2e tests, or a `localhost:<port>`
+  webapp that needs end-to-end exercise.
+  Do NOT use for Telegram Bot-API tests (`telegram-test-harness`),
+  CLI/unit tests (vitest under `tests/`), or non-web UI testing.
 license: Complete terms in LICENSE.txt
 ---
 

@@ -1,14 +1,23 @@
 ---
 name: buildkite-test-engine
 description: >
-  This skill should be used when the user asks to "split tests across machines",
-  "set up test splitting", "parallelize test suite", "detect flaky tests",
-  "quarantine flaky tests", "configure test collectors", "speed up tests",
-  "set up bktec", "configure test engine", or "reduce flaky test failures".
-  Also use when the user mentions bktec, Test Engine, test suites,
-  BUILDKITE_TEST_ENGINE_* environment variables, BUILDKITE_ANALYTICS_TOKEN,
-  test-collector plugin, test reliability scores, test timing data,
-  or asks about Buildkite test splitting and flaky test management.
+  Use when the user wants to split tests across parallel machines, set up
+  test splitting, parallelize a test suite, detect or quarantine flaky tests,
+  configure test collectors, speed up tests via Buildkite's Test Engine, set
+  up `bktec`, or reduce flaky test failures.
+  Triggers on natural phrasings including: "Help me detect flaky tests.",
+  "Can you parallelize test suite?", "I need to configure test collectors.",
+  "Can you configure test collectors?", "Let's speed up tests.",
+  "Can you speed up tests?", "yo, how do i speed up tests",
+  "gonna need to configure test collectors",
+  "quick q — can i configure test collectors", and typo'd variants like
+  "parallelize  test suite", "set up tes tsplitting", "set up test splitting".
+  Also fires on `bktec`, Buildkite Test Engine, test suites,
+  `BUILDKITE_TEST_ENGINE_*` environment variables, `BUILDKITE_ANALYTICS_TOKEN`,
+  the `test-collector` plugin, test reliability scores, test timing data,
+  or any mention of Buildkite test splitting and flaky-test management.
+  Do NOT use for authoring general pipeline YAML (that's `buildkite-pipelines`)
+  or for `buildkite-agent` in-step subcommands (that's `buildkite-agent-runtime`).
 ---
 
 # Buildkite Test Engine

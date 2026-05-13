@@ -1,21 +1,32 @@
 ---
 name: buildkite-agent-runtime
 description: >
-  This skill should be used when the user asks to "add an annotation",
-  "upload artifacts from a step", "share data between steps", "upload pipeline
-  dynamically", "request an OIDC token inside a step", "acquire a distributed lock",
-  "get or update a step attribute", "redact a secret from logs", "retrieve a cluster
-  secret at runtime", or "debug environment variables in hooks".
-  Also use when the user mentions buildkite-agent annotate, buildkite-agent artifact
-  upload/download, buildkite-agent meta-data set/get, buildkite-agent pipeline upload,
-  buildkite-agent oidc request-token, buildkite-agent step, buildkite-agent lock,
-  buildkite-agent env, buildkite-agent secret get, buildkite-agent redactor add,
-  buildkite-agent tool sign/verify, or any buildkite-agent subcommand used inside
-  a running job step.
+  Use when the user wants to call the `buildkite-agent` binary from inside
+  a running job step — annotating builds, uploading or downloading artifacts,
+  setting or getting meta-data between steps, uploading dynamic pipeline YAML,
+  requesting an OIDC token, acquiring distributed locks, getting or updating
+  a step attribute, redacting secrets from logs, or fetching cluster secrets
+  at runtime.
+  Triggers on natural phrasings including: "Help me add an annotation.",
+  "Please add an annotation.", "Please upload artifacts from a step.",
+  "Could you upload pipeline dynamically for me?",
+  "Help me request an OIDC token inside a step.",
+  "Get or update a step attribute, please.",
+  "pls acquire a distributed lock", "gonna need to add an annotation",
+  "quick q — can i get or update a step attribute", and typo'd variants
+  like "request an IDC token inside a step", "retrieve a custer secret at runtime".
+  Also fires on `buildkite-agent annotate`, `buildkite-agent artifact upload/download`,
+  `buildkite-agent meta-data set/get`, `buildkite-agent pipeline upload`,
+  `buildkite-agent oidc request-token`, `buildkite-agent step`,
+  `buildkite-agent lock`, `buildkite-agent env`, `buildkite-agent secret get`,
+  `buildkite-agent redactor add`, `buildkite-agent tool sign/verify`, or any
+  `buildkite-agent` subcommand invoked inside a running job step.
   Do NOT use when the user is provisioning or configuring rather than calling
-  from inside a running step — cluster/queue/token provisioning belongs to
-  `buildkite-agent-infrastructure`, and OIDC trust setup (vs in-step
-  `oidc request-token`) belongs to `buildkite-secure-delivery`.
+  from inside a step — cluster/queue/token provisioning is
+  `buildkite-agent-infrastructure`, and OIDC trust setup (the IdP side, vs
+  in-step `oidc request-token`) is `buildkite-secure-delivery`. Do NOT use
+  for authoring `.buildkite/pipeline.yml` step definitions — that's
+  `buildkite-pipelines`.
 ---
 
 # Buildkite Agent Runtime

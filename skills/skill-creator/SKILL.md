@@ -1,6 +1,26 @@
 ---
 name: skill-creator
-description: Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.
+description: >
+  Create new skills, modify and improve existing skills, and measure skill
+  performance. Use when users want to create a skill from scratch, edit an
+  existing skill, run evals to test a skill, benchmark skill performance
+  with variance analysis, or optimize a skill's description / frontmatter
+  for better triggering accuracy.
+  Triggers on natural phrasings including: "I need to create a new skill.",
+  "Help me create a new skill.", "Edit an existing skill, please.",
+  "Could you edit an existing skill for me?",
+  "Can you improve the trigger accuracy of a skill?",
+  "Can you optimize a skill description?",
+  "any way to optimize a skill description?",
+  "yo, how do i edit an existing skill",
+  "yo, how do i optimize a skill description",
+  and typo'd variants like "create a new skill",
+  "improve teh trigger accuracy of a skill", "optimize  skill description".
+  Also fires on indirect signals like "the skill-creator thing is weird",
+  "something is going on with skill-creator",
+  "can you take a look at the skill-creator situation".
+  Do NOT use for building MCP servers / MCP tools — that's `mcp-builder`.
+  Do NOT use for filing a bug report — that's `file-bug`.
 ---
 
 # Skill Creator

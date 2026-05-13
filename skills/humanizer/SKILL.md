@@ -8,6 +8,15 @@ description: |
   inflated symbolism, promotional language, superficial -ing analyses, vague
   attributions, em dash overuse, rule of three, AI vocabulary words, passive
   voice, negative parallelisms, and filler phrases.
+  Triggers on natural phrasings including: "Let's rewrite this to sound natural.",
+  "Please edit this so it doesn't sound like AI.", "Remove signs of AI writing,
+  please.", "I need to make this sound more human.", "Can you remove the rule
+  of three?", "Let's fix the em-dash overuse.", "yo, how do i remove signs of
+  AI writing", "gonna need to remove signs of AI writing", and typo'd variants
+  like "make this soudn more human", "fix theem-dash overuse", "remove signs
+  of AI writing". Also fires on indirect signals like "this paragraph screams
+  ChatGPT", "the prose sounds robotic", "this reads like AI slop" — anywhere
+  the user complains text feels AI-flavored and wants it rewritten.
   Do NOT use for proofreading, grammar fixes, or style edits where the input
   wasn't AI-generated. This skill specifically removes AI tells.
 license: MIT

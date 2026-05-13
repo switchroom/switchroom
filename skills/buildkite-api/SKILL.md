@@ -1,17 +1,28 @@
 ---
 name: buildkite-api
 description: >
-  This skill should be used when the user asks to "call the Buildkite API",
-  "use the REST API", "write a GraphQL query", "set up webhooks",
-  "automate Buildkite", "integrate with Buildkite programmatically",
-  "write a script that calls Buildkite", "handle webhook events",
-  "paginate API results", or "authenticate with the Buildkite API".
-  Also use when the user mentions api.buildkite.com, graphql.buildkite.com,
-  Buildkite REST endpoints, GraphQL mutations, webhook payloads,
-  API tokens, or asks about programmatic access to Buildkite data.
-  Do NOT use for interactive `bk` CLI usage — that's `buildkite-cli`. Prefer
-  this skill for one-shot terminal CI ops via curl/GraphQL/scripts rather
-  than `bk` subcommands.
+  Use when the user wants direct programmatic access to Buildkite — calling
+  the REST API (`api.buildkite.com`), writing GraphQL queries or mutations
+  (`graphql.buildkite.com`), handling webhook events, paginating API
+  results, or scripting integrations that hit Buildkite endpoints.
+  Triggers on natural phrasings including: "Please write a GraphQL query.",
+  "Let's paginate API results.", "Could you automate Buildkite for me?",
+  "Automate Buildkite, please.",
+  "Can you authenticate with the Buildkite API?",
+  "hey, automate Buildkite?", "any way to write a GraphQL query?",
+  "any way to write a script that calls Buildkite?",
+  and typo'd variants like "authenticate with  the Buildkite API",
+  "write a GraaphQL query", "integrate with Buildikte programmatically".
+  Also fires on indirect signals like "the buildkite-api thing is weird",
+  "can you take a look at the buildkite-api situation",
+  "something is going on with buildkite-api".
+  Also fires on mentions of `api.buildkite.com`, `graphql.buildkite.com`,
+  REST endpoints, GraphQL mutations, webhook payloads, API tokens, or
+  programmatic access to Buildkite data.
+  Do NOT use for interactive `bk` CLI usage — that's `buildkite-cli`. Do
+  NOT use for authoring `.buildkite/pipeline.yml` — that's
+  `buildkite-pipelines`. Do NOT use for `buildkite-agent <subcommand>`
+  inside a step — that's `buildkite-agent-runtime`.
 ---
 
 # Buildkite API

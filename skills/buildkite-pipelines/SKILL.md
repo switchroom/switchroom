@@ -1,17 +1,26 @@
 ---
 name: buildkite-pipelines
 description: >
-  This skill should be used when the user asks to "write a pipeline",
-  "add caching", "make this build faster", "show test failures in the build page",
-  "add annotations", "only run tests when code changes", "set up dynamic pipelines",
-  "add retry", "parallel steps", "matrix build", "add plugins", or
-  "work with artifacts in pipeline YAML".
-  Also use when the user mentions .buildkite/ directory, pipeline.yml,
-  buildkite-agent pipeline upload, step types (command, wait, block, trigger,
-  group, input), if_changed, notify, concurrency, or asks about Buildkite CI
-  configuration.
+  Use when the user is authoring or editing `.buildkite/pipeline.yml` — the
+  declarative CI/CD configuration for Buildkite. Covers step types, caching,
+  parallelism, annotations, retry, dynamic pipelines, matrix builds, plugins,
+  notifications, artifacts, and concurrency in pipeline YAML.
+  Triggers on natural phrasings including: "Help me write a pipeline.",
+  "Can you parallel steps?", "Let's add retry.", "I'd like to add caching.",
+  "Let's add annotations.", "Let's show test failures in the build page.",
+  "yo, how do i matrix build", "pls only run tests when code changes",
+  "yo, how do i only run tests when code changes", and typo'd variants like
+  "write a pipeline", "add annotations", "set up dnamic pipelines".
+  Also fires on indirect signals like "my pipeline.yml is a mess",
+  "the build is slow", "tests run in serial when they shouldn't".
+  Also fires on mentions of the `.buildkite/` directory, `pipeline.yml`,
+  step types (command, wait, block, trigger, group, input), `if_changed`,
+  `notify`, `concurrency`, plugin blocks, matrix steps, or general
+  Buildkite CI configuration.
   Do NOT use when the user is invoking `buildkite-agent <subcommand>` inside
-  a step — that's `buildkite-agent-runtime`.
+  a running step — that's `buildkite-agent-runtime`. Do NOT use for
+  terminal-driven `bk` CLI operations — that's `buildkite-cli`. Do NOT use
+  for direct REST/GraphQL API calls — that's `buildkite-api`.
 ---
 
 # Buildkite Pipelines
