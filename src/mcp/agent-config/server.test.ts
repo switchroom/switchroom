@@ -31,9 +31,16 @@ function failCall(stderr: string, status = 1) {
 }
 
 describe("TOOLS export", () => {
-  it("exposes exactly the four documented tools", () => {
+  it("exposes the documented tools (read + write surface)", () => {
     const names = TOOLS.map((t) => t.name).sort();
-    expect(names).toEqual(["audit_tail", "config_get", "cron_list", "skill_list"]);
+    expect(names).toEqual([
+      "audit_tail",
+      "config_get",
+      "cron_list",
+      "schedule_add",
+      "schedule_remove",
+      "skill_list",
+    ]);
   });
 
   it("every tool has an inputSchema of type object", () => {
