@@ -416,6 +416,37 @@ const HINDSIGHT_MCP_TOOLS = [
 ];
 
 /**
+ * Pre-approved MCP tool names for the `agent-config` server (every
+ * agent has this server wired via .mcp.json). Without these in the
+ * allow list, every first-time call to skill_list / cron_list /
+ * config_get / audit_tail / peers_list / schedule_add / schedule_remove
+ * / skill_install / skill_remove blocks on a Claude Code permission
+ * prompt that the operator has to approve via Telegram. The first
+ * inbound that needs one of these tools wedges the agent — the very
+ * regression that surfaced in the UAT for PR #1215 (skill_list
+ * permission popup screenshot). Wildcard covers future additions to
+ * the same server without another scaffold bump.
+ */
+const AGENT_CONFIG_MCP_TOOLS = [
+  "mcp__agent-config",
+  "mcp__agent-config__*",
+];
+
+/**
+ * Pre-approved MCP tool names for the `hostd` server. Bind-mounted
+ * only when the agent is `admin: true` (compose.ts gates the socket
+ * mount); pre-approving the wildcard for non-admin agents is harmless
+ * because the daemon-side gate (src/host-control/server.ts checkGate)
+ * is the security boundary, not the client-side allow list. Avoids
+ * the same first-use approval wedge for agent_restart / agent_logs /
+ * agent_exec / update_check / update_apply.
+ */
+const HOSTD_MCP_TOOLS = [
+  "mcp__hostd",
+  "mcp__hostd__*",
+];
+
+/**
  * Legacy `mcp__switchroom__*` permission tokens that pre-#235 agents have
  * baked into their `settings.permissions.allow`. The switchroom-mcp server
  * is deprecated (#235) — its 4 tools were dormant (zero callers) and the
@@ -1782,6 +1813,13 @@ export function scaffoldAgent(
     ...readOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
+    // agent-config + hostd are always wired into .mcp.json so the
+    // prompt fragment can claim "you have these tools available" —
+    // but Claude Code blocks the first call on a permission prompt
+    // unless the tool is on the allow list. Pre-approve unconditionally
+    // (daemon-side gates remain the real security boundary).
+    ...AGENT_CONFIG_MCP_TOOLS,
+    ...HOSTD_MCP_TOOLS,
   ]);
 
   // Compute Hindsight plugin context for the start.sh + settings.json
@@ -1887,6 +1925,24 @@ export function scaffoldAgent(
       if (hindsightEntry && !settings.mcpServers[hindsightEntry.key]) {
         settings.mcpServers[hindsightEntry.key] = hindsightEntry.value;
       }
+
+      // Pre-allow the every-agent MCP servers in settings.permissions.allow
+      // so existing agents pick up the wildcards on `switchroom apply`
+      // (writeIfMissing above skips settings.json for existing agents,
+      // so a fresh permissionAllow would otherwise only land on first
+      // scaffold). Without this merge a first call to skill_list /
+      // cron_list / config_get / audit_tail / peers_list wedges the
+      // agent on a Claude Code permission prompt the operator has to
+      // approve via Telegram one-tool-at-a-time. See the UAT for
+      // PR #1215 (skill_list screenshot).
+      settings.permissions = settings.permissions ?? {};
+      const allow: string[] = Array.isArray(settings.permissions.allow)
+        ? settings.permissions.allow
+        : [];
+      for (const t of [...AGENT_CONFIG_MCP_TOOLS, ...HOSTD_MCP_TOOLS]) {
+        if (!allow.includes(t)) allow.push(t);
+      }
+      settings.permissions.allow = allow;
 
       // #235: actively retract the legacy switchroom-mcp entry on reconcile
       // so existing agents stop spawning the dormant child process. The 4
@@ -3134,6 +3190,10 @@ export function reconcileAgent(
     ...reconcileReadOnlyDefaults,
     ...(usesSwitchroomTelegramPlugin(agentConfig) ? SWITCHROOM_TELEGRAM_MCP_TOOLS : []),
     ...(hindsightEnabled ? HINDSIGHT_MCP_TOOLS : []),
+    // See scaffoldAgent for the rationale — pre-approve every-agent
+    // MCP servers so first-use doesn't wedge on a permission prompt.
+    ...AGENT_CONFIG_MCP_TOOLS,
+    ...HOSTD_MCP_TOOLS,
   ]);
   const desiredDeny = tools.deny ?? [];
 

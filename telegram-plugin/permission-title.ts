@@ -18,6 +18,45 @@ const COMMAND_TITLE_MAX = 40;
 const PATH_TITLE_MAX = 40;
 
 /**
+ * Human-friendly descriptions for switchroom-managed MCP tools. The
+ * raw `mcp__<server>__<tool>` name is operator-unfriendly — they shouldn't
+ * have to decode the namespace to understand what the agent is asking
+ * to do. Use this map to turn the code-level identifier into a verb
+ * phrase ("Read its own merged config" instead of
+ * "mcp__agent-config__config_get") for the approval card.
+ *
+ * Note: post-#1215 these tools are pre-allowed in scaffolded
+ * settings.permissions.allow, so the card should fire rarely.
+ * This map is for the fallback path — agents the operator
+ * narrowed the allowlist on, or tools added in future PRs that
+ * haven't shipped the allowlist bump yet.
+ */
+const MCP_TOOL_DESCRIPTIONS: Record<string, string> = {
+  // agent-config — every agent's self-service surface (#1163, #1215)
+  "mcp__agent-config__config_get": "Read its own merged config",
+  "mcp__agent-config__cron_list": "List its own scheduled tasks",
+  "mcp__agent-config__skill_list": "List its own installed skills",
+  "mcp__agent-config__audit_tail": "Read its own recent tool-call audit log",
+  "mcp__agent-config__peers_list": "List the other agents on this instance",
+  "mcp__agent-config__schedule_add": "Add a scheduled task to its own cron",
+  "mcp__agent-config__schedule_remove": "Remove one of its own scheduled tasks",
+  "mcp__agent-config__skill_install": "Install a bundled skill onto itself",
+  "mcp__agent-config__skill_remove": "Remove one of its own installed skills",
+  // hostd — admin-flagged agents' fleet-management surface (#1175, #1215)
+  "mcp__hostd__agent_restart": "Restart an agent in the fleet",
+  "mcp__hostd__agent_start": "Start a stopped agent in the fleet",
+  "mcp__hostd__agent_stop": "Stop a running agent in the fleet",
+  "mcp__hostd__agent_logs": "Read another agent's container logs",
+  "mcp__hostd__agent_exec": "Run a read-only inspection inside another agent",
+  "mcp__hostd__update_check": "Check what a fleet-wide update would do",
+  "mcp__hostd__update_apply": "Apply a fleet-wide update (pull + recreate)",
+  // hindsight — memory
+  "mcp__hindsight__recall": "Recall relevant memories",
+  "mcp__hindsight__retain": "Retain a memory",
+  "mcp__hindsight__reflect": "Reflect across its memory bank",
+};
+
+/**
  * Build a title fragment for a permission prompt. Returns the toolName
  * for any tool we don't recognise — the helper is intentionally
  * conservative: better to keep the bare name than render gibberish from
@@ -27,6 +66,23 @@ export function summarizeToolForTitle(
   toolName: string,
   inputPreview: string | undefined,
 ): string {
+  // MCP tools: `mcp__<server>__<verb>`. Prefer a curated human
+  // description (so the card reads "Read its own merged config"
+  // instead of "mcp__agent-config__config_get"). Fall through to a
+  // generic `<server>: <verb-with-spaces>` shape for unknown MCP
+  // tools and finally to the raw name when even that fails.
+  if (toolName.startsWith("mcp__")) {
+    const curated = MCP_TOOL_DESCRIPTIONS[toolName];
+    if (curated) return curated;
+    const parts = toolName.split("__");
+    if (parts.length >= 3) {
+      const server = parts[1]!;
+      const verb = parts.slice(2).join("__").replace(/_/g, " ");
+      return `${server}: ${verb}`;
+    }
+    return toolName;
+  }
+
   const input = parseInput(inputPreview);
   if (!input) return toolName;
 

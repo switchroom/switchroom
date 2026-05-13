@@ -103,4 +103,35 @@ describe('summarizeToolForTitle (#186)', () => {
     const input = JSON.stringify({ skill: 'mail', name: 'wrong' })
     expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
   })
+
+  test('MCP curated: agent-config tools render as human verb-phrases (#1215)', () => {
+    expect(summarizeToolForTitle('mcp__agent-config__skill_list', undefined)).toBe(
+      'List its own installed skills',
+    )
+    expect(summarizeToolForTitle('mcp__agent-config__cron_list', undefined)).toBe(
+      'List its own scheduled tasks',
+    )
+    expect(summarizeToolForTitle('mcp__agent-config__peers_list', undefined)).toBe(
+      'List the other agents on this instance',
+    )
+  })
+
+  test('MCP curated: hostd tools render as human verb-phrases (#1215)', () => {
+    expect(summarizeToolForTitle('mcp__hostd__agent_logs', undefined)).toBe(
+      "Read another agent's container logs",
+    )
+    expect(summarizeToolForTitle('mcp__hostd__agent_exec', undefined)).toBe(
+      'Run a read-only inspection inside another agent',
+    )
+  })
+
+  test('MCP fallback: unknown mcp tool renders as `<server>: <verb with spaces>`', () => {
+    expect(summarizeToolForTitle('mcp__some-server__do_thing', undefined)).toBe(
+      'some-server: do thing',
+    )
+  })
+
+  test('MCP malformed: bare mcp__ prefix without __<server>__<verb> shape is left alone', () => {
+    expect(summarizeToolForTitle('mcp__bad', undefined)).toBe('mcp__bad')
+  })
 })
