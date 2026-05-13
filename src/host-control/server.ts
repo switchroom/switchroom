@@ -951,9 +951,27 @@ function tail(s: string, bytes = TAIL_BYTES): string {
  * that writes, mounts, kills, reboots, or modifies the network stack
  * stays off this list.
  *
- * Rationale: a 5-command allowlist is more legible than a regex
- * blocklist, and the exec surface is meant to answer "what's going on
- * in that container" rather than to be a general shell.
+ * **Trust model.** Admin-flagged agents can already restart any peer
+ * (`agent_restart`), stop any peer (`agent_stop`), and recreate every
+ * container in the fleet (`update_apply`). Granting them peer-container
+ * READ via this allowlist is consistent with that posture: admin: true
+ * is the operator's standing proxy. The CLAUDE.md "Admin surface"
+ * block calls this out explicitly: "treat these like a root shell on
+ * the host." Operators who want stricter posture should not flag any
+ * agent admin: true at all.
+ *
+ * **What's reachable via `cat` / `env`.** Inside a peer container, an
+ * allowlisted `cat /state/agent/telegram/.env` reveals the peer's bot
+ * token; `cat /state/agent/.claude/credentials.json` reveals its
+ * Claude OAuth refresh token. Both are credential-equivalent to root
+ * over that peer. This is the deliberate trade-off — without read
+ * access, "the peer is wedged" debugging requires shelling onto the
+ * host, defeating the point of the admin surface. Operators who want
+ * mutation gating beyond restart/stop should layer the
+ * `host_os.exec` approval-kernel scope (deferred follow-up).
+ *
+ * Rationale for an allowlist over a blocklist: legible, auditable,
+ * and forces a deliberate add when a new inspection tool is needed.
  */
 export const READONLY_EXEC_ALLOWLIST = [
   "cat",

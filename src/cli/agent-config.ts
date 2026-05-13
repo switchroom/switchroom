@@ -346,9 +346,26 @@ export function registerAgentConfigCommands(program: Command): void {
       withConfigError(async (opts: { agent?: string; includeSelf?: boolean }) => {
         let self: string | null;
         try {
-          // Allow operator context (no env, no --agent) to list ALL agents:
-          // pass through with self = null and skip the cross-agent guard.
+          // Three contexts:
+          //   1. Container with $SWITCHROOM_AGENT_NAME set — env-pinned
+          //      identity; resolveTargetAgent enforces "no --agent
+          //      cross-read".
+          //   2. Container with NO env set — denied. We must not fall
+          //      through to "operator: list all" here because a
+          //      misconfigured / probing in-container caller would
+          //      bypass the cross-agent gate that protects every
+          //      other agent-config verb. The container probe
+          //      (/.dockerenv OR SWITCHROOM_CONTAINER=1) detects this.
+          //   3. Host with no env (operator running the CLI directly).
+          //      switchroom.yaml is already on disk and operator-
+          //      readable, so listing every agent is not a new leak —
+          //      we just pass through with self = null.
           if (!opts.agent && !process.env.SWITCHROOM_AGENT_NAME) {
+            if (isContainerContext()) {
+              throw new Error(
+                "agent identity missing in container context: refuse to serve",
+              );
+            }
             self = null;
           } else {
             self = resolveTargetAgent(opts.agent);

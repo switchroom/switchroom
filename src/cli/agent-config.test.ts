@@ -315,6 +315,25 @@ describe("registered commands", () => {
     ]);
   });
 
+  it("peers list denies when in container context with no $SWITCHROOM_AGENT_NAME (no operator fallthrough)", async () => {
+    // Simulate a container caller that managed to invoke `switchroom
+    // peers list` without an env-pinned identity (e.g. an injected
+    // process, a debug shell, an MCP shim misconfig). Without this
+    // gate the caller would receive the entire fleet, bypassing the
+    // cross-agent denial that every other agent-config verb enforces.
+    process.env.SWITCHROOM_CONTAINER = "1";
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    try {
+      const program = buildProgram();
+      await expect(
+        program.parseAsync(["node", "switchroom", "peers", "list"]),
+      ).rejects.toThrow(/__exit_7/);
+      expect(stderr).toMatch(/identity missing in container context/);
+    } finally {
+      delete process.env.SWITCHROOM_CONTAINER;
+    }
+  });
+
   it("peers list --include-self includes the caller in the result", async () => {
     process.env.SWITCHROOM_AGENT_NAME = "a";
     const program = buildProgram();
