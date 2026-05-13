@@ -73,7 +73,7 @@ steps:
       # The cache is keyed by bun.lock checksum (see `cache.key` below), so
       # hitting this path means the lockfile is unchanged since the last build.
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       # --prefer-offline: skip registry lookups when the cache already has
@@ -85,7 +85,7 @@ steps:
       paths:
         - "~/.bun"
         - "node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}"
+      key: "v2-bun-{{ checksum 'bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1   # agent lost
@@ -114,7 +114,7 @@ steps:
       - ".buildkite/pipeline.yml"
     command: |
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       # tests/boot-self-test.test.ts shells bin/boot-self-test.sh, which
@@ -287,7 +287,7 @@ steps:
       - ".buildkite/pipeline.yml"
     command: |
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile --prefer-offline --no-progress
@@ -298,7 +298,7 @@ steps:
       paths:
         - "~/.bun"
         - "node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}"
+      key: "v2-bun-{{ checksum 'bun.lock' }}"
     soft_fail:
       # The test self-skips when docker is unavailable; treat any
       # non-fatal exit as a soft signal so the build doesn't block
@@ -345,7 +345,7 @@ steps:
       - ".buildkite/pipeline.yml"
     command: |
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       cd telegram-plugin
@@ -367,7 +367,7 @@ steps:
       paths:
         - "~/.bun"
         - "telegram-plugin/node_modules/"
-      key: "v1-tg-{{ checksum 'telegram-plugin/bun.lock' }}"
+      key: "v2-tg-{{ checksum 'telegram-plugin/bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1
@@ -401,7 +401,7 @@ steps:
       - ".buildkite/docker-snapshot-gate.sh"
     command: |
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile --prefer-offline --no-progress
@@ -411,7 +411,7 @@ steps:
       paths:
         - "~/.bun"
         - "node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}"
+      key: "v2-bun-{{ checksum 'bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1

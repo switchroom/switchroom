@@ -47,7 +47,7 @@ steps:
     concurrency_group: "switchroom/uat-fuzz"
     command: |
       if [ ! -x "$$HOME/.bun/bin/bun" ]; then
-        curl -fsSL https://bun.sh/install | bash
+        curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
       bun install --frozen-lockfile --prefer-offline --no-progress
@@ -75,7 +75,7 @@ steps:
         - "~/.bun"
         - "node_modules/"
         - "telegram-plugin/node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
+      key: "v2-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
     retry:
       automatic:
         - exit_status: -1
