@@ -43,7 +43,7 @@ The agent box needs:
 | Type check | `bun lint` (= `tsc --noEmit`) | Any `*.ts`, `tsconfig.json`, package/lockfile |
 | Core tests | `bun run test:vitest` | `src/`, `tests/`, `telegram-plugin/**/*.ts`, vitest config, lockfiles |
 | Plugin tests | `cd telegram-plugin && bun test` | `telegram-plugin/**` |
-| UAT fuzz | `bun run test:uat fuzz-` (self-hosted `uat-host` queue) | `telegram-plugin/**`, `src/agents/**`, `telegram-plugin/uat/**`, `vitest.uat.config.ts` |
+| UAT fuzz (gated) | `pipeline upload .buildkite/pipeline.uat.yml` → `bun run test:uat fuzz-` (self-hosted `uat-host` queue) | `telegram-plugin/**`, `src/agents/**`, `telegram-plugin/uat/**`, `vitest.uat.config.ts` — only when `SWITCHROOM_UAT_GATE_ENABLED=true` |
 | Trigger evals | `python3 evals/run_trigger.py --parallel 5` | `skills/**/SKILL.md`, eval framework, profile CLAUDE.md |
 | Quality evals | `python3 evals/run_quality.py --parallel 5` | `skills/**/SKILL.md`, eval framework, dataset |
 | Eval summary | `annotate-evals.sh` | Always (after eval steps); no-ops if no result files |
@@ -100,20 +100,25 @@ bot in a real supergroup — it cannot run on the stock hosted queue.
 
 ### Pipeline env opt-in
 
-The UAT step is gated on a pipeline-level env var so it doesn't hang
-every PR while you're still provisioning the agent + secrets. Add it
-via **Pipeline Settings → Environment Variables** in the Buildkite
-web UI (same surface that hosts `ANTHROPIC_API_KEY` — see step 3 of
-"One-time setup in Buildkite" above):
+The UAT step lives in a separate fragment (`.buildkite/pipeline.uat.yml`)
+that's only uploaded into the build plan when this pipeline-level env
+var is set on the pipeline. Add it via **Pipeline Settings →
+Environment Variables** in the Buildkite web UI (same surface that
+hosts `ANTHROPIC_API_KEY` — see step 3 of "One-time setup in Buildkite"
+above):
 
 ```
 SWITCHROOM_UAT_GATE_ENABLED=true
 ```
 
-Set this **last** — only after the agent is online and the four
-secrets exist. Before that, `build.env("SWITCHROOM_UAT_GATE_ENABLED")`
-returns `null`, the step's `if:` condition evaluates to false, and
-the step is omitted entirely from the build plan.
+Set this **last** — only after the agent is online (so the `uat-host`
+queue is registered with the cluster) AND the four secrets exist.
+Before that, `build.env("SWITCHROOM_UAT_GATE_ENABLED")` returns
+`null`, the upload step's `if:` condition evaluates to false, the
+fragment is never loaded, and the `uat-host` queue reference never
+reaches the pipeline.yml validator. (Without this split, the BK
+validator rejects `pipeline.yml` outright with "Queue 'uat-host'
+does not exist".)
 
 ### Setting up the `uat-host` self-hosted agent (one-time)
 
