@@ -46,6 +46,12 @@ import {
 import { filterOverlaySecrets } from "../config/overlay-secrets-filter.js";
 import { cronUnitName, cronUnitHash } from "../agents/cron-unit-name.js";
 import { dryRunReconcile, violatesMinInterval } from "../agents/reconcile-dry-run.js";
+import {
+  reconcileAgentCronOnly,
+  type ReconcileBridgeResult,
+  type ReconcileBridgeError,
+} from "./reconcile-bridge.js";
+import { existsSync, readFileSync } from "node:fs";
 
 const MAX_ENTRIES_PER_AGENT = 20;
 
@@ -57,7 +63,16 @@ type ErrorCode =
   | "E_INVALID_CRON"
   | "E_INVALID_PROMPT"
   | "E_NOT_FOUND"
+  | "E_RECONCILE_FAILED"
   | "E_INTERNAL";
+
+/**
+ * Reconcile DI hook — overridable for tests. Defaults to the live
+ * hot-apply path from #1185 via the bridge module.
+ */
+export type ReconcileFn = (
+  agent: string,
+) => ReconcileBridgeResult | ReconcileBridgeError;
 
 function emitError(code: ErrorCode, message: string, extra: Record<string, unknown> = {}): void {
   process.stderr.write(JSON.stringify({ code, message, ...extra }) + "\n");
@@ -75,6 +90,8 @@ function exitCodeFor(code: ErrorCode): number {
     case "E_NOT_FOUND":
     case "E_INTERNAL":
       return 1;
+    case "E_RECONCILE_FAILED":
+      return 10;
   }
 }
 
@@ -86,6 +103,12 @@ interface AddOpts {
   name?: string;
   /** Test-only: override overlay root. */
   root?: string;
+  /**
+   * Reconcile trigger. Defaults to the production hot-apply bridge.
+   * Tests inject a mock. Pass `null` to skip reconcile entirely (used
+   * by the existing test suite which doesn't load a real config).
+   */
+  reconcile?: ReconcileFn | null;
 }
 
 interface RemoveOpts {
@@ -94,6 +117,8 @@ interface RemoveOpts {
   cronHash?: string;
   /** Test-only: override overlay root. */
   root?: string;
+  /** See AddOpts.reconcile. */
+  reconcile?: ReconcileFn | null;
 }
 
 export interface ScheduleAddResult {
@@ -202,7 +227,52 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
 
   const hash = cronUnitHash(opts.cronExpr, opts.prompt);
   const slug = `cron-${hash}`;
+
+  // Snapshot prior on-disk state for rollback. Read BEFORE write so a
+  // reconcile-failure rollback can restore exactly what was there
+  // (handles the rare hash-collision / pre-seeded-file case).
+  let priorContent: string | null = null;
+  try {
+    const prior = listOverlayEntries(agent, { root: opts.root }).find(
+      (e) => e.slug === slug,
+    );
+    if (prior) priorContent = prior.raw;
+  } catch {
+    /* ignore — rollback degrades to delete */
+  }
+
   const path = writeOverlayEntry(agent, slug, yamlText, { root: opts.root });
+
+  // Default reconcile: production hot-apply. Tests override via the
+  // `reconcile` param; when `opts.root` is supplied (test-only) we also
+  // default reconcile off, because the test harness doesn't have a
+  // real switchroom.yaml on disk.
+  const reconcileFn =
+    opts.reconcile === undefined
+      ? (opts.root ? null : reconcileAgentCronOnly)
+      : opts.reconcile;
+  if (reconcileFn) {
+    const rr = reconcileFn(agent);
+    if (!rr.ok) {
+      // Rollback: delete the just-written file (or restore prior content
+      // if there was one). Best-effort — log if rollback itself fails.
+      try {
+        if (priorContent !== null) {
+          writeOverlayEntry(agent, slug, priorContent, { root: opts.root });
+        } else {
+          deleteOverlayEntry(agent, slug, { root: opts.root });
+        }
+      } catch {
+        /* rollback failure: caller still gets E_RECONCILE_FAILED */
+      }
+      return {
+        ok: false,
+        code: "E_RECONCILE_FAILED",
+        message: `overlay write succeeded but reconcile failed: ${rr.error}`,
+        exit: 10,
+      };
+    }
+  }
 
   return {
     ok: true,
@@ -263,7 +333,38 @@ export function scheduleRemove(opts: RemoveOpts): ScheduleRemoveResult | Schedul
       exit: 1,
     };
   }
+  // Capture prior content for rollback before we delete.
+  let priorContent: string | null = null;
+  try {
+    if (existsSync(match.path)) priorContent = readFileSync(match.path, "utf-8");
+  } catch {
+    /* ignore — reconcile failure rollback will just be a no-op */
+  }
   deleteOverlayEntry(agent, match.slug, { root: opts.root });
+
+  const reconcileFn =
+    opts.reconcile === undefined
+      ? (opts.root ? null : reconcileAgentCronOnly)
+      : opts.reconcile;
+  if (reconcileFn) {
+    const rr = reconcileFn(agent);
+    if (!rr.ok) {
+      // Rollback: restore the deleted file's content.
+      try {
+        if (priorContent !== null) {
+          writeOverlayEntry(agent, match.slug, priorContent, { root: opts.root });
+        }
+      } catch {
+        /* best-effort */
+      }
+      return {
+        ok: false,
+        code: "E_RECONCILE_FAILED",
+        message: `overlay delete succeeded but reconcile failed: ${rr.error}`,
+        exit: 10,
+      };
+    }
+  }
   return { ok: true, slug: match.slug, path: match.path };
 }
 

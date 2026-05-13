@@ -114,6 +114,78 @@ describe("scheduleRemove", () => {
   });
 });
 
+describe("scheduleAdd — reconcile trigger (hot-apply wiring)", () => {
+  it("calls reconcile once with the caller agent name on successful add", () => {
+    const calls: string[] = [];
+    const r = scheduleAdd({
+      cronExpr: "0 9 * * *",
+      prompt: "morning",
+      root,
+      reconcile: (agent) => {
+        calls.push(agent);
+        return { ok: true, changes: [], cronScripts: [] };
+      },
+    });
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual(["alice"]);
+  });
+
+  it("rolls back the overlay write when reconcile fails, returns E_RECONCILE_FAILED", () => {
+    const r = scheduleAdd({
+      cronExpr: "0 9 * * *",
+      prompt: "boom",
+      root,
+      reconcile: () => ({ ok: false, error: "scheduler exploded" }),
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_RECONCILE_FAILED");
+    expect(r.exit).toBe(10);
+    expect(r.message).toContain("scheduler exploded");
+    // The overlay file must be gone (rollback).
+    const expected = cronUnitHash("0 9 * * *", "boom");
+    expect(
+      existsSync(join(root, "alice", "schedule.d", `cron-${expected}.yaml`)),
+    ).toBe(false);
+  });
+});
+
+describe("scheduleRemove — reconcile trigger", () => {
+  it("calls reconcile once with the caller agent on successful remove", () => {
+    const add = scheduleAdd({ cronExpr: "0 9 * * *", prompt: "p", root });
+    expect(add.ok).toBe(true);
+    if (!add.ok) return;
+    const calls: string[] = [];
+    const r = scheduleRemove({
+      cronHash: add.cron_hash,
+      root,
+      reconcile: (agent) => {
+        calls.push(agent);
+        return { ok: true, changes: [], cronScripts: [] };
+      },
+    });
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual(["alice"]);
+  });
+
+  it("restores the deleted overlay file when reconcile fails", () => {
+    const add = scheduleAdd({ cronExpr: "0 9 * * *", prompt: "p", root });
+    expect(add.ok).toBe(true);
+    if (!add.ok) return;
+    const before = readFileSync(add.path, "utf-8");
+    const r = scheduleRemove({
+      cronHash: add.cron_hash,
+      root,
+      reconcile: () => ({ ok: false, error: "nope" }),
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_RECONCILE_FAILED");
+    expect(existsSync(add.path)).toBe(true);
+    expect(readFileSync(add.path, "utf-8")).toBe(before);
+  });
+});
+
 describe("scheduleAdd — cross-agent denial", () => {
   it("throws when --agent mismatches the env-pinned identity", () => {
     expect(() => {
