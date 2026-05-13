@@ -52,32 +52,16 @@ describe("performVaultAccessApproval injects a synthetic inbound on success (#10
     expect(sendIdx, "sendToAgent must come AFTER the error-return early exit").toBeGreaterThan(errorReturn);
   });
 
-  it("synthetic inbound carries meta.source = 'vault_grant_approved'", () => {
-    // fails when: the source marker is missing or different — the
-    // bridge uses meta.source to render `<channel source="...">`,
-    // and the agent's system prompt may filter on this. Pinning the
-    // string so future renders stay consistent.
-    expect(block).toMatch(/source:\s*['"]vault_grant_approved['"]/);
-  });
-
-  it("synthetic inbound carries the structured meta forensics need", () => {
-    // The meta carries fields the post-hoc audit / agent filter use:
-    // agent, key, scope, grant_id, stage_id, operator_id.
-    const metaBlock = block.split("meta: {")[1]?.split("}")[0] ?? "";
-    expect(metaBlock).toMatch(/\bagent\b/);
-    expect(metaBlock).toMatch(/\bkey\b/);
-    expect(metaBlock).toMatch(/\bscope\b/);
-    expect(metaBlock).toMatch(/grant_id/);
-    expect(metaBlock).toMatch(/stage_id/);
-    expect(metaBlock).toMatch(/operator_id/);
-  });
-
-  it("user/userId identifies the synthetic source as the vault broker", () => {
-    // The bridge surfaces `user` in the channel tag the agent sees.
-    // Should be 'vault-broker' (or similar marker), not a real user
-    // name. userId=0 because no real Telegram user authored it.
-    expect(block).toMatch(/user:\s*['"]vault-broker['"]/);
-    expect(block).toMatch(/userId:\s*0/);
+  it("delegates inbound construction to buildVaultGrantApprovedInbound", () => {
+    // PR #1168 extracted the InboundMessage literals (meta.source,
+    // user, userId, meta.{agent,key,scope,grant_id,stage_id,operator_id})
+    // into `gateway/vault-grant-inbound-builders.ts`. The shape itself
+    // is now pinned by `vault-grant-inbound-builders.test.ts` against
+    // the builder directly. What this test still pins is the call-site
+    // contract: `performVaultAccessApproval` must keep wiring to the
+    // builder — a regression that inlines or replaces the builder
+    // would silently drop the meta fields downstream filters rely on.
+    expect(block).toMatch(/buildVaultGrantApprovedInbound\(/);
   });
 
   it("logs delivery outcome to stderr for forensics", () => {

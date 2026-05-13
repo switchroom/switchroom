@@ -48,7 +48,14 @@ snapshot() {
 }
 
 filter_snapshot() {
-  grep -v -E 'switchroom\.test=|^switchroom-phase[0-9]|^phase[0-9][a-z]-' | sort
+  # `grep -v` exits 1 when stdin is empty (no lines processed). Combined
+  # with `pipefail` + `set -e` (enabled around the post-vitest call), an
+  # empty `docker ps` snapshot — the steady-state on hosted Buildkite
+  # agents with no production containers — would kill the script with
+  # exit 1 and no error output, masking the actual outcome of the
+  # test run. Absorb that one specific case so an empty snapshot stays
+  # an empty filtered snapshot.
+  { grep -v -E 'switchroom\.test=|^switchroom-phase[0-9]|^phase[0-9][a-z]-' || true; } | sort
 }
 
 PRE_FILE="$(mktemp)"

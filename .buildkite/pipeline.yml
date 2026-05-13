@@ -223,8 +223,17 @@ steps:
       paths:
         - "~/.bun"
         - "node_modules/"
-        - "telegram-plugin/node_modules/"
-      key: "v1-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
+        # NOTE: do NOT cache `telegram-plugin/node_modules/`. `telegram-plugin`
+        # is a workspace of the root; the hoisted root install satisfies its
+        # deps. A populated `telegram-plugin/node_modules/` (left behind by an
+        # earlier build that ran a redundant per-package install) creates a
+        # shadow `@mtcute/node`, breaking Node-style resolution from
+        # `telegram-plugin/uat/driver.ts` and causing `tests/uat-driver.test.ts`
+        # to fail every run with "Invalid session string". See the install
+        # comment block at the top of this step's command for the full
+        # diagnosis. Cache key bumped to v2 to invalidate any existing cache
+        # entry that contains the bad directory.
+      key: "v2-bun-{{ checksum 'bun.lock' }}-{{ checksum 'telegram-plugin/bun.lock' }}"
     artifact_paths:
       - "coverage/**/*"
     retry:

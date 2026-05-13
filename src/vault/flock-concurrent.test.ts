@@ -32,8 +32,9 @@
  * cross-process behavior on the real platform we ship on).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { Worker } from "node:worker_threads";
+import { spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -97,14 +98,44 @@ const { existsSync, writeFileSync, unlinkSync } = require('node:fs');
 })();
 `;
 
-// Resolve the bundled flock helper for the worker. In vitest the
-// source path works directly because vitest sets up loader hooks.
-const FLOCK_MODULE_PATH = new URL("./flock.ts", import.meta.url).pathname;
+// Resolve the bundled flock helper for the worker. Vitest's loader hooks
+// transform `.ts` on import inside the main thread, but a `new Worker()`
+// spawns a fresh Node runtime that has no such hooks — `require()`ing
+// `./flock.ts` raw fails with "Cannot use import statement outside a
+// module". To bridge: at `beforeAll` we run `bun build` on `flock.ts`
+// and stash the resulting single-file CJS bundle in a per-suite tmp
+// dir, then hand that path to the worker. Bun is a hard prereq of the
+// repo and the Buildkite pipeline (see `.buildkite/pipeline.yml`), so
+// this doesn't add a new dependency.
+const FLOCK_SRC_PATH = new URL("./flock.ts", import.meta.url).pathname;
+let FLOCK_MODULE_PATH: string;
 
 describe.skipIf(process.platform !== "linux")("flock — cross-process concurrency (#978)", () => {
   let tmp: string;
   let vaultPath: string;
   let markerPath: string;
+
+  beforeAll(() => {
+    const bundleDir = mkdtempSync(join(tmpdir(), "vault-flock-bundle-"));
+    FLOCK_MODULE_PATH = join(bundleDir, "flock.cjs");
+    const result = spawnSync(
+      "bun",
+      [
+        "build",
+        FLOCK_SRC_PATH,
+        "--target=node",
+        "--format=cjs",
+        "--outfile",
+        FLOCK_MODULE_PATH,
+      ],
+      { stdio: "pipe", encoding: "utf8" },
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `bun build of flock.ts failed (status=${result.status}): ${result.stderr || result.stdout}`,
+      );
+    }
+  });
 
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), "vault-flock-concurrent-"));
