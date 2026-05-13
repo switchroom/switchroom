@@ -26,9 +26,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import {
   reconcileAgentDefaultSkills,
   reconcileAllAgentDefaultSkills,
+  getBundledSkillsPoolDir,
 } from "./reconcile-default-skills.js";
 import type { BuiltinSkillEntry } from "../memory/scaffold-integration.js";
 
@@ -209,6 +211,61 @@ describe("reconcileAllAgentDefaultSkills", () => {
       poolDir,
     );
     expect(results).toEqual([]);
+  });
+});
+
+describe("getBundledSkillsPoolDir", () => {
+  it("resolves under ~/.switchroom/skills/_bundled (host-stable, RCA #1164)", () => {
+    const dir = getBundledSkillsPoolDir();
+    expect(dir).toBe(join(homedir(), ".switchroom/skills/_bundled"));
+  });
+});
+
+describe("reconcileAgentDefaultSkills — legacy-prefix migration (#1164)", () => {
+  let tmpRoot: string;
+  let poolDir: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "sr-skills-mig-"));
+    poolDir = makePool(tmpRoot, ["skill-a"]);
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("repoints a symlink whose target was a legacy /opt/skills/* path", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    const skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // The legacy target path doesn't have to exist for readlink — we
+    // only need lstat to identify a symlink. Create a dangling link.
+    symlinkSync("/opt/skills/skill-a", join(skillsDir, "skill-a"));
+
+    const result = reconcileAgentDefaultSkills(
+      agentDir,
+      {},
+      [{ key: "skill-a", optOutKey: "skill-a", source: "anthropic" }],
+      poolDir,
+    );
+    expect(result.added).toContain("skill-a");
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
+  });
+
+  it("repoints a symlink whose target was a legacy */switchroom/skills/* dev-checkout path", () => {
+    const agentDir = makeAgentDir(tmpRoot, "ag1");
+    const skillsDir = join(agentDir, ".claude", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    symlinkSync("/home/dev/code/switchroom/skills/skill-a", join(skillsDir, "skill-a"));
+
+    const result = reconcileAgentDefaultSkills(
+      agentDir,
+      {},
+      [{ key: "skill-a", optOutKey: "skill-a", source: "anthropic" }],
+      poolDir,
+    );
+    expect(result.added).toContain("skill-a");
+    expect(readlinkSync(join(skillsDir, "skill-a"))).toBe(join(poolDir, "skill-a"));
   });
 });
 
