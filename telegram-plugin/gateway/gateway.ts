@@ -8431,14 +8431,19 @@ async function runCreditWatch(): Promise<void> {
   // assumption mirrors auto-fallback's notification routing.
   const access = loadAccess()
   for (const chat_id of access.allowFrom) {
-    try {
-      await bot.api.sendMessage(chat_id, decision.message, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      })
-    } catch (err) {
-      process.stderr.write(`telegram gateway: credit-watch notify chat=${chat_id} failed: ${err}\n`)
-    }
+    // Credit-watch notify — best-effort. Wrap via swallowingApiCall so
+    // flood-wait / deleted-chat / not-found surface as a stderr log
+    // rather than a thrown exception that aborts the loop and leaves
+    // half the allowFrom chats unnotified. Matches the wrapping
+    // contract enforced by scripts/check-bot-api-wrapping.sh (#1075).
+    await swallowingApiCall(
+      () =>
+        bot.api.sendMessage(chat_id, decision.message, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }),
+      { chat_id, verb: 'credit-watch.notify' },
+    )
   }
   // Persist state regardless of whether send succeeded — losing a
   // notify is bad, but re-spamming on every poll tick is worse.
