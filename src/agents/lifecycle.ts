@@ -655,3 +655,85 @@ export function getAgentLogs(name: string, follow: boolean): void {
   });
 }
 
+/**
+ * Coarse classification of a reconcile change-path used by Phase F to
+ * decide whether a config edit can be applied without bouncing the
+ * agent container.
+ *
+ * The categories intentionally collapse together:
+ *   - "cron"     — `telegram/cron-*.sh` script regeneration. The script
+ *                  file lives on the host bind-mount, so a rewrite is
+ *                  visible to the in-container agent-scheduler on its
+ *                  next fire without any container touch.
+ *   - "skill"    — `.claude/skills/` symlinks / payload. Phase C will
+ *                  build hot-reload for these; for now they still need
+ *                  a restart, but we tag them so #1163's Phase C can
+ *                  upgrade the decision in one place.
+ *   - "settings" — `.claude/settings.json`, `.mcp.json` — claude-code
+ *                  reads these at process start; restart-required.
+ *   - "hooks"    — `.claude/hooks/*` — same lifecycle as settings.
+ *   - "infra"    — `start.sh`, compose-adjacent files; restart-required.
+ *   - "other"    — anything we can't pattern-match; conservatively
+ *                  treated as restart-required by the caller.
+ */
+export type ChangeKind = "cron" | "skill" | "settings" | "hooks" | "infra" | "other";
+
+export function classifyChangeKind(path: string): ChangeKind {
+  // Use substring matches so callers don't have to pass paths relative
+  // to agentDir — scaffold.ts pushes absolute paths into `changes`.
+  if (/\/telegram\/cron-\d+\.sh$/.test(path)) return "cron";
+  if (path.includes("/.claude/skills/")) return "skill";
+  if (path.endsWith("/.claude/settings.json")) return "settings";
+  if (path.endsWith("/.mcp.json")) return "settings";
+  if (path.includes("/.claude/hooks/")) return "hooks";
+  if (path.endsWith("/start.sh")) return "infra";
+  return "other";
+}
+
+export interface ApplyCronChangesHotResult {
+  /** Cron script paths that were rewritten by reconcileAgent. */
+  cronScripts: string[];
+  /**
+   * If a host-side agent-scheduler IPC reload channel becomes available
+   * (per the Phase F design plan in switchroom#1163), this will flip
+   * true once that signal is delivered. Today it's always false — the
+   * host has no scheduler-reload socket; the scheduler lives inside the
+   * container and reads its schedule at boot. Cron-script CONTENT edits
+   * are picked up on the next fire (bind-mount + exec). Cron-EXPRESSION
+   * edits in switchroom.yaml require the next natural container restart
+   * to be observed, which is the documented trade for not killing the
+   * running session on every prompt tweak.
+   */
+  ipcSignalled: boolean;
+}
+
+/**
+ * Apply cron-only reconcile changes without restarting the agent
+ * container. `reconcileAgent` has already rewritten the per-task
+ * `telegram/cron-<i>.sh` scripts on the host bind-mount, so the
+ * in-container scheduler sees the new content on its next fire.
+ *
+ * This helper exists as a named seam so:
+ *   1. Phase F's decision in `reconcileAndRestartAgent` has a single
+ *      symbol to call instead of duplicating the "do nothing destructive"
+ *      branch inline, and
+ *   2. A future host→scheduler IPC reload (for cron-expression edits)
+ *      can plug in here without touching the caller.
+ *
+ * Returns the set of cron scripts we observed in `changes` so the
+ * caller can log a precise summary line.
+ */
+export function applyCronChangesHot(
+  name: string,
+  changes: string[],
+): ApplyCronChangesHotResult {
+  const cronScripts = changes.filter((p) => classifyChangeKind(p) === "cron");
+  // No host-side cron systemd units exist in this codebase — scheduling
+  // is internal to the agent container (see src/agent-scheduler/). The
+  // bind-mount carrying the agent dir makes the rewritten scripts live
+  // immediately. Intentionally no docker / systemctl call here: that's
+  // the whole point of the hot-cron-reload path. `name` is accepted for
+  // symmetry with restartAgent / future IPC plumbing.
+  void name;
+  return { cronScripts, ipcSignalled: false };
+}

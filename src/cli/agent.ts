@@ -15,6 +15,8 @@ import {
   stopAgent,
   restartAgent,
   gracefulRestartAgent,
+  applyCronChangesHot,
+  classifyChangeKind,
   interruptAgent,
   getAgentStatus,
   getAllAgentStatuses,
@@ -516,6 +518,12 @@ export interface ReconcileAndRestartDeps {
   reconcileAgent: typeof reconcileAgent;
   restartAgent: typeof restartAgent;
   gracefulRestartAgent: typeof gracefulRestartAgent;
+  /**
+   * Phase F (switchroom#1163): apply cron-only reconcile changes without
+   * a container bounce. Injected for tests; production wiring uses the
+   * helper exported from `src/agents/lifecycle.ts`.
+   */
+  applyCronChangesHot: typeof applyCronChangesHot;
 }
 
 export interface ReconcileAndRestartOpts {
@@ -549,6 +557,7 @@ export async function reconcileAndRestartAgent(
     reconcileAgent,
     restartAgent,
     gracefulRestartAgent,
+    applyCronChangesHot,
   },
 ): Promise<{ reconciled: boolean; restarted: boolean; waitingForTurn?: boolean; changes: string[] }> {
   const log = opts.silent ? () => {} : (msg: string) => console.log(msg);
@@ -582,6 +591,44 @@ export async function reconcileAndRestartAgent(
     log(chalk.green(`  ${name}: reconciled (${allChanges.length} file${allChanges.length === 1 ? "" : "s"})`));
     for (const f of allChanges) {
       log(chalk.gray(`    - ${f}`));
+    }
+  }
+
+  // ── Phase F (switchroom#1163): cron-only hot reload ──────────────────────
+  // A `cron:` block edit in switchroom.yaml regenerates
+  // `telegram/cron-<i>.sh` on the host bind-mount. The script content is
+  // live in-container without any docker touch — `docker compose up -d
+  // --force-recreate --no-deps` would needlessly kill any in-flight
+  // Claude session for what's effectively a file edit. So: when every
+  // change in this reconcile is cron-tagged, take the hot path.
+  //
+  // Most-restrictive wins: any single non-cron change in `allChanges`
+  // falls through to the bot-token preflight + restart path below.
+  //
+  // Skill changes are a separate Phase C concern; they currently
+  // classify as "skill" but until Phase C lands the hot-reload plumbing
+  // for skills, they still require a restart. TODO(switchroom#1163,
+  // Phase C): teach this branch to handle skill-only reconciles
+  // without a container bounce.
+  if (allChanges.length > 0) {
+    const kinds = allChanges.map((p) => classifyChangeKind(p));
+    const allCron = kinds.every((k) => k === "cron");
+    if (allCron) {
+      const r = deps.applyCronChangesHot(name, allChanges);
+      log(
+        chalk.cyan(
+          `  [hot-reload] agent=${name} changes=${allChanges.length} cron units regenerated, no container restart`,
+        ),
+      );
+      return {
+        reconciled: true,
+        restarted: false,
+        changes: allChanges,
+        // Surface for tests / callers; ipcSignalled is currently false
+        // by design (host has no scheduler-reload socket — see
+        // applyCronChangesHot's doc-comment).
+        ...(r.ipcSignalled ? { ipcSignalled: true as const } : {}),
+      };
     }
   }
 
