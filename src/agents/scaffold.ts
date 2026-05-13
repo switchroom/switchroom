@@ -2003,6 +2003,18 @@ export function scaffoldAgent(
           SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
       },
+      // Read-only agent-config broker. Exposes 4 tools (config_get,
+      // cron_list, skill_list, audit_tail) that re-exec the switchroom
+      // CLI. Identity is pinned by SWITCHROOM_AGENT_NAME — the CLI
+      // refuses cross-agent reads.
+      "agent-config": {
+        command: switchroomCliPath,
+        args: ["mcp", "agent-config"],
+        env: {
+          SWITCHROOM_AGENT_NAME: name,
+          SWITCHROOM_CONFIG: resolvedConfigPath,
+        },
+      },
     };
 
     // Add hindsight memory MCP if configured
@@ -3558,6 +3570,18 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
           TELEGRAM_STATE_DIR: join(agentDir, "telegram"),
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
+        },
+      },
+      // Read-only agent-config broker. Exposes 4 tools (config_get,
+      // cron_list, skill_list, audit_tail) that re-exec the switchroom
+      // CLI. Identity is pinned by SWITCHROOM_AGENT_NAME — the CLI
+      // refuses cross-agent reads.
+      "agent-config": {
+        command: switchroomCliPath,
+        args: ["mcp", "agent-config"],
+        env: {
+          SWITCHROOM_AGENT_NAME: name,
+          SWITCHROOM_CONFIG: resolvedConfigPath,
         },
       },
     };
