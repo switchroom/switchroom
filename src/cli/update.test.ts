@@ -26,7 +26,7 @@ function fakeRunner() {
 }
 
 describe("planUpdate", () => {
-  it("produces 5 steps in default mode (no --rebuild)", () => {
+  it("produces 6 steps in default mode (no --rebuild)", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-plan-"));
     try {
       const composePath = join(tmp, "docker-compose.yml");
@@ -35,6 +35,7 @@ describe("planUpdate", () => {
       expect(steps.map((s) => s.name)).toEqual([
         "pull-images",
         "apply-config",
+        "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
         "doctor",
@@ -54,6 +55,7 @@ describe("planUpdate", () => {
         "pull-images",
         "rebuild-source",
         "apply-config",
+        "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
         "doctor",
@@ -379,6 +381,8 @@ describe("runUpdate", () => {
         // agent set deterministically here so the assertions don't read
         // the host's real switchroom.yaml.
         agentNamesFn: () => ["a", "b"],
+        // No-op the sync-bundled-skills filesystem effect under tests.
+        syncBundledSkillsFn: () => { /* intentional no-op */ },
       });
       expect(code).toBe(0);
       // 6 calls total:

@@ -34,9 +34,9 @@
  */
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig } from "../config/loader.js";
 import { writeRestartReasonMarker } from "../agents/lifecycle.js";
@@ -65,6 +65,10 @@ interface UpdateOptions {
   /** Test seam — supply the agent name list for the stamp-restart-marker
    *  step instead of reading from switchroom.yaml. */
   agentNamesFn?: () => readonly string[];
+  /** Test seam — replace the bundled-skills sync (default: real cpSync to
+   *  `~/.switchroom/skills/_bundled/`). Tests override to a no-op so
+   *  the step doesn't write into the developer's HOME. */
+  syncBundledSkillsFn?: () => void;
   /** Test seam — replace the marker writer used by stamp-restart-marker. */
   writeMarkerFn?: (agent: string, reason: string) => void;
 }
@@ -202,6 +206,51 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   // correctly attributes the planned redeploy to the operator. The
   // host-side fallback below DOES use preserveExisting: true so
   // systemd-runtime hosts retain the original /restart-race guard.
+  // Sync the shipped skills/ payload to the host-stable pool dir at
+  // `~/.switchroom/skills/_bundled/`. The runtime resolvers (reconcile-
+  // default-skills, scaffold.installSwitchroomSkills, cli/deps) all
+  // read from there, so this step is what makes default-skill symlinks
+  // resolve correctly across dev, packaged, and docker installs
+  // (RCA: #1164). Prune-and-replace: delete existing `_bundled/`, then
+  // recursive copy.
+  steps.push({
+    name: "sync-bundled-skills",
+    description:
+      "Sync shipped skills/ to ~/.switchroom/skills/_bundled/ (host-stable pool dir).",
+    run: () => {
+      if (opts.syncBundledSkillsFn) {
+        opts.syncBundledSkillsFn();
+        return;
+      }
+      // SOURCE: the skills/ directory shipped alongside the running
+      // CLI bundle. `import.meta.dirname` is dist/cli/ at runtime; the
+      // skills/ payload lives two levels up beside dist/ (see package
+      // .json "files" — skills/ is shipped). This is the only place
+      // the legacy `resolve(import.meta.dirname, "../../skills")`
+      // expression is still correct, because here it really IS the
+      // source for the copy.
+      const source = resolve(import.meta.dirname, "../../skills");
+      const dest = join(homedir(), ".switchroom", "skills", "_bundled");
+      if (!existsSync(source)) {
+        process.stderr.write(
+          `switchroom update: sync-bundled-skills — CLI bundle has no adjacent skills/ at ${source}; skipping.\n`,
+        );
+        return;
+      }
+      try {
+        if (existsSync(dest)) {
+          rmSync(dest, { recursive: true, force: true });
+        }
+        mkdirSync(dirname(dest), { recursive: true });
+        cpSync(source, dest, { recursive: true, dereference: false });
+      } catch (err) {
+        throw new Error(
+          `sync-bundled-skills failed: ${(err as Error).message}`,
+        );
+      }
+    },
+  });
+
   steps.push({
     name: "stamp-restart-marker",
     description:
