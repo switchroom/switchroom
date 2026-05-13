@@ -37,14 +37,20 @@ interface MakeConfigAgent {
   env?: Record<string, string>;
   bind_mounts?: Array<{ source: string; target?: string; mode?: "ro" | "rw" }>;
   resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
+  timezone?: string;
 }
 
 function makeConfig(
   agents: Record<string, MakeConfigAgent>,
-  topLevel?: { host_control?: { enabled?: boolean } },
+  topLevel?: { host_control?: { enabled?: boolean }; timezone?: string },
 ): SwitchroomConfig {
   return {
-    switchroom: { version: 1, agents_dir: "~/.switchroom/agents", skills_dir: "~/.switchroom/skills" },
+    switchroom: {
+      version: 1,
+      agents_dir: "~/.switchroom/agents",
+      skills_dir: "~/.switchroom/skills",
+      timezone: topLevel?.timezone,
+    },
     telegram: { bot_token: "x" },
     defaults: undefined,
     profiles: undefined,
@@ -58,6 +64,7 @@ function makeConfig(
           env: cfg.env,
           bind_mounts: cfg.bind_mounts,
           resources: cfg.resources,
+          timezone: cfg.timezone,
           schedule: [],
           tools: { allow: [], deny: [] },
           hooks: undefined,
@@ -997,6 +1004,84 @@ describe("agent service env (Phase 2c F2 — IPC wiring)", () => {
       expect(env).toMatch(/PIP_USER:\s*"1"/);
       expect(env).toMatch(/PIP_BREAK_SYSTEM_PACKAGES:\s*"1"/);
     }
+  });
+
+  // Per-agent timezone wiring (#1198).
+  //
+  // Pre-fix, compose.ts emitted no `TZ` or `SWITCHROOM_TIMEZONE` env var
+  // for agent services, so every container inherited the Debian base
+  // image's `Etc/UTC` default. node-cron inside the container read
+  // process.env.TZ (undefined) and evaluated every cron expression
+  // against UTC — `0 8 * * *` fired at 08:00 UTC instead of 08:00 in
+  // the operator's local zone, a 10-11 hour skew for Melbourne. The
+  // `resolveTimezone` cascade existed (agent → profile → switchroom →
+  // server detect → UTC) but its output never reached the container —
+  // it was only consumed by a scaffold-time CLI warning and the legacy
+  // (removed in #906) systemd unit's [Service] block. Restored here:
+  // emit both names so existing Unix tooling (`TZ`) and the
+  // UserPromptSubmit hook's stale-detection check (SWITCHROOM_TIMEZONE)
+  // both see the operator-intended zone.
+
+  it("emits TZ + SWITCHROOM_TIMEZONE from agent.timezone when set at the agent layer (#1198)", () => {
+    const out = generateCompose({
+      config: makeConfig({ clerk: { timezone: "Australia/Melbourne" } }),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).toMatch(/TZ:\s*"Australia\/Melbourne"/);
+    expect(env).toMatch(/SWITCHROOM_TIMEZONE:\s*"Australia\/Melbourne"/);
+  });
+
+  it("emits TZ + SWITCHROOM_TIMEZONE from switchroom.timezone (global default) when no agent layer set it", () => {
+    // The global cascade entry: `switchroom.timezone: "Region/City"` at
+    // the top of switchroom.yaml. Resolves through the cascade to every
+    // agent that doesn't declare its own zone.
+    const out = generateCompose({
+      config: makeConfig({ alice: {}, bob: {} }, { timezone: "America/New_York" }),
+    });
+    for (const a of ["alice", "bob"]) {
+      const env = envBlockFor(out, a);
+      expect(env).toMatch(/TZ:\s*"America\/New_York"/);
+      expect(env).toMatch(/SWITCHROOM_TIMEZONE:\s*"America\/New_York"/);
+    }
+  });
+
+  it("per-agent timezone wins over the global default", () => {
+    const out = generateCompose({
+      config: makeConfig(
+        {
+          clerk: { timezone: "Australia/Melbourne" },
+          alice: {},
+        },
+        { timezone: "America/New_York" },
+      ),
+    });
+    expect(envBlockFor(out, "clerk")).toMatch(/TZ:\s*"Australia\/Melbourne"/);
+    expect(envBlockFor(out, "alice")).toMatch(/TZ:\s*"America\/New_York"/);
+  });
+
+  it("emits a TZ env var unconditionally — never absent", () => {
+    // resolveTimezone always returns a string (final fallback "UTC" via
+    // server detection). The compose generator must therefore always
+    // emit TZ. A missing-TZ container would silently regress to UTC,
+    // re-introducing the #1198 bug without an obvious signal.
+    const out = generateCompose({
+      config: makeConfig({ alice: {}, bob: {} }), // no timezone anywhere
+    });
+    for (const a of ["alice", "bob"]) {
+      const env = envBlockFor(out, a);
+      expect(env).toMatch(/^\s*TZ:\s*"/m);
+      expect(env).toMatch(/^\s*SWITCHROOM_TIMEZONE:\s*"/m);
+    }
+  });
+
+  it("describeAgents() surfaces the resolved timezone on each agent's metadata", () => {
+    // The doctor checks + tests want to know the resolved zone without
+    // re-parsing YAML, so the resolution is exposed on AgentServiceData.
+    const agents = describeAgents(
+      makeConfig({ clerk: { timezone: "Australia/Melbourne" } }),
+    );
+    const clerk = agents.find((a) => a.name === "clerk");
+    expect(clerk?.timezone).toBe("Australia/Melbourne");
   });
 });
 

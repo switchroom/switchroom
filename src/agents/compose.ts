@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { resolveTimezone } from "../config/timezone.js";
 import { isReservedAgentName } from "../vault/broker/peercred.js";
 import { getBundledSkillsPoolDir } from "./reconcile-default-skills.js";
 
@@ -381,6 +382,30 @@ interface AgentServiceData {
    * mirrors here.
    */
   userEnv: Record<string, string>;
+  /**
+   * Resolved IANA timezone for this agent (e.g. "Australia/Melbourne").
+   * Walks the four-step cascade in `resolveTimezone`:
+   * agent → profile (via merge) → switchroom.timezone → server detection
+   * → "UTC". Always a valid zone string; never undefined.
+   *
+   * Surfaces in the container `environment:` block as BOTH `TZ` (so
+   * `date(1)`, `Intl.DateTimeFormat`, and `node-cron`'s default schedule
+   * timezone read the operator-intended zone) AND `SWITCHROOM_TIMEZONE`
+   * (so `bin/timezone-hook.sh`'s UserPromptSubmit hint matches without
+   * a stale-unit warning).
+   *
+   * Why both: `TZ` is what every Unix tool already reads, including
+   * node-cron via libc. `SWITCHROOM_TIMEZONE` is the explicit name
+   * the hook checks so it can distinguish "operator declared zone is
+   * X" from "container default happens to be X" (the latter would
+   * leave SWITCHROOM_TIMEZONE unset and trigger the in-band warning).
+   *
+   * Wiring regressed during the v0.6→v0.7 systemd→Docker migration
+   * (#906 removed `generateUnit` which used to bake `TZ=` /
+   * `SWITCHROOM_TIMEZONE=` into the [Service] block). Restored here
+   * via the compose `environment:` block — see #1198.
+   */
+  timezone: string;
 }
 
 /** Per-agent metadata exposed to doctor checks (and tests). */
@@ -410,6 +435,12 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
       // profile + agent layers all contribute. Empty object when the
       // operator hasn't declared any (the common case).
       userEnv: { ...(resolved.env ?? {}) },
+      // Resolve once at describe-time so the same value lands in TZ
+      // and SWITCHROOM_TIMEZONE in `emitAgentService`. The resolver
+      // is pure modulo the server-detection probes, so two consecutive
+      // calls return the same string — but consolidating to one call
+      // keeps the surface obvious in tests.
+      timezone: resolveTimezone(config, resolved),
     });
     void resolved;
   }
@@ -1155,6 +1186,19 @@ function emitAgentService(
     // doesn't write the marker and gets SIGKILL'd at grace-period
     // expiry like before.
     TINI_KILL_PROCESS_GROUP: "1",
+    // Per-agent timezone (#1198). Both vars are emitted unconditionally
+    // because `resolveTimezone` always returns a valid IANA string
+    // (final fallback = "UTC"). `TZ` is the standard Unix env var
+    // every tool reads — `date(1)`, `Intl.DateTimeFormat`, `node-cron`'s
+    // schedule evaluator. Without it the agent container inherits the
+    // Debian base image's `Etc/UTC` and every cron expression fires
+    // 10–11 hours off the operator's local clock.
+    // `SWITCHROOM_TIMEZONE` is the explicit name `bin/timezone-hook.sh`
+    // reads so its UserPromptSubmit hint can distinguish "operator
+    // declared zone is X" from "container default happens to be X".
+    // Wiring regressed in #906 (systemd→Docker migration); see #1198.
+    SWITCHROOM_TIMEZONE: a.timezone,
+    TZ: a.timezone,
   };
   // PostHog runtime telemetry — opt-out honoured, distinct-ID propagated
   // from the host CLI so CLI + runtime events merge under the same user.

@@ -54,7 +54,15 @@ describe("timezone-hook.sh", () => {
     expect(ctx).toMatch(/Current local time:/);
     expect(ctx).toMatch(/WARNING/);
     expect(ctx).toMatch(/SWITCHROOM_TIMEZONE unset/);
-    expect(ctx).toMatch(/switchroom systemd install/);
+    // The remediation hint pivoted in #1198: the legacy systemd unit
+    // path is gone (#906 removed `switchroom systemd install`), and the
+    // new wiring lives in the compose `environment:` block. Hint must
+    // point at the compose path now.
+    expect(ctx).toMatch(/compose env may be stale/);
+    expect(ctx).toMatch(/switchroom apply/);
+    expect(ctx).toMatch(/switchroom agent restart/);
+    // Regression pin: the legacy systemd verb is gone.
+    expect(ctx).not.toMatch(/switchroom systemd install/);
     // Still falls back to UTC so the base time string is meaningful.
     expect(ctx).toMatch(/UTC/);
   });
