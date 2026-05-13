@@ -5,6 +5,7 @@ import { parse as parseYaml } from "yaml";
 import { ZodError } from "zod";
 import { SwitchroomConfigSchema, type SwitchroomConfig } from "./schema.js";
 import { resolveDualPath } from "./paths.js";
+import { applyAgentOverlays } from "./overlay-loader.js";
 
 export class ConfigError extends Error {
   constructor(
@@ -101,14 +102,22 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
     delete obj.clerk;
   }
 
+  let config: SwitchroomConfig;
   try {
-    return SwitchroomConfigSchema.parse(parsed);
+    config = SwitchroomConfigSchema.parse(parsed);
   } catch (err) {
     if (err instanceof ZodError) {
       throw new ConfigError("Invalid switchroom.yaml configuration", formatZodErrors(err));
     }
     throw err;
   }
+
+  // Phase B (switchroom #1163): merge per-agent overlay YAML from
+  // ~/.switchroom/agents/<name>/schedule.d/*.yaml. Overlay failures are
+  // per-file isolated and surfaced as warnings — they never fail the load.
+  applyAgentOverlays(config);
+
+  return config;
 }
 
 export function resolveAgentsDir(config: SwitchroomConfig): string {
