@@ -62,6 +62,11 @@ function errorText(msg: string) {
 interface ToolArgs {
   agent?: string;
   limit?: number;
+  cron_expr?: string;
+  prompt?: string;
+  secrets?: string[];
+  name?: string;
+  cron_hash?: string;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -112,6 +117,39 @@ export const TOOLS = [
     },
   },
   {
+    name: "schedule_add",
+    description:
+      "Append a cron schedule entry to the agent's overlay dir. " +
+      "Overlay-sourced entries with non-empty `secrets:` are REJECTED " +
+      "(E_OVERLAY_SECRETS_REQUIRES_APPROVAL); operator-authored entries " +
+      "in switchroom.yaml are unaffected.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["cron_expr", "prompt"],
+      properties: {
+        cron_expr: { type: "string" },
+        prompt: { type: "string", minLength: 1, maxLength: 4000 },
+        secrets: { type: "array", items: { type: "string" } },
+        name: { type: "string", pattern: "^[a-z0-9-]{1,40}$" },
+      },
+    },
+  },
+  {
+    name: "schedule_remove",
+    description:
+      "Remove an overlay-managed schedule entry by `name` or 12-hex `cron_hash`.",
+    inputSchema: {
+      type: "object" as const,
+      oneOf: [
+        { required: ["name"], properties: { name: { type: "string" } } },
+        {
+          required: ["cron_hash"],
+          properties: { cron_hash: { type: "string", pattern: "^[a-f0-9]{12}$" } },
+        },
+      ],
+    },
+  },
+  {
     name: "audit_tail",
     description:
       "Tail the most recent rows of the agent-config audit log " +
@@ -152,6 +190,29 @@ export function dispatchTool(
       cliArgs = buildArgs(["audit", "tail"], args);
       parseMode = "jsonl";
       break;
+    case "schedule_add": {
+      const a = args as ToolArgs;
+      if (!a.cron_expr || !a.prompt) {
+        return errorText("schedule_add: cron_expr and prompt are required");
+      }
+      const base = ["schedule", "add", "--cron", a.cron_expr, "--prompt", a.prompt];
+      if (a.agent) base.push("--agent", a.agent);
+      if (a.name) base.push("--name", a.name);
+      if (a.secrets && a.secrets.length > 0) base.push("--secrets", a.secrets.join(","));
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    case "schedule_remove": {
+      const a = args as ToolArgs;
+      const base = ["schedule", "remove"];
+      if (a.agent) base.push("--agent", a.agent);
+      if (a.name) base.push("--name", a.name);
+      if (a.cron_hash) base.push("--cron-hash", a.cron_hash);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
     default:
       return errorText(`unknown tool: ${name}`);
   }
