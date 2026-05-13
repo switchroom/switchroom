@@ -32,7 +32,7 @@
  * cross-process behavior on the real platform we ship on).
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, it } from "vitest";
 import { Worker } from "node:worker_threads";
 import { spawnSync } from "node:child_process";
 import {
@@ -109,6 +109,7 @@ const { existsSync, writeFileSync, unlinkSync } = require('node:fs');
 // this doesn't add a new dependency.
 const FLOCK_SRC_PATH = new URL("./flock.ts", import.meta.url).pathname;
 let FLOCK_MODULE_PATH: string;
+let FLOCK_BUNDLE_DIR: string;
 
 describe.skipIf(process.platform !== "linux")("flock — cross-process concurrency (#978)", () => {
   let tmp: string;
@@ -116,8 +117,8 @@ describe.skipIf(process.platform !== "linux")("flock — cross-process concurren
   let markerPath: string;
 
   beforeAll(() => {
-    const bundleDir = mkdtempSync(join(tmpdir(), "vault-flock-bundle-"));
-    FLOCK_MODULE_PATH = join(bundleDir, "flock.cjs");
+    FLOCK_BUNDLE_DIR = mkdtempSync(join(tmpdir(), "vault-flock-bundle-"));
+    FLOCK_MODULE_PATH = join(FLOCK_BUNDLE_DIR, "flock.cjs");
     const result = spawnSync(
       "bun",
       [
@@ -134,6 +135,12 @@ describe.skipIf(process.platform !== "linux")("flock — cross-process concurren
       throw new Error(
         `bun build of flock.ts failed (status=${result.status}): ${result.stderr || result.stdout}`,
       );
+    }
+  });
+
+  afterAll(() => {
+    if (FLOCK_BUNDLE_DIR) {
+      try { rmSync(FLOCK_BUNDLE_DIR, { recursive: true, force: true }); } catch { /* */ }
     }
   });
 
