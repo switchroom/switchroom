@@ -999,6 +999,10 @@ function emitAgentService(
     PIP_BREAK_SYSTEM_PACKAGES: "1",
     PIP_USER: "1",
     SWITCHROOM_AGENT_NAME: a.name,
+    // Belt-and-braces in-container marker for the agent-config CLI's
+    // isContainerContext() probe (the primary signal is /.dockerenv,
+    // but a second independent check is the point of writing `||`).
+    SWITCHROOM_CONTAINER: "1",
     // Broker / kernel socket paths inside the agent container. The
     // per-agent volume is mounted at `/run/switchroom/broker` (and
     // `/run/switchroom/kernel`) — directly at the parent dir, NOT
