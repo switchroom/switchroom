@@ -38,6 +38,26 @@ import {
 import { createAgent, completeCreation } from "../agents/create-orchestrator.js";
 import { addAgent, type AgentTopology } from "../agents/add-orchestrator.js";
 import { bringUpAgentService } from "../agents/docker-fleet.js";
+
+/**
+ * Summarise a reconcile batch run. Returns `null` when there is
+ * nothing to summarise (zero failures). When at least one agent
+ * failed, returns a header line plus one line per failure. The
+ * caller is responsible for printing and setting `process.exitCode`
+ * so this helper stays a pure function we can unit-test without
+ * tangling with chalk / stdout.
+ */
+export function summarizeReconcileBatch(
+  totalCount: number,
+  failures: { name: string; error: string }[],
+): { header: string; lines: string[] } | null {
+  if (failures.length === 0) return null;
+  const successCount = totalCount - failures.length;
+  return {
+    header: `Summary: ${successCount} succeeded, ${failures.length} failed`,
+    lines: failures.map((f) => `${f.name}: ${f.error}`),
+  };
+}
 import { execFileSync as dockerExecFile } from "node:child_process";
 import { renameAgent, type HindsightMode } from "../agents/rename-orchestrator.js";
 import { validateBotTokenMatchesAgent } from "../setup/telegram-api.js";
@@ -1513,13 +1533,14 @@ export function registerAgentCommand(program: Command): void {
         }
         let totalChanges = 0;
         let agentsTouched = 0;
+        const failures: { name: string; error: string }[] = [];
 
         for (const n of names) {
           const agentConfig = config.agents[n];
           if (!agentConfig) {
-            console.error(
-              chalk.red(`Agent "${n}" is not defined in switchroom.yaml`)
-            );
+            const msg = `Agent "${n}" is not defined in switchroom.yaml`;
+            console.error(chalk.red(msg));
+            failures.push({ name: n, error: msg });
             continue;
           }
           try {
@@ -1641,10 +1662,25 @@ export function registerAgentCommand(program: Command): void {
               }
             }
           } catch (err) {
+            const msg = (err as Error).message;
             console.error(
-              chalk.red(`  ${n}: ${(err as Error).message}`)
+              chalk.red(`  ${n}: ${msg}`)
             );
+            failures.push({ name: n, error: msg });
           }
+        }
+
+        // Aggregate summary for batch runs. When any agent failed,
+        // print success/fail counts plus per-failure one-liners and
+        // exit non-zero so callers (CI, shell scripts) can detect
+        // partial failure rather than silently continuing.
+        const summary = summarizeReconcileBatch(names.length, failures);
+        if (summary) {
+          console.log(chalk.bold(`\n${summary.header}`));
+          for (const line of summary.lines) {
+            console.log(chalk.red(`  - ${line}`));
+          }
+          process.exitCode = 1;
         }
 
         if (totalChanges === 0 && agentsTouched === 0) {
