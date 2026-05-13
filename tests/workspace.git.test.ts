@@ -96,11 +96,16 @@ describe("workspace git versioning (Phase 4)", () => {
     const soulPath = join(workspaceDir, "SOUL.md");
     expect(existsSync(soulPath)).toBe(true);
 
-    // Verify SOUL.md is not tracked by git
+    // Verify SOUL.md is not tracked by git. Use line-level equality
+    // rather than substring containment: PR #1181 added `SOUL.md.fingerprint`
+    // (a tracked re-render watermark) which is correctly tracked but
+    // accidentally satisfied a naive `.toContain("SOUL.md")` substring
+    // match, hiding any real regression where SOUL.md itself slipped
+    // into the index.
     const trackedFiles = execSync("git ls-files", {
       cwd: workspaceDir,
       encoding: "utf-8",
-    });
+    }).split("\n").filter(Boolean);
     expect(trackedFiles).not.toContain("SOUL.md");
   });
 
