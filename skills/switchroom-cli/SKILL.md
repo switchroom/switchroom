@@ -47,26 +47,20 @@ Include the last ~20 lines verbatim, then summarise what you see (crash, stall, 
 
 ## Update — "update", "pull latest", "get new code", "upgrade"
 
-Pull the latest switchroom source, then re-apply config and bring the fleet back up via docker compose.
+Use the `switchroom update` verb (since v0.7.8 / #918). It collapses pull + apply + recreate + doctor into one command.
 
 ```bash
-cd ~/code/switchroom
-git pull
-bun install
-bun run build
-switchroom apply
-docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml pull
-docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d
+switchroom update                # pull images + apply + recreate + run doctor
+switchroom update --check        # dry-run: print the plan, exit 0
+switchroom update --status       # read-only: CLI version + image/container ages
+switchroom update --rebuild      # source-checkout users: also git pull + npm build
 ```
 
-`switchroom apply` reconciles every agent declared in `switchroom.yaml`
-(scaffolding any missing workspaces, refreshing bootstrap files), then
-writes `~/.switchroom/compose/docker-compose.yml`. The CLI deliberately
-does not run `docker` for you — the operator owns the bring-up.
+`switchroom update` is the operator path. The CLI self-elevates via sudo internally for the per-agent scaffold dirs that need root — no need for `sudo HOME=… PATH=…` incantations.
 
-The v0.6 `switchroom update` verb is removed in v0.7+; calling it now
-prints this upgrade hint and exits 1. The shim is slated for full removal
-in v0.8.
+If you only need the config-reconcile half without restarting agents, `switchroom apply` writes `~/.switchroom/compose/docker-compose.yml` and refreshes per-agent scaffolds without touching running containers. The operator runs the docker bring-up themselves.
+
+From inside an agent's Telegram DM, the same flow is available as `/upgradestatus` (read-only) and `/update apply` (admin-gated).
 
 ---
 

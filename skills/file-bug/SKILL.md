@@ -107,7 +107,7 @@ HH:MM:SS [journalctl]     <line>
 
 ## Environment
 - agent: <name>
-- branch: <branch> (run `cd ~/code/switchroom && git rev-parse --short HEAD`)
+- branch: <branch> (from inside your switchroom clone: `git rev-parse --short HEAD`)
 - runtime versions: <bun/node/claude-cli versions>
 - triggered: <human-readable timestamp>
 ```
