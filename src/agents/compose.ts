@@ -1236,6 +1236,15 @@ function emitAgentService(
   try {
     mkdirSync(`${hostHomeForChecks}/.switchroom/audit/${a.name}`, { recursive: true });
   } catch { /* best-effort */ }
+  // Phase B (switchroom #1163): pre-create the per-agent overlay
+  // directory so the agent-config write tools (Phase C) have a writable
+  // landing zone. The whole ~/.switchroom/agents/<name>/ tree is already
+  // bind-mounted rw at lines above (the dual-mount), so no separate
+  // volume entry is needed — just the host-side dir, owned by the
+  // operator umask before docker auto-creates it as root.
+  try {
+    mkdirSync(`${hostHomeForChecks}/.switchroom/agents/${a.name}/schedule.d`, { recursive: true });
+  } catch { /* best-effort */ }
   // Agent-config audit log (rw) — the read-only agent-config MCP broker
   // (src/mcp/agent-config/server.ts) appends one JSONL row per tool call
   // to ~/.switchroom/audit/<agent>/agent-config.jsonl. PER-AGENT mount:
