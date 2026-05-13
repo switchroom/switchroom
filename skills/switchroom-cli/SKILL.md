@@ -8,8 +8,9 @@ allowed-tools: Bash(switchroom *) Bash(docker *) Bash(docker compose *)
 
 This skill is the reference for running `switchroom` CLI commands against existing agents. Each section below is triggered by a distinct user intent — jump to the relevant one rather than walking top-to-bottom.
 
-**Three commands to know:**
-- `switchroom apply` — reconcile every agent + (re)write `~/.switchroom/compose/docker-compose.yml`. Bring the fleet up afterwards with `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d`. (Replaces the v0.6 `switchroom update` flow.)
+**Four commands to know:**
+- `switchroom update` — full operator path: pulls images + applies config + recreates containers + runs doctor (since v0.7.8 / #918). What you want 95% of the time.
+- `switchroom apply` — config-only reconcile: refresh per-agent scaffolds and (re)write `~/.switchroom/compose/docker-compose.yml` without touching running containers. Use when you want to inspect the generated compose before bringing the fleet up yourself.
 - `switchroom restart [agent]` — bounces a stuck or wedged agent
 - `switchroom version` — shows what's running (versions + health summary)
 
