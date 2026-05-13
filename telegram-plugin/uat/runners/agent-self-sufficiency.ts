@@ -32,6 +32,16 @@
  *
  *   TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_UAT_DRIVER_SESSION
  *
+ * **Why a user-account session, not bot tokens.** The acceptance-
+ * criteria text mentioned `TELEGRAM_BOT_TOKEN_<agent>` env vars, but
+ * Telegram's Bot API forbids bots from reading other bots' messages
+ * (https://core.telegram.org/bots/faq) — a bot can send to another
+ * bot's chat but can't observe the reply. The only way to drive the
+ * fleet AND capture every agent's reply is an mtcute user-account
+ * session, which is what the existing telegram-plugin/uat harness
+ * uses. This runner inherits that machinery wholesale; the env-var
+ * rename is forced by the platform, not a design choice.
+ *
  * Missing creds fail loud, not silent — the goal explicitly demands
  * no silent skips on missing UAT credentials.
  */

@@ -169,7 +169,7 @@ export const TOOLS = [
       "Run a read-only inspection command inside a peer agent's " +
       "container via `docker exec`. Self-target allowed; cross-agent " +
       "requires admin: true. argv[0] must be on the daemon's read-only " +
-      "allowlist (cat, df, du, env, free, grep, head, hostname, id, " +
+      "allowlist (cat, df, du, free, grep, head, hostname, id, " +
       "ls, ps, pwd, stat, tail, uname, uptime, wc, whoami). Anything " +
       "outside the allowlist returns `denied` with a pointer to the " +
       "deferred host_os.exec approval-kernel scope. Returns stdout/" +

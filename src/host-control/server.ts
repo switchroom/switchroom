@@ -977,7 +977,13 @@ export const READONLY_EXEC_ALLOWLIST = [
   "cat",
   "df",
   "du",
-  "env",
+  // `env` deliberately omitted. A single `env` call dumps the entire
+  // process environment (bot tokens, vault keys, etc.) into the 4 KiB
+  // response tail — a no-friction secret-exfil gadget for a prompt-
+  // injected admin agent. Equivalent forensic data is reachable via
+  // `cat /proc/self/environ` (or `/proc/<pid>/environ` for tini's
+  // child), which is one extra step a reviewer can spot in the
+  // audit log. (Reviewer note on PR #1215.)
   "free",
   "grep",
   "head",
