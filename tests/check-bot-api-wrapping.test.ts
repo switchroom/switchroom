@@ -49,11 +49,18 @@ function runScript(cwd: string): { ok: boolean; stdout: string; stderr: string }
 }
 
 describe('scripts/check-bot-api-wrapping.sh (#1075)', () => {
-  it('passes against the live repo (regression gate)', () => {
-    const result = runScript(REPO)
-    expect(result.ok).toBe(true)
-    expect(result.stdout).toMatch(/clean/)
-  })
+  it(
+    'passes against the live repo (regression gate)',
+    () => {
+      const result = runScript(REPO)
+      expect(result.ok).toBe(true)
+      expect(result.stdout).toMatch(/clean/)
+    },
+    // Local runs finish in ~1.5s; hosted Buildkite agents have slower I/O
+    // and the script grep-walks the entire telegram-plugin tree, occasionally
+    // pushing past vitest's 5s default. 30s is well above worst-case observed.
+    30_000,
+  )
 
   it('fails when a non-allowlisted raw bot.api.sendMessage lands in plugin source', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'check-bot-api-'))

@@ -3731,14 +3731,46 @@ describe("installSwitchroomSkills", () => {
   let tmpDir: string;
   let fakeSkillsDir: string;
   let agentDir: string;
+  // Per-describe HOME override so the real installSwitchroomSkills (which
+  // resolves the bundled pool from `homedir() + /.switchroom/skills/_bundled`,
+  // since PR #1173) finds a populated pool. CI hosted agents don't have
+  // `~/.switchroom` set up — without this override the function early-
+  // returns with "bundled skills pool dir not found" and every "scaffoldAgent
+  // installs switchroom skills" assertion fails.
+  let prevHome: string | undefined;
+  let homeDir: string;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "switchroom-builtin-skills-"));
     agentDir = join(tmpDir, "my-agent");
     mkdirSync(agentDir, { recursive: true });
 
-    // Create a fake built-in skills directory with two switchroom-* skills and
-    // one non-switchroom directory that must be ignored.
+    // Stage a fake `~/.switchroom/skills/_bundled` under tmpDir and point
+    // HOME at it. Covers the full universe of switchroom-* skills the
+    // production resolver expects to find (universal-default trio +
+    // foreman-only trio + runtime), each with a stub SKILL.md so the
+    // SKILL.md-presence filter in installSwitchroomSkills accepts them.
+    homeDir = join(tmpDir, "fake-home");
+    const bundledPoolDir = join(homeDir, ".switchroom", "skills", "_bundled");
+    mkdirSync(bundledPoolDir, { recursive: true });
+    for (const name of [
+      "switchroom-cli",
+      "switchroom-health",
+      "switchroom-runtime",
+      "switchroom-status",
+      "switchroom-install",
+      "switchroom-manage",
+      "switchroom-architecture",
+    ]) {
+      const d = join(bundledPoolDir, name);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, "SKILL.md"), `# ${name}\n`, "utf-8");
+    }
+    prevHome = process.env.HOME;
+    process.env.HOME = homeDir;
+
+    // Legacy `fakeSkillsDir` retained for the runWithFakeSkills helper
+    // tests below (those don't touch the real installSwitchroomSkills).
     fakeSkillsDir = join(tmpDir, "fake-skills");
     for (const name of ["switchroom-manage", "switchroom-health"]) {
       const d = join(fakeSkillsDir, name);
@@ -3754,6 +3786,8 @@ describe("installSwitchroomSkills", () => {
   });
 
   afterEach(() => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

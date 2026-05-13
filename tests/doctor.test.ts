@@ -57,19 +57,26 @@ describe("classifyReadError + tryReadHostFile", () => {
     expect(result.kind).toBe("enoent");
   });
 
-  it("tryReadHostFile returns eacces when file exists but is unreadable", async () => {
-    const { tryReadHostFile } = await import("../src/cli/doctor.js");
-    const path = join(tempDir, "secret.txt");
-    writeFileSync(path, "x");
-    chmodSync(path, 0o000);
-    try {
-      const result = tryReadHostFile(path);
-      expect(result.kind).toBe("eacces");
-      if (result.kind === "eacces") expect(result.error).toMatch(/EACCES|permission/i);
-    } finally {
-      chmodSync(path, 0o600);
-    }
-  });
+  it.skipIf(process.getuid?.() === 0)(
+    "tryReadHostFile returns eacces when file exists but is unreadable",
+    async () => {
+      // Root reads through chmod 0o000, so this branch is unreachable
+      // when the test process is uid=0 (hosted Buildkite agents run as
+      // root). The EACCES classification itself is covered by the
+      // pure-function test above.
+      const { tryReadHostFile } = await import("../src/cli/doctor.js");
+      const path = join(tempDir, "secret.txt");
+      writeFileSync(path, "x");
+      chmodSync(path, 0o000);
+      try {
+        const result = tryReadHostFile(path);
+        expect(result.kind).toBe("eacces");
+        if (result.kind === "eacces") expect(result.error).toMatch(/EACCES|permission/i);
+      } finally {
+        chmodSync(path, 0o600);
+      }
+    },
+  );
 });
 
 describe("parseEnvFile", () => {
@@ -304,7 +311,9 @@ describe("checkTelegram", () => {
     expect(results).toHaveLength(0);
   });
 
-  it("reports warn (not fail) when .env exists but is unreadable from host UID (EACCES)", async () => {
+  it.skipIf(process.getuid?.() === 0)(
+    "reports warn (not fail) when .env exists but is unreadable from host UID (EACCES)",
+    async () => {
     // Per-agent state files are mode 0600 owned by the agent UID
     // (compose.ts allocates 10001-10999); when `switchroom doctor`
     // runs as the host operator, open(2) fails with EACCES even
@@ -314,6 +323,10 @@ describe("checkTelegram", () => {
     //
     // Simulate by writing the file with mode 0000 (so existsSync
     // still returns true but readFileSync throws EACCES).
+    // Skipped when running as root (uid=0) — chmod 0o000 doesn't
+    // block root reads, so the EACCES branch is unreachable.
+    // Hosted Buildkite agents run as root; this test is exercised
+    // locally and in any non-root CI environment.
     writeAgentEnv("assistant", "123:ABC");
     const envPath = join(tempDir, "assistant", "telegram", ".env");
     chmodSync(envPath, 0o000);
@@ -331,7 +344,8 @@ describe("checkTelegram", () => {
       // Restore so afterEach's rmSync can clean up.
       chmodSync(envPath, 0o600);
     }
-  });
+    },
+  );
 
   it("dedupes tokens across multiple agents sharing one bot", async () => {
     writeAgentEnv("agent-a", "123:ABC");
