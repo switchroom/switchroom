@@ -1225,20 +1225,20 @@ function emitAgentService(
   if (existsSync(`${hostHomeForChecks}/.switchroom/credentials`)) {
     lines.push(`      - ${homePrefix}/.switchroom/credentials:${homePrefix}/.switchroom/credentials:ro`);
   }
-  // Ensure the host-side audit dir exists before docker compose tries
-  // to bind-mount it (docker auto-creates as root, which then traps the
-  // agent uid out of writing — pre-creating with the operator's umask
-  // sidesteps that).
+  // Ensure the host-side per-agent audit dir exists before docker
+  // compose tries to bind-mount it (docker auto-creates as root, which
+  // then traps the agent uid out of writing — pre-creating with the
+  // operator's umask sidesteps that).
   try {
-    mkdirSync(`${hostHomeForChecks}/.switchroom/audit`, { recursive: true });
+    mkdirSync(`${hostHomeForChecks}/.switchroom/audit/${a.name}`, { recursive: true });
   } catch { /* best-effort */ }
   // Agent-config audit log (rw) — the read-only agent-config MCP broker
   // (src/mcp/agent-config/server.ts) appends one JSONL row per tool call
-  // to ~/.switchroom/audit/agent-config.jsonl. Mounted rw so every agent
-  // shares a single host-visible audit trail. Mount is narrow (only the
-  // audit subdir, not all of ~/.switchroom). The directory is created
-  // host-side by the scaffolder so the `:rw` mount source always exists.
-  lines.push(`      - ${homePrefix}/.switchroom/audit:${homePrefix}/.switchroom/audit:rw`);
+  // to ~/.switchroom/audit/<agent>/agent-config.jsonl. PER-AGENT mount:
+  // each agent sees only its own audit subdir, never any other agent's.
+  // Critical: do NOT mount the parent ~/.switchroom/audit/ — that would
+  // let any agent read every other agent's audit trail.
+  lines.push(`      - ${homePrefix}/.switchroom/audit/${a.name}:${homePrefix}/.switchroom/audit/${a.name}:rw`);
   // Bundled-skills pool: mount at the same absolute host path so the
   // symlinks created by reconcileAgentDefaultSkills (which target the
   // source-repo or npm-package skills/ dir — e.g.
