@@ -37,6 +37,7 @@ describe("TOOLS export", () => {
       "audit_tail",
       "config_get",
       "cron_list",
+      "peers_list",      // identity / peer-awareness
       "schedule_add",
       "schedule_remove",
       "skill_install",   // #1163 Phase 2
@@ -81,6 +82,30 @@ describe("dispatchTool — happy path", () => {
       skills: ["s"],
       bundled_skills: {},
     });
+  });
+
+  it("peers_list shells out with no --agent flag (caller identity is env-pinned)", () => {
+    okCall(
+      JSON.stringify([
+        { name: "scribe", purpose: "notes" },
+        { name: "doc", purpose: "Health" },
+      ]) + "\n",
+    );
+    const res = dispatchTool("peers_list", {});
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual([
+      { name: "scribe", purpose: "notes" },
+      { name: "doc", purpose: "Health" },
+    ]);
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["peers", "list"]);
+  });
+
+  it("peers_list forwards include_self when set", () => {
+    okCall(JSON.stringify([]) + "\n");
+    dispatchTool("peers_list", { include_self: true });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["peers", "list", "--include-self"]);
   });
 
   it("audit_tail parses JSONL (one row per line)", () => {

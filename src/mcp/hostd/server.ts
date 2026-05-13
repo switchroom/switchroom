@@ -56,6 +56,9 @@ interface ToolArgs {
   force?: boolean;
   skip_images?: boolean;
   rebuild?: boolean;
+  // agent_logs / agent_exec
+  tail?: number;
+  argv?: string[];
 }
 
 export const TOOLS = [
@@ -134,6 +137,61 @@ export const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "agent_logs",
+    description:
+      "Read recent docker logs of any peer agent. Self-target is " +
+      "always allowed; cross-agent requires admin: true on the caller. " +
+      "Returns the trailing `tail` lines (default 100, max 2000) as " +
+      "`stdout_tail` / `stderr_tail` (each capped at 4 KiB). Use this " +
+      "for triage when a user reports a peer agent is misbehaving.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+          description: "Target agent name (kebab-case ASCII).",
+        },
+        tail: {
+          type: "number",
+          description: "Trailing lines to return. Default 100, max 2000.",
+        },
+      },
+    },
+  },
+  {
+    name: "agent_exec",
+    description:
+      "Run a read-only inspection command inside a peer agent's " +
+      "container via `docker exec`. Self-target allowed; cross-agent " +
+      "requires admin: true. argv[0] must be on the daemon's read-only " +
+      "allowlist (cat, df, du, env, free, grep, head, hostname, id, " +
+      "ls, ps, pwd, stat, tail, uname, uptime, wc, whoami). Anything " +
+      "outside the allowlist returns `denied` with a pointer to the " +
+      "deferred host_os.exec approval-kernel scope. Returns stdout/" +
+      "stderr tails capped at 4 KiB each.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name", "argv"],
+      properties: {
+        name: {
+          type: "string",
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+        },
+        argv: {
+          type: "array",
+          minItems: 1,
+          maxItems: 32,
+          items: { type: "string", minLength: 1 },
+          description:
+            "Command + args, e.g. [\"ls\", \"-la\", \"/state\"]. " +
+            "argv[0] is the program; argv[1..] are its arguments.",
+        },
+      },
     },
   },
   {
@@ -229,6 +287,32 @@ export async function dispatchTool(
         op: "agent_stop",
         request_id: makeRequestId("mcp-stop"),
         args: { name: args.name },
+      };
+      break;
+    }
+    case "agent_logs": {
+      if (!args.name) return errorText("agent_logs: name is required");
+      req = {
+        v: 1,
+        op: "agent_logs",
+        request_id: makeRequestId("mcp-logs"),
+        args: {
+          name: args.name,
+          ...(typeof args.tail === "number" ? { tail: args.tail } : {}),
+        },
+      };
+      break;
+    }
+    case "agent_exec": {
+      if (!args.name) return errorText("agent_exec: name is required");
+      if (!Array.isArray(args.argv) || args.argv.length === 0) {
+        return errorText("agent_exec: argv is required and must be non-empty");
+      }
+      req = {
+        v: 1,
+        op: "agent_exec",
+        request_id: makeRequestId("mcp-exec"),
+        args: { name: args.name, argv: args.argv },
       };
       break;
     }

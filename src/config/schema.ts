@@ -1138,6 +1138,18 @@ export const AgentSchema = z.object({
     .string()
     .optional()
     .describe("Emoji for the topic (e.g., '🏋️')"),
+  purpose: z
+    .string()
+    .max(140)
+    .optional()
+    .describe(
+      "One-line description of what this agent does (≤140 chars). Shown to " +
+      "peer agents when they call the agent-config MCP `peers_list` tool, so " +
+      "every agent on the instance can answer 'is there an agent that does X' " +
+      "without baking the fleet into prompts. Sourced live from " +
+      "switchroom.yaml — never memorized into Hindsight. Falls back to " +
+      "`topic_name` when absent.",
+    ),
   role: z
     .enum(["assistant", "foreman"])
     .optional()

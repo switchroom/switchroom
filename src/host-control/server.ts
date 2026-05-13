@@ -62,6 +62,10 @@ export interface ServerOptions {
   /** Absolute path to the host `switchroom` binary. Default: lookup on
    *  PATH at request time. */
   switchroomBin?: string;
+  /** Absolute path to the host `docker` binary. Default: lookup on
+   *  PATH at request time. Used by Phase 3 admin observability verbs
+   *  (agent_logs / agent_exec) that shell out to docker directly. */
+  dockerBin?: string;
   /** Audit-log path. Default: `<homeDir>/.switchroom/host-control-audit.log`. */
   auditLogPath?: string;
   /** Allow non-Linux dev mode (skips chown). */
@@ -347,6 +351,13 @@ export class HostdServer {
         case "agent_stop":
           resp = await this.handleAgentStop(req, started);
           break;
+        // ── Phase 3 admin-observability verbs ────────────────────
+        case "agent_logs":
+          resp = await this.handleAgentLogs(req, started);
+          break;
+        case "agent_exec":
+          resp = await this.handleAgentExec(req, started);
+          break;
       }
     } catch (err) {
       resp = errorResponse(
@@ -423,6 +434,18 @@ export class HostdServer {
         // there's no concurrent-fleet-write hazard.
         if (req.args.name === ("name" in caller ? caller.name : null))
           return null;
+        return callerAdmin
+          ? null
+          : `${req.op} cross-agent requires admin: true on caller "${caller.name}"`;
+      case "agent_logs":
+      case "agent_exec":
+        // Phase 3 admin-observability verbs. Self-target is allowed
+        // (an agent reading its own logs / inspecting its own
+        // container is harmless and useful for self-debugging);
+        // cross-agent requires admin. agent_exec additionally enforces
+        // a read-only argv allowlist at dispatch time — see
+        // isAllowlistedReadOnlyArgv.
+        if (req.args.name === caller.name) return null;
         return callerAdmin
           ? null
           : `${req.op} cross-agent requires admin: true on caller "${caller.name}"`;
@@ -648,6 +671,105 @@ export class HostdServer {
   }
 
   /**
+   * `docker logs --tail <n> <container>` — synchronous read of a peer
+   * container's combined stdout/stderr. The default container name in
+   * the switchroom compose project is `switchroom-<agent>`; we shell
+   * out via `docker` directly rather than through the CLI because no
+   * `switchroom agent logs` verb exists and adding one would just
+   * proxy this anyway. The `4 KiB tail` cap on stdout_tail caps the
+   * response frame size; for full logs the operator should use
+   * `docker logs` directly on the host.
+   */
+  private async handleAgentLogs(
+    req: Extract<HostdRequest, { op: "agent_logs" }>,
+    started: number,
+  ): Promise<HostdResponse> {
+    const tailLines = req.args.tail ?? 100;
+    const container = `switchroom-${req.args.name}`;
+    const res = await this.runDocker([
+      "logs",
+      "--tail",
+      String(tailLines),
+      container,
+    ]);
+    return {
+      v: 1,
+      request_id: req.request_id,
+      result: res.exit_code === 0 ? "completed" : "error",
+      exit_code: res.exit_code,
+      duration_ms: Date.now() - started,
+      stdout_tail: tail(res.stdout),
+      stderr_tail: tail(res.stderr),
+    };
+  }
+
+  /**
+   * `docker exec <container> <argv...>` — synchronous, gated by a
+   * read-only inspection allowlist enforced here in the daemon. argv[0]
+   * must be one of {@link READONLY_EXEC_ALLOWLIST}; writes / mutations
+   * are rejected with a clear pointer to the deferred approval-kernel
+   * scope work. This is deliberately a small allowlist: anything you
+   * can do here you can also do via `agent_logs` + a careful reading of
+   * the agent's state files, so the surface stays observability-only.
+   */
+  private async handleAgentExec(
+    req: Extract<HostdRequest, { op: "agent_exec" }>,
+    started: number,
+  ): Promise<HostdResponse> {
+    const argv0 = req.args.argv[0]!;
+    if (!isAllowlistedReadOnlyArgv(argv0)) {
+      return deniedResponse(
+        req.request_id,
+        `agent_exec: "${argv0}" is not on the read-only allowlist. ` +
+          `Allowed: ${READONLY_EXEC_ALLOWLIST.join(", ")}. ` +
+          `Writes inside peer containers require the host_os.exec ` +
+          `approval-kernel scope, which is not yet wired — see ` +
+          `docs/rfcs/approval-kernel.md §6 (deferred follow-up).`,
+        Date.now() - started,
+      );
+    }
+    const container = `switchroom-${req.args.name}`;
+    const res = await this.runDocker(["exec", container, ...req.args.argv]);
+    return {
+      v: 1,
+      request_id: req.request_id,
+      result: res.exit_code === 0 ? "completed" : "error",
+      exit_code: res.exit_code,
+      duration_ms: Date.now() - started,
+      stdout_tail: tail(res.stdout),
+      stderr_tail: tail(res.stderr),
+    };
+  }
+
+  /** Spawn the host `docker` CLI and capture stdout/stderr. Symmetric
+   *  with {@link runSwitchroom}; broken out for testability + so
+   *  failures get a "docker binary missing" surface separate from
+   *  switchroom CLI failures. */
+  private runDocker(
+    args: string[],
+  ): Promise<{ exit_code: number; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const bin = this.opts.dockerBin ?? "docker";
+      const child = spawn(bin, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => {
+        stdout += d.toString("utf8");
+      });
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString("utf8");
+      });
+      child.on("error", (err) => reject(err));
+      child.on("close", (code) =>
+        resolve({ exit_code: code ?? -1, stdout, stderr }),
+      );
+    });
+  }
+
+  /**
    * Acquire the fleet-mutation lock. If something else is already
    * holding it, return a `denied` response naming the in-flight
    * request so the caller can `get_status` it instead of waiting.
@@ -820,6 +942,42 @@ export class HostdServer {
 function tail(s: string, bytes = TAIL_BYTES): string {
   if (Buffer.byteLength(s, "utf8") <= bytes) return s;
   return s.slice(s.length - bytes);
+}
+
+/**
+ * argv[0] commands the daemon will run via `docker exec` against a
+ * peer container without an approval-kernel grant. Curated to a small
+ * set of obviously-side-effect-free POSIX inspection tools. Anything
+ * that writes, mounts, kills, reboots, or modifies the network stack
+ * stays off this list.
+ *
+ * Rationale: a 5-command allowlist is more legible than a regex
+ * blocklist, and the exec surface is meant to answer "what's going on
+ * in that container" rather than to be a general shell.
+ */
+export const READONLY_EXEC_ALLOWLIST = [
+  "cat",
+  "df",
+  "du",
+  "env",
+  "free",
+  "grep",
+  "head",
+  "hostname",
+  "id",
+  "ls",
+  "ps",
+  "pwd",
+  "stat",
+  "tail",
+  "uname",
+  "uptime",
+  "wc",
+  "whoami",
+] as const;
+
+export function isAllowlistedReadOnlyArgv(argv0: string): boolean {
+  return (READONLY_EXEC_ALLOWLIST as readonly string[]).includes(argv0);
 }
 
 /** Probe whether an agent socket exists at the canonical in-container

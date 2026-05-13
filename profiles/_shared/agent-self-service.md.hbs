@@ -19,6 +19,9 @@ tools is to let you do the edit yourself.
 | "what skills do I have access to?" | `skill_list` |
 | "show me my config" | `config_get` |
 | "show me my recent tool calls" | `audit_tail` |
+| "what other agents are running here?" / "is there an agent that does X?" / "who handles Y?" | `peers_list` |
+| "install the foo skill" / "give yourself the foo skill" | `skill_install` with `source: "bundled:foo"` |
+| "drop the foo skill" / "remove the foo skill" | `skill_remove` with `name: "foo"` |
 
 ### Tools
 
@@ -46,6 +49,23 @@ tools is to let you do the edit yourself.
 - **`audit_tail(limit?)`** — last N rows from your agent-config audit log
   (default 20, max 100). Use this to confirm a write landed.
 
+- **`peers_list(include_self?)`** — every OTHER switchroom agent on this
+  instance as `[{name, purpose, admin}]`. Live-sourced from
+  `switchroom.yaml` at every call — never cache or memorize the fleet.
+  Use whenever the user asks who else is here, whether some other agent
+  handles a thing, or which agent has admin (the entry with
+  `admin: true`).
+
+- **`skill_install(source, name?)`** — install a bundled skill into your
+  overlay. v1 source format: `bundled:<skill-name>`. The named skill must
+  already exist in the host's skills pool. 20-skill cap; rejects with
+  `E_SKILL_QUOTA_EXCEEDED` at the limit. Reconcile creates the
+  `.claude/skills/<name>` symlink — no restart needed.
+
+- **`skill_remove(name)`** — remove an overlay-installed skill by slug.
+  Does NOT remove skills the operator wrote directly into
+  `switchroom.yaml` — those are removed by the operator only.
+
 ### Safety rails — what gets rejected
 
 The broker hard-rejects writes that would violate these limits. Anticipate
@@ -71,14 +91,16 @@ the rails will block:
   the user wants to set something up on a different agent, tell them
   which agent to ask.
 
-### Skills — read-only today
+### Skills — self-service is live (#1163 Phase 2)
 
-You can `skill_list` to see what's installed, but `skill_install` and
-`skill_remove` aren't yet implemented (issue #1163 Phase 2 — coming
-soon). For now, if the user asks you to install a new skill, tell them
-the operator needs to drop the skill in `~/.switchroom/skills/<name>/`
-on the host and run `switchroom apply`. Point them at the operator
-docs rather than improvising a hack.
+You can `skill_list` to inventory, `skill_install` to add, and
+`skill_remove` to drop. v1 source format is `bundled:<name>` only — the
+skill must exist in the host's bundled-skills pool (run `skill_list` on
+the host to see what's available, or pass an obvious slug like
+`webapp-testing`, `pdf`, `mcp-builder`). git+https sources are designed
+but not yet shipped; if the user asks for an arbitrary URL, tell them
+the operator needs to drop it under `~/.switchroom/skills/<name>/` and
+run `switchroom apply`.
 
 ### Honest confirmation pattern
 

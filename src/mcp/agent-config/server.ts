@@ -14,6 +14,7 @@
  *   cron_list   → `switchroom cron list  [--agent <n>]`
  *   skill_list  → `switchroom skill list [--agent <n>]`
  *   audit_tail  → `switchroom audit tail [--agent <n>] [--limit N]`
+ *   peers_list  → `switchroom peers list [--agent <n>]`  (live-sourced)
  *
  * Each tool exec's the CLI, captures stdout, parses JSON (or JSONL
  * for audit_tail), and returns it as the tool result.
@@ -69,6 +70,8 @@ interface ToolArgs {
   cron_hash?: string;
   // skill_install (#1163 Phase 2)
   source?: string;
+  // peers_list
+  include_self?: boolean;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -149,6 +152,28 @@ export const TOOLS = [
           properties: { cron_hash: { type: "string", pattern: "^[a-f0-9]{12}$" } },
         },
       ],
+    },
+  },
+  {
+    name: "peers_list",
+    description:
+      "List every OTHER switchroom agent on this instance as JSON: " +
+      "[{name, purpose, admin}]. Live-sourced from switchroom.yaml at " +
+      "every call — never cache or memorize the fleet. `purpose` " +
+      "falls back to the agent's `topic_name` if no explicit purpose " +
+      "is set. `admin: true` means that peer can run fleet-management " +
+      "operations (read other agents' logs, exec into containers, " +
+      "restart/update). Use this whenever a user asks 'who else is " +
+      "here', 'is there an agent that does X', 'which bot handles Y', " +
+      "or 'which agent can do <admin op>'.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        include_self: {
+          type: "boolean",
+          description: "Include the caller in the result. Default: false.",
+        },
+      },
     },
   },
   {
@@ -242,6 +267,13 @@ export function dispatchTool(
       cliArgs = buildArgs(["audit", "tail"], args);
       parseMode = "jsonl";
       break;
+    case "peers_list": {
+      const base = ["peers", "list"];
+      if (args.include_self) base.push("--include-self");
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
     case "schedule_add": {
       const a = args as ToolArgs;
       if (!a.cron_expr || !a.prompt) {

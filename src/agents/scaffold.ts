@@ -3328,16 +3328,30 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
         model: agentConfig.model,
         schedule: agentConfig.schedule,
         useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
+        // Used by the "Admin surface" section of CLAUDE.md.hbs so an
+        // admin: true agent gets the fleet-ops paragraph and a regular
+        // agent gets the "I'm not admin — ask <peer>" refusal pattern.
+        admin: agentConfig.admin === true,
       };
 
-      // Render template, then append the switchroom-managed vault
-      // protocol section (every agent gets it; reconcile re-applies on
-      // every run so updates to the fragment propagate without touching
-      // per-profile templates), then compose with the user sidecar.
+      // Render template, then append the switchroom-managed
+      // fragments (every agent gets them; reconcile re-applies on
+      // every run so updates propagate without touching per-profile
+      // templates). The ORDER must mirror the first-scaffold path
+      // (line 2080+ above: vault protocol, then agent-self-service)
+      // or the diff-abort below will trip on every reconcile — the
+      // root cause of the 30+ scaffold test failures landing before
+      // PR #1163 was that this path missed the self-service fragment
+      // the other path applied. Both fragments are no-ops if their
+      // source file is absent.
       let rendered = renderTemplate(claudeMdSrc, claudeContext);
       const vaultProtocol = renderVaultProtocolFragment(claudeContext);
       if (vaultProtocol) {
         rendered = rendered.trimEnd() + "\n\n" + vaultProtocol + "\n";
+      }
+      const selfService = renderAgentSelfServiceFragment(claudeContext);
+      if (selfService) {
+        rendered = rendered.trimEnd() + "\n\n" + selfService + "\n";
       }
       let composed = composeWithSidecar(rendered, claudeCustomPath);
 

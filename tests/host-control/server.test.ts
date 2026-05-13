@@ -603,6 +603,145 @@ describe("hostd server — Phase 2 fleet mutations + lock", () => {
     }
   });
 
+  // ── Phase 3 admin observability — agent_logs / agent_exec ─────────────
+  it("agent_logs: shells out to docker and returns stdout_tail (admin cross-agent)", async () => {
+    // Swap to a "docker" stub that echoes its argv so we can assert
+    // the command line and the response shape.
+    const dockerStub = join(tmp, "docker-stub.sh");
+    writeFileSync(dockerStub, `#!/bin/sh\necho "docker: $@"\nexit 0\n`);
+    chmodSync(dockerStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      dockerBin: dockerStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_logs",
+        request_id: "logs-1",
+        args: { name: "bob", tail: 50 },
+      },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    expect(resp.stdout_tail).toContain("docker: logs --tail 50 switchroom-bob");
+  });
+
+  it("agent_logs: cross-agent denied for non-admin caller", async () => {
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_logs",
+        request_id: "logs-deny-1",
+        args: { name: "klanker" },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/cross-agent requires admin/);
+  });
+
+  it("agent_logs: self-target allowed even for non-admin", async () => {
+    const dockerStub = join(tmp, "docker-stub2.sh");
+    writeFileSync(dockerStub, `#!/bin/sh\necho "docker: $@"\nexit 0\n`);
+    chmodSync(dockerStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      dockerBin: dockerStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_logs",
+        request_id: "logs-self-1",
+        args: { name: "bob" },
+      },
+    );
+    expect(resp.result).toBe("completed");
+  });
+
+  it("agent_exec: read-only allowlisted argv runs via docker exec", async () => {
+    const dockerStub = join(tmp, "docker-stub3.sh");
+    writeFileSync(dockerStub, `#!/bin/sh\necho "docker: $@"\nexit 0\n`);
+    chmodSync(dockerStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      dockerBin: dockerStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_exec",
+        request_id: "exec-1",
+        args: { name: "bob", argv: ["ls", "-la", "/state"] },
+      },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.stdout_tail).toContain(
+      "docker: exec switchroom-bob ls -la /state",
+    );
+  });
+
+  it("agent_exec: non-allowlisted argv[0] is denied with a clear pointer to the deferred scope", async () => {
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_exec",
+        request_id: "exec-deny-1",
+        // `rm` is not on the read-only allowlist.
+        args: { name: "bob", argv: ["rm", "-rf", "/state"] },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/read-only allowlist/);
+    expect(resp.error).toMatch(/host_os\.exec/);
+  });
+
+  it("agent_exec: cross-agent denied for non-admin caller (regardless of argv legality)", async () => {
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "agent_exec",
+        request_id: "exec-deny-2",
+        args: { name: "klanker", argv: ["ls", "/"] },
+      },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/cross-agent requires admin/);
+  });
+
   it("per-agent verbs (agent_start/agent_stop) are NOT gated by the fleet lock", async () => {
     // Re-create the standard server with the fast stub (the prior
     // test left us on the slow stub). beforeEach should also reset

@@ -133,8 +133,18 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // a new bundled `switchroom-runtime` skill. Always-loaded prompt
     // now points at the skill via short triggers; procedural detail
     // loads on demand. ~5KB removed from every-turn context.
+    // RAISED 28000 → 32000 for the agent-self-sufficiency epic
+    // (#TBD): four new always-loaded blocks the goal explicitly
+    // required — (a) "What you are" honest-identity statement +
+    // peer-awareness pointer at `peers_list`, (b) admin-vs-non-admin
+    // refusal posture so non-admin agents hand off to the right
+    // peer instead of trying to run hostd verbs, (c) peers_list +
+    // skill_install/skill_remove rows in the self-service fragment.
+    // Net adds ~3KB; trimmed otherwise where prose was redundant.
+    // The previous 33000 ceiling left effectively no headroom for
+    // future fragments, so we step back up to a comparable point.
     // Each block is load-bearing. Future bumps should justify themselves
     // similarly.
-    expect(claudeMd.length).toBeLessThan(28000); // tightened post-hoist; target is lean but not 3KB
+    expect(claudeMd.length).toBeLessThan(32000); // post-self-sufficiency epic; identity + peers + admin posture
   });
 });

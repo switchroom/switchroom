@@ -149,6 +149,42 @@ export const AgentStopRequestSchema = z.object({
   }),
 });
 
+// ─── Phase 3 verbs — admin observability (this PR) ────────────────────────
+//
+// Adds the two verbs an admin agent needs to actually be useful as a
+// peer operator on the fleet: read another agent's logs, and run a
+// read-only inspection command inside another agent's container.
+// Both are admin-gated (self-target is fine for symmetry with the
+// Phase-2 agent_{start,stop,restart} verbs, but the interesting use
+// case is cross-agent). Mutations inside the peer container are
+// deferred to a follow-up PR that adds the `host_os.exec` scope to the
+// approval-kernel (see docs/rfcs/approval-kernel.md §6).
+
+/** `docker logs --tail <n> <agent>` — synchronous, read-only. */
+export const AgentLogsRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("agent_logs"),
+  args: z.object({
+    name: AgentNameSchema,
+    /** Number of trailing lines to return (default 100, max 2000). */
+    tail: z.number().int().positive().max(2000).optional(),
+  }),
+});
+
+/** `docker exec <agent> <cmd>` — synchronous; command must be on the
+ *  read-only inspection allowlist enforced by the daemon. Writes are
+ *  rejected pending the approval-kernel scope work. */
+export const AgentExecRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("agent_exec"),
+  args: z.object({
+    name: AgentNameSchema,
+    /** Command + args as a list, e.g. ["ls", "-la", "/state"]. argv[0]
+     *  is the program; argv[1..] are its arguments. */
+    argv: z.array(z.string().min(1)).min(1).max(32),
+  }),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   AgentRestartRequestSchema,
   UpgradeStatusRequestSchema,
@@ -158,6 +194,8 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ApplyRequestSchema,
   AgentStartRequestSchema,
   AgentStopRequestSchema,
+  AgentLogsRequestSchema,
+  AgentExecRequestSchema,
 ]);
 
 export type AgentRestartRequest = z.infer<typeof AgentRestartRequestSchema>;
@@ -168,6 +206,8 @@ export type UpdateApplyRequest = z.infer<typeof UpdateApplyRequestSchema>;
 export type ApplyRequest = z.infer<typeof ApplyRequestSchema>;
 export type AgentStartRequest = z.infer<typeof AgentStartRequestSchema>;
 export type AgentStopRequest = z.infer<typeof AgentStopRequestSchema>;
+export type AgentLogsRequest = z.infer<typeof AgentLogsRequestSchema>;
+export type AgentExecRequest = z.infer<typeof AgentExecRequestSchema>;
 export type HostdRequest = z.infer<typeof RequestSchema>;
 
 /** All verb names that pass discriminated-union validation. New verbs

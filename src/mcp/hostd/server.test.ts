@@ -64,9 +64,11 @@ afterEach(() => {
 });
 
 describe("TOOLS export", () => {
-  it("exposes the 5 documented hostd tools", () => {
+  it("exposes the documented hostd tools (Phase 2 + Phase 3 admin observability)", () => {
     const names = TOOLS.map((t) => t.name).sort();
     expect(names).toEqual([
+      "agent_exec",     // Phase 3 — peer container read-only inspection
+      "agent_logs",     // Phase 3 — peer container log read
       "agent_restart",
       "agent_start",
       "agent_stop",
@@ -84,7 +86,13 @@ describe("TOOLS export", () => {
   });
 
   it("agent_* tools require `name` as a kebab-case ASCII string", () => {
-    for (const name of ["agent_restart", "agent_start", "agent_stop"]) {
+    for (const name of [
+      "agent_restart",
+      "agent_start",
+      "agent_stop",
+      "agent_logs",
+      "agent_exec",
+    ]) {
       const t = TOOLS.find((x) => x.name === name)!;
       const schema = t.inputSchema as unknown as {
         required?: string[];
@@ -141,6 +149,37 @@ describe("dispatchTool — happy path", () => {
     await dispatchTool("update_apply", {});
     const sent = hostdRequestMock.mock.calls[0]![1];
     expect(sent.args).toEqual({});
+  });
+
+  it("agent_logs forwards tail when provided and omits it when not", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
+    await dispatchTool("agent_logs", { name: "scribe", tail: 250 });
+    let sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("agent_logs");
+    expect(sent.args).toEqual({ name: "scribe", tail: 250 });
+
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
+    await dispatchTool("agent_logs", { name: "scribe" });
+    sent = hostdRequestMock.mock.calls[1]![1];
+    expect(sent.args).toEqual({ name: "scribe" });
+  });
+
+  it("agent_exec forwards name + argv", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
+    await dispatchTool("agent_exec", {
+      name: "scribe",
+      argv: ["ls", "-la", "/state"],
+    });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("agent_exec");
+    expect(sent.args).toEqual({ name: "scribe", argv: ["ls", "-la", "/state"] });
+  });
+
+  it("agent_exec without argv returns isError without wire-calling", async () => {
+    const res = await dispatchTool("agent_exec", { name: "scribe" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/argv is required/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
   });
 
   it("response is surfaced as JSON text in content[0]", async () => {

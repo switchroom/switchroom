@@ -346,14 +346,26 @@ describe("agent-self-service partial — cron/skill MCP discoverability (#1163)"
     expect(fragment.toLowerCase()).toMatch(/recur|every/);
   });
 
-  it("calls out the skill_list-only status (no skill_install yet)", async () => {
-    // skill_install / skill_remove aren't built yet (Phase 2). The
-    // fragment must tell the agent NOT to claim it can install skills,
-    // and to redirect the user to the operator instead.
+  it("names every skill write tool now that #1163 Phase 2 has shipped", async () => {
+    // skill_install + skill_remove are now LIVE (#1163 Phase 2,
+    // PRs #1209/#1210). The fragment must teach the agent that
+    // installing a bundled skill is a one-tool call away — not a
+    // "ask the operator to drop a directory" referral.
     const { renderAgentSelfServiceFragment } = await import("./profiles.js");
     const fragment = renderAgentSelfServiceFragment();
-    expect(fragment.toLowerCase()).toMatch(/skill_install/);
-    expect(fragment.toLowerCase()).toMatch(/not yet|coming soon|phase 2|operator/);
+    expect(fragment).toContain("skill_install");
+    expect(fragment).toContain("skill_remove");
+    // v1 source format is bundled:<name>.
+    expect(fragment.toLowerCase()).toContain("bundled:");
+  });
+
+  it("names peers_list so agents can answer 'is there an agent that does X'", async () => {
+    const { renderAgentSelfServiceFragment } = await import("./profiles.js");
+    const fragment = renderAgentSelfServiceFragment();
+    expect(fragment).toContain("peers_list");
+    // The fragment must warn against memorizing the fleet — that's
+    // the whole anti-drift point.
+    expect(fragment.toLowerCase()).toMatch(/never cache|never memori[sz]e|live-source/);
   });
 
   it("is non-empty (file present and rendered)", async () => {

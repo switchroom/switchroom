@@ -324,6 +324,57 @@ export function registerAgentConfigCommands(program: Command): void {
       }),
     );
 
+  // switchroom peers list
+  const peers = program
+    .command("peers")
+    .description(
+      "Read-only listing of peer agents on this switchroom instance. " +
+      "Live-sourced from switchroom.yaml — never cached. The agent's " +
+      "own name is excluded when called from a container context.",
+    );
+  peers
+    .command("list")
+    .description(
+      "Emit every other agent on this instance as JSON: " +
+      "[{name, purpose}]. `purpose` falls back to `topic_name` when " +
+      "the agent has no explicit `purpose:` set. Caller (env-pinned " +
+      "agent) is excluded from results so an agent never lists itself.",
+    )
+    .option("--agent <name>", "Caller identity (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--include-self", "Include the calling agent in the result (default: exclude)")
+    .action(
+      withConfigError(async (opts: { agent?: string; includeSelf?: boolean }) => {
+        let self: string | null;
+        try {
+          // Allow operator context (no env, no --agent) to list ALL agents:
+          // pass through with self = null and skip the cross-agent guard.
+          if (!opts.agent && !process.env.SWITCHROOM_AGENT_NAME) {
+            self = null;
+          } else {
+            self = resolveTargetAgent(opts.agent);
+          }
+        } catch (err) {
+          process.stderr.write(`${(err as Error).message}\n`);
+          appendAudit(opts.agent ?? "<unknown>", "peers.list", { ...opts }, 7);
+          process.exit(7);
+        }
+        const cfg = getConfig(program);
+        const agentsMap = (cfg.agents ?? {}) as Record<
+          string,
+          { purpose?: string; topic_name?: string; admin?: boolean }
+        >;
+        const out: { name: string; purpose: string; admin: boolean }[] = [];
+        for (const [name, slice] of Object.entries(agentsMap)) {
+          if (self && name === self && !opts.includeSelf) continue;
+          const purpose = (slice.purpose ?? slice.topic_name ?? "").toString();
+          out.push({ name, purpose, admin: slice.admin === true });
+        }
+        out.sort((a, b) => a.name.localeCompare(b.name));
+        process.stdout.write(JSON.stringify(out) + "\n");
+        appendAudit(self ?? "<operator>", "peers.list", { ...opts }, 0);
+      }),
+    );
+
   // switchroom audit tail
   const audit = program
     .command("audit")
