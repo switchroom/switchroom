@@ -438,7 +438,7 @@ hindsight   me@kenthompson.com.au    socket bound (last seen 12s ago)
 $ switchroom auth show ziggy
 ziggy
   Active account: me@kenthompson.com.au (fleet-active)
-  Token expires:  355d 23h (refreshes at 30 min remaining)
+  Token expires:  355d 23h (refreshes at 60 min remaining)
   Last refresh:   2026-05-14 13:54:02
   Mirror sha:     ab12cd…  (matches broker index)
   Container:      switchroom-ziggy up 2 minutes
@@ -524,7 +524,7 @@ outside the agent fleet. The pattern:
    shared at the account level).
 6. Refresh attribution is the broker's job — broker owns the
    refresh lease. The refresh-threshold invariant (broker at
-   30min, claude at <5min) means the in-container claude never
+   60min, claude at <5min) means the in-container claude never
    fires its own refresh against the same credentials.json file.
    Hindsight re-fetches via `get-credentials` after its tmpfs copy
    ages out.
@@ -578,7 +578,7 @@ Image build via `npm run build:auth-broker` (new script that bundles
 `src/auth/broker/index.ts` to `dist/auth-broker/index.js`), then
 `docker/Dockerfile.auth-broker` COPYs the bundle into the image.
 
-## 6. No migration — clean break
+## 6. In-place upgrade (no compatibility shims)
 
 Existing on-disk state on a dev host today:
 - `~/.switchroom/accounts/<label>/credentials.json` — **preserved**,
@@ -684,8 +684,6 @@ The implementation is ~120 lines and lives in
 - `tests/auth-accounts-yaml.test.ts`
 - Any test under `telegram-plugin/tests/` matching pattern
   `auth-slot-*.test.ts`.
-
-### 7.2 Modified (not deleted)
 
 ### 7.2 Modified (not deleted)
 
