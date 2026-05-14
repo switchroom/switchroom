@@ -15,7 +15,7 @@
  * captured Google response body, no network round-trip.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it } from "vitest";
 
 import { GoogleProvider } from "./google-provider.js";
 

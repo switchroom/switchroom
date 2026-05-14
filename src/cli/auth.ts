@@ -421,11 +421,19 @@ export function registerAuthCommand(program: Command): void {
         // default config-dir from `<agentsDir>/<agent>/.claude`.
         let configDir = opts.configDir;
         if (configDir === undefined) {
-          const config = getConfig(program);
-          const agentsDir = resolveAgentsDir(config);
-          configDir = join(agentsDir, agent, ".claude");
+          // Wrap just the config-derivation branch in withConfigError so a
+          // human typing `switchroom auth heal foo` without a yaml gets
+          // the friendly `chalk.red("Config error: ...")` line rather than
+          // an unformatted commander stack trace. boot-self-test always
+          // passes --config-dir and bypasses this branch entirely, so the
+          // wrapper has no effect on the programmatic path.
+          await withConfigError(async () => {
+            const config = getConfig(program);
+            const agentsDir = resolveAgentsDir(config);
+            configDir = join(agentsDir, agent, ".claude");
+          })();
         }
-        const diag = diagnoseAuthState(configDir);
+        const diag = diagnoseAuthState(configDir!);
         if (opts.json) {
           console.log(JSON.stringify(diag));
         } else {
