@@ -307,6 +307,15 @@ globally. During local work on src/, prefer `bun run dev` over rebuilding.
 - **Tests:** vitest for `src/` + `tests/`, bun test for
   `telegram-plugin/tests/` (some rely on Bun's native APIs). Both run
   under `npm test`.
+  - **Import the right runner.** Tests under `src/` + `tests/` MUST
+    import from `"vitest"`, not `"bun:test"` — vitest can't resolve
+    `bun:test` and the whole suite fails to load. The natural reach is
+    `bun:test` because the project is bun-runtime; resist it. If a
+    file genuinely needs bun-only APIs (`mock()`, `bun:sqlite`,
+    `spyOn`), add it to the `exclude` array in `vitest.config.ts`. The
+    `lint:bun-test-imports` step catches this structurally — five PRs
+    in 24h on 2026-05-14 fixed this same one-line bug class before
+    the lint rule landed.
 - **No commented-out code.** Don't leave `// TODO: rename` or half-dead
   blocks — either fix it or open an issue.
 - **CLI structure:** each top-level verb gets its own file in `src/cli/`
