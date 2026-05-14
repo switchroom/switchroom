@@ -45,6 +45,22 @@
 
 export type PokeLevel = 'soft' | 'firm'
 
+/** #1292: snapshot of an in-flight tool call, surfaced in the 300s
+ * framework-fallback message so the user sees the actual observable
+ * ("running Grep \"foo\" for 4m") instead of the dishonest generic
+ * "still working… no update in 5 min" when the agent is clearly busy
+ * grinding through tool calls. */
+export interface ToolSnapshot {
+  /** Bare tool name as it came off the wire (e.g. "Grep", "Read", "Bash"). */
+  name: string
+  /** Natural-language descriptor from `toolLabel()` if available (e.g. the
+   * query for Grep, basename for Read/Edit/Write, hostname for WebFetch),
+   * or null when no useful label could be derived. */
+  label: string | null
+  /** Time since this tool call started, in ms. */
+  durationMs: number
+}
+
 export interface SilencePokeState {
   /** Wall-clock ms of turn start. Silence clock zero-point when no outbound yet. */
   turnStartedAt: number
@@ -62,6 +78,16 @@ export interface SilencePokeState {
   fallbackFired: boolean
   /** Wall-clock ms of last poke fire — used for poke-success latency. */
   lastPokeFiredAt: number | null
+  /** #1292: in-flight tool calls keyed by toolUseId. Populated by
+   * `noteToolStart` on every parent-agent `tool_use` event the gateway
+   * sees and drained by `noteToolEnd` on the matching `tool_result`.
+   * Read only inside `tick()` when the 300s fallback fires — at that
+   * point we snapshot the entries (sorted by startedAt ascending) and
+   * include the longest-running one in the fallback message body.
+   * NOTE: presence of in-flight tools does NOT reset the silence
+   * clock — the design choice in this module's header is preserved.
+   * We only enrich the fallback TEXT, not the timing. */
+  inFlightTools: Map<string, { name: string; startedAt: number; label: string | null }>
 }
 
 export interface ThresholdsMs {
@@ -89,9 +115,19 @@ export interface FrameworkFallbackContext {
   chatId: string
   threadId: number | null
   /** Picked from lastThinkingAt: 'thinking' if a thinking event landed in
-   *  the last 30s of silence, else 'working'. */
+   *  the last 30s of silence, else 'working'. Note: 'working' is the
+   *  default base; when `inFlightTools` is non-empty the fallback text
+   *  uses the tool-aware wording instead of either 'working' / 'thinking'
+   *  (see `formatFrameworkFallbackText`). */
   fallbackKind: 'working' | 'thinking'
   silenceMs: number
+  /** #1292: snapshot of in-flight tool calls at the moment the fallback
+   *  fires, sorted by startedAt ascending. Empty when no tools were
+   *  in flight (e.g. agent genuinely silent, or all tools completed
+   *  faster than the 300s threshold). The format helper uses entry [0]
+   *  (longest-running) for the message body and "+ N more" when
+   *  length > 1. */
+  inFlightTools: ToolSnapshot[]
 }
 
 export type SilencePokeMetric =
@@ -141,6 +177,7 @@ export function startTurn(key: string, now: number): void {
     lastThinkingAt: null,
     fallbackFired: false,
     lastPokeFiredAt: null,
+    inFlightTools: new Map(),
   })
 }
 
@@ -203,6 +240,72 @@ export function noteThinking(key: string, now: number): void {
   const s = state.get(key)
   if (s == null) return
   s.lastThinkingAt = now
+}
+
+/**
+ * #1292: record the start of a tool call. Stored in `inFlightTools` keyed
+ * by `toolUseId` so a later `noteToolEnd` can drain the entry. Read only
+ * by `tick()` when the 300s fallback fires, where we snapshot the map
+ * into the fallback context so the user-visible message can name the
+ * actual observable (e.g. "running Grep \"foo\" for 4m") instead of the
+ * dishonest generic "still working… no update in 5 min".
+ *
+ * Idempotent: calling twice with the same toolUseId overwrites — useful
+ * when a late `noteToolLabel` arrives but the caller wants to reuse the
+ * start-side API. The `startedAt` is updated; for label-only refreshes
+ * use `noteToolLabel` instead so duration stays correct.
+ *
+ * No-op when the kill switch is on (state Map will be empty for this key).
+ */
+export function noteToolStart(
+  key: string,
+  toolUseId: string,
+  name: string,
+  label: string | null,
+  now: number,
+): void {
+  const s = state.get(key)
+  if (s == null) return
+  s.inFlightTools.set(toolUseId, { name, startedAt: now, label })
+}
+
+/**
+ * #1292: record completion of a tool call. Removes the entry from
+ * `inFlightTools`. Idempotent — calling on an unknown toolUseId is a
+ * no-op. Sub-second tools that start and end inside one poll interval
+ * are still safe because the map is only read inside `tick()` at the
+ * 300s fallback boundary; the churn never gets observed.
+ */
+export function noteToolEnd(
+  key: string,
+  toolUseId: string,
+  _now: number,
+): void {
+  const s = state.get(key)
+  if (s == null) return
+  s.inFlightTools.delete(toolUseId)
+}
+
+/**
+ * #1292: late label update for an in-flight tool. The tool-label sidecar
+ * (PreToolUse hook, polled every 250ms via `tool-label-sidecar.ts`) can
+ * publish a richer label some time after the `tool_use` event landed.
+ * When that arrives, refresh the entry in-place so the fallback message
+ * — if it fires later — picks up the better label.
+ *
+ * No-op when the toolUseId isn't tracked (e.g. tool already completed,
+ * or the start event was skipped because the tool is a Telegram surface).
+ */
+export function noteToolLabel(
+  key: string,
+  toolUseId: string,
+  label: string,
+): void {
+  const s = state.get(key)
+  if (s == null) return
+  const entry = s.inFlightTools.get(toolUseId)
+  if (entry == null) return
+  entry.label = label
 }
 
 /**
@@ -273,12 +376,50 @@ export function formatPokeText(level: PokeLevel): string {
 export function formatFrameworkFallbackText(
   fallbackKind: 'working' | 'thinking',
   silenceMs: number,
+  inFlightTools: ToolSnapshot[] = [],
 ): string {
   const minutes = Math.max(1, Math.round(silenceMs / 60_000))
   const suffix = `(no update from agent in ${minutes} min)`
+  // #1292 case (a): tools in flight. Name the longest-running one
+  // (entry[0] — caller pre-sorts by startedAt ascending). Avoid the
+  // "still working" framing #1292 explicitly calls out as dishonest:
+  // the agent IS doing work, we can see the tool. Format:
+  //   running Grep "foo" for 4m (no update from agent in 5 min)
+  //   running Grep "foo" + 2 more (4m) (no update from agent in 5 min)
+  //   running Grep (no label) for 4m (no update from agent in 5 min)
+  if (inFlightTools.length > 0) {
+    const longest = inFlightTools[0]!
+    const dur = formatDurationShort(longest.durationMs)
+    const labelTail = longest.label && longest.label.length > 0
+      ? ` ${truncateLabel(longest.label)}`
+      : ''
+    const more = inFlightTools.length > 1
+      ? ` + ${inFlightTools.length - 1} more`
+      : ''
+    return `running ${longest.name}${labelTail}${more} for ${dur} ${suffix}`
+  }
   return fallbackKind === 'thinking'
     ? `still thinking… ${suffix}`
     : `still working… ${suffix}`
+}
+
+/** Compact m/s rendering for the fallback message. Anything under a
+ *  minute reads as `${s}s`, otherwise `${m}m`. Always rounds toward the
+ *  user-honest direction — "4m" for 4m 30s, "5m" for 4m 45s. */
+function formatDurationShort(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000))
+  if (totalSec < 60) return `${totalSec}s`
+  const minutes = Math.round(totalSec / 60)
+  return `${minutes}m`
+}
+
+/** Telegram lines are short on mobile. Clip the label to keep the
+ *  fallback message readable. Truncation point is generous (60 chars)
+ *  because tool labels are pre-truncated by `toolLabel()` already. */
+function truncateLabel(label: string): string {
+  const MAX = 60
+  if (label.length <= MAX) return label
+  return label.slice(0, MAX - 1) + '…'
 }
 
 /**
@@ -331,6 +472,16 @@ function tick(now: number): void {
       const recentThinking = s.lastThinkingAt != null
         && (now - s.lastThinkingAt) < 30_000
       const fallbackKind: 'working' | 'thinking' = recentThinking ? 'thinking' : 'working'
+      // #1292: snapshot in-flight tools at fire time, sorted by
+      // startedAt ascending so entry[0] is the longest-running.
+      // Pre-computed durations in ms; the formatter just renders.
+      const inFlightTools: ToolSnapshot[] = Array.from(s.inFlightTools.values())
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .map(t => ({
+          name: t.name,
+          label: t.label,
+          durationMs: now - t.startedAt,
+        }))
       activeDeps.emitMetric({
         kind: 'silence_fallback_sent',
         key,
@@ -345,6 +496,7 @@ function tick(now: number): void {
           threadId,
           fallbackKind,
           silenceMs: silence,
+          inFlightTools,
         })
         if (r != null && typeof (r as Promise<void>).catch === 'function') {
           ;(r as Promise<void>).catch((err) => {

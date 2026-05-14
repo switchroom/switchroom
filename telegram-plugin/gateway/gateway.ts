@@ -52,6 +52,7 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
+import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
@@ -2513,6 +2514,7 @@ silencePoke.startTimer({
     const text = silencePoke.formatFrameworkFallbackText(
       ctx.fallbackKind,
       ctx.silenceMs,
+      ctx.inFlightTools,
     )
     try {
       await robustApiCall(
@@ -2820,9 +2822,46 @@ const ipcServer: IpcServer = createIpcServer({
       const key = statusKey(currentTurn.sessionChatId, currentTurn.sessionThreadId)
       if (ev.kind === 'thinking') {
         silencePoke.noteThinking(key, Date.now())
-      } else if (ev.kind === 'tool_use' && (ev.toolName === 'Task' || ev.toolName === 'Agent')) {
-        // Built-in claude sub-agent dispatch — extends soft threshold to 5min.
-        silencePoke.noteSubagentDispatch(key)
+      } else if (ev.kind === 'tool_use') {
+        if (ev.toolName === 'Task' || ev.toolName === 'Agent') {
+          // Built-in claude sub-agent dispatch — extends soft threshold to 5min.
+          silencePoke.noteSubagentDispatch(key)
+        }
+        // #1292: track in-flight tool calls so the 300s framework
+        // fallback message can name the actual observable (e.g.
+        // "running Grep \"foo\" for 4m") instead of the dishonest
+        // generic "still working… no update in 5 min" when the agent
+        // is clearly busy on tool calls. Telegram-surface tools are
+        // excluded — their job IS the outbound message, the silence
+        // clock resets via noteOutbound when they fire. Sub-agent
+        // tool_use events (kind='sub_agent_tool_use') intentionally
+        // NOT tracked: the parent's Task tool_use is already on the
+        // map and represents the user-observable wait.
+        if (
+          ev.toolUseId != null
+          && ev.toolUseId.length > 0
+          && !isTelegramSurfaceTool(ev.toolName)
+        ) {
+          const label = toolLabel(
+            ev.toolName,
+            ev.input,
+            /*preamble*/ undefined,
+            ev.precomputedLabel,
+          )
+          silencePoke.noteToolStart(
+            key,
+            ev.toolUseId,
+            ev.toolName,
+            label.length > 0 ? label : null,
+            Date.now(),
+          )
+        }
+      } else if (ev.kind === 'tool_result') {
+        // #1292: drain the in-flight entry. Idempotent on unknown ids
+        // (covers Telegram-surface tools we skipped at start time).
+        if (ev.toolUseId != null && ev.toolUseId.length > 0) {
+          silencePoke.noteToolEnd(key, ev.toolUseId, Date.now())
+        }
       }
     }
   },

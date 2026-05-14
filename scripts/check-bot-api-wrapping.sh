@@ -83,13 +83,17 @@ ALLOWLIST=(
   # permission-request keyboard send. opts only has reply_markup. No thread_id.
   # Range bumped 2026-05-13 for stuck-turn-recovery v2 cleanup expansion
   # (~100 lines total added around line 2510).
-  "telegram-plugin/gateway/gateway.ts:2695-2880:permission-request keyboard; no thread_id"
+  # Range bumped 2026-05-15 for #1292 tool-aware silence-poke fallback
+  # (~32 lines added in onSessionEvent + ctx threading).
+  "telegram-plugin/gateway/gateway.ts:2695-2920:permission-request keyboard; no thread_id"
 
   # reply chunk-loop fallback after robustApiCall threw THREAD_NOT_FOUND.
   # The caller dropped the thread; this raw sendMessage retries on the
   # main chat. Wrapping would re-enter the THREAD_NOT_FOUND throw on a
   # phantom second deletion.
-  "telegram-plugin/gateway/gateway.ts:3160-3360:reply chunk-loop THREAD_NOT_FOUND fallback (intentional raw)"
+  # Range bumped 2026-05-15 for #1292 tool-aware silence-poke fallback
+  # (~32 lines added earlier in the file shift this band down).
+  "telegram-plugin/gateway/gateway.ts:3160-3400:reply chunk-loop THREAD_NOT_FOUND fallback (intentional raw)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
