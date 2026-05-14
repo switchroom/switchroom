@@ -103,27 +103,19 @@ describe("scaffoldAgent", () => {
     expect(startSh).not.toContain("$(node -v)");
   });
 
-  it("start.sh exports CLAUDE_CODE_OAUTH_TOKEN from .oauth-token if present", () => {
-    // Root-cause fix for the reauth token-loading bug: the token is saved to
-    // .oauth-token on disk, but must also be exported into the live Claude
-    // process env — otherwise Claude ignores .oauth-token and falls back to
-    // .credentials.json (old account).
+  it("start.sh does NOT export CLAUDE_CODE_OAUTH_TOKEN (RFC H §7.4)", () => {
+    // Pre-RFC-H, start.sh exported CLAUDE_CODE_OAUTH_TOKEN from
+    // <agentDir>/.claude/.oauth-token into the live claude process env.
+    // RFC H Decision 5 deletes this path: claude reads
+    // <agentDir>/.claude/credentials.json directly (broker-written),
+    // and CLAUDE_CODE_OAUTH_TOKEN is stripped from subprocess env by
+    // claude anyway. This test pins the deletion.
     const config = makeAgentConfig();
     const result = scaffoldAgent("token-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    // Must unset first (clear any inherited value from the outer shell)
-    expect(startSh).toContain("unset CLAUDE_CODE_OAUTH_TOKEN");
-    // Must read the token from $CLAUDE_CONFIG_DIR/.oauth-token when it exists
-    expect(startSh).toMatch(/if \[ -f "\$CLAUDE_CONFIG_DIR\/\.oauth-token" \]/);
-    expect(startSh).toContain("export CLAUDE_CODE_OAUTH_TOKEN=");
-    expect(startSh).toContain(".oauth-token");
-    // The export must come BEFORE the exec claude line
-    const exportIdx = startSh.indexOf("export CLAUDE_CODE_OAUTH_TOKEN=");
-    const execIdx = startSh.indexOf("exec claude");
-    expect(exportIdx).toBeGreaterThanOrEqual(0);
-    expect(execIdx).toBeGreaterThanOrEqual(0);
-    expect(exportIdx).toBeLessThan(execIdx);
+    expect(startSh).not.toContain("export CLAUDE_CODE_OAUTH_TOKEN=");
+    expect(startSh).not.toContain(".oauth-token");
   });
 
   it("start.sh exports SWITCHROOM_CONFIG when a config path is passed", () => {

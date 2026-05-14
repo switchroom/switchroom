@@ -380,41 +380,11 @@ describe('fetchAccountQuota — cache + token resolution', () => {
     }
   })
 
-  it('persists the snapshot under the supplied home, not the real homedir (issue #708 regression)', async () => {
-    const home = makeAccountHome({
-      'work@example.com': { accessToken: 'tok' },
-    })
-    const fakeFetch = async () =>
-      new Response('{}', {
-        status: 200,
-        headers: {
-          'anthropic-ratelimit-unified-5h-utilization': '0.42',
-          'anthropic-ratelimit-unified-7d-utilization': '0.17',
-        },
-      })
-    try {
-      const r = await fetchAccountQuota('work@example.com', {
-        home,
-        fetchImpl: fakeFetch as typeof fetch,
-      })
-      expect(r.ok).toBe(true)
-      const snapPath = join(
-        home,
-        '.switchroom',
-        'accounts',
-        'work@example.com',
-        'quota.json',
-      )
-      // The bug: writeAccountQuota was called without opts.home, so the
-      // snapshot landed under the real $HOME instead of the test home.
-      expect(existsSync(snapPath)).toBe(true)
-      const snap = JSON.parse(readFileSync(snapPath, 'utf-8'))
-      expect(snap.fiveHourPct).toBeCloseTo(42, 0)
-      expect(snap.sevenDayPct).toBeCloseTo(17, 0)
-    } finally {
-      rmSync(home, { recursive: true, force: true })
-    }
-  })
+  // Removed in RFC H: per-account quota.json disk persistence is gone.
+  // switchroom-auth-broker holds canonical quota state and exposes it
+  // via list-state; the gateway's in-process cache is enough between
+  // restarts (and the broker survives gateway restarts, so the state
+  // is preserved at the broker side anyway).
 })
 
 describe('getCachedAccountQuota + prefetchAccountQuotaIfStale', () => {

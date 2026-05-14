@@ -81,9 +81,13 @@ describe("checkAgentSocketMounts", () => {
 
   it("fails when an agent mounts another's kernel socket", () => {
     const good = generateCompose({ config: makeConfig({ x: {}, y: {} }) });
+    // Post-RFC-H the agent's volume list interleaves an auth-broker-x-sock
+    // mount between kernel-x-sock and the agent-state bind. Anchor the
+    // injection between kernel-x-sock and the immediately-following
+    // auth-broker-x-sock line so the patch is unambiguous.
     const hostile = good.replace(
-      "      - kernel-x-sock:/run/switchroom/kernel\n      - ${HOME}/.switchroom/agents/x",
-      "      - kernel-x-sock:/run/switchroom/kernel\n      - kernel-y-sock:/run/switchroom/kernel-y\n      - ${HOME}/.switchroom/agents/x",
+      "      - kernel-x-sock:/run/switchroom/kernel\n      - auth-broker-x-sock",
+      "      - kernel-x-sock:/run/switchroom/kernel\n      - kernel-y-sock:/run/switchroom/kernel-y\n      - auth-broker-x-sock",
     );
     const r = checkAgentSocketMounts(hostile);
     expect(r.status).toBe("fail");

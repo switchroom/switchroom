@@ -17,11 +17,13 @@
 
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
-import {
-  readAccountQuota,
-  snapshotFromQuotaUtilization,
-  writeAccountQuota,
-} from "../src/auth/account-quota-store.js";
+
+// RFC H: per-account quota state moved to switchroom-auth-broker
+// (state/auth-broker/quota.json). The gateway's in-process cache
+// below is still useful for sub-second formatting, but the disk-
+// persistence layer that account-quota-store provided is gone —
+// the broker owns the canonical store and exposes it via
+// `list-state`. Disk hydrate / disk persist below are no-ops.
 
 /**
  * OAuth beta flag — proves the request is coming from a subscription client.
@@ -350,20 +352,10 @@ export async function fetchAccountQuota(
     timeoutMs: opts.timeoutMs,
   });
   accountQuotaCache.set(label, { fetchedAt: now, result });
-  // Persist the snapshot to disk so a future gateway restart can
-  // re-hydrate its in-process cache without an API call. Best-effort
-  // (write errors swallowed inside writeAccountQuota). Issue #708.
-  if (result.ok) {
-    try {
-      writeAccountQuota(
-        label,
-        snapshotFromQuotaUtilization(result.data, new Date(now)),
-        opts.home,
-      );
-    } catch {
-      /* best-effort */
-    }
-  }
+  // Note: pre-RFC-H this also persisted to disk via writeAccountQuota
+  // (#708) so a gateway restart could re-hydrate without an API call.
+  // Post-RFC-H the broker holds canonical quota state and answers
+  // via `list-state`, so the gateway's in-process cache is enough.
   return result;
 }
 
@@ -381,29 +373,15 @@ export async function fetchAccountQuota(
  * prefetch will replace it on the next tap.
  */
 export function hydrateAccountQuotaCacheFromDisk(
-  labels: ReadonlyArray<string>,
-  home?: string,
+  _labels: ReadonlyArray<string>,
+  _home?: string,
 ): void {
-  for (const label of labels) {
-    if (accountQuotaCache.has(label)) continue;
-    const snap = readAccountQuota(label, home);
-    if (!snap) continue;
-    const fetchedAt = Date.parse(snap.capturedAt);
-    if (!Number.isFinite(fetchedAt)) continue;
-    const result: QuotaResult = {
-      ok: true,
-      data: {
-        fiveHourUtilizationPct: snap.fiveHourPct ?? 0,
-        sevenDayUtilizationPct: snap.sevenDayPct ?? 0,
-        fiveHourResetAt: snap.fiveHourResetAt ? new Date(snap.fiveHourResetAt) : null,
-        sevenDayResetAt: snap.sevenDayResetAt ? new Date(snap.sevenDayResetAt) : null,
-        representativeClaim: null,
-        overageStatus: null,
-        overageDisabledReason: null,
-      },
-    };
-    accountQuotaCache.set(label, { fetchedAt, result });
-  }
+  // No-op post-RFC-H. The disk-snapshot store this function used to
+  // re-hydrate from (per-account quota.json files under
+  // ~/.switchroom/accounts/<label>/) is gone — switchroom-auth-broker
+  // now owns canonical quota state. Boot-time hydration is the
+  // broker's `list-state` call instead. Signature preserved so
+  // existing call sites continue to compile while we phase them out.
 }
 
 /** Test/utility helper — wipe the per-account quota cache. The

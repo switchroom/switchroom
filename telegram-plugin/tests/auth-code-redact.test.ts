@@ -240,9 +240,13 @@ describe('auth-code paste call-site coverage (architectural pin)', () => {
       'utf-8',
     )
     const matches = text.match(/redactAuthCodeMessage\s*\(/g) ?? []
-    // 2 call sites + 1 import statement = ≥3. Floor at 2 to be safe.
-    // (Pre-v0.6.13 was floor=3 with three call sites including
-    // the now-removed /reauth typed handler.)
-    expect(matches.length).toBeGreaterThanOrEqual(2)
+    // Post-RFC-H: 1 call site — the pendingReauthFlows intercept that
+    // catches a code pasted by a user mid-reauth. Pre-RFC-H also had
+    // a second site under `bot.command('auth', ...)` for /auth code,
+    // but that dispatcher was deleted with auth-dashboard.ts (the
+    // dashboard owned the reauth/code typed sub-verbs). The architectural
+    // intent — every callsite calls redactAuthCodeMessage — is preserved;
+    // the floor just dropped from 2 to 1 along with the surface.
+    expect(matches.length).toBeGreaterThanOrEqual(1)
   })
 })

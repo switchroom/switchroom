@@ -391,6 +391,39 @@ export function registerAuthCommand(program: Command): void {
 
   registerAuthGoogleSubcommands(program, auth);
 
+  // ── auth heal <agent> --json --config-dir <dir> ────────────────────────
+  // Minimal surface kept for boot-self-test.sh's structural diagnoser
+  // shell-out (`diagnoseAuthState`). The pre-RFC-H "heal the slot pool"
+  // CLI verb is gone — there's no slot pool. This verb just emits the
+  // diagnoser's JSON so the boot script can decide which issue card
+  // to file. Human-facing path is empty by design.
+  auth
+    .command("heal <agent>")
+    .description("[boot self-test] emit structural auth-state diagnosis as JSON")
+    .option("--json", "Emit JSON (the only supported output)")
+    .option(
+      "--config-dir <dir>",
+      "Override the .claude config dir to inspect (default: <agentsDir>/<agent>/.claude)",
+    )
+    .action(
+      withConfigError(
+        async (
+          agent: string,
+          opts: { json?: boolean; configDir?: string },
+        ) => {
+          const config = getConfig(program);
+          const agentsDir = resolveAgentsDir(config);
+          const configDir = opts.configDir ?? join(agentsDir, agent, ".claude");
+          const diag = diagnoseAuthState(configDir);
+          if (opts.json) {
+            console.log(JSON.stringify(diag));
+          } else {
+            console.log(JSON.stringify(diag, null, 2));
+          }
+        },
+      ),
+    );
+
   // ── auth add <label> ──────────────────────────────────────────────────
   auth
     .command("add <label>")

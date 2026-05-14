@@ -54,10 +54,12 @@ ALLOWLIST=(
   # retry-api-call.ts: the file that defines the wrapper.
   "telegram-plugin/retry-api-call.ts:1-9999:wrapper definition"
 
-  # foreman.ts:1131,1149 — DM `sendMessage` (no thread_id passed). Cannot
+  # foreman.ts:1066,1084 — DM `sendMessage` (no thread_id passed). Cannot
   # trigger THREAD_NOT_FOUND. No wrapping needed; allowlisted to avoid
-  # noise.
-  "telegram-plugin/foreman/foreman.ts:1100-1170:DM sendMessage in setup/create-agent flow recovery — no thread_id"
+  # noise. Range widened post-RFC-H (auth-dashboard.ts removal shifted
+  # lines up; keep the window generous so further small shifts don't
+  # cascade through this allowlist).
+  "telegram-plugin/foreman/foreman.ts:1050-1170:DM sendMessage in setup/create-agent flow recovery — no thread_id"
 
   # slot-banner-driver.ts — ALL calls target args.ownerChatId (a DM).
   # No thread_id. THREAD_NOT_FOUND impossible by construction.
@@ -68,9 +70,9 @@ ALLOWLIST=(
 
   # "Paired!" sendMessage to senderId (always a DM, bare). No thread_id.
   # Range bumped 2026-05 for #1122 PR1 telemetry insertions that shifted
-  # lines down. Use generous windows so further small shifts don't
-  # cascade through this allowlist.
-  "telegram-plugin/gateway/gateway.ts:980-1030:Paired! sendMessage to DM senderId; no thread_id"
+  # lines down. Re-bumped 2026-05 post-RFC-H (auth-dashboard.ts removal
+  # shifted ~3k lines up — callsite now near 979). Use generous windows.
+  "telegram-plugin/gateway/gateway.ts:970-1030:Paired! sendMessage to DM senderId; no thread_id"
 
   # operator-event broadcast. The loop's `opts` is built without
   # `message_thread_id` (parse_mode + reply_markup only).

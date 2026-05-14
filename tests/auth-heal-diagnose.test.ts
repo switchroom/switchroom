@@ -49,12 +49,12 @@ describe("diagnoseAuthState", () => {
     // Summary is the user-facing string surfaced in the Telegram
     // boot-self-test issue card. It must point users at the inline
     // /auth dashboard — the agent's chat is the only surface a
-    // Telegram-only user has, so a "switchroom auth reauth"
+    // Telegram-only user has, so a "switchroom auth add"
     // terminal command is wrong place. See reference/principles.md
     // "docs test."
     expect(r.findings[0].summary).toMatch(/\/auth/);
     expect(r.findings[0].summary).toMatch(/this chat/);
-    expect(r.recommendation.join("\n")).toContain("switchroom auth reauth");
+    expect(r.recommendation.join("\n")).toContain("switchroom auth add");
   });
 
   it("treats .oauth-token-only as OK — switchroom's intended steady state", () => {
@@ -166,7 +166,7 @@ describe("diagnoseAuthState", () => {
     rmSync(join(configDir, ".credentials.json"));
     const r = diagnoseAuthState(configDir);
     expect(r.recommendation.length).toBeGreaterThan(0);
-    expect(r.recommendation.join("\n")).toContain("switchroom auth reauth");
+    expect(r.recommendation.join("\n")).toContain("switchroom auth add");
   });
 
   it("recommendation prose differs for credentials_missing vs token_expired (so the user knows what's wrong)", () => {
