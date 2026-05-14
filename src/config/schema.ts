@@ -1153,15 +1153,6 @@ export const AgentSchema = z.object({
       "the UserPromptSubmit timezone hook's emitted local time and the " +
       "systemd unit's TZ= env.",
     ),
-  auth_label: z
-    .string()
-    .optional()
-    .describe(
-      "Human-readable identity for the session-start greeting (e.g. 'user@example.com'). " +
-      "Anthropic does not expose a public user-profile endpoint for OAuth tokens, so the " +
-      "email/account cannot be read locally; the user declares it here. Appears in the Auth " +
-      "row as '✓ max · <label> · expires ...'."
-    ),
   auth: z
     .object({
       override: z
@@ -1172,21 +1163,13 @@ export const AgentSchema = z.object({
           "Per-agent override of the fleet-wide `auth.active`. Edge-case use only — " +
           "this agent talks to the named account regardless of fleet active. See RFC H §4.5.",
         ),
-      accounts: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "[DEPRECATED — pre-RFC-H schema, retained only for in-place migration] " +
-          "Ordered list of Anthropic account labels. `switchroom apply` lifts these " +
-          "into top-level `auth.active` + `fallback_order` and (if divergent) synthesises " +
-          "per-agent `override:`. See src/auth/migrate-schema.ts.",
-        ),
     })
     .optional()
     .describe(
       "Account routing for switchroom-auth-broker. RFC H schema uses " +
       "fleet-wide `auth.active` plus per-agent `override:` for edge cases. " +
-      "Legacy `accounts: [..]` is migrated in-place on first apply.",
+      "Pre-RFC-H `auth.accounts: [..]` and `auth_label:` are migrated in-place " +
+      "on first apply (see src/auth/migrate-schema.ts).",
     ),
   dm_only: z
     .boolean()
