@@ -5144,6 +5144,21 @@ function handleSessionEvent(ev: SessionEvent): void {
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
         preambleSuppressor.dropNow()
+        // #1289 fix — drain silence-poke + signal-tracker state for this
+        // turn. The three sibling turn_end exit branches (context-exhaust
+        // at ~5098, silent-marker at ~5097-5098, default reply-called tail
+        // at ~5348-5349) all call signalTracker.clear + silencePoke.endTurn.
+        // The flush-backstop branch was retrofitted in #1067 to null
+        // currentTurn early but never had this cleanup added — leaving the
+        // silence-poke state in the Map, so 300s after the original turn
+        // start the framework fallback fires and the user sees
+        // "still working… (no update from agent in 5 min)" on a turn the
+        // gateway already considers over.
+        {
+          const tKey = statusKey(chatId, threadId)
+          signalTracker.clear(tKey)
+          silencePoke.endTurn(tKey)
+        }
 
         void (async () => {
           await new Promise<void>(resolve => setTimeout(resolve, 500))

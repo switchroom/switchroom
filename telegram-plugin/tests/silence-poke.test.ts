@@ -309,6 +309,35 @@ describe('silence-poke — abnormal turn-end invariants (CC-5 follow-up)', () =>
     ).toHaveLength(1) // unchanged: only the original soft
     expect(fx.fallbacks).toHaveLength(0)
   })
+
+  // #1289: the flush-backstop turn-end branch in the gateway (the path
+  // taken when the agent emits assistant text but never calls the reply
+  // tool) was retrofitted in #1067 to null `currentTurn` early but never
+  // had `silencePoke.endTurn` added — leaving state2 populated so the
+  // 300s framework fallback fired after the gateway already flushed the
+  // captured prose and considered the turn over. Pin the contract at
+  // the silence-poke level: a turn that records an outbound (the
+  // flushed message) and then calls endTurn must not later fire a
+  // fallback even if 300s elapses from the original turn start.
+  it('#1289: flush-backstop turn-end (outbound + endTurn) suppresses the 300s fallback', () => {
+    const fx = setupDeps()
+    startTurn('k', 0)
+    // Some time passes while the agent generates prose without calling
+    // the reply tool. No soft/firm armed yet.
+    __tickForTests(60_000)
+    // Gateway turn-flush fires: captured text is sent as an outbound,
+    // then the flush branch nulls currentTurn AND (post-fix) calls
+    // signalTracker.clear + silencePoke.endTurn.
+    noteOutbound('k', 60_000)
+    endTurn('k')
+    // 300s elapses from the original turn start. Pre-fix: the framework
+    // fallback fired here. Post-fix: the state is drained, no fallback.
+    __tickForTests(240_000)
+    expect(fx.fallbacks).toHaveLength(0)
+    expect(
+      fx.emitted.filter((e) => e.kind === 'silence_fallback_sent'),
+    ).toHaveLength(0)
+  })
 })
 
 describe('silence-poke — consumeArmedPoke draining', () => {
