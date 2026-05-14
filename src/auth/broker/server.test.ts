@@ -597,3 +597,132 @@ describe("AuthBroker — refresh tick + threshold-violation", () => {
     broker.stop();
   });
 });
+
+describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)", () => {
+  // Both bugs lived in the deleted account-refresh.ts:fanoutAccountToAgents
+  // path. They surfaced when an operator flipped the fleet's primary Claude
+  // account: `auth promote` EACCESed under user-mode (Bug 1), the operator
+  // re-ran under sudo (which wrote root-owned files), then
+  // `auth refresh-accounts` iterated every label and last-write-wins
+  // overwrote the primary mirror (Bug 2). Net effect: agents silently
+  // locked themselves out at next restart. The broker architecture closes
+  // both vectors structurally — these tests pin that closure.
+
+  it("Bug 1: per-agent mirror is chowned to the per-agent UID, never left as root", async () => {
+    // The broker container runs as root and writes per-agent credentials.json.
+    // Without an explicit chown, the file would land as root:root 0600 and
+    // the agent (running as 10001–10999) couldn't read it. server.ts:953-956
+    // calls `chownSync(targetPath, uid, uid)` where uid = allocateAgentUid().
+    // We can't run as root in the test (so chownSync is a best-effort no-op
+    // under dev — see the catch block), but we CAN verify the call is made
+    // and reaches the right UID by spying on chownSync indirectly:
+    // statSync(targetPath).uid will equal the test runner's UID in dev mode
+    // (broker tried to chown to per-agent UID but lacked CAP_CHOWN). In
+    // production with CAP_CHOWN, it would equal allocateAgentUid("ziggy").
+    //
+    // The pin: read the broker's source to confirm the chown call exists
+    // with the right argument shape — a structural assertion that survives
+    // a future "just remove the chown, it's a no-op in dev" refactor.
+    const fs = await import("node:fs");
+    const url = await import("node:url");
+    const path = await import("node:path");
+    const here = path.dirname(url.fileURLToPath(import.meta.url));
+    const serverSrc = fs.readFileSync(path.join(here, "server.ts"), "utf-8");
+    // Must chown the mirror file to allocateAgentUid(agentName), not leave
+    // it root-owned. The exact pattern (a chownSync call against the
+    // freshly-written credentials.json path inside mirrorAccountToAgent)
+    // is what closes Bug 1.
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,800}allocateAgentUid/);
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,800}chownSync\(targetPath/);
+  });
+
+  it("Bug 2: refresh tick writes ONLY the agent's effective account, not last-iterated label", async () => {
+    // Pre-broker, refreshAllAccounts iterated every enabled account and
+    // fanned each one out to every agent — last-write wins, alphabetic
+    // sort destroys the YAML primary. Post-broker, fanoutForAgent computes
+    // `agent.auth.override ?? auth.active` and writes EXACTLY THAT.
+    // Iteration order doesn't exist as a concept.
+    //
+    // Setup: three accounts, ken < me < pixsoul (the exact alphabetic
+    // order that caused the original incident — pixsoul sorted last).
+    // Two agents, one on fleet active (= "ken"), one with override = "me".
+    // Run a full refresh tick. Verify each agent's mirror is its own
+    // declared account, not pixsoul's.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "ken.thompson@outlook.com.au",
+      fallback_order: [
+        "ken.thompson@outlook.com.au",
+        "me@kenthompson.com.au",
+        "pixsoul@gmail.com",
+      ],
+      agents: {
+        ziggy: {}, // inherits fleet active = ken
+        lawgpt: { auth: { override: "me@kenthompson.com.au" } },
+      },
+    });
+    // Seed all three accounts with near-expiry creds so the tick attempts
+    // a refresh against each. The exact alphabetic ordering of the labels
+    // is what triggered the original last-write-wins. With pixsoul iterating
+    // last, the pre-broker code would have ended with pixsoul's creds in
+    // every agent. The broker MUST write ken to ziggy and me to lawgpt.
+    const nearExpiry = Date.now() + 30 * 60 * 1000; // 30 min — under threshold
+    seedAccount(h, "ken.thompson@outlook.com.au", { expiresAt: nearExpiry });
+    seedAccount(h, "me@kenthompson.com.au", { expiresAt: nearExpiry });
+    seedAccount(h, "pixsoul@gmail.com", { expiresAt: nearExpiry });
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "lawgpt"), { recursive: true });
+    // Stub fetcher that returns predictable per-label access tokens. The
+    // body matters: each agent's mirror should contain the token of the
+    // RIGHT account, not the last-iterated one.
+    const fetcher = async (_url: unknown, init: unknown) => {
+      // Body is application/json; refresh_token field carries
+      // "rt-<label>" (set by seedAccount). Parse to recover the label.
+      const body = (init as { body?: string })?.body ?? "{}";
+      const parsed = JSON.parse(body) as { refresh_token?: string };
+      const rt = parsed.refresh_token ?? "";
+      const label = rt.replace(/^rt-/, "");
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            access_token: `at-refreshed-${label}`,
+            refresh_token: `rt-rotated-${label}`,
+            expires_in: 8 * 60 * 60,
+            token_type: "Bearer",
+          }),
+      };
+    };
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      fetcher: fetcher as never,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+    await broker._tick();
+
+    const ziggyMirror = readFileSync(
+      join(h.agentsDir, "ziggy", ".claude", "credentials.json"),
+      "utf-8",
+    );
+    const lawgptMirror = readFileSync(
+      join(h.agentsDir, "lawgpt", ".claude", "credentials.json"),
+      "utf-8",
+    );
+
+    // ziggy should have ken's refreshed token (fleet active).
+    expect(ziggyMirror).toContain("at-refreshed-ken.thompson@outlook.com.au");
+    expect(ziggyMirror).not.toContain("at-refreshed-pixsoul@gmail.com");
+    expect(ziggyMirror).not.toContain("at-refreshed-me@kenthompson.com.au");
+
+    // lawgpt should have me's refreshed token (override).
+    expect(lawgptMirror).toContain("at-refreshed-me@kenthompson.com.au");
+    expect(lawgptMirror).not.toContain("at-refreshed-pixsoul@gmail.com");
+    expect(lawgptMirror).not.toContain("at-refreshed-ken.thompson@outlook.com.au");
+
+    broker.stop();
+  });
+});
