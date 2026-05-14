@@ -80,7 +80,7 @@ const PROD_FLEET_LIVE = productionFleetIsLive();
 const TAG = "phase1b-test";
 // Phase 4 cron-fold-in cutover removed the singleton scheduler image.
 // Cron now runs in-container in every agent (see start.sh.hbs).
-const IMAGES = ["base", "agent", "broker", "kernel"].map(
+const IMAGES = ["base", "agent", "broker", "kernel", "auth-broker"].map(
   (n) => `switchroom/${n}:${TAG}`,
 );
 const PROJECT = `phase1c-race-${process.pid}`;

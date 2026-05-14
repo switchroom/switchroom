@@ -28,6 +28,8 @@ on:
       - "docker/Dockerfile.broker"
       - "docker/Dockerfile.kernel"
       - "docker/Dockerfile.agent"
+      - "docker/Dockerfile.auth-broker"
+      - "src/auth/broker/**"
       - "tests/docker/**"
       - ".github/workflows/docker-e2e.yml"
   push:

@@ -66,7 +66,7 @@ const TAG = "phase1b-test";
 // Phase 4 (#893) retired the singleton scheduler image. Listing it
 // here would make `imagesOk` false in any environment that doesn't
 // build the (now-deleted) image, silently skipping the whole suite.
-const IMAGES = ["base", "agent", "broker", "kernel"].map(
+const IMAGES = ["base", "agent", "broker", "kernel", "auth-broker"].map(
   (n) => `switchroom/${n}:${TAG}`,
 );
 const PROJECT = `phase1c-iso-${process.pid}`;

@@ -120,10 +120,11 @@ jobs:
       fail-fast: false
       matrix:
         image:
-          - { name: agent,     file: docker/Dockerfile.agent }
-          - { name: broker,    file: docker/Dockerfile.broker }
-          - { name: kernel,    file: docker/Dockerfile.kernel }
-          - { name: hostd,     file: docker/Dockerfile.hostd }
+          - { name: agent,        file: docker/Dockerfile.agent }
+          - { name: broker,       file: docker/Dockerfile.broker }
+          - { name: kernel,       file: docker/Dockerfile.kernel }
+          - { name: hostd,        file: docker/Dockerfile.hostd }
+          - { name: auth-broker,  file: docker/Dockerfile.auth-broker }
     steps:
       - name: Checkout
         uses: actions/checkout@v4

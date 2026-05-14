@@ -15,7 +15,7 @@ echo "[build-images] running npm build (emits dist/ bundles required by COPY dir
 echo "[build-images] base"
 docker buildx build -t "switchroom/base:${TAG}" -f "$ROOT/docker/Dockerfile.base" --load "$ROOT"
 
-for img in agent broker kernel; do
+for img in agent broker kernel auth-broker; do
   echo "[build-images] ${img}"
   docker buildx build \
     --build-arg "BASE_IMAGE=switchroom/base:${TAG}" \
