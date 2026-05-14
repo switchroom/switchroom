@@ -419,12 +419,17 @@ export interface SpawnAgentOneShotDeps {
 
 /**
  * Spawn a fresh `claude -p` process for the given agent and prompt.
- * Follows the same env setup as `buildCronScript` in scaffold.ts:
+ * Env setup:
  *   - CLAUDE_CONFIG_DIR → <agentDir>/.claude
  *   - SWITCHROOM_AGENT_NAME → <agentName>
  *   - TELEGRAM_STATE_DIR → <agentDir>/telegram
- *   - CLAUDE_CODE_OAUTH_TOKEN injected from disk if present
  *   - ANTHROPIC_API_KEY unset to force OAuth
+ *
+ * Post-RFC-H: claude reads its OAuth token directly from
+ * `<CLAUDE_CONFIG_DIR>/credentials.json`. The auth-broker writes that
+ * file atomically and refreshes ahead of claude's own window —
+ * `CLAUDE_CODE_OAUTH_TOKEN` env injection has been removed everywhere
+ * (one mechanism, not two).
  */
 export function spawnAgentOneShot(
   agent: string,
@@ -450,18 +455,10 @@ export function spawnAgentOneShot(
 
   // Unset ANTHROPIC_API_KEY to force OAuth auth (mirrors cron script pattern).
   delete env.ANTHROPIC_API_KEY
-
-  // Inject OAuth token from disk if not already in env.
-  if (!env.CLAUDE_CODE_OAUTH_TOKEN) {
-    const tokenPath = join(claudeConfigDir, '.oauth-token')
-    try {
-      if (existsSync(tokenPath)) {
-        env.CLAUDE_CODE_OAUTH_TOKEN = readFileSync(tokenPath, 'utf-8').trim()
-      }
-    } catch {
-      // Non-fatal — claude will fall back to .credentials.json
-    }
-  }
+  // Defence in depth: scrub any inherited CLAUDE_CODE_OAUTH_TOKEN so a
+  // legacy operator-shell export can't shadow the broker-managed
+  // credentials.json. (RFC H §7.4)
+  delete env.CLAUDE_CODE_OAUTH_TOKEN
 
   const spawnFn = deps.spawnFn ?? (
     (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv; stdio: [string, string, string] }) =>

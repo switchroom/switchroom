@@ -312,7 +312,7 @@ export interface ComposeGeneratorOptions {
 
 /** Resolve the image ref for one of the four service images. */
 function resolveImageRef(
-  name: "agent" | "broker" | "kernel" | "scheduler",
+  name: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker",
   imageTag: string,
 ): string {
   return `ghcr.io/switchroom/switchroom-${name}:${imageTag}`;
@@ -325,7 +325,7 @@ function resolveImageRef(
  */
 function emitImageOrBuild(
   lines: string[],
-  service: "agent" | "broker" | "kernel" | "scheduler",
+  service: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker",
   imageTag: string,
   buildMode: "pull" | "local",
   buildContext: string | undefined,
@@ -963,6 +963,82 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // agent transcript through the same InboundMessage path Telegram
   // uses, tagged meta.source="cron".
 
+  // ── switchroom-auth-broker (singleton, RFC H §4.1) ─────────────────
+  // Sole writer of per-agent <agentDir>/.claude/credentials.json and
+  // canonical owner of the OAuth refresh loop for every Anthropic
+  // account on the host. Same shape as vault-broker / approval-kernel:
+  // per-agent UDS socket at /run/switchroom/auth-broker/<name>/sock,
+  // path-as-identity authorization, bind-presence healthcheck.
+  const authConsumers = config.auth?.consumers ?? [];
+  lines.push(`  switchroom-auth-broker:`);
+  emitImageOrBuild(lines, "auth-broker", imageTag, buildMode, buildContext);
+  lines.push(`    container_name: ${containerNamePrefix}-auth-broker`);
+  lines.push(`    labels:`);
+  lines.push(`      switchroom.role: "auth-broker"`);
+  lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
+  lines.push(`    restart: unless-stopped`);
+  // Bind-presence healthcheck — same probe pattern as vault-broker /
+  // approval-kernel (PR #898). Empty-fleet trade-off applies: a
+  // switchroom install with zero agents and zero consumers reports
+  // unhealthy, which is correct (the broker has nothing to serve).
+  lines.push(`    healthcheck:`);
+  lines.push(`      test: ["CMD-SHELL", "ls /run/switchroom/auth-broker/*/sock 2>/dev/null | head -1 | grep -q ."]`);
+  lines.push(`      interval: 30s`);
+  lines.push(`      timeout: 5s`);
+  lines.push(`      retries: 3`);
+  lines.push(`      start_period: 20s`);
+  lines.push(`    user: "0:0"`);
+  lines.push(`    stop_grace_period: 10s`);
+  lines.push(`    security_opt:`);
+  lines.push(`      - "no-new-privileges:true"`);
+  lines.push(`    cap_drop:`);
+  lines.push(`      - "ALL"`);
+  // RFC H §4.1: smallest cap set that lets the broker bind sockets
+  // (CHOWN to per-agent UID) and read/write mirror files into per-
+  // agent state dirs owned by per-agent UIDs.
+  lines.push(`    cap_add:`);
+  lines.push(`      - "CHOWN"`);
+  lines.push(`      - "FOWNER"`);
+  lines.push(`      - "DAC_READ_SEARCH"`);
+  lines.push(`      - "DAC_OVERRIDE"`);
+  lines.push(`    environment:`);
+  if (switchroomConfigPath) {
+    lines.push(`      SWITCHROOM_CONFIG: /state/config/switchroom.yaml`);
+  }
+  // Internal paths follow vault-broker convention:
+  //   /state/accounts  → ~/.switchroom/accounts/
+  //   /state/agents    → ~/.switchroom/agents/
+  //   /state/auth-broker → ~/.switchroom/state/auth-broker/
+  lines.push(`      SWITCHROOM_AUTH_BROKER_STATE_DIR: /state/auth-broker`);
+  lines.push(`      SWITCHROOM_ACCOUNTS_DIR: /state/accounts`);
+  lines.push(`      SWITCHROOM_AGENTS_DIR: /state/agents`);
+  lines.push(`    volumes:`);
+  // Per-agent socket dir (named volume; agent side mounts the parent).
+  for (const a of describeAgents(config)) {
+    lines.push(`      - auth-broker-${a.name}-sock:/run/switchroom/auth-broker/${a.name}`);
+  }
+  // Per-consumer socket dir — same shape, but the consumer container
+  // (e.g. hindsight) lives outside the switchroom compose project and
+  // bind-mounts the named volume by canonical name.
+  for (const c of authConsumers) {
+    lines.push(`      - auth-broker-${c.name}-sock:/run/switchroom/auth-broker/${c.name}`);
+  }
+  // Operator socket — host-mounted bind so `switchroom auth …` from a
+  // shell on the host can reach the broker. Path is the operator-
+  // socket bind documented in the RFC §4.2.
+  lines.push(
+    `      - ${homePrefix}/.switchroom/state/auth-broker-operator:/run/switchroom/auth-broker/operator`,
+  );
+  if (switchroomConfigPath) {
+    lines.push(`      - ${switchroomConfigPath}:/state/config/switchroom.yaml:ro`);
+  }
+  // Accounts dir (sole writer post-RFC-H), per-agent dirs (mirror writes),
+  // and the broker's own state dir.
+  lines.push(`      - ${homePrefix}/.switchroom/accounts:/state/accounts`);
+  lines.push(`      - ${homePrefix}/.switchroom/agents:/state/agents`);
+  lines.push(`      - ${homePrefix}/.switchroom/state/auth-broker:/state/auth-broker`);
+  lines.push(``);
+
   // ── per-agent services ─────────────────────────────────────────────
   for (const a of describeAgents(config)) {
     if (a.strippedCaps.length > 0) {
@@ -994,6 +1070,10 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   for (const a of describeAgents(config)) {
     lines.push(`  broker-${a.name}-sock:`);
     lines.push(`  kernel-${a.name}-sock:`);
+    lines.push(`  auth-broker-${a.name}-sock:`);
+  }
+  for (const c of authConsumers) {
+    lines.push(`  auth-broker-${c.name}-sock:`);
   }
   lines.push("");
 
@@ -1093,6 +1173,11 @@ function emitAgentService(
   lines.push(`        condition: service_started`);
   lines.push(`      approval-kernel:`);
   lines.push(`        condition: service_started`);
+  // RFC H §5: agents wait on the auth-broker healthcheck before booting.
+  // Without it the agent comes up with stale (or no) credentials.json
+  // and claude's first call fails on auth, panicking the boot card.
+  lines.push(`      switchroom-auth-broker:`);
+  lines.push(`        condition: service_healthy`);
   lines.push(`    environment:`);
   // env keys MUST be sorted for byte determinism.
   const env: Record<string, string> = {
@@ -1163,6 +1248,13 @@ function emitAgentService(
     // path value. Both fixed here.
     SWITCHROOM_VAULT_BROKER_SOCK: `/run/switchroom/broker/sock`,
     SWITCHROOM_KERNEL_SOCKET: `/run/switchroom/kernel/sock`,
+    // RFC H §5: in-container path to the auth-broker socket. The
+    // named volume mounts the per-agent dir at /run/switchroom/auth-
+    // broker (one level shallower than the broker container sees it,
+    // mirroring SWITCHROOM_VAULT_BROKER_SOCK). The auth-broker client
+    // library reads this env to locate the socket — see
+    // src/auth/broker/client.ts:resolveAuthBrokerSocketPath.
+    SWITCHROOM_AUTH_BROKER_SOCKET: `/run/switchroom/auth-broker/sock`,
     SWITCHROOM_RUNTIME: "docker",
     // tini's process-group signal mode. Default tini forwards signals
     // ONLY to its single direct child — under our process tree that's
@@ -1270,6 +1362,13 @@ function emitAgentService(
   // invariant on every regenerated compose.
   lines.push(`      - broker-${a.name}-sock:/run/switchroom/broker`);
   lines.push(`      - kernel-${a.name}-sock:/run/switchroom/kernel`);
+  // RFC H §5: per-agent auth-broker socket dir. The agent sees the
+  // socket at /run/switchroom/auth-broker/sock (its single-agent
+  // view), the broker sees /run/switchroom/auth-broker/<name>/sock
+  // (its multi-agent view). Same shape vault-broker / approval-kernel
+  // use; path-as-identity invariant is enforced by socketPathToName
+  // parsing the broker-side path on every connection.
+  lines.push(`      - auth-broker-${a.name}-sock:/run/switchroom/auth-broker`);
   if (a.admin === true) {
     // Admin agents need read access to the host operator's vault
     // audit log so the bot's `/vault audit <agent>` Recent-denials

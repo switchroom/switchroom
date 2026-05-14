@@ -161,9 +161,10 @@ describe("generateCompose", () => {
     // on every service so `docker ps --filter
     // label=switchroom.fleet=switchroom` finds them.
     const out = generateCompose({ config: makeConfig({ coach: {} }) });
-    // One label line per service: broker + kernel + 1 agent = 3.
+    // One label line per service: vault-broker + approval-kernel +
+    // switchroom-auth-broker + 1 agent = 4.
     const matches = out.match(/switchroom\.fleet: "switchroom"/g) ?? [];
-    expect(matches.length).toBe(3);
+    expect(matches.length).toBe(4);
   });
 
   it("emits agents in sorted order", () => {

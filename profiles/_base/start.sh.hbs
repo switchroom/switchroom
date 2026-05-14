@@ -149,10 +149,10 @@ export PATH="$HOME/.bun/bin:$PATH"
 # /state/agent bind mount (HOME=/state/agent/home).
 export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"
 export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
+# CLAUDE_CODE_OAUTH_TOKEN injection was removed with RFC H (auth-broker).
+# Claude reads .credentials.json directly; the broker is the sole writer
+# of that file and updates it before claude's own refresh window opens.
 unset CLAUDE_CODE_OAUTH_TOKEN
-if [ -f "$CLAUDE_CONFIG_DIR/.oauth-token" ]; then
-  export CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '\r\n' < "$CLAUDE_CONFIG_DIR/.oauth-token")"
-fi
 export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 # SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
 # telegram-plugin reads to detect self-restart commands. We can't rely on

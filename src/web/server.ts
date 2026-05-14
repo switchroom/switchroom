@@ -25,7 +25,7 @@ import {
   handleGetAccounts,
   handleGetAgentAccounts,
   handleGetAgentConfig,
-  handlePromoteAccount,
+  handleUseAccount,
 } from "./api.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 
@@ -336,16 +336,14 @@ function parseRoute(
     return { handler: "getAccounts", params: {} };
   }
 
-  // POST /api/accounts/:label/promote
-  // NOTE: account labels accept `[A-Za-z0-9._@+-]+` (validated server-side),
-  // so the regex deliberately mirrors that character class. The web layer
-  // re-runs `validateAccountLabel` so the inert characters can't sneak past.
-  const promoteMatch = pathname.match(/^\/api\/accounts\/([A-Za-z0-9._@+-]+)\/promote$/);
-  if (method === "POST" && promoteMatch) {
-    return {
-      handler: "promoteAccount",
-      params: { label: decodeURIComponent(promoteMatch[1]) },
-    };
+  // POST /api/auth/use
+  //   body: { account: string }
+  // Replaces the pre-RFC-H `/api/accounts/:label/promote` endpoint. The
+  // fleet-wide model has one knob, not a per-agent matrix — body carries
+  // the chosen label so callers don't have to URL-encode it past the
+  // account-label charset.
+  if (method === "POST" && pathname === "/api/auth/use") {
+    return { handler: "useAccount", params: {} };
   }
 
   // GET /api/agents/:name/accounts
@@ -512,55 +510,25 @@ export function startWebServer(
           }
 
           case "getAccounts":
-            return jsonResponse(handleGetAccounts(config));
+            return (async () => jsonResponse(await handleGetAccounts(config)))();
 
-          case "promoteAccount": {
-            if (!configPath) {
-              return jsonResponse(
-                { ok: false, error: "Server started without a config path; promote is unavailable." },
-                500,
-              );
-            }
-            const label = route.params.label;
-            // Body shape: { agent: string } | { agent: "all" } | { agents: string[] }
+          case "useAccount": {
             return (async () => {
-              let body: { agent?: string; agents?: string[] };
+              let body: { account?: string };
               try {
-                body = (await req.json()) as { agent?: string; agents?: string[] };
+                body = (await req.json()) as { account?: string };
               } catch {
                 return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
               }
-              let agents: string[];
-              if (Array.isArray(body.agents) && body.agents.length > 0) {
-                agents = body.agents.map(String);
-              } else if (typeof body.agent === "string" && body.agent.length > 0) {
-                if (body.agent === "all") {
-                  agents = Object.entries(config.agents)
-                    .filter(([, a]) => (a as { claude?: boolean }).claude !== false)
-                    .map(([n]) => n)
-                    .sort();
-                } else {
-                  agents = [body.agent];
-                }
-              } else {
+              const account = body.account;
+              if (typeof account !== "string" || account.length === 0) {
                 return jsonResponse(
-                  { ok: false, error: "Body must include `agent` (string or 'all') or `agents` (string[])." },
+                  { ok: false, error: "Body must include `account` (string)." },
                   400,
                 );
               }
-              for (const name of agents) {
-                if (!config.agents[name]) {
-                  return jsonResponse(
-                    { ok: false, error: `Unknown agent: ${name}` },
-                    404,
-                  );
-                }
-              }
-              const result = handlePromoteAccount(config, configPath, label, agents);
+              const result = await handleUseAccount(account);
               if (!result.ok) {
-                // Validation failures (label format, account missing,
-                // not-enabled-on-agent) surface as 400 — they're caller
-                // mistakes, not server errors.
                 return jsonResponse(result, 400);
               }
               return jsonResponse(result);

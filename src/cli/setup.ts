@@ -795,11 +795,56 @@ async function stepScaffoldAgents(
     );
   }
   console.log(chalk.green(`  ${STEP_DONE} ${summary}`));
+
+  // RFC H §4.6: first-run defaults `auth.active` to "default" so the
+  // first OAuth flow (run as `switchroom auth add default --from-oauth`)
+  // lands the fleet on a working account without any per-agent `auth:`
+  // block. Idempotent — does nothing when `auth.active` is already set.
+  if (switchroomConfigPath && !config.auth?.active) {
+    try {
+      await ensureAuthActiveDefault(switchroomConfigPath);
+      console.log(
+        chalk.gray(
+          "  Set auth.active: default — run `switchroom auth add default --from-oauth` to log in",
+        ),
+      );
+    } catch (err) {
+      console.log(
+        chalk.yellow(
+          `  ⚠ Could not set auth.active default: ${(err as Error).message}`,
+        ),
+      );
+    }
+  }
+
   console.log(
     chalk.gray(
       "  Next: switchroom apply  (regenerates docker-compose.yml + brings agents up)",
     ),
   );
+}
+
+/**
+ * Set `auth.active: default` in switchroom.yaml when unset. Pure-YAML
+ * edit (preserves comments via `yaml` library's Document model).
+ * Atomic write via the shared util. Idempotent.
+ */
+async function ensureAuthActiveDefault(configPath: string): Promise<void> {
+  const fs = await import("node:fs");
+  const { parseDocument, isMap } = await import("yaml");
+  const { atomicWriteFileSync } = await import("../util/atomic.js");
+  const raw = fs.readFileSync(configPath, "utf-8");
+  const doc = parseDocument(raw);
+  const root = doc.contents;
+  if (!isMap(root)) return;
+  const existing = root.get("auth", true);
+  if (isMap(existing) && existing.has("active")) return;
+  doc.setIn(["auth", "active"], "default");
+  const out = String(doc);
+  const tail = out.endsWith("\n") ? out : out + "\n";
+  let mode = 0o644;
+  try { mode = fs.statSync(configPath).mode & 0o777; } catch { /* default */ }
+  atomicWriteFileSync(configPath, tail, mode);
 }
 
 // ─── Step 8: Vault Auto-Unlock ──────────────────────────────────────────────

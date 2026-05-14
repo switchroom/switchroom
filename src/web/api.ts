@@ -14,13 +14,11 @@ import { resolveAgentsDir } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import {
-  readAccountQuota,
-  type AccountQuotaSnapshot,
-} from "../auth/account-quota-store.js";
-import {
-  promoteAccountToPrimary,
-  type PromoteOutcome,
-} from "../auth/account-promote.js";
+  AuthBrokerError,
+  AuthBrokerUnreachableError,
+  withAuthBrokerClient,
+  type AccountState,
+} from "../auth/broker/client.js";
 import { openTurnsDb, listTurnsForAgent, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
 import { applySubagentsSchema, listSubagents, type Subagent } from "../../telegram-plugin/registry/subagents-schema.js";
 
@@ -52,7 +50,9 @@ export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
     const auth = authStatuses[name];
     const collection = getCollectionForAgent(name, config);
     const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
-    const primaryAccount = resolved.auth?.accounts?.[0];
+    // RFC H schema: per-agent `auth.override:` wins, else fleet-wide
+    // `auth.active`. No more per-agent fallback list.
+    const primaryAccount = resolved.auth?.override ?? config.auth?.active;
 
     agents.push({
       name,
@@ -176,109 +176,96 @@ export function handleGetSubagents(
 }
 
 /**
- * Per-account dashboard view: stock AccountInfo + cached quota snapshot
- * + which agents have this label at slot 0 (primary) vs as a fallback.
+ * Per-account dashboard view: stock AccountInfo + broker-derived quota
+ * state + which agents are currently bound to this account.
  *
- * Quota source is the on-disk snapshot at
- * `~/.switchroom/accounts/<label>/quota.json` (#708) — never a live API
- * call. Snapshots are populated by the gateway/boot card flow.
+ * Quota source post-RFC-H is the broker's `list-state` snapshot — there's
+ * no more `~/.switchroom/accounts/<label>/quota.json`. When the broker
+ * is unreachable the quota field is `null` and callers fall back to the
+ * cached view (Decision 9: degraded, not catastrophic).
  */
 export interface AccountDashboardInfo extends AccountInfo {
-  /** Cached quota snapshot, null when no snapshot has been written. */
-  quota: AccountQuotaSnapshot | null;
-  /** Agents whose `auth.accounts:[0]` is this label (primary). */
-  primaryFor: string[];
-  /** Agents that list this label at index >= 1 (fallback only). */
-  fallbackFor: string[];
+  /** Broker-derived quota / exhaustion state. `null` when broker unreachable. */
+  quota: AccountState | null;
+  /** Agents currently bound to this account (fleet active or per-agent override). */
+  usedBy: string[];
 }
 
-export function handleGetAccounts(
+export async function handleGetAccounts(
   config?: SwitchroomConfig,
   home?: string,
-): AccountDashboardInfo[] {
+): Promise<AccountDashboardInfo[]> {
   const infos = getAccountInfos(Date.now(), home);
+  const brokerAccounts = new Map<string, AccountState>();
+  try {
+    await withAuthBrokerClient(async (client) => {
+      const state = await client.listState();
+      for (const a of state.accounts) brokerAccounts.set(a.label, a);
+    });
+  } catch (err) {
+    if (!(err instanceof AuthBrokerUnreachableError)) throw err;
+    // Degraded mode — keep the account list, drop the quota rows.
+  }
   return infos.map((info) => {
-    const primaryFor: string[] = [];
-    const fallbackFor: string[] = [];
+    const usedBy: string[] = [];
     if (config) {
+      const fleetActive = config.auth?.active;
       for (const [name, agent] of Object.entries(config.agents)) {
         const resolved = resolveAgentConfig(
           config.defaults,
           config.profiles,
           agent,
         );
-        const list = resolved.auth?.accounts ?? [];
-        const idx = list.indexOf(info.label);
-        if (idx === 0) primaryFor.push(name);
-        else if (idx > 0) fallbackFor.push(name);
+        const bound = resolved.auth?.override ?? fleetActive;
+        if (bound === info.label) usedBy.push(name);
       }
-      primaryFor.sort();
-      fallbackFor.sort();
+      usedBy.sort();
     }
     return {
       ...info,
-      quota: readAccountQuota(info.label, home),
-      primaryFor,
-      fallbackFor,
+      quota: brokerAccounts.get(info.label) ?? null,
+      usedBy,
     };
   });
 }
 
-export interface PromoteAccountResult {
+export interface UseAccountResult {
   ok: boolean;
   error?: string;
-  /** Agents whose YAML primary changed; the caller should restart these. */
-  promoted?: string[];
-  alreadyPrimary?: string[];
+  /** Resolved fleet-active label after the call. */
+  active?: string;
+  /** Agents whose per-agent mirror the broker rewrote. */
   fanned?: string[];
-  fanFails?: Array<{ agent: string; error: string }>;
 }
 
 /**
- * Promote an account to primary on one or more agents. Mirrors
- * `switchroom auth promote` exactly — no shell-out, same code path.
+ * Set the fleet-wide active account. Replaces the pre-RFC-H
+ * `/api/auth/promote` endpoint. No YAML rewrite from this code path —
+ * the broker owns mirror writes; the CLI handles YAML when present.
  */
-export function handlePromoteAccount(
-  config: SwitchroomConfig,
-  configPath: string,
-  label: string,
-  agents: string[],
-  home?: string,
-): PromoteAccountResult {
+export async function handleUseAccount(label: string): Promise<UseAccountResult> {
   try {
-    const outcome: PromoteOutcome = promoteAccountToPrimary({
-      label,
-      agents,
-      config,
-      configPath,
-      home,
-    });
-    void captureEvent("account_promoted", {
+    const data = await withAuthBrokerClient((client) => client.setActive(label));
+    void captureEvent("auth_use", {
       account: label,
-      agents: agents.join(","),
-      promoted_count: outcome.promoted.length,
+      fanned_count: data.fanned.length,
       source: "web_api",
     });
-    return {
-      ok: true,
-      promoted: outcome.promoted,
-      alreadyPrimary: outcome.alreadyPrimary,
-      fanned: outcome.fanned,
-      fanFails: outcome.fanFails,
-    };
+    return { ok: true, active: data.active, fanned: data.fanned };
   } catch (err) {
-    void captureException(err, { action: "promote_account", account: label });
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    void captureException(err, { action: "auth_use", account: label });
+    let msg: string;
+    if (err instanceof AuthBrokerUnreachableError) msg = err.message;
+    else if (err instanceof AuthBrokerError) msg = `${err.code}: ${err.message}`;
+    else msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: msg };
   }
 }
 
 export interface AgentAccountsResponse {
-  /** Account labels declared in `agents.<name>.auth.accounts` (cascaded). */
-  assigned: string[];
-  /** AccountInfo for each label in `assigned` that exists in the global store, in order. */
+  /** Single bound account label — fleet active or per-agent override. */
+  active: string | null;
+  /** AccountInfo for the bound label when present in the global store. */
   details: AccountInfo[];
 }
 
@@ -289,13 +276,15 @@ export function handleGetAgentAccounts(
 ): AgentAccountsResponse {
   const agent = config.agents[agentName];
   const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
-  const assigned = resolved.auth?.accounts ?? [];
+  const active = resolved.auth?.override ?? config.auth?.active ?? null;
   const allInfos = getAccountInfos(Date.now(), home);
   const byLabel = new Map(allInfos.map((info) => [info.label, info]));
-  const details = assigned
-    .map((label) => byLabel.get(label))
-    .filter((info): info is AccountInfo => info !== undefined);
-  return { assigned, details };
+  const details: AccountInfo[] = [];
+  if (active) {
+    const info = byLabel.get(active);
+    if (info) details.push(info);
+  }
+  return { active, details };
 }
 
 export function handleGetAgentConfig(

@@ -654,11 +654,10 @@ export CLAUDE_CONFIG_DIR=${shellSingleQuote(agentDir + "/.claude")}
 # and so the vault broker client can resolve a default agent.
 export SWITCHROOM_AGENT_NAME=${shellSingleQuote(basename(agentDir))}
 
-# Inject OAuth token from the agent's own .oauth-token file.
+# CLAUDE_CODE_OAUTH_TOKEN injection was removed with RFC H (auth-broker).
+# Claude reads .credentials.json directly; the auth-broker writes it
+# atomically and refreshes ahead of claude's own window.
 unset CLAUDE_CODE_OAUTH_TOKEN
-if [ -f "$CLAUDE_CONFIG_DIR/.oauth-token" ]; then
-  export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_CONFIG_DIR/.oauth-token" | tr -d '[:space:]')"
-fi
 
 # MCP-only delivery path (issue #269, closes #251): the prompt instructs
 # the model to call mcp__switchroom-telegram__reply directly, then print
