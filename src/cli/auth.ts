@@ -406,22 +406,32 @@ export function registerAuthCommand(program: Command): void {
       "Override the .claude config dir to inspect (default: <agentsDir>/<agent>/.claude)",
     )
     .action(
-      withConfigError(
-        async (
-          agent: string,
-          opts: { json?: boolean; configDir?: string },
-        ) => {
+      async (
+        agent: string,
+        opts: { json?: boolean; configDir?: string },
+      ) => {
+        // boot-self-test.sh shells this from start.sh BEFORE the
+        // switchroom.yaml is reliably reachable (the script runs with
+        // a stripped env to mirror the hook sub-process context — see
+        // tests/boot-self-test.test.ts). When --config-dir is set, the
+        // caller already knows the exact path to inspect; loading
+        // global config here just makes `auth heal` ConfigError-out and
+        // the boot script swallow the error (its `2>/dev/null` masks it).
+        // Skip the config lookup unless we actually need to derive the
+        // default config-dir from `<agentsDir>/<agent>/.claude`.
+        let configDir = opts.configDir;
+        if (configDir === undefined) {
           const config = getConfig(program);
           const agentsDir = resolveAgentsDir(config);
-          const configDir = opts.configDir ?? join(agentsDir, agent, ".claude");
-          const diag = diagnoseAuthState(configDir);
-          if (opts.json) {
-            console.log(JSON.stringify(diag));
-          } else {
-            console.log(JSON.stringify(diag, null, 2));
-          }
-        },
-      ),
+          configDir = join(agentsDir, agent, ".claude");
+        }
+        const diag = diagnoseAuthState(configDir);
+        if (opts.json) {
+          console.log(JSON.stringify(diag));
+        } else {
+          console.log(JSON.stringify(diag, null, 2));
+        }
+      },
     );
 
   // ── auth add <label> ──────────────────────────────────────────────────
