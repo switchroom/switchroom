@@ -25,6 +25,7 @@ import type { SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight } from "../memory/hindsight.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
+import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 
 /**
  * Result of a single doctor check.
@@ -2174,6 +2175,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Telegram", results: await checkTelegram(config) },
           { title: "Agents", results: checkAgents(config, configPath) },
           { title: "Docker (Phase 1a)", results: runDockerSection(config) },
+          { title: "Auth Broker", results: runAuthBrokerChecks(config) },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath) },
         ];
 
