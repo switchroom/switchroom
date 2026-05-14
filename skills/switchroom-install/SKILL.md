@@ -40,7 +40,7 @@ Only install what's missing. Check each first:
 command -v docker || echo "MISSING: docker"
 docker compose version >/dev/null 2>&1 || echo "MISSING: docker compose v2"
 
-# Claude Code CLI (needed for switchroom auth login)
+# Claude Code CLI (used inside agent containers and for the initial OAuth flow)
 command -v claude || echo "MISSING: claude"
 ```
 
@@ -102,7 +102,7 @@ If `switchroom doctor` reports healthy and at least one agent is listed, install
 
 ### Optional follow-up: share one Anthropic account across multiple agents
 
-Once the first agent is up and authenticated, the user can promote that agent's auth to a global Anthropic account so additional agents share the same Pro/Max subscription without each running its own OAuth flow. See `switchroom-manage` (Anthropic accounts section) for the bootstrap flow. This is the path most users want when they add a second agent — flag it as soon as they ask "how do I add another agent?".
+This is the default. One OAuth flow per Anthropic account, then every agent in the fleet inherits the fleet-wide active account — no per-agent OAuth round. The auth-broker handles refresh and credential fanout automatically. See `switchroom-manage` (Anthropic accounts section) and `docs/auth.md` for the bootstrap flow. Flag this as soon as they ask "how do I add another agent?".
 
 ## What not to do
 

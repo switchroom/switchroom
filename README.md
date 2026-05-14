@@ -60,7 +60,7 @@ So I built this.
 | Feature | What it does |
 |---|---|
 | **Progress cards** | Pinned, in-place, every tool call visible. The headline UX. |
-| **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. Multi-account fallback pool per agent. |
+| **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. Fleet-wide active account + fallback order; broker-owned refresh and credential fanout. |
 | **Approval kernel** | Inline allow/deny cards in Telegram for every gated tool. TTL'd grants, full audit trail. |
 | **Sub-agents** | Opus plans, Sonnet implements. Sub-agent work surfaces in the parent card. |
 | **Config cascade** | Defaults, then profiles, then per-agent YAML. Change one line, every agent updates. |
@@ -119,7 +119,7 @@ Each agent is a long-running service. They survive reboots, network drops, and y
 - **Auto-restart.** Agent containers come up with `restart: unless-stopped`, and each service has a healthcheck — a crashed or wedged agent is brought back automatically. No silent dropped work.
 - **Resume protocol.** When an agent reboots mid-turn, `start.sh` exports `SWITCHROOM_PENDING_TURN=true` plus the original chat / message ids. The agent's first action on boot is to acknowledge the gap and ask the user how to proceed (start over, summarise and continue, or drop it).
 - **Wake-audit.** On every fresh boot the agent checks for owed replies, orphan sub-agents, and stale in-progress todos. If everything's clean it stays quiet. If it owed you a reply, it tells you.
-- **Token refresh.** Runs unattended for weeks via a `refresh-tick` daemon. Multi-account fallback pool kicks in when the active slot hits its quota window.
+- **Token refresh.** The `switchroom-auth-broker` daemon owns the refresh loop and is the sole writer of every `credentials.json`. Per-account quota state fans out across the fleet in seconds; `auth.fallback_order` cycles when an account is exhausted.
 
 ## How it stacks up
 
@@ -157,7 +157,7 @@ Then log out and back in so the docker group takes effect, and:
 ```bash
 switchroom setup                       # interactive: Telegram + vault + first agent
 switchroom setup --foreman             # optional: admin bot (fleet control via Telegram)
-switchroom auth login assistant        # OAuth into your Claude Pro or Max account
+switchroom auth add me --from-oauth    # OAuth into your Claude Pro or Max account (one flow, fleet-wide)
 switchroom apply                       # write ~/.switchroom/compose/docker-compose.yml
 docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d
 ```
@@ -191,11 +191,10 @@ Pre-built single-binary releases (no Node or Bun required on the host) are scaff
 
 ### One-shot happy path (no wizard)
 
-If you already have Telegram credentials in `~/.switchroom/switchroom.yaml`, skip `switchroom setup`. `agent create --profile` writes a minimal entry for you, and auth is scoped per-agent:
+If you already have Telegram credentials in `~/.switchroom/switchroom.yaml` and one Anthropic account already added, skip `switchroom setup`. `agent create --profile` writes a minimal entry; the new agent inherits the fleet-wide active account automatically — no per-agent OAuth flow:
 
 ```bash
 switchroom agent create coach --profile health-coach
-switchroom auth login coach
 switchroom apply && docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d
 ```
 
@@ -325,26 +324,29 @@ If the agent is already in yaml, `--profile` must match the existing `extends:` 
 
 Model aliases: the bare names `opus`, `sonnet`, `haiku` are accepted alongside the full IDs (`claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Use whichever reads cleaner in your config.
 
-### Authentication (multi-account slot pool)
+### Authentication (one OAuth, many agents)
 
-Each agent has a pool of Claude OAuth slots. The **active** slot is what the agent uses; other slots are automatic fallbacks when the active slot hits its quota window. Every `<slot>` option defaults to the active slot if omitted.
+The **Anthropic account is the unit of authentication.** One OAuth flow per account, then every agent in the fleet inherits the fleet-wide active account. The `switchroom-auth-broker` daemon owns the refresh loop and is the sole writer of every `credentials.json`. Per-account quota state fans out across the fleet in seconds. See [`docs/auth.md`](docs/auth.md) for the full operator guide.
 
 ```bash
-switchroom auth status                            # All agents, one table
-switchroom auth login <agent>                     # First-time OAuth into the active slot
-switchroom auth code <agent> <browser-code>       # Paste the code back from the browser
-switchroom auth cancel <agent>                    # Abandon a pending login
-switchroom auth reauth <agent> [--slot <s>]       # Fresh OAuth, replace existing token
-switchroom auth refresh <agent>                   # Alias for reauth (back-compat)
-switchroom auth refresh-tick [--threshold-ms N]   # Daemon: rotate tokens nearing expiry (cron/timer)
+switchroom auth add <label> --from-oauth          # New account via OAuth (one flow per Anthropic account)
+switchroom auth add <label> --from-agent <name>   # Seed from an existing agent's creds
+switchroom auth add <label> --from-credentials <path>  # Import a credentials.json
+switchroom auth add <label> --from-oauth --replace     # Re-auth an existing label (drift recovery)
 
-switchroom auth add <agent> [--slot <name>]       # Add another account to the fallback pool
-switchroom auth use <agent> <slot>                # Switch the active slot
-switchroom auth list <agent> [--json]             # Show slots: health, quota status, expiry
-switchroom auth rm <agent> <slot> [--force]       # Remove a slot (refuses active/last slot)
+switchroom auth list                              # Accounts + health + which one is fleet-active
+switchroom auth show [agent]                      # Full snapshot (fleet + agents + consumers), or one agent
+switchroom auth use <label>                       # Fleet-wide active swap
+switchroom auth rotate                            # Cycle to next non-exhausted in fallback_order
+switchroom auth rm <label>                        # Remove an account (refused if it's the only one)
+
+switchroom auth agent override <agent> <label>    # Edge case: one agent on a different account
+switchroom auth agent override <agent> --clear    # Back to fleet active
+
+switchroom auth refresh [label]                   # Diagnostic: force a refresh tick
 ```
 
-The fallback pool also works from Telegram. The switchroom MCP plugin exposes the same verbs as `/auth add|use|list|rm` inside the chat.
+The same surface is reachable from Telegram in any agent's chat: `/auth show` (read-only), `/auth use <label>`, `/auth rotate`. The latter two are admin-gated (`auth.admin_agents:` in `switchroom.yaml`).
 
 ### Workspace (agent bootstrap layer)
 

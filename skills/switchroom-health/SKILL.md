@@ -35,13 +35,14 @@ Run these diagnostics with Bash:
 # Check switchroom CLI version
 switchroom --version 2>/dev/null || echo "FAIL: switchroom not found"
 
-# Check auth status (per-agent legacy view)
-switchroom auth status 2>/dev/null || echo "FAIL: auth check failed"
+# Check Anthropic accounts + fleet auth state (see docs/auth.md)
+# Shows accounts at ~/.switchroom/accounts/<label>/, the fleet-wide active
+# account, and per-account health (healthy / quota-exhausted / expired /
+# missing-refresh-token). The auth-broker is the sole writer of credentials.
+switchroom auth list 2>/dev/null || echo "FAIL: auth check failed"
 
-# Check Anthropic accounts (new model — see reference/share-auth-across-the-fleet.md)
-# Shows accounts at ~/.switchroom/accounts/<label>/, which agents use each,
-# and per-account health (healthy / quota-exhausted / expired / missing-refresh-token).
-switchroom auth account list 2>/dev/null || echo "INFO: no Anthropic accounts configured (legacy per-agent slot model in use)"
+# Full snapshot — fleet + per-agent effective accounts + consumers
+switchroom auth show 2>/dev/null || echo "INFO: switchroom auth show unavailable"
 
 # Check docker-compose service health
 docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml ps 2>/dev/null || echo "no switchroom docker fleet"
@@ -102,9 +103,9 @@ For common failures, give the exact fix:
 | Problem | Fix |
 |---------|-----|
 | `switchroom: command not found` | `npm install -g switchroom` |
-| Per-agent auth expired (slot model) | `switchroom auth login <agent>` |
-| Account expired (new model — `auth account list` shows red ✗) | `switchroom auth refresh-accounts` (one tick); if no refresh-token, the account needs re-adding |
-| Account quota-exhausted (yellow ⊘ in `auth account list`) | Auto-fallback handles it if the agent has multiple accounts; otherwise wait for the reset window or `switchroom auth enable <other-account> <agent>` |
+| Account expired (`auth list` shows red ✗) | `switchroom auth refresh <label>` (force a tick; broker normally handles this on its own loop). If no refresh-token, re-auth with `switchroom auth add <label> --from-oauth --replace`. |
+| Account quota-exhausted (yellow ⊘ in `auth list`) | `switchroom auth rotate` cycles to the next account in `auth.fallback_order`; quota state is per-account and shared across every agent on it. |
+| Fleet on the wrong account | `switchroom auth use <label>` (fleet-wide) or `switchroom auth agent override <agent> <label>` (one agent) |
 | Container unhealthy | `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml restart switchroom-<name>` |
 | Missing .mcp.json | `switchroom apply` (full reconcile + rewrite compose; bring up via `docker compose ... up -d`) or `switchroom agent reconcile <name>` (targeted) |
 | Bot token unresolved | Check vault: `switchroom vault list` |

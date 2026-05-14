@@ -157,70 +157,73 @@ Agent config resolves through `defaults → extends profile → agent-specific`,
 
 ## Auth — "share my Pro account across agents", "auth verbs", "who's logged into what"
 
-Two layers coexist. **Use the new account model when an operator wants one OAuth flow to drive multiple agents.** The legacy per-agent slot model still works for first-time agent auth.
+The **Anthropic account is the unit of authentication** — one OAuth flow per account, then "use this account on these agents" is fleet-wide config (not another OAuth round per agent). The `switchroom-auth-broker` daemon is the sole writer of every `credentials.json`; agents are passive readers. See `docs/auth.md` for the full model.
 
-### Per-agent (slot model) — first-time agent auth + the existing Telegram /auth flow
-
-```bash
-switchroom auth login <agent>          # interactive OAuth, writes to <agent>/.claude/.credentials.json
-switchroom auth status                 # one row per agent
-switchroom auth list <agent>           # show the agent's slot pool
-switchroom auth use <agent> <slot>     # switch the agent's active slot
-switchroom auth refresh-tick           # cron entrypoint for the legacy refresh loop
-```
-
-### Anthropic accounts (new model — see `reference/share-auth-across-the-fleet.md`)
-
-The Anthropic account is the unit of authentication. One account → many agents. Storage at `~/.switchroom/accounts/<label>/`. Per-agent `.credentials.json` becomes a passive mirror that the broker keeps in sync.
+### CLI verbs
 
 ```bash
-# Lift an already-authenticated agent's credentials into a global account
-switchroom auth account add <label> --from-agent <agent>
+# Add an account (one OAuth flow per account, ever)
+switchroom auth add <label> --from-oauth                   # interactive OAuth
+switchroom auth add <label> --from-agent <name>            # seed from an existing agent's creds
+switchroom auth add <label> --from-credentials <path>      # import a credentials.json
+switchroom auth add <label> --from-oauth --replace         # re-auth an existing label (drift recovery)
 
-# Or import from a credentials.json file you already have
-switchroom auth account add <label> --from-credentials <path>
+# See the state of the fleet
+switchroom auth list                                       # accounts + health + which one is active
+switchroom auth show                                       # full snapshot (fleet + agents + consumers)
+switchroom auth show <agent>                               # one agent's effective account + override
 
-switchroom auth account list           # accounts + which agents use each + health
-switchroom auth account rm <label>     # refused while any agent is enabled
+# Move the fleet to a different account
+switchroom auth use <label>                                # fleet-wide active swap
+switchroom auth rotate                                     # cycle to next non-exhausted in fallback_order
 
-# Wire an account to one or more agents (writes agents.<name>.auth.accounts in switchroom.yaml + immediate fanout)
-switchroom auth enable <label> <agent...>
-switchroom auth disable <label> <agent...>
+# Manage accounts
+switchroom auth rm <label>                                 # refused if it's the only account
 
-# Single account-refresh tick: refresh expiring tokens, fan out to enabled agents
-switchroom auth refresh-accounts [--json]
+# Edge case: per-agent override (opts one agent out of the fleet active)
+switchroom auth agent override <agent> <label>
+switchroom auth agent override <agent> --clear
+
+# Diagnostics (broker owns the refresh loop; this just forces a tick)
+switchroom auth refresh                                    # all accounts
+switchroom auth refresh <label>                            # one account
 ```
 
 ### Schema
 
 ```yaml
+auth:
+  active: me@example.com              # fleet-wide active account
+  fallback_order:                     # ordered cycle list for `auth rotate`
+    - me@example.com
+    - work
+    - personal
+  admin_agents: [clerk]               # agents allowed to call admin verbs from Telegram
+
 agents:
-  foo:
+  ziggy: {}                           # inherits fleet active
+  klanker:
     auth:
-      accounts: [work-pro, personal-max]   # ordered priority — first non-quota-exhausted wins
+      override: work                  # opt-out (edge case)
 ```
 
-When unset, the agent uses the legacy per-agent slot path. The two are not mutually exclusive during the transition.
+Most agents need no `auth:` block — they inherit `auth.active`. The pre-RFC-H per-agent `auth.accounts: [...]` and `auth_label:` fields are gone; replace them with fleet-wide `auth.active` + (rarely) `agents.<name>.auth.override`.
 
-### Telegram parity
+### Telegram surface
 
-Every CLI verb above has a Telegram twin:
+Three commands the gateway recognises in any agent chat:
 
-```
-/auth account add <label> [--from-agent <name>]
-/auth account list
-/auth account rm <label>
-/auth enable <label> [agents...]    — defaults to the current agent
-/auth disable <label> [agents...]   — defaults to the current agent
-```
+- `/auth show` — fleet snapshot. Open to any agent (read-only).
+- `/auth use <label>` — admin agents only.
+- `/auth rotate` — admin agents only.
 
-`/auth login`, `/auth code`, `/auth list <agent>` etc. continue to work for the per-agent path.
+These replaced the v0.7-era `/auth dashboard` UI (a 1100-LOC slot-model promote UI, deleted in the broker rollout).
 
 ### When auth-related questions come in
 
-- "I want one Pro/Max subscription on multiple agents" → account model. Walk them through the bootstrap (`auth login` first agent → `auth account add --from-agent` → `auth enable` others).
-- "An agent's auth expired" → check `switchroom auth account list` first. If the account is healthy but the agent isn't getting it, the broker fanout may be stale — `switchroom auth refresh-accounts` forces a tick.
-- "I hit a quota" → `switchroom auth account list` shows quota-exhausted accounts; auto-fallback handles it if the agent has multiple accounts in priority order.
+- "I want one Pro/Max subscription on multiple agents" → that's just the default. `switchroom auth add me@example.com --from-oauth`, then `switchroom auth use me@example.com`. Every agent in the fleet inherits.
+- "An agent's auth expired" → `switchroom auth list` first. If broker thinks the account is healthy but the agent isn't getting it, force a tick with `switchroom auth refresh` (diagnostic; the broker normally handles this on its own loop).
+- "I hit a quota" → `switchroom auth rotate` cycles to the next non-exhausted account in `fallback_order`. Quota state is per-account and fans out in seconds across every agent on that account.
 
 ---
 
@@ -267,7 +270,7 @@ Additional features:
 - **PI-safe envelope** — inbound text wrapped in `<channel source="telegram">` for prompt-injection safety
 - **Inline approvals** — tool permissions surface as ✅/❌ buttons or via `/approve` `/deny` `/pending`
 - **Slash commands** — `/new`, `/reset`, `/approve`, `/deny`, `/pending`, `/restart`, `/update`, `/version`, `/logs`, `/doctor`, `/auth`, `/switchroomhelp` (see `TELEGRAM_MENU_COMMANDS` in `telegram-plugin/welcome-text.ts`)
-- **`/auth`** — full auth surface inside Telegram: per-agent slot verbs (`login`/`reauth`/`code`/`add`/`use`/`list`/`rm`) AND account-shaped verbs (`account add`/`account list`/`account rm`/`enable`/`disable`). The account verbs implement the new "one Pro account, many agents" model — see the **Auth** section above.
+- **`/auth`** — three chat commands: `/auth show` (read-only, open to any agent), `/auth use <label>` and `/auth rotate` (admin agents only). Backed by the auth-broker — see the **Auth** section above and `docs/auth.md` for the full model.
 - **Access control** — `dmPolicy: pairing | allowlist | disabled` per agent
 
 ---

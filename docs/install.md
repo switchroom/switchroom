@@ -128,11 +128,17 @@ don't care about Telegram-based fleet control.
 ## Step 5 — Authenticate with your Claude subscription
 
 ```sh
-switchroom auth login assistant
+switchroom auth add me --from-oauth
+switchroom auth use me
 ```
 
-Opens an OAuth browser flow. Log in with your Claude Pro or Max
-account. The CLI prints a code; you paste it back at the prompt.
+`auth add` opens an OAuth browser flow — log in with your Claude Pro or
+Max account, paste the code back at the prompt. `auth use` makes that
+account the fleet-wide active account; every agent inherits.
+
+One OAuth flow per Anthropic account, ever. New agents you add later
+don't need their own login — they inherit the fleet active. See
+[`docs/auth.md`](auth.md) for the full model.
 
 > **No API keys.** The whole point: this uses your existing Pro/Max
 > subscription via OAuth, exactly like the desktop app. No per-token
@@ -183,7 +189,8 @@ agents, and MCP wireup, and prints actionable fixes.
   rendering to a user-writable cache dir.
 - **Telegram bot doesn't reply** — `switchroom agent logs assistant -f`
   and `switchroom doctor`. The most common cause is OAuth not yet
-  completed (`switchroom auth status`).
+  completed (`switchroom auth list` — confirm an account is present
+  and `auth.active` is set).
 - **`unauthorized` on `docker compose pull`** — see
   [`operators/install.md#ghcr-auth`](operators/install.md#ghcr-auth).
 

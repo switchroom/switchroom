@@ -64,36 +64,31 @@ Per-agent `access.json` defines:
 
 ### `/auth` router
 
-The plugin exposes the multi-account slot-pool verbs inside Telegram, so
-you can add, switch, and prune subscriptions without SSHing into the
-host. The agent argument is optional. If omitted, it defaults to the
-agent receiving the message.
+The gateway exposes three chat commands, backed by the
+`switchroom-auth-broker` daemon. See [`docs/auth.md`](auth.md) for the
+full model.
 
-| Command | Equivalent CLI |
-|---|---|
-| `/auth` | (help listing) |
-| `/auth login [agent]` | `switchroom auth login <agent>` |
-| `/auth reauth [agent]` | `switchroom auth reauth <agent>` |
-| `/auth code [agent] <browser-code>` | `switchroom auth code <agent> <code>` |
-| `/auth cancel [agent]` | `switchroom auth cancel <agent>` |
-| `/auth add [agent] [--slot <name>]` | `switchroom auth add <agent>` |
-| `/auth use [agent] <slot>` | `switchroom auth use <agent> <slot>` |
-| `/auth list [agent]` | `switchroom auth list <agent>` |
-| `/auth rm [agent] <slot> [--force]` | `switchroom auth rm <agent> <slot>` |
+| Command | Who can call | Purpose |
+|---|---|---|
+| `/auth show` | any agent | Read-only snapshot of the fleet (accounts + health + active) |
+| `/auth use <label>` | admin agents only | Swap the fleet-wide active account |
+| `/auth rotate` | admin agents only | Cycle to the next non-exhausted account in `auth.fallback_order` |
 
-`/auth rm` refuses to remove the only remaining slot or the currently
-active slot unless you pass `--force`. `/auth list` renders the slot
-table as a short HTML block with health + quota status per slot.
+Admin agents are listed in `auth.admin_agents:` in `switchroom.yaml`.
+The 1100-LOC slot-pool `/auth` dashboard from v0.7 was deleted in the
+broker rollout — the broker model doesn't need it.
 
 ### Auto-fallback on quota exhaustion
 
-When the active slot's quota window is exhausted, the plugin's
-`auto-fallback` poller marks the slot as `quota-exhausted`, swaps to the
-next healthy slot in the pool, restarts the agent process, and posts a
-short notice into the chat. If no fallback slot is available, it prompts
-you to `/auth add <agent>` another subscription. See
-`telegram-plugin/auto-fallback.ts` and `src/auth/accounts.ts` for the
-storage layout.
+When any consumer (agent or hindsight) hits a 429, it tells the broker
+via `mark-exhausted`. The broker sets `exhausted_until` for that
+account and, in seconds, atomically rewrites every affected agent's
+per-agent credentials mirror to the next account in `auth.fallback_order`.
+Quota events propagate across the fleet automatically — no per-agent
+restart, no manual intervention. If `fallback_order` is exhausted, the
+broker logs the state and agents see expired-token errors until the
+window resets or an operator runs `switchroom auth add` for a new
+account. See `src/auth/broker/` for the implementation.
 
 ### Forum topic support
 
