@@ -3,7 +3,13 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { reconcile, isNewer, hashMetadata } from "./reconciler.js";
+import {
+  detectRecovery,
+  hashMetadata,
+  isNewer,
+  reconcile,
+  type ReconcilerVerdict,
+} from "./reconciler.js";
 
 describe("reconcile — three-state detection", () => {
   it("404 → missing(not_found)", () => {
@@ -122,5 +128,109 @@ describe("hashMetadata", () => {
     const a = await hashMetadata({ mimeType: "x", modifiedTime: "t", size: 1 });
     const b = await hashMetadata({ mimeType: "x", modifiedTime: "t", size: 2 });
     expect(a).not.toBe(b);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// RFC E §4.4 — missing→present recovery detection
+// ────────────────────────────────────────────────────────────────────────
+
+const sampleMeta = {
+  id: "1abc",
+  name: "Q3 Strategy Notes",
+  modifiedTime: "2026-01-01T00:00:00Z",
+};
+
+describe("detectRecovery", () => {
+  it("returns false when there's no previous verdict (first observation)", () => {
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    expect(detectRecovery(null, current)).toEqual({ recovered: false });
+  });
+
+  it("returns false on present → present (steady state)", () => {
+    const prev: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    expect(detectRecovery(prev, current)).toEqual({ recovered: false });
+  });
+
+  it("returns false on present → missing (loss event, NOT recovery)", () => {
+    const prev: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const current: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    expect(detectRecovery(prev, current)).toEqual({ recovered: false });
+  });
+
+  it("returns false on present → conflict (drift, covered by staleness digest)", () => {
+    const prev: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const current: ReconcilerVerdict = {
+      state: "conflict",
+      meta: sampleMeta,
+      reasons: ["modified_time_newer"],
+    };
+    expect(detectRecovery(prev, current)).toEqual({ recovered: false });
+  });
+
+  it("returns false on conflict → present (drift resolved, not a recovery)", () => {
+    const prev: ReconcilerVerdict = {
+      state: "conflict",
+      meta: sampleMeta,
+      reasons: ["modified_time_newer"],
+    };
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    expect(detectRecovery(prev, current)).toEqual({ recovered: false });
+  });
+
+  it("returns false on missing → missing (still gone)", () => {
+    const prev: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    const current: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    expect(detectRecovery(prev, current)).toEqual({ recovered: false });
+  });
+
+  it("fires recovery on missing(trashed) → present (operator un-trashed)", () => {
+    const prev: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const r = detectRecovery(prev, current);
+    expect(r.recovered).toBe(true);
+    if (r.recovered) {
+      expect(r.fromReason).toBe("trashed");
+      expect(r.toState).toBe("present");
+      expect(r.meta).toBe(sampleMeta);
+    }
+  });
+
+  it("fires recovery on missing(not_found) → present (re-uploaded with same id is unusual but possible)", () => {
+    const prev: ReconcilerVerdict = { state: "missing", reason: "not_found" };
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const r = detectRecovery(prev, current);
+    expect(r.recovered).toBe(true);
+    if (r.recovered) {
+      expect(r.fromReason).toBe("not_found");
+      expect(r.toState).toBe("present");
+    }
+  });
+
+  it("fires recovery on missing → conflict (restored but evolved while gone)", () => {
+    const prev: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    const current: ReconcilerVerdict = {
+      state: "conflict",
+      meta: sampleMeta,
+      reasons: ["modified_time_newer", "content_hash_changed"],
+    };
+    const r = detectRecovery(prev, current);
+    expect(r.recovered).toBe(true);
+    if (r.recovered) {
+      expect(r.fromReason).toBe("trashed");
+      expect(r.toState).toBe("conflict");
+      expect(r.meta).toBe(sampleMeta);
+    }
+  });
+
+  it("preserves the fromReason across the recovery (not_found vs trashed)", () => {
+    const prev1: ReconcilerVerdict = { state: "missing", reason: "trashed" };
+    const prev2: ReconcilerVerdict = { state: "missing", reason: "not_found" };
+    const current: ReconcilerVerdict = { state: "present", meta: sampleMeta };
+    const r1 = detectRecovery(prev1, current);
+    const r2 = detectRecovery(prev2, current);
+    expect(r1.recovered && r1.fromReason).toBe("trashed");
+    expect(r2.recovered && r2.fromReason).toBe("not_found");
   });
 });

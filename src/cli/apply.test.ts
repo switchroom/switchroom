@@ -235,10 +235,16 @@ describe("runApply", () => {
 
       // Only `bob` got scaffolded + aligned — alice and carol are
       // still on whatever state they had before (presumably v0.6 systemd).
+      // `alignAgentUid` is called twice for the named agent — once in the
+      // per-agent scaffold loop and again in the post-host-mount-sources
+      // re-align pass that #1255 added (re-chown the log dir after
+      // `ensureHostMountSources` creates it). Both calls must target
+      // `bob` only — siblings stay untouched.
       expect(scaffoldSpy).toHaveBeenCalledTimes(1);
       expect(scaffoldSpy.mock.calls[0]![0]).toBe("bob");
-      expect(alignSpy).toHaveBeenCalledTimes(1);
+      expect(alignSpy).toHaveBeenCalledTimes(2);
       expect(alignSpy.mock.calls[0]![0]).toBe("bob");
+      expect(alignSpy.mock.calls[1]![0]).toBe("bob");
     });
 
     it("regenerates compose for the FULL fleet even with --only", async () => {

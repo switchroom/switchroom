@@ -156,7 +156,6 @@ Then log out and back in so the docker group takes effect, and:
 
 ```bash
 switchroom setup                       # interactive: Telegram + vault + first agent
-switchroom setup --foreman             # optional: admin bot (fleet control via Telegram)
 switchroom auth add me --from-oauth    # OAuth into your Claude Pro or Max account (one flow, fleet-wide)
 switchroom apply                       # write ~/.switchroom/compose/docker-compose.yml
 docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d

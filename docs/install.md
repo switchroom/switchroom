@@ -53,17 +53,17 @@ sudo npm install -g bun @anthropic-ai/claude-code switchroom
 
 ## Step 2 — Create your bots in BotFather
 
-Switchroom uses one Telegram bot per agent. You'll create **two** bots
-for a typical setup:
-
-1. An **admin (foreman) bot** — the fleet's control panel. You DM it to
-   run `/agents`, `/restart`, `/update apply`, etc. Required.
-2. A **first agent bot** — a working agent you'll actually chat with.
-   Required to verify the install end-to-end.
+Switchroom uses one Telegram bot per agent. For a minimal install you
+need **one** bot — the agent you'll talk to. If you want a separate
+"admin" bot that exposes fleet-management slash commands (`/agents`,
+`/restart`, `/update apply`, etc.), create **two** bots and flag one
+agent with `admin: true` in your `switchroom.yaml`. There's no
+separate "admin bot" concept — admin agents are regular agents whose
+gateway intercepts admin slash commands before Claude sees them.
 
 See [BotFather walkthrough](botfather-walkthrough.md) for the exact
-steps. Total time: ~3 minutes. You'll end up with two HTTP API tokens —
-keep them in a scratch buffer for Step 3.
+steps. Total time: ~3 minutes per bot. Keep the HTTP API tokens in a
+scratch buffer for Step 3.
 
 ## Step 3 — Run setup
 
@@ -73,8 +73,7 @@ switchroom setup
 
 Interactive wizard. You'll be prompted for:
 
-- **Your first agent's bot token** — paste the token from BotFather for
-  the *agent* bot (not the foreman).
+- **Your first agent's bot token** — paste the token from BotFather.
 - **Your Telegram user ID** — the wizard will DM you a pairing link;
   open it from your Telegram account and the wizard resolves your ID
   automatically. (If pairing fails, get your ID from `@userinfobot` and
@@ -110,20 +109,34 @@ Recognised env vars:
 | `HINDSIGHT_API_LLM_API_KEY` | Required if memory backend is `hindsight` |
 | `SWITCHROOM_DANGEROUS_MODE` | `1` to skip approval prompts globally (not recommended) |
 
-## Step 4 — Set up the foreman (admin bot)
+## Step 4 — (Optional) Add an admin agent for fleet-management commands
 
-```sh
-TELEGRAM_FOREMAN_BOT_TOKEN=<foreman bot token> \
-  TELEGRAM_USER_ID=<your telegram user id> \
-  switchroom setup --foreman
+If you want a separate Telegram bot for fleet-management slash
+commands (`/agents`, `/restart`, `/update`, `/logs`, etc.), add a
+second agent to `~/.switchroom/switchroom.yaml` with `admin: true`:
+
+```yaml
+agents:
+  admin:
+    topic_name: "Admin"
+    bot_token: "vault:telegram-admin-bot-token"
+    admin: true             # gateway intercepts admin slash commands
+    system_prompt_append: |
+      You are the fleet admin agent.
 ```
 
-This writes `~/.switchroom/foreman/{env,access.json}` and adds the
-`switchroom-foreman` service to the compose project. The foreman runs
-as a docker-compose sibling of your agents.
+Add the token to the vault (`switchroom vault set
+telegram-admin-bot-token`), then `switchroom apply`. The admin
+agent's gateway will handle fleet-management commands locally
+without invoking Claude — Claude only sees conversational messages.
 
-You can skip this step if you only want a single working agent and
-don't care about Telegram-based fleet control.
+Per-agent commands like `/auth list`, `/auth reauth`, `/interrupt`,
+`/restart` (self), `/new`, and `/reset` work on **every** agent's
+gateway regardless of `admin: true` — they're independent of the
+LLM's health, so they keep working even when Claude is rate-limited
+or the OAuth token is expired.
+
+You can skip this step for a single-agent install.
 
 ## Step 5 — Authenticate with your Claude subscription
 
@@ -152,8 +165,8 @@ docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d
 ```
 
 `apply` regenerates `docker-compose.yml` from your yaml. The `up -d`
-pulls images from GHCR (first run is slow — ~1-2 GiB across 5 images)
-and starts the broker, kernel, foreman, and agent container(s).
+pulls images from GHCR (first run is slow — ~1-2 GiB across 4 images)
+and starts the broker, kernel, and your agent container(s).
 
 Check status:
 

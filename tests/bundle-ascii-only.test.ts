@@ -32,7 +32,6 @@ const BUNDLES = [
   "telegram-plugin/dist/gateway/gateway.js",
   "telegram-plugin/dist/server.js",
   "telegram-plugin/dist/bridge/bridge.js",
-  "telegram-plugin/dist/foreman/foreman.js",
 ];
 
 describe("bundle ASCII-only invariant (#642 follow-up)", () => {

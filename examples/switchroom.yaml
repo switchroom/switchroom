@@ -201,3 +201,20 @@ agents:
     schedule:
       - cron: "0 7 * * 1-5"
         prompt: "Daily briefing: summarize today's calendar, pending tasks, and priorities"
+
+  # Example admin agent — its gateway intercepts fleet-management slash
+  # commands (/agents, /restart, /update, /logs, etc.) and runs them
+  # locally via the switchroom CLI instead of forwarding to Claude. Per-
+  # agent commands like /auth list, /auth reauth, /interrupt, /new work
+  # on every agent regardless of admin status. See the three-tier
+  # command model in docs/architecture.md.
+  #
+  # Uncomment after creating a second BotFather bot and adding its
+  # token to the vault (`switchroom vault set telegram-admin-bot-token`).
+  # admin:
+  #   topic_name: "Admin"
+  #   topic_emoji: "🛠️"
+  #   bot_token: "vault:telegram-admin-bot-token"
+  #   admin: true
+  #   system_prompt_append: |
+  #     You are the fleet admin agent. Always respond concisely.

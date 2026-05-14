@@ -1,11 +1,11 @@
 /**
  * Runtime materialization of TELEGRAM_BOT_TOKEN from the vault.
  *
- * Issue #758: the persistent telegram gateway / foreman previously required
- * the bot token to be present in `<agent>/telegram/.env` (or
- * `~/.switchroom/foreman/.env`). When the operator's switchroom.yaml stores
- * the token as a `vault:` reference there is no plaintext to copy into .env,
- * so cold restarts of the gateway died with "TELEGRAM_BOT_TOKEN required".
+ * Issue #758: the persistent telegram gateway previously required the
+ * bot token to be present in `<agent>/telegram/.env`. When the
+ * operator's switchroom.yaml stores the token as a `vault:` reference
+ * there is no plaintext to copy into .env, so cold restarts of the
+ * gateway died with "TELEGRAM_BOT_TOKEN required".
  *
  * This helper resolves the token from the vault at startup and exposes it
  * via `process.env.TELEGRAM_BOT_TOKEN` IN-MEMORY ONLY — it never writes the

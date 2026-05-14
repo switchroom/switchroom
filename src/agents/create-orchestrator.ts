@@ -38,8 +38,9 @@ export interface CreateAgentOpts {
   /** BotFather token for the new agent's Telegram bot. */
   telegramBotToken: string;
   /**
-   * Admin chat ID to relay OAuth URL to (reserved for Phase 3 foreman bot).
-   * Not used in Phase 2 — included for forward-compatibility.
+   * Admin chat ID to relay OAuth URL to (reserved for future
+   * Telegram-side `/create-agent` flow on an `admin: true` agent).
+   * Not currently used — included for forward-compatibility.
    */
   adminChatId?: string;
   /** Handle of the admin bot (reserved for Phase 3). */

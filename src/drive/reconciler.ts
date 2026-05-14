@@ -107,6 +107,57 @@ export function isNewer(a: string, b: string): boolean {
   return ta > tb;
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// RFC E §4.4 — missing→present recovery detection
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The shape of "recovery" the user-facing JTBD cares about: a doc that
+ * was missing (deleted/trashed) on the previous reconciler check is
+ * back. Conflict↔present transitions are NOT recoveries — those are
+ * normal evolution, not the "I un-trashed it" signal that warrants a
+ * chat nudge.
+ *
+ * Recovery is asymmetric on purpose:
+ *   - missing → present  ✅ recovery (operator un-trashed / restored)
+ *   - missing → conflict ✅ recovery (restored but evolved while gone)
+ *   - present → present  ✗ no event
+ *   - present → missing  ✗ that's the loss event, separate signal
+ *   - conflict → *       ✗ the staleness digest covers conflict drift
+ *
+ * Pure: takes the previous + current verdicts, returns whether to fire
+ * a recovery event. Caller is responsible for the actual side-effects
+ * (writing the `recover` row to `approval_audit` per RFC B §5,
+ * surfacing the `[ ↻ Re-enabled ]` line in the staleness digest, and
+ * posting the chat nudge). Phase 1d ships the detector; wiring those
+ * three side-effects into the as-yet-unwritten reconciler-driver is
+ * follow-up work (matches the same shipped-helper-then-wire-up
+ * pattern as RFC G Phase 2's `detectLegacyGdriveSlots`).
+ */
+export interface RecoveryEvent {
+  recovered: true;
+  fromReason: "not_found" | "trashed";
+  toState: "present" | "conflict";
+  meta: DriveFileMetadata;
+}
+
+export type RecoveryResult = RecoveryEvent | { recovered: false };
+
+export function detectRecovery(
+  prev: ReconcilerVerdict | null,
+  current: ReconcilerVerdict,
+): RecoveryResult {
+  if (prev === null) return { recovered: false };
+  if (prev.state !== "missing") return { recovered: false };
+  if (current.state === "missing") return { recovered: false };
+  return {
+    recovered: true,
+    fromReason: prev.reason,
+    toState: current.state,
+    meta: current.meta,
+  };
+}
+
 /**
  * Stable content hash from the metadata fields Drive returns cheaply (we
  * don't want to download the body just to hash it — `files.get` is the only

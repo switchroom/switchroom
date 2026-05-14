@@ -1991,9 +1991,10 @@ export function registerAgentCommand(program: Command): void {
 
   // switchroom agent bootstrap <name>
   //
-  // One-shot: scaffold + OAuth + start. For Phase 2 testing the OAuth URL is
-  // printed to stdout and the code is pasted from stdin. Phase 3 replaces this
-  // terminal stub with the foreman bot relay.
+  // One-shot: scaffold + OAuth + start. The OAuth URL is printed to
+  // stdout and the code is pasted from stdin. For an already-running
+  // fleet, the same flow is reachable from Telegram via `/auth code`
+  // on an `admin: true` agent (see telegram-plugin/admin-commands/).
   agent
     .command("bootstrap <name>")
     .description(

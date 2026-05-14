@@ -133,7 +133,15 @@ The main agent loop does **not** use `claude -p`. Agents run interactive — by 
 
 **Config cascade** — agent config is resolved at apply time from `switchroom.yaml`: global defaults, then profile (`extends:`), then per-agent overrides. The rendered config is written into the agent's directory and the compose file is re-emitted. `switchroom apply` is the canonical reconcile.
 
-**Foreman** — an optional always-on admin bot (`telegram-plugin/foreman/foreman.ts`) over a separate Telegram bot token. Talks to the `switchroom` CLI directly for status, logs, restart, and create operations. Gated by `access.json` sender allowlists.
+**Three-tier Telegram command model** — every per-agent gateway routes inbound slash commands through three tiers:
+
+1. **Self-management commands** — `/auth`, `/restart` (self), `/interrupt`, `/new`, `/reset`, `/version`, `/help`, `/approve`, `/deny`, `/pending`. Handled by the gateway locally on **every** agent, regardless of admin status. Claude is never invoked. These work even when Claude is rate-limited, the OAuth token is expired, or the model is unreachable.
+2. **Fleet-management commands** — `/agents`, `/restart <other>`, `/stop`, `/agentstart`, `/update`, `/logs`, `/reconcile`, `/grant`, `/dangerous`, `/permissions`, `/vault`, `/memory`, `/topics`. Intercepted by the gateway and routed to the `switchroom` CLI **only when the agent has `admin: true`** in `switchroom.yaml`. Other agents reject with an "admin required" reply; Claude never sees the command.
+3. **Conversational fall-through** — everything else (plain text, non-slash messages, slash commands the gateway doesn't recognise) is forwarded to Claude as a normal inbound turn.
+
+An `admin: true` agent acts as the fleet's control panel from Telegram. Per-agent operations like `/auth reauth` work on every agent regardless of admin status. See `telegram-plugin/admin-commands/index.ts` for the authoritative list of fleet-management verbs and `telegram-plugin/gateway/gateway.ts:7452` for the admin-gate middleware.
+
+> Historical note: a separate `switchroom-foreman` standalone bot used to provide fleet-wide admin commands. It was retired in favour of the three-tier model — gateway-side intercepts on `admin: true` agents subsume foreman's role without an extra container.
 
 ---
 

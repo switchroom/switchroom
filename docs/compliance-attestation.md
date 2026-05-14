@@ -19,7 +19,7 @@ Switchroom is scaffolding and lifecycle management for multiple Claude Code sess
 3. Assigns one Telegram bot per agent, each using the official Telegram plugin
 4. Provides a CLI for managing agent lifecycle (start, stop, restart, logs)
 5. Manages an encrypted vault for secrets
-6. Includes a fleet admin bot (foreman) for fleet-wide operational visibility
+6. Routes fleet-management slash commands (`/agents`, `/restart`, `/update`, etc.) through the per-agent gateway when the agent has `admin: true` in its config — see the three-tier command model in docs/architecture.md
 7. Provides a persistent gateway process for managing the Telegram bot connection
 
 ## What Switchroom Is NOT
@@ -98,17 +98,19 @@ Each agent runs an unmodified `claude` CLI session with standard command-line fl
 
 ## New Architecture Components (Added Since April 13, 2026)
 
-### Foreman Admin Bot (Fleet Operational Dashboard)
+### Admin Agents (Fleet Operational Dashboard)
 
-**What it is:** A standalone Telegram bot (`telegram-plugin/foreman/foreman.ts`) that provides fleet-wide read-only and administrative visibility (Phase 3a/3b).
+**What it is:** Any agent with `admin: true` in `switchroom.yaml`. Its gateway intercepts fleet-management slash commands (`/agents`, `/restart`, `/update`, `/logs`, etc.) before they reach Claude — the gateway shells `switchroom <verb>` directly and replies to Telegram. Claude is never invoked for admin commands.
 
-**Compliance take:** The foreman bot is **out of scope for the third-party harness restriction** because:
-1. It does NOT run Claude Code or route Claude inference
-2. It does NOT touch authentication or subscription credentials
-3. It does NOT proxy or intercept any user requests
+**Compliance take:** Admin-agent slash command handling is **out of scope for the third-party harness restriction** because:
+1. It does NOT route Claude inference — admin commands bypass Claude entirely
+2. It does NOT touch authentication or subscription credentials at the inference layer
+3. It does NOT proxy or intercept user requests to Claude
 4. It is purely an operational admin interface using Telegram's bot API
 
-The foreman runs on its own isolated Telegram bot token, is not connected to Claude Code, and serves only to display fleet status via `switchroom agent list` and manage agent lifecycle (restart, logs, create). Users must explicitly grant access via sender allowlists in `access.json`.
+Users must explicitly grant access via sender allowlists in `access.json` and the agent must be flagged `admin: true` in `switchroom.yaml` for the gateway-side intercept to activate. Plain conversational messages on the same bot fall through to Claude as normal turns.
+
+> Historical note: an earlier release shipped a separate standalone `switchroom-foreman` Telegram bot for fleet-wide visibility. It was retired once the per-agent `admin: true` model superseded it — the gateway-side intercept on an admin agent provides the same isolation guarantee (no Claude in the admin command path) without the extra container.
 
 ### Gateway Process (Persistent Telegram Connection Manager)
 
@@ -165,7 +167,7 @@ User → Telegram API → Telegram Plugin (switchroom fork or official) → Clau
 Claude Code → Telegram Plugin → Telegram API → User
 ```
 
-At no point does any Switchroom component sit between Claude Code and Anthropic's inference API. There is no daemon or router — each agent's plugin polls Telegram independently using the agent's own bot token. The foreman bot and gateway process do not participate in inference routing.
+At no point does any Switchroom component sit between Claude Code and Anthropic's inference API. There is no daemon or router — each agent's plugin polls Telegram independently using the agent's own bot token. The gateway process and admin-command intercepts do not participate in inference routing.
 
 ---
 

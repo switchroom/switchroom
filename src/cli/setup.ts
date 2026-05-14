@@ -60,14 +60,7 @@ export function registerSetupCommand(program: Command): void {
     )
     .option("--non-interactive", "Run without prompts (use env vars and flags)")
     .option("--user-id <id>", "Telegram user ID (non-interactive mode)")
-    .option("--foreman", "Set up the foreman admin bot only (skip agent setup)")
     .action(async (opts) => {
-      // ── --foreman shortcut ────────────────────────────────────────
-      if (opts.foreman) {
-        await runForemanSetup(opts);
-        return;
-      }
-
       const parentOpts = program.opts();
       const nonInteractive =
         opts.nonInteractive === true || !process.stdin.isTTY;
@@ -367,22 +360,38 @@ async function stepBotToken(
   return { botToken: token, botUsername: botInfo.username, agentBots };
 }
 
-async function resolveOrPromptToken(
+export async function resolveOrPromptToken(
   rawToken: string,
   label: string,
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<string> {
-  // Check env var first
-  let token: string | undefined = process.env[`TELEGRAM_BOT_TOKEN_${label.toUpperCase().replace(/-/g, "_")}`];
-  if (!token) token = process.env.TELEGRAM_BOT_TOKEN;
+  // Resolution precedence (install-validation finding #31):
+  //
+  //   1. Agent-scoped env var: TELEGRAM_BOT_TOKEN_<LABEL>
+  //   2. Vault ref in config (if rawToken starts with `vault:`)
+  //   3. Literal config value (if rawToken is a plain token)
+  //   4. Global TELEGRAM_BOT_TOKEN env var (LAST RESORT)
+  //   5. Interactive prompt
+  //
+  // Why the global env is last for vault-ref configs: a multi-bot
+  // fleet declares `agents.<n>.bot_token: "vault:<key-per-agent>"`,
+  // and an operator running `TELEGRAM_BOT_TOKEN=… switchroom setup`
+  // would (pre-fix) get every agent stamped with the same global
+  // token — multiple gateways then poll the same bot and Telegram
+  // returns 409 conflicts. Resolving the per-agent vault ref first
+  // makes the per-agent declaration win, as the operator intended.
+  //
+  // Plain (non-vault) literal tokens in config still defer to the
+  // global env for backwards compat — single-bot fleets that used
+  // `TELEGRAM_BOT_TOKEN=… switchroom setup` as a one-shot override
+  // keep working.
 
-  // Check if config has a non-vault token
-  if (!token && !rawToken.startsWith("vault:")) {
-    token = rawToken;
-  }
+  // 1. Agent-scoped env var.
+  const labelEnvKey = `TELEGRAM_BOT_TOKEN_${label.toUpperCase().replace(/-/g, "_")}`;
+  let token: string | undefined = process.env[labelEnvKey];
 
-  // Try vault resolution
+  // 2. Vault ref takes priority over global env when present.
   if (!token && rawToken.startsWith("vault:")) {
     const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     if (passphrase) {
@@ -399,9 +408,22 @@ async function resolveOrPromptToken(
     }
   }
 
+  // 3. Plain literal config value.
+  if (!token && !rawToken.startsWith("vault:")) {
+    token = rawToken;
+  }
+
+  // 4. Global env var (backwards-compat fallback).
+  if (!token) token = process.env.TELEGRAM_BOT_TOKEN;
+
+  // 5. Interactive prompt.
   if (!token) {
     if (nonInteractive) {
-      throw new Error(`No bot token found for ${label}. Set TELEGRAM_BOT_TOKEN environment variable.`);
+      throw new Error(
+        `No bot token found for ${label}. Set ${labelEnvKey} or TELEGRAM_BOT_TOKEN, ` +
+          `or store the token in the vault under the key referenced by ` +
+          `agents.${label}.bot_token (run with SWITCHROOM_VAULT_PASSPHRASE).`,
+      );
     }
     token = await ask(`  Paste bot token for ${label} (from @BotFather)`);
     if (!token) throw new Error(`Bot token for ${label} is required`);
@@ -1259,148 +1281,4 @@ async function stepVerification(
   }
 
   console.log(chalk.green(`  ${STEP_DONE} Verification steps ready`));
-}
-
-// ─── Foreman setup (--foreman) ────────────────────────────────────────────
-
-/**
- * Standalone foreman setup flow. Prompts for a bot token and user Telegram
- * ID, writes ~/.switchroom/foreman/.env + access.json, installs + enables
- * the switchroom-foreman.service unit.
- *
- * Invoked via: switchroom setup --foreman
- */
-async function runForemanSetup(opts: { nonInteractive?: boolean; userId?: string }): Promise<void> {
-  const { mkdirSync, writeFileSync, chmodSync, existsSync } = await import("node:fs");
-  const { resolve: resolvePath, join } = await import("node:path");
-  const { homedir } = await import("node:os");
-  const { execFileSync } = await import("node:child_process");
-
-  const nonInteractive = opts.nonInteractive === true || !process.stdin.isTTY;
-
-  console.log(
-    chalk.bold("\n  switchroom setup --foreman\n") +
-      chalk.gray("  Sets up the foreman admin bot (token + access.json). The bot runs as a docker compose service under the switchroom project.\n"),
-  );
-
-  const foremanDir = join(homedir(), ".switchroom", "foreman");
-  mkdirSync(foremanDir, { recursive: true });
-
-  // ── Bot token ──────────────────────────────────────────────────────────
-  let botToken: string | undefined = process.env.TELEGRAM_FOREMAN_BOT_TOKEN;
-
-  if (!botToken) {
-    if (nonInteractive) {
-      console.error(
-        chalk.red("  No bot token. Set TELEGRAM_FOREMAN_BOT_TOKEN env var."),
-      );
-      process.exit(1);
-    }
-    console.log(chalk.yellow(
-      "  Token will be visible as you paste. " +
-      "For production, use TELEGRAM_FOREMAN_BOT_TOKEN env var.",
-    ));
-    botToken = await ask(
-      "  Paste foreman bot token from @BotFather",
-    );
-    if (!botToken) {
-      console.error(chalk.red("  Bot token is required."));
-      process.exit(1);
-    }
-  }
-
-  // Validate token
-  const spin = spinner("Validating foreman bot token...");
-  let botUsername: string;
-  try {
-    const info = await validateBotToken(botToken);
-    botUsername = info.username;
-    spin.stop(chalk.green(`${STEP_DONE} Bot validated: @${botUsername}`));
-  } catch (err) {
-    spin.stop(chalk.red(`  Token invalid: ${(err as Error).message}`));
-    process.exit(1);
-  }
-
-  // ── User Telegram ID ────────────────────────────────────────────────────
-  let userId = opts.userId ?? process.env.TELEGRAM_USER_ID ?? process.env.USER_ID;
-
-  if (!userId) {
-    if (nonInteractive) {
-      console.error(
-        chalk.red("  No user ID. Set TELEGRAM_USER_ID env var or pass --user-id."),
-      );
-      process.exit(1);
-    }
-    console.log(chalk.cyan(`\n  DM /start to @${botUsername}: ${chalk.underline(`t.me/${botUsername}`)}`));
-    const pollSpin = spinner("Waiting for /start DM (up to 2 minutes)...");
-    try {
-      const result = await pollForDmStart(botToken, 120_000);
-      pollSpin.stop(
-        chalk.green(`${STEP_DONE} Paired with user ID: ${result.userId}`),
-      );
-      userId = String(result.userId);
-    } catch {
-      pollSpin.stop(chalk.yellow("Timed out — enter user ID manually."));
-      userId = await ask("  Your Telegram user ID (numeric)");
-      if (!userId) {
-        console.error(chalk.red("  User ID is required."));
-        process.exit(1);
-      }
-    }
-  }
-
-  // ── Write config files ─────────────────────────────────────────────────
-  const envFile = join(foremanDir, ".env");
-  const force = process.env.SWITCHROOM_FOREMAN_FORCE === "1";
-
-  if (existsSync(envFile) && !force) {
-    if (nonInteractive) {
-      console.error(
-        chalk.red(`  ${envFile} already exists.`) +
-          chalk.gray(
-            "\n  Re-running setup rotates the bot token. To confirm, set SWITCHROOM_FOREMAN_FORCE=1.\n  To only update the allowlist, delete and recreate access.json directly.",
-          ),
-      );
-      process.exit(1);
-    }
-    const confirm = await askYesNo(
-      `\n  ${envFile} already exists. Overwrite bot token?`,
-      false,
-    );
-    if (!confirm) {
-      console.log(
-        chalk.gray("  Keeping existing token. (Access list will still be updated.)"),
-      );
-    } else {
-      writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${botToken}\n`, { mode: 0o600 });
-      chmodSync(envFile, 0o600);
-      console.log(chalk.green(`  ${STEP_DONE} Rewrote ${envFile}`));
-    }
-  } else {
-    writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${botToken}\n`, { mode: 0o600 });
-    chmodSync(envFile, 0o600);
-    console.log(chalk.green(`  ${STEP_DONE} Wrote ${envFile}`));
-  }
-
-  const accessFile = join(foremanDir, "access.json");
-  writeFileSync(
-    accessFile,
-    JSON.stringify({ allowFrom: [userId] }, null, 2) + "\n",
-    { mode: 0o644 },
-  );
-  console.log(chalk.green(`  ${STEP_DONE} Wrote ${accessFile}`));
-
-  // v0.7: foreman runs as a docker-compose service. The compose file
-  // is regenerated + brought up by `switchroom apply`. The setup
-  // wizard no longer installs/starts a systemd unit.
-  console.log(
-    chalk.gray(
-      "\n  Next: switchroom apply  (regenerates docker-compose.yml + brings foreman up)",
-    ),
-  );
-
-  console.log(
-    chalk.bold.green("\n  Foreman setup complete!") +
-      chalk.gray(` DM @${botUsername} after \`switchroom apply\` and try /help.\n`),
-  );
 }

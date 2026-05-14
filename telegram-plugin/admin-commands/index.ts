@@ -21,11 +21,13 @@
  * middleware (via `makeAdminCommandMiddleware`) BEFORE its bot.command() calls;
  * the middleware redirects to handleInbound when admin=false.
  *
- * Out of scope for Phase 1
- * ────────────────────────
- * `/create-agent` has a complex multi-turn state machine (persisted wizard
- * state across messages). It is intentionally NOT included here and remains
- * foreman/server-only until Phase 2 or later.
+ * Out of scope
+ * ────────────
+ * `/create-agent` is a multi-turn wizard for onboarding a new agent
+ * from Telegram. Not implemented — operators run `switchroom agent
+ * add <name>` on the host. (The standalone foreman bot used to host
+ * this wizard; it was retired since the gateway-intercept model
+ * supersedes it.)
  */
 
 /**

@@ -91,7 +91,7 @@ function locateSwitchroomInstallDir(): string | null {
  *   ✓ switchroom 7278044 (clean)
  *   ✓ klanker → up 5m, on 7278044
  *   ✗ gymbro → down
- *   ✓ foreman → up 2d, on ?
+ *   ✓ admin   → up 2d, on ?
  */
 export function printHealthSummary(config: ReturnType<typeof getConfig>): void {
   const lines: string[] = [];

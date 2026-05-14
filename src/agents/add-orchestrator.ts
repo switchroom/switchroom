@@ -208,8 +208,8 @@ const DEFAULT_PAIR_TIMEOUT_MS = 5 * 60 * 1000;
  *      verifies the agent's bot token, asserts username/slug match.
  *   1b. Profile + skill picker (or validate --profile / --skills).
  *   2. createAgent — scaffold + systemd + auth session.
- *   3. readOAuthCode — caller relays the OAuth dance (terminal stdin or
- *      a future foreman bot).
+ *   3. readOAuthCode — caller relays the OAuth dance (terminal stdin,
+ *      or for an already-running agent, `/auth code` from Telegram).
  *   4. completeCreation — submit code + start the agent.
  *   5. Pairing block — pollForDmStart unless allowFromUserId is given.
  *      Writes telegram/access.json with the captured user_id and (for

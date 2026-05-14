@@ -1,7 +1,8 @@
 /**
- * Shared bot runtime helpers — extracted from gateway.ts so both the
- * per-agent gateway and the foreman bot can share the same core plumbing
- * without duplicating code.
+ * Shared bot runtime helpers — extracted from gateway.ts as a reusable
+ * core that callers can build on without duplicating the boilerplate.
+ * Used today by the per-agent gateway; historically also by the
+ * standalone foreman bot before its retirement.
  *
  * What lives here:
  *   - `createRobustApiCall` — thin re-export of createRetryApiCall pre-wired
@@ -361,7 +362,7 @@ export async function runPollingLoop(
 
 /**
  * Returns true if the sender's user ID is in the allowFrom list.
- * Used by both gateway and foreman for auth gating.
+ * Used by the gateway for sender-allowlist auth gating.
  */
 export function isAllowedSender(ctx: Context, allowFrom: string[]): boolean {
   const from = ctx.from

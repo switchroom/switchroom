@@ -6,6 +6,26 @@ import { rmSync } from "node:fs";
 
 import { createServer } from "node:net";
 import { validateBotToken } from "../src/setup/telegram-api.js";
+import type { SwitchroomConfig } from "../src/config/schema.js";
+
+// Mock the vault module so importing setup.ts (which dynamic-imports
+// vault.ts AND statically imports vault-broker.js → broker/server.ts
+// → grants-db.ts → bun:sqlite) doesn't transitively load bun:sqlite.
+// vitest doesn't ship the bun:sqlite shim. The resolveOrPromptToken
+// precedence tests stub the vault read path via the vault.js mock.
+vi.mock("../src/vault/vault.js", () => ({
+  openVault: vi.fn(),
+  createVault: vi.fn(),
+  setStringSecret: vi.fn(),
+}));
+vi.mock("../src/vault/grants-db.ts", () => ({}));
+vi.mock("../src/vault/broker/server.js", () => ({
+  VaultBroker: vi.fn(),
+  registerShutdownHandlers: vi.fn(),
+}));
+
+import { resolveOrPromptToken } from "../src/cli/setup.js";
+import * as vaultMod from "../src/vault/vault.js";
 import {
   buildAccessJson,
   findExistingClaudeJson,
@@ -530,5 +550,113 @@ describe("pickHindsightPorts", () => {
     } finally {
       blocker.close();
     }
+  });
+});
+
+// ─── resolveOrPromptToken precedence (install-validation #31) ────────────────
+//
+// Regression pins for the bug a multi-bot fleet hit in Phase 4 of the
+// install-validation goal-loop: per-agent `vault:` refs were silently
+// overridden by a global TELEGRAM_BOT_TOKEN env var, so every agent
+// ended up polling the same bot and Telegram returned 409 conflicts.
+//
+// Precedence (after #1256):
+//   1. Agent-scoped env var: TELEGRAM_BOT_TOKEN_<LABEL>
+//   2. Vault ref (`vault:<key>` resolves via SWITCHROOM_VAULT_PASSPHRASE)
+//   3. Literal config value
+//   4. Global TELEGRAM_BOT_TOKEN env var
+//   5. Interactive prompt (only when stdin is a TTY)
+
+describe("resolveOrPromptToken precedence", () => {
+  // Save + restore env so tests don't leak into each other.
+  const envKeys = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN_ADMIN",
+    "TELEGRAM_BOT_TOKEN_AGENT",
+    "SWITCHROOM_VAULT_PASSPHRASE",
+  ];
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const k of envKeys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+  afterEach(() => {
+    for (const k of envKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function makeConfig(vaultPath?: string): SwitchroomConfig {
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "", forum_chat_id: "0" },
+      agents: {},
+      vault: vaultPath ? { path: vaultPath } : undefined,
+      defaults: {},
+      memory: { backend: "none" },
+    } as unknown as SwitchroomConfig;
+  }
+
+  it("(1) agent-scoped env var TELEGRAM_BOT_TOKEN_<LABEL> wins over everything", async () => {
+    process.env.TELEGRAM_BOT_TOKEN_ADMIN = "from-agent-env";
+    process.env.TELEGRAM_BOT_TOKEN = "from-global-env";
+    const token = await resolveOrPromptToken(
+      "literal-in-config",
+      "admin",
+      makeConfig(),
+      true,
+    );
+    expect(token).toBe("from-agent-env");
+  });
+
+  it("(2) vault: ref beats global TELEGRAM_BOT_TOKEN env var (the #31 regression pin)", async () => {
+    // Create an empty vault file so existsSync passes; openVault is mocked
+    // at the module level (top of this file) and returns the secret shape
+    // resolveOrPromptToken expects.
+    const tmp = mkdtempSync(join(tmpdir(), "switchroom-resolve-token-vault-"));
+    const vaultPath = join(tmp, "vault.enc");
+    try {
+      writeFileSync(vaultPath, "stub vault placeholder");
+      vi.mocked(vaultMod.openVault).mockReturnValueOnce({
+        "telegram-admin-bot-token": { kind: "string", value: "from-vault" },
+      } as unknown as ReturnType<typeof vaultMod.openVault>);
+      process.env.SWITCHROOM_VAULT_PASSPHRASE = "test-passphrase";
+      process.env.TELEGRAM_BOT_TOKEN = "from-global-env";
+      const token = await resolveOrPromptToken(
+        "vault:telegram-admin-bot-token",
+        "admin",
+        makeConfig(vaultPath),
+        true,
+      );
+      expect(token).toBe("from-vault");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("(3) literal non-empty config value beats global env (config-as-source-of-truth)", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "from-global-env";
+    const token = await resolveOrPromptToken(
+      "literal-from-config",
+      "admin",
+      makeConfig(),
+      true,
+    );
+    expect(token).toBe("literal-from-config");
+  });
+
+  it("(4) empty literal config falls through to global TELEGRAM_BOT_TOKEN", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "from-global-env";
+    const token = await resolveOrPromptToken("", "admin", makeConfig(), true);
+    expect(token).toBe("from-global-env");
+  });
+
+  it("(5) non-interactive with nothing set throws and names all three keys", async () => {
+    await expect(
+      resolveOrPromptToken("", "admin", makeConfig(), true),
+    ).rejects.toThrow(/TELEGRAM_BOT_TOKEN_ADMIN.*TELEGRAM_BOT_TOKEN.*vault/s);
   });
 });

@@ -80,6 +80,7 @@ The old `/auth` dashboard (1,104 LOC of in-place promote UI built on slot-pool c
 - `src/auth/account-promote.ts`, `src/auth/token-refresh.ts`, `src/auth/account-quota-store.ts`, `src/cli/auth-accounts-yaml.ts` — all functionality subsumed by the broker.
 - `telegram-plugin/auth-dashboard.ts` (1,104 LOC) and `telegram-plugin/auth-slot-parser.ts` — replaced by the three thin chat commands.
 - The fanout half of `src/auth/account-refresh.ts` (`fanoutAccountToAgents`, `refreshAllAccounts`, `enabledAgentsForAccount`). The single-account refresh primitive `refreshAccountIfNeeded` stays — the broker imports it.
+- **Standalone `switchroom-foreman` Telegram bot.** `telegram-plugin/foreman/`, the `switchroom setup --foreman` CLI verb, and the `~/.switchroom/foreman/` config dir are all deleted. Fleet-management slash commands are now handled by per-agent gateways on agents with `admin: true` (three-tier command model — see `docs/architecture.md`). The `role: "foreman"` schema flag is **unchanged** — it controls auto-installation of operator skills and is orthogonal to the retired standalone bot. Foreman commands intentionally **not** migrated (run on host): `/create-agent` + `/setup` → `switchroom agent add <name>`; `/delete <agent>` → `switchroom agent destroy <name>`.
 - ~2,000 LOC of paired tests for all the above.
 
 ### Migration
@@ -92,7 +93,6 @@ No long-term migration framework. `switchroom apply` runs an in-place upgrade on
 - `docs/operators/auth-broker-drift.md` — drift recovery runbook.
 - `docs/rfcs/auth-broker.md` — the RFC (3 review rounds).
 - `reference/share-auth-across-the-fleet.md` — the JTBD design contract this operationalises.
-
 ## v0.8.1 — SOUL.md fingerprint re-render (v0.8.0 follow-up)
 
 Single fix. The v0.8.0 voice consolidation (PR #1177) moved the canonical AI-tells ban-list into `SOUL.md` "Never", but `seedWorkspaceBootstrapFiles` was seeding workspace bootstrap files via `writeIfMissing`. Once an agent had a `SOUL.md`, the template was frozen forever — same failure shape as #1122 was for `CLAUDE.md` before that fix.
