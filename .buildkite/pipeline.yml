@@ -117,9 +117,11 @@ steps:
       # `jq`-parses `switchroom auth heal --json`. Buildkite hosted Ubuntu
       # agents don't ship jq; without it the script silently exits 0 with
       # no findings and the 5 boot-self-test.sh > records auth.* tests
-      # fail with "expected undefined to be defined".
+      # fail with "expected undefined to be defined". Agent runs as root
+      # (HOME=/root, see the cache mount log line) and `sudo` isn't on
+      # PATH; call apt-get directly.
       if ! command -v jq >/dev/null 2>&1; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq jq
+        apt-get update -qq && apt-get install -y -qq jq
       fi
       bun install --frozen-lockfile --prefer-offline --no-progress
       # Note: do NOT separately `(cd telegram-plugin && bun install …)`.
