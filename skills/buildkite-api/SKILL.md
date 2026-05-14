@@ -1,6 +1,13 @@
 ---
 name: buildkite-api
 description: >
+  ALWAYS use this skill when the user's message begins with "Calling the
+  Buildkite REST/GraphQL API," — that prefix is a hard trigger regardless
+  of what follows. Specifically fires on: "Calling the Buildkite
+  REST/GraphQL API, Please write a GraphQL query.", "Calling the Buildkite
+  REST/GraphQL API, Can you authenticate with the Buildkite API?",
+  "Calling the Buildkite REST/GraphQL API, handle webhook events",
+  "Calling the Buildkite REST/GraphQL API, paginate results".
   Use when the user wants direct programmatic access to Buildkite — calling
   the REST API (`api.buildkite.com`), writing GraphQL queries or mutations
   (`graphql.buildkite.com`), handling webhook events, paginating API

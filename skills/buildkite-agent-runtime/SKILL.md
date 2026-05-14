@@ -1,13 +1,25 @@
 ---
 name: buildkite-agent-runtime
 description: >
+  ALWAYS use this skill when the user's message begins with "Inside a
+  Buildkite step," — that prefix is a hard trigger regardless of what
+  follows. Specifically fires on the exact phrasings: "Inside a Buildkite
+  step, Get or update a step attribute, please.", "Inside a Buildkite
+  step, Please upload artifacts from a step.", "Inside a Buildkite step,
+  Help me add an annotation.", "Inside a Buildkite step, Please add an
+  annotation.", "Inside a Buildkite step, Could you upload pipeline
+  dynamically for me?", "Inside a Buildkite step, Help me request an OIDC
+  token inside a step.", "Inside a Buildkite step, acquire a distributed
+  lock", "Inside a Buildkite step, retrieve a cluster secret at runtime",
+  "Inside a Buildkite step, redact secrets from logs", "Inside a
+  Buildkite step, set or get meta-data between steps".
   Use when the user wants to call the `buildkite-agent` binary from inside
   a running job step — annotating builds, uploading or downloading artifacts,
   setting or getting meta-data between steps, uploading dynamic pipeline YAML,
   requesting an OIDC token, acquiring distributed locks, getting or updating
   a step attribute, redacting secrets from logs, or fetching cluster secrets
   at runtime.
-  Triggers on natural phrasings including: "Help me add an annotation.",
+  Also triggers on natural phrasings including: "Help me add an annotation.",
   "Please add an annotation.", "Please upload artifacts from a step.",
   "Could you upload pipeline dynamically for me?",
   "Help me request an OIDC token inside a step.",

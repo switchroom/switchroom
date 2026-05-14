@@ -1,0 +1,1504 @@
+{
+  "startedAt": "2026-05-14T00:25:41.499Z",
+  "finishedAt": "2026-05-14T00:41:22.316Z",
+  "seed": 1,
+  "agentName": "claude-cli",
+  "results": [
+    {
+      "probe": {
+        "id": "fa68195ea5ecfd69",
+        "targetSkill": "switchroom-runtime",
+        "kind": "paraphrase",
+        "phrase": "For switchroom runtime hand-offs, Why did you restart, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7282,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "6a352e1fae1eb98b",
+        "targetSkill": "switchroom-runtime",
+        "kind": "paraphrase",
+        "phrase": "For switchroom runtime hand-offs, I'd like to you went away.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5626,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "7b2d8b651305ea15",
+        "targetSkill": "switchroom-runtime",
+        "kind": "paraphrase",
+        "phrase": "For switchroom runtime hand-offs, Let's can I stop you mid-turn.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5522,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "baaf645f25688ee3",
+        "targetSkill": "switchroom-runtime",
+        "kind": "paraphrase",
+        "phrase": "For switchroom runtime hand-offs, I'd like to why did you restart.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7623,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "804e347cfe9edb0a",
+        "targetSkill": null,
+        "kind": "negative",
+        "phrase": "report this issue on GitHub",
+        "source": "negative-from-adjacent",
+        "expectedOtherSkill": "file-bug"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5545,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "532f5db97dcb9197",
+        "targetSkill": null,
+        "kind": "negative",
+        "phrase": "apply my config changes",
+        "source": "negative-from-adjacent",
+        "expectedOtherSkill": "switchroom-cli"
+      },
+      "skillsInvoked": [
+        "update-config"
+      ],
+      "turnDurationMs": 10218,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "19c365e9f7fe2b96",
+        "targetSkill": null,
+        "kind": "negative",
+        "phrase": "file a bug",
+        "source": "negative-from-adjacent",
+        "expectedOtherSkill": "file-bug"
+      },
+      "skillsInvoked": [
+        "file-bug"
+      ],
+      "turnDurationMs": 9299,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "beba76aa860bd8fc",
+        "targetSkill": null,
+        "kind": "negative",
+        "phrase": "what version is running",
+        "source": "negative-from-adjacent",
+        "expectedOtherSkill": "switchroom-cli"
+      },
+      "skillsInvoked": [
+        "switchroom-runtime"
+      ],
+      "turnDurationMs": 9423,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "29dd0fd76efcc36a",
+        "targetSkill": "buildkite-cli",
+        "kind": "paraphrase",
+        "phrase": "Using the Buildkite CLI, Help me retry a build.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-cli"
+      ],
+      "turnDurationMs": 8521,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "164b298fe7acd33d",
+        "targetSkill": "buildkite-cli",
+        "kind": "paraphrase",
+        "phrase": "Using the Buildkite CLI, List builds, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-cli"
+      ],
+      "turnDurationMs": 7537,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "ad05a4b17dfec70e",
+        "targetSkill": "buildkite-cli",
+        "kind": "paraphrase",
+        "phrase": "Using the Buildkite CLI, Let's upload artifacts.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-cli"
+      ],
+      "turnDurationMs": 11608,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f602bb899348b38a",
+        "targetSkill": "buildkite-cli",
+        "kind": "paraphrase",
+        "phrase": "Using the Buildkite CLI, Let's manage secrets.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-cli"
+      ],
+      "turnDurationMs": 9034,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "4d3bcd86ddf3f306",
+        "targetSkill": "mcp-builder",
+        "kind": "paraphrase",
+        "phrase": "For building an MCP server, Let's write an MCP server for.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5955,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "ca14b1ed9593402c",
+        "targetSkill": "mcp-builder",
+        "kind": "paraphrase",
+        "phrase": "For building an MCP server, Please integrate an external API as MCP.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7963,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "cb6257ebc6dcd77d",
+        "targetSkill": "mcp-builder",
+        "kind": "paraphrase",
+        "phrase": "For building an MCP server, Use the MCP SDK in TypeScript, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6566,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "49cbf7aede4d4c38",
+        "targetSkill": "mcp-builder",
+        "kind": "paraphrase",
+        "phrase": "For building an MCP server, Write an MCP server for, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6216,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5cb5b66c0cda563e",
+        "targetSkill": "switchroom-install",
+        "kind": "paraphrase",
+        "phrase": "For switchroom setup, Please what are the switchroom prerequisites.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-install"
+      ],
+      "turnDurationMs": 8500,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "e4a1081efde4c354",
+        "targetSkill": "switchroom-install",
+        "kind": "paraphrase",
+        "phrase": "For switchroom setup, I need to get switchroom running.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-install"
+      ],
+      "turnDurationMs": 8606,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "b47e182b9a49f8f6",
+        "targetSkill": "switchroom-install",
+        "kind": "paraphrase",
+        "phrase": "For switchroom setup, Can you bootstrap switchroom from scratch?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-install"
+      ],
+      "turnDurationMs": 8609,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "1ade0f2b358072ab",
+        "targetSkill": "switchroom-install",
+        "kind": "paraphrase",
+        "phrase": "For switchroom setup, Help me what are the switchroom prerequisites.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-install"
+      ],
+      "turnDurationMs": 9640,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "7f5b4c9ca62df0bb",
+        "targetSkill": "buildkite-api",
+        "kind": "paraphrase",
+        "phrase": "Calling the Buildkite REST/GraphQL API, Please write a GraphQL query.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6519,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "8dfc5ea08e72a921",
+        "targetSkill": "buildkite-api",
+        "kind": "paraphrase",
+        "phrase": "Calling the Buildkite REST/GraphQL API, Let's paginate API results.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-api"
+      ],
+      "turnDurationMs": 9737,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "7e08793758116121",
+        "targetSkill": "buildkite-api",
+        "kind": "paraphrase",
+        "phrase": "Calling the Buildkite REST/GraphQL API, Could you automate Buildkite for me?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6670,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "133026c922808017",
+        "targetSkill": "buildkite-api",
+        "kind": "paraphrase",
+        "phrase": "Calling the Buildkite REST/GraphQL API, Can you authenticate with the Buildkite API?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-api"
+      ],
+      "turnDurationMs": 14667,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "14c538af1a89b529",
+        "targetSkill": "file-bug",
+        "kind": "paraphrase",
+        "phrase": "For filing a GitHub bug report, Can you report this issue on GitHub?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6483,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "e70fd69ecf35bae8",
+        "targetSkill": "file-bug",
+        "kind": "paraphrase",
+        "phrase": "For filing a GitHub bug report, Please raise a ticket.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6368,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "81d92fb7cacce3a0",
+        "targetSkill": "file-bug",
+        "kind": "paraphrase",
+        "phrase": "For filing a GitHub bug report, I need to this needs a real ticket.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6686,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "98aff157e7222098",
+        "targetSkill": "file-bug",
+        "kind": "paraphrase",
+        "phrase": "For filing a GitHub bug report, I need to file a bug.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "file-bug"
+      ],
+      "turnDurationMs": 9332,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "03c1ecdb2773c327",
+        "targetSkill": "switchroom-status",
+        "kind": "paraphrase",
+        "phrase": "For switchroom fleet status, Can you show me the fleet?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-status"
+      ],
+      "turnDurationMs": 8944,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "8e068561398da142",
+        "targetSkill": "switchroom-status",
+        "kind": "paraphrase",
+        "phrase": "For switchroom fleet status, Let's how long has X been up.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-status"
+      ],
+      "turnDurationMs": 8971,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "128a6ccf571687b7",
+        "targetSkill": "switchroom-status",
+        "kind": "paraphrase",
+        "phrase": "For switchroom fleet status, I'd like to what's the uptime of each agent.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-status"
+      ],
+      "turnDurationMs": 8516,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "3b7cb60387ed89b9",
+        "targetSkill": "switchroom-status",
+        "kind": "paraphrase",
+        "phrase": "For switchroom fleet status, Let's list switchroom agents.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-status"
+      ],
+      "turnDurationMs": 9136,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "af8e03b8fd951a2e",
+        "targetSkill": "buildkite-pipelines",
+        "kind": "paraphrase",
+        "phrase": "In a Buildkite pipeline.yml, Help me write a pipeline.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-pipelines"
+      ],
+      "turnDurationMs": 12987,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "bec645397ee5037a",
+        "targetSkill": "buildkite-pipelines",
+        "kind": "paraphrase",
+        "phrase": "In a Buildkite pipeline.yml, Can you parallel steps?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-pipelines"
+      ],
+      "turnDurationMs": 10697,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "c0965ff318a6e916",
+        "targetSkill": "buildkite-pipelines",
+        "kind": "paraphrase",
+        "phrase": "In a Buildkite pipeline.yml, Let's add retry.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-pipelines"
+      ],
+      "turnDurationMs": 9545,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "e3c695bf046fb187",
+        "targetSkill": "buildkite-pipelines",
+        "kind": "paraphrase",
+        "phrase": "In a Buildkite pipeline.yml, Let's show test failures in the build page.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-pipelines"
+      ],
+      "turnDurationMs": 11298,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "fe58c503d43578fc",
+        "targetSkill": "switchroom-manage",
+        "kind": "paraphrase",
+        "phrase": "In switchroom agent management, I need to reprovision my agents.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-manage"
+      ],
+      "turnDurationMs": 11142,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5d3f9bb5b7864f23",
+        "targetSkill": "switchroom-manage",
+        "kind": "paraphrase",
+        "phrase": "In switchroom agent management, Could you reprovision my agents for me?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-runtime"
+      ],
+      "turnDurationMs": 15034,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5b114197128c85e4",
+        "targetSkill": "switchroom-manage",
+        "kind": "paraphrase",
+        "phrase": "In switchroom agent management, Manage my agents, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-manage"
+      ],
+      "turnDurationMs": 8124,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "2a834a94cdb05da4",
+        "targetSkill": "switchroom-manage",
+        "kind": "paraphrase",
+        "phrase": "In switchroom agent management, Can you reinstall my agents?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-runtime"
+      ],
+      "turnDurationMs": 12267,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "fd4ea5e66a776e06",
+        "targetSkill": "buildkite-secure-delivery",
+        "kind": "paraphrase",
+        "phrase": "For Buildkite OIDC/SLSA, Please secure the supply chain.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8842,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "c99857bac32a3cd9",
+        "targetSkill": "buildkite-secure-delivery",
+        "kind": "paraphrase",
+        "phrase": "For Buildkite OIDC/SLSA, I'd like to push a Docker image.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 9604,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "e3a7b755db9849f8",
+        "targetSkill": "buildkite-secure-delivery",
+        "kind": "paraphrase",
+        "phrase": "For Buildkite OIDC/SLSA, Can you sign pipelines?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 12308,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "7bc8ee4315c292b8",
+        "targetSkill": "buildkite-secure-delivery",
+        "kind": "paraphrase",
+        "phrase": "For Buildkite OIDC/SLSA, I need to verify pipeline signatures.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8479,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "dd8af9c579156ef1",
+        "targetSkill": "pptx",
+        "kind": "paraphrase",
+        "phrase": "For my PowerPoint deck, I need to combine slide files.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6144,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "157063cdaef5750a",
+        "targetSkill": "pptx",
+        "kind": "paraphrase",
+        "phrase": "For my PowerPoint deck, I need to work from a slide template.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6358,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "3fb7b879584f7e2d",
+        "targetSkill": "pptx",
+        "kind": "paraphrase",
+        "phrase": "For my PowerPoint deck, Help me split this deck.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5640,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "e234056b6f0cd6b7",
+        "targetSkill": "pptx",
+        "kind": "paraphrase",
+        "phrase": "For my PowerPoint deck, I'd like to edit this presentation.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7321,
+      "timedOut": true,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "9f0104122b1d902a",
+        "targetSkill": "webapp-testing",
+        "kind": "paraphrase",
+        "phrase": "For browser-based webapp testing with Playwright, Please spin up a local server and test it.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7713,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "976461024a3c480c",
+        "targetSkill": "webapp-testing",
+        "kind": "paraphrase",
+        "phrase": "For browser-based webapp testing with Playwright, I'd like to run a Playwright test.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "webapp-testing"
+      ],
+      "turnDurationMs": 7738,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f4fa67cac980746f",
+        "targetSkill": "webapp-testing",
+        "kind": "paraphrase",
+        "phrase": "For browser-based webapp testing with Playwright, Can you run a Playwright test?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7663,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "1adf3bcafa8a85a3",
+        "targetSkill": "webapp-testing",
+        "kind": "paraphrase",
+        "phrase": "For browser-based webapp testing with Playwright, Help me view browser logs.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "webapp-testing"
+      ],
+      "turnDurationMs": 8001,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "854545d990ef3fca",
+        "targetSkill": "skill-creator",
+        "kind": "paraphrase",
+        "phrase": "Edit an existing skill, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "skill-creator"
+      ],
+      "turnDurationMs": 7697,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "3c28490199165a06",
+        "targetSkill": "skill-creator",
+        "kind": "paraphrase",
+        "phrase": "I need to create a new skill.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "skill-creator"
+      ],
+      "turnDurationMs": 9470,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "497305ff3f6914be",
+        "targetSkill": "skill-creator",
+        "kind": "paraphrase",
+        "phrase": "Help me create a new skill.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "skill-creator"
+      ],
+      "turnDurationMs": 11187,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f0c1d85234cccb74",
+        "targetSkill": "skill-creator",
+        "kind": "paraphrase",
+        "phrase": "Can you improve the trigger accuracy of a skill?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "skill-creator"
+      ],
+      "turnDurationMs": 8486,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "6a535dd04984c85a",
+        "targetSkill": "xlsx",
+        "kind": "paraphrase",
+        "phrase": "For my Excel spreadsheet, I'd like to edit a spreadsheet.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5772,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "8958e9a03a820b0b",
+        "targetSkill": "xlsx",
+        "kind": "paraphrase",
+        "phrase": "For my Excel spreadsheet, Help me create a spreadsheet from scratch.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "xlsx"
+      ],
+      "turnDurationMs": 9321,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "bfbade386f35b354",
+        "targetSkill": "xlsx",
+        "kind": "paraphrase",
+        "phrase": "For my Excel spreadsheet, Let's build a financial model.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8670,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "91928f1da852a8a1",
+        "targetSkill": "xlsx",
+        "kind": "paraphrase",
+        "phrase": "For my Excel spreadsheet, Fix malformed rows in this CSV, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5257,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5d0c82aca1a9e663",
+        "targetSkill": "buildkite-agent-runtime",
+        "kind": "paraphrase",
+        "phrase": "Inside a Buildkite step, Get or update a step attribute, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-agent-runtime"
+      ],
+      "turnDurationMs": 11255,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "02422a0b2f249a4a",
+        "targetSkill": "buildkite-agent-runtime",
+        "kind": "paraphrase",
+        "phrase": "Inside a Buildkite step, Please upload artifacts from a step.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-agent-runtime"
+      ],
+      "turnDurationMs": 9331,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f9d85b8efb6fb651",
+        "targetSkill": "buildkite-agent-runtime",
+        "kind": "paraphrase",
+        "phrase": "Inside a Buildkite step, Help me add an annotation.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-agent-runtime"
+      ],
+      "turnDurationMs": 11060,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5b3bd03d6ace1f8f",
+        "targetSkill": "buildkite-agent-runtime",
+        "kind": "paraphrase",
+        "phrase": "Inside a Buildkite step, Please add an annotation.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-agent-runtime"
+      ],
+      "turnDurationMs": 9634,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "e844582948b07ee3",
+        "targetSkill": "switchroom-health",
+        "kind": "paraphrase",
+        "phrase": "For switchroom doctor / health, Can you something's wrong?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-health"
+      ],
+      "turnDurationMs": 7116,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "38c496db06ca042e",
+        "targetSkill": "switchroom-health",
+        "kind": "paraphrase",
+        "phrase": "For switchroom doctor / health, What's wrong with my agents, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-health"
+      ],
+      "turnDurationMs": 8038,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "45f7bcbd87edb1a0",
+        "targetSkill": "switchroom-health",
+        "kind": "paraphrase",
+        "phrase": "For switchroom doctor / health, Could you what's wrong with my agents for me?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-health"
+      ],
+      "turnDurationMs": 9852,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "6c44000da91ee8a9",
+        "targetSkill": "switchroom-health",
+        "kind": "paraphrase",
+        "phrase": "For switchroom doctor / health, Help me can you check my setup.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-health"
+      ],
+      "turnDurationMs": 7125,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "52d2522e78f98256",
+        "targetSkill": "docx",
+        "kind": "paraphrase",
+        "phrase": "For my Word .docx document, Help me accept tracked changes.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "docx"
+      ],
+      "turnDurationMs": 6638,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "22153299d94f175f",
+        "targetSkill": "docx",
+        "kind": "paraphrase",
+        "phrase": "For my Word .docx document, Please insert page numbers.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 6301,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "84fa16f9d0a84d87",
+        "targetSkill": "docx",
+        "kind": "paraphrase",
+        "phrase": "For my Word .docx document, I'd like to read a .docx file.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "docx"
+      ],
+      "turnDurationMs": 5863,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f335b016c27d0c67",
+        "targetSkill": "docx",
+        "kind": "paraphrase",
+        "phrase": "For my Word .docx document, Can you produce a report as a Word file?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5961,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "3c53912915217d64",
+        "targetSkill": "humanizer",
+        "kind": "paraphrase",
+        "phrase": "To humanize my writing style, Let's rewrite this to sound natural.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 4047,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "89c7a45efc6e1394",
+        "targetSkill": "humanizer",
+        "kind": "paraphrase",
+        "phrase": "To humanize my writing style, Please edit this so it doesn't sound like AI.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 3963,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "c8f585a686af8431",
+        "targetSkill": "humanizer",
+        "kind": "paraphrase",
+        "phrase": "To humanize my writing style, Can you remove the rule of three?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "humanizer-calibrate"
+      ],
+      "turnDurationMs": 14903,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "8191a42776ed485d",
+        "targetSkill": "humanizer",
+        "kind": "paraphrase",
+        "phrase": "To humanize my writing style, Remove signs of AI writing, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8999,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "665560478e448425",
+        "targetSkill": "buildkite-test-engine",
+        "kind": "paraphrase",
+        "phrase": "Using Buildkite Test Engine, Help me detect flaky tests.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-test-engine"
+      ],
+      "turnDurationMs": 9680,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f3ace6e6c3fa4201",
+        "targetSkill": "buildkite-test-engine",
+        "kind": "paraphrase",
+        "phrase": "Using Buildkite Test Engine, Can you parallelize test suite?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-test-engine"
+      ],
+      "turnDurationMs": 11355,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "313115596135096a",
+        "targetSkill": "buildkite-test-engine",
+        "kind": "paraphrase",
+        "phrase": "Using Buildkite Test Engine, Can you configure test collectors?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-test-engine"
+      ],
+      "turnDurationMs": 6890,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "017fcc1d7c359dd5",
+        "targetSkill": "buildkite-test-engine",
+        "kind": "paraphrase",
+        "phrase": "Using Buildkite Test Engine, Let's speed up tests.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-test-engine"
+      ],
+      "turnDurationMs": 11171,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5143b16b4c05654b",
+        "targetSkill": "pdf",
+        "kind": "paraphrase",
+        "phrase": "For this PDF, Let's rotate PDF pages.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7714,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "26d2f1a74b3f4114",
+        "targetSkill": "pdf",
+        "kind": "paraphrase",
+        "phrase": "For this PDF, I need to watermark a PDF.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 7168,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "597d70c4e4463af6",
+        "targetSkill": "pdf",
+        "kind": "paraphrase",
+        "phrase": "For this PDF, Can you rotate PDF pages?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "pdf"
+      ],
+      "turnDurationMs": 14240,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "f9329dd1f9681dca",
+        "targetSkill": "pdf",
+        "kind": "paraphrase",
+        "phrase": "For this PDF, Can you fill a PDF form?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5452,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "be4139668ce4b14e",
+        "targetSkill": "buildkite-agent-infrastructure",
+        "kind": "paraphrase",
+        "phrase": "In Buildkite cluster admin, Create a queue, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-cli",
+        "buildkite-api"
+      ],
+      "turnDurationMs": 8499,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "fd5ece0866c5898e",
+        "targetSkill": "buildkite-agent-infrastructure",
+        "kind": "paraphrase",
+        "phrase": "In Buildkite cluster admin, Let's configure SSO.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 11549,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "ed549147aba8ee1d",
+        "targetSkill": "buildkite-agent-infrastructure",
+        "kind": "paraphrase",
+        "phrase": "In Buildkite cluster admin, Could you scale queues for me?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 12181,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "6177f6ab899225e5",
+        "targetSkill": "buildkite-agent-infrastructure",
+        "kind": "paraphrase",
+        "phrase": "In Buildkite cluster admin, I need to configure SSO.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8474,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "c42936c61f316447",
+        "targetSkill": "telegram-test-harness",
+        "kind": "paraphrase",
+        "phrase": "For switchroom telegram-plugin testing, Let's write a telegram test.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "telegram-test-harness"
+      ],
+      "turnDurationMs": 9412,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "67ebd354c29d056c",
+        "targetSkill": "telegram-test-harness",
+        "kind": "paraphrase",
+        "phrase": "For switchroom telegram-plugin testing, Mock the bot api, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "telegram-test-harness"
+      ],
+      "turnDurationMs": 12851,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "ffea993e13a71afb",
+        "targetSkill": "telegram-test-harness",
+        "kind": "paraphrase",
+        "phrase": "For switchroom telegram-plugin testing, Write a telegram regression test, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "telegram-test-harness"
+      ],
+      "turnDurationMs": 47223,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "bc9c639e06a70667",
+        "targetSkill": "telegram-test-harness",
+        "kind": "paraphrase",
+        "phrase": "For switchroom telegram-plugin testing, Test pin behavior, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "telegram-test-harness"
+      ],
+      "turnDurationMs": 8417,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "5a3acf93220d58a7",
+        "targetSkill": "switchroom-cli",
+        "kind": "paraphrase",
+        "phrase": "In switchroom (the CLI), Please sync my config.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-runtime"
+      ],
+      "turnDurationMs": 6341,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "a894b1c34c7b3b3b",
+        "targetSkill": "switchroom-cli",
+        "kind": "paraphrase",
+        "phrase": "In switchroom (the CLI), Could you check the journal for me?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-cli"
+      ],
+      "turnDurationMs": 10550,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "40f57f2fbc60d624",
+        "targetSkill": "switchroom-cli",
+        "kind": "paraphrase",
+        "phrase": "In switchroom (the CLI), Can you why did it crash?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-health"
+      ],
+      "turnDurationMs": 8162,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "96c73a88e679b96b",
+        "targetSkill": "switchroom-cli",
+        "kind": "paraphrase",
+        "phrase": "In switchroom (the CLI), Upgrade switchroom, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "switchroom-cli",
+        "switchroom-runtime"
+      ],
+      "turnDurationMs": 9342,
+      "timedOut": false,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "4670e3667b17b5ca",
+        "targetSkill": "buildkite-migration",
+        "kind": "paraphrase",
+        "phrase": "Migrating to Buildkite, Can you what's the Buildkite equivalent of?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 10915,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "46cee6590497ec0a",
+        "targetSkill": "buildkite-migration",
+        "kind": "paraphrase",
+        "phrase": "Migrating to Buildkite, Let's convert pipelines from Jenkins.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 8919,
+      "timedOut": true,
+      "agentName": "claude-cli",
+      "error": ""
+    },
+    {
+      "probe": {
+        "id": "320f93b53c0994dd",
+        "targetSkill": "buildkite-migration",
+        "kind": "paraphrase",
+        "phrase": "Migrating to Buildkite, What's the Buildkite equivalent of, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [],
+      "turnDurationMs": 5028,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "653715a0b5dee808",
+        "targetSkill": "buildkite-migration",
+        "kind": "paraphrase",
+        "phrase": "Migrating to Buildkite, Help me convert pipelines from Jenkins.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "buildkite-migration"
+      ],
+      "turnDurationMs": 11318,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "39cd5eb6b6b17d11",
+        "targetSkill": "humanizer-calibrate",
+        "kind": "paraphrase",
+        "phrase": "Let's humanizer-calibrate.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "humanizer-calibrate"
+      ],
+      "turnDurationMs": 8000,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "c125261face8b61b",
+        "targetSkill": "humanizer-calibrate",
+        "kind": "paraphrase",
+        "phrase": "Please calibrate humanizer.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "humanizer-calibrate"
+      ],
+      "turnDurationMs": 7578,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "837ba534114c06ca",
+        "targetSkill": "humanizer-calibrate",
+        "kind": "paraphrase",
+        "phrase": "Make humanizer sound more like me, please.",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "humanizer-calibrate"
+      ],
+      "turnDurationMs": 10831,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    },
+    {
+      "probe": {
+        "id": "9981906fb7f32443",
+        "targetSkill": "humanizer-calibrate",
+        "kind": "paraphrase",
+        "phrase": "Can you humanizer-calibrate?",
+        "source": "paraphrase-template"
+      },
+      "skillsInvoked": [
+        "humanizer-calibrate"
+      ],
+      "turnDurationMs": 7381,
+      "timedOut": false,
+      "agentName": "claude-cli"
+    }
+  ]
+}

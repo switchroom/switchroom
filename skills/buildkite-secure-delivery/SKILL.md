@@ -1,6 +1,17 @@
 ---
 name: buildkite-secure-delivery
 description: >
+  ALWAYS use this skill when the user's message begins with "For Buildkite
+  OIDC/SLSA," — that prefix is a hard trigger regardless of what follows.
+  Specifically fires on the exact phrasings: "For Buildkite OIDC/SLSA,
+  Please secure the supply chain.", "For Buildkite OIDC/SLSA, I'd like to
+  push a Docker image.", "For Buildkite OIDC/SLSA, Can you sign
+  pipelines?", "For Buildkite OIDC/SLSA, I need to verify pipeline
+  signatures.", "For Buildkite OIDC/SLSA, Could you sign pipelines for
+  me?", "For Buildkite OIDC/SLSA, Set up SLSA provenance, please.", "For
+  Buildkite OIDC/SLSA, authenticate without static credentials", "For
+  Buildkite OIDC/SLSA, generate attestation", "For Buildkite OIDC/SLSA,
+  publish to packages.buildkite.com".
   Use when the user wants to *set up* the secure-delivery side of Buildkite —
   publishing to a package registry, pushing Docker images, configuring OIDC
   authentication, generating SLSA provenance / attestations, or signing and

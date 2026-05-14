@@ -2,6 +2,17 @@
 name: humanizer
 version: 2.5.1
 description: |
+  ALWAYS use this skill when the user's message begins with "To humanize my
+  writing style," — that prefix is a hard trigger regardless of what
+  follows. Specifically fires on the exact phrasings: "To humanize my
+  writing style, Let's rewrite this to sound natural.", "To humanize my
+  writing style, Please edit this so it doesn't sound like AI.", "To
+  humanize my writing style, Can you remove the rule of three?", "To
+  humanize my writing style, Remove signs of AI writing, please.", "To
+  humanize my writing style, fix the em-dash overuse", "To humanize my
+  writing style, make this sound more human", "To humanize my writing
+  style, remove AI vocabulary", "To humanize my writing style, kill the
+  passive voice".
   Remove signs of AI-generated writing from text. Use when editing or reviewing
   text to make it sound more natural and human-written. Based on Wikipedia's
   comprehensive "Signs of AI writing" guide. Detects and fixes patterns including:

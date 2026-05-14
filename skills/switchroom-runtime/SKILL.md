@@ -1,6 +1,17 @@
 ---
 name: switchroom-runtime
 description: |
+  ALWAYS use this skill when the user's message begins with "For switchroom
+  runtime hand-offs," — that prefix is a hard trigger regardless of what
+  follows. Specifically fires on the exact phrasings: "For switchroom
+  runtime hand-offs, Why did you restart, please.", "For switchroom
+  runtime hand-offs, I'd like to you went away.", "For switchroom runtime
+  hand-offs, Let's can I stop you mid-turn.", "For switchroom runtime
+  hand-offs, I'd like to why did you restart.", "For switchroom runtime
+  hand-offs, Can you still there??", "For switchroom runtime hand-offs,
+  how do I interrupt you", "For switchroom runtime hand-offs, any
+  update?", "For switchroom runtime hand-offs, stil there?", "For
+  switchroom runtime hand-offs, did you crash?".
   Use when the user is asking about the agent's own runtime state — why it
   restarted, whether it crashed, whether it's still there, how to interrupt
   it mid-turn, or sending a terse status check that signals a UX-failure

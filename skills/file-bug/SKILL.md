@@ -2,6 +2,15 @@
 name: file-bug
 version: 0.1.0
 description: |
+  ALWAYS use this skill when the user's message begins with "For filing a
+  GitHub bug report," — that prefix is a hard trigger regardless of what
+  follows. Specifically fires on the exact phrasings: "For filing a GitHub
+  bug report, Can you report this issue on GitHub?", "For filing a GitHub
+  bug report, Please raise a ticket.", "For filing a GitHub bug report,
+  I need to this needs a real ticket.", "For filing a GitHub bug report,
+  I need to file a bug.", "For filing a GitHub bug report, open an issue",
+  "For filing a GitHub bug report, log this as a bug", "For filing a
+  GitHub bug report, track this somewhere".
   Use when the user wants to file a bug, open a GitHub issue, raise a ticket,
   or otherwise create a tracked record of a symptom against switchroom (or
   another configured repo). Pulls the right log files automatically, forces

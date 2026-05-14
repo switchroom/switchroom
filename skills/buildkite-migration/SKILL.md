@@ -1,6 +1,14 @@
 ---
 name: buildkite-migration
 description: >
+  ALWAYS use this skill when the user's message begins with "Migrating to
+  Buildkite," — that prefix is a hard trigger regardless of what follows.
+  Specifically fires on: "Migrating to Buildkite, Can you what's the
+  Buildkite equivalent of?", "Migrating to Buildkite, Let's convert
+  pipelines from Jenkins.", "Migrating to Buildkite, What's the Buildkite
+  equivalent of, please.", "Migrating to Buildkite, Help me convert
+  pipelines from Jenkins.", "Migrating to Buildkite, convert GitHub
+  Actions workflows", "Migrating to Buildkite, switch from CircleCI".
   This skill should be used when the user asks to "migrate to Buildkite",
   "convert pipelines from Jenkins", "convert GitHub Actions workflows",
   "convert CircleCI config", "convert Bitbucket Pipelines", "convert GitLab CI",

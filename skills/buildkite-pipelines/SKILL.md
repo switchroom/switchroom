@@ -18,9 +18,15 @@ description: >
   `notify`, `concurrency`, plugin blocks, matrix steps, or general
   Buildkite CI configuration.
   Do NOT use when the user is invoking `buildkite-agent <subcommand>` inside
-  a running step — that's `buildkite-agent-runtime`. Do NOT use for
-  terminal-driven `bk` CLI operations — that's `buildkite-cli`. Do NOT use
-  for direct REST/GraphQL API calls — that's `buildkite-api`.
+  a running step — that's `buildkite-agent-runtime`. In particular, if the
+  user's message begins with "Inside a Buildkite step," that is the
+  hard-trigger prefix for `buildkite-agent-runtime`, NOT this skill — even
+  if the message also mentions annotations, artifacts, step attributes, or
+  pipeline upload. The distinguishing rule is: authoring `pipeline.yml` =
+  this skill; calling the `buildkite-agent` binary from inside a running
+  job = `buildkite-agent-runtime`. Do NOT use for terminal-driven `bk` CLI
+  operations — that's `buildkite-cli`. Do NOT use for direct REST/GraphQL
+  API calls — that's `buildkite-api`.
 ---
 
 # Buildkite Pipelines

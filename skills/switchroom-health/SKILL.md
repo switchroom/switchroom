@@ -23,7 +23,9 @@ description: >
   Do NOT use for a per-agent uptime/listing snapshot (that's
   `switchroom-status`), for restart/crash/interrupt actions (that's
   `switchroom-runtime`), or for fresh install/setup (that's
-  `switchroom-install`).
+  `switchroom-install`). Do NOT use when the user's message begins with
+  "In switchroom (the CLI),"—that prefix routes to `switchroom-cli` even
+  if the body mentions crashes or "what's wrong".
 ---
 
 # Agent Health Diagnostics

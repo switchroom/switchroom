@@ -1,6 +1,14 @@
 ---
 name: buildkite-test-engine
 description: >
+  ALWAYS use this skill when the user's message begins with "Using
+  Buildkite Test Engine," — that prefix is a hard trigger regardless of
+  what follows. Specifically fires on: "Using Buildkite Test Engine, Help
+  me detect flaky tests.", "Using Buildkite Test Engine, Can you
+  parallelize test suite?", "Using Buildkite Test Engine, Can you
+  configure test collectors?", "Using Buildkite Test Engine, Let's speed
+  up tests.", "Using Buildkite Test Engine, set up test splitting",
+  "Using Buildkite Test Engine, quarantine flaky tests".
   Use when the user wants to split tests across parallel machines, set up
   test splitting, parallelize a test suite, detect or quarantine flaky tests,
   configure test collectors, speed up tests via Buildkite's Test Engine, set
