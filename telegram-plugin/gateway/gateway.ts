@@ -85,7 +85,12 @@ import { writeQuarantineMarker } from './quarantine.js'
 // RFC H §7.3: auth-dashboard + auth-slot-parser deleted. Three chat
 // verbs (/auth show | use | rotate) talk to switchroom-auth-broker
 // via the thin client in src/auth/broker/client.ts.
-import { parseAuthCommand, handleAuthCommand, isAuthAdmin } from './auth-command.js'
+import {
+  parseAuthCommand,
+  handleAuthCommand,
+  isAuthAdmin,
+  pendingAuthRmFlows,
+} from './auth-command.js'
 import type { AuthBrokerClient } from './auth-command.js'
 import type { ListStateData } from './auth-line.js'
 import { getAuthBrokerClient, addAccountViaBroker } from './auth-broker-client.js'
@@ -2027,6 +2032,10 @@ const pendingStateReaper = setInterval(() => {
       cancelAccountAuthSession(v)
       pendingAuthAddFlows.delete(k)
     }
+  }
+  // /auth rm two-step confirm window — self-expires at `expiresAt`.
+  for (const [k, v] of pendingAuthRmFlows) {
+    if (now >= v.expiresAt) pendingAuthRmFlows.delete(k)
   }
   for (const [k, v] of pendingVaultOps) {
     if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
@@ -8591,7 +8600,12 @@ bot.command("auth", async ctx => {
     await switchroomReply(ctx, "<b>/auth unavailable:</b> auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
     return
   }
-  const reply = await handleAuthCommand(parsed, { agentName: currentAgent, adminAgents, client })
+  const reply = await handleAuthCommand(parsed, {
+    agentName: currentAgent,
+    adminAgents,
+    client,
+    chatId,
+  })
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
