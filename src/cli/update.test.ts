@@ -357,6 +357,58 @@ describe("--status (#927)", () => {
     expect(err.join("")).toMatch(/--json is only honored under --status/);
   });
 
+  it("formatStatusReport handles long service names without breaking column alignment", async () => {
+    const { formatStatusReport } = await import("./update.js");
+    const now = Date.parse("2026-05-14T18:00:00Z");
+    const out = formatStatusReport({
+      cliVersion: "0.7.13",
+      cliBuiltAt: null,
+      services: [
+        {
+          name: "vault-broker",
+          image: "ghcr.io/x/sw-broker:latest",
+          imageDigestShort: "abc",
+          imagePulledAt: new Date(now - 3600 * 1000).toISOString(),
+          containerCreatedAt: new Date(now - 1800 * 1000).toISOString(),
+          status: "running",
+        },
+        {
+          name: "switchroom-auth-broker",
+          image: "ghcr.io/x/sw-auth-broker:latest",
+          imageDigestShort: "def",
+          imagePulledAt: new Date(now - 3600 * 1000).toISOString(),
+          containerCreatedAt: new Date(now - 1800 * 1000).toISOString(),
+          status: "running",
+        },
+      ],
+      warnings: [],
+    });
+    // The auth-broker line should appear, and the vault-broker line
+    // should be padded out to align with the longer name.
+    expect(out).toContain("switchroom-auth-broker");
+    expect(out).toContain("vault-broker");
+    // Pulled-from-padding: vault-broker should be padded with at least
+    // (len(switchroom-auth-broker) - len(vault-broker)) = 10 trailing spaces
+    // before the status column. We assert the [abc] digest comes after
+    // a run of >= 2 spaces on the vault-broker line.
+    const vaultLine = out.split("\n").find((l) => l.includes("vault-broker"))!;
+    expect(vaultLine).toMatch(/vault-broker {10,}/);
+  });
+
+  it("serviceToContainerName maps every compose-service shape", async () => {
+    const { serviceToContainerName } = await import("./update.js");
+    expect(serviceToContainerName("agent-clerk")).toBe("switchroom-clerk");
+    expect(serviceToContainerName("vault-broker")).toBe("switchroom-vault-broker");
+    expect(serviceToContainerName("approval-kernel")).toBe("switchroom-approval-kernel");
+    // Already-prefixed services (e.g. the auth-broker service that's
+    // named `switchroom-auth-broker` in compose) must NOT be double-
+    // prefixed — that would land on `switchroom-switchroom-auth-broker`
+    // and `docker inspect` would always miss.
+    expect(serviceToContainerName("switchroom-auth-broker")).toBe(
+      "switchroom-auth-broker",
+    );
+  });
+
   it("runUpdate --status --json emits parseable JSON with the report shape", async () => {
     const { runUpdate } = await import("./update.js");
     const out: string[] = [];

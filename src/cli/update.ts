@@ -485,6 +485,29 @@ export interface StatusReport {
 }
 
 /**
+ * Map a compose service name to the container_name the generator
+ * emits. Compose conventions in `src/agents/compose.ts`:
+ *
+ *   - `agent-<name>`             → `switchroom-<name>`
+ *   - `vault-broker`             → `switchroom-vault-broker`
+ *   - `approval-kernel`          → `switchroom-approval-kernel`
+ *   - `switchroom-auth-broker`   → `switchroom-auth-broker` (already prefixed)
+ *
+ * The auth-broker service name is already prefixed in the compose
+ * generator (RFC H §4.1), so we don't double-prefix it. Any future
+ * service that decides to live under the `switchroom-` namespace at
+ * service-name level (rather than via prefix at container_name level)
+ * is picked up the same way.
+ *
+ * @internal exported for testing
+ */
+export function serviceToContainerName(svc: string): string {
+  if (svc.startsWith("agent-")) return `switchroom-${svc.slice("agent-".length)}`;
+  if (svc.startsWith("switchroom-")) return svc;
+  return `switchroom-${svc}`;
+}
+
+/**
  * Probe the host for current update state. No side effects. Heavy on
  * docker shellouts but each is bounded by spawnSync's default timeout.
  */
@@ -576,12 +599,7 @@ function defaultStatusProbe(composePath: string): StatusReport {
   }
 
   for (const svc of serviceList) {
-    // Map service → container name. Compose generator uses
-    // `switchroom-<svc-without-agent-prefix>` for agents, or the bare
-    // service name for singletons (vault-broker / approval-kernel).
-    const containerName = svc.startsWith("agent-")
-      ? `switchroom-${svc.slice("agent-".length)}`
-      : `switchroom-${svc}`;
+    const containerName = serviceToContainerName(svc);
     let image: string | null = null;
     let containerCreatedAt: string | null = null;
     let status = "<unknown>";
