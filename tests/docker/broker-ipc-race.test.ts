@@ -206,13 +206,20 @@ function buildTestCompose(agents: string[], cfgPath: string): string {
     `      SWITCHROOM_CONFIG: /state/config/switchroom.yaml`,
     `      SWITCHROOM_KERNEL_DB_PATH: /state/approvals/kernel.db`,
   ]);
-  // Mount the test config into broker + kernel.
+  yml = mergeServiceEnv(yml, "switchroom-auth-broker", [
+    `      SWITCHROOM_CONFIG: /state/config/switchroom.yaml`,
+  ]);
+  // Mount the test config into broker + kernel + auth-broker.
   yml = yml.replace(
     /(  vault-broker:[\s\S]*?volumes:\n)/,
     `$1      - ${cfgPath}:/state/config/switchroom.yaml:ro\n`,
   );
   yml = yml.replace(
     /(  approval-kernel:[\s\S]*?volumes:\n)/,
+    `$1      - ${cfgPath}:/state/config/switchroom.yaml:ro\n`,
+  );
+  yml = yml.replace(
+    /(  switchroom-auth-broker:[\s\S]*?volumes:\n)/,
     `$1      - ${cfgPath}:/state/config/switchroom.yaml:ro\n`,
   );
   // Phase 4 cron-fold-in cutover: the singleton scheduler container
