@@ -8,7 +8,7 @@
  * the `AuthBrokerClient` interface from `./auth-command.ts`.
  */
 
-import { AuthBrokerClient as BrokerClient } from '../../src/auth/broker/client.js'
+import { AuthBrokerClient as BrokerClient, type AddAccountCredentials } from '../../src/auth/broker/client.js'
 import type { AuthBrokerClient } from './auth-command.js'
 
 /**
@@ -45,4 +45,25 @@ export async function getAuthBrokerClient(
 ): Promise<AuthBrokerClient | null> {
   const { client } = createAuthBrokerClient()
   return client
+}
+
+/**
+ * Add an account via the broker. Used exclusively by the `/auth add`
+ * chat flow — the narrow {@link AuthBrokerClient} surface in
+ * `auth-command.ts` deliberately omits `addAccount` because the verb
+ * is gateway-routed (not handler-routed). Constructs and closes a
+ * one-shot {@link BrokerClient} so the gateway doesn't need a
+ * long-lived handle just for this verb.
+ */
+export async function addAccountViaBroker(
+  label: string,
+  credentials: AddAccountCredentials,
+  opts: { replace?: boolean } = {},
+): Promise<{ label: string; expiresAt?: number }> {
+  const broker = new BrokerClient()
+  try {
+    return await broker.addAccount(label, credentials, opts.replace)
+  } finally {
+    await broker.close()
+  }
 }

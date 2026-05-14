@@ -24,7 +24,34 @@ export type ParsedAuthCommand =
   | { kind: 'show' }
   | { kind: 'use'; label: string }
   | { kind: 'rotate' }
+  | { kind: 'add'; label: string }
+  | { kind: 'cancel' }
   | { kind: 'help'; reason?: string }
+
+/**
+ * Account-label regex — must match the broker's `LABEL_RE` in
+ * `src/auth/account-store.ts`. Duplicated rather than imported to
+ * keep `auth-command.ts` pure (no side-effecting imports) so the
+ * parser is cheap to unit test.
+ */
+const LABEL_RE = /^[A-Za-z0-9._@+-]+$/
+const LABEL_MAX = 64
+
+/** Returns null when label is valid; otherwise a user-facing error string. */
+export function validateAuthAddLabel(label: string): string | null {
+  if (!label || label.length === 0) return 'Label cannot be empty.'
+  if (label.length > LABEL_MAX) {
+    return `Label too long (max ${LABEL_MAX} chars).`
+  }
+  if (label === '.' || label === '..') return `Label "${label}" is reserved.`
+  if (label.includes('/') || label.includes('\\')) {
+    return 'Label cannot contain path separators.'
+  }
+  if (!LABEL_RE.test(label)) {
+    return 'Label must match <code>[A-Za-z0-9._@+-]+</code> (letters, digits, dot, underscore, dash, @, +).'
+  }
+  return null
+}
 
 /**
  * Parse a `/auth …` chat command. Returns `null` when the text is
@@ -56,6 +83,15 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (!label) return { kind: 'help', reason: 'Usage: /auth use <label>' }
       return { kind: 'use', label }
     }
+    case 'add': {
+      const label = parts[1]
+      if (!label) return { kind: 'help', reason: 'Usage: /auth add <label>' }
+      const err = validateAuthAddLabel(label)
+      if (err) return { kind: 'help', reason: err }
+      return { kind: 'add', label }
+    }
+    case 'cancel':
+      return { kind: 'cancel' }
     default:
       return { kind: 'help', reason: `Unknown verb: <code>${escapeHtml(verb)}</code>` }
   }
@@ -100,10 +136,12 @@ export async function handleAuthCommand(
     const reason = parsed.reason ? `${parsed.reason}\n\n` : ''
     return {
       text:
-        `${reason}<b>/auth</b> — three verbs:\n` +
+        `${reason}<b>/auth</b> — verbs:\n` +
         `  <code>/auth show</code> — fleet snapshot (read-only)\n` +
         `  <code>/auth use &lt;label&gt;</code> — swap fleet active (admin)\n` +
-        `  <code>/auth rotate</code> — failover to next non-exhausted (admin)`,
+        `  <code>/auth rotate</code> — failover to next non-exhausted (admin)\n` +
+        `  <code>/auth add &lt;label&gt;</code> — add a new Anthropic OAuth account (admin)\n` +
+        `  <code>/auth cancel</code> — abort a pending <code>/auth add</code> flow (admin)`,
       html: true,
     }
   }
@@ -126,6 +164,19 @@ export async function handleAuthCommand(
       text:
         `<b>Not authorized.</b> <code>/auth ${parsed.kind}</code> is admin-only.\n` +
         `Add this agent to <code>auth.admin_agents</code> in switchroom.yaml to unlock.`,
+      html: true,
+    }
+  }
+
+  // `add` and `cancel` are dispatched directly by the gateway (they
+  // need to drive the `claude setup-token` scratch-dir lifecycle and
+  // the per-chat pending-paste state). They should never reach this
+  // handler in production — if they do (defensive), return a clear
+  // error rather than silently coercing into a different verb.
+  if (parsed.kind === 'add' || parsed.kind === 'cancel') {
+    return {
+      text:
+        `<b>/auth ${parsed.kind} not routed.</b> Internal error — gateway should dispatch this verb directly. Report this.`,
       html: true,
     }
   }
@@ -177,9 +228,21 @@ export async function handleAuthCommand(
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
+/**
+ * Admin gate. Exposed so the gateway-routed verbs (`/auth add`,
+ * `/auth cancel`) reuse the same ACL check as the handler-routed
+ * verbs (`/auth use`, `/auth rotate`).
+ */
+export function isAuthAdmin(args: {
+  agentName: string
+  adminAgents: ReadonlyArray<string> | undefined
+}): boolean {
+  if (!args.adminAgents || args.adminAgents.length === 0) return false
+  return args.adminAgents.includes(args.agentName)
+}
+
 function isAdmin(ctx: AuthCommandContext): boolean {
-  if (!ctx.adminAgents || ctx.adminAgents.length === 0) return false
-  return ctx.adminAgents.includes(ctx.agentName)
+  return isAuthAdmin(ctx)
 }
 
 /**
@@ -237,6 +300,13 @@ export function renderShowText(state: ListStateData, now: number = Date.now()): 
     lines.push(formatConsumersTable(state, now))
     lines.push('</pre>')
   }
+
+  // Discovery hint — operators on a quota-walled fleet need to know
+  // `/auth add` exists so they can add a fresh account without an
+  // LLM in the loop. Keep it short; the help text has the full menu.
+  lines.push(
+    '<i>Add a new Anthropic account: <code>/auth add &lt;label&gt;</code> (admin)</i>',
+  )
 
   return lines.join('\n')
 }

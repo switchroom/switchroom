@@ -85,10 +85,17 @@ import { writeQuarantineMarker } from './quarantine.js'
 // RFC H §7.3: auth-dashboard + auth-slot-parser deleted. Three chat
 // verbs (/auth show | use | rotate) talk to switchroom-auth-broker
 // via the thin client in src/auth/broker/client.ts.
-import { parseAuthCommand, handleAuthCommand } from './auth-command.js'
+import { parseAuthCommand, handleAuthCommand, isAuthAdmin } from './auth-command.js'
 import type { AuthBrokerClient } from './auth-command.js'
 import type { ListStateData } from './auth-line.js'
-import { getAuthBrokerClient } from './auth-broker-client.js'
+import { getAuthBrokerClient, addAccountViaBroker } from './auth-broker-client.js'
+import {
+  pendingAuthAddFlows,
+  startAccountAuthSession,
+  submitAccountAuthCode,
+  cancelAccountAuthSession,
+  cleanScratchDir as cleanAuthAddScratchDir,
+} from './auth-add-flow.js'
 import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
@@ -2014,6 +2021,12 @@ const pendingStateReaper = setInterval(() => {
   const now = Date.now()
   for (const [k, v] of pendingReauthFlows) {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) pendingReauthFlows.delete(k)
+  }
+  for (const [k, v] of pendingAuthAddFlows) {
+    if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
+      cancelAccountAuthSession(v)
+      pendingAuthAddFlows.delete(k)
+    }
   }
   for (const [k, v] of pendingVaultOps) {
     if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
@@ -5930,6 +5943,60 @@ async function handleInbound(
     return
   }
 
+  // `/auth add` paste-back intercept — sibling to pendingReauthFlows.
+  // Both intercepts are deliberate so the LLM never sees the OAuth
+  // code (it doesn't need to + plaintext OAuth in chat history is bad
+  // hygiene). The add-flow intercept comes first because /auth add
+  // creates fresh credentials at the broker layer, vs /reauth which
+  // mutates an existing agent's slot — different success paths.
+  const pendingAdd = pendingAuthAddFlows.get(chat_id)
+  if (pendingAdd && looksLikeAuthCode(text)) {
+    const elapsed = Date.now() - pendingAdd.startedAt
+    if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
+      pendingAuthAddFlows.delete(chat_id)
+      try {
+        const credentials = await submitAccountAuthCode(pendingAdd, text.trim())
+        try {
+          await addAccountViaBroker(pendingAdd.label, credentials, { replace: false })
+          // success — wipe scratch dir now that the broker owns the creds
+          cleanAuthAddScratchDir(pendingAdd.scratchDir)
+          await switchroomReply(
+            ctx,
+            `✓ Account <code>${escapeHtmlForTg(pendingAdd.label)}</code> added.\n` +
+              `The fleet's active account hasn't changed. Send ` +
+              `<code>/auth use ${escapeHtmlForTg(pendingAdd.label)}</code> to switch to it.`,
+            { html: true },
+          )
+        } catch (brokerErr) {
+          // Broker rejected (e.g. label already exists). Wipe scratch
+          // either way — the credentials are useless without broker
+          // bookkeeping.
+          cleanAuthAddScratchDir(pendingAdd.scratchDir)
+          await switchroomReply(
+            ctx,
+            `<b>/auth add failed at broker:</b> ${escapeHtmlForTg((brokerErr as Error)?.message ?? String(brokerErr))}`,
+            { html: true },
+          )
+        }
+      } catch (err) {
+        // submitAccountAuthCode wiped the scratch dir on its own
+        // failure paths (timeout, child exit, stdin broken).
+        await switchroomReply(
+          ctx,
+          `<b>/auth add code failed:</b> ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+          { html: true },
+        )
+      }
+      // Redact the OAuth code paste from chat history (#488).
+      redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
+      return
+    }
+    // Stale — drop the pending entry but let the message fall through
+    // to other intercepts (defensively wipe scratch).
+    cancelAccountAuthSession(pendingAdd)
+    pendingAuthAddFlows.delete(chat_id)
+  }
+
   // Auth-code intercept
   const pendingReauth = pendingReauthFlows.get(chat_id)
   if (pendingReauth && looksLikeAuthCode(text)) {
@@ -8455,6 +8522,70 @@ bot.command("auth", async ctx => {
     const raw = (cfg as unknown as { auth?: { admin_agents?: unknown } } )?.auth?.admin_agents
     if (Array.isArray(raw)) adminAgents = raw.filter((s): s is string => typeof s === "string")
   } catch { /* best-effort */ }
+
+  // `/auth add` and `/auth cancel` are gateway-routed (drive a
+  // scratch-dir-backed `claude setup-token` lifecycle the broker
+  // client can't model). Everything else delegates to
+  // handleAuthCommand which only needs the narrow broker surface.
+  const chatId = String(ctx.chat?.id ?? '')
+  if (parsed.kind === 'add' || parsed.kind === 'cancel') {
+    if (!isAuthAdmin({ agentName: currentAgent, adminAgents })) {
+      await switchroomReply(
+        ctx,
+        `<b>Not authorized.</b> <code>/auth ${parsed.kind}</code> is admin-only.\n` +
+          `Add this agent to <code>auth.admin_agents</code> in switchroom.yaml to unlock.`,
+        { html: true },
+      )
+      return
+    }
+    if (parsed.kind === 'cancel') {
+      const existing = pendingAuthAddFlows.get(chatId)
+      if (!existing) {
+        await switchroomReply(ctx, "<i>No pending <code>/auth add</code> flow in this chat.</i>", { html: true })
+        return
+      }
+      cancelAccountAuthSession(existing)
+      pendingAuthAddFlows.delete(chatId)
+      await switchroomReply(ctx, "Cancelled.", { html: true })
+      return
+    }
+    // parsed.kind === 'add'
+    if (pendingAuthAddFlows.has(chatId)) {
+      await switchroomReply(
+        ctx,
+        "<i>An <code>/auth add</code> flow is already in progress for this chat. " +
+          "Finish the paste, or send <code>/auth cancel</code> to abort.</i>",
+        { html: true },
+      )
+      return
+    }
+    try {
+      const { loginUrl, scratchDir, child } = await startAccountAuthSession(parsed.label)
+      pendingAuthAddFlows.set(chatId, {
+        label: parsed.label,
+        scratchDir,
+        child,
+        startedAt: Date.now(),
+      })
+      await switchroomReply(
+        ctx,
+        `<b>Adding account</b> <code>${escapeHtmlForTg(parsed.label)}</code>\n\n` +
+          `1. Open this URL on your phone:\n${loginUrl}\n\n` +
+          `2. Log into Anthropic, copy the code Claude shows.\n` +
+          `3. Paste it back here.\n\n` +
+          `Send <code>/auth cancel</code> to abort.`,
+        { html: true },
+      )
+    } catch (err) {
+      await switchroomReply(
+        ctx,
+        `<b>/auth add failed:</b> ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        { html: true },
+      )
+    }
+    return
+  }
+
   const client = await getAuthBrokerClient(currentAgent)
   if (!client) {
     await switchroomReply(ctx, "<b>/auth unavailable:</b> auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
