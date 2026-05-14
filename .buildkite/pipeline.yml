@@ -113,6 +113,14 @@ steps:
         curl -fsSL https://bun.sh/install | bash
       fi
       export PATH="$$HOME/.bun/bin:$$PATH"
+      # tests/boot-self-test.test.ts shells bin/boot-self-test.sh, which
+      # `jq`-parses `switchroom auth heal --json`. Buildkite hosted Ubuntu
+      # agents don't ship jq; without it the script silently exits 0 with
+      # no findings and the 5 boot-self-test.sh > records auth.* tests
+      # fail with "expected undefined to be defined".
+      if ! command -v jq >/dev/null 2>&1; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      fi
       bun install --frozen-lockfile --prefer-offline --no-progress
       # Note: do NOT separately `(cd telegram-plugin && bun install …)`.
       # `telegram-plugin` is a workspace of the root (see /package.json

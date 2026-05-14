@@ -5,7 +5,7 @@
  * Mirrors the test pattern in `tests/auth-accounts-yaml.test.ts`.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it } from "vitest";
 
 import {
   disableAgentsOnGoogleAccount,

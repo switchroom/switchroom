@@ -402,14 +402,21 @@ export function generateForSkill(
     });
   }
 
-  // ── indirect: 3 (curated table preferred, fallback to generic)
+  // ── indirect: 3 (curated table preferred, fallback to generic). Honour
+  // the existing yaml-seeded count so cap-aware generation matches paraphrase/
+  // typo/slang above — 3 yaml + 3 template = 6 would violate the documented
+  // per-category cap that tests/skill-coverage/tests/corpus.test.ts pins.
+  const indirectRemaining = Math.max(
+    0,
+    3 - probes.filter((p) => p.kind === "indirect").length,
+  );
   const indirectPool =
     INDIRECT_TEMPLATES[skill.id] ?? [
       `something is going on with ${skill.id}`,
       `the ${skill.id} thing is weird`,
       `can you take a look at the ${skill.id} situation`,
     ];
-  const indirects = pickN(indirectPool, 3, rng);
+  const indirects = pickN(indirectPool, indirectRemaining, rng);
   for (const phrase of indirects) {
     push({
       targetSkill: skill.id,
