@@ -2024,6 +2024,7 @@ function isAutoFallbackCooldownActive(_agentName: string, now: number): boolean 
 // 60-second sweep drops anything past its documented TTL.
 const pendingStateReaper = setInterval(() => {
   const now = Date.now()
+  // OAuth-code state grouped first (pinned by secret-detect-oauth-code.test.ts).
   for (const [k, v] of pendingReauthFlows) {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) pendingReauthFlows.delete(k)
   }
@@ -2032,6 +2033,9 @@ const pendingStateReaper = setInterval(() => {
       cancelAccountAuthSession(v)
       pendingAuthAddFlows.delete(k)
     }
+  }
+  for (const [k, v] of awaitingAuthCodeAt) {
+    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
   }
   // /auth rm two-step confirm window — self-expires at `expiresAt`.
   for (const [k, v] of pendingAuthRmFlows) {
@@ -2045,9 +2049,6 @@ const pendingStateReaper = setInterval(() => {
   }
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
-  }
-  for (const [k, v] of awaitingAuthCodeAt) {
-    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
   }
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
