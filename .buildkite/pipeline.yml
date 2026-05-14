@@ -119,9 +119,15 @@ steps:
       # no findings and the 5 boot-self-test.sh > records auth.* tests
       # fail with "expected undefined to be defined". Agent runs as root
       # (HOME=/root, see the cache mount log line) and `sudo` isn't on
-      # PATH; call apt-get directly.
+      # PATH; call apt-get directly. Drop -qq so an install failure
+      # surfaces — the silent-failure mode is what wedged builds 1948/1957.
+      echo "--- jq probe before install ---"
+      command -v jq || echo "jq missing"
       if ! command -v jq >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq jq
+        apt-get update && apt-get install -y jq
+        echo "--- jq probe after install ---"
+        command -v jq || echo "jq STILL missing after install — fail loud"
+        command -v jq >/dev/null 2>&1 || exit 1
       fi
       bun install --frozen-lockfile --prefer-offline --no-progress
       # Note: do NOT separately `(cd telegram-plugin && bun install …)`.
