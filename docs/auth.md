@@ -210,11 +210,42 @@ broker's boot-time config check both enforce this.
 
 ## Telegram surface
 
-Three commands the gateway recognises in any agent chat:
+The `/auth` chat command mirrors the CLI verb set (RFC H §
+"Same shape on the CLI and in Telegram"). Read verbs (`show`,
+`list`, `help`) are open to any agent; mutating verbs are
+admin-gated against `auth.admin_agents`.
 
-- `/auth show` — fleet snapshot. Open to any agent (read-only).
-- `/auth use <label>` — admin agents only.
-- `/auth rotate` — admin agents only.
+### Quota-emergency recovery — LLM-free
+
+The most important property: every verb runs in the gateway's
+deterministic chat handler. **No agent claude process is invoked.**
+When every account on the fleet is quota-exhausted and the LLM is
+unreachable, the operator can still add a fresh account, swap to
+it, and unblock the fleet — entirely from chat:
+
+1. `/auth add <label>` — bot spawns `claude setup-token`, replies
+   with the authorize URL, and intercepts the code you paste back
+   (deleted from chat history on completion). On success the new
+   account is registered with the broker; the fleet active is
+   unchanged.
+2. `/auth use <label>` — switches the fleet to the new account.
+
+`/auth cancel` aborts an in-flight `/auth add`.
+
+### Full surface
+
+| Chat command | Equivalent CLI verb |
+|---|---|
+| `/auth show [<agent>]` | `switchroom auth show [<agent>]` |
+| `/auth list` | `switchroom auth list` |
+| `/auth add <label>` | `switchroom auth add <label> --from-oauth` (chat-native OAuth flow) |
+| `/auth cancel` | (chat-only: aborts an in-flight `/auth add`) |
+| `/auth use <label>` | `switchroom auth use <label>` |
+| `/auth rotate` | `switchroom auth rotate` |
+| `/auth rm <label>` | `switchroom auth rm <label>` (two-step confirm in chat) |
+| `/auth refresh [<label>]` | `switchroom auth refresh [<label>]` |
+| `/auth agent override <agent> <label\|clear>` | `switchroom auth agent override <agent> [<label>]` |
+| `/auth help` | `switchroom auth --help` |
 
 These replace the v0.7-era `/auth dashboard` UI (deleted in this
 release; it was a 1100-LOC in-place promote UI built on the
