@@ -3,13 +3,16 @@
  * `<agentDir>/.claude/credentials.json` and canonical owner of the OAuth
  * refresh loop for every Anthropic account on the host (RFC H).
  *
- * Architectural shape mirrors `src/vault/broker/server.ts`:
- *   - Per-agent UDS listener at `/run/switchroom/auth-broker/<name>/sock`,
- *     mode 0660, chowned to the per-agent UID.
- *   - Operator listener at `/run/switchroom/auth-broker/operator/sock`,
- *     mode 0600, chowned to operator UID.
- *   - Per-consumer listener at `/run/switchroom/auth-broker/<name>/sock`,
- *     mode 0600, chowned to the consumer's UID (default 0).
+ * Architectural shape mirrors `src/vault/broker/server.ts`. All three
+ * kinds of caller share the same path layout
+ * `/run/switchroom/auth-broker/<name>/sock` — the *kind* of caller
+ * (agent / consumer / operator) is resolved by config lookup in
+ * `peercred.classify()`, not by path shape. Per-bind mode/UID still
+ * differs by kind:
+ *   - Agent peer       — mode 0660, chowned to allocateAgentUid(name).
+ *   - Consumer peer    — mode 0600, chowned to consumers[].uid (default 0).
+ *   - Operator peer    — mode 0600, chowned to --operator-uid at the
+ *                        reserved `operator/` subpath.
  *   - NDJSON over UDS, 64 KiB frame cap, identity derived from bind path.
  *
  * Verbs (RFC H §4.3): get-credentials, list-state, set-active,
@@ -182,6 +185,11 @@ export class AuthBroker {
   /** Refresh leases held while a POST is in flight (in-process). */
   private refreshInFlight = new Set<string>();
   private consumerLastSeen: ConsumerLastSeen = {};
+  /** Set on first observed EPERM from chownSync — produces one warning,
+   *  not one per write. Production runs with CAP_CHOWN so this stays
+   *  false; dev/test boxes without the cap stay quiet after the
+   *  first heads-up. */
+  private capChownWarned = false;
 
   private closed = false;
 
@@ -953,7 +961,9 @@ export class AuthBroker {
       try {
         const uid = allocateAgentUid(agentName);
         chownSync(targetPath, uid, uid);
-      } catch { /* dev / no CAP_CHOWN */ }
+      } catch (err) {
+        this.warnCapChownMissing(err);
+      }
       return true;
     } catch (err) {
       this.logErr(`fanout ${agentName} <- ${label}: ${(err as Error).message}`);
@@ -1069,6 +1079,26 @@ export class AuthBroker {
 
   private logErr(msg: string): void {
     process.stderr.write(`[auth-broker] ${msg}\n`);
+  }
+
+  /**
+   * Emit a one-shot warning on the first chown failure. Production
+   * runs with CAP_CHOWN so this is normally silent. Dev/test boxes
+   * lacking the cap produce ONE line per process lifetime, not one
+   * per credentials.json write — keeps stderr from drowning.
+   * The mirror still lands (atomic write succeeded); ownership stays
+   * whoever the broker runs as, which on a dev box is fine since
+   * the agent is the same user.
+   */
+  private warnCapChownMissing(err: unknown): void {
+    if (this.capChownWarned) return;
+    this.capChownWarned = true;
+    const msg = err instanceof Error ? err.message : String(err);
+    this.logErr(
+      `chown failed (CAP_CHOWN missing?): ${msg}. ` +
+      `Per-agent mirror written but ownership not flipped. ` +
+      `Suppressing further chown warnings for this process.`,
+    );
   }
 
   /* ─── Config validation ─────────────────────────────────────── */
