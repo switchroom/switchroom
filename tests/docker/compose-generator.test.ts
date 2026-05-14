@@ -764,6 +764,51 @@ describe("generateCompose", () => {
     expect(block).not.toContain("SWITCHROOM_AUTH_BROKER_OPERATOR_UID");
   });
 
+  // PR #1278: the auth-broker entry script reads `--operator-uid` as a
+  // CLI flag, not an env var. The env var above is a fallback the
+  // broker entry consumes (PR #1277) but the canonical wiring is a
+  // `command:` override that appends the flag. Without this, the
+  // bare CMD in docker/Dockerfile.auth-broker leaves operatorUid
+  // undefined inside the broker → bindOperatorListener never fires →
+  // operator socket never gets created. Caught live on 2026-05-15
+  // during the RFC H redeploy.
+  it("emits `command:` with --operator-uid flag when operatorUid is set", () => {
+    const out = generateCompose({
+      config: makeConfig({ a: {} }),
+      operatorUid: 1000,
+    });
+    const block = /switchroom-auth-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).toMatch(
+      /command:\s*\["bun",\s*"\/opt\/switchroom\/dist\/auth-broker\/index\.js",\s*"--operator-uid",\s*"1000"\]/,
+    );
+  });
+
+  it("omits the `command:` override when operatorUid is not set (back-compat)", () => {
+    const out = generateCompose({ config: makeConfig({ a: {} }) });
+    const block = /switchroom-auth-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).not.toMatch(/^\s+command:/m);
+  });
+
+  // The host-side operator bind mount must mirror the env / command
+  // gating — otherwise a no-operatorUid install ends up with an empty
+  // bind dir on disk that confuses operators reading the compose file.
+  it("emits the operator-socket bind mount when operatorUid is set", () => {
+    const out = generateCompose({
+      config: makeConfig({ a: {} }),
+      operatorUid: 1000,
+    });
+    const block = /switchroom-auth-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).toMatch(
+      /\$\{HOME\}\/\.switchroom\/state\/auth-broker-operator:\/run\/switchroom\/auth-broker\/operator/,
+    );
+  });
+
+  it("omits the operator-socket bind mount when operatorUid is not set", () => {
+    const out = generateCompose({ config: makeConfig({ a: {} }) });
+    const block = /switchroom-auth-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).not.toContain("auth-broker-operator:/run/switchroom/auth-broker/operator");
+  });
+
 });
 
 describe("agent service env (Phase 2c F2 — IPC wiring)", () => {
