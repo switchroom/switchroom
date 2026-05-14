@@ -1,3 +1,5 @@
+{"id":"b3073fa8e5232804","targetSkill":null,"kind":"negative","phrase":"run a buildkite command in my terminal","source":"seed-yaml","expectedOtherSkill":"buildkite-cli"}
+{"id":"562cbd6a4dc740b2","targetSkill":null,"kind":"negative","phrase":"upload artifacts from inside a job step","source":"seed-yaml","expectedOtherSkill":"buildkite-agent-runtime"}
 {"id":"7f5b4c9ca62df0bb","targetSkill":"buildkite-api","kind":"paraphrase","phrase":"Calling the Buildkite REST/GraphQL API, Please write a GraphQL query.","source":"paraphrase-template"}
 {"id":"8dfc5ea08e72a921","targetSkill":"buildkite-api","kind":"paraphrase","phrase":"Calling the Buildkite REST/GraphQL API, Let's paginate API results.","source":"paraphrase-template"}
 {"id":"7e08793758116121","targetSkill":"buildkite-api","kind":"paraphrase","phrase":"Calling the Buildkite REST/GraphQL API, Could you automate Buildkite for me?","source":"paraphrase-template"}
@@ -14,5 +16,3 @@
 {"id":"8d337fb40c5b1dd1","targetSkill":"buildkite-api","kind":"indirect","phrase":"Calling the Buildkite REST/GraphQL API, something is going on with buildkite-api","source":"indirect-template"}
 {"id":"69373c12dd02cb39","targetSkill":null,"kind":"negative","phrase":"upload artifacts","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
 {"id":"f8c2fccbbc969fe9","targetSkill":null,"kind":"negative","phrase":"manage cluster secrets","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-agent-infrastructure"}
-{"id":"d51be7e23a3be0ef","targetSkill":null,"kind":"negative","phrase":"set up SAML","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-agent-infrastructure"}
-{"id":"38f4356316901b5d","targetSkill":null,"kind":"negative","phrase":"download artifacts","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}

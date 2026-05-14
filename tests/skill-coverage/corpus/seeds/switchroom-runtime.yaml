@@ -1,0 +1,28 @@
+paraphrases:
+  - "the agent restarted unexpectedly, what happened"
+  - "what was the last hand-off before you reloaded"
+  - "why did you reload mid-conversation"
+  - "resume from the crash you just had"
+  - "you went silent, did you crash"
+  - "how do I interrupt you mid-turn"
+slang:
+  - "yo, you alive"
+  - "still there?"
+  - "any update on the turn you were doing"
+indirect:
+  - "you went away for a bit"
+  - "did the session reset on me"
+  - "I need to cancel what you're doing"
+negatives:
+  - phrase: "show me the crash logs from journalctl"
+    expectedOtherSkill: "switchroom-cli"
+  - phrase: "run a health check on my fleet"
+    expectedOtherSkill: "switchroom-health"
+  - phrase: "what agents are currently running"
+    expectedOtherSkill: "switchroom-status"
+  - phrase: "file a bug about the restart"
+    expectedOtherSkill: "file-bug"
+  - phrase: "how should I format this message"
+    expectedOtherSkill: "humanizer"
+  - phrase: "what MCP tool should I use"
+    expectedOtherSkill: "mcp-builder"

@@ -1,3 +1,5 @@
+{"id":"2bed675990509904","targetSkill":null,"kind":"negative","phrase":"call the Buildkite REST API from a script","source":"seed-yaml","expectedOtherSkill":"buildkite-api"}
+{"id":"b63d8416c2000993","targetSkill":null,"kind":"negative","phrase":"provision a new cluster with hosted agents","source":"seed-yaml","expectedOtherSkill":"buildkite-agent-infrastructure"}
 {"id":"29dd0fd76efcc36a","targetSkill":"buildkite-cli","kind":"paraphrase","phrase":"Using the Buildkite CLI, Help me retry a build.","source":"paraphrase-template"}
 {"id":"164b298fe7acd33d","targetSkill":"buildkite-cli","kind":"paraphrase","phrase":"Using the Buildkite CLI, List builds, please.","source":"paraphrase-template"}
 {"id":"ad05a4b17dfec70e","targetSkill":"buildkite-cli","kind":"paraphrase","phrase":"Using the Buildkite CLI, Let's upload artifacts.","source":"paraphrase-template"}
@@ -15,5 +17,3 @@
 {"id":"e169b0941a696b4d","targetSkill":"buildkite-cli","kind":"indirect","phrase":"Using the Buildkite CLI, I'd rather not click around the UI","source":"indirect-template"}
 {"id":"d96f5c7ba99f4a00","targetSkill":null,"kind":"negative","phrase":"show test failures in the build page","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
 {"id":"9cab4663cb1d0bb1","targetSkill":null,"kind":"negative","phrase":"authenticate with the Buildkite API","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-api"}
-{"id":"6240b1b988432a88","targetSkill":null,"kind":"negative","phrase":"standardize pipelines across teams","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-agent-infrastructure"}
-{"id":"2a3061c9e9a4fc2c","targetSkill":null,"kind":"negative","phrase":"add plugins","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}

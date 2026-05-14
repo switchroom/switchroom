@@ -1,0 +1,12 @@
+paraphrases:
+  - "add a new agent to my fleet"
+  - "remove this agent from the lineup"
+  - "reprovision all my agents from scratch"
+  - "tear down the staging agent"
+  - "list all agents I have configured"
+slang:
+  - "pls add a fresh agent named foo"
+  - "yo, kill that agent for good"
+indirect:
+  - "I want one more specialist in the rotation"
+  - "this agent is dead weight, get rid of it"

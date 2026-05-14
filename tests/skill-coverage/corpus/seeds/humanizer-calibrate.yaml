@@ -1,0 +1,11 @@
+paraphrases:
+  - "build a voice template from these writing samples"
+  - "calibrate the humanizer to match my voice"
+  - "create a style profile from my past emails"
+  - "tune the humanizer to mimic this author's tone"
+slang:
+  - "pls train the humanizer on these samples"
+  - "yo, calibrate my voice template"
+indirect:
+  - "I want the rewrites to sound like me, not generic"
+  - "give the humanizer my voice fingerprint"

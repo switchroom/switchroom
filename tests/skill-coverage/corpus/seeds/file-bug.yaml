@@ -1,0 +1,22 @@
+paraphrases:
+  - "file a bug for this in Linear"
+  - "open a ticket about this regression"
+  - "I want to log this as an issue"
+  - "track this defect somewhere we won't forget"
+  - "raise a bug for the team to pick up"
+  - "create a Linear issue for the broken flow"
+slang:
+  - "pls log a bug for this"
+  - "yo, file an issue about it"
+  - "any way to ticket this so it doesn't get lost"
+indirect:
+  - "this needs to be tracked somewhere"
+  - "I want a paper trail for this regression"
+  - "remember this defect for later"
+negatives:
+  - phrase: "report this status to the team via Telegram"
+    expectedOtherSkill: "telegram-test-harness"
+  - phrase: "submit feedback to the humanizer voice"
+    expectedOtherSkill: "humanizer"
+  - phrase: "post a status update to the chat"
+    expectedOtherSkill: "switchroom-status"

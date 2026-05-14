@@ -1,0 +1,5 @@
+negatives:
+  - phrase: "show me the crash logs for last night"
+    expectedOtherSkill: "switchroom-cli"
+  - phrase: "file a bug about the recurring health failure"
+    expectedOtherSkill: "file-bug"

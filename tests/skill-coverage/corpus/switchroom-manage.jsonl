@@ -1,19 +1,21 @@
+{"id":"5574a7a66b3ad3a8","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"add a new agent to my fleet","source":"seed-yaml"}
+{"id":"41620fcbd91fc965","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"remove this agent from the lineup","source":"seed-yaml"}
+{"id":"18b7abf8a91dedf6","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"reprovision all my agents from scratch","source":"seed-yaml"}
+{"id":"26db27ed7004f995","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"tear down the staging agent","source":"seed-yaml"}
+{"id":"6a73a400d2faa1ff","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"list all agents I have configured","source":"seed-yaml"}
+{"id":"dcad142dc11d345c","targetSkill":"switchroom-manage","kind":"slang","phrase":"pls add a fresh agent named foo","source":"seed-yaml"}
+{"id":"2da882e2e5d7cdd1","targetSkill":"switchroom-manage","kind":"slang","phrase":"yo, kill that agent for good","source":"seed-yaml"}
+{"id":"66bdebd01637ba44","targetSkill":"switchroom-manage","kind":"indirect","phrase":"I want one more specialist in the rotation","source":"seed-yaml"}
+{"id":"6feaa64c26e26853","targetSkill":"switchroom-manage","kind":"indirect","phrase":"this agent is dead weight, get rid of it","source":"seed-yaml"}
 {"id":"fe58c503d43578fc","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, I need to reprovision my agents.","source":"paraphrase-template"}
-{"id":"5d3f9bb5b7864f23","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, Could you reprovision my agents for me?","source":"paraphrase-template"}
-{"id":"5b114197128c85e4","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, Manage my agents, please.","source":"paraphrase-template"}
-{"id":"2a834a94cdb05da4","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, Can you reinstall my agents?","source":"paraphrase-template"}
-{"id":"b25eb3edefdbef83","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, I'd like to reinstall my agents.","source":"paraphrase-template"}
-{"id":"694fc3af2ecb558f","targetSkill":"switchroom-manage","kind":"paraphrase","phrase":"In switchroom agent management, Help me list my agents.","source":"paraphrase-template"}
-{"id":"48fd69721fc14fb4","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, create a enw agent","source":"typo-rule"}
-{"id":"0ec28c19caab359d","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, reinstll my agents","source":"typo-rule"}
-{"id":"aa3b2bd29b78d1fb","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, list mya gents","source":"typo-rule"}
-{"id":"18e70157479ca3a3","targetSkill":"switchroom-manage","kind":"slang","phrase":"In switchroom agent management, yo, how do i manage my agents","source":"slang-template"}
-{"id":"b004abf2b30a41f8","targetSkill":"switchroom-manage","kind":"slang","phrase":"In switchroom agent management, gonna need to add a new agent","source":"slang-template"}
-{"id":"5ca721cda08ce295","targetSkill":"switchroom-manage","kind":"slang","phrase":"In switchroom agent management, quick q — can i add a new agent","source":"slang-template"}
+{"id":"76013c4f4a18b206","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, reproviion my agents","source":"typo-rule"}
+{"id":"a21fd153e9eaaed1","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, manage myy agents","source":"typo-rule"}
+{"id":"ef36bc70575e4f07","targetSkill":"switchroom-manage","kind":"typo","phrase":"In switchroom agent management, reinstallm y agents","source":"typo-rule"}
+{"id":"048516eb8d51383f","targetSkill":"switchroom-manage","kind":"slang","phrase":"In switchroom agent management, pls reinstall my agents","source":"slang-template"}
 {"id":"65bdf721d41d3cc9","targetSkill":"switchroom-manage","kind":"indirect","phrase":"In switchroom agent management, the switchroom-manage thing is weird","source":"indirect-template"}
 {"id":"f691a55685883a5a","targetSkill":"switchroom-manage","kind":"indirect","phrase":"In switchroom agent management, can you take a look at the switchroom-manage situation","source":"indirect-template"}
 {"id":"3d6cb8bfcd92d28e","targetSkill":"switchroom-manage","kind":"indirect","phrase":"In switchroom agent management, something is going on with switchroom-manage","source":"indirect-template"}
-{"id":"9ab6e31fce837dfc","targetSkill":null,"kind":"negative","phrase":"how do I get started with switchroom","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-install"}
-{"id":"bc1b39b6bf8b8562","targetSkill":null,"kind":"negative","phrase":"per-agent snapshot","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-status"}
-{"id":"894936e3d147ee65","targetSkill":null,"kind":"negative","phrase":"set up switchroom for the first time","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-install"}
 {"id":"f69a2b5b8d64dc82","targetSkill":null,"kind":"negative","phrase":"bootstrap switchroom from scratch","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-install"}
+{"id":"951d70143f82a774","targetSkill":null,"kind":"negative","phrase":"list switchroom agents","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-status"}
+{"id":"4b5eb3356bfb332d","targetSkill":null,"kind":"negative","phrase":"install switchroom on this machine","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-install"}
+{"id":"58c413e82084f082","targetSkill":null,"kind":"negative","phrase":"how long has X been up","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-status"}

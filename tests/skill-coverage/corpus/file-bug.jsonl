@@ -1,18 +1,22 @@
-{"id":"14c538af1a89b529","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, Can you report this issue on GitHub?","source":"paraphrase-template"}
-{"id":"e70fd69ecf35bae8","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, Please raise a ticket.","source":"paraphrase-template"}
-{"id":"81d92fb7cacce3a0","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, I need to this needs a real ticket.","source":"paraphrase-template"}
-{"id":"98aff157e7222098","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, I need to file a bug.","source":"paraphrase-template"}
-{"id":"f25bd531f4cf4fe9","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, Report this issue on GitHub, please.","source":"paraphrase-template"}
-{"id":"3b209880ae44b69d","targetSkill":"file-bug","kind":"paraphrase","phrase":"For filing a GitHub bug report, Please file a bug.","source":"paraphrase-template"}
-{"id":"5484b8d9bae3f88e","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, raise a  ticket","source":"typo-rule"}
-{"id":"c372a66229ec49e4","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, file aa bug","source":"typo-rule"}
-{"id":"9f63a1ddfc3d0046","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, log this  as a bug","source":"typo-rule"}
-{"id":"993a90ae7bfd3635","targetSkill":"file-bug","kind":"slang","phrase":"For filing a GitHub bug report, gonna need to report this issue on GitHub","source":"slang-template"}
-{"id":"0edade22c7ca0c55","targetSkill":"file-bug","kind":"slang","phrase":"For filing a GitHub bug report, quick q — can i open an issue","source":"slang-template"}
-{"id":"d63f129dffe9e47c","targetSkill":"file-bug","kind":"indirect","phrase":"For filing a GitHub bug report, remember this for later","source":"indirect-template"}
+{"id":"68cdded3090111fe","targetSkill":"file-bug","kind":"paraphrase","phrase":"file a bug for this in Linear","source":"seed-yaml"}
+{"id":"7f0470092c5c3ff1","targetSkill":"file-bug","kind":"paraphrase","phrase":"open a ticket about this regression","source":"seed-yaml"}
+{"id":"e5806791bd2f2429","targetSkill":"file-bug","kind":"paraphrase","phrase":"I want to log this as an issue","source":"seed-yaml"}
+{"id":"f869dd4bc5686674","targetSkill":"file-bug","kind":"paraphrase","phrase":"track this defect somewhere we won't forget","source":"seed-yaml"}
+{"id":"9b41eb74daeac24d","targetSkill":"file-bug","kind":"paraphrase","phrase":"raise a bug for the team to pick up","source":"seed-yaml"}
+{"id":"50c43be45dbb89ce","targetSkill":"file-bug","kind":"paraphrase","phrase":"create a Linear issue for the broken flow","source":"seed-yaml"}
+{"id":"3adc1cb84389d66d","targetSkill":"file-bug","kind":"slang","phrase":"pls log a bug for this","source":"seed-yaml"}
+{"id":"d6f667d87d8db6bc","targetSkill":"file-bug","kind":"slang","phrase":"yo, file an issue about it","source":"seed-yaml"}
+{"id":"1f8d77f34e2359b6","targetSkill":"file-bug","kind":"slang","phrase":"any way to ticket this so it doesn't get lost","source":"seed-yaml"}
+{"id":"665adcd7968daa05","targetSkill":"file-bug","kind":"indirect","phrase":"this needs to be tracked somewhere","source":"seed-yaml"}
+{"id":"40259baaadafa527","targetSkill":"file-bug","kind":"indirect","phrase":"I want a paper trail for this regression","source":"seed-yaml"}
+{"id":"46904fe396c015ba","targetSkill":"file-bug","kind":"indirect","phrase":"remember this defect for later","source":"seed-yaml"}
+{"id":"68884dfd77ca528f","targetSkill":null,"kind":"negative","phrase":"report this status to the team via Telegram","source":"seed-yaml","expectedOtherSkill":"telegram-test-harness"}
+{"id":"69bfecee20a506f7","targetSkill":null,"kind":"negative","phrase":"submit feedback to the humanizer voice","source":"seed-yaml","expectedOtherSkill":"humanizer"}
+{"id":"e27c6cd83c8009cc","targetSkill":null,"kind":"negative","phrase":"post a status update to the chat","source":"seed-yaml","expectedOtherSkill":"switchroom-status"}
+{"id":"a9b003db749e7f6e","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, report this issue on GitHub","source":"typo-rule"}
+{"id":"387ac03e29de6d1b","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, raise a ticket","source":"typo-rule"}
+{"id":"0275ea67b0433914","targetSkill":"file-bug","kind":"typo","phrase":"For filing a GitHub bug report, this needs ar eal ticket","source":"typo-rule"}
 {"id":"3dd76aee8320c8c2","targetSkill":"file-bug","kind":"indirect","phrase":"For filing a GitHub bug report, this needs to be tracked somewhere","source":"indirect-template"}
 {"id":"8afeaad9c1c05f3d","targetSkill":"file-bug","kind":"indirect","phrase":"For filing a GitHub bug report, I want a paper trail for this","source":"indirect-template"}
-{"id":"3a94f9490a4268ab","targetSkill":null,"kind":"negative","phrase":"troubleshoot the fleet","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-health"}
-{"id":"ed644e48dda4283b","targetSkill":null,"kind":"negative","phrase":"reboot this agent","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}
-{"id":"85ad14d64092e3ec","targetSkill":null,"kind":"negative","phrase":"run a health check","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-health"}
-{"id":"2c39ff7ac6919250","targetSkill":null,"kind":"negative","phrase":"update the agents","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}
+{"id":"d63f129dffe9e47c","targetSkill":"file-bug","kind":"indirect","phrase":"For filing a GitHub bug report, remember this for later","source":"indirect-template"}
+{"id":"4ce3457a0df8a7dc","targetSkill":null,"kind":"negative","phrase":"my agents are broken","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-health"}

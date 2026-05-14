@@ -1,0 +1,15 @@
+paraphrases:
+  - "spin up a new Buildkite cluster for our team"
+  - "I need to set up SAML SSO on our Buildkite org"
+  - "provision more hosted agents for the load"
+  - "manage our cluster's secrets store"
+  - "audit who's using the Buildkite platform"
+  - "right-size the instance shapes on our hosted agents"
+slang:
+  - "yo, how do i add a queue to our cluster"
+  - "any way to bulk-rotate agent tokens"
+  - "pls hook up SSO for buildkite"
+indirect:
+  - "our CI bill is way too high, can you help"
+  - "we need governance over which teams can push pipelines"
+  - "compliance is asking who deployed what, where do I look"

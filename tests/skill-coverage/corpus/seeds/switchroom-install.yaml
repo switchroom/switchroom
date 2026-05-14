@@ -1,0 +1,5 @@
+negatives:
+  - phrase: "add another agent to my existing fleet"
+    expectedOtherSkill: "switchroom-manage"
+  - phrase: "what version of switchroom is currently running"
+    expectedOtherSkill: "switchroom-cli"

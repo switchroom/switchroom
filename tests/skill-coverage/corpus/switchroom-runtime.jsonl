@@ -1,18 +1,24 @@
-{"id":"fa68195ea5ecfd69","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"For switchroom runtime hand-offs, Why did you restart, please.","source":"paraphrase-template"}
-{"id":"6a352e1fae1eb98b","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"For switchroom runtime hand-offs, I'd like to you went away.","source":"paraphrase-template"}
-{"id":"7b2d8b651305ea15","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"For switchroom runtime hand-offs, Let's can I stop you mid-turn.","source":"paraphrase-template"}
-{"id":"baaf645f25688ee3","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"For switchroom runtime hand-offs, I'd like to why did you restart.","source":"paraphrase-template"}
-{"id":"782b4b987eaae1d4","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"For switchroom runtime hand-offs, Can you still there??","source":"paraphrase-template"}
-{"id":"080610fabc265540","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, anyupdate?","source":"typo-rule"}
-{"id":"0d4bfa46776498c6","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, how do I interrupt you","source":"typo-rule"}
-{"id":"76bf35e9098ebfb6","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, stil there?","source":"typo-rule"}
-{"id":"357c2653ae6bea2b","targetSkill":"switchroom-runtime","kind":"slang","phrase":"For switchroom runtime hand-offs, gonna need to still there?","source":"slang-template"}
-{"id":"2cc15dfb17a55582","targetSkill":"switchroom-runtime","kind":"slang","phrase":"For switchroom runtime hand-offs, gonna need to how do I interrupt you","source":"slang-template"}
-{"id":"1d6d7579ebb03774","targetSkill":"switchroom-runtime","kind":"slang","phrase":"For switchroom runtime hand-offs, gonna need to any update?","source":"slang-template"}
+{"id":"3fec628dff743e11","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"the agent restarted unexpectedly, what happened","source":"seed-yaml"}
+{"id":"4c759b722240121b","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"what was the last hand-off before you reloaded","source":"seed-yaml"}
+{"id":"4211b04c9f377612","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"why did you reload mid-conversation","source":"seed-yaml"}
+{"id":"9d43a2969ceb1ea1","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"resume from the crash you just had","source":"seed-yaml"}
+{"id":"ea0887ce0df69de6","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"you went silent, did you crash","source":"seed-yaml"}
+{"id":"c4ca8907f347223c","targetSkill":"switchroom-runtime","kind":"paraphrase","phrase":"how do I interrupt you mid-turn","source":"seed-yaml"}
+{"id":"1cb2e9cb983ea5e4","targetSkill":"switchroom-runtime","kind":"slang","phrase":"yo, you alive","source":"seed-yaml"}
+{"id":"f74d2a7c67b76f28","targetSkill":"switchroom-runtime","kind":"slang","phrase":"still there?","source":"seed-yaml"}
+{"id":"7c0cd8384a1c855e","targetSkill":"switchroom-runtime","kind":"slang","phrase":"any update on the turn you were doing","source":"seed-yaml"}
+{"id":"ef74e7e180430e99","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"you went away for a bit","source":"seed-yaml"}
+{"id":"60dad54e4014c6e9","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"did the session reset on me","source":"seed-yaml"}
+{"id":"acaa744a4e07826d","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"I need to cancel what you're doing","source":"seed-yaml"}
+{"id":"61f322736cdc02b2","targetSkill":null,"kind":"negative","phrase":"show me the crash logs from journalctl","source":"seed-yaml","expectedOtherSkill":"switchroom-cli"}
+{"id":"11298f56bc6cc489","targetSkill":null,"kind":"negative","phrase":"run a health check on my fleet","source":"seed-yaml","expectedOtherSkill":"switchroom-health"}
+{"id":"9c22628b6c5cdc8b","targetSkill":null,"kind":"negative","phrase":"what agents are currently running","source":"seed-yaml","expectedOtherSkill":"switchroom-status"}
+{"id":"f2e6a23b4b541d6f","targetSkill":null,"kind":"negative","phrase":"file a bug about the restart","source":"seed-yaml","expectedOtherSkill":"file-bug"}
+{"id":"4912758d48e6f008","targetSkill":null,"kind":"negative","phrase":"how should I format this message","source":"seed-yaml","expectedOtherSkill":"humanizer"}
+{"id":"3199f30dfb593ca5","targetSkill":null,"kind":"negative","phrase":"what MCP tool should I use","source":"seed-yaml","expectedOtherSkill":"mcp-builder"}
+{"id":"79443f039fcf25cb","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, why did yoou restart","source":"typo-rule"}
+{"id":"f1b92e544d9152b9","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, you went away","source":"typo-rule"}
+{"id":"ae8d500d751fe823","targetSkill":"switchroom-runtime","kind":"typo","phrase":"For switchroom runtime hand-offs, can I stop yyou mid-turn","source":"typo-rule"}
+{"id":"53bdf51a372fcf10","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"For switchroom runtime hand-offs, something is going on with switchroom-runtime","source":"indirect-template"}
 {"id":"3fd072ae49efcc38","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"For switchroom runtime hand-offs, the switchroom-runtime thing is weird","source":"indirect-template"}
 {"id":"bf18f1d44f49aec8","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"For switchroom runtime hand-offs, can you take a look at the switchroom-runtime situation","source":"indirect-template"}
-{"id":"53bdf51a372fcf10","targetSkill":"switchroom-runtime","kind":"indirect","phrase":"For switchroom runtime hand-offs, something is going on with switchroom-runtime","source":"indirect-template"}
-{"id":"804e347cfe9edb0a","targetSkill":null,"kind":"negative","phrase":"report this issue on GitHub","source":"negative-from-adjacent","expectedOtherSkill":"file-bug"}
-{"id":"532f5db97dcb9197","targetSkill":null,"kind":"negative","phrase":"apply my config changes","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}
-{"id":"19c365e9f7fe2b96","targetSkill":null,"kind":"negative","phrase":"file a bug","source":"negative-from-adjacent","expectedOtherSkill":"file-bug"}
-{"id":"beba76aa860bd8fc","targetSkill":null,"kind":"negative","phrase":"what version is running","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}

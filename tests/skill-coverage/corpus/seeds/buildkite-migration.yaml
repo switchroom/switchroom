@@ -1,0 +1,12 @@
+paraphrases:
+  - "migrate our Jenkins pipelines to Buildkite"
+  - "port our GitHub Actions workflows over to Buildkite"
+  - "move our CircleCI setup onto Buildkite"
+  - "translate this GitLab CI config into a Buildkite pipeline"
+  - "help us cut over from Travis to Buildkite"
+slang:
+  - "pls move our CI off jenkins"
+  - "yo, how do I port this gha workflow to buildkite"
+indirect:
+  - "we're getting off our old CI vendor, what do we do"
+  - "the legacy pipelines need to live in Buildkite now"

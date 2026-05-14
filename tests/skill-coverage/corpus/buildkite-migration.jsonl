@@ -1,19 +1,21 @@
+{"id":"d5fb1be8c54412db","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"migrate our Jenkins pipelines to Buildkite","source":"seed-yaml"}
+{"id":"26524fb7e0c031b6","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"port our GitHub Actions workflows over to Buildkite","source":"seed-yaml"}
+{"id":"3f840702752cfac5","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"move our CircleCI setup onto Buildkite","source":"seed-yaml"}
+{"id":"ac72366804d228de","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"translate this GitLab CI config into a Buildkite pipeline","source":"seed-yaml"}
+{"id":"0aa679d796316cf8","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"help us cut over from Travis to Buildkite","source":"seed-yaml"}
+{"id":"7aaa4ce4dfc8bee8","targetSkill":"buildkite-migration","kind":"slang","phrase":"pls move our CI off jenkins","source":"seed-yaml"}
+{"id":"86ea3034fdea80f7","targetSkill":"buildkite-migration","kind":"slang","phrase":"yo, how do I port this gha workflow to buildkite","source":"seed-yaml"}
+{"id":"ff4726ba097aa661","targetSkill":"buildkite-migration","kind":"indirect","phrase":"we're getting off our old CI vendor, what do we do","source":"seed-yaml"}
+{"id":"4e62cccde5b402be","targetSkill":"buildkite-migration","kind":"indirect","phrase":"the legacy pipelines need to live in Buildkite now","source":"seed-yaml"}
 {"id":"4670e3667b17b5ca","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, Can you what's the Buildkite equivalent of?","source":"paraphrase-template"}
-{"id":"46cee6590497ec0a","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, Let's convert pipelines from Jenkins.","source":"paraphrase-template"}
-{"id":"320f93b53c0994dd","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, What's the Buildkite equivalent of, please.","source":"paraphrase-template"}
-{"id":"653715a0b5dee808","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, Help me convert pipelines from Jenkins.","source":"paraphrase-template"}
-{"id":"b35bad8f37099f4a","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, Please convert GitHub Actions workflows.","source":"paraphrase-template"}
-{"id":"0ad39c4adf363c09","targetSkill":"buildkite-migration","kind":"paraphrase","phrase":"Migrating to Buildkite, I'd like to bk pipeline convert.","source":"paraphrase-template"}
-{"id":"f87f01be4c4d2e78","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, convert CirccleCI config","source":"typo-rule"}
-{"id":"a654952312a3a877","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, convert GitHub Atcions workflows","source":"typo-rule"}
-{"id":"3899deb6c8606825","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, convert CircleCI config","source":"typo-rule"}
-{"id":"ab3b3a8394f170a6","targetSkill":"buildkite-migration","kind":"slang","phrase":"Migrating to Buildkite, quick q — can i what's the Buildkite equivalent of","source":"slang-template"}
-{"id":"fca7a9b2010a4ac4","targetSkill":"buildkite-migration","kind":"slang","phrase":"Migrating to Buildkite, hey, migrate to Buildkite?","source":"slang-template"}
+{"id":"ea7e4725deae4663","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, convert pipelinees from Jenkins","source":"typo-rule"}
+{"id":"0486493542586d88","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, what's the Buildkiite equivalent of","source":"typo-rule"}
+{"id":"45d4960d07b63f75","targetSkill":"buildkite-migration","kind":"typo","phrase":"Migrating to Buildkite, convert pielines from Jenkins","source":"typo-rule"}
 {"id":"53db79c565b80fcf","targetSkill":"buildkite-migration","kind":"slang","phrase":"Migrating to Buildkite, hey, convert GitHub Actions workflows?","source":"slang-template"}
 {"id":"ae637921c481da84","targetSkill":"buildkite-migration","kind":"indirect","phrase":"Migrating to Buildkite, can you take a look at the buildkite-migration situation","source":"indirect-template"}
 {"id":"15ba4a2e007d9625","targetSkill":"buildkite-migration","kind":"indirect","phrase":"Migrating to Buildkite, something is going on with buildkite-migration","source":"indirect-template"}
 {"id":"53ab585748a68bd9","targetSkill":"buildkite-migration","kind":"indirect","phrase":"Migrating to Buildkite, the buildkite-migration thing is weird","source":"indirect-template"}
-{"id":"020507f9710d7ef8","targetSkill":null,"kind":"negative","phrase":"trigger a build","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
-{"id":"60999319a31298a0","targetSkill":null,"kind":"negative","phrase":"write a pipeline","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
-{"id":"82dc0047aa12ffb7","targetSkill":null,"kind":"negative","phrase":"add caching","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
-{"id":"164f970f3dea946a","targetSkill":null,"kind":"negative","phrase":"retry a build","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
+{"id":"a02b65cd7725b76c","targetSkill":null,"kind":"negative","phrase":"manage secrets","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
+{"id":"90a11cd581409f08","targetSkill":null,"kind":"negative","phrase":"add annotations","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
+{"id":"7c60cb8e94f9e181","targetSkill":null,"kind":"negative","phrase":"interact with Buildkite from the command line","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
+{"id":"162115356e615805","targetSkill":null,"kind":"negative","phrase":"make this build faster","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}

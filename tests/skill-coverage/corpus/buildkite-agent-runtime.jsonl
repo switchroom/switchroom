@@ -1,3 +1,5 @@
+{"id":"7c85f38bcd3f7fe4","targetSkill":null,"kind":"negative","phrase":"create a cluster and configure SSO","source":"seed-yaml","expectedOtherSkill":"buildkite-agent-infrastructure"}
+{"id":"cffcb80dd0f01a3f","targetSkill":null,"kind":"negative","phrase":"write a GraphQL query against the Buildkite API","source":"seed-yaml","expectedOtherSkill":"buildkite-api"}
 {"id":"5d0c82aca1a9e663","targetSkill":"buildkite-agent-runtime","kind":"paraphrase","phrase":"Inside a Buildkite step, Get or update a step attribute, please.","source":"paraphrase-template"}
 {"id":"02422a0b2f249a4a","targetSkill":"buildkite-agent-runtime","kind":"paraphrase","phrase":"Inside a Buildkite step, Please upload artifacts from a step.","source":"paraphrase-template"}
 {"id":"f9d85b8efb6fb651","targetSkill":"buildkite-agent-runtime","kind":"paraphrase","phrase":"Inside a Buildkite step, Help me add an annotation.","source":"paraphrase-template"}
@@ -14,5 +16,3 @@
 {"id":"bd63f468646c9d41","targetSkill":"buildkite-agent-runtime","kind":"indirect","phrase":"Inside a Buildkite step, can you take a look at the buildkite-agent-runtime situation","source":"indirect-template"}
 {"id":"2a3061c9e9a4fc2c","targetSkill":null,"kind":"negative","phrase":"add plugins","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
 {"id":"164f970f3dea946a","targetSkill":null,"kind":"negative","phrase":"retry a build","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
-{"id":"5bfd5a2a54cb2879","targetSkill":null,"kind":"negative","phrase":"publish to package registry","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-secure-delivery"}
-{"id":"90a11cd581409f08","targetSkill":null,"kind":"negative","phrase":"add annotations","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}

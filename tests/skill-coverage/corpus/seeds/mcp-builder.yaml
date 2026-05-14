@@ -1,0 +1,15 @@
+paraphrases:
+  - "build a new MCP server from scratch"
+  - "create an MCP tool that wraps our API"
+  - "publish my MCP package to npm"
+  - "scaffold an MCP server in Python"
+  - "wire up an MCP tool definition with input schema"
+  - "design an MCP server for Claude to use"
+slang:
+  - "yo, how do i make an mcp server"
+  - "any way to add a new mcp tool quickly"
+  - "pls scaffold an mcp server for me"
+indirect:
+  - "I want Claude to be able to call our internal API"
+  - "we need a custom tool that talks to our database"
+  - "Claude needs to talk to this external service somehow"

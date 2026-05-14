@@ -1,0 +1,5 @@
+negatives:
+  - phrase: "create a cluster and configure SSO"
+    expectedOtherSkill: "buildkite-agent-infrastructure"
+  - phrase: "write a GraphQL query against the Buildkite API"
+    expectedOtherSkill: "buildkite-api"

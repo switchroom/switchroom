@@ -1,18 +1,21 @@
+{"id":"f6fc5bbdd79c2ad1","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"build a voice template from these writing samples","source":"seed-yaml"}
+{"id":"c16fc3d542a2c3d0","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"calibrate the humanizer to match my voice","source":"seed-yaml"}
+{"id":"5ef01850757426c4","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"create a style profile from my past emails","source":"seed-yaml"}
+{"id":"77eda11780283f21","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"tune the humanizer to mimic this author's tone","source":"seed-yaml"}
+{"id":"cbb51dfa4f80ef2c","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"pls train the humanizer on these samples","source":"seed-yaml"}
+{"id":"f2738d49169f736b","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"yo, calibrate my voice template","source":"seed-yaml"}
+{"id":"5b9b24f81e0a61e8","targetSkill":"humanizer-calibrate","kind":"indirect","phrase":"I want the rewrites to sound like me, not generic","source":"seed-yaml"}
+{"id":"11f8c8721580dbd2","targetSkill":"humanizer-calibrate","kind":"indirect","phrase":"give the humanizer my voice fingerprint","source":"seed-yaml"}
 {"id":"39cd5eb6b6b17d11","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Let's humanizer-calibrate.","source":"paraphrase-template"}
 {"id":"c125261face8b61b","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Please calibrate humanizer.","source":"paraphrase-template"}
-{"id":"837ba534114c06ca","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Make humanizer sound more like me, please.","source":"paraphrase-template"}
-{"id":"9981906fb7f32443","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Can you humanizer-calibrate?","source":"paraphrase-template"}
-{"id":"996640fc5d723131","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Calibrate humanizer, please.","source":"paraphrase-template"}
-{"id":"f534a96f373073e9","targetSkill":"humanizer-calibrate","kind":"paraphrase","phrase":"Let's build a voice template.","source":"paraphrase-template"}
-{"id":"b67054fd6e5ee563","targetSkill":"humanizer-calibrate","kind":"typo","phrase":"calibrte humanizer","source":"typo-rule"}
-{"id":"e19200af1e1e23a8","targetSkill":"humanizer-calibrate","kind":"typo","phrase":"make humanier sound more like me","source":"typo-rule"}
-{"id":"3b4381336e8c217d","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"quick q — can i make humanizer sound more like me","source":"slang-template"}
-{"id":"e86fbbfbb1da74a4","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"gonna need to humanizer-calibrate","source":"slang-template"}
-{"id":"8da2758c14dfde10","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"pls humanizer-calibrate","source":"slang-template"}
+{"id":"9b2c0e0fd3acc229","targetSkill":"humanizer-calibrate","kind":"typo","phrase":"make humanizer soound more like me","source":"typo-rule"}
+{"id":"9dc5a4991533b142","targetSkill":"humanizer-calibrate","kind":"typo","phrase":"humanizerc-alibrate","source":"typo-rule"}
+{"id":"e5d3895755797b2d","targetSkill":"humanizer-calibrate","kind":"typo","phrase":"calibrate  humanizer","source":"typo-rule"}
+{"id":"ddbbe99d6ebb0043","targetSkill":"humanizer-calibrate","kind":"slang","phrase":"gonna need to build a voice template","source":"slang-template"}
 {"id":"fde3246fc66879da","targetSkill":"humanizer-calibrate","kind":"indirect","phrase":"something is going on with humanizer-calibrate","source":"indirect-template"}
 {"id":"9e85e8802cfb0bf2","targetSkill":"humanizer-calibrate","kind":"indirect","phrase":"the humanizer-calibrate thing is weird","source":"indirect-template"}
 {"id":"96f94bbe1933e489","targetSkill":"humanizer-calibrate","kind":"indirect","phrase":"can you take a look at the humanizer-calibrate situation","source":"indirect-template"}
-{"id":"63533286e85cc636","targetSkill":null,"kind":"negative","phrase":"de-AI this paragraph","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
-{"id":"531c9439523690c4","targetSkill":null,"kind":"negative","phrase":"review this text for AI tells","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
-{"id":"f5fd008e868c9651","targetSkill":null,"kind":"negative","phrase":"remove the rule of three","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
 {"id":"bbdecae9e762fc04","targetSkill":null,"kind":"negative","phrase":"rewrite this to sound natural","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
+{"id":"0e301c046196ab0d","targetSkill":null,"kind":"negative","phrase":"make this sound more human","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
+{"id":"ee82c6637e35dace","targetSkill":null,"kind":"negative","phrase":"edit this so it doesn't sound like AI","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}
+{"id":"6576411a24a44a05","targetSkill":null,"kind":"negative","phrase":"fix the em-dash overuse","source":"negative-from-adjacent","expectedOtherSkill":"humanizer"}

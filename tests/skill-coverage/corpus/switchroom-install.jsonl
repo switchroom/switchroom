@@ -1,3 +1,5 @@
+{"id":"de28d7ea92c31e77","targetSkill":null,"kind":"negative","phrase":"add another agent to my existing fleet","source":"seed-yaml","expectedOtherSkill":"switchroom-manage"}
+{"id":"fa5046d55a449ede","targetSkill":null,"kind":"negative","phrase":"what version of switchroom is currently running","source":"seed-yaml","expectedOtherSkill":"switchroom-cli"}
 {"id":"5cb5b66c0cda563e","targetSkill":"switchroom-install","kind":"paraphrase","phrase":"For switchroom setup, Please what are the switchroom prerequisites.","source":"paraphrase-template"}
 {"id":"e4a1081efde4c354","targetSkill":"switchroom-install","kind":"paraphrase","phrase":"For switchroom setup, I need to get switchroom running.","source":"paraphrase-template"}
 {"id":"b47e182b9a49f8f6","targetSkill":"switchroom-install","kind":"paraphrase","phrase":"For switchroom setup, Can you bootstrap switchroom from scratch?","source":"paraphrase-template"}
@@ -15,5 +17,3 @@
 {"id":"0748fd4d873fb5cb","targetSkill":"switchroom-install","kind":"indirect","phrase":"For switchroom setup, something is going on with switchroom-install","source":"indirect-template"}
 {"id":"5863d0584fbae4cd","targetSkill":null,"kind":"negative","phrase":"tear down this agent","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-manage"}
 {"id":"e66f4ed7e3a7e8f0","targetSkill":null,"kind":"negative","phrase":"switchroom internals","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-architecture"}
-{"id":"35b3358b56c3e968","targetSkill":null,"kind":"negative","phrase":"reinstall my agents","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-manage"}
-{"id":"4e583f72f0342843","targetSkill":null,"kind":"negative","phrase":"switchroom design","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-architecture"}

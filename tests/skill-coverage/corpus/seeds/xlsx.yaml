@@ -1,0 +1,12 @@
+paraphrases:
+  - "open this Excel file and pull out the data"
+  - "edit a spreadsheet for me"
+  - "read the values from this xlsx workbook"
+  - "write a new sheet with these numbers"
+  - "modify cells in this Excel file"
+slang:
+  - "pls fix the formulas in this sheet"
+  - "yo, can you crunch the columns in this xlsx"
+indirect:
+  - "this csv is a mess and I need it cleaned up"
+  - "the columns are all wrong in this workbook"

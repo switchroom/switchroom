@@ -1,19 +1,22 @@
-{"id":"4d3bcd86ddf3f306","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, Let's write an MCP server for.","source":"paraphrase-template"}
-{"id":"ca14b1ed9593402c","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, Please integrate an external API as MCP.","source":"paraphrase-template"}
-{"id":"cb6257ebc6dcd77d","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, Use the MCP SDK in TypeScript, please.","source":"paraphrase-template"}
-{"id":"49cbf7aede4d4c38","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, Write an MCP server for, please.","source":"paraphrase-template"}
-{"id":"020fc4da75b4f0c1","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, I'd like to create a new MCP server.","source":"paraphrase-template"}
-{"id":"1bcb33179626cef9","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"For building an MCP server, I need to use the MCP SDK in TypeScript.","source":"paraphrase-template"}
-{"id":"3940e02162258931","targetSkill":"mcp-builder","kind":"typo","phrase":"For building an MCP server, create  new MCP server","source":"typo-rule"}
+{"id":"dbf8771bcb8daaef","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"build a new MCP server from scratch","source":"seed-yaml"}
+{"id":"8901f39b3350b0dc","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"create an MCP tool that wraps our API","source":"seed-yaml"}
+{"id":"65aead1854ad1a27","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"publish my MCP package to npm","source":"seed-yaml"}
+{"id":"d8937e3dd8ca7698","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"scaffold an MCP server in Python","source":"seed-yaml"}
+{"id":"84fb7d6b25f2e568","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"wire up an MCP tool definition with input schema","source":"seed-yaml"}
+{"id":"678fd7d4fe1e1cf0","targetSkill":"mcp-builder","kind":"paraphrase","phrase":"design an MCP server for Claude to use","source":"seed-yaml"}
+{"id":"99902199e8602f95","targetSkill":"mcp-builder","kind":"slang","phrase":"yo, how do i make an mcp server","source":"seed-yaml"}
+{"id":"eb04f9465e5ae39f","targetSkill":"mcp-builder","kind":"slang","phrase":"any way to add a new mcp tool quickly","source":"seed-yaml"}
+{"id":"7af1a11fffde20e7","targetSkill":"mcp-builder","kind":"slang","phrase":"pls scaffold an mcp server for me","source":"seed-yaml"}
+{"id":"4b8a720e0433a57a","targetSkill":"mcp-builder","kind":"indirect","phrase":"I want Claude to be able to call our internal API","source":"seed-yaml"}
+{"id":"887a5e1cd2e43544","targetSkill":"mcp-builder","kind":"indirect","phrase":"we need a custom tool that talks to our database","source":"seed-yaml"}
+{"id":"fa0107e9dcb24d64","targetSkill":"mcp-builder","kind":"indirect","phrase":"Claude needs to talk to this external service somehow","source":"seed-yaml"}
 {"id":"3925164336a3212d","targetSkill":"mcp-builder","kind":"typo","phrase":"For building an MCP server, write an MCPP server for","source":"typo-rule"}
-{"id":"ea50c28629c149ed","targetSkill":"mcp-builder","kind":"typo","phrase":"For building an MCP server, use the MCP SD Kin TypeScript","source":"typo-rule"}
-{"id":"e06cf5f384a36d80","targetSkill":"mcp-builder","kind":"slang","phrase":"For building an MCP server, pls create a new MCP server","source":"slang-template"}
-{"id":"f98ee845c7e3f0ff","targetSkill":"mcp-builder","kind":"slang","phrase":"For building an MCP server, pls build an MCP server","source":"slang-template"}
-{"id":"7a8221f413c0d64f","targetSkill":"mcp-builder","kind":"slang","phrase":"For building an MCP server, gonna need to build an MCP server","source":"slang-template"}
-{"id":"dd217c225346583c","targetSkill":"mcp-builder","kind":"indirect","phrase":"For building an MCP server, the mcp-builder thing is weird","source":"indirect-template"}
+{"id":"1f46e642de0c87c9","targetSkill":"mcp-builder","kind":"typo","phrase":"For building an MCP server, integrate an external API as MCP","source":"typo-rule"}
+{"id":"6180b09a9cdb6af1","targetSkill":"mcp-builder","kind":"typo","phrase":"For building an MCP server, use the MCP SDKK in TypeScript","source":"typo-rule"}
 {"id":"76ef48348429c26b","targetSkill":"mcp-builder","kind":"indirect","phrase":"For building an MCP server, can you take a look at the mcp-builder situation","source":"indirect-template"}
 {"id":"94d8085f5250be36","targetSkill":"mcp-builder","kind":"indirect","phrase":"For building an MCP server, something is going on with mcp-builder","source":"indirect-template"}
-{"id":"042682ac45dbdcff","targetSkill":null,"kind":"negative","phrase":"edit an existing skill","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}
+{"id":"dd217c225346583c","targetSkill":"mcp-builder","kind":"indirect","phrase":"For building an MCP server, the mcp-builder thing is weird","source":"indirect-template"}
 {"id":"e7b7662551300d17","targetSkill":null,"kind":"negative","phrase":"improve the trigger accuracy of a skill","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}
+{"id":"042682ac45dbdcff","targetSkill":null,"kind":"negative","phrase":"edit an existing skill","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}
+{"id":"bd7894e61c29c7ab","targetSkill":null,"kind":"negative","phrase":"run evals on a skill","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}
 {"id":"5c62319dbca551cb","targetSkill":null,"kind":"negative","phrase":"create a new skill","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}
-{"id":"9473fd6467d99336","targetSkill":null,"kind":"negative","phrase":"optimize a skill description","source":"negative-from-adjacent","expectedOtherSkill":"skill-creator"}

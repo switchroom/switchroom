@@ -1,3 +1,5 @@
+{"id":"bbc5a5c878bda74c","targetSkill":null,"kind":"negative","phrase":"show me the crash logs for last night","source":"seed-yaml","expectedOtherSkill":"switchroom-cli"}
+{"id":"2825cdaac80ab5f2","targetSkill":null,"kind":"negative","phrase":"file a bug about the recurring health failure","source":"seed-yaml","expectedOtherSkill":"file-bug"}
 {"id":"e844582948b07ee3","targetSkill":"switchroom-health","kind":"paraphrase","phrase":"For switchroom doctor / health, Can you something's wrong?","source":"paraphrase-template"}
 {"id":"38c496db06ca042e","targetSkill":"switchroom-health","kind":"paraphrase","phrase":"For switchroom doctor / health, What's wrong with my agents, please.","source":"paraphrase-template"}
 {"id":"45f7bcbd87edb1a0","targetSkill":"switchroom-health","kind":"paraphrase","phrase":"For switchroom doctor / health, Could you what's wrong with my agents for me?","source":"paraphrase-template"}
@@ -15,5 +17,3 @@
 {"id":"78dda55f05cf42f1","targetSkill":"switchroom-health","kind":"indirect","phrase":"For switchroom doctor / health, my agents are acting weird","source":"indirect-template"}
 {"id":"e9e83bceac9354b0","targetSkill":null,"kind":"negative","phrase":"sync my config","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}
 {"id":"804e347cfe9edb0a","targetSkill":null,"kind":"negative","phrase":"report this issue on GitHub","source":"negative-from-adjacent","expectedOtherSkill":"file-bug"}
-{"id":"842dae820114650a","targetSkill":null,"kind":"negative","phrase":"show me the logs","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-cli"}
-{"id":"282e000b65a17b9a","targetSkill":null,"kind":"negative","phrase":"raise a ticket","source":"negative-from-adjacent","expectedOtherSkill":"file-bug"}

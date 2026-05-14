@@ -1,19 +1,21 @@
+{"id":"cc1c128819e5f853","targetSkill":"xlsx","kind":"paraphrase","phrase":"open this Excel file and pull out the data","source":"seed-yaml"}
+{"id":"bf1b4f615cedda2a","targetSkill":"xlsx","kind":"paraphrase","phrase":"edit a spreadsheet for me","source":"seed-yaml"}
+{"id":"2ced66444991fe15","targetSkill":"xlsx","kind":"paraphrase","phrase":"read the values from this xlsx workbook","source":"seed-yaml"}
+{"id":"4cd9f457ccd14898","targetSkill":"xlsx","kind":"paraphrase","phrase":"write a new sheet with these numbers","source":"seed-yaml"}
+{"id":"3391ddfca1cd80c3","targetSkill":"xlsx","kind":"paraphrase","phrase":"modify cells in this Excel file","source":"seed-yaml"}
+{"id":"f3f597ef37adbbed","targetSkill":"xlsx","kind":"slang","phrase":"pls fix the formulas in this sheet","source":"seed-yaml"}
+{"id":"f6d9127467622b64","targetSkill":"xlsx","kind":"slang","phrase":"yo, can you crunch the columns in this xlsx","source":"seed-yaml"}
+{"id":"dbf1091231e6fa17","targetSkill":"xlsx","kind":"indirect","phrase":"this csv is a mess and I need it cleaned up","source":"seed-yaml"}
+{"id":"68c35e5ab9b0a1a2","targetSkill":"xlsx","kind":"indirect","phrase":"the columns are all wrong in this workbook","source":"seed-yaml"}
 {"id":"6a535dd04984c85a","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, I'd like to edit a spreadsheet.","source":"paraphrase-template"}
-{"id":"8958e9a03a820b0b","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, Help me create a spreadsheet from scratch.","source":"paraphrase-template"}
-{"id":"bfbade386f35b354","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, Let's build a financial model.","source":"paraphrase-template"}
-{"id":"91928f1da852a8a1","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, Fix malformed rows in this CSV, please.","source":"paraphrase-template"}
-{"id":"4f8f2944ba4618e2","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, Open this xlsx, please.","source":"paraphrase-template"}
-{"id":"8faea324f2fd8ab5","targetSkill":"xlsx","kind":"paraphrase","phrase":"For my Excel spreadsheet, Compute formulas in Excel, please.","source":"paraphrase-template"}
-{"id":"b474bba969b92446","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, build a finnacial model","source":"typo-rule"}
-{"id":"167fcd6a5b8cd0c5","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, fix malfored rows in this CSV","source":"typo-rule"}
-{"id":"8ba2f92d40ed55b0","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, compute ormulas in Excel","source":"typo-rule"}
-{"id":"95437c712911e622","targetSkill":"xlsx","kind":"slang","phrase":"For my Excel spreadsheet, any way to fix malformed rows in this CSV?","source":"slang-template"}
-{"id":"a0e4616e712ea0d0","targetSkill":"xlsx","kind":"slang","phrase":"For my Excel spreadsheet, pls convert CSV to xlsx","source":"slang-template"}
-{"id":"d9e11b318d11bec1","targetSkill":"xlsx","kind":"slang","phrase":"For my Excel spreadsheet, pls add columns to a CSV","source":"slang-template"}
-{"id":"dd6e59ca40d38690","targetSkill":"xlsx","kind":"indirect","phrase":"For my Excel spreadsheet, this csv is a mess","source":"indirect-template"}
+{"id":"4fb3df0126196871","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, create a speadsheet from scratch","source":"typo-rule"}
+{"id":"cc2540a542447f0c","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, build a finaancial model","source":"typo-rule"}
+{"id":"b29a47cd63aa6c26","targetSkill":"xlsx","kind":"typo","phrase":"For my Excel spreadsheet, fix malformed roows in this CSV","source":"typo-rule"}
+{"id":"33a5a5019dc5b862","targetSkill":"xlsx","kind":"slang","phrase":"For my Excel spreadsheet, gonna need to open this xlsx","source":"slang-template"}
 {"id":"76c3b4f90c7f0924","targetSkill":"xlsx","kind":"indirect","phrase":"For my Excel spreadsheet, the columns are all wrong in this sheet","source":"indirect-template"}
 {"id":"7e43538ce64bdb1e","targetSkill":"xlsx","kind":"indirect","phrase":"For my Excel spreadsheet, I need to crunch some numbers in a sheet","source":"indirect-template"}
-{"id":"a113419f817d8314","targetSkill":null,"kind":"negative","phrase":"produce a report as a Word file","source":"negative-from-adjacent","expectedOtherSkill":"docx"}
-{"id":"9aa3b919eee8c702","targetSkill":null,"kind":"negative","phrase":"extract tables from a PDF","source":"negative-from-adjacent","expectedOtherSkill":"pdf"}
+{"id":"dd6e59ca40d38690","targetSkill":"xlsx","kind":"indirect","phrase":"For my Excel spreadsheet, this csv is a mess","source":"indirect-template"}
 {"id":"9ead93293a462adb","targetSkill":null,"kind":"negative","phrase":"accept tracked changes","source":"negative-from-adjacent","expectedOtherSkill":"docx"}
-{"id":"21ecaa887914ad6a","targetSkill":null,"kind":"negative","phrase":"rotate PDF pages","source":"negative-from-adjacent","expectedOtherSkill":"pdf"}
+{"id":"1e5f75b8aaec5004","targetSkill":null,"kind":"negative","phrase":"create a PDF from scratch","source":"negative-from-adjacent","expectedOtherSkill":"pdf"}
+{"id":"409583b46a4a919d","targetSkill":null,"kind":"negative","phrase":"read a .docx file","source":"negative-from-adjacent","expectedOtherSkill":"docx"}
+{"id":"f5009eb78b6837c1","targetSkill":null,"kind":"negative","phrase":"encrypt this PDF","source":"negative-from-adjacent","expectedOtherSkill":"pdf"}

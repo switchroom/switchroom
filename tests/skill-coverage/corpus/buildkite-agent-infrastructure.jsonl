@@ -1,19 +1,22 @@
-{"id":"be4139668ce4b14e","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, Create a queue, please.","source":"paraphrase-template"}
-{"id":"fd5ece0866c5898e","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, Let's configure SSO.","source":"paraphrase-template"}
-{"id":"ed549147aba8ee1d","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, Could you scale queues for me?","source":"paraphrase-template"}
-{"id":"6177f6ab899225e5","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, I need to configure SSO.","source":"paraphrase-template"}
-{"id":"0ad483f351f135c2","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, Could you create a queue for me?","source":"paraphrase-template"}
-{"id":"6631222bf2be02b7","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"In Buildkite cluster admin, Please optimize CI costs.","source":"paraphrase-template"}
-{"id":"a9eb039fc1e52080","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, manage clusetr secrets","source":"typo-rule"}
-{"id":"da95d5375719c801","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, configuree agents","source":"typo-rule"}
-{"id":"1ae84332242af2e8","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, set up hostted agents","source":"typo-rule"}
-{"id":"a8dc24526d90eeab","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"In Buildkite cluster admin, pls create a pipeline template","source":"slang-template"}
-{"id":"2fd860986595b725","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"In Buildkite cluster admin, quick q — can i optimize CI costs","source":"slang-template"}
-{"id":"24f04c13340e1617","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"In Buildkite cluster admin, hey, set up audit logging?","source":"slang-template"}
+{"id":"62e19bae1cfcff31","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"spin up a new Buildkite cluster for our team","source":"seed-yaml"}
+{"id":"b24b10f75e04dbc2","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"I need to set up SAML SSO on our Buildkite org","source":"seed-yaml"}
+{"id":"6d5f13cc81c772e8","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"provision more hosted agents for the load","source":"seed-yaml"}
+{"id":"377da5caae2c9b8f","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"manage our cluster's secrets store","source":"seed-yaml"}
+{"id":"a1c3fde60ae41fed","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"audit who's using the Buildkite platform","source":"seed-yaml"}
+{"id":"936d32c82ed2a8a7","targetSkill":"buildkite-agent-infrastructure","kind":"paraphrase","phrase":"right-size the instance shapes on our hosted agents","source":"seed-yaml"}
+{"id":"6ab32b175b4b078b","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"yo, how do i add a queue to our cluster","source":"seed-yaml"}
+{"id":"b0680cd648dd0bed","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"any way to bulk-rotate agent tokens","source":"seed-yaml"}
+{"id":"e0ed7a74a656bd50","targetSkill":"buildkite-agent-infrastructure","kind":"slang","phrase":"pls hook up SSO for buildkite","source":"seed-yaml"}
+{"id":"4909fd5de8ee2fba","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"our CI bill is way too high, can you help","source":"seed-yaml"}
+{"id":"a3d5eeddba4dda4d","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"we need governance over which teams can push pipelines","source":"seed-yaml"}
+{"id":"506423036a7eae88","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"compliance is asking who deployed what, where do I look","source":"seed-yaml"}
+{"id":"a5aba231eb807e29","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, create aa queue","source":"typo-rule"}
+{"id":"47d3a4231f3fbfac","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, configuure SSO","source":"typo-rule"}
+{"id":"67246beeb92cd06a","targetSkill":"buildkite-agent-infrastructure","kind":"typo","phrase":"In Buildkite cluster admin, scal queues","source":"typo-rule"}
+{"id":"845d27124fd748c2","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"In Buildkite cluster admin, can you take a look at the buildkite-agent-infrastructure situation","source":"indirect-template"}
 {"id":"5be3ae28ffa2051d","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"In Buildkite cluster admin, something is going on with buildkite-agent-infrastructure","source":"indirect-template"}
 {"id":"f8a49aeec03d3029","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"In Buildkite cluster admin, the buildkite-agent-infrastructure thing is weird","source":"indirect-template"}
-{"id":"845d27124fd748c2","targetSkill":"buildkite-agent-infrastructure","kind":"indirect","phrase":"In Buildkite cluster admin, can you take a look at the buildkite-agent-infrastructure situation","source":"indirect-template"}
-{"id":"b5991733c20e6ed1","targetSkill":null,"kind":"negative","phrase":"list builds","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
-{"id":"0093601c5cd0eb02","targetSkill":null,"kind":"negative","phrase":"set up dynamic pipelines","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
-{"id":"9cab4663cb1d0bb1","targetSkill":null,"kind":"negative","phrase":"authenticate with the Buildkite API","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-api"}
-{"id":"c9cd0a82299e5e4a","targetSkill":null,"kind":"negative","phrase":"view build logs","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
+{"id":"ca5fcf7ca86a4530","targetSkill":null,"kind":"negative","phrase":"check build status","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}
+{"id":"82dc0047aa12ffb7","targetSkill":null,"kind":"negative","phrase":"add caching","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-pipelines"}
+{"id":"28570ba6ce1d2e9d","targetSkill":null,"kind":"negative","phrase":"automate Buildkite","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-api"}
+{"id":"ffa2a429cd379b46","targetSkill":null,"kind":"negative","phrase":"list pipelines","source":"negative-from-adjacent","expectedOtherSkill":"buildkite-cli"}

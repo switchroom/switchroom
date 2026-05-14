@@ -1,18 +1,21 @@
+{"id":"abe5802ce3a8f212","targetSkill":"humanizer","kind":"paraphrase","phrase":"rewrite this prose to sound more human","source":"seed-yaml"}
+{"id":"a1d74d0c6c49cec6","targetSkill":"humanizer","kind":"paraphrase","phrase":"make this paragraph sound more like a real person wrote it","source":"seed-yaml"}
+{"id":"ab71f014ea65c07a","targetSkill":"humanizer","kind":"paraphrase","phrase":"edit my writing style — it's too robotic","source":"seed-yaml"}
+{"id":"5c7f96839f4545c7","targetSkill":"humanizer","kind":"paraphrase","phrase":"humanize this draft, it reads like AI","source":"seed-yaml"}
+{"id":"cd54015149f86b5d","targetSkill":"humanizer","kind":"slang","phrase":"pls de-AI this text","source":"seed-yaml"}
+{"id":"395330573ddc96ce","targetSkill":"humanizer","kind":"slang","phrase":"yo, make this sound less like ChatGPT","source":"seed-yaml"}
+{"id":"86200dd27088c2fa","targetSkill":"humanizer","kind":"indirect","phrase":"this paragraph screams LLM","source":"seed-yaml"}
+{"id":"08d7bdda4eaf8129","targetSkill":"humanizer","kind":"indirect","phrase":"the prose feels lifeless and corporate","source":"seed-yaml"}
 {"id":"3c53912915217d64","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, Let's rewrite this to sound natural.","source":"paraphrase-template"}
 {"id":"89c7a45efc6e1394","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, Please edit this so it doesn't sound like AI.","source":"paraphrase-template"}
-{"id":"c8f585a686af8431","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, Can you remove the rule of three?","source":"paraphrase-template"}
-{"id":"8191a42776ed485d","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, Remove signs of AI writing, please.","source":"paraphrase-template"}
-{"id":"7ad0e706d154d0c5","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, Let's fix the em-dash overuse.","source":"paraphrase-template"}
-{"id":"da6e8b0d6c8b5df8","targetSkill":"humanizer","kind":"paraphrase","phrase":"To humanize my writing style, I need to make this sound more human.","source":"paraphrase-template"}
-{"id":"dd29ab038a7253a4","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, make this soudn more human","source":"typo-rule"}
-{"id":"2c8a34f5f5355fbb","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, remove signs of AI writing","source":"typo-rule"}
-{"id":"a0e1846f69d4c746","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, fix theem-dash overuse","source":"typo-rule"}
-{"id":"b1f31b108c6b329e","targetSkill":"humanizer","kind":"slang","phrase":"To humanize my writing style, yo, how do i remove signs of AI writing","source":"slang-template"}
-{"id":"3636df2ebd610c0e","targetSkill":"humanizer","kind":"slang","phrase":"To humanize my writing style, gonna need to remove signs of AI writing","source":"slang-template"}
+{"id":"fa223cf4453d4f81","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, remove the rlue of three","source":"typo-rule"}
+{"id":"20d17ba4e50aabf5","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, remove signs oof AI writing","source":"typo-rule"}
+{"id":"940f4462da5aa236","targetSkill":"humanizer","kind":"typo","phrase":"To humanize my writing style, fix the em-ddash overuse","source":"typo-rule"}
+{"id":"c1323fb92c3f4fff","targetSkill":"humanizer","kind":"slang","phrase":"To humanize my writing style, any way to make this sound more human?","source":"slang-template"}
 {"id":"ee1f5bb310198608","targetSkill":"humanizer","kind":"indirect","phrase":"To humanize my writing style, this paragraph screams ChatGPT","source":"indirect-template"}
 {"id":"ca605ed4be893c6a","targetSkill":"humanizer","kind":"indirect","phrase":"To humanize my writing style, the prose sounds robotic","source":"indirect-template"}
 {"id":"05c7c4c88bfbfa64","targetSkill":"humanizer","kind":"indirect","phrase":"To humanize my writing style, this reads like AI slop","source":"indirect-template"}
-{"id":"9c6b7f7f9543041b","targetSkill":null,"kind":"negative","phrase":"humanizer-calibrate","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
-{"id":"caf6f3b37a17929c","targetSkill":null,"kind":"negative","phrase":"fresh voice template for humanizer","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
-{"id":"b13a5c7ce9b0a6d5","targetSkill":null,"kind":"negative","phrase":"build a voice template","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
+{"id":"fcfe5caa7a3ac164","targetSkill":null,"kind":"negative","phrase":"make humanizer sound more like me","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
 {"id":"91f194613377a010","targetSkill":null,"kind":"negative","phrase":"calibrate humanizer","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
+{"id":"caf6f3b37a17929c","targetSkill":null,"kind":"negative","phrase":"fresh voice template for humanizer","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}
+{"id":"9c6b7f7f9543041b","targetSkill":null,"kind":"negative","phrase":"humanizer-calibrate","source":"negative-from-adjacent","expectedOtherSkill":"humanizer-calibrate"}

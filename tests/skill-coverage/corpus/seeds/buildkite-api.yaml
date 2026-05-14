@@ -1,0 +1,5 @@
+negatives:
+  - phrase: "run a buildkite command in my terminal"
+    expectedOtherSkill: "buildkite-cli"
+  - phrase: "upload artifacts from inside a job step"
+    expectedOtherSkill: "buildkite-agent-runtime"

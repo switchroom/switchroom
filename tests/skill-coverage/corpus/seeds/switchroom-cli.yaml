@@ -1,0 +1,22 @@
+paraphrases:
+  - "run a switchroom CLI command for me"
+  - "what does `switchroom agent restart` do"
+  - "show me the available switchroom subcommands"
+  - "use the switchroom command-line tool to update"
+  - "tail the switchroom logs for this agent"
+  - "what version of switchroom is running"
+slang:
+  - "yo, bounce this agent"
+  - "any way to pull the latest switchroom from the CLI"
+  - "pls upgrade switchroom and restart"
+indirect:
+  - "I need to see the crash logs for last night's incident"
+  - "I want to know what sha is live right now"
+  - "apply my config changes to the running agent"
+negatives:
+  - phrase: "my agents are broken, run a health check"
+    expectedOtherSkill: "switchroom-health"
+  - phrase: "what agents are running right now"
+    expectedOtherSkill: "switchroom-status"
+  - phrase: "install switchroom for the first time"
+    expectedOtherSkill: "switchroom-install"

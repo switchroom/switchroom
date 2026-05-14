@@ -1,0 +1,5 @@
+negatives:
+  - phrase: "call the Buildkite REST API from a script"
+    expectedOtherSkill: "buildkite-api"
+  - phrase: "provision a new cluster with hosted agents"
+    expectedOtherSkill: "buildkite-agent-infrastructure"

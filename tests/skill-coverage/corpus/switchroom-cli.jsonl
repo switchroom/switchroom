@@ -1,19 +1,22 @@
-{"id":"5a3acf93220d58a7","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), Please sync my config.","source":"paraphrase-template"}
-{"id":"a894b1c34c7b3b3b","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), Could you check the journal for me?","source":"paraphrase-template"}
-{"id":"40f57f2fbc60d624","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), Can you why did it crash?","source":"paraphrase-template"}
-{"id":"96c73a88e679b96b","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), Upgrade switchroom, please.","source":"paraphrase-template"}
-{"id":"11f591b4f419ded0","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), I'd like to why did it crash.","source":"paraphrase-template"}
-{"id":"ecfb4dba1f9a2667","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"In switchroom (the CLI), I'd like to apply my config changes.","source":"paraphrase-template"}
-{"id":"7c585a8db7c59926","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), list schedlued tasks","source":"typo-rule"}
-{"id":"cc05b3418d6c2e00","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), apply my cofnig changes","source":"typo-rule"}
-{"id":"d4f152899f79cf2f","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), kick teh agent, it's stuck","source":"typo-rule"}
-{"id":"83dd88c0404841d3","targetSkill":"switchroom-cli","kind":"slang","phrase":"In switchroom (the CLI), pls why did it crash","source":"slang-template"}
-{"id":"e17c19ce34a90be2","targetSkill":"switchroom-cli","kind":"slang","phrase":"In switchroom (the CLI), yo, how do i check the journal","source":"slang-template"}
-{"id":"e16a0776307faf7a","targetSkill":"switchroom-cli","kind":"slang","phrase":"In switchroom (the CLI), yo, how do i show the cascade for X","source":"slang-template"}
-{"id":"493df60cd866f115","targetSkill":"switchroom-cli","kind":"indirect","phrase":"In switchroom (the CLI), the agent just disappeared on me","source":"indirect-template"}
+{"id":"18c28ac1a3baff15","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"run a switchroom CLI command for me","source":"seed-yaml"}
+{"id":"2659c5285ed67098","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"what does `switchroom agent restart` do","source":"seed-yaml"}
+{"id":"1fb6f21d761b333f","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"show me the available switchroom subcommands","source":"seed-yaml"}
+{"id":"d5c5f4acaea32437","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"use the switchroom command-line tool to update","source":"seed-yaml"}
+{"id":"fe9f66d59729f5f1","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"tail the switchroom logs for this agent","source":"seed-yaml"}
+{"id":"da3a9aa1dad58c01","targetSkill":"switchroom-cli","kind":"paraphrase","phrase":"what version of switchroom is running","source":"seed-yaml"}
+{"id":"3b806f5b9e5f1b01","targetSkill":"switchroom-cli","kind":"slang","phrase":"yo, bounce this agent","source":"seed-yaml"}
+{"id":"71e58074b3c13228","targetSkill":"switchroom-cli","kind":"slang","phrase":"any way to pull the latest switchroom from the CLI","source":"seed-yaml"}
+{"id":"de9dc51987f82ab4","targetSkill":"switchroom-cli","kind":"slang","phrase":"pls upgrade switchroom and restart","source":"seed-yaml"}
+{"id":"358faf360ce6de5c","targetSkill":"switchroom-cli","kind":"indirect","phrase":"I need to see the crash logs for last night's incident","source":"seed-yaml"}
+{"id":"d03f24c7499562e9","targetSkill":"switchroom-cli","kind":"indirect","phrase":"I want to know what sha is live right now","source":"seed-yaml"}
+{"id":"36c14ed822e1682e","targetSkill":"switchroom-cli","kind":"indirect","phrase":"apply my config changes to the running agent","source":"seed-yaml"}
+{"id":"ddc08f9588009c25","targetSkill":null,"kind":"negative","phrase":"my agents are broken, run a health check","source":"seed-yaml","expectedOtherSkill":"switchroom-health"}
+{"id":"41dc1029e93a5d63","targetSkill":null,"kind":"negative","phrase":"what agents are running right now","source":"seed-yaml","expectedOtherSkill":"switchroom-status"}
+{"id":"ba8c656e6d787d48","targetSkill":null,"kind":"negative","phrase":"install switchroom for the first time","source":"seed-yaml","expectedOtherSkill":"switchroom-install"}
+{"id":"fe64eca672e1aa10","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), sync my config","source":"typo-rule"}
+{"id":"1335f3f4df517d30","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), checkthe journal","source":"typo-rule"}
+{"id":"62f410d241d9d170","targetSkill":"switchroom-cli","kind":"typo","phrase":"In switchroom (the CLI), why did ti crash","source":"typo-rule"}
 {"id":"68421b6f41cb9478","targetSkill":"switchroom-cli","kind":"indirect","phrase":"In switchroom (the CLI), I don't know what version is live","source":"indirect-template"}
 {"id":"68fbb520e8128f78","targetSkill":"switchroom-cli","kind":"indirect","phrase":"In switchroom (the CLI), I want to know what happened last night","source":"indirect-template"}
-{"id":"4ce3457a0df8a7dc","targetSkill":null,"kind":"negative","phrase":"my agents are broken","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-health"}
-{"id":"fa99fc025157fece","targetSkill":null,"kind":"negative","phrase":"add a new agent","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-manage"}
-{"id":"f69a2b5b8d64dc82","targetSkill":null,"kind":"negative","phrase":"bootstrap switchroom from scratch","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-install"}
-{"id":"bc1b39b6bf8b8562","targetSkill":null,"kind":"negative","phrase":"per-agent snapshot","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-status"}
+{"id":"493df60cd866f115","targetSkill":"switchroom-cli","kind":"indirect","phrase":"In switchroom (the CLI), the agent just disappeared on me","source":"indirect-template"}
+{"id":"9cd7a103c4a70996","targetSkill":null,"kind":"negative","phrase":"can you check my setup","source":"negative-from-adjacent","expectedOtherSkill":"switchroom-health"}
