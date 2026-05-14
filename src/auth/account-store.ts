@@ -108,9 +108,26 @@ export interface AccountInfo {
 
 /* ── Paths ───────────────────────────────────────────────────────────── */
 
-/** `~/.switchroom/accounts/`. */
+/**
+ * Container-mode override: when the broker (or any CLI tool running inside
+ * a container) is launched with `SWITCHROOM_ACCOUNTS_DIR` set, that absolute
+ * path wins over the `${home}/.switchroom/accounts` default. Compose mounts
+ * the host `~/.switchroom/accounts` to `/state/accounts` inside the auth-
+ * broker container; without honouring the env var here the broker would
+ * resolve `accountsRoot` to `/root/.switchroom/accounts` (nothing mounted)
+ * and operate on an empty fleet. See `src/agents/compose.ts:1013`.
+ *
+ * Only honoured when set to a non-empty absolute path.
+ */
+function accountsRootOverride(): string | undefined {
+  const v = process.env.SWITCHROOM_ACCOUNTS_DIR;
+  if (v && v.length > 0 && v.startsWith("/")) return v;
+  return undefined;
+}
+
+/** `~/.switchroom/accounts/` (or `$SWITCHROOM_ACCOUNTS_DIR` in container mode). */
 export function accountsRoot(home: string = homedir()): string {
-  return resolve(home, ".switchroom", "accounts");
+  return accountsRootOverride() ?? resolve(home, ".switchroom", "accounts");
 }
 
 export function accountDir(label: string, home: string = homedir()): string {

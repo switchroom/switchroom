@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadConfig, ConfigError } from "./loader.js";
+import { loadConfig, ConfigError, resolveAgentsDir } from "./loader.js";
+import type { SwitchroomConfig } from "./schema.js";
 
 let tempRoots: string[] = [];
 
@@ -180,5 +181,47 @@ google_workspace:
     const config = loadConfig(path);
     expect(config.drive).toBeUndefined();
     expect(config.google_workspace).toBeUndefined();
+  });
+});
+
+// ─── resolveAgentsDir: env-var override (RFC H container mode) ─────────────
+// Regression pin for the auth-broker / approval-kernel container layout:
+// compose emits SWITCHROOM_AGENTS_DIR=/state/agents and bind-mounts the
+// host ~/.switchroom/agents there. Without honouring the env var here,
+// the broker resolves agents_dir from config.switchroom.agents_dir
+// (= ~/.switchroom/agents → /root/.switchroom/agents inside the container,
+// nothing mounted) and per-agent credential mirrors land in tmpfs. The
+// auth-broker / kernel containers stay quiet but the operator sees an
+// empty fleet.
+
+describe("resolveAgentsDir: SWITCHROOM_AGENTS_DIR env var override", () => {
+  const yamlAgentsDir = "/tmp/from-yaml-agents";
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+  const cfg = {
+    switchroom: { version: 1, agents_dir: yamlAgentsDir },
+  } as SwitchroomConfig;
+
+  afterEach(() => {
+    delete process.env.SWITCHROOM_AGENTS_DIR;
+  });
+
+  it("falls back to config.switchroom.agents_dir when env var unset", () => {
+    delete process.env.SWITCHROOM_AGENTS_DIR;
+    expect(resolveAgentsDir(cfg)).toBe(yamlAgentsDir);
+  });
+
+  it("env var wins over yaml when set to an absolute path", () => {
+    process.env.SWITCHROOM_AGENTS_DIR = "/state/agents";
+    expect(resolveAgentsDir(cfg)).toBe("/state/agents");
+  });
+
+  it("env var ignored when empty", () => {
+    process.env.SWITCHROOM_AGENTS_DIR = "";
+    expect(resolveAgentsDir(cfg)).toBe(yamlAgentsDir);
+  });
+
+  it("env var ignored when not absolute (defensive: refuse relative)", () => {
+    process.env.SWITCHROOM_AGENTS_DIR = "relative/path";
+    expect(resolveAgentsDir(cfg)).toBe(yamlAgentsDir);
   });
 });

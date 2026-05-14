@@ -203,6 +203,19 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
 }
 
 export function resolveAgentsDir(config: SwitchroomConfig): string {
+  // Container-mode override: when set (auth-broker / approval-kernel
+  // containers do this via compose env), `SWITCHROOM_AGENTS_DIR` wins
+  // over `config.switchroom.agents_dir`. Compose bind-mounts the host
+  // `~/.switchroom/agents` to `/state/agents`; without this override the
+  // broker resolves agent dirs to `/root/.switchroom/agents` (nothing
+  // mounted) and per-agent credential mirrors land in a tmpfs path
+  // instead of the host. See `src/agents/compose.ts:1014`.
+  //
+  // Only honoured when set to a non-empty absolute path.
+  const override = process.env.SWITCHROOM_AGENTS_DIR;
+  if (override && override.length > 0 && override.startsWith("/")) {
+    return override;
+  }
   return resolveDualPath(config.switchroom.agents_dir);
 }
 
