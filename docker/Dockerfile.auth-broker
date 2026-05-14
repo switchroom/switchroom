@@ -1,0 +1,49 @@
+# switchroom/auth-broker — singleton OAuth credential broker (RFC H).
+#
+# Sole writer of `<agentDir>/.claude/credentials.json` and the canonical
+# owner of the OAuth refresh loop for every Anthropic account. Mirrors
+# the architectural shape of Dockerfile.broker:
+#
+#   1. process.umask(0o077) BEFORE creating any inode.
+#   2. mkdir each <name>/ with mode 0o700 in the SAME syscall (no
+#      mkdir-then-chmod race).
+#   3. chown <name>/ to the target UID (agent UID / consumer UID /
+#      operator UID).
+#   4. bind socket inside; chown socket; chmod 0o660 (agent) or 0o600
+#      (consumer / operator).
+#
+# Enforced in src/auth/broker/server.ts at startup. Compose drops ALL
+# caps and re-adds CHOWN + FOWNER + DAC_READ_SEARCH so step 3/4 still
+# work under no-new-privileges.
+ARG BASE_IMAGE=switchroom/base:latest
+FROM ${BASE_IMAGE}
+
+ARG TARGETARCH=amd64
+RUN echo "switchroom/auth-broker building for arch=${TARGETARCH}" >&2
+
+# State dir for quota.json, audit.jsonl, sha-index.json,
+# threshold-violations.json, refresh-lease/, and the healthy marker.
+# Compose bind-mounts ~/.switchroom/state/auth-broker over this.
+RUN mkdir -p /state/auth-broker
+
+# Socket parent dir — mode 0o755 so per-name subdirs (each 0o700, owned
+# by the target UID) are reachable through the bind mounts the agent /
+# consumer containers carry. The broker creates each <name>/ subdir at
+# startup with the strict mode option (NOT chmod-after).
+RUN install -d -m 0755 /run/switchroom/auth-broker
+
+# Phase 1: bundled auth-broker entry. scripts/build.mjs emits
+# dist/auth-broker/index.js with native deps marked external; the
+# broker has no native deps so no in-image npm install is required.
+COPY dist/auth-broker/index.js /opt/switchroom/dist/auth-broker/index.js
+
+USER 0:0
+
+# Bind-presence healthcheck — the broker writes /state/auth-broker/healthy
+# once all listeners are bound. Probe is `test -f` so an absent marker
+# reads as unhealthy without ever invoking the broker itself.
+HEALTHCHECK --interval=10s --timeout=2s --start-period=15s --retries=3 \
+  CMD test -f /state/auth-broker/healthy
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bun", "/opt/switchroom/dist/auth-broker/index.js"]

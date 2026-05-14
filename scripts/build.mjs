@@ -170,6 +170,10 @@ const serverEntries = [
   // The host-side singleton scheduler bundle (`dist/scheduler/index.js`)
   // and Dockerfile.scheduler were removed in Phase 4.
   { src: "src/agent-scheduler/index.ts", out: "dist/agent-scheduler/index.js" },
+  // RFC H: switchroom-auth-broker singleton. Bundled into the image as
+  // /opt/switchroom/dist/auth-broker/index.js; Dockerfile.auth-broker
+  // sets CMD to `bun` on the bundle. No native deps.
+  { src: "src/auth/broker/index.ts", out: "dist/auth-broker/index.js" },
   // RFC C Phase 1: host-control daemon. Bundled as a node-target
   // file the operator launches via a systemd user unit (see RFC
   // C §5.1). NOT baked into any docker image — the daemon runs
