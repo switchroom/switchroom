@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.9.0 — `switchroom-auth-broker` (RFC H): single-writer OAuth plane
+
+Big release. RFC H operationalises `reference/share-auth-across-the-fleet.md`: the **Anthropic account becomes the unit of authentication**, not the agent. One OAuth flow per account drives N agents. A new singleton container, `switchroom-auth-broker`, owns the refresh loop, per-agent credentials.json mirrors, and per-account quota state. Net diff is **−6,771 LOC** — the cleanup is the win, not just the new daemon.
+
+### Headline benefits
+
+- **One OAuth flow per Anthropic account, not per agent.** Six agents on one Pro subscription used to mean six `claude setup-token` invocations and six independent refresh cycles. Now: `switchroom auth add <label> --from-oauth` once, then every agent that uses that account just works.
+- **Quota events propagate in seconds.** When one agent gets 429, the broker marks the account exhausted and fans every co-account agent over to its fallback. No more six-agents-rediscover-the-same-wall.
+- **Fleet-wide active account is one verb.** `switchroom auth use <label>` swaps every agent to the new account. The Telegram twin `/auth use <label>` (admin agents only) is the same thing.
+- **Per-agent override is the edge case.** Most agents have no `auth:` block in `switchroom.yaml`. Agents that need a different account from the fleet get `agents.<n>.auth.override: <label>`.
+- **Visibility.** `switchroom auth show` (and `/auth show` in any agent's chat) prints accounts + agents + consumers + expiries + quota state in one screen. The old `auth status` was empty rows.
+- **Refresh races eliminated.** The single-use Anthropic refresh-token endpoint was racing every time multiple consumers refreshed concurrently; the loser silently got an invalid token. Broker holds an exclusive lease per account.
+- **Two silent-failure bugs that bit 2026-05-14 are now structurally impossible.** Bug 1 (sudo fanout writing root-owned credentials.json → silent fleet lockout at next restart). Bug 2 (`auth refresh-accounts` last-write-wins overwriting the YAML primary). Both pinned by regression tests at `src/auth/broker/server.test.ts`.
+- **Hindsight (and other ephemeral consumers) get a first-class slot.** `auth.consumers[]` schema field + per-consumer UDS socket means a non-agent container can `get-credentials` from the broker and feed claude. Unblocks the parked `feat/hindsight-claude-code` branch.
+
+### CLI changes
+
+| Before | After |
+|---|---|
+| `auth promote <label> <agents...>` | `auth use <label>` (fleet-wide) |
+| `auth enable / auth disable <label> <agents>` | `auth agent override <agent> <label>` (edge case) |
+| `auth login <agent>` | `auth add <label> --from-oauth` |
+| `auth reauth <agent>` | `auth add <label> --from-oauth --replace` |
+| `auth account add / list / rm / rename` | `auth add / list / rm` (no more `account` subcommand) |
+| `auth refresh-accounts` | `auth refresh [<label>]` (diagnostic; broker owns the loop) |
+| `auth share <label>` | `auth add` + `auth use` (two clear verbs) |
+| `auth status` (empty rows) | `auth show [<agent>]` (real state) |
+| `auth heal <agent>` | gone (no slot pool to heal); `--json` shim retained for boot-self-test |
+
+### Schema changes
+
+```yaml
+# BEFORE (per-agent auth.accounts arrays)
+agents:
+  ziggy:
+    auth_label: "pixsoul@gmail.com"
+    auth:
+      accounts: [me@kenthompson.com.au, pixsoul@gmail.com]
+
+# AFTER (one fleet active + per-agent override edge case)
+auth:
+  active: me@kenthompson.com.au
+  fallback_order: [me@kenthompson.com.au, pixsoul@gmail.com]
+  admin_agents: [clerk]
+  consumers:
+    - name: hindsight
+      account: me@kenthompson.com.au
+      uid: 11000
+
+agents:
+  ziggy: {}                                # uses fleet active
+  klanker:
+    auth:
+      override: pixsoul@gmail.com          # edge case only
+```
+
+`switchroom apply` runs an in-place schema upgrade with a `switchroom.yaml.pre-auth-broker` backup. Divergent fleets emit a loud warning explaining both the ordering loss and the tail-account loss (the new schema can't represent per-agent fallback preferences).
+
+### Architecture (read `docs/auth.md` for the operator guide)
+
+- Per-agent UDS socket at `/run/switchroom/auth-broker/<name>/sock`, mode 0660, chowned to the per-agent UID.
+- Per-consumer socket at `/run/switchroom/auth-broker/<consumer>/sock`, chowned to the consumer's declared UID.
+- Operator socket at `/run/switchroom/auth-broker/operator/sock`, chowned to the operator UID — host operator reaches the broker without sudo.
+- Drift detection: broker records sha256 of every credentials.json it writes in `sha-index.json`. Boot-time mismatch is a hard error; recovery is `auth add <label> --replace`. Runbook at `docs/operators/auth-broker-drift.md`.
+- Refresh threshold: 60min remaining (broker) vs ≤5min (claude). The 55-min gap is the load-bearing invariant — broker refreshes first, claude reads the new bytes on its next disk-read, no tmp+rename race.
+- `CLAUDE_CODE_OAUTH_TOKEN` env injection deleted (Decision 5). Stop hooks, sub-agents, summarizers, cron-launched `claude -p` all read `credentials.json` from disk, same path.
+- Per-agent slot tree (`<agentDir>/.claude/accounts/<slot>/`, `.oauth-token`, `.oauth-token.meta.json`, `active` marker) deleted (Decision 6).
+
+### Telegram
+
+The old `/auth` dashboard (1,104 LOC of in-place promote UI built on slot-pool concepts) is gone. Replaced with three chat commands:
+- `/auth show` — open to any agent (read-only).
+- `/auth use <label>` — admin agents only.
+- `/auth rotate` — admin agents only.
+
+### Deletions
+
+- `src/auth/account-promote.ts`, `src/auth/token-refresh.ts`, `src/auth/account-quota-store.ts`, `src/cli/auth-accounts-yaml.ts` — all functionality subsumed by the broker.
+- `telegram-plugin/auth-dashboard.ts` (1,104 LOC) and `telegram-plugin/auth-slot-parser.ts` — replaced by the three thin chat commands.
+- The fanout half of `src/auth/account-refresh.ts` (`fanoutAccountToAgents`, `refreshAllAccounts`, `enabledAgentsForAccount`). The single-account refresh primitive `refreshAccountIfNeeded` stays — the broker imports it.
+- ~2,000 LOC of paired tests for all the above.
+
+### Migration
+
+No long-term migration framework. `switchroom apply` runs an in-place upgrade on first run post-merge and writes `switchroom.yaml.pre-auth-broker` for the audit trail. There are no users in the wild, so the migration is destructive of per-agent fallback ordering on divergent fleets — the loud warning surfaces the loss.
+
+### See also
+
+- `docs/auth.md` — full operator guide.
+- `docs/operators/auth-broker-drift.md` — drift recovery runbook.
+- `docs/rfcs/auth-broker.md` — the RFC (3 review rounds).
+- `reference/share-auth-across-the-fleet.md` — the JTBD design contract this operationalises.
+
 ## v0.8.1 — SOUL.md fingerprint re-render (v0.8.0 follow-up)
 
 Single fix. The v0.8.0 voice consolidation (PR #1177) moved the canonical AI-tells ban-list into `SOUL.md` "Never", but `seedWorkspaceBootstrapFiles` was seeding workspace bootstrap files via `writeIfMissing`. Once an agent had a `SOUL.md`, the template was frozen forever — same failure shape as #1122 was for `CLAUDE.md` before that fix.
