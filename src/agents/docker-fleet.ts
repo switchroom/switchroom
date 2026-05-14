@@ -21,6 +21,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { generateCompose } from "./compose.js";
+import { findConfigFile } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 export interface BringUpAgentServiceOpts {
@@ -40,6 +41,18 @@ export interface BringUpAgentServiceOpts {
    * Compose YAML is written to `<switchroomHome>/compose/docker-compose.yml`.
    */
   switchroomHome?: string;
+  /**
+   * Absolute path to the active switchroom.yaml. Threaded into
+   * {@link generateCompose} as `switchroomConfigPath` so the singleton
+   * services (vault-broker, approval-kernel, switchroom-auth-broker)
+   * get the `SWITCHROOM_CONFIG` env var + read-only bind mount they
+   * need to boot. Without this, every `switchroom agent add` overwrites
+   * `~/.switchroom/compose/docker-compose.yml` with a file where those
+   * singletons restart-loop on `ConfigError: No switchroom.yaml found`
+   * the next time compose recreates them. Defaults to
+   * {@link findConfigFile}.
+   */
+  switchroomConfigPath?: string;
   /** Override compose generator (tests inject a pre-built YAML). */
   generateComposeContent?: () => string;
   /** Override docker binary path (tests). */
@@ -78,13 +91,38 @@ export function bringUpAgentService(
   const composeDir = resolve(home, "compose");
   mkdirSync(composeDir, { recursive: true, mode: 0o755 });
 
+  // Resolve the active switchroom.yaml path before generating compose.
+  // Without `switchroomConfigPath`, generateCompose emits a compose file
+  // where vault-broker / approval-kernel / switchroom-auth-broker have
+  // no SWITCHROOM_CONFIG env or config bind mount, and they restart-loop
+  // on `ConfigError: No switchroom.yaml found` the next time compose
+  // recreates them. Bail loud rather than persisting a broken compose.
+  let switchroomConfigPath = opts.switchroomConfigPath;
+  if (!switchroomConfigPath && !opts.generateComposeContent) {
+    try {
+      switchroomConfigPath = findConfigFile();
+    } catch (err) {
+      throw new Error(
+        `bringUpAgentService: could not locate switchroom.yaml to thread ` +
+          `into generateCompose (set SWITCHROOM_CONFIG or pass ` +
+          `switchroomConfigPath). Refusing to write a compose file whose ` +
+          `singletons would restart-loop on ConfigError. Underlying: ` +
+          `${(err as Error).message}`,
+      );
+    }
+  }
+
   const compose =
     opts.generateComposeContent?.() ??
     // PR-A1 made compose interpolation use absolute HOME paths instead of
     // ${HOME}; that fix requires threading homeDir through to
     // generateCompose. Without it, sudo'd `agent add` would re-write
     // compose.yml with /root/-rooted paths.
-    generateCompose({ config: opts.config, homeDir: homedir() });
+    generateCompose({
+      config: opts.config,
+      homeDir: homedir(),
+      switchroomConfigPath,
+    });
   const composePath = resolve(composeDir, "docker-compose.yml");
   // 0o600 matches `switchroom apply` — compose can contain references to
   // sockets/state under the operator's home and shouldn't be world-readable.

@@ -52,6 +52,7 @@ describe("bringUpAgentService", () => {
       config: STUB_CONFIG,
       agentName: "bot",
       switchroomHome: home,
+      switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
       stdio: "ignore",
     });
 
@@ -64,7 +65,7 @@ describe("bringUpAgentService", () => {
     expect(mode).toBe(0o600);
   });
 
-  it("calls generateCompose with homeDir = os.homedir() (PR-A1 fix)", () => {
+  it("calls generateCompose with homeDir = os.homedir() (PR-A1 fix) and threaded switchroomConfigPath", () => {
     const home = mkdtempSync(join(tmpdir(), "docker-fleet-"));
     (execFileSync as any).mockReturnValue(Buffer.from(""));
 
@@ -72,12 +73,14 @@ describe("bringUpAgentService", () => {
       config: STUB_CONFIG,
       agentName: "bot",
       switchroomHome: home,
+      switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
       stdio: "ignore",
     });
 
     expect(generateCompose).toHaveBeenCalledWith({
       config: STUB_CONFIG,
       homeDir: homedir(),
+      switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
     });
   });
 
@@ -89,6 +92,7 @@ describe("bringUpAgentService", () => {
       config: STUB_CONFIG,
       agentName: "bot",
       switchroomHome: home,
+      switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
       stdio: "ignore",
     });
 
@@ -144,6 +148,7 @@ describe("bringUpAgentService", () => {
       config: STUB_CONFIG,
       agentName: "bot",
       switchroomHome: home,
+      switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
       dockerBin: "/usr/local/bin/podman",
       stdio: "ignore",
     });
@@ -183,6 +188,7 @@ describe("bringUpAgentService", () => {
         config: STUB_CONFIG,
         agentName: "bot",
         switchroomHome: home,
+        switchroomConfigPath: "/etc/switchroom/switchroom.yaml",
         stdio: "ignore",
       }),
     ).toThrow(/docker compose up failed/);
@@ -190,6 +196,35 @@ describe("bringUpAgentService", () => {
     // The compose file MUST still have been persisted before the docker
     // shellout — that's what makes a retry possible.
     expect(existsSync(resolve(home, "compose", "docker-compose.yml"))).toBe(true);
+  });
+
+  it("bails with a clear error when no switchroomConfigPath is supplied and findConfigFile() can't locate switchroom.yaml", () => {
+    const home = mkdtempSync(join(tmpdir(), "docker-fleet-"));
+    (execFileSync as any).mockReturnValue(Buffer.from(""));
+
+    // Point both env override and HOME at empty dirs so findConfigFile()
+    // exhausts its search and throws.
+    const emptyDir = mkdtempSync(join(tmpdir(), "docker-fleet-empty-"));
+    const prevConfig = process.env.SWITCHROOM_CONFIG;
+    const prevHome = process.env.HOME;
+    const prevCwd = process.cwd();
+    delete process.env.SWITCHROOM_CONFIG;
+    process.env.HOME = emptyDir;
+    process.chdir(emptyDir);
+    try {
+      expect(() =>
+        bringUpAgentService({
+          config: STUB_CONFIG,
+          agentName: "bot",
+          switchroomHome: home,
+          stdio: "ignore",
+        }),
+      ).toThrow(/could not locate switchroom\.yaml/);
+    } finally {
+      if (prevConfig !== undefined) process.env.SWITCHROOM_CONFIG = prevConfig;
+      if (prevHome !== undefined) process.env.HOME = prevHome;
+      process.chdir(prevCwd);
+    }
   });
 });
 

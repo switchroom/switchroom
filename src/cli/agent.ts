@@ -2308,6 +2308,7 @@ export function registerAgentCommand(program: Command): void {
               const upRes = bringUpAgentService({
                 config: cfg,
                 agentName: name,
+                switchroomConfigPath: configPath,
               });
               composePath = upRes.composePath;
               console.log(chalk.gray(`  Wrote compose: ${composePath}`));
