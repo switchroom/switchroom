@@ -206,30 +206,52 @@ protocol so future protocol additions reuse the framing primitives.
 
 | op | args | returns | who can call |
 |---|---|---|---|
-| `get-credentials` | `{ account?: string }` | `{ account, credentials, expiresAt }` | any agent |
-| `list-state` | `{}` | `{ active, fallback_order, accounts: [{ label, expiresAt, exhausted, exhausted_until }], agents: [{ name, account, override?: string }] }` | any agent |
-| `set-active` | `{ account: string }` | `{ active, fanned: string[] }` | admin agents only |
-| `mark-exhausted` | `{ account: string, until?: number }` | `{ account, rolled: string[] }` | any agent (reactive 429s) |
-| `refresh-account` | `{ account: string }` | `{ account, expiresAt }` | admin agents only |
-| `add-account` | `{ label: string, credentials: object }` | `{ label, expiresAt }` | admin agents only — CLI-initiated only, gated by peer UID==0 / operator UID |
-| `rm-account` | `{ label: string }` | `{ label }` | admin agents only |
-| `set-override` | `{ agent: string, account: string \| null }` | `{ agent, account }` | admin agents only |
+| `get-credentials` | `{}` | `{ account, credentials, expiresAt }` | any agent / consumer |
+| `list-state` | `{}` | `{ active, fallback_order, accounts: [{ label, expiresAt, exhausted, exhausted_until }], agents: [{ name, account, override?: string }] }` | any agent / consumer |
+| `set-active` | `{ account: string }` | `{ active, fanned: string[] }` | admin only |
+| `mark-exhausted` | `{ until?: number }` | `{ account, rolled: string[] }` | any agent / consumer — but only for the *caller's currently active account* (broker derives from path-identity → active-account lookup; argument cannot override) |
+| `refresh-account` | `{ account: string }` | `{ account, expiresAt }` | admin only |
+| `add-account` | `{ label: string, credentials: object }` | `{ label, expiresAt }` | admin only |
+| `rm-account` | `{ label: string }` | `{ label }` | admin only |
+| `set-override` | `{ agent: string, account: string \| null }` | `{ agent, account }` | admin only |
 
 **Authorization model:**
 
-- `get-credentials` and `mark-exhausted` are open to any agent —
-  every agent needs to be able to read its own credentials and
-  report quota events. The broker fills in `account` from the
-  agent's bind-path identity if not given.
-- All other verbs require an *admin* peer. v1 ships with two
-  recognised admin identities:
-  - Peer UID == 0 (root, i.e. the CLI re-execed under sudo) — host
-    operator path.
+The broker derives the caller's identity from the bind-path (peer
+agent name or consumer name), looks up that caller's *currently
+active account* (`auth.active`, or the per-agent `auth.override`,
+or for a consumer the `auth.consumers[].account` binding), and
+gates verbs against that:
+
+- `get-credentials` always returns the caller's active account's
+  credentials. No argument override — a caller cannot ask for an
+  account it isn't on.
+- `mark-exhausted` always operates on the caller's active account.
+  Argument is `until` only; no `account` argument. This closes the
+  abuse path where any agent could spuriously deauth the fleet by
+  marking accounts it wasn't using. Spurious-from-real-user case
+  (an agent that's actually on account X spamming `mark-exhausted`
+  on X) is still possible but bounded — that agent's own account
+  is the one it kills, which is self-limiting.
+- All `admin only` verbs require one of:
+  - Peer UID == 0 (root, i.e. CLI re-execed under sudo via the
+    operator path) — host operator.
   - Peer agent listed in `auth.admin_agents: [...]` in
-    `switchroom.yaml` — admin-agent capability (intentionally
-    introduced *with* the broker, not as a separate prior step).
-- A non-admin agent's call to an admin verb returns
-  `{ ok: false, error: { code: "FORBIDDEN", … } }`.
+    `switchroom.yaml` (admin-agent capability, intentionally
+    introduced *with* the broker).
+- Non-admin caller of an admin verb gets
+  `{ ok: false, error: { code: "FORBIDDEN", … } }`. Path-identity
+  is always logged with the audit line so abuse is greppable.
+
+**Refresh-threshold invariant.** The single-writer guarantee depends
+on the broker refreshing tokens *strictly before* claude would. Claude's
+built-in refresh fires when access tokens have <5 min remaining
+(`claude` source — pinned in `docs/auth.md` § "Refresh windows" as
+part of this RFC). The broker fires at <30 min remaining. The 25-min
+gap is what guarantees no concurrent tmp+rename race between broker
+and claude on the same `credentials.json`. If a future claude release
+narrows that window, the broker threshold must move ahead of it; this
+is a documented dependency, not a coincidence.
 
 ### 4.4 On-disk state ownership
 
@@ -239,13 +261,37 @@ protocol so future protocol additions reuse the framing primitives.
 | `~/.switchroom/accounts/<label>/meta.json` | broker | created/last-refreshed/source label. |
 | `~/.switchroom/agents/<name>/.claude/credentials.json` | broker | per-agent active-account mirror. Atomic write, chowned to agent UID, mode 0600. |
 | `~/.switchroom/state/auth-broker/quota.json` | broker | per-account exhaustion state (label → reset-time). |
-| `~/.switchroom/state/auth-broker/audit.jsonl` | broker | every op logged with peer UID, agent name, ts. |
-| `~/.switchroom/state/auth-broker/refresh-lease/<label>` | broker | flock-protected pidfile to ensure single-refresher. |
-| `switchroom.yaml` | CLI | `auth.active`, `auth.fallback_order`, `auth.admin_agents`. Broker reads it, doesn't write it. |
+| `~/.switchroom/state/auth-broker/audit.jsonl` | broker | size-rotated at 10MB → `.1..5`, oldest discarded. |
+| `~/.switchroom/state/auth-broker/refresh-lease/<label>` | broker | flock-protected lease file. Cross-container flock via host bind mount — protects against the (theoretical, today single-instance) restart-overlap race and against future multi-broker scenarios. |
+| `switchroom.yaml` | CLI | `auth.active`, `auth.fallback_order`, `auth.admin_agents`, `auth.consumers`. Broker reads it on boot + on SIGHUP; CLI writes it. |
 
-**Atomic writes:** broker uses `tmp+fsync+rename` for every file
-write, same primitive vault-broker uses (see `src/vault/atomic.ts`
-— pattern is shared, not duplicated).
+**Atomic writes.** Both brokers (vault and auth) want the same
+`tmp+fsync+rename` primitive. Today vault-broker has its own copy
+inside `src/vault/vault.ts:62` (`atomicWriteFileSync`). This RFC
+factors it out into `src/util/atomic.ts` as a side commit (~30
+LOC moved, no behaviour change) so both brokers depend on the
+same implementation.
+
+**`~/.switchroom/accounts/<label>/credentials.json` ownership.** The
+file is created by the operator's CLI invocation of `auth add`
+(host-user UID) and *then* written atomically by the broker (root)
+on each subsequent refresh — so its on-disk owner flips to root
+after the first refresh. The broker chowns to root on first write.
+Any host-user CLI code path that previously read this file directly
+(e.g., to seed an agent) now goes through `get-credentials` over
+the broker UDS — no direct file reads from the CLI. This is the
+sole-writer invariant: it costs one indirection in the CLI but
+keeps the file's owner stable.
+
+**Drift detection.** The broker computes and stores the sha256 of
+every `~/.switchroom/accounts/<label>/credentials.json` it writes,
+in `state/auth-broker/sha-index.json`. On boot, it verifies the
+on-disk sha matches its index; mismatch is a hard error — broker
+logs a `DRIFT_DETECTED <label>` line and exits non-zero. Operator
+recovers via `switchroom auth add <label> --replace`, which the
+broker accepts as authoritative and re-indexes. This commits the
+RFC to "sole-writer" semantics rather than the "polite-mirror"
+middle ground the reviewer flagged as worst-of-both-worlds.
 
 ### 4.5 Schema diff
 
@@ -265,6 +311,11 @@ auth:
     - pixsoul@gmail.com
     - ken.thompson@outlook.com.au
   admin_agents: [clerk]                    # optional — admin verbs allowed
+  consumers:                               # optional — non-agent peers (hindsight, etc.)
+    - name: hindsight
+      account: me@kenthompson.com.au       # consumer's pinned active account
+      # `mark-exhausted` from this consumer only affects this account.
+      # `get-credentials` always returns this account's creds.
 
 agents:
   ziggy: {}                                # default: uses fleet active
@@ -277,11 +328,18 @@ agents:
 deleted from per-agent schema. The single-knob default is the
 common case; per-agent override is an explicit edge case.
 
+`auth.consumers[]` entries each declare a non-agent peer that can
+hold a broker socket. v1 schema is `{ name: string, account: string }`
+— `name` becomes the socket-path identity (binds at
+`/run/switchroom/auth-broker/<name>/sock`), `account` is the
+consumer's pinned active account. Consumers cannot be admins;
+adding a consumer name to `admin_agents` is a config error.
+
 ### 4.6 CLI surface diff
 
 | Verb | Before | After |
 |---|---|---|
-| Add account | `auth account add <label> --from-agent <a>` | `auth add <label> --from-agent <a>` |
+| Add account | `auth account add <label> --from-agent <a>` | `auth add <label> --from-agent <a>` (also `--from-oauth` runs full OAuth flow) |
 | List accounts | `auth account list` | `auth list` |
 | Remove account | `auth account rm <label>` | `auth rm <label>` |
 | Set fleet active | `auth promote <label> <a>...` (per-agent) | `auth use <label>` (fleet-wide) |
@@ -294,6 +352,46 @@ common case; per-agent override is an explicit edge case.
 
 CLI calls hit the broker UDS via a thin client (`src/auth/broker/
 client.ts`). No file writes from the CLI for per-agent state.
+
+**`auth show` output format.** Two modes:
+
+```
+$ switchroom auth show
+ACCOUNT                           STATUS       EXPIRES   QUOTA-RESET
+● me@kenthompson.com.au           active       355d 23h  —
+✓ pixsoul@gmail.com               available    353d 23h  —
+! ken.thompson@outlook.com.au     exhausted    356d 0h   1h 22m
+
+AGENT       ACTIVE                   SOURCE
+clerk       me@kenthompson.com.au    fleet-active (admin)
+ziggy       me@kenthompson.com.au    fleet-active
+klanker     ken.thompson@outlook…    override
+
+CONSUMER    ACTIVE                   STATUS
+hindsight   me@kenthompson.com.au    socket bound (last seen 12s ago)
+```
+
+```
+$ switchroom auth show ziggy
+ziggy
+  Active account: me@kenthompson.com.au (fleet-active)
+  Token expires:  355d 23h (refreshes at 30 min remaining)
+  Last refresh:   2026-05-14 13:54:02
+  Mirror sha:     ab12cd…  (matches broker index)
+  Container:      switchroom-ziggy up 2 minutes
+```
+
+**`auth show` and `auth list` are open to any agent.** Per the docs
+test: an operator should be able to answer "what's authenticated"
+without `--admin`. The CLI builds these views from broker
+`list-state` data.
+
+**First-run / setup-wizard.** `switchroom setup` post-RFC: detects
+no `auth.accounts` configured, runs OAuth (`auth add default
+--from-oauth`), sets `auth.active = default`. The first agent
+scaffolded inherits the fleet active by default. Two prompts ("log
+in to Anthropic" + "name your first agent"), zero per-agent
+`auth:` blocks emitted.
 
 ### 4.7 Refresh loop + quota state
 
@@ -332,27 +430,50 @@ A "customer hindsight container" running `claude -p` against a
 switchroom-managed Anthropic account is the motivating consumer
 outside the agent fleet. The pattern:
 
-1. Hindsight container has a bind mount on
-   `/run/switchroom/auth-broker/hindsight/sock` (broker binds it at
-   apply time if `auth.consumers: [hindsight]` is set in
-   `switchroom.yaml`).
-2. Container calls `get-credentials` on the socket → returns
-   `{ account, credentials, expiresAt }`.
-3. Container writes `credentials` to a tmpfs path
+1. Operator declares the consumer in `switchroom.yaml`:
+   ```yaml
+   auth:
+     consumers:
+       - name: hindsight
+         account: me@kenthompson.com.au
+   ```
+   On next `apply`, broker binds a socket at
+   `/run/switchroom/auth-broker/hindsight/sock`, chowned to the
+   hindsight container's UID (declared via `consumers[].uid` if
+   non-default).
+2. Hindsight compose (separate project — `docker-compose -p
+   hindsight`) bind-mounts the named volume `auth-broker-hindsight-sock`
+   at `/run/switchroom/auth-broker/`.
+3. Container calls `get-credentials` on the socket → returns
+   the credentials for *its declared account* (cannot ask for
+   a different one — peer-identity gating).
+4. Container writes `credentials` to a tmpfs path
    `/run/claude-creds/credentials.json`, sets
    `CLAUDE_CONFIG_DIR=/run/claude-creds`, runs `claude -p '…'`.
-4. On 429, container calls `mark-exhausted` so switchroom agents
-   on the same account fail over too (quota state is shared).
-5. Refresh attribution is the broker's job, not hindsight's — the
-   broker owns the refresh lease. Hindsight just re-fetches when
-   its tmpfs copy expires.
+5. On 429, container calls `mark-exhausted` — broker affects only
+   the consumer's bound account (path-identity → consumer →
+   bound account; the `account` arg is not honoured). Switchroom
+   agents on the same account fail over too (quota state is
+   shared at the account level).
+6. Refresh attribution is the broker's job — broker owns the
+   refresh lease. The refresh-threshold invariant (broker at
+   30min, claude at <5min) means the in-container claude never
+   fires its own refresh against the same credentials.json file.
+   Hindsight re-fetches via `get-credentials` after its tmpfs copy
+   ages out.
 
-The `auth.consumers:` schema field is the minimum surface
-needed for this to work (broker needs to know which sockets to bind
-beyond the per-agent ones). Specific cross-host /
-non-switchroom-managed hindsight integration is **out of scope** for
-v1 — that's where the network-reachable broker variant lives, and
-its trust model is non-trivial.
+**Trust model for consumers.** Consumers are first-class peers
+with path-identity (same primitive as agents), but they cannot be
+admins (rejected at schema validation if added to `admin_agents`).
+A consumer's reachable verbs are `get-credentials`, `list-state`,
+and `mark-exhausted` — all scoped to its declared account by
+broker-side derivation. `set-active`, `add-account`, etc. are
+forbidden — admin operations only come from operator-CLI (UID 0
+peer) or admin-agent peers.
+
+Cross-host / network-reachable broker (a remote hindsight on a
+different host) is **out of scope** for v1 — that's a TLS-fronted
+variant with its own trust model. v1 is UDS-only.
 
 ## 5. Compose / installer changes
 
@@ -365,7 +486,22 @@ its trust model is non-trivial.
 - Add `SWITCHROOM_AUTH_BROKER_SOCKET` env to each agent service
   pointing at `/run/switchroom/auth-broker/sock`.
 - For each entry in `auth.consumers`, emit a per-consumer named
-  volume and broker mount.
+  volume and broker mount; consumer service definitions themselves
+  live outside `switchroom`'s compose project (e.g. the hindsight
+  compose) and bind the named volume by canonical name.
+- **`depends_on:` ordering.** Every agent service emits
+  `depends_on: switchroom-auth-broker: { condition: service_healthy }`.
+  Agents do not start until the broker passes bind-presence
+  healthcheck. Same pattern as vault-broker today. Removes the boot
+  race window the reviewer flagged.
+
+**Boot-race-with-no-broker fallback.** If the broker is *down at
+agent boot* (e.g. crashlooping post-update), the dep-condition holds
+the agent in `created` state until the broker recovers. If the
+broker *dies after agents are running*, agents continue on their
+existing mirrored credentials (Decision 9 of the JTBD doc). The
+only window of risk is "broker has never been up + healthcheck
+hasn't passed" — `depends_on` handles that.
 
 Tests update at `tests/docker/compose-generator.test.ts` — pin
 every emitted field, same pattern as existing broker / kernel
@@ -387,50 +523,146 @@ Existing on-disk state on a dev host today:
 - `<agentDir>/.claude/.oauth-token`, `.oauth-token.meta.json` —
   **deleted** by apply (legacy env-injection mirrors gone).
 - `<agentDir>/.claude/active` — **deleted** by apply (slot-name file).
-- `switchroom.yaml` — `apply` runs a one-shot in-place rewrite:
-  - Lift the most common `auth.accounts[0]` to top-level `auth.active`.
-  - Lift the union of unique values across all agents'
-    `auth.accounts` lists to `auth.fallback_order` (preserving
-    first-seen order).
-  - Any agent whose `auth.accounts[0]` ≠ the lifted active gets a
-    per-agent `auth.override:` synthesized.
-  - `auth_label:` and per-agent `auth.accounts:` are stripped.
-  - A `# upgraded by auth-broker migration on <date>` comment
-    marker is appended once so the user sees what happened.
 
-This is *not* a migration framework — it's a one-shot in-place
-upgrade run from `apply`, idempotent, runs only when the legacy
-schema shape is detected. The implementation is ~80 lines and lives
-in `src/auth/migrate-schema.ts`. No CLI verb for it. Re-running
-`apply` post-upgrade is a no-op.
+**`switchroom.yaml` upgrade algorithm.** `apply` runs a one-shot
+in-place rewrite when it detects the legacy schema. Pseudocode:
 
-## 7. Files deleted
+```
+detect:  any agent has auth.accounts or auth_label in YAML
+algorithm:
+  primary_counts = histogram of agent.auth.accounts[0] across all agents
+  if len(primary_counts) == 1:
+    # uniform fleet — safe, fully recoverable
+    auth.active = sole primary
+    auth.fallback_order = first-seen union of all agents' auth.accounts
+    no agents get override:
+  else:
+    # divergent fleet — primary preference per-agent is lost
+    LOUDLY WARN to stderr:
+      ⚠ Divergent per-agent auth.accounts[0] detected across N agents.
+        Lifting "<most-common>" to fleet-active. Per-agent fallback
+        ordering is NOT preserved (the new schema only supports one
+        global fallback_order). Agents whose primary differed from
+        the fleet-active have been pinned via `override:`.
+        Pre-RFC YAML backed up at ~/.switchroom/switchroom.yaml.pre-auth-broker
+    auth.active = most-common primary; tiebreak: first-seen order
+                  in the YAML file
+    auth.fallback_order = first-seen union
+    for each agent a where a.auth.accounts[0] != auth.active:
+      a.auth.override = a.auth.accounts[0]
+  strip every agent's auth_label and auth.accounts fields
+  append: # upgraded by auth-broker migration on <date>
+  write atomically
+```
 
-- `src/auth/account-promote.ts` (subsumed by `auth use`).
-- The fanout half of `src/auth/account-refresh.ts` —
-  `fanoutAccountToAgents`, `refreshAllAccounts`, `enabledAgentsForAccount`
-  (the refresh-and-fan-out loop moves into the broker;
-  the single-account refresh primitive `refreshAccountIfNeeded`
-  stays put and gets imported by the broker server).
-- `src/auth/token-refresh.ts` (per-agent refresh loop — replaced by
-  broker's per-account loop).
-- `src/cli/auth-accounts.ts` (most of the verb wiring; what remains
-  becomes a thin client-shim over broker UDS).
+The pre-upgrade backup at `switchroom.yaml.pre-auth-broker` is
+the audit trail. The migration is **destructive of per-agent
+fallback ordering** when the fleet was divergent — that data does
+not survive because the new schema can't express it. This is the
+deliberate cost of the simpler model; the loud warning is the
+mitigation. Tested against three fixture shapes (uniform-single,
+uniform-multi, divergent) in `migrate-schema.test.ts`.
+
+The implementation is ~120 lines and lives in
+`src/auth/migrate-schema.ts`. No CLI verb for it. Re-running
+`apply` post-upgrade is a no-op (detection short-circuits).
+
+## 7. Files deleted / changed
+
+### 7.1 Deleted
+
+- `src/auth/account-promote.ts` (subsumed by broker `set-active`).
+- `src/auth/token-refresh.ts` (per-agent refresh loop — replaced
+  by broker's per-account loop).
+- `src/auth/account-quota-store.ts` (broker owns the canonical
+  quota store at `state/auth-broker/quota.json`).
 - `src/cli/auth-accounts-yaml.ts` (per-agent `auth.accounts:` list
-  manipulation — no longer a list, no longer per-agent in the
-  common case).
-- `src/auth/account-quota-store.ts` per-agent quota files (broker
-  owns the canonical quota store).
-- The `accounts/<slot>/` directory creation in scaffold.ts.
-- The `.oauth-token` + `.oauth-token.meta.json` writes in
-  `account-refresh.ts` and the env-injection block in
-  `profiles/_base/start.sh.hbs`.
-- `src/cli/auth.ts:registerHealCommand` (no slot pool to heal).
+  manipulation — no longer a list).
+- `telegram-plugin/auth-dashboard.ts` (1,104 lines — the in-place
+  promote UI built on top of the old per-agent slot model. Replaced
+  by simpler in-chat `/auth use <label>` and `/auth show` commands;
+  see §7.3).
+- `src/cli/auth.ts:registerHealCommand` and `auth heal` verb (no
+  slot pool to heal).
 - The `auth_label` field in `src/config/schema.ts` and its emit
-  in scaffold's `greetingCard` (already cosmetic; greeting now
-  derives from `auth.active` at render time).
+  in scaffold's `greetingCard` (replaced by deriving greeting from
+  the broker's `list-state`).
 
-Roughly **~2,000 lines deleted, ~1,500 added** net.
+### 7.2 Modified (not deleted)
+
+- `src/auth/account-refresh.ts` — keeps `refreshAccountIfNeeded`
+  (the single-account refresh primitive, broker imports it),
+  deletes `fanoutAccountToAgents` / `refreshAllAccounts` /
+  `enabledAgentsForAccount` (the loop-and-fanout half moves into
+  the broker).
+- `src/cli/auth-accounts.ts` — collapsed to thin client-shims
+  over broker UDS. The `withConfigError(... fanout ... writeFileSync)`
+  paths go away; what remains is "build args, call broker, format
+  response."
+- `src/cli/auth.ts` — keeps the parent CLI router, rewires
+  subcommands. `registerLoginCommand`, `registerReauthCommand`,
+  `registerCodeCommand`, `registerCancelCommand` (the per-agent
+  OAuth flow) collapse into one new `registerAddCommand` that
+  scopes to accounts not agents.
+- `src/web/api.ts` — the `/api/auth/promote` endpoint becomes
+  `/api/auth/use` and calls the broker over UDS instead of
+  `promoteAccountToPrimary` directly. Web dashboard's "promote on
+  this agent" UI control retargets to the fleet-wide use button.
+  `/api/auth/quota` reads from broker `list-state` instead of
+  `readAccountQuota`.
+- `telegram-plugin/quota-check.ts` — the per-account quota cache
+  shape stays, but the read path swaps from
+  `readAccountQuota(label)` to `brokerClient.listState().accounts[label]`.
+  The cache itself is fine; only the upstream changes.
+- `src/agents/scaffold.ts` — `accounts/<slot>/` directory creation
+  removed; greeting-card auth-row rendering reads broker
+  `list-state` via `brokerClient` instead of `auth_label`.
+- `profiles/_base/start.sh.hbs` — `CLAUDE_CODE_OAUTH_TOKEN` env
+  injection block deleted (Decision 5). Per-agent broker socket
+  path exported as `SWITCHROOM_AUTH_BROKER_SOCKET`.
+- `src/agents/compose.ts` — adds broker service emit + per-agent
+  socket volumes + `depends_on` healthcheck wiring.
+- `src/setup/wizard.ts` — first-run flow detects no accounts,
+  guides through OAuth, sets `auth.active`.
+
+### 7.3 Telegram surface
+
+`auth-dashboard.ts` is replaced — not by a deletion-with-no-
+replacement — by two thin chat commands the gateway adds:
+
+- `/auth show` → calls broker `list-state` via gateway IPC,
+  renders the same two-table format as the CLI's `auth show`.
+  Reachable to any agent's chat (read-only).
+- `/auth use <label>` → admin-gated (gateway checks
+  `auth.admin_agents`), calls broker `set-active`. Admin agents
+  can fleet-swap from Telegram.
+- `/auth rotate` → same admin gate, calls broker. Useful one-tap
+  failover from any admin chat when a 429 lands.
+
+The complexity of the old dashboard (drift-warnings, slot-state
+fixups, per-agent promote with mid-flight YAML editing) is gone
+because the *fleet-wide* model has nothing to fix up — there's one
+account active and one knob to change it.
+
+### 7.4 `CLAUDE_CODE_OAUTH_TOKEN` consumers
+
+Three callsites today reference the env var. All three are
+deleted in this RFC:
+- `src/agents/scaffold.ts` — emits the env injection in start.sh
+  (deleted with the rest of the env path).
+- `src/agents/handoff-summarizer.ts` — passes the token into the
+  summarizer subprocess explicitly via env (deleted; summarizer
+  now reads `<agentDir>/.claude/credentials.json` like every other
+  consumer).
+- `src/web/webhook-dispatch.ts` — same env pass for the webhook
+  worker. Switches to broker `get-credentials` (it's an
+  in-container consumer with broker socket access).
+
+### 7.5 Net diff
+
+Net negative — roughly **~2,400 LOC removed in src/ and telegram-plugin/
+plus ~2,000 LOC of paired tests removed; ~1,500 LOC added** for the
+broker, client, protocol, migrate-schema, and the new test surface.
 
 ## 8. Test plan
 
@@ -492,48 +724,46 @@ the PR.
   containers; survives switchroom-project recreate by being a
   sibling container, not a different process model.
 
-## 10. Open questions
+## 10. Decisions (resolved during review)
 
-1. **Should `auth.consumers:` ship in v1 or v2?**
-   Hindsight is the one motivating consumer and its branch is
-   parked specifically on this. Shipping the socket-binding surface
-   in v1 unblocks that branch immediately; deferring means hindsight
-   re-blocks on a v2 PR. I lean v1 (add the schema field, broker
-   binds the socket, semantics for non-agent peers are tight: same
-   verbs, no admin escalation). But the agent-vs-consumer trust
-   delta is real — wants a sentence from Ken in this review.
+1. **`auth.consumers:` ships in v1.** Concrete schema in §4.5;
+   trust model in §4.8. Hindsight branch unblocks on this PR.
 
-2. **What does `auth rotate` do mid-turn for an agent currently
-   executing?** Options:
-   - (a) Swap the mirror file immediately. Active claude process may
-     hold the old token in memory for the duration of its current
-     request — fine; the swap takes effect on the next subprocess
-     spawn or next idle.
-   - (b) Wait for in-flight turns to drain, then swap.
-   Option (a) is simpler and matches the broker's
-   "I-write-the-file, claude-rereads-eventually" contract. Proposed.
+2. **`auth rotate` mid-turn: swap-mirror-immediately.** Active claude
+   process holds the old token in memory until the next subprocess
+   spawn or its own next disk-read. Acceptable; matches the
+   broker's "I-write-the-file, claude-rereads-eventually" contract.
 
-3. **Telegram-side: do we expose `/auth use` and `/auth rotate` in
-   v1?** The host CLI verbs are mandatory. The Telegram twin is
-   reachable today by piggybacking on the existing `spawnSwitchroom
-   Detached` shell-out, but it'll be cleaner once RFC C's
-   `switchroom-hostd` lands. Proposing v1 ships **CLI-only**; the
-   Telegram twins land in a follow-up after hostd Phase 2.
+3. **Telegram-side ships in v1 — three commands** (`/auth show`,
+   `/auth use`, `/auth rotate`). The old `auth-dashboard.ts` is
+   deleted in the same PR, replaced by these three chat commands
+   (§7.3). The UX is simpler than the dashboard *because* the
+   fleet-wide model has less state to manage.
 
-4. **Audit log retention.** Append-only JSONL has no rotation. For
-   v1 propose 30-day implicit retention (logrotate-compatible by
-   filename), tracked as a follow-up if it becomes an actual
-   space problem.
+4. **Audit log: size-rotation at 10MB.** Five files retained
+   (`audit.jsonl`, `.1`, `.2`, `.3`, `.4`, `.5`). Implementation
+   is ~30 LOC in `src/auth/broker/audit.ts`. Date-based rotation
+   added later if needed.
 
-5. **Drift detection on `~/.switchroom/accounts/<label>/credentials.json`.**
-   What if a user `claude setup-token`s into a global account file
-   directly, behind the broker's back? Vault-broker has a
-   drift-detection pattern (`drift-detection.test.ts`). Should we
-   port it? I lean *yes* for v1 — the broker should warn on
-   mtime/sha drift it didn't cause, even if it doesn't reject the
-   foreign bytes.
+5. **Drift detection: hard error.** Broker refuses to start if
+   sha-index mismatch with on-disk creds. Operator recovers via
+   `auth add <label> --replace`. Detailed in §4.4. This commits
+   to "sole writer" and gives up the polite-mirror compromise.
 
-## 11. Verdict / next steps
+## 11. Remaining open questions
+
+None blocking. Two minor items tracked as PR-time decisions:
+
+- Should `--replace` on `auth add` require an interactive
+  confirmation, or is the verb name sufficient? Lean: confirmation
+  if stdout is a TTY, skip if `--non-interactive`.
+- Should the broker expose its quota-cap data (`5h / 7d` windows
+  per account, already gathered by `quota-check.ts`) via
+  `list-state`, or keep that in the chat-surface layer? Lean: yes
+  expose via `list-state.accounts[].quota_5h_pct` etc — JTBD
+  *track-plan-quota-live* benefits directly.
+
+## 12. Verdict / next steps
 
 The RFC ships when:
 - The four product-principle checks pass:
@@ -556,9 +786,8 @@ The RFC ships when:
   prompts" pass on a 3-agent / 2-account dev fleet.
 - The unit + integration test plan from §8 is implemented and
   green.
-- Net diff size is roughly what § "Files deleted" predicts (~2k
-  deleted, ~1.5k added) — meaningful negative net signals the
-  cleanup landed.
+- Net diff is meaningfully negative (~2k LOC deleted net) — the
+  cleanup is the win, not just the new daemon.
 
 After merge: `feat/hindsight-claude-code` rebases on this and uses
 `get-credentials` per Decision 7.
