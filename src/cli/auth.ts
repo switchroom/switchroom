@@ -1,120 +1,67 @@
+/**
+ * `switchroom auth` CLI surface — post-RFC-H thin client over the
+ * auth-broker UDS.
+ *
+ * The fleet-wide model collapses what used to be a per-agent verb tree
+ * (`auth login / reauth / heal / promote / enable / disable / share /
+ * refresh-accounts / status / account add / account list / account rm`)
+ * into a small accounts-and-fleet surface:
+ *
+ *   auth add <label> --from-agent | --from-credentials | --from-oauth
+ *   auth list
+ *   auth use <label>            — set fleet active
+ *   auth rotate                 — cycle to next non-exhausted entry
+ *   auth rm <label>
+ *   auth show [<agent>]
+ *   auth refresh [<label>]      — diagnostic force-tick
+ *   auth agent override <agent> (<label> | --clear)
+ *
+ * Every verb hits the broker over the operator socket and prints the
+ * result. No per-agent state writes from this code path; the broker
+ * owns mirror files.
+ *
+ * `diagnoseAuthState` survives as a pure helper used by the
+ * `auth-heal-diagnose` test. The CLI verb that wrapped it (`auth heal`)
+ * is gone — there's no slot pool to heal post-RFC-H.
+ */
+
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { join, resolve } from "node:path";
+
+import {
+  AuthBrokerClient,
+  AuthBrokerError,
+  AuthBrokerUnreachableError,
+  withAuthBrokerClient,
+  type AccountState,
+  type AddAccountCredentials,
+  type AgentState,
+  type ConsumerState,
+  type ListStateData,
+} from "../auth/broker/client.js";
+import {
+  accountCredentialsPath,
+  readAccountCredentials,
+} from "../auth/account-store.js";
 import { resolveAgentsDir } from "../config/loader.js";
-import {
-  loginAgent,
-  getAllAuthStatuses,
-  refreshAgent,
-  submitAuthCode,
-  cancelAuthSession,
-  addAccountStart,
-  listAccounts,
-  switchAccount,
-  removeAccount,
-  startAuthSession,
-} from "../auth/manager.js";
-import {
-  refreshAllAgents,
-  REFRESH_THRESHOLD_MS,
-  type RefreshOutcome,
-} from "../auth/token-refresh.js";
-import { getAgentStatus, restartAgent } from "../agents/lifecycle.js";
 import { withConfigError, getConfig } from "./helpers.js";
-import { registerAuthAccountSubcommands } from "./auth-accounts.js";
 import { registerAuthGoogleSubcommands } from "./auth-google.js";
 
-function printAuthTable(
-  headers: string[],
-  rows: string[][],
-  widths: number[]
-): void {
-  const headerLine = headers
-    .map((h, i) => chalk.bold(h.padEnd(widths[i])))
-    .join("  ");
-  console.log(`  ${headerLine}`);
-
-  for (const row of rows) {
-    const line = row.map((cell, i) => cell.padEnd(widths[i])).join("  ");
-    console.log(`  ${line}`);
-  }
-}
-
-function requireKnownAgent(config: ReturnType<typeof getConfig>, name: string): void {
-  if (!config.agents[name]) {
-    console.error(
-      chalk.red(`Agent "${name}" is not defined in switchroom.yaml`)
-    );
-    console.error(
-      chalk.gray(
-        `  Available agents: ${Object.keys(config.agents).join(", ")}`
-      )
-    );
-    process.exit(1);
-  }
-}
-
-function formatOutcomeTag(o: RefreshOutcome): string {
-  switch (o.kind) {
-    case "refreshed":
-      return chalk.green("[refreshed]");
-    case "skipped-fresh":
-      return chalk.dim("[fresh]    ");
-    case "skipped-no-refresh-token":
-      return chalk.yellow("[no-rtoken]");
-    case "skipped-no-credentials":
-      return chalk.dim("[no-creds] ");
-    case "skipped-malformed":
-      return chalk.yellow("[malformed]");
-    case "failed":
-      return chalk.red("[failed]   ");
-  }
-}
-
-function formatOutcomeNote(o: RefreshOutcome): string {
-  switch (o.kind) {
-    case "refreshed":
-      return `expires ${new Date(o.newExpiresAt).toISOString()}`;
-    case "skipped-fresh": {
-      const mins = Math.round(o.remainingMs / 60_000);
-      return `still ${mins}m remaining`;
-    }
-    case "skipped-no-refresh-token":
-      return "no refreshToken — user must /auth in chat";
-    case "skipped-no-credentials":
-      return ".credentials.json missing (oauth-token-only is fine)";
-    case "skipped-malformed":
-      return o.reason;
-    case "failed":
-      return o.error;
-  }
-}
-
-function rejectAll(name: string, verb: string): void {
-  if (name !== "all") return;
-  console.error(chalk.red(`switchroom auth ${verb} all is not supported.`));
-  console.error(
-    chalk.gray("  Start one auth flow at a time so you can paste the browser code back in.")
-  );
-  process.exit(1);
-}
+// ─── Diagnose (used by tests; CLI heal verb removed) ─────────────────────
 
 export type AuthSeverity = "ok" | "warn" | "error" | "critical";
 
 export interface AuthFinding {
-  /** Stable identifier (matches boot-self-test fingerprint codes). */
   code: string;
   severity: AuthSeverity;
   summary: string;
 }
 
 export interface AuthDiagnosis {
-  /** Aggregated severity (max of finding severities). "ok" when no issue. */
   severity: AuthSeverity;
   findings: AuthFinding[];
-  /** Operator-readable lines for the recommended next step. */
   recommendation: string[];
 }
 
@@ -126,16 +73,13 @@ const SEVERITY_RANK: Record<AuthSeverity, number> = {
 };
 
 /**
- * Inspect the agent's `.credentials.json` and `.oauth-token` and
- * return a structured diagnosis matching the boot-self-test (#427)
- * checks. Pure read; no side effects.
+ * Inspect an agent's `.credentials.json` and return a structured
+ * diagnosis. Pure read; no side effects. Used by the boot-self-test
+ * issue card path and by `tests/auth-heal-diagnose.test.ts`.
  *
- * Exposed for tests and for the heal CLI verb. The recommendation
- * lines are scoped to what the user can actually do — currently that
- * means `switchroom auth reauth <name>` for any non-ok state, since
- * none of these failure modes are auto-recoverable yet (Phase 1.1
- * adds the OAuth refresh loop that would self-heal `token_expired`
- * when a refreshToken is present).
+ * `auth heal` (which wrapped this in a CLI verb) was deleted with
+ * RFC H — the broker writes mirrors directly, so there's no per-agent
+ * state to heal from the CLI.
  */
 export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
   const findings: AuthFinding[] = [];
@@ -145,41 +89,13 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
   const hasCreds = existsSync(credsPath);
   const hasOauthToken = existsSync(oauthTokenPath);
 
-  // Summary text is the user-facing string surfaced in the boot-self-test
-  // issue card on Telegram. It must be ACTIONABLE without docs — see
-  // reference/principles.md "docs test." The technical fingerprint is
-  // preserved in `code` for forensics; `summary` tells the user what to
-  // do. Send /auth in the agent's chat to open the inline auth dashboard
-  // (telegram-plugin/auth-dashboard.ts), which has Reauth / Add / Use
-  // buttons — no terminal needed.
   if (!hasCreds && !hasOauthToken) {
     findings.push({
       code: "credentials_missing",
       severity: "error",
       summary: "needs first-time login — send /auth in this chat to start the flow",
     });
-  } else if (!hasCreds) {
-    // `.oauth-token`-only IS switchroom's intended steady state. The
-    // auth flow (src/auth/manager.ts:writeOAuthToken + the deliberate
-    // `rmSync(credentialsPath(...))` at line 922) explicitly persists
-    // ONLY the bearer token; the temp `.credentials.json` written by
-    // `claude setup-token` is wiped to prevent state-drift incidents
-    // (gymbro 2026-04-25). Hooks that shell `claude -p` get the token
-    // via the `CLAUDE_CODE_OAUTH_TOKEN` env var injected at start.sh
-    // (and re-injected by `defaultClaudeCliRunner` when the parent
-    // strips it) — they never read `.credentials.json`.
-    //
-    // So `.credentials.json` absence is NOT a problem under
-    // switchroom's design. Earlier versions of this diagnoser
-    // (inherited from claude CLI's assumptions) flagged it as a warn
-    // and told users to `/auth` to fix — but `/auth` produces the
-    // same `.oauth-token`-only state, so the warning was unfixable
-    // and the user-facing message was a UX dead end. Suppress it.
-    //
-    // Token-expiry tracking lives in `.oauth-token.meta.json`
-    // (createdAt + expiresAt) — that's where any future "your token
-    // is about to expire" warning belongs, not in this branch.
-  } else {
+  } else if (hasCreds) {
     let parsed:
       | { claudeAiOauth?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }
       | undefined;
@@ -201,13 +117,9 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
           summary: "credentials file corrupted — send /auth in this chat to reset",
         });
       } else {
-        // Token shape OK; check expiry.
         const expiresAt = oauth.expiresAt;
         if (typeof expiresAt === "number") {
           if (!Number.isFinite(expiresAt)) {
-            // NaN / Infinity — same masking concern as #441: silently
-            // skipping non-numeric values lets a corrupt creds file
-            // appear healthy when it isn't.
             findings.push({
               code: "credentials_malformed",
               severity: "warn",
@@ -222,16 +134,12 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
             });
           }
         } else if (expiresAt !== undefined) {
-          // expiresAt present but the wrong type (string/null/object).
-          // Pre-fix this branch silently fell through, masking a corrupt
-          // creds file as healthy. See #441.
           findings.push({
             code: "credentials_malformed",
             severity: "warn",
             summary: "credentials file has invalid expiry — send /auth in this chat to reset",
           });
         }
-        // Refresh token: warn if missing.
         if (!oauth.refreshToken || oauth.refreshToken.length === 0) {
           findings.push({
             code: "refresh_token_missing",
@@ -243,7 +151,6 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
     }
   }
 
-  // Aggregate severity.
   let severity: AuthSeverity = "ok";
   for (const f of findings) {
     if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[severity]) {
@@ -251,15 +158,8 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
     }
   }
 
-  // Build the recommendation. For now everything routes to reauth —
-  // Phase 1.1 will add a programmatic refresh path for the
-  // refreshToken-present case.
   const recommendation: string[] = [];
-  if (severity === "ok") {
-    // No recommendation needed.
-  } else {
-    // Different prescription depending on what's broken — but the
-    // command is the same. The PROSE differs to be actionable.
+  if (severity !== "ok") {
     if (findings.some((f) => f.code === "credentials_missing" && f.severity === "error")) {
       recommendation.push("This agent has never been authenticated. Start the OAuth flow:");
     } else if (findings.some((f) => f.code === "token_expired")) {
@@ -270,594 +170,458 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
       recommendation.push("Recommended: refresh credentials so the access token can be renewed:");
     }
     recommendation.push("");
-    recommendation.push("  switchroom auth reauth <agent-name>");
+    recommendation.push("  switchroom auth add default --from-oauth");
     recommendation.push("");
-    recommendation.push("Or pass --auto to this command to start the flow now.");
   }
 
   return { severity, findings, recommendation };
 }
 
-/**
- * Suppress the unused-import warning when the build path doesn't
- * statically reference these. Keeps the import list intentional.
- */
-void execFileSync;
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+function dieBrokerUnreachable(err: AuthBrokerUnreachableError): never {
+  console.error(chalk.red(`  auth-broker unreachable: ${err.message}`));
+  console.error(
+    chalk.gray(
+      `  Check the daemon: docker compose -p switchroom ps switchroom-auth-broker`,
+    ),
+  );
+  process.exit(2);
+}
+
+function dieBrokerError(err: AuthBrokerError): never {
+  console.error(chalk.red(`  ${err.code}: ${err.message}`));
+  process.exit(1);
+}
+
+async function brokerCall<T>(fn: (client: AuthBrokerClient) => Promise<T>): Promise<T> {
+  try {
+    return await withAuthBrokerClient(fn);
+  } catch (err) {
+    if (err instanceof AuthBrokerUnreachableError) dieBrokerUnreachable(err);
+    if (err instanceof AuthBrokerError) dieBrokerError(err);
+    throw err;
+  }
+}
+
+function formatExpiry(expiresAt?: number): string {
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) return "—";
+  const remainingMs = expiresAt - Date.now();
+  if (remainingMs <= 0) return chalk.red("expired");
+  const days = Math.floor(remainingMs / 86_400_000);
+  const hours = Math.floor((remainingMs % 86_400_000) / 3_600_000);
+  return `${days}d ${hours}h`;
+}
+
+function formatQuotaReset(state: AccountState): string {
+  if (!state.exhausted) return "—";
+  const u = state.exhausted_until;
+  if (typeof u !== "number") return "exhausted";
+  const remainingMs = u - Date.now();
+  if (remainingMs <= 0) return "—";
+  const hours = Math.floor(remainingMs / 3_600_000);
+  const mins = Math.floor((remainingMs % 3_600_000) / 60_000);
+  return `${hours}h ${mins}m`;
+}
+
+function printAccountsTable(state: ListStateData): void {
+  console.log(
+    chalk.bold("  ACCOUNT                           STATUS       EXPIRES    QUOTA-RESET"),
+  );
+  for (const a of state.accounts) {
+    const marker =
+      a.label === state.active
+        ? chalk.green("●")
+        : a.exhausted
+          ? chalk.red("!")
+          : chalk.gray("✓");
+    const status =
+      a.label === state.active
+        ? chalk.green("active   ")
+        : a.exhausted
+          ? chalk.red("exhausted")
+          : "available";
+    const label = a.label.padEnd(32);
+    const exp = formatExpiry(a.expiresAt).padEnd(10);
+    const quota = formatQuotaReset(a);
+    console.log(`  ${marker} ${label} ${status}    ${exp} ${quota}`);
+  }
+}
+
+function printAgentsTable(state: ListStateData): void {
+  console.log();
+  console.log(chalk.bold("  AGENT       ACTIVE                       SOURCE"));
+  for (const a of state.agents) {
+    const acct = a.account.padEnd(28);
+    const source = a.override ? "override" : "fleet-active";
+    console.log(`  ${a.name.padEnd(10)} ${acct} ${source}`);
+  }
+}
+
+function printConsumersTable(state: ListStateData): void {
+  if (state.consumers.length === 0) return;
+  console.log();
+  console.log(chalk.bold("  CONSUMER    ACTIVE                       STATUS"));
+  for (const c of state.consumers) {
+    const acct = c.account.padEnd(28);
+    const status =
+      c.last_seen_at == null
+        ? chalk.gray("never seen")
+        : `last seen ${Math.round((Date.now() - c.last_seen_at) / 1000)}s ago`;
+    console.log(`  ${c.name.padEnd(10)} ${acct} ${status}`);
+  }
+}
+
+function printAgentDetail(state: ListStateData, agent: AgentState): void {
+  console.log();
+  console.log(chalk.bold(`  ${agent.name}`));
+  console.log(
+    `    Active account: ${agent.account} (${agent.override ? "override" : "fleet-active"})`,
+  );
+  const acct = state.accounts.find((a) => a.label === agent.account);
+  if (acct) {
+    console.log(
+      `    Token expires:  ${formatExpiry(acct.expiresAt)} (refreshes at 60 min remaining)`,
+    );
+    if (typeof acct.last_refreshed_at === "number") {
+      console.log(
+        `    Last refresh:   ${new Date(acct.last_refreshed_at).toISOString()}`,
+      );
+    }
+    if (acct.exhausted) {
+      console.log(`    Quota:          ${chalk.red("exhausted")} (resets in ${formatQuotaReset(acct)})`);
+    }
+    if (typeof acct.threshold_violations === "number" && acct.threshold_violations > 0) {
+      console.log(
+        chalk.yellow(
+          `    Threshold violations: ${acct.threshold_violations} — claude refreshed under the broker's feet`,
+        ),
+      );
+    }
+  }
+}
+
+function loadCredentialsFromAgent(agentName: string): AddAccountCredentials {
+  const config = getConfigSafe();
+  const agentsDir = resolveAgentsDir(config);
+  const agentDir = resolve(agentsDir, agentName);
+  const credsPath = join(agentDir, ".claude", ".credentials.json");
+  if (!existsSync(credsPath)) {
+    console.error(
+      chalk.red(`  Agent "${agentName}" has no .claude/.credentials.json — log it in first.`),
+    );
+    process.exit(1);
+  }
+  let parsed: AddAccountCredentials;
+  try {
+    parsed = JSON.parse(readFileSync(credsPath, "utf-8")) as AddAccountCredentials;
+  } catch (err) {
+    console.error(
+      chalk.red(`  Failed to parse credentials.json: ${(err as Error).message}`),
+    );
+    process.exit(1);
+  }
+  if (typeof parsed?.claudeAiOauth?.accessToken !== "string") {
+    console.error(
+      chalk.red(`  credentials.json missing claudeAiOauth.accessToken`),
+    );
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function loadCredentialsFromFile(path: string): AddAccountCredentials {
+  if (!existsSync(path)) {
+    console.error(chalk.red(`  No file at ${path}`));
+    process.exit(1);
+  }
+  let parsed: AddAccountCredentials;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf-8")) as AddAccountCredentials;
+  } catch (err) {
+    console.error(chalk.red(`  Failed to parse ${path}: ${(err as Error).message}`));
+    process.exit(1);
+  }
+  if (typeof parsed?.claudeAiOauth?.accessToken !== "string") {
+    console.error(chalk.red(`  ${path} is missing claudeAiOauth.accessToken`));
+    process.exit(1);
+  }
+  return parsed;
+}
+
+function loadCredentialsFromGlobalAccount(label: string): AddAccountCredentials {
+  const creds = readAccountCredentials(label);
+  if (!creds || typeof creds.claudeAiOauth?.accessToken !== "string") {
+    console.error(
+      chalk.red(
+        `  No credentials found at ${accountCredentialsPath(label)}.\n` +
+          `  Run 'claude setup-token' first to populate them.`,
+      ),
+    );
+    process.exit(1);
+  }
+  return {
+    claudeAiOauth: {
+      accessToken: creds.claudeAiOauth.accessToken,
+      refreshToken: creds.claudeAiOauth.refreshToken,
+      expiresAt: creds.claudeAiOauth.expiresAt,
+      scopes: creds.claudeAiOauth.scopes,
+      subscriptionType: creds.claudeAiOauth.subscriptionType,
+      rateLimitTier: creds.claudeAiOauth.rateLimitTier,
+    },
+  };
+}
+
+function getConfigSafe(): ReturnType<typeof getConfig> {
+  // Some `auth` verbs (add --from-oauth, list, show) don't strictly need
+  // a switchroom.yaml, but the helpers `getConfig` does require one. The
+  // CLI integration test relies on `getConfig` failing loudly when the
+  // config is missing.
+  // Use a tiny faux Command so getConfig's traversal works.
+  type GetConfigArg = Parameters<typeof getConfig>[0];
+  return getConfig(undefined as unknown as GetConfigArg);
+}
+
+// ─── Register ─────────────────────────────────────────────────────────────
 
 export function registerAuthCommand(program: Command): void {
   const auth = program
     .command("auth")
-    .description("Manage OAuth authentication per agent");
+    .description("Manage OAuth authentication via switchroom-auth-broker (RFC H)");
 
-  // Account-shaped verbs (new auth model — see
-  // reference/share-auth-across-the-fleet.md). Registered first so the
-  // `auth account ...` subcommand tree exists before the per-agent
-  // legacy verbs hang off the same parent.
-  registerAuthAccountSubcommands(program, auth);
-
-  // RFC G Phase 3a — `auth google enable|disable|list` for Google
-  // Workspace per-account ACL management. See
-  // docs/rfcs/google-workspace-generalization.md §4.5. Phase 3b adds
-  // `account add`, `account remove`, `share`, `connect` (wizard alias),
-  // and the apply-time legacy-slot detector.
   registerAuthGoogleSubcommands(program, auth);
 
-  // switchroom auth login <name>
+  // ── auth add <label> ──────────────────────────────────────────────────
   auth
-    .command("login <name>")
-    .description("Start Claude OAuth token setup for an agent")
-    .action(
-      withConfigError(async (name: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        rejectAll(name, "login");
-        requireKnownAgent(config, name);
-
-        const agentDir = resolve(agentsDir, name);
-        const result = loginAgent(name, agentDir);
-
-        console.log();
-        for (const line of result.instructions) {
-          console.log(line);
-        }
-        console.log();
-      })
-    );
-
-  // switchroom auth reauth <name> [--slot <slot>]
-  auth
-    .command("reauth <name>")
-    .description("Start a fresh Claude OAuth token flow and replace the current one")
-    .option("--slot <slot>", "Re-auth a specific slot (defaults to active)")
-    .action(
-      withConfigError(async (name: string, opts: { slot?: string }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        rejectAll(name, "reauth");
-        requireKnownAgent(config, name);
-
-        const agentDir = resolve(agentsDir, name);
-        const result = opts.slot
-          ? startAuthSession(name, agentDir, { force: true, slot: opts.slot })
-          : refreshAgent(name, agentDir);
-
-        console.log();
-        for (const line of result.instructions) {
-          console.log(line);
-        }
-        console.log();
-      })
-    );
-
-  // switchroom auth heal <name> [--auto]
-  //
-  // Diagnostic verb for the issue cards (#427, #428): inspects an
-  // agent's auth state and prints the specific next step the operator
-  // needs. With --auto, kicks off `auth reauth` directly instead of
-  // requiring a copy-paste.
-  //
-  // Mirrors the boot-self-test checks (creds present, not expired,
-  // refreshToken present, claude -p works in stripped env) so the
-  // diagnosis here matches what the issue card shows. Default mode is
-  // read-only — diagnose-only — so an operator can run it from
-  // anywhere without side effects.
-  auth
-    .command("heal <name>")
-    .description("Diagnose and (optionally) repair an agent's broken auth state")
-    .option("--auto", "Trigger reauth automatically instead of just printing instructions", false)
-    .option("--json", "Emit a structured diagnosis instead of prose", false)
-    .option(
-      "--config-dir <path>",
-      "Inspect this CLAUDE_CONFIG_DIR directly instead of resolving from " +
-        "switchroom.yaml. Used by boot-self-test and tests where agents may " +
-        "not be registered in a yaml file.",
-    )
-    .action(
-      withConfigError(async (
-        name: string,
-        opts: { auto?: boolean; json?: boolean; configDir?: string },
-      ) => {
-        // --config-dir bypasses yaml validation. The agent must still
-        // be a valid name (used in output), but we don't require a
-        // switchroom.yaml entry. --auto is incompatible because the
-        // reauth flow requires the registered agentsDir.
-        let claudeConfigDir: string;
-        let agentDir: string;
-        if (opts.configDir) {
-          if (opts.auto) {
-            console.error(chalk.red("--auto is incompatible with --config-dir; " +
-              "the reauth flow needs the agent registered in switchroom.yaml."));
-            process.exit(2);
-          }
-          claudeConfigDir = resolve(opts.configDir);
-          agentDir = resolve(claudeConfigDir, "..");
-        } else {
-          const config = getConfig(program);
-          const agentsDir = resolveAgentsDir(config);
-          rejectAll(name, "heal");
-          requireKnownAgent(config, name);
-          agentDir = resolve(agentsDir, name);
-          claudeConfigDir = join(agentDir, ".claude");
-        }
-        const diagnosis = diagnoseAuthState(claudeConfigDir);
-
-        if (opts.json) {
-          console.log(JSON.stringify({ agent: name, ...diagnosis }, null, 2));
-          if (diagnosis.severity === "critical" || diagnosis.severity === "error") {
-            process.exit(2);
-          }
-          return;
-        }
-
-        // Prose output — dim header, then the prescribed action.
-        console.log();
-        console.log(`  ${chalk.bold(name)}:`);
-        for (const finding of diagnosis.findings) {
-          const tag =
-            finding.severity === "critical" ? chalk.red("[critical]") :
-            finding.severity === "error"    ? chalk.red("[error]") :
-            finding.severity === "warn"     ? chalk.yellow("[warn]") :
-                                              chalk.green("[ok]");
-          console.log(`    ${tag} ${finding.summary}`);
-        }
-        console.log();
-        if (diagnosis.severity === "ok") {
-          console.log(chalk.green("  ok: Auth healthy - nothing to do."));
-          console.log();
-          return;
-        }
-
-        console.log(chalk.bold("  Recommended next step:"));
-        for (const line of diagnosis.recommendation) {
-          console.log(`    ${line}`);
-        }
-        console.log();
-
-        if (opts.auto) {
-          console.log(chalk.dim("  --auto specified; kicking off reauth..."));
-          console.log();
-          // Hand off to the existing reauth flow. We don't try to
-          // recover state ourselves — the reauth path is already the
-          // authoritative way to bootstrap fresh creds.
-          const result = refreshAgent(name, agentDir);
-          for (const line of result.instructions) {
-            console.log(line);
-          }
-          console.log();
-        } else {
-          console.log(chalk.dim("  Pass --auto to start the reauth flow now."));
-          console.log();
-          // Non-zero exit so callers (issue card resolution flows,
-          // CI scripts) can detect a non-healthy state.
-          process.exit(2);
-        }
-      })
-    );
-
-  // switchroom auth refresh-tick [--threshold-ms N] [--json]
-  //
-  // The watchdog-side half of #429 Phase 1.1. Iterates every agent and
-  // proactively rotates `.credentials.json` when the access token is
-  // within `--threshold-ms` of expiry AND a refreshToken is present.
-  // Idempotent — when nothing needs refreshing this is a pure read.
-  //
-  // Designed to be invoked by an external scheduler (cron / the
-  // docker scheduler / an existing watchdog tick) every few minutes.
-  // Keeps the shell side minimal and makes the refresh behaviour
-  // fully testable via the underlying `refreshAllAgents` function.
-  //
-  // Outcomes per agent are surfaced as a JSON summary (--json) or a
-  // one-line-per-agent prose summary. Process exit code is 0 unless
-  // EVERY refresh attempt failed — partial failures are visible in the
-  // summary but don't fail the tick (so a single broken agent doesn't
-  // tear down the operator's monitoring).
-  auth
-    .command("refresh-tick")
+    .command("add <label>")
     .description(
-      "Refresh OAuth access tokens that are about to expire (run from cron or the docker scheduler)",
+      "Add a new account to the broker (seeds the credentials store)",
     )
+    .option("--from-agent <name>", "Seed from an existing agent's .claude/.credentials.json")
+    .option("--from-credentials <path>", "Seed from a credentials.json file")
     .option(
-      "--threshold-ms <ms>",
-      `Refresh tokens whose remaining lifetime is below this many ms (default: ${REFRESH_THRESHOLD_MS})`,
+      "--from-oauth",
+      "Seed from a freshly-completed OAuth flow's credentials at ~/.switchroom/accounts/<label>/credentials.json",
     )
-    .option("--json", "Emit a structured JSON summary instead of prose", false)
+    .option("--replace", "Overwrite an existing account (drift recovery)")
     .action(
-      withConfigError(async (opts: { thresholdMs?: string; json?: boolean }) => {
-        const config = getConfig(program);
-        const thresholdMs = opts.thresholdMs
-          ? parseInt(opts.thresholdMs, 10)
-          : REFRESH_THRESHOLD_MS;
-        if (!Number.isFinite(thresholdMs) || thresholdMs < 0) {
-          console.error(chalk.red(`Invalid --threshold-ms: ${opts.thresholdMs}`));
-          process.exit(2);
-        }
-
-        const summary = await refreshAllAgents(config, { thresholdMs });
-
-        if (opts.json) {
-          console.log(JSON.stringify(summary, null, 2));
-        } else {
-          console.log();
-          for (const o of summary.outcomes) {
-            const tag = formatOutcomeTag(o);
-            const note = formatOutcomeNote(o);
-            console.log(`  ${tag} ${o.agent ?? "?"}${note ? `  — ${note}` : ""}`);
-          }
-          console.log();
-          const c = summary.counts;
-          console.log(
-            chalk.dim(
-              `  refreshed=${c.refreshed} fresh=${c["skipped-fresh"]} no-refresh-token=${c["skipped-no-refresh-token"]} no-credentials=${c["skipped-no-credentials"]} malformed=${c["skipped-malformed"]} failed=${c.failed}`,
-            ),
-          );
-          console.log();
-        }
-
-        // Exit non-zero only if there's no positive outcome AND there
-        // are failures — i.e. the tick produced no successful refresh
-        // and at least one outright error. A tick where everything was
-        // already fresh exits 0 (the common steady state).
-        if (
-          summary.counts.failed > 0 &&
-          summary.counts.refreshed === 0 &&
-          summary.counts["skipped-fresh"] === 0
-        ) {
-          process.exit(2);
-        }
-      }),
-    );
-
-  // switchroom auth refresh <name> (back-compat alias)
-  auth
-    .command("refresh <name>")
-    .description("Alias for reauth")
-    .action(
-      withConfigError(async (name: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        rejectAll(name, "refresh");
-        requireKnownAgent(config, name);
-
-        const agentDir = resolve(agentsDir, name);
-        const result = refreshAgent(name, agentDir);
-
-        console.log();
-        for (const line of result.instructions) {
-          console.log(line);
-        }
-        console.log();
-      })
-    );
-
-  // switchroom auth code <name> <code> [--slot <slot>] [--json]
-  auth
-    .command("code <name> <code>")
-    .description("Finish a pending Claude OAuth token flow by pasting the browser code")
-    .option("--slot <slot>", "Target slot for the pending flow (defaults to pending)")
-    .option("--json", "Output structured JSON result (includes AuthCodeOutcome)")
-    .action(
-      withConfigError(async (name: string, code: string, opts: { slot?: string; json?: boolean }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        requireKnownAgent(config, name);
-        const agentDir = resolve(agentsDir, name);
-        const result = submitAuthCode(name, agentDir, code, opts.slot);
-
-        if (opts.json) {
-          console.log(JSON.stringify({
-            completed: result.completed,
-            tokenSaved: result.tokenSaved,
-            tokenPath: result.tokenPath ?? null,
-            outcome: result.outcome ?? null,
-            instructions: result.instructions,
-          }));
-          // Still attempt restart even in JSON mode so callers get the
-          // full effect, but don't surface restart output to stdout.
-          if (result.completed && result.tokenSaved) {
-            try {
-              const status = getAgentStatus(name);
-              if (status.active === "active" || status.active === "running") {
-                restartAgent(name);
-              }
-            } catch {
-              // swallow — caller reads the JSON, not this
-            }
-          }
-          return;
-        }
-
-        console.log();
-        for (const line of result.instructions) {
-          console.log(line);
-        }
-
-        if (result.completed && result.tokenSaved) {
-          try {
-            const status = getAgentStatus(name);
-            if (status.active === "active" || status.active === "running") {
-              restartAgent(name);
-              console.log(`Restarted ${name} to pick up the new Claude account.`);
-            } else {
-              console.log(`Agent ${name} is not running — start or restart it when ready.`);
-            }
-          } catch (err) {
-            console.log(
-              `Saved token, but could not restart ${name}: ${(err as Error).message}`
+      withConfigError(
+        async (
+          label: string,
+          opts: {
+            fromAgent?: string;
+            fromCredentials?: string;
+            fromOauth?: boolean;
+            replace?: boolean;
+          },
+        ) => {
+          const sources = [opts.fromAgent, opts.fromCredentials, opts.fromOauth]
+            .filter((v) => v !== undefined && v !== false).length;
+          if (sources !== 1) {
+            console.error(
+              chalk.red(
+                "  Pass exactly one of --from-agent, --from-credentials, --from-oauth.",
+              ),
             );
+            process.exit(2);
           }
-        }
+          let credentials: AddAccountCredentials;
+          if (opts.fromAgent) credentials = loadCredentialsFromAgent(opts.fromAgent);
+          else if (opts.fromCredentials)
+            credentials = loadCredentialsFromFile(opts.fromCredentials);
+          else credentials = loadCredentialsFromGlobalAccount(label);
 
-        console.log();
-      })
+          const data = await brokerCall((client) =>
+            client.addAccount(label, credentials, opts.replace === true),
+          );
+          console.log(chalk.green(`  Added "${data.label}" to the broker.`));
+          if (typeof data.expiresAt === "number") {
+            console.log(chalk.gray(`  Token expires: ${formatExpiry(data.expiresAt)}`));
+          }
+        },
+      ),
     );
 
-  // switchroom auth cancel <name> [--slot <slot>]
+  // ── auth list ─────────────────────────────────────────────────────────
   auth
-    .command("cancel <name>")
-    .description("Cancel a pending Claude OAuth token flow")
-    .option("--slot <slot>", "Target slot (defaults to pending)")
-    .action(
-      withConfigError(async (name: string, opts: { slot?: string }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        requireKnownAgent(config, name);
-        const agentDir = resolve(agentsDir, name);
-        const result = cancelAuthSession(name, agentDir, opts.slot);
-
-        console.log();
-        for (const line of result.instructions) {
-          console.log(line);
-        }
-        console.log();
-      })
-    );
-
-  // switchroom auth status
-  auth
-    .command("status")
-    .description("Show authentication status for all agents")
-    .option("--json", "Output as JSON")
+    .command("list")
+    .description("List every account known to the broker")
+    .option("--json", "Output JSON")
     .action(
       withConfigError(async (opts: { json?: boolean }) => {
-        const config = getConfig(program);
-        const statuses = getAllAuthStatuses(config);
-        const agentNames = Object.keys(config.agents);
-
-        if (agentNames.length === 0) {
-          if (opts.json) {
-            console.log(JSON.stringify({ agents: [] }));
-          } else {
-            console.log(chalk.yellow("No agents defined in switchroom.yaml"));
-          }
-          return;
-        }
-
+        const state = await brokerCall((client) => client.listState());
         if (opts.json) {
-          const data = agentNames.map((name) => {
-            const status = statuses[name];
-            return {
-              name,
-              authenticated: status.authenticated,
-              auth_source: status.source ?? null,
-              pending_auth: status.pendingAuth ?? false,
-              subscription_type: status.subscriptionType ?? null,
-              expires_in: status.timeUntilExpiry ?? null,
-              rate_limit_tier: status.rateLimitTier ?? null,
-            };
-          });
-          console.log(JSON.stringify({ agents: data }, null, 2));
+          console.log(JSON.stringify(state, null, 2));
           return;
         }
-
-        const headers = ["Name", "Source", "Subscription", "Expires In", "Rate Limit", "Status"];
-        const widths = [16, 12, 14, 12, 26, 10];
-
-        const rows = agentNames.map((name) => {
-          const status = statuses[name];
-          const source = status.source ?? (status.pendingAuth ? "pending" : "—");
-
-          if (!status.authenticated) {
-            return [
-              name,
-              source,
-              "—",
-              "—",
-              "—",
-              status.pendingAuth ? chalk.yellow("pending") : chalk.red("✗"),
-            ];
-          }
-
-          const expiry = status.timeUntilExpiry ?? "—";
-          const isExpiringSoon =
-            status.expiresAt != null &&
-            status.expiresAt - Date.now() < 60 * 60 * 1000 &&
-            status.expiresAt > Date.now();
-
-          const expiryDisplay = isExpiringSoon
-            ? chalk.yellow(expiry)
-            : expiry === "—"
-              ? expiry
-              : chalk.green(expiry);
-
-          return [
-            name,
-            source,
-            status.subscriptionType ?? "—",
-            expiryDisplay,
-            status.rateLimitTier ?? "—",
-            chalk.green("✓"),
-          ];
-        });
-
         console.log();
-        printAuthTable(headers, rows, widths);
+        printAccountsTable(state);
         console.log();
-      })
+      }),
     );
 
-  // ── Multi-account subcommands ────────────────────────────────────────
-
-  // switchroom auth add <name> [--slot <slot>]
+  // ── auth use <label> ──────────────────────────────────────────────────
   auth
-    .command("add <name>")
-    .description("Start OAuth flow into a new account slot (fallback pool)")
-    .option("--slot <slot>", "Slot name (auto-generated if omitted)")
+    .command("use <label>")
+    .description("Set the fleet-wide active account")
     .action(
-      withConfigError(async (name: string, opts: { slot?: string }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-
-        rejectAll(name, "add");
-        requireKnownAgent(config, name);
-
-        const agentDir = resolve(agentsDir, name);
-        const result = addAccountStart(name, agentDir, opts.slot);
-
-        console.log();
-        console.log(`Target slot: ${result.slot}`);
-        for (const line of result.instructions) {
-          console.log(line);
+      withConfigError(async (label: string) => {
+        const data = await brokerCall((client) => client.setActive(label));
+        console.log(chalk.green(`  Fleet active: ${data.active}`));
+        if (data.fanned.length > 0) {
+          console.log(
+            chalk.gray(`  Re-mirrored to ${data.fanned.length} agent(s): ${data.fanned.join(", ")}`),
+          );
         }
-        console.log(
-          `Finish with: switchroom auth code ${name} <browser-code> --slot ${result.slot}`,
+      }),
+    );
+
+  // ── auth rotate ───────────────────────────────────────────────────────
+  auth
+    .command("rotate")
+    .description("Cycle to the next non-exhausted entry in auth.fallback_order")
+    .action(
+      withConfigError(async () => {
+        const config = getConfig(program);
+        const order = config.auth?.fallback_order ?? [];
+        if (order.length === 0) {
+          console.error(
+            chalk.red("  auth.fallback_order is empty — nothing to rotate."),
+          );
+          process.exit(1);
+        }
+        const state = await brokerCall((client) => client.listState());
+        const current = state.active;
+        const exhausted = new Set(
+          state.accounts.filter((a) => a.exhausted).map((a) => a.label),
         );
-        console.log();
-      }),
-    );
-
-  // switchroom auth use <name> <slot>
-  auth
-    .command("use <name> <slot>")
-    .description("Switch the active account slot for an agent")
-    .action(
-      withConfigError(async (name: string, slot: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        rejectAll(name, "use");
-        requireKnownAgent(config, name);
-        const agentDir = resolve(agentsDir, name);
-        try {
-          const { slot: active } = switchAccount(name, agentDir, slot);
-          console.log(`Active slot for ${name} is now: ${active}`);
-          console.log(`Restart ${name} to pick up the new account.`);
-        } catch (err) {
-          console.error(chalk.red((err as Error).message));
-          process.exit(1);
-        }
-      }),
-    );
-
-  // switchroom auth list <name> [--json]
-  auth
-    .command("list <name>")
-    .description("List all account slots for an agent")
-    .option("--json", "Output as JSON")
-    .action(
-      withConfigError(async (name: string, opts: { json?: boolean }) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        rejectAll(name, "list");
-        requireKnownAgent(config, name);
-        const agentDir = resolve(agentsDir, name);
-        const slots = listAccounts(name, agentDir);
-
-        if (opts.json) {
-          console.log(
-            JSON.stringify(
-              {
-                agent: name,
-                slots: slots.map((s) => ({
-                  slot: s.slot,
-                  active: s.active,
-                  health: s.health,
-                  expires_at: s.expiresAt ?? null,
-                  quota_exhausted_until: s.quotaExhaustedUntil ?? null,
-                })),
-              },
-              null,
-              2,
-            ),
-          );
-          return;
-        }
-
-        if (slots.length === 0) {
-          console.log(
-            chalk.yellow(
-              `No account slots found for ${name}. Run 'switchroom auth login ${name}' or 'switchroom auth add ${name}'.`,
-            ),
-          );
-          return;
-        }
-        const headers = ["Slot", "Active", "Health", "Notes"];
-        const widths = [16, 8, 18, 30];
-        const rows = slots.map((s) => {
-          let notes = "";
-          if (s.health === "quota-exhausted" && s.quotaExhaustedUntil) {
-            const mins = Math.max(
-              0,
-              Math.round((s.quotaExhaustedUntil - Date.now()) / 60_000),
-            );
-            notes = `resets in ~${mins}m`;
-          } else if (s.health === "expired") {
-            notes = "run auth reauth";
+        const startIdx = order.indexOf(current);
+        let pick: string | undefined;
+        for (let i = 1; i <= order.length; i++) {
+          const candidate = order[(startIdx + i) % order.length];
+          if (!exhausted.has(candidate)) {
+            pick = candidate;
+            break;
           }
-          return [
-            s.slot,
-            s.active ? chalk.green("✓") : "",
-            s.health,
-            notes,
-          ];
-        });
-        console.log();
-        printAuthTable(headers, rows, widths);
+        }
+        if (!pick) {
+          console.error(
+            chalk.red(
+              `  Every account in auth.fallback_order is exhausted. Nothing to roll to.`,
+            ),
+          );
+          process.exit(1);
+        }
+        if (pick === current) {
+          console.log(chalk.gray(`  Already on ${current} — no rotation needed.`));
+          return;
+        }
+        const data = await brokerCall((client) => client.setActive(pick!));
+        console.log(chalk.green(`  Rotated to ${data.active}`));
+        if (data.fanned.length > 0) {
+          console.log(
+            chalk.gray(`  Re-mirrored to ${data.fanned.length} agent(s)`),
+          );
+        }
+      }),
+    );
+
+  // ── auth rm <label> ───────────────────────────────────────────────────
+  auth
+    .command("rm <label>")
+    .description("Remove an account from the broker")
+    .action(
+      withConfigError(async (label: string) => {
+        const data = await brokerCall((client) => client.rmAccount(label));
+        console.log(chalk.green(`  Removed "${data.label}".`));
+      }),
+    );
+
+  // ── auth show [<agent>] ───────────────────────────────────────────────
+  auth
+    .command("show [agent]")
+    .description("Show broker state — global by default, per-agent when named")
+    .option("--json", "Output JSON")
+    .action(
+      withConfigError(async (agentName: string | undefined, opts: { json?: boolean }) => {
+        const state = await brokerCall((client) => client.listState());
+        if (opts.json) {
+          console.log(JSON.stringify(state, null, 2));
+          return;
+        }
+        if (!agentName) {
+          console.log();
+          printAccountsTable(state);
+          printAgentsTable(state);
+          printConsumersTable(state);
+          console.log();
+          return;
+        }
+        const agent = state.agents.find((a) => a.name === agentName);
+        if (!agent) {
+          console.error(chalk.red(`  No agent named "${agentName}" in broker view.`));
+          process.exit(1);
+        }
+        printAgentDetail(state, agent);
         console.log();
       }),
     );
 
-  // switchroom auth rm <name> <slot>
+  // ── auth refresh [<label>] ────────────────────────────────────────────
   auth
-    .command("rm <name> <slot>")
-    .description("Delete an account slot")
+    .command("refresh [label]")
+    .description("Force a refresh tick (diagnostic). Without a label, refreshes the fleet active.")
     .action(
-      withConfigError(async (name: string, slot: string) => {
-        const config = getConfig(program);
-        const agentsDir = resolveAgentsDir(config);
-        rejectAll(name, "rm");
-        requireKnownAgent(config, name);
-        const agentDir = resolve(agentsDir, name);
-        try {
-          removeAccount(name, agentDir, slot);
-          console.log(`Removed slot "${slot}" from ${name}.`);
-        } catch (err) {
-          console.error(chalk.red((err as Error).message));
-          process.exit(1);
-        }
+      withConfigError(async (label: string | undefined) => {
+        const target =
+          label ??
+          (await brokerCall((client) => client.listState())).active;
+        const data = await brokerCall((client) => client.refreshAccount(target));
+        console.log(
+          chalk.green(
+            `  Refreshed ${data.account}` +
+              (typeof data.expiresAt === "number"
+                ? ` — expires ${formatExpiry(data.expiresAt)}`
+                : ""),
+          ),
+        );
       }),
+    );
+
+  // ── auth agent override <agent> <label|--clear> ───────────────────────
+  const agentCmd = auth
+    .command("agent")
+    .description("Per-agent overrides (edge case — fleet active is the default)");
+
+  agentCmd
+    .command("override <agent> [label]")
+    .description("Pin an agent to a specific account (or --clear to drop the pin)")
+    .option("--clear", "Clear an existing override and return to fleet active")
+    .action(
+      withConfigError(
+        async (
+          agent: string,
+          label: string | undefined,
+          opts: { clear?: boolean },
+        ) => {
+          if (opts.clear) {
+            const data = await brokerCall((client) => client.setOverride(agent, null));
+            console.log(
+              chalk.green(`  Cleared override on ${data.agent} (returned to fleet active).`),
+            );
+            return;
+          }
+          if (!label) {
+            console.error(
+              chalk.red("  Pass a label or --clear."),
+            );
+            process.exit(2);
+          }
+          const data = await brokerCall((client) => client.setOverride(agent, label));
+          console.log(
+            chalk.green(`  ${data.agent} is now pinned to ${data.account}.`),
+          );
+        },
+      ),
     );
 }
