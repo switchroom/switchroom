@@ -49,14 +49,9 @@ import {
   handleUpdateCommand,
   handleVersionCommand,
 } from './foreman-handlers.js'
-import {
-  buildDashboard,
-  isQuotaHot,
-  type DashboardState,
-  type DashboardSlot,
-  type SlotHealth,
-} from '../auth-dashboard.js'
-import { parseAuthSubCommand } from '../auth-slot-parser.js'
+// RFC H: auth-dashboard / auth-slot-parser are gone. Foreman's
+// `/auth` shells out to the canonical `switchroom auth show` CLI
+// verb (RFC §4.6) — one source of truth, no slot vocabulary.
 import {
   getState,
   setState,
@@ -201,53 +196,8 @@ bot.use(async (ctx, next) => {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
-/** Fetch auth dashboard state for a named agent. */
-function fetchForemanDashboardState(agent: string): DashboardState | null {
-  type SlotListing = {
-    slots: Array<{
-      slot: string; active: boolean; health: string;
-      quota_exhausted_until?: number | null;
-    }>
-  }
-  let slots: DashboardSlot[] = []
-  try {
-    const listing = switchroomExecJson<SlotListing>(['auth', 'list', agent, '--json'])
-    if (listing && Array.isArray(listing.slots)) {
-      slots = listing.slots.map(s => ({
-        slot: s.slot,
-        active: s.active,
-        health: (s.health as SlotHealth) ?? 'missing',
-        quotaExhaustedUntil: s.quota_exhausted_until ?? null,
-        fiveHourPct: null,
-        sevenDayPct: null,
-      }))
-    }
-  } catch {
-    return null
-  }
-
-  let plan: string | null = null
-  let rateLimitTier: string | null = null
-  try {
-    type AuthStatusResp = {
-      agents: Array<{ name: string; subscription_type: string | null; rate_limit_tier?: string | null }>
-    }
-    const statusData = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
-    const thisAgent = statusData?.agents?.find(a => a.name === agent)
-    if (thisAgent?.subscription_type) plan = thisAgent.subscription_type
-    if (thisAgent?.rate_limit_tier) rateLimitTier = thisAgent.rate_limit_tier
-  } catch { /* best-effort */ }
-
-  return {
-    agent,
-    bankId: agent,
-    plan,
-    rateLimitTier,
-    slots,
-    quotaHot: isQuotaHot(slots),
-    generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-  }
-}
+// (RFC H: dashboard-state fetch removed — foreman now shells out to
+// `switchroom auth show` for the canonical fleet snapshot.)
 
 // ─── /start ──────────────────────────────────────────────────────────────
 bot.command('start', async ctx => {
@@ -308,50 +258,35 @@ bot.command('logs', async ctx => {
 })
 
 // ─── /auth ────────────────────────────────────────────────────────────────
+// Post-RFC H: shell out to the canonical `switchroom auth show`. The
+// CLI builds its view from the broker's `list-state`, so foreman
+// stays a thin renderer with no slot-pool vocabulary of its own.
 bot.command('auth', async ctx => {
-  const rawArgs = ((ctx.match ?? '') as string).trim()
-
-  // Determine which agents to show
-  let agentNames: string[]
-
-  if (rawArgs) {
-    // User specified an agent name. parseAuthSubCommand needs the
-    // arguments split into parts and a fallback agent name. The 'status'
-    // intent kind has no `agent` field — narrow before reading it.
-    const parts = rawArgs.split(/\s+/)
-    const parsed = parseAuthSubCommand(parts, parts[0] ?? '')
-    const agentArg = ('agent' in parsed ? parsed.agent : undefined) || parts[0] || ''
-    try { assertSafeAgentName(agentArg) } catch {
+  const rawArg = ((ctx.match ?? '') as string).trim()
+  const args: string[] = ['auth', 'show']
+  if (rawArg) {
+    try { assertSafeAgentName(rawArg.split(/\s+/)[0] ?? '') } catch {
       await switchroomReply(ctx, 'Invalid agent name.', { html: true })
       return
     }
-    agentNames = [agentArg]
-  } else {
-    // Enumerate all agents
-    try {
-      const data = switchroomExecJson<{ agents: Array<{ name: string }> }>(['agent', 'list'])
-      agentNames = data?.agents?.map(a => a.name) ?? []
-    } catch {
-      agentNames = []
-    }
-    if (agentNames.length === 0) {
-      await switchroomReply(ctx, '<i>No agents found. Try <code>/auth &lt;agentname&gt;</code>.</i>', { html: true })
+    args.push(rawArg.split(/\s+/)[0] ?? '')
+  }
+  try {
+    const output = switchroomExecCombined(args)
+    const trimmed = (output ?? '').trim()
+    if (trimmed.length === 0) {
+      await switchroomReply(ctx, '<i>(no output)</i>', { html: true })
       return
     }
-  }
-
-  // Render dashboard per agent
-  for (const agent of agentNames) {
-    const state = fetchForemanDashboardState(agent)
-    if (!state) {
-      await switchroomReply(ctx,
-        `<b>/auth ${escapeHtmlForTg(agent)}</b> — no data (agent missing or CLI unreachable)`,
-        { html: true },
-      )
-      continue
-    }
-    const { text, keyboard } = buildDashboard(state)
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard, link_preview_options: { is_disabled: true } })
+    // Render in a <pre> block so the CLI's column layout survives
+    // Telegram's variable-width default font.
+    await switchroomReply(ctx, `<pre>${escapeHtmlForTg(trimmed)}</pre>`, { html: true })
+  } catch (err) {
+    await switchroomReply(
+      ctx,
+      `<b>/auth failed:</b> ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+      { html: true },
+    )
   }
 })
 

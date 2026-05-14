@@ -82,32 +82,13 @@ import {
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { gatewayStartupRetry } from './startup-network-retry.js'
 import { writeQuarantineMarker } from './quarantine.js'
-import {
-  parseAuthSubCommand,
-  checkRemoveSafety,
-  formatSlotList,
-  type SlotListingFromCli,
-} from '../auth-slot-parser.js'
-import {
-  buildDashboard,
-  buildRemoveConfirmKeyboard,
-  buildAccountConfirmKeyboard,
-  buildAccountPromoteConfirmKeyboard,
-  buildSwitchPrimaryKeyboard,
-  buildAccountSubViewText,
-  buildAccountSubViewKeyboard,
-  buildAccountRemoveConfirmKeyboard,
-  parseCallbackData,
-  encodeCallbackData,
-  isQuotaHot,
-  isAccountQuotaHot,
-  ACCOUNTS_DISPLAY_CAP,
-  type DashboardState,
-  type DashboardSlot,
-  type SlotHealth,
-  type AccountSummary,
-  type AccountHealth,
-} from '../auth-dashboard.js'
+// RFC H §7.3: auth-dashboard + auth-slot-parser deleted. Three chat
+// verbs (/auth show | use | rotate) talk to switchroom-auth-broker
+// via the thin client in src/auth/broker/client.ts.
+import { parseAuthCommand, handleAuthCommand } from './auth-command.js'
+import type { AuthBrokerClient } from './auth-command.js'
+import type { ListStateData } from './auth-line.js'
+import { getAuthBrokerClient } from './auth-broker-client.js'
 import {
   initHistory, recordInbound, recordOutbound, recordEdit,
   deleteFromHistory, query as queryHistory, getLatestInboundMessageId,
@@ -196,10 +177,6 @@ import { PreambleSuppressor } from './preamble-suppressor.js'
 import {
   fetchQuota,
   formatQuotaBlock,
-  getCachedAccountQuota,
-  prefetchAccountQuotaIfStale,
-  hydrateAccountQuotaCacheFromDisk,
-  clearAccountQuotaCache,
 } from '../quota-check.js'
 import {
   evaluateFallbackTrigger,
@@ -8463,429 +8440,41 @@ async function runCreditWatch(): Promise<void> {
 // pinned messages from earlier versions still work, and the
 // auto-fallback poller still calls runAutoFallbackCheck directly.
 
-bot.command('auth', async ctx => {
+bot.command("auth", async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  const parts = getCommandArgs(ctx).split(/\s+/).filter(Boolean)
+  const text = ctx.message?.text ?? ""
+  const parsed = parseAuthCommand(text)
+  if (!parsed) return
   const currentAgent = getMyAgentName()
-  const intent = parseAuthSubCommand(parts, currentAgent)
-
-  if (intent.kind === 'error' || intent.kind === 'usage') {
-    await switchroomReply(ctx, intent.message)
+  // Per RFC §4.3 admin gating, `auth.admin_agents[]` is the ACL. Load
+  // the local switchroom.yaml config and pull the list; broker enforces
+  // server-side too — the gateway-side check is for clean UX.
+  let adminAgents: string[] | undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const raw = (cfg as unknown as { auth?: { admin_agents?: unknown } } )?.auth?.admin_agents
+    if (Array.isArray(raw)) adminAgents = raw.filter((s): s is string => typeof s === "string")
+  } catch { /* best-effort */ }
+  const client = await getAuthBrokerClient(currentAgent)
+  if (!client) {
+    await switchroomReply(ctx, "<b>/auth unavailable:</b> auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
     return
   }
-
-  if (intent.kind === 'login' || intent.kind === 'reauth' || intent.kind === 'link') {
-    await runSwitchroomAuthCommand(ctx, intent.cliArgs, intent.label)
-    if (intent.registerReauth) pendingReauthFlows.set(String(ctx.chat!.id), { agent: intent.agent, startedAt: Date.now() })
-    return
-  }
-  if (intent.kind === 'code') {
-    // Use structured JSON path so we can render typed outcome messages.
-    const { result, errorText } = execAuthCode(intent.agent, intent.code)
-    if (errorText) {
-      await switchroomReply(ctx, `<b>${escapeHtmlForTg(intent.label)} failed:</b>\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
-    } else if (result) {
-      const outcomeMsg = renderAuthCodeOutcome(result.outcome)
-      if (outcomeMsg) {
-        await switchroomReply(ctx, outcomeMsg, { html: true })
-      } else {
-        const output = result.instructions.join('\n')
-        const formatted = formatAuthOutputForTelegram(output)
-        await switchroomReply(ctx, formatted.text, { html: true })
-      }
-    }
-    pendingReauthFlows.delete(String(ctx.chat!.id))
-    // Redact the OAuth code from chat history (#488).
-    redactAuthCodeMessage(bot.api as never, String(ctx.chat!.id), ctx.message?.message_id ?? null, line => process.stderr.write(line))
-    return
-  }
-  if (intent.kind === 'cancel') {
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    pendingReauthFlows.delete(String(ctx.chat!.id))
-    return
-  }
-
-  // --- Slot management verbs ---
-
-  if (intent.kind === 'add') {
-    await runSwitchroomAuthCommand(ctx, intent.cliArgs, intent.label)
-    pendingReauthFlows.set(String(ctx.chat!.id), { agent: intent.agent, startedAt: Date.now() })
-    void refreshPinnedBanner('auth-add')
-    return
-  }
-
-  if (intent.kind === 'use') {
-    // Soft-confirm: a slot swap restarts the agent process, killing any
-    // in-flight turn. If a turn is currently running, refuse without
-    // --force so a fat-finger tap doesn't quietly destroy the user's
-    // work-in-progress. Idle-state swaps proceed with no friction. (#421B)
-    if (!intent.force && activeTurnStartedAt.size > 0) {
-      await switchroomReply(
-        ctx,
-        `⚠️ A turn is in flight. Swapping to <code>${escapeHtmlForTg(intent.slot)}</code> will abort it.\n` +
-          `Resend as <code>/auth use ${escapeHtmlForTg(intent.agent)} ${escapeHtmlForTg(intent.slot)} --force</code> to proceed.`,
-        { html: true },
-      )
-      return
-    }
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    // Restart the agent so the new OAuth token is picked up.
-    try { assertSafeAgentName(intent.agent) } catch { return }
-    await runSwitchroomCommand(ctx, ['agent', 'restart', intent.agent], `restart ${intent.agent}`)
-    void refreshPinnedBanner('auth-use')
-    return
-  }
-
-  if (intent.kind === 'list') {
-    await runSwitchroomCommandFormatted(ctx, intent.cliArgs, intent.label, () => {
-      const data = switchroomExecJson<SlotListingFromCli>(intent.cliArgs)
-      if (!data) return null
-      return formatSlotList({ ...data, agent: data.agent ?? intent.agent })
-    })
-    return
-  }
-
-  if (intent.kind === 'rm') {
-    // Safety check against current slot listing unless --force.
-    if (!intent.force) {
-      const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', intent.agent, '--json'])
-      if (listing) {
-        const err = checkRemoveSafety({ ...listing, agent: listing.agent ?? intent.agent }, intent.slot, intent.force)
-        if (err) { await switchroomReply(ctx, err); return }
-      }
-    }
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  // --- New account-shaped verbs (see reference/share-auth-across-the-fleet.md) ---
-
-  if (intent.kind === 'account-add') {
-    // /auth account add <label> [--from-agent <name>]
-    // Lifts an already-authenticated agent's credentials into a global
-    // account so other agents can share the same Anthropic subscription
-    // without each running its own OAuth flow.
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  if (intent.kind === 'account-list') {
-    // /auth account list — table of accounts + which agents use each.
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  if (intent.kind === 'account-rm') {
-    // /auth account rm <label> — refused if any agent is still enabled.
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  if (intent.kind === 'account-rename') {
-    // /auth account rename <old> <new> — atomic dir rename + YAML
-    // rewrite of every agents.<name>.auth.accounts list. No agent
-    // restart required: per-agent credentials.json content is
-    // unchanged (only the source-of-truth label moved).
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  if (intent.kind === 'enable') {
-    // /auth enable <label> [agents...|all] — wires the account to those agents
-    // (defaults to the current agent), then restarts each so claude picks
-    // up the freshly fanned-out credentials. The CLI accepts the `all`
-    // keyword verbatim and expands it itself; we expand here too so the
-    // restart loop knows the real agent names.
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    if (intent.restartAgentsAfter) {
-      const restartTargets = await resolveAgentsForRestart(intent.agents)
-      for (const a of restartTargets) {
-        try { assertSafeAgentName(a) } catch { continue }
-        await runSwitchroomCommand(ctx, ['agent', 'restart', a], `restart ${a}`)
-      }
-    }
-    void refreshPinnedBanner('auth-enable')
-    return
-  }
-
-  if (intent.kind === 'disable') {
-    // /auth disable <label> [agents...|all] — unwires the account from those
-    // agents. Doesn't auto-restart: the operator may want to drain the
-    // current credential first. The CLI hint already says "restart now".
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    return
-  }
-
-  if (intent.kind === 'share') {
-    // /auth share <label> [--from-agent <name>] — one-shot account-add +
-    // enable on every claude-enabled agent. The CLI does the merged YAML
-    // write; we restart every agent it touched so credentials load.
-    await runSwitchroomCommand(ctx, intent.cliArgs, intent.label)
-    const restartTargets = await resolveAgentsForRestart(['all'])
-    for (const a of restartTargets) {
-      try { assertSafeAgentName(a) } catch { continue }
-      await runSwitchroomCommand(ctx, ['agent', 'restart', a], `restart ${a}`)
-    }
-    void refreshPinnedBanner('auth-share')
-    return
-  }
-
-  // intent.kind === 'status' — render the inline-keyboard dashboard.
-  // For the dashboard we're the bot-bound agent: we don't list every
-  // agent in the switchroom config; we show THIS bot's agent with its
-  // slots and actions. The 'status' branch of AuthIntent has no
-  // `agent` field; use currentAgent as the dashboard target.
-  await sendAuthDashboard(ctx, currentAgent)
+  const reply = await handleAuthCommand(parsed, { agentName: currentAgent, adminAgents, client })
+  await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
-/**
- * Gather DashboardState for an agent and send the dashboard as a fresh
- * message (on `/auth` command) or editMessageText (on callback refresh).
- *
- * Implementation note: we could poll fetchQuota here to populate the
- * fiveHour/sevenDay utilization per slot. Skipping for the initial
- * landing — quota-check is expensive (one Anthropic API call per poll)
- * and the background auto-fallback already surfaces quota-exhausted
- * state. Dashboard renders the CLI-side health badges and omits
- * utilization numbers when they're absent; a future PR can wire
- * quota-check in.
- */
-async function sendAuthDashboard(
-  ctx: Context,
-  agent: string,
-  opts: { edit?: boolean } = {},
-): Promise<void> {
-  const state = fetchDashboardState(agent)
-  if (!state) {
-    await switchroomReply(
-      ctx,
-      `<b>/auth</b> — no data (agent "${escapeHtmlForTg(agent)}" missing from switchroom.yaml or CLI unreachable)`,
-      { html: true },
-    )
-    return
-  }
-  const { text, keyboard } = buildDashboard(state)
-  if (opts.edit && ctx.callbackQuery) {
-    try {
-      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard, link_preview_options: { is_disabled: true } })
-      return
-    } catch {
-      // Message may have been deleted or identical content
-      // (editMessageText throws MESSAGE_NOT_MODIFIED) — fall through
-      // to sending a new one.
-    }
-  }
-  await switchroomReply(ctx, text, { html: true, reply_markup: keyboard })
-}
-
-/**
- * Drop the cached per-account quota and immediately schedule a
- * background re-probe for every known account. Used after auth-mutating
- * dashboard taps (enable/disable/promote/share/account-rm-confirm) so
- * the next `/auth` render shows fresh quota rather than a 30s-stale
- * snapshot from before the change.
- *
- * Fire-and-forget: probes complete in ~hundreds of ms; the user's
- * follow-up dashboard render reads whatever's cached at that moment,
- * usually the freshly-warmed value. Errors (network, rate limit) are
- * absorbed by `prefetchAccountQuotaIfStale`.
- */
-function clearAndRewarmAccountQuotas(): void {
-  clearAccountQuotaCache()
+// Boot-card auth-row loader (issue #708, RFC H rewire). Queries the
+// broker for `list-state` and hands the raw shape to the boot card,
+// which delegates rendering to `renderAuthLine`. Returns null on any
+// failure so the boot card silently omits the section.
+async function loadAccountsForBootCard(agent: string): Promise<ListStateData | null> {
   try {
-    const accounts = switchroomExecJson<Array<{ label: string }>>([
-      'auth', 'account', 'list', '--json',
-    ])
-    if (Array.isArray(accounts)) {
-      for (const a of accounts) {
-        if (typeof a?.label === 'string') prefetchAccountQuotaIfStale(a.label)
-      }
-    }
-  } catch {
-    /* clear-only fallback — next dashboard render's lazy prefetch will warm */
-  }
-}
-
-function fetchDashboardState(agent: string): DashboardState | null {
-  // Slots come from switchroom auth list --json.
-  let slots: DashboardSlot[] = []
-  try {
-    const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', agent, '--json'])
-    if (listing && Array.isArray(listing.slots)) {
-      slots = listing.slots.map((s) => ({
-        slot: s.slot,
-        active: s.active,
-        health: (s.health as SlotHealth) ?? 'missing',
-        quotaExhaustedUntil: s.quota_exhausted_until ?? null,
-        fiveHourPct: null,
-        sevenDayPct: null,
-      }))
-    }
-  } catch {
-    return null
-  }
-
-  // Plan + bank + rateLimitTier come from switchroom auth status for
-  // THIS agent. rateLimitTier is the signal users need to verify the
-  // correct Anthropic account got authorized during reauth (e.g.
-  // max_5x vs max_20x). See 2026-04-22 account-mismatch discussion.
-  let plan: string | null = null
-  let rateLimitTier: string | null = null
-  const bankId = agent
-  try {
-    type AuthStatusResp = { agents: Array<{ name: string; subscription_type: string | null; rate_limit_tier?: string | null }> }
-    const statusData = switchroomExecJson<AuthStatusResp>(['auth', 'status'])
-    const thisAgent = statusData?.agents?.find((a) => a.name === agent)
-    if (thisAgent?.subscription_type) plan = thisAgent.subscription_type
-    if (thisAgent?.rate_limit_tier) rateLimitTier = thisAgent.rate_limit_tier
-  } catch {
-    /* best-effort */
-  }
-
-  // Check for a pending auth session on disk. When present, surface it
-  // on the dashboard so the user can tap [♻️ Restart flow] without
-  // waiting for the automatic stale-session detection to fire (which
-  // only fires on actual PKCE challenge drift).
-  const pendingSessionSlot = readPendingSessionSlot(agent)
-
-  // Account-level state for the dashboard's accounts section. The CLI
-  // emits a sorted, JSON array via `auth account list --json` (added
-  // in v0.6.x). We map it to the dashboard's `AccountSummary` shape,
-  // computing `enabledHere` from the per-account `agents` list.
-  //
-  // Wrapped in try/catch so an older CLI without --json (or any other
-  // failure) leaves `accounts` undefined — the renderer hides the
-  // section gracefully.
-  type AccountListItem = {
-    label: string
-    health: AccountHealth
-    subscriptionType?: string
-    expiresAt?: number
-    quotaExhaustedUntil?: number
-    email?: string
-    agents: string[]
-    /** v0.6.9+: agents for which this label is at index 0 of
-     *  auth.accounts: (i.e. the post-fanout active for that agent).
-     *  Optional — older CLIs without the field cause the dashboard to
-     *  fall back to the v3a unmarked render. */
-    primaryForAgents?: string[]
-  }
-  let accounts: AccountSummary[] | undefined
-  let accountsTruncated = false
-  try {
-    const raw = switchroomExecJson<AccountListItem[]>([
-      'auth', 'account', 'list', '--json',
-    ])
-    if (Array.isArray(raw)) {
-      accounts = raw.map((a) => {
-        // Layer per-account quota onto the summary from the in-process
-        // cache (warmed by `prefetchAccountQuotaIfStale` below). Sync
-        // read keeps `fetchDashboardState` itself sync; the cache TTL
-        // (30s) keeps the API-call rate bounded.
-        const cached = getCachedAccountQuota(a.label)
-        const summary: AccountSummary = {
-          label: a.label,
-          health: a.health,
-          enabledHere: Array.isArray(a.agents) && a.agents.includes(agent),
-          ...(Array.isArray(a.primaryForAgents)
-            ? { activeForThisAgent: a.primaryForAgents.includes(agent) }
-            : {}),
-          ...(a.subscriptionType ? { subscriptionType: a.subscriptionType } : {}),
-          ...(a.expiresAt != null ? { expiresAt: a.expiresAt } : {}),
-          ...(a.quotaExhaustedUntil != null
-            ? { quotaExhaustedUntil: a.quotaExhaustedUntil }
-            : {}),
-          ...(cached?.ok
-            ? {
-                fiveHourPct: cached.data.fiveHourUtilizationPct,
-                sevenDayPct: cached.data.sevenDayUtilizationPct,
-                ...(cached.data.fiveHourResetAt
-                  ? { fiveHourResetAt: cached.data.fiveHourResetAt.getTime() }
-                  : {}),
-                ...(cached.data.sevenDayResetAt
-                  ? { sevenDayResetAt: cached.data.sevenDayResetAt.getTime() }
-                  : {}),
-              }
-            : {}),
-        }
-        // Fire a background probe if the cache is cold/stale. The
-        // current render uses whatever's already cached; the *next*
-        // tap of /auth (after the probe completes) sees the fresh
-        // numbers. Swallowed errors keep the dashboard responsive even
-        // when Anthropic is slow or returns a transient 5xx.
-        prefetchAccountQuotaIfStale(a.label)
-        return summary
-      })
-      accountsTruncated = accounts.length > ACCOUNTS_DISPLAY_CAP
-    }
-  } catch {
-    /* leave accounts undefined */
-  }
-
-  // `canBootstrapShare` decides whether to surface the "🌐 Share to
-  // fleet" button when zero accounts exist. We only show it when this
-  // agent has slot creds we could promote — otherwise the share verb
-  // would fail at the credentials lookup.
-  const canBootstrapShare = slots.some(
-    (s) => s.health === 'healthy' || s.health === 'active',
-  )
-
-  // `quotaHot` now considers BOTH per-slot percentages (legacy slot
-  // model) and per-account percentages (new account model). Either
-  // path lighting up flips the [Fall back now] affordance, so the
-  // operator sees the warning whether they're on the legacy or new
-  // framework.
-  const slotQuotaHot = isQuotaHot(slots)
-  const accountQuotaHot = isAccountQuotaHot(accounts)
-
-  return {
-    agent,
-    bankId,
-    plan,
-    rateLimitTier,
-    slots,
-    quotaHot: slotQuotaHot || accountQuotaHot,
-    generatedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
-    pendingSessionSlot,
-    accounts,
-    accountsTruncated,
-    canBootstrapShare,
-  }
-}
-
-/**
- * Build the per-account list rendered on the boot/health card (issue
- * #708). Reuses `fetchDashboardState` so the data source matches
- * `/auth` exactly — same cache, same shape. Returns null on any
- * failure so the boot card silently omits the section.
- */
-function loadAccountsForBootCard(agent: string): ReadonlyArray<AccountSummary> | null {
-  try {
-    // Re-hydrate the in-process cache from on-disk snapshots
-    // captured by previous gateway lifetimes. Without this, a fresh
-    // boot would render the accounts section with empty quota rows
-    // until the background prefetch ticks. Best-effort.
-    try {
-      const labels = switchroomExecJson<Array<{ label?: string }>>([
-        'auth', 'account', 'list', '--json',
-      ])
-      if (Array.isArray(labels)) {
-        hydrateAccountQuotaCacheFromDisk(
-          labels.map((l) => l?.label).filter((s): s is string => typeof s === 'string'),
-        )
-      }
-    } catch {
-      /* hydrate is best-effort; fall through to live state */
-    }
-
-    const state = fetchDashboardState(agent)
-    if (!state || !state.accounts) return null
-    // Show only accounts enabled on this agent — fallback rows on the
-    // dashboard are useful, but on the boot card "accounts I'm using"
-    // is the right scope.
-    const enabled = state.accounts.filter((a) => a.enabledHere)
-    return enabled.length > 0 ? enabled : null
-  } catch {
+    const client = await getAuthBrokerClient(agent)
+    if (!client) return null
+    return await client.listState()
+  } catch (err) {
+    process.stderr.write(`telegram gateway: boot-card auth probe failed: ${(err as Error)?.message ?? String(err)}\n`)
     return null
   }
 }
@@ -10495,310 +10084,17 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
   }
 }
 
+// RFC H §7.3: the dashboard callback dispatcher is gone — there are
+// no auth: callback buttons in the new chat surface. We keep a no-op
+// stub so any stale pinned message that fires an `auth:*` tap is
+// silently dismissed instead of crashing the gateway.
 async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
-  const data = ctx.callbackQuery?.data ?? ''
-  const senderId = String(ctx.from?.id ?? '')
-  const access = loadAccess()
-  if (!access.allowFrom.includes(senderId)) {
-    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
-    return
-  }
-  const action = parseCallbackData(data)
-
-  switch (action.kind) {
-    case 'refresh': {
-      await ctx.answerCallbackQuery({ text: 'Refreshed' }).catch(() => {})
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'reauth': {
-      await ctx.answerCallbackQuery({ text: 'Starting reauth…' }).catch(() => {})
-      await runSwitchroomAuthCommand(
-        ctx,
-        action.slot ? ['auth', 'reauth', action.agent, '--slot', action.slot] : ['auth', 'reauth', action.agent],
-        `auth reauth ${action.agent}`,
-      )
-      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
-      return
-    }
-    case 'add': {
-      await ctx.answerCallbackQuery({ text: 'Adding slot…' }).catch(() => {})
-      await runSwitchroomAuthCommand(ctx, ['auth', 'add', action.agent], `auth add ${action.agent}`)
-      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
-      return
-    }
-    case 'use': {
-      await ctx.answerCallbackQuery({ text: `Switching to ${action.slot}…` }).catch(() => {})
-      await runSwitchroomCommand(ctx, ['auth', 'use', action.agent, action.slot], `auth use ${action.agent} ${action.slot}`)
-      try { assertSafeAgentName(action.agent) } catch { return }
-      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'rm': {
-      // Two-step confirm — swap the dashboard keyboard for a
-      // confirmation keyboard before doing anything destructive.
-      await ctx.answerCallbackQuery({ text: `Confirm remove ${action.slot}?` }).catch(() => {})
-      try {
-        await ctx.editMessageReplyMarkup({ reply_markup: buildRemoveConfirmKeyboard(action.agent, action.slot) })
-      } catch { /* ignore */ }
-      return
-    }
-    case 'confirm-rm': {
-      await ctx.answerCallbackQuery({ text: `Removing ${action.slot}…` }).catch(() => {})
-      const listing = switchroomExecJson<SlotListingFromCli>(['auth', 'list', action.agent, '--json'])
-      if (listing) {
-        const err = checkRemoveSafety({ ...listing, agent: listing.agent ?? action.agent }, action.slot, false)
-        if (err) {
-          await switchroomReply(ctx, err)
-          await sendAuthDashboard(ctx, action.agent, { edit: true })
-          return
-        }
-      }
-      await runSwitchroomCommand(ctx, ['auth', 'rm', action.agent, action.slot], `auth rm ${action.agent} ${action.slot}`)
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'fallback': {
-      await ctx.answerCallbackQuery({ text: 'Triggering fallback…' }).catch(() => {})
-      const result = await runAutoFallbackCheck({ trigger: 'manual' })
-      if (result.kind === 'executed') {
-        await switchroomReply(ctx, `✅ Switched <code>${escapeHtmlForTg(result.previousSlot)}</code> → <code>${escapeHtmlForTg(result.newSlot)}</code>.`, { html: true })
-      } else if (result.kind === 'exhausted-all') {
-        await switchroomReply(ctx, `🚨 All slots quota-exhausted. Tap ➕ Add slot.`, { html: true })
-      } else if (result.kind === 'error') {
-        await switchroomReply(ctx, `❌ Fallback error: ${escapeHtmlForTg(result.message)}`, { html: true })
-      } else {
-        await switchroomReply(ctx, `No action: ${escapeHtmlForTg(result.reason)}`, { html: true })
-      }
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'restart-flow': {
-      // Kill any pending session + restart the same flow (reauth or
-      // add-slot) fresh. Exists for the case where the user wants to
-      // start over BEFORE the automatic stale-session detection fires
-      // (e.g. closed the browser tab, 2FA failed, waited too long).
-      await ctx.answerCallbackQuery({ text: `Restarting ${action.slot} flow…` }).catch(() => {})
-      // Step 1: cancel any pending session for this agent.
-      try {
-        await runSwitchroomCommand(ctx, ['auth', 'cancel', action.agent], `auth cancel ${action.agent}`)
-      } catch { /* cancel is best-effort */ }
-      // Step 2: re-initiate. Slot == 'default' → reauth; else → add-slot.
-      // Both paths print the fresh URL + button + ForceReply prompt via
-      // runSwitchroomAuthCommand.
-      if (action.slot === 'default') {
-        await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', action.agent], `auth reauth ${action.agent}`)
-      } else {
-        await runSwitchroomAuthCommand(ctx, ['auth', 'add', action.agent, '--slot', action.slot], `auth add ${action.agent} --slot ${action.slot}`)
-      }
-      pendingReauthFlows.set(String(ctx.chat!.id), { agent: action.agent, startedAt: Date.now() })
-      return
-    }
-    case 'usage': {
-      await ctx.answerCallbackQuery({ text: 'Fetching quota…' }).catch(() => {})
-      const agentDir = resolveAgentDirFromEnv()
-      if (!agentDir) {
-        await switchroomReply(ctx, 'Quota lookup unavailable: no agent directory.')
-        return
-      }
-      try {
-        const quota = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
-        if (!quota.ok) {
-          await switchroomReply(ctx, `<b>Quota:</b> ${escapeHtmlForTg(quota.reason)}`, { html: true })
-        } else {
-          await switchroomReply(ctx, formatQuotaBlock(quota.data), { html: true })
-        }
-      } catch (err) {
-        await switchroomReply(ctx, `Quota fetch failed: ${escapeHtmlForTg(String(err))}`, { html: true })
-      }
-      return
-    }
-    // Account-level toggles (#share-auth-across-the-fleet). Two-stage
-    // confirm pattern mirrors `rm`/`confirm-rm` so a stray tap doesn't
-    // re-shuffle credentials. The CLI verb is the one source of truth
-    // for the YAML mutation + fanout; we only translate the tap into
-    // a `runSwitchroomCommand` call and refresh the dashboard.
-    case 'account-enable': {
-      await ctx.answerCallbackQuery({ text: `Confirm enable ${action.label}?` }).catch(() => {})
-      try {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: buildAccountConfirmKeyboard(action.agent, action.label, 'enable'),
-        })
-      } catch { /* ignore */ }
-      return
-    }
-    case 'account-disable': {
-      await ctx.answerCallbackQuery({ text: `Confirm disable ${action.label}?` }).catch(() => {})
-      try {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: buildAccountConfirmKeyboard(action.agent, action.label, 'disable'),
-        })
-      } catch { /* ignore */ }
-      return
-    }
-    case 'confirm-account-enable': {
-      await ctx.answerCallbackQuery({ text: `Enabling ${action.label}…` }).catch(() => {})
-      try { assertSafeAgentName(action.agent) } catch { return }
-      // CLI does the YAML mutation + per-agent credential fanout. The
-      // restart afterwards is what actually loads the new credentials
-      // into the running claude process.
-      await runSwitchroomCommand(
-        ctx,
-        ['auth', 'enable', action.label, action.agent],
-        `auth enable ${action.label} ${action.agent}`,
-      )
-      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      // Account roster changed — drop cached quota so the next
-      // dashboard render kicks a fresh probe instead of showing
-      // stale numbers (or a zero row for a label that just got added).
-      clearAndRewarmAccountQuotas()
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'confirm-account-disable': {
-      await ctx.answerCallbackQuery({ text: `Disabling ${action.label}…` }).catch(() => {})
-      try { assertSafeAgentName(action.agent) } catch { return }
-      await runSwitchroomCommand(
-        ctx,
-        ['auth', 'disable', action.label, action.agent],
-        `auth disable ${action.label} ${action.agent}`,
-      )
-      // Force restart so claude drops the stale credentials immediately.
-      // The CLI's `disable` doesn't auto-restart (it expects the operator
-      // to drain manually); the dashboard tap is implicit "I'm done with
-      // this account on this agent now," so we restart on their behalf.
-      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAndRewarmAccountQuotas()
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'account-promote': {
-      // Two-stage confirm — same UX as enable/disable, just a different
-      // verb on the confirm row's callback. The CLI verb does the
-      // YAML reorder + fanout. Reachable via the legacy v3b per-row
-      // `⤴ Promote` button (callback verb `apr`) — kept for any
-      // already-pinned messages that still have it.
-      await ctx.answerCallbackQuery({ text: `Confirm promote ${action.label}?` }).catch(() => {})
-      try {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: buildAccountPromoteConfirmKeyboard(action.agent, action.label),
-        })
-      } catch { /* ignore */ }
-      return
-    }
-    case 'switch-primary-view': {
-      // v3c picker: open a sub-keyboard that lists every non-active
-      // account as a one-tap promote target. Direct
-      // `confirm-account-promote` callbacks (no second confirm) — the
-      // picker IS the confirmation surface.
-      await ctx.answerCallbackQuery().catch(() => {})
-      const state = fetchDashboardState(action.agent)
-      const candidates = (state?.accounts ?? [])
-        .filter((a) => a.activeForThisAgent !== true)
-        .map((a) => ({ label: a.label, health: a.health }))
-      if (candidates.length === 0) {
-        // No fallbacks to switch to — return to the main board with a
-        // toast explaining why.
-        await ctx.answerCallbackQuery({ text: 'No fallback accounts to switch to.' }).catch(() => {})
-        await sendAuthDashboard(ctx, action.agent, { edit: true })
-        return
-      }
-      try {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: buildSwitchPrimaryKeyboard(action.agent, candidates),
-        })
-      } catch { /* ignore MESSAGE_NOT_MODIFIED */ }
-      return
-    }
-    case 'confirm-account-promote': {
-      await ctx.answerCallbackQuery({ text: `Promoting ${action.label}…` }).catch(() => {})
-      try { assertSafeAgentName(action.agent) } catch { return }
-      await runSwitchroomCommand(
-        ctx,
-        ['auth', 'promote', action.label, action.agent],
-        `auth promote ${action.label} ${action.agent}`,
-      )
-      // Promotion changes the active credential — must restart so
-      // claude reloads the new primary's tokens.
-      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAndRewarmAccountQuotas()
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'share-fleet': {
-      // Bootstrap one-tap: zero accounts exist, this agent has healthy
-      // slot creds. Synthesise label="default" so the user gets a
-      // sensible starting state in one tap; rename via CLI later.
-      await ctx.answerCallbackQuery({ text: 'Sharing to fleet…' }).catch(() => {})
-      try { assertSafeAgentName(action.agent) } catch { return }
-      await runSwitchroomCommand(
-        ctx,
-        ['auth', 'share', 'default', '--from-agent', action.agent],
-        `auth share default --from-agent ${action.agent}`,
-      )
-      await runSwitchroomCommand(ctx, ['agent', 'restart', action.agent], `restart ${action.agent}`)
-      clearAndRewarmAccountQuotas()
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    // v3a: per-account drill-down sub-view handlers.
-    case 'account-view': {
-      // Drill into the per-account sub-view. Fetch current account state
-      // so the sub-view reflects live health, then edit-in-place.
-      await ctx.answerCallbackQuery().catch(() => {})
-      const state = fetchDashboardState(action.agent)
-      const acc = state?.accounts?.find((a) => a.label === action.label)
-      if (!acc || !state) {
-        await ctx.answerCallbackQuery({ text: `Account "${action.label}" not found.` }).catch(() => {})
-        await sendAuthDashboard(ctx, action.agent, { edit: true })
-        return
-      }
-      const text = buildAccountSubViewText(action.agent, acc)
-      const keyboard = buildAccountSubViewKeyboard(action.agent, action.label)
-      try {
-        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard, link_preview_options: { is_disabled: true } })
-      } catch { /* ignore MESSAGE_NOT_MODIFIED */ }
-      return
-    }
-    case 'account-reauth': {
-      // Reauth by account is not wired to a CLI verb in v3a.
-      // Surface a toast so the button is visible-but-inert; the full
-      // flow lands in v3b when `auth account reauth <label>` exists.
-      await ctx.answerCallbackQuery({ text: 'Reauth not yet wired — coming in v3b' }).catch(() => {})
-      return
-    }
-    case 'account-rm': {
-      // Two-step confirm — swap sub-view keyboard for remove confirm.
-      await ctx.answerCallbackQuery({ text: `Remove ${action.label}?` }).catch(() => {})
-      try {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: buildAccountRemoveConfirmKeyboard(action.agent, action.label),
-        })
-      } catch { /* ignore */ }
-      return
-    }
-    case 'account-rm-confirm': {
-      await ctx.answerCallbackQuery({ text: `Removing ${action.label}…` }).catch(() => {})
-      try { assertSafeAgentName(action.agent) } catch { return }
-      await runSwitchroomCommand(
-        ctx,
-        ['auth', 'account', 'rm', action.label],
-        `auth account rm ${action.label}`,
-      )
-      // Removed account label is gone — drop its cache entry (and any
-      // siblings, since `enabledHere` shifts when an agent's account
-      // list changes).
-      clearAndRewarmAccountQuotas()
-      await sendAuthDashboard(ctx, action.agent, { edit: true })
-      return
-    }
-    case 'noop':
-    default: {
-      await ctx.answerCallbackQuery().catch(() => {})
-      return
-    }
-  }
+  try {
+    await ctx.answerCallbackQuery({
+      text: "This button is from the old /auth dashboard (removed in RFC H). Send /auth show instead.",
+      show_alert: false,
+    })
+  } catch { /* tap from a too-old message — drop */ }
 }
 
 // /reauth was removed in v0.6.13 — the `/auth` dashboard's
@@ -13083,35 +12379,10 @@ void (async () => {
           )
         }
 
-        // v0.6.10 boot-warm: kick off a background per-account quota
-        // probe for every account in the new auth framework. Without
-        // this, the FIRST `/auth` after a restart shows no mini-bars
-        // because the in-process cache is cold — the dashboard's lazy
-        // prefetch fires the probe but the operator's already-rendered
-        // message has empty quota rows. Pre-warming fills the cache
-        // before the user can tap.
-        //
-        // Fire-and-forget per label. Failures (rate limit, network,
-        // expired token) leave the cache unset so the dashboard's lazy
-        // path retries on the next render — same safety-net contract
-        // as available_reactions above.
-        try {
-          const accountsAtBoot = switchroomExecJson<Array<{ label: string }>>([
-            'auth', 'account', 'list', '--json',
-          ])
-          if (Array.isArray(accountsAtBoot) && accountsAtBoot.length > 0) {
-            for (const a of accountsAtBoot) {
-              if (typeof a?.label === 'string') prefetchAccountQuotaIfStale(a.label)
-            }
-            process.stderr.write(
-              `telegram gateway: boot-warmed quota cache for ${accountsAtBoot.length} account(s)\n`,
-            )
-          }
-        } catch (err) {
-          process.stderr.write(
-            `telegram gateway: boot-warm of account quota cache failed (continuing): ${(err as Error).message}\n`,
-          )
-        }
+        // RFC H removes the per-account-quota-cache boot-warm: the
+        // auth-broker owns quota state now; the gateway reads it via
+        // `list-state` on demand and renders directly. No in-process
+        // cache to warm.
 
         // #412 boot-cleanup: clear any pre-existing turn-active marker.
         // By definition no turn can be in flight when the gateway just

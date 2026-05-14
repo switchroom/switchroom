@@ -33,8 +33,8 @@
  */
 
 import type { ProbeResult, GatewayRuntimeInfo } from './boot-probes.js'
-import type { AccountSummary } from '../auth-dashboard.js'
-import { formatAccountQuotaLine } from '../auth-dashboard.js'
+import type { ListStateData } from './auth-line.js'
+import { renderAuthLine } from './auth-line.js'
 import {
   probeAccount,
   probeAgentProcess,
@@ -274,9 +274,12 @@ export interface RenderBootCardOpts {
    * silent-when-healthy contract for callers that don't pass account
    * data (tests, harnesses, gateways without the auth model).
    *
-   * Closes #708.
+   * Post-RFC H (auth-broker rewire): this carries the broker's
+   * `list-state` shape — `renderAuthLine` consumes it to emit the
+   * same one-line-per-account rows as before. Callers that pass
+   * `null`/`undefined` get no section. Closes #708.
    */
-  accounts?: ReadonlyArray<AccountSummary>
+  accounts?: ListStateData | null
   /** Probe keys for which the prior boot saw degraded/fail and this boot
    *  sees ok. Rendered as a small ✅ line above the degraded section so
    *  the user gets positive-feedback that a known issue is gone. */
@@ -380,11 +383,13 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     }
   }
 
-  // Per-account quota section (issue #708) — one line per enabled
-  // account showing 5h % / 7d % / nearest reset, with the active
-  // account marked. Renders alongside the ack line so users see
-  // headroom without running /auth or /usage.
-  const accountRows = renderAccountRows(opts.accounts, opts.now ?? new Date())
+  // Per-account auth section (issue #708, RFC H rewire) — one line
+  // per known account with the active account marked. Renders
+  // alongside the ack line so users see headroom without running
+  // /auth or /usage. Source of truth: auth-broker list-state.
+  const accountRows = opts.accounts
+    ? renderAuthLine(opts.accounts, agentName, (opts.now ?? new Date()).getTime())
+    : []
 
   const sections: string[] = [ack]
   if (degradedRows.length > 0) sections.push('', ...degradedRows)
@@ -394,31 +399,12 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
 }
 
 /**
- * Render the per-account quota rows. Returns an empty array when no
- * accounts are passed — keeping the boot card's silent-when-healthy
- * default for callers that don't supply account data.
- *
- * Reuses the dashboard's `formatAccountQuotaLine` so the two surfaces
- * speak with one voice.
+ * Re-export the broker-fed auth-row renderer under its historical
+ * name so direct callers (tests, harnesses) keep working without
+ * importing two modules. New code should import `renderAuthLine`
+ * from `./auth-line.js` directly.
  */
-export function renderAccountRows(
-  accounts: ReadonlyArray<AccountSummary> | undefined,
-  now: Date,
-): string[] {
-  if (!accounts || accounts.length === 0) return []
-  const rows: string[] = []
-  rows.push(`<b>Accounts (${accounts.length})</b>`)
-  const nowMs = now.getTime()
-  for (const a of accounts) {
-    const marker = a.activeForThisAgent ? '▶' : '↳'
-    const labelHtml = `<code>${escapeHtml(a.label)}</code>`
-    // formatAccountQuotaLine returns HTML (with <i> tags) so we don't
-    // re-escape — pass it through verbatim.
-    const quotaLine = formatAccountQuotaLine(a, nowMs)
-    rows.push(quotaLine ? `${marker} ${labelHtml}  ${quotaLine}` : `${marker} ${labelHtml}`)
-  }
-  return rows
-}
+export { renderAuthLine as renderAccountRows } from './auth-line.js'
 
 // ─── Probe orchestration ─────────────────────────────────────────────────────
 
@@ -480,9 +466,9 @@ export interface RunProbesOpts {
    * during the post-settle re-render so the first paint stays fast.
    */
   loadAccounts?: () =>
-    | ReadonlyArray<AccountSummary>
+    | ListStateData
     | null
-    | Promise<ReadonlyArray<AccountSummary> | null>
+    | Promise<ListStateData | null>
   /** When true, resolve the agent PID via cgroup walk instead of MainPID
    *  (which is the tmux server pid under tmux supervisor). */
   tmuxSupervisor?: boolean
@@ -604,7 +590,7 @@ export async function startBootCard(
         // Per-account rows (issue #708). Loaded best-effort
         // alongside probes; failures are swallowed so the card still
         // renders correctly with no accounts section.
-        let accountRows: ReadonlyArray<AccountSummary> | null = null
+        let accountRows: ListStateData | null = null
         if (opts.loadAccounts) {
           try {
             accountRows = await opts.loadAccounts()
