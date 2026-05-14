@@ -1164,23 +1164,29 @@ export const AgentSchema = z.object({
     ),
   auth: z
     .object({
+      override: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Per-agent override of the fleet-wide `auth.active`. Edge-case use only — " +
+          "this agent talks to the named account regardless of fleet active. See RFC H §4.5.",
+        ),
       accounts: z
         .array(z.string())
         .optional()
         .describe(
-          "Ordered list of Anthropic account labels (from `~/.switchroom/accounts/`) " +
-          "this agent can use. The first non-quota-exhausted account is the active one; " +
-          "subsequent entries are auto-fallback targets. switchroom-auth-broker keeps " +
-          "`<agentDir>/.claude/credentials.json` in sync with the active account on " +
-          "every refresh and on every quota event. When unset, the agent falls back to " +
-          "a single 'default' account; if no `default` account exists, the boot self-test " +
-          "surfaces a one-line nudge to run `switchroom auth account add`.",
+          "[DEPRECATED — pre-RFC-H schema, retained only for in-place migration] " +
+          "Ordered list of Anthropic account labels. `switchroom apply` lifts these " +
+          "into top-level `auth.active` + `fallback_order` and (if divergent) synthesises " +
+          "per-agent `override:`. See src/auth/migrate-schema.ts.",
         ),
     })
     .optional()
     .describe(
-      "Account routing for switchroom-auth-broker. See " +
-      "reference/share-auth-across-the-fleet.md for the unit-of-authentication model.",
+      "Account routing for switchroom-auth-broker. RFC H schema uses " +
+      "fleet-wide `auth.active` plus per-agent `override:` for edge cases. " +
+      "Legacy `accounts: [..]` is migrated in-place on first apply.",
     ),
   dm_only: z
     .boolean()
@@ -1797,6 +1803,78 @@ export const SwitchroomConfigSchema = z.object({
   telegram: TelegramConfigSchema,
   memory: MemoryBackendConfigSchema.optional(),
   vault: VaultConfigSchema.optional(),
+  auth: z
+    .object({
+      active: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Fleet-wide active Anthropic account label. Every agent without " +
+          "an explicit `agent.auth.override` uses this account. See " +
+          "docs/auth.md for the full model. Set by `switchroom auth use <label>`.",
+        ),
+      fallback_order: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          "Ordered list of account labels for `switchroom auth rotate` to cycle " +
+          "through when the active account hits a quota event. First entry is " +
+          "normally the same as `auth.active`. When unset, `rotate` is a no-op.",
+        ),
+      admin_agents: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          "Agents allowed to call admin verbs on switchroom-auth-broker " +
+          "(set-active, refresh-account, add-account, rm-account, set-override). " +
+          "Non-admin agents can only read their own credentials and report " +
+          "quota exhaustion on their own account. See RFC H §4.3.",
+        ),
+      consumers: z
+        .array(
+          z.object({
+            name: z
+              .string()
+              .regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/, {
+                message:
+                  "Consumer name must be a path-safe slug (letters, digits, underscore, hyphen)",
+              })
+              .describe("Socket-path identity; binds at /run/switchroom/auth-broker/<name>/sock"),
+            account: z
+              .string()
+              .min(1)
+              .describe(
+                "Pinned account label for this consumer. `get-credentials` returns " +
+                "this account's credentials; `mark-exhausted` from this consumer " +
+                "only affects this account.",
+              ),
+            uid: z
+              .number()
+              .int()
+              .nonnegative()
+              .optional()
+              .describe(
+                "Optional UID to chown the consumer socket to (defaults to 0 = root, " +
+                "suitable for sibling containers running as root).",
+              ),
+          }),
+        )
+        .optional()
+        .describe(
+          "Non-agent peers that hold a broker socket (RFC H §4.8). Each gets " +
+          "its own `/run/switchroom/auth-broker/<name>/sock` chowned to its UID. " +
+          "Consumers cannot be admins; adding a consumer name to `admin_agents` " +
+          "is a config error.",
+        ),
+    })
+    .optional()
+    .describe(
+      "Switchroom-auth-broker configuration (RFC H). Fleet-wide active account, " +
+      "fallback order, admin-agent ACL, and ephemeral-consumer surface. " +
+      "Required from the v0.8+ schema onwards; pre-v0.8 fleets are migrated " +
+      "in-place by `switchroom apply` (see src/auth/migrate-schema.ts).",
+    ),
   drive: GoogleWorkspaceConfigSchema.describe(
     "RFC D legacy key — use `google_workspace:` instead. Optional Google " +
     "Workspace onboarding configuration. When set, supplies Google OAuth " +
@@ -1910,6 +1988,8 @@ export type AgentDriveConfig = z.infer<typeof AgentDriveConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
 export type HostControlConfig = z.infer<typeof HostControlConfigSchema>;
+export type AuthConfig = NonNullable<z.infer<typeof SwitchroomConfigSchema>["auth"]>;
+export type AuthConsumer = NonNullable<AuthConfig["consumers"]>[number];
 export type CodeRepoEntry = z.infer<typeof CodeRepoEntrySchema>;
 export type AgentBindMount = z.infer<typeof AgentBindMountSchema>;
 export type AgentRepoEntry = NonNullable<z.infer<typeof AgentSchema>["repos"]>[string];
