@@ -1,6 +1,6 @@
 /**
  * switchroom-auth-broker server — sole writer of per-agent
- * `<agentDir>/.claude/credentials.json` and canonical owner of the OAuth
+ * `<agentDir>/.claude/.credentials.json` and canonical owner of the OAuth
  * refresh loop for every Anthropic account on the host (RFC H).
  *
  * Architectural shape mirrors `src/vault/broker/server.ts`. All three
@@ -955,7 +955,15 @@ export class AuthBroker {
     if (!existsSync(agentDir)) return false;
     const claudeDir = join(agentDir, ".claude");
     mkdirSync(claudeDir, { recursive: true, mode: 0o700 });
-    const targetPath = join(claudeDir, "credentials.json");
+    // Claude Code (2.x) reads OAuth credentials from `.credentials.json`
+    // (dotfile, see the binary string table). The pre-RFC-H fanout used
+    // the non-dot name `credentials.json` and got away with it because
+    // `start.sh` also exported CLAUDE_CODE_OAUTH_TOKEN from the legacy
+    // .oauth-token — claude never actually read the on-disk mirror.
+    // RFC H §7.4 deletes the env-injection path, so the on-disk mirror
+    // must land at the dotfile path or agents silently lose auth on
+    // first restart. Pinned by tests in server.test.ts.
+    const targetPath = join(claudeDir, ".credentials.json");
     try {
       atomicWriteFileSync(targetPath, content, 0o600);
       try {

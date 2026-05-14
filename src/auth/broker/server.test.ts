@@ -287,7 +287,7 @@ describe("AuthBroker — admin gating", () => {
     expect(resp.data.active).toBe("secondary");
     expect(resp.data.fanned.sort()).toEqual(["clerk", "ziggy"]);
     // Verify mirror file contents
-    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", "credentials.json"), "utf-8");
+    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", ".credentials.json"), "utf-8");
     expect(mirror).toContain("at-secondary");
     broker.stop();
   });
@@ -322,7 +322,7 @@ describe("AuthBroker — mark-exhausted", () => {
     const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
     expect(quota["default"].exhausted_until).toBe(until);
     // Agent mirror now holds the secondary account creds.
-    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", "credentials.json"), "utf-8");
+    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", ".credentials.json"), "utf-8");
     expect(mirror).toContain("at-secondary");
     broker.stop();
   });
@@ -550,7 +550,7 @@ describe("AuthBroker — refresh tick + threshold-violation", () => {
     );
     expect(credsAfter).toContain("at-new");
     // The mirror fans out to ziggy.
-    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", "credentials.json"), "utf-8");
+    const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", ".credentials.json"), "utf-8");
     expect(mirror).toContain("at-new");
     broker.stop();
   });
@@ -598,6 +598,51 @@ describe("AuthBroker — refresh tick + threshold-violation", () => {
   });
 });
 
+describe("AuthBroker — claude-compatibility", () => {
+  // Claude Code (2.x) reads OAuth credentials from `<configDir>/.credentials.json`
+  // (DOTFILE). The broker writes the per-agent mirror at exactly that path.
+  // Pre-RFC-H, both the deleted fanoutAccountToAgents and the very first
+  // cut of this broker wrote to `credentials.json` (no dot) and got away
+  // with it ONLY because start.sh.hbs also exported CLAUDE_CODE_OAUTH_TOKEN
+  // from the legacy .oauth-token, so claude never read the on-disk mirror.
+  // RFC H §7.4 deletes that env-injection path. The mirror MUST live at
+  // the dotfile path or agents lose auth on first restart.
+  //
+  // This test pins the dotfile contract so a future "simplify the
+  // filename" refactor can't silently undo it.
+  it("writes the per-agent mirror to .credentials.json (dotfile — claude reads this path)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      admin_agents: ["clerk"],
+      agents: { ziggy: {}, clerk: {} },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+    await rpc(join(h.socketRoot, "clerk", "sock"), {
+      v: 1,
+      id: "1",
+      op: "set-active",
+      account: "secondary",
+    });
+    const fs = await import("node:fs");
+    // Dotfile path EXISTS — claude can read it.
+    expect(fs.existsSync(join(h.agentsDir, "ziggy", ".claude", ".credentials.json"))).toBe(true);
+    // Non-dot path DOES NOT exist — the broker doesn't double-write.
+    expect(fs.existsSync(join(h.agentsDir, "ziggy", ".claude", "credentials.json"))).toBe(false);
+    broker.stop();
+  });
+});
+
 describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)", () => {
   // Both bugs lived in the deleted account-refresh.ts:fanoutAccountToAgents
   // path. They surfaced when an operator flipped the fleet's primary Claude
@@ -630,10 +675,10 @@ describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)
     const serverSrc = fs.readFileSync(path.join(here, "server.ts"), "utf-8");
     // Must chown the mirror file to allocateAgentUid(agentName), not leave
     // it root-owned. The exact pattern (a chownSync call against the
-    // freshly-written credentials.json path inside mirrorAccountToAgent)
+    // freshly-written .credentials.json path inside mirrorAccountToAgent)
     // is what closes Bug 1.
-    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,800}allocateAgentUid/);
-    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,800}chownSync\(targetPath/);
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,1600}allocateAgentUid/);
+    expect(serverSrc).toMatch(/mirrorAccountToAgent[\s\S]{0,1600}chownSync\(targetPath/);
   });
 
   it("Bug 2: refresh tick writes ONLY the agent's effective account, not last-iterated label", async () => {
@@ -705,11 +750,11 @@ describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)
     await broker._tick();
 
     const ziggyMirror = readFileSync(
-      join(h.agentsDir, "ziggy", ".claude", "credentials.json"),
+      join(h.agentsDir, "ziggy", ".claude", ".credentials.json"),
       "utf-8",
     );
     const lawgptMirror = readFileSync(
-      join(h.agentsDir, "lawgpt", ".claude", "credentials.json"),
+      join(h.agentsDir, "lawgpt", ".claude", ".credentials.json"),
       "utf-8",
     );
 

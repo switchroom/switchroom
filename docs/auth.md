@@ -24,8 +24,9 @@ This doc is the operator-facing summary.
     per-agent UDS         ← /run/switchroom/auth-broker/<name>/sock
 
   per-agent mirror
-    ~/.switchroom/agents/<name>/.claude/credentials.json
-                          ← broker writes, agent reads. atomic rename.
+    ~/.switchroom/agents/<name>/.claude/.credentials.json
+                          ← broker writes, claude reads (dotfile).
+                          ← atomic rename, mode 0600, chowned to per-agent UID.
 ```
 
 The agents and consumers are clients of the broker. They never
@@ -85,6 +86,26 @@ agents:
 
 The schema is intentionally minimal in the common case — most agents
 need no `auth:` block.
+
+## Filename conventions
+
+Two on-disk credential files with deliberately different names:
+
+- **Global account store** at `~/.switchroom/accounts/<label>/credentials.json`
+  (no dot). Switchroom's internal canonical record per account.
+  Read/written by the broker only.
+- **Per-agent mirror** at `~/.switchroom/agents/<name>/.claude/.credentials.json`
+  **(with dot — this is Claude Code's own dotfile convention)**. The
+  broker atomically writes this every refresh and on every `auth use`;
+  the agent's `claude` process reads it directly. Same shape as the
+  global file; only the name (and owner UID, mode 0600) differs.
+
+The dot prefix on the per-agent file is load-bearing: Claude Code
+2.x reads `<CLAUDE_CONFIG_DIR>/.credentials.json` (verified against
+the binary's string table). Writing to the non-dot path is invisible
+to claude — agents would silently lose authentication on first
+restart. Pinned by a test at `src/auth/broker/server.test.ts`
+("writes the per-agent mirror to .credentials.json").
 
 ## Refresh windows
 
@@ -229,7 +250,7 @@ node -e '
   sock.on("data", buf => {
     const { ok, data } = JSON.parse(buf.toString())
     if (!ok) process.exit(1)
-    require("fs").writeFileSync("/run/claude-creds/credentials.json",
+    require("fs").writeFileSync("/run/claude-creds/.credentials.json",
       JSON.stringify(data.credentials, null, 2))
     process.exit(0)
   })
@@ -243,7 +264,7 @@ switchroom agents on the same account too (quota state is shared).
 ## Degraded mode
 
 If the broker is down, agents continue running on whatever bytes
-are already in their per-agent `credentials.json`. Token lifetime
+are already in their per-agent `.credentials.json`. Token lifetime
 is 8h; the broker can be down for hours without a user-visible
 outage. On restart, the broker re-syncs from the account store and
 resumes the refresh loop.

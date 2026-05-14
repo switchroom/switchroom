@@ -7,7 +7,7 @@ Date: 2026-05-14
 ## 1. Summary
 
 A new compose singleton, `switchroom-auth-broker`, that becomes the
-**sole writer** of per-agent `<agentDir>/.claude/credentials.json` and
+**sole writer** of per-agent `<agentDir>/.claude/.credentials.json` and
 the canonical owner of the OAuth refresh loop for every Anthropic
 account on the host. The broker mirrors the architectural shape of
 `switchroom-vault-broker` (long-lived UDS daemon, per-agent socket
@@ -54,7 +54,7 @@ that have shown up in production over the last week:
 1. **EACCES from host operator.** `apply` self-elevates via sudo;
    `auth promote / enable / disable / refresh-accounts` and `agent
    restart` do not. They try to write into `~/.switchroom/agents/<a>
-   /.claude/credentials.json` (owned by the per-agent UID, mode 0700)
+   /.claude/.credentials.json` (owned by the per-agent UID, mode 0700)
    from the host user (UID 1000) and silently fail with a ⚠ that the
    exit code claims is success. Operator recovers by running
    `sudo HOME=… /full/path/bun /full/path/dist/cli/switchroom.js …`
@@ -82,7 +82,7 @@ refresher per account. This RFC is the *how* to that *what*.
 
 **Goals:**
 
-- Single writer for `<agentDir>/.claude/credentials.json` is the
+- Single writer for `<agentDir>/.claude/.credentials.json` is the
   broker; the host CLI never writes per-agent credential files
   directly. EACCES on auth verbs becomes impossible.
 - Single refresher per Anthropic account. The broker holds an
@@ -151,7 +151,7 @@ Volumes:
 - `~/.switchroom/accounts/` mounted rw — broker is canonical
   writer of `<label>/credentials.json` (it's where refreshes land).
 - `~/.switchroom/agents/` mounted rw — broker writes per-agent
-  mirror files into `<agentDir>/.claude/credentials.json`. This is
+  mirror files into `<agentDir>/.claude/.credentials.json`. This is
   intentionally a broad mount (the broker only needs each
   `<agentDir>/.claude/`) — it matches vault-broker's existing
   mount scope, so per-agent introspection commands can reuse the
@@ -292,7 +292,7 @@ regression on the first refresh after the upgrade.
 |---|---|---|
 | `~/.switchroom/accounts/<label>/credentials.json` | broker | OAuth refresh writes here atomically (tmp+rename). |
 | `~/.switchroom/accounts/<label>/meta.json` | broker | created/last-refreshed/source label. |
-| `~/.switchroom/agents/<name>/.claude/credentials.json` | broker | per-agent active-account mirror. Atomic write, chowned to agent UID, mode 0600. |
+| `~/.switchroom/agents/<name>/.claude/.credentials.json` | broker | per-agent active-account mirror. Atomic write, chowned to agent UID, mode 0600. |
 | `~/.switchroom/state/auth-broker/quota.json` | broker | per-account exhaustion state (label → reset-time). |
 | `~/.switchroom/state/auth-broker/audit.jsonl` | broker | size-rotated at 10MB → `.1..5`, oldest discarded. |
 | `~/.switchroom/state/auth-broker/refresh-lease/<label>` | broker | flock-protected lease file. Cross-container flock via host bind mount — protects against the (theoretical, today single-instance) restart-overlap race and against future multi-broker scenarios. |
@@ -583,7 +583,7 @@ Image build via `npm run build:auth-broker` (new script that bundles
 Existing on-disk state on a dev host today:
 - `~/.switchroom/accounts/<label>/credentials.json` — **preserved**,
   unchanged shape. Broker reads as-is.
-- `<agentDir>/.claude/credentials.json` — **overwritten** on first
+- `<agentDir>/.claude/.credentials.json` — **overwritten** on first
   post-merge `switchroom apply` (broker re-mirrors).
 - `<agentDir>/.claude/accounts/default/credentials.json` — **deleted**
   by apply (slot pool is gone).
@@ -776,7 +776,7 @@ deleted in this RFC:
   (deleted with the rest of the env path).
 - `src/agents/handoff-summarizer.ts` — passes the token into the
   summarizer subprocess explicitly via env (deleted; summarizer
-  now reads `<agentDir>/.claude/credentials.json` like every other
+  now reads `<agentDir>/.claude/.credentials.json` like every other
   consumer).
 - `src/web/webhook-dispatch.ts` — same env pass for the webhook
   worker. Switches to broker `get-credentials` (it's an
