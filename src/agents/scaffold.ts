@@ -2897,15 +2897,23 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          // Layer 2 of the sandbox UX work — fires on every PostToolUse,
-          // detects EROFS / read-only / sandbox-related errors in
-          // tool_response, and injects a one-line hint via
-          // additionalContext so the agent responds usefully on Telegram
-          // instead of silently retrying or echoing the raw kernel
-          // error. Pairs with the SANDBOX primer in
-          // --append-system-prompt. Hook is fail-silent: a broken hint
-          // never blocks the tool flow.
-          matcher: ".*",
+          // Layer 2 of the sandbox UX work — detects EROFS / read-only
+          // / sandbox-related errors in tool_response and injects a
+          // one-line hint via additionalContext so the agent responds
+          // usefully on Telegram instead of silently retrying or
+          // echoing the raw kernel error. Pairs with the SANDBOX
+          // primer in --append-system-prompt. Hook is fail-silent: a
+          // broken hint never blocks the tool flow.
+          //
+          // #1303: matcher narrowed from ".*" to write-capable tools +
+          // MCP tools only. Read/Grep/Glob/WebFetch/etc. cannot hit a
+          // kernel sandbox boundary by definition, and the old
+          // matcher caused false positives every time a Read/Grep
+          // payload merely MENTIONED EROFS / read-only-fs strings
+          // (file content, code comments, the hook source itself).
+          // The hook script also gates on these tools internally as
+          // defence in depth.
+          matcher: "^(Edit|Write|NotebookEdit|Bash|mcp__.*)$",
           hooks: [
             {
               type: "command",

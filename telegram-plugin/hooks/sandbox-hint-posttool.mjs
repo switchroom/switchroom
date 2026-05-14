@@ -90,6 +90,85 @@ function emitContext(text) {
   process.stdout.write(JSON.stringify(payload) + '\n')
 }
 
+/**
+ * #1303: classify a tool_response as a failure. Only failures can have
+ * hit a kernel sandbox boundary. Pre-fix the hook stringified the whole
+ * tool_response and pattern-matched against it — that meant a SUCCESSFUL
+ * Read/Edit/Bash whose payload merely MENTIONED "EROFS" or "Read-only
+ * file system" (e.g. file content, code comments, grep results, the hook
+ * source itself) tripped the advisory. Verified live during #1291/#1292
+ * PR work: every `Read` on a file talking about the sandbox model
+ * produced a false positive; every `Edit` adding a comment that
+ * mentioned read-only-fs did too.
+ *
+ * Recognise failure across the three observed tool_response shapes:
+ *   - Edit / Write / NotebookEdit / MCP: `{ is_error: true, ... }`
+ *   - Bash: `{ exit_code: <non-zero>, stdout, stderr, ... }`
+ *   - Free-form string body: assume failure if the string parses; the
+ *     pattern match downstream still gates the advisory text.
+ *
+ * Also exported as `legacy.error` style for forward-compat: any
+ * non-null `tool_response.error` field is treated as failure.
+ *
+ * If no failure signal is found we have no kernel error to advise on,
+ * and the hook stays silent.
+ */
+function classifyFailure(toolResponse) {
+  if (toolResponse == null) return null
+  if (typeof toolResponse === 'string') {
+    // Bare string body — no structured failure marker. Treat as a
+    // candidate; the pattern match decides.
+    return { kind: 'bare-string', body: toolResponse }
+  }
+  if (typeof toolResponse !== 'object') return null
+  const isError =
+    toolResponse.is_error === true
+    || toolResponse.success === false
+    || toolResponse.error != null
+    || (typeof toolResponse.exit_code === 'number'
+        && toolResponse.exit_code !== 0)
+  if (!isError) return null
+  // Extract error-bearing fields only — never the full response. For a
+  // failed Bash, stdout may carry the relevant kernel message alongside
+  // stderr (some commands write errors to stdout), so include stdout
+  // when there's a non-zero exit code.
+  const parts = []
+  if (typeof toolResponse.error === 'string') parts.push(toolResponse.error)
+  if (typeof toolResponse.stderr === 'string') parts.push(toolResponse.stderr)
+  if (toolResponse.exit_code != null && toolResponse.exit_code !== 0
+      && typeof toolResponse.stdout === 'string') {
+    parts.push(toolResponse.stdout)
+  }
+  // Fallback: failure was signalled but no error-bearing field
+  // surfaced — stringify the structured response so we don't miss an
+  // unusual tool that puts the kernel error in an unexpected key.
+  // Bounded by the 64 KiB cap downstream.
+  if (parts.length === 0) {
+    try { parts.push(JSON.stringify(toolResponse)) } catch { /* unprintable */ }
+  }
+  return { kind: 'structured-failure', body: parts.join('\n') }
+}
+
+/**
+ * #1303 secondary defence: only write-capable tools can hit a kernel
+ * sandbox boundary. Read/Grep/Glob/WebFetch/etc. cannot EROFS — even if
+ * settings.json wires this hook with matcher ".*", we gate at the
+ * script level so a future scaffold change can't re-introduce the
+ * false-positive class. Bash is included because it's the canonical
+ * write surface (mkdir, rm, install, apt, etc.). MCP tools that may
+ * proxy writes are included by an `mcp__` prefix check.
+ */
+const WRITE_CAPABLE_TOOLS = new Set([
+  'Edit', 'Write', 'NotebookEdit', 'Bash',
+])
+
+function isWriteCapableTool(toolName) {
+  if (typeof toolName !== 'string') return false
+  if (WRITE_CAPABLE_TOOLS.has(toolName)) return true
+  if (toolName.startsWith('mcp__')) return true
+  return false
+}
+
 function main() {
   const raw = readStdin()
   if (!raw) return
@@ -101,18 +180,18 @@ function main() {
     return
   }
 
-  // tool_response shape varies by tool — string for Bash, object with
-  // file/oldString/newString for Edit/Write, etc. Stringify the whole
-  // thing so we match against every nested error field at once. Cap the
-  // scan window to keep memory bounded if the model just dumped a 10MB
-  // log into the tool_response.
-  let body
-  try {
-    body = JSON.stringify(evt.tool_response ?? '')
-  } catch {
-    return
-  }
-  if (!body) return
+  if (!isWriteCapableTool(evt.tool_name)) return
+
+  // #1303 primary fix: classify success vs failure FIRST. A successful
+  // tool can't have hit a kernel sandbox boundary by definition — its
+  // payload may mention EROFS / read-only-fs in benign content but
+  // that's not a kernel error.
+  const failure = classifyFailure(evt.tool_response)
+  if (failure == null) return
+
+  let body = failure.body
+  if (typeof body !== 'string') return
+  if (body.length === 0) return
   if (body.length > 64 * 1024) body = body.slice(0, 64 * 1024)
 
   for (const [pattern, key] of PATTERNS) {
@@ -121,6 +200,18 @@ function main() {
       return
     }
   }
+}
+
+// Test-only export hooks. Node ESM doesn't expose internal symbols
+// without a named export; tests import `__internals` and assert against
+// `classifyFailure` / `isWriteCapableTool` directly. Production paths
+// use `main()` and never touch this object.
+export const __internals = {
+  classifyFailure,
+  isWriteCapableTool,
+  WRITE_CAPABLE_TOOLS,
+  PATTERNS,
+  buildHint,
 }
 
 try {
