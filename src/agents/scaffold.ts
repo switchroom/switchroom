@@ -2913,7 +2913,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           // (file content, code comments, the hook source itself).
           // The hook script also gates on these tools internally as
           // defence in depth.
-          matcher: "^(Edit|Write|NotebookEdit|Bash|mcp__.*)$",
+          matcher: "^(Edit|MultiEdit|Write|NotebookEdit|Bash|mcp__.*)$",
           hooks: [
             {
               type: "command",

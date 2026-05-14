@@ -159,7 +159,7 @@ function classifyFailure(toolResponse) {
  * proxy writes are included by an `mcp__` prefix check.
  */
 const WRITE_CAPABLE_TOOLS = new Set([
-  'Edit', 'Write', 'NotebookEdit', 'Bash',
+  'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash',
 ])
 
 function isWriteCapableTool(toolName) {

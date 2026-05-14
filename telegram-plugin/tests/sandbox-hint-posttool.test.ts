@@ -338,7 +338,7 @@ describe('sandbox-hint-posttool', () => {
   describe('isWriteCapableTool', () => {
     it('returns true for the canonical write tools', async () => {
       const mod = await import('../hooks/sandbox-hint-posttool.mjs')
-      for (const n of ['Edit', 'Write', 'NotebookEdit', 'Bash']) {
+      for (const n of ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash']) {
         expect(mod.__internals.isWriteCapableTool(n)).toBe(true)
       }
     })
