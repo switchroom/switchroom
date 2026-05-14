@@ -3,9 +3,11 @@
  *
  * The broker client is a stateful class (holds a persistent UDS
  * connection). The gateway constructs one per `/auth` command —
- * cheap, and avoids dangling sockets on idle. The handler only needs
- * `listState` and `setActive`, so this adapter narrows the surface to
- * the `AuthBrokerClient` interface from `./auth-command.ts`.
+ * cheap, and avoids dangling sockets on idle. The handler needs the
+ * five methods on the `AuthBrokerClient` interface in
+ * `./auth-command.ts` (listState / setActive / rmAccount /
+ * refreshAccount / setOverride); we narrow `BrokerClient` down to
+ * that surface so a test mock only has to stub those five.
  */
 
 import { AuthBrokerClient as BrokerClient, type AddAccountCredentials } from '../../src/auth/broker/client.js'
@@ -24,6 +26,10 @@ export function createAuthBrokerClient(): {
   const client: AuthBrokerClient = {
     listState: () => broker.listState(),
     setActive: (label: string) => broker.setActive(label),
+    rmAccount: (label: string) => broker.rmAccount(label),
+    refreshAccount: (label: string) => broker.refreshAccount(label),
+    setOverride: (agent: string, account: string | null) =>
+      broker.setOverride(agent, account),
   }
   return { client, close: () => broker.close() }
 }
