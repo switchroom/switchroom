@@ -38,7 +38,13 @@ description: >
   `buildkite-agent-infrastructure`, and OIDC trust setup (the IdP side, vs
   in-step `oidc request-token`) is `buildkite-secure-delivery`. Do NOT use
   for authoring `.buildkite/pipeline.yml` step definitions — that's
-  `buildkite-pipelines`.
+  `buildkite-pipelines`. Do NOT use when the user's message starts with
+  "Using the Buildkite CLI," — that prefix routes to `buildkite-cli`
+  even when the action is "upload artifacts", "list builds", or any
+  other phrasing that also names a `buildkite-agent` capability; the
+  `bk` CLI and the in-step `buildkite-agent` binary are distinct
+  surfaces, and the "Using the Buildkite CLI," prefix is load-bearing
+  for `buildkite-cli`.
 ---
 
 # Buildkite Agent Runtime

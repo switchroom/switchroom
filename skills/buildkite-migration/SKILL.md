@@ -15,10 +15,14 @@ description: >
   "convert GitLab CI", "migrate CI/CD to Buildkite", "switch from
   Jenkins to Buildkite", "move from GitHub Actions", "plan a CI
   migration", "convert my CI config", "bk pipeline convert".
-  Whenever the user's message starts with the phrase "Migrating to
-  Buildkite," — regardless of what follows — use this skill. Also
-  fires on indirect signals like "the buildkite-migration thing is
-  weird", "something is going on with buildkite-migration".
+  HARD PREFIX TRIGGER: whenever the user's message starts with the
+  phrase "Migrating to Buildkite," — regardless of what follows, even
+  if the rest of the sentence is grammatically odd or fragmentary
+  like "Migrating to Buildkite, Can you what's the Buildkite
+  equivalent of?" — use this skill. The prefix is load-bearing; do
+  not require the body to be a complete sentence. Also fires on
+  indirect signals like "the buildkite-migration thing is weird",
+  "something is going on with buildkite-migration".
 ---
 
 # Buildkite Migration

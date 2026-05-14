@@ -1,25 +1,32 @@
 ---
 name: buildkite-agent-infrastructure
 description: >
-  Provision and administer Buildkite CI infrastructure at the cluster /
-  organization level: creating clusters, creating queues, scaling queues,
-  setting up hosted agents, right-sizing instance shapes, optimizing CI
-  costs, managing agent tokens, managing cluster secrets, configuring SSO
-  or SAML, setting up audit logging, creating pipeline templates, and
-  standardizing pipelines across teams. Use when the user says: "Create
-  a queue, please.", "Let's configure SSO.", "Could you scale queues
-  for me?", "I need to configure SSO.", "set up hosted agents", "manage
-  cluster secrets", "create a cluster", "set up audit logging", "manage
-  agent tokens", "set up SAML", "right-size instance shapes", "optimize
-  CI costs", "standardize pipelines across teams", "create a pipeline
+  Buildkite cluster / organization / platform administration. Whenever
+  the user's message starts with the phrase "In Buildkite cluster
+  admin," — regardless of what follows — use this skill; that prefix
+  is a hard trigger that wins over `buildkite-api`, `buildkite-cli`,
+  and `buildkite-agent-runtime`. Provision and govern Buildkite CI
+  infrastructure: creating clusters, creating queues, scaling queues,
+  setting up hosted agents, right-sizing instance shapes, optimizing
+  CI costs, managing agent tokens, managing cluster secrets,
+  configuring SSO, setting up SAML, setting up audit logging, creating
+  pipeline templates, and standardizing pipelines across teams. Use
+  when the user says, verbatim: "set up SAML", "manage agent tokens",
+  "configure SSO", "set up audit logging", "Let's configure SSO.",
+  "I need to configure SSO.", "Could you scale queues for me?",
+  "Scale queues, please.", "scale queues", "Create a queue, please.",
+  "Create a cluster, please.", "set up hosted agents", "manage
+  cluster secrets", "right-size instance shapes", "optimize CI
+  costs", "standardize pipelines across teams", "create a pipeline
   template", "configure agents", and typo'd variants like "manage
   clusetr secrets", "configuree agents", "set up hostted agents".
-  Whenever the user's message starts with the phrase "In Buildkite
-  cluster admin," — regardless of what follows — use this skill. Anything
-  about buildkite-agent.cfg, agent tags, agent tokens, cluster queues,
-  hosted agent instance shapes, pipeline templates, audit events,
-  SSO/SAML providers, queue wait time, agent lifecycle hooks, or
-  Buildkite platform governance fires this skill.
+  Anything about buildkite-agent.cfg, agent tags, agent tokens, cluster
+  queues, hosted agent instance shapes, pipeline templates, audit
+  events, SSO/SAML providers, queue wait time, agent lifecycle hooks,
+  or Buildkite platform governance fires this skill — even when the
+  request mentions GraphQL or API calls (the rival `buildkite-api` is
+  for generic webhook/pagination/scripting, NOT for SSO/queue/cluster
+  admin which always belongs here).
   Do NOT use when the user is calling `buildkite-agent <subcommand>` from
   inside a running step (token use, artifact upload, annotate) — that's
   `buildkite-agent-runtime`; or when the user just wants cluster CLI

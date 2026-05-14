@@ -1,6 +1,6 @@
 ---
 name: switchroom-install
-description: Install switchroom and its dependencies (docker, claude CLI, switchroom binary) on a fresh machine. Use for onboarding and first-time setup — when the user says 'install switchroom on this machine', 'set up switchroom for the first time', 'bootstrap switchroom from scratch', 'get switchroom running', 'how do I get started with switchroom', "I'm new to switchroom, where do I begin", or asks about switchroom dependencies or prerequisites. This is the onboarding entry point, not for managing existing agents.
+description: Install switchroom and its dependencies (docker, claude CLI, switchroom binary) on a fresh machine. Use for onboarding and first-time setup — when the user says 'install switchroom on this machine', 'set up switchroom for the first time', 'bootstrap switchroom from scratch', 'get switchroom running', 'how do I get started with switchroom', "I'm new to switchroom, where do I begin", or asks about switchroom dependencies or prerequisites. This is the onboarding entry point, not for managing existing agents. Do NOT use when the user's message starts with "In switchroom agent management," — that prefix is a hard trigger for `switchroom-manage` even when the action mentions "reinstall my agents" or "set up my agents"; agent-management prefix means fleet operations on an already-installed switchroom, not first-time host bootstrap.
 ---
 
 # Install Switchroom

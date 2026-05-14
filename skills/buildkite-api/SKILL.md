@@ -25,7 +25,13 @@ description: >
   Do NOT use for interactive `bk` CLI usage — that's `buildkite-cli`. Do
   NOT use for authoring `.buildkite/pipeline.yml` — that's
   `buildkite-pipelines`. Do NOT use for `buildkite-agent <subcommand>`
-  inside a step — that's `buildkite-agent-runtime`.
+  inside a step — that's `buildkite-agent-runtime`. Do NOT use when the
+  user's message starts with "In Buildkite cluster admin," — that
+  prefix is a hard trigger for `buildkite-agent-infrastructure` (which
+  owns SSO/SAML setup, queue scaling, agent tokens, cluster secrets,
+  audit logging, and pipeline templates) even when the underlying
+  implementation would use GraphQL mutations; cluster-admin intent
+  routes to infrastructure, not this generic API skill.
 ---
 
 # Buildkite API

@@ -25,6 +25,16 @@ description: |
   `switchroom-manage`. Do NOT use for asking why the agent restarted or
   whether it crashed — that's `switchroom-runtime` (which may then *offer*
   to invoke this skill).
+  Do NOT use when the user is reporting a bug to a non-GitHub system or
+  another channel: "report a bug to <Jira/Linear/Notion/Slack/email>",
+  "submit feedback to <support/help-desk/another channel>", "send this
+  to support", "email this to the team", "post this in Slack", "open a
+  Jira ticket", "create a Linear issue" — those route to the relevant
+  external channel, not this skill. Also do NOT fire on bare, contextless
+  phrases like "file a bug" or "report this issue on GitHub" with no
+  attached symptom, repo, or log evidence — those are ambient phrases
+  the user may say in passing; only fire when there is a concrete
+  symptom or context to attach to the report.
 license: MIT
 compatibility: claude-code
 allowed-tools:

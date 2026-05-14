@@ -24,8 +24,14 @@ description: >
   `switchroom-status`), for restart/crash/interrupt actions (that's
   `switchroom-runtime`), or for fresh install/setup (that's
   `switchroom-install`). Do NOT use when the user's message begins with
-  "In switchroom (the CLI),"—that prefix routes to `switchroom-cli` even
-  if the body mentions crashes or "what's wrong".
+  "In switchroom (the CLI),"—that prefix is a HARD trigger for
+  `switchroom-cli` and ALWAYS wins over this skill, even if the body
+  asks "why did it crash", "what's wrong", "diagnose my setup", or
+  any other phrasing that would normally fire this health-check
+  skill. Examples that MUST route to `switchroom-cli` not here: "In
+  switchroom (the CLI), Can you why did it crash?", "In switchroom
+  (the CLI), what's wrong?", "In switchroom (the CLI), diagnose my
+  setup."
 ---
 
 # Agent Health Diagnostics

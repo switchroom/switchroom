@@ -22,6 +22,12 @@ description: >
   or REST/GraphQL calls — that's `buildkite-api`. Do NOT use for cluster
   admin tasks like "create a queue", "configure SSO", "manage cluster
   secrets", "set up hosted agents" — those are `buildkite-agent-infrastructure`.
+  Do NOT use when the user's message starts with "In Buildkite cluster
+  admin," — that prefix is a hard trigger for `buildkite-agent-infrastructure`
+  and ALWAYS wins over this skill, even when the action ("create a queue",
+  "scale queues", "manage secrets") sounds like something `bk` could do
+  from the terminal; cluster-admin prefix means provisioning intent, not
+  terminal-workflow intent.
 ---
 
 # Buildkite CLI
