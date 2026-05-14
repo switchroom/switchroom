@@ -1001,6 +1001,18 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      - "FOWNER"`);
   lines.push(`      - "DAC_READ_SEARCH"`);
   lines.push(`      - "DAC_OVERRIDE"`);
+  // Operator UID — when set, pass `--operator-uid <N>` so the broker
+  // entry binds the operator listener at
+  // /run/switchroom/auth-broker/operator/sock and chowns it to <N>.
+  // Without this the host operator's `switchroom auth use|add|show` CLI
+  // hits "auth-broker unreachable at .../auth-broker-operator/sock" —
+  // the bind mount below exists but the socket never gets created.
+  // Mirror of vault-broker's pattern (line ~813) but plumbed via flag
+  // rather than env var since the broker entry script reads
+  // --operator-uid as a flag, not an env (see src/auth/broker/index.ts).
+  if (opts.operatorUid !== undefined) {
+    lines.push(`    command: ["bun", "/opt/switchroom/dist/auth-broker/index.js", "--operator-uid", "${opts.operatorUid}"]`);
+  }
   lines.push(`    environment:`);
   if (switchroomConfigPath) {
     lines.push(`      SWITCHROOM_CONFIG: /state/config/switchroom.yaml`);
@@ -1025,10 +1037,15 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   }
   // Operator socket — host-mounted bind so `switchroom auth …` from a
   // shell on the host can reach the broker. Path is the operator-
-  // socket bind documented in the RFC §4.2.
-  lines.push(
-    `      - ${homePrefix}/.switchroom/state/auth-broker-operator:/run/switchroom/auth-broker/operator`,
-  );
+  // socket bind documented in the RFC §4.2. Only emitted when an
+  // operator-uid is set (mirrors vault-broker line ~834) — without one
+  // the broker doesn't bind an operator listener so the bind mount
+  // would just be a confusingly-empty dir on disk.
+  if (opts.operatorUid !== undefined) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/state/auth-broker-operator:/run/switchroom/auth-broker/operator`,
+    );
+  }
   if (switchroomConfigPath) {
     lines.push(`      - ${switchroomConfigPath}:/state/config/switchroom.yaml:ro`);
   }
