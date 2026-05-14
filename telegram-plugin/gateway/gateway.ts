@@ -1086,6 +1086,14 @@ type CurrentTurn = {
   gatewayReceiveAt: number
   replyCalled: boolean
   capturedText: string[]
+  // #1291: snapshot of capturedText.length at the moment of the most
+  // recent reply / stream_reply tool call. Used by decideTurnFlush to
+  // isolate the post-reply tail (e.g. a soft-commit reply followed by
+  // the real substantive answer in terminal text only) and flush it as
+  // a follow-up message. Pre-#1291 the existence of ANY reply call
+  // suppressed flush entirely — that lost long terminal-only answers
+  // after a "let me check" interim reply.
+  capturedTextLenAtLastReply: number
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
   registryKey: string | null
   // Last assistant outbound message id for the current turn — populated
@@ -4638,6 +4646,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           gatewayReceiveAt: startedAt,
           replyCalled: false,
           capturedText: [],
+          capturedTextLenAtLastReply: 0,
           orphanedReplyTimeoutId: null,
           registryKey: null,
           lastAssistantMsgId: null,
@@ -4734,6 +4743,12 @@ function handleSessionEvent(ev: SessionEvent): void {
       // placeholder-heartbeat label, which has been retired.
       if (isTelegramReplyTool(name)) {
         turn.replyCalled = true
+        // #1291: pin the captured-text index at the moment of this reply
+        // tool call. Anything pushed into capturedText after this point
+        // is the post-reply tail (e.g. the substantive answer composed
+        // in terminal text after a soft-commit "on it, back in a few").
+        // decideTurnFlush slices from this index to flush the tail.
+        turn.capturedTextLenAtLastReply = turn.capturedText.length
         if (turn.orphanedReplyTimeoutId != null) {
           clearTimeout(turn.orphanedReplyTimeoutId)
           turn.orphanedReplyTimeoutId = null
@@ -4993,8 +5008,20 @@ function handleSessionEvent(ev: SessionEvent): void {
         chatId: turn.sessionChatId,
         replyCalled: turn.replyCalled,
         capturedText: turn.capturedText,
+        capturedTextLenAtLastReply: turn.capturedTextLenAtLastReply,
         flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
       })
+      // #1291: when the model emitted a soft-commit reply followed by a
+      // substantive terminal-only answer, decideTurnFlush returns
+      // kind:'flush' with the post-reply tail. Log WARN so this case is
+      // auditable — the model SHOULD have called reply for the tail, but
+      // didn't, and the framework is covering for it.
+      if (flushDecision.kind === 'flush' && turn.replyCalled) {
+        process.stderr.write(
+          `telegram gateway: WARN post-reply-tail flush (#1291) — model emitted ${flushDecision.text.length} chars after a prior reply call without a follow-up reply tool` +
+          ` chat=${chatId} turnStartedAt=${turn.startedAt}\n`,
+        )
+      }
       if (flushDecision.kind === 'skip' && flushDecision.reason !== 'reply-called') {
         process.stderr.write(
           `telegram gateway: turn-flush skipped — reason=${flushDecision.reason}\n`,

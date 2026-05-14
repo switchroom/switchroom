@@ -57,6 +57,7 @@ export type FlushDecision =
 export type FlushSkipReason =
   | 'flag-disabled'
   | 'reply-called'
+  | 'reply-called-no-new-text'
   | 'no-inbound-chat'
   | 'empty-text'
   | 'silent-marker'
@@ -71,9 +72,32 @@ export interface FlushDecisionInput {
   /** Raw text content blocks accumulated from assistant events across the
    * turn. Joined + trimmed internally. */
   capturedText: string[]
+  /** Snapshot of `capturedText.length` at the moment of the most recent
+   * reply / stream_reply tool call in this turn. Indices `[capturedText
+   * length-at-last-reply, capturedText.length)` are the post-reply tail
+   * — substantive content the model emitted AFTER the reply (e.g. soft
+   * commit "on it, back in a few" followed by the real answer in
+   * terminal text only, the #1291 repro). When the tail meets
+   * `replyCalledTailMinChars` we flush it; otherwise we skip.
+   *
+   * Defaults to `capturedText.length` (treat all captured text as
+   * pre-reply, preserve the pre-#1291 behaviour where any reply tool
+   * call suppressed flush entirely) so callers that don't track the
+   * marker keep the old contract. */
+  capturedTextLenAtLastReply?: number
+  /** Minimum trimmed-tail length to qualify a post-reply tail flush.
+   * Defaults to `REPLY_CALLED_TAIL_MIN_CHARS` (40). Below this we skip
+   * with `reply-called-no-new-text` — typical for trailing markdown
+   * artifacts or a one-word afterthought. */
+  replyCalledTailMinChars?: number
   /** Feature flag — defaults to true. Pass `false` to force skip everywhere. */
   flushEnabled?: boolean
 }
+
+/** Default minimum trimmed length for the post-reply tail to be flushed
+ * as a follow-up message. Below this we treat the tail as noise / artifact
+ * and skip silently. */
+export const REPLY_CALLED_TAIL_MIN_CHARS = 40
 
 /**
  * Pure decision: should the gateway deterministically send the model's
@@ -82,11 +106,41 @@ export interface FlushDecisionInput {
  *
  * Ordering of checks is deliberate: cheapest/strongest first so logs
  * attribute a skip to the most specific cause.
+ *
+ * #1291 — when `replyCalled` is true we no longer suppress unconditionally.
+ * The model may have emitted a soft-commit reply ("on it, back in a few")
+ * followed by the real substantive answer in terminal text only. Using
+ * `capturedTextLenAtLastReply` we isolate the post-reply tail and flush
+ * it if it's substantive enough; otherwise we skip with
+ * `reply-called-no-new-text` (logged) or `reply-called` (silent, no tail).
  */
 export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   const flushEnabled = input.flushEnabled !== false
   if (!flushEnabled) return { kind: 'skip', reason: 'flag-disabled' }
-  if (input.replyCalled) return { kind: 'skip', reason: 'reply-called' }
+
+  if (input.replyCalled) {
+    const tailIdx = input.capturedTextLenAtLastReply ?? input.capturedText.length
+    const tail = input.capturedText.slice(tailIdx).join('\n').trim()
+    const minChars = input.replyCalledTailMinChars ?? REPLY_CALLED_TAIL_MIN_CHARS
+    if (tail.length === 0) {
+      // The reply tool was called and nothing of substance came after —
+      // the turn is fully served by the reply. Skip silently (the gateway
+      // WARN gate excludes this reason from logs).
+      return { kind: 'skip', reason: 'reply-called' }
+    }
+    if (tail.length < minChars) {
+      // Post-reply tail exists but is below the substantive-content
+      // threshold — typically trailing markdown artifacts or a one-word
+      // afterthought. Skip but with a distinct reason so this case IS
+      // logged (auditable for #1291 regressions, vs the silent
+      // 'reply-called' which is the expected steady state).
+      return { kind: 'skip', reason: 'reply-called-no-new-text' }
+    }
+    if (input.chatId == null) return { kind: 'skip', reason: 'no-inbound-chat' }
+    if (isSilentFlushMarker(tail)) return { kind: 'skip', reason: 'silent-marker' }
+    return { kind: 'flush', text: tail }
+  }
+
   if (input.chatId == null) return { kind: 'skip', reason: 'no-inbound-chat' }
   const joined = input.capturedText.join('\n').trim()
   if (joined.length === 0) return { kind: 'skip', reason: 'empty-text' }
