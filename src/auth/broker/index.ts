@@ -74,7 +74,17 @@ export async function main(): Promise<void> {
   }
 
   const config = loadConfig(configPath);
-  const broker = new AuthBroker(config, { operatorUid: flags.operatorUid });
+  // Compose sets SWITCHROOM_AUTH_BROKER_STATE_DIR=/state/auth-broker; without
+  // honouring it here the broker writes its healthy marker to the default
+  // ~/.switchroom/state/auth-broker/ (inside the container that resolves to
+  // /root/.switchroom/state/auth-broker/) while the Dockerfile's HEALTHCHECK
+  // looks at /state/auth-broker/healthy — container never goes healthy and
+  // any `depends_on: service_healthy` chain stalls forever.
+  const stateDirEnv = process.env.SWITCHROOM_AUTH_BROKER_STATE_DIR;
+  const broker = new AuthBroker(config, {
+    operatorUid: flags.operatorUid,
+    stateDir: stateDirEnv && stateDirEnv.length > 0 ? stateDirEnv : undefined,
+  });
 
   const shutdown = (): void => {
     try { broker.stop(); } catch { /* ignore */ }
