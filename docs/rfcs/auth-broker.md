@@ -118,11 +118,14 @@ refresher per account. This RFC is the *how* to that *what*.
   (and the trust model that comes with it is its own RFC).
 - API-key auth. Subscription-honest principle still applies. The
   broker speaks OAuth and only OAuth.
-- Migration tooling. No users in the wild → `switchroom apply`
-  on the new binary rips the legacy on-disk state (slot dirs,
-  `.oauth-token`, `.oauth-token.meta.json`) and the broker re-mirrors
-  from `~/.switchroom/accounts/<label>/credentials.json` (which is
-  unchanged in shape).
+- Long-term migration framework. There are no external users; the
+  one in-the-wild deployment is the canonical-repo author's
+  dogfood fleet. `apply` runs a one-shot in-place upgrade
+  algorithm (§6) that handles that fleet's specific shape and is
+  retained as deletable code for ~one release. The "no migration"
+  stance here means: no compatibility shims, no two-shapes-
+  coexisting, no `switchroom auth migrate` verb — *not* "no
+  in-place upgrade." Pick the right framing when reading §6.
 
 ## 4. Design
 
@@ -148,13 +151,19 @@ Volumes:
 - `~/.switchroom/accounts/` mounted rw — broker is canonical
   writer of `<label>/credentials.json` (it's where refreshes land).
 - `~/.switchroom/agents/` mounted rw — broker writes per-agent
-  mirror files into `<agentDir>/.claude/credentials.json`.
+  mirror files into `<agentDir>/.claude/credentials.json`. This is
+  intentionally a broad mount (the broker only needs each
+  `<agentDir>/.claude/`) — it matches vault-broker's existing
+  mount scope, so per-agent introspection commands can reuse the
+  same code path. Principle-of-consistency trade. If a future
+  PR tightens vault-broker's mount scope, this one follows.
 - Named volume `auth-broker-<name>-sock` per agent at
   `/run/switchroom/auth-broker/<name>/` inside the broker AND at
   `/run/switchroom/auth-broker/` inside agent-`<name>`. Same per-agent
   socket model as vault-broker / approval-kernel.
 - `~/.switchroom/state/auth-broker/` mounted rw — broker's own
-  state (quota tracker, audit log, refresh lease records).
+  state (quota tracker, audit log, refresh lease records,
+  sha-index).
 
 The broker is implemented in TypeScript, built into a Bun bundle,
 COPYed into the image as `/opt/switchroom/auth-broker/index.js`.
@@ -244,14 +253,38 @@ gates verbs against that:
   is always logged with the audit line so abuse is greppable.
 
 **Refresh-threshold invariant.** The single-writer guarantee depends
-on the broker refreshing tokens *strictly before* claude would. Claude's
-built-in refresh fires when access tokens have <5 min remaining
-(`claude` source — pinned in `docs/auth.md` § "Refresh windows" as
-part of this RFC). The broker fires at <30 min remaining. The 25-min
-gap is what guarantees no concurrent tmp+rename race between broker
-and claude on the same `credentials.json`. If a future claude release
-narrows that window, the broker threshold must move ahead of it; this
-is a documented dependency, not a coincidence.
+on the broker refreshing tokens *strictly before* claude would. Concrete
+values:
+
+- **Broker threshold: 60 minutes remaining.** Keeps the existing
+  `REFRESH_THRESHOLD_MS = 60 * 60 * 1000` constant from
+  `src/auth/token-refresh.ts:77` and `src/auth/account-refresh.ts:60`;
+  the broker imports it from the surviving `account-refresh.ts`
+  module.
+- **Claude's threshold: ≤5 minutes remaining**, per observed
+  behaviour in the claude OAuth client. This is the dependency
+  the invariant rests on.
+
+The 55-minute gap is what guarantees no concurrent tmp+rename race
+between broker and claude on the same `credentials.json`. Two
+deliverables in this PR enforce the invariant:
+
+1. **`docs/auth.md` § "Refresh windows"** — new operator doc that
+   pins the broker / claude thresholds with the claude version
+   range we tested against. The doc is part of this PR, not a
+   follow-up.
+2. **Runtime assertion in the broker.** On every refresh tick, the
+   broker compares the current credentials' `expiresAt` against
+   the *last value it wrote*. If it changed under the broker's
+   feet (claude refreshed), the broker logs
+   `THRESHOLD_VIOLATION <label> mtime=…` and increments a counter
+   surfaced via `list-state.accounts[].threshold_violations`.
+   This makes a future claude-narrows-the-window regression visible
+   in production, not silent.
+
+If a future claude release narrows its window below 60 min, the
+broker threshold must move ahead of it; the assertion catches the
+regression on the first refresh after the upgrade.
 
 ### 4.4 On-disk state ownership
 
@@ -293,6 +326,24 @@ broker accepts as authoritative and re-indexes. This commits the
 RFC to "sole-writer" semantics rather than the "polite-mirror"
 middle ground the reviewer flagged as worst-of-both-worlds.
 
+**Operator runbook for drift recovery** lives at
+`docs/operators/auth-broker-drift.md`, shipped in this PR.
+Documents: the error message, the cause patterns (`claude
+setup-token` behind the broker, manual file edit, restore from
+backup, ownership change), and the `auth add --replace` flow.
+Without this runbook the sole-writer-with-hard-error stance fails
+the docs test.
+
+**Account-file ownership.** First broker refresh flips
+`~/.switchroom/accounts/<label>/credentials.json` from operator-UID
+to root (the broker writes atomically as its container user).
+After flip, the operator can `ls` and `cat` (file mode 0644 on
+the parent dir is preserved; the file itself is 0600) but cannot
+`rm` or `mv` without `sudo`. Operator-facing CLI paths that
+previously read the file directly are routed through
+`get-credentials` over UDS (no sudo). The runbook documents the
+flip so operators don't trip over "I owned this file yesterday."
+
 ### 4.5 Schema diff
 
 ```yaml
@@ -314,6 +365,7 @@ auth:
   consumers:                               # optional — non-agent peers (hindsight, etc.)
     - name: hindsight
       account: me@kenthompson.com.au       # consumer's pinned active account
+      uid: 11000                           # optional; broker chowns socket to this UID
       # `mark-exhausted` from this consumer only affects this account.
       # `get-credentials` always returns this account's creds.
 
@@ -329,11 +381,22 @@ deleted from per-agent schema. The single-knob default is the
 common case; per-agent override is an explicit edge case.
 
 `auth.consumers[]` entries each declare a non-agent peer that can
-hold a broker socket. v1 schema is `{ name: string, account: string }`
-— `name` becomes the socket-path identity (binds at
+hold a broker socket. v1 schema is
+`{ name: string, account: string, uid?: number }` — `name`
+becomes the socket-path identity (binds at
 `/run/switchroom/auth-broker/<name>/sock`), `account` is the
-consumer's pinned active account. Consumers cannot be admins;
-adding a consumer name to `admin_agents` is a config error.
+consumer's pinned active account, `uid` (optional) is the UID the
+broker chowns the socket to (defaults to 0 = root, suitable for
+sibling containers running as root; override for non-root
+consumers).
+
+Consumers cannot be admins. Enforcement happens in **two places**:
+the CLI's `switchroom.yaml` schema validator (`src/config/schema.ts`)
+refuses to write a config where any name appears in both
+`admin_agents` and `consumers[].name`; the broker re-checks on
+boot and refuses to start with a `CONFIG_INVALID` error if the
+invariant is violated (defence in depth — operator could edit
+the YAML by hand).
 
 ### 4.6 CLI surface diff
 
@@ -398,10 +461,14 @@ in to Anthropic" + "name your first agent"), zero per-agent
 Per-account, the broker owns:
 
 1. **Refresh loop.** A scheduled task per account, fires when
-   `expiresAt - now < REFRESH_THRESHOLD_MS` (currently 30 min, same
-   as `src/auth/token-refresh.ts`). Holds an exclusive flock on
+   `expiresAt - now < REFRESH_THRESHOLD_MS` (60 minutes — the
+   existing constant in `src/auth/account-refresh.ts:60`, imported
+   into the broker, *not* changed by this RFC). The broker also
+   compares the on-disk `expiresAt` against its own last-write to
+   detect a claude-side refresh (the threshold-violation assertion
+   from §4.3). Holds an exclusive flock on
    `state/auth-broker/refresh-lease/<label>` for the duration of the
-   POST so concurrent broker restarts cannot race. On success,
+   POST so future multi-broker scenarios cannot race. On success,
    writes `~/.switchroom/accounts/<label>/credentials.json`
    atomically, then walks every agent whose active account == this
    label and re-mirrors their `.claude/credentials.json`.
@@ -540,10 +607,18 @@ algorithm:
     # divergent fleet — primary preference per-agent is lost
     LOUDLY WARN to stderr:
       ⚠ Divergent per-agent auth.accounts[0] detected across N agents.
-        Lifting "<most-common>" to fleet-active. Per-agent fallback
-        ordering is NOT preserved (the new schema only supports one
-        global fallback_order). Agents whose primary differed from
-        the fleet-active have been pinned via `override:`.
+        Lifting "<most-common>" to fleet-active. The new schema
+        loses TWO things from the old per-agent lists:
+          1. Per-agent fallback ORDERING (each agent had its own
+             priority list — the new schema only supports one
+             global fallback_order; first-seen-union order is
+             used).
+          2. Per-agent fallback TAIL (each agent's accounts[1:]
+             list is dropped except for the override target —
+             agents with override:X no longer have a documented
+             fallback to whatever they used to list after X).
+        Agents whose primary differed from the fleet-active have
+        been pinned via `override:`.
         Pre-RFC YAML backed up at ~/.switchroom/switchroom.yaml.pre-auth-broker
     auth.active = most-common primary; tiebreak: first-seen order
                   in the YAML file
@@ -569,7 +644,7 @@ The implementation is ~120 lines and lives in
 
 ## 7. Files deleted / changed
 
-### 7.1 Deleted
+### 7.1 Deleted source files
 
 - `src/auth/account-promote.ts` (subsumed by broker `set-active`).
 - `src/auth/token-refresh.ts` (per-agent refresh loop — replaced
@@ -582,11 +657,35 @@ The implementation is ~120 lines and lives in
   promote UI built on top of the old per-agent slot model. Replaced
   by simpler in-chat `/auth use <label>` and `/auth show` commands;
   see §7.3).
+- `telegram-plugin/auth-slot-parser.ts` (parses `/auth <verb>` chat
+  syntax for the dashboard model — replaced by a tighter parser
+  for the three new chat commands inline in `gateway.ts`).
 - `src/cli/auth.ts:registerHealCommand` and `auth heal` verb (no
   slot pool to heal).
 - The `auth_label` field in `src/config/schema.ts` and its emit
   in scaffold's `greetingCard` (replaced by deriving greeting from
   the broker's `list-state`).
+
+### 7.1a Deleted test files
+
+- `telegram-plugin/tests/auth-dashboard-render.test.ts`
+- `telegram-plugin/tests/auth-dashboard-callback.test.ts`
+- `telegram-plugin/tests/auth-dashboard-summary.test.ts`
+- `telegram-plugin/tests/auth-dashboard-quota.test.ts`
+- `telegram-plugin/tests/boot-card-account-quota.test.ts` (boot-card
+  account-quota path is rewired through broker `list-state`; new test
+  replaces it).
+- `telegram-plugin/tests/auth-account-identity-surface.test.ts`
+- `tests/auth-token-refresh.test.ts`
+- `tests/auth-account-quota-store.test.ts`
+- `tests/web-api.account-promote.test.ts` (replaced by
+  `tests/web-api.auth-use.test.ts`).
+- `tests/auth-account-promote.test.ts`
+- `tests/auth-accounts-yaml.test.ts`
+- Any test under `telegram-plugin/tests/` matching pattern
+  `auth-slot-*.test.ts`.
+
+### 7.2 Modified (not deleted)
 
 ### 7.2 Modified (not deleted)
 
@@ -628,7 +727,7 @@ The implementation is ~120 lines and lives in
 ### 7.3 Telegram surface
 
 `auth-dashboard.ts` is replaced — not by a deletion-with-no-
-replacement — by two thin chat commands the gateway adds:
+replacement — by three thin chat commands the gateway adds:
 
 - `/auth show` → calls broker `list-state` via gateway IPC,
   renders the same two-table format as the CLI's `auth show`.
@@ -643,6 +742,33 @@ The complexity of the old dashboard (drift-warnings, slot-state
 fixups, per-agent promote with mid-flight YAML editing) is gone
 because the *fleet-wide* model has nothing to fix up — there's one
 account active and one knob to change it.
+
+**Transitive imports.** The deletion of `auth-dashboard.ts` and
+`auth-slot-parser.ts` cascades into three live callsites that need
+explicit replacement, not just a "remove the import" pass:
+
+- `telegram-plugin/gateway/boot-card.ts:36-37` — imports
+  `AccountSummary` type and `formatAccountQuotaLine` formatter.
+  Boot-card auth-row rendering rewires to a new
+  `telegram-plugin/gateway/auth-line.ts` (~50 LOC) that takes the
+  broker's `list-state` shape and emits the existing one-line
+  format. Boot-card visual output is unchanged; only the source of
+  truth moves.
+- `telegram-plugin/foreman/foreman.ts:55-59` — imports
+  `DashboardState`, `DashboardSlot`, `parseAuthSubCommand`. Foreman
+  retargets at the simpler broker-derived state model; the slot
+  vocabulary disappears in favour of accounts-and-agents.
+- `telegram-plugin/gateway/gateway.ts:86-110` — imports the bulk
+  of the dashboard surface (`DashboardState`, `DashboardSlot`,
+  `SlotHealth`, `AccountSummary`, `AccountHealth`, `isQuotaHot`,
+  `isAccountQuotaHot`, `ACCOUNTS_DISPLAY_CAP`, `parseCallbackData`,
+  `encodeCallbackData`, `parseAuthSubCommand`). Gateway gets a new
+  inline `parseAuthCommand()` (~60 LOC) handling the three verbs;
+  the rest of the symbols just stop being imported.
+
+Each rewire is straightforward but visible — the implementer must
+*replace* the surface, not just delete the imports and call it
+done.
 
 ### 7.4 `CLAUDE_CODE_OAUTH_TOKEN` consumers
 
