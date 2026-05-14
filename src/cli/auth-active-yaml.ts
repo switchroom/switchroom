@@ -37,10 +37,21 @@ export function setAuthActive(yamlText: string, label: string): string {
     throw new Error("setAuthActive: YAML root is not a map");
   }
   const existing = root.get("auth", true);
-  if (isMap(existing) && existing.get("active") === label) {
-    return yamlText;
+  if (isMap(existing)) {
+    if (existing.get("active") === label) {
+      return yamlText;
+    }
+    // Map exists with other siblings (fallback_order, admin_agents, etc.) —
+    // patch only the `active` key so siblings + comments survive.
+    doc.setIn(["auth", "active"], label);
+  } else {
+    // `auth:` either absent, null (e.g. operator wrote a bare `auth:`
+    // key with no children), or scalar. `setIn` crashes on null/scalar
+    // because the yaml lib expects a collection — replace the whole
+    // `auth` value with a fresh map. There are no siblings to preserve
+    // in any of these branches.
+    doc.set("auth", { active: label });
   }
-  doc.setIn(["auth", "active"], label);
   const out = String(doc);
   return out.endsWith("\n") ? out : out + "\n";
 }

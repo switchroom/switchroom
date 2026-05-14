@@ -65,4 +65,32 @@ ${BASE}`;
     const out = setAuthActive(noTrail, "x@y.com");
     expect(out.endsWith("\n")).toBe(true);
   });
+
+  // Regression pins from PR #1282 reviewer: `setIn(["auth","active"], …)`
+  // crashes when `auth` exists but isn't a map. These are realistic
+  // operator states — `auth:` with no children is common after a partial
+  // setup or hand-edit — and the CLI callsites' yellow-warn fallback
+  // would otherwise silently leave the YAML out of sync with broker state.
+  it("handles auth: null (bare key) by replacing with a fresh map", () => {
+    const withNull = `auth:\n${BASE}`;
+    const out = setAuthActive(withNull, "x@y.com");
+    expect(out).toMatch(/^auth:\n  active: x@y\.com$/m);
+    expect(out).toContain("switchroom:");
+  });
+
+  it("handles auth: <scalar> by replacing with a fresh map", () => {
+    const withScalar = `auth: "legacy-string"\n${BASE}`;
+    const out = setAuthActive(withScalar, "x@y.com");
+    expect(out).toMatch(/^auth:\n  active: x@y\.com$/m);
+    expect(out).not.toContain("legacy-string");
+  });
+
+  it("round-trips cleanly across multiple calls (byte-equality short-circuit)", () => {
+    const first = setAuthActive(BASE, "a@x.com");
+    const second = setAuthActive(first, "a@x.com");
+    expect(second).toBe(first);
+    const third = setAuthActive(second, "b@x.com");
+    expect(third).not.toBe(second);
+    expect(third).toMatch(/active: b@x\.com/);
+  });
 });

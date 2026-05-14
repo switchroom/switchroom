@@ -499,6 +499,34 @@ export function registerAuthCommand(program: Command): void {
       }),
     );
 
+  // Shared YAML-pin helper for `auth use` and `auth rotate`. Without
+  // this, doctor's `auth-broker: fleet active account` check stays red
+  // until manual YAML edit (caught live on 2026-05-15 RFC H redeploy).
+  // Failure is intentionally soft (yellow warn, command stays exit-0)
+  // because the broker is the runtime source of truth — the YAML write
+  // is for next-boot persistence and the operator can retry.
+  function pinAuthActiveInYaml(label: string, quiet = false): void {
+    try {
+      const yamlPath = getConfigPath(program);
+      const before = readFileSync(yamlPath, "utf-8");
+      const after = setAuthActive(before, label);
+      if (after !== before) {
+        let mode = 0o644;
+        try { mode = statSync(yamlPath).mode & 0o777; } catch { /* default */ }
+        atomicWriteFileSync(yamlPath, after, mode);
+        if (!quiet) {
+          console.log(chalk.gray(`  Pinned auth.active: ${label} in ${yamlPath}`));
+        }
+      }
+    } catch (err) {
+      console.error(
+        chalk.yellow(
+          `  ⚠ Could not write auth.active to YAML: ${(err as Error).message}`,
+        ),
+      );
+    }
+  }
+
   // ── auth use <label> ──────────────────────────────────────────────────
   auth
     .command("use <label>")
@@ -512,27 +540,7 @@ export function registerAuthCommand(program: Command): void {
             chalk.gray(`  Re-mirrored to ${data.fanned.length} agent(s): ${data.fanned.join(", ")}`),
           );
         }
-        // Also patch switchroom.yaml so `auth.active` matches the broker's
-        // in-memory state. Without this, doctor's `auth-broker: fleet
-        // active account` check stays red until manual YAML edit (caught
-        // live on 2026-05-15 RFC H redeploy).
-        try {
-          const yamlPath = getConfigPath(program);
-          const before = readFileSync(yamlPath, "utf-8");
-          const after = setAuthActive(before, data.active);
-          if (after !== before) {
-            let mode = 0o644;
-            try { mode = statSync(yamlPath).mode & 0o777; } catch { /* default */ }
-            atomicWriteFileSync(yamlPath, after, mode);
-            console.log(chalk.gray(`  Pinned auth.active: ${data.active} in ${yamlPath}`));
-          }
-        } catch (err) {
-          console.error(
-            chalk.yellow(
-              `  ⚠ Could not write auth.active to YAML: ${(err as Error).message}`,
-            ),
-          );
-        }
+        pinAuthActiveInYaml(data.active);
       }),
     );
 
@@ -584,23 +592,9 @@ export function registerAuthCommand(program: Command): void {
           );
         }
         // Pin the rotation target into YAML so doctor + restart-after-OOM
-        // pick up the new active (same rationale as `auth use` above).
-        try {
-          const yamlPath = getConfigPath(program);
-          const before = readFileSync(yamlPath, "utf-8");
-          const after = setAuthActive(before, data.active);
-          if (after !== before) {
-            let mode = 0o644;
-            try { mode = statSync(yamlPath).mode & 0o777; } catch { /* default */ }
-            atomicWriteFileSync(yamlPath, after, mode);
-          }
-        } catch (err) {
-          console.error(
-            chalk.yellow(
-              `  ⚠ Could not write auth.active to YAML: ${(err as Error).message}`,
-            ),
-          );
-        }
+        // pick up the new active (quiet — the "Rotated to" line above is
+        // the operator-facing signal).
+        pinAuthActiveInYaml(data.active, true);
       }),
     );
 
