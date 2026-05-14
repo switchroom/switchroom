@@ -292,13 +292,16 @@ describe('probeQuota — #1163: /v1/messages headers path', () => {
     expect(result.detail).toContain('18% / 7d')
   })
 
-  it('surfaces auth rejection with login hint on 403', async () => {
+  it('surfaces auth rejection with the RFC-H replace-account hint on 403', async () => {
     const fakeFetch: typeof fetch = async () =>
       new Response(null, { status: 403 }) as Response
 
     const result = await probeQuota(claudeDir, agentDir, fakeFetch)
     expect(result.status).toBe('degraded')
-    expect(result.nextStep).toMatch(/switchroom auth login/)
+    // Post-RFC-H: per-agent `auth login` is retired. probeQuota emits the
+    // broker-aware "replace the account" hint pointing at `auth add ...
+    // --replace` instead. See telegram-plugin/gateway/boot-probes.ts.
+    expect(result.nextStep).toMatch(/switchroom auth add .*--from-oauth --replace/)
   })
 
   it('writing rate-limited result to cache produces a readable 30 s entry', () => {
@@ -1149,14 +1152,18 @@ describe('nextStep — agent systemd states', () => {
 })
 
 describe('nextStep — quota / hindsight / broker / kernel / scheduler', () => {
-  it('quota: no OAuth token → degraded with login hint', async () => {
+  it('quota: no OAuth token → degraded with RFC-H add+use hint', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'quota-nextstep-'))
     const oldCachePath = process.env.SWITCHROOM_QUOTA_CACHE_PATH
     process.env.SWITCHROOM_QUOTA_CACHE_PATH = join(dir, 'cache.json')
     try {
       const r = await probeQuota(dir, dir, (async () => new Response('{}')) as unknown as typeof fetch)
       expect(r.status).toBe('degraded')
-      expect(r.nextStep).toMatch(/switchroom auth login/)
+      // Post-RFC-H: the no-token nextStep points at `auth add` (register a
+      // fleet account) + `auth use` (set fleet active), not the retired
+      // per-agent `auth login`. See telegram-plugin/gateway/boot-probes.ts.
+      expect(r.nextStep).toMatch(/switchroom auth add .*--from-oauth/)
+      expect(r.nextStep).toMatch(/switchroom auth use/)
     } finally {
       if (oldCachePath) process.env.SWITCHROOM_QUOTA_CACHE_PATH = oldCachePath
       else delete process.env.SWITCHROOM_QUOTA_CACHE_PATH
