@@ -883,26 +883,33 @@ async function stepScaffoldAgents(
 }
 
 /**
- * Set `auth.active: default` in switchroom.yaml when unset. Pure-YAML
- * edit (preserves comments via `yaml` library's Document model).
- * Atomic write via the shared util. Idempotent.
+ * Set `auth.active: default` in switchroom.yaml when unset. Atomic
+ * write via the shared util. Idempotent — does nothing when
+ * `auth.active` is already set.
+ *
+ * The YAML mutation itself lives in src/cli/auth-active-yaml.ts so
+ * `switchroom auth use|rotate` can share it (caught during the
+ * 2026-05-15 RFC H redeploy: `auth use` updated broker state but
+ * never wrote the YAML, leaving doctor red).
  */
 async function ensureAuthActiveDefault(configPath: string): Promise<void> {
   const fs = await import("node:fs");
   const { parseDocument, isMap } = await import("yaml");
   const { atomicWriteFileSync } = await import("../util/atomic.js");
+  const { setAuthActive } = await import("./auth-active-yaml.js");
   const raw = fs.readFileSync(configPath, "utf-8");
+  // Guard: only seed "default" when auth.active is unset (setAuthActive
+  // would otherwise overwrite an operator-pinned active).
   const doc = parseDocument(raw);
   const root = doc.contents;
   if (!isMap(root)) return;
   const existing = root.get("auth", true);
   if (isMap(existing) && existing.has("active")) return;
-  doc.setIn(["auth", "active"], "default");
-  const out = String(doc);
-  const tail = out.endsWith("\n") ? out : out + "\n";
+  const after = setAuthActive(raw, "default");
+  if (after === raw) return;
   let mode = 0o644;
   try { mode = fs.statSync(configPath).mode & 0o777; } catch { /* default */ }
-  atomicWriteFileSync(configPath, tail, mode);
+  atomicWriteFileSync(configPath, after, mode);
 }
 
 // ─── Step 8: Vault Auto-Unlock ──────────────────────────────────────────────

@@ -44,8 +44,11 @@ import {
   readAccountCredentials,
 } from "../auth/account-store.js";
 import { resolveAgentsDir } from "../config/loader.js";
-import { withConfigError, getConfig } from "./helpers.js";
+import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { registerAuthGoogleSubcommands } from "./auth-google.js";
+import { setAuthActive } from "./auth-active-yaml.js";
+import { atomicWriteFileSync } from "../util/atomic.js";
+import { statSync } from "node:fs";
 
 // ─── Diagnose (used by tests; CLI heal verb removed) ─────────────────────
 
@@ -509,6 +512,27 @@ export function registerAuthCommand(program: Command): void {
             chalk.gray(`  Re-mirrored to ${data.fanned.length} agent(s): ${data.fanned.join(", ")}`),
           );
         }
+        // Also patch switchroom.yaml so `auth.active` matches the broker's
+        // in-memory state. Without this, doctor's `auth-broker: fleet
+        // active account` check stays red until manual YAML edit (caught
+        // live on 2026-05-15 RFC H redeploy).
+        try {
+          const yamlPath = getConfigPath(program);
+          const before = readFileSync(yamlPath, "utf-8");
+          const after = setAuthActive(before, data.active);
+          if (after !== before) {
+            let mode = 0o644;
+            try { mode = statSync(yamlPath).mode & 0o777; } catch { /* default */ }
+            atomicWriteFileSync(yamlPath, after, mode);
+            console.log(chalk.gray(`  Pinned auth.active: ${data.active} in ${yamlPath}`));
+          }
+        } catch (err) {
+          console.error(
+            chalk.yellow(
+              `  ⚠ Could not write auth.active to YAML: ${(err as Error).message}`,
+            ),
+          );
+        }
       }),
     );
 
@@ -557,6 +581,24 @@ export function registerAuthCommand(program: Command): void {
         if (data.fanned.length > 0) {
           console.log(
             chalk.gray(`  Re-mirrored to ${data.fanned.length} agent(s)`),
+          );
+        }
+        // Pin the rotation target into YAML so doctor + restart-after-OOM
+        // pick up the new active (same rationale as `auth use` above).
+        try {
+          const yamlPath = getConfigPath(program);
+          const before = readFileSync(yamlPath, "utf-8");
+          const after = setAuthActive(before, data.active);
+          if (after !== before) {
+            let mode = 0o644;
+            try { mode = statSync(yamlPath).mode & 0o777; } catch { /* default */ }
+            atomicWriteFileSync(yamlPath, after, mode);
+          }
+        } catch (err) {
+          console.error(
+            chalk.yellow(
+              `  ⚠ Could not write auth.active to YAML: ${(err as Error).message}`,
+            ),
           );
         }
       }),
