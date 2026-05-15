@@ -533,12 +533,14 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
  *   1. `auth.consumers[]` in `switchroom.yaml` contains an entry named
  *      `hindsight`. The auth-broker only binds a per-consumer socket
  *      when this is set.
- *   2. The bound socket exists on the host side at
- *      `~/.switchroom/state/auth-broker/<host-socket-path>/sock`.
- *      The hindsight side bind-mounts the named volume
- *      `auth-broker-hindsight-sock` (managed by compose) into its own
- *      container; the host-side state dir is where the broker writes
- *      the socket.
+ *   2. The broker container has actually bound the socket at
+ *      `/run/switchroom/auth-broker/hindsight/sock` (in-container path).
+ *      We `docker exec ... test -S <path>` because the host-side docker
+ *      volume mountpoint at `/var/lib/docker/volumes/.../_data/sock`
+ *      lives under a root-only-traversable parent (`/var/lib/docker` is
+ *      mode 0711 root:root on the common docker.io install), so an
+ *      operator-uid `existsSync()` returns false even when the socket
+ *      is present and healthy — false positive (#1281).
  *
  * Replaces the pre-#1245 `hindsight env leak` probe — that was
  * defending against an OpenAI-key shape that the broker-fed flow
@@ -548,7 +550,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
  */
 export function checkHindsightConsumer(
   config: SwitchroomConfig,
-  opts?: { socketProbe?: (path: string) => boolean },
+  opts?: { socketProbe?: (consumerName: string) => "present" | "missing" | "unreachable" },
 ): CheckResult {
   const consumers = config.auth?.consumers ?? [];
   const entry = consumers.find((c) => c.name === "hindsight");
@@ -568,31 +570,37 @@ export function checkHindsightConsumer(
     };
   }
 
-  // Host-side path the broker container chowns its consumer socket into.
-  // Mirrors the named volume `auth-broker-hindsight-sock` populated by
-  // compose. The hindsight container itself sees this at
-  // /run/switchroom/auth-broker/sock, but the doctor runs on the host
-  // and inspects the docker volume's mountpoint via the
-  // ~/.switchroom/state/auth-broker- side. We just check it's there
-  // (volume mount may not be filesystem-visible without inspecting
-  // the named volume; treat absence as warn, not fail).
-  const socketProbe = opts?.socketProbe ?? ((p: string) => existsSync(p));
-  const home = process.env.HOME ?? "";
-  const dockerVolPath = `/var/lib/docker/volumes/switchroom_auth-broker-hindsight-sock/_data/sock`;
-  const altVolPath = join(home, ".local", "share", "docker", "volumes", "switchroom_auth-broker-hindsight-sock", "_data", "sock");
-  const present = socketProbe(dockerVolPath) || socketProbe(altVolPath);
+  // Ask the broker container — it owns the socket bind and runs as root
+  // inside the container, so it can stat its own socket regardless of
+  // host-side docker volume permissions.
+  const probe = opts?.socketProbe ?? probeAuthBrokerSocket;
+  const state = probe(entry.name);
 
-  if (!present) {
+  if (state === "unreachable") {
+    // Broker container isn't around to ask. Don't speculate about the
+    // socket — the auth-broker service-health probe covers that case
+    // separately. Just surface what we know.
     return {
       name: "hindsight consumer",
       status: "warn",
       detail:
         `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
-        `socket not yet bound on disk`,
+        `couldn't query auth-broker container (not running / docker unavailable)`,
       fix:
-        "Run `switchroom apply` to bring up the auth-broker singleton " +
-        "and bind the per-consumer socket. The hindsight container will " +
-        "fetch credentials from it via `get-credentials` at boot.",
+        "Check `auth-broker: service health` row above; if the broker is " +
+        "down, `switchroom apply` will bring it back and bind the socket.",
+    };
+  }
+
+  if (state === "missing") {
+    return {
+      name: "hindsight consumer",
+      status: "warn",
+      detail:
+        `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0}); ` +
+        `auth-broker is running but socket not bound at /run/switchroom/auth-broker/${entry.name}/sock`,
+      fix:
+        "Run `switchroom apply` to refresh compose and rebind per-consumer sockets.",
     };
   }
 
@@ -601,6 +609,32 @@ export function checkHindsightConsumer(
     status: "ok",
     detail: `auth.consumers[hindsight] -> ${entry.account} (uid ${entry.uid ?? 0})`,
   };
+}
+
+/**
+ * Ask the auth-broker container whether a consumer's UDS is bound.
+ * `docker exec switchroom-auth-broker test -S <path>` exits 0 if the
+ * path is a socket; non-zero otherwise. Distinguishes "container not
+ * reachable" (e.g. docker isn't installed, broker isn't up) from
+ * "broker says no socket" so the doctor row can route the operator to
+ * the right fix.
+ */
+function probeAuthBrokerSocket(
+  consumerName: string,
+): "present" | "missing" | "unreachable" {
+  const containerPath = `/run/switchroom/auth-broker/${consumerName}/sock`;
+  const r = spawnSync(
+    "docker",
+    ["exec", "switchroom-auth-broker", "test", "-S", containerPath],
+    { stdio: "pipe", timeout: 3000 },
+  );
+  if (r.error || r.status === null) return "unreachable";
+  if (r.status === 0) return "present";
+  // Distinguish "broker says no socket" (test exit 1) from "docker
+  // couldn't reach the container at all" (exit 125+, the docker CLI
+  // family of "no such container" / daemon errors).
+  if (r.status >= 125) return "unreachable";
+  return "missing";
 }
 
 async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> {
