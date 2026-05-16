@@ -102,18 +102,25 @@ describe("spinUp: lifecycle ordering", () => {
     // spin-up latency for every scenario.
     let resolveResolved = 0;
     let getMeResolved = 0;
+    // Each fake call sleeps 100ms. Serial would take >=200ms, parallel
+    // ~100ms — large gap to avoid flake under loaded test runners
+    // (vitest workers, container CPU contention).
+    const LAT = 100;
     driverResolveBot.mockImplementationOnce(
-      () => new Promise((r) => setTimeout(() => { resolveResolved = Date.now(); r(555_000_001); }, 30)),
+      () => new Promise((r) => setTimeout(() => { resolveResolved = Date.now(); r(555_000_001); }, LAT)),
     );
     driverGetMyUserId.mockImplementationOnce(
-      () => new Promise((r) => setTimeout(() => { getMeResolved = Date.now(); r(8_248_703_757); }, 30)),
+      () => new Promise((r) => setTimeout(() => { getMeResolved = Date.now(); r(8_248_703_757); }, LAT)),
     );
     const t0 = Date.now();
     await spinUp({ agent: "test-harness", settleMs: 0 });
     const total = Date.now() - t0;
-    // Both calls have ~30ms latency; serial would take ~60ms+, parallel ~30ms.
-    expect(total).toBeLessThan(50);
-    expect(Math.abs(resolveResolved - getMeResolved)).toBeLessThan(20);
+    // Serial would take >=2*LAT (200ms); parallel ~LAT (100ms). Pick a
+    // generous-but-discriminating upper bound at 1.5*LAT.
+    expect(total).toBeLessThan(LAT * 1.5);
+    // Both setTimeouts fire within a small window of each other when
+    // dispatched in parallel; allow generous slack under load.
+    expect(Math.abs(resolveResolved - getMeResolved)).toBeLessThan(LAT * 0.5);
   });
 
   it("returns a Scenario with sendDM bound to the resolved bot user_id", async () => {
