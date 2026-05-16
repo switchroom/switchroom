@@ -58,3 +58,5 @@ spike/results/
 switchroom-linux-*
 switchroom-macos-*
 switchroom-checksums.txt
+
+.test-tmp/

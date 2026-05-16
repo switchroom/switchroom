@@ -26,9 +26,38 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+/**
+ * Pick an exec-allowed temp root. Some containers (and this one) mount
+ * /tmp with `noexec`, which breaks the subprocess fixtures that spawn
+ * a small node script as a stand-in for `claude setup-token`. When the
+ * default tmpdir is noexec, fall back to a project-local `.test-tmp/`
+ * which inherits the project mount's exec bits.
+ */
+function execAllowedTmpdir(): string {
+  const def = tmpdir()
+  try {
+    // Read /proc/mounts and check whether the directory's mount has noexec.
+    const mounts = readFileSync('/proc/mounts', 'utf8')
+    const noexec = mounts.split('\n').some((line) => {
+      const parts = line.split(' ')
+      if (parts.length < 4) return false
+      const [, mountPoint, , opts] = parts
+      return mountPoint === def && opts.split(',').includes('noexec')
+    })
+    if (!noexec) return def
+  } catch {
+    return def
+  }
+  const fallback = join(process.cwd(), '.test-tmp')
+  mkdirSync(fallback, { recursive: true })
+  return fallback
+}
+
+const EXEC_TMPDIR = execAllowedTmpdir()
 
 import {
   parseAuthCommand,
@@ -51,7 +80,7 @@ import {
 let workspace: string
 
 beforeEach(() => {
-  workspace = mkdtempSync(join(tmpdir(), 'auth-add-flow-test-'))
+  workspace = mkdtempSync(join(EXEC_TMPDIR, 'auth-add-flow-test-'))
   pendingAuthAddFlows.clear()
 })
 
