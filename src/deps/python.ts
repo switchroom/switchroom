@@ -97,10 +97,19 @@ export function ensurePythonEnv(opts: PythonEnvOptions): PythonEnv {
   }
 
   try {
+    // Clear PIP_USER from the environment: when set in the parent shell
+    // (a common pattern on Debian/Ubuntu hosts where the system python
+    // forces PEP 668 user-site installs), pip-in-venv refuses with
+    // "Can not perform a '--user' install. User site-packages are not
+    // visible in this virtualenv." We deliberately install INTO the
+    // venv, so override the inherited flag here.
+    const childEnv = { ...process.env };
+    delete childEnv.PIP_USER;
+    delete childEnv.PIP_REQUIRE_VIRTUALENV;
     execFileSync(
       pipBin,
       ["install", "--disable-pip-version-check", "-r", requirementsPath],
-      { stdio: "pipe" }
+      { stdio: "pipe", env: childEnv }
     );
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: Buffer };
