@@ -97,13 +97,25 @@ export class AutoUnlockDecryptError extends Error {
  * Exported so tests can stub via vi.mock.
  */
 export function readMachineId(): string {
-  // Test-only override. Honored ONLY when the env var is set, so
-  // production behaviour (read /etc/machine-id) is unchanged. The
-  // file-helper tests need a deterministic machine-id without
-  // mocking node:fs; setting this var to a fixed hex value gives
-  // the same property.
-  const override = process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
-  if (override && override.length > 0) return override;
+  // Test-only override. Honored ONLY under a vitest / NODE_ENV=test
+  // process (so a hostile or careless prod env var cannot downgrade
+  // machine-binding by injecting a known value). Production behaviour
+  // — read /etc/machine-id — is unchanged. The file-helper tests
+  // need a deterministic machine-id without mocking node:fs; setting
+  // this var to a fixed hex value under vitest gives the same
+  // property.
+  // VITEST is set to "true" by vitest itself (per its docs); we accept
+  // any non-empty value defensively. An empty string counts as "not
+  // set" — `vi.stubEnv(name, "")` in tests is how we simulate the
+  // env var being absent.
+  const vitestVal = process.env.VITEST;
+  const isTestEnv =
+    process.env.NODE_ENV === "test" ||
+    (vitestVal !== undefined && vitestVal.length > 0);
+  if (isTestEnv) {
+    const override = process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
+    if (override && override.length > 0) return override;
+  }
   for (const path of [MACHINE_ID_PRIMARY, MACHINE_ID_FALLBACK]) {
     try {
       const id = readFileSync(path, "utf8").trim();

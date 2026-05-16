@@ -12,7 +12,7 @@
 import { mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 // Ensure the file-helper test path has a deterministic machine-id even
 // on hosts without /etc/machine-id (rootless containers, fresh images).
@@ -30,9 +30,11 @@ afterAll(() => {
 
 import {
   AutoUnlockDecryptError,
+  MachineIdUnavailableError,
   decryptAutoUnlock,
   encryptAutoUnlock,
   readAutoUnlockFile,
+  readMachineId,
   writeAutoUnlockFile,
 } from "./auto-unlock.js";
 
@@ -132,3 +134,44 @@ describe("file helpers", () => {
     }
   });
 });
+
+describe("readMachineId — override is test-env-gated", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("ignores SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE when NODE_ENV != 'test' AND VITEST is unset", () => {
+    // Prod-env injection threat model: an attacker who can set
+    // SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE in the broker's environment
+    // must NOT be able to downgrade the machine-binding to a value of
+    // their choosing. Outside vitest / NODE_ENV=test the override is
+    // dead env, and readMachineId falls through to the real
+    // /etc/machine-id resolution. This test host has neither
+    // /etc/machine-id nor /var/lib/dbus/machine-id readable, so the
+    // fall-through surfaces as MachineIdUnavailableError — proving
+    // the override was NOT honoured.
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE", "attacker-controlled-id-0000000000");
+    expect(() => readMachineId()).toThrow(MachineIdUnavailableError);
+  });
+
+  it("honours SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE when VITEST is set (the existing test-helper path)", () => {
+    // VITEST is set by vitest itself for every test run; we re-state
+    // it explicitly here to make the intent obvious (and so this test
+    // doesn't accidentally pass purely because the top-level beforeAll
+    // already set the override env var).
+    vi.stubEnv("VITEST", "true");
+    vi.stubEnv("NODE_ENV", "production"); // proves VITEST alone is enough
+    vi.stubEnv("SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE", "test-only-value-000000000000000000");
+    expect(readMachineId()).toBe("test-only-value-000000000000000000");
+  });
+
+  it("honours SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE when NODE_ENV=test (the legacy gate)", () => {
+    vi.stubEnv("VITEST", "");
+    vi.stubEnv("NODE_ENV", "test");
+    vi.stubEnv("SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE", "node-env-test-id-00000000000000");
+    expect(readMachineId()).toBe("node-env-test-id-00000000000000");
+  });
+});
+
