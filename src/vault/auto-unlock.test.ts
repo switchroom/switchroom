@@ -12,7 +12,21 @@
 import { mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+// Ensure the file-helper test path has a deterministic machine-id even
+// on hosts without /etc/machine-id (rootless containers, fresh images).
+// Production readMachineId() ignores this env var when it's unset.
+const _origMachineId = process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
+beforeAll(() => {
+  process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE =
+    "test0000000000000000000000000000";
+});
+afterAll(() => {
+  if (_origMachineId === undefined)
+    delete process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
+  else process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE = _origMachineId;
+});
 
 import {
   AutoUnlockDecryptError,

@@ -7,7 +7,21 @@
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Make `encryptCredential` / `writeAutoUnlockFile` reachable on hosts
+// without /etc/machine-id by providing a deterministic test override.
+// Production readMachineId() ignores this when unset.
+const _origMachineId = process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
+beforeAll(() => {
+  process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE =
+    "test0000000000000000000000000000";
+});
+afterAll(() => {
+  if (_origMachineId === undefined)
+    delete process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE;
+  else process.env.SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE = _origMachineId;
+});
 
 import {
   applyAutoUnlock,
