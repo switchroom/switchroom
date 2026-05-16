@@ -106,6 +106,16 @@ export function ensurePythonEnv(opts: PythonEnvOptions): PythonEnv {
     const childEnv = { ...process.env };
     delete childEnv.PIP_USER;
     delete childEnv.PIP_REQUIRE_VIRTUALENV;
+    // Also strip the install-location overrides. Each one redirects pip
+    // OUT of the venv we just created: PIP_TARGET forces installs into
+    // an arbitrary directory, PIP_PREFIX prepends a different prefix to
+    // every install path, and PYTHONUSERBASE relocates the user-site
+    // dir that PIP_USER refers to. Any of these inherited from the
+    // parent shell silently breaks the venv install (or worse — succeeds
+    // but the skill imports the wrong copy at runtime).
+    delete childEnv.PIP_TARGET;
+    delete childEnv.PIP_PREFIX;
+    delete childEnv.PYTHONUSERBASE;
     execFileSync(
       pipBin,
       ["install", "--disable-pip-version-check", "-r", requirementsPath],
