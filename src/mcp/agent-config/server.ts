@@ -142,16 +142,14 @@ export const TOOLS = [
   {
     name: "schedule_remove",
     description:
-      "Remove an overlay-managed schedule entry by `name` or 12-hex `cron_hash`.",
+      "Remove an overlay-managed schedule entry by `name` or 12-hex `cron_hash`. " +
+      "Exactly one of `name` or `cron_hash` is required (enforced at runtime in scheduleRemove()).",
     inputSchema: {
       type: "object" as const,
-      oneOf: [
-        { required: ["name"], properties: { name: { type: "string" } } },
-        {
-          required: ["cron_hash"],
-          properties: { cron_hash: { type: "string", pattern: "^[a-f0-9]{12}$" } },
-        },
-      ],
+      properties: {
+        name: { type: "string" },
+        cron_hash: { type: "string", pattern: "^[a-f0-9]{12}$" },
+      },
     },
   },
   {
