@@ -7,6 +7,15 @@ import * as scaffoldModule from "../agents/scaffold.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 /**
+ * Test seam: bypass the `docker compose` v2 preflight check so these
+ * tests can exercise the apply orchestrator on hosts without Docker
+ * installed. The real preflight gate is exercised by its own dedicated
+ * test under `describe("compose v2 preflight")` further down which
+ * uses an emptied PATH instead of the dep injection.
+ */
+const SKIP_COMPOSE_PREFLIGHT = { detectComposeV2: () => null };
+
+/**
  * Minimal config — `runApply` forwards to `scaffoldAgent` (via
  * `loadConfig` resolution) and `generateCompose` directly. Both are
  * exercised in their own dedicated unit tests; here we only verify
@@ -65,6 +74,7 @@ describe("runApply", () => {
       {
         writeOut: (s) => sink.push(s),
         writeErr: (s) => sink.push(s),
+        ...SKIP_COMPOSE_PREFLIGHT,
       },
     );
 
@@ -122,7 +132,7 @@ describe("runApply", () => {
         runApply(
           makeStubConfig(join(dir, "agents")),
           { outPath: join(dir, "docker-compose.yml") },
-          { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s) },
+          { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
         ),
       ).rejects.toThrow(/UID alignment failed|allow-unaligned/i);
       const all = sink.join("");
@@ -139,7 +149,7 @@ describe("runApply", () => {
           outPath: join(dir, "docker-compose.yml"),
           allowUnaligned: true,
         },
-        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s) },
+        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
       );
       expect(res.scaffolded).toBe(1);
       const all = sink.join("");
@@ -173,7 +183,7 @@ describe("runApply", () => {
     const res = await runApply(
       makeStubConfig(join(dir, "agents")),
       { outPath },
-      { writeOut: () => {}, writeErr: () => {} },
+      { writeOut: () => {}, writeErr: () => {}, ...SKIP_COMPOSE_PREFLIGHT },
     );
 
     // scaffoldAgent may legitimately fail in this minimal-stub
@@ -230,7 +240,7 @@ describe("runApply", () => {
       await runApply(
         multiAgentConfig(join(dir, "agents")),
         { outPath, only: "bob", nonInteractive: true },
-        { writeOut: () => {}, writeErr: () => {} },
+        { writeOut: () => {}, writeErr: () => {}, ...SKIP_COMPOSE_PREFLIGHT },
       );
 
       // Only `bob` got scaffolded + aligned — alice and carol are
@@ -258,7 +268,7 @@ describe("runApply", () => {
       const res = await runApply(
         multiAgentConfig(join(dir, "agents")),
         { outPath, only: "alice", nonInteractive: true },
-        { writeOut: () => {}, writeErr: () => {} },
+        { writeOut: () => {}, writeErr: () => {}, ...SKIP_COMPOSE_PREFLIGHT },
       );
 
       const composeYml = await readFile(outPath, "utf-8");
@@ -278,7 +288,7 @@ describe("runApply", () => {
         runApply(
           multiAgentConfig(join(dir, "agents")),
           { outPath, only: "frank", nonInteractive: true },
-          { writeOut: () => {}, writeErr: () => {} },
+          { writeOut: () => {}, writeErr: () => {}, ...SKIP_COMPOSE_PREFLIGHT },
         ),
       ).rejects.toThrow(/--only=frank.*no such agent/);
     });
@@ -337,7 +347,7 @@ describe("runApply", () => {
           outPath: join(dir, "docker-compose.yml"),
           nonInteractive: true,
         },
-        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s) },
+        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
       );
 
       expect(res.scaffolded).toBe(1);
@@ -381,7 +391,7 @@ describe("runApply", () => {
           nonInteractive: true,
           composeOnly: true,
         },
-        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s) },
+        { writeOut: (s) => sink.push(s), writeErr: (s) => sink.push(s), ...SKIP_COMPOSE_PREFLIGHT },
       );
 
       expect(scaffoldSpy).not.toHaveBeenCalled();

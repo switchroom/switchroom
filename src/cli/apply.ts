@@ -127,6 +127,14 @@ export interface ApplyDeps {
   writeOut?: (s: string) => void;
   /** stderr writer; defaults to `process.stderr.write`. */
   writeErr?: (s: string) => void;
+  /**
+   * Test-only seam: override the `docker compose` v2 detection. When
+   * unset, the real `detectComposeV2()` is invoked. Tests in
+   * environments without docker installed pass `() => null` to bypass
+   * the preflight gate so they can exercise the orchestrator's actual
+   * scaffold/compose logic.
+   */
+  detectComposeV2?: () => string | null;
 }
 
 export interface ApplyResult {
@@ -321,7 +329,7 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
  * `docker-compose` v1 binary) is installed. Returns a friendly error
  * string explaining how to upgrade if it isn't, otherwise null.
  */
-function detectComposeV2(): string | null {
+export function detectComposeV2(): string | null {
   try {
     const out = execFileSync("docker", ["compose", "version"], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -351,7 +359,10 @@ function detectComposeV2(): string | null {
  * when `docker compose` v2 is unavailable. Both conditions would have
  * surfaced as cryptic mid-apply / mid-up failures otherwise.
  */
-export function runApplyPreflight(config: SwitchroomConfig): void {
+export function runApplyPreflight(
+  config: SwitchroomConfig,
+  opts: { detectComposeV2?: () => string | null } = {},
+): void {
   const vaultPath = resolvePath(
     config.vault?.path ?? "~/.switchroom/vault.enc",
   );
@@ -361,7 +372,8 @@ export function runApplyPreflight(config: SwitchroomConfig): void {
       `Run \`switchroom setup\` first to initialise the vault.`,
     );
   }
-  const composeErr = detectComposeV2();
+  const detect = opts.detectComposeV2 ?? detectComposeV2;
+  const composeErr = detect();
   if (composeErr) {
     throw new Error(composeErr);
   }
@@ -456,7 +468,7 @@ export async function runApply(
   // Fail-fast on missing prerequisites before we touch anything.
   // Both checks throw with operator-actionable messages; the action
   // wrapper catches and prints them red.
-  runApplyPreflight(config);
+  runApplyPreflight(config, { detectComposeV2: deps.detectComposeV2 });
 
   const agentsDir = resolveAgentsDir(config);
   const allAgentNames = Object.keys(config.agents);
