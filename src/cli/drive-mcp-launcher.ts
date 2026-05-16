@@ -145,6 +145,18 @@ export function buildSeedCredentials(
     .split(/\s+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+  if (scopes.length === 0) {
+    // Fail loud, consistent with the other required-field guards above.
+    // A scopeless seed starts upstream with zero Drive scopes — every
+    // tool call then 403s downstream, a deferred/opaque symptom with no
+    // signal at the layer that was actually wrong. The broker should
+    // never return an empty scope string for a Google credential; if it
+    // does, that's the bug to surface, not paper over.
+    throw new Error(
+      "buildSeedCredentials: scope is required (empty scope string would " +
+        "seed upstream with zero Drive scopes — every tool call 403s)",
+    );
+  }
   return {
     token: null,
     refresh_token: input.refreshToken,
@@ -187,7 +199,9 @@ export function buildSeedCredentials(
 // validated end-to-end in a real agent container: reaches "Starting
 // MCP server 'google_workspace' (stdio)". Bump in lockstep with the
 // upstream SHA + a re-test of the import+startup path.
-const AIOFILE_PIN = "aiofile==3.8.8";
+// Exported so the test imports the single source of truth instead of
+// re-typing the literal — a bump here can't silently pass a stale test.
+export const AIOFILE_PIN = "aiofile==3.8.8";
 
 export function buildUvxArgs(tier?: string): string[] {
   const args = [

@@ -327,9 +327,21 @@ export function ensureMcpServersTrusted(
       encoding: "utf-8",
       mode: 0o600,
     });
-  } catch {
-    // If we can't read/parse the config, skip silently (mirrors
-    // preTrustWorkspace).
+  } catch (err) {
+    // The absent-file case is handled by the early return above and is
+    // a legitimate transient during scaffold (the first call runs
+    // before `.claude.json` exists; a later pass re-applies). But a
+    // present-yet-unreadable/unparseable/unwritable `.claude.json`
+    // silently dropping the trust allowlist is exactly the kind of
+    // invisible failure that made the Drive integration so hard to
+    // debug — the only symptom is "agent has no Drive tools". Warn so
+    // it is at least visible without failing the whole scaffold.
+    console.warn(
+      `  WARNING: could not update MCP trust allowlist in ${configPath} ` +
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        `Scaffolded MCP servers (gdrive, agent-config, hostd) may be ` +
+        `silently ignored by Claude Code for this agent.`,
+    );
   }
 }
 

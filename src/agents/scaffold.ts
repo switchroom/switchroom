@@ -2172,6 +2172,14 @@ export function scaffoldAgent(
   // the MCP server definition from the project-level .mcp.json in the
   // working directory — NOT from settings.json mcpServers. Write it here
   // so the enhanced Telegram plugin can be launched as a dev channel.
+  //
+  // Captured here, applied to the trust allowlist a SECOND time after
+  // `.claude.json` is created (~`preTrustWorkspace` below). The in-block
+  // ensureMcpServersTrusted call is a silent no-op on a brand-new agent
+  // (`.claude.json` doesn't exist that early) — without the post-create
+  // pass a net-new agent's gdrive/agent-config/hostd servers are never
+  // trusted and Claude silently ignores them.
+  let mcpServerKeysToTrust: string[] | null = null;
   if (usesSwitchroomTelegramPlugin(agentConfig)) {
     const mcpJsonPath = join(agentDir, ".mcp.json");
     // The agent image (Dockerfile.agent) COPYs the plugin to a stable
@@ -2256,8 +2264,14 @@ export function scaffoldAgent(
     // hasTrustDialogAccepted but never enabledMcpjsonServers, so any
     // server scaffolded after original onboarding (gdrive, plus
     // agent-config/hostd for non-original agents) is silently ignored.
-    // Union every server we just wrote into the allowlist.
-    ensureMcpServersTrusted(agentDir, Object.keys(mcpServers));
+    // Union every server we just wrote into the allowlist. NOTE: on a
+    // brand-new agent `.claude.json` does not exist yet at this point —
+    // this call silently no-ops and the post-`preTrustWorkspace` pass
+    // below is what actually lands the trust. Kept here too because it
+    // is idempotent and covers the re-scaffold path where the file
+    // already exists.
+    mcpServerKeysToTrust = Object.keys(mcpServers);
+    ensureMcpServersTrusted(agentDir, mcpServerKeysToTrust);
   }
 
   // --- Render template-specific files ---
@@ -2436,6 +2450,19 @@ export function scaffoldAgent(
 
   // Pre-trust the agent's workspace directory
   preTrustWorkspace(agentDir);
+
+  // Now that `.claude.json` is guaranteed to exist (copyOnboardingState /
+  // createMinimalClaudeConfig + preTrustWorkspace just ran), re-apply the
+  // MCP trust allowlist. The in-block call during .mcp.json write is a
+  // silent no-op on a net-new agent (`.claude.json` absent that early),
+  // so without this pass a fresh agent's gdrive/agent-config/hostd
+  // servers are never added to enabledMcpjsonServers and Claude Code
+  // silently ignores them — the integration would only "work" because
+  // reconcileAgent re-trusts on the next restart. ensureMcpServersTrusted
+  // is idempotent; running it twice is safe.
+  if (mcpServerKeysToTrust) {
+    ensureMcpServersTrusted(agentDir, mcpServerKeysToTrust);
+  }
 
   // --- Memory index ---
   writeIfMissing(

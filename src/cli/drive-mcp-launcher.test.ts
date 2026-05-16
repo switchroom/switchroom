@@ -11,6 +11,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AIOFILE_PIN,
   buildChildEnv,
   buildSeedCredentials,
   buildUvxArgs,
@@ -54,14 +55,26 @@ describe("buildSeedCredentials — exact upstream shape", () => {
     expect(seed.scopes).toEqual(["scope.a", "scope.b", "scope.c"]);
   });
 
-  it("yields an empty scopes array for an empty scope string", () => {
-    const seed = buildSeedCredentials({
-      refreshToken: "rt",
-      clientId: "cid",
-      clientSecret: "sec",
-      scope: "",
-    });
-    expect(seed.scopes).toEqual([]);
+  it("throws on an empty/whitespace scope string (fail loud, never seed scopeless)", () => {
+    // A scopeless seed starts upstream with zero Drive scopes — every
+    // tool call 403s downstream. Consistent with the other required-
+    // field guards; the broker should never return an empty scope.
+    expect(() =>
+      buildSeedCredentials({
+        refreshToken: "rt",
+        clientId: "cid",
+        clientSecret: "sec",
+        scope: "",
+      }),
+    ).toThrow(/scope is required/);
+    expect(() =>
+      buildSeedCredentials({
+        refreshToken: "rt",
+        clientId: "cid",
+        clientSecret: "sec",
+        scope: "   \t  ",
+      }),
+    ).toThrow(/scope is required/);
   });
 
   it("injects the client secret verbatim (not from the broker schema)", () => {
@@ -123,7 +136,7 @@ describe("buildUvxArgs — pinned upstream + --single-user", () => {
       // in-container; ==1.20.4 and latest PyPI crash identically). Must
       // sit BEFORE the entrypoint positional (it's a uvx option).
       "--with",
-      "aiofile==3.8.8",
+      AIOFILE_PIN,
       // MUST be `workspace-mcp` — the upstream package provides only
       // `workspace-mcp` and `workspace-cli`. The original
       // `google-workspace-mcp` made uvx exit "executable not provided
@@ -136,7 +149,7 @@ describe("buildUvxArgs — pinned upstream + --single-user", () => {
     // Regression guard for the aiofile landmine — order matters
     // (uvx options precede the entrypoint).
     expect(args.indexOf("--with")).toBeLessThan(args.indexOf("workspace-mcp"));
-    expect(args).toContain("aiofile==3.8.8");
+    expect(args).toContain(AIOFILE_PIN);
   });
 
   it("appends --tool-tier <tier> after --single-user when a tier is given", () => {

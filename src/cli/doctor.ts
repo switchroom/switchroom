@@ -26,6 +26,7 @@ import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight } from "../memory/hindsight.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
+import { runDriveChecks } from "./doctor-drive.js";
 
 /**
  * Result of a single doctor check.
@@ -2172,6 +2173,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Agents", results: checkAgents(config, configPath) },
           { title: "Docker (Phase 1a)", results: runDockerSection(config) },
           { title: "Auth Broker", results: runAuthBrokerChecks(config) },
+          { title: "Google Drive", results: runDriveChecks(config) },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath) },
         ];
 
