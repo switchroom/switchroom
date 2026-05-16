@@ -7,7 +7,7 @@
  * via integration tests; here we keep it to pure unit coverage.
  */
 
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   escapeHtmlForTg,
   preBlock,
@@ -19,6 +19,28 @@ import {
   makeSwitchroomExecJson,
 } from '../shared/bot-runtime.js'
 import type { Context } from 'grammy'
+
+// ─── env hygiene ─────────────────────────────────────────────────────────
+// The exec factories read SWITCHROOM_CONFIG and prepend `--config <path>` to
+// argv. When the test runner inherits SWITCHROOM_CONFIG from the environment
+// (e.g. switchroom-managed shells), this leaks into tests that use `echo`
+// as the cliPath and breaks stdout assertions. Clear before each test and
+// restore after.
+
+let savedSwitchroomConfig: string | undefined
+
+beforeEach(() => {
+  savedSwitchroomConfig = process.env.SWITCHROOM_CONFIG
+  delete process.env.SWITCHROOM_CONFIG
+})
+
+afterEach(() => {
+  if (savedSwitchroomConfig !== undefined) {
+    process.env.SWITCHROOM_CONFIG = savedSwitchroomConfig
+  } else {
+    delete process.env.SWITCHROOM_CONFIG
+  }
+})
 
 // ─── escapeHtmlForTg ─────────────────────────────────────────────────────
 
