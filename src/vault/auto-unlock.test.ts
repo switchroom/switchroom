@@ -146,14 +146,24 @@ describe("readMachineId — override is test-env-gated", () => {
     // must NOT be able to downgrade the machine-binding to a value of
     // their choosing. Outside vitest / NODE_ENV=test the override is
     // dead env, and readMachineId falls through to the real
-    // /etc/machine-id resolution. This test host has neither
-    // /etc/machine-id nor /var/lib/dbus/machine-id readable, so the
-    // fall-through surfaces as MachineIdUnavailableError — proving
-    // the override was NOT honoured.
+    // /etc/machine-id resolution. Two legitimate outcomes prove the
+    // override was ignored: (a) the host has no /etc/machine-id and
+    // readMachineId throws MachineIdUnavailableError, or (b) the host
+    // has one and readMachineId returns the REAL id (not the override).
+    // The only failure mode this test catches is the override leaking
+    // into a prod-env read.
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE", "attacker-controlled-id-0000000000");
-    expect(() => readMachineId()).toThrow(MachineIdUnavailableError);
+    const override = "attacker-controlled-id-0000000000";
+    vi.stubEnv("SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE", override);
+    let result: string | undefined;
+    try {
+      result = readMachineId();
+    } catch (e) {
+      expect(e).toBeInstanceOf(MachineIdUnavailableError);
+      return;
+    }
+    expect(result).not.toBe(override);
   });
 
   it("honours SWITCHROOM_VAULT_MACHINE_ID_OVERRIDE when VITEST is set (the existing test-helper path)", () => {
