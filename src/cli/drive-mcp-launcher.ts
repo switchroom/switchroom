@@ -184,30 +184,50 @@ export function buildSeedCredentials(
  * package `workspace-mcp`" — verified in-container against the pinned
  * SHA.
  */
-// Upstream dependency landmine. `workspace-mcp` pulls a modern
-// `fastmcp` whose `oauth_proxy → key_value → filetree` import chain
-// imports `aiofile`. `aiofile/version.py` (still, on master) does
-// `package_metadata["Author"]`; under the `importlib_metadata`
-// backport's #371 behavior change (KeyError on a missing key) and
-// aiofile's newer wheels emitting only `Author-email`, that import
-// raises `KeyError: 'Author'` and the MCP server never starts. NOT a
-// switchroom bug and NOT fixed by repinning workspace-mcp (==1.20.4
-// and latest PyPI both crash identically — verified in-container).
-// Constraining the leaf package to a version whose wheel metadata
-// still carries `Author` defuses it with minimal blast radius (vs.
-// pinning the foundational importlib_metadata). `aiofile==3.8.8`
-// validated end-to-end in a real agent container: reaches "Starting
-// MCP server 'google_workspace' (stdio)". Bump in lockstep with the
-// upstream SHA + a re-test of the import+startup path.
+// Upstream dependency landmine — NOW FIXED UPSTREAM, so this pins the
+// FIX, not a workaround. `workspace-mcp` pulls a modern `fastmcp` whose
+// import chain imports `aiofile`. `aiofile/version.py` historically did
+// `package_metadata["Author"]`, which raises `KeyError: 'Author'` under
+// modern `importlib_metadata` (newer wheels emit only `Author-email`) —
+// the MCP server never started. `aiofile==3.8.8` only "worked" by the
+// accident of an old wheel still carrying `Author`: a fragile pin.
+//
+// Resolved upstream in aiofile PR mosquito/aiofile#106 (commit
+// c27fdc7e8, 2026-05-16): the crashing subscript is now
+// `package_metadata.get("Author", <fallback>)`. First fixed releases:
+// 3.10.1 / 3.10.2 / 3.11.0. We pin `aiofile==3.10.2` — a fixed release
+// that resolves on the agent image's Python (3.11.2) — instead of
+// sitting on the accidental 3.8.8. The floor (>= 3.10.1, the first
+// commit-c27fdc7e8 release) is asserted in the launcher test so a
+// careless downgrade back into the buggy range fails CI.
+//
+// Bump in lockstep with the upstream SHA + a re-test of the
+// import+startup path (the docker pin-smoke test does exactly this).
 // Exported so the test imports the single source of truth instead of
 // re-typing the literal — a bump here can't silently pass a stale test.
-export const AIOFILE_PIN = "aiofile==3.8.8";
+export const AIOFILE_PIN = "aiofile==3.10.2";
+
+/**
+ * The bare package name from {@link AIOFILE_PIN} (single-sourced). Used
+ * for `uvx --refresh-package <name>` below.
+ */
+export const AIOFILE_PKG = AIOFILE_PIN.split("==")[0];
 
 export function buildUvxArgs(tier?: string): string[] {
   const args = [
     "--from",
     `git+https://github.com/taylorwilsdon/google_workspace_mcp.git@${GOOGLE_WORKSPACE_MCP_PINNED_SHA}`,
-    // uvx option — must precede the `workspace-mcp` entrypoint positional.
+    // Load-bearing, not optional. AIOFILE_PIN tracks a freshly-released
+    // upstream fix; uv caches its package index, so an agent whose
+    // cache was populated before the fixed release existed resolves
+    // "no version of aiofile==<pin>" and the MCP never starts —
+    // reproduced in-container. `--refresh-package aiofile` forces uv to
+    // re-fetch ONLY aiofile's index (not the whole upstream git clone /
+    // dep tree, so startup stays cheap), guaranteeing the pinned fixed
+    // version is always resolvable regardless of cache age. uvx option
+    // — must precede the `workspace-mcp` entrypoint positional.
+    "--refresh-package",
+    AIOFILE_PKG,
     "--with",
     AIOFILE_PIN,
     "workspace-mcp",

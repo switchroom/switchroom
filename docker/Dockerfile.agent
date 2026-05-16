@@ -40,7 +40,9 @@ RUN mkdir -p /tmp/tmux-shared
 # uv / uvx — required by the Google Workspace MCP launcher
 # (`switchroom drive-mcp-launcher`, RFC G). The launcher execs
 # `uvx --from git+https://github.com/taylorwilsdon/google_workspace_mcp.git@<SHA>
-# --with aiofile==3.8.8 workspace-mcp --single-user`; without `uvx` on PATH the
+# --refresh-package aiofile --with aiofile==<pin> workspace-mcp --single-user`
+# (exact SHA/pin are single-sourced in src/, deliberately not repeated
+# here so this comment can't rot on a bump); without `uvx` on PATH the
 # launcher fails fast with exit 127 ("Executable not found in $PATH:
 # uvx") and the agent gets no Drive tools. Same pre-bake rationale as
 # playwright below: bake it into the image, version-pinned, instead of

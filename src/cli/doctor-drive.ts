@@ -245,45 +245,63 @@ function checkScaffoldWiring(
       continue;
     }
 
-    // .mcp.json must carry gdrive WITH a non-empty env block.
+    // Read both scaffold artifacts. In the canonical docker topology
+    // these are mode-0600 files owned by the per-agent UID, while
+    // `doctor` runs as the host operator — so the host genuinely
+    // cannot read them (EACCES). That is NOT a scaffold failure: the
+    // agent process reads them fine. Mirror the doctor-auth-broker
+    // "unverifiable from host" contract — one honest warn per agent —
+    // rather than crying a false `fail`. Only a file we COULD read but
+    // that is corrupt / mis-wired is a real `fail`.
     const mcpPath = join(agentDir, ".mcp.json");
+    const claudeJsonPath = join(agentDir, ".claude", ".claude.json");
+
+    const mcpRead = readJson(d, mcpPath);
+    const trustRead = readJson(d, claudeJsonPath);
+
+    if (mcpRead.kind === "unreadable" || trustRead.kind === "unreadable") {
+      results.push({
+        name: `drive: ${name} scaffold`,
+        status: "warn",
+        detail:
+          "scaffold files are agent-UID-owned (mode 0600) — unverifiable from the host operator; the agent process reads them fine. Verify in-container if needed: `docker exec switchroom-" +
+          name +
+          " sh -lc 'python3 -m json.tool /state/agent/.mcp.json >/dev/null && echo ok'`",
+      });
+      continue;
+    }
+
+    // .mcp.json must carry gdrive WITH a non-empty env block.
     let mcpOk = false;
     let mcpDetail = "no .mcp.json";
-    if (d.existsSync(mcpPath)) {
-      try {
-        const mcp = JSON.parse(d.readFileSync(mcpPath));
-        const g = mcp?.mcpServers?.gdrive;
-        if (!g) {
-          mcpDetail = ".mcp.json has no gdrive server";
-        } else if (!g.env || Object.keys(g.env).length === 0) {
-          mcpDetail =
-            "gdrive entry has no env block — Claude spawns MCP with a sanitized env; the launcher can't reach switchroom.yaml/the broker (bug-8 class)";
-        } else {
-          mcpOk = true;
-        }
-      } catch {
-        mcpDetail = ".mcp.json is unparseable";
+    if (mcpRead.kind === "ok") {
+      const g = mcpRead.data?.mcpServers?.gdrive;
+      if (!g) {
+        mcpDetail = ".mcp.json has no gdrive server";
+      } else if (!g.env || Object.keys(g.env).length === 0) {
+        mcpDetail =
+          "gdrive entry has no env block — Claude spawns MCP with a sanitized env; the launcher can't reach switchroom.yaml/the broker (bug-8 class)";
+      } else {
+        mcpOk = true;
       }
+    } else if (mcpRead.kind === "corrupt") {
+      mcpDetail = ".mcp.json exists but is not valid JSON (corrupt)";
     }
 
     // .claude.json must TRUST gdrive under the agent's project key.
-    const claudeJsonPath = join(agentDir, ".claude", ".claude.json");
     let trustOk = false;
     let trustDetail = "no .claude/.claude.json";
-    if (d.existsSync(claudeJsonPath)) {
-      try {
-        const cj = JSON.parse(d.readFileSync(claudeJsonPath));
-        const proj = cj?.projects?.[resolve(agentDir)];
-        const enabled: unknown = proj?.enabledMcpjsonServers;
-        if (Array.isArray(enabled) && enabled.includes("gdrive")) {
-          trustOk = true;
-        } else {
-          trustDetail =
-            "gdrive not in projects[].enabledMcpjsonServers — Claude silently ignores the un-allowlisted server (bug-9 / scaffold-ordering class)";
-        }
-      } catch {
-        trustDetail = ".claude.json is unparseable";
+    if (trustRead.kind === "ok") {
+      const proj = trustRead.data?.projects?.[resolve(agentDir)];
+      const enabled: unknown = proj?.enabledMcpjsonServers;
+      if (Array.isArray(enabled) && enabled.includes("gdrive")) {
+        trustOk = true;
+      } else {
+        trustDetail =
+          "gdrive not in projects[].enabledMcpjsonServers — Claude silently ignores the un-allowlisted server (bug-9 / scaffold-ordering class)";
       }
+    } else if (trustRead.kind === "corrupt") {
+      trustDetail = ".claude.json exists but is not valid JSON (corrupt)";
     }
 
     if (mcpOk && trustOk) {
@@ -302,6 +320,37 @@ function checkScaffoldWiring(
     }
   }
   return results;
+}
+
+type ReadJsonResult =
+  | { kind: "ok"; data: any }
+  | { kind: "absent" }
+  | { kind: "unreadable" } // exists but host can't read it (EACCES/EPERM)
+  | { kind: "corrupt" }; // read OK but not valid JSON
+
+/**
+ * Read + parse a JSON file, classifying the failure mode. The
+ * EACCES/EPERM split is load-bearing: in docker the scaffold artifacts
+ * are agent-UID-owned 0600 and the host operator running `doctor`
+ * cannot read them — that must NOT read as corruption/failure.
+ */
+function readJson(d: ResolvedDeps, path: string): ReadJsonResult {
+  if (!d.existsSync(path)) return { kind: "absent" };
+  let raw: string;
+  try {
+    raw = d.readFileSync(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EACCES" || code === "EPERM") return { kind: "unreadable" };
+    // Any other read error (e.g. the file vanished mid-check) — treat
+    // as absent rather than corrupt; we have no parsed content to judge.
+    return { kind: "absent" };
+  }
+  try {
+    return { kind: "ok", data: JSON.parse(raw) };
+  } catch {
+    return { kind: "corrupt" };
+  }
 }
 
 /**

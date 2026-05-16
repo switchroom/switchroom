@@ -62,18 +62,27 @@ export type GdriveMcpTier = "core" | "extended" | "complete";
  * Pinned upstream commit SHA for `taylorwilsdon/google_workspace_mcp`.
  *
  * Specific commit SHA — bump deliberately. Pinning to a 40-char commit
- * SHA (not a tag) means upstream history rewrites can't change what we
- * run. google_workspace_mcp v1.20.3 = this SHA; verified MIT-licensed
- * at this SHA on 2026-05-06. (Note: RFC C originally referenced v0.5.0;
- * that tag does not exist on upstream — v1.20.3 is the latest stable as
- * of this pin.)
+ * SHA (not the moving tag ref) means upstream history rewrites can't
+ * change what we run, while still tracking a tagged release. This SHA
+ * is the commit annotated tag `v1.20.4` dereferences to
+ * (`gh api repos/taylorwilsdon/google_workspace_mcp/git/refs/tags/v1.20.4`
+ * → tag obj → `.object.sha`). v1.20.4 (2026-05-07) supersedes the prior
+ * pin v1.20.3 (`f3c7dc5…`): it hardens the `--single-user` stdio OAuth
+ * callback path switchroom depends on (upstream PR #762, "missing state
+ * parameter fallback for single-user stdio OAuth callbacks"). The
+ * `workspace-mcp` entrypoint is unchanged at this tag (pyproject
+ * `[project.scripts]` still defines `workspace-mcp = "main:main"` —
+ * the bug-6 guard). Validated end-to-end in a real agent container at
+ * this SHA: MCP starts and a real Drive call authenticates the seeded
+ * single-user account. When bumping: re-deref a NEW tag to its commit
+ * SHA, confirm the entrypoint, and re-run the docker pin-smoke test.
  *
  * Exported as the single source of truth: the scaffold MCP entry and
  * the in-container `drive-mcp-launcher` both reference this constant so
  * the spawned upstream revision is identical on both code paths.
  */
 export const GOOGLE_WORKSPACE_MCP_PINNED_SHA =
-  "f3c7dc5df2641c8545abc9e8f402d794f2853745";
+  "9d69115b63e6bc2ef0d4b5d7a3b962396382b44c";
 
 export interface GdriveMcpEntryOptions {
   /**

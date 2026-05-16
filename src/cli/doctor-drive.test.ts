@@ -199,4 +199,52 @@ describe("runDriveChecks — deployed scaffold wiring (bug-8 / bug-9)", () => {
       rs.find((r) => r.name === "drive: carrie scaffold")?.status,
     ).toBe("warn");
   });
+
+  // Regression for the #1368 doctor false-positive: in the canonical
+  // docker topology the scaffold files are agent-UID-owned 0600 and
+  // `doctor` runs as the host operator → EACCES. That must read as a
+  // single honest "unverifiable from host" WARN, never a `fail`
+  // (the original code mislabeled EACCES as ".mcp.json is unparseable"
+  // and failed all 9 agents on a perfectly healthy fleet).
+  it("WARNS (not fail) when scaffold files are host-unreadable (EACCES)", () => {
+    const rs = runDriveChecks(base, {
+      agentsDir: "/agents",
+      existsSync: (p) =>
+        p === "/agents/carrie" ||
+        p === "/agents/carrie/.mcp.json" ||
+        p === "/agents/carrie/.claude/.claude.json",
+      readFileSync: () => {
+        throw Object.assign(new Error("EACCES: permission denied"), {
+          code: "EACCES",
+        });
+      },
+    });
+    const w = rs.find((r) => r.name === "drive: carrie scaffold");
+    expect(w?.status).toBe("warn");
+    expect(w?.detail).toContain("unverifiable from the host");
+    // Crucially: nothing in the section is a `fail` purely because the
+    // host can't read agent-UID-owned files.
+    expect(rs.filter((r) => r.status === "fail")).toEqual([]);
+  });
+
+  it("FAILS when a readable .mcp.json is genuinely corrupt (not EACCES)", () => {
+    const rs = runDriveChecks(base, {
+      agentsDir: "/agents",
+      existsSync: (p) =>
+        p === "/agents/carrie" ||
+        p === "/agents/carrie/.mcp.json" ||
+        p === "/agents/carrie/.claude/.claude.json",
+      readFileSync: (p) =>
+        p.endsWith(".mcp.json")
+          ? "{ this is not json"
+          : JSON.stringify({
+              projects: {
+                "/agents/carrie": { enabledMcpjsonServers: ["gdrive"] },
+              },
+            }),
+    });
+    const w = rs.find((r) => r.name === "drive: carrie scaffold");
+    expect(w?.status).toBe("fail");
+    expect(w?.detail).toContain("corrupt");
+  });
 });
