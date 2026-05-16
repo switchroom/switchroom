@@ -17,8 +17,8 @@ import {
   buildSeedCredentials,
   buildUvxArgs,
   encodeCredentialsFilename,
+  classifyRootSchema,
   resolveCredentialsDir,
-  sanitizeRootSchema,
   sanitizeToolsListMessage,
 } from "./drive-mcp-launcher.js";
 import { GOOGLE_WORKSPACE_MCP_PINNED_SHA } from "../memory/scaffold-integration.js";
@@ -247,61 +247,53 @@ describe("buildChildEnv — strips --single-user-incompatible knobs", () => {
   });
 });
 
-describe("sanitizeRootSchema — Pydantic anyOf/oneOf/allOf root rewrap", () => {
-  it("rewraps a root anyOf schema as {type:object, properties:{input:<orig>}}", () => {
-    const orig = { anyOf: [{ type: "string" }, { type: "null" }] };
-    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
-    expect(out.type).toBe("object");
-    expect(out.required).toEqual(["input"]);
-    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+describe("classifyRootSchema — drop unless root is {type:\"object\",...}", () => {
+  it("returns ok for a well-formed {type:object, properties:...} schema", () => {
+    expect(
+      classifyRootSchema({ type: "object", properties: { foo: { type: "string" } } }),
+    ).toBe("ok");
   });
 
-  it("rewraps a root oneOf schema the same way", () => {
-    const orig = { oneOf: [{ type: "string" }, { type: "integer" }] };
-    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
-    expect(out.type).toBe("object");
-    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  it("returns drop for a root anyOf schema (no wrap — see docstring)", () => {
+    expect(
+      classifyRootSchema({ anyOf: [{ type: "string" }, { type: "null" }] }),
+    ).toBe("drop");
   });
 
-  it("rewraps a root allOf schema the same way", () => {
-    const orig = { allOf: [{ type: "object" }, { properties: {} }] };
-    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
-    expect(out.type).toBe("object");
-    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  it("returns drop for a root oneOf schema", () => {
+    expect(
+      classifyRootSchema({ oneOf: [{ type: "string" }, { type: "integer" }] }),
+    ).toBe("drop");
   });
 
-  it("leaves a well-formed {type:object, properties:...} schema untouched", () => {
-    const orig = { type: "object", properties: { foo: { type: "string" } } };
-    expect(sanitizeRootSchema(orig)).toBe(orig);
+  it("returns drop for a root allOf schema", () => {
+    expect(
+      classifyRootSchema({ allOf: [{ type: "object" }, { properties: {} }] }),
+    ).toBe("drop");
   });
 
-  it("does NOT recurse — nested anyOf inside a property stays as-is", () => {
-    const orig = {
-      type: "object",
-      properties: {
-        foo: { anyOf: [{ type: "string" }, { type: "null" }] },
-      },
-    };
-    const out = sanitizeRootSchema(orig);
-    expect(out).toBe(orig); // identity — no rewrap
-    expect((orig.properties.foo as Record<string, unknown>).anyOf).toBeDefined();
+  it("returns drop for null / undefined / non-object schemas", () => {
+    expect(classifyRootSchema(null)).toBe("drop");
+    expect(classifyRootSchema(undefined)).toBe("drop");
+    expect(classifyRootSchema("string")).toBe("drop");
+    expect(classifyRootSchema(42)).toBe("drop");
+    expect(classifyRootSchema([])).toBe("drop");
   });
 
-  it("preserves title and description on the wrapper", () => {
-    const orig = {
-      title: "MyInput",
-      description: "A union input.",
-      anyOf: [{ type: "string" }, { type: "integer" }],
-    };
-    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
-    expect(out.title).toBe("MyInput");
-    expect(out.description).toBe("A union input.");
-    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  it("does NOT recurse — a top-level object with nested anyOf is ok", () => {
+    // Nested anyOf inside properties.<x> is fine — Anthropic's
+    // validator only rejects ROOT-level anyOf/oneOf/allOf.
+    expect(
+      classifyRootSchema({
+        type: "object",
+        properties: { foo: { anyOf: [{ type: "string" }, { type: "null" }] } },
+      }),
+    ).toBe("ok");
   });
 });
 
-describe("sanitizeToolsListMessage — walks tools[].inputSchema", () => {
-  it("sanitises tools with a bad root and leaves good ones untouched", () => {
+describe("sanitizeToolsListMessage — drops tools with bad root schemas", () => {
+  it("keeps good tools untouched and drops tools with root anyOf", () => {
     const msg = {
       jsonrpc: "2.0",
       id: 1,
@@ -318,16 +310,31 @@ describe("sanitizeToolsListMessage — walks tools[].inputSchema", () => {
         ],
       },
     };
-    const drops: string[] = [];
-    const out = sanitizeToolsListMessage(msg, (n) => drops.push(n)) as typeof msg;
-    expect(drops).toEqual([]);
+    const drops: { name: string; reason: string }[] = [];
+    const out = sanitizeToolsListMessage(msg, (name, reason) =>
+      drops.push({ name, reason }),
+    ) as typeof msg;
+    expect(out.result.tools.length).toBe(1);
+    expect(out.result.tools[0].name).toBe("good_tool");
     expect(out.result.tools[0].inputSchema).toEqual({
       type: "object",
       properties: { x: { type: "string" } },
     });
-    const fixed = out.result.tools[1].inputSchema as Record<string, unknown>;
-    expect(fixed.type).toBe("object");
-    expect(fixed.required).toEqual(["input"]);
+    expect(drops.length).toBe(1);
+    expect(drops[0].name).toBe("bad_tool");
+    expect(drops[0].reason).toMatch(/anyOf\/oneOf\/allOf/);
+  });
+
+  it("drops a tool with missing inputSchema (logged accordingly)", () => {
+    const msg = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: { tools: [{ name: "no_schema" }] },
+    };
+    const drops: string[] = [];
+    const out = sanitizeToolsListMessage(msg, (n) => drops.push(n)) as typeof msg;
+    expect(out.result.tools).toEqual([]);
+    expect(drops).toEqual(["no_schema"]);
   });
 
   it("passes through messages that are not tools/list responses", () => {

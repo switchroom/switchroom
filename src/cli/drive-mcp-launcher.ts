@@ -290,42 +290,41 @@ export function buildChildEnv(
  * allOf, or anyOf at the top level`) once Anthropic tightened
  * validation in mid-May 2026.
  *
- * This sanitiser rewraps the offending schema as a single-property
- * object so the wire shape is valid. We only touch the ROOT — nested
- * `anyOf`/`oneOf`/`allOf` (inside `properties.<x>`) is fine and stays
- * untouched.
+ * Classification — the schema is either "ok" (root `type:"object"` —
+ * forward untouched) or "drop" (anything else, including root
+ * anyOf/oneOf/allOf). We DO NOT attempt to rewrap into a
+ * `{type:"object", properties:{input:<orig>}}` envelope: that fixes
+ * `tools/list` but silently breaks `tools/call` because upstream's
+ * Pydantic handler expects FLAT kwargs (`{real_kwargs}`), while a
+ * wrapped tool causes Claude to call with `{input: {real_kwargs}}`. A
+ * safe wrap would need bidirectional `tools/call` arg-unwrapping in
+ * the parent→child direction, which is non-trivial; empirically the
+ * upstream pinned SHA has ZERO tools with bad-root schemas at either
+ * `--tool-tier extended` (89 tools) or `--tool-tier complete` (119
+ * tools), so wrap is dead code in practice. Dropping is safe, loud
+ * (the dropped tool is logged to stderr), and won't half-work the way
+ * wrap would.
  *
- * Exported for unit tests; called from the stdio proxy below.
+ * Returns `"ok"` if the schema can be forwarded untouched, `"drop"`
+ * otherwise. Exported for unit tests; called from the stdio proxy
+ * below.
  */
-export function sanitizeRootSchema(schema: unknown): unknown {
+export function classifyRootSchema(schema: unknown): "ok" | "drop" {
   if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
-    return schema;
+    return "drop";
   }
   const s = schema as Record<string, unknown>;
-  if (s.type === "object") return schema; // well-formed, leave alone
-  const hasBadRoot =
-    "anyOf" in s || "oneOf" in s || "allOf" in s;
-  if (!hasBadRoot) return schema;
-  // Preserve title/description on the wrapper for surface readability,
-  // but leave them ALSO on the inner schema (harmless duplication; the
-  // inner schema is opaque to Anthropic's validator since it lives
-  // under `properties.input`).
-  const wrapper: Record<string, unknown> = {
-    type: "object",
-    properties: { input: schema },
-    required: ["input"],
-  };
-  if (typeof s.title === "string") wrapper.title = s.title;
-  if (typeof s.description === "string") wrapper.description = s.description;
-  return wrapper;
+  if (s.type === "object") return "ok";
+  return "drop";
 }
 
 /**
  * Walk a parsed JSON-RPC message and, if it's a `tools/list` response,
- * sanitise every tool's `inputSchema` (MCP wire field) via
- * {@link sanitizeRootSchema}. Also drops any tool whose schema cannot
- * be made valid (`null` / non-object after sanitisation) — boot must
- * continue regardless, dropped tools are logged to stderr.
+ * classify every tool's `inputSchema` (MCP wire field) via
+ * {@link classifyRootSchema}. Tools whose root schema isn't
+ * `{"type": "object", ...}` are DROPPED from the response (and the
+ * drop is logged to stderr) — see classifyRootSchema for why we drop
+ * rather than wrap. Boot must continue regardless.
  *
  * Returns the (possibly mutated) message. Non-`tools/list` messages
  * pass through untouched.
@@ -350,22 +349,19 @@ export function sanitizeToolsListMessage(
     const t = tool as Record<string, unknown>;
     const name = typeof t.name === "string" ? t.name : "<unnamed>";
     const schema = t.inputSchema;
-    const sanitised = sanitizeRootSchema(schema);
-    if (
-      !sanitised ||
-      typeof sanitised !== "object" ||
-      (sanitised as Record<string, unknown>).type !== "object"
-    ) {
-      logDrop(
-        name,
-        `inputSchema root is not an object after sanitisation (got ${
-          sanitised === null ? "null" : typeof sanitised
-        })`,
-      );
+    if (classifyRootSchema(schema) === "ok") {
+      kept.push(t);
       continue;
     }
-    t.inputSchema = sanitised;
-    kept.push(t);
+    const why =
+      schema === null || schema === undefined
+        ? "missing"
+        : typeof schema !== "object" || Array.isArray(schema)
+          ? `not a JSON object (got ${schema === null ? "null" : typeof schema})`
+          : "root is not {type:\"object\",...} (likely root-level anyOf/oneOf/allOf — " +
+            "Anthropic's validator rejects this and we no longer rewrap; see " +
+            "classifyRootSchema docstring)";
+    logDrop(name, why);
   }
   r.tools = kept;
   return msg;
@@ -388,18 +384,36 @@ export function installToolsListSanitiserProxy(
 ): void {
   let buf = "";
   upstream.setEncoding?.("utf8");
+  // Pause upstream on `write()===false` and resume on `drain` so a
+  // slow downstream consumer (Claude Code's stdio reader paused mid-
+  // turn) can't grow this Node process's buffer without bound. The
+  // 'drain' listener is one-shot per pause cycle; re-installed when
+  // we pause again. `pause`/`resume` on a piped stream is a no-op
+  // for the pipe (we don't pipe — we consume via 'data'), so this
+  // governs the flow correctly.
+  const writeWithBackpressure = (s: string) => {
+    const ok = downstream.write(s);
+    if (!ok && typeof (upstream as { pause?: () => void }).pause === "function") {
+      (upstream as NodeJS.ReadableStream).pause();
+      downstream.once("drain", () => {
+        if (typeof (upstream as { resume?: () => void }).resume === "function") {
+          (upstream as NodeJS.ReadableStream).resume();
+        }
+      });
+    }
+  };
   upstream.on("data", (chunk: string | Buffer) => {
     buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     let idx: number;
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx);
       buf = buf.slice(idx + 1);
-      downstream.write(processJsonRpcLine(line) + "\n");
+      writeWithBackpressure(processJsonRpcLine(line) + "\n");
     }
   });
   upstream.on("end", () => {
     if (buf.length > 0) {
-      downstream.write(processJsonRpcLine(buf));
+      writeWithBackpressure(processJsonRpcLine(buf));
       buf = "";
     }
   });
@@ -696,7 +710,7 @@ export async function runDriveMcpLauncher(opts: {
   // `Union[A, B]` root parameters as a root-level `anyOf` —
   // Anthropic's tool-schema validator rejects that shape with HTTP
   // 400. We intercept `tools/list` responses and rewrap any offending
-  // `inputSchema` (see {@link sanitizeRootSchema}). All other traffic
+  // `inputSchema` (see {@link classifyRootSchema}). All other traffic
   // is forwarded byte-perfect.
   const { spawn } = await import("node:child_process");
   const os = await import("node:os");
