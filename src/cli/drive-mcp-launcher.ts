@@ -208,16 +208,33 @@ export function buildUvxArgs(tier?: string): string[] {
 /**
  * Build the child-process environment for upstream. Starts from the
  * current env, points `WORKSPACE_MCP_CREDENTIALS_DIR` at the seed dir,
- * and DELETES the three env knobs that are incompatible with
- * `--single-user` (so an operator-set or inherited value can't silently
- * break the browserless path).
+ * pins `USER_GOOGLE_EMAIL` to the seeded account, and DELETES the env
+ * knobs that are incompatible with `--single-user` (so an operator-set
+ * or inherited value can't silently break the browserless path).
+ *
+ * `USER_GOOGLE_EMAIL` is load-bearing, not cosmetic. Upstream
+ * single-user resolves auth per tool call by the agent-supplied
+ * `user_google_email` arg and, when it doesn't match a seeded file,
+ * *refuses to fall back* — it drops to interactive OAuth instead
+ * (`get_credentials:951` "no credentials for requested user …; not
+ * falling back to another user" → port-8000 bind → fail). The agent's
+ * notion of "the user" (e.g. its own operator email) is unrelated to
+ * the Google account we seeded. Setting `USER_GOOGLE_EMAIL` makes
+ * `core.server` configure that address as THE single user and marks
+ * the per-call arg optional (`server.py:106`,
+ * `service_decorator.py:78`), so every call authenticates against the
+ * seed regardless of what the agent passes. It MUST be the exact same
+ * value handed to `writeSeedFile` (the broker's `accountEmail`) — same
+ * source ⇒ seed filename and single-user pin can never diverge.
  */
 export function buildChildEnv(
   baseEnv: NodeJS.ProcessEnv,
   credentialsDir: string,
+  accountEmail: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   env.WORKSPACE_MCP_CREDENTIALS_DIR = credentialsDir;
+  env.USER_GOOGLE_EMAIL = accountEmail;
   // Incompatible with --single-user — see upstream. Strip unconditionally.
   delete env.MCP_ENABLE_OAUTH21;
   delete env.WORKSPACE_MCP_STATELESS_MODE;
@@ -489,7 +506,11 @@ export async function runDriveMcpLauncher(opts: {
   // wins over the config top-level tier.
   const tier = opts.tier ?? configSecrets.tier;
   const args = buildUvxArgs(tier);
-  const env = buildChildEnv(process.env, credentialsDir);
+  const env = buildChildEnv(
+    process.env,
+    credentialsDir,
+    brokerCreds.accountEmail,
+  );
 
   // Replace this process with upstream so Claude Code's MCP stdio
   // transport talks directly to it and signals/exit propagate. Node has

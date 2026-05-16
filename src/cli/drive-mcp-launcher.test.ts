@@ -161,6 +161,7 @@ describe("buildChildEnv — strips --single-user-incompatible knobs", () => {
         WORKSPACE_MCP_SERVICE_ACCOUNT_FILE: "/sa2.json",
       },
       "/state/agent/google-workspace-mcp/credentials",
+      "pixsoul@gmail.com",
     );
     expect(env.WORKSPACE_MCP_CREDENTIALS_DIR).toBe(
       "/state/agent/google-workspace-mcp/credentials",
@@ -173,9 +174,27 @@ describe("buildChildEnv — strips --single-user-incompatible knobs", () => {
     expect(env.PATH).toBe("/usr/bin");
   });
 
+  it("pins USER_GOOGLE_EMAIL to the seeded account (single-user identity)", () => {
+    // Load-bearing: upstream single-user refuses to fall back to the
+    // seed when the agent's per-call user_google_email doesn't match;
+    // USER_GOOGLE_EMAIL makes core.server treat this address as THE
+    // single user. MUST equal the value writeSeedFile used.
+    const env = buildChildEnv({}, "/tmp/c", "pixsoul@gmail.com");
+    expect(env.USER_GOOGLE_EMAIL).toBe("pixsoul@gmail.com");
+  });
+
+  it("overrides any inherited USER_GOOGLE_EMAIL with the seeded account", () => {
+    const env = buildChildEnv(
+      { USER_GOOGLE_EMAIL: "stale@example.com" },
+      "/tmp/c",
+      "pixsoul@gmail.com",
+    );
+    expect(env.USER_GOOGLE_EMAIL).toBe("pixsoul@gmail.com");
+  });
+
   it("does not mutate the passed-in base env object", () => {
     const base = { MCP_ENABLE_OAUTH21: "1" };
-    buildChildEnv(base, "/tmp/c");
+    buildChildEnv(base, "/tmp/c", "pixsoul@gmail.com");
     expect(base.MCP_ENABLE_OAUTH21).toBe("1");
   });
 });
