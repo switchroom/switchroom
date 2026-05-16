@@ -277,6 +277,150 @@ export function buildChildEnv(
   return env;
 }
 
+// ─── tools/list input_schema sanitiser ────────────────────────────────────
+
+/**
+ * Anthropic's tool-schema validator rejects tools whose `input_schema`
+ * has `anyOf` / `oneOf` / `allOf` at the ROOT (top-level must be
+ * `{"type": "object", ...}`). Upstream `google_workspace_mcp` is built
+ * on Pydantic v2, which serialises `Optional[X]` / `Union[A, B]` root
+ * parameters as a root-level `anyOf`. The result: agents with the
+ * gdrive MCP enabled started 400-ing on every turn
+ * (`tools.<N>.custom.input_schema: input_schema does not support oneOf,
+ * allOf, or anyOf at the top level`) once Anthropic tightened
+ * validation in mid-May 2026.
+ *
+ * This sanitiser rewraps the offending schema as a single-property
+ * object so the wire shape is valid. We only touch the ROOT — nested
+ * `anyOf`/`oneOf`/`allOf` (inside `properties.<x>`) is fine and stays
+ * untouched.
+ *
+ * Exported for unit tests; called from the stdio proxy below.
+ */
+export function sanitizeRootSchema(schema: unknown): unknown {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    return schema;
+  }
+  const s = schema as Record<string, unknown>;
+  if (s.type === "object") return schema; // well-formed, leave alone
+  const hasBadRoot =
+    "anyOf" in s || "oneOf" in s || "allOf" in s;
+  if (!hasBadRoot) return schema;
+  // Preserve title/description on the wrapper for surface readability,
+  // but leave them ALSO on the inner schema (harmless duplication; the
+  // inner schema is opaque to Anthropic's validator since it lives
+  // under `properties.input`).
+  const wrapper: Record<string, unknown> = {
+    type: "object",
+    properties: { input: schema },
+    required: ["input"],
+  };
+  if (typeof s.title === "string") wrapper.title = s.title;
+  if (typeof s.description === "string") wrapper.description = s.description;
+  return wrapper;
+}
+
+/**
+ * Walk a parsed JSON-RPC message and, if it's a `tools/list` response,
+ * sanitise every tool's `inputSchema` (MCP wire field) via
+ * {@link sanitizeRootSchema}. Also drops any tool whose schema cannot
+ * be made valid (`null` / non-object after sanitisation) — boot must
+ * continue regardless, dropped tools are logged to stderr.
+ *
+ * Returns the (possibly mutated) message. Non-`tools/list` messages
+ * pass through untouched.
+ */
+export function sanitizeToolsListMessage(
+  msg: unknown,
+  logDrop: (toolName: string, reason: string) => void,
+): unknown {
+  if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return msg;
+  const m = msg as Record<string, unknown>;
+  const result = m.result;
+  if (!result || typeof result !== "object") return msg;
+  const r = result as Record<string, unknown>;
+  const tools = r.tools;
+  if (!Array.isArray(tools)) return msg;
+  const kept: unknown[] = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") {
+      kept.push(tool);
+      continue;
+    }
+    const t = tool as Record<string, unknown>;
+    const name = typeof t.name === "string" ? t.name : "<unnamed>";
+    const schema = t.inputSchema;
+    const sanitised = sanitizeRootSchema(schema);
+    if (
+      !sanitised ||
+      typeof sanitised !== "object" ||
+      (sanitised as Record<string, unknown>).type !== "object"
+    ) {
+      logDrop(
+        name,
+        `inputSchema root is not an object after sanitisation (got ${
+          sanitised === null ? "null" : typeof sanitised
+        })`,
+      );
+      continue;
+    }
+    t.inputSchema = sanitised;
+    kept.push(t);
+  }
+  r.tools = kept;
+  return msg;
+}
+
+/**
+ * Wire a line-delimited JSON-RPC sanitiser between upstream's stdout
+ * and Claude Code's stdin (our process.stdout). MCP stdio framing is
+ * newline-delimited JSON; we accumulate bytes, split on `\n`, parse
+ * each line, sanitise tools/list responses via
+ * {@link sanitizeToolsListMessage}, and re-serialise.
+ *
+ * Non-JSON lines (or parse failures) are forwarded verbatim — the
+ * sanitiser must be transparent on anything it doesn't recognise so a
+ * future upstream framing change can't bring the agent down.
+ */
+export function installToolsListSanitiserProxy(
+  upstream: NodeJS.ReadableStream,
+  downstream: NodeJS.WritableStream,
+): void {
+  let buf = "";
+  upstream.setEncoding?.("utf8");
+  upstream.on("data", (chunk: string | Buffer) => {
+    buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let idx: number;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      downstream.write(processJsonRpcLine(line) + "\n");
+    }
+  });
+  upstream.on("end", () => {
+    if (buf.length > 0) {
+      downstream.write(processJsonRpcLine(buf));
+      buf = "";
+    }
+  });
+}
+
+function processJsonRpcLine(line: string): string {
+  if (line.length === 0) return line;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return line; // not JSON; pass through
+  }
+  const sanitised = sanitizeToolsListMessage(parsed, (name, reason) => {
+    process.stderr.write(
+      `drive-mcp-launcher: dropping tool '${name}' from tools/list — ${reason}\n`,
+    );
+  });
+  return JSON.stringify(sanitised);
+}
+
 // ─── I/O helpers (thin) ───────────────────────────────────────────────────
 
 /**
@@ -546,13 +690,25 @@ export async function runDriveMcpLauncher(opts: {
     brokerCreds.accountEmail,
   );
 
-  // Replace this process with upstream so Claude Code's MCP stdio
-  // transport talks directly to it and signals/exit propagate. Node has
-  // no execvp; spawn with stdio:inherit + mirror the child's exit is the
-  // idiomatic equivalent for a stdio MCP server.
+  // Pipe stdio (NOT inherit) so we can interpose a JSON-RPC sanitiser
+  // on the upstream→Claude direction. Upstream `google_workspace_mcp`
+  // is built on Pydantic v2, which serialises `Optional[X]` /
+  // `Union[A, B]` root parameters as a root-level `anyOf` —
+  // Anthropic's tool-schema validator rejects that shape with HTTP
+  // 400. We intercept `tools/list` responses and rewrap any offending
+  // `inputSchema` (see {@link sanitizeRootSchema}). All other traffic
+  // is forwarded byte-perfect.
   const { spawn } = await import("node:child_process");
   const os = await import("node:os");
-  const child = spawn("uvx", args, { stdio: "inherit", env });
+  const child = spawn("uvx", args, {
+    stdio: ["pipe", "pipe", "inherit"],
+    env,
+  });
+  // stdin: forward parent → child verbatim (no parsing needed; the
+  // sanitiser only touches RESPONSES from upstream).
+  process.stdin.pipe(child.stdin!);
+  // stdout: parse line-delimited JSON-RPC, sanitise tools/list, forward.
+  installToolsListSanitiserProxy(child.stdout!, process.stdout);
   child.on("error", (err) => {
     process.stderr.write(
       `drive-mcp-launcher: failed to exec uvx: ${err.message}. Is \`uv\` ` +

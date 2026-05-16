@@ -18,6 +18,8 @@ import {
   buildUvxArgs,
   encodeCredentialsFilename,
   resolveCredentialsDir,
+  sanitizeRootSchema,
+  sanitizeToolsListMessage,
 } from "./drive-mcp-launcher.js";
 import { GOOGLE_WORKSPACE_MCP_PINNED_SHA } from "../memory/scaffold-integration.js";
 
@@ -242,6 +244,95 @@ describe("buildChildEnv — strips --single-user-incompatible knobs", () => {
     const base = { MCP_ENABLE_OAUTH21: "1" };
     buildChildEnv(base, "/tmp/c", "pixsoul@gmail.com");
     expect(base.MCP_ENABLE_OAUTH21).toBe("1");
+  });
+});
+
+describe("sanitizeRootSchema — Pydantic anyOf/oneOf/allOf root rewrap", () => {
+  it("rewraps a root anyOf schema as {type:object, properties:{input:<orig>}}", () => {
+    const orig = { anyOf: [{ type: "string" }, { type: "null" }] };
+    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
+    expect(out.type).toBe("object");
+    expect(out.required).toEqual(["input"]);
+    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  });
+
+  it("rewraps a root oneOf schema the same way", () => {
+    const orig = { oneOf: [{ type: "string" }, { type: "integer" }] };
+    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
+    expect(out.type).toBe("object");
+    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  });
+
+  it("rewraps a root allOf schema the same way", () => {
+    const orig = { allOf: [{ type: "object" }, { properties: {} }] };
+    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
+    expect(out.type).toBe("object");
+    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  });
+
+  it("leaves a well-formed {type:object, properties:...} schema untouched", () => {
+    const orig = { type: "object", properties: { foo: { type: "string" } } };
+    expect(sanitizeRootSchema(orig)).toBe(orig);
+  });
+
+  it("does NOT recurse — nested anyOf inside a property stays as-is", () => {
+    const orig = {
+      type: "object",
+      properties: {
+        foo: { anyOf: [{ type: "string" }, { type: "null" }] },
+      },
+    };
+    const out = sanitizeRootSchema(orig);
+    expect(out).toBe(orig); // identity — no rewrap
+    expect((orig.properties.foo as Record<string, unknown>).anyOf).toBeDefined();
+  });
+
+  it("preserves title and description on the wrapper", () => {
+    const orig = {
+      title: "MyInput",
+      description: "A union input.",
+      anyOf: [{ type: "string" }, { type: "integer" }],
+    };
+    const out = sanitizeRootSchema(orig) as Record<string, unknown>;
+    expect(out.title).toBe("MyInput");
+    expect(out.description).toBe("A union input.");
+    expect((out.properties as Record<string, unknown>).input).toEqual(orig);
+  });
+});
+
+describe("sanitizeToolsListMessage — walks tools[].inputSchema", () => {
+  it("sanitises tools with a bad root and leaves good ones untouched", () => {
+    const msg = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        tools: [
+          {
+            name: "good_tool",
+            inputSchema: { type: "object", properties: { x: { type: "string" } } },
+          },
+          {
+            name: "bad_tool",
+            inputSchema: { anyOf: [{ type: "string" }, { type: "null" }] },
+          },
+        ],
+      },
+    };
+    const drops: string[] = [];
+    const out = sanitizeToolsListMessage(msg, (n) => drops.push(n)) as typeof msg;
+    expect(drops).toEqual([]);
+    expect(out.result.tools[0].inputSchema).toEqual({
+      type: "object",
+      properties: { x: { type: "string" } },
+    });
+    const fixed = out.result.tools[1].inputSchema as Record<string, unknown>;
+    expect(fixed.type).toBe("object");
+    expect(fixed.required).toEqual(["input"]);
+  });
+
+  it("passes through messages that are not tools/list responses", () => {
+    const msg = { jsonrpc: "2.0", id: 1, method: "ping", params: {} };
+    expect(sanitizeToolsListMessage(msg, () => {})).toEqual(msg);
   });
 });
 
