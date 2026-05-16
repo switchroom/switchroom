@@ -162,8 +162,9 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > resolve every anchor before posting the diff-preview card.
 >
 > Implementation landed differently. Agents reach Drive via the
-> upstream `taylorwilsdon/google_workspace_mcp` server (pinned at
-> `f3c7dc5df2641c8545abc9e8f402d794f2853745`), which exposes 9
+> upstream `taylorwilsdon/google_workspace_mcp` server (pinned to the
+> commit in `GOOGLE_WORKSPACE_MCP_PINNED_SHA`, single-sourced in
+> `src/memory/scaffold-integration.ts`), which exposes 9
 > direct write tools (`modify_doc_text`, `find_and_replace_doc`,
 > `insert_doc_elements`, `insert_doc_image`, `batch_update_doc`,
 > `create_table_with_data`, `update_doc_headers_footers`,

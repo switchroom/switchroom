@@ -21,12 +21,22 @@ Google account, not a service account. Nothing leaves your subscription.
 switchroom auth google connect
 
 # 1. Connect a Google account to the auth-broker (one-time per account).
-switchroom auth google account add ken-personal
+#    <account> is the Google EMAIL, not a label.
+switchroom auth google account add you@gmail.com
 
-# 2. Allow an agent to use that account.
-switchroom auth google enable ken-personal klanker
+# 2. Allow an agent to use that account (the ACL — enabled_for[]).
+switchroom auth google enable you@gmail.com klanker
 
-# 3. (Optional) Pick the Workspace tier — defaults to "core".
+# 3. REQUIRED, separate from step 2: set the agent's account selector
+#    in switchroom.yaml, then reconcile. Without this the broker returns
+#    ACCOUNT_NOT_FOUND and the agent silently has no Drive.
+#      agents: { klanker: { google_workspace: { account: you@gmail.com } } }
+switchroom agent restart klanker      # or `switchroom update` for the fleet
+
+# 4. Verify (catches the step-3 trap up front):
+switchroom doctor                     # see the "Google Drive" section
+
+# 5. (Optional) Pick the Workspace tier — defaults to "core".
 #    See docs/configuration.md § google_workspace for the cascade.
 ```
 
@@ -42,25 +52,34 @@ one of:
 ```
             ┌─ auth-broker ──────────────────────┐
             │                                    │
-operator ───▶ google account add <label>         │
-            │   → device-flow OAuth              │
+operator ───▶ google account add <email>          │
+            │   → loopback OAuth                 │
             │   → refresh_token stored in        │
             │     ~/.switchroom/auth-broker/     │
             │                                    │
-operator ───▶ google enable <agent> <label>      │
-            │   → adds <agent> to the per-       │
-            │     account ACL                    │
+operator ───▶ google enable <email> <agents…>     │
+            │   → adds agents to the per-        │
+            │     account ACL (enabled_for[])    │
             │                                    │
-agent ──────▶ get_credentials(provider=google,   │
-            │   account=<label>)                 │
-            │   → access_token (refreshed on     │
-            │     demand by the broker)          │
+operator ───▶ set agents.<name>.google_workspace. │
+            │   account: <email>  (REQUIRED —    │
+            │   the broker selects the account   │
+            │   from this, not a per-call arg)   │
+            │                                    │
+agent ──────▶ get_credentials(provider=google)    │
+            │   → broker derives account from    │
+            │     the agent's config + enforces  │
+            │     enabled_for[] → access_token   │
             └────────────────────────────────────┘
 ```
 
-**Per-account, not per-agent.** One Google account → many agents that
-can use it (controlled by the ACL). One agent → can have multiple
-accounts (the agent picks `account=<label>` per call). RFC G §4.4
+**Accounts are identified by Google email, not an arbitrary label.**
+`account add`, `google_accounts:` keys, and `google_workspace.account`
+are all the email (validated + lowercased). One Google account → many
+agents (gated by `enabled_for[]`); one agent → exactly one Google
+account, named in its `google_workspace.account`. Granting access is
+**two fields, both required** — `enabled_for[]` *and* the per-agent
+`google_workspace.account` (see "Granting an agent access"). RFC G §4.4
 spells out why this shape is load-bearing.
 
 ## Prerequisite — your OAuth client (one-time per install)
@@ -153,11 +172,13 @@ If you'd rather do it by hand (the wizard automates exactly this):
 ## Connecting an account
 
 ```bash
-switchroom auth google account add ken-personal
+switchroom auth google account add you@gmail.com
 ```
 
-This runs Google's **loopback** flow (device-code and OOB do not work
-for Drive — see the client-type note above):
+`<account>` is the **Google account email** — it is validated and
+lowercased, not a free-form label. This runs Google's **loopback** flow
+(device-code and OOB do not work for Drive — see the client-type note
+above):
 
 1. Prints a consent URL and binds an ephemeral `127.0.0.1:<port>`
    listener.
@@ -169,9 +190,10 @@ for Drive — see the client-type note above):
    rest of switchroom).
 4. Account is now visible in `switchroom auth google account list`.
 
-If you have multiple Google accounts to attach, repeat with different
-labels (`ken-personal`, `ken-work`, etc.). The label is just for your
-own reference — agents reference accounts by label, not by Google email.
+If you have multiple Google accounts to attach, repeat with each
+account's email. Agents reference accounts by that email everywhere
+(`google_accounts:` keys, `google_workspace.account`) — there is no
+separate label.
 
 ### Scopes — read by default, write is opt-in
 
@@ -185,9 +207,9 @@ let agents *create and edit* docs (e.g. draft a new doc into a folder),
 pass `--write`:
 
 ```bash
-switchroom auth google account add ken-personal --write
+switchroom auth google account add you@gmail.com --write
 # re-consent an already-connected account to add write:
-switchroom auth google account add ken-personal --replace --write
+switchroom auth google account add you@gmail.com --replace --write
 ```
 
 `--write` adds **`drive.file`** — least-privilege: agents can create
@@ -201,7 +223,7 @@ exposed — it is independent of these OAuth scopes.
 ### Removing an account
 
 ```bash
-switchroom auth google account remove ken-personal
+switchroom auth google account remove you@gmail.com
 ```
 
 Deletes the refresh token from the broker AND best-effort-revokes it
@@ -210,23 +232,50 @@ Google.
 
 ## Granting an agent access
 
-By default a new Google account is reachable by **no agents**. Enable
-explicitly:
+Granting an agent Drive access is **two required steps** — doing only
+the first is the most common failure mode (it fails *silently* until
+the agent is asked to use Drive).
+
+**Step 1 — the ACL.** By default a new account is reachable by no
+agents. Add agents to its `enabled_for[]`:
 
 ```bash
-# Enable one or more agents on an account ("all" expands to every agent):
-switchroom auth google enable ken-personal klanker
-switchroom auth google enable ken-personal klanker clerk
-switchroom auth google enable ken-personal all
+# "all" expands to every declared agent:
+switchroom auth google enable you@gmail.com klanker
+switchroom auth google enable you@gmail.com klanker clerk
+switchroom auth google enable you@gmail.com all
 
 # Inspect / revoke:
-switchroom auth google list                       # show the full agent × account matrix
-switchroom auth google disable ken-personal klanker
+switchroom auth google list                       # full agent × account matrix
+switchroom auth google disable you@gmail.com klanker
 ```
 
-ACL changes take effect on the next `get_credentials` call — no agent
-restart needed. The auth-broker is the source of truth (RFC G §4.4
-+ RFC H Phase 3b).
+**Step 2 — the per-agent account selector (REQUIRED, separate).**
+`auth google enable` only writes `enabled_for[]`. The broker selects
+which account to return for an agent from that agent's own
+`google_workspace.account` (path-as-identity — the launcher passes no
+account). Without it the broker returns `ACCOUNT_NOT_FOUND` and the
+agent has no Drive tools, with **no error at config time**:
+
+```yaml
+agents:
+  klanker:
+    google_workspace:
+      account: you@gmail.com    # must match a google_accounts: key
+```
+
+Then apply the scaffold so the agent's `.mcp.json` + trust are
+regenerated: `switchroom update` (fleet) or `switchroom agent restart
+klanker`. A *pure* `enabled_for[]` change on an already-wired agent
+takes effect on the next `get_credentials` call with no restart; adding
+a brand-new Drive agent needs the reconcile because its MCP wiring
+doesn't exist yet.
+
+**Verify.** `switchroom doctor` has a **Google Drive** section that
+flags every `enabled_for[]` ↔ `google_workspace.account` mismatch and
+the deployed scaffold wiring — run it after any change here instead of
+discovering the gap when an agent says "Drive's blocked". The
+auth-broker is the source of truth (RFC G §4.4 + RFC H Phase 3b).
 
 ## Working with the agent over Telegram
 
@@ -322,8 +371,13 @@ google_workspace:
   # tools: { include: [...], exclude: [...] }  # optional per-tool override
 ```
 
-Per-agent ACL is set via `auth google enable/disable`, not the YAML —
-ACL changes need to be auditable without an agent restart (RFC G §4.4).
+Two distinct knobs, don't conflate them: the **ACL**
+(`google_accounts.<email>.enabled_for[]`) is set via `auth google
+enable/disable` (or by hand in YAML) and a pure ACL change takes effect
+on the next `get_credentials` with no restart (RFC G §4.4); the
+**per-agent account selector** (`agents.<name>.google_workspace.account`)
+is YAML and is *required* — see `docs/configuration.md` § "Per-account
+ACL + per-agent selection" and "Granting an agent access" above.
 
 ## Troubleshooting
 
@@ -332,15 +386,17 @@ ACL changes need to be auditable without an agent restart (RFC G §4.4).
 The refresh token has been revoked or rotated. Re-run:
 
 ```bash
-switchroom auth google account add ken-personal  # OAuth flow
+switchroom auth google account add you@gmail.com --replace  # re-consent
 # OR if the broker still has the slot but the token is dead:
-switchroom auth google account remove ken-personal
-switchroom auth google account add ken-personal
+switchroom auth google account remove you@gmail.com
+switchroom auth google account add you@gmail.com
 ```
 
-Causes: the user changed their Google password, revoked switchroom in
-the Google Account dashboard, or the OAuth client's verification
-expired (7-day Testing-mode token lifetimes).
+Causes: the user changed their Google password, or revoked switchroom
+in the Google Account dashboard. Note the **7-day refresh-token
+lifetime applies only to Testing-mode OAuth clients** — move the client
+to Production in the GCP console (the recommended posture) and that
+clock goes away; it is not a cause there.
 
 ### Agent says "Not logged in" right after `switchroom update`
 

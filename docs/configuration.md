@@ -421,6 +421,37 @@ only: one OAuth client per switchroom install. A per-agent
 `google_workspace:` override may narrow `approvers` or pick a different
 `tier`, but not the client credentials (RFC G Phase 1).
 
+### Per-account ACL + per-agent selection (`google_accounts:` + `google_workspace.account`)
+
+The `google_workspace:` block above only configures the OAuth *client*.
+Two more pieces gate whether a given agent can actually reach Drive —
+**both are required; one without the other silently fails:**
+
+```yaml
+google_accounts:                 # top-level; keyed by the Google EMAIL
+  alice@example.com:             #   (validated + lowercased — NOT an
+    enabled_for: [carrie, finn]  #   arbitrary label)
+
+agents:
+  carrie:
+    google_workspace:
+      account: alice@example.com  # the account THIS agent uses
+```
+
+| Field | Notes |
+|---|---|
+| `google_accounts.<email>.enabled_for[]` | The cross-agent ACL: which agents may read that account's broker-held refresh token. Set by `switchroom auth google enable <email> <agents…>` (or by hand). |
+| `agents.<name>.google_workspace.account` | The account the broker returns for that agent. The launcher passes **no** account — the broker derives it from this field (path-as-identity) and then enforces `enabled_for[]`. Must be a key in `google_accounts:`. |
+
+Being listed in `enabled_for[]` is **necessary but not sufficient**: an
+agent with no `google_workspace.account` gets `ACCOUNT_NOT_FOUND` from
+the broker; an agent with `account:` set but absent from that account's
+`enabled_for[]` gets `ACCESS_DENIED`. Both are silent at config time and
+only surface when the agent tries to use Drive — so `switchroom doctor`
+has a **Google Drive** section that flags every such mismatch (and the
+deployed `.mcp.json`/trust wiring) up front. Run it after any change
+here.
+
 ## Escape Hatches
 
 For Claude Code settings switchroom doesn't wrap:
