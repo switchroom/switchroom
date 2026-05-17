@@ -116,6 +116,17 @@ export const UpdateApplyRequestSchema = z.object({
       /** Source-checkout users: also run `git pull && npm run build`
        *  before the compose recreate. Mirrors `switchroom update --rebuild`. */
       rebuild: z.boolean().optional(),
+      /** One-shot release-channel override. Mirrors `switchroom update
+       *  --channel`. Mutually exclusive with `pin` (enforced server-side
+       *  in dispatch). */
+      channel: z.enum(["dev", "rc", "latest"]).nullable().optional(),
+      /** One-shot release-pin override. Mirrors `switchroom update --pin`.
+       *  Mutually exclusive with `channel`. */
+      pin: z
+        .string()
+        .regex(/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/)
+        .nullable()
+        .optional(),
     })
     .optional(),
 });

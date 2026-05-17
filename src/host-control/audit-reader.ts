@@ -31,6 +31,18 @@ export interface AuditEntry {
   phase?: string;
   stdout_tail?: string;
   stderr_tail?: string;
+  // ─── Update-flow enrichment (PR B) ─────────────────────────────────
+  /** Resolved release channel for `update_apply` terminal rows. */
+  channel?: string;
+  /** Resolved release pin for `update_apply` terminal rows. */
+  pin?: string;
+  /** Captured image-ref → digest map for `update_apply` terminal rows. */
+  resolved_sha?: Record<string, string>;
+  /** Install-context snapshot at the time of the update_apply call. */
+  install_context?: {
+    install_type: string;
+    detected_at: string;
+  };
 }
 
 export interface AuditFilters {
@@ -85,6 +97,31 @@ export function parseAuditLine(line: string): AuditEntry | null {
   if (typeof o.phase === "string") entry.phase = o.phase;
   if (typeof o.stdout_tail === "string") entry.stdout_tail = o.stdout_tail;
   if (typeof o.stderr_tail === "string") entry.stderr_tail = o.stderr_tail;
+  if (typeof o.channel === "string") entry.channel = o.channel;
+  if (typeof o.pin === "string") entry.pin = o.pin;
+  if (o.resolved_sha && typeof o.resolved_sha === "object" && !Array.isArray(o.resolved_sha)) {
+    const rs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(o.resolved_sha as Record<string, unknown>)) {
+      if (typeof v === "string") rs[k] = v;
+    }
+    if (Object.keys(rs).length > 0) entry.resolved_sha = rs;
+  }
+  if (
+    o.install_context &&
+    typeof o.install_context === "object" &&
+    !Array.isArray(o.install_context)
+  ) {
+    const ic = o.install_context as Record<string, unknown>;
+    if (
+      typeof ic.install_type === "string" &&
+      typeof ic.detected_at === "string"
+    ) {
+      entry.install_context = {
+        install_type: ic.install_type,
+        detected_at: ic.detected_at,
+      };
+    }
+  }
   return entry;
 }
 

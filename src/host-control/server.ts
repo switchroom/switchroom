@@ -23,9 +23,17 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir, chmod, chown, unlink, appendFile } from "node:fs/promises";
-import { readdirSync, existsSync, statSync } from "node:fs";
+import {
+  readdirSync,
+  existsSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  mkdirSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -41,6 +49,7 @@ import {
 } from "./protocol.js";
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
+import { detectInstallType, type InstallType } from "../cli/install-detect.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
 export interface ServerConfig {
@@ -71,6 +80,21 @@ export interface ServerOptions {
   auditLogPath?: string;
   /** Allow non-Linux dev mode (skips chown). */
   allowNonLinux?: boolean;
+  /**
+   * Filesystem root the daemon uses to read host-side artifacts (e.g.
+   * the install-type cache at `<bindRoot>/.switchroom/install-type.json`).
+   * For the dockerised daemon, set this to the bind-mount path of the
+   * operator's HOME inside the container (typically `/host-home`); for
+   * the host-direct daemon, leave unset and the daemon falls back to
+   * `homeDir`.
+   */
+  bindRoot?: string;
+  /**
+   * Test seam: override the image refs the digest resolver is called
+   * with. When unset the daemon shells out to `docker compose config`
+   * to enumerate refs from the operator's compose file.
+   */
+  imageRefsForDigests?: () => string[];
 }
 
 /**
@@ -90,6 +114,120 @@ interface StatusEntry {
   stdout_tail: string;
   stderr_tail: string;
   error?: string;
+  // ─── Update-flow enrichment (PR B) ─────────────────────────────────
+  // Populated only on `update_apply` rows so the terminal audit row
+  // carries enough information for the gateway / `get_status` reader
+  // to surface what was rolled out without re-querying docker.
+  channel?: string;
+  pin?: string;
+  /** Map of image-ref → "sha256:<hex>" digest, captured at the moment
+   *  `docker compose pull` finished (best effort). */
+  resolved_sha?: Record<string, string>;
+  install_context?: {
+    install_type: InstallType;
+    detected_at: string;
+  };
+}
+
+/**
+ * Resolve docker image references to their RepoDigests via
+ * `docker inspect --format='{{index .RepoDigests 0}}' <ref>`.
+ *
+ * Pure side-effect-free (only spawns `docker inspect`, no mutations).
+ * Fail-soft: any image whose digest can't be read (image not present,
+ * `docker` not on PATH, parse failure) is omitted from the returned
+ * map rather than throwing. The audit row captures whatever digests
+ * we COULD resolve and the caller can decide whether the partial set
+ * is useful — typically yes, because even one resolved digest pins
+ * the rollout's identity.
+ *
+ * Exported for unit-test access (mock `child_process.spawnSync`).
+ */
+export function resolveDigests(imageRefs: readonly string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const ref of imageRefs) {
+    try {
+      const r = spawnSync(
+        "docker",
+        ["inspect", "--format={{index .RepoDigests 0}}", ref],
+        { encoding: "utf-8", timeout: 5000 },
+      );
+      if (r.status !== 0) continue;
+      const trimmed = (r.stdout ?? "").trim();
+      // Parse "repo@sha256:<hex>" → keep the "sha256:<hex>" half.
+      const at = trimmed.lastIndexOf("@");
+      if (at < 0) continue;
+      const digest = trimmed.slice(at + 1);
+      if (!/^sha256:[0-9a-f]{32,}$/.test(digest)) continue;
+      out.set(ref, digest);
+    } catch {
+      // Spawn failure (docker not installed, EACCES). Skip silently —
+      // see the fail-soft contract above.
+      continue;
+    }
+  }
+  return out;
+}
+
+/**
+ * Read the host-side install-type cache written by `switchroom apply`
+ * (see `writeInstallTypeCache` in `src/cli/apply.ts`). Reads from
+ * `<bindRoot>/.switchroom/install-type.json` — for the daemon running
+ * inside docker, `bindRoot` is `/host-home`; for the daemon running on
+ * the host directly, it's the operator's home.
+ *
+ * Lazy detection: if the cache file is missing, run `detectInstallType()`
+ * directly and write the result back atomically (`.tmp` + rename, mode
+ * 0o644) so subsequent calls hit the cache. Mirrors the apply-side
+ * writer so the two paths stay structurally identical.
+ *
+ * Defensive: a corrupt cache file (malformed JSON, missing fields)
+ * collapses to `{install_type: "unknown"}` rather than throwing — the
+ * audit row prefers a degraded value to a missing one. No mtime /
+ * staleness check; `apply` is the canonical invalidator.
+ *
+ * Exported for unit-test access.
+ */
+export function readCachedInstallType(bindRoot: string): {
+  install_type: InstallType;
+  detected_at: string;
+  source_paths?: { bin?: string; repo?: string };
+} {
+  const cacheDir = join(bindRoot, ".switchroom");
+  const cachePath = join(cacheDir, "install-type.json");
+  if (existsSync(cachePath)) {
+    try {
+      const raw = readFileSync(cachePath, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed.install_type === "string" &&
+        typeof parsed.detected_at === "string"
+      ) {
+        return parsed;
+      }
+      return { install_type: "unknown", detected_at: new Date().toISOString() };
+    } catch {
+      return { install_type: "unknown", detected_at: new Date().toISOString() };
+    }
+  }
+  // Lazy detect + write back.
+  const ctx = detectInstallType();
+  const payload = {
+    install_type: ctx.install_type,
+    detected_at: new Date().toISOString(),
+    source_paths: ctx.source_paths,
+  };
+  try {
+    mkdirSync(cacheDir, { recursive: true });
+    const tmp = `${cachePath}.tmp`;
+    writeFileSync(tmp, JSON.stringify(payload, null, 2), { mode: 0o644 });
+    renameSync(tmp, cachePath);
+  } catch {
+    // Read-only filesystem (e.g. docker bind-mounted :ro) — return the
+    // detected value without caching. Best-effort by contract.
+  }
+  return payload;
 }
 
 const STATUS_RETENTION_MS = 10 * 60 * 1000; // 10 min
@@ -563,9 +701,34 @@ export class HostdServer {
     const denied = this.checkFleetMutationLock(req.op, req.request_id, started);
     if (denied) return denied;
 
+    // Mutual exclusion of channel vs pin. Schema accepts both optional;
+    // server-side enforcement here keeps the contract honest at the
+    // dispatch boundary (and the structured `denied` is friendlier than
+    // a Zod parse error after the fact).
+    if (req.args?.channel && req.args?.pin) {
+      return deniedResponse(
+        req.request_id,
+        "update_apply: `channel` and `pin` are mutually exclusive — pass at most one.",
+        Date.now() - started,
+      );
+    }
+
     const args = ["update"];
     if (req.args?.skip_images) args.push("--skip-images");
     if (req.args?.rebuild) args.push("--rebuild");
+    if (req.args?.channel) args.push("--channel", req.args.channel);
+    if (req.args?.pin) args.push("--pin", req.args.pin);
+
+    // Capture install-type + (best-effort) digests up-front so the
+    // started/terminal rows for this request carry full forensic
+    // context even if `docker inspect` becomes unavailable mid-flight.
+    const installCtx = readCachedInstallType(
+      this.opts.bindRoot ?? this.opts.homeDir,
+    );
+    const digestRefs = this.imageRefsForDigestCapture();
+    const digests = resolveDigests(digestRefs);
+    const resolved_sha: Record<string, string> = {};
+    for (const [k, v] of digests) resolved_sha[k] = v;
 
     const entry: StatusEntry = {
       request_id: req.request_id,
@@ -577,6 +740,13 @@ export class HostdServer {
       finished_at: null,
       stdout_tail: "",
       stderr_tail: "",
+      ...(req.args?.channel ? { channel: req.args.channel } : {}),
+      ...(req.args?.pin ? { pin: req.args.pin } : {}),
+      ...(Object.keys(resolved_sha).length > 0 ? { resolved_sha } : {}),
+      install_context: {
+        install_type: installCtx.install_type,
+        detected_at: installCtx.detected_at,
+      },
     };
     this.recordStatus(entry);
     this.fleetMutationInFlight = {
@@ -798,6 +968,48 @@ export class HostdServer {
    * we reach this check, we know this isn't a retry of the
    * in-flight call.
    */
+  /**
+   * Enumerate the docker image refs the digest resolver should look up.
+   * In production, shells out to `docker compose config --images` so
+   * the resolver targets exactly the images the running compose file
+   * references. Returns [] on any failure — the resolver itself is
+   * fail-soft so missing input degrades to an empty digest map.
+   *
+   * Tests override via the `imageRefsForDigests` opt.
+   */
+  private imageRefsForDigestCapture(): string[] {
+    if (this.opts.imageRefsForDigests) return this.opts.imageRefsForDigests();
+    try {
+      const composePath = join(
+        this.opts.bindRoot ?? this.opts.homeDir,
+        ".switchroom",
+        "compose",
+        "docker-compose.yml",
+      );
+      if (!existsSync(composePath)) return [];
+      const r = spawnSync(
+        "docker",
+        [
+          "compose",
+          "-p",
+          "switchroom",
+          "-f",
+          composePath,
+          "config",
+          "--images",
+        ],
+        { encoding: "utf-8", timeout: 5000 },
+      );
+      if (r.status !== 0) return [];
+      return (r.stdout ?? "")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+    } catch {
+      return [];
+    }
+  }
+
   private checkFleetMutationLock(
     op: "update_apply" | "apply",
     request_id: string,
@@ -1010,6 +1222,12 @@ export class HostdServer {
       ...(stdoutTail ? { stdout_tail: stdoutTail } : {}),
       ...(stderrTail ? { stderr_tail: stderrTail } : {}),
       ...(errMsg ? { error: errMsg } : {}),
+      // Update-flow enrichment fields (only present on update_apply
+      // entries; spread-omit keeps them off other ops' rows).
+      ...(entry.channel ? { channel: entry.channel } : {}),
+      ...(entry.pin ? { pin: entry.pin } : {}),
+      ...(entry.resolved_sha ? { resolved_sha: entry.resolved_sha } : {}),
+      ...(entry.install_context ? { install_context: entry.install_context } : {}),
     });
   }
 

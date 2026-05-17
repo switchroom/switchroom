@@ -302,4 +302,57 @@ describe("parseAuditLine — persisted tails (#22)", () => {
     expect(e!.phase).toBeUndefined();
     expect(e!.stderr_tail).toBeUndefined();
   });
+
+  it("round-trips PR-B enrichment fields (channel, pin, resolved_sha, install_context)", () => {
+    const row = {
+      ts: "2026-05-17T01:02:03.000Z",
+      op: "update_apply",
+      caller: { kind: "operator" },
+      request_id: "ua-1",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 12345,
+      phase: "terminal",
+      channel: "dev",
+      pin: "v0.11.1",
+      resolved_sha: {
+        "ghcr.io/switchroom/switchroom-agent:dev": "sha256:abc123",
+      },
+      install_context: {
+        install_type: "binary",
+        detected_at: "2026-05-17T01:00:00.000Z",
+      },
+    };
+    const e = parseAuditLine(JSON.stringify(row));
+    expect(e).not.toBeNull();
+    expect(e!.channel).toBe("dev");
+    expect(e!.pin).toBe("v0.11.1");
+    expect(e!.resolved_sha).toEqual({
+      "ghcr.io/switchroom/switchroom-agent:dev": "sha256:abc123",
+    });
+    expect(e!.install_context).toEqual({
+      install_type: "binary",
+      detected_at: "2026-05-17T01:00:00.000Z",
+    });
+  });
+
+  it("ignores malformed enrichment fields rather than rejecting the row", () => {
+    const row = {
+      ts: "2026-05-17T01:02:03.000Z",
+      op: "update_apply",
+      caller: { kind: "operator" },
+      request_id: "ua-2",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 1,
+      channel: 42, // wrong type
+      resolved_sha: "not-an-object",
+      install_context: { install_type: "binary" /* missing detected_at */ },
+    };
+    const e = parseAuditLine(JSON.stringify(row));
+    expect(e).not.toBeNull();
+    expect(e!.channel).toBeUndefined();
+    expect(e!.resolved_sha).toBeUndefined();
+    expect(e!.install_context).toBeUndefined();
+  });
 });
