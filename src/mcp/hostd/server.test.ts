@@ -72,6 +72,7 @@ describe("TOOLS export", () => {
       "agent_restart",
       "agent_start",
       "agent_stop",
+      "get_status",     // PR B — read last terminal update_apply audit row
       "update_apply",
       "update_check",
     ]);
@@ -149,6 +150,35 @@ describe("dispatchTool — happy path", () => {
     await dispatchTool("update_apply", {});
     const sent = hostdRequestMock.mock.calls[0]![1];
     expect(sent.args).toEqual({});
+  });
+
+  it("update_apply forwards channel through to the daemon", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("update_apply", { channel: "dev" });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args).toEqual({ channel: "dev" });
+  });
+
+  it("update_apply forwards pin through to the daemon", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("update_apply", { pin: "sha-abc1234" });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args).toEqual({ pin: "sha-abc1234" });
+  });
+
+  it("update_apply rejects channel+pin combo without hitting the wire", async () => {
+    const res = await dispatchTool("update_apply", {
+      channel: "dev",
+      pin: "v0.11.1",
+    });
+    expect(res.isError).toBe(true);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("update_apply rejects malformed pin without hitting the wire", async () => {
+    const res = await dispatchTool("update_apply", { pin: "not-a-pin" });
+    expect(res.isError).toBe(true);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
   });
 
   it("agent_logs forwards tail when provided and omits it when not", async () => {
@@ -243,6 +273,85 @@ describe("dispatchTool — failure modes", () => {
     expect(res.content[0]!.text).toMatch(/socket not bound/);
     expect(res.content[0]!.text).toMatch(/switchroom hostd install/);
     expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("get_status returns the most recent terminal update_apply audit row", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "mcp-getstatus-"));
+    const auditPath = join(dir, "audit.log");
+    // Two rows — one in-flight `started`, one terminal `completed` with
+    // enrichment fields. `get_status` should return the terminal row.
+    const lines = [
+      JSON.stringify({
+        ts: "2026-05-17T01:00:00.000Z",
+        op: "update_apply",
+        caller: { kind: "operator" },
+        request_id: "ua-1",
+        result: "started",
+        exit_code: null,
+        duration_ms: 1,
+      }),
+      JSON.stringify({
+        ts: "2026-05-17T01:05:00.000Z",
+        op: "update_apply",
+        caller: { kind: "operator" },
+        request_id: "ua-1",
+        result: "completed",
+        exit_code: 0,
+        duration_ms: 240000,
+        phase: "terminal",
+        channel: "dev",
+        resolved_sha: {
+          "ghcr.io/switchroom/switchroom-agent:dev": "sha256:abc",
+        },
+        install_context: {
+          install_type: "binary",
+          detected_at: "2026-05-17T00:59:30.000Z",
+        },
+      }),
+    ];
+    writeFileSync(auditPath, lines.join("\n") + "\n");
+    const prev = process.env.HOSTD_AUDIT_LOG_PATH;
+    process.env.HOSTD_AUDIT_LOG_PATH = auditPath;
+    try {
+      const res = await dispatchTool("get_status", {});
+      expect(res.isError).toBeFalsy();
+      const parsed = JSON.parse(res.content[0]!.text);
+      expect(parsed.op).toBe("update_apply");
+      expect(parsed.phase).toBe("terminal");
+      expect(parsed.channel).toBe("dev");
+      expect(parsed.install_context.install_type).toBe("binary");
+      expect(parsed.resolved_sha).toEqual({
+        "ghcr.io/switchroom/switchroom-agent:dev": "sha256:abc",
+      });
+      expect(hostdRequestMock).not.toHaveBeenCalled();
+    } finally {
+      if (prev !== undefined) process.env.HOSTD_AUDIT_LOG_PATH = prev;
+      else delete process.env.HOSTD_AUDIT_LOG_PATH;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("get_status surfaces a clear error when no terminal update_apply rows exist", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "mcp-getstatus-empty-"));
+    const auditPath = join(dir, "audit.log");
+    writeFileSync(auditPath, "");
+    const prev = process.env.HOSTD_AUDIT_LOG_PATH;
+    process.env.HOSTD_AUDIT_LOG_PATH = auditPath;
+    try {
+      const res = await dispatchTool("get_status", {});
+      expect(res.isError).toBe(true);
+      expect(res.content[0]!.text).toMatch(/no terminal update_apply rows/);
+    } finally {
+      if (prev !== undefined) process.env.HOSTD_AUDIT_LOG_PATH = prev;
+      else delete process.env.HOSTD_AUDIT_LOG_PATH;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("unknown tool name returns an error without wire-calling", async () => {

@@ -33,8 +33,13 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { hostdRequest } from "../../host-control/client.js";
+import {
+  defaultAuditLogPath,
+  parseAuditLine,
+  type AuditEntry,
+} from "../../host-control/audit-reader.js";
 import type {
   HostdRequest,
   HostdResponse,
@@ -59,6 +64,9 @@ interface ToolArgs {
   // agent_logs / agent_exec
   tail?: number;
   argv?: string[];
+  // update_apply release-override (PR B)
+  channel?: "dev" | "rc" | "latest";
+  pin?: string;
 }
 
 export const TOOLS = [
@@ -217,7 +225,37 @@ export const TOOLS = [
             "Source-checkout users: also run `git pull && npm run " +
             "build` before the compose recreate.",
         },
+        channel: {
+          type: "string",
+          enum: ["dev", "rc", "latest"],
+          description:
+            "One-shot release-channel override. Mirrors `switchroom " +
+            "update --channel`. Mutually exclusive with `pin`.",
+        },
+        pin: {
+          type: "string",
+          pattern: "^(sha-[0-9a-f]{7,40}|v\\d+\\.\\d+\\.\\d+)$",
+          description:
+            "One-shot release-pin override (sha-<7-40 hex> or " +
+            "v<semver>). Mirrors `switchroom update --pin`. Mutually " +
+            "exclusive with `channel`.",
+        },
       },
+    },
+  },
+  {
+    name: "get_status",
+    description:
+      "Read the most recent terminal `update_apply` audit row " +
+      "(channel, pin, resolved_sha, install_context, result, " +
+      "exit_code, stderr_tail). Use this after issuing an " +
+      "`update_apply` to confirm what actually rolled out, or to " +
+      "report the last update on demand. Returns the parsed audit " +
+      "entry as JSON.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      additionalProperties: false,
     },
   },
 ];
@@ -236,6 +274,13 @@ export async function dispatchTool(
   content: { type: "text"; text: string }[];
   isError?: boolean;
 }> {
+  // `get_status` reads the audit log directly — no hostd RPC, so it
+  // doesn't need SWITCHROOM_AGENT_NAME or the socket. Handle it
+  // before the wire-checks below.
+  if (name === "get_status") {
+    return getLastUpdateApplyStatus();
+  }
+
   if (!SELF_AGENT) {
     return errorText(
       "hostd MCP: SWITCHROOM_AGENT_NAME env var is not set — cannot " +
@@ -325,6 +370,19 @@ export async function dispatchTool(
       break;
     }
     case "update_apply": {
+      // Mutual exclusion mirrored from the hostd dispatcher so the
+      // MCP layer fails fast with a friendly message instead of
+      // round-tripping a `denied`.
+      if (args.channel && args.pin) {
+        return errorText(
+          "update_apply: `channel` and `pin` are mutually exclusive — pass at most one.",
+        );
+      }
+      if (args.pin && !/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/.test(args.pin)) {
+        return errorText(
+          `update_apply: pin "${args.pin}" is invalid. Expected sha-<7-40 hex> or v<semver>.`,
+        );
+      }
       req = {
         v: 1,
         op: "update_apply",
@@ -332,6 +390,8 @@ export async function dispatchTool(
         args: {
           ...(args.skip_images ? { skip_images: true } : {}),
           ...(args.rebuild ? { rebuild: true } : {}),
+          ...(args.channel ? { channel: args.channel } : {}),
+          ...(args.pin ? { pin: args.pin } : {}),
         },
       };
       break;
@@ -366,6 +426,68 @@ export async function dispatchTool(
     content: [{ type: "text" as const, text: JSON.stringify(resp) }],
     isError: true,
   };
+}
+
+/**
+ * Audit-log path resolver for the get_status tool. Honors
+ * `HOSTD_AUDIT_LOG_PATH` for test injection; otherwise falls back to
+ * the bind-mounted host home (`/host-home/.switchroom/host-control-audit.log`)
+ * when present, else the daemon's default-path resolver.
+ *
+ * Exported so the unit test in src/mcp/hostd/server.test.ts can stub
+ * via the same code path.
+ */
+export function resolveAuditLogPath(): string {
+  if (process.env.HOSTD_AUDIT_LOG_PATH) return process.env.HOSTD_AUDIT_LOG_PATH;
+  // Admin agents see the host audit log at /host-home/.switchroom/...
+  // via the RFC C bind mount (#1337); fall back to defaultAuditLogPath
+  // (operator-HOME-relative) when not bind-mounted.
+  const bindMounted = "/host-home/.switchroom/host-control-audit.log";
+  if (existsSync(bindMounted)) return bindMounted;
+  return defaultAuditLogPath();
+}
+
+/**
+ * Dispatch handler for the `get_status` MCP tool. Reads the audit log
+ * and returns the most recent terminal `update_apply` row as JSON. No
+ * hostd RPC needed — the audit log is the durable record.
+ *
+ * Exported for the dispatch-test seam.
+ */
+export function getLastUpdateApplyStatus(): {
+  content: { type: "text"; text: string }[];
+  isError?: boolean;
+} {
+  const path = resolveAuditLogPath();
+  if (!existsSync(path)) {
+    return errorText(
+      `get_status: audit log not found at ${path}. No update_apply has run yet?`,
+    );
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    return errorText(
+      `get_status: failed to read audit log at ${path}: ${(err as Error).message}`,
+    );
+  }
+  const lines = raw.split("\n");
+  let last: AuditEntry | null = null;
+  // Walk backwards — most recent terminal update_apply wins.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const e = parseAuditLine(lines[i]!);
+    if (e && e.op === "update_apply" && e.phase === "terminal") {
+      last = e;
+      break;
+    }
+  }
+  if (!last) {
+    return errorText(
+      "get_status: no terminal update_apply rows found in audit log.",
+    );
+  }
+  return jsonText(last);
 }
 
 function jsonText(data: unknown) {
