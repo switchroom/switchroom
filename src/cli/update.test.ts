@@ -46,6 +46,59 @@ describe("planUpdate", () => {
     }
   });
 
+  it("inserts regen-compose-for-release-override BEFORE pull-images when --channel is set", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-chan-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const steps = planUpdate({
+        composePath,
+        hostControlEnabled: false,
+        channel: "dev",
+      });
+      const idxRegen = steps.findIndex(
+        (s) => s.name === "regen-compose-for-release-override",
+      );
+      const idxPull = steps.findIndex((s) => s.name === "pull-images");
+      expect(idxRegen).toBeGreaterThanOrEqual(0);
+      expect(idxRegen).toBeLessThan(idxPull);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("inserts regen-compose-for-release-override when --pin is set", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-pin-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const steps = planUpdate({
+        composePath,
+        hostControlEnabled: false,
+        pin: "sha-abc1234",
+      });
+      expect(steps.map((s) => s.name)).toContain(
+        "regen-compose-for-release-override",
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT insert regen-compose-for-release-override when neither --channel nor --pin set", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-norel-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const steps = planUpdate({ composePath, hostControlEnabled: false });
+      expect(steps.map((s) => s.name)).not.toContain(
+        "regen-compose-for-release-override",
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("inserts the rebuild-source step when --rebuild is set", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-rebuild-"));
     try {

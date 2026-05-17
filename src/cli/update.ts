@@ -32,7 +32,7 @@
  * Legacy `--phase=post-build` is still accepted as a no-op so any
  * in-flight v0.6 → v0.7 self-reexec path doesn't crash mid-flight.
  */
-import type { Command } from "commander";
+import { Option, type Command } from "commander";
 import chalk from "chalk";
 import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -74,6 +74,11 @@ interface UpdateOptions {
   /** Test seam — override `host_control.enabled` detection for the
    *  `refresh-hostd` step instead of reading from switchroom.yaml. */
   hostControlEnabled?: boolean;
+  /** One-shot release-channel override (mirrors `apply --channel`). */
+  channel?: "dev" | "rc" | "latest";
+  /** One-shot release-pin override (mirrors `apply --pin`). Mutually
+   *  exclusive with `channel`. */
+  pin?: string;
 }
 
 interface UpdateStep {
@@ -116,7 +121,37 @@ export function isGitCheckout(scriptPath: string): boolean {
 export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   const composePath = opts.composePath ?? DEFAULT_COMPOSE_PATH;
   const runner = opts.runner ?? defaultRunner;
+  const scriptPath = process.argv[1] ?? "";
   const steps: UpdateStep[] = [];
+
+  // When --channel / --pin is set, the resolved image tag in compose
+  // needs to change BEFORE pull-images runs (so `docker compose pull`
+  // grabs the right tag). Inject a pre-pull `apply --compose-only`
+  // step that regenerates the compose with the override applied; the
+  // main apply-config step below then re-runs apply with the full
+  // scaffold sweep + the same override for consistency.
+  const releaseOverrideArgs: string[] = [];
+  if (opts.channel) releaseOverrideArgs.push("--channel", opts.channel);
+  if (opts.pin) releaseOverrideArgs.push("--pin", opts.pin);
+  if (releaseOverrideArgs.length > 0) {
+    steps.push({
+      name: "regen-compose-for-release-override",
+      description:
+        "Regenerate compose with the --channel/--pin override so pull-images grabs the right tag",
+      run: () => {
+        const r = runner(process.execPath, [
+          scriptPath,
+          "apply",
+          "--compose-only",
+          "--non-interactive",
+          ...releaseOverrideArgs,
+        ]);
+        if (r.status !== 0) {
+          throw new Error("regen-compose-for-release-override failed");
+        }
+      },
+    });
+  }
 
   steps.push({
     name: "pull-images",
@@ -139,7 +174,6 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   // checkout, the runUpdate dispatcher will fail loudly — the explicit
   // flag is treated as a hard intent, not a hint we can quietly drop
   // (#923 reviewer feedback).
-  const scriptPath = process.argv[1] ?? "";
   if (opts.rebuild) {
     steps.push({
       name: "rebuild-source",
@@ -182,6 +216,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         "apply",
         "--non-interactive",
         "--no-doctor",
+        ...releaseOverrideArgs,
       ]);
       if (r.status !== 0) throw new Error("switchroom apply failed");
     },
@@ -779,6 +814,18 @@ export function registerUpdateCommand(program: Command): void {
       "--json",
       "Output as JSON (currently only honored under --status; other modes ignore).",
     )
+    .addOption(
+      new Option(
+        "--channel <c>",
+        "Override the resolved release block for this update run: follow the named channel (dev|rc|latest). Mutually exclusive with --pin.",
+      ).choices(["dev", "rc", "latest"]).conflicts("pin"),
+    )
+    .addOption(
+      new Option(
+        "--pin <p>",
+        "Override the resolved release block for this update run: pin to a specific build (sha-<7-40 hex> or v<semver>). Mutually exclusive with --channel.",
+      ).conflicts("channel"),
+    )
     // Legacy v0.6 flags — accepted as no-ops so a stale operator
     // muscle-memory invocation doesn't crash. The --phase=post-build
     // path was the in-flight v0.6→v0.7 self-reexec; that's dead now,
@@ -788,6 +835,16 @@ export function registerUpdateCommand(program: Command): void {
     .option("--resume <file>", "[legacy v0.6 no-op]")
     .option("--phase <phase>", "[legacy v0.6 no-op]")
     .action(async (opts: UpdateOptions) => {
+      // Defensive pin-regex validation (commander's choices() handles
+      // --channel; --pin is a free-form string at the parser layer).
+      if (opts.pin && !/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/.test(opts.pin)) {
+        console.error(
+          chalk.red(
+            `--pin "${opts.pin}" is invalid. Expected sha-<7-40 hex> or v<semver>.`,
+          ),
+        );
+        process.exit(2);
+      }
       if (opts.phase === "post-build") {
         console.warn(
           chalk.yellow(
