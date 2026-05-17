@@ -205,12 +205,22 @@ describe.skipIf(!dockerOk || !allImagesPresent)(
     // inside the agent image via the bundled agent-scheduler sidecar.
 
     it("agent image enforces read-only rootfs (touch /etc/passwd → EROFS)", () => {
+      // Run as root inside the container so DAC permission isn't what
+      // stops us. The agent image now defaults to USER 10001 (WS6-F5,
+      // #1435) — without --user 0 the touch fails with EACCES at the
+      // DAC layer before the kernel ever consults rootfs-readonly,
+      // making this test assert on the wrong layer of defense. The
+      // property under test is "the runtime --read-only flag prevents
+      // even root from writing to the rootfs", which is what compose
+      // gives every agent in production.
       const r = spawnSync(
         "docker",
         [
           "run",
           "--rm",
           ...LABELS_ARGV,
+          "--user",
+          "0",
           "--read-only",
           "--cap-drop=ALL",
           "--security-opt=no-new-privileges",
@@ -302,12 +312,22 @@ describe.skipIf(!dockerOk || !allImagesPresent)(
     });
 
     it("agent image with cap_drop=ALL blocks mount (mount -t tmpfs → EPERM)", () => {
+      // Run as root inside the container so the test exercises the
+      // capability-drop defense rather than the DAC "must be superuser"
+      // shortcut. The agent image now defaults to USER 10001
+      // (WS6-F5, #1435); without --user 0 mount(8) refuses before the
+      // kernel ever consults capabilities, making the assertion lie
+      // about which layer of defense is being verified. cap_drop=ALL
+      // is what compose gives every agent in production, so this is
+      // what we actually want to prove.
       const r = spawnSync(
         "docker",
         [
           "run",
           "--rm",
           ...LABELS_ARGV,
+          "--user",
+          "0",
           "--read-only",
           "--cap-drop=ALL",
           "--security-opt=no-new-privileges",
