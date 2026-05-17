@@ -56,6 +56,7 @@ import {
   ConfigError,
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid } from "../agents/scaffold.js";
+import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { generateCompose, allocateAgentUid } from "../agents/compose.js";
 import { resolveImageTag, resolveRelease } from "../config/release-resolve.js";
 import { detectInstallType } from "./install-detect.js";
@@ -585,6 +586,18 @@ export async function runApply(
         chalk.green(`  + ${name}`) +
           chalk.gray(` (${agentConfig.extends ?? "default"}) — ${detail}\n`),
       );
+      // PR C: install the UserPromptSubmit hook that surfaces
+      // mid-conversation MCP-originated update_apply outcomes. Fail-soft
+      // — a hook install failure should never break apply.
+      try {
+        installUpdatePromptHook(join(agentsDir, name));
+      } catch (hookErr) {
+        writeOut(
+          chalk.gray(
+            `    (update-prompt hook install failed for ${name}: ${(hookErr as Error).message})\n`,
+          ),
+        );
+      }
       // Align per-agent dir ownership with the container UID assigned
       // by compose.ts. Without this the bind-mount lands read-only
       // for the in-container UID and the agent fails on first write.
