@@ -103,6 +103,12 @@ jobs:
             TAG_VERSION="${GITHUB_REF#refs/tags/}"
             echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
           elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # PR C: keep :latest as the canonical install per
+            # docs/operators/install.md, BUT also publish :sha-<7> for
+            # rollback / promote.yml retagging. (The :dev floating tag
+            # is gated by the smoke-test job and assigned by a separate
+            # retag step below — NOT included in this initial push so
+            # that a failed smoke run can't leave a broken :dev behind.)
             echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
           else
             # PR builds: synthesize a non-pushed tag for build-only mode.
@@ -279,3 +285,79 @@ jobs:
           # sec WS9-F3 (#1418): provenance + SBOM on the hindsight image too.
           provenance: mode=max
           sbom: true
+
+  # PR C: smoke test the freshly-pushed :sha-<7> agent image — runs the
+  # MCP tools/list harness inside a throwaway container with the
+  # channels.telegram.enabled:false fixture (no bot-token needed at
+  # boot). Validates every tool's input_schema against Anthropic's
+  # tool-use constraints (root type:object, no top-level
+  # oneOf/anyOf/allOf). Gates the floating :dev tag below — a failed
+  # smoke run leaves :sha-<7> pushed (for rollback) but does NOT
+  # promote to :dev. Job timeout 5 min.
+  smoke-test:
+    needs: [build-dependents]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "22"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+
+      - name: Install deps
+        run: bun install
+
+      - name: Log in to GHCR (smoke pulls private images)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull freshly-pushed :sha-<7> agent image
+        run: |
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-agent:sha-${SHA_SHORT}"
+          docker pull "$IMAGE"
+          echo "SMOKE_AGENT_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Run MCP tools/list smoke test
+        env:
+          RUN_DOCKER_SMOKE: "1"
+        run: npx vitest run tests/docker/mcp-tools-list.smoke.test.ts
+
+  # PR C: promote :sha-<7> → :dev for every image when smoke passes.
+  # Matrix-fanout retag using buildx imagetools so we don't rebuild.
+  promote-to-dev:
+    needs: [smoke-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag :sha-<7> as :dev (no rebuild)
+        run: |
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
+          docker buildx imagetools create -t "${IMAGE}:dev" "${IMAGE}:sha-${SHA_SHORT}"
