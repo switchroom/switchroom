@@ -482,6 +482,17 @@ export function mergeAgentConfig(
     merged.session_continuity = combined as AgentConfig["session_continuity"];
   }
 
+  // --- release: REPLACE, not field-merge ---
+  //
+  // A per-agent `release` block fully replaces the defaults `release`.
+  // We intentionally do NOT shallow-merge `channel` + `pin` from the
+  // two layers — a pinned agent must not silently inherit a channel
+  // from the fleet defaults (or vice versa). If the agent declared
+  // anything, take it whole; otherwise inherit defaults whole.
+  if (merged.release === undefined && defaults.release !== undefined) {
+    merged.release = defaults.release;
+  }
+
   // --- channels: per-channel shallow merge, agent wins ---
   //
   // Today only telegram exists; the structure generalizes for future

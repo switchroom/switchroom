@@ -629,3 +629,54 @@ describe("AgentGoogleWorkspaceConfigSchema (RFC G per-agent override)", () => {
     expect(result.google_workspace?.tier).toBe("extended");
   });
 });
+
+describe("ReleaseBlock (release-channel pin / pointer)", () => {
+  it("accepts a bare channel", () => {
+    const result = AgentSchema.parse(baseAgentInput({ release: { channel: "dev" } }));
+    expect(result.release).toEqual({ channel: "dev" });
+  });
+
+  it("accepts a sha pin", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({ release: { pin: "sha-abc1234" } }),
+    );
+    expect(result.release).toEqual({ pin: "sha-abc1234" });
+  });
+
+  it("accepts a semver pin", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({ release: { pin: "v1.2.3" } }),
+    );
+    expect(result.release).toEqual({ pin: "v1.2.3" });
+  });
+
+  it("rejects channel + pin together (mutually exclusive)", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({ release: { channel: "dev", pin: "sha-abc1234" } }),
+      ),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("rejects a malformed pin (non-hex)", () => {
+    expect(() =>
+      AgentSchema.parse(baseAgentInput({ release: { pin: "sha-zzz" } })),
+    ).toThrow();
+  });
+
+  it("rejects an unknown channel value", () => {
+    expect(() =>
+      AgentSchema.parse(baseAgentInput({ release: { channel: "stable" } })),
+    ).toThrow();
+  });
+
+  it("attaches to the root SwitchroomConfigSchema as well", () => {
+    const result = SwitchroomConfigSchema.parse({
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "1" },
+      release: { channel: "latest" },
+      agents: {},
+    });
+    expect(result.release).toEqual({ channel: "latest" });
+  });
+});
