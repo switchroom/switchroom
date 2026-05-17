@@ -1,0 +1,99 @@
+name: promote
+
+# Hand-promote a published image tag across channels — `dev → rc`,
+# `rc → latest`, or any arbitrary `from → to` pair an operator needs
+# (e.g. `dev → operator-canary` for a one-off dogfood ring).
+#
+# This is the operator surface for PR C's channel-based release model:
+#
+#   build pipeline:    main push → :sha-<7> → smoke test → :dev (auto)
+#   promote (this):    :dev → :rc → :latest (gated by human dispatch)
+#
+# What this workflow guarantees:
+#
+#   1. Source tag MUST exist in the registry. We `buildx imagetools
+#      inspect` it as a precheck and exit with an actionable message
+#      ("source tag :<from> not found — check for typos or wait for the
+#      build pipeline to publish :<from>") if it doesn't.
+#   2. We retag, never rebuild. `buildx imagetools create -t :<to>
+#      :<from>` carries the same manifest digest and signed provenance
+#      to the destination tag — operators pulling :latest after
+#      promotion get bit-for-bit the same image as those who pulled
+#      :dev a week earlier.
+#   3. We verify digest equality post-retag. If the destination tag's
+#      manifest digest doesn't match the source's (registry race, push
+#      conflict), the job fails loudly so the promotion is treated as
+#      "did not happen" rather than "happened with a different image."
+#
+# Matrix fans out across all 7 fleet images. `fail-fast: true` so a
+# single bad image stops the promotion mid-flight rather than leaving a
+# half-promoted channel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "Source tag (e.g. dev, rc, sha-abc1234)"
+        required: true
+        type: string
+      to:
+        description: "Destination tag (e.g. rc, latest)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Precheck — source tag exists
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
+          FROM="${IMAGE}:${{ inputs.from }}"
+          if ! docker buildx imagetools inspect "$FROM" >/dev/null 2>&1; then
+            echo "::error::Source tag ${FROM} not found in registry."
+            echo "::error::Check for typos or wait for the build pipeline to publish :${{ inputs.from }}."
+            exit 1
+          fi
+          # Capture source digest for the post-retag verification step.
+          SRC_DIGEST=$(docker buildx imagetools inspect "$FROM" --format '{{.Manifest.Digest}}')
+          echo "SRC_DIGEST=$SRC_DIGEST" >> "$GITHUB_ENV"
+          echo "FROM_REF=$FROM" >> "$GITHUB_ENV"
+          echo "TO_REF=${IMAGE}:${{ inputs.to }}" >> "$GITHUB_ENV"
+
+      - name: Retag (no rebuild)
+        run: |
+          docker buildx imagetools create -t "${TO_REF}" "${FROM_REF}"
+
+      - name: Verify digest equality post-retag
+        run: |
+          DST_DIGEST=$(docker buildx imagetools inspect "${TO_REF}" --format '{{.Manifest.Digest}}')
+          if [ "${SRC_DIGEST}" != "${DST_DIGEST}" ]; then
+            echo "::error::Digest mismatch after retag!"
+            echo "::error::  source ${FROM_REF} → ${SRC_DIGEST}"
+            echo "::error::  dest   ${TO_REF}   → ${DST_DIGEST}"
+            echo "::error::Promotion did NOT happen as a no-op manifest copy. Investigate registry race / push conflict."
+            exit 1
+          fi
+          echo "Promoted ${FROM_REF} → ${TO_REF} (digest ${DST_DIGEST})"
