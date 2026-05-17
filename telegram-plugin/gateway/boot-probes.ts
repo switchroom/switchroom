@@ -1318,7 +1318,14 @@ export async function probeKernel(
  */
 export async function probeSkills(
   agentDir: string,
-  opts: { fs?: SkillsFsImpl; maxNamesShown?: number; agentName?: string } = {},
+  opts: {
+    fs?: SkillsFsImpl
+    maxNamesShown?: number
+    agentName?: string
+    /** Override skills.d overlay dir. Defaults to `<agentDir>/skills.d`
+     *  on host installs; tests inject a path. */
+    overlaySkillsDir?: string
+  } = {},
 ): Promise<ProbeResult> {
   return withTimeout('Skills', (async (): Promise<ProbeResult> => {
     const fs = opts.fs ?? realSkillsFs
@@ -1359,8 +1366,32 @@ export async function probeSkills(
         continue
       }
     }
+
+    // Bucket entries by source: agent-overlay slugs come from filenames
+    // under <agentRoot>/skills.d/<slug>.yaml (written by skill_install).
+    // Everything else is operator-baseline from switchroom.yaml.
+    const overlayDir = opts.overlaySkillsDir ?? join(agentDir, 'skills.d')
+    const overlaySlugs = new Set<string>()
+    if (fs.exists(overlayDir)) {
+      let overlayEntries: string[] = []
+      try {
+        overlayEntries = fs.readdir(overlayDir)
+      } catch {
+        /* unreadable overlay — fall through with empty set */
+      }
+      for (const name of overlayEntries) {
+        const m = name.match(/^(.+)\.ya?ml$/i)
+        if (!m) continue
+        overlaySlugs.add(m[1])
+      }
+    }
+    const liveEntries = entries.filter(n => !dangling.includes(n)).sort()
+    const switchroomSkills = liveEntries.filter(n => !overlaySlugs.has(n))
+    const agentSkills = liveEntries.filter(n => overlaySlugs.has(n))
+    const bucketed = renderBucketedSkills(switchroomSkills, agentSkills)
+
     if (dangling.length === 0) {
-      return { status: 'ok', label: 'Skills', detail: `${entries.length} resolved` }
+      return { status: 'ok', label: 'Skills', detail: bucketed }
     }
     const named = dangling.slice(0, max).join(', ')
     const more = dangling.length > max ? ` +${dangling.length - max} more` : ''
@@ -1368,10 +1399,19 @@ export async function probeSkills(
     return {
       status: 'degraded',
       label: 'Skills',
-      detail: `${dangling.length}/${entries.length} dangling: ${named}${more}`,
+      detail: `${dangling.length}/${entries.length} dangling: ${named}${more} · ${bucketed}`,
       nextStep: `Run \`switchroom agent reconcile${reconcileTarget}\` to rebuild symlinks, or remove unused entries from switchroom.yaml`,
     }
   })())
+}
+
+/** Format the two source-buckets into a single mobile-readable line.
+ *  Empty buckets are omitted. `none` covers the all-dangling edge case. */
+function renderBucketedSkills(switchroom: string[], agent: string[]): string {
+  const parts: string[] = []
+  if (switchroom.length > 0) parts.push(`Switchroom: ${switchroom.join(', ')}`)
+  if (agent.length > 0) parts.push(`Agent: ${agent.join(', ')}`)
+  return parts.length === 0 ? 'none resolved' : parts.join(' · ')
 }
 
 export interface SkillsFsImpl {

@@ -883,7 +883,7 @@ describe('probeSkills', () => {
     expect(result.detail).toContain('no skills dir')
   })
 
-  it('returns ok with count when every skill resolves', async () => {
+  it('returns ok with every skill listed under Switchroom bucket when no overlay', async () => {
     const fs = makeSkillsFs(
       { [skillsDir]: ['simplify', 'review'] },
       new Set([
@@ -893,7 +893,40 @@ describe('probeSkills', () => {
     )
     const result = await probeSkills(agentDir, { fs })
     expect(result.status).toBe('ok')
-    expect(result.detail).toContain('2 resolved')
+    expect(result.detail).toBe('Switchroom: review, simplify')
+  })
+
+  it('buckets overlay-installed skills under Agent', async () => {
+    const overlayDir = '/state/agent/skills.d'
+    const fs = makeSkillsFs(
+      {
+        [skillsDir]: ['simplify', 'review', 'webapp-testing'],
+        [overlayDir]: ['webapp-testing.yaml'],
+      },
+      new Set([
+        `${skillsDir}/simplify`, `${skillsDir}/simplify/SKILL.md`,
+        `${skillsDir}/review`, `${skillsDir}/review/SKILL.md`,
+        `${skillsDir}/webapp-testing`, `${skillsDir}/webapp-testing/SKILL.md`,
+        overlayDir,
+      ]),
+    )
+    const result = await probeSkills(agentDir, { fs })
+    expect(result.status).toBe('ok')
+    expect(result.detail).toBe('Switchroom: review, simplify · Agent: webapp-testing')
+  })
+
+  it('lists every skill without a +N more truncation in the healthy case', async () => {
+    const names = Array.from({ length: 12 }, (_, i) => `skill-${i.toString().padStart(2, '0')}`)
+    const fileSet = new Set<string>()
+    for (const n of names) {
+      fileSet.add(`${skillsDir}/${n}`)
+      fileSet.add(`${skillsDir}/${n}/SKILL.md`)
+    }
+    const fs = makeSkillsFs({ [skillsDir]: names }, fileSet)
+    const result = await probeSkills(agentDir, { fs })
+    expect(result.status).toBe('ok')
+    expect(result.detail).not.toContain('+')
+    for (const n of names) expect(result.detail).toContain(n)
   })
 
   it('degraded when at least one symlink dangles, names them up to cap', async () => {
@@ -912,6 +945,8 @@ describe('probeSkills', () => {
     expect(result.detail).toContain('also-gone')
     expect(result.detail).toContain('+1 more')
     expect(result.detail).not.toContain('and-this')
+    // resolved skills still surface alongside the dangling summary
+    expect(result.detail).toContain('Switchroom: review, simplify')
   })
 
   it('returns ok when entries dir is empty', async () => {
