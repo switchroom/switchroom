@@ -57,6 +57,7 @@ import {
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid } from "../agents/scaffold.js";
 import { generateCompose, allocateAgentUid } from "../agents/compose.js";
+import { resolveImageTag, resolveRelease } from "../config/release-resolve.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 
@@ -75,6 +76,15 @@ export const COMPOSE_PROJECT = "switchroom";
 export interface ApplyOptions {
   buildLocal?: boolean;
   buildContext?: string;
+  /**
+   * One-shot release-block override for this apply run. When set, this
+   * REPLACES the resolved per-agent / root `release` block from the
+   * cascade — used by `--channel <c>` / `--pin <p>` CLI flags and by
+   * `switchroom update` to pass through its own flag values. Mutually
+   * exclusive channel/pin enforced upstream by ReleaseBlock's Zod
+   * refinement; this struct mirrors that shape.
+   */
+  releaseOverride?: { channel?: "dev" | "rc" | "latest"; pin?: string };
   /** Override compose output path (defaults to {@link DEFAULT_COMPOSE_PATH}). */
   outPath?: string;
   /** Optional example name to copy before applying (e.g. "minimal"). */
@@ -758,8 +768,23 @@ export async function runApply(
     }
     return undefined;
   })();
+  // Resolve the release block for this apply run. Priority:
+  //   1. CLI flag override (--channel/--pin on `apply` or `update`)
+  //   2. Root `release` block from switchroom.yaml
+  //   3. Default {channel:"latest"} (implicit, via resolveImageTag's
+  //      undefined fallback)
+  // Per-agent `release` overrides are not (yet) plumbed through to
+  // compose tag selection — compose currently emits one image tag for
+  // the whole fleet. The data is still validated by the schema and
+  // surfaced in audit rows for forensic visibility.
+  const composeRelease = resolveRelease({
+    override: options.releaseOverride,
+    root: config.release,
+  });
+  const composeImageTag = resolveImageTag(composeRelease);
   const composeContent = generateCompose({
     config,
+    imageTag: composeImageTag,
     buildMode: options.buildLocal ? "local" : "pull",
     buildContext: options.buildContext,
     // Bake the operator's HOME absolute path into volume sources at
@@ -1097,6 +1122,22 @@ export function registerApplyCommand(program: Command): void {
       "--no-doctor",
       "Skip the post-apply doctor sweep that surfaces stale start.sh / unhealthy agents (#929). Default: doctor runs after a successful scaffold so the operator sees whether the v0.7+ post-Phase-4 supervisor block is now in place. `switchroom update` passes this internally to avoid running doctor twice (it has its own doctor step).",
     )
+    .addOption(
+      new Option(
+        "--channel <c>",
+        "Override the resolved `release` block for this apply run: " +
+        "follow the named channel pointer (dev|rc|latest). Mutually " +
+        "exclusive with --pin.",
+      ).choices(["dev", "rc", "latest"]).conflicts("pin"),
+    )
+    .addOption(
+      new Option(
+        "--pin <p>",
+        "Override the resolved `release` block for this apply run: " +
+        "pin to a specific build (sha-<7-40 hex> or v<semver>). " +
+        "Mutually exclusive with --channel.",
+      ).conflicts("channel"),
+    )
     .option(
       "--print-sudo-cmd",
       "Print the sudo invocation that `apply` would re-exec itself with when escalation is needed, then exit. Operators who want to script the escalation themselves (CI, custom orchestration) can capture this. Note: tokens are space-separated and not shell-quoted; re-quote arguments if pasting into a shell.",
@@ -1118,6 +1159,8 @@ export function registerApplyCommand(program: Command): void {
         composeOnly?: boolean;
         printSudoCmd?: boolean;
         skipSelfElevate?: boolean;
+        channel?: "dev" | "rc" | "latest";
+        pin?: string;
         // Commander auto-coerces --no-doctor → opts.doctor = false; default true.
         doctor?: boolean;
       }) => {
@@ -1194,6 +1237,27 @@ export function registerApplyCommand(program: Command): void {
               ? opts.buildLocal
               : process.cwd();
 
+          // Build the release override from CLI flags. Mutual exclusion
+          // is enforced by commander's `.conflicts(...)` above, so we
+          // never see both set here.
+          const releaseOverride: ApplyOptions["releaseOverride"] | undefined =
+            opts.channel
+              ? { channel: opts.channel }
+              : opts.pin
+                ? { pin: opts.pin }
+                : undefined;
+          // Defensive: validate --pin shape early (commander's choices()
+          // already covers --channel). Mirror the regex from
+          // ReleaseBlock so a malformed pin fails fast at the CLI layer
+          // rather than landing as a bogus image tag.
+          if (opts.pin && !/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/.test(opts.pin)) {
+            console.error(
+              chalk.red(
+                `--pin "${opts.pin}" is invalid. Expected sha-<7-40 hex> or v<semver>.`,
+              ),
+            );
+            process.exit(2);
+          }
           const result = await runApply(
             config,
             {
@@ -1205,6 +1269,7 @@ export function registerApplyCommand(program: Command): void {
               allowUnaligned: opts.allowUnaligned ?? false,
               only: opts.only,
               composeOnly: opts.composeOnly ?? false,
+              releaseOverride,
             },
             {},
             switchroomConfigPath,
