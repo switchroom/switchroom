@@ -420,6 +420,15 @@ export const SessionContinuitySchema = z
  */
 export const TelegramChannelSchema = z
   .object({
+    enabled: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Master switch for the per-agent Telegram gateway sidecar. " +
+        "When false, start.sh skips the gateway supervise loop and the " +
+        "agent boots without bot-token requirements (smoke-test + " +
+        "offline-dev use case).",
+      ),
     plugin: z
       .enum(["switchroom", "official"])
       .optional()

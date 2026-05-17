@@ -680,3 +680,19 @@ describe("ReleaseBlock (release-channel pin / pointer)", () => {
     expect(result.release).toEqual({ channel: "latest" });
   });
 });
+
+describe("TelegramChannelSchema.enabled (offline-dev master switch)", () => {
+  it("defaults to true when omitted", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({ channels: { telegram: {} } }),
+    );
+    expect(result.channels?.telegram?.enabled).toBe(true);
+  });
+
+  it("accepts an explicit false to disable the gateway sidecar", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({ channels: { telegram: { enabled: false } } }),
+    );
+    expect(result.channels?.telegram?.enabled).toBe(false);
+  });
+});
