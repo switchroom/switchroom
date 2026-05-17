@@ -116,7 +116,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) base
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: docker/Dockerfile.base
@@ -217,7 +217,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) ${{ matrix.image.name }}
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: ${{ matrix.image.file }}
@@ -273,7 +273,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) hindsight
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: docker/Dockerfile.hindsight
