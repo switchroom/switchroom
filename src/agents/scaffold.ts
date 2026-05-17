@@ -1611,6 +1611,10 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     dangerousMode: agentConfig.dangerous_mode === true,
     useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
     useHotReloadStable: agentConfig.channels?.telegram?.hotReloadStable === true,
+    // PR C: surface channels.telegram.enabled into start.sh as a literal
+    // "true"/"false" string. Default true preserves prior behavior.
+    telegramEnabledFlag:
+      agentConfig.channels?.telegram?.enabled === false ? "false" : "true",
     // sec WS8-F1 / #1416: unconditional read-only image-baked
     // security-hooks plugin dir. Always set — it is the unstrippable
     // tool-safety authority, not an opt-in feature.
@@ -3542,6 +3546,11 @@ export function reconcileAgent(
       // {{#unless useHotReloadStable}} block always renders, so flipping
       // hotReloadStable on never removes the _WS_STABLE bake from start.sh.
       useHotReloadStable: agentConfig.channels?.telegram?.hotReloadStable === true,
+      // PR C: see buildWorkspaceContext for rationale — mirror here so
+      // reconcile (apply on existing agents) re-renders start.sh with
+      // the current enabled flag.
+      telegramEnabledFlag:
+        agentConfig.channels?.telegram?.enabled === false ? "false" : "true",
       // sec WS8-F1 / #1416: reconcile re-asserts the security-plugin
       // --plugin-dir on every `switchroom apply` so the boundary
       // self-heals if an older start.sh (without it) is on disk.

@@ -74,6 +74,12 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   }
 
   # 1) Gateway daemon — the long-running Telegram bot client.
+  #    Honors channels.telegram.enabled (PR A schema, PR C wiring).
+  #    When the operator sets enabled:false, skip the gateway sidecar
+  #    entirely so the agent boots without bot-token requirements —
+  #    used by the CI smoke-test harness and any offline-dev setup.
+  #    Default behavior preserved: when the var is unset/empty, treat
+  #    as enabled (no operator action required for existing agents).
   #    Polls Telegram, writes gateway.sock for the in-claude MCP
   #    sidecar to bridge through. Mirrors the v0.6 sibling
   #    switchroom-<name>-gateway.service unit. Talks to the broker
@@ -83,9 +89,12 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #    invalid → 401 from Telegram, gateway exits, same loop. The
   #    cap avoids an infinite vault-locked respawn storm.
   _gateway_bundle=/opt/switchroom/telegram-plugin/dist/gateway/gateway.js
-  if [ -f "$_gateway_bundle" ] && command -v bun >/dev/null 2>&1; then
+  _telegram_enabled={{#if telegramEnabledFlag}}{{telegramEnabledFlag}}{{else}}true{{/if}}
+  if [ "$_telegram_enabled" = "true" ] && [ -f "$_gateway_bundle" ] && command -v bun >/dev/null 2>&1; then
     _switchroom_supervise gateway /var/log/switchroom/gateway-supervisor.log \
       bun "$_gateway_bundle" &
+  elif [ "$_telegram_enabled" != "true" ]; then
+    echo "[start.sh] channels.telegram.enabled=false — skipping gateway sidecar" >&2
   fi
 
   # 2) autoaccept-poll — first-run TUI prompt dispatcher. Single-shot
