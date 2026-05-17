@@ -292,6 +292,12 @@ export interface RenderBootCardOpts {
   snoozeRows?: ReadonlyArray<ProbeKey>
   /** Clock injection point for tests; defaults to `new Date()`. */
   now?: Date
+  /** PR C update-flow: outcome line for the most recent terminal
+   *  update_apply audit row (rendered by `update-announce.ts`). When
+   *  present, appended as a stand-alone section below the probe rows so
+   *  the operator sees what happened with the update that triggered
+   *  this boot without trawling the audit log. */
+  updateOutcomeLine?: string
 }
 
 /**
@@ -400,6 +406,12 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
   const sections: string[] = [ack]
   if (degradedRows.length > 0) sections.push('', ...degradedRows)
   if (accountRows.length > 0) sections.push('', ...accountRows)
+  if (opts.updateOutcomeLine) {
+    // PR C: each line of the update-outcome blob is its own row in the
+    // sections array so the join('\n') below renders the multi-line
+    // failure-with-recovery hint cleanly.
+    sections.push('', ...opts.updateOutcomeLine.split('\n'))
+  }
   if (sections.length === 1) return ack
   return sections.join('\n')
 }
@@ -501,6 +513,13 @@ export interface RunProbesOpts {
    *  and externally-managed surface text instead of execing systemctl
    *  (which doesn't exist in the agent image). See `runtime-mode.ts`. */
   dockerMode?: boolean
+  /** PR C: pass-through to the renderer. When the gateway boot path
+   *  detects a recent terminal `update_apply` audit row, it computes the
+   *  outcome line via `update-announce.ts` and passes it here so the
+   *  card surfaces "✅ update completed (channel:dev, sha:…)" or the
+   *  failure body with a recovery hint. Append-only — never replaces
+   *  the existing ack/probe sections. */
+  updateOutcomeLine?: string
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -555,6 +574,7 @@ export async function startBootCard(
     version: opts.version,
     restartReason: opts.restartReason,
     restartAgeMs: opts.restartAgeMs,
+    ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
   })
 
   // Silence the notification for operator-initiated redeploys. A
@@ -661,6 +681,7 @@ export async function startBootCard(
           ...(accountRows ? { accounts: accountRows } : {}),
           ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
           ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
+          ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
         })
 
         if (currentText !== ackText) {
@@ -712,6 +733,7 @@ export async function startBootCard(
             // cache write from the live-watch loop.
             ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
             ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
+            ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
           })
 
           if (updatedText === currentText) continue

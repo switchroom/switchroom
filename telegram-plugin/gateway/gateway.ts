@@ -303,6 +303,7 @@ import {
 } from './boot-card.js'
 import { determineRestartReason } from './boot-reason.js'
 import { shouldSkipDuplicateBootCard, type RestartReason } from './boot-card.js'
+import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
@@ -2777,6 +2778,12 @@ const ipcServer: IpcServer = createIpcServer({
           // second bridge-reconnect in the same lifetime can't race against
           // an in-flight sendMessage here either (#489).
           bootCardPending = true
+          // PR C: surface the most recent terminal update_apply audit
+          // row if it lands within the lookback window AND no other
+          // boot has claimed it. Cheap (one file read + one O_EXCL).
+          const updateOutcomeLine = (() => {
+            try { return maybeRenderUpdateAnnouncement() ?? undefined } catch { return undefined }
+          })()
           startBootCard(chatId, threadId, botApiForCard, {
             agentName: agentDisplayName,
             agentSlug,
@@ -2790,6 +2797,7 @@ const ipcServer: IpcServer = createIpcServer({
             probeQuotaViaBroker: (t) => probeQuotaForBootCard(agentSlug, t),
             tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
             dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
+            ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
           }, ackMsgId).then(handle => {
             activeBootCard = handle
           }).catch((err: Error) => {
@@ -13587,6 +13595,13 @@ void (async () => {
                   // sendMessage round-trip) sees an in-flight emit. See #489.
                   bootCardPending = true
                   try {
+                    // PR C: mirror the bridge-reconnect path — surface
+                    // a recent terminal update_apply outcome with claim
+                    // dedupe so it doesn't render twice if bridge
+                    // re-connects within the lookback window.
+                    const updateOutcomeLine = (() => {
+                      try { return maybeRenderUpdateAnnouncement() ?? undefined } catch { return undefined }
+                    })()
                     const handle = await startBootCard(chatId, threadId, botApiForCard, {
                       agentName: agentDisplayName,
                       agentSlug,
@@ -13600,6 +13615,7 @@ void (async () => {
                       probeQuotaViaBroker: (t) => probeQuotaForBootCard(agentSlug, t),
                       tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
                       dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
+                      ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
                     }, ackMsgId)
                     activeBootCard = handle
                   } catch (err) {
