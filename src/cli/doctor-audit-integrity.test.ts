@@ -14,7 +14,18 @@ const VAULT = "/h/.switchroom/vault-audit.log";
 const HOSTD = "/h/.switchroom/host-control-audit.log";
 
 function chainedLog(rows: Record<string, unknown>[]): string {
-  let st: ChainState = { seq: 0, lastHash: CHAIN_GENESIS };
+  return chainedFrom({ seq: 0, lastHash: CHAIN_GENESIS }, rows);
+}
+
+/** Chain rows starting from an arbitrary state — used to simulate a
+ *  real post-rollout host where the broker's seedChain poisoned the
+ *  anchor off a pre-#1433 legacy tail (first chained row has
+ *  _seq=1, _prev="CORRUPT-TAIL-…", NOT GENESIS). */
+function chainedFrom(
+  initial: ChainState,
+  rows: Record<string, unknown>[],
+): string {
+  let st = initial;
   let t = "";
   for (const r of rows) {
     const { line, next } = chainRow(st, r);
@@ -22,6 +33,11 @@ function chainedLog(rows: Record<string, unknown>[]): string {
     st = next;
   }
   return t;
+}
+
+/** A legacy (pre-#1433, unchained) audit row — plain JSON, no _seq. */
+function legacyRow(o: Record<string, unknown>): string {
+  return JSON.stringify({ caller: "c", pid: 1, result: "allowed", ...o }) + "\n";
 }
 
 /** A reader that serves `files[path]`; absent path → throw (ENOENT). */
@@ -84,6 +100,59 @@ describe("runAuditIntegrityChecks", () => {
     const r = run({ [VAULT]: tampered, [HOSTD]: chainedLog([{ ts: "t", op: "x" }]) });
     const broken = r.find((c) => c.name.includes("vault-broker audit chain BROKEN"));
     expect(broken?.status).toBe("fail");
-    expect(broken?.detail).toMatch(/row 1/);
+    expect(broken?.detail).toMatch(/file line 1/);
+  });
+
+  // ── Mixed legacy→chained logs — the real post-rollout host shape.
+  // Any host that predates #1433 keeps appending to the SAME log, so
+  // it has a pre-#1433 legacy PREAMBLE then chained rows. The old
+  // looksChained() inspected only the first row, so these were
+  // permanently misreported "pre-#1433 legacy / inactive" (warn that
+  // never clears) AND verifyAuditChain never ran (a tampered chained
+  // suffix behind the preamble was undetectable).
+
+  it("ok on a pre-#1433 legacy preamble followed by a VALID chained suffix", () => {
+    const legacy = legacyRow({ ts: "L1", op: "get" }) + legacyRow({ ts: "L2", op: "put" });
+    // Real host: seedChain poisoned the anchor off the legacy tail.
+    const chained = chainedFrom({ seq: 0, lastHash: "CORRUPT-TAIL-deadbeef" }, [
+      { ts: "t1", op: "get" },
+      { ts: "t2", op: "put" },
+    ]);
+    const log = legacy + chained;
+    const r = run({ [VAULT]: log, [HOSTD]: log });
+    const c = r.find((x) => x.name.includes("vault-broker audit chain valid"));
+    expect(c?.status).toBe("ok");
+    expect(c?.detail).toMatch(/2 pre-#1433 legacy preamble row\(s\)/);
+    expect(c?.detail).toMatch(/tamper-evidence active/);
+    // Must NOT be the stale "legacy / inactive" warn anymore.
+    expect(
+      r.find((x) => x.name.includes("vault-broker audit tamper-evidence")),
+    ).toBeUndefined();
+  });
+
+  it("FAILS (not warn) when the chained suffix behind a legacy preamble is tampered", () => {
+    const legacy = legacyRow({ ts: "L1", op: "get" });
+    const chained = chainedFrom({ seq: 0, lastHash: "CORRUPT-TAIL-deadbeef" }, [
+      { ts: "t1", op: "get", key: "a" },
+      { ts: "t2", op: "put", key: "b" },
+    ]);
+    const cl = chained.trim().split("\n");
+    const r0 = JSON.parse(cl[0]);
+    r0.key = "TAMPERED"; // edit body, keep its _hash
+    cl[0] = JSON.stringify(r0);
+    const log = legacy + cl.join("\n") + "\n";
+    const r = run({
+      [VAULT]: log,
+      [HOSTD]: chainedFrom({ seq: 0, lastHash: CHAIN_GENESIS }, [{ ts: "t", op: "x" }]),
+    });
+    const broken = r.find((c) => c.name.includes("vault-broker audit chain BROKEN"));
+    expect(broken?.status).toBe("fail");
+    // 1 legacy preamble row → the tampered first chained row is file line 2.
+    expect(broken?.detail).toMatch(/file line 2/);
+    // Pre-fix this was silently a "legacy / inactive" warn — tamper
+    // behind a legacy preamble was undetectable.
+    expect(
+      r.find((c) => c.name.includes("vault-broker audit tamper-evidence")),
+    ).toBeUndefined();
   });
 });
