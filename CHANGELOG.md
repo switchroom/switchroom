@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.12.4 — fix: hostd `update_apply`/`apply` stranded the fleet (missing apply assets)
+
+In-Telegram `/update apply` by an admin agent (→ hostd) silently failed and left the **whole fleet stranded on the old image** with the agent's turn wedged. hostd's image baked only the CLI bundle, not the assets `switchroom apply` resolves relative to the CLI module (`profiles/` via `resolve(import.meta.dirname,"../../profiles")`, and the vendored hindsight plugin). So hostd's `apply` died `Profile not found: default (searched /opt/switchroom/profiles)` **after `pull-images`, before `recreate-containers`**. (Agent images deliberately don't bake these either — agents never run `apply`; hostd is the one container that does.)
+
+This makes the operator's intended flow reliable — admin agent initiates `/update apply` from Telegram, operator attests the card, fleet updates — with agents staying unprivileged (hostd remains the audited broker; no container gets host root).
+
+### Changes
+
+#### Fixes
+
+- **fix(hostd):** `Dockerfile.hostd` now bakes `profiles/` → `/opt/switchroom/profiles` and `vendor/hindsight-memory/` → `/opt/switchroom/vendor/hindsight-memory` (exactly the paths the bundled CLI resolves at runtime), so hostd's in-container `apply` behaves like host-side. Plus a **fail-fast asset preflight** in `handleUpdateApply`/`handleApply`: if those assets are missing, hostd refuses with a clear actionable error **before pulling or changing anything** (same principle as the `--rebuild` guard) instead of pulling-then-stranding the fleet — and future-proofs the per-asset fragility. **The behaviour change ships in the rebuilt `switchroom-hostd` GHCR image**; the running daemon picks it up via `switchroom update`'s refresh-hostd step. (#1510)
+
 ## v0.12.3 — fix: the v0.12.2 `--rebuild` guard never fired on nvm/npm-global
 
 v0.12.2's `--rebuild` published-install guardrail was ineffective on the exact install model it protects. It detected "source checkout" as *any* `.git` within 10 parent directories — but **nvm is itself a git clone** (`~/.nvm/.git` exists) and an npm-global install lives under `~/.nvm/…`, so the guard saw a `.git` ancestor and **allowed** `--rebuild` on a published host (a dotfiles `$HOME` git repo defeats it the same way). The guard now requires a directory that has **both** a `.git` (dir *or* file — git worktrees still count) **and** a `package.json` whose `name` is `switchroom`, at the same level — so nvm/dotfiles `.git` dirs and installed package dirs both correctly refuse, while real checkouts and worktrees are still allowed. Anyone on v0.12.2 should upgrade: until 0.12.3, `update --rebuild` on a published host silently drifts it off the released artifacts instead of refusing.
