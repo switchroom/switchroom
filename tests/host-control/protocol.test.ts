@@ -36,6 +36,16 @@ describe("hostd protocol — framing & schema", () => {
     expect(decoded).toEqual(req);
   });
 
+  it("round-trips a doctor request without args", () => {
+    const req: HostdRequest = {
+      v: 1,
+      op: "doctor",
+      request_id: "doc-001",
+    };
+    const decoded = decodeRequest(encodeRequest(req).trimEnd());
+    expect(decoded).toEqual(req);
+  });
+
   it("round-trips a get_status request", () => {
     const req: HostdRequest = {
       v: 1,

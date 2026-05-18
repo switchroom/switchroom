@@ -11652,16 +11652,81 @@ bot.command('usage', async ctx => {
   await switchroomReply(ctx, formatQuotaBlock(result.data), { html: true })
 })
 
+// Two-button scope picker shown to admin agents (when hostd is
+// reachable) so the operator can run doctor for the WHOLE FLEET
+// (host-side via hostd — has the docker socket) or just THIS agent
+// (in-container, degraded). callback_data is tiny (`dr:fleet` /
+// `dr:self`) — well within Telegram's 64-byte limit.
+function buildDoctorScopeKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🩺 Whole fleet', 'dr:fleet')
+    .text('🩺 This agent', 'dr:self')
+}
+
+// Shared report prettifier: ANSI-strip + status-glyph swap + pre block.
+// Identical rendering for the in-container and the hostd fleet report.
+function formatDoctorReport(raw: string): string {
+  const trimmed = stripAnsi(raw).trim()
+  if (!trimmed) return 'doctor: no output'
+  const pretty = trimmed
+    .replace(/^( *)✓ /gm, '$1🟢 ')
+    .replace(/^( *)✗ /gm, '$1🔴 ')
+    .replace(/^( *)! /gm, '$1🟡 ')
+  return preBlock(formatSwitchroomOutput(pretty))
+}
+
+// In-container `switchroom doctor` — this agent's own (degraded: no
+// docker socket) view. The original /doctor behaviour, unchanged.
+async function renderSelfDoctor(ctx: Context): Promise<void> {
+  let output: string
+  try { output = switchroomExecCombined(['doctor'], 30000) }
+  catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'doctor failed' }
+  await switchroomReply(ctx, formatDoctorReport(output), { html: true })
+}
+
+// Whole-fleet `switchroom doctor` via hostd: it runs host-side where
+// the docker socket exists, so it sees every container + singleton
+// instead of the degraded in-container reading. Read-only verb; the
+// daemon independently enforces the admin gate (path-as-identity), so
+// this is the audited boundary even though the gateway only offers
+// the button to admin agents.
+async function renderFleetDoctor(ctx: Context): Promise<void> {
+  const resp = await tryHostdDispatch(getMyAgentName(), {
+    v: 1,
+    op: 'doctor',
+    request_id: hostdRequestId('gw-doctor'),
+  })
+  if (resp === 'not-configured') {
+    await switchroomReply(ctx, '🩺 Whole-fleet doctor needs hostd, which isn’t configured here — showing this agent instead.', { html: true })
+    await renderSelfDoctor(ctx)
+    return
+  }
+  if (resp.result === 'denied') {
+    await switchroomReply(ctx, `🩺 <b>Whole-fleet doctor denied by hostd:</b>\n${preBlock(formatSwitchroomOutput(resp.error ?? 'admin required'))}`, { html: true })
+    return
+  }
+  // `completed` (including `switchroom doctor` exit 1 = "found
+  // problems", which the handler classifies as completed) or `error`:
+  // the report on stdout (or the error text) is exactly what the
+  // operator wants surfaced.
+  const body = resp.stdout_tail?.trim() || resp.error || '(no output from hostd doctor)'
+  await switchroomReply(ctx, formatDoctorReport(body), { html: true })
+}
+
 bot.command('doctor', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   try {
-    let output: string
-    try { output = switchroomExecCombined(['doctor'], 30000) }
-    catch (err: unknown) { output = (err as any).stdout ?? (err as any).message ?? 'doctor failed' }
-    const trimmed = stripAnsi(output).trim()
-    if (!trimmed) { await switchroomReply(ctx, 'doctor: no output'); return }
-    const pretty = trimmed.replace(/^( *)✓ /gm, '$1🟢 ').replace(/^( *)✗ /gm, '$1🔴 ').replace(/^( *)! /gm, '$1🟡 ')
-    await switchroomReply(ctx, preBlock(formatSwitchroomOutput(pretty)), { html: true })
+    // Admin agents with hostd reachable choose scope (one tap, no
+    // approval card — doctor is read-only). Everyone else keeps the
+    // original zero-extra-tap in-container behaviour.
+    if (AGENT_ADMIN && hostdWillBeUsed(getMyAgentName())) {
+      await switchroomReply(ctx, '🩺 <b>Doctor</b> — which scope?', {
+        html: true,
+        reply_markup: buildDoctorScopeKeyboard(),
+      })
+      return
+    }
+    await renderSelfDoctor(ctx)
   } catch (err: unknown) {
     await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
   }
@@ -11817,6 +11882,30 @@ bot.on('callback_query:data', async ctx => {
   // Issue #44.
   if (data.startsWith('vd:')) {
     await handleVaultDeferCallback(ctx, data)
+    return
+  }
+
+  // dr:<scope> — /doctor scope picker (only shown to admin agents
+  // with hostd reachable). `dr:fleet` → host-side hostd `doctor`
+  // (full fleet); `dr:self` → in-container doctor. Read-only, no
+  // approval card. Same sender-auth as the /doctor command itself —
+  // every callback family must re-auth (the absence of this check
+  // was a past vulnerability class; see apv:/drvpick: notes above).
+  if (data.startsWith('dr:')) {
+    if (!isAuthorizedSender(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const scope = data.slice(3)
+    await ctx.answerCallbackQuery({
+      text: scope === 'fleet' ? '🩺 Running fleet doctor…' : '🩺 Running doctor…',
+    }).catch(() => {})
+    try {
+      if (scope === 'fleet') await renderFleetDoctor(ctx)
+      else await renderSelfDoctor(ctx)
+    } catch (err: unknown) {
+      await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+    }
     return
   }
 

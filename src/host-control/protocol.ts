@@ -24,6 +24,12 @@
  * underlying `switchroom reconcile` CLI verb exists; `apply` covers
  * the intent.
  *
+ * Phase 3 (#1175 RFC §10) adds `agent_logs` / `agent_exec` (admin
+ * observability). Phase 3.1 (this PR) adds:
+ *   - `doctor`        (read-only host-side `switchroom doctor` →
+ *                       full-fleet health; same posture as
+ *                       `update_check`)
+ *
  * See docs/rfcs/host-control-daemon.md for the full verb table and
  * trust posture.
  */
@@ -202,6 +208,23 @@ export const AgentExecRequestSchema = z.object({
   }),
 });
 
+// ─── Phase 3.1 verb — read-only fleet doctor (this PR) ────────────────────
+//
+// `switchroom doctor` run host-side, where the docker socket is
+// present, so it produces the *full fleet* health view (containers,
+// singletons, image/CLI ages) instead of the degraded in-container
+// reading an agent gets when it shells `switchroom doctor` itself
+// (no docker socket in the agent container). Read-only — same trust
+// posture as `update_check`/`upgrade_status`: no fleet-mutation lock,
+// returns `completed` synchronously. Gateway only surfaces the
+// whole-fleet option on admin agents; the daemon is the audited
+// boundary regardless.
+export const DoctorRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("doctor"),
+  args: z.object({}).optional(),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   AgentRestartRequestSchema,
   UpgradeStatusRequestSchema,
@@ -213,6 +236,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   AgentStopRequestSchema,
   AgentLogsRequestSchema,
   AgentExecRequestSchema,
+  DoctorRequestSchema,
 ]);
 
 export type AgentRestartRequest = z.infer<typeof AgentRestartRequestSchema>;
@@ -225,6 +249,7 @@ export type AgentStartRequest = z.infer<typeof AgentStartRequestSchema>;
 export type AgentStopRequest = z.infer<typeof AgentStopRequestSchema>;
 export type AgentLogsRequest = z.infer<typeof AgentLogsRequestSchema>;
 export type AgentExecRequest = z.infer<typeof AgentExecRequestSchema>;
+export type DoctorRequest = z.infer<typeof DoctorRequestSchema>;
 export type HostdRequest = z.infer<typeof RequestSchema>;
 
 /** All verb names that pass discriminated-union validation. New verbs

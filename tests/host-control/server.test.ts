@@ -441,6 +441,64 @@ describe("hostd server — Phase 2 read-only verbs", () => {
   });
 });
 
+describe("hostd server — doctor (read-only, admin-gated)", () => {
+  it("doctor: admin caller returns completed with the fleet report", async () => {
+    const sock = server
+      .getBoundPaths()
+      .find((p) => p.endsWith("/klanker/sock"))!; // klanker IS admin
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "doctor", request_id: "doc-ok" },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    expect(resp.stdout_tail).toContain("stub: doctor");
+  });
+
+  it("doctor: denied for a non-admin caller (whole-fleet visibility is admin-only)", async () => {
+    const sock = server
+      .getBoundPaths()
+      .find((p) => p.endsWith("/bob/sock"))!; // bob is NOT admin
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "doctor", request_id: "doc-deny" },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/doctor requires admin/);
+  });
+
+  it("doctor: stays `completed` when `switchroom doctor` exits non-zero (findings ≠ dispatch failure)", async () => {
+    // `switchroom doctor` exits 1 when it finds failing checks — a
+    // *finding*, not a verb-dispatch failure. Unlike update_check
+    // (exit≠0 → error) the doctor verb must still return `completed`
+    // with the report + the real exit_code so the operator sees
+    // "doctor found problems" rather than an opaque error.
+    const failStub = join(tmp, "switchroom-doctorfail-stub.sh");
+    writeFileSync(failStub, `#!/bin/sh\necho "stub: $@"\necho "  2 ok · 1 warn · 1 fail"\nexit 1\n`);
+    chmodSync(failStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: failStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server
+      .getBoundPaths()
+      .find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "doctor", request_id: "doc-fail" },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(1);
+    expect(resp.stdout_tail).toContain("1 fail");
+  });
+});
+
 describe("hostd server — Phase 2 per-agent verbs", () => {
   it("agent_start: self-target allowed even for non-admin", async () => {
     const sock = server

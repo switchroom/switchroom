@@ -519,6 +519,10 @@ export class HostdServer {
         case "agent_exec":
           resp = await this.handleAgentExec(req, started);
           break;
+        // ── Phase 3.1 read-only fleet doctor ─────────────────────
+        case "doctor":
+          resp = await this.handleDoctor(req, started);
+          break;
       }
     } catch (err) {
       resp = errorResponse(
@@ -610,6 +614,18 @@ export class HostdServer {
         return callerAdmin
           ? null
           : `${req.op} cross-agent requires admin: true on caller "${caller.name}"`;
+      case "doctor":
+        // Read-only, but whole-fleet: running `switchroom doctor`
+        // host-side enumerates every agent + singleton's health —
+        // broader exposure than update_check's version/plan view, so
+        // gate it to admin (no operator-attest / fleet-mutation lock;
+        // it changes nothing). The gateway only surfaces the
+        // whole-fleet option on admin agents, but the daemon is the
+        // enforced boundary. Operator (kind === "operator") already
+        // returned null at the top of this method.
+        return callerAdmin
+          ? null
+          : `doctor requires admin: true on caller "${caller.name}"`;
     }
   }
 
@@ -693,6 +709,37 @@ export class HostdServer {
       v: 1,
       request_id: req.request_id,
       result,
+      exit_code: res.exit_code,
+      duration_ms: Date.now() - started,
+      stdout_tail: tail(res.stdout),
+      stderr_tail: tail(res.stderr),
+    };
+  }
+
+  /**
+   * Read-only: `switchroom doctor` run host-side, where the docker
+   * socket is present, so it reports the FULL fleet (containers,
+   * singletons, image/CLI ages) instead of the degraded in-container
+   * view an agent gets when it shells `switchroom doctor` itself.
+   *
+   * Unlike update_check this is `completed` whenever the process ran,
+   * regardless of exit code: `switchroom doctor` exits 1 when it
+   * finds failing checks (a degraded fleet) — that's a *finding*, not
+   * a verb-dispatch failure, and the report on stdout is exactly what
+   * the operator wants surfaced. exit_code is carried through so the
+   * caller can still see "doctor found problems". A genuine spawn
+   * failure (CLI missing, OOM) throws and is caught upstream as
+   * `error`.
+   */
+  private async handleDoctor(
+    req: Extract<HostdRequest, { op: "doctor" }>,
+    started: number,
+  ): Promise<HostdResponse> {
+    const res = await this.runSwitchroom(["doctor"]);
+    return {
+      v: 1,
+      request_id: req.request_id,
+      result: "completed",
       exit_code: res.exit_code,
       duration_ms: Date.now() - started,
       stdout_tail: tail(res.stdout),
