@@ -294,10 +294,16 @@ export async function ensureUserProfileMentalModel(
       return { ok: false, reason: `HTTP ${initResponse.status}` };
     }
 
+    // Hindsight MCP is stateless by design and does not issue an
+    // mcp-session-id; the MCP spec makes that header optional. Forward
+    // it only when a stateful server actually returns one. Hard-failing
+    // on its absence silently broke every scaffold memory-onboarding op
+    // (bank create / mission / mental model) fleet-wide against the
+    // stateless Hindsight server.
     const sessionId = initResponse.headers.get("mcp-session-id");
-    if (!sessionId) {
-      return { ok: false, reason: "No session ID returned" };
-    }
+    const sessionHeader: Record<string, string> = sessionId
+      ? { "mcp-session-id": sessionId }
+      : {};
 
     // Step 2: Check if MM already exists
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
@@ -307,7 +313,7 @@ export async function ensureUserProfileMentalModel(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -347,7 +353,7 @@ export async function ensureUserProfileMentalModel(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -444,10 +450,16 @@ export async function createBank(
       return { ok: false, reason: `HTTP ${initResponse.status}` };
     }
 
+    // Hindsight MCP is stateless by design and does not issue an
+    // mcp-session-id; the MCP spec makes that header optional. Forward
+    // it only when a stateful server actually returns one. Hard-failing
+    // on its absence silently broke every scaffold memory-onboarding op
+    // (bank create / mission / mental model) fleet-wide against the
+    // stateless Hindsight server.
     const sessionId = initResponse.headers.get("mcp-session-id");
-    if (!sessionId) {
-      return { ok: false, reason: "No session ID returned" };
-    }
+    const sessionHeader: Record<string, string> = sessionId
+      ? { "mcp-session-id": sessionId }
+      : {};
 
     // Step 2: Call create_bank tool
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
@@ -461,7 +473,7 @@ export async function createBank(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -553,10 +565,16 @@ export async function updateBankMissions(
       return { ok: false, reason: `HTTP ${initResponse.status}` };
     }
 
+    // Hindsight MCP is stateless by design and does not issue an
+    // mcp-session-id; the MCP spec makes that header optional. Forward
+    // it only when a stateful server actually returns one. Hard-failing
+    // on its absence silently broke every scaffold memory-onboarding op
+    // (bank create / mission / mental model) fleet-wide against the
+    // stateless Hindsight server.
     const sessionId = initResponse.headers.get("mcp-session-id");
-    if (!sessionId) {
-      return { ok: false, reason: "No session ID returned" };
-    }
+    const sessionHeader: Record<string, string> = sessionId
+      ? { "mcp-session-id": sessionId }
+      : {};
 
     // Step 2: Call update_bank tool
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
@@ -566,7 +584,7 @@ export async function updateBankMissions(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -655,10 +673,16 @@ export async function addMemoryTag(
       return { ok: false, reason: `HTTP ${initResponse.status}` };
     }
 
+    // Hindsight MCP is stateless by design and does not issue an
+    // mcp-session-id; the MCP spec makes that header optional. Forward
+    // it only when a stateful server actually returns one. Hard-failing
+    // on its absence silently broke every scaffold memory-onboarding op
+    // (bank create / mission / mental model) fleet-wide against the
+    // stateless Hindsight server.
     const sessionId = initResponse.headers.get("mcp-session-id");
-    if (!sessionId) {
-      return { ok: false, reason: "No session ID returned" };
-    }
+    const sessionHeader: Record<string, string> = sessionId
+      ? { "mcp-session-id": sessionId }
+      : {};
 
     // Step 2: call update_memory with `add_tags` to append (rather than
     // replace) the tag. Hindsight's update_memory accepts an `add_tags`
@@ -673,7 +697,7 @@ export async function addMemoryTag(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
