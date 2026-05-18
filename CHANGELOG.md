@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.12.5 — admin agents get their admin CLAUDE.md; deterministic in-flight update status
+
+Two fixes completing the in-Telegram admin-fleet-ops path (the klanker incident).
+
+### Changes
+
+#### Fixes
+
+- **fix(scaffold):** admin agents now get the **admin branch** of their switchroom-managed `CLAUDE.md`. `buildWorkspaceContext()` — the template context the `switchroom apply` / `update_apply` / `agent restart→reconcile` render path uses — omitted top-level `admin`, while `profiles/default/CLAUDE.md.hbs` gates its "Admin operations" section on `{{#if admin}}`. So **every admin agent's CLAUDE.md rendered the non-admin `{{else}}` branch** ("You're NOT `admin: true` — hand fleet ops to a peer"), telling admin agents (klanker, carrie, test-harness) they were *not* admin and to refuse the fleet ops the operator wants them to run — and it never self-healed (fresh render == stale file → `apply` reported "up to date"). Fix mirrors the field into `buildWorkspaceContext` (single source with the reconcile path; the divergence that site's own comment warned about). On the next `apply` each admin agent's CLAUDE.md self-heals to the admin branch. (#1513)
+
+#### Features
+
+- **feat(gateway):** **deterministic, model-free in-flight status** for hostd `update_apply`. An admin agent's `/update apply` runs async in hostd for minutes and recreates the agent itself; previously the only signal was the content-free framework backstop ("still working… no update from agent in N min"). Now, while an update is in flight, that same backstop carries hostd's **real phase + elapsed** ("⏳ Fleet update in progress — phase: apply-config (~2m). …I'll report the result here when it's done.") sourced from a single-shot `get_status` (no model, no pinned card). Degrades byte-identically to the prior generic text if hostd is unreachable; the post-recreate terminal verdict was already in place. Serves the `know-what-my-agent-is-doing` JTBD. (#1512)
+
 ## v0.12.4 — fix: hostd `update_apply`/`apply` stranded the fleet (missing apply assets)
 
 In-Telegram `/update apply` by an admin agent (→ hostd) silently failed and left the **whole fleet stranded on the old image** with the agent's turn wedged. hostd's image baked only the CLI bundle, not the assets `switchroom apply` resolves relative to the CLI module (`profiles/` via `resolve(import.meta.dirname,"../../profiles")`, and the vendored hindsight plugin). So hostd's `apply` died `Profile not found: default (searched /opt/switchroom/profiles)` **after `pull-images`, before `recreate-containers`**. (Agent images deliberately don't bake these either — agents never run `apply`; hostd is the one container that does.)
