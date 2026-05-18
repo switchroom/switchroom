@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.12.8 — operator vault CLI fix, whole-fleet /doctor, audit tamper-evidence correctness
+
+Three fixes from a `switchroom doctor` audit pass.
+
+### Changes
+
+#### Fixes
+
+- **fix(vault-broker):** the broker runs as root, so its only vault write path (`saveVault` → atomic rename) left `~/.switchroom/vault/vault.enc` `root:root 0600`. The broker keeps reading it (CAP_DAC_READ_SEARCH) which masked the breakage, but the operator's `switchroom vault …` CLI failed `EACCES` on its own vault — and it silently re-broke on every persist (token rotation, `/vault put`, auto-unlock, every broker bounce). doctor's lone hard fail. Broker now chowns `vault.enc` back to the operator UID after persist, mirroring its existing socket-chown pattern. (#1519)
+- **fix(doctor):** audit tamper-evidence (`doctor-audit-integrity`) was a false-negative on every long-lived host: it inspected only the first log row, so an append-only log's permanent pre-#1433 legacy preamble made it report "tamper-evidence inactive, run `switchroom update`" forever AND never verify the chained region (a forensically-rewritten row was undetectable — the exact WS10-F2 attack the check exists for). New `verifyAuditLog()` is segment-aware: the broker/hostd re-anchor the chain on every restart (multi-segment is normal — the live host has 6 segments / 5 restarts), so pass/fail is per-row self-consistency (`_hash == sha256(_prev∥_seq∥body)`), which never false-alarms on restarts yet still catches an in-place edit. (#1520)
+
+#### Features
+
+- **feat(hostd,telegram):** `/doctor` from Telegram now offers admin agents a one-tap scope picker — **🩺 Whole fleet** (host-side via the new read-only, admin-gated hostd `doctor` verb, so it sees every container + singleton) or **🩺 This agent** (the prior in-container view). Non-admin / no-hostd agents keep the original behaviour unchanged. No approval card — `doctor` is read-only. (#1518)
+
 ## v0.12.7 — republish of v0.12.6 (broken artifact had no dist/)
 
 `switchroom@0.12.6` was published with **no `dist/`** — the build had failed silently (the publish command piped the build through `tail`, which masked its non-zero exit) so the tarball shipped without the CLI bundle and is unusable. **Use v0.12.7.** v0.12.6 is deprecated on npm. The *code* content of v0.12.7 is identical to the intended v0.12.6 — the only delta is a correctly built artifact (verified post-publish that the tarball contains `dist/cli/switchroom.js` with the fix). No source changes vs v0.12.6.
