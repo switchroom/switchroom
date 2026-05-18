@@ -38,12 +38,17 @@ import {
   appendAudit,
   authorErr,
   authorExitCodeFor,
+  authorshipMarkerName,
   ensureSkillsRoot,
+  globalScopeSkillDir,
+  globalScopeSkillsRoot,
+  hasAuthorshipMarker,
   isCronTurn,
   listSkillFiles,
   MAX_FILES_PER_SKILL,
   MAX_SKILL_BYTES,
   readSkillFrontmatter,
+  resolveGlobalScopeRoot,
   safeWriteFile,
   skillVersionToken,
   totalSkillBytes,
@@ -52,6 +57,74 @@ import {
   validateSkillName,
   type SkillAuthorError,
 } from "./skill-common.js";
+import { existsSync as fsExistsSync, writeFileSync } from "node:fs";
+import { loadConfig } from "../config/loader.js";
+
+export type SkillScope = "agent" | "global";
+
+/** Resolve whether `agent` is `admin: true` in the merged switchroom
+ *  config. Used to gate global-scope writes (PR B).
+ *
+ *  Tests can inject `isAdminOverride` to bypass disk-loading the yaml. */
+export function defaultIsAdmin(agent: string): boolean {
+  try {
+    const cfg = loadConfig();
+    const slice = cfg.agents?.[agent] as { admin?: boolean } | undefined;
+    return slice?.admin === true;
+  } catch {
+    return false;
+  }
+}
+
+interface ScopeContext {
+  scope: SkillScope;
+  /** Absolute root dir for this scope (parent of all skill dirs). */
+  rootDir: string;
+  /** Absolute path to this specific skill's dir. */
+  skillDir: string;
+}
+
+function resolveScope(
+  agent: string,
+  slug: string,
+  scope: SkillScope | undefined,
+  perAgentRoot: string | undefined,
+  globalRoot: string | undefined,
+  isAdminFn: (a: string) => boolean,
+): ScopeContext | SkillAuthorError {
+  const s: SkillScope = scope ?? "agent";
+  if (s === "agent") {
+    return {
+      scope: "agent",
+      rootDir: agentScopeSkillsRoot(agent, perAgentRoot),
+      skillDir: agentScopeSkillDir(agent, slug, perAgentRoot),
+    };
+  }
+  if (s === "global") {
+    if (!isAdminFn(agent)) {
+      return authorErr(
+        "E_SKILL_SCOPE_DENIED",
+        `global-scope skill authoring requires admin: true on agent "${agent}"`,
+      );
+    }
+    const root = globalRoot ?? resolveGlobalScopeRoot();
+    if (!fsExistsSync(root)) {
+      return authorErr(
+        "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED",
+        `global scope root ${root} is not present — the /skills-rw bind mount is missing (rebuild compose with admin: true)`,
+      );
+    }
+    return {
+      scope: "global",
+      rootDir: globalScopeSkillsRoot(root),
+      skillDir: globalScopeSkillDir(slug, root),
+    };
+  }
+  return authorErr(
+    "E_SKILL_SCOPE_DENIED",
+    `unknown scope ${JSON.stringify(s)} — must be "agent" or "global"`,
+  );
+}
 
 /**
  * Identity-pin enforcement.
@@ -120,7 +193,14 @@ export interface SkillCreateOpts {
   name: string;
   /** Map of skill-relative path → file content. MUST include SKILL.md. */
   files: Record<string, string>;
+  /** Per-agent test root override (agent scope only). */
   root?: string;
+  /** Scope: "agent" (default) or "global" (admin only, PR B). */
+  scope?: SkillScope;
+  /** Global-scope root override (defaults to /skills-rw via env). */
+  globalRoot?: string;
+  /** Admin lookup override (defaults to merged-config check). */
+  isAdmin?: (agent: string) => boolean;
 }
 
 export interface SkillCreateResult {
@@ -195,8 +275,15 @@ export function skillCreate(
   const fmCheck = validateSkillMd(opts.files["SKILL.md"]!, opts.name);
   if ("ok" in fmCheck && fmCheck.ok === false) return fmCheck;
 
+  // Resolve scope (agent | global). Global requires admin + mount.
+  const isAdminFn = opts.isAdmin ?? defaultIsAdmin;
+  const sc = resolveScope(
+    agent, opts.name, opts.scope, opts.root, opts.globalRoot, isAdminFn,
+  );
+  if ("ok" in sc && sc.ok === false) return sc;
+  const ctx = sc as ScopeContext;
   // Refuse if the destination dir already exists.
-  const destDir = agentScopeSkillDir(agent, opts.name, opts.root);
+  const destDir = ctx.skillDir;
   if (existsSync(destDir)) {
     return authorErr(
       "E_SKILL_ALREADY_EXISTS",
@@ -221,14 +308,19 @@ export function skillCreate(
     /* ENOENT — good, we want it absent */
   }
 
-  ensureSkillsRoot(agent, opts.root);
+  if (ctx.scope === "agent") {
+    ensureSkillsRoot(agent, opts.root);
+  } else {
+    // /skills-rw already exists (we checked above); create the slug parent.
+    mkdirSync(ctx.rootDir, { recursive: true });
+  }
 
   // B2 defence: refuse if any path component leading to skillsRoot is
   // itself a symlink. This catches the "swap .claude/skills for a
   // symlink to /tmp" attack BEFORE we materialize a stage dir under
   // the attacker-controlled location. Best-effort vs full TOCTOU; see
   // safeWriteFile() for the parent-walk invariant + O_EXCL pairing.
-  const rootDir = agentScopeSkillsRoot(agent, opts.root);
+  const rootDir = ctx.rootDir;
   {
     // Walk every component of rootDir. lstatSync each one; refuse on
     // any symlink hit.
@@ -270,6 +362,22 @@ export function skillCreate(
       }
     }
     renameSync(stageDir, destDir);
+    // PR B operator-overwrite guard: drop an authorship marker on
+    // global-scope creates so future edit/delete can verify ownership.
+    // Agent-scope skills don't need a marker — the dir is already
+    // per-agent.
+    if (ctx.scope === "global") {
+      try {
+        writeFileSync(
+          join(destDir, authorshipMarkerName(agent)),
+          "",
+          { flag: "wx", mode: 0o600 },
+        );
+      } catch {
+        // best-effort: even if marker write fails, the skill exists.
+        // Surfacing this as a hard error would leave an orphan dir.
+      }
+    }
   } catch (e) {
     try { rmSync(stageDir, { recursive: true, force: true }); } catch { /* */ }
     return authorErr(
@@ -297,6 +405,9 @@ export interface SkillEditOpts {
   /** Optimistic-concurrency token from a prior skillRead. */
   version: string;
   root?: string;
+  scope?: SkillScope;
+  globalRoot?: string;
+  isAdmin?: (agent: string) => boolean;
 }
 
 export interface SkillEditResult {
@@ -339,7 +450,13 @@ export function skillEdit(
     );
   }
 
-  const destDir = agentScopeSkillDir(agent, opts.name, opts.root);
+  const isAdminFn = opts.isAdmin ?? defaultIsAdmin;
+  const sc = resolveScope(
+    agent, opts.name, opts.scope, opts.root, opts.globalRoot, isAdminFn,
+  );
+  if ("ok" in sc && sc.ok === false) return sc;
+  const ctx = sc as ScopeContext;
+  const destDir = ctx.skillDir;
   if (!existsSync(destDir)) {
     return authorErr(
       "E_SKILL_NOT_FOUND",
@@ -357,6 +474,15 @@ export function skillEdit(
     }
   } catch {
     return authorErr("E_SKILL_NOT_FOUND", `${destDir} missing`);
+  }
+
+  // PR B operator-overwrite guard: global-scope edits are denied
+  // unless the agent's own authorship marker is present.
+  if (ctx.scope === "global" && !hasAuthorshipMarker(destDir, agent)) {
+    return authorErr(
+      "E_SKILL_OPERATOR_OWNED",
+      `global skill ${opts.name} is not authored by ${agent} (no ${authorshipMarkerName(agent)} marker) — operator-curated or peer-authored skills are immutable`,
+    );
   }
 
   const currentToken = skillVersionToken(destDir);
@@ -422,6 +548,9 @@ export interface SkillReadOpts {
   name: string;
   file?: string;
   root?: string;
+  scope?: SkillScope;
+  globalRoot?: string;
+  isAdmin?: (agent: string) => boolean;
 }
 
 export type SkillReadResult =
@@ -455,7 +584,13 @@ export function skillRead(
       `skill name must match [a-z0-9][a-z0-9_-]{0,62}: got ${JSON.stringify(opts.name)}`,
     );
   }
-  const destDir = agentScopeSkillDir(agent, opts.name, opts.root);
+  const isAdminFn = opts.isAdmin ?? defaultIsAdmin;
+  const sc = resolveScope(
+    agent, opts.name, opts.scope, opts.root, opts.globalRoot, isAdminFn,
+  );
+  if ("ok" in sc && sc.ok === false) return sc;
+  const ctx = sc as ScopeContext;
+  const destDir = ctx.skillDir;
   if (!existsSync(destDir)) {
     return authorErr(
       "E_SKILL_NOT_FOUND",
@@ -524,6 +659,9 @@ export interface SkillDeleteOpts {
   agent?: string;
   name: string;
   root?: string;
+  scope?: SkillScope;
+  globalRoot?: string;
+  isAdmin?: (agent: string) => boolean;
 }
 
 export interface SkillDeleteResult {
@@ -548,7 +686,13 @@ export function skillDelete(
       `skill name must match [a-z0-9][a-z0-9_-]{0,62}: got ${JSON.stringify(opts.name)}`,
     );
   }
-  const destDir = agentScopeSkillDir(agent, opts.name, opts.root);
+  const isAdminFn = opts.isAdmin ?? defaultIsAdmin;
+  const sc = resolveScope(
+    agent, opts.name, opts.scope, opts.root, opts.globalRoot, isAdminFn,
+  );
+  if ("ok" in sc && sc.ok === false) return sc;
+  const ctx = sc as ScopeContext;
+  const destDir = ctx.skillDir;
   if (!existsSync(destDir)) {
     return authorErr(
       "E_SKILL_NOT_FOUND",
@@ -567,6 +711,13 @@ export function skillDelete(
   } catch {
     return authorErr("E_SKILL_NOT_FOUND", `${destDir} missing`);
   }
+  // PR B operator-overwrite guard.
+  if (ctx.scope === "global" && !hasAuthorshipMarker(destDir, agent)) {
+    return authorErr(
+      "E_SKILL_OPERATOR_OWNED",
+      `global skill ${opts.name} is not authored by ${agent} (no ${authorshipMarkerName(agent)} marker) — refuse to delete operator-curated or peer-authored skill`,
+    );
+  }
   rmSync(destDir, { recursive: true, force: true });
   return { ok: true, slug: opts.name, path: destDir };
 }
@@ -580,6 +731,16 @@ interface AuthorCliOpts {
   content?: string;
   fromStdin?: boolean;
   version?: string;
+  scope?: string;
+}
+
+function parseScope(raw: string | undefined): SkillScope | SkillAuthorError {
+  if (raw == null || raw === "agent") return "agent";
+  if (raw === "global") return "global";
+  return authorErr(
+    "E_SKILL_SCOPE_DENIED",
+    `--scope must be "agent" or "global" (got ${JSON.stringify(raw)})`,
+  );
 }
 
 function readStdin(): Promise<string> {
@@ -616,6 +777,7 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
     )
     .requiredOption("--name <slug>", "Skill slug (must match [a-z0-9][a-z0-9_-]{0,62})")
     .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--scope <agent|global>", "Authoring scope (default: agent)")
     .option("--from-stdin", "Read {path: content} JSON map from stdin", false)
     .action(async (opts: AuthorCliOpts) => {
       const resolvedAgent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "<unknown>";
@@ -623,6 +785,8 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
         process.stderr.write("--from-stdin is required for skill create\n");
         process.exit(2);
       }
+      const sp = parseScope(opts.scope);
+      if (typeof sp !== "string") fail(sp, resolvedAgent, "skill.create", { name: opts.name, scope: opts.scope });
       const raw = await readStdin();
       let files: Record<string, string>;
       try {
@@ -631,8 +795,8 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
         process.stderr.write(`failed to parse stdin JSON: ${(e as Error).message}\n`);
         process.exit(2);
       }
-      const r = skillCreate({ agent: opts.agent, name: opts.name, files });
-      if (!r.ok) fail(r, resolvedAgent, "skill.create", { name: opts.name });
+      const r = skillCreate({ agent: opts.agent, name: opts.name, files, scope: sp as SkillScope });
+      if (!r.ok) fail(r, resolvedAgent, "skill.create", { name: opts.name, scope: sp });
       emit(r);
       try {
         appendAudit(resolvedAgent, "skill.create",
@@ -652,6 +816,7 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
     .option("--content <string>", "New file content (or use --from-stdin)")
     .option("--from-stdin", "Read raw content from stdin", false)
     .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--scope <agent|global>", "Authoring scope (default: agent)")
     .action(async (opts: AuthorCliOpts) => {
       const resolvedAgent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "<unknown>";
       let content = opts.content;
@@ -660,12 +825,15 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
         process.stderr.write("--content or --from-stdin required\n");
         process.exit(2);
       }
+      const sp = parseScope(opts.scope);
+      if (typeof sp !== "string") fail(sp, resolvedAgent, "skill.edit", { name: opts.name, scope: opts.scope });
       const r = skillEdit({
         agent: opts.agent,
         name: opts.name,
         file: opts.file!,
         content,
         version: opts.version!,
+        scope: sp as SkillScope,
       });
       if (!r.ok) fail(r, resolvedAgent, "skill.edit",
         { name: opts.name, file: opts.file });
@@ -685,12 +853,16 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
     .requiredOption("--name <slug>", "Skill slug")
     .option("--file <relpath>", "Specific file to read (omit for tree summary)")
     .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--scope <agent|global>", "Read scope (default: agent)")
     .action(async (opts: AuthorCliOpts) => {
       const resolvedAgent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "<unknown>";
+      const sp = parseScope(opts.scope);
+      if (typeof sp !== "string") fail(sp, resolvedAgent, "skill.read", { name: opts.name, scope: opts.scope });
       const r = skillRead({
         agent: opts.agent,
         name: opts.name,
         file: opts.file,
+        scope: sp as SkillScope,
       });
       if (!("ok" in r) || r.ok !== true) {
         fail(r, resolvedAgent, "skill.read", { name: opts.name, file: opts.file });
@@ -710,9 +882,12 @@ export function registerAgentConfigSkillAuthorCommands(program: Command): void {
     )
     .requiredOption("--name <slug>", "Skill slug")
     .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--scope <agent|global>", "Delete scope (default: agent)")
     .action(async (opts: AuthorCliOpts) => {
       const resolvedAgent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME ?? "<unknown>";
-      const r = skillDelete({ agent: opts.agent, name: opts.name });
+      const sp = parseScope(opts.scope);
+      if (typeof sp !== "string") fail(sp, resolvedAgent, "skill.delete", { name: opts.name, scope: opts.scope });
+      const r = skillDelete({ agent: opts.agent, name: opts.name, scope: sp as SkillScope });
       if (!r.ok) fail(r, resolvedAgent, "skill.delete", { name: opts.name });
       emit(r);
       try {

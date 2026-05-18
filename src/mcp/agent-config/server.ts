@@ -100,6 +100,8 @@ interface ToolArgs {
   file?: string;
   content?: string;
   version?: string;
+  // PR B: scope selector for skill_create/edit/read/delete.
+  scope?: "agent" | "global";
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -285,7 +287,13 @@ export const TOOLS = [
       "E_SKILL_INVALID_NAME, E_SKILL_INVALID_PATH, " +
       "E_SKILL_INVALID_FRONTMATTER, E_SKILL_FILE_TOO_LARGE, " +
       "E_SKILL_BUNDLE_TOO_LARGE, E_SKILL_ALREADY_EXISTS, " +
-      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED.",
+      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED. " +
+      "PR B: pass `scope: \"global\"` (admin agents only) to author into " +
+      "the operator's skills_dir (mounted at /skills-rw). Global creates " +
+      "drop a `.authored-by-<agent>` marker so future edit/delete can " +
+      "verify ownership — operator-curated globals (no marker) are " +
+      "immutable from agents. Additional errors: E_SKILL_OPERATOR_OWNED " +
+      "(exit 18), E_SKILL_GLOBAL_MOUNT_UNCONFIGURED (exit 17).",
     inputSchema: {
       type: "object" as const,
       required: ["name", "files"],
@@ -298,6 +306,14 @@ export const TOOLS = [
             "Map of skill-relative path → file content. Must include SKILL.md.",
         },
         agent: { type: "string" },
+        scope: {
+          type: "string",
+          enum: ["agent", "global"],
+          description:
+            "Authoring scope. \"agent\" (default) writes under the " +
+            "calling agent's overlay. \"global\" writes under /skills-rw " +
+            "(operator's skills_dir) — admin agents only.",
+        },
       },
     },
   },
@@ -317,7 +333,12 @@ export const TOOLS = [
       "E_SKILL_INVALID_PATH, E_SKILL_INVALID_NAME, " +
       "E_SKILL_INVALID_FRONTMATTER, E_SKILL_VERSION_STALE, " +
       "E_SKILL_FILE_TOO_LARGE, E_SKILL_BUNDLE_TOO_LARGE, " +
-      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED.",
+      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED. " +
+      "PR B: with `scope: \"global\"` (admin only) the edit is refused " +
+      "with E_SKILL_OPERATOR_OWNED (exit 18) unless the agent's own " +
+      "`.authored-by-<agent>` marker is present in the skill dir. Also: " +
+      "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED (exit 17) if /skills-rw is " +
+      "missing.",
     inputSchema: {
       type: "object" as const,
       required: ["name", "file", "content", "version"],
@@ -327,6 +348,14 @@ export const TOOLS = [
         content: { type: "string" },
         version: { type: "string" },
         agent: { type: "string" },
+        scope: {
+          type: "string",
+          enum: ["agent", "global"],
+          description:
+            "Edit scope. \"agent\" (default) or \"global\" (admin-only; " +
+            "operator-curated skills without an authorship marker are " +
+            "immutable).",
+        },
       },
     },
   },
@@ -338,7 +367,8 @@ export const TOOLS = [
       "frontmatter. Always returns a `version` token suitable for a " +
       "subsequent `skill_edit` call. Symlinks are refused for safety. " +
       "Error codes: E_SKILL_NOT_FOUND, E_SKILL_INVALID_PATH, " +
-      "E_SKILL_INVALID_NAME, E_SKILL_SCOPE_DENIED.",
+      "E_SKILL_INVALID_NAME, E_SKILL_SCOPE_DENIED, " +
+      "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED (exit 17 — only with scope=global).",
     inputSchema: {
       type: "object" as const,
       required: ["name"],
@@ -346,6 +376,12 @@ export const TOOLS = [
         name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
         file: { type: "string" },
         agent: { type: "string" },
+        scope: {
+          type: "string",
+          enum: ["agent", "global"],
+          description:
+            "Read scope. \"agent\" (default) or \"global\" (admin only).",
+        },
       },
     },
   },
@@ -357,13 +393,24 @@ export const TOOLS = [
       "`skill_remove` instead). Refused from cron-fired turns. Error " +
       "codes: E_SKILL_NOT_FOUND, E_SKILL_INVALID_PATH, " +
       "E_SKILL_INVALID_NAME, E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, " +
-      "E_SKILL_SCOPE_DENIED.",
+      "E_SKILL_SCOPE_DENIED. PR B: with `scope: \"global\"` (admin " +
+      "only), refused with E_SKILL_OPERATOR_OWNED (exit 18) unless the " +
+      "agent's own `.authored-by-<agent>` marker is present. Also " +
+      "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED (exit 17) if /skills-rw is " +
+      "missing.",
     inputSchema: {
       type: "object" as const,
       required: ["name"],
       properties: {
         name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
         agent: { type: "string" },
+        scope: {
+          type: "string",
+          enum: ["agent", "global"],
+          description:
+            "Delete scope. \"agent\" (default) or \"global\" (admin only; " +
+            "marker-gated).",
+        },
       },
     },
   },
@@ -466,6 +513,7 @@ export function dispatchTool(
       }
       const base = ["skill", "create", "--name", a.name, "--from-stdin"];
       if (a.agent) base.push("--agent", a.agent);
+      if (a.scope) base.push("--scope", a.scope as string);
       const r = spawnSyncWithStdin(base, JSON.stringify(a.files));
       if (r.status !== 0) {
         return errorText(
@@ -493,6 +541,7 @@ export function dispatchTool(
         "--from-stdin",
       ];
       if (a.agent) base.push("--agent", a.agent);
+      if (a.scope) base.push("--scope", a.scope as string);
       const r = spawnSyncWithStdin(base, a.content);
       if (r.status !== 0) {
         return errorText(
@@ -511,6 +560,7 @@ export function dispatchTool(
       const base = ["skill", "read", "--name", a.name];
       if (a.file) base.push("--file", a.file);
       if (a.agent) base.push("--agent", a.agent);
+      if (a.scope) base.push("--scope", a.scope as string);
       cliArgs = base;
       parseMode = "json";
       break;
@@ -520,6 +570,7 @@ export function dispatchTool(
       if (!a.name) return errorText("skill_delete: name is required");
       const base = ["skill", "delete", "--name", a.name];
       if (a.agent) base.push("--agent", a.agent);
+      if (a.scope) base.push("--scope", a.scope as string);
       cliArgs = base;
       parseMode = "json";
       break;

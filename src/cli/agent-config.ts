@@ -329,14 +329,19 @@ export function registerAgentConfigCommands(program: Command): void {
           const slice = getAgentSlice(cfg, agent) as {
             skills?: string[];
             bundled_skills?: Record<string, boolean>;
+            admin?: boolean;
           };
+          // PR B: admin agents can also author into global scope
+          // (host's skills_dir, mounted at /skills-rw). Non-admin
+          // agents see ["agent"] only. The admin lookup matches the
+          // bind-mount + global-write gate exactly.
+          const editableScopes: string[] = slice.admin === true
+            ? ["agent", "global"]
+            : ["agent"];
           const out = {
             skills: slice.skills ?? [],
             bundled_skills: slice.bundled_skills ?? {},
-            // PR A of agent-skill-authoring: agents can author into their
-            // own .claude/skills/<slug>/. Global scope (operator-owned
-            // bundled pool) comes in PR B.
-            editable_scopes: ["agent"] as string[],
+            editable_scopes: editableScopes,
           };
           process.stdout.write(JSON.stringify(out) + "\n");
           appendAudit(agent, "skill.list", { ...opts }, 0);

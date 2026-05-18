@@ -296,6 +296,25 @@ describe("registered commands", () => {
     expect(parsed.bundled_skills).toEqual({ "skill-creator": true });
   });
 
+  it("skill list editable_scopes is ['agent','global'] for admin agents", async () => {
+    // PR B: admin agents may author into global scope; the list verb
+    // surfaces that capability so callers can branch on it without a
+    // separate config_get round-trip. `a` is admin: true in this fixture.
+    process.env.SWITCHROOM_AGENT_NAME = "a";
+    const program = buildProgram();
+    await program.parseAsync(["node", "switchroom", "skill", "list"]);
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.editable_scopes).toEqual(["agent", "global"]);
+  });
+
+  it("skill list editable_scopes is ['agent'] for non-admin agents", async () => {
+    process.env.SWITCHROOM_AGENT_NAME = "b";
+    const program = buildProgram();
+    await program.parseAsync(["node", "switchroom", "skill", "list"]);
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.editable_scopes).toEqual(["agent"]);
+  });
+
   it("peers list excludes the caller and includes name + purpose + admin for every other agent", async () => {
     process.env.SWITCHROOM_AGENT_NAME = "a";
     const program = buildProgram();

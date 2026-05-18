@@ -69,7 +69,9 @@ export type SkillAuthorErrorCode =
   | "E_SKILL_VERSION_STALE"
   | "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE"
   | "E_SKILL_NOT_FOUND"
-  | "E_AGENT_PIN_REQUIRED";
+  | "E_AGENT_PIN_REQUIRED"
+  | "E_SKILL_OPERATOR_OWNED"
+  | "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED";
 
 export interface SkillAuthorError {
   ok: false;
@@ -98,7 +100,54 @@ export function authorExitCodeFor(code: SkillAuthorErrorCode): number {
       return 9;
     case "E_AGENT_PIN_REQUIRED":
       return 16;
+    case "E_SKILL_GLOBAL_MOUNT_UNCONFIGURED":
+      return 17;
+    case "E_SKILL_OPERATOR_OWNED":
+      return 18;
   }
+}
+
+// ─── PR B: global-scope authoring (admin agents only) ────────────────
+
+/** In-container path where the host's `skills_dir` is bind-mounted
+ *  `:rw` for admin agents. PR B (#TBD). Non-admin agents do NOT get
+ *  this mount; the dispatcher refuses with E_SKILL_SCOPE_DENIED before
+ *  we ever resolve a path against /skills-rw.
+ *
+ *  Tests may override this via `SWITCHROOM_SKILLS_RW_ROOT` env var so
+ *  fixtures can point at a temp dir without needing a real mount. */
+export const DEFAULT_GLOBAL_SCOPE_ROOT = "/skills-rw";
+
+export function resolveGlobalScopeRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return env.SWITCHROOM_SKILLS_RW_ROOT ?? DEFAULT_GLOBAL_SCOPE_ROOT;
+}
+
+export function globalScopeSkillsRoot(root?: string): string {
+  return root ?? resolveGlobalScopeRoot();
+}
+
+export function globalScopeSkillDir(slug: string, root?: string): string {
+  return join(globalScopeSkillsRoot(root), slug);
+}
+
+/** Marker filename written into a global-scope skill dir on create
+ *  to record the agent that authored it. Operator-curated skills have
+ *  no marker, so they're immune from agent edits/deletes. */
+export function authorshipMarkerName(agent: string): string {
+  return `.authored-by-${agent}`;
+}
+
+/** Check whether `skillDir` carries an authorship marker for `agent`.
+ *  Returns true ONLY if the exact `.authored-by-<agent>` file is
+ *  present. A marker for a different agent (or no marker at all)
+ *  returns false. */
+export function hasAuthorshipMarker(
+  skillDir: string,
+  agent: string,
+): boolean {
+  return existsSync(join(skillDir, authorshipMarkerName(agent)));
 }
 
 export function authorErr(

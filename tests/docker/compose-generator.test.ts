@@ -2349,3 +2349,62 @@ describe("network_isolation — sec WS6-F1 / feature #1413", () => {
     expect(out).not.toContain("switchroom-net-hostagent:");
   });
 });
+
+describe("PR B: /skills-rw admin bind-mount for global skill authoring", () => {
+  // The agent-config skill-author CLI (scope:"global") writes under
+  // /skills-rw inside the container, which is the host's skills_dir
+  // bind-mounted :rw. The mount is implicit on `admin: true` — no
+  // schema field — and MUST NOT appear for non-admin agents.
+
+  it("admin agent gets the /skills-rw bind when skills dir exists on host", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-skills-rw-"));
+    mkdirSync(join(tmp, ".switchroom", "skills"), { recursive: true });
+    try {
+      const out = generateCompose({
+        config: makeConfig({ alice: { admin: true } }),
+        homeDir: tmp,
+      });
+      expect(out).toMatch(new RegExp(
+        `agent-alice:[\\s\\S]*?- ${tmp}/.switchroom/skills:/skills-rw:rw`,
+      ));
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("non-admin agent does NOT get /skills-rw even when skills dir exists", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-skills-rw-deny-"));
+    mkdirSync(join(tmp, ".switchroom", "skills"), { recursive: true });
+    try {
+      const out = generateCompose({
+        config: makeConfig({ bob: { admin: false } }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain("/skills-rw:rw");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("admin agent skips /skills-rw when host skills dir is missing", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-skills-rw-empty-"));
+    try {
+      const out = generateCompose({
+        config: makeConfig({ alice: { admin: true } }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain("/skills-rw:rw");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
