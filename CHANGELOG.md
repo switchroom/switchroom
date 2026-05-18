@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.12.7 — republish of v0.12.6 (broken artifact had no dist/)
+
+`switchroom@0.12.6` was published with **no `dist/`** — the build had failed silently (the publish command piped the build through `tail`, which masked its non-zero exit) so the tarball shipped without the CLI bundle and is unusable. **Use v0.12.7.** v0.12.6 is deprecated on npm. The *code* content of v0.12.7 is identical to the intended v0.12.6 — the only delta is a correctly built artifact (verified post-publish that the tarball contains `dist/cli/switchroom.js` with the fix). No source changes vs v0.12.6.
+
+Carries the v0.12.6 fix:
+
 ## v0.12.6 — fix: stateless Hindsight MCP broke memory onboarding fleet-wide
 
 `switchroom apply` / `agent reconcile` silently failed to create every agent's Hindsight memory bank, bank mission, and user-profile mental model — `⚠ Failed to create Hindsight bank for <agent>: No session ID returned` for the whole fleet. Hindsight's MCP server runs **stateless by design** (`HINDSIGHT_API_MCP_STATELESS=true`) and returns no `mcp-session-id` header on `initialize` (the MCP spec makes it optional, and tool calls work statelessly), but the scaffold client *required* that header in all four memory-onboarding paths and hard-failed when it was absent. Latent fleet-wide since the stateless Hindsight container rolled out.
