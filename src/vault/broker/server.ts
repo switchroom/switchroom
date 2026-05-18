@@ -603,6 +603,30 @@ export class VaultBroker {
    * model as per-agent sockets). Mode 0600 + chown keeps anyone but
    * the host operator UID from connecting in the first place.
    */
+  /**
+   * Re-own vault.enc to the host operator UID after a broker write.
+   * The broker container is root, so saveVault → atomicWriteFileSync
+   * renames a root-owned tmp into place; without this the operator's
+   * `switchroom vault …` CLI fails EACCES on its own vault (the
+   * broker keeps working via CAP_DAC_READ_SEARCH, masking it). Same
+   * UID source + best-effort posture as the operator-socket chowns:
+   * no-op when SWITCHROOM_BROKER_OPERATOR_UID is unset (legacy/tests)
+   * or chown isn't permitted (non-docker dev / no CAP_CHOWN).
+   * `chownSync` follows the v0.7.12+ `vault.enc -> vault/vault.enc`
+   * symlink, so the underlying file is what gets re-owned.
+   */
+  private chownVaultToOperator(): void {
+    const uidStr = process.env.SWITCHROOM_BROKER_OPERATOR_UID;
+    if (uidStr === undefined) return;
+    const uid = parseInt(uidStr, 10);
+    if (!Number.isFinite(uid) || uid <= 0) return;
+    try {
+      if (existsSync(this.vaultPath)) chownSync(this.vaultPath, uid, uid);
+    } catch {
+      /* non-docker dev / no CAP_CHOWN — same posture as socket chowns */
+    }
+  }
+
   bindOperatorListener(socketPath: string, operatorUid: number): Promise<void> {
     const abs = resolve(socketPath);
     const identity = socketPathToIdentity(abs);
@@ -1582,6 +1606,16 @@ export class VaultBroker {
         );
         return;
       }
+      // Hand vault.enc back to the host operator UID. The broker runs
+      // as root, so the saveVault → atomicWriteFileSync rename above
+      // left the file root:root 0600. The broker still reads it
+      // (CAP_DAC_READ_SEARCH) which masks the breakage, but the
+      // operator's `switchroom vault …` CLI then fails EACCES — and it
+      // silently re-broke on every persist (token rotation, /vault
+      // put, auto-unlock re-persist) before this. Mirrors the
+      // socket-chown pattern; no-op on legacy/test (env unset) or
+      // non-docker dev (no CAP_CHOWN).
+      this.chownVaultToOperator();
       // Successful put — log only the key, NEVER the value. Surface the
       // auth method so audit downstream can trace which path authorized
       // the write: passphrase (operator-attested via gateway), grant
