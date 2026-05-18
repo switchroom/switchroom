@@ -155,11 +155,15 @@ describe("updateBankMissions", () => {
     expect(result.reason).toBe("Timeout");
   });
 
-  it("returns error when no session ID returned", async () => {
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      headers: new Map(), // No session ID
-    } as any);
+  it("tolerates a stateless server (no mcp-session-id) and proceeds without the header", async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Map(), // stateless: no mcp-session-id
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+      } as any);
 
     const result = await updateBankMissions(
       "http://test.local/mcp/",
@@ -168,7 +172,10 @@ describe("updateBankMissions", () => {
       { fetchImpl: mockFetch as any }
     );
 
-    expect(result).toEqual({ ok: false, reason: "No session ID returned" });
+    expect(result).toEqual({ ok: true });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const toolHeaders = mockFetch.mock.calls[1][1].headers;
+    expect("mcp-session-id" in toolHeaders).toBe(false);
   });
 
   it("returns error on network failure", async () => {

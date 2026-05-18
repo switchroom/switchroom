@@ -113,11 +113,15 @@ describe("addMemoryTag — error paths", () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("returns error when initialize returns no session ID", async () => {
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      headers: new Map(), // no mcp-session-id
-    } as any);
+  it("tolerates a stateless server (no mcp-session-id) and proceeds without the header", async () => {
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Map(), // stateless: no mcp-session-id
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+      } as any);
     const result = await addMemoryTag(
       "http://test.local/mcp/",
       "clerk",
@@ -125,8 +129,10 @@ describe("addMemoryTag — error paths", () => {
       DEMOTE_FROM_RECALL_TAG,
       { fetchImpl: mockFetch as any },
     );
-    expect(result).toEqual({ ok: false, reason: "No session ID returned" });
-    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const toolHeaders = mockFetch.mock.calls[1][1].headers;
+    expect("mcp-session-id" in toolHeaders).toBe(false);
   });
 
   it("returns error when tools/call HTTP fails", async () => {

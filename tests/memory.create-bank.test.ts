@@ -184,11 +184,18 @@ describe("createBank", () => {
     expect(result).toEqual({ ok: false, reason: "Timeout" });
   });
 
-  it("returns error when no session ID returned", async () => {
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      headers: new Map(), // no mcp-session-id
-    } as any);
+  it("tolerates a stateless server (no mcp-session-id) and proceeds without the header", async () => {
+    // Hindsight MCP is stateless by design — initialize returns no
+    // mcp-session-id. The client must NOT hard-fail; it should proceed
+    // and omit the header on the follow-up tool call.
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Map(), // stateless: no mcp-session-id
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+      } as any);
 
     const result = await createBank(
       "http://test.local/mcp/",
@@ -196,6 +203,10 @@ describe("createBank", () => {
       { fetchImpl: mockFetch as any }
     );
 
-    expect(result).toEqual({ ok: false, reason: "No session ID returned" });
+    expect(result).toEqual({ ok: true });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const toolHeaders = mockFetch.mock.calls[1][1].headers;
+    expect("mcp-session-id" in toolHeaders).toBe(false);
+    expect(toolHeaders["X-Bank-Id"]).toBe("test-bank");
   });
 });
