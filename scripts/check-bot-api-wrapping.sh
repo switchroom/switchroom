@@ -102,7 +102,10 @@ ALLOWLIST=(
   # Re-bumped 2026-05-15 for #1308 folder-picker handler integration.
   # Re-bumped 2026-05-15 for RFC E §4.2 PR-2C drive PreToolUse hook
   # (#1319) — added ~2 more lines above this block.
-  "telegram-plugin/gateway/gateway.ts:2695-3000:permission-request keyboard; no thread_id"
+  # End 3000 -> 3010: feat/hostd-deterministic-status inserted the
+  # inFlightUpdate var + the silence-fallback update-status branch
+  # above this block; the permission-keyboard raw send moved to 3002.
+  "telegram-plugin/gateway/gateway.ts:2695-3010:permission-request keyboard; no thread_id"
 
   # reply chunk-loop fallback after robustApiCall threw THREAD_NOT_FOUND.
   # The caller dropped the thread; this raw sendMessage retries on the
@@ -124,7 +127,9 @@ ALLOWLIST=(
   # sendChunkPlainText raw send (~3498) is the SAME intentional-raw
   # rationale — a terminal last-resort resend that must not re-enter
   # the retry/parse-mode policy that just rejected the payload.
-  "telegram-plugin/gateway/gateway.ts:3160-3540:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # End 3540 -> 3580: same insertion shifted the chunk-loop fallback
+  # raw sends to 3545/3566.
+  "telegram-plugin/gateway/gateway.ts:3160-3580:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -158,7 +163,9 @@ ALLOWLIST=(
   # editMessageText to 10358/10382 (past 10340). New ceiling stops before
   # executeGrantWizard (10408); inserted code uses listViaBroker (not a
   # raw bot.api call), so the wider span adds no un-allowlisted call.
-  "telegram-plugin/gateway/gateway.ts:9340-10400:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # End 10400 -> 10430: same insertion shifted the vault-wizard
+  # editMessageText callsite to 10422.
+  "telegram-plugin/gateway/gateway.ts:9340-10430:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see
