@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.12.6 — fix: stateless Hindsight MCP broke memory onboarding fleet-wide
+
+`switchroom apply` / `agent reconcile` silently failed to create every agent's Hindsight memory bank, bank mission, and user-profile mental model — `⚠ Failed to create Hindsight bank for <agent>: No session ID returned` for the whole fleet. Hindsight's MCP server runs **stateless by design** (`HINDSIGHT_API_MCP_STATELESS=true`) and returns no `mcp-session-id` header on `initialize` (the MCP spec makes it optional, and tool calls work statelessly), but the scaffold client *required* that header in all four memory-onboarding paths and hard-failed when it was absent. Latent fleet-wide since the stateless Hindsight container rolled out.
+
+### Changes
+
+#### Fixes
+
+- **fix(memory):** the Hindsight client (`createBank`, `ensureUserProfileMentalModel`, `updateBankMissions`, `addMemoryTag`) now forwards `mcp-session-id` only when a stateful server actually returns one, and otherwise proceeds without it instead of hard-failing `"No session ID returned"`. The stateful path is unchanged (header still forwarded when present); the stateless path now completes memory onboarding. Regression tests updated to assert stateless tolerance and that the header is still forwarded on the stateful path. Do **not** "fix" this by flipping Hindsight stateful — that re-introduces the bounce-strands-sessions fleet outage. (#1515)
+
 ## v0.12.5 — admin agents get their admin CLAUDE.md; deterministic in-flight update status
 
 Two fixes completing the in-Telegram admin-fleet-ops path (the klanker incident).
