@@ -1619,6 +1619,16 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     botToken: resolvedBotToken ?? rawBotToken,
     forumChatId: telegramConfig.forum_chat_id,
     dangerousMode: agentConfig.dangerous_mode === true,
+    // `{{#if admin}}` in CLAUDE.md.hbs (the "Admin operations" section)
+    // keys off this. MUST mirror the reconcile path's claudeContext
+    // (~scaffold.ts `admin: agentConfig.admin === true`). It was
+    // missing here, so the `switchroom apply` / scaffoldAgent render
+    // (which uses THIS context) always rendered the non-admin
+    // `{{else}}` branch — every admin agent's CLAUDE.md told it "you
+    // are NOT admin, hand fleet ops off", the klanker incident. The
+    // two render sites diverging on exactly this field is the hazard
+    // the comment at the reconcile site warns about.
+    admin: agentConfig.admin === true,
     useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
     useHotReloadStable: agentConfig.channels?.telegram?.hotReloadStable === true,
     // PR C: surface channels.telegram.enabled into start.sh as a literal

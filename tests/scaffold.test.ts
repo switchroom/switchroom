@@ -74,6 +74,24 @@ describe("scaffoldAgent", () => {
     expect(soulMd).toContain("not a doctor");
   });
 
+  it("admin:true agent gets the admin branch in CLAUDE.md (klanker incident regression)", () => {
+    // buildWorkspaceContext omitted `admin`, so scaffoldAgent (the
+    // `switchroom apply` render path) always rendered the non-admin
+    // `{{else}}` branch — admin agents were told "you are NOT admin".
+    const adminCfg = makeAgentConfig({ extends: "default", admin: true });
+    const a = scaffoldAgent("admin-agent", adminCfg, tmpDir, telegramConfig);
+    const adminMd = readFileSync(join(a.agentDir, "CLAUDE.md"), "utf-8");
+    expect(adminMd).toMatch(/Fleet operations live on the `hostd`/);
+    expect(adminMd).toContain("update_apply");
+    expect(adminMd).not.toMatch(/You're NOT `admin: true`/);
+
+    const plainCfg = makeAgentConfig({ extends: "default" });
+    const p = scaffoldAgent("plain-agent", plainCfg, tmpDir, telegramConfig);
+    const plainMd = readFileSync(join(p.agentDir, "CLAUDE.md"), "utf-8");
+    expect(plainMd).toMatch(/You're NOT `admin: true`/);
+    expect(plainMd).not.toMatch(/Fleet operations live on the `hostd`/);
+  });
+
   it("generates start.sh with correct env vars", () => {
     const config = makeAgentConfig({ topic_id: 42 });
     const result = scaffoldAgent("my-agent", config, tmpDir, telegramConfig);
