@@ -333,6 +333,10 @@ export function registerAgentConfigCommands(program: Command): void {
           const out = {
             skills: slice.skills ?? [],
             bundled_skills: slice.bundled_skills ?? {},
+            // PR A of agent-skill-authoring: agents can author into their
+            // own .claude/skills/<slug>/. Global scope (operator-owned
+            // bundled pool) comes in PR B.
+            editable_scopes: ["agent"] as string[],
           };
           process.stdout.write(JSON.stringify(out) + "\n");
           appendAudit(agent, "skill.list", { ...opts }, 0);

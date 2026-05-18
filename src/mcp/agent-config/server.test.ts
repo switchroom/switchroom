@@ -40,8 +40,12 @@ describe("TOOLS export", () => {
       "peers_list",      // identity / peer-awareness
       "schedule_add",
       "schedule_remove",
+      "skill_create",    // PR A author surface
+      "skill_delete",    // PR A author surface
+      "skill_edit",      // PR A author surface
       "skill_install",   // #1163 Phase 2
       "skill_list",
+      "skill_read",      // PR A author surface
       "skill_remove",    // #1163 Phase 2
     ]);
   });

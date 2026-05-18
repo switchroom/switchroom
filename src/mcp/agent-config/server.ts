@@ -49,6 +49,22 @@ export function execCli(args: string[]): ExecResult {
   };
 }
 
+/** PR A: like `execCli` but pipes `stdin` text in for skill create/edit
+ *  bodies that are too large for argv. */
+export function spawnSyncWithStdin(args: string[], stdin: string): ExecResult {
+  const r = spawnSync(CLI_BIN, args, {
+    encoding: "utf-8",
+    env: process.env,
+    timeout: 15000,
+    input: stdin,
+  });
+  return {
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    status: r.status ?? 1,
+  };
+}
+
 function jsonText(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
 }
@@ -72,6 +88,11 @@ interface ToolArgs {
   source?: string;
   // peers_list
   include_self?: boolean;
+  // skill_create / skill_edit / skill_read / skill_delete (PR A)
+  files?: Record<string, string>;
+  file?: string;
+  content?: string;
+  version?: string;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -240,6 +261,102 @@ export const TOOLS = [
       },
     },
   },
+  // ── PR A: agent-scope skill authoring ──────────────────────────────
+  {
+    name: "skill_create",
+    description:
+      "Create an agent-scope skill (scope=agent) at " +
+      "`~/.switchroom/agents/<agent>/.claude/skills/<slug>/`. Atomic " +
+      "temp-dir → rename — refuses if the target slug dir already " +
+      "exists. The `files` arg is a map of skill-relative path → " +
+      "string content; MUST include `SKILL.md` with valid YAML " +
+      "frontmatter (`name:` matching the slug, `description:` 1..1024 " +
+      "chars). Path allowlist: SKILL.md, README.md, scripts/*.{sh,py}, " +
+      "assets/*, reference/*.md (max depth 3). Limits: 256 KiB per file, " +
+      "2 MiB per skill, 50 files per skill. Refused from cron-fired " +
+      "turns (E_SKILL_AUTHOR_REQUIRES_INTERACTIVE). Error codes: " +
+      "E_SKILL_INVALID_NAME, E_SKILL_INVALID_PATH, " +
+      "E_SKILL_INVALID_FRONTMATTER, E_SKILL_FILE_TOO_LARGE, " +
+      "E_SKILL_BUNDLE_TOO_LARGE, E_SKILL_ALREADY_EXISTS, " +
+      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name", "files"],
+      properties: {
+        name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        files: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description:
+            "Map of skill-relative path → file content. Must include SKILL.md.",
+        },
+        agent: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "skill_edit",
+    description:
+      "Edit a single file within an existing agent-scope skill " +
+      "(scope=agent). Atomic single-file write. Requires `version` (an " +
+      "opaque token returned by `skill_read`) for optimistic " +
+      "concurrency — mismatch returns E_SKILL_VERSION_STALE. If " +
+      "editing SKILL.md, frontmatter is re-validated. Path allowlist " +
+      "and 256 KiB / 2 MiB / 50-file limits enforced. Refused from " +
+      "cron-fired turns. Error codes: E_SKILL_NOT_FOUND, " +
+      "E_SKILL_INVALID_PATH, E_SKILL_INVALID_NAME, " +
+      "E_SKILL_INVALID_FRONTMATTER, E_SKILL_VERSION_STALE, " +
+      "E_SKILL_FILE_TOO_LARGE, E_SKILL_BUNDLE_TOO_LARGE, " +
+      "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, E_SKILL_SCOPE_DENIED.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name", "file", "content", "version"],
+      properties: {
+        name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        file: { type: "string" },
+        content: { type: "string" },
+        version: { type: "string" },
+        agent: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "skill_read",
+    description:
+      "Read a file from an agent-scope skill, OR (when `file` is " +
+      "omitted) return the skill's file tree plus its SKILL.md " +
+      "frontmatter. Always returns a `version` token suitable for a " +
+      "subsequent `skill_edit` call. Symlinks are refused for safety. " +
+      "Error codes: E_SKILL_NOT_FOUND, E_SKILL_INVALID_PATH, " +
+      "E_SKILL_INVALID_NAME, E_SKILL_SCOPE_DENIED.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name"],
+      properties: {
+        name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        file: { type: "string" },
+        agent: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "skill_delete",
+    description:
+      "Delete an agent-scope skill dir (scope=agent). Refuses if the " +
+      "path is a symlink (that's a bundled-skill install — use " +
+      "`skill_remove` instead). Refused from cron-fired turns. Error " +
+      "codes: E_SKILL_NOT_FOUND, E_SKILL_INVALID_PATH, " +
+      "E_SKILL_INVALID_NAME, E_SKILL_AUTHOR_REQUIRES_INTERACTIVE, " +
+      "E_SKILL_SCOPE_DENIED.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name"],
+      properties: {
+        name: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        agent: { type: "string" },
+      },
+    },
+  },
 ];
 
 export function dispatchTool(
@@ -325,6 +442,73 @@ export function dispatchTool(
         return errorText("skill_remove: name is required");
       }
       const base = ["skill", "remove", "--name", a.name as string];
+      if (a.agent) base.push("--agent", a.agent);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    // ── PR A: skill authoring ─────────────────────────────────────────
+    case "skill_create": {
+      const a = args as ToolArgs;
+      if (!a.name) return errorText("skill_create: name is required");
+      if (!a.files || typeof a.files !== "object") {
+        return errorText("skill_create: files map is required");
+      }
+      const base = ["skill", "create", "--name", a.name, "--from-stdin"];
+      if (a.agent) base.push("--agent", a.agent);
+      const r = spawnSyncWithStdin(base, JSON.stringify(a.files));
+      if (r.status !== 0) {
+        return errorText(
+          `CLI exit ${r.status}: ${r.stderr.trim() || r.stdout.trim()}`,
+        );
+      }
+      try {
+        return jsonText(JSON.parse(r.stdout.trim() || "null"));
+      } catch (err) {
+        return errorText(`failed to parse CLI output: ${(err as Error).message}`);
+      }
+    }
+    case "skill_edit": {
+      const a = args as ToolArgs;
+      if (!a.name || !a.file || a.content == null || !a.version) {
+        return errorText(
+          "skill_edit: name, file, content, and version are required",
+        );
+      }
+      const base = [
+        "skill", "edit",
+        "--name", a.name,
+        "--file", a.file,
+        "--version", a.version,
+        "--from-stdin",
+      ];
+      if (a.agent) base.push("--agent", a.agent);
+      const r = spawnSyncWithStdin(base, a.content);
+      if (r.status !== 0) {
+        return errorText(
+          `CLI exit ${r.status}: ${r.stderr.trim() || r.stdout.trim()}`,
+        );
+      }
+      try {
+        return jsonText(JSON.parse(r.stdout.trim() || "null"));
+      } catch (err) {
+        return errorText(`failed to parse CLI output: ${(err as Error).message}`);
+      }
+    }
+    case "skill_read": {
+      const a = args as ToolArgs;
+      if (!a.name) return errorText("skill_read: name is required");
+      const base = ["skill", "read", "--name", a.name];
+      if (a.file) base.push("--file", a.file);
+      if (a.agent) base.push("--agent", a.agent);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    case "skill_delete": {
+      const a = args as ToolArgs;
+      if (!a.name) return errorText("skill_delete: name is required");
+      const base = ["skill", "delete", "--name", a.name];
       if (a.agent) base.push("--agent", a.agent);
       cliArgs = base;
       parseMode = "json";
