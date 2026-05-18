@@ -31,7 +31,7 @@ import {
   rmSync,
   renameSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, sep } from "node:path";
 import {
   agentScopeSkillDir,
   agentScopeSkillsRoot,
@@ -53,20 +53,52 @@ import {
   type SkillAuthorError,
 } from "./skill-common.js";
 
+/**
+ * Identity-pin enforcement.
+ *
+ * The original implementation only rejected cross-agent writes when
+ * the env-pin was both set AND mismatched. That left a bypass: with
+ * SWITCHROOM_AGENT_NAME unset, an attacker could pass --agent victim
+ * and write into a peer's overlay. Fix: any explicit `agent` arg
+ * REQUIRES the env-pin to be set AND to match. If `agent` is omitted
+ * and the env-pin is unset, we also refuse (we have no idea who's
+ * calling). Returns a sentinel-tagged object on failure so callers
+ * can map to the right error code (E_AGENT_PIN_REQUIRED, exit 16).
+ */
+class AgentPinRequiredError extends Error {
+  readonly kind = "pin-required" as const;
+}
+
 function resolveAgent(agent: string | undefined): string {
-  const a = agent ?? process.env.SWITCHROOM_AGENT_NAME;
-  if (!a) {
-    throw new Error(
-      "agent name required: pass --agent or set SWITCHROOM_AGENT_NAME",
-    );
-  }
   const pinned = process.env.SWITCHROOM_AGENT_NAME;
-  if (pinned && a !== pinned) {
-    throw new Error(
-      `cross-agent skill writes are denied: agent=${a} but identity is pinned to ${pinned}`,
+  if (agent !== undefined) {
+    if (!pinned) {
+      throw new AgentPinRequiredError(
+        `cross-agent skill writes require SWITCHROOM_AGENT_NAME to be set ` +
+        `(got --agent=${agent} with no env-pin)`,
+      );
+    }
+    if (agent !== pinned) {
+      throw new AgentPinRequiredError(
+        `cross-agent skill writes are denied: agent=${agent} but identity is pinned to ${pinned}`,
+      );
+    }
+    return agent;
+  }
+  // No explicit agent → must have the env-pin to know who's calling.
+  if (!pinned) {
+    throw new AgentPinRequiredError(
+      "agent name required: pass --agent (which must match SWITCHROOM_AGENT_NAME) or set SWITCHROOM_AGENT_NAME",
     );
   }
-  return a;
+  return pinned;
+}
+
+function agentErrCode(e: unknown): SkillAuthorError {
+  if (e instanceof AgentPinRequiredError) {
+    return authorErr("E_AGENT_PIN_REQUIRED", e.message);
+  }
+  return authorErr("E_SKILL_SCOPE_DENIED", (e as Error).message);
 }
 
 function denyIfCron(env: NodeJS.ProcessEnv = process.env):
@@ -107,7 +139,7 @@ export function skillCreate(
 
   let agent: string;
   try { agent = resolveAgent(opts.agent); }
-  catch (e) { return authorErr("E_SKILL_SCOPE_DENIED", (e as Error).message); }
+  catch (e) { return agentErrCode(e); }
 
   if (!validateSkillName(opts.name)) {
     return authorErr(
@@ -171,14 +203,18 @@ export function skillCreate(
       `skill dir already exists: ${destDir}`,
     );
   }
-  // Defensive: refuse if it exists as a symlink (lstat-check; existsSync
-  // follows symlinks).
+  // Defensive: refuse if a stale symlink sits at the target path.
+  // existsSync() above follows symlinks (so a dangling symlink reports
+  // false), but we want to catch any leftover symlink whether dangling
+  // or live. Only trigger on `isSymbolicLink()` — any other lstat hit
+  // would have been caught by the existsSync check above (or is an
+  // ENOENT race that's harmless).
   try {
     const st = lstatSync(destDir);
-    if (st) {
+    if (st && st.isSymbolicLink()) {
       return authorErr(
         "E_SKILL_ALREADY_EXISTS",
-        `path exists at ${destDir}`,
+        `symlink exists at ${destDir} — refuse to overwrite`,
       );
     }
   } catch {
@@ -187,9 +223,33 @@ export function skillCreate(
 
   ensureSkillsRoot(agent, opts.root);
 
-  // Atomic temp-dir → rename. Stage in a sibling temp dir under the
-  // .claude/skills/ root and rename at the end.
+  // B2 defence: refuse if any path component leading to skillsRoot is
+  // itself a symlink. This catches the "swap .claude/skills for a
+  // symlink to /tmp" attack BEFORE we materialize a stage dir under
+  // the attacker-controlled location. Best-effort vs full TOCTOU; see
+  // safeWriteFile() for the parent-walk invariant + O_EXCL pairing.
   const rootDir = agentScopeSkillsRoot(agent, opts.root);
+  {
+    // Walk every component of rootDir. lstatSync each one; refuse on
+    // any symlink hit.
+    const segs = rootDir.split(sep).filter((s) => s.length > 0);
+    let cur = rootDir.startsWith(sep) ? sep : "";
+    for (const seg of segs) {
+      cur = cur === sep ? sep + seg : cur + sep + seg;
+      try {
+        const st = lstatSync(cur);
+        if (st.isSymbolicLink()) {
+          return authorErr(
+            "E_SKILL_INVALID_PATH",
+            `refuse to create under symlinked path component: ${cur}`,
+          );
+        }
+      } catch {
+        // Component doesn't exist yet — that's fine for the not-yet-
+        // created tail of the path. Continue walking.
+      }
+    }
+  }
   const stageDir = join(rootDir, `.staging-${opts.name}.${process.pid}.${Date.now()}`);
   mkdirSync(stageDir, { recursive: true });
   try {
@@ -255,7 +315,7 @@ export function skillEdit(
 
   let agent: string;
   try { agent = resolveAgent(opts.agent); }
-  catch (e) { return authorErr("E_SKILL_SCOPE_DENIED", (e as Error).message); }
+  catch (e) { return agentErrCode(e); }
 
   if (!validateSkillName(opts.name)) {
     return authorErr(
@@ -387,7 +447,7 @@ export function skillRead(
 ): SkillReadResult | SkillAuthorError {
   let agent: string;
   try { agent = resolveAgent(opts.agent); }
-  catch (e) { return authorErr("E_SKILL_SCOPE_DENIED", (e as Error).message); }
+  catch (e) { return agentErrCode(e); }
 
   if (!validateSkillName(opts.name)) {
     return authorErr(
@@ -480,7 +540,7 @@ export function skillDelete(
 
   let agent: string;
   try { agent = resolveAgent(opts.agent); }
-  catch (e) { return authorErr("E_SKILL_SCOPE_DENIED", (e as Error).message); }
+  catch (e) { return agentErrCode(e); }
 
   if (!validateSkillName(opts.name)) {
     return authorErr(

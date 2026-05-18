@@ -68,7 +68,8 @@ export type SkillAuthorErrorCode =
   | "E_SKILL_ALREADY_EXISTS"
   | "E_SKILL_VERSION_STALE"
   | "E_SKILL_AUTHOR_REQUIRES_INTERACTIVE"
-  | "E_SKILL_NOT_FOUND";
+  | "E_SKILL_NOT_FOUND"
+  | "E_AGENT_PIN_REQUIRED";
 
 export interface SkillAuthorError {
   ok: false;
@@ -95,6 +96,8 @@ export function authorExitCodeFor(code: SkillAuthorErrorCode): number {
     case "E_SKILL_INVALID_FRONTMATTER":
     case "E_SKILL_SCOPE_DENIED":
       return 9;
+    case "E_AGENT_PIN_REQUIRED":
+      return 16;
   }
 }
 
@@ -366,6 +369,51 @@ export function safeWriteFile(
       "E_SKILL_INVALID_PATH",
       `parent dir ${parent} resolves outside scope root`,
     );
+  }
+
+  // Per-component symlink walk from scopeRoot → parent(absPath).
+  // realpathSync() collapses the chain but doesn't tell us whether any
+  // intermediate dir is itself a symlink — and Node doesn't expose
+  // openat(2)/O_NOFOLLOW per-segment from JS. Walking with lstatSync
+  // catches the "swap a parent dir for a symlink to /tmp" attack.
+  //
+  // Best-effort caveat: this is racy against an attacker swapping a
+  // parent inode between the walk and the openSync() below (true
+  // TOCTOU window). The tighter invariant that closes that gap: the
+  // temp file is opened with O_EXCL ("wx") in `parent` and immediately
+  // renameSync()'d onto `absPath` in the SAME parent. If the parent
+  // inode is swapped post-walk, either (a) open and rename both
+  // resolve against the kernel's current dirent for `parent` (so the
+  // swap is the attacker's problem — the data lands wherever the new
+  // parent points, but the caller never sees a success path that
+  // promises otherwise), or (b) open fails. Crucially we never follow
+  // a stale realpath result after walking.
+  // Walk the UNRESOLVED `parent` path (not parentReal, which already
+  // followed every symlink): start at scopeRoot and lstat each
+  // intermediate component.
+  if (parent === scopeRoot || parent.startsWith(scopeRoot + sep)) {
+    const relFromRoot = parent === scopeRoot
+      ? ""
+      : parent.slice(scopeRoot.length + 1);
+    if (relFromRoot.length > 0) {
+      const segs = relFromRoot.split(sep);
+      let cur = scopeRoot;
+      for (const seg of segs) {
+        cur = join(cur, seg);
+        try {
+          const st = lstatSync(cur);
+          if (st.isSymbolicLink()) {
+            return authorErr(
+              "E_SKILL_INVALID_PATH",
+              `refuse to write under symlinked parent component: ${cur}`,
+            );
+          }
+        } catch {
+          // Missing intermediate dir is a caller bug, but defer the
+          // failure to openSync below for a clearer error.
+        }
+      }
+    }
   }
 
   // Atomic write via O_EXCL temp + rename for both modes.

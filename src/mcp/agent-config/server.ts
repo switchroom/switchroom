@@ -50,13 +50,20 @@ export function execCli(args: string[]): ExecResult {
 }
 
 /** PR A: like `execCli` but pipes `stdin` text in for skill create/edit
- *  bodies that are too large for argv. */
+ *  bodies that are too large for argv.
+ *
+ *  Timeout: 30s (vs. execCli's 15s). The stdin path handles up to 2 MiB
+ *  skill bundles, and on a loaded box the JSON.parse + per-file
+ *  validation + atomic temp-dir + per-component lstat walk + fsync on
+ *  rename can chew through more than 15s before the CLI exits cleanly.
+ *  We'd rather wait than spuriously kill a legitimate skill_create. */
 export function spawnSyncWithStdin(args: string[], stdin: string): ExecResult {
   const r = spawnSync(CLI_BIN, args, {
     encoding: "utf-8",
     env: process.env,
-    timeout: 15000,
+    timeout: 30000,
     input: stdin,
+    maxBuffer: 8 * 1024 * 1024,
   });
   return {
     stdout: r.stdout ?? "",
@@ -300,7 +307,10 @@ export const TOOLS = [
       "Edit a single file within an existing agent-scope skill " +
       "(scope=agent). Atomic single-file write. Requires `version` (an " +
       "opaque token returned by `skill_read`) for optimistic " +
-      "concurrency — mismatch returns E_SKILL_VERSION_STALE. If " +
+      "concurrency — mismatch returns E_SKILL_VERSION_STALE. Token is " +
+      "per-skill, not per-file — any change anywhere in the skill bumps " +
+      "it. Re-read (via `skill_read`) before retrying on " +
+      "E_SKILL_VERSION_STALE. If " +
       "editing SKILL.md, frontmatter is re-validated. Path allowlist " +
       "and 256 KiB / 2 MiB / 50-file limits enforced. Refused from " +
       "cron-fired turns. Error codes: E_SKILL_NOT_FOUND, " +

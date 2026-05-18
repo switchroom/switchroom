@@ -34,7 +34,10 @@ describe("agent-config-skill-author (PR A)", () => {
 
   beforeEach(() => {
     root = mkRoot();
-    delete process.env.SWITCHROOM_AGENT_NAME;
+    // Identity-pin: most tests exercise same-agent writes, so pin to
+    // AGENT by default. The B1 cross-agent tests below clear/reset
+    // this env explicitly.
+    process.env.SWITCHROOM_AGENT_NAME = AGENT;
     delete process.env.SWITCHROOM_TURN_SOURCE;
   });
   afterEach(() => {
@@ -218,6 +221,84 @@ describe("agent-config-skill-author (PR A)", () => {
     if (r.ok) return;
     expect(r.code).toBe("E_SKILL_INVALID_PATH");
     expect(existsSync(dir)).toBe(true); // still there
+  });
+
+  it("B1: refuses cross-agent write when env-pin is unset", () => {
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    expect(process.env.SWITCHROOM_AGENT_NAME).toBeUndefined();
+    const r = skillCreate({
+      agent: "victim",
+      name: "evil",
+      files: { "SKILL.md": validSkillMd("evil") },
+      root,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_AGENT_PIN_REQUIRED");
+    expect(r.exit).toBe(16);
+  });
+
+  it("B1: refuses cross-agent write when env-pin mismatches", () => {
+    process.env.SWITCHROOM_AGENT_NAME = "alice";
+    const r = skillCreate({
+      agent: "victim",
+      name: "evil",
+      files: { "SKILL.md": validSkillMd("evil") },
+      root,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_AGENT_PIN_REQUIRED");
+  });
+
+  it("B1: allows write when --agent matches env-pin", () => {
+    process.env.SWITCHROOM_AGENT_NAME = AGENT;
+    const r = skillCreate({
+      agent: AGENT,
+      name: "ok",
+      files: { "SKILL.md": validSkillMd("ok") },
+      root,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("B1: refuses skillEdit / skillRead / skillDelete cross-agent too", () => {
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    expect(process.env.SWITCHROOM_AGENT_NAME).toBeUndefined();
+    const opts = { agent: "victim", name: "x", root };
+    const e = skillEdit({ ...opts, file: "SKILL.md", content: "x", version: "1" });
+    expect(e.ok).toBe(false);
+    if (!e.ok) expect(e.code).toBe("E_AGENT_PIN_REQUIRED");
+    const r = skillRead(opts);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("E_AGENT_PIN_REQUIRED");
+    const d = skillDelete(opts);
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.code).toBe("E_AGENT_PIN_REQUIRED");
+  });
+
+  it("B2: refuses create when a parent component is a symlink", () => {
+    // Pre-create scope root with a real subdir, then swap the
+    // .claude/skills dir for a symlink pointing outside.
+    const skillsRoot = join(root, AGENT, ".claude", "skills");
+    mkdirSync(skillsRoot, { recursive: true });
+    // Swap .claude/skills itself for a symlink to an outside dir.
+    const outside = join(root, "_attacker_target");
+    mkdirSync(outside);
+    rmSync(skillsRoot, { recursive: true, force: true });
+    symlinkSync(outside, skillsRoot);
+    const r = skillCreate({
+      agent: AGENT,
+      name: "trojan",
+      files: { "SKILL.md": validSkillMd("trojan") },
+      root,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("E_SKILL_INVALID_PATH");
+    // The outside dir must remain empty (no files leaked through).
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    expect(readdirSync(outside).length).toBe(0);
   });
 
   it("rejects create when dir already exists", () => {
