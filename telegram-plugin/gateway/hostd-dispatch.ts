@@ -125,6 +125,44 @@ export function hostdRequestId(prefix: string): string {
 }
 
 /**
+ * Single-shot `get_status` snapshot for `targetRequestId` (NOT a
+ * poll-until-terminal — {@link pollHostdStatus} does that). Used by
+ * the framework silence-fallback to render a deterministic in-flight
+ * status line. Returns `"not-configured"` (hostd off / socket absent)
+ * or `"unavailable"` (wire error / hostd couldn't answer) so the
+ * caller can cleanly fall back to the generic fallback text — never
+ * throws, never blocks the fallback.
+ */
+export async function hostdGetStatusOnce(
+  agentName: string,
+  targetRequestId: string,
+): Promise<HostdResponse | "not-configured" | "unavailable"> {
+  if (!isHostdEnabled()) return "not-configured";
+  const sockPath = hostdSocketPath(agentName);
+  if (!existsSync(sockPath)) return "not-configured";
+  try {
+    const resp = await hostdRequest(
+      { socketPath: sockPath, timeoutMs: 3000 },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: hostdRequestId("gw-poke-status"),
+        args: { target_request_id: targetRequestId },
+      },
+    );
+    // hostd answered but couldn't resolve the entry → treat as
+    // unavailable so we degrade to the generic fallback, not a
+    // confusing "error" status line.
+    if (resp.result === "denied" || resp.result === "error") {
+      return "unavailable";
+    }
+    return resp;
+  } catch {
+    return "unavailable";
+  }
+}
+
+/**
  * Poll hostd's `get_status` verb until the target request reaches a
  * terminal state (`completed` / `error` / `denied`) or the caller's
  * timeout elapses.

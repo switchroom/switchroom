@@ -233,9 +233,11 @@ import {
   hostdRequestId,
   hostdWillBeUsed,
   pollHostdStatus,
+  hostdGetStatusOnce,
   warnLegacySpawnIfHostdDisabled,
   _resetHostdEnabledCache,
 } from './hostd-dispatch.js'
+import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
@@ -2567,22 +2569,50 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
 // the framework itself sends a user-visible "still working… / still
 // thinking…" message. Honours SWITCHROOM_DISABLE_SILENCE_POKE=1 kill
 // switch (no-op if set).
+// Set when this gateway dispatches an `update_apply` to hostd that
+// returns `started`; cleared when the dispatch poll resolves (terminal
+// / not-configured / timeout). While set, the framework silence
+// fallback substitutes hostd's real phase + elapsed for the generic
+// "still working…" text — deterministic, model-free, the klanker
+// incident fix. In-memory only; a gateway recreate naturally resets it.
+let inFlightUpdate: { requestId: string; startedAt: number } | null = null
+
 silencePoke.startTimer({
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
   },
   onFrameworkFallback: async (ctx) => {
-    // Wording is load-bearing — extracted to `formatFrameworkFallbackText`
-    // in `silence-poke.ts` so it can be snapshot-tested in isolation
-    // (CC-4 in `docs/status-ask-cause-classes.md`). Derives "N min" suffix
-    // from `ctx.silenceMs` so the wording stays honest if the 300s
-    // threshold is tuned.
-    const text = silencePoke.formatFrameworkFallbackText(
-      ctx.fallbackKind,
-      ctx.silenceMs,
-      ctx.inFlightTools,
-    )
+    // Deterministic in-flight update status (klanker incident). If this
+    // gateway dispatched an update_apply that's still running, the
+    // recurring framework fallback carries hostd's REAL phase + elapsed
+    // instead of the content-free "still working…". No model: pure
+    // get_status snapshot → pure formatter. Any hostd unavailability
+    // degrades silently to the existing generic text (zero regression).
+    let text: string | null = null
+    const upd = inFlightUpdate
+    if (upd != null) {
+      try {
+        const st = await hostdGetStatusOnce(getMyAgentName(), upd.requestId)
+        if (st !== 'not-configured' && st !== 'unavailable') {
+          text = formatUpdateStatusLine(st, upd.startedAt, Date.now())
+        }
+      } catch {
+        /* degrade to generic fallback below */
+      }
+    }
+    if (text == null) {
+      // Wording is load-bearing — extracted to `formatFrameworkFallbackText`
+      // in `silence-poke.ts` so it can be snapshot-tested in isolation
+      // (CC-4 in `docs/status-ask-cause-classes.md`). Derives "N min" suffix
+      // from `ctx.silenceMs` so the wording stays honest if the 300s
+      // threshold is tuned.
+      text = silencePoke.formatFrameworkFallbackText(
+        ctx.fallbackKind,
+        ctx.silenceMs,
+        ctx.inFlightTools,
+      )
+    }
     try {
       await robustApiCall(
         () => bot.api.sendMessage(ctx.chatId, text, {
@@ -8594,6 +8624,10 @@ bot.command('update', async ctx => {
     return
   }
   if (hostdResp.result === 'started') {
+    // Mark in-flight so the framework silence fallback renders hostd's
+    // real phase + elapsed (deterministic, model-free) instead of the
+    // content-free "still working…" — the klanker incident fix.
+    inFlightUpdate = { requestId: updateRequestId, startedAt: Date.now() }
     // RFC C §5.3: long-running mutation. Poll get_status until terminal
     // or until the recreate kills this gateway (whichever happens first).
     // The success signal is the post-restart greeting card edited into
@@ -8602,6 +8636,7 @@ bot.command('update', async ctx => {
     // doesn't leave the operator staring at the orphan "🚀 update started"
     // ack indefinitely. Live repro: PR #1305.
     void (async () => {
+     try {
       // 60s budget: RFC C §5.3 specs `apply` at 30s and `update_apply`
       // at 60s. Image pulls + scaffold regeneration dominate the wall
       // clock for update_apply, hence the larger budget. The poll
@@ -8648,6 +8683,11 @@ bot.command('update', async ctx => {
           await switchroomReply(ctx, editedText, { html: true })
         } catch {}
       }
+     } finally {
+       // Poll resolved (terminal / completed / not-configured /
+       // timeout) — stop substituting in-flight update status.
+       inFlightUpdate = null
+     }
     })()
     return
   }
