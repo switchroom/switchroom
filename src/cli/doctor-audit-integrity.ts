@@ -29,7 +29,7 @@ import { readFileSync as fsReadFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { verifyAuditChain, CHAIN_GENESIS } from "../util/audit-hashchain.js";
+import { verifyAuditLog } from "../util/audit-hashchain.js";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 
@@ -61,21 +61,6 @@ function rootWrittenLogs(home: string): LogTarget[] {
       path: join(home, ".switchroom", "host-control-audit.log"),
     },
   ];
-}
-
-/** True when the first non-empty row carries the chain fields. A
- *  wholly-unchained file is a pre-#1433 legacy log, not tampering. */
-function looksChained(text: string): boolean {
-  for (const raw of text.split("\n")) {
-    if (raw.length === 0) continue;
-    try {
-      const o = JSON.parse(raw) as { _seq?: unknown };
-      return typeof o._seq === "number";
-    } catch {
-      return false; // first row not JSON → let verify report it
-    }
-  }
-  return false;
 }
 
 export function runAuditIntegrityChecks(
@@ -110,29 +95,40 @@ export function runAuditIntegrityChecks(
       continue;
     }
 
-    if (!looksChained(text)) {
+    const v = verifyAuditLog(text);
+    const preamble =
+      v.legacyRows > 0
+        ? `${v.legacyRows} pre-#1433 legacy preamble row(s) + `
+        : ``;
+    const restarts =
+      v.segments > 1
+        ? ` across ${v.segments} segment(s) (${v.segments - 1} broker restart re-anchor(s))`
+        : ``;
+
+    if (v.state === "legacy") {
       results.push({
         name: `${label} audit tamper-evidence`,
         status: "warn",
-        detail: `${path} is present but its rows are NOT hash-chained — this is a pre-#1433 legacy log; tamper-evidence is inactive until the post-#1433 ${label} image is deployed`,
+        detail: `${path} is present but NO rows are hash-chained — this is a pre-#1433 legacy log; tamper-evidence is inactive until the post-#1433 ${label} image is deployed`,
         fix: `Run \`switchroom update\` to roll the ${label} image forward (#1433 added the chain). Expected during the rollout window; not itself a tamper signal.`,
       });
-      continue;
-    }
-
-    const v = verifyAuditChain(text, CHAIN_GENESIS);
-    if (v.ok) {
+    } else if (v.state === "ok") {
       results.push({
         name: `${label} audit chain valid`,
         status: "ok",
-        detail: `${v.rows} rows, hash chain intact from genesis`,
+        detail: `${preamble}${v.chainedRows} hash-chained row(s)${restarts}, every row self-consistent (tamper-evidence active)`,
       });
     } else {
+      // state === "tampered": a chained row's _hash ≠ recompute (or a
+      // non-JSON / chain-stripped row inside the chained region). A
+      // broker restart can NEVER cause this (its re-anchored rows are
+      // still self-hashed) — so this is a genuine WS10-F2 signal, not
+      // a benign re-anchor.
       results.push({
         name: `${label} audit chain BROKEN`,
         status: "fail",
-        detail: `${path}: chain breaks at row ${v.brokenAtLine} — ${v.reason}. A row was edited, deleted, reordered, or the head was truncated (WS10-F2 tamper signal).`,
-        fix: `Treat the ${label} audit trail as compromised from row ${v.brokenAtLine} onward. Preserve the file for forensics; investigate host/broker compromise before trusting subsequent rows.`,
+        detail: `${path}: tamper detected at file line ${v.brokenAtLine} — ${v.reason} (WS10-F2: a row was forensically rewritten). ${preamble}${v.chainedRows} prior chained row(s) verified.`,
+        fix: `Treat the ${label} audit trail as compromised at/after file line ${v.brokenAtLine}. Preserve the file for forensics; investigate host/broker compromise before trusting subsequent rows.`,
       });
     }
   }
