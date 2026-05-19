@@ -250,6 +250,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
 import { createInboundSpool } from './inbound-spool.js'
+import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
@@ -3011,6 +3012,23 @@ silencePoke.startTimer({
     // for this chat starts a fresh turn instead of queueing forever.
     silencePoke.endTurn(fbKey)
     purgeReactionTracking(fbKey)
+    // Defense-in-depth: the fallback's purgeReactionTracking above
+    // clears the canonical statusKey(chatId, threadId) for fbKey
+    // only. activeTurnStartedAt can hold sibling entries for the
+    // SAME chat (different threads, or a `null` vs `undefined`-thread
+    // variant left over from a normal turn-end path that nulled
+    // currentTurn without invoking purgeReactionTracking — the
+    // gymbro/klanker held-mid-turn symptom, 2026-05-20). Any sibling
+    // for fbChatId is by definition stale when THIS fallback fires
+    // (the chat has been silent ≥5 min); sweep them via the same
+    // purger. Multi-chat-safe — only touches keys for fbChatId, so
+    // #1546's intentional cross-chat safety guard is preserved.
+    // See turn-state-purge.ts.
+    const fbExtraPurge = purgeStaleTurnsForChat(
+      fbChatId,
+      activeTurnStartedAt.keys(),
+      purgeReactionTracking,
+    )
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
     // (or never does), the handler's `const turn = currentTurn` snapshot
@@ -3044,7 +3062,8 @@ silencePoke.startTimer({
       `chat=${fbChatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
       `currentTurn_nulled=${turnMatchesFallback} ` +
       `drained_buffered=${fbRedeliver.redelivered}/${fbRedeliver.drained}` +
-      `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}\n`,
+      `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}` +
+      `${fbExtraPurge.purged.length > 0 ? ` extra_keys_purged=${fbExtraPurge.purged.length}` : ''}\n`,
     )
   },
 })
