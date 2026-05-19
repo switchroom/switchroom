@@ -3070,6 +3070,7 @@ const inboundSpool = STATIC
         appendFileSync: (p, d) => appendFileSync(p, d),
         readFileSync: (p) => readFileSync(p, 'utf8'),
         writeFileSync: (p, d) => writeFileSync(p, d),
+        renameSync: (a, b) => renameSync(a, b),
         existsSync: (p) => existsSync(p),
         statSizeSync: (p) => statSync(p).size,
       },

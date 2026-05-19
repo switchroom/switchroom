@@ -71,6 +71,9 @@ export interface InboundSpoolFsSeam {
   appendFileSync: (path: string, data: string) => void
   readFileSync: (path: string) => string
   writeFileSync: (path: string, data: string) => void
+  /** Atomic same-dir replace (POSIX rename). Used so compaction can't
+   *  lose entries to a crash mid-rewrite. */
+  renameSync: (from: string, to: string) => void
   existsSync: (path: string) => boolean
   statSizeSync: (path: string) => number
 }
@@ -194,20 +197,27 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     }
     if (size <= compactAtBytes) return
     // Rewrite the file as exactly the current live set (one put per
-    // live id, no acks). Crash-safe enough for a spool: a crash mid-
-    // rewrite loses at worst the compaction (the pre-compaction file
-    // is replaced in a single writeFileSync); replay still works off
-    // whatever landed because every surviving line is self-contained.
+    // live id, no acks). ATOMIC: write a sibling tmp then rename over
+    // the real path. rename(2) is atomic within a filesystem, so a
+    // crash at any point leaves EITHER the full pre-compaction log OR
+    // the full compacted log on disk — never a truncated/torn file
+    // that loses live entries after the tear. (Plain writeFileSync is
+    // not atomic; a crash mid-write of a >256 KiB rewrite could drop
+    // entries past the tear — the residual the reviewer flagged.)
     const lines: string[] = []
     for (const [id, e] of live) {
       lines.push(
         JSON.stringify({ t: 'put', id, agent: e.agent, msg: e.msg, firstAt: e.firstAt } satisfies SpoolRecord),
       )
     }
+    const tmp = path + '.compact.tmp'
     try {
-      fs.writeFileSync(path, lines.length ? lines.join('\n') + '\n' : '')
+      fs.writeFileSync(tmp, lines.length ? lines.join('\n') + '\n' : '')
+      fs.renameSync(tmp, path)
       log(`inbound-spool: compacted path=${path} live=${live.size}\n`)
     } catch (err) {
+      // Compaction is opportunistic — a failure keeps the (larger but
+      // correct) append-only log; never lose data trying to shrink it.
       log(`inbound-spool: compact FAILED path=${path}: ${(err as Error).message}\n`)
     }
   }

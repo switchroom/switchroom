@@ -32,23 +32,21 @@ function msg(over: Partial<InboundMessage> = {}): InboundMessage {
   } as InboundMessage
 }
 
-/** In-memory fake fs. Models append-only + full rewrite. */
-function fakeFs(): InboundSpoolFsSeam & { dump(): string } {
-  let store = ''
-  let exists = false
+/** In-memory fake fs keyed by path. Models append, full rewrite, and
+ *  atomic rename (so the tmp→rename compaction path is exercised). */
+function fakeFs(): InboundSpoolFsSeam & { dump(p?: string): string } {
+  const files = new Map<string, string>()
   return {
-    appendFileSync: (_p, d) => {
-      store += d
-      exists = true
+    appendFileSync: (p, d) => files.set(p, (files.get(p) ?? '') + d),
+    readFileSync: (p) => files.get(p) ?? '',
+    writeFileSync: (p, d) => files.set(p, d),
+    renameSync: (from, to) => {
+      files.set(to, files.get(from) ?? '')
+      files.delete(from)
     },
-    readFileSync: () => store,
-    writeFileSync: (_p, d) => {
-      store = d
-      exists = true
-    },
-    existsSync: () => exists,
-    statSizeSync: () => Buffer.byteLength(store),
-    dump: () => store,
+    existsSync: (p) => files.has(p),
+    statSizeSync: (p) => Buffer.byteLength(files.get(p) ?? ''),
+    dump: (p = PATH) => files.get(p) ?? '',
   }
 }
 
@@ -207,5 +205,25 @@ describe('inbound-spool — robustness', () => {
     expect(s2.liveCount()).toBe(1)
     expect(s2.liveEntries()[0].msg.messageId).toBe(999)
     expect(fs.dump().split('\n').filter(Boolean).length).toBeLessThan(5)
+  })
+
+  it('atomic compaction: a rename crash leaves the ORIGINAL log intact (no loss)', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs, compactAtBytes: 200 })
+    for (let i = 1; i <= 10; i++) {
+      s.put('a', msg({ messageId: i, text: 'y'.repeat(50) }))
+    }
+    // Simulate a crash AFTER the tmp write but BEFORE/at the rename.
+    fs.renameSync = () => {
+      throw new Error('crash mid-compact')
+    }
+    s.put('a', msg({ messageId: 11, text: 'y'.repeat(50) })) // triggers maybeCompact → rename throws
+    // Original append-only log must still hold every live entry — the
+    // failed compaction is a no-op, never a truncation.
+    const s2 = createInboundSpool({ path: PATH, fs })
+    expect(s2.liveCount()).toBe(11)
+    expect(s2.liveEntries().map((e) => e.msg.messageId)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ])
   })
 })
