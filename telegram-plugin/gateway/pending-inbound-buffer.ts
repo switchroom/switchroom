@@ -30,6 +30,7 @@
  */
 
 import type { InboundMessage } from './ipc-protocol.js'
+import type { InboundSpool } from './inbound-spool.js'
 
 /** Default cap per agent. Tuned for `should fit a reasonable backlog of
  *  approval cards stacked while bridge is offline` but no more. */
@@ -52,6 +53,19 @@ export interface PendingInboundBuffer {
 export interface PendingInboundBufferOptions {
   capPerAgent?: number
   log?: (line: string) => void
+  /**
+   * Durable spool. When set, every `push` is also recorded on the
+   * persistent per-agent volume so a gateway/container restart cannot
+   * silently lose the message (the finn/carrie incident class). The
+   * in-memory queue stays the hot path + cap; the spool is the
+   * crash-survivable record, acked only on confirmed delivery (by
+   * `redeliverBufferedInbound`/`idleDrainTick`), boot-replayed by the
+   * gateway, and escalated-then-dropped if undeliverable past its
+   * bound. The in-memory cap eviction does NOT touch the spool — an
+   * evicted-from-memory entry survives in the spool (strictly safer
+   * than the old silent in-memory drop).
+   */
+  spool?: InboundSpool
 }
 
 /**
@@ -72,6 +86,7 @@ export function redeliverBufferedInbound(
   buffer: PendingInboundBuffer,
   agent: string,
   send: (msg: InboundMessage) => boolean,
+  spool?: InboundSpool,
 ): { drained: number; redelivered: number; rebuffered: number } {
   const pending = buffer.drain(agent)
   let redelivered = 0
@@ -85,6 +100,11 @@ export function redeliverBufferedInbound(
     }
     if (delivered) {
       redelivered++
+      // Confirmed delivery to a live registered bridge → the durable
+      // promise is kept; tombstone the spool entry so it is NOT
+      // boot-replayed again. A miss leaves it spooled (re-pushed below
+      // AND still live in the spool) for the next drain / escalation.
+      spool?.ack(msg)
     } else {
       buffer.push(agent, msg)
       rebuffered++
@@ -129,11 +149,12 @@ export function idleDrainTick(
   agent: string,
   isBridgeAlive: () => boolean,
   send: (msg: InboundMessage) => boolean,
+  spool?: InboundSpool,
 ): { drained: number; redelivered: number; rebuffered: number } | null {
   if (!agent) return null
   if (buffer.depth(agent) === 0) return null
   if (!isBridgeAlive()) return null
-  return redeliverBufferedInbound(buffer, agent, send)
+  return redeliverBufferedInbound(buffer, agent, send, spool)
 }
 
 export function createPendingInboundBuffer(
@@ -141,6 +162,7 @@ export function createPendingInboundBuffer(
 ): PendingInboundBuffer {
   const cap = opts.capPerAgent ?? DEFAULT_PENDING_INBOUND_CAP
   const log = opts.log ?? ((line: string) => process.stderr.write(line))
+  const spool = opts.spool
   const queues = new Map<string, InboundMessage[]>()
 
   return {
@@ -160,6 +182,12 @@ export function createPendingInboundBuffer(
         )
       }
       q.push(msg)
+      // Durable record FIRST-class to the in-memory queue: spool BEFORE
+      // returning, regardless of the cap eviction above — an entry the
+      // in-memory cap drops still survives in the spool (boot-replayed /
+      // escalated), which is the whole point. spool.put dedups by
+      // spoolId so a boot-replay re-push is a no-op here.
+      spool?.put(agent, msg)
       log(
         `pending-inbound-buffer: agent=${agent} buffered source=${msg.meta?.source ?? '-'} ` +
         `depth_after=${q.length} evicted=${evicted}\n`,

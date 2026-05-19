@@ -174,7 +174,12 @@ ALLOWLIST=(
   # lines drifted the chunk-loop raw sends to 3928/3949 (past 3860). End
   # 3860 -> 4000; check flags only 3928/3949 before the next allowlist
   # entry (8100), so no new un-allowlisted call enters the margin.
-  "telegram-plugin/gateway/gateway.ts:3160-4000:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-19 for the durable-inbound-spool feature: the
+  # ~40-line spool construct + boot-replay block (~3057) drifted the
+  # chunk-loop raw sends to 4026/4047 (past 4000). End 4000 -> 4060;
+  # check flags only 4026/4047 before the next entry (8100), so no new
+  # un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:3160-4060:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -249,7 +254,13 @@ ALLOWLIST=(
   # 10814/10837/10861 (past 10760). End 10760 -> 10920; next raw
   # ctx.api call is still far outside (~12700+), so no new
   # un-allowlisted call enters.
-  "telegram-plugin/gateway/gateway.ts:9340-10920:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for the durable-inbound-spool feature: the
+  # ~40-line spool construct + boot-replay block (~3057) drifted the
+  # vault-wizard editMessageText sites to 10935/10958/10982 (past
+  # 10920). End 10920 -> 11000; next raw call is well outside, so no
+  # new un-allowlisted call enters — same already-.catch-swallowed
+  # wizard sites.
+  "telegram-plugin/gateway/gateway.ts:9340-11000:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see
