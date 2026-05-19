@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.12.16 — fix: close the bridge-flap-while-idle inbound-orphan gap + green CI on hindsight-untouched releases
+
+Headline: v0.12.15 made agents self-heal a *wedged-turn* (silence-poke
+fallback flushes the buffer). But a message buffered during a
+bridge-IPC flap that settled with no subsequent clean re-register,
+while the agent was *idle* (no turn → silence-poke never arms), was
+drained by neither path and orphaned until a manual restart (hit on
+`finn`). This adds a third, opportunistic drain trigger so that case
+self-heals too. Also: `docker-images` no longer false-reds on `main`
+for releases that don't rebuild hindsight.
+
+### Changes
+
+#### Fixes
+
+- **fix(gateway):** opportunistic idle-drain of `pendingInboundBuffer`
+  — a 5s `.unref()` timer (new pure, unit-tested `idleDrainTick`)
+  flushes any buffered inbound once the bridge is alive again, closing
+  the bridge-flap-while-idle orphan gap that v0.12.15's wedged-turn
+  self-heal didn't cover. Gated zero-cost / zero-churn: a no-op when
+  the buffer is empty or the bridge is down (never drains into a dead
+  bridge); reuses the lossless `redeliverBufferedInbound` (re-buffers
+  any per-message miss). `onClientRegistered` + the silence-poke
+  paths are unchanged — purely additive. (#1549)
+
+#### CI / build
+
+- **ci(docker-images):** `promote-to-dev` tolerates a missing
+  per-commit `:sha-<short>` source tag. A release that doesn't change
+  hindsight's build context is a 100% buildx cache hit → nothing
+  pushed → the hindsight retag hard-failed → whole `docker-images`
+  run RED on `main` for almost every release (fleet always
+  unaffected: `:latest` is pushed inline by the build jobs). Now
+  gated `needs: [smoke-test, build-hindsight]` so a missing tag
+  provably means cache-hit (never failed build), and only an explicit
+  not-found skips — any other inspect error fails loudly so a
+  transient registry/network error can't silently stall `:dev`. (#1548)
+
 ## v0.12.15 — fix: agents self-heal a post-network-storm wedge (no manual restart)
 
 Headline: an agent that had a turn in flight when the network flapped
