@@ -542,6 +542,34 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
     expect(body.probes.every((p: { state: string }) => p.state === "ok")).toBe(true);
   });
 
+  it("probe commands target the real in-agent paths (regression: auth path)", async () => {
+    // Pin the probe command STRINGS. Live-verify caught the auth probe
+    // checking $CLAUDE_CONFIG_DIR/$HOME (both wrong/empty in-agent) →
+    // false "auth FAIL" fleet-wide; the real cred is
+    // /state/agent/.claude/.credentials.json. Stub-only tests can't
+    // exercise real paths, so assert the literal cmds here.
+    const argsLog = join(tmp, `smoke-args-${Math.random().toString(36).slice(2)}.log`);
+    await withDocker(
+      `#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) echo "$@" >> ${argsLog}; exit 0 ;;\nesac\nexit 0\n`,
+    );
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-paths", args: { name: "klanker" } },
+    );
+    const { readFileSync } = await import("node:fs");
+    const seen = readFileSync(argsLog, "utf8");
+    // auth probe must use the verified real path…
+    expect(seen).toContain("/state/agent/.claude/.credentials.json");
+    // …and must NOT use the old wrong locations.
+    expect(seen).not.toContain("CLAUDE_CONFIG_DIR");
+    expect(seen).not.toContain("$HOME/.claude/.credentials.json");
+    // other probes still key off /state/agent
+    expect(seen).toContain("/state/agent/start.sh");
+    expect(seen).toContain("/state/agent/.mcp.json");
+    expect(seen).toContain("/state/agent/telegram/.env");
+  });
+
   it("cross-agent denied for a non-admin caller", async () => {
     await withDocker('#!/bin/sh\nexit 0\n');
     const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
