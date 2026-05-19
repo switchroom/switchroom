@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -8,6 +8,19 @@ import { resolve } from "node:path";
  * SWITCHROOM_TIMEZONE set, and unset — both need to emit valid JSON and
  * the "unset" branch must surface an in-band WARNING so a stale unit is
  * visible in the agent's context rather than silently falling back to UTC.
+ *
+ * #1563 (de-flake): the original shape ran `runHook` per-test (1–2
+ * shell-outs each, 7 total), each gated by vitest's default 5s test
+ * timeout. Under contended CI shards a cold bash startup occasionally
+ * pushed a single shell-out past 5s, producing a spurious "Test timed
+ * out in 5000ms" on `vitest-shard (4)` (#1560 PR's CI; same class as
+ * other CI-load flakes on this repo). Now: hoist the four distinct
+ * invocations into a single `beforeAll` with an explicit 30s timeout,
+ * and assert on the cached results. Also reduces — though doesn't
+ * eliminate — the back-to-back-bucket-straddle race in test #4 by
+ * running the two reproducibility-pair calls inside the same hook
+ * frame instead of across separate `it` bodies with vitest scheduling
+ * between them.
  */
 const HOOK = resolve(__dirname, "../bin/timezone-hook.sh");
 
@@ -31,9 +44,27 @@ function runHook(env: Record<string, string | undefined>): { stdout: string; jso
   return { stdout, json: JSON.parse(stdout) };
 }
 
+type Sample = { stdout: string; json: unknown };
+
 describe("timezone-hook.sh", () => {
+  // Four distinct invocations cover every assertion in the suite. The
+  // "byte-identical back-to-back" pair (`setMelb`/`setMelb2`) runs in
+  // tight sequence inside this hook so vitest scheduling between
+  // tests can't widen the wall-clock window between the two calls.
+  let setMelb: Sample;
+  let setMelb2: Sample;
+  let unsetTZ: Sample;
+  let setUTC: Sample;
+
+  beforeAll(() => {
+    setMelb = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
+    setMelb2 = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
+    unsetTZ = runHook({ SWITCHROOM_TIMEZONE: undefined });
+    setUTC = runHook({ SWITCHROOM_TIMEZONE: "UTC" });
+  }, 30_000);
+
   it("emits well-formed additionalContext when SWITCHROOM_TIMEZONE is set", () => {
-    const { json } = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
+    const { json } = setMelb;
     expect(json).toMatchObject({
       hookSpecificOutput: {
         hookEventName: "UserPromptSubmit",
@@ -48,7 +79,7 @@ describe("timezone-hook.sh", () => {
   });
 
   it("emits a WARNING-annotated context when SWITCHROOM_TIMEZONE is unset", () => {
-    const { json } = runHook({ SWITCHROOM_TIMEZONE: undefined });
+    const { json } = unsetTZ;
     const ctx = (json as { hookSpecificOutput: { additionalContext: string } })
       .hookSpecificOutput.additionalContext;
     expect(ctx).toMatch(/Current local time:/);
@@ -68,9 +99,11 @@ describe("timezone-hook.sh", () => {
   });
 
   it("produces valid JSON in both branches (no unescaped control chars)", () => {
-    // Just re-parse; the runHook helper already calls JSON.parse.
-    expect(() => runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" })).not.toThrow();
-    expect(() => runHook({ SWITCHROOM_TIMEZONE: undefined })).not.toThrow();
+    // The cached values already round-tripped through JSON.parse() inside
+    // runHook(); re-parse the raw stdout here as a regression guard on
+    // the no-throw contract.
+    expect(() => JSON.parse(setMelb.stdout)).not.toThrow();
+    expect(() => JSON.parse(unsetTZ.stdout)).not.toThrow();
   });
 
   // The hook must round to a 15-minute bucket so the additionalContext
@@ -80,13 +113,11 @@ describe("timezone-hook.sh", () => {
   // but two back-to-back invocations should always land in the same
   // bucket (the 15-min window is far longer than the test runtime).
   it("emits byte-identical stdout for back-to-back invocations (15-min bucket)", () => {
-    const a = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
-    const b = runHook({ SWITCHROOM_TIMEZONE: "Australia/Melbourne" });
-    expect(b.stdout).toBe(a.stdout);
+    expect(setMelb2.stdout).toBe(setMelb.stdout);
   });
 
   it("the embedded HH:MM minute is a multiple of 15", () => {
-    const { json } = runHook({ SWITCHROOM_TIMEZONE: "UTC" });
+    const { json } = setUTC;
     const ctx = (json as { hookSpecificOutput: { additionalContext: string } })
       .hookSpecificOutput.additionalContext;
     // Match "YYYY-MM-DD HH:MM " — the literal minute token after the colon.
