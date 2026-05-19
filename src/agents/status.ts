@@ -661,10 +661,20 @@ export async function probeHindsight(
     if (!initResp.ok) {
       return { reachable: false, bankExists: false, reason: `HTTP ${initResp.status}` };
     }
+    // Hindsight runs STATELESS by design (HINDSIGHT_API_MCP_STATELESS=true) —
+    // a stateless server returns 200 OK on `initialize` but emits NO
+    // `mcp-session-id` header (there is no session to track; every request
+    // is self-contained). The old hard-fail here ("no session id" →
+    // reachable:false) was a false negative: it drove `overall: fail` and
+    // surfaced `hindsight: fail unreachable (no session id)` on every
+    // agent even though the daemon was up and healthy. `initResp.ok`
+    // already proves reachability. Forward the session header only when a
+    // stateful server actually issued one — same fix as #1515 in
+    // src/memory/hindsight.ts.
     const sessionId = initResp.headers.get("mcp-session-id");
-    if (!sessionId) {
-      return { reachable: false, bankExists: false, reason: "no session id" };
-    }
+    const sessionHeader: Record<string, string> = sessionId
+      ? { "mcp-session-id": sessionId }
+      : {};
 
     // list_banks → look for bankId
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
@@ -674,7 +684,7 @@ export async function probeHindsight(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "X-Bank-Id": bankId,
-        "mcp-session-id": sessionId,
+        ...sessionHeader,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
