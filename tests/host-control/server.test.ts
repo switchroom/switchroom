@@ -597,6 +597,68 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
   });
 });
 
+describe("hostd server — operator socket", () => {
+  const ENV = "SWITCHROOM_HOSTD_OPERATOR_UID";
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env[ENV];
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+  });
+
+  async function freshServer(): Promise<void> {
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+  }
+
+  it("is NOT bound when SWITCHROOM_HOSTD_OPERATOR_UID is unset (legacy/test default)", async () => {
+    delete process.env[ENV];
+    await freshServer();
+    expect(server.getBoundPaths().some((p) => p.endsWith("/operator/sock"))).toBe(false);
+  });
+
+  it("is bound when the env is set, and is UNGATED (operator bypasses the admin gate)", async () => {
+    process.env[ENV] = String(process.getuid?.() ?? 1000);
+    await freshServer();
+    const opSock = server.getBoundPaths().find((p) => p.endsWith("/operator/sock"));
+    expect(opSock).toBeDefined();
+
+    // `doctor` is admin-gated for agents. From the operator socket it
+    // must be allowed (kind:"operator" bypasses checkGate).
+    const opResp = await hostdRequest(
+      { socketPath: opSock! },
+      { v: 1, op: "doctor", request_id: "op-doctor" },
+    );
+    expect(opResp.result).toBe("completed");
+
+    // Same verb from the non-admin `bob` per-agent socket → denied.
+    // Proves the operator socket is genuinely a different (ungated)
+    // identity, not just "any socket works".
+    const bobSock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const bobResp = await hostdRequest(
+      { socketPath: bobSock },
+      { v: 1, op: "doctor", request_id: "bob-doctor" },
+    );
+    expect(bobResp.result).toBe("denied");
+  });
+
+  it("skips the operator listener on an invalid (non-positive) env value", async () => {
+    process.env[ENV] = "not-a-number";
+    await freshServer();
+    expect(server.getBoundPaths().some((p) => p.endsWith("/operator/sock"))).toBe(false);
+  });
+});
+
 describe("hostd server — Phase 2 per-agent verbs", () => {
   it("agent_start: self-target allowed even for non-admin", async () => {
     const sock = server

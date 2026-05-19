@@ -83,6 +83,21 @@ describe("renderHostdComposeFile", () => {
     expect(out).toContain("PATH:");
   });
 
+  it("emits SWITCHROOM_HOSTD_OPERATOR_UID only when operatorUid is provided", () => {
+    const without = renderHostdComposeFile({ hostHome: "/h", imageTag: "latest" });
+    expect(without).not.toContain("SWITCHROOM_HOSTD_OPERATOR_UID");
+
+    const withUid = renderHostdComposeFile({
+      hostHome: "/h",
+      imageTag: "latest",
+      operatorUid: 1234,
+    });
+    expect(withUid).toContain('SWITCHROOM_HOSTD_OPERATOR_UID: "1234"');
+    // Still valid env block — sits alongside the existing keys.
+    expect(withUid).toContain("HOME: /host-home");
+    expect(withUid).toContain("SWITCHROOM_CONFIG: /state/config/switchroom.yaml");
+  });
+
   it("byte-deterministic for the same inputs", () => {
     const a = renderHostdComposeFile({ hostHome: "/h", imageTag: "v1" });
     const b = renderHostdComposeFile({ hostHome: "/h", imageTag: "v1" });

@@ -353,6 +353,55 @@ export class HostdServer {
         }
         this.servers.set(sockPath, server);
       }
+
+      // Operator socket — host-shell reachable. Without this, hostd is
+      // ONLY reachable agent→hostd (per-agent sockets are agent-UID-
+      // owned 0660); the host operator's `switchroom doctor` etc. have
+      // no transport. Mirrors the vault-broker / auth-broker operator-
+      // listener pattern: bind `<hostdDir>/operator/sock`, mode 0600,
+      // chowned to the operator UID. peercred maps this path to
+      // kind:"operator" and checkGate leaves it ungated (the operator
+      // IS root-equivalent on its own host). Inside the try so the
+      // partial-bind teardown covers it. No-op when the operator UID
+      // env is unset (tests / a legacy compose without it) — same
+      // posture as the broker.
+      const opUidStr = process.env.SWITCHROOM_HOSTD_OPERATOR_UID;
+      if (opUidStr !== undefined) {
+        const opUid = Number.parseInt(opUidStr, 10);
+        if (!Number.isFinite(opUid) || opUid <= 0) {
+          process.stderr.write(
+            `hostd: SWITCHROOM_HOSTD_OPERATOR_UID='${opUidStr}' is not a positive integer; skipping operator listener\n`,
+          );
+        } else {
+          const dir = join(hostdDir, "operator");
+          const sockPath = join(dir, "sock");
+          await mkdir(dir, { recursive: true });
+          await chmod(dir, 0o755).catch(() => undefined);
+          if (existsSync(sockPath)) await unlink(sockPath).catch(() => undefined);
+          const server = createServer((socket) =>
+            this.onConnection(socket, sockPath),
+          );
+          server.on("error", (err) => {
+            process.stderr.write(
+              `hostd: server error on ${sockPath}: ${err.message}\n`,
+            );
+          });
+          await new Promise<void>((resolve, reject) => {
+            server.listen(sockPath, () => resolve());
+            server.once("error", reject);
+          });
+          // 0600 (not 0660 like the per-agent sockets): operator-only.
+          await chmod(sockPath, 0o600).catch(() => undefined);
+          if (process.platform === "linux" && !this.opts.allowNonLinux) {
+            await chown(sockPath, opUid, opUid).catch((err) => {
+              process.stderr.write(
+                `hostd: chown(${sockPath}, uid=${opUid}): ${(err as Error).message}\n`,
+              );
+            });
+          }
+          this.servers.set(sockPath, server);
+        }
+      }
     } catch (err) {
       await this.stop();
       throw err;
