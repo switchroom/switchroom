@@ -1177,7 +1177,14 @@ export class HostdServer {
     const PROBES: { name: string; cmd: string }[] = [
       {
         name: "auth",
-        cmd: 'test -s "$CLAUDE_CONFIG_DIR/.credentials.json" || test -s "$HOME/.claude/.credentials.json"',
+        // The agent's claude state dir is /state/agent/.claude — NOT
+        // $HOME/.claude (HOME=/state/agent/home) and CLAUDE_CONFIG_DIR
+        // is unset in-container. Verified live: the OAuth credential
+        // is /state/agent/.claude/.credentials.json. Probing the
+        // $HOME/$CLAUDE_CONFIG_DIR paths gave a false "auth FAIL" for
+        // every (healthy, Telegram-serving) agent. Match the other
+        // probes, which already key off /state/agent.
+        cmd: "test -s /state/agent/.claude/.credentials.json",
       },
       {
         name: "scheduler",
