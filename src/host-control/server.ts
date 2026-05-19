@@ -1097,10 +1097,18 @@ export class HostdServer {
       );
     }
     const container = `switchroom-${req.args.name}`;
-    // #1401: `--` terminates docker's own option parsing, so no
-    // user-supplied argv element can be reinterpreted as a `docker
-    // exec` flag (-e / -u / -w / --privileged / --entrypoint, …).
-    const res = await this.runDocker(["exec", container, "--", ...req.args.argv]);
+    // No `--`. Unlike `docker run`, `docker exec` stops parsing its
+    // OWN options at CONTAINER: every token after the container name
+    // is the command/args. Verified against real docker —
+    // `docker exec C -e X cmd` execs a program literally named "-e"
+    // (it is NOT read as --env). So the #1401 concern (argv[0]
+    // reinterpreted as a docker flag) cannot occur for `docker exec`;
+    // and a literal `--` is actively harmful — docker exec tries to
+    // exec a binary named "--" → "executable file not found" / exit
+    // 127. The prior `--` silently broke EVERY real agent_exec; it
+    // was only ever exercised against a docker STUB in tests, which
+    // didn't model real docker's post-CONTAINER argv handling.
+    const res = await this.runDocker(["exec", container, ...req.args.argv]);
     return {
       v: 1,
       request_id: req.request_id,
@@ -1130,8 +1138,9 @@ export class HostdServer {
     req: Extract<HostdRequest, { op: "agent_smoke" }>,
     started: number,
   ): Promise<HostdResponse> {
-    // req.args.name is AgentNameSchema-validated at decode; passed as
-    // its own argv element (+ `--`) so it can't be a docker flag.
+    // req.args.name is AgentNameSchema-validated at decode and passed
+    // as its own argv element; docker exec stops parsing its options
+    // at CONTAINER so nothing after it is read as a docker flag.
     const container = `switchroom-${req.args.name}`;
     type Probe = { name: string; state: "ok" | "fail" | "skip"; detail: string };
     const respond = (
@@ -1207,10 +1216,12 @@ export class HostdServer {
     const probes: Probe[] = await Promise.all(
       PROBES.map(async (p): Promise<Probe> => {
         try {
+          // No `--`: docker exec stops option-parsing at CONTAINER
+          // (see handleAgentExec) — a literal `--` is exec'd as the
+          // command → exit 127. p.cmd is a fixed literal anyway.
           const r = await this.runDocker([
             "exec",
             container,
-            "--",
             "sh",
             "-lc",
             p.cmd,

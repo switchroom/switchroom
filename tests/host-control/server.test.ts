@@ -520,7 +520,12 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
 
   it("running container, all probes pass → completed, exit 0, every probe ok", async () => {
     await withDocker(
-      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) exit 0 ;;\nesac\nexit 0\n',
+      // exec) models real docker: a literal `--` as the command
+      // position (docker exec C -- ...) is exec'd as a binary named
+      // "--" → 127. Guards against re-introducing the cargo-culted
+      // `docker run`-style `--` (the bug that broke prod, masked
+      // because the old stub ignored argv past $1).
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) [ "$3" = "--" ] && { echo \'exec: "--": not found\' >&2; exit 127; }; exit 0 ;;\nesac\nexit 0\n',
     );
     const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
     const resp = await hostdRequest(
@@ -550,7 +555,12 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
 
   it("self-target allowed for a non-admin caller", async () => {
     await withDocker(
-      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) exit 0 ;;\nesac\nexit 0\n',
+      // exec) models real docker: a literal `--` as the command
+      // position (docker exec C -- ...) is exec'd as a binary named
+      // "--" → 127. Guards against re-introducing the cargo-culted
+      // `docker run`-style `--` (the bug that broke prod, masked
+      // because the old stub ignored argv past $1).
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) [ "$3" = "--" ] && { echo \'exec: "--": not found\' >&2; exit 127; }; exit 0 ;;\nesac\nexit 0\n',
     );
     const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
     const resp = await hostdRequest(
@@ -581,7 +591,7 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
     // exec echoes a fake secret then exits 1 — the handler must never
     // surface stdout (probes are exit-code only).
     await withDocker(
-      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) echo "FAKE-SECRET-LEAK-XYZ"; exit 1 ;;\nesac\nexit 0\n',
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) [ "$3" = "--" ] && { echo \'exec: "--": not found\' >&2; exit 127; }; echo "FAKE-SECRET-LEAK-XYZ"; exit 1 ;;\nesac\nexit 0\n',
     );
     const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
     const resp = await hostdRequest(
@@ -1059,12 +1069,17 @@ describe("hostd server — Phase 2 fleet mutations + lock", () => {
       },
     );
     expect(resp.result).toBe("completed");
-    // #1401: `--` separates the fixed `docker exec <container>` prefix
-    // from caller-supplied argv so no element can be reparsed as a
-    // docker flag.
+    // NO `--`: `docker exec` stops parsing its own options at
+    // CONTAINER, so caller argv after the container name can't be
+    // reparsed as a docker flag (the #1401 concern doesn't apply to
+    // `docker exec`). A literal `--` would be exec'd as a binary
+    // named "--" → 127, which silently broke every real agent_exec
+    // until this fix (the old stub ignored argv past $1 so tests
+    // never caught it). This pins the corrected invocation.
     expect(resp.stdout_tail).toContain(
-      "docker: exec switchroom-bob -- ls -la /state",
+      "docker: exec switchroom-bob ls -la /state",
     );
+    expect(resp.stdout_tail).not.toContain(" -- ");
   });
 
   it("agent_exec: argv element with a newline/NUL/CR is denied (#1401)", async () => {
