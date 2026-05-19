@@ -50,6 +50,7 @@ import {
   requestApproval,
   lookupDecision,
   consumeNonce,
+  consumeAndRecord,
   revokeDecision,
   listDecisions,
   recordDecision,
@@ -484,6 +485,45 @@ function handleRequest(
       ttl_ms: req.ttl_ms ?? undefined,
     });
     socket.write(encodeResponse({ ok: true, decision_id }));
+    return;
+  }
+  if (req.op === "approval_consume_record") {
+    // Atomic consume+record (PR-6). ACL EXACTLY mirrors approval_consume
+    // (not approval_record): this op BURNS the nonce, so a null peek
+    // must fall through to the non-committal {consumed:false} rather
+    // than approval_record's BAD_REQUEST "unknown request_id" — the
+    // latter would be a cross-agent existence oracle on a burning op
+    // (regresses kernel-listener-acl). Listener identity is bind-time
+    // (`agent`), never from the wire. Operator socket can't reach this:
+    // OPERATOR_ALLOWED_OPS is deny-by-default and gates earlier.
+    const peek = getNonce(db, req.request_id);
+    if (peek !== null) {
+      const acl = checkApprovalAclByAgent(agent, peek.agent_unit);
+      if (!acl.allow) {
+        socket.write(encodeResponse(errorResponse("DENIED", "approval_consume_record denied: nonce does not belong to the calling agent")));
+        return;
+      }
+    }
+    const res = consumeAndRecord(db, {
+      request_id: req.request_id,
+      decision: req.decision,
+      approver_set: req.approver_set,
+      granted_by_user_id: req.granted_by_user_id,
+      ttl_ms: req.ttl_ms ?? undefined,
+    });
+    if (!res.consumed) {
+      socket.write(encodeResponse({ ok: true, consumed: false }));
+      return;
+    }
+    socket.write(encodeResponse({
+      ok: true,
+      consumed: true,
+      decision_id: res.decision_id,
+      agent_unit: res.nonce.agent_unit,
+      scope: res.nonce.scope,
+      action: res.nonce.action,
+      why: res.nonce.why,
+    }));
     return;
   }
   if (req.op === "approval_list") {

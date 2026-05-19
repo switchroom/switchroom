@@ -136,3 +136,16 @@ the gateway by writing directly to the broker's grants DB through a
 side channel (or by adding `approval_record` later). The kernel's
 internal `recordDecision` function is exported so a future
 `approval_record` RPC handler can call it without code duplication.
+
+> **PR-6 update.** Both anticipated steps shipped: `approval_record`
+> landed, then the two-RPC split (`approval_consume` → `approval_record`)
+> was fused into a single atomic `approval_consume_record` op for the
+> Telegram `apv:` card path. It composes the same exported `consumeNonce`
+> + `recordDecision` primitives inside ONE `db.transaction()`, closing
+> the consume↔record gap (a broker/gateway death between the two legacy
+> ops burned the nonce with no decision → wedged turn). This realizes
+> RFC §6.1's "only on rowcount=1 does the kernel proceed to insert the
+> decision row" as one atomic step instead of two round-trips.
+> `approval_consume` / `approval_record` remain for their other callers
+> (deferred-secret + `/vault grant` dual-dispatch, `/folders`); only the
+> `apv:` card migrated.

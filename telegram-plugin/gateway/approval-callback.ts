@@ -27,10 +27,7 @@ import {
   ttlMsFromToken,
   type ApprovalChoice,
 } from "./approval-card.js";
-import {
-  approvalConsume,
-  approvalRecord,
-} from "../../src/vault/approvals/client.js";
+import { approvalConsumeRecord } from "../../src/vault/approvals/client.js";
 import type { ApprovalDecisionMode } from "../../src/vault/approvals/schema.js";
 import { scopeToOpenInDriveButton } from "../../src/drive/deep-links.js";
 
@@ -120,18 +117,6 @@ export async function handleApprovalCallback(
   }
   const { decision, granted, ttl_ms, displayMode } = resolved;
 
-  const consumed = await approvalConsume(parsed.request_id);
-  if (consumed === null) {
-    await ctx.answerCallbackQuery({ text: "approval kernel unreachable" });
-    return;
-  }
-  if (!consumed.consumed) {
-    // Single-use enforcement: someone already tapped, or the nonce
-    // expired/unknown. Match the RFC §8.1 wording.
-    await ctx.answerCallbackQuery({ text: "this prompt expired" });
-    return;
-  }
-
   const granted_by_user_id = ctx.from?.id ?? 0;
   // Approver set at decision time = the chat that received the card. We
   // store the singleton for now; the gateway-side approver-set lookup
@@ -139,18 +124,37 @@ export async function handleApprovalCallback(
   // when each surface migrates and starts passing access.allowFrom.
   const approver_set = [String(granted_by_user_id)];
 
-  const decision_id = await approvalRecord({
+  // PR-6: atomic consume+record — ONE round-trip; the kernel burns the
+  // single-use nonce AND writes the decision in one SQLite transaction.
+  // If the record fails the burn rolls back, so `null` genuinely means
+  // "nothing happened, safe to retry" — there is no burned-nonce /
+  // no-decision wedge any more (the residual the shipped permission-TTL
+  // auto-deny used to backstop). resolveApprovalDecision already
+  // validated the ttl above, so no fallible step precedes this call.
+  const result = await approvalConsumeRecord({
     request_id: parsed.request_id,
     decision,
     approver_set,
     granted_by_user_id,
     ttl_ms,
   });
-
-  if (decision_id === null) {
+  if (result === null) {
+    await ctx.answerCallbackQuery({ text: "approval kernel unreachable" });
+    return;
+  }
+  if (!result.consumed) {
+    // Already tapped / expired / unknown — single-use is enforced
+    // kernel-side and NO decision was written. RFC §8.1 wording.
+    await ctx.answerCallbackQuery({ text: "this prompt expired" });
+    return;
+  }
+  if (!result.decision_id) {
+    // Defensive: consumed:true must carry a decision_id. Kept distinct
+    // from the unreachable message for operator triage.
     await ctx.answerCallbackQuery({ text: "kernel record failed" });
     return;
   }
+  const decision_id: string = result.decision_id;
 
   // Edit the original card to its post-tap state. Drop the original
   // action keyboard either way; on a successful grant for a Drive
@@ -163,8 +167,8 @@ export async function handleApprovalCallback(
       ? ` · /approvals revoke <code>${decision_id}</code>`
       : "");
 
-  const postTapKeyboard = granted && consumed.scope
-    ? buildGrantedKeyboard(consumed.scope)
+  const postTapKeyboard = granted && result.scope
+    ? buildGrantedKeyboard(result.scope)
     : undefined;
 
   try {

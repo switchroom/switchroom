@@ -10,6 +10,7 @@ import { migrateApprovalSchema, DEFAULT_MAX_TTL_LIFETIME_MS } from "./schema.js"
 import {
   requestApproval,
   consumeNonce,
+  consumeAndRecord,
   recordDecision,
   lookupDecision,
   revokeDecision,
@@ -379,5 +380,94 @@ describe("approval kernel — RFC §10 rate caps", () => {
   it("constants align with RFC §10", () => {
     expect(MAX_PENDING_PER_AGENT).toBe(2);
     expect(MAX_PENDING_GLOBAL).toBe(32);
+  });
+});
+
+describe("approval kernel — consumeAndRecord atomic op (PR-6)", () => {
+  let db: Database;
+  beforeEach(() => { db = newDb(); });
+
+  function freshNonce(): string {
+    return requestApproval(db, {
+      agent_unit: "switchroom-klanker.service",
+      scope: "secret:OPENAI_API_KEY",
+      action: "read",
+      approver_set: ["123"],
+      why: "needs key",
+    }).request_id;
+  }
+
+  it("consumes the nonce AND records the decision atomically", () => {
+    const rid = freshNonce();
+    const res = consumeAndRecord(db, {
+      request_id: rid,
+      decision: "allow_once",
+      approver_set: ["123"],
+      granted_by_user_id: 123,
+    });
+    expect(res.consumed).toBe(true);
+    if (!res.consumed) throw new Error("unreachable");
+    expect(res.decision_id).toBeTruthy();
+    // Nonce burned + linked to the decision; exactly one decision row.
+    const nonce = getNonce(db, rid)!;
+    expect(nonce.consumed_at).not.toBeNull();
+    expect(nonce.decision_id).toBe(res.decision_id);
+    expect(
+      db.query<{ n: number }, []>(`SELECT COUNT(*) n FROM approval_decisions`).get()!.n,
+    ).toBe(1);
+    // The decision is visible to a subsequent lookup → grant flow works.
+    expect(
+      lookupDecision(db, {
+        agent_unit: "switchroom-klanker.service",
+        scope: "secret:OPENAI_API_KEY",
+        action: "read",
+        current_approver_set: ["123"],
+      }).state,
+    ).toBe("granted");
+  });
+
+  it("second call is non-committal {consumed:false} — single-use, exactly one decision", () => {
+    const rid = freshNonce();
+    expect(consumeAndRecord(db, { request_id: rid, decision: "allow_once", approver_set: ["123"], granted_by_user_id: 1 }).consumed).toBe(true);
+    const second = consumeAndRecord(db, { request_id: rid, decision: "allow_always", approver_set: ["123"], granted_by_user_id: 1 });
+    expect(second.consumed).toBe(false);
+    expect(
+      db.query<{ n: number }, []>(`SELECT COUNT(*) n FROM approval_decisions`).get()!.n,
+    ).toBe(1);
+  });
+
+  it("unknown request_id → {consumed:false}, no decision (non-committal, mirrors approval_consume)", () => {
+    const res = consumeAndRecord(db, {
+      request_id: "0badf00d0badf00d0badf00d0badf00d",
+      decision: "allow_once",
+      approver_set: ["123"],
+      granted_by_user_id: 1,
+    });
+    expect(res.consumed).toBe(false);
+    expect(
+      db.query<{ n: number }, []>(`SELECT COUNT(*) n FROM approval_decisions`).get()!.n,
+    ).toBe(0);
+  });
+
+  it("rollback-on-throw: a throw inside the consume txn reverts the burn (PR-6 is the repo's first db.transaction use)", () => {
+    // Directly exercises the bun:sqlite db.transaction rollback
+    // semantics consumeAndRecord relies on: consume the nonce, then
+    // throw — the consumed_at burn AND any decision row must roll back.
+    const rid = freshNonce();
+    expect(() =>
+      db.transaction(() => {
+        const n = consumeNonce(db, rid);
+        expect(n).not.toBeNull();
+        recordDecision(db, { nonce: n!, decision: "allow_once", approver_set: ["123"], granted_by_user_id: 1 });
+        throw new Error("boom — simulate a failure after the burn+record");
+      })(),
+    ).toThrow("boom");
+    // Burn reverted (nonce reusable) and NO decision persisted.
+    expect(getNonce(db, rid)!.consumed_at).toBeNull();
+    expect(
+      db.query<{ n: number }, []>(`SELECT COUNT(*) n FROM approval_decisions`).get()!.n,
+    ).toBe(0);
+    // And consumeAndRecord can still succeed afterward (proves reusable).
+    expect(consumeAndRecord(db, { request_id: rid, decision: "allow_once", approver_set: ["123"], granted_by_user_id: 1 }).consumed).toBe(true);
   });
 });
