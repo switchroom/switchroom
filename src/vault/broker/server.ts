@@ -678,9 +678,15 @@ export class VaultBroker {
         try { chmodSync(abs, 0o600); } catch { /* ignore */ }
         try { chownSync(abs, operatorUid, operatorUid); } catch { /* dev / no CAP_CHOWN */ }
 
-        // Now bind the unlock pair. Same chown target.
+        // Now bind the unlock pair. Same chown target. Pass
+        // `isOperator=true` so the unlock handler applies the same
+        // peercred bypass the data handler already uses on the
+        // operator path — `identify()` returns null for the reserved
+        // "operator" path by design (peercred.ts socketPathToIdentity),
+        // so without this the host operator's `vault broker unlock`
+        // fails with "ERR unable to verify caller identity".
         const unlockServer = net.createServer((sock) => {
-          this._handleUnlockConnection(sock);
+          this._handleUnlockConnection(sock, true);
         });
         unlockServer.on("error", (err) => rejectP(err));
         unlockServer.listen(unlockAbs, () => {
@@ -2489,12 +2495,43 @@ export class VaultBroker {
     }
   }
 
-  private _handleUnlockConnection(socket: net.Socket): void {
+  /**
+   * Handle an incoming unlock connection. The first newline-terminated
+   * line on the socket is taken as the vault passphrase (max 4096 bytes);
+   * `unlockFromPassphrase()` then attempts decrypt. The peer is allowed
+   * a single shot — buffered overflow / non-first-line content is
+   * discarded and the socket is closed.
+   *
+   * **Trust model** (mirroring `_handleDataConnection`'s rationale):
+   * when `isOperator` is true the listener is bound at the canonical
+   * operator path (`/run/switchroom/broker/operator/unlock`), mode 0600,
+   * chowned to the host operator UID, and bind-mounted to the host so
+   * only that UID's processes can connect — kernel-enforced at the FS
+   * layer. peercred is NOT load-bearing here: `identify()` returns
+   * `null` for the reserved "operator" path by design
+   * (`peercred.ts` `socketPathToIdentity` + reserved-name guard), so
+   * running it would always deny. The bind path itself is the identity.
+   * Same trust gate the data handler relies on (RFC J Phase 3) — this
+   * extends it to the unlock handler, closing the gap that produced the
+   * `ERR unable to verify caller identity` regression on the operator
+   * unlock path. The legacy non-operator unlock callers retain the
+   * peercred gate verbatim.
+   */
+  private _handleUnlockConnection(
+    socket: net.Socket,
+    isOperator: boolean = false,
+  ): void {
     // Same UID check for unlock socket. On Linux: verify via peercred,
     // pinned to this connection's fd (issue #129).
     // On other OSes: rely on socket file mode 0600.
+    //
+    // Operator path: skip peercred entirely (see docstring above).
+    // Incidentally also sidesteps the latent issue that
+    // `identify(this.unlockSocketPath, ...)` hardcodes the default
+    // unlock socket path even when the connection arrived on the
+    // operator listener — irrelevant once we don't probe at all.
     let unlockPeer: PeerInfo | null = null;
-    if (process.platform === "linux") {
+    if (!isOperator && process.platform === "linux") {
       unlockPeer = this.testOpts._testIdentify
         ? this.testOpts._testIdentify(this.unlockSocketPath, socket)
         : identify(this.unlockSocketPath, socket);
@@ -2511,9 +2548,19 @@ export class VaultBroker {
       }
     }
 
-    const auditPid = unlockPeer?.pid ?? process.pid;
-    const auditCaller = unlockPeer !== null ? callerFromPeer(unlockPeer) : `pid:${process.pid}`;
-    const auditCgroup = unlockPeer?.systemdUnit ?? undefined;
+    // Mirror `_handleDataConnection`'s audit convention: the operator
+    // path records `caller:"operator"` (the bind-path-derived identity),
+    // not a peercred-derived value (which is structurally meaningless
+    // across the host↔container PID namespace boundary).
+    const auditPid = isOperator
+      ? process.pid
+      : unlockPeer?.pid ?? process.pid;
+    const auditCaller = isOperator
+      ? "operator"
+      : unlockPeer !== null
+        ? callerFromPeer(unlockPeer)
+        : `pid:${process.pid}`;
+    const auditCgroup = isOperator ? undefined : unlockPeer?.systemdUnit ?? undefined;
 
     let buffer = "";
     socket.on("data", (chunk: Buffer) => {
