@@ -1320,6 +1320,32 @@ function purgeReactionTracking(key: string): void {
 }
 
 /**
+ * Atomic null-and-purge for a wedged turn. Every site that ends a
+ * turn by nulling `currentTurn` MUST also clear the turn's statusKey
+ * from `activeTurnStartedAt` — else a dangling entry survives and
+ * `#1556`'s turn-gate holds every new inbound mid-turn forever
+ * (gymbro / klanker held-mid-turn symptom, 2026-05-20).
+ *
+ * Pre-this, three turn-end paths (silent-marker / turn-flush /
+ * `turn_end`) nulled `currentTurn` on code-paths whose
+ * `purgeReactionTracking` calls weren't reached on every branch,
+ * leaving sibling entries under the turn's statusKey that the
+ * silence-poke framework-fallback's `purgeReactionTracking(fbKey)`
+ * couldn't catch (different key shape). The fallback now also sweeps
+ * siblings for `fbChatId` (`turn-state-purge.ts`) as defense-in-depth,
+ * but THIS helper closes the leak at origin: null and purge are
+ * inseparable at every call site.
+ *
+ * Idempotent: a second purge is a no-op `.delete()` on a key already
+ * gone — handlers that already purge elsewhere are unharmed.
+ */
+function endCurrentTurnAtomic(turn: CurrentTurn): void {
+  if (currentTurn !== turn) return
+  currentTurn = null
+  purgeReactionTracking(statusKey(turn.sessionChatId, turn.sessionThreadId))
+}
+
+/**
  * Model-idle proactive-compaction check. Called ONLY from the
  * activeTurnStartedAt.size === 0 gate above (never mid-turn). Opt-in via
  * the resolved agent config's session.max_context_tokens; a no-op when
@@ -5705,7 +5731,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           turn.answerStream = null
         }
         // Null the atom — this turn is being abandoned.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — context-exhaustion teardown also resets preamble state.
         preambleSuppressor.reset()
       }
@@ -5903,7 +5929,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // returns early at handler entry. A new `enqueue` swaps in a
         // fresh atom; the silent-turn teardown doesn't need to preserve
         // any of the prior turn's state.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — silent-marker teardown drops any pending preamble.
         preambleSuppressor.dropNow()
         return
@@ -5937,7 +5963,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // sendMessage await for this turn will see currentTurn == null
         // and bail; a new enqueue will swap in a fresh atom. The
         // `backstop*` locals above hold everything the IIFE needs.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -6209,7 +6235,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // #1067: null the atom in one assignment, replacing the seven
       // field clears the pre-refactor version did. Any late-arriving
       // event for this turn will see currentTurn == null and bail.
-      if (currentTurn === turn) currentTurn = null
+      endCurrentTurnAtomic(turn)
       // #549 fix — preamble flush already happened at the TOP of this
       // turn_end handler (before turn.answerStream is nulled). See
       // comment near line 3431.
