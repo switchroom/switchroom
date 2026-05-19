@@ -25,27 +25,35 @@ Two ways to do that today. Both miss:
 - **OpenClaw + Telegram.** Great UX. But it hits the Anthropic API on your own key, so a token bill ticks over in the background. You signed up to use your subscription, not to buy API credits on top of it.
 - **Claude Code's built-in Telegram channel.** Uses the subscription correctly. But it's an MVP black box. Send a message, wait, eventually something comes back. What did the agent actually do? Which tools ran? Did it get stuck? No idea.
 
-Switchroom is the third option. Subscription-honest, and the UX done properly. The headline is a live progress card that pins to the chat and shows every step as it happens.
+Switchroom is the third option. Subscription-honest, and the UX done properly. The headline: the agent is never a black box and never silent. You always see what it is doing, what it is waiting on, and when it is done.
 
 ## See it work
 
-Every time an agent starts work a progress card pins into its Telegram topic and updates in place as tools run. Each Read, Bash, Edit, Grep shows as it happens, with elapsed time so you can tell if something is stuck. Sub-agents surface in the same card. When the agent finishes, the card flips to Done and unpins.
-
-No silent gaps. No ghosts. No squinting into a black box.
+Switchroom's UX is deterministic. Every agent topic carries a status line that is always one of three honest states, never a guess and never nothing:
 
 ```
-⚙️ Working… · ⏱ 12s
-💬 refactor the auth module to use JWT
-  ─ ─ ─
-  … (+3 more earlier steps)
-  ✅ Read src/auth/session.ts
-  ✅ Grep "cookie" (in src/)
-  🤖 Edit src/auth/jwt.ts · 4s
+🟡 quiet · no turns yet
+⚙️ working since 2m ago
+🟢 idle · last reply 5m ago
 ```
 
-<p align="center"><img src="docs/diagrams/progress-card-anatomy.svg" width="700" alt="Annotated progress card: pin badge, user quote, last 5 steps, collapsed older, in-flight pulse, elapsed timer, sub-agent indent"></p>
+While the agent works, the reply streams in place (about once a second, not one delayed dump at the end) and tool steps render as they run with `MM:SS` durations. Long-running work gets a Steer button so you can redirect mid-turn without killing it. When an agent delegates, a sub-agent block shows the live fleet, up to 5 members, each with its role and current tool:
 
-The card is the headline. The rest of the product keeps it honest: updates throttled to once every 5 seconds, last 5 steps visible with older ones collapsed, deterministic tool labels written by a `PreToolUse` hook so the card never lies about what is running. Two agents at once each get their own card, labelled `(1/2)` and `(2/2)`. [Full card behaviour →](docs/telegram-plugin.md)
+```
+⚙️ Working…  ·  00:12
+refactor the auth module to use JWT
+
+✅ Read session.ts
+✅ Grep "cookie"
+🔵 Edit jwt.ts  ·  00:04
+
+Sub-agents · 2 running
+🔵 implement  ·  Edit jwt.ts
+🔵 test-runner  ·  Bash npm test
+                                   [ Steer ]
+```
+
+Older sub-agents collapse to `+N more` once the live set passes 5. Tool arguments are sanitised before they render: file paths show the basename only, token-shaped strings get redacted, so a secret never lands in a status message. The card is posted and edited in the topic, not pinned, so it never leaves a stale `⚙️ Working…` stranded at the top of your chat. [Full UX behaviour →](docs/telegram-plugin.md)
 
 ## Quickstart
 
@@ -83,26 +91,31 @@ Full new-user walkthrough, zero to first Telegram message in ~15 minutes, plus t
 
 | Feature | What it does |
 |---|---|
-| **Progress cards** | Pinned, in-place, every tool call visible. The headline UX. Every edit also appended to a local `card-events.jsonl` audit log. |
+| **Deterministic UX** | Every topic shows an honest state: quiet, working since, or idle. Never a black box, never silent. The headline. |
+| **Live step streaming** | The reply streams in place while tools run, with durations and a Steer button to redirect mid-turn. Not pinned, no stale cards. |
+| **Sub-agent fleet view** | Delegated workers surface as live rows (up to 5, then `+N more`), each with role and current tool. Args sanitised before render. |
 | **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. Fleet-wide active account plus fallback order, broker-owned refresh and credential fanout. |
-| **Approval kernel** | Inline Allow/Deny cards in Telegram for every gated tool. TTL'd grants, full audit trail. |
-| **Sub-agents** | Opus plans, Sonnet implements. Sub-agent work surfaces in the parent card. |
+| **Vault + approval kernel** | AES-256-GCM secrets. Per-agent least-privilege ACL. Anything extra needs your tap on an inline Telegram Approve/Deny card. |
+| **Sub-agents** | Opus plans, Sonnet implements. Sub-agent work surfaces in the fleet block. |
 | **Config cascade** | Defaults, then profiles, then per-agent YAML. Change one line, every agent updates. |
 | **Scheduled tasks** | Cron-syntax tasks that fire across reboots. Headless secret access through the vault broker. |
-| **Persistent memory** | Hindsight semantic memory with knowledge graphs and mental models. |
+| **Persistent memory** | Hindsight semantic memory, including a per-user mental model that carries across conversations. |
 | **Always-on** | Long-running service per agent. Survives reboots, network drops, your laptop closing. Resumes mid-turn with a wake-audit. |
-| **Encrypted vault** | AES-256-GCM for secrets. Optional auto-unlock keyed off `/etc/machine-id`. |
-| **15 Telegram MCP tools** | Reply, stream, edit, pin, react, native checklists, sticker aliases, voice-in transcription, attachments, history. Plus per-agent Google Drive read. |
+| **17 Telegram MCP tools** | reply, stream, react, edit, pin, delete, forward, typing, history, checklists (+update), stickers, GIFs, attachment download, ask-user, vault request access/save. |
 
 ## Subscription-honest, and safe by default
 
 **Stock CLI, real OAuth.** Each agent runs the unmodified `claude` binary, authenticated with Anthropic through the same OAuth flow you use on the desktop app. No API key. No harness. No patched CLI. No proxied inference. One bill, the one you already pay. See the [Compliance Attestation](docs/compliance-attestation.md) for the full analysis against Anthropic's April 2026 third-party policy.
 
-**Approval kernel.** Tools that touch the world (Bash, Edit, Write, anything off an agent's allowlist) pause for an inline Telegram card showing the actual diff or command. Tap Allow and the tool resumes. Tap Deny and the agent gets a clean refusal it can recover from. TTL'd grants expire on their own, every grant and denial is logged, and a per-agent allowlist covers the boring tools you do not want to be asked about. The agent never decides its own permissions. It asks and waits.
+**Least privilege, and you hold the keys.** This is the core opinion. An agent never holds the vault passphrase and never sees a secret it was not given. Secrets live in an AES-256-GCM vault. Each agent reaches the vault broker over its own socket whose identity is the bind path, so a compromised agent cannot pose as another. An agent can read a key only if you listed it for that agent's task: that is the standing, least-privilege ACL. Anything beyond that is just-in-time. The agent asks, you get an inline Telegram Approve/Deny card showing exactly what and why, and only your tap mints a scoped, expiring grant. The agent cannot self-elevate.
 
-<p align="center"><img src="docs/diagrams/approval-grant-flow.svg" width="700" alt="Approval grant flow: agent tool call pauses at the kernel, broker writes pending grant to sqlite, user taps Allow on the Telegram card, broker releases the gate, tool resumes"></p>
+<p align="center"><img src="docs/diagrams/approval-grant-flow.svg" width="700" alt="Approval grant flow: agent requests a key it does not have, broker stages a pending grant, you tap Allow on the Telegram card, broker mints a scoped TTL grant, the read proceeds"></p>
 
-**Encrypted vault.** Secrets sit in an AES-256-GCM store. Scheduled tasks run headless, so they cannot prompt for a passphrase. The vault broker holds the vault decrypted in memory after a one-time unlock, and a cron only ever reads the specific keys it declares, over a per-agent unix socket whose identity is the bind path and cannot be spoofed by a compromised agent. Optional boot auto-unlock derives a key from `/etc/machine-id` for unattended hosts. [Vault guide](docs/vault.md) and [auto-unlock threat model](docs/auto-unlock.md).
+**The approval kernel gates risky actions too.** A separate kernel daemon handles action approvals on the same model: an agent that wants to write to a Google Doc requests it, ends its turn, and waits. You see the diff and tap Allow or Deny. Nothing destructive happens on the agent's say-so alone. TTL'd decisions expire, and every grant and denial is logged.
+
+### How agents collaborate on files
+
+Switchroom's position: agents should collaborate with you on real documents, not paste walls of text into chat. The supported path is Google Drive. An agent reads and proposes changes, and every write or suggestion is gated through the approval kernel exactly like a credential request, so an agent never silently edits your Drive. Today Drive is opt-in per agent: you connect a Google account and enable it for the agents that should have it (`switchroom drive connect <agent>`), and the broker enforces that allowlist at runtime. It is not on by default for a fresh agent.
 
 ## Survives real life
 
@@ -110,7 +123,7 @@ Always-on is not enough on its own. Things still die. The product has to handle 
 
 <p align="center"><img src="docs/diagrams/wake-audit-lifecycle.svg" width="700" alt="Wake-audit lifecycle: kill, crash-pane snapshot, auto-restart, agent boots with SWITCHROOM_PENDING_TURN, acks with three options"></p>
 
-- **Auto-restart.** Agent containers come up with `restart: unless-stopped` and a healthcheck. A crashed or wedged agent is brought back automatically. No silent dropped work.
+- **Auto-restart.** Agent containers run with `restart: unless-stopped` and only start once the auth-broker's healthcheck passes. The vault broker, approval kernel, and auth broker each have their own healthchecks, so a wedged dependency is caught instead of silently breaking agents.
 - **Resume protocol.** When an agent reboots mid-turn it boots with `SWITCHROOM_PENDING_TURN` plus the original chat ids. Its first action is to acknowledge the gap and ask how to proceed: start over, summarise and continue, or drop it.
 - **Wake-audit.** On every fresh boot the agent checks for owed replies, orphan sub-agents, and stale todos. Clean means it stays quiet. If it owed you a reply, it tells you.
 - **Token refresh.** The `switchroom-auth-broker` owns the refresh loop and is the sole writer of every `credentials.json`. Per-account quota state fans out across the fleet in seconds, and `auth.fallback_order` cycles when an account is exhausted.
@@ -119,11 +132,11 @@ Always-on is not enough on its own. Things still die. The product has to handle 
 
 | | Switchroom | Claude Code channels | OpenClaw | NanoClaw |
 |---|---|---|---|---|
-| Progress visibility | Live cards, pinned | Black box | None | None |
+| Progress visibility | Deterministic status, never silent | Black box | None | None |
 | Runtime | Claude Code CLI | Claude Code CLI | Custom runtime | Agents SDK |
 | Auth | Pro/Max OAuth | Pro/Max OAuth | API key | API key |
-| Sub-agent tracking | Yes, in card | No | No | No |
-| Parallel task display | Labelled cards `(1/N)` | No | No | No |
+| Sub-agent tracking | Yes, live fleet block | No | No | No |
+| Parallel display | Shared fleet status, up to 5 rows | No | No | No |
 | Approval UX | Inline Telegram cards | None | None | None |
 | Config | YAML with cascade | None | JSON/TOML | Env vars |
 | Setup | `switchroom setup` | Built-in (limited) | Docker compose | Docker compose |
@@ -132,23 +145,24 @@ The wedge against OpenClaw and NanoClaw is not the substrate. It is the stock `c
 
 ## Architecture
 
-One long-running service per agent. Each agent runs the stock `claude` CLI, not a fork, not the Agents SDK, not a wrapped harness, authenticated directly with Anthropic over official OAuth. Switchroom is scaffolding and lifecycle around the CLI you would run by hand: a Telegram bot, an approval broker, a vault broker, an auth broker, and Docker Compose for supervision.
+One long-running service per agent. Each agent runs the stock `claude` CLI, not a fork, not the Agents SDK, not a wrapped harness, authenticated directly with Anthropic over official OAuth. Switchroom is scaffolding and lifecycle around the CLI you would run by hand: a Telegram bot, an approval kernel, a vault broker, an auth broker, and Docker Compose for supervision.
 
 ```
 You (Telegram)
     │
     ▼
 @YourBot ──┬── switchroom-telegram MCP ──┬── agent supervisor ─── Claude Code CLI
-           │       (15 tools)            │     (per-agent)        │
+           │       (17 tools)            │     (per-agent)        │
            │                             │                        ├─ .claude/agents/*.md (sub-agents)
-           ├─ Progress cards             ├─ Approval kernel ◄─────┤   settings.json (tools, hooks, MCP)
-           ├─ Pin / unpin lifecycle      │   (allow/deny broker)  ├─ Hindsight plugin (memory)
-           ├─ SQLite history             ├─ Vault broker ◄────────┤   Drive MCP, Playwright MCP, …
-           ├─ Card-events.jsonl audit    ├─ Auth broker ◄─────────┤   in-agent scheduler sidecar
-           ├─ Emoji reactions            │   (OAuth refresh,       └─ (cron, fires across reboots)
-           └─ Format conversion          │    sole creds writer)
-                                         ├─ hostd (host-control:
-                                         │   /restart, /update apply)
+           ├─ Deterministic status       ├─ Approval kernel ◄─────┤   settings.json (tools, hooks, MCP)
+           │   (quiet/working/idle)      │   (action grants)      ├─ Hindsight plugin (memory)
+           ├─ Live step streaming        ├─ Vault broker ◄────────┤   Drive MCP, Playwright MCP, …
+           ├─ Sub-agent fleet block      │   (per-agent ACL)      ├─ in-agent scheduler sidecar
+           ├─ SQLite history             ├─ Auth broker ◄─────────┤   (cron, fires across reboots)
+           └─ Emoji reactions            │   (OAuth refresh,       │
+                                         │    sole creds writer)   │
+                                         ├─ hostd (host-control:   │
+                                         │   /restart, /update)    │
                                          └─ Docker Compose restart (unless-stopped)
 ```
 
@@ -163,7 +177,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the process model, IPC la
 | **[Configuration](docs/configuration.md)** | Full field reference, cascade semantics, profiles, example config |
 | **[CLI reference](docs/cli-reference.md)** | Every verb, grouped, with behaviour and usage |
 | **[Vault](docs/vault.md)** | Architecture, per-cron secrets, ACL, audit log, threat model |
-| **[Telegram Plugin](docs/telegram-plugin.md)** | Progress cards, 15 MCP tools, native checklists, sticker aliases, voice-in |
+| **[Telegram Plugin](docs/telegram-plugin.md)** | Deterministic UX, 17 MCP tools, checklists, sticker aliases, voice-in |
 | **[Sub-Agents](docs/sub-agents.md)** | Model routing, delegation patterns, frontmatter spec |
 | **[Scheduling](docs/scheduling.md)** | Cron tasks (in-agent scheduler sidecar), model selection |
 | **[Session Management](docs/session-optimization.md)** | Continuity, compaction, freshness policy |
@@ -177,10 +191,10 @@ See [`docs/architecture.md`](docs/architecture.md) for the process model, IPC la
 Yes. That is the whole point. Switchroom runs the unmodified `claude` CLI with the same OAuth flow you use on the desktop app. No API key. No per-token billing.
 
 **How is this different from Claude Code's built-in Telegram channel?**
-The built-in channel is message in, message out, with no visibility into what the agent is doing in between. Switchroom adds live progress cards that pin to the top of each topic and update as tools run. You can always see what is happening, which is the bit the built-in channel gets wrong.
+The built-in channel is message in, message out, with no visibility into what the agent is doing in between. Switchroom shows a deterministic status on every topic (quiet, working, idle) and streams the steps in place as tools run. You always know the state, which is the bit the built-in channel gets wrong.
 
 **Does it work with multiple agents at the same time?**
-Yes. Each agent gets its own Telegram forum topic. When several work at once, each has its own pinned progress card labelled `(1/N)`, `(2/N)`, and so on. Sub-agent work shows up indented inside the parent's card.
+Yes. Each agent gets its own Telegram forum topic with its own status. When an agent delegates, its sub-agents show up as live rows in a shared fleet block (up to 5, then `+N more`), each with role and current tool.
 
 **What does it cost to run?**
 A cheap Linux VPS (around $6/mo on Hetzner, DigitalOcean, wherever), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. Switchroom itself is MIT-licensed, free.

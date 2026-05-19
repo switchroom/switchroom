@@ -225,8 +225,9 @@ don't need their own login — they inherit the fleet active. See
 
 1. Open Telegram, search for your agent bot's username, hit `/start`.
 2. Send "hello".
-3. You should see a pinned **progress card** appear within a couple of
-   seconds, then a reply from the agent.
+3. Within a couple of seconds the topic status should flip to
+   `⚙️ working since …`, the reply should stream in place as the agent
+   works, then the status settles to `🟢 idle · last reply …`.
 
 If anything's off, run `switchroom doctor` — it sweeps deps, vault,
 agents, and MCP wireup, and prints actionable fixes.

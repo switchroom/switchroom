@@ -16,8 +16,8 @@ If you came here because OpenClaw stopped working with your Claude subscription,
 | Auth | Claude Pro/Max OAuth | Anthropic API key |
 | Billing | Your existing subscription | Per-token API billing |
 | Runtime | Stock `claude` CLI | Custom runtime |
-| Channels | Telegram (enhanced fork with 15 MCP tools) | WhatsApp, Telegram, Slack |
-| Memory | Hindsight (semantic, knowledge graph, mental models) | File-based |
+| Channels | Telegram (enhanced fork with 17 MCP tools) | WhatsApp, Telegram, Slack |
+| Memory | Hindsight (semantic, per-user mental model) | File-based |
 | Scheduling | Cron syntax in YAML, fires across reboots | Built-in cron engine |
 | Sub-agents | Native Claude Code sub-agents | Custom orchestration |
 | Config | YAML with cascade + profiles | JSON/TOML per agent |
@@ -52,7 +52,7 @@ Substrate aside, here's what the product promises:
 - **Auto-recovery on crash, with audit trail.** A watchdog catches stuck turns, captures a crash-pane snapshot for forensics, restarts the agent. The agent then runs a wake-audit on boot for owed replies and orphan sub-agents. No silent dropped work.
 - **Per-agent isolated logs you can grep.** One process per agent, one log stream per agent.
 - **Scheduled tasks that fire across reboots.** Cron syntax in YAML, per-task model selection, output to Telegram.
-- **Live progress cards in Telegram.** Pinned per topic, every tool call visible. The headline UX.
+- **Deterministic status in Telegram.** Every topic shows quiet / working / idle, steps stream in place as tools run, never silent and never a stale pinned card. The headline UX.
 
 ## When OpenClaw might still be the right call
 
