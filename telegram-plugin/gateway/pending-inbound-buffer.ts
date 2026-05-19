@@ -107,8 +107,19 @@ export function redeliverBufferedInbound(
  *     which would re-buffer+log-spin every tick; onClientRegistered
  *     will drain on the eventual reconnect instead)
  *   - otherwise → `redeliverBufferedInbound` (lossless: re-buffers any
- *     per-message miss). A message delivered mid-turn is queued
- *     normally by the bridge, same as a live arrival — not lost.
+ *     per-message miss).
+ *
+ * NOTE (#1556): a message delivered mid-turn is NOT safely queued by
+ * the bridge — the prior "queued normally, same as a live arrival"
+ * claim here was the false assumption behind the lawgpt composer
+ * wedge. claude types a mid-turn channel notification into its TUI
+ * composer and the auto-submit races turn-completion, stranding it.
+ * The `idleDrainTick` caller therefore also gates on
+ * `activeTurnStartedAt.size === 0`, so this function is never invoked
+ * mid-turn. The Telegram `handleInbound` delivery path is turn-gated
+ * (gateway.ts); the `inject_inbound` cron/synthetic path is a separate
+ * delivery contract and deliberately not gated — see
+ * `inbound-delivery-gate.ts`.
  *
  * Returns the redeliver counts only when it actually ran, else null
  * (so the caller logs only on a real flush).

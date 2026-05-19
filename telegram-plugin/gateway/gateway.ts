@@ -249,6 +249,7 @@ import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
+import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -1278,6 +1279,29 @@ function purgeReactionTracking(key: string): void {
   // response to the client was already sent when the restart was
   // scheduled, so nobody is waiting on this.
   if (activeTurnStartedAt.size === 0) {
+    // #1556: the deterministic delivery point. claude has just gone
+    // idle — flush any inbound held mid-turn so the channel
+    // notification lands at the idle prompt and submits as a fresh
+    // turn (instead of stranding in the composer, the lawgpt wedge).
+    // Zero-churn: depth check first, no work on the common empty path.
+    // Lossless: redeliver re-buffers any per-message miss (bridge
+    // mid-reconnect), which onClientRegistered then drains.
+    const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
+      const fr = redeliverBufferedInbound(
+        pendingInboundBuffer,
+        selfAgentForFlush,
+        (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
+      )
+      if (fr.redelivered > 0) {
+        process.stderr.write(
+          `telegram gateway: turn-complete flushed ${fr.redelivered}/${fr.drained} ` +
+          `held inbound for ${selfAgentForFlush}` +
+          `${fr.rebuffered > 0 ? ` (${fr.rebuffered} re-buffered)` : ''}\n`,
+        )
+      }
+    }
+
     if (pendingRestarts.size > 0) {
       for (const [agentName, _timestamp] of pendingRestarts.entries()) {
         triggerSelfRestart(agentName, 'turn-complete-pending-restart');
@@ -3542,12 +3566,17 @@ const ipcServer: IpcServer = createIpcServer({
 //
 // This is the third drain trigger. It's gated to be zero-cost and
 // zero-churn: skip entirely when nothing is buffered (one Map.get, no
-// log) or when the bridge isn't alive (exactly sendToAgent's own
-// guard — so we never drain into a dead bridge and re-buffer/log-spin).
-// Only when there IS a buffered message AND a live bridge do we reuse
-// the #1546 `redeliverBufferedInbound` (lossless: re-buffers any
-// per-message miss). A message delivered while a turn is active is
-// queued normally by the bridge — same as a live arrival, not lost.
+// log), when the bridge isn't alive (exactly sendToAgent's own guard —
+// so we never drain into a dead bridge and re-buffer/log-spin), OR
+// when a turn is in flight. The turn gate is #1556: a message
+// delivered while a turn is active is NOT safely queued by the bridge
+// — claude types it into its TUI composer and the auto-submit races
+// turn-completion, stranding it (the lawgpt wedge). Draining only at
+// `activeTurnStartedAt.size === 0` guarantees the channel notification
+// lands at an idle prompt and submits as a fresh turn. Only when there
+// IS a buffered message AND a live bridge AND no active turn do we
+// reuse the #1546 `redeliverBufferedInbound` (lossless: re-buffers any
+// per-message miss).
 const IDLE_DRAIN_INTERVAL_MS = 5000
 if (!STATIC) {
   setInterval(() => {
@@ -3556,6 +3585,9 @@ if (!STATIC) {
       pendingInboundBuffer,
       selfAgent,
       () => {
+        // #1556: never drain mid-turn — that re-creates the composer
+        // wedge this buffer exists to prevent.
+        if (activeTurnStartedAt.size > 0) return false
         const c = ipcServer.getClient(selfAgent)
         return c != null && c.isAlive()
       },
@@ -7377,6 +7409,29 @@ async function handleInbound(
   // push to pendingInboundBuffer, which onClientRegistered drains on
   // the next bridge register — so the notice below is now truthful.
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+
+  // #1556: turn-gated delivery. A non-steering inbound that arrives
+  // mid-turn must NOT be sent to the bridge now — claude would type it
+  // into its TUI composer and the auto-submit races turn-completion,
+  // stranding the message (the lawgpt wedge, 2026-05-19). Buffer it;
+  // `purgeReactionTracking`'s turn-complete hook and the turn-gated
+  // idle-drain flush it the instant claude goes idle, where the channel
+  // notification submits cleanly as a fresh turn. Steering messages are
+  // exempt — reaching claude mid-turn is the whole point of /steer.
+  if (
+    decideInboundDelivery({
+      turnInFlight: activeTurnStartedAt.size > 0,
+      isSteering,
+    }) === 'buffer-until-idle'
+  ) {
+    pendingInboundBuffer.push(selfAgent, inboundMsg)
+    process.stderr.write(
+      `telegram gateway: inbound held mid-turn agent=${selfAgent} ` +
+      `chat=${chat_id} msg=${msgId ?? '-'} — will flush on turn-complete\n`,
+    )
+    return
+  }
+
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
   if (!delivered) {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
