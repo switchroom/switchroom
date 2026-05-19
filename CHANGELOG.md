@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.12.11 — hostd operator socket; honest doctor, part 3 (verified liveness goes live)
+
+Completes the honest-doctor arc. Part 1 (v0.12.9) made the
+host-unverifiable rows an honest `skip`; part 2 (v0.12.10) built the
+verified `agent_smoke` probe; deploying part 2 surfaced that hostd
+had **no operator socket**, so the host CLI couldn't consume it and
+the "Agent liveness" section degraded to a single `skip`. Part 3
+gives the host operator the transport.
+
+### Changes
+
+#### Features
+
+- **feat(hostd):** hostd now binds an **operator socket**
+  (`~/.switchroom/hostd/operator/sock`, mode 0600, chowned to
+  `SWITCHROOM_HOSTD_OPERATOR_UID`) alongside the per-agent sockets.
+  `peercred` maps it to `kind:"operator"` and `checkGate` leaves it
+  ungated (the operator is root-equivalent on its own host). The
+  hostd compose template passes the operator UID (SUDO-aware). No-op
+  when the env is unset/invalid — fail-closed, same posture as the
+  vault-broker. With this, `switchroom doctor`'s "Agent liveness
+  (in-agent via hostd)" section flips from a degraded `skip` to real
+  per-agent verified `ok`/`✗`. (#1527)
+
 ## v0.12.10 — verified in-agent liveness (`agent_smoke`); honest doctor, part 2
 
 Part 2 of the `switchroom doctor` signal-to-noise work (part 1, the
