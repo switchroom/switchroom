@@ -225,6 +225,28 @@ export const DoctorRequestSchema = z.object({
   args: z.object({}).optional(),
 });
 
+/**
+ * Read-only in-agent liveness battery. hostd `docker exec`s a FIXED
+ * set of presence/validity probes inside the target agent container
+ * (auth creds present, scheduler block + sidecar, .mcp.json /
+ * .claude.json valid, bot-token present, /state writable). Every
+ * probe returns only a boolean/state — NEVER a secret value. `deep`
+ * opts into a real, quota-costing `claude -p` auth smoke; the default
+ * makes NO model call (subscription-honest). Self-target is allowed;
+ * cross-agent requires admin (mirrors agent_logs/agent_exec). The
+ * doctor CLI (operator socket) + Telegram /doctor consume this to
+ * upgrade the WS6-F2 host-unverifiable `skip` rows to real ok/fail;
+ * a down container / unreachable hostd degrades to skip, never fail.
+ */
+export const AgentSmokeRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("agent_smoke"),
+  args: z.object({
+    name: AgentNameSchema,
+    deep: z.boolean().optional(),
+  }),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   AgentRestartRequestSchema,
   UpgradeStatusRequestSchema,
@@ -237,6 +259,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   AgentLogsRequestSchema,
   AgentExecRequestSchema,
   DoctorRequestSchema,
+  AgentSmokeRequestSchema,
 ]);
 
 export type AgentRestartRequest = z.infer<typeof AgentRestartRequestSchema>;
@@ -250,6 +273,7 @@ export type AgentStopRequest = z.infer<typeof AgentStopRequestSchema>;
 export type AgentLogsRequest = z.infer<typeof AgentLogsRequestSchema>;
 export type AgentExecRequest = z.infer<typeof AgentExecRequestSchema>;
 export type DoctorRequest = z.infer<typeof DoctorRequestSchema>;
+export type AgentSmokeRequest = z.infer<typeof AgentSmokeRequestSchema>;
 export type HostdRequest = z.infer<typeof RequestSchema>;
 
 /** All verb names that pass discriminated-union validation. New verbs

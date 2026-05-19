@@ -34,6 +34,7 @@ import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
+import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 
 /**
  * Result of a single doctor check.
@@ -2219,8 +2220,12 @@ export function registerDoctorCommand(program: Command): void {
     .description("Diagnose Switchroom's setup: deps, vault, memory, agents, MCP wireup")
     .option("--json", "Output as JSON")
     .option("--skill <name>", "Run probes for a specific skill only (e.g. mff)")
+    .option(
+      "--fast",
+      "Skip in-agent (hostd) liveness probes — offline/quick; the host-unverifiable rows stay `skip`",
+    )
     .action(
-      withConfigError(async (opts: { json?: boolean; skill?: string }) => {
+      withConfigError(async (opts: { json?: boolean; skill?: string; fast?: boolean }) => {
         // Pre-config-load short-circuit: if no switchroom.yaml exists yet
         // (e.g. fresh install before `switchroom setup`), running doctor
         // should still be useful — that's exactly when an operator wants
@@ -2324,6 +2329,10 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Docker (Phase 1a)", results: runDockerSection(config) },
           { title: "Auth Broker", results: runAuthBrokerChecks(config) },
           { title: "Host control (hostd)", results: runHostdChecks(config) },
+          {
+            title: "Agent liveness (in-agent via hostd)",
+            results: await runAgentSmokeChecks(config, { fast: opts.fast }),
+          },
           { title: "Google Drive", results: runDriveChecks(config) },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
         ];

@@ -499,6 +499,104 @@ describe("hostd server — doctor (read-only, admin-gated)", () => {
   });
 });
 
+describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
+  async function withDocker(stubBody: string): Promise<string> {
+    const dockerStub = join(tmp, `docker-smoke-${Math.random().toString(36).slice(2)}.sh`);
+    writeFileSync(dockerStub, stubBody);
+    chmodSync(dockerStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      dockerBin: dockerStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    return dockerStub;
+  }
+
+  it("running container, all probes pass → completed, exit 0, every probe ok", async () => {
+    await withDocker(
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) exit 0 ;;\nesac\nexit 0\n',
+    );
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-ok", args: { name: "klanker" } },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    const body = JSON.parse(resp.stdout_tail!);
+    expect(body.container).toBe("running");
+    expect(body.probes.map((p: { name: string }) => p.name).sort()).toEqual(
+      ["auth", "bot_token", "mcp", "scheduler", "state"],
+    );
+    expect(body.probes.every((p: { state: string }) => p.state === "ok")).toBe(true);
+  });
+
+  it("cross-agent denied for a non-admin caller", async () => {
+    await withDocker('#!/bin/sh\nexit 0\n');
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-deny", args: { name: "klanker" } },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/cross-agent requires admin/);
+  });
+
+  it("self-target allowed for a non-admin caller", async () => {
+    await withDocker(
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) exit 0 ;;\nesac\nexit 0\n',
+    );
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-self", args: { name: "bob" } },
+    );
+    expect(resp.result).toBe("completed");
+    expect(JSON.parse(resp.stdout_tail!).container).toBe("running");
+  });
+
+  it("down container → completed, exit 0, every probe skip (never fail)", async () => {
+    await withDocker(
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "false"; exit 0 ;;\nesac\nexit 0\n',
+    );
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-down", args: { name: "klanker" } },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    const body = JSON.parse(resp.stdout_tail!);
+    expect(body.container).toBe("absent");
+    expect(body.probes.every((p: { state: string }) => p.state === "skip")).toBe(true);
+  });
+
+  it("a failing probe → completed (NOT error), exit 1, and NO probe stdout leaks", async () => {
+    // exec echoes a fake secret then exits 1 — the handler must never
+    // surface stdout (probes are exit-code only).
+    await withDocker(
+      '#!/bin/sh\ncase "$1" in\n  inspect) echo "true"; exit 0 ;;\n  exec) echo "FAKE-SECRET-LEAK-XYZ"; exit 1 ;;\nesac\nexit 0\n',
+    );
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "agent_smoke", request_id: "sm-fail", args: { name: "klanker" } },
+    );
+    expect(resp.result).toBe("completed"); // a finding, not a dispatch error
+    expect(resp.exit_code).toBe(1);
+    expect(resp.stdout_tail).not.toContain("FAKE-SECRET-LEAK-XYZ");
+    const body = JSON.parse(resp.stdout_tail!);
+    expect(body.probes.every((p: { state: string }) => p.state === "fail")).toBe(true);
+    expect(body.probes.every((p: { detail: string }) => /^exit \d+$/.test(p.detail))).toBe(true);
+  });
+});
+
 describe("hostd server — Phase 2 per-agent verbs", () => {
   it("agent_start: self-target allowed even for non-admin", async () => {
     const sock = server
