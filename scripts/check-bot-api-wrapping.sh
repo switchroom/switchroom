@@ -176,7 +176,13 @@ ALLOWLIST=(
   # inside). Widened end 10430 -> 10480; grep confirms only
   # 10423/10446/10470 are raw calls in 10431-10480 — all the same
   # already-.catch-swallowed wizard editMessageText sites, no new one.
-  "telegram-plugin/gateway/gateway.ts:9340-10480:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for PR-2 of the callback-continuation series:
+  # the ~+11-line normal-inbound sendToAgent+buffer rewrite (~line
+  # 6987) drifted the wizard editMessageText callsites to
+  # 10434/10457/10481 (10481 past the old 10480 ceiling). Widened end
+  # 10480 -> 10490; grep confirms 10481 is the only raw call in
+  # 10481-10540 — same already-.catch-swallowed wizard site, no new one.
+  "telegram-plugin/gateway/gateway.ts:9340-10490:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see

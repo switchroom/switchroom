@@ -6984,17 +6984,28 @@ async function handleInbound(
     },
   }
 
-  // Try to send to a connected bridge. If no bridge connected, tell the user.
-  ipcServer.broadcast(inboundMsg)
-  const delivered = ipcServer.clientCount() > 0
-
+  // Deliver to THIS agent's registered bridge, buffering on miss.
+  // broadcast()/clientCount() were the wrong primitives: broadcast is
+  // not registered-keyed (writes to any alive socket incl. an
+  // unregistered pre-handshake one) and yields no delivered signal,
+  // and clientCount() counts unregistered sockets — so a bridge
+  // mid-reconnect made clientCount()>0, the message was broadcast into
+  // a non-registered socket, the "restarting" notice was suppressed,
+  // and the user's message was silently lost. The old "queued either
+  // way" comment was false: broadcast does not queue. sendToAgent is
+  // registered-keyed + returns a real delivered bool; on a miss we
+  // push to pendingInboundBuffer, which onClientRegistered drains on
+  // the next bridge register — so the notice below is now truthful.
+  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
   if (!delivered) {
+    pendingInboundBuffer.push(selfAgent, inboundMsg)
     const threadOpts = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
     // #1075: thread-id-bearing — swallow via robustApiCall so a deleted
-    // topic doesn't crash the gateway. Fire-and-forget; the user-visible
-    // hint is non-critical (the inbound is queued either way).
+    // topic doesn't crash the gateway. Fire-and-forget; the inbound is
+    // genuinely buffered now, so the hint is accurate, not a guess.
     void swallowingApiCall(
-      () => bot.api.sendMessage(chat_id, '⏳ Agent is restarting, please wait…', { ...threadOpts }),
+      () => bot.api.sendMessage(chat_id, '⏳ Agent is restarting — your message is queued and will be processed when it reconnects.', { ...threadOpts }),
       {
         chat_id,
         verb: 'agent-restarting-notice',
@@ -12132,16 +12143,25 @@ bot.on('callback_query:data', async ctx => {
     process.stderr.write(
       `telegram gateway: button_callback chatId=${cbChatId} user=${ctx.from.id} data=${JSON.stringify(agentCb.raw)} btnText=${JSON.stringify(buttonText ?? null)}\n`,
     )
-    ipcServer.broadcast(inboundMsg)
-    if (ipcServer.clientCount() === 0) {
-      // No bridge connected — the agent's gone. Tell the user so they
-      // don't think the button silently swallowed their tap.
+    // Registered-keyed delivery + buffer-on-miss (same fix as the
+    // normal-inbound path above): broadcast()/clientCount() lost the
+    // tap whenever the bridge was mid-reconnect (clientCount() counts
+    // unregistered sockets, so the notice was suppressed AND nothing
+    // was actually queued). sendToAgent → pendingInboundBuffer (drained
+    // by onClientRegistered) makes the "queued" promise real.
+    const selfAgentBtn = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    const btnDelivered = ipcServer.sendToAgent(selfAgentBtn, inboundMsg)
+    if (!btnDelivered) {
+      pendingInboundBuffer.push(selfAgentBtn, inboundMsg)
+      // No registered bridge — the agent's mid-restart. Tell the user
+      // so they don't think the button silently swallowed their tap;
+      // the tap is genuinely buffered now and replays on reconnect.
       // #1075: thread-id-bearing — swallow on THREAD_NOT_FOUND.
       void swallowingApiCall(
         () =>
           bot.api.sendMessage(
             cbChatId,
-            '⏳ Agent is restarting — your button tap was queued but won\'t be processed until it comes back.',
+            '⏳ Agent is restarting — your button tap is queued and will be processed when it comes back.',
             cbThreadId != null ? { message_thread_id: cbThreadId } : {},
           ),
         {
