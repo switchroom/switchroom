@@ -4,7 +4,7 @@ source: switchroom.ai (canonical), README.md, reference/*.md JTBDs
 audience: anyone deciding whether a feature, PR, or release belongs in switchroom
 ---
 
-# Switchroom — product vision
+# Switchroom: product vision
 
 > **A switchboard for your Pro or Max.**
 > Your standing team. Specialists who remember you, own their patch,
@@ -58,7 +58,7 @@ use case worth loving, made to work the way it should.
 Every feature should serve one of these. If it doesn't, it doesn't
 belong.
 
-### 1. A standing team that knows you — *specialists, not one generalist*
+### 1. A standing team that knows you: *specialists, not one generalist*
 
 The headline. One bot per specialist, each a real `claude` session
 with its own SOUL.md (who it is), CLAUDE.md (what it does), memory,
@@ -76,7 +76,7 @@ point.* Switchroom gives each specialist its own semantic memory bank
 and keeps it from fighting Claude's native memory. That is a sound
 fit, not a differentiator.
 
-### 2. You hold the leash — *controlled, purposeful, never roaming*
+### 2. You hold the leash: *controlled, purposeful, never roaming*
 
 The substantive one. Agents act, but only with what you gave them. An
 approval kernel and per-agent ACLs mean a specialist sees only the
@@ -89,7 +89,7 @@ And you are never in the dark, the state is always legible in plain
 words, and you can steer or stop a turn mid-flight. Awareness and
 control, not a tool-call log to supervise.
 
-### 3. Subscription-honest and predictable — *the plan is the ceiling*
+### 3. Subscription-honest and predictable: *the plan is the ceiling*
 
 Each agent runs the unmodified `claude` binary, authenticated directly
 with Anthropic over the same OAuth as the desktop app. No Agent SDK,
@@ -99,7 +99,7 @@ you chose, not a meter you can't forecast. Need more capacity, pool
 several accounts with automatic failover. One bill. The one you
 already pay.
 
-### 4. Always available, in Telegram, done properly — *there when you want it*
+### 4. Always available, in Telegram, done properly: *there when you want it*
 
 Each specialist is a long-running service. It survives reboots,
 network drops, and your laptop closing. It does its regular scheduled
@@ -114,12 +114,12 @@ multi-channel bridge.
 
 Two different people, do not conflate them:
 
-- **The principal** — the person the team serves. Could be you in
+- **The principal.** The person the team serves. Could be you in
   non-coding mode, could be someone non-technical in your house. They
   never see a server. They text an assistant that knows them, gets
   things done, and checks before anything that matters. The bar: one
   even a non-technical partner likes working with.
-- **The operator** — the person who stands it up. Comfortable with a
+- **The operator.** The person who stands it up. Comfortable with a
   Linux box, YAML, and an OAuth flow. Runs it once, then mostly lives
   as a principal too.
 
@@ -162,9 +162,9 @@ messages, the status the principal sees, the setup wizard.
 This document is the *what* and *why*. Two sibling documents turn it
 into a verdict on any specific PR or design:
 
-- **`reference/principles.md`** — the three load-bearing standards
+- **`reference/principles.md`** carries the three load-bearing standards
   (docs / defaults / consistency) every change is checked against.
-- **`reference/*.md` JTBDs** — outcome-focused jobs the product must
+- **`reference/*.md` JTBDs** are the outcome-focused jobs the product must
   do. Each maps to one of the four outcomes above.
 
 A feature lands when it (a) advances one of the four outcomes,
