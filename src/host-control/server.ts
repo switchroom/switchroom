@@ -1138,8 +1138,9 @@ export class HostdServer {
     req: Extract<HostdRequest, { op: "agent_smoke" }>,
     started: number,
   ): Promise<HostdResponse> {
-    // req.args.name is AgentNameSchema-validated at decode; passed as
-    // its own argv element (+ `--`) so it can't be a docker flag.
+    // req.args.name is AgentNameSchema-validated at decode and passed
+    // as its own argv element; docker exec stops parsing its options
+    // at CONTAINER so nothing after it is read as a docker flag.
     const container = `switchroom-${req.args.name}`;
     type Probe = { name: string; state: "ok" | "fail" | "skip"; detail: string };
     const respond = (
