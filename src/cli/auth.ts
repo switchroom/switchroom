@@ -44,6 +44,11 @@ import {
   readAccountCredentials,
 } from "../auth/account-store.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import {
+  startAuthSession,
+  submitAuthCode,
+  cancelAuthSession,
+} from "../auth/manager.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { registerAuthGoogleSubcommands } from "./auth-google.js";
 import { setAuthActive } from "./auth-active-yaml.js";
@@ -795,5 +800,110 @@ export function registerAuthCommand(program: Command): void {
           );
         },
       ),
+    );
+
+  // ── auth reauth <agent> ───────────────────────────────────────────────
+  // Per-agent OAuth re-auth. RFC-H #1254 removed the CLI registrations
+  // (registerReauthCommand/registerCodeCommand/registerCancelCommand,
+  // §7.2) but left the engine (src/auth/manager.ts), every caller
+  // (telegram-plugin gateway op:reauth / `/auth reauth`), welcome-text,
+  // operator-events) and the tests all expecting these verbs — an
+  // orphaned-glue regression that broke the whole Telegram reauth flow.
+  // These are thin wrappers over the existing, tested manager engine;
+  // the credential write stays where claude/the agent already reads it
+  // (`<agentDir>/.claude/.credentials.json`).
+  auth
+    .command("reauth <agent>")
+    .description(
+      "Start/resume an OAuth re-auth session for an agent; prints the login URL",
+    )
+    .option(
+      "--slot <label>",
+      "Target a specific account slot/label instead of the agent's active one",
+    )
+    .option(
+      "--force",
+      "Kill any existing session and force a fresh login (use to switch accounts)",
+    )
+    .action(
+      withConfigError(
+        async (agent: string, opts: { slot?: string; force?: boolean }) => {
+          const config = getConfig(program);
+          const agentDir = join(resolveAgentsDir(config), agent);
+          const r = startAuthSession(agent, agentDir, {
+            force: opts.force,
+            slot: opts.slot,
+          });
+          for (const line of r.instructions) console.log(line);
+          // The gateway extracts the URL with /https:\/\/\S+/ from the
+          // combined output. startAuthSession's instructions already
+          // include the bare URL line; only print it separately if it
+          // somehow wasn't folded into the instructions.
+          if (
+            r.loginUrl &&
+            !r.instructions.some((l) => l.includes(r.loginUrl!))
+          ) {
+            console.log(r.loginUrl);
+          }
+        },
+      ),
+    );
+
+  // ── auth code <agent> <code> ──────────────────────────────────────────
+  auth
+    .command("code <agent> <code>")
+    .description(
+      "Submit the browser OAuth code to complete a pending `auth reauth`",
+    )
+    .option("--slot <label>", "Target a specific account slot/label")
+    .option(
+      "--json",
+      "Emit the structured AuthCodeResult as JSON (consumed by the Telegram gateway)",
+    )
+    .action(
+      withConfigError(
+        async (
+          agent: string,
+          code: string,
+          opts: { slot?: string; json?: boolean },
+        ) => {
+          const config = getConfig(program);
+          const agentDir = join(resolveAgentsDir(config), agent);
+          const r = submitAuthCode(agent, agentDir, code, opts.slot);
+          if (opts.json) {
+            // Shape pinned by telegram-plugin/gateway/gateway.ts
+            // `AuthCodeJsonResult` (execAuthCode parses this). Keep the
+            // field set + nullability exactly in sync with that type.
+            console.log(
+              JSON.stringify({
+                completed: r.completed,
+                tokenSaved: r.tokenSaved,
+                tokenPath: r.tokenPath ?? null,
+                outcome: r.outcome ?? null,
+                instructions: r.instructions,
+              }),
+            );
+          } else {
+            for (const line of r.instructions) console.log(line);
+          }
+          // Intentionally exits 0 even on a failed/timed-out code: the
+          // body (JSON or instructions) carries the actionable outcome
+          // and the gateway parses that, not the exit status.
+        },
+      ),
+    );
+
+  // ── auth cancel <agent> ───────────────────────────────────────────────
+  auth
+    .command("cancel <agent>")
+    .description("Cancel a pending `auth reauth` session for an agent")
+    .option("--slot <label>", "Target a specific account slot/label")
+    .action(
+      withConfigError(async (agent: string, opts: { slot?: string }) => {
+        const config = getConfig(program);
+        const agentDir = join(resolveAgentsDir(config), agent);
+        const r = cancelAuthSession(agent, agentDir, opts.slot);
+        for (const line of r.instructions) console.log(line);
+      }),
     );
 }
