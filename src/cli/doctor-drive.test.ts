@@ -12,7 +12,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { runDriveChecks, type DriveProbeDeps } from "./doctor-drive.js";
+import {
+  runDriveChecks,
+  runDriveBrokerReachabilityChecks,
+  type DriveProbeDeps,
+} from "./doctor-drive.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 function cfg(partial: Partial<SwitchroomConfig>): SwitchroomConfig {
@@ -246,5 +250,135 @@ describe("runDriveChecks — deployed scaffold wiring (bug-8 / bug-9)", () => {
     const w = rs.find((r) => r.name === "drive: carrie scaffold");
     expect(w?.status).toBe("fail");
     expect(w?.detail).toContain("corrupt");
+  });
+});
+
+describe("runDriveBrokerReachabilityChecks — the silent-failure blind spot", () => {
+  // This is the check that would have caught #1538 loud: config /
+  // scaffold / MCP-trust all green, but the broker DENIES the agent the
+  // OAuth client secret, so the gdrive MCP never spawns.
+  const DRIVE_CFG = (
+    clientSecret: string,
+    clientId?: string,
+  ): SwitchroomConfig =>
+    cfg({
+      agents: {
+        carrie: { google_workspace: { account: "you@x.com" } } as never,
+      },
+      google_accounts: { "you@x.com": { enabled_for: ["carrie"] } } as never,
+      google_workspace: {
+        ...(clientId ? { google_client_id: clientId } : {}),
+        google_client_secret: clientSecret,
+      } as never,
+    });
+
+  it("returns [] when Drive is unused (no drive agents)", async () => {
+    expect(
+      await runDriveBrokerReachabilityChecks(cfg({ agents: {} as never })),
+    ).toEqual([]);
+  });
+
+  it("reports ok (no broker needed) when the client secret is a literal", async () => {
+    let called = false;
+    const rs = await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("GOCSPX-literal"),
+      { preflight: async () => { called = true; return { kind: "locked" }; } },
+    );
+    expect(called).toBe(false);
+    expect(rs).toHaveLength(1);
+    expect(rs[0].status).toBe("ok");
+    expect(rs[0].detail).toContain("literal");
+  });
+
+  it("OK when the broker will serve the vault: client secret to the agent", async () => {
+    const rs = await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("vault:google/client-secret"),
+      {
+        preflight: async (_a, keys) => ({
+          kind: "ok",
+          results: keys.map((key) => ({
+            key,
+            exists: true,
+            acl_ok: true,
+            scope_ok: true,
+          })),
+        }),
+      },
+    );
+    expect(rs).toHaveLength(1);
+    expect(rs[0].status).toBe("ok");
+    expect(rs[0].name).toBe("drive: carrie client-cred broker-reachable");
+  });
+
+  it("FAILS loud when the broker DENIES the client secret (the #1538 regression)", async () => {
+    const rs = await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("vault:google/client-secret"),
+      {
+        preflight: async (_a, keys) => ({
+          kind: "ok",
+          results: keys.map((key) => ({
+            key,
+            exists: true,
+            acl_ok: false,
+            acl_reason:
+              "agent 'carrie' has no schedule entries declaring 'secrets'; nothing is broker-accessible",
+            scope_ok: true,
+          })),
+        }),
+      },
+    );
+    expect(rs).toHaveLength(1);
+    expect(rs[0].status).toBe("fail");
+    expect(rs[0].detail).toContain("DENIES");
+    expect(rs[0].detail).toContain("google/client-secret");
+    expect(rs[0].detail).toContain("silently never works");
+    expect(rs[0].fix).toContain("enabled_for[]");
+  });
+
+  it("SKIPS (never false-fails) when the broker is locked", async () => {
+    const rs = await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("vault:google/client-secret"),
+      { preflight: async () => ({ kind: "locked" }) },
+    );
+    expect(rs[0].status).toBe("skip");
+    expect(rs[0].detail).toContain("locked");
+  });
+
+  it("SKIPS (never false-fails) when the broker operator socket is unreachable", async () => {
+    const rs = await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("vault:google/client-secret"),
+      {
+        preflight: async () => ({
+          kind: "unreachable",
+          msg: "ENOENT operator sock",
+        }),
+      },
+    );
+    expect(rs[0].status).toBe("skip");
+    expect(rs[0].detail).toContain("unreachable");
+  });
+
+  it("probes BOTH client_id and client_secret when both are vault: refs", async () => {
+    let seen: string[] = [];
+    await runDriveBrokerReachabilityChecks(
+      DRIVE_CFG("vault:google/client-secret", "vault:google/client-id"),
+      {
+        preflight: async (_a, keys) => {
+          seen = keys;
+          return {
+            kind: "ok",
+            results: keys.map((key) => ({
+              key,
+              exists: true,
+              acl_ok: true,
+              scope_ok: true,
+            })),
+          };
+        },
+      },
+    );
+    expect(seen.sort()).toEqual(
+      ["google/client-id", "google/client-secret"].sort(),
+    );
   });
 });

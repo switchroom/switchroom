@@ -29,7 +29,7 @@ import { probeHindsight, isHindsightEnabled } from "../memory/hindsight.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
-import { runDriveChecks } from "./doctor-drive.js";
+import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
@@ -2333,7 +2333,13 @@ export function registerDoctorCommand(program: Command): void {
             title: "Agent liveness (in-agent via hostd)",
             results: await runAgentSmokeChecks(config, { fast: opts.fast }),
           },
-          { title: "Google Drive", results: runDriveChecks(config) },
+          {
+            title: "Google Drive",
+            results: [
+              ...runDriveChecks(config),
+              ...(await runDriveBrokerReachabilityChecks(config)),
+            ],
+          },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
         ];
 
