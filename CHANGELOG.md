@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.12.18 — feat: tell the user when proactive compaction runs
+
+Headline: v0.12.17 added opt-in proactive `/compact`, but it ran
+silently — an agent could drop ~600k+ of working context with no
+visible trace, which is at odds with switchroom's Visibility outcome.
+This makes proactive compaction observable: a single Telegram card is
+posted when `/compact` fires and edited in place to "context compacted
+(~X → ~Y tokens)" once the context has verifiably shrunk. Session
+reset/rotation (`session.max_idle` / `max_turns`) stays deliberately
+silent — unchanged. No new config: the notice activates automatically
+wherever `session.max_context_tokens` is set.
+
+### Changes
+
+#### Features
+
+- **feat(session):** proactive-compaction start/finish notification.
+  On `/compact` fire the gateway posts a START card and edits it in
+  place to FINISHED once the proactive-compaction decider's re-arm
+  edge confirms context actually dropped below 0.6×cap (no new IPC /
+  no new session event — reuses the v0.12.17 state machine and the
+  bridge's already-forwarded active-file). A same-file guard rejects a
+  sub-agent transcript briefly leading session-tail's current file
+  (no spurious / pre-completion finish); a wall-clock 15-minute
+  timeout edits a never-confirmed card to a neutral terminal state so
+  it can't dangle on an idle agent; a single-outstanding-card
+  invariant supersedes a prior card and clears the record+timer
+  atomically so a stale message is never re-edited. START is decided
+  synchronously after the opt-in `cap == null` return, so a fleet
+  with the feature off posts nothing (Defaults preserved). Transition
+  selection is a pure, unit-tested module; `proactive-compact.ts` is
+  unchanged. (#1553)
+
 ## v0.12.17 — feat: proactive context compaction (opt-in token cap)
 
 Headline: an always-on fleet on the 1M Opus window only hits Claude
