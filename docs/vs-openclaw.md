@@ -69,6 +69,37 @@ Substrate aside, here's what the product promises:
 5. Import memory: if you stored anything in OpenClaw's file-based memory, `switchroom memory` can ingest arbitrary text into a Hindsight bank.
 6. Point your existing Telegram bot token at Switchroom (or create a new bot), and `switchroom agent start` each agent.
 
+## Migrating credentials
+
+`scripts/import-openclaw-credentials.ts` is a one-shot migration script
+that lifts `/data/openclaw-config/credentials/` into the Switchroom
+vault. It ships with a small set of default mappings for filenames
+OpenClaw documents out of the box.
+
+User-specific credential filenames (your custom bot tokens, SSH keys,
+and so on) belong in a local overlay file, not the source repository.
+Create `~/.switchroom/import-openclaw.yaml`:
+
+```yaml
+# ~/.switchroom/import-openclaw.yaml
+files:
+  telegram-bot-token-mybot: telegram/mybot-bot-token
+  discord-bot-token-mybot: discord/mybot-bot-token
+  my-server-ssh-key: ssh/my-server
+skip:
+  compass-mac-cookies.json: "auto-managed by compass skill (8h TTL cache)"
+secrets_env:
+  X_BEARER_TOKEN: x-api/bearer-token
+directories:
+  garmin-tokens: garmin/tokens
+```
+
+Overlay entries win on collision with built-in defaults. Unknown files
+that appear in neither defaults nor the overlay surface as `warn`
+entries so nothing is silently dropped. Run `bun
+scripts/import-openclaw-credentials.ts --help` for flags including
+`--mapping <path>` to override the default overlay location.
+
 ## See also
 
 - [Configuration reference](configuration.md)

@@ -51,6 +51,23 @@ If you can't run the script, install the same things by hand:
 sudo npm install -g bun @anthropic-ai/claude-code switchroom
 ```
 
+### Other install paths and caveats
+
+- **Package name.** The npm package was originally `switchroom-ai`. It
+  is now just `switchroom`. The old name is deprecated and will stop
+  receiving updates. `npm install -g switchroom` is the current path.
+- **Bun is a hard runtime dep.** The `switchroom` CLI entrypoint is a
+  Bun script. A Node-only CLI build is on the roadmap, not yet shipped,
+  so install Bun even on the manual path.
+- **Static binary (planned, not yet shipped).** Pre-built single-binary
+  releases (no Node or Bun on the host) are scaffolded in
+  [`install.sh`](../install.sh) and referenced from the GitHub Releases
+  page, but the release workflow that publishes those binaries still
+  does not exist as of v0.12.0. Use the one-script or npm paths above.
+  Tracking work: switching the release pipeline to actually upload
+  `switchroom-linux-{amd64,arm64}` and `switchroom-macos-{amd64,arm64}`
+  on every tag.
+
 ## Step 2 — Create your bots in BotFather
 
 Switchroom uses **one Telegram bot per agent — always, no
@@ -240,7 +257,7 @@ agents, and MCP wireup, and prints actionable fixes.
 
 - [Configuration reference](configuration.md) — every yaml field, the
   cascade, profiles.
-- [Adding more agents](../README.md#cli-reference) — `switchroom agent add`
+- [Adding more agents](cli-reference.md#agents) — `switchroom agent add`
   walks you through it.
 - [Telegram features](telegram-features.md) — voice-in, long replies,
   scheduled tasks.
