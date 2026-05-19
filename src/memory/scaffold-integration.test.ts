@@ -1,20 +1,20 @@
 /**
- * RFC G — `getGdriveMcpSettingsEntry()` launcher wiring + the shared
- * broker-ACL gate predicate (`shouldEmitGdriveMcp`).
+ * RFC G — `getGdriveMcpSettingsEntry()` launcher wiring.
  *
  * The entry used to be a bare `uvx` command with a dead
  * `GOOGLE_OAUTH_TOKEN_FROM_VAULT` env. It now points at the switchroom
  * CLI's hidden `drive-mcp-launcher` verb (the launcher seeds a
  * refresh-token credentials file and execs upstream `--single-user`).
- * These tests pin: the launcher command, no env block, the tier
- * pass-through, and the broker-ACL-contract agreement.
+ * These tests pin: the launcher command, no env block, and the tier
+ * pass-through. The shared broker-ACL gate predicate
+ * (`shouldEmitGdriveMcp`) moved to `config/google-workspace-acl.ts` —
+ * its contract tests live alongside it.
  */
 
 import { describe, expect, it } from "vitest";
 
 import {
   getGdriveMcpSettingsEntry,
-  shouldEmitGdriveMcp,
   type GdriveMcpTier,
 } from "./scaffold-integration.js";
 
@@ -57,70 +57,4 @@ describe("getGdriveMcpSettingsEntry — launcher command", () => {
       expect(flagIdx).toBeGreaterThan(args.indexOf("drive-mcp-launcher"));
     },
   );
-});
-
-describe("shouldEmitGdriveMcp — broker-ACL contract", () => {
-  // The same config that makes the scaffold emit the gdrive entry MUST
-  // be the config under which the broker would return a Google account.
-  // Broker logic (src/auth/broker/server.ts opGoogleGetCredentials):
-  //   account = agents.<name>.google_workspace.account  (must be set)
-  //   ACL     = google_accounts[account].enabled_for[].includes(name)
-  // shouldEmitGdriveMcp encodes exactly that — these cases pin both
-  // sides to one predicate.
-
-  it("emits when account set AND agent in enabled_for[] (broker would return creds)", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", "you@example.com", {
-        "you@example.com": { enabled_for: ["clerk", "carrie"] },
-      }),
-    ).toBe(true);
-  });
-
-  it("does NOT emit when agent has no google_workspace.account (broker → ACCOUNT_NOT_FOUND)", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", undefined, {
-        "you@example.com": { enabled_for: ["carrie"] },
-      }),
-    ).toBe(false);
-  });
-
-  it("does NOT emit when the referenced account isn't in google_accounts", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", "you@example.com", {
-        "other@gmail.com": { enabled_for: ["carrie"] },
-      }),
-    ).toBe(false);
-  });
-
-  it("does NOT emit when agent NOT in enabled_for[] (broker → FORBIDDEN)", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", "you@example.com", {
-        "you@example.com": { enabled_for: ["clerk"] },
-      }),
-    ).toBe(false);
-  });
-
-  it("does NOT emit when google_accounts is entirely absent", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", "you@example.com", undefined),
-    ).toBe(false);
-  });
-
-  it("normalizes account case/whitespace the same way the schema + broker do", () => {
-    // Schema lowercases+trims both the per-agent account and the
-    // google_accounts keys; the predicate must agree post-normalization.
-    expect(
-      shouldEmitGdriveMcp("carrie", "  You@Example.com  ", {
-        "you@example.com": { enabled_for: ["carrie"] },
-      }),
-    ).toBe(true);
-  });
-
-  it("treats an empty-string account as not configured", () => {
-    expect(
-      shouldEmitGdriveMcp("carrie", "   ", {
-        "you@example.com": { enabled_for: ["carrie"] },
-      }),
-    ).toBe(false);
-  });
 });
