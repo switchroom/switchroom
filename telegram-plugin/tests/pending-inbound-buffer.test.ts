@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { createPendingInboundBuffer, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
 function inbound(source: string, ts = Date.now()): InboundMessage {
@@ -128,5 +128,75 @@ describe('pending-inbound-buffer', () => {
     expect(buf.totalDepth()).toBe(3)
     buf.drain('a')
     expect(buf.totalDepth()).toBe(1)
+  })
+})
+
+describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incident 2026-05-19)', () => {
+  it('delivers every buffered message and empties the buffer when send succeeds', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    buf.push('klanker', inbound('user', 2))
+    const seen: number[] = []
+    const r = redeliverBufferedInbound(buf, 'klanker', (m) => {
+      seen.push(m.messageId as number)
+      return true
+    })
+    expect(r).toEqual({ drained: 2, redelivered: 2, rebuffered: 0 })
+    expect(seen).toEqual([1, 2]) // FIFO preserved
+    expect(buf.depth('klanker')).toBe(0)
+  })
+
+  it('re-buffers (loses nothing) when the bridge is still offline — send returns false', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    buf.push('klanker', inbound('cron', 2))
+    const r = redeliverBufferedInbound(buf, 'klanker', () => false)
+    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2 })
+    expect(buf.depth('klanker')).toBe(2) // still there, nothing lost
+    expect(buf.drain('klanker').map((m) => m.meta?.source)).toEqual(['user', 'cron'])
+  })
+
+  it('treats a throwing send as not-delivered and re-buffers', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    const r = redeliverBufferedInbound(buf, 'klanker', () => {
+      throw new Error('bridge write failed')
+    })
+    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1 })
+    expect(buf.depth('klanker')).toBe(1)
+  })
+
+  it('mixed: delivers what it can, re-buffers only the misses', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('a', 1))
+    buf.push('klanker', inbound('b', 2))
+    buf.push('klanker', inbound('c', 3))
+    let n = 0
+    const r = redeliverBufferedInbound(buf, 'klanker', () => {
+      n++
+      return n !== 2 // 2nd send fails
+    })
+    expect(r).toEqual({ drained: 3, redelivered: 2, rebuffered: 1 })
+    expect(buf.drain('klanker').map((m) => m.meta?.source)).toEqual(['b'])
+  })
+
+  it('is a no-op on an empty buffer (no send calls)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    let calls = 0
+    const r = redeliverBufferedInbound(buf, 'klanker', () => {
+      calls++
+      return true
+    })
+    expect(r).toEqual({ drained: 0, redelivered: 0, rebuffered: 0 })
+    expect(calls).toBe(0)
+  })
+
+  it('only touches the named agent', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    buf.push('clerk', inbound('user', 2))
+    redeliverBufferedInbound(buf, 'klanker', () => true)
+    expect(buf.depth('klanker')).toBe(0)
+    expect(buf.depth('clerk')).toBe(1) // untouched
   })
 })

@@ -245,7 +245,7 @@ import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
-import { createPendingInboundBuffer } from './pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound } from './pending-inbound-buffer.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -2743,10 +2743,27 @@ silencePoke.startTimer({
     try {
       clearSilentEndState(fbKey)
     } catch { /* best-effort */ }
+    // Self-heal the inbound buffer. pendingInboundBuffer otherwise
+    // drains ONLY on bridge re-register (onClientRegistered). After a
+    // network storm that settles with the bridge STILL connected, user
+    // messages buffered during the flap sit forever — until a manual
+    // restart forces a re-register (the fleet-update thundering-herd
+    // incident, 2026-05-19: agents "not responding", logs show
+    // pending-inbound-buffer depth>0 with no drain). Flushing on
+    // wedge-clear makes the agent self-heal. selfAgent-keyed; a miss
+    // re-buffers so nothing is lost if the bridge is genuinely offline.
+    const fbSelfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    const fbRedeliver = redeliverBufferedInbound(
+      pendingInboundBuffer,
+      fbSelfAgent,
+      (m) => ipcServer.sendToAgent(fbSelfAgent, m),
+    )
     process.stderr.write(
       `telegram gateway: silence-poke framework-fallback ended wedged turn ` +
       `chat=${fbChatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
-      `currentTurn_nulled=${turnMatchesFallback}\n`,
+      `currentTurn_nulled=${turnMatchesFallback} ` +
+      `drained_buffered=${fbRedeliver.redelivered}/${fbRedeliver.drained}` +
+      `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}\n`,
     )
   },
 })
