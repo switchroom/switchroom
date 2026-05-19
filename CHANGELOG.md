@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.12.12 — fix: docker-exec `--` broke agent_exec & agent_smoke in production
+
+### Changes
+
+#### Fixes
+
+- **fix(hostd):** drop the `--` from `docker exec` invocations in
+  `agent_exec` (#1208/#1401) and `agent_smoke` (#1525). Unlike
+  `docker run`, `docker exec` stops parsing its **own** options at
+  `CONTAINER`, so the `--` #1401 added was both unnecessary and
+  prod-breaking: docker tried to exec a binary literally named `"--"`
+  → exit 127, so **every real `agent_exec`/`agent_smoke` call failed**
+  (invisible because the hostd tests used a docker stub that ignored
+  argv past `$1`). The caller-argv-as-docker-flag concern #1401
+  worried about cannot occur for `docker exec` (verified against real
+  docker); the `agent_exec` allowlist + charclass backstops are
+  unchanged. The test stub now models real docker (a `--` command
+  position exits 127) so this can't regress unseen. Surfaced by
+  live-verifying the v0.12.11 "Agent liveness" doctor section. (#1529)
+
 ## v0.12.11 — hostd operator socket; honest doctor, part 3 (verified liveness goes live)
 
 Completes the honest-doctor arc. Part 1 (v0.12.9) made the
