@@ -1,11 +1,12 @@
 # approval-grant-flow — diagram spec
 
-Status: needs-revision
-(Prior spec/SVG overstated the model: headline "Every gated tool call"
-and a synchronous "claude REPL paused" node. The kernel does NOT gate
-every tool call generically. It is a decision store keyed
-(agent, scope, action); the agent registers a request, ends its turn,
-and polls for the verdict. Regenerate the SVG/JPG from this spec.)
+Status: current
+(Corrected 2026-05-19: the prior spec/SVG overstated the model with
+"Every gated tool call" and a synchronous "claude REPL paused" node.
+The kernel does NOT gate every tool call generically. It is a decision
+store keyed (agent, scope, action); the agent registers a request,
+ends its turn, and polls for the verdict. Spec and SVG were both
+regenerated to the corrected register-and-poll model.)
 
 Source of truth in code:
 - `src/vault/approvals/kernel.ts:1-13` — stateless decision store keyed
