@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.12.14 — fix: Google Drive MCP works fleet-wide (RFC G §4.4) + gateway/approval delivery reliability
+
+Headline: the Google Drive MCP was dead on arrival on every install
+that stores the OAuth client secret as a `vault:` ref (the documented
+`switchroom auth google connect` shape). The launcher resolves
+`google_workspace.google_client_secret` through the vault-broker, but
+the broker's only standing read-ACL is per-agent
+`schedule[].secrets[]` and nothing in onboarding wired the client
+secret into it — so every Drive-enabled agent was broker-`DENIED` the
+secret and the `gdrive` MCP never spawned, even with config, scaffold,
+MCP trust, and the refresh token all correct. This release completes
+RFC G §4.4: the broker now derives the grant from
+`google_workspace` + `google_accounts.enabled_for[]` config, the same
+gate the scaffold uses. No operator action — works on fresh installs.
+Also: a four-part gateway/approval delivery-reliability series and a
+default-doctor cron-secret preflight.
+
+### Changes
+
+#### Features
+
+- **feat(broker,doctor):** `preflight_access` — the default `doctor`
+  run now verifies each agent's declared cron `secrets[]` are actually
+  broker-reachable, so a misconfigured ACL surfaces before a 3am cron
+  fails on it rather than after. (#1533)
+
+#### Fixes
+
+- **fix(vault-broker):** grant Drive-enabled agents read access to the
+  configured Google OAuth client credential
+  (`google_workspace.google_client_{id,secret}` vault refs), gated by
+  the same `shouldEmitGdriveMcp` predicate the scaffold uses so broker
+  and scaffold can never disagree. Completes RFC G §4.4 — the Google
+  *account* slots were already exempt from `schedule.secrets`; the
+  client credential was the one piece of the same Drive auth flow left
+  out, which made the `gdrive` MCP fail to connect fleet-wide. The
+  predicate moved to a new dependency-free
+  `config/google-workspace-acl.ts` so the broker (whose `acl.ts` is
+  deliberately pure) can share it. Identity-bound, not cross-agent —
+  exactly analogous to the existing per-agent `bot_token` clause; the
+  `mcp_servers: { gdrive: false }` opt-out is honoured. (#1538)
+- **fix(gateway):** wake the agent after `vault_request_save`
+  Save/Discard/fail so a vault-save decision no longer leaves the
+  turn hung (PR-1/4). (#1536)
+- **fix(gateway):** buffer Telegram-inbound messages and button-tap
+  delivery so taps/messages arriving mid-reconnect are not dropped
+  (PR-2/4). (#1537)
+- **fix(gateway):** permission verdicts survive a gateway reconnect,
+  with TTL auto-deny so a never-answered prompt fails closed rather
+  than hanging forever (PR-3/4). (#1539)
+- **fix(approval):** compute the approval decision *before* burning
+  the single-use nonce, so a decision is not lost when the nonce is
+  consumed (PR-4/4). (#1541)
+- **fix(broker):** a test-injected broker must not auto-unlock the
+  real vault — test isolation fix preventing a test broker from
+  touching operator vault state. (#1534)
+
+#### Docs
+
+- **docs:** value-first README restructure + accuracy pass and
+  diagram alignment. (#1540)
+
 ## v0.12.13 — fix: agent_smoke auth probe checked the wrong path
 
 ### Changes
