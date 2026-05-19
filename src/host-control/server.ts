@@ -523,6 +523,10 @@ export class HostdServer {
         case "doctor":
           resp = await this.handleDoctor(req, started);
           break;
+        // ── Phase 3.2 read-only in-agent liveness battery ────────
+        case "agent_smoke":
+          resp = await this.handleAgentSmoke(req, started);
+          break;
       }
     } catch (err) {
       resp = errorResponse(
@@ -604,12 +608,15 @@ export class HostdServer {
           : `${req.op} cross-agent requires admin: true on caller "${caller.name}"`;
       case "agent_logs":
       case "agent_exec":
+      case "agent_smoke":
         // Phase 3 admin-observability verbs. Self-target is allowed
         // (an agent reading its own logs / inspecting its own
         // container is harmless and useful for self-debugging);
         // cross-agent requires admin. agent_exec additionally enforces
         // a read-only argv allowlist at dispatch time — see
-        // isAllowlistedReadOnlyArgv.
+        // isAllowlistedReadOnlyArgv. agent_smoke runs a FIXED
+        // read-only probe battery (no caller-supplied argv at all),
+        // so it's strictly safer than agent_exec under the same gate.
         if (req.args.name === caller.name) return null;
         return callerAdmin
           ? null
@@ -735,7 +742,14 @@ export class HostdServer {
     req: Extract<HostdRequest, { op: "doctor" }>,
     started: number,
   ): Promise<HostdResponse> {
-    const res = await this.runSwitchroom(["doctor"]);
+    // `--fast`: the whole-fleet doctor reached via this verb (the
+    // Telegram /doctor surface, #1518) must stay STRUCTURAL only. The
+    // in-agent liveness section makes a hostd round-trip per agent;
+    // running it here would risk the gateway's 30s shell-out timeout
+    // and re-enter hostd recursively. Operators get in-agent liveness
+    // by running `switchroom doctor` directly on the host (no 30s
+    // budget), or via the standalone `agent_smoke` verb per agent.
+    const res = await this.runSwitchroom(["doctor", "--fast"]);
     return {
       v: 1,
       request_id: req.request_id,
@@ -1047,6 +1061,130 @@ export class HostdServer {
       stdout_tail: tail(res.stdout),
       stderr_tail: tail(res.stderr),
     };
+  }
+
+  /**
+   * Read-only in-agent liveness battery (Phase 3.2). hostd is the one
+   * audited, admin-gated component with the docker socket, so the
+   * privileged in-container probing lives HERE, not in an
+   * unprivileged caller. Every probe is a FIXED literal command (no
+   * caller argv) returning only a boolean/state — NEVER a secret
+   * value (the bot-token probe uses `grep -q`, which emits nothing).
+   * A down container or a docker failure degrades every probe to
+   * `skip`; the verb itself is always `completed` when it ran (a
+   * failing probe is a *finding* the caller renders, not a
+   * verb-dispatch failure — same posture as the doctor verb). `deep`
+   * adds a real, quota-costing `claude -p` auth smoke; the default
+   * makes NO model call.
+   */
+  private async handleAgentSmoke(
+    req: Extract<HostdRequest, { op: "agent_smoke" }>,
+    started: number,
+  ): Promise<HostdResponse> {
+    // req.args.name is AgentNameSchema-validated at decode; passed as
+    // its own argv element (+ `--`) so it can't be a docker flag.
+    const container = `switchroom-${req.args.name}`;
+    type Probe = { name: string; state: "ok" | "fail" | "skip"; detail: string };
+    const respond = (
+      containerState: "running" | "absent",
+      probes: Probe[],
+    ): HostdResponse => ({
+      v: 1,
+      request_id: req.request_id,
+      result: "completed",
+      exit_code: probes.some((p) => p.state === "fail") ? 1 : 0,
+      duration_ms: Date.now() - started,
+      stdout_tail: tail(
+        JSON.stringify({
+          container: containerState,
+          deep: !!req.args.deep,
+          probes,
+        }),
+      ),
+    });
+
+    let running = false;
+    try {
+      const insp = await this.runDocker([
+        "inspect",
+        "-f",
+        "{{.State.Running}}",
+        container,
+      ]);
+      running = insp.exit_code === 0 && insp.stdout.trim() === "true";
+    } catch {
+      running = false;
+    }
+
+    const PROBES: { name: string; cmd: string }[] = [
+      {
+        name: "auth",
+        cmd: 'test -s "$CLAUDE_CONFIG_DIR/.credentials.json" || test -s "$HOME/.claude/.credentials.json"',
+      },
+      {
+        name: "scheduler",
+        cmd: "grep -q '_switchroom_supervise.*agent-scheduler' /state/agent/start.sh && pgrep -f agent-scheduler >/dev/null",
+      },
+      {
+        name: "mcp",
+        cmd: "python3 -m json.tool /state/agent/.mcp.json >/dev/null 2>&1",
+      },
+      {
+        // grep -q emits NOTHING on stdout — only an exit code, so the
+        // token value never leaves the container.
+        name: "bot_token",
+        cmd: "test -f /state/agent/telegram/.env && grep -qE '^TELEGRAM_BOT_TOKEN=[0-9]+:' /state/agent/telegram/.env",
+      },
+      { name: "state", cmd: "test -w /state/agent" },
+    ];
+    if (req.args.deep) {
+      PROBES.push({
+        name: "auth_live",
+        cmd: "timeout 25 claude -p ok >/dev/null 2>&1",
+      });
+    }
+
+    if (!running) {
+      return respond(
+        "absent",
+        PROBES.map((p) => ({
+          name: p.name,
+          state: "skip" as const,
+          detail: `container ${container} is not running — use agent_start`,
+        })),
+      );
+    }
+
+    const probes: Probe[] = await Promise.all(
+      PROBES.map(async (p): Promise<Probe> => {
+        try {
+          const r = await this.runDocker([
+            "exec",
+            container,
+            "--",
+            "sh",
+            "-lc",
+            p.cmd,
+          ]);
+          return {
+            name: p.name,
+            state: r.exit_code === 0 ? "ok" : "fail",
+            // NEVER include r.stdout: probes are exit-code only so a
+            // secret can't leak into the operator/audit surface.
+            detail: r.exit_code === 0 ? "ok" : `exit ${r.exit_code}`,
+          };
+        } catch (err) {
+          // docker binary missing / exec spawn error → not a health
+          // signal about the agent. Skip, never fail.
+          return {
+            name: p.name,
+            state: "skip",
+            detail: `probe could not run: ${(err as Error).message}`,
+          };
+        }
+      }),
+    );
+    return respond("running", probes);
   }
 
   /** Spawn the host `docker` CLI and capture stdout/stderr. Symmetric
