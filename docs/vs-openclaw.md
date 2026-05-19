@@ -16,8 +16,8 @@ If you came here because OpenClaw stopped working with your Claude subscription,
 | Auth | Claude Pro/Max OAuth | Anthropic API key |
 | Billing | Your existing subscription | Per-token API billing |
 | Runtime | Stock `claude` CLI | Custom runtime |
-| Channels | Telegram (enhanced fork with 15 MCP tools) | WhatsApp, Telegram, Slack |
-| Memory | Hindsight (semantic, knowledge graph, mental models) | File-based |
+| Channels | Telegram (enhanced fork with 17 MCP tools) | WhatsApp, Telegram, Slack |
+| Memory | Hindsight (semantic, per-user mental model) | File-based |
 | Scheduling | Cron syntax in YAML, fires across reboots | Built-in cron engine |
 | Sub-agents | Native Claude Code sub-agents | Custom orchestration |
 | Config | YAML with cascade + profiles | JSON/TOML per agent |
@@ -52,7 +52,7 @@ Substrate aside, here's what the product promises:
 - **Auto-recovery on crash, with audit trail.** A watchdog catches stuck turns, captures a crash-pane snapshot for forensics, restarts the agent. The agent then runs a wake-audit on boot for owed replies and orphan sub-agents. No silent dropped work.
 - **Per-agent isolated logs you can grep.** One process per agent, one log stream per agent.
 - **Scheduled tasks that fire across reboots.** Cron syntax in YAML, per-task model selection, output to Telegram.
-- **Live progress cards in Telegram.** Pinned per topic, every tool call visible. The headline UX.
+- **Deterministic status in Telegram.** Every topic shows quiet / working / idle, steps stream in place as tools run, never silent and never a stale pinned card. The headline UX.
 
 ## When OpenClaw might still be the right call
 
@@ -68,6 +68,37 @@ Substrate aside, here's what the product promises:
 4. Bring your persona: the setup wizard prompts for each agent's name/style/boundaries, or paste your OpenClaw `SOUL.md` into the seeded `workspace/SOUL.md` afterwards. Like OpenClaw, **SOUL.md is your file** — switchroom seeds it once and never overwrites it on update (the root `CLAUDE.md` operating-manual *is* switchroom-managed, so its updates still reach you). Re-seed any time with `switchroom soul reset <agent>`.
 5. Import memory: if you stored anything in OpenClaw's file-based memory, `switchroom memory` can ingest arbitrary text into a Hindsight bank.
 6. Point your existing Telegram bot token at Switchroom (or create a new bot), and `switchroom agent start` each agent.
+
+## Migrating credentials
+
+`scripts/import-openclaw-credentials.ts` is a one-shot migration script
+that lifts `/data/openclaw-config/credentials/` into the Switchroom
+vault. It ships with a small set of default mappings for filenames
+OpenClaw documents out of the box.
+
+User-specific credential filenames (your custom bot tokens, SSH keys,
+and so on) belong in a local overlay file, not the source repository.
+Create `~/.switchroom/import-openclaw.yaml`:
+
+```yaml
+# ~/.switchroom/import-openclaw.yaml
+files:
+  telegram-bot-token-mybot: telegram/mybot-bot-token
+  discord-bot-token-mybot: discord/mybot-bot-token
+  my-server-ssh-key: ssh/my-server
+skip:
+  compass-mac-cookies.json: "auto-managed by compass skill (8h TTL cache)"
+secrets_env:
+  X_BEARER_TOKEN: x-api/bearer-token
+directories:
+  garmin-tokens: garmin/tokens
+```
+
+Overlay entries win on collision with built-in defaults. Unknown files
+that appear in neither defaults nor the overlay surface as `warn`
+entries so nothing is silently dropped. Run `bun
+scripts/import-openclaw-credentials.ts --help` for flags including
+`--mapping <path>` to override the default overlay location.
 
 ## See also
 

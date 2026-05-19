@@ -1,35 +1,53 @@
 # approval-grant-flow — diagram spec
 
-Status: current (verified accurate — no regeneration needed)
-Captured so the diagram set is fully spec-backed and so
-`drive-write-approval` can link its kernel reuse here.
+Status: current
+(Corrected 2026-05-19: the prior spec/SVG overstated the model with
+"Every gated tool call" and a synchronous "claude REPL paused" node.
+The kernel does NOT gate every tool call generically. It is a decision
+store keyed (agent, scope, action); the agent registers a request,
+ends its turn, and polls for the verdict. Spec and SVG were both
+regenerated to the corrected register-and-poll model.)
 
 Source of truth in code:
-- `src/vault/approvals/schema.ts`, `kernel.ts` — SQLite-backed grant store
-- `src/vault/approvals/kernel-server.ts` — per-agent UDS IPC
-- `src/vault/approvals/acl.ts` — TTL'd grants, one-off vs always scope
-- `src/agents/compose.ts:898` — `approval-kernel` singleton service
+- `src/vault/approvals/kernel.ts:1-13` — stateless decision store keyed
+  `(agent_unit, scope, action)`; durable allow/deny, TTL, approver set
+- `src/vault/approvals/schema.ts` — SQLite-backed grant store
+- `src/vault/approvals/kernel-server.ts:24-27` — per-agent UDS IPC;
+  operator host socket is read-only (`approval_list` only, `:542`)
+- `telegram-plugin/gateway/approval-callback.ts:14-21` — agent fires the
+  request, ends the turn, polls `approval_lookup` once for the verdict
+- `telegram-plugin/gateway/approval-card.ts:49` — `apv:<request_id>:once`
+  Allow/Deny callback (the inline Telegram card)
+- `src/agents/compose.ts:904` — `approval-kernel` singleton service
+  (citation aligned with `runtime-topology.spec.md`)
 
-Headline: "Every gated tool call. User-confirmed in Telegram. TTL'd. Audited."
+Headline: "Privileged action? The agent asks. You approve in Telegram. Scoped, TTL'd, audited."
 Footer:   (none)
 
 ## Nodes
 
-1. `agent · claude REPL` · "Paused — awaiting approval" mock (Tool/File/Diff/Status) · dark card
-2. `approval kernel` · "SQLite + IPC broker" · grant table (id/tool/state/ttl) · plain, focal
-   - caption: "Grants are TTL'd. One-off allow does not silently become forever."
-3. `your phone (Telegram)` · approval card mock: `@worker wants to edit`, diff, **Allow / Deny**, scope chips "this call · ttl 15m · always" · phone frame
+1. `agent · claude` · registers a scoped request, ends the turn, then
+   polls for the verdict (NOT a held synchronous pause) · dark card
+2. `approval kernel` · "SQLite decision store + per-agent UDS" · table
+   (agent/scope/action/state/ttl) · plain, focal
+   - caption: "Decisions are scoped and TTL'd. One-off allow never
+     silently becomes forever. The agent cannot self-approve."
+3. `your phone (Telegram)` · approval card mock: `@worker wants to <action>`,
+   the what + why (diff / key / command), **Allow / Deny**, scope chips
+   "this call · ttl 15m · always" · phone frame
 
 ## Edges
 
-- 1 → 2 · "1 — agent → kernel: tool call" · primary-flow (brass step ①)
-- 2 → 3 · "2 — kernel → phone: pause and push approval card" · primary-flow (cord step ②)
-- 3 → 2 · "3 — phone → kernel: user taps allow" · primary-flow (cord step ③)
-- 2 → 1 · "4 — kernel → agent: tool resumes" · primary-flow (teal step ④)
+- 1 → 2 · "① agent → kernel: register request (scope, get request_id + expires_at)" · primary-flow (brass ①)
+- 2 → 3 · "② kernel → phone: push Approve/Deny card with what + why" · primary-flow (cord ②)
+- 3 → 2 · "③ phone → kernel: you tap Allow (or Deny)" · primary-flow (cord ③)
+- 2 → 1 · "④ agent polls request_id → proceeds on allow; clean recoverable refusal on deny" · primary-flow (teal ④)
 
 ## Style notes
 
-Inherits v3. Verified still accurate as of this spec. The Drive write
-path (`drive-write-approval.spec.md`) reuses this exact kernel + the
-`apv:<request_id>:once` callback — keep both diagrams visually
-consistent (same kernel card treatment, same step-numbering colors).
+Inherits v3. The Drive write path (`drive-write-approval.spec.md`)
+reuses this exact kernel + the `apv:<request_id>:once` callback — keep
+both diagrams visually consistent (same kernel card treatment, same
+①②③④ step-numbering colors). The vault-broker grant path
+(`auth-broker-credential-plane` / vault docs) is the sibling on the
+*credential* plane; same human-approval shape, different daemon.

@@ -53,5 +53,6 @@ kernel card 1:1 and the same ①②③④ step-color scheme so a reader sees
 "Drive writes ride the existing approval rail." The only new surface is
 the single-request diff card + the Open-in-Drive post-grant button; the
 second escalation button is drawn ghosted/dashed (renderer-capable, not
-wired) so the diagram never overstates the shipped flow. Callout 7 of
-`progress-card-anatomy` points here.
+wired) so the diagram never overstates the shipped flow. Callout 8 of
+`deterministic-status-anatomy` points here (a Drive write is a separate
+gated approval, not part of the status surface — do not conflate).

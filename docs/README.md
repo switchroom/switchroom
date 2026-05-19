@@ -74,7 +74,7 @@ operators jump to **Operating**; contributors and reviewers use
 | Doc | What it covers |
 |---|---|
 | [diagrams/DESIGN.md](diagrams/DESIGN.md) | Unified diagram design system (v3) + source-of-truth/regeneration model. |
-| [diagrams/progress-card-anatomy.spec.md](diagrams/progress-card-anatomy.spec.md) | Regeneration spec for the progress-card-anatomy diagram. |
+| [diagrams/deterministic-status-anatomy.spec.md](diagrams/deterministic-status-anatomy.spec.md) | Regeneration spec for the deterministic-status anatomy diagram (supersedes the retired pinned progress-card). |
 | [diagrams/approval-grant-flow.spec.md](diagrams/approval-grant-flow.spec.md) | Regeneration spec for the approval-grant-flow diagram. |
 | [diagrams/wake-audit-lifecycle.spec.md](diagrams/wake-audit-lifecycle.spec.md) | Regeneration spec for the wake-audit-lifecycle diagram. |
 | [diagrams/auth-broker-credential-plane.spec.md](diagrams/auth-broker-credential-plane.spec.md) | Regeneration spec for the auth-broker-credential-plane diagram. |
