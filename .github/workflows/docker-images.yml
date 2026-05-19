@@ -338,7 +338,17 @@ jobs:
   # PR C: promote :sha-<7> → :dev for every image when smoke passes.
   # Matrix-fanout retag using buildx imagetools so we don't rebuild.
   promote-to-dev:
-    needs: [smoke-test]
+    # `build-hindsight` is intentionally decoupled from the base→
+    # build-dependents→smoke-test chain (it extends upstream, builds in
+    # parallel). But promote-to-dev's `hindsight` matrix leg retags
+    # hindsight's `:sha-<short>`, so it MUST gate on build-hindsight
+    # succeeding — otherwise a genuine hindsight build/push failure
+    # (job green path not taken) could be misread by the retag step as
+    # a benign "image unchanged" skip. With build-hindsight in `needs`,
+    # a missing `:sha-<short>` at promote time provably means
+    # "build succeeded but context unchanged → buildx cache hit, nothing
+    # pushed", never "build failed".
+    needs: [smoke-test, build-hindsight]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
@@ -358,6 +368,39 @@ jobs:
 
       - name: Retag :sha-<7> as :dev (no rebuild)
         run: |
+          set -euo pipefail
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
           IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image }}"
-          docker buildx imagetools create -t "${IMAGE}:dev" "${IMAGE}:sha-${SHA_SHORT}"
+          SRC="${IMAGE}:sha-${SHA_SHORT}"
+          # An image whose build context is unchanged for this commit is
+          # a 100% buildx cache hit and pushes NOTHING — so its per-commit
+          # `:sha-<short>` tag never gets created. This is the norm for
+          # `hindsight` (it extends upstream `vectorize-io/hindsight`, not
+          # `switchroom-base`, so most main commits don't touch its
+          # context). Hard-failing the retag here turned that into a
+          # whole-run red on `docker-images` for every hindsight-untouched
+          # release (e.g. v0.12.15 / dc508a9), even though the fleet is
+          # fine: `:latest` is pushed inline by the build jobs, and the
+          # existing `:dev` already points at the last good build.
+          #
+          # promote-to-dev `needs: [smoke-test, build-hindsight]`, so by
+          # the time this runs EVERY image's build job has SUCCEEDED — a
+          # missing `:sha-<short>` therefore provably means "cache hit,
+          # nothing pushed", never "build failed". In that case the
+          # existing `:dev` is already the last good build → skip.
+          #
+          # CRITICAL: only skip on a genuine NOT-FOUND. A transient
+          # registry/auth/network error from `imagetools inspect` must
+          # NOT be misread as "absent" — that would silently stop `:dev`
+          # advancing for a CHANGED image (e.g. agent/kernel on a code
+          # release). Any non-absence error fails the step loudly.
+          if out=$(docker buildx imagetools inspect "$SRC" 2>&1); then
+            docker buildx imagetools create -t "${IMAGE}:dev" "$SRC"
+            echo "promoted $SRC -> ${IMAGE}:dev"
+          elif printf '%s' "$out" | grep -qiE 'manifest unknown|not found|404|no such manifest|MANIFEST_UNKNOWN'; then
+            echo "::notice title=promote-to-dev skipped::$SRC absent (build context unchanged this commit — buildx cache hit, nothing pushed). Existing ${IMAGE}:dev retained; nothing to re-promote."
+          else
+            echo "::error title=promote-to-dev failed::inspecting $SRC failed with a non-absence error (registry/auth/network?) — NOT masking a possibly-real promotion."
+            printf '%s\n' "$out"
+            exit 1
+          fi
