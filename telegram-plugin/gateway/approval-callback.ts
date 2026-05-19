@@ -57,19 +57,18 @@ export async function handleApprovalCallback(
     return;
   }
 
-  const consumed = await approvalConsume(parsed.request_id);
-  if (consumed === null) {
-    await ctx.answerCallbackQuery({ text: "approval kernel unreachable" });
-    return;
-  }
-  if (!consumed.consumed) {
-    // Single-use enforcement: someone already tapped, or the nonce
-    // expired/unknown. Match the RFC §8.1 wording.
-    await ctx.answerCallbackQuery({ text: "this prompt expired" });
-    return;
-  }
-
-  // Compute decision + ttl from the choice variant.
+  // Compute decision + ttl from the choice variant BEFORE burning the
+  // single-use nonce. This block has a fallible early-return (the
+  // `bad ttl token` path). Pre-fix it ran AFTER approvalConsume(), so a
+  // malformed ttl token burned the nonce but recorded no decision — the
+  // agent's approval_lookup poll never saw a verdict and the turn
+  // wedged (pre-PR-3: forever; now bounded by PR-3's PERMISSION_TTL
+  // auto-deny). approvalConsume stays the atomic single-use guard; it
+  // simply doesn't fire until we have a valid decision to record
+  // immediately after. There is now NO fallible step between
+  // consume→record; the only residual gap is the inherent 1-RPC
+  // consume/record non-atomicity (backstopped by PR-3's TTL auto-deny;
+  // a fully atomic kernel consume+record is a tracked follow-up).
   let decision: ApprovalDecisionMode;
   let granted: boolean;
   let ttl_ms: number | null = null;
@@ -105,6 +104,18 @@ export async function handleApprovalCallback(
       displayMode = `granted for ${parsed.choice.param}`;
       break;
     }
+  }
+
+  const consumed = await approvalConsume(parsed.request_id);
+  if (consumed === null) {
+    await ctx.answerCallbackQuery({ text: "approval kernel unreachable" });
+    return;
+  }
+  if (!consumed.consumed) {
+    // Single-use enforcement: someone already tapped, or the nonce
+    // expired/unknown. Match the RFC §8.1 wording.
+    await ctx.answerCallbackQuery({ text: "this prompt expired" });
+    return;
   }
 
   const granted_by_user_id = ctx.from?.id ?? 0;
