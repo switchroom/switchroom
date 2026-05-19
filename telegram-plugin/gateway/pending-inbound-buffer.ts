@@ -54,6 +54,45 @@ export interface PendingInboundBufferOptions {
   log?: (line: string) => void
 }
 
+/**
+ * Drain `agent`'s buffered inbound and re-deliver each via `send`. A
+ * `send` returning false (or throwing) means "not delivered" — the
+ * message is re-buffered so nothing is lost when the bridge is still
+ * offline. Returns counts for observability.
+ *
+ * This exists because `drain` is otherwise only called on bridge
+ * re-register (`onClientRegistered`). After a network storm that
+ * settles with the bridge STILL connected, messages buffered during
+ * the flap never drain — they sit until a manual restart forces a
+ * re-register. The silence-poke framework fallback calls this on
+ * wedge-clear so the agent self-heals (fleet-update thundering-herd
+ * incident, 2026-05-19).
+ */
+export function redeliverBufferedInbound(
+  buffer: PendingInboundBuffer,
+  agent: string,
+  send: (msg: InboundMessage) => boolean,
+): { drained: number; redelivered: number; rebuffered: number } {
+  const pending = buffer.drain(agent)
+  let redelivered = 0
+  let rebuffered = 0
+  for (const msg of pending) {
+    let delivered = false
+    try {
+      delivered = send(msg)
+    } catch {
+      delivered = false
+    }
+    if (delivered) {
+      redelivered++
+    } else {
+      buffer.push(agent, msg)
+      rebuffered++
+    }
+  }
+  return { drained: pending.length, redelivered, rebuffered }
+}
+
 export function createPendingInboundBuffer(
   opts: PendingInboundBufferOptions = {},
 ): PendingInboundBuffer {

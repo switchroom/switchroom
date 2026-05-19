@@ -116,7 +116,12 @@ ALLOWLIST=(
   # (+~49 after line 2745) drifted the permission-request keyboard send
   # to 3069 (past 3010). End 3010 -> 3080; next raw call is 3209
   # (outside), so no new un-allowlisted call enters the margin.
-  "telegram-plugin/gateway/gateway.ts:2695-3080:permission-request keyboard; no thread_id"
+  # Re-bumped 2026-05-19 for the silence-poke wedge-clear buffer
+  # self-heal (+14 lines in onFrameworkFallback ~2746) drifted the
+  # permission-request keyboard send 3072 -> 3086 (past 3080). End
+  # 3080 -> 3100; next raw call is 3650 (far outside), so no new
+  # un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:2695-3100:permission-request keyboard; no thread_id"
 
   # reply chunk-loop fallback after robustApiCall threw THREAD_NOT_FOUND.
   # The caller dropped the thread; this raw sendMessage retries on the
@@ -143,7 +148,11 @@ ALLOWLIST=(
   # Re-bumped 2026-05-19 for PR-3: +~49 drift moved the reply chunk-loop
   # raw sends to 3612/3633 (past 3580). End 3580 -> 3640; next raw call
   # is 3689 (outside), so no new un-allowlisted call enters the margin.
-  "telegram-plugin/gateway/gateway.ts:3160-3640:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-19 for the silence-poke wedge-clear buffer
+  # self-heal (+14 lines ~2746) drifted the chunk-loop raw sends to
+  # ~3636/3650 (3650 past 3640). End 3640 -> 3660; next raw call is
+  # 10562 (far outside), so no new un-allowlisted call enters.
+  "telegram-plugin/gateway/gateway.ts:3160-3660:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -197,7 +206,12 @@ ALLOWLIST=(
   # 10490 -> 10560; next raw call is 10698 (outside), so no new
   # un-allowlisted call enters the margin — same already-.catch-
   # swallowed wizard sites.
-  "telegram-plugin/gateway/gateway.ts:9340-10560:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for the silence-poke wedge-clear buffer
+  # self-heal (+14 lines ~2746) drifted the last wizard
+  # editMessageText site to 10562 (past 10560). End 10560 -> 10580;
+  # next raw call is 10698 (outside), so no new un-allowlisted call
+  # enters — same already-.catch-swallowed wizard site.
+  "telegram-plugin/gateway/gateway.ts:9340-10580:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see
