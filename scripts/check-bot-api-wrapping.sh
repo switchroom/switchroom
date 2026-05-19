@@ -89,7 +89,10 @@ ALLOWLIST=(
   # the +3-line builder-import block drifted the broadcast send to 2353
   # (just past the old 2350 ceiling). Widened end 2350 -> 2360; grep
   # confirms 2353 is the only raw call in 2351-2360.
-  "telegram-plugin/gateway/gateway.ts:2250-2360:operator-event broadcast; no thread_id in opts"
+  # Re-bumped 2026-05-19 for PR-3: import + TTL-sweep insertions drifted
+  # the broadcast send +19 to 2371 (past 2360). End 2360 -> 2380; next
+  # raw call is 2399 (outside), so no new un-allowlisted call enters.
+  "telegram-plugin/gateway/gateway.ts:2250-2380:operator-event broadcast; no thread_id in opts"
 
   # permission-request keyboard send. opts only has reply_markup. No thread_id.
   # Range bumped 2026-05-13 for stuck-turn-recovery v2 cleanup expansion
@@ -109,7 +112,11 @@ ALLOWLIST=(
   # End 3000 -> 3010: feat/hostd-deterministic-status inserted the
   # inFlightUpdate var + the silence-fallback update-status branch
   # above this block; the permission-keyboard raw send moved to 3002.
-  "telegram-plugin/gateway/gateway.ts:2695-3010:permission-request keyboard; no thread_id"
+  # Re-bumped 2026-05-19 for PR-3: the dispatchPermissionVerdict helper
+  # (+~49 after line 2745) drifted the permission-request keyboard send
+  # to 3069 (past 3010). End 3010 -> 3080; next raw call is 3209
+  # (outside), so no new un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:2695-3080:permission-request keyboard; no thread_id"
 
   # reply chunk-loop fallback after robustApiCall threw THREAD_NOT_FOUND.
   # The caller dropped the thread; this raw sendMessage retries on the
@@ -133,7 +140,10 @@ ALLOWLIST=(
   # the retry/parse-mode policy that just rejected the payload.
   # End 3540 -> 3580: same insertion shifted the chunk-loop fallback
   # raw sends to 3545/3566.
-  "telegram-plugin/gateway/gateway.ts:3160-3580:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-19 for PR-3: +~49 drift moved the reply chunk-loop
+  # raw sends to 3612/3633 (past 3580). End 3580 -> 3640; next raw call
+  # is 3689 (outside), so no new un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:3160-3640:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -182,7 +192,12 @@ ALLOWLIST=(
   # 10434/10457/10481 (10481 past the old 10480 ceiling). Widened end
   # 10480 -> 10490; grep confirms 10481 is the only raw call in
   # 10481-10540 — same already-.catch-swallowed wizard site, no new one.
-  "telegram-plugin/gateway/gateway.ts:9340-10490:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for PR-3: +~49 drift moved the wizard
+  # editMessageText sites to 10498/10521/10545 (past 10490). End
+  # 10490 -> 10560; next raw call is 10698 (outside), so no new
+  # un-allowlisted call enters the margin — same already-.catch-
+  # swallowed wizard sites.
+  "telegram-plugin/gateway/gateway.ts:9340-10560:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see

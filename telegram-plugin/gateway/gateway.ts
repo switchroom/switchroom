@@ -246,6 +246,7 @@ import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer } from './pending-inbound-buffer.js'
+import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -265,6 +266,7 @@ import type {
   PtyPartialForward,
   InboundMessage,
   InjectInboundMessage,
+  PermissionEvent,
 } from './ipc-protocol.js'
 import { DebounceBuffer, HourCap, buildReactionInboundMeta, buildReactionInboundText, evaluateTriggerCandidate, isGroupChat, resolveReactionsConfig, truncatePreview, type PendingReaction, type ReactionBatch, type ReactionsResolvedConfig } from './reaction-trigger.js'
 import { writePidFile, clearPidFile } from './pid-file.js'
@@ -2096,7 +2098,23 @@ const pendingStateReaper = setInterval(() => {
     if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
   }
   for (const [k, v] of pendingPermissions) {
-    if (now - v.startedAt > PERMISSION_TTL_MS) pendingPermissions.delete(k)
+    if (now - v.startedAt > PERMISSION_TTL_MS) {
+      // Don't just drop it: the claude turn is suspended INSIDE the MCP
+      // permission call waiting for a verdict. A silent delete left it
+      // wedged forever when the operator never tapped — permanent
+      // silence, the exact symptom this series fixes. Auto-deny so the
+      // call unblocks; claude then tells the user it couldn't get
+      // permission (or takes a fallback). Routed through
+      // dispatchPermissionVerdict so it's buffered+redelivered too if
+      // the bridge is also offline at sweep time.
+      dispatchPermissionVerdict({ type: 'permission', requestId: k, behavior: 'deny' })
+      process.stderr.write(
+        `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
+        `tool=${v.tool_name} (no operator response in ` +
+        `${Math.round(PERMISSION_TTL_MS / 60000)}m)\n`,
+      )
+      pendingPermissions.delete(k)
+    }
   }
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
@@ -2741,6 +2759,36 @@ silencePoke.startTimer({
 // would mint the grant but silently drop the `vault_grant_approved`
 // inbound, leaving the agent stuck waiting for a manual poke.
 const pendingInboundBuffer = createPendingInboundBuffer()
+const pendingPermissionBuffer = createPendingPermissionBuffer()
+
+/**
+ * Deliver a permission verdict to this agent's bridge, buffering on a
+ * miss so it's redelivered when the bridge reconnects. Replaces the
+ * bare `ipcServer.broadcast({type:'permission',...})` at every verdict
+ * site (and the TTL-sweep auto-deny). broadcast was fire-and-forget:
+ * a verdict produced while the bridge was mid-reconnect was dropped
+ * and the claude turn stayed suspended INSIDE the MCP permission call
+ * forever — the user tapped Approve/Deny and nothing happened, no
+ * further output, permanent silence. sendToAgent is registered-keyed
+ * and returns a real delivered bool; on a miss we buffer and
+ * onClientRegistered re-sends so the reconnecting bridge relays the
+ * verdict to the still-suspended call. A late verdict for a dead
+ * request_id is harmless — the bridge relays it and Claude Code
+ * ignores an unknown request_id. (Function declaration so the
+ * pre-2747 TTL sweep can reference it; ipcServer/pendingPermissionBuffer
+ * are resolved at call-time, after module init.)
+ */
+function dispatchPermissionVerdict(ev: PermissionEvent): void {
+  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  const delivered = ipcServer.sendToAgent(selfAgent, ev)
+  if (!delivered) {
+    pendingPermissionBuffer.push(selfAgent, ev)
+    process.stderr.write(
+      `telegram gateway: permission verdict buffered (bridge offline) ` +
+      `request=${ev.requestId} behavior=${ev.behavior}\n`,
+    )
+  }
+}
 
 const ipcServer: IpcServer = createIpcServer({
   socketPath: SOCKET_PATH,
@@ -2765,6 +2813,22 @@ const ipcServer: IpcServer = createIpcServer({
           process.stderr.write(
             `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
             `source=${msg.meta?.source ?? '-'}: ${(err as Error).message}\n`,
+          )
+        }
+      }
+      // PR-3: drain permission verdicts missed while the bridge was
+      // offline. A claude turn suspended inside the MCP permission call
+      // is unblocked the moment the reconnecting bridge relays the
+      // verdict; without this the verdict (incl. the TTL auto-deny) was
+      // lost and the turn stayed silent forever.
+      const pendingVerdicts = pendingPermissionBuffer.drain(client.agentName)
+      for (const ev of pendingVerdicts) {
+        try {
+          client.send(ev)
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: pending-permission drain failed agent=${client.agentName} ` +
+            `request=${ev.requestId} behavior=${ev.behavior}: ${(err as Error).message}\n`,
           )
         }
       }
@@ -6254,7 +6318,7 @@ async function handleInbound(
     // Forward permission reply to connected bridge
     const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
     const request_id = permMatch[2]!.toLowerCase()
-    ipcServer.broadcast({
+    dispatchPermissionVerdict({
       type: 'permission',
       requestId: request_id,
       behavior,
@@ -8861,7 +8925,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
     return
   }
   // Forward to connected bridges — same IPC the button handler uses.
-  ipcServer.broadcast({ type: 'permission', requestId: request_id, behavior })
+  dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
   pendingPermissions.delete(request_id)
   process.stderr.write(
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
@@ -12290,7 +12354,7 @@ bot.on('callback_query:data', async ctx => {
       // otherwise the rule may be unsafe to honour at scale and we
       // fall back to single-use allow.
       synthInbound: () => {
-        ipcServer.broadcast({
+        dispatchPermissionVerdict({
           type: 'permission',
           requestId: request_id,
           behavior: 'allow',
@@ -12328,7 +12392,7 @@ bot.on('callback_query:data', async ctx => {
     newText: baseText ? `${baseText}\n\n${label}` : label,
     parseMode: 'HTML',
     synthInbound: () => {
-      ipcServer.broadcast({
+      dispatchPermissionVerdict({
         type: 'permission',
         requestId: request_id,
         behavior: behavior as 'allow' | 'deny',
