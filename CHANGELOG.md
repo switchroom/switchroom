@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.10 — verified in-agent liveness (`agent_smoke`); honest doctor, part 2
+
+Part 2 of the `switchroom doctor` signal-to-noise work (part 1, the
+`skip` status, shipped in v0.12.9). The host operator can't read
+agent-private 0600 state (WS6-F2), so those rows are honest `skip`.
+This adds the *verified* truth via the one audited, admin-gated
+component that holds the docker socket — hostd — rather than the
+unprivileged doctor CLI shelling docker itself.
+
+### Changes
+
+#### Features
+
+- **feat(hostd):** new read-only `agent_smoke` verb — hostd runs a
+  fixed, exit-code-only probe battery inside an agent container
+  (auth-creds present, scheduler block + sidecar, `.mcp.json` valid,
+  bot-token present, `/state` writable; opt-in `--deep` adds a
+  bounded real `claude -p` auth smoke — the default makes **no**
+  model call). Probes never surface stdout (the bot-token probe is
+  `grep -q`; the token never leaves the container). Self-target
+  allowed, cross-agent admin-gated (mirrors `agent_logs`/`agent_exec`).
+  A down container / docker failure degrades every probe to `skip`;
+  the verb is always `completed` when it ran (a failing probe is a
+  finding, not a dispatch error). (#1525)
+- **feat(doctor):** new "Agent liveness (in-agent via hostd)" section
+  — one compact verified row per agent. hostd unreachable /
+  `host_control` off / agent down → `skip`, never fail. `--fast`
+  omits it (offline/quick). The Telegram whole-fleet `/doctor`
+  (#1518) now runs `doctor --fast` so it stays structural and can't
+  blow the gateway's 30 s budget. (#1525)
+
 ## v0.12.9 — restore the Telegram reauth flow (auth reauth/code/cancel)
 
 One fix: the per-agent OAuth reauth flow was dead fleet-wide.
