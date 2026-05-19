@@ -53,6 +53,8 @@ Sub-agents · 2 running
                                    [ Steer ]
 ```
 
+<p align="center"><img src="docs/diagrams/deterministic-status-anatomy.svg" width="760" alt="Deterministic status anatomy: the never-silent state strip (quiet, working, idle) feeding a working-status message with streamed tool steps at MM:SS, a sub-agent fleet block, and a Steer button. Posted and edited in the topic, never pinned."></p>
+
 Older sub-agents collapse to `+N more` once the live set passes 5. Tool arguments are sanitised before they render: file paths show the basename only, token-shaped strings get redacted, so a secret never lands in a status message. The card is posted and edited in the topic, not pinned, so it never leaves a stale `⚙️ Working…` stranded at the top of your chat. [Full UX behaviour →](docs/telegram-plugin.md)
 
 ## Quickstart
