@@ -533,3 +533,62 @@ describe("ACL: an agent may read its OWN configured bot_token (install-validatio
     expect(checkAclByAgent(config, "admin", "random_key").allow).toBe(false);   // still gated
   });
 });
+
+describe("ACL: Google OAuth client credential (RFC G §4.4 completion)", () => {
+  // End-to-end through checkAclByAgent (the real broker entrypoint), not
+  // just the predicate. Pins that the clause is wired AND that it does
+  // not shadow the schedule.secrets gate for other keys.
+  function clientCredConfig(opts: {
+    enabledFor: string[];
+    clientSecret?: string;
+    schedule?: { cron: string; prompt: string; secrets?: string[] }[];
+  }): SwitchroomConfig {
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      google_accounts: {
+        "you@example.com": { enabled_for: opts.enabledFor },
+      },
+      google_workspace: {
+        google_client_secret: opts.clientSecret ?? "vault:google/client-secret",
+      },
+      agents: {
+        klanker: {
+          topic_name: "klanker",
+          google_workspace: { account: "you@example.com" },
+          schedule: (opts.schedule ?? []).map((s) => ({
+            cron: s.cron,
+            prompt: s.prompt,
+            secrets: s.secrets ?? [],
+          })),
+        },
+      },
+    } as unknown as SwitchroomConfig;
+  }
+
+  it("a Drive-enabled agent with ZERO schedule entries can read the client secret (the prod regression)", () => {
+    const config = clientCredConfig({ enabledFor: ["klanker"] });
+    const r = checkAclByAgent(config, "klanker", "google/client-secret");
+    expect(r.allow).toBe(true);
+  });
+
+  it("a non-enabled agent is still denied (falls through to the schedule.secrets gate)", () => {
+    const config = clientCredConfig({ enabledFor: ["clerk"] });
+    const r = checkAclByAgent(config, "klanker", "google/client-secret");
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toContain("no schedule entries");
+  });
+
+  it("does not shadow schedule.secrets — an unrelated key is still gated", () => {
+    // klanker gets the client-cred grant but must NOT thereby gain
+    // access to a key that isn't in any schedule.secrets[].
+    const config = clientCredConfig({
+      enabledFor: ["klanker"],
+      schedule: [{ cron: "* * * * *", prompt: "p", secrets: ["allowed_key"] }],
+    });
+    expect(checkAclByAgent(config, "klanker", "google/client-secret").allow).toBe(true);
+    expect(checkAclByAgent(config, "klanker", "allowed_key").allow).toBe(true);
+    expect(checkAclByAgent(config, "klanker", "stripe/api-key").allow).toBe(false);
+  });
+});

@@ -39,6 +39,7 @@
 import type { SwitchroomConfig } from "../../config/schema.js";
 import type { PeerInfo } from "./peercred.js";
 import type { VaultEntryScope } from "../vault.js";
+import { isGoogleClientCredentialKeyForAgent } from "../../config/google-workspace-acl.js";
 
 export interface AclAllow {
   allow: true;
@@ -219,6 +220,17 @@ export function checkAcl(
  *
  * Allowlist semantics — fail-closed:
  *   - If config.agents[agentName] is missing → deny.
+ *   - Config-derived identity-bound exceptions (checked BEFORE the
+ *     schedule.secrets allowlist, because they are auth-boundary access
+ *     to the single key the config binds to THIS agent, not cron-
+ *     misconfiguration protection):
+ *       · `google:<account>:*` account slots → gated by
+ *         `google_accounts.<account>.enabled_for[]` (RFC G §4.4).
+ *       · the Google OAuth client credential
+ *         (`google_workspace.google_client_{id,secret}` vault refs) →
+ *         gated by the same `shouldEmitGdriveMcp` predicate the scaffold
+ *         uses (config/google-workspace-acl.ts).
+ *       · the agent's own effective `bot_token` vault ref.
  *   - If the agent has no `schedule` array (or empty) → deny: there's no
  *     declared per-cron secrets[] to consult. Long-running agent-direct
  *     access is opted in only via populated `schedule[i].secrets`.
@@ -252,6 +264,27 @@ export function checkAclByAgent(
   const googleSlot = parseGoogleAccountSlotKey(key);
   if (googleSlot !== null) {
     return checkGoogleAccountAcl(config, agentName, googleSlot.account, key);
+  }
+
+  // RFC G §4.4, completed — the OAuth *client credential*.
+  // The google: account slots above bypass schedule.secrets because the
+  // Google account is the unit of trust (enabled_for[]), not a per-cron
+  // allowlist. The OAuth client_id/client_secret are the one remaining
+  // piece of the SAME Drive auth flow that the original RFC G ACL left
+  // out: they're referenced from config (`google_workspace.
+  // google_client_{id,secret}`), commonly as `vault:` refs (the
+  // documented `switchroom auth google connect` shape). Without this
+  // clause the `gdrive` MCP is dead on arrival fleet-wide — the launcher
+  // is broker-denied the client secret before it can spawn, even though
+  // every other layer (account slot, scaffold, MCP trust) is correctly
+  // wired. This is identity-bound access to the single credential the
+  // config binds to THIS agent's gdrive MCP — NOT cross-agent access —
+  // exactly analogous to the bot_token clause below, and gated by the
+  // SAME `shouldEmitGdriveMcp` predicate the scaffold uses to decide
+  // whether to emit the entry at all, so broker and scaffold can never
+  // disagree. See config/google-workspace-acl.ts.
+  if (isGoogleClientCredentialKeyForAgent(config, agentName, key)) {
+    return { allow: true };
   }
 
   // An agent legitimately needs to read its OWN configured bot token.

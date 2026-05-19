@@ -110,8 +110,8 @@ import {
   getHindsightSettingsEntry,
   getBuiltinDefaultMcpEntries,
   getGdriveMcpSettingsEntry,
-  shouldEmitGdriveMcp,
 } from "../memory/scaffold-integration.js";
+import { shouldEmitGdriveMcp } from "../config/google-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance, applyCronTelegramGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";

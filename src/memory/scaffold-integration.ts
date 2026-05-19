@@ -144,7 +144,8 @@ export interface GdriveMcpEntryOptions {
  * Default OFF for an agent — the scaffold only emits this entry when the
  * agent has `google_workspace.account` set AND that account lists the
  * agent in `google_accounts.<account>.enabled_for[]` (see
- * `shouldEmitGdriveMcp`). Agents can still hard opt-out with
+ * `shouldEmitGdriveMcp` in `config/google-workspace-acl.ts`). Agents can
+ * still hard opt-out with
  * `mcp_servers: { gdrive: false }`.
  *
  * @param switchroomCliPath  Absolute path to the in-container switchroom
@@ -168,46 +169,6 @@ export function getGdriveMcpSettingsEntry(
       args: ["drive-mcp-launcher", ...tierArgs],
     },
   };
-}
-
-/**
- * The shared gate predicate: should agent `<agentName>` receive the
- * `gdrive` MCP entry?
- *
- * This MUST agree with the auth-broker's account-selection + ACL logic
- * (`src/auth/broker/server.ts` opGoogleGetCredentials): the broker
- * returns a Google account iff `agents.<name>.google_workspace.account`
- * is set AND that account is a key in top-level `google_accounts` with
- * `<name>` in its `enabled_for[]`. If the scaffold emitted the entry
- * under looser conditions, the agent would get a `gdrive` MCP whose
- * launcher fails at spawn (broker returns FORBIDDEN/ACCOUNT_NOT_FOUND) —
- * a broken tool surface. So both sides call this one predicate.
- *
- * Hard opt-out (`mcp_servers: { gdrive: false }`) is handled by the
- * caller (same shape as every other built-in default), NOT here — this
- * predicate answers only "is this agent broker-authorized for Google".
- *
- * Account-name comparison is case-insensitive + trimmed because the
- * config schema normalizes both the per-agent `google_workspace.account`
- * and the `google_accounts` keys to lowercase; the broker compares the
- * post-normalization strings. We re-normalize here defensively so a
- * test or caller that hand-builds an un-normalized config still gets
- * the same answer the broker would.
- */
-export function shouldEmitGdriveMcp(
-  agentName: string,
-  agentGoogleAccount: string | undefined,
-  googleAccounts:
-    | Record<string, { enabled_for?: string[] } | undefined>
-    | undefined,
-): boolean {
-  if (!agentGoogleAccount) return false;
-  const account = agentGoogleAccount.trim().toLowerCase();
-  if (account.length === 0) return false;
-  const acctEntry = googleAccounts?.[account];
-  if (!acctEntry) return false;
-  const enabledFor = acctEntry.enabled_for ?? [];
-  return enabledFor.includes(agentName);
 }
 
 /**
