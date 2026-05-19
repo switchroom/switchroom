@@ -330,6 +330,22 @@ export function backupVault(opts: {
   } finally {
     closeSync(fd);
   }
+
+  // Refuse on sub-second collision: two backups in the same UTC second
+  // would otherwise silently overwrite each other (renameSync replaces
+  // an existing target with no warning) while the manifest appends two
+  // rows pointing at the same filename with different sha256s — confusing
+  // and a silent data-loss path. Operator-facing error tells them to
+  // retry in 1s. Sub-second backup invocations only happen with concurrent
+  // operator scripts; daily-cron usage never hits this.
+  if (existsSync(fullPath)) {
+    try { unlinkSync(tmpPath); } catch { /* tolerate cleanup failure */ }
+    throw new Error(
+      `vault backup refused: '${fullPath}' already exists ` +
+      `(sub-second collision with another backup). Retry in 1 second, ` +
+      `or check for a concurrent backup process.`,
+    );
+  }
   renameSync(tmpPath, fullPath);
   const stat = statSync(fullPath);
   const sha256 = sha256OfFile(fullPath);
@@ -348,11 +364,37 @@ export function backupVault(opts: {
   try { unlinkSync(latestPath); } catch { /* not present */ }
   try { symlinkSync(filename, latestPath); } catch { /* best-effort */ }
 
-  // 7. Rotate.
+  // 7. Durability: fsync the destination directory so the new dirent
+  //    (the backup file, the manifest entry update, the new symlink) is
+  //    persisted to stable storage. WITHOUT this, POSIX permits the
+  //    kernel to defer the directory-entry write — a host crash
+  //    post-rename can lose the backup file even though renameSync
+  //    returned. For a feature whose raison d'être is "don't lose the
+  //    vault on incident", this is load-bearing. One fsync at the end
+  //    is sufficient: it makes ALL changes-to-this-dir-since-last-fsync
+  //    durable atomically.
+  try {
+    const dirFd = openSync(opts.destDir, "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } catch {
+    // Best-effort: some filesystems (FAT, tmpfs in some configs) refuse
+    // fsync on directories. Don't fail the backup if the fs doesn't
+    // support it — the file is still written; durability is degraded
+    // but not catastrophically lost.
+  }
+
+  // 8. Rotate.
   const sorted = listBackupFiles(opts.destDir);
   const pruneNames = selectBackupsToPrune(sorted, retain);
   for (const old of pruneNames) {
     try { unlinkSync(join(opts.destDir, old)); } catch { /* tolerate */ }
+  }
+  // Fsync again after pruning so the unlinks are durable. Same best-effort.
+  if (pruneNames.length > 0) {
+    try {
+      const dirFd = openSync(opts.destDir, "r");
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } catch { /* best-effort */ }
   }
 
   return {

@@ -305,6 +305,22 @@ describe("backupVault (IO orchestrator)", () => {
     backupVault({ vaultPath, destDir });
     expect(statSync(destDir).mode & 0o777).toBe(0o700);
   });
+
+  it("refuses sub-second collision instead of silently overwriting (code-review finding F3)", () => {
+    // Same `now` → same computed filename → second call must refuse.
+    const t = new Date(Date.UTC(2026, 4, 20, 8, 9, 4));
+    const r1 = backupVault({ vaultPath, destDir, now: t });
+    expect(existsSync(r1.fullPath)).toBe(true);
+    expect(() => backupVault({ vaultPath, destDir, now: t })).toThrow(/sub-second collision/);
+    // The pre-existing backup file is unchanged
+    expect(readFileSync(r1.fullPath, "utf8")).toBe(VALID_VAULT_JSON);
+    // The manifest still has exactly one row for this filename
+    const rows = readManifest(destDir);
+    expect(rows.filter((r) => r.file === r1.filename)).toHaveLength(1);
+    // The tmp file from the second (refused) attempt was cleaned up
+    const dirEntries = readdirSync(destDir);
+    expect(dirEntries.filter((n) => n.startsWith(".tmp."))).toEqual([]);
+  });
 });
 
 describe("defaultHome", () => {
