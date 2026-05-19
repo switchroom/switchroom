@@ -501,6 +501,59 @@ export function recordDecision(
 }
 
 /**
+ * Atomically consume the single-use nonce AND record the decision in
+ * ONE SQLite transaction (PR-6). Composes the existing primitives — no
+ * new SQL. If `recordDecision` throws (or anything else in the body),
+ * bun:sqlite rolls back the `consumed_at` burn too, so the nonce stays
+ * reusable rather than being burned with no decision (the exact gap
+ * that wedged the agent's turn when the broker died between the two
+ * legacy ops — RFC §6.1 always specified this as one atomic
+ * rowcount-gated step; the two-RPC split was a Phase-1 expedient, see
+ * MIGRATION.md).
+ *
+ * `{ consumed: false }` ⇒ already-consumed / expired / unknown (race or
+ * re-tap): NO decision row is written, identical to a standalone
+ * `consumeNonce` returning null. Audit rows (`consume` + `grant|deny`,
+ * or just `expire`) are emitted by the composed primitives and commit
+ * atomically with the state — `approval_audit` is unchained
+ * (schema.ts), so a rolled-back+retried call cannot corrupt any chain.
+ *
+ * NOTE: first explicit `db.transaction()` use in the repo — covered by
+ * an explicit rollback-on-throw test.
+ */
+export function consumeAndRecord(
+  db: Database,
+  input: {
+    request_id: string;
+    decision: ApprovalDecisionMode;
+    approver_set: string[];
+    granted_by_user_id: number;
+    ttl_ms?: number;
+  },
+  now: number = Date.now(),
+): { consumed: false } | { consumed: true; decision_id: string; nonce: NonceRow } {
+  const run = db.transaction(():
+    | { consumed: false }
+    | { consumed: true; decision_id: string; nonce: NonceRow } => {
+    const nonce = consumeNonce(db, input.request_id, now);
+    if (nonce === null) return { consumed: false };
+    const decision_id = recordDecision(
+      db,
+      {
+        nonce,
+        decision: input.decision,
+        approver_set: input.approver_set,
+        granted_by_user_id: input.granted_by_user_id,
+        ttl_ms: input.ttl_ms,
+      },
+      now,
+    );
+    return { consumed: true, decision_id, nonce };
+  });
+  return run();
+}
+
+/**
  * Revoke a decision by id. Idempotent (revoking a revoked row is a no-op).
  * `reason` is persisted into approval_decisions.revoke_reason.
  */

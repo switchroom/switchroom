@@ -311,6 +311,23 @@ export const ApprovalRecordRequestSchema = z.object({
   ttl_ms: z.number().int().positive().nullable().optional(),
 });
 
+// Atomic consume+record (PR-6). Identical payload to approval_record;
+// the kernel burns the single-use nonce AND writes the decision inside
+// ONE SQLite transaction, eliminating the consume↔record IPC gap that
+// wedged the agent's turn if the broker/gateway died between the two
+// legacy ops. Additive: approval_consume / approval_record stay intact
+// for their other callers (deferred-secret + /vault-grant dual-dispatch,
+// /folders picker, tests) — only the apv: card path migrates.
+export const ApprovalConsumeRecordRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("approval_consume_record"),
+  request_id: z.string().regex(/^[0-9a-f]{32}$/),
+  decision: ApprovalDecisionModeSchema,
+  approver_set: z.array(z.string()),
+  granted_by_user_id: z.number().int(),
+  ttl_ms: z.number().int().positive().nullable().optional(),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   GetRequestSchema,
   PutRequestSchema,
@@ -327,6 +344,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ApprovalRevokeRequestSchema,
   ApprovalListRequestSchema,
   ApprovalRecordRequestSchema,
+  ApprovalConsumeRecordRequestSchema,
 ]);
 
 export type GetRequest = z.infer<typeof GetRequestSchema>;
@@ -522,6 +540,20 @@ export const OkApprovalRecordResponseSchema = z.object({
   decision_id: z.string(),
 });
 
+// Reuses OkApprovalConsumeResponseSchema's exact field shape (so the
+// gateway's consumed.scope Drive-button path needs no adaptation) plus
+// an optional decision_id present only on the consumed+recorded path.
+// consumed:false ⇒ nonce already burned/expired/unknown, no decision.
+export const OkApprovalConsumeRecordResponseSchema = z.object({
+  ok: z.literal(true),
+  consumed: z.boolean(),
+  decision_id: z.string().optional(),
+  agent_unit: z.string().optional(),
+  scope: z.string().optional(),
+  action: z.string().optional(),
+  why: z.string().nullable().optional(),
+});
+
 export const ErrorResponseSchema = z.object({
   ok: z.literal(false),
   code: ErrorCode,
@@ -544,6 +576,7 @@ export const ResponseSchema = z.union([
   OkApprovalRevokeResponseSchema,
   OkApprovalListResponseSchema,
   OkApprovalRecordResponseSchema,
+  OkApprovalConsumeRecordResponseSchema,
   ErrorResponseSchema,
 ]);
 

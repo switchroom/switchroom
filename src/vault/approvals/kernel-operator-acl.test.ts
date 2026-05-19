@@ -139,6 +139,21 @@ describe("kernel operator socket — deny-by-default ACL", () => {
         granted_by_user_id: 1,
       },
     ],
+    [
+      // PR-6 R1: the atomic consume+record op BURNS a nonce AND records
+      // a decision — it must never be reachable on the operator socket.
+      // Pinned so a future OPERATOR_ALLOWED_OPS edit can't silently
+      // expose it.
+      "approval_consume_record",
+      {
+        v: 1,
+        op: "approval_consume_record",
+        request_id: "0badf00d0badf00d0badf00d0badf00d",
+        decision: "allow_always",
+        approver_set: ["u1"],
+        granted_by_user_id: 1,
+      },
+    ],
   ];
 
   for (const [op, req] of forbidden) {

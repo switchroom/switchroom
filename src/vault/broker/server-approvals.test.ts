@@ -137,7 +137,13 @@ describe("VaultBroker: approval-kernel ops", () => {
       approver_set: ["U1"], granted_by_user_id: 42,
     });
     if (!(recRes.ok && "decision_id" in recRes)) throw new Error("bad");
+    // approval_record always returns a string decision_id. The response
+    // union is a plain z.union and (since PR-6) two variants carry
+    // `decision_id` — one optional — so the `in` narrowing yields
+    // string|undefined. Assert it's a string: strengthens the test and
+    // gives the later approval_revoke a `string` decision_id.
     const id = recRes.decision_id;
+    if (typeof id !== "string") throw new Error("expected a string decision_id");
 
     const list = await rpc(socketPath, { v: 1, op: "approval_list" });
     expect(list.ok).toBe(true);

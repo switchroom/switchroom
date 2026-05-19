@@ -145,6 +145,18 @@ export interface ApprovalConsumeResult {
   why?: string | null;
 }
 
+/** Result of the atomic consume+record op (PR-6). Superset of
+ *  ApprovalConsumeResult — `decision_id` is present only on the
+ *  consumed-and-recorded path; `consumed:false` ⇒ no decision written. */
+export interface ApprovalConsumeRecordResult {
+  consumed: boolean;
+  decision_id?: string;
+  agent_unit?: string;
+  scope?: string;
+  action?: string;
+  why?: string | null;
+}
+
 export async function approvalRequest(
   args: ApprovalRequestArgs,
   opts?: ApprovalKernelClientOpts,
@@ -268,7 +280,74 @@ export async function approvalRecord(
   );
   if (r.kind !== "response" || !r.resp.ok) return null;
   if (!("decision_id" in r.resp)) return null;
-  return r.resp.decision_id;
+  // `decision_id` is required on OkApprovalRecord but optional on the
+  // structurally-similar OkApprovalConsumeRecord (the response union is
+  // a plain z.union, not discriminated), so the narrowed type is
+  // string|undefined — coalesce to satisfy the string|null contract.
+  return r.resp.decision_id ?? null;
+}
+
+/**
+ * Atomic consume+record (PR-6). One round-trip; the kernel burns the
+ * single-use nonce AND writes the decision in one SQLite transaction.
+ * Returns `null` on kernel-unreachable / `!ok` / malformed (caller
+ * treats as "kernel unreachable"); `{consumed:false}` ⇒ nonce already
+ * burned/expired/unknown ("this prompt expired", no decision);
+ * `{consumed:true, decision_id, scope, …}` ⇒ recorded. Mirrors the
+ * approvalConsume/approvalRecord wrappers; both of those are kept for
+ * their other callers (deferred-secret + /vault-grant dual-dispatch,
+ * /folders). On a mixed-version rollout an old kernel rejects the
+ * unknown op → `null` → the gateway shows "kernel unreachable" and the
+ * shipped permission-TTL auto-deny backstops; switchroom update
+ * recreates containers together so the window is seconds.
+ */
+export async function approvalConsumeRecord(
+  args: {
+    request_id: string;
+    decision: ApprovalDecisionMode;
+    approver_set: string[];
+    granted_by_user_id: number;
+    ttl_ms?: number | null;
+  },
+  opts?: ApprovalKernelClientOpts,
+): Promise<ApprovalConsumeRecordResult | null> {
+  const r = await rpcRaw(
+    {
+      v: 1,
+      op: "approval_consume_record",
+      request_id: args.request_id,
+      decision: args.decision,
+      approver_set: args.approver_set,
+      granted_by_user_id: args.granted_by_user_id,
+      ttl_ms: args.ttl_ms ?? null,
+    },
+    withKernelOpts(opts),
+  );
+  if (r.kind !== "response" || !r.resp.ok) return null;
+  if (!("consumed" in r.resp)) return null;
+  // The response union is a plain z.union and OkApprovalConsumeResponse
+  // is structurally a prefix of OkApprovalConsumeRecordResponse, so the
+  // `"consumed" in` narrowing keeps both and TS can't see `decision_id`.
+  // The kernel only ever returns the consume_record shape for this op
+  // and the payload is already zod-validated at the wire boundary —
+  // read the fields through a narrow structural view (same trust level
+  // as the sibling approvalConsume wrapper).
+  const resp = r.resp as {
+    consumed: boolean;
+    decision_id?: string;
+    agent_unit?: string;
+    scope?: string;
+    action?: string;
+    why?: string | null;
+  };
+  return {
+    consumed: resp.consumed,
+    decision_id: resp.decision_id,
+    agent_unit: resp.agent_unit,
+    scope: resp.scope,
+    action: resp.action,
+    why: resp.why ?? null,
+  };
 }
 
 export async function approvalList(

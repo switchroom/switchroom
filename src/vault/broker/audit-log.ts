@@ -28,8 +28,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { chainRow, seedChain, type ChainState } from "../../util/audit-hashchain.js";
 
-/** Operations the broker can perform. */
-export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant" | "preflight_access";
+/** Operations the broker can perform. (PR-6: `approval_consume_record`
+ *  is an additive member of the shared broker/kernel request union, so
+ *  the broker's grant-mgmt `writeAudit({ op: req.op })` callsites now
+ *  see it in `req.op`'s static type even though the broker never
+ *  dispatches it — including it here keeps the audit-op vocabulary a
+ *  superset of the wire ops and satisfies tsc with no runtime change.) */
+export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant" | "preflight_access" | "approval_consume_record";
 
 /**
  * One audit log entry.

@@ -151,7 +151,7 @@ apv:<8-hex request id>:<action>[:<param>]
 ```
 
 - 8-hex request id matches `generateAskId` convention.
-- Single-use enforced by an atomic `UPDATE approval_nonces SET consumed_at = ? WHERE request_id = ? AND consumed_at IS NULL` with a rowcount check. Only on rowcount=1 does the kernel proceed to insert/update the corresponding `approval_decisions` row. A re-tap of an already-consumed callback returns a brief "this prompt expired" toast via `answerCallbackQuery`.
+- Single-use enforced by an atomic `UPDATE approval_nonces SET consumed_at = ? WHERE request_id = ? AND consumed_at IS NULL` with a rowcount check. Only on rowcount=1 does the kernel proceed to insert/update the corresponding `approval_decisions` row. A re-tap of an already-consumed callback returns a brief "this prompt expired" toast via `answerCallbackQuery`. *(PR-6: the Telegram `apv:` card path realizes this "only on rowcount=1 do we proceed to the decision row" as a single atomic `approval_consume_record` op — `consumeNonce` + `recordDecision` in one `db.transaction()` — rather than two RPC round-trips, so a broker death between consume and record can no longer burn the nonce without a decision. See `src/vault/approvals/MIGRATION.md`.)*
 - Examples: `apv:a3f1b9c2:allow`, `apv:a3f1b9c2:ttl:1h`, `apv:a3f1b9c2:deny`.
 
 Full scope and humanized title are stored server-side keyed by request id.

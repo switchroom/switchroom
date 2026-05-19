@@ -200,4 +200,55 @@ describe("kernel listener-identity ACL on mutating ops (#1399)", () => {
     expect(ok.ok).toBe(true);
     expect(ok.revoked).toBe(true);
   });
+
+  // PR-6: the atomic approval_consume_record op must enforce the SAME
+  // listener-identity ACL as approval_consume (it burns + records).
+  it("denies cross-agent approval_consume_record, nonce intact, no decision, no oracle", async () => {
+    const rid = await aliceRequest();
+
+    // bob tries to atomically burn+record alice's nonce.
+    const denied = await rpc(bobSock, {
+      v: 1,
+      op: "approval_consume_record",
+      request_id: rid,
+      decision: "allow_always",
+      approver_set: ["op1"],
+      granted_by_user_id: 1,
+    });
+    expect(denied.ok).toBe(false);
+    expect(denied.code).toBe("DENIED");
+    expect(String(denied.msg)).not.toContain("alice"); // no owner oracle
+
+    // bob's attempt was a no-op: alice can still atomically
+    // consume+record her own nonce.
+    const okay = await rpc(aliceSock, {
+      v: 1,
+      op: "approval_consume_record",
+      request_id: rid,
+      decision: "allow_once",
+      approver_set: ["op1"],
+      granted_by_user_id: 1,
+    });
+    expect(okay.ok).toBe(true);
+    expect(okay.consumed).toBe(true);
+    expect(okay.decision_id).toBeTruthy();
+    expect(okay.agent_unit).toBe("alice");
+  });
+
+  it("second approval_consume_record is non-committal {consumed:false} (single-use)", async () => {
+    const rid = await aliceRequest();
+    const first = await rpc(aliceSock, {
+      v: 1, op: "approval_consume_record", request_id: rid,
+      decision: "allow_once", approver_set: ["op1"], granted_by_user_id: 1,
+    });
+    expect(first.ok).toBe(true);
+    expect(first.consumed).toBe(true);
+    const second = await rpc(aliceSock, {
+      v: 1, op: "approval_consume_record", request_id: rid,
+      decision: "allow_always", approver_set: ["op1"], granted_by_user_id: 1,
+    });
+    expect(second.ok).toBe(true);
+    expect(second.consumed).toBe(false);
+    expect(second.decision_id).toBeUndefined();
+  });
 });
