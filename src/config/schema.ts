@@ -330,6 +330,19 @@ export const SessionSchema = z
         "turns than this. Useful for preventing context bloat on " +
         "long-running agents.",
       ),
+    max_context_tokens: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Proactively run /compact when the live context window " +
+        "occupancy (latest assistant turn input + cache-read + " +
+        "cache-creation tokens) reaches this many tokens. Opt-in: " +
+        "unset means rely on Claude Code's native auto-compaction. " +
+        "Useful on large-window models (e.g. 1M Opus) to hold a " +
+        "deliberately lean working context.",
+      ),
   })
   .optional();
 

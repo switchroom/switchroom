@@ -121,6 +121,15 @@ export interface SessionEventForward {
   event: Record<string, unknown>;
   chatId: string;
   threadId?: number;
+  /**
+   * The session-tail's currently-attached JSONL path (its tracked
+   * `currentFile`, not an independent re-scan). Forwarded so the
+   * gateway's proactive-compaction check reads occupancy from the
+   * exact file the tailer is on — avoids the sub-agent-mtime /
+   * stale-rotation wrong-file hazard. Absent until the tailer has
+   * attached a file.
+   */
+  activeFile?: string;
 }
 
 export interface PermissionRequestForward {

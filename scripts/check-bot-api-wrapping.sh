@@ -92,7 +92,11 @@ ALLOWLIST=(
   # Re-bumped 2026-05-19 for PR-3: import + TTL-sweep insertions drifted
   # the broadcast send +19 to 2371 (past 2360). End 2360 -> 2380; next
   # raw call is 2399 (outside), so no new un-allowlisted call enters.
-  "telegram-plugin/gateway/gateway.ts:2250-2380:operator-event broadcast; no thread_id in opts"
+  # Re-bumped 2026-05-19 for proactive context-compaction: +107 net
+  # lines higher in the file drifted the broadcast send to 2475 (past
+  # 2380). End 2380 -> 2520; check flags only 2475 in 2381-2694 (next
+  # allowlist entry starts 2695), so no new un-allowlisted call enters.
+  "telegram-plugin/gateway/gateway.ts:2250-2520:operator-event broadcast; no thread_id in opts"
 
   # permission-request keyboard send. opts only has reply_markup. No thread_id.
   # Range bumped 2026-05-13 for stuck-turn-recovery v2 cleanup expansion
@@ -157,7 +161,12 @@ ALLOWLIST=(
   # drifted the chunk-loop raw send to 3692 (past 3660). End
   # 3660 -> 3700; next raw call is 10604 (far outside), so no new
   # un-allowlisted call enters the margin.
-  "telegram-plugin/gateway/gateway.ts:3160-3700:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-19 for proactive context-compaction: +107 net
+  # lines higher in the file drifted the chunk-loop raw sends to
+  # 3778/3799 (past 3700). End 3700 -> 3860; check flags only
+  # 3778/3799 before the next allowlist entry (8100), so no new
+  # un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:3160-3860:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -221,7 +230,13 @@ ALLOWLIST=(
   # editMessageText site to 10604 (past 10580). End 10580 -> 10620;
   # next raw call is 10698 (outside), so no new un-allowlisted call
   # enters — same already-.catch-swallowed wizard site.
-  "telegram-plugin/gateway/gateway.ts:9340-10620:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for proactive context-compaction: +107 net
+  # lines (perf import, maybeProactiveCompact + module state, onSession
+  # event activeFile capture) drifted the three already-.catch-swallowed
+  # wizard editMessageText sites to 10664/10687/10711 (past 10620). End
+  # 10620 -> 10760; the next raw ctx.api call is 12579 (ctx.api.getFile,
+  # far outside), so no new un-allowlisted call enters.
+  "telegram-plugin/gateway/gateway.ts:9340-10760:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see

@@ -616,11 +616,18 @@ function forwardSessionEvent(ev: SessionEvent): void {
     chatId = ev.chatId ?? ''
     threadId = ev.threadId != null ? Number(ev.threadId) : undefined
   }
+  // Forward the tailer's already-attached file (its tracked
+  // currentFile) so the gateway's proactive-compaction check reads
+  // occupancy from the exact session JSONL the tailer is on, never an
+  // independent findActiveSessionFile re-scan (which can transiently
+  // resolve a sub-agent transcript or a stale rotated file).
+  const activeFile = sessionTailHandle?.getActiveFile() ?? null
   ipc.sendSessionEvent({
     type: 'session_event',
     event: ev as unknown as Record<string, unknown>,
     chatId,
     ...(threadId != null ? { threadId } : {}),
+    ...(activeFile ? { activeFile } : {}),
   })
 }
 
