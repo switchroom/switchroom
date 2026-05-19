@@ -1790,6 +1790,41 @@ export const VaultConfigSchema = z.object({
       "in memory and serves secrets to cron scripts via a Unix socket, so the " +
       "vault passphrase is entered once at startup rather than per-cron invocation.",
     ),
+  backup: z
+    .object({
+      destination: z
+        .string()
+        .optional()
+        .describe(
+          "Destination directory for `switchroom vault backup`. " +
+          "When unset, the CLI defaults to " +
+          "`~/.switchroom-config/vault-backups/` if that operator config " +
+          "repo exists, else `~/.switchroom/vault-backups/`. " +
+          "Path is tilde-expanded at read time. " +
+          "MUST NOT be `~/.switchroom/vault/` (the broker bind-mount dir, " +
+          "validated by `switchroom apply` against an artifact allowlist)."
+        ),
+      retain: z
+        .number()
+        .int()
+        .nonnegative()
+        .default(30)
+        .describe(
+          "How many of the most-recent backups to keep in the destination dir. " +
+          "Older ones are pruned after each new backup is written. Default 30 " +
+          "= roughly a month at daily cadence."
+        ),
+    })
+    .optional()
+    .describe(
+      "Configuration for `switchroom vault backup`. Optional — the CLI works " +
+      "with built-in defaults if this block is absent. The backed-up file is " +
+      "the AES-256-GCM-encrypted vault envelope; the operator passphrase " +
+      "remains the gate, so committing backups to a private git repo extends " +
+      "durability without weakening encryption (provided the auto-unlock " +
+      "blob is NEVER co-located — `vault backup` refuses to write into a " +
+      "directory that contains an auto-unlock-shaped sibling)."
+    ),
 });
 
 /**

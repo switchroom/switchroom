@@ -30,6 +30,7 @@ import { registerVaultBrokerCommand } from "./vault-broker.js";
 import { registerVaultDoctorCommand } from "./vault-doctor.js";
 import { registerVaultAuditCommand } from "./vault-audit.js";
 import { registerVaultGrantCommands } from "./vault-grant.js";
+import { registerVaultBackupCommand } from "./vault-backup.js";
 
 /**
  * Sandbox-context detection.
@@ -1006,4 +1007,10 @@ export function registerVaultCommand(program: Command): void {
 
   // `vault grant` / `vault grants` / `vault revoke` — capability token management.
   registerVaultGrantCommands(vault, program);
+
+  // `vault backup` — dated encrypted snapshots of vault.enc to a
+  // configured destination (operator's private config repo by default).
+  // Companion to the proven manual `cp + restart broker` recovery flow;
+  // see src/cli/vault-backup.ts for the trust-model + design discussion.
+  registerVaultBackupCommand(vault, program);
 }
