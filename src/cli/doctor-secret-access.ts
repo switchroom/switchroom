@@ -204,8 +204,10 @@ function keyGap(
 }
 
 /** Default preflight: one operator-socket RPC per agent. No
- *  passphrase needed — the broker answers from its unlocked vault. */
-async function defaultPreflight(
+ *  passphrase needed — the broker answers from its unlocked vault.
+ *  Exported so the Drive doctor reuses the exact RPC + LOCKED/
+ *  unreachable mapping (one source → byte-identical verdicts). */
+export async function defaultPreflight(
   socketPath: string,
   agent: string,
   keys: string[],

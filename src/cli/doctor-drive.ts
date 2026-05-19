@@ -43,11 +43,14 @@ import {
   readFileSync as realReadFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 
 import { resolveAgentsDir } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { vaultRefKey } from "../config/google-workspace-acl.js";
 
 import type { CheckStatus } from "./doctor-status.js";
+import { defaultPreflight, type PreflightOutcome } from "./doctor-secret-access.js";
 
 export interface CheckResult {
   name: string;
@@ -62,6 +65,15 @@ export interface DriveProbeDeps {
   agentsDir?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /**
+   * Operator-socket preflight RPC, used only by
+   * `runDriveBrokerReachabilityChecks`. Defaults to the shared
+   * `defaultPreflight` over `~/.switchroom/broker-operator/sock` (same
+   * client `runSecretAccessChecks` uses). Injectable for tests.
+   */
+  preflight?: (agent: string, keys: string[]) => Promise<PreflightOutcome>;
+  /** Override the broker operator socket path (tests). */
+  brokerOperatorSocket?: string;
 }
 
 interface ResolvedDeps {
@@ -378,9 +390,26 @@ export function runDriveChecks(
   const matrix = checkConfigMatrix(config);
   results.push(...matrix);
 
-  // An agent is "Drive-enabled" only when BOTH sides of the matrix
-  // agree — that's exactly the set the launcher will succeed for.
-  const driveAgents = Object.keys(config.agents ?? {}).filter((name) => {
+  const driveAgents = computeDriveAgents(config);
+
+  results.push(...checkOAuthClient(config, driveAgents.length > 0));
+  results.push(...checkScaffoldWiring(config, driveAgents, d));
+
+  return results;
+}
+
+/**
+ * The "Drive-enabled" set: agents where BOTH sides of the matrix agree
+ * (per-agent `google_workspace.account` set AND that account lists the
+ * agent in `google_accounts.<acct>.enabled_for[]`). Exactly the set the
+ * launcher succeeds for — and the set the broker now grants the OAuth
+ * client credential (RFC G §4.4, v0.12.14). Shared by the sync
+ * config/scaffold checks and the async broker-reachability check so the
+ * two can never disagree about which agents to probe.
+ */
+function computeDriveAgents(config: SwitchroomConfig): string[] {
+  const accounts = config.google_accounts;
+  return Object.keys(config.agents ?? {}).filter((name) => {
     const acct = agentAccount(config, name);
     return (
       !!acct &&
@@ -388,9 +417,101 @@ export function runDriveChecks(
       (accounts[acct].enabled_for ?? []).includes(name)
     );
   });
+}
 
-  results.push(...checkOAuthClient(config, driveAgents.length > 0));
-  results.push(...checkScaffoldWiring(config, driveAgents, d));
+/**
+ * Check 4 — does the broker actually SERVE the OAuth client credential?
+ *
+ * `checkOAuthClient` only proves the value is *present in config*. When
+ * it's a `vault:` ref (the documented `switchroom auth google connect`
+ * shape) the launcher resolves it through the vault-broker — and before
+ * v0.12.14 the broker denied it fleet-wide (the client cred was the one
+ * piece of the Drive auth flow outside both `schedule.secrets` and the
+ * RFC G §4.4 account-slot grant), so the `gdrive` MCP silently never
+ * spawned while every config/scaffold/trust check stayed green. THIS is
+ * the blind spot that let that ship. We ask the broker the same
+ * question it answers at runtime (`preflight_access` → full
+ * `checkAclByAgent`, which includes the v0.12.14 client-cred clause),
+ * using the SAME key-extraction (`vaultRefKey`) the broker authorizes
+ * against, so the verdict matches enforcement exactly.
+ *
+ * Literal (non-`vault:`) creds need no broker — reported ok. Broker
+ * locked / unreachable → `skip` (never a false fail; a static miss does
+ * not prove the agent lacks access — mirrors runSecretAccessChecks).
+ *
+ * Async + separate from `runDriveChecks` (which stays sync) so the
+ * broker RPC doesn't change that function's signature or its tests;
+ * `doctor.ts` composes both into the one "Google Drive" section, the
+ * same shape it already uses for the async `runSecretAccessChecks`.
+ */
+export async function runDriveBrokerReachabilityChecks(
+  config: SwitchroomConfig,
+  deps: DriveProbeDeps = {},
+): Promise<CheckResult[]> {
+  const driveAgents = computeDriveAgents(config);
+  if (driveAgents.length === 0) return [];
 
+  const gw = config.google_workspace;
+  const idKey = vaultRefKey(gw?.google_client_id);
+  const secretKey = vaultRefKey(gw?.google_client_secret);
+  const vaultKeys = [idKey, secretKey].filter((k): k is string => k !== null);
+
+  if (vaultKeys.length === 0) {
+    // Both creds are literals (or unset — checkOAuthClient fails that
+    // case separately). A literal is read straight from config by the
+    // launcher; the broker is never consulted, so nothing to verify.
+    return [
+      {
+        name: "drive: OAuth client broker-reachable",
+        status: "ok",
+        detail:
+          "client credential is a literal (not a vault: ref) — the launcher reads it from config; no broker grant needed",
+      },
+    ];
+  }
+
+  const sock =
+    deps.brokerOperatorSocket ??
+    join(homedir(), ".switchroom", "broker-operator", "sock");
+  const preflight =
+    deps.preflight ?? ((a: string, k: string[]) => defaultPreflight(sock, a, k));
+
+  const results: CheckResult[] = [];
+  for (const agent of driveAgents) {
+    const outcome = await preflight(agent, vaultKeys);
+    if (outcome.kind === "locked") {
+      results.push({
+        name: `drive: ${agent} client-cred broker-reachable`,
+        status: "skip",
+        detail:
+          "vault-broker is locked — cannot verify; the fleet's launchers/crons are dead while locked anyway (not a Drive-specific fault)",
+      });
+      continue;
+    }
+    if (outcome.kind === "unreachable") {
+      results.push({
+        name: `drive: ${agent} client-cred broker-reachable`,
+        status: "skip",
+        detail: `broker operator socket unreachable (${outcome.msg}) — cannot verify; not a false fail`,
+      });
+      continue;
+    }
+    const denied = outcome.results.filter((r) => !r.acl_ok);
+    if (denied.length === 0) {
+      results.push({
+        name: `drive: ${agent} client-cred broker-reachable`,
+        status: "ok",
+        detail: `vault-broker will serve the OAuth client credential (${vaultKeys.join(", ")}) to '${agent}'`,
+      });
+      continue;
+    }
+    const d0 = denied[0];
+    results.push({
+      name: `drive: ${agent} client-cred broker-reachable`,
+      status: "fail",
+      detail: `vault-broker DENIES '${agent}' the OAuth client key '${d0.key}' (${d0.acl_reason ?? "no ACL grant"}) — the gdrive MCP launcher exits before spawning and Drive silently never works for this agent`,
+      fix: `confirm '${agent}' is in google_accounts[<account>].enabled_for[] and has agents.${agent}.google_workspace.account set (v0.12.14+ broker grants the client credential off that gate automatically); then ensure the broker is running the v0.12.14+ image`,
+    });
+  }
   return results;
 }
