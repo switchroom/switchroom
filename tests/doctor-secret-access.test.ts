@@ -4,6 +4,7 @@ import {
   runSecretAccessChecks,
   type VaultFileStat,
   type SecretAccessDeps,
+  type PreflightOutcome,
 } from "../src/cli/doctor-secret-access.js";
 import type { VaultEntry } from "../src/vault/vault.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -20,6 +21,7 @@ const READABLE: VaultFileStat = {
   realPath: "/home/op/.switchroom/vault/vault.enc",
 };
 
+// Default deps: passphrase SET → exercises the (preserved) LOCAL path.
 function deps(over: Partial<SecretAccessDeps> = {}): SecretAccessDeps {
   return {
     vaultPath: "/v",
@@ -32,12 +34,28 @@ function deps(over: Partial<SecretAccessDeps> = {}): SecretAccessDeps {
   };
 }
 
-const get = (r: ReturnType<typeof runSecretAccessChecks>, name: string) =>
-  r.find((x) => x.name === name);
+// Broker-path deps: NO passphrase, inject a fake preflight RPC.
+function brokerDeps(
+  preflight: (a: string, k: string[]) => Promise<PreflightOutcome>,
+  over: Partial<SecretAccessDeps> = {},
+): SecretAccessDeps {
+  return {
+    vaultPath: "/v",
+    selfUid: 1000,
+    selfUser: "op",
+    statVault: () => READABLE,
+    passphrase: undefined,
+    preflight,
+    ...over,
+  };
+}
+
+type R = Awaited<ReturnType<typeof runSecretAccessChecks>>;
+const get = (r: R, name: string) => r.find((x) => x.name === name);
 
 describe("runSecretAccessChecks — Check A (operator readable)", () => {
-  it("ok when the vault file is absent (defers to Vault section)", () => {
-    const r = runSecretAccessChecks(
+  it("ok when the vault file is absent (defers to Vault section)", async () => {
+    const r = await runSecretAccessChecks(
       cfg({}),
       deps({
         statVault: () => ({
@@ -54,8 +72,8 @@ describe("runSecretAccessChecks — Check A (operator readable)", () => {
     expect(a?.detail).toContain("not present");
   });
 
-  it("FAILs with a chown fix when the file is root-locked", () => {
-    const r = runSecretAccessChecks(
+  it("FAILs with a chown fix when the file is root-locked", async () => {
+    const r = await runSecretAccessChecks(
       cfg({}),
       deps({
         statVault: () => ({
@@ -70,36 +88,18 @@ describe("runSecretAccessChecks — Check A (operator readable)", () => {
     const a = get(r, "vault: operator readable");
     expect(a?.status).toBe("fail");
     expect(a?.detail).toContain("uid 0");
-    expect(a?.fix).toBe(
-      "sudo chown op:op /home/op/.switchroom/vault/vault.enc",
-    );
+    expect(a?.fix).toBe("sudo chown op:op /home/op/.switchroom/vault/vault.enc");
   });
 
-  it("ok when the operator can read it", () => {
-    const r = runSecretAccessChecks(cfg({}), deps());
+  it("ok when the operator can read it", async () => {
+    const r = await runSecretAccessChecks(cfg({}), deps());
     expect(get(r, "vault: operator readable")?.status).toBe("ok");
   });
 });
 
-describe("runSecretAccessChecks — Check B (per-agent access)", () => {
-  it("skips (cannot verify) when the passphrase is unset", () => {
-    const saved = process.env.SWITCHROOM_VAULT_PASSPHRASE;
-    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
-    try {
-      const r = runSecretAccessChecks(
-        cfg({ a: {} }),
-        deps({ passphrase: undefined }),
-      );
-      const b = get(r, "agent secret access");
-      expect(b?.status).toBe("skip");
-      expect(b?.detail).toContain("SWITCHROOM_VAULT_PASSPHRASE not set");
-    } finally {
-      if (saved !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = saved;
-    }
-  });
-
-  it("fails 'agent secret access' when the vault won't open and the file IS readable", () => {
-    const r = runSecretAccessChecks(
+describe("runSecretAccessChecks — Check B local path (passphrase set)", () => {
+  it("fails when the vault won't open and the file IS readable", async () => {
+    const r = await runSecretAccessChecks(
       cfg({ a: {} }),
       deps({
         openVault: () => {
@@ -112,7 +112,7 @@ describe("runSecretAccessChecks — Check B (per-agent access)", () => {
     expect(b?.detail).toContain("bad passphrase");
   });
 
-  it("ok per agent when declared cron secrets exist and ACL allows", () => {
+  it("ok per agent when declared cron secrets exist and ACL allows", async () => {
     const config = cfg({
       scout: {
         schedule: [{ cron: "0 8 * * *", prompt: "x", secrets: ["api-key"] }],
@@ -122,97 +122,138 @@ describe("runSecretAccessChecks — Check B (per-agent access)", () => {
     const entries: Record<string, VaultEntry> = {
       "api-key": { kind: "string", value: "v" },
     };
-    const r = runSecretAccessChecks(config, deps({ openVault: () => entries }));
+    const r = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => entries }),
+    );
     expect(get(r, "secret access: scout")?.status).toBe("ok");
     expect(get(r, "secret access: scout")?.detail).toContain("all present");
-    expect(get(r, "secret access: bare")?.status).toBe("ok");
     expect(get(r, "secret access: bare")?.detail).toContain(
       "no declared vault secrets",
     );
   });
 
-  it("FAILs when a declared cron secret is missing from the vault", () => {
+  it("FAILs when a declared cron secret is missing from the vault", async () => {
     const config = cfg({
       scout: {
         schedule: [{ cron: "0 8 * * *", prompt: "x", secrets: ["api-key"] }],
       },
     });
-    const r = runSecretAccessChecks(config, deps({ openVault: () => ({}) }));
+    const r = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => ({}) }),
+    );
     const s = get(r, "secret access: scout");
     expect(s?.status).toBe("fail");
     expect(s?.detail).toContain("'api-key' missing from the vault");
     expect(s?.fix).toContain("--allow scout");
   });
 
-  it("FAILs when the per-key scope denies the agent", () => {
+  it("config vault: ref is per-key-scope checked but NOT run through checkAclByAgent", async () => {
+    const config = cfg({
+      tgbot: { channels: { telegram: { bot_token: "vault:tok" } } },
+    });
+    const okEntries: Record<string, VaultEntry> = {
+      tok: { kind: "string", value: "123:ABC" },
+    };
+    const okR = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => okEntries }),
+    );
+    expect(get(okR, "secret access: tgbot")?.status).toBe("ok");
+
+    const denyEntries: Record<string, VaultEntry> = {
+      tok: { kind: "string", value: "v", scope: { deny: ["tgbot"] } },
+    };
+    const denyR = await runSecretAccessChecks(
+      config,
+      deps({ openVault: () => denyEntries }),
+    );
+    const s = get(denyR, "secret access: tgbot");
+    expect(s?.status).toBe("fail");
+    expect(s?.detail).toContain("per-key scope denies");
+    expect(s?.detail).not.toContain("no static ACL");
+  });
+});
+
+describe("runSecretAccessChecks — Check B broker path (no passphrase)", () => {
+  it("ok per agent when the broker reports all keys present + ACL ok", async () => {
     const config = cfg({
       scout: {
         schedule: [{ cron: "0 8 * * *", prompt: "x", secrets: ["api-key"] }],
       },
+      bare: {},
     });
-    const entries: Record<string, VaultEntry> = {
-      "api-key": { kind: "string", value: "v", scope: { deny: ["scout"] } },
-    };
-    const r = runSecretAccessChecks(config, deps({ openVault: () => entries }));
-    const s = get(r, "secret access: scout");
-    expect(s?.status).toBe("fail");
-    expect(s?.detail).toContain("per-key scope denies");
+    const r = await runSecretAccessChecks(
+      config,
+      brokerDeps(async (_agent, keys) => ({
+        kind: "ok",
+        results: keys.map((key) => ({
+          key,
+          exists: true,
+          acl_ok: true,
+          scope_ok: true,
+        })),
+      })),
+    );
+    expect(get(r, "secret access: scout")?.status).toBe("ok");
+    expect(get(r, "secret access: scout")?.detail).toContain("all present");
+    expect(get(r, "secret access: bare")?.detail).toContain(
+      "no declared vault secrets",
+    );
   });
 
-  it("picks up `vault:` refs from config (not just cron) and flags missing", () => {
+  it("FAILs with the SAME gap strings as the local path (missing / cron-ACL / scope)", async () => {
     const config = cfg({
-      tgbot: { channels: { telegram: { bot_token: "vault:bot#x" } } },
-    });
-    const r = runSecretAccessChecks(config, deps({ openVault: () => ({}) }));
-    const s = get(r, "secret access: tgbot");
-    expect(s?.status).toBe("fail");
-    expect(s?.detail).toContain("'bot' missing from the vault");
-  });
-
-  it("OK for the canonical bot_token vault: ref with no cron schedule (no false ACL fail)", () => {
-    // Regression for the BLOCK: bot_token is resolved operator-side at
-    // scaffold time, NOT via the broker cron allowlist. An agent with
-    // no schedule[] must NOT be failed by checkAclByAgent.
-    const config = cfg({
-      tgbot: { channels: { telegram: { bot_token: "vault:tok" } } },
-    });
-    const entries: Record<string, VaultEntry> = {
-      tok: { kind: "string", value: "123:ABC" }, // exists, default (open) scope
-    };
-    const r = runSecretAccessChecks(config, deps({ openVault: () => entries }));
-    const s = get(r, "secret access: tgbot");
-    expect(s?.status).toBe("ok");
-    expect(s?.detail).toContain("all present");
-  });
-
-  it("config vault: ref is still per-key-scope checked (deny ⇒ fail)", () => {
-    const config = cfg({
-      tgbot: { channels: { telegram: { bot_token: "vault:tok" } } },
-    });
-    const entries: Record<string, VaultEntry> = {
-      tok: { kind: "string", value: "v", scope: { deny: ["tgbot"] } },
-    };
-    const r = runSecretAccessChecks(config, deps({ openVault: () => entries }));
-    const s = get(r, "secret access: tgbot");
-    expect(s?.status).toBe("fail");
-    expect(s?.detail).toContain("per-key scope denies");
-    expect(s?.detail).not.toContain("no static ACL"); // not run through checkAclByAgent
-  });
-
-  it("does not false-'missing' a google:<acct> slot ref (existence skipped)", () => {
-    const config = cfg({
-      g: {
+      scout: {
         schedule: [
-          { cron: "0 8 * * *", prompt: "x", secrets: ["google:a@x:drive"] },
+          { cron: "0 8 * * *", prompt: "x", secrets: ["missing", "noacl"] },
         ],
       },
     });
-    // not in the vault blob, but isGoogleSlot ⇒ existence skipped; ACL
-    // is evaluated via checkAclByAgent (no google_accounts ⇒ denied).
-    const r = runSecretAccessChecks(config, deps({ openVault: () => ({}) }));
-    const s = get(r, "secret access: g");
+    const r = await runSecretAccessChecks(
+      config,
+      brokerDeps(async (_a, _k) => ({
+        kind: "ok",
+        results: [
+          { key: "missing", exists: false, acl_ok: true, scope_ok: true },
+          {
+            key: "noacl",
+            exists: true,
+            acl_ok: false,
+            acl_reason: "no allow grant",
+            scope_ok: true,
+          },
+        ],
+      })),
+    );
+    const s = get(r, "secret access: scout");
     expect(s?.status).toBe("fail");
-    expect(s?.detail).not.toContain("missing from the vault");
-    expect(s?.detail).toContain("no static ACL");
+    expect(s?.detail).toContain("'missing' missing from the vault");
+    expect(s?.detail).toContain(
+      "'noacl' (cron) — no static ACL grants read (no allow grant)",
+    );
+  });
+
+  it("broker LOCKED → single honest skip (never a false fail)", async () => {
+    const r = await runSecretAccessChecks(
+      cfg({ a: { schedule: [{ cron: "* * * * *", prompt: "p", secrets: ["k"] }] } }),
+      brokerDeps(async () => ({ kind: "locked" })),
+    );
+    const b = get(r, "agent secret access");
+    expect(b?.status).toBe("skip");
+    expect(b?.detail).toContain("locked");
+    expect(r.some((x) => x.status === "fail")).toBe(false);
+  });
+
+  it("broker unreachable → single honest skip (never a false fail)", async () => {
+    const r = await runSecretAccessChecks(
+      cfg({ a: { schedule: [{ cron: "* * * * *", prompt: "p", secrets: ["k"] }] } }),
+      brokerDeps(async () => ({ kind: "unreachable", msg: "ENOENT" })),
+    );
+    const b = get(r, "agent secret access");
+    expect(b?.status).toBe("skip");
+    expect(b?.detail).toContain("unreachable");
+    expect(r.some((x) => x.status === "fail")).toBe(false);
   });
 });

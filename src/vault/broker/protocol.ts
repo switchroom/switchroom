@@ -206,6 +206,49 @@ export const LockRequestSchema = z.object({
   op: z.literal("lock"),
 });
 
+/**
+ * Read-only OPERATOR-ONLY introspection: "for agent <agent>, what is
+ * the static existence + ACL/scope status of these keys?" Answered
+ * from the broker's already-unlocked in-memory vault using the SAME
+ * predicates the real `get` path composes — so the caller (doctor)
+ * gets the verified truth WITHOUT holding SWITCHROOM_VAULT_PASSPHRASE.
+ * NEVER returns secret values. Agent (per-agent socket) callers are
+ * rejected — this is an operator tool, and the key list is a key-
+ * existence oracle that only the operator (same trust root as the
+ * vault file) may use. `acl`/`scope` mirror what doctor-secret-
+ * access.ts already computes locally; the caller decides per
+ * provenance which to apply (cron keys → acl; scope always; google:
+ * slots → existence n/a). Caveat preserved on the consumer side:
+ * a missing static ACL does NOT prove no access (a runtime
+ * capability/token grant the static check can't see may still cover
+ * it) — same "no *static* ACL" wording as the local path.
+ */
+export const PreflightAccessRequestSchema = z.object({
+  v: z.literal(1),
+  op: z.literal("preflight_access"),
+  agent: z.string().min(1),
+  keys: z.array(z.string().min(1)).min(1).max(128),
+});
+
+export const OkPreflightAccessResponseSchema = z.object({
+  ok: z.literal(true),
+  op: z.literal("preflight_access"),
+  results: z.array(
+    z.object({
+      key: z.string(),
+      /** Key present in the unlocked vault map. */
+      exists: z.boolean(),
+      /** checkAclByAgent(config, agent, key).allow — the static-ACL
+       *  signal the agent `get` path uses. NEVER a value. */
+      acl_ok: z.boolean(),
+      acl_reason: z.string().optional(),
+      /** checkEntryScope(entry.scope, agent).allow */
+      scope_ok: z.boolean(),
+      scope_reason: z.string().optional(),
+    }),
+  ),
+});
+
 
 // ─── Approval kernel (RFC B) ────────────────────────────────────────────────
 
@@ -274,6 +317,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ListRequestSchema,
   StatusRequestSchema,
   LockRequestSchema,
+  PreflightAccessRequestSchema,
   MintGrantRequestSchema,
   ListGrantsRequestSchema,
   RevokeGrantRequestSchema,
@@ -290,6 +334,8 @@ export type PutRequest = z.infer<typeof PutRequestSchema>;
 export type ListRequest = z.infer<typeof ListRequestSchema>;
 export type StatusRequest = z.infer<typeof StatusRequestSchema>;
 export type LockRequest = z.infer<typeof LockRequestSchema>;
+export type PreflightAccessRequest = z.infer<typeof PreflightAccessRequestSchema>;
+export type OkPreflightAccessResponse = z.infer<typeof OkPreflightAccessResponseSchema>;
 export type MintGrantRequest = z.infer<typeof MintGrantRequestSchema>;
 export type ListGrantsRequest = z.infer<typeof ListGrantsRequestSchema>;
 export type RevokeGrantRequest = z.infer<typeof RevokeGrantRequestSchema>;
@@ -487,6 +533,7 @@ export const ResponseSchema = z.union([
   OkKeysResponseSchema,
   OkStatusResponseSchema,
   OkLockResponseSchema,
+  OkPreflightAccessResponseSchema,
   OkPutResponseSchema,
   OkMintGrantResponseSchema,
   OkListGrantsResponseSchema,

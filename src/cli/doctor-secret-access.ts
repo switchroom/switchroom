@@ -35,12 +35,14 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { userInfo } from "node:os";
+import { userInfo, homedir } from "node:os";
+import { join } from "node:path";
 
 import { resolveStatePath } from "../config/paths.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { openVault, type VaultEntry } from "../vault/vault.js";
 import { checkAclByAgent, checkEntryScope } from "../vault/broker/acl.js";
+import { rpcRaw } from "../vault/broker/client.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 import type { CheckStatus } from "./doctor-status.js";
@@ -74,7 +76,30 @@ export interface SecretAccessDeps {
   selfUid?: number;
   /** Current operator username (default os.userInfo().username). */
   selfUser?: string;
+  /**
+   * Operator-socket preflight RPC. Default: `rpcRaw(preflight_access)`
+   * over `~/.switchroom/broker-operator/sock`. Lets default `doctor`
+   * (no SWITCHROOM_VAULT_PASSPHRASE) verify cron-secret existence+ACL
+   * via the broker's already-unlocked vault. Injectable for tests.
+   */
+  preflight?: (agent: string, keys: string[]) => Promise<PreflightOutcome>;
+  /** Override the broker operator socket path (tests). */
+  brokerOperatorSocket?: string;
 }
+
+export interface PreflightKeyResult {
+  key: string;
+  exists: boolean;
+  acl_ok: boolean;
+  acl_reason?: string;
+  scope_ok: boolean;
+  scope_reason?: string;
+}
+
+export type PreflightOutcome =
+  | { kind: "ok"; results: PreflightKeyResult[] }
+  | { kind: "locked" }
+  | { kind: "unreachable"; msg: string };
 
 function resolveVaultPath(config: SwitchroomConfig): string {
   return config.vault?.path
@@ -133,10 +158,84 @@ function collectVaultRefs(value: unknown, out: Set<string>): void {
   }
 }
 
-export function runSecretAccessChecks(
+/** Per-agent declared secret needs: cron `schedule[].secrets[]`
+ *  (broker-served → checkAclByAgent gates) + every `vault:` config
+ *  ref (resolved operator-side; scope still applies). */
+function collectNeeds(resolved: unknown): {
+  needed: Set<string>;
+  cronKeys: Set<string>;
+} {
+  const cronKeys = new Set<string>();
+  for (const entry of (resolved as { schedule?: Array<{ secrets?: string[] }> })
+    .schedule ?? []) {
+    for (const s of entry.secrets ?? []) cronKeys.add(s);
+  }
+  const refKeys = new Set<string>();
+  collectVaultRefs(resolved, refKeys);
+  return { needed: new Set<string>([...cronKeys, ...refKeys]), cronKeys };
+}
+
+/**
+ * The ONE per-key gap rule, shared by the local-passphrase and the
+ * broker paths so they produce byte-identical verdicts. Returns a gap
+ * string or null. `google:` slots are auth-broker slots — existence
+ * is governed by google_accounts, not the vault blob, so skip the
+ * existence check for them. Cron keys get the static ACL check; the
+ * "no *static* ACL" wording is deliberate — a runtime capability/
+ * token grant the static check can't see may still cover it (do not
+ * regress this caveat).
+ */
+function keyGap(
+  key: string,
+  isCron: boolean,
+  exists: boolean,
+  acl: { allow: boolean; reason?: string },
+  scope: { allow: boolean; reason?: string },
+): string | null {
+  const isGoogleSlot = key.startsWith("google:");
+  if (!isGoogleSlot && !exists) return `'${key}' missing from the vault`;
+  if (isCron && !acl.allow) {
+    return `'${key}' (cron) — no static ACL grants read (${acl.reason})`;
+  }
+  if (!scope.allow) {
+    return `'${key}' — per-key scope denies read (${scope.reason})`;
+  }
+  return null;
+}
+
+/** Default preflight: one operator-socket RPC per agent. No
+ *  passphrase needed — the broker answers from its unlocked vault. */
+async function defaultPreflight(
+  socketPath: string,
+  agent: string,
+  keys: string[],
+): Promise<PreflightOutcome> {
+  const r = await rpcRaw(
+    { v: 1, op: "preflight_access", agent, keys },
+    { socket: socketPath, timeoutMs: 5000 },
+  );
+  if (r.kind === "unreachable") return { kind: "unreachable", msg: r.msg };
+  const resp = r.resp;
+  if (resp.ok === true && (resp as { op?: string }).op === "preflight_access") {
+    return {
+      kind: "ok",
+      results: (resp as unknown as { results: PreflightKeyResult[] }).results,
+    };
+  }
+  if (resp.ok === false && resp.code === "LOCKED") return { kind: "locked" };
+  return {
+    kind: "unreachable",
+    msg:
+      resp.ok === false
+        ? `broker error ${resp.code}: ${resp.msg}`
+        : "unexpected broker response",
+  };
+}
+
+export async function runSecretAccessChecks(
   config: SwitchroomConfig,
   deps: SecretAccessDeps = {},
-): CheckResult[] {
+): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   const vaultPath = deps.vaultPath ?? resolveVaultPath(config);
   const statVault = deps.statVault ?? defaultStatVault;
@@ -178,16 +277,91 @@ export function runSecretAccessChecks(
   }
 
   // ---- Check B: per-agent secret existence + ACL --------------------
+  const pushAgentResult = (
+    name: string,
+    total: number,
+    gaps: string[],
+  ): void => {
+    results.push(
+      gaps.length === 0
+        ? {
+            name: `secret access: ${name}`,
+            status: "ok",
+            detail: `${total} secret(s): all present + ACL ok`,
+          }
+        : {
+            name: `secret access: ${name}`,
+            status: "fail",
+            detail: `${gaps.length}/${total} unreachable — ${gaps.join("; ")}`,
+            fix:
+              "`switchroom vault set <key>` for missing keys; " +
+              "`switchroom vault set <key> --allow " +
+              name +
+              "` to grant this agent read access",
+          },
+    );
+  };
+
   const passphrase = deps.passphrase ?? process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (!passphrase) {
-    results.push({
-      name: "agent secret access",
-      status: "skip",
-      detail:
-        "SWITCHROOM_VAULT_PASSPHRASE not set — cannot enumerate vault keys/ACLs " +
-        "to verify per-agent secret access",
-      fix: "Export SWITCHROOM_VAULT_PASSPHRASE and re-run `switchroom doctor`",
-    });
+    // Default path — NO passphrase. Ask the vault-broker (which holds
+    // the vault unlocked in memory) over its operator socket, using
+    // the broker's OWN enforcement predicates. Turns the old
+    // passphrase-gated `skip` into a real verified verdict.
+    const sock =
+      deps.brokerOperatorSocket ??
+      join(homedir(), ".switchroom", "broker-operator", "sock");
+    const preflight =
+      deps.preflight ?? ((a: string, k: string[]) => defaultPreflight(sock, a, k));
+    for (const name of Object.keys(config.agents ?? {})) {
+      const resolved = resolveAgentConfig(
+        config.defaults,
+        config.profiles,
+        config.agents[name],
+      );
+      const { needed, cronKeys } = collectNeeds(resolved);
+      if (needed.size === 0) {
+        results.push({
+          name: `secret access: ${name}`,
+          status: "ok",
+          detail: "no declared vault secrets",
+        });
+        continue;
+      }
+      const out = await preflight(name, [...needed].sort());
+      if (out.kind === "unreachable" || out.kind === "locked") {
+        // Global condition (one broker) → a single honest skip, stop.
+        // Mirrors the historical single-skip shape; never a false fail.
+        results.push({
+          name: "agent secret access",
+          status: "skip",
+          detail:
+            out.kind === "locked"
+              ? "vault-broker is locked — cron-secret existence/ACL unverified (re-run after it unlocks; it auto-unlocks on boot)"
+              : `vault-broker operator socket unreachable (${out.msg}) and SWITCHROOM_VAULT_PASSPHRASE unset — cron-secret existence/ACL unverified`,
+          fix: "Ensure the broker operator socket (~/.switchroom/broker-operator/sock) is bound, or export SWITCHROOM_VAULT_PASSPHRASE and re-run `switchroom doctor`",
+        });
+        return results;
+      }
+      const byKey = new Map(out.results.map((r) => [r.key, r]));
+      const gaps: string[] = [];
+      for (const key of [...needed].sort()) {
+        const r = byKey.get(key);
+        if (r === undefined) {
+          gaps.push(`'${key}' — broker returned no result`);
+          continue;
+        }
+        const g = keyGap(
+          key,
+          cronKeys.has(key),
+          r.exists,
+          { allow: r.acl_ok, reason: r.acl_reason },
+          { allow: r.scope_ok, reason: r.scope_reason },
+        );
+        if (g) gaps.push(g);
+      }
+      pushAgentResult(name, needed.size, gaps);
+    }
     return results;
   }
 
@@ -206,31 +380,20 @@ export function runSecretAccessChecks(
     return results;
   }
 
-  const agents = Object.keys(config.agents ?? {});
-  for (const name of agents) {
+  // Passphrase IS set → local path (operator decrypts the vault
+  // themselves). Behaviour-identical to before; shares the SAME
+  // collectNeeds + keyGap rule as the broker path so the two can't
+  // drift. (Provenance: cron `schedule[].secrets[]` are broker-served
+  // → checkAclByAgent gates; plain `vault:` config refs are resolved
+  // operator-side and only the per-key scope applies — keyGap encodes
+  // exactly this.)
+  for (const name of Object.keys(config.agents ?? {})) {
     const resolved = resolveAgentConfig(
       config.defaults,
       config.profiles,
       config.agents[name],
     );
-
-    // Provenance matters. Cron `schedule[].secrets[]` are served at
-    // runtime BY THE BROKER, so the broker's cron allowlist
-    // (checkAclByAgent) AND the per-key scope (checkEntryScope) both
-    // gate them. Plain `vault:` config refs (bot_token, env, mcp, …)
-    // are resolved operator-side at scaffold time via openVault — they
-    // do NOT pass through checkAclByAgent (applying it here would
-    // falsely FAIL the canonical `bot_token: "vault:…"` config on any
-    // agent without a cron schedule). Per-key scope still applies to
-    // them wherever the broker serves them.
-    const cronKeys = new Set<string>();
-    for (const entry of (resolved as { schedule?: Array<{ secrets?: string[] }> }).schedule ?? []) {
-      for (const s of entry.secrets ?? []) cronKeys.add(s);
-    }
-    const refKeys = new Set<string>();
-    collectVaultRefs(resolved, refKeys);
-    const needed = new Set<string>([...cronKeys, ...refKeys]);
-
+    const { needed, cronKeys } = collectNeeds(resolved);
     if (needed.size === 0) {
       results.push({
         name: `secret access: ${name}`,
@@ -239,49 +402,18 @@ export function runSecretAccessChecks(
       });
       continue;
     }
-
     const gaps: string[] = [];
     for (const key of [...needed].sort()) {
-      // google:<acct>:* are auth-broker slots, not literal vault keys —
-      // existence is governed by google_accounts, not the vault blob;
-      // the ACL predicate already routes them, so check ACL only.
-      const isGoogleSlot = key.startsWith("google:");
-      if (!isGoogleSlot && !(key in entries)) {
-        gaps.push(`'${key}' missing from the vault`);
-        continue;
-      }
-      const byScope = checkEntryScope(entries[key]?.scope, name);
-      if (cronKeys.has(key)) {
-        // broker-served cron secret → full broker predicate
-        const byAgent = checkAclByAgent(config, name, key);
-        if (!byAgent.allow) {
-          gaps.push(`'${key}' (cron) — no static ACL grants read (${byAgent.reason})`);
-          continue;
-        }
-      }
-      if (!byScope.allow) {
-        gaps.push(`'${key}' — per-key scope denies read (${byScope.reason})`);
-      }
+      const g = keyGap(
+        key,
+        cronKeys.has(key),
+        key in entries,
+        checkAclByAgent(config, name, key),
+        checkEntryScope(entries[key]?.scope, name),
+      );
+      if (g) gaps.push(g);
     }
-
-    if (gaps.length === 0) {
-      results.push({
-        name: `secret access: ${name}`,
-        status: "ok",
-        detail: `${needed.size} secret(s): all present + ACL ok`,
-      });
-    } else {
-      results.push({
-        name: `secret access: ${name}`,
-        status: "fail",
-        detail: `${gaps.length}/${needed.size} unreachable — ${gaps.join("; ")}`,
-        fix:
-          "`switchroom vault set <key>` for missing keys; " +
-          "`switchroom vault set <key> --allow " +
-          name +
-          "` to grant this agent read access",
-      });
-    }
+    pushAgentResult(name, needed.size, gaps);
   }
 
   return results;

@@ -29,7 +29,7 @@ import * as path from "node:path";
 import { chainRow, seedChain, type ChainState } from "../../util/audit-hashchain.js";
 
 /** Operations the broker can perform. */
-export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant";
+export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lock" | "mint_grant" | "list_grants" | "revoke_grant" | "preflight_access";
 
 /**
  * One audit log entry.

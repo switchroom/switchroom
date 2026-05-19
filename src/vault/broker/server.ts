@@ -856,6 +856,78 @@ export class VaultBroker {
       return;
     }
 
+    if (req.op === "preflight_access") {
+      // OPERATOR-ONLY. The {key→exists} answer is a key-existence
+      // oracle; only the operator (same trust root as the vault
+      // file — the operator socket is 0600 + chowned to the operator
+      // UID) may use it. An agent must never probe another agent's
+      // (or arbitrary) keys/ACL. `isOperator` is set ONLY by the
+      // canonical operator-socket bind (peercred), never by a
+      // per-agent socket, so this gate is airtight.
+      if (!isOperator) {
+        writeAudit({
+          ts: new Date().toISOString(),
+          op: "preflight_access",
+          caller: auditCaller,
+          pid: auditPid,
+          cgroup: auditCgroup,
+          result: "denied:operator-only",
+        });
+        socket.write(
+          encodeResponse(
+            errorResponse("DENIED", "preflight_access is operator-only"),
+          ),
+        );
+        return;
+      }
+      if (this.secrets === null) {
+        // Locked → the caller (doctor) maps LOCKED to `skip`, never a
+        // false fail. The broker is only locked pre-first-unlock or
+        // post-auth-failure, when the fleet's crons are dead anyway.
+        socket.write(
+          encodeResponse(errorResponse("LOCKED", "Vault is locked")),
+        );
+        return;
+      }
+      const pfSecrets = this.secrets;
+      const pfConfig = this.config;
+      const results = req.keys.map((key) => {
+        const exists = Object.prototype.hasOwnProperty.call(pfSecrets, key);
+        // The SAME predicates the real `get` path composes, so the
+        // verdict matches enforcement. NO secret value is ever read
+        // or returned — only existence + the boolean ACL/scope
+        // predicates. (The caller decides per provenance which to
+        // apply, and preserves the "no *static* ACL — a runtime
+        // grant may still cover this" caveat: a static miss here
+        // does NOT prove the agent lacks access.)
+        const acl =
+          pfConfig !== null
+            ? checkAclByAgent(pfConfig, req.agent, key)
+            : { allow: false as const, reason: "broker has no config loaded" };
+        const scope = checkEntryScope(pfSecrets[key]?.scope, req.agent);
+        return {
+          key,
+          exists,
+          acl_ok: acl.allow,
+          ...(acl.allow ? {} : { acl_reason: acl.reason }),
+          scope_ok: scope.allow,
+          ...(scope.allow ? {} : { scope_reason: scope.reason }),
+        };
+      });
+      writeAudit({
+        ts: new Date().toISOString(),
+        op: "preflight_access",
+        caller: auditCaller,
+        pid: auditPid,
+        cgroup: auditCgroup,
+        result: `allowed:agent=${req.agent},keys=${req.keys.length}`,
+      });
+      socket.write(
+        encodeResponse({ ok: true, op: "preflight_access", results }),
+      );
+      return;
+    }
+
     if (req.op === "list") {
       if (this.secrets === null) {
         socket.write(encodeResponse(errorResponse("LOCKED", "Vault is locked")));
