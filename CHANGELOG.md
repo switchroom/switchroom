@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.12.19 — feat: "your message is queued" now survives a restart (durable inbound spool)
+
+Headline: the gateway's "⏳ your message is queued and will be
+processed when it reconnects" promise was backed by an in-memory
+buffer — a gateway/container restart silently lost the message (the
+user had to resend; hit twice, finn + carrie). This release makes the
+promise deterministic with a crash-tolerant on-disk spool on the
+persistent per-agent volume: every queued inbound is durably
+recorded, boot-replayed if undelivered, acked only on confirmed
+delivery, and — if still undeliverable past a bound — the promise is
+explicitly retracted with a "couldn't deliver, resend" card rather
+than vanishing. Also closes the mid-turn composer wedge and a
+stateless-hindsight false-fail in the status probe.
+
+### Changes
+
+#### Features
+
+- **feat(gateway):** durable inbound spool. The "message is queued"
+  promise is now crash-survivable: a JSONL spool on
+  `STATE_DIR=/state/agent/telegram` (survives container recreate),
+  composed into the in-memory buffer at a single chokepoint (all push
+  sites). Boot-replays un-acked inbound; acks only on confirmed
+  delivery to a live registered bridge; dedups by a stable id; and a
+  bounded-escalation sweep posts an explicit "couldn't deliver —
+  resend" card so a queued message is ALWAYS resolved (delivered or
+  visibly retracted), never silently lost across a restart.
+  Compaction is atomic (tmp+rename). v1 ack = "delivered to a live
+  bridge"; a true claude→gateway consumption-ack is a documented
+  follow-up. (#1558)
+
+#### Fixes
+
+- **fix(gateway):** turn-gate inbound delivery to end the composer
+  wedge — a non-steering Telegram message arriving mid-turn was typed
+  into claude's TUI composer and its auto-submit raced
+  turn-completion, stranding the message (the lawgpt wedge). Such
+  inbound is now buffered until claude goes idle, where it submits
+  cleanly as a fresh turn; steering messages stay exempt. (#1555)
+- **fix(status):** the agent-status probe tolerates a stateless
+  hindsight backend instead of false-failing the status check when
+  hindsight is configured stateless. (#1556)
+
 ## v0.12.18 — feat: tell the user when proactive compaction runs
 
 Headline: v0.12.17 added opt-in proactive `/compact`, but it ran
