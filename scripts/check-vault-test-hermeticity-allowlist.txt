@@ -1,0 +1,46 @@
+# Allowlist for check-vault-test-hermeticity.mjs
+#
+# Each path is a vault test file that REFERENCES `os.homedir()` or a
+# literal `~/.switchroom` string but does NOT yet set `process.env.HOME`
+# to a tmpdir. On the 2026-05-20 incident host these contaminated the
+# operator's `~/.switchroom/` with fixture-named dirs (a, alice, alpha,
+# b, bob, c, carol, … 22 of them survived as evidence) — the same class
+# that, when it landed in `server-grants.test.ts`'s `mint_grant` path,
+# rewrote the live `vault/vault.enc` to a fresh empty file and locked
+# the fleet for hours.
+#
+# Mandate: GOAL = ZERO ENTRIES. Each entry is a tracked prod-risk on
+# any shared-host install. Removing an entry means the test now sets
+# `process.env.HOME = tmpDir` in its `beforeEach` (BEFORE `broker.start()`)
+# and restores in `afterEach`. Follow-up tracking: file an issue when
+# unsticking each entry, reference it in the PR description.
+#
+# DO NOT ADD NEW ENTRIES to paper over a fresh test that introduces
+# the pattern — fix the test instead. The CI gate's job is to make
+# adding new entries a deliberate, reviewer-visible decision.
+#
+# Format: one repo-relative path per line. Comments start with `#`.
+# Blank lines ignored.
+
+src/vault/broker/acl.test.ts
+src/vault/broker/audit-log.test.ts
+src/vault/broker/auto-unlock.test.ts
+src/vault/broker/client-token.test.ts
+src/vault/broker/scope.test.ts
+src/vault/broker/server-approvals.test.ts
+src/vault/broker/server-mint-grant-passphrase-attest.test.ts
+src/vault/broker/server-mint-grant-posture-attest.test.ts
+src/vault/broker/server-passphrase-attest.test.ts
+src/vault/broker/server-token-fallthrough.test.ts
+# Below are flagged on the literal "~/.switchroom" socket string inside their
+# `makeMinimalConfig` helper. The string is passed as `vault.broker.socket`
+# but in practice the test overrides the socket path via `broker.start(tmpSock)`,
+# so today they ARE hermetic in effect. They're listed here because the
+# static lint can't prove that without a wider analysis, and because the
+# safer fix is the same uniform HOME override — also unsticks them as a
+# future test that DOES rely on the config string can't accidentally land
+# the literal.
+src/vault/broker/server-unlock.test.ts
+src/vault/broker/server-write-grants.test.ts
+src/vault/broker/server.test.ts
+src/vault/resolver-via-broker.test.ts
