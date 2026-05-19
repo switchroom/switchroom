@@ -230,6 +230,7 @@ import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
+import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
   hostdRequestId,
@@ -1086,6 +1087,25 @@ let lastSessionActiveFile: string | null = null
 // turn and we must not double-dispatch before the first send settles.
 let compactState: CompactState = initialCompactState()
 let compactDispatching = false
+
+// User-facing proactive-compaction notification (single Telegram card
+// edited START → FINISH; transition selection is pure in
+// ./compact-notify). Session reset/rotation stays silent — not here.
+// The wall-clock timer is owned HERE (not the pure helper): an idle
+// agent produces no idle evaluations, so a card that never gets a
+// re-arm edge must be resolved by a real timer, independent of the
+// eval loop, or it would dangle forever.
+const COMPACT_CARD_TIMEOUT_MS = 15 * 60 * 1000
+interface OutstandingCompactCard {
+  chatId: string
+  threadId: number | undefined
+  messageId: number
+  occAtStart: number
+  capAtStart: number
+  timer: ReturnType<typeof setTimeout>
+}
+let compactNotifyState: CompactNotifyState = idleCompactNotifyState()
+let outstandingCompactCard: OutstandingCompactCard | null = null
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
 const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 const suppressPtyPreview = new Set<string>()
@@ -1321,8 +1341,35 @@ function maybeProactiveCompact(): void {
   const t = turns[0];
   const occupancy = t.input + t.cacheRead + t.cacheCreate;
 
+  const wasArmed = compactState.armed;
   const decision = decideProactiveCompact(compactState, occupancy, cap);
   compactState = decision.state;
+  // Re-arm edge: the decider only flips disarmed→armed when post-
+  // /compact occupancy fell below 0.6×cap — i.e. context verifiably
+  // shrank. That edge is the honest "compaction finished" signal.
+  const rearmed = !wasArmed && decision.state.armed;
+
+  // User-facing notification transitions (pure). Resolved synchronously
+  // here — before any await and before the !fire return — so a
+  // re-entrant purge pass can't double-post (compactState was already
+  // persisted/disarmed above). All card I/O is reached only past the
+  // `cap == null` opt-in return earlier in this function, so a fleet
+  // with the feature off never posts anything (Defaults preserved).
+  const nt = nextCompactNotify(compactNotifyState, {
+    fired: decision.fire,
+    rearmed,
+    activeFile: file,
+  });
+  compactNotifyState = nt.state;
+  if (nt.action === 'finish') {
+    void resolveCompactCard('finished', occupancy);
+  } else if (nt.action === 'start' || nt.action === 'start-superseding') {
+    if (nt.action === 'start-superseding') {
+      void resolveCompactCard('superseded', occupancy);
+    }
+    void postCompactCard(occupancy, cap);
+  }
+
   if (!decision.fire) return;
 
   // Set the re-entrancy guard synchronously BEFORE the await so a
@@ -1343,6 +1390,109 @@ function maybeProactiveCompact(): void {
     .finally(() => {
       compactDispatching = false;
     });
+}
+
+/**
+ * Post the START card for a proactive compaction. Best-effort: a failed
+ * send just means no card (the compaction itself still happens). The
+ * outstanding record + a wall-clock timeout are armed so the card can
+ * never dangle if the re-arm edge never arrives (failed/idle case).
+ */
+async function postCompactCard(occ: number, cap: number): Promise<void> {
+  try {
+    const chatId = loadAccess().allowFrom[0];
+    if (!chatId) return;
+    const threadId = chatThreadMap.get(chatId);
+    const text =
+      `🗜️ <b>Context compaction</b>\n` +
+      `Working context hit ~${occ.toLocaleString()} tokens ` +
+      `(cap ${cap.toLocaleString()}) — running <code>/compact</code>. ` +
+      `Older detail moves to Hindsight; I'll confirm here once the ` +
+      `context has shrunk (may take a turn or two).`;
+    const sent = await swallowingApiCall(
+      () =>
+        bot.api.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: chatId, verb: 'proactiveCompact.start' },
+    );
+    const messageId = (sent as { message_id?: number } | undefined)
+      ?.message_id;
+    if (typeof messageId !== 'number') return;
+    const timer = setTimeout(() => {
+      void resolveCompactCard('timeout', null);
+    }, COMPACT_CARD_TIMEOUT_MS);
+    timer.unref?.();
+    outstandingCompactCard = {
+      chatId,
+      threadId,
+      messageId,
+      occAtStart: occ,
+      capAtStart: cap,
+      timer,
+    };
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: proactive-compact start card failed: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+/**
+ * Resolve the outstanding START card to a terminal state by editing it
+ * in place. `finished` is driven by the decider re-arm edge (context
+ * verifiably shrank), `superseded` when a newer compaction starts first,
+ * `timeout` by the wall-clock timer (re-arm never arrived). The
+ * outstanding record + timer are cleared synchronously BEFORE the await
+ * so a stale message_id can never be edited twice and the timer can't
+ * double-fire. On `timeout` the pure notify state is also reset so a
+ * future compaction starts a clean lifecycle.
+ */
+async function resolveCompactCard(
+  kind: 'finished' | 'superseded' | 'timeout',
+  occNow: number | null,
+): Promise<void> {
+  const card = outstandingCompactCard;
+  if (!card) return;
+  outstandingCompactCard = null;
+  clearTimeout(card.timer);
+  if (kind === 'timeout') compactNotifyState = idleCompactNotifyState();
+  let text: string;
+  if (kind === 'finished') {
+    text =
+      `✅ <b>Context compacted</b>\n` +
+      `Working context reduced` +
+      (occNow != null
+        ? ` (~${card.occAtStart.toLocaleString()} → ` +
+          `~${occNow.toLocaleString()} tokens)`
+        : '') +
+      `. Hindsight retains the detail.`;
+  } else if (kind === 'superseded') {
+    text =
+      `↩️ <b>Context compaction superseded</b>\n` +
+      `A newer compaction started before this one confirmed.`;
+  } else {
+    text =
+      `⚠️ <b>Compaction issued</b>\n` +
+      `<code>/compact</code> was requested but the context isn't ` +
+      `confirmed reduced yet. Native compaction and Hindsight still apply.`;
+  }
+  try {
+    await swallowingApiCall(
+      () =>
+        bot.api.editMessageText(card.chatId, card.messageId, text, {
+          parse_mode: 'HTML',
+        }),
+      { chat_id: card.chatId, verb: `proactiveCompact.${kind}` },
+    );
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: proactive-compact ${kind} card edit failed: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
 }
 
 function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
