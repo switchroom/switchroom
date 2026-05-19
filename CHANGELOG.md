@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.12.9 — restore the Telegram reauth flow (auth reauth/code/cancel)
+
+One fix: the per-agent OAuth reauth flow was dead fleet-wide.
+
+### Changes
+
+#### Fixes
+
+- **fix(auth):** restore the `auth reauth` / `auth code` / `auth cancel` CLI verbs. RFC-H (#1254) removed their registrations from `src/cli/auth.ts` when it restructured auth around the broker, but left the engine (`src/auth/manager.ts` — `startAuthSession`/`submitAuthCode`/`cancelAuthSession`), every caller (the Telegram gateway `op:reauth` + `/auth reauth`, `welcome-text`, `operator-events`) and the tests all still expecting them. Net effect: any agent's 🔐 Reauth button ran `switchroom auth reauth <agent>` → "unknown command" → the operator saw **"Command failed"** (surfaced on `gymbro` after a transient 4xx). Re-registered as thin, agent-scoped wrappers over the existing, tested engine (`--slot`/`--force`, `auth code … --json` pinned to the gateway's parser); the credential write path is unchanged, so RFC-H's single-*writer* broker plane is untouched. (#1522)
+
 ## v0.12.8 — operator vault CLI fix, whole-fleet /doctor, audit tamper-evidence correctness
 
 Three fixes from a `switchroom doctor` audit pass.
