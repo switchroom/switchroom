@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.12.17 — feat: proactive context compaction (opt-in token cap)
+
+Headline: an always-on fleet on the 1M Opus window only hits Claude
+Code's native auto-compaction near the very top of the window
+(~800k+), which means agents can run for a long time on a huge,
+mostly-stale context — slower, costlier per turn, lower-signal. This
+adds an opt-in token cap that proactively runs `/compact` once live
+context occupancy reaches a configured threshold, so the fleet holds
+a deliberately lean working context on a large-window model. Off by
+default (a fresh `switchroom setup` is unchanged); Hindsight remains
+the cross-session safety net.
+
+### Changes
+
+#### Features
+
+- **feat(session):** new opt-in `session.max_context_tokens`. When
+  set, the gateway runs the allowlisted `/compact` once the latest
+  assistant turn's live occupancy (`input + cache_read +
+  cache_creation` — the prefix actually re-read this turn, not a
+  cumulative total) reaches the cap. Fires only at the model-idle
+  turn boundary (never mid-generation), reading the session-tail's
+  already-attached transcript (forwarded bridge→gateway) rather than
+  an independent re-scan. Anti-flap is a pure, unit-tested state
+  machine: disarm-on-fire + occupancy hysteresis (re-arm below
+  0.6×cap) + a turn-count cooldown floor — it degrades to "don't
+  fire" rather than livelooping if a compaction fails to shrink
+  context. Standard per-field `session` cascade (agent-wins); set
+  fleet-wide under `defaults.session`. No schema default → opt-in.
+  `docs/session-optimization.md` documents the trade-off and revises
+  the prior "let native compaction handle it" guidance for
+  large-window fleets. (#1551)
+
 ## v0.12.16 — fix: close the bridge-flap-while-idle inbound-orphan gap + green CI on hindsight-untouched releases
 
 Headline: v0.12.15 made agents self-heal a *wedged-turn* (silence-poke
