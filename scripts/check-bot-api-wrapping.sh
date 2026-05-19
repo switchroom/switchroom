@@ -85,7 +85,11 @@ ALLOWLIST=(
   # Re-bumped 2026-05-15 for #1308 folder-picker handler (callsite now ~2331).
   # Re-bumped 2026-05-15 post-#1328 (/audit hostd) + #1329 (auth-ux
   # follow-ups) — broadcast loop now at ~2334 after combined drift.
-  "telegram-plugin/gateway/gateway.ts:2250-2350:operator-event broadcast; no thread_id in opts"
+  # Re-bumped 2026-05-19 for PR-1 of the callback-continuation series:
+  # the +3-line builder-import block drifted the broadcast send to 2353
+  # (just past the old 2350 ceiling). Widened end 2350 -> 2360; grep
+  # confirms 2353 is the only raw call in 2351-2360.
+  "telegram-plugin/gateway/gateway.ts:2250-2360:operator-event broadcast; no thread_id in opts"
 
   # permission-request keyboard send. opts only has reply_markup. No thread_id.
   # Range bumped 2026-05-13 for stuck-turn-recovery v2 cleanup expansion
@@ -165,7 +169,14 @@ ALLOWLIST=(
   # raw bot.api call), so the wider span adds no un-allowlisted call.
   # End 10400 -> 10430: same insertion shifted the vault-wizard
   # editMessageText callsite to 10422.
-  "telegram-plugin/gateway/gateway.ts:9340-10430:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for PR-1 of the callback-continuation series:
+  # the ~+261-line vault_request_save wake-up insertions in
+  # handleVaultRequestSaveCallback drifted the wizard editMessageText
+  # callsites to 10446/10470 (past the old 10430 ceiling; 10423 still
+  # inside). Widened end 10430 -> 10480; grep confirms only
+  # 10423/10446/10470 are raw calls in 10431-10480 — all the same
+  # already-.catch-swallowed wizard editMessageText sites, no new one.
+  "telegram-plugin/gateway/gateway.ts:9340-10480:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see
