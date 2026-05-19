@@ -243,4 +243,206 @@ describe("VaultBroker unlock socket: audit sanitization (issue #214)", () => {
     // Protocol: "ERR <message>" — the message is now a constant.
     expect(resp).toBe("ERR decryption failed");
   });
+
+  // ── Legacy unlock peercred contract (regression guard) ───────────────────
+  //
+  // The default (non-operator) unlock path MUST keep denying when
+  // `identify()` cannot resolve a peer — that's the original Linux
+  // peer-credential gate from issue #129. The operator-path bypass
+  // (added in #1560 to fix the v0.12.x RFC-J Phase-3 regression) must
+  // NOT have weakened this.
+  it("legacy unlock: _testIdentify returning null → denied:unable to verify caller identity", async () => {
+    // Replace the default _testIdentify (which returns a synthetic peer)
+    // with one that returns null on the legacy unlock path, simulating
+    // a peercred failure. Cast through any because _testIdentify lives
+    // under BrokerTestOpts (guarded test-only hook).
+    (broker as unknown as { testOpts: { _testIdentify?: unknown } }).testOpts._testIdentify = () => null;
+
+    if (process.platform !== "linux") {
+      // peercred is Linux-only; on macOS the deny path is unreachable.
+      return;
+    }
+
+    const resp = await unlockRpc(unlockSocketPath, CORRECT_PASSPHRASE);
+    expect(resp).toBe("ERR unable to verify caller identity");
+    const lines = readAuditLines(auditLogPath);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].result).toBe("denied:unable to verify caller identity");
+  });
+});
+
+// ─── Operator unlock handler: peercred bypass (RFC-J Phase-3, fix #1560) ─────
+//
+// `_handleUnlockConnection(sock, /*isOperator=*/ true)` is the handler
+// path the operator unlock listener wires to (server.ts in
+// `bindOperatorListener`'s inner `unlockServer.listen` callback). The
+// peercred gate is structurally unable to authenticate that caller —
+// `identify()` returns null for the reserved "operator" path by design
+// (peercred.ts socketPathToIdentity + RESERVED_AGENT_NAMES) — so the
+// unlock handler MUST skip peercred when isOperator=true, mirroring the
+// data handler's bypass. Pre-fix this manifested as `ERR unable to
+// verify caller identity` on every host-operator unlock attempt,
+// leaving the fleet permanently locked across a recreate.
+//
+// We exercise the handler DIRECTLY with a duck-typed socket (no
+// bindOperatorListener round-trip). `bindOperatorListener` hard-anchors
+// the bind path on `^/run/switchroom/broker/` (a deliberate security
+// control) and rejects tmp paths, so an integration test through it
+// would require either weakening that anchor or running as root with
+// the canonical path — neither acceptable. The handler logic IS the
+// change; the call-site wiring (`_handleUnlockConnection(sock, true)`
+// inside bindOperatorListener's unlock-server closure) is a one-line
+// static guarantee visible in review.
+
+describe("VaultBroker _handleUnlockConnection: operator path bypass (#1560)", () => {
+  const CORRECT_PASSPHRASE_OP = "correct-horse-battery-staple-op";
+  const WRONG_PASSPHRASE_OP = "totally-wrong-passphrase-op";
+
+  /** Minimal net.Socket stand-in for the unlock handler:
+   *  - emits 'data' events when caller invokes `feed()`
+   *  - records the single `end(line)` the handler emits
+   *  - implements just enough of EventEmitter for the handler. */
+  type DuckSocket = {
+    feed: (chunk: string) => void;
+    ended: () => string | null;
+    closed: () => boolean;
+    asNetSocket: () => unknown;
+  };
+  function makeDuckSocket(): DuckSocket {
+    let dataHandler: ((c: Buffer) => void) | null = null;
+    let endedWith: string | null = null;
+    let closed = false;
+    const sock = {
+      on(event: string, fn: (c: Buffer) => void) {
+        if (event === "data") dataHandler = fn;
+        return sock;
+      },
+      end(line?: string) {
+        if (endedWith === null && typeof line === "string") endedWith = line;
+        closed = true;
+        return sock;
+      },
+      // unused by handler but present on the real net.Socket type
+      write() { return true; },
+      destroy() { closed = true; },
+      removeListener() { return sock; },
+      // Prevent stray Node typing complaints if anything peeks
+      readable: true,
+      writable: true,
+    };
+    return {
+      feed(chunk: string) { dataHandler?.(Buffer.from(chunk, "utf8")); },
+      ended() { return endedWith; },
+      closed() { return closed; },
+      asNetSocket() { return sock; },
+    };
+  }
+
+  let broker: VaultBroker;
+  let tmpDir: string;
+  let vaultPath: string;
+  let auditLogPath: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-op-handler-"));
+    vaultPath = path.join(tmpDir, "vault.enc");
+    auditLogPath = path.join(tmpDir, "vault-audit.log");
+
+    createVault(CORRECT_PASSPHRASE_OP, vaultPath);
+
+    broker = new VaultBroker({
+      _testConfig: makeMinimalConfig(vaultPath),
+      _testAuditLogger: createAuditLogger({ path: auditLogPath }),
+      _testGrantsDb: makeInMemoryGrantsDb(),
+      // CRITICAL: peercred returns null on the operator path by design
+      // (peercred.ts:130). The bypass must NOT depend on a synthetic
+      // peer — pin the real production-deploy behavior. Note that
+      // when we pass isOperator=true to the handler, this should NOT
+      // be consulted at all; we set it as a regression guard against
+      // accidentally falling through into the peercred branch.
+      _testIdentify: () => null,
+    });
+    // start() so the broker is in a valid lifecycle state (binds the
+    // legacy unlock socket at a tmp path — unused by these tests).
+    const legacySockPath = path.join(tmpDir, "legacy.sock");
+    await broker.start(legacySockPath, undefined, undefined);
+  });
+
+  afterEach(() => {
+    broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  /** Cast through unknown to reach the private handler. The handler's
+   *  contract — (socket, isOperator?) — is the unit under test. */
+  function callHandler(sock: unknown, isOperator: boolean): void {
+    (broker as unknown as {
+      _handleUnlockConnection: (s: unknown, op: boolean) => void;
+    })._handleUnlockConnection(sock, isOperator);
+  }
+
+  it("correct passphrase: isOperator=true unlocks despite _testIdentify=null", () => {
+    const d = makeDuckSocket();
+    callHandler(d.asNetSocket(), true);
+    d.feed(CORRECT_PASSPHRASE_OP + "\n");
+    expect(d.ended()).toBe("OK\n");
+
+    const unlockRows = readAuditLines(auditLogPath).filter((e) => e.op === "unlock");
+    const entry = unlockRows[unlockRows.length - 1];
+    expect(entry.result).toBe("allowed");
+    expect(entry.caller).toBe("operator");
+    expect(entry.cgroup).toBeUndefined();
+  });
+
+  it("isOperator=false (legacy) + _testIdentify=null → denied:unable to verify caller identity", () => {
+    if (process.platform !== "linux") return; // peercred is Linux-only
+    const d = makeDuckSocket();
+    callHandler(d.asNetSocket(), false);
+    // No feed needed — handler denies pre-data.
+    expect(d.ended()).toBe("ERR unable to verify caller identity\n");
+
+    const unlockRows = readAuditLines(auditLogPath).filter((e) => e.op === "unlock");
+    const entry = unlockRows[unlockRows.length - 1];
+    expect(entry.result).toBe("denied:unable to verify caller identity");
+    // Audit caller is the broker's own pid:N on the deny — NOT "operator".
+    expect(entry.caller).not.toBe("operator");
+  });
+
+  it("empty passphrase on operator path: audit caller='operator'", () => {
+    const d = makeDuckSocket();
+    callHandler(d.asNetSocket(), true);
+    d.feed("\n");
+    expect(d.ended()).toBe("ERR passphrase cannot be empty\n");
+
+    const entry = readAuditLines(auditLogPath).filter((e) => e.op === "unlock").pop()!;
+    expect(entry.result).toBe("denied:passphrase cannot be empty");
+    expect(entry.caller).toBe("operator");
+  });
+
+  it("wrong passphrase on operator path: audit caller='operator' + sanitized result", () => {
+    const d = makeDuckSocket();
+    callHandler(d.asNetSocket(), true);
+    d.feed(WRONG_PASSPHRASE_OP + "\n");
+    expect(d.ended()).toBe("ERR decryption failed\n");
+
+    const entry = readAuditLines(auditLogPath).filter((e) => e.op === "unlock").pop()!;
+    expect(entry.result).toBe("error:decryption failed");
+    expect(entry.caller).toBe("operator");
+  });
+
+  it(">4096-byte input before newline on operator path: ERR passphrase too long", () => {
+    const d = makeDuckSocket();
+    callHandler(d.asNetSocket(), true);
+    d.feed("x".repeat(5000)); // no newline → buffer-cap branch fires
+    expect(d.ended()).toBe("ERR passphrase too long\n");
+  });
 });
