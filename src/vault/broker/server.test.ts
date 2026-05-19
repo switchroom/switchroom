@@ -842,4 +842,32 @@ describe("VaultBroker server: audit log emission (denied identity)", () => {
       expect(entry.result).toMatch(/^denied:/);
     },
   );
+
+  // ── preflight_access: operator-only gate ────────────────────────────────
+  // The operator-ALLOWED path needs a real /run/switchroom/broker/
+  // operator socket (peercred's SOCKET_PATH regexes are hard-anchored
+  // there — that path-shape IS the security root, so a unit test can't
+  // bind one; no broker test does). The GATE — a non-operator
+  // (per-agent/default) caller is refused — is the new security-
+  // critical behaviour and is fully testable here. The operator-
+  // allowed computation is covered by composition: checkAclByAgent/
+  // checkEntryScope (acl.test.ts) + the consumer mapping incl.
+  // locked→skip (doctor-secret-access.test.ts, injected preflight).
+  it("preflight_access: DENIED on a non-operator socket, and audited without secret material", async () => {
+    const resp = await rpc(socketPath, {
+      v: 1,
+      op: "preflight_access",
+      agent: "anyone",
+      keys: ["foo", "baz"],
+    });
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.code).toBe("DENIED");
+    const row = readAuditLines(auditLogPath).find(
+      (e) => e.op === "preflight_access",
+    );
+    expect(row).toBeDefined();
+    expect(row!.result).toMatch(/^denied:operator-only/);
+    // Never carries a secret value.
+    expect(JSON.stringify(row)).not.toContain("bar-value");
+  });
 });
