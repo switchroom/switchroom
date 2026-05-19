@@ -123,3 +123,120 @@ export function buildVaultGrantDeniedInbound(opts: {
     },
   }
 }
+
+/** Subset of PendingVaultRequestSave the save-outcome builders need.
+ *  The `vault_request_save` flow has no scope/ttl (it stores a value,
+ *  it doesn't mint a scoped grant). */
+export interface VaultSaveInboundContext {
+  agent: string
+  key: string
+  /** Telegram chat the save card lived in — keeps the synthesized
+   *  resume-turn associated with the originating conversation. */
+  chat_id: string
+}
+
+/**
+ * Synthetic inbound for a successful operator Save tap on a
+ * `vault_request_save` card. Symmetric with
+ * `buildVaultGrantApprovedInbound`: the `vault_request_save` tool
+ * returns "waiting for operator" and the agent ends its turn, so
+ * without this inbound the secret is stored but the agent is never
+ * told and never resumes (the exact silence bug this fixes — the
+ * `vrs:` handler had no wake-up despite a comment claiming one).
+ */
+export function buildVaultSaveCompletedInbound(opts: {
+  ctx: VaultSaveInboundContext
+  stageId: string
+  operatorId: string
+  nowMs?: number
+}): InboundMessage {
+  const ts = opts.nowMs ?? Date.now()
+  return {
+    type: 'inbound',
+    chatId: opts.ctx.chat_id,
+    messageId: ts,
+    user: 'vault-broker',
+    userId: 0,
+    ts,
+    text:
+      `✅ Operator saved your secret as \`vault:${opts.ctx.key}\`. ` +
+      `Please resume the task that was waiting on it — reference the ` +
+      `value via the usual \`vault:${opts.ctx.key}\` path.`,
+    meta: {
+      source: 'vault_save_completed',
+      agent: opts.ctx.agent,
+      key: opts.ctx.key,
+      stage_id: opts.stageId,
+      operator_id: opts.operatorId,
+    },
+  }
+}
+
+/**
+ * Synthetic inbound for a Save tap whose vault write FAILED. Steers
+ * the model away from assuming the secret exists.
+ */
+export function buildVaultSaveFailedInbound(opts: {
+  ctx: VaultSaveInboundContext
+  stageId: string
+  operatorId: string
+  reason: string
+  nowMs?: number
+}): InboundMessage {
+  const ts = opts.nowMs ?? Date.now()
+  return {
+    type: 'inbound',
+    chatId: opts.ctx.chat_id,
+    messageId: ts,
+    user: 'vault-broker',
+    userId: 0,
+    ts,
+    text:
+      `⚠️ The operator tapped Save but the vault write for ` +
+      `\`vault:${opts.ctx.key}\` FAILED (${opts.reason}). The secret was ` +
+      `NOT stored — do NOT assume \`vault:${opts.ctx.key}\` resolves. ` +
+      `Either retry the save (the operator may need to fix the underlying ` +
+      `issue first) or pick a fallback for the original task.`,
+    meta: {
+      source: 'vault_save_failed',
+      agent: opts.ctx.agent,
+      key: opts.ctx.key,
+      stage_id: opts.stageId,
+      operator_id: opts.operatorId,
+    },
+  }
+}
+
+/**
+ * Synthetic inbound for an operator Discard tap. The secret was never
+ * written; steer the model to a fallback rather than silent idle.
+ */
+export function buildVaultSaveDiscardedInbound(opts: {
+  ctx: VaultSaveInboundContext
+  stageId: string
+  operatorId: string
+  nowMs?: number
+}): InboundMessage {
+  const ts = opts.nowMs ?? Date.now()
+  return {
+    type: 'inbound',
+    chatId: opts.ctx.chat_id,
+    messageId: ts,
+    user: 'vault-broker',
+    userId: 0,
+    ts,
+    text:
+      `🚫 Operator discarded your \`vault_request_save\` for ` +
+      `\`${opts.ctx.key}\` — the secret was NOT stored and ` +
+      `\`vault:${opts.ctx.key}\` will not resolve. Pick a fallback for ` +
+      `the original task (ask the user, try another approach, or skip ` +
+      `the feature). Do NOT re-request the save without asking the user.`,
+    meta: {
+      source: 'vault_save_discarded',
+      agent: opts.ctx.agent,
+      key: opts.ctx.key,
+      stage_id: opts.stageId,
+      operator_id: opts.operatorId,
+    },
+  }
+}

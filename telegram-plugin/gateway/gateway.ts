@@ -249,6 +249,9 @@ import { createPendingInboundBuffer } from './pending-inbound-buffer.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
+  buildVaultSaveCompletedInbound,
+  buildVaultSaveFailedInbound,
+  buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
@@ -10039,6 +10042,21 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         )
         .catch(() => {})
     }
+    // Wake the agent that called vault_request_save — symmetric with
+    // the vra: approve/deny path (#1052/#1150/#1156). Without this the
+    // tool returned "waiting for operator", the turn ended, and a
+    // Discard left the agent silently idle forever.
+    const discardInbound = buildVaultSaveDiscardedInbound({
+      ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+      stageId,
+      operatorId: senderId,
+    })
+    const dDelivered = ipcServer.sendToAgent(pending.agent, discardInbound)
+    process.stderr.write(
+      `telegram gateway: vault_save_discarded injection agent=${pending.agent} ` +
+      `key=${pending.key} stage=${stageId} delivered=${dDelivered}\n`,
+    )
+    if (!dDelivered) pendingInboundBuffer.push(pending.agent, discardInbound)
     return
   }
 
@@ -10143,6 +10161,22 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       // retry by re-invoking the same MCP tool, but the value will be
       // re-staged with a new ID. Drop the current stage.
       pendingVaultRequestSaves.delete(stageId)
+      // Wake the waiting agent with the failure (symmetric with the
+      // success/discard paths) so it doesn't assume vault:<key> exists.
+      const failReason =
+        (write.output || 'vault write error').split('\n')[0]!.slice(0, 200)
+      const failInbound = buildVaultSaveFailedInbound({
+        ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+        stageId,
+        operatorId: senderId,
+        reason: failReason,
+      })
+      const fDelivered = ipcServer.sendToAgent(pending.agent, failInbound)
+      process.stderr.write(
+        `telegram gateway: vault_save_failed injection agent=${pending.agent} ` +
+        `key=${pending.key} stage=${stageId} delivered=${fDelivered}\n`,
+      )
+      if (!fDelivered) pendingInboundBuffer.push(pending.agent, failInbound)
       return
     }
 
@@ -10158,6 +10192,20 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         )
         .catch(() => {})
     }
+    // Wake the agent that called vault_request_save so it resumes the
+    // task that was blocked on this credential (symmetric with the
+    // vra: approve path; buffered if the bridge is mid-reconnect).
+    const okInbound = buildVaultSaveCompletedInbound({
+      ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+      stageId,
+      operatorId: senderId,
+    })
+    const okDelivered = ipcServer.sendToAgent(pending.agent, okInbound)
+    process.stderr.write(
+      `telegram gateway: vault_save_completed injection agent=${pending.agent} ` +
+      `key=${pending.key} stage=${stageId} delivered=${okDelivered}\n`,
+    )
+    if (!okDelivered) pendingInboundBuffer.push(pending.agent, okInbound)
     return
   }
 
