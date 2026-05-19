@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.12.13 — fix: agent_smoke auth probe checked the wrong path
+
+### Changes
+
+#### Fixes
+
+- **fix(hostd):** the `agent_smoke` `auth` probe tested
+  `$CLAUDE_CONFIG_DIR`/`$HOME/.claude/.credentials.json`, but
+  in-agent `CLAUDE_CONFIG_DIR` is unset and `HOME=/state/agent/home`
+  while the real OAuth credential is `/state/agent/.claude/.credentials.json`
+  — so it false-failed "auth" for every healthy agent (the only
+  probe still red after the v0.12.12 `--` fix). Probe now targets the
+  verified path, consistent with the other probes. Completes the
+  honest-doctor arc (v0.12.9 `skip` → v0.12.10 `agent_smoke` →
+  v0.12.11 operator socket → v0.12.12 `--` → this): the "Agent
+  liveness" section now reports real per-agent `ok`. A new server
+  test pins every probe's command string so a wrong-path probe
+  can't regress unseen. (#1531)
+
 ## v0.12.12 — fix: docker-exec `--` broke agent_exec & agent_smoke in production
 
 ### Changes
