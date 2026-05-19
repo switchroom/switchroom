@@ -228,6 +228,8 @@ import { handleInjectCommand } from './inject-handler.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
+import { readTurnUsages } from '../../src/agents/perf.js'
+import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import {
   tryHostdDispatch,
   hostdRequestId,
@@ -1062,6 +1064,28 @@ const chatAvailableReactions = new Map<string, Set<string> | null>()
 const chatProbesInFlight = new Set<string>()
 const activeTurnStartedAt = new Map<string, number>()
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
+
+// ─── Proactive context compaction (session.max_context_tokens) ──────────
+//
+// Opt-in: when the resolved agent config sets session.max_context_tokens,
+// we fire `/compact` once the live context-window occupancy of the latest
+// assistant turn reaches that many tokens. Evaluated ONLY at the
+// model-idle gate inside purgeReactionTracking (activeTurnStartedAt.size
+// === 0) — never mid-turn — mirroring the pendingRestarts drain. The
+// `/compact` verb is allowlisted in src/agents/inject.ts and runs via the
+// tmux send-keys path (the only path that actually executes the slash
+// command; inject_inbound would deliver it as literal text).
+//
+// `lastSessionActiveFile` is the session-tail's tracked currentFile,
+// forwarded by the bridge on every session_event — we read occupancy from
+// exactly that file (never an independent findActiveSessionFile re-scan).
+let lastSessionActiveFile: string | null = null
+// Anti-spam state machine lives in ./proactive-compact (pure, unit
+// tested). `compactDispatching` is a synchronous re-entrancy guard for
+// the async tmux send — purgeReactionTracking can run several times per
+// turn and we must not double-dispatch before the first send settles.
+let compactState: CompactState = initialCompactState()
+let compactDispatching = false
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
 const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 const suppressPtyPreview = new Set<string>()
@@ -1233,12 +1257,92 @@ function purgeReactionTracking(key: string): void {
   // survives us getting killed by our own restart. Fire-and-forget;
   // response to the client was already sent when the restart was
   // scheduled, so nobody is waiting on this.
-  if (activeTurnStartedAt.size === 0 && pendingRestarts.size > 0) {
-    for (const [agentName, _timestamp] of pendingRestarts.entries()) {
-      triggerSelfRestart(agentName, 'turn-complete-pending-restart');
-      pendingRestarts.delete(agentName);
+  if (activeTurnStartedAt.size === 0) {
+    if (pendingRestarts.size > 0) {
+      for (const [agentName, _timestamp] of pendingRestarts.entries()) {
+        triggerSelfRestart(agentName, 'turn-complete-pending-restart');
+        pendingRestarts.delete(agentName);
+      }
+    } else {
+      // Strictly lower priority than a pending restart: if we just
+      // kicked a restart the process is going away and compacting is
+      // moot, so only evaluate when no restart drained this pass.
+      maybeProactiveCompact();
     }
   }
+}
+
+/**
+ * Model-idle proactive-compaction check. Called ONLY from the
+ * activeTurnStartedAt.size === 0 gate above (never mid-turn). Opt-in via
+ * the resolved agent config's session.max_context_tokens; a no-op when
+ * unset, so a fresh `switchroom setup` is unchanged.
+ *
+ * Occupancy = the latest usage-bearing assistant turn's
+ * input + cache_read + cache_creation tokens (the prefix the model
+ * actually re-read this turn ≈ current window fill). readTurnUsages(_,1)
+ * returns exactly that single turn and skips tool-only / usage-less
+ * lines, so we never under-count off a sub-line.
+ *
+ * Note (accepted, benign): there is a check-to-send race — a new inbound
+ * could set activeTurnStartedAt between this idle check and the async
+ * tmux send. A `/compact` that lands as a new turn starts is queued in
+ * claude's prompt buffer and runs at the next idle prompt (see the
+ * FUTURE-GAP note in src/agents/inject.ts); it is not a mid-generation
+ * injection. We do not claim size===0 is atomic.
+ */
+function maybeProactiveCompact(): void {
+  if (compactDispatching) return;
+
+  const agentName = process.env.SWITCHROOM_AGENT_NAME;
+  if (!agentName) return;
+
+  let cap: number | undefined;
+  try {
+    const cfg = loadSwitchroomConfig();
+    // Resolve through the cascade so a fleet-wide
+    // `defaults.session.max_context_tokens` applies even when the agent
+    // has no explicit per-agent session block (rawAgent → {}).
+    const rawAgent = cfg.agents?.[agentName] ?? {};
+    const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent);
+    cap = resolved.session?.max_context_tokens;
+  } catch {
+    // Best-effort — config may be unreadable in odd boot states; a
+    // failed read just means "no proactive compaction this pass".
+    return;
+  }
+  if (cap == null || cap <= 0) return; // opt-in: unset → native compaction only
+
+  const file = lastSessionActiveFile;
+  if (!file) return;
+
+  const turns = readTurnUsages(file, 1);
+  if (turns.length === 0) return;
+  const t = turns[0];
+  const occupancy = t.input + t.cacheRead + t.cacheCreate;
+
+  const decision = decideProactiveCompact(compactState, occupancy, cap);
+  compactState = decision.state;
+  if (!decision.fire) return;
+
+  // Set the re-entrancy guard synchronously BEFORE the await so a
+  // re-entrant purge pass can't double-dispatch (the decider already
+  // disarmed + armed the cooldown in decision.state).
+  compactDispatching = true;
+  process.stderr.write(
+    `telegram gateway: proactive /compact for ${agentName} ` +
+      `(occupancy=${occupancy} >= cap=${cap})\n`,
+  );
+  void injectSlashCommandImpl(agentName, '/compact')
+    .catch((err: unknown) => {
+      process.stderr.write(
+        `telegram gateway: proactive /compact inject failed for ` +
+          `${agentName}: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    })
+    .finally(() => {
+      compactDispatching = false;
+    });
 }
 
 function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
@@ -2997,6 +3101,9 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onSessionEvent(_client: IpcClient, msg: SessionEventForward) {
+    // Track the session-tail's attached file for the proactive-
+    // compaction occupancy read (see maybeProactiveCompact).
+    if (msg.activeFile) lastSessionActiveFile = msg.activeFile
     const ev = msg.event as unknown as SessionEvent
     // Pass the envelope's chatId so non-enqueue events can route to the
     // correct card even when the driver's currentChatId is stale.

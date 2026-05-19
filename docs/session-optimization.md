@@ -66,11 +66,31 @@ The main agent (Opus) handles planning and review. `@worker` (Sonnet) handles im
 
 ## Compaction
 
-Claude Code auto-compacts at ~83.5% of the context window (~835k tokens on the 1M Opus model). This is handled transparently:
+Claude Code auto-compacts late in the context window (roughly 80–85% full — on the 1M Opus model that is well past 800k tokens). This is handled transparently:
 
 - **Micro-compaction** selectively summarizes old tool results.
 - **Full compaction** produces a structured summary of intent, changes, and pending work.
 - **CLAUDE.md is sacred** — never compacted, always in the system prompt.
 - **Hindsight is the safety net** — anything compaction loses can be recalled from the memory bank.
 
-With the 1M context window on Opus 4.6, most conversations won't hit compaction in a single session.
+On the 1M context window (Opus 4.7), most conversations never reach native auto-compaction in a single session.
+
+### Proactive compaction (`session.max_context_tokens`)
+
+Native auto-compaction firing only near the very top of a 1M window means an agent can spend a long time operating with a very large, mostly-stale context — slower, costlier per turn, and lower-signal than a lean window. To hold a **deliberately small working context** on a large-window model, set a token cap:
+
+```yaml
+defaults:
+  session:
+    max_context_tokens: 190000   # /compact when occupancy reaches ~190k
+```
+
+Behavior:
+
+- **Opt-in.** Unset (the default) → unchanged: rely on Claude Code's native auto-compaction. A fresh `switchroom setup` is unaffected.
+- **What's measured.** Occupancy = the latest assistant turn's `input + cache-read + cache-creation` tokens — the prefix the model actually re-read this turn, i.e. the live window fill. Not cumulative across the session.
+- **When it fires.** Only at a turn boundary while the model is idle (never mid-generation). It runs the same `/compact` the model would, just earlier and on your schedule.
+- **Anti-flap.** After a compaction it disarms and re-arms only once occupancy falls back below ~60% of the cap, with an additional few-turn floor — so a borderline post-compact turn can't trigger a second compaction.
+- **Cascade.** Standard `session.*` per-field merge: set fleet-wide under `defaults.session` or override per agent/profile. Orthogonal to `session.max_idle` / `session.max_turns` (fresh-session rotation) and `session_continuity.resume_mode`.
+
+This is the recommended setting for an always-on fleet on the 1M Opus model where lean, fast, high-signal turns matter more than maximum single-session memory (Hindsight remains the cross-session safety net).
