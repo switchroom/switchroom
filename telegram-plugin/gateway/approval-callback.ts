@@ -22,13 +22,60 @@
  */
 
 import { type Context, InlineKeyboard } from "grammy";
-import { parseApprovalCallback, ttlMsFromToken } from "./approval-card.js";
+import {
+  parseApprovalCallback,
+  ttlMsFromToken,
+  type ApprovalChoice,
+} from "./approval-card.js";
 import {
   approvalConsume,
   approvalRecord,
 } from "../../src/vault/approvals/client.js";
 import type { ApprovalDecisionMode } from "../../src/vault/approvals/schema.js";
 import { scopeToOpenInDriveButton } from "../../src/drive/deep-links.js";
+
+/**
+ * Resolve a tapped approval choice to its decision tuple — PURE, no
+ * kernel I/O, so the `bad ttl token` branch (the only fallible path in
+ * the old inline switch) is unit-testable without mocking grammy.
+ *
+ * Extracted (PR-5) from `handleApprovalCallback` so PR-4's invariant —
+ * "compute + validate the decision BEFORE burning the single-use
+ * nonce" — is now structural, not a comment: the handler calls this
+ * first and only proceeds to `approvalConsume` on `ok: true`. A
+ * malformed ttl token returns `{ ok: false }` and the nonce is never
+ * touched (operator can re-tap a valid choice).
+ */
+export type ResolvedApprovalDecision =
+  | {
+      ok: true;
+      decision: ApprovalDecisionMode;
+      granted: boolean;
+      ttl_ms: number | null;
+      displayMode: string;
+    }
+  | { ok: false; error: string };
+
+export function resolveApprovalDecision(
+  choice: ApprovalChoice,
+): ResolvedApprovalDecision {
+  switch (choice.kind) {
+    case "deny":
+      return { ok: true, decision: "deny", granted: false, ttl_ms: null, displayMode: "denied" };
+    case "once":
+      // No expiry — recorded as a one-shot grant; the agent calls
+      // approval_lookup at most once, then proceeds. /approvals revoke
+      // can still target the row by id.
+      return { ok: true, decision: "allow_once", granted: true, ttl_ms: null, displayMode: "granted once" };
+    case "always":
+      return { ok: true, decision: "allow_always", granted: true, ttl_ms: null, displayMode: "granted always" };
+    case "ttl": {
+      const ms = ttlMsFromToken(choice.param);
+      if (ms === null) return { ok: false, error: "bad ttl token" };
+      return { ok: true, decision: "allow_ttl", granted: true, ttl_ms: ms, displayMode: `granted for ${choice.param}` };
+    }
+  }
+}
 
 /**
  * Build the post-tap keyboard for a granted decision. Today this is
@@ -57,54 +104,21 @@ export async function handleApprovalCallback(
     return;
   }
 
-  // Compute decision + ttl from the choice variant BEFORE burning the
-  // single-use nonce. This block has a fallible early-return (the
-  // `bad ttl token` path). Pre-fix it ran AFTER approvalConsume(), so a
-  // malformed ttl token burned the nonce but recorded no decision — the
-  // agent's approval_lookup poll never saw a verdict and the turn
-  // wedged (pre-PR-3: forever; now bounded by PR-3's PERMISSION_TTL
-  // auto-deny). approvalConsume stays the atomic single-use guard; it
-  // simply doesn't fire until we have a valid decision to record
-  // immediately after. There is now NO fallible step between
-  // consume→record; the only residual gap is the inherent 1-RPC
-  // consume/record non-atomicity (backstopped by PR-3's TTL auto-deny;
-  // a fully atomic kernel consume+record is a tracked follow-up).
-  let decision: ApprovalDecisionMode;
-  let granted: boolean;
-  let ttl_ms: number | null = null;
-  let displayMode: string;
-  switch (parsed.choice.kind) {
-    case "deny":
-      decision = "deny";
-      granted = false;
-      displayMode = "denied";
-      break;
-    case "once":
-      decision = "allow_once";
-      granted = true;
-      // No expiry — recorded as a one-shot grant; the agent calls
-      // approval_lookup at most once, then proceeds. /approvals revoke
-      // can still target the row by id.
-      displayMode = "granted once";
-      break;
-    case "always":
-      decision = "allow_always";
-      granted = true;
-      displayMode = "granted always";
-      break;
-    case "ttl": {
-      decision = "allow_ttl";
-      granted = true;
-      const ms = ttlMsFromToken(parsed.choice.param);
-      if (ms === null) {
-        await ctx.answerCallbackQuery({ text: "bad ttl token" });
-        return;
-      }
-      ttl_ms = ms;
-      displayMode = `granted for ${parsed.choice.param}`;
-      break;
-    }
+  // Resolve + validate the decision BEFORE burning the single-use
+  // nonce (PR-4 invariant, now structural via the pure
+  // resolveApprovalDecision — see its doc). A malformed ttl token
+  // returns { ok: false } here and the nonce is never touched, so the
+  // operator can re-tap a valid choice; pre-fix this validation ran
+  // AFTER approvalConsume(), burning the nonce with no decision
+  // recorded → the agent's approval_lookup poll never saw a verdict
+  // and the turn wedged. There is now NO fallible step between the
+  // consume→record below.
+  const resolved = resolveApprovalDecision(parsed.choice);
+  if (!resolved.ok) {
+    await ctx.answerCallbackQuery({ text: resolved.error });
+    return;
   }
+  const { decision, granted, ttl_ms, displayMode } = resolved;
 
   const consumed = await approvalConsume(parsed.request_id);
   if (consumed === null) {

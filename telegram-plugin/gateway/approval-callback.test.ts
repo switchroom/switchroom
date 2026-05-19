@@ -12,7 +12,10 @@
 
 import { describe, expect, it } from "vitest";
 import { InlineKeyboard } from "grammy";
-import { buildGrantedKeyboard } from "./approval-callback.js";
+import {
+  buildGrantedKeyboard,
+  resolveApprovalDecision,
+} from "./approval-callback.js";
 
 /**
  * Helper — pull the `[{text, url}]` rows out of a grammy InlineKeyboard
@@ -100,5 +103,50 @@ describe("buildGrantedKeyboard — no button cases", () => {
     // edit MUST NOT render a URL button derived from such a string.
     expect(buildGrantedKeyboard("doc:gdrive:folder/abc/def/**")).toBeUndefined();
     expect(buildGrantedKeyboard("doc:gdrive:write:abc?evil=1")).toBeUndefined();
+  });
+});
+
+describe("resolveApprovalDecision — pure decision resolution (PR-5)", () => {
+  it("deny → deny / not granted", () => {
+    expect(resolveApprovalDecision({ kind: "deny" })).toEqual({
+      ok: true, decision: "deny", granted: false, ttl_ms: null, displayMode: "denied",
+    });
+  });
+
+  it("once → allow_once, no ttl", () => {
+    expect(resolveApprovalDecision({ kind: "once" })).toEqual({
+      ok: true, decision: "allow_once", granted: true, ttl_ms: null, displayMode: "granted once",
+    });
+  });
+
+  it("always → allow_always, no ttl", () => {
+    expect(resolveApprovalDecision({ kind: "always" })).toEqual({
+      ok: true, decision: "allow_always", granted: true, ttl_ms: null, displayMode: "granted always",
+    });
+  });
+
+  it("ttl with a valid token → allow_ttl with computed ms", () => {
+    expect(resolveApprovalDecision({ kind: "ttl", param: "24h" })).toEqual({
+      ok: true,
+      decision: "allow_ttl",
+      granted: true,
+      ttl_ms: 24 * 60 * 60 * 1000,
+      displayMode: "granted for 24h",
+    });
+    expect(resolveApprovalDecision({ kind: "ttl", param: "7d" })).toMatchObject({
+      ok: true, decision: "allow_ttl", ttl_ms: 7 * 24 * 60 * 60 * 1000,
+    });
+  });
+
+  it("ttl with a bad token → { ok: false } so the caller does NOT consume the nonce", () => {
+    // This is the load-bearing case: pre-PR-4 this branch ran after
+    // approvalConsume() burned the single-use nonce, wedging the agent.
+    // It must report failure WITHOUT side effects (pure fn → caller
+    // returns before approvalConsume).
+    for (const param of ["bogus", "0h", "1w", "", "h", "12"]) {
+      expect(resolveApprovalDecision({ kind: "ttl", param })).toEqual({
+        ok: false, error: "bad ttl token",
+      });
+    }
   });
 });
