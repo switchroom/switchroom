@@ -318,7 +318,18 @@ export class VaultBroker {
     // default mechanism, opt-in via vault.broker.autoUnlock=true), then
     // falls back to $CREDENTIALS_DIRECTORY for power users running the
     // broker as a system unit with systemd LoadCredentialEncrypted=.
-    this._tryAutoUnlock();
+    //
+    // SKIP when _testSecrets was injected: those ARE the authoritative
+    // unlocked vault for this (test-only) broker. Without this guard a
+    // test broker started on a real deployment host auto-unlocks from
+    // the host's ~/.switchroom/vault-auto-unlock blob and silently
+    // replaces the 3 injected fixtures with the real ~90-key fleet
+    // vault — making the broker server tests pass in clean CI but FAIL
+    // on any host where switchroom is actually deployed (a hermeticity
+    // bug), and pulling the real fleet vault into a test process.
+    if (this.testOpts._testSecrets === undefined) {
+      this._tryAutoUnlock();
+    }
 
     if (process.platform !== "linux") {
       // Reachable only when SWITCHROOM_BROKER_ALLOW_NON_LINUX=1 was set
