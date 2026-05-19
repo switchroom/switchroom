@@ -247,3 +247,69 @@ describe('idleDrainTick — the 3rd drain trigger (finn orphan gap, 2026-05-19)'
     expect(probed).toBe(false) // cheap path: Map.get only, no bridge probe, no log
   })
 })
+
+describe('durable-spool integration (finn/carrie lost-on-restart fix)', () => {
+  function spySpool() {
+    const puts: string[] = []
+    const acks: string[] = []
+    return {
+      puts,
+      acks,
+      spool: {
+        put: (_a: string, m: InboundMessage) => {
+          puts.push(String(m.messageId))
+          return true
+        },
+        ack: (m: InboundMessage) => {
+          acks.push(String(m.messageId))
+        },
+        liveEntries: () => [],
+        sweepEscalations: () => 0,
+        liveCount: () => 0,
+      },
+    }
+  }
+
+  it('every push is durably spooled (chokepoint for all ~10 push sites)', () => {
+    const sp = spySpool()
+    const buf = createPendingInboundBuffer({ log: () => {}, spool: sp.spool as never })
+    buf.push('carrie', inbound('user', 7))
+    buf.push('carrie', inbound('user', 8))
+    expect(sp.puts).toEqual(['7', '8'])
+  })
+
+  it('a CONFIRMED delivery acks the spool; a miss does NOT (stays durable)', () => {
+    const sp = spySpool()
+    const buf = createPendingInboundBuffer({ log: () => {}, spool: sp.spool as never })
+    buf.push('carrie', inbound('user', 7))
+    // delivery succeeds → spool acked
+    redeliverBufferedInbound(buf, 'carrie', () => true, sp.spool as never)
+    expect(sp.acks).toEqual(['7'])
+
+    // delivery misses → NOT acked, re-buffered + still spooled
+    const sp2 = spySpool()
+    const buf2 = createPendingInboundBuffer({ log: () => {}, spool: sp2.spool as never })
+    buf2.push('carrie', inbound('user', 9))
+    redeliverBufferedInbound(buf2, 'carrie', () => false, sp2.spool as never)
+    expect(sp2.acks).toEqual([]) // never acked on a miss → survives for retry/escalation
+    expect(buf2.depth('carrie')).toBe(1) // re-buffered in memory too
+  })
+
+  it('idleDrainTick threads the spool through (ack only on delivered)', () => {
+    const sp = spySpool()
+    const buf = createPendingInboundBuffer({ log: () => {}, spool: sp.spool as never })
+    buf.push('carrie', inbound('user', 7))
+    idleDrainTick(buf, 'carrie', () => true, () => true, sp.spool as never)
+    expect(sp.acks).toEqual(['7'])
+  })
+
+  it('works with no spool (back-compat: undefined spool is a no-op)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('carrie', inbound('user', 7))
+    expect(redeliverBufferedInbound(buf, 'carrie', () => true)).toEqual({
+      drained: 1,
+      redelivered: 1,
+      rebuffered: 0,
+    })
+  })
+})

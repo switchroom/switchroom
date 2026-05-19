@@ -17,7 +17,7 @@ import { execFileSync, execSync, spawn } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
   statSync, renameSync, realpathSync, chmodSync, openSync, closeSync,
-  existsSync, unlinkSync,
+  existsSync, unlinkSync, appendFileSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
@@ -249,6 +249,7 @@ import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
+import { createInboundSpool } from './inbound-spool.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
@@ -1292,6 +1293,7 @@ function purgeReactionTracking(key: string): void {
         pendingInboundBuffer,
         selfAgentForFlush,
         (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
+        inboundSpool,
       )
       if (fr.redelivered > 0) {
         process.stderr.write(
@@ -3035,6 +3037,7 @@ silencePoke.startTimer({
       pendingInboundBuffer,
       fbSelfAgent,
       (m) => ipcServer.sendToAgent(fbSelfAgent, m),
+      inboundSpool,
     )
     process.stderr.write(
       `telegram gateway: silence-poke framework-fallback ended wedged turn ` +
@@ -3053,7 +3056,42 @@ silencePoke.startTimer({
 // vault_request_access card during the 100ms bridge-reconnect window
 // would mint the grant but silently drop the `vault_grant_approved`
 // inbound, leaving the agent stuck waiting for a manual poke.
-const pendingInboundBuffer = createPendingInboundBuffer()
+// Durable inbound spool on the persistent per-agent volume
+// (STATE_DIR = /state/agent/telegram in prod — survives container
+// recreate). Makes the "⏳ your message is queued and will be
+// processed when it reconnects" promise deterministic across a
+// gateway/container restart (finn/carrie lost-on-restart incident,
+// 2026-05-19). STATIC mode has no runtime/bridge, so no spool.
+const inboundSpool = STATIC
+  ? undefined
+  : createInboundSpool({
+      path: join(STATE_DIR, 'inbound-spool.jsonl'),
+      fs: {
+        appendFileSync: (p, d) => appendFileSync(p, d),
+        readFileSync: (p) => readFileSync(p, 'utf8'),
+        writeFileSync: (p, d) => writeFileSync(p, d),
+        renameSync: (a, b) => renameSync(a, b),
+        existsSync: (p) => existsSync(p),
+        statSizeSync: (p) => statSync(p).size,
+      },
+    })
+const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
+// Boot-replay: re-queue every un-acked spooled inbound into the
+// in-memory buffer so the existing drain triggers (onClientRegistered
+// / silence-poke #1546 / idle-drain #1549) deliver them. push →
+// spool.put dedups on the already-live id, so this re-push does NOT
+// double-append. This is what makes a queued message survive a
+// restart instead of being silently lost.
+if (inboundSpool != null) {
+  const replay = inboundSpool.liveEntries()
+  for (const e of replay) pendingInboundBuffer.push(e.agent, e.msg)
+  if (replay.length > 0) {
+    process.stderr.write(
+      `telegram gateway: inbound-spool boot-replay re-queued ${replay.length} ` +
+      `un-acked inbound (durable-queue, survives restart)\n`,
+    )
+  }
+}
 const pendingPermissionBuffer = createPendingPermissionBuffer()
 
 /**
@@ -3104,6 +3142,12 @@ const ipcServer: IpcServer = createIpcServer({
       for (const msg of pending) {
         try {
           client.send(msg)
+          // Confirmed delivery to the just-registered live bridge →
+          // tombstone the durable spool entry so it isn't boot-replayed
+          // again. A throw below leaves it spooled (un-acked) so the
+          // idle-drain / escalation path still recovers it — strictly
+          // safer than the old log-and-drop.
+          inboundSpool?.ack(msg)
         } catch (err) {
           process.stderr.write(
             `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
@@ -3592,6 +3636,7 @@ if (!STATIC) {
         return c != null && c.isAlive()
       },
       (m) => ipcServer.sendToAgent(selfAgent, m),
+      inboundSpool,
     )
     if (r != null && r.redelivered > 0) {
       process.stderr.write(
@@ -3600,6 +3645,28 @@ if (!STATIC) {
         `${r.rebuffered > 0 ? ` (${r.rebuffered} re-buffered)` : ''}\n`,
       )
     }
+    // Bounded escalation: a spooled inbound still un-acked past its
+    // bound (default 15 min — well past the 5-min silence-poke ladder)
+    // is undeliverable in practice. Retract the "will be processed"
+    // promise EXPLICITLY (honest failure) instead of letting it sit
+    // forever. This is what makes the guarantee deterministic: every
+    // queued message ends either delivered or visibly retracted.
+    inboundSpool?.sweepEscalations((e) => {
+      const chat = e.msg.chatId
+      const threadOpts =
+        typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
+          ? { message_thread_id: Number(e.msg.meta.threadId) }
+          : {}
+      void swallowingApiCall(
+        () =>
+          bot.api.sendMessage(
+            chat,
+            "⚠️ I couldn't deliver an earlier message to the agent after repeated retries (it survived restarts but the agent never picked it up). Please resend it.",
+            { ...threadOpts },
+          ),
+        { chat_id: chat, verb: 'inbound-spool-escalation' },
+      )
+    })
   }, IDLE_DRAIN_INTERVAL_MS).unref()
 }
 
