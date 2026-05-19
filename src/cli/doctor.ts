@@ -1,5 +1,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
+
+import { type CheckStatus, statusGlyph } from "./doctor-status.js";
 import { execSync, spawnSync } from "node:child_process";
 import {
   accessSync,
@@ -35,25 +37,14 @@ import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 
 /**
  * Result of a single doctor check.
+ * `CheckStatus` + `statusGlyph` live in ./doctor-status.ts (imported
+ * above) so the 9 doctor modules share one definition.
  */
-export type CheckStatus = "ok" | "warn" | "fail";
-
 export interface CheckResult {
   name: string;
   status: CheckStatus;
   detail?: string;
   fix?: string;
-}
-
-function statusGlyph(status: CheckStatus): string {
-  switch (status) {
-    case "ok":
-      return chalk.green("\u2713");
-    case "warn":
-      return chalk.yellow("!");
-    case "fail":
-      return chalk.red("\u2717");
-  }
 }
 
 /**
@@ -555,7 +546,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
       },
       {
         name: "vault unlock",
-        status: "warn",
+        status: "skip",
         detail: "SWITCHROOM_VAULT_PASSPHRASE not set; cannot verify decrypt",
         fix: "Export SWITCHROOM_VAULT_PASSPHRASE to verify the vault unlocks",
       },
@@ -1038,8 +1029,9 @@ export async function checkTelegram(config: SwitchroomConfig): Promise<CheckResu
       // deploy doctor across all 8 agents).
       results.push({
         name: `${name}: bot token`,
-        status: "warn",
+        status: "skip",
         detail: `unreadable from host (${read.error}) — agent reads it fine; cannot verify TELEGRAM_BOT_TOKEN from operator UID`,
+        fix: `Verify in-agent (PR2 hostd agent_smoke), or: docker exec switchroom-${name} sh -lc 'test -s "$TELEGRAM_BOT_TOKEN_FILE" || grep -q TELEGRAM_BOT_TOKEN /state/agent/telegram/.env && echo ok'`,
       });
       continue;
     }
@@ -1118,10 +1110,14 @@ export function checkStartShStale(
   try {
     content = readFileSync(startShPath, "utf-8");
   } catch (err) {
+    // start.sh is mode 0700 owned by the per-agent UID; the host
+    // operator can't read it. By-design unverifiable from here — not
+    // a problem (the agent runs it fine). PR2 verifies in-agent.
     return {
       name: label,
-      status: "warn",
-      detail: `unreadable: ${(err as Error).message}`,
+      status: "skip",
+      detail: `unreadable from host (${(err as Error).message}) — agent-UID-owned; the scheduler block can't be checked from the operator UID`,
+      fix: `Verify in-agent (PR2 hostd agent_smoke), or: docker exec switchroom-${agentName} grep -q _switchroom_supervise.*agent-scheduler /state/agent/start.sh && echo ok`,
     };
   }
   // Match on the actual supervisor invocation, not the bare token —
@@ -1418,8 +1414,9 @@ export function checkAgents(config: SwitchroomConfig, configPath: string): Check
         // post-deploy doctor across the full fleet (2026-05-10).
         results.push({
           name: `${name}: auth`,
-          status: "warn",
+          status: "skip",
           detail: "auth state owned by agent UID — unverifiable from host (agent reads it fine)",
+          fix: `Verify in-agent (PR2 hostd agent_smoke runs a real auth liveness check)`,
         });
       } else {
         results.push({
@@ -1557,22 +1554,28 @@ export function printSection(title: string, results: CheckResult[]): {
   oks: number;
   warns: number;
   fails: number;
+  skips: number;
 } {
   console.log(chalk.bold(`\n${title}`));
   let oks = 0;
   let warns = 0;
   let fails = 0;
+  let skips = 0;
   for (const r of results) {
     if (r.status === "ok") oks++;
     if (r.status === "warn") warns++;
     if (r.status === "fail") fails++;
+    if (r.status === "skip") skips++;
     const detail = r.detail ? chalk.gray(`  (${r.detail})`) : "";
     console.log(`  ${statusGlyph(r.status)} ${r.name}${detail}`);
+    // Show the how-to-verify line for skip too: it's not a problem,
+    // but the operator should be able to verify it on demand. Honest,
+    // not hidden (the "lying by omission" anti-pattern).
     if (r.fix && r.status !== "ok") {
       console.log(chalk.gray(`      \u2192 ${r.fix}`));
     }
   }
-  return { oks, warns, fails };
+  return { oks, warns, fails, skips };
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,7 +1650,7 @@ export function checkMffVaultKeyPresent(
   if (!passphrase) {
     return {
       name: "mff: vault key present",
-      status: "warn",
+      status: "skip",
       detail: "SWITCHROOM_VAULT_PASSPHRASE not set — skipping vault checks",
       fix: "Export SWITCHROOM_VAULT_PASSPHRASE to enable MFF vault probes",
     };
@@ -1823,7 +1826,7 @@ export async function checkMffApiReachable(
   if (state !== "readable") {
     return {
       name: "mff: API reachable",
-      status: "warn",
+      status: "skip",
       detail:
         state === "agent-private"
           ? "skipped — MFF creds are per-agent/agent-private since WS6-F2; deep probe must run in-agent"
@@ -1891,7 +1894,7 @@ export async function checkMffAuthFlow(
   if (state !== "readable") {
     return {
       name: "mff: auth flow",
-      status: "warn",
+      status: "skip",
       detail:
         state === "agent-private"
           ? "skipped — MFF creds are per-agent/agent-private since WS6-F2; deep probe must run in-agent"
@@ -2013,7 +2016,7 @@ export async function checkMffCloudflareUa(
   if (state !== "readable") {
     return {
       name: "mff: Cloudflare UA bypass",
-      status: "warn",
+      status: "skip",
       detail:
         state === "agent-private"
           ? "skipped — MFF creds are per-agent/agent-private since WS6-F2; deep probe must run in-agent"
@@ -2355,16 +2358,24 @@ export function registerDoctorCommand(program: Command): void {
         let totalOk = 0;
         let totalWarn = 0;
         let totalFail = 0;
+        let totalSkip = 0;
         for (const { title, results } of sections) {
           if (results.length === 0) continue;
-          const { oks, warns, fails } = printSection(title, results);
+          const { oks, warns, fails, skips } = printSection(title, results);
           totalOk += oks;
           totalWarn += warns;
           totalFail += fails;
+          totalSkip += skips;
         }
 
         console.log();
-        const summary = `${chalk.green(`${totalOk} ok`)} · ${chalk.yellow(`${totalWarn} warn`)} · ${chalk.red(`${totalFail} fail`)}`;
+        // `skip` is appended last and never affects the exit code —
+        // it means "not checked from here by design", not a problem.
+        // Keeping the ok/warn/fail order stable preserves operator
+        // muscle-memory and any loose output readers.
+        const summary =
+          `${chalk.green(`${totalOk} ok`)} · ${chalk.yellow(`${totalWarn} warn`)} · ${chalk.red(`${totalFail} fail`)}` +
+          ` · ${chalk.gray(`${totalSkip} skip`)}`;
         console.log(`  ${summary}`);
         console.log();
 

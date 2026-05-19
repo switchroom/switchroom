@@ -26,7 +26,7 @@ import { parse as parseYaml } from "yaml";
 
 import type { SwitchroomConfig } from "../config/schema.js";
 
-export type CheckStatus = "ok" | "warn" | "fail";
+import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
   name: string;

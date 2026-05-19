@@ -206,7 +206,7 @@ describe("runDriveChecks — deployed scaffold wiring (bug-8 / bug-9)", () => {
   // single honest "unverifiable from host" WARN, never a `fail`
   // (the original code mislabeled EACCES as ".mcp.json is unparseable"
   // and failed all 9 agents on a perfectly healthy fleet).
-  it("WARNS (not fail) when scaffold files are host-unreadable (EACCES)", () => {
+  it("SKIPS (not warn/fail) when scaffold files are host-unreadable (EACCES)", () => {
     const rs = runDriveChecks(base, {
       agentsDir: "/agents",
       existsSync: (p) =>
@@ -220,7 +220,7 @@ describe("runDriveChecks — deployed scaffold wiring (bug-8 / bug-9)", () => {
       },
     });
     const w = rs.find((r) => r.name === "drive: carrie scaffold");
-    expect(w?.status).toBe("warn");
+    expect(w?.status).toBe("skip");
     expect(w?.detail).toContain("unverifiable from the host");
     // Crucially: nothing in the section is a `fail` purely because the
     // host can't read agent-UID-owned files.
