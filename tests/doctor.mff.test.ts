@@ -129,10 +129,10 @@ describe("checkMffVaultKeyPresent", () => {
   beforeEach(() => { tempDir = makeTempDir(); });
   afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
-  it("returns warn when passphrase is not set", () => {
+  it("returns skip when passphrase is not set", () => {
     const vaultPath = join(tempDir, "vault.enc");
     const result = checkMffVaultKeyPresent(undefined, vaultPath);
-    expect(result.status).toBe("warn");
+    expect(result.status).toBe("skip");
     expect(result.detail).toContain("SWITCHROOM_VAULT_PASSPHRASE");
   });
 
@@ -641,20 +641,20 @@ describe("WS6-F2 agent-private behaviour", () => {
   );
 
   it.skipIf(isRoot)(
-    "deep probes skip (warn) on an agent-private .env — no host read of agent secrets",
+    "deep probes skip (status=skip) on an agent-private .env — no host read of agent secrets",
     async () => {
       const p = join(tempDir, ".env");
       writeFileSync(p, "MFF_API_URL=https://x\n");
       chmodSync(p, 0o000);
       const api = await checkMffApiReachable(p);
-      expect(api.status).toBe("warn");
+      expect(api.status).toBe("skip");
       expect(api.detail).toContain("agent-private");
     },
   );
 
-  it("deep probes skip (warn) when the .env is absent", async () => {
+  it("deep probes skip (status=skip) when the .env is absent", async () => {
     const api = await checkMffApiReachable(join(tempDir, "nope.env"));
-    expect(api.status).toBe("warn");
+    expect(api.status).toBe("skip");
     expect(api.detail).toContain("not found");
   });
 });

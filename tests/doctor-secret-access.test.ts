@@ -82,7 +82,7 @@ describe("runSecretAccessChecks — Check A (operator readable)", () => {
 });
 
 describe("runSecretAccessChecks — Check B (per-agent access)", () => {
-  it("warns (cannot verify) when the passphrase is unset", () => {
+  it("skips (cannot verify) when the passphrase is unset", () => {
     const saved = process.env.SWITCHROOM_VAULT_PASSPHRASE;
     delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
     try {
@@ -91,7 +91,7 @@ describe("runSecretAccessChecks — Check B (per-agent access)", () => {
         deps({ passphrase: undefined }),
       );
       const b = get(r, "agent secret access");
-      expect(b?.status).toBe("warn");
+      expect(b?.status).toBe("skip");
       expect(b?.detail).toContain("SWITCHROOM_VAULT_PASSPHRASE not set");
     } finally {
       if (saved !== undefined) process.env.SWITCHROOM_VAULT_PASSPHRASE = saved;

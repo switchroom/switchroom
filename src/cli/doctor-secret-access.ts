@@ -43,7 +43,7 @@ import { openVault, type VaultEntry } from "../vault/vault.js";
 import { checkAclByAgent, checkEntryScope } from "../vault/broker/acl.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
-export type CheckStatus = "ok" | "warn" | "fail";
+import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
   name: string;
@@ -182,7 +182,7 @@ export function runSecretAccessChecks(
   if (!passphrase) {
     results.push({
       name: "agent secret access",
-      status: "warn",
+      status: "skip",
       detail:
         "SWITCHROOM_VAULT_PASSPHRASE not set — cannot enumerate vault keys/ACLs " +
         "to verify per-agent secret access",

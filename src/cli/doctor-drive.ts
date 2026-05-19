@@ -47,7 +47,7 @@ import { join, resolve } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
-export type CheckStatus = "ok" | "warn" | "fail";
+import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
   name: string;
@@ -262,7 +262,7 @@ function checkScaffoldWiring(
     if (mcpRead.kind === "unreadable" || trustRead.kind === "unreadable") {
       results.push({
         name: `drive: ${name} scaffold`,
-        status: "warn",
+        status: "skip",
         detail:
           "scaffold files are agent-UID-owned (mode 0600) — unverifiable from the host operator; the agent process reads them fine. Verify in-container if needed: `docker exec switchroom-" +
           name +

@@ -312,7 +312,7 @@ describe("checkTelegram", () => {
   });
 
   it.skipIf(process.getuid?.() === 0)(
-    "reports warn (not fail) when .env exists but is unreadable from host UID (EACCES)",
+    "reports skip (not warn/fail) when .env exists but is unreadable from host UID (EACCES)",
     async () => {
     // Per-agent state files are mode 0600 owned by the agent UID
     // (compose.ts allocates 10001-10999); when `switchroom doctor`
@@ -335,7 +335,7 @@ describe("checkTelegram", () => {
         makeConfig({ assistant: { plugin: "switchroom" } }),
       );
       expect(results).toHaveLength(1);
-      expect(results[0].status).toBe("warn");
+      expect(results[0].status).toBe("skip");
       expect(results[0].detail).toContain("unreadable from host");
       expect(results[0].detail).toContain("agent reads it fine");
       // Crucially: the row must NOT claim TELEGRAM_BOT_TOKEN is "missing".

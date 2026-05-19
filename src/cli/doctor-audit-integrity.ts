@@ -31,7 +31,7 @@ import { join } from "node:path";
 
 import { verifyAuditLog } from "../util/audit-hashchain.js";
 
-export type CheckStatus = "ok" | "warn" | "fail";
+import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
   name: string;

@@ -35,7 +35,7 @@ import { accountCredentialsPath, accountDir } from "../auth/account-store.js";
 import { resolveStatePath } from "../config/paths.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
-export type CheckStatus = "ok" | "warn" | "fail";
+import type { CheckStatus } from "./doctor-status.js";
 
 export interface CheckResult {
   name: string;
@@ -366,6 +366,7 @@ export function runAuthBrokerChecks(
     checkAuthBrokerThresholdViolations(deps),
     checkAuthBrokerActiveAccount(config, deps),
   ];
-  const rank: Record<CheckStatus, number> = { fail: 0, warn: 1, ok: 2 };
+  // skip ranks after ok — it's "not checked from here", least urgent.
+  const rank: Record<CheckStatus, number> = { fail: 0, warn: 1, ok: 2, skip: 3 };
   return [...results].sort((a, b) => rank[a.status] - rank[b.status]);
 }
