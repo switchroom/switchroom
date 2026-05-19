@@ -116,7 +116,10 @@ export function redeliverBufferedInbound(
  * composer and the auto-submit races turn-completion, stranding it.
  * The `idleDrainTick` caller therefore also gates on
  * `activeTurnStartedAt.size === 0`, so this function is never invoked
- * mid-turn. Delivery is turn-gated end to end (gateway.ts).
+ * mid-turn. The Telegram `handleInbound` delivery path is turn-gated
+ * (gateway.ts); the `inject_inbound` cron/synthetic path is a separate
+ * delivery contract and deliberately not gated — see
+ * `inbound-delivery-gate.ts`.
  *
  * Returns the redeliver counts only when it actually ran, else null
  * (so the caller logs only on a real flush).

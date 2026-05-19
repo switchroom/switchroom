@@ -31,13 +31,21 @@
  *
  * ## The deterministic guarantee
  *
- * A non-steering inbound is delivered to the bridge ONLY when no turn
- * is in flight. The channel notification therefore always lands at an
- * idle claude prompt, where it submits cleanly as a fresh turn. It can
- * be *delayed* (until the current turn completes) but can never strand
- * in the composer. The turn-complete hook
- * (`purgeReactionTracking`) and the turn-gated idle-drain timer flush
- * the buffer the instant `activeTurnStartedAt.size === 0`.
+ * A non-steering inbound on the Telegram `handleInbound` path is
+ * delivered to the bridge ONLY when no turn is in flight. The channel
+ * notification therefore always lands at an idle claude prompt, where
+ * it submits cleanly as a fresh turn. It can be *delayed* (until the
+ * current turn completes) but can never strand in the composer. The
+ * turn-complete hook (`purgeReactionTracking`) and the turn-gated
+ * idle-drain timer flush the buffer the instant
+ * `activeTurnStartedAt.size === 0`.
+ *
+ * Scope: this gates the Telegram `handleInbound` path only — the one
+ * the lawgpt wedge hit. The `inject_inbound` IPC path (cron / synthetic
+ * operator wakeups) reaches the bridge directly and is deliberately
+ * NOT gated here: cron fires carry at-least-once replay semantics and
+ * their delivery contract is a separate product decision, out of scope
+ * for this bug.
  *
  * ## Steering is deliberately exempt
  *
