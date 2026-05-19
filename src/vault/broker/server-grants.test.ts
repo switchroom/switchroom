@@ -92,6 +92,15 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
   let grantsDb: Database;
   let auditEntries: AuditEntry[];
   let prevNonLinuxFlag: string | undefined;
+  // #1561: the broker resolves `~/.switchroom/agents/<agent>/.vault-token`
+  // via `os.homedir()` when minting grants. Without overriding HOME the
+  // mint path writes into the operator's REAL `~/.switchroom/agents/`,
+  // creating fixture-named dirs (myagent, agent1, …) — and on this
+  // shared host that propagated into a vault-rewrite that destroyed the
+  // live vault.enc (incident 2026-05-20, see PR). Override HOME for the
+  // duration of the test so every `os.homedir()`-derived path stays
+  // inside `tmpDir`. Restored in afterEach.
+  let prevHome: string | undefined;
 
   beforeEach(async () => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -99,6 +108,11 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-grants-test-"));
     socketPath = path.join(tmpDir, "test.sock");
+
+    // MUST come BEFORE broker.start() — the broker captures `os.homedir()`
+    // when constructing token write paths during mint_grant.
+    prevHome = process.env.HOME;
+    process.env.HOME = tmpDir;
 
     grantsDb = makeInMemoryGrantsDb();
     auditEntries = [];
@@ -117,6 +131,11 @@ describe("VaultBroker: grant operations (mint_grant / list_grants / revoke_grant
   afterEach(() => {
     broker.stop();
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
+    }
     if (prevNonLinuxFlag === undefined) {
       delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     } else {
