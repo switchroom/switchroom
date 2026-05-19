@@ -179,7 +179,15 @@ ALLOWLIST=(
   # chunk-loop raw sends to 4026/4047 (past 4000). End 4000 -> 4060;
   # check flags only 4026/4047 before the next entry (8100), so no new
   # un-allowlisted call enters the margin.
-  "telegram-plugin/gateway/gateway.ts:3160-4060:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-20 for the silence-poke turn-state purge fix:
+  # the ~17-line purgeStaleTurnsForChat insertion (~3014) drifted the
+  # chunk-loop raw send to 4067 (past 4060). End 4060 -> 4080; next
+  # raw call is 11002 (far outside), no new un-allowlisted call enters.
+  # Re-bumped 2026-05-20 (same-PR follow-up): the +~26-line
+  # endCurrentTurnAtomic helper insertion (~1320) drifted the
+  # chunk-loop raw send 4067 -> 4093 (past 4080). End 4080 -> 4100;
+  # next raw call is 11028 (far outside), no new un-allowlisted call.
+  "telegram-plugin/gateway/gateway.ts:3160-4100:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -260,7 +268,17 @@ ALLOWLIST=(
   # 10920). End 10920 -> 11000; next raw call is well outside, so no
   # new un-allowlisted call enters — same already-.catch-swallowed
   # wizard sites.
-  "telegram-plugin/gateway/gateway.ts:9340-11000:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-20 for the silence-poke turn-state purge fix:
+  # the ~17-line purgeStaleTurnsForChat insertion (~3014) drifted the
+  # last wizard editMessageText site to 11002 (past 11000). End
+  # 11000 -> 11020; next raw call is well outside — same already-
+  # .catch-swallowed wizard site, no new un-allowlisted call enters.
+  # Re-bumped 2026-05-20 (same-PR follow-up): the +~26-line
+  # endCurrentTurnAtomic helper insertion (~1320) drifted the last
+  # wizard editMessageText site 11002 -> 11028 (past 11020). End
+  # 11020 -> 11040; same already-.catch-swallowed wizard site, no
+  # new un-allowlisted call enters.
+  "telegram-plugin/gateway/gateway.ts:9340-11040:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see

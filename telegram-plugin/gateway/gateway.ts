@@ -250,6 +250,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
 import { createInboundSpool } from './inbound-spool.js'
+import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
@@ -1316,6 +1317,32 @@ function purgeReactionTracking(key: string): void {
       maybeProactiveCompact();
     }
   }
+}
+
+/**
+ * Atomic null-and-purge for a wedged turn. Every site that ends a
+ * turn by nulling `currentTurn` MUST also clear the turn's statusKey
+ * from `activeTurnStartedAt` — else a dangling entry survives and
+ * `#1556`'s turn-gate holds every new inbound mid-turn forever
+ * (gymbro / klanker held-mid-turn symptom, 2026-05-20).
+ *
+ * Pre-this, three turn-end paths (silent-marker / turn-flush /
+ * `turn_end`) nulled `currentTurn` on code-paths whose
+ * `purgeReactionTracking` calls weren't reached on every branch,
+ * leaving sibling entries under the turn's statusKey that the
+ * silence-poke framework-fallback's `purgeReactionTracking(fbKey)`
+ * couldn't catch (different key shape). The fallback now also sweeps
+ * siblings for `fbChatId` (`turn-state-purge.ts`) as defense-in-depth,
+ * but THIS helper closes the leak at origin: null and purge are
+ * inseparable at every call site.
+ *
+ * Idempotent: a second purge is a no-op `.delete()` on a key already
+ * gone — handlers that already purge elsewhere are unharmed.
+ */
+function endCurrentTurnAtomic(turn: CurrentTurn): void {
+  if (currentTurn !== turn) return
+  currentTurn = null
+  purgeReactionTracking(statusKey(turn.sessionChatId, turn.sessionThreadId))
 }
 
 /**
@@ -3011,6 +3038,23 @@ silencePoke.startTimer({
     // for this chat starts a fresh turn instead of queueing forever.
     silencePoke.endTurn(fbKey)
     purgeReactionTracking(fbKey)
+    // Defense-in-depth: the fallback's purgeReactionTracking above
+    // clears the canonical statusKey(chatId, threadId) for fbKey
+    // only. activeTurnStartedAt can hold sibling entries for the
+    // SAME chat (different threads, or a `null` vs `undefined`-thread
+    // variant left over from a normal turn-end path that nulled
+    // currentTurn without invoking purgeReactionTracking — the
+    // gymbro/klanker held-mid-turn symptom, 2026-05-20). Any sibling
+    // for fbChatId is by definition stale when THIS fallback fires
+    // (the chat has been silent ≥5 min); sweep them via the same
+    // purger. Multi-chat-safe — only touches keys for fbChatId, so
+    // #1546's intentional cross-chat safety guard is preserved.
+    // See turn-state-purge.ts.
+    const fbExtraPurge = purgeStaleTurnsForChat(
+      fbChatId,
+      activeTurnStartedAt.keys(),
+      purgeReactionTracking,
+    )
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
     // (or never does), the handler's `const turn = currentTurn` snapshot
@@ -3044,7 +3088,8 @@ silencePoke.startTimer({
       `chat=${fbChatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs} ` +
       `currentTurn_nulled=${turnMatchesFallback} ` +
       `drained_buffered=${fbRedeliver.redelivered}/${fbRedeliver.drained}` +
-      `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}\n`,
+      `${fbRedeliver.rebuffered > 0 ? ` rebuffered=${fbRedeliver.rebuffered}` : ''}` +
+      `${fbExtraPurge.purged.length > 0 ? ` extra_keys_purged=${fbExtraPurge.purged.length}` : ''}\n`,
     )
   },
 })
@@ -5686,7 +5731,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           turn.answerStream = null
         }
         // Null the atom — this turn is being abandoned.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — context-exhaustion teardown also resets preamble state.
         preambleSuppressor.reset()
       }
@@ -5884,7 +5929,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // returns early at handler entry. A new `enqueue` swaps in a
         // fresh atom; the silent-turn teardown doesn't need to preserve
         // any of the prior turn's state.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — silent-marker teardown drops any pending preamble.
         preambleSuppressor.dropNow()
         return
@@ -5918,7 +5963,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // sendMessage await for this turn will see currentTurn == null
         // and bail; a new enqueue will swap in a fresh atom. The
         // `backstop*` locals above hold everything the IIFE needs.
-        if (currentTurn === turn) currentTurn = null
+        endCurrentTurnAtomic(turn)
         // #549 fix — turn-flush takes ownership of the captured-text
         // backup; reset the preamble buffer (its content is already in
         // the captured `capturedText`, which turn-flush is about to send).
@@ -6190,7 +6235,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // #1067: null the atom in one assignment, replacing the seven
       // field clears the pre-refactor version did. Any late-arriving
       // event for this turn will see currentTurn == null and bail.
-      if (currentTurn === turn) currentTurn = null
+      endCurrentTurnAtomic(turn)
       // #549 fix — preamble flush already happened at the TOP of this
       // turn_end handler (before turn.answerStream is nulled). See
       // comment near line 3431.
