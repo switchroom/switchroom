@@ -245,7 +245,7 @@ import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
-import { createPendingInboundBuffer, redeliverBufferedInbound } from './pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import {
   buildVaultGrantApprovedInbound,
@@ -3271,6 +3271,48 @@ const ipcServer: IpcServer = createIpcServer({
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
 })
+
+// ─── Opportunistic idle-drain of pendingInboundBuffer ─────────────────────
+// pendingInboundBuffer otherwise drains only on (a) bridge re-register
+// (onClientRegistered) or (b) the silence-poke framework fallback
+// clearing a wedged turn (#1546). NEITHER fires when a message is
+// buffered during a bridge-IPC flap that then settles with no
+// subsequent clean re-register AND claude is idle (no active turn →
+// silence-poke never arms). The message orphans until a manual restart
+// (finn, 2026-05-19 — buffered "verify with mff-query.py cashflow"
+// while idle; last `bridge registered` predated the buffer push, so
+// onClientRegistered's drain never ran for it).
+//
+// This is the third drain trigger. It's gated to be zero-cost and
+// zero-churn: skip entirely when nothing is buffered (one Map.get, no
+// log) or when the bridge isn't alive (exactly sendToAgent's own
+// guard — so we never drain into a dead bridge and re-buffer/log-spin).
+// Only when there IS a buffered message AND a live bridge do we reuse
+// the #1546 `redeliverBufferedInbound` (lossless: re-buffers any
+// per-message miss). A message delivered while a turn is active is
+// queued normally by the bridge — same as a live arrival, not lost.
+const IDLE_DRAIN_INTERVAL_MS = 5000
+if (!STATIC) {
+  setInterval(() => {
+    const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    const r = idleDrainTick(
+      pendingInboundBuffer,
+      selfAgent,
+      () => {
+        const c = ipcServer.getClient(selfAgent)
+        return c != null && c.isAlive()
+      },
+      (m) => ipcServer.sendToAgent(selfAgent, m),
+    )
+    if (r != null && r.redelivered > 0) {
+      process.stderr.write(
+        `telegram gateway: idle-drain flushed ${r.redelivered}/${r.drained} ` +
+        `buffered inbound for ${selfAgent}` +
+        `${r.rebuffered > 0 ? ` (${r.rebuffered} re-buffered)` : ''}\n`,
+      )
+    }
+  }, IDLE_DRAIN_INTERVAL_MS).unref()
+}
 
 // ─── Tool execution ──────────────────────────────────────────────────────
 
