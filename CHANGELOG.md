@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.12.15 — fix: agents self-heal a post-network-storm wedge (no manual restart)
+
+Headline: an agent that had a turn in flight when the network flapped
+(e.g. every gateway hitting `api.telegram.org` at once during a
+fleet-wide `switchroom update` recreate) could end up silently "not
+responding" — the inbound buffer drained ONLY on a bridge re-register,
+so once connectivity returned with the bridge still connected the
+buffered user messages sat forever until a manual per-agent restart.
+The silence-poke framework fallback now flushes that buffer when it
+clears the wedged turn, so the agent self-recovers within the
+silence-poke window with no operator action. Also: the approval kernel
+closes its consume↔record gap (atomic), and `switchroom doctor` now
+actively probes Drive OAuth-client broker-reachability instead of only
+checking config presence.
+
+### Changes
+
+#### Features
+
+- **feat(approval):** `approval_consume_record` is now atomic — the
+  single-use nonce consume and the audit-record write can no longer
+  tear apart on a crash/race between the two, closing the
+  consume↔record gap (PR-6). (#1545)
+
+#### Fixes
+
+- **fix(gateway):** agents self-heal a wedged turn after a network
+  storm. `pendingInboundBuffer` previously drained only on bridge
+  re-register (`onClientRegistered`); after a storm that settled with
+  the bridge still connected, messages buffered during the flap never
+  drained and the agent looked dead until a manual restart. The
+  silence-poke framework fallback now flushes the buffer (new pure
+  `redeliverBufferedInbound` — drain → send → re-buffer on miss so
+  nothing is lost) when it clears the wedge. The fallback log gains
+  `drained_buffered=<n>/<n>` for visibility. Root-caused from the
+  2026-05-19 fleet-update thundering-herd incident. (#1546)
+- **fix(doctor):** the Google Drive section now actively probes that
+  the vault-broker will actually *serve* the configured OAuth client
+  credential to each Drive-enabled agent (operator-socket
+  `preflight_access` → full `checkAclByAgent`), instead of only
+  checking the value is present in config. Closes the blind spot that
+  let the v0.12.14 client-secret broker-ACL bug ship silently; broker
+  locked/unreachable maps to `skip`, never a false fail. (#1543)
+
+#### Internal
+
+- **refactor(approval):** extracted a pure `resolveApprovalDecision`
+  and unit-tested the bad-TTL seam, de-risking the approval-decision
+  path ahead of the atomic-consume change. (#1544)
+
 ## v0.12.14 — fix: Google Drive MCP works fleet-wide (RFC G §4.4) + gateway/approval delivery reliability
 
 Headline: the Google Drive MCP was dead on arrival on every install
