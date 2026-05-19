@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { createPendingInboundBuffer, redeliverBufferedInbound, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
 function inbound(source: string, ts = Date.now()): InboundMessage {
@@ -198,5 +198,52 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
     redeliverBufferedInbound(buf, 'klanker', () => true)
     expect(buf.depth('klanker')).toBe(0)
     expect(buf.depth('clerk')).toBe(1) // untouched
+  })
+})
+
+describe('idleDrainTick — the 3rd drain trigger (finn orphan gap, 2026-05-19)', () => {
+  it('no-op (returns null, no send) when the buffer is empty', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    let sent = 0
+    const r = idleDrainTick(buf, 'finn', () => true, () => { sent++; return true })
+    expect(r).toBeNull()
+    expect(sent).toBe(0)
+  })
+
+  it('no-op (returns null) when bridge is NOT alive — never drains into a dead bridge', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('finn', inbound('user', 1))
+    let sent = 0
+    const r = idleDrainTick(buf, 'finn', () => false, () => { sent++; return true })
+    expect(r).toBeNull()
+    expect(sent).toBe(0)
+    expect(buf.depth('finn')).toBe(1) // untouched — onClientRegistered will get it on reconnect
+  })
+
+  it('flushes the buffer when bridge is alive AND something is buffered (the finn fix)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('finn', inbound('user', 2013)) // the orphaned "verify with mff-query.py" class
+    const seen: number[] = []
+    const r = idleDrainTick(buf, 'finn', () => true, (m) => { seen.push(m.messageId as number); return true })
+    expect(r).toEqual({ drained: 1, redelivered: 1, rebuffered: 0 })
+    expect(seen).toEqual([2013])
+    expect(buf.depth('finn')).toBe(0)
+  })
+
+  it('is lossless — a delivery miss re-buffers, returns null on empty agent', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('finn', inbound('user', 1))
+    const r = idleDrainTick(buf, 'finn', () => true, () => false)
+    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1 })
+    expect(buf.depth('finn')).toBe(1) // nothing lost
+    expect(idleDrainTick(buf, '', () => true, () => true)).toBeNull() // empty agent guard
+  })
+
+  it('checks depth BEFORE isBridgeAlive — empty buffer never probes the bridge', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    let probed = false
+    const r = idleDrainTick(buf, 'finn', () => { probed = true; return true }, () => true)
+    expect(r).toBeNull()
+    expect(probed).toBe(false) // cheap path: Map.get only, no bridge probe, no log
   })
 })

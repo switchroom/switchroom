@@ -93,6 +93,38 @@ export function redeliverBufferedInbound(
   return { drained: pending.length, redelivered, rebuffered }
 }
 
+/**
+ * One opportunistic idle-drain tick. The third drain trigger, beside
+ * `onClientRegistered` (bridge re-register) and the silence-poke
+ * wedge-clear (#1546). Closes the orphan gap those two miss: a message
+ * buffered during a bridge-IPC flap that settles with no subsequent
+ * clean re-register while claude is idle (no turn → no silence-poke)
+ * — it would otherwise sit until a manual restart (finn, 2026-05-19).
+ *
+ * Gated to be zero-cost / zero-churn so it can run on a short timer:
+ *   - empty buffer → return null (one Map.get, NO drain, NO log)
+ *   - bridge not alive → return null (never drain into a dead bridge,
+ *     which would re-buffer+log-spin every tick; onClientRegistered
+ *     will drain on the eventual reconnect instead)
+ *   - otherwise → `redeliverBufferedInbound` (lossless: re-buffers any
+ *     per-message miss). A message delivered mid-turn is queued
+ *     normally by the bridge, same as a live arrival — not lost.
+ *
+ * Returns the redeliver counts only when it actually ran, else null
+ * (so the caller logs only on a real flush).
+ */
+export function idleDrainTick(
+  buffer: PendingInboundBuffer,
+  agent: string,
+  isBridgeAlive: () => boolean,
+  send: (msg: InboundMessage) => boolean,
+): { drained: number; redelivered: number; rebuffered: number } | null {
+  if (!agent) return null
+  if (buffer.depth(agent) === 0) return null
+  if (!isBridgeAlive()) return null
+  return redeliverBufferedInbound(buffer, agent, send)
+}
+
 export function createPendingInboundBuffer(
   opts: PendingInboundBufferOptions = {},
 ): PendingInboundBuffer {

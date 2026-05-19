@@ -152,7 +152,12 @@ ALLOWLIST=(
   # self-heal (+14 lines ~2746) drifted the chunk-loop raw sends to
   # ~3636/3650 (3650 past 3640). End 3640 -> 3660; next raw call is
   # 10562 (far outside), so no new un-allowlisted call enters.
-  "telegram-plugin/gateway/gateway.ts:3160-3660:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
+  # Re-bumped 2026-05-19 for the idle-drain fix: the +~30-line
+  # opportunistic idle-drain block (~line 3274, inside this range)
+  # drifted the chunk-loop raw send to 3692 (past 3660). End
+  # 3660 -> 3700; next raw call is 10604 (far outside), so no new
+  # un-allowlisted call enters the margin.
+  "telegram-plugin/gateway/gateway.ts:3160-3700:reply chunk-loop THREAD_NOT_FOUND + plaintext-fallback raw sends (intentional)"
 
   # credit-watch notification. No thread_id (DM).
   # Range bumped 2026-05-13 for stuck-turn-recovery (#1136) v2 cleanup
@@ -211,7 +216,12 @@ ALLOWLIST=(
   # editMessageText site to 10562 (past 10560). End 10560 -> 10580;
   # next raw call is 10698 (outside), so no new un-allowlisted call
   # enters — same already-.catch-swallowed wizard site.
-  "telegram-plugin/gateway/gateway.ts:9340-10580:vault grant wizard ctx.api.editMessageText already has .catch swallow"
+  # Re-bumped 2026-05-19 for the idle-drain fix: the +~30-line
+  # opportunistic idle-drain block (~3274) drifted the last wizard
+  # editMessageText site to 10604 (past 10580). End 10580 -> 10620;
+  # next raw call is 10698 (outside), so no new un-allowlisted call
+  # enters — same already-.catch-swallowed wizard site.
+  "telegram-plugin/gateway/gateway.ts:9340-10620:vault grant wizard ctx.api.editMessageText already has .catch swallow"
 
   # boot-card.ts and issues-card.ts: these MODULES receive a bot adapter
   # via DI. The gateway wires those adapters through robustApiCall (see
