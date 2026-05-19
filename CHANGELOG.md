@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.12.20 — fix: held-mid-turn wedge closed at both source and recovery; vault-broker operator-unlock + backups
+
+Two headlines. (a) Gateway: the gymbro/klanker "agent receives the
+message, acknowledges with a reaction, then never replies" wedge is
+fully closed — the silence-poke framework fallback now sweeps sibling
+`activeTurnStartedAt` entries for the firing chat (recovery), AND
+every site that nulls `currentTurn` now atomically purges the turn's
+statusKey (source). #1556's turn-gate can no longer stay stuck on a
+dangling sibling key while claude is idle. (b) Vault: the broker's
+operator-unlock path now bypasses peercred (closes the RFC-J Phase-3
+gap surfaced during the vault-forensics window), and a new
+`switchroom vault backup` verb writes dated, encrypted, versioned
+snapshots so a vault rewrite is no longer single-copy-fatal.
+
+### Changes
+
+#### Features
+
+- **feat(vault):** `switchroom vault backup` — operator-run command
+  that writes dated, encrypted, versioned snapshots of the vault to a
+  configurable destination, so a single-copy loss (rewrite, accidental
+  reinit) is no longer fatal to vault state. (#1562)
+
+#### Fixes
+
+- **fix(gateway):** held-mid-turn wedge closed at both layers.
+  (a) The silence-poke framework fallback now sweeps any
+  `activeTurnStartedAt` sibling key for the firing chat (new pure
+  `purgeStaleTurnsForChat` helper) — catches any dangling state from
+  whichever path leaked it. Multi-chat safe: only touches keys for
+  `fbChatId`, preserving #1546's cross-chat guard. (b) All four
+  turn-end paths (context-exhaust / silent-marker / turn-flush /
+  `turn_end`) now call a new `endCurrentTurnAtomic(turn)` helper that
+  pairs `currentTurn = null` with
+  `purgeReactionTracking(statusKey(turn.sessionChatId,
+  turn.sessionThreadId))` — null and purge are inseparable at the
+  source, so siblings can't leak through to begin with. The fallback's
+  multi-chat-safe null guard is untouched. Symptom (gymbro/klanker
+  2026-05-20): `currentTurn_nulled=false drained_buffered=0/N
+  rebuffered=N` followed by every subsequent inbound stuck in `inbound
+  held mid-turn`. (#1564)
+- **fix(vault-broker):** bypass peercred on the operator-unlock path —
+  closes a Phase-3 gap from RFC-J where an unlock invoked via the
+  operator socket could fail the peercred check that's only meaningful
+  for per-agent sockets. (#1561)
+- **fix(test-hermeticity):** regression-proof gate against the
+  `os.homedir()` trap so vault-related tests can no longer leak into
+  the real `~/.switchroom` instead of a tmpdir. (#1560)
+- **test:** de-flake `timezone-hook.test.ts` (CI shard timeout under
+  load). (#1563)
+
 ## v0.12.19 — feat: "your message is queued" now survives a restart (durable inbound spool)
 
 Headline: the gateway's "⏳ your message is queued and will be
