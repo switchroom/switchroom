@@ -29,12 +29,12 @@ describe('purgeStaleTurnsForChat', () => {
   it('purges the canonical DM key for the firing chat (typical case)', () => {
     const purged: string[] = []
     const r = purgeStaleTurnsForChat(
-      '8248703757',
-      [statusKey('8248703757')],
+      '12345',
+      [statusKey('12345')],
       (k) => purged.push(k),
     )
-    expect(r.purged).toEqual(['8248703757:_'])
-    expect(purged).toEqual(['8248703757:_'])
+    expect(r.purged).toEqual(['12345:_'])
+    expect(purged).toEqual(['12345:_'])
   })
 
   it('purges every sibling key for the same chat (multi-thread / dangling)', () => {
@@ -43,31 +43,31 @@ describe('purgeStaleTurnsForChat', () => {
     // canonical purgeReactionTracking(fbKey).
     const purged: string[] = []
     const r = purgeStaleTurnsForChat(
-      '8248703757',
+      '12345',
       [
-        statusKey('8248703757'),       // DM, no thread
-        statusKey('8248703757', 42),    // thread 42
-        statusKey('8248703757', 99),    // thread 99
+        statusKey('12345'),       // DM, no thread
+        statusKey('12345', 42),    // thread 42
+        statusKey('12345', 99),    // thread 99
       ],
       (k) => purged.push(k),
     )
-    expect(r.purged.sort()).toEqual(['8248703757:42', '8248703757:99', '8248703757:_'])
+    expect(r.purged.sort()).toEqual(['12345:42', '12345:99', '12345:_'])
     expect(purged).toHaveLength(3)
   })
 
   it('NEVER touches keys for OTHER chats (multi-chat safety — the #1546 guard)', () => {
     const purged: string[] = []
     const r = purgeStaleTurnsForChat(
-      '8248703757',
+      '12345',
       [
-        statusKey('8248703757'),       // target chat — purge
-        statusKey('9999999999'),       // different chat — must NOT touch
-        statusKey('9999999999', 7),    // different chat thread — must NOT touch
+        statusKey('12345'),       // target chat — purge
+        statusKey('-1001234567890'),       // different chat — must NOT touch
+        statusKey('-1001234567890', 7),    // different chat thread — must NOT touch
       ],
       (k) => purged.push(k),
     )
-    expect(r.purged).toEqual(['8248703757:_'])
-    expect(purged).toEqual(['8248703757:_']) // ONLY the target chat
+    expect(r.purged).toEqual(['12345:_'])
+    expect(purged).toEqual(['12345:_']) // ONLY the target chat
   })
 
   it('does not false-match on a chatId-prefix superstring (e.g. 123 vs 1234)', () => {
