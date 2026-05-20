@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.12.26 — fix(P0): close the chronic bridge-flap class (IPC agentIndex race)
+
+P0 hotfix for the fleet-wide chronic bridge-flap that caused
+clerk + gymbro to be unresponsive on 2026-05-20 (and predates
+that — first carrie disconnect at gateway log line 20464 from
+earlier in the day).
+
+Two concurrent races in `ipc-server.ts`'s agentIndex maintenance:
+
+1. `handleRegister` was replace-not-reject — when a new client
+   registered as an agent already in the index, it overwrote the
+   prior entry without closing it. The code comment even admitted
+   it: *"handleRegister does replace-not-reject, so this is
+   belt-and-suspenders"*.
+
+2. `removeClient` blindly deleted `agentIndex[client.agentName]`
+   with no identity check — when a stale client got evicted (by
+   the watchdog or natural disconnect), the delete removed the
+   LIVE replacement client's entry by accident.
+
+Combined: a fast bridge reconnect could orphan the live client
+from the routing table. `sendToAgent` returned false despite a
+healthy bridge being connected; messages buffered indefinitely
+until the next reconnect happened to land in an order that left
+the index populated.
+
+### Fix
+
+`removeClient` identity-checks before deleting — only the OWNER
+(current value) can remove its own entry. `handleRegister`
+explicitly closes any prior client with the same agent name
+before installing the new one — single canonical value at all
+times. Together the agentIndex stays consistent with reality
+through all bridge churn.
+
+### Changes
+
+#### Fixes
+
+- **fix(gateway):** IPC agentIndex race — close the chronic
+  bridge-flap class. Identity-checked removeClient + zombie-close
+  in handleRegister. Logs new line `register: closing prior
+  client for agent=X — bridge reconnect race` when the zombie
+  path fires (forensic visibility). (#1585)
+
 ## v0.12.25 — fix: shadow trace only emits for REAL bridge events (observability fix)
 
 Hotfix for an observability bug in v0.12.24's shadow mode. The
