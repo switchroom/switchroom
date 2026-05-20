@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.12.21 — fix: structural defenses against the wedge-cluster bug classes (canonical chat-key, broadcast lint, live docker-exec guard)
+
+Five PRs that turn the lessons of the 2026-05-19 wedge cluster into
+durable structural fences. The headline fix closes the **#1564
+sibling-key class at its root** — a single canonical chat-key
+constructor that collapses `0` / `null` / `undefined` thread IDs into
+the same token, so the bug that wedged gymbro/klanker (sibling
+`activeTurnStartedAt` entries surviving turn-end) becomes
+unrepresentable, not just recoverable. A forward-looking lint bans
+fire-and-forget `ipcServer.broadcast(...)` for delivery semantics
+(Class A — the bug behind PRs #1536/#1537/#1539/#1546/#1549/#1555/
+#1558). The gateway.ts bot-api allowlist cuts over from drift-prone
+line ranges (~20 ceiling-bumps in 14 days) to inline markers — the
+tax is gone. And the first **live-docker integration test** (#1529
+regression class) catches the stub-vs-real divergence that hid every
+real `agent_exec` being 127'd for months.
+
+### Changes
+
+#### Fixes
+
+- **fix(gateway):** canonicalize chat-key derivation to close the
+  #1564 sibling-key class at the source. New
+  `telegram-plugin/gateway/chat-key.ts` provides the single canonical
+  constructor (`chatKey(chatId, threadId)`) that collapses
+  `0`/`null`/`undefined` thread IDs into the same token (`_`).
+  `${chatId}:${threadId ?? '_'}` previously rendered `0` as `"0"` (??
+  doesn't coalesce `0`) and null/undefined as `"_"`, accumulating
+  sibling keys for the same chat+thread; the silence-poke fallback's
+  per-key purge left them stranded. Migrates the 4 ad-hoc literal
+  sites in gateway.ts (lane suffixes + turnKey + silent-turn
+  suppressPrefix) plus the sibling helpers in `stream-reply-handler.ts`
+  and `pty-partial-handler.ts`. Test harnesses in `tests/e2e.test.ts`
+  and `tests/races.test.ts` realigned from divergent `'default'`
+  sentinel to canonical `_`. (#1570)
+
+#### Tests
+
+- **test(docker):** live argv-passthrough regression guard for
+  `docker-exec` (the #1529 bug class). New
+  `tests/docker/docker-exec-argv-e2e.test.ts` exercises 5 cases
+  against a real `busybox:latest` container labeled per project test
+  discipline. Pre-#1529 the production `runDocker(["exec", container,
+  "--", ...argv])` invocation 127'd every real `agent_exec` for
+  months because `docker exec` (unlike `docker run`) does NOT
+  recognize `--` as an argv separator — it execs a binary named
+  literally "--". CI was green throughout because the docker stub
+  ignored argv past `$1`. This test is the first live-docker
+  integration coverage of `runDocker(["exec", ...])` against a real
+  container; a future PR that reinserts `--` (or any other
+  argv-passthrough breakage) fails the gate. (#1571)
+
+#### Lint / Dev infrastructure
+
+- **feat(lint):** ban `ipcServer.broadcast(...)` for delivery
+  semantics. New `scripts/check-no-broadcast-delivery.mjs` (160-file
+  scan, comment-aware) requires a `// allow-broadcast: <reason>`
+  marker on the line IMMEDIATELY preceding every broadcast callsite.
+  Forward-looking guard against Class A (fire-and-forget delivery
+  over a flappy bridge) — the bug class that the entire wedge cluster
+  patched outward in 8 layers. The 2 broadcasts remaining on main
+  (checklist task notify, shutdown status) are both informational
+  and now carry explicit markers. (#1567)
+- **feat(lint):** accept inline `// allow-raw-bot-api: <reason>`
+  markers in `scripts/check-bot-api-wrapping.sh` as an alternative
+  to the line-range ALLOWLIST. The wrapper-detection lookback
+  (`robustApiCall` / `swallowingApiCall` / `retryWithThreadFallback`
+  closures) is unchanged. **Zero behavior change** — both mechanisms
+  coexist for one PR window to enable a clean cutover. (#1568)
+- **refactor(lint):** cut over the gateway.ts bot-api allowlist from
+  6 drift-prone line-range entries to 8 inline markers at the
+  callsites that aren't already inside a wrapper closure. Deletes
+  212 lines of bump-trail comments (the file's own comments
+  documented ~20 ceiling-bumps in 14 days as gateway.ts insertions
+  drifted the ranges). Per memory `feedback_gateway_bot_api_allowlist_drift.md`
+  the recurring tax is gone — markers don't drift. (#1569)
+
 ## v0.12.20 — fix: held-mid-turn wedge closed at both source and recovery; vault-broker operator-unlock + backups
 
 Two headlines. (a) Gateway: the gymbro/klanker "agent receives the
