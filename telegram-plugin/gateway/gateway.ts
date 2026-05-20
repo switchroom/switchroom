@@ -6637,6 +6637,39 @@ async function handleInbound(
   // network RTT) but not a user-perceived end-to-end measurement.
   const inboundReceivedAt = Date.now()
 
+  // #1556 self-blocking fix (v0.12.22): snapshot the live turn-state
+  // BEFORE the fresh-turn branch (line ~7357) sets activeTurnStartedAt
+  // for THIS inbound. The #1556 delivery gate further down asks "is a
+  // turn ALREADY in flight" — but if we read activeTurnStartedAt.size
+  // at the gate, we see the entry this handler just wrote, and buffer
+  // the very message that just started the turn. Symptom: every first
+  // post-restart message in each thread was held 5 minutes until the
+  // silence-poke fallback drained the buffer; the "5-min blank after
+  // restart" wedge documented in
+  // feedback_5min_restart_wedge_violates_vision.md.
+  //
+  // Why ONLY first-after-restart, not every steady-state message: the
+  // fresh-turn branch fires only when `priorActive = activeStatusReactions.get(key)`
+  // returns null (no controller currently running for this chat+thread).
+  // In a live conversation, the controller from the previous turn
+  // typically hasn't been cleared yet when the user's follow-up
+  // arrives (or follow-ups arrive mid-turn, taking the queued path) —
+  // so the else branch at ~7313 is skipped and the .set never fires.
+  // A fresh container after restart has EMPTY `activeStatusReactions`,
+  // so the very first message in each thread is guaranteed to enter
+  // the fresh-turn branch and trigger the self-block.
+  //
+  // Why snapshot, not move-the-set(): the .set() at ~7357 is embedded
+  // in a coupled init bundle (controller, msgIds, signalTracker.reset,
+  // silencePoke.startTurn, the 👀 reaction emit). Moving only the .set
+  // splits the bundle in ways future maintainers will drift; moving
+  // the WHOLE bundle past the gate changes user-visible ack timing
+  // (👀 wouldn't land until after the gate decides to deliver, hiding
+  // an ack on the buffered path). The snapshot is the minimal precise
+  // fix. Phase 2b's state-machine extraction will revisit this
+  // structurally.
+  const turnInFlightAtReceipt = activeTurnStartedAt.size > 0
+
   const access = result.access
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
@@ -7546,9 +7579,15 @@ async function handleInbound(
   // idle-drain flush it the instant claude goes idle, where the channel
   // notification submits cleanly as a fresh turn. Steering messages are
   // exempt — reaching claude mid-turn is the whole point of /steer.
+  //
+  // CRITICAL: turnInFlight reads the snapshot taken at receipt above,
+  // not `activeTurnStartedAt.size > 0` live. The fresh-turn branch at
+  // line ~7357 already populated the Map for THIS inbound's turn;
+  // reading the live size here would self-block (see the comment on
+  // turnInFlightAtReceipt for the wedge symptom this fixes).
   if (
     decideInboundDelivery({
-      turnInFlight: activeTurnStartedAt.size > 0,
+      turnInFlight: turnInFlightAtReceipt,
       isSteering,
     }) === 'buffer-until-idle'
   ) {
