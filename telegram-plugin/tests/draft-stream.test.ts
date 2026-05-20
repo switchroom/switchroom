@@ -927,4 +927,152 @@ describe('createDraftStream — draft transport', () => {
     })
   })
 
+  // ─── PR C: persist-then-continue chain at 25s / 4000-char boundary ───
+  describe('persist-chain (PR C)', () => {
+    let captured: string[] = []
+    let originalWrite: typeof process.stderr.write
+
+    beforeEach(() => {
+      // Outer describe sets useFakeTimers; keep that and drive time with
+      // advanceTimersByTimeAsync. The size-trigger doesn't need time at
+      // all (it fires on tail length); the time-trigger tests advance.
+      captured = []
+      originalWrite = process.stderr.write
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        captured.push(text)
+        return true
+      }) as typeof process.stderr.write
+    })
+    afterEach(() => {
+      process.stderr.write = originalWrite
+    })
+
+    it('size-trigger: persist fires when tail crosses persistSizeLimit', async () => {
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-size',
+        persistSizeLimit: 200, // small for tests
+      })
+
+      // First update: 100 chars, below threshold. Drafts.
+      void stream.update('a'.repeat(100))
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      // Second update: 250 chars total, tail exceeds 200 → size persist.
+      void stream.update('a'.repeat(250))
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      await microtaskFlush(20)
+      await stream.finalize()
+
+      const persistLine = captured.find((c) => c.includes('gw-trace stream-persist'))
+      expect(persistLine).toBeDefined()
+      expect(persistLine).toContain('reason=size')
+      expect(m.sendCalls.length).toBeGreaterThan(0)
+    })
+
+    it('time-trigger: persist fires after persistIntervalMs elapsed', async () => {
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-time',
+        persistIntervalMs: 200, // small for tests
+      })
+
+      void stream.update('first chunk text')
+      await microtaskFlush(20)
+      // Advance past the time trigger.
+      vi.advanceTimersByTime(250); await microtaskFlush(20)
+      void stream.update('first chunk text continues')
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      await microtaskFlush(20)
+      await stream.finalize()
+
+      const persistLine = captured.find((c) => c.includes('gw-trace stream-persist'))
+      expect(persistLine).toBeDefined()
+      expect(persistLine).toContain('reason=time')
+    })
+
+    it('persist bumps persists counter in stream-end trace', async () => {
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-2',
+        persistSizeLimit: 100,
+      })
+
+      void stream.update('x'.repeat(50))
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      void stream.update('x'.repeat(150))
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      await microtaskFlush(20)
+      await stream.finalize()
+
+      const endLine = captured.find((c) => c.includes('gw-trace stream-end'))
+      expect(endLine).toBeDefined()
+      expect(endLine).toMatch(/persists=[1-9]/)
+    })
+
+    it('finalize only materializes the unpersisted tail (no duplicate)', async () => {
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-3',
+        persistSizeLimit: 200,
+      })
+
+      void stream.update('a'.repeat(100))
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      void stream.update('a'.repeat(250)) // size trigger fires
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      await microtaskFlush(20)
+      const persistsBefore = m.sendCalls.length
+      expect(persistsBefore).toBeGreaterThan(0)
+
+      // Now add a small tail and finalize. The tail-only send should
+      // be much smaller than 250 — only post-persist content.
+      void stream.update('a'.repeat(250) + 'tail')
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
+      await stream.finalize()
+
+      const lastSend = m.sendCalls[m.sendCalls.length - 1]
+      expect(lastSend).toBeDefined()
+      // Without PR C, finalize would re-send the entire 250+ chars.
+      expect(lastSend!.text.length).toBeLessThan(50)
+    })
+
+    it('message-transport stream has persists=0 (no chunking)', async () => {
+      const m = makeMock()
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'message',
+      })
+      void stream.update('z'.repeat(3000))
+      await microtaskFlush(20)
+      await stream.finalize()
+      const endLine = captured.find((c) => c.includes('gw-trace stream-end'))
+      expect(endLine).toContain('persists=0')
+    })
+  })
+
 })
