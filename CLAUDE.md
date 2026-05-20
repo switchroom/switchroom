@@ -485,6 +485,24 @@ bash scripts/check-bot-api-wrapping.sh    # if you touched gateway.ts
 The CI required-checks list is in **CI** above; the gates that run
 locally cover the load-bearing subset.
 
+**Two lint traps worth memorising:**
+
+- **`check-bot-api-wrapping.sh` allowlist drift** (gateway.ts only).
+  The allowlist of permitted raw `ctx.api`/`bot.api` callsites is
+  line-keyed. Any line insertion in `gateway.ts` shifts pre-existing
+  raw callsites past their allowlist range and CI fails — tsc + tests
+  pass, only this script catches it. If you inserted any code in
+  `gateway.ts`, run the script locally; widen the allowlist range in
+  the same PR if needed. See
+  `feedback_gateway_bot_api_allowlist_drift`.
+
+- **Push Protection on token fixtures.** GitHub blocks contiguous
+  token-shaped strings even in test fixtures. If you need a fake
+  token for a secret-detector test, build it at runtime by
+  concatenation (`"sk-ant-" + "fake" + "-xyz"`), never as a single
+  literal. Pattern lives in
+  `telegram-plugin/tests/secret-detect-secretlint.test.ts`.
+
 **4. Commit with Conventional Commits, push to fork, open PR against
 `upstream/main`.**
 
@@ -518,7 +536,11 @@ review carefully. Iterate on REQUEST_CHANGES until APPROVE.
 
 **Do not enable auto-merge before the reviewer APPROVE.** Per
 `feedback_automerge_after_review`, auto-merge fires on CI-green and
-will beat an out-of-band reviewer on a fast-CI / docs PR.
+will beat an out-of-band reviewer on a fast-CI / docs PR. The **CI**
+section above documents that auto-merge is the intended *repo* policy
+(autonomous agents + green-checks-merge); this dev-process step is
+the *personal* gate that the coder agent applies on top — fresh
+reviewer first, then turn on auto-merge.
 
 **6. After APPROVE: enable auto-merge.**
 
@@ -549,7 +571,14 @@ git fetch upstream
 git worktree add /home/kenthompson/code/switchroom-rel-<vX.Y.Z> \
   -b chore/release-v<X.Y.Z> upstream/main
 cd /home/kenthompson/code/switchroom-rel-<vX.Y.Z>
-ln -s /home/kenthompson/code/switchroom-sec-1417/node_modules node_modules
+# For a RELEASE worktree, prefer a real copy over the symlink. `bun
+# build` (the bundler in scripts/build.mjs) does NOT resolve through
+# certain symlink shapes — the `~`-prefixed form `ln` leaves unexpanded
+# silently produces an EMPTY dist/cli/. Releases have shipped broken
+# this way (0.12.6 → 0.12.7 deprecation). See
+# `feedback_npm_publish_landmines` for the post-mortem. Real copy is
+# the safe default for a release worktree:
+rm -rf node_modules && cp -a /home/kenthompson/code/switchroom-sec-1417/node_modules ./node_modules
 ```
 
 **2. Bump `package.json` + CHANGELOG.**
@@ -562,9 +591,14 @@ ln -s /home/kenthompson/code/switchroom-sec-1417/node_modules node_modules
 **3. Build, verify, commit.**
 
 ```
-node scripts/build.mjs                 # regenerates dist/cli/switchroom.js
-ls -la dist/cli/switchroom.js          # confirm exists (size ~2.7MB)
-git checkout HEAD -- src/build-info.ts node_modules  # revert build artifacts
+# Never pipe build through tail — pipeline exit is tail's exit (0),
+# so `npm run build | tail && npm publish` runs publish even on a
+# failed build. Run build standalone:
+node scripts/build.mjs
+echo "BUILD EXIT=$?"                    # must be 0; abort otherwise
+ls -la dist/cli/switchroom.js           # confirm exists, ~2.7MB
+git checkout HEAD -- src/build-info.ts  # revert build-info only (node_modules is
+                                        # untracked symlink/copy — don't `checkout` it)
 git add CHANGELOG.md package.json
 git commit -m "chore: release vX.Y.Z"
 ```
@@ -639,17 +673,28 @@ After UAT passes:
 
 ```
 sudo env PATH=$PATH HOME=$HOME switchroom update --pin vX.Y.Z
-# OR staggered, per-agent:
-for a in clerk gymbro ziggy ...; do
+# OR per-agent (preferred for the first staggered rollout of any
+# risky change — sequential, blocks until each agent's reconcile
+# returns):
+for a in clerk gymbro ziggy klanker lawgpt carrie finn reggie; do
   sudo env PATH=$PATH HOME=$HOME switchroom agent restart $a --force
-  sleep 12   # avoid Telegram thundering-herd
+  # `--version` assertion guards the `:latest` pull-race documented
+  # in `project_release_rollout_ci_gotchas`. Without it, agents may
+  # still report the prior version because the local docker daemon
+  # raced GHCR's `:latest` tag update.
+  docker exec switchroom-$a sh -lc 'switchroom --version' | grep -q "X.Y.Z" \
+    || { echo "version mismatch on $a"; break; }
 done
 ```
 
-Per `project_fleet_update_thundering_herd_wedge`: mass-recreate
-storms the Telegram API and can wedge agents with an in-flight turn.
-The 12-second stagger gives each agent time to land its boot card
-before the next bounce begins.
+The historical thundering-herd wedge — mass-recreate stranding
+mid-turn inbounds — was closed by the self-heal landing in v0.12.16
+(#1546/#1549) and the durable inbound spool in v0.12.19 (#1558). So
+the wedge class is no longer load-bearing for the stagger. The
+sequential per-agent recipe is still preferred for two reasons: each
+`switchroom agent restart` blocks ~30s on the boot card, naturally
+spacing the bounces; and the `--version` assertion per-agent catches
+the `:latest` pull-race that's still a live concern.
 
 ### Pre-rollout UAT (MTCute harness)
 
