@@ -97,3 +97,23 @@ jobs:
         # scenario file, but only fuzz scenarios are PR-gate-stable.
         working-directory: telegram-plugin
         run: bun run test:uat fuzz-
+
+      - name: UAT JTBD vision scenarios (operator-host only — self-skips without sudo)
+        if: steps.secrets.outputs.ok == 'true'
+        # The jtbd-* scenarios encode vision/JTBD contracts that require
+        # a live switchroom host (NOPASSWD sudo + the switchroom CLI on
+        # PATH + a running test-harness agent) to run. On CI runners
+        # without that setup, each scenario self-skips via a
+        # `canShellSudo()` guard — the step still completes, so CI stays
+        # green, but a regression on the operator's harness host fails
+        # the gate as soon as they run UAT.
+        #
+        # Why this is gated separately from the fuzz scenarios: the
+        # vision UAT shells out to `switchroom agent restart`, which is
+        # mutating + side-effecting. It's the right tool for catching
+        # post-restart wedges (the #1556 self-blocking gate that
+        # produced the 5-min blank on every restart pre-v0.12.22) but
+        # mixing it with the fuzz pool would let one flake stall the
+        # gate. Keep them separate; operators run both during UAT.
+        working-directory: telegram-plugin
+        run: bun run test:uat jtbd-always-on-after-restart
