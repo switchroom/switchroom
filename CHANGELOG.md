@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — feat(gateway): prefix-cache warmup turn (Phase 1, opt-in)
+## v0.12.29 — feat(gateway): prefix-cache warmup (Phase 1, opt-in) + outboundEmitted refinement
 
 Per cold-start TTFO RFC (#1589) Option A. On every bridge-up after
 restart, the gateway synthesizes a `__WARMUP_PING__` inbound and
@@ -30,7 +30,7 @@ Phase 1 is deliberately minimal:
 shape (`meta.source="warmup"`, synthetic messageId=0), boot-target
 fallback, send-error handling.
 
-## unreleased — fix(gateway): refine turnEnd outboundEmitted to track replyCalled
+### turnEnd outboundEmitted refinement (PR 3b precondition)
 
 Phase 2b PR 3b precondition. The shadow emit at `gateway.ts:1287`
 previously sent `outboundEmitted: true` blindly on every turnEnd —
