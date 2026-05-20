@@ -261,7 +261,7 @@ import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 // effects.
 import { shadowEmit } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
-import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
+import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -3223,14 +3223,43 @@ const ipcServer: IpcServer = createIpcServer({
     // bridges never registered an identity and can't have accumulated
     // buffered inbounds keyed by name).
     if (client.agentName != null) {
-      dispatchEffects(bridgeUpEffects, {
-        selfAgent: client.agentName,
-        ipcServer,
-        pendingInboundBuffer,
-        inboundSpool: inboundSpool ?? null,
-        pendingPermissionBuffer,
-        client,
-      })
+      if (isDispatchEnabled()) {
+        dispatchEffects(bridgeUpEffects, {
+          selfAgent: client.agentName,
+          ipcServer,
+          pendingInboundBuffer,
+          inboundSpool: inboundSpool ?? null,
+          pendingPermissionBuffer,
+          client,
+        })
+      } else {
+        // Kill-switch fallback: imperative drain (parity with pre-cutover
+        // behavior). Kept for SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0
+        // rollback safety; deleted in PR 4 once the cutover bakes.
+        const pending = pendingInboundBuffer.drain(client.agentName)
+        for (const msg of pending) {
+          try {
+            client.send(msg)
+            inboundSpool?.ack(msg)
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
+              `source=${msg.meta?.source ?? '-'}: ${(err as Error).message}\n`,
+            )
+          }
+        }
+        const pendingVerdicts = pendingPermissionBuffer.drain(client.agentName)
+        for (const ev of pendingVerdicts) {
+          try {
+            client.send(ev)
+          } catch (err) {
+            process.stderr.write(
+              `telegram gateway: pending-permission drain failed agent=${client.agentName} ` +
+              `request=${ev.requestId} behavior=${ev.behavior}: ${(err as Error).message}\n`,
+            )
+          }
+        }
+      }
     }
 
     // If the agent reconnected after a /restart (or any restart), post a boot
