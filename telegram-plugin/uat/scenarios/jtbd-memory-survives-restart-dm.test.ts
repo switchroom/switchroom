@@ -81,28 +81,30 @@ function restartAgent(name: string): void {
   );
 }
 
-// Retained for when this test is unskipped — gates on the same
-// sudo-availability prerequisite as jtbd-always-on-after-restart.
 const sudoOk = canShellSudo();
-void sudoOk;
 
-// KNOWN VISION GAP — captured 2026-05-20. The first live run of this
-// UAT against test-harness FAILED: after capture → restart → recall,
-// the agent replied "I don't have that token — no SWITCHROOM_UAT_MEM_*
-// value was ever shared with me to remember." The
-// `remember-across-sessions` JTBD is NOT being met in production for
-// content captured within a single turn.
+// UNSKIPPED 2026-05-20 after root-cause + fix.
 //
-// Critically: this is distinct from claude-code session resume.
-// The wake-audit-content UAT (jtbd-wake-audit-content-dm.test.ts)
-// run immediately after this one observed the agent REFERENCE the
-// SWITCHROOM_UAT_MEM_ token in its post-restart status summary
-// ("Token recall — SWITCHROOM_UAT_MEM_ missing from memory") — so
-// session resume DID surface the prior turn's conversation in
-// claude's context. What's missing is hindsight LONG-TERM memory
-// capture. The session-JSONL replay carries forward the immediate
-// conversation; hindsight is the structured memory that's supposed
-// to outlast individual sessions and surface cross-session.
+// Original failure: the first live run on 2026-05-20 FAILED — after
+// capture → restart → recall, the agent replied "I don't have that
+// token — no SWITCHROOM_UAT_MEM_* value was ever shared with me to
+// remember." Documented at the time as a known vision gap.
+//
+// Root cause: the vendored hindsight-memory plugin's default
+// `retainEveryNTurns: 10` throttled auto-retention to every 10
+// turns. A 2-turn UAT session (capture turn → restart) NEVER reached
+// the threshold, so the Stop hook's retain.py skipped (`turn_count %
+// retain_every_n != 0`) and the token never persisted. The recall
+// query at the new boot found nothing.
+//
+// Fix: switchroom's scaffold (src/agents/scaffold.ts) now applies a
+// post-copy override that sets `retainEveryNTurns: 1` in the
+// per-agent settings.json. Every turn end retains. Vendor file
+// stays untouched. See project_hindsight_memory_gap_root_cause.md.
+//
+// Live re-run after the fix: capture TTFO=22.7s, recall TTFO=14.1s,
+// token round-tripped successfully. The remember-across-sessions
+// JTBD is now met for single-turn explicit-memory prompts.
 //
 // Likely root causes (any/all):
 //   - Hindsight capture is opportunistic — the model decides when to
@@ -121,8 +123,8 @@ void sudoOk;
 //
 // (Memory is the moat — see comment block above. Shipping the test
 // as a known-failing skip is more honest than not shipping it at all.)
-describe.skip(
-  "uat: memory survives across restart (remember-across-sessions JTBD) — SKIPPED: known vision gap, see comment above",
+(sudoOk ? describe : describe.skip)(
+  "uat: memory survives across restart (remember-across-sessions JTBD)",
   () => {
     it(
       "agent remembers a unique token after capture → restart → recall",
