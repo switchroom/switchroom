@@ -16,6 +16,15 @@ callsites. NO_REPLY / HEARTBEAT_OK / wedged turns now correctly emit
 won't get over-suppressed by stale `lastOutboundAt` data when the state
 machine's tick effects are eventually wired live (PR 3b2).
 
+Implementation note: `endCurrentTurnAtomic` nulls `currentTurn` BEFORE
+calling `purgeReactionTracking`, so reading module-scope `currentTurn`
+inside the helper would always see `null` on the happy path (every
+replied turn). Fixed by threading the ending turn explicitly through
+the new optional second parameter `endingTurn?: CurrentTurn`. Legacy
+sibling-purge / restart-init callsites still pass undefined and fall
+back to module-scope — `false` is correct there since those paths
+aren't ending the current turn.
+
 Pure data-quality change for the shadow trace; no behavior delta until
 the turnEnd cutover (PR 3b2) executes the dispatcher's `noteOutbound`
 effect.
