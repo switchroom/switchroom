@@ -1,5 +1,25 @@
 # Changelog
 
+## unreleased — fix(gateway): refine turnEnd outboundEmitted to track replyCalled
+
+Phase 2b PR 3b precondition. The shadow emit at `gateway.ts:1287`
+previously sent `outboundEmitted: true` blindly on every turnEnd —
+flagged in the PR 3a CHANGELOG (gateway.ts:1277-1281 doc comment) as a
+known approximation that would corrupt invariant #5's `lastOutboundAt`
+data once dispatched live.
+
+Now reads from `endingTurn?.replyCalled` (threaded explicitly from
+`endCurrentTurnAtomic`) with a fallback to module-scope
+`currentTurn?.replyCalled` for legacy sibling-purge / restart-init
+callsites. NO_REPLY / HEARTBEAT_OK / wedged turns now correctly emit
+`outboundEmitted: false` — so a subsequent silence-poke fallback fire
+won't get over-suppressed by stale `lastOutboundAt` data when the state
+machine's tick effects are eventually wired live (PR 3b2).
+
+Pure data-quality change for the shadow trace; no behavior delta until
+the turnEnd cutover (PR 3b2) executes the dispatcher's `noteOutbound`
+effect.
+
 ## v0.12.28 — fix(npm): ship vendor/ in published tarball + per-line log timestamps
 
 The `vendor/` directory (containing the hindsight-memory plugin tree)

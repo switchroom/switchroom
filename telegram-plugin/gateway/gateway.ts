@@ -1278,13 +1278,20 @@ function streamKey(chatId: string, threadId?: number | null): string {
 }
 
 function purgeReactionTracking(key: string): void {
-  // Phase 2b shadow: turn end. The key was registered via setTurnStarted
-  // when the inbound arrived; purge is the canonical turn-end signal.
-  // outboundEmitted is approximated `true` here — refined in PR 3 to read
-  // from the per-turn `replyCalled` flag on `currentTurn`. Conservative
-  // shadow approximation is safe (only affects machine's lastOutboundAt
-  // tracking; can't drive incorrect behavior in shadow mode).
-  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted: true })
+  // Phase 2b: turn end. The key was registered via setTurnStarted when
+  // the inbound arrived; purge is the canonical turn-end signal.
+  //
+  // outboundEmitted: read from `currentTurn?.replyCalled` — the gateway's
+  // authoritative signal for whether the model called the reply tool
+  // during this turn. Without this refinement (PR 3a era was blindly
+  // `true`), invariant #5's `lastOutboundAt` data would write on every
+  // turn-end regardless of model behavior, over-suppressing the
+  // silence-poke fallback for silent (NO_REPLY) turns that genuinely
+  // ARE stuck. `currentTurn` is null on cleanup paths where the turn
+  // has already been nulled (sibling-key sweep, restart-init); `false`
+  // is the safe default there too.
+  const outboundEmitted = currentTurn?.replyCalled === true
+  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
   const msgInfo = activeReactionMsgIds.get(key)
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
