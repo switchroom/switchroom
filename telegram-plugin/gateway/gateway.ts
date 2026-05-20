@@ -3196,8 +3196,17 @@ const ipcServer: IpcServer = createIpcServer({
 
   onClientRegistered(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
-    // Phase 2b shadow: bridge up.
-    shadowEmit({ kind: 'bridgeUp', at: Date.now() })
+    // Phase 2b shadow: ONLY emit bridgeUp for the REAL bridge sidecar
+    // (with an agent name). Anonymous IPC clients (recall.py, mcp
+    // handshakes, etc.) connect briefly without a name and would
+    // false-positive a bridgeUp/bridgeDown cycle that doesn't reflect
+    // the real bridge state. This bug — discovered post-v0.12.24 — was
+    // causing the shadow state to read `bridge_dead` even when the
+    // real bridge was healthy, because every recall.py connect+disconnect
+    // would flip the state.
+    if (client.agentName != null) {
+      shadowEmit({ kind: 'bridgeUp', at: Date.now() })
+    }
     client.send({ type: 'status', status: 'agent_connected' })
 
     // #1150: drain any synthetic inbounds queued for this agent while
@@ -3323,8 +3332,12 @@ const ipcServer: IpcServer = createIpcServer({
 
   onClientDisconnected(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
-    // Phase 2b shadow: bridge down.
-    shadowEmit({ kind: 'bridgeDown', at: Date.now() })
+    // Phase 2b shadow: ONLY emit bridgeDown for the REAL bridge sidecar
+    // (matching the bridgeUp gate above). Anonymous IPC clients
+    // disconnect frequently — those are not bridge flaps.
+    if (client.agentName != null) {
+      shadowEmit({ kind: 'bridgeDown', at: Date.now() })
+    }
 
     // Scope the flush to clients that actually registered as an agent.
     // Anonymous one-shot connections (e.g. recall.py's legacy
