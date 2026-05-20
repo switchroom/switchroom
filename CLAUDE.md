@@ -431,15 +431,334 @@ review + merge + release happens.
 
 ### Two workflows — know which one you're in
 
-**1. Code-change dev loop (most common).** Editing source, iterating.
-```
-bun run build                  # ~1s, regenerates dist/cli/switchroom.js
-switchroom agent restart all   # reconciles + restarts running agents
-```
+**1. Code-change dev loop (most common).** Editing source, iterating
+locally. Full process in **Standard dev process** below.
 
 **2. Release to npm (canonical maintainers).** Bump `package.json`,
-update `CHANGELOG.md`, commit `chore: release vX.Y.Z`, tag, push, then
-`npm publish`. Publishes come from the canonical repo only.
+update `CHANGELOG.md`, tag, push, `npm publish`. Full process in
+**Standard release process** below.
+
+### Standard dev process
+
+This is the **mandatory** path for any non-trivial change. Skip steps
+only with an explicit operator instruction (e.g. "no review", "ship
+without UAT").
+
+**1. Branch off `upstream/main`, in a fresh worktree.**
+
+Multiple agents share this server and can collide on the same checkout.
+Always work in a per-task worktree:
+
+```
+git fetch upstream
+git worktree add /home/kenthompson/code/switchroom-<short-task-slug> \
+  -b feat/<branch-name> upstream/main
+cd /home/kenthompson/code/switchroom-<short-task-slug>
+ln -s /home/kenthompson/code/switchroom-sec-1417/node_modules node_modules
+```
+
+The `node_modules` symlink lets `bun`/`vitest` resolve dependencies
+without re-installing. `bun install` in a fresh worktree on this host
+is unreliable — see `feedback_worktree_node_modules_symlink` memory.
+
+**2. Implement, with tests.**
+
+For most modules: a Vitest test that pins the behaviour you're adding.
+For draft-stream / streaming code: tests run under **both** vitest AND
+`bun test`, so avoid bun-incompatible APIs (e.g.
+`vi.advanceTimersByTimeAsync` — use the sync `vi.advanceTimersByTime`
+plus `await microtaskFlush()` instead). See
+`telegram-plugin/tests/draft-stream.test.ts` for the canonical pattern.
+
+For state-machine / pure-function changes: property tests with
+~1k–10k random schedules.
+
+**3. Validate locally before pushing.**
+
+```
+./node_modules/.bin/vitest run <path-to-affected-tests>
+./node_modules/.bin/tsc --noEmit          # plugin-references gate
+node scripts/check-plugin-references.mjs  # if you touched plugin/
+bash scripts/check-bot-api-wrapping.sh    # if you touched gateway.ts
+```
+
+The CI required-checks list is in **CI** above; the gates that run
+locally cover the load-bearing subset.
+
+**Two lint traps worth memorising:**
+
+- **`check-bot-api-wrapping.sh` allowlist drift** (gateway.ts only).
+  The allowlist of permitted raw `ctx.api`/`bot.api` callsites is
+  line-keyed. Any line insertion in `gateway.ts` shifts pre-existing
+  raw callsites past their allowlist range and CI fails — tsc + tests
+  pass, only this script catches it. If you inserted any code in
+  `gateway.ts`, run the script locally; widen the allowlist range in
+  the same PR if needed. See
+  `feedback_gateway_bot_api_allowlist_drift`.
+
+- **Push Protection on token fixtures.** GitHub blocks contiguous
+  token-shaped strings even in test fixtures. If you need a fake
+  token for a secret-detector test, build it at runtime by
+  concatenation (`"sk-ant-" + "fake" + "-xyz"`), never as a single
+  literal. Pattern lives in
+  `telegram-plugin/tests/secret-detect-secretlint.test.ts`.
+
+**4. Commit with Conventional Commits, push to fork, open PR against
+`upstream/main`.**
+
+```
+git commit -m "feat(scope): short imperative summary
+
+Longer body explaining the why and any non-obvious tradeoffs.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
+git push -u origin feat/<branch-name>
+gh pr create --repo switchroom/switchroom --base main \
+  --head <your-fork-user>:feat/<branch-name> --title "..." --body "..."
+```
+
+PR title under 70 chars. Body covers: Summary, Why, Test plan
+(check-list), Risk. Link any related PRs.
+
+**5. Dispatch a fresh-process reviewer agent.**
+
+The coder agent CANNOT review its own work in the same context — it
+rubber-stamps. Spawn a separate `general-purpose` agent (or
+`reviewer` if defined) with an explicit brief:
+
+> Review PR #N (branch `<name>` against `<base>`). Verdict: APPROVE /
+> REQUEST_CHANGES / BLOCK. Be specific about blockers and cite
+> `file:line`.
+
+Tell the reviewer what to check: behaviour equivalence, kill-switch
+correctness, test adequacy, hidden coupling, CI state. Read the
+review carefully. Iterate on REQUEST_CHANGES until APPROVE.
+
+**Do not enable auto-merge before the reviewer APPROVE.** Per
+`feedback_automerge_after_review`, auto-merge fires on CI-green and
+will beat an out-of-band reviewer on a fast-CI / docs PR. The **CI**
+section above documents that auto-merge is the intended *repo* policy
+(autonomous agents + green-checks-merge); this dev-process step is
+the *personal* gate that the coder agent applies on top — fresh
+reviewer first, then turn on auto-merge.
+
+**6. After APPROVE: enable auto-merge.**
+
+```
+gh pr merge <PR#> --repo switchroom/switchroom --auto --squash
+```
+
+The PR merges when all 10 required checks are green. If checks fail,
+fix and re-push — never bypass hooks (`--no-verify`) or skip required
+checks.
+
+**7. UAT (when the change affects user-visible behaviour).**
+
+See **Pre-rollout UAT (MTCute harness)** below. Required before any
+fleet rollout; optional but encouraged before merging behaviour
+changes.
+
+### Standard release process
+
+Cut a release **only** after the relevant feature PRs have merged to
+`upstream/main` and you have at least one passing UAT (or an explicit
+no-UAT directive).
+
+**1. Release worktree off `upstream/main`.**
+
+```
+git fetch upstream
+git worktree add /home/kenthompson/code/switchroom-rel-<vX.Y.Z> \
+  -b chore/release-v<X.Y.Z> upstream/main
+cd /home/kenthompson/code/switchroom-rel-<vX.Y.Z>
+# For a RELEASE worktree, prefer a real copy over the symlink. `bun
+# build` (the bundler in scripts/build.mjs) does NOT resolve through
+# certain symlink shapes — the `~`-prefixed form `ln` leaves unexpanded
+# silently produces an EMPTY dist/cli/. Releases have shipped broken
+# this way (0.12.6 → 0.12.7 deprecation). See
+# `feedback_npm_publish_landmines` for the post-mortem. Real copy is
+# the safe default for a release worktree:
+rm -rf node_modules && cp -a /home/kenthompson/code/switchroom-sec-1417/node_modules ./node_modules
+```
+
+**2. Bump `package.json` + CHANGELOG.**
+
+- `package.json` `"version": "X.Y.Z"`.
+- `CHANGELOG.md`: consolidate any `## unreleased — …` sections under
+  a single `## vX.Y.Z — <theme>` header. For multi-PR releases,
+  group entries under `### PR <letter> — <title> (#NNNN)` subsections.
+
+**3. Build, verify, commit.**
+
+```
+# Never pipe build through tail — pipeline exit is tail's exit (0),
+# so `npm run build | tail && npm publish` runs publish even on a
+# failed build. Run build standalone:
+node scripts/build.mjs
+echo "BUILD EXIT=$?"                    # must be 0; abort otherwise
+ls -la dist/cli/switchroom.js           # confirm exists, ~2.7MB
+git checkout HEAD -- src/build-info.ts  # revert build-info only (node_modules is
+                                        # untracked symlink/copy — don't `checkout` it)
+git add CHANGELOG.md package.json
+git commit -m "chore: release vX.Y.Z"
+```
+
+**4. Open release PR, auto-merge after CI green.**
+
+```
+git push -u origin chore/release-v<X.Y.Z>
+gh pr create --repo switchroom/switchroom --base main \
+  --head <your-fork-user>:chore/release-v<X.Y.Z> \
+  --title "chore: release vX.Y.Z" --body "..."
+gh pr merge <PR#> --repo switchroom/switchroom --auto --squash
+```
+
+Release PRs are usually trivial diff + green CI = APPROVE-equivalent;
+the reviewer step can be skipped IF every constituent feature PR was
+properly reviewed.
+
+**5. Tag the merged commit + push the tag.**
+
+```
+git fetch upstream && git reset --hard upstream/main
+git tag vX.Y.Z <merge-commit-sha>
+git push upstream vX.Y.Z
+```
+
+The tag push triggers the `docker-images` workflow, which builds
+the per-version-tagged ghcr.io images (~5 min).
+
+**6. npm publish — verify the tarball first.**
+
+Per `feedback_npm_publish_landmines`: ALWAYS verify the tarball has
+`dist/cli/switchroom.js` before publishing. Past releases have shipped
+broken (0.12.6→0.12.7) because dist wasn't bundled.
+
+```
+node scripts/build.mjs                          # rebuild — reset --hard wipes dist
+npm pack                                        # produces switchroom-X.Y.Z.tgz
+tar tzf switchroom-X.Y.Z.tgz | grep -E "dist/cli/switchroom.js|vendor/hindsight" | head -5
+npm publish --ignore-scripts switchroom-X.Y.Z.tgz
+```
+
+`--ignore-scripts` skips `prepublishOnly` (which would re-run build +
+lint + test); the just-verified tarball is what publishes. Operators
+running `npm i -g switchroom` get the newest version.
+
+**7. Update local host CLI.**
+
+```
+sudo env PATH=$PATH npm i -g switchroom@X.Y.Z
+switchroom --version    # confirm X.Y.Z
+```
+
+**8. Wait for docker-images workflow to complete.**
+
+```
+gh run list --repo switchroom/switchroom --workflow=docker-images --limit 2
+```
+
+The `v<X.Y.Z>` tag-trigger run takes ~5 min. Don't roll the fleet
+until ALL 5 images (agent, broker, auth-broker, kernel, hindsight)
+are pull-able under the new tag.
+
+**9. Canary on test-harness BEFORE fleet rollout.**
+
+This is the mandatory gate. See **Pre-rollout UAT (MTCute harness)**
+below.
+
+**10. Fleet rollout — staggered, not bulk.**
+
+After UAT passes:
+
+```
+sudo env PATH=$PATH HOME=$HOME switchroom update --pin vX.Y.Z
+# OR per-agent (preferred for the first staggered rollout of any
+# risky change — sequential, blocks until each agent's reconcile
+# returns):
+for a in clerk gymbro ziggy klanker lawgpt carrie finn reggie; do
+  sudo env PATH=$PATH HOME=$HOME switchroom agent restart $a --force
+  # `--version` assertion guards the `:latest` pull-race documented
+  # in `project_release_rollout_ci_gotchas`. Without it, agents may
+  # still report the prior version because the local docker daemon
+  # raced GHCR's `:latest` tag update.
+  docker exec switchroom-$a sh -lc 'switchroom --version' | grep -q "X.Y.Z" \
+    || { echo "version mismatch on $a"; break; }
+done
+```
+
+The historical thundering-herd wedge — mass-recreate stranding
+mid-turn inbounds — was closed by the self-heal landing in v0.12.16
+(#1546/#1549) and the durable inbound spool in v0.12.19 (#1558). So
+the wedge class is no longer load-bearing for the stagger. The
+sequential per-agent recipe is still preferred for two reasons: each
+`switchroom agent restart` blocks ~30s on the boot card, naturally
+spacing the bounces; and the `--version` assertion per-agent catches
+the `:latest` pull-race that's still a live concern.
+
+### Pre-rollout UAT (MTCute harness)
+
+The `telegram-plugin/uat/` directory uses **mtcute** — a real Telegram
+client driving a real bot over real chat. It's the only way to exercise
+the full inbound → claude → outbound path end-to-end. **Required**
+before any fleet rollout.
+
+**Setup (one-time per dev host).**
+
+```
+cp .env.example .env                # operator credentials for mtcute
+bun run uat:login                   # interactive — pastes a Telegram code
+bun run uat:driver-info             # confirms session is valid
+```
+
+The driver session persists in `.env`'s `MTCUTE_SESSION` so subsequent
+runs are non-interactive.
+
+**Scenarios live at `telegram-plugin/uat/scenarios/`.**
+
+Naming convention: `jtbd-<job>-<surface>.test.ts`. Each scenario
+spins up a driver, sends a DM via the real Telegram API to a real
+agent, asserts the response shape and timing.
+
+```
+bun run --cwd telegram-plugin test:uat jtbd-fast-trivial-dm
+```
+
+**When releasing changes that touch streaming, message format, or
+turn lifecycle, run at least:**
+
+- `jtbd-fast-trivial-dm` — warm-cache TTFO (baseline ~1.7s in DM).
+- `jtbd-always-on-after-restart-dm` — first message after a restart
+  must reply within 60s (the 5-min wedge regression gate).
+- `jtbd-memory-survives-restart-dm` — memory persistence across
+  restart.
+- Any new scenario specific to the feature shipping.
+
+If a UAT fails, **roll back the test-harness canary** and investigate.
+Do NOT proceed to fleet.
+
+**Canary discipline.**
+
+The flow is always:
+
+1. Roll test-harness to the new version, NOT the fleet:
+   ```
+   sudo env PATH=$PATH HOME=$HOME switchroom update --pin vX.Y.Z
+   # (update is fleet-wide; until per-agent update exists, this
+   # bounces all 9 — accept that for canary OR use a feature flag /
+   # env var to keep the new code dormant on the other 8 until
+   # validated.)
+   ```
+2. Run the UAT suite against test-harness.
+3. Tail `/var/log/switchroom/gateway-supervisor.log` for the new
+   trace lines / log shapes the change should produce.
+4. Observe ≥1 real human DM round-trip if the change is user-visible.
+5. If green: fleet rollout (step 10 of the release process).
+6. If red: revert the pin (`switchroom update --pin v<previous>`)
+   and queue a fix PR.
+
+**The release isn't "shipped" until step 5 of the canary passes.**
+Tagging + publishing + rolling are necessary but not sufficient.
 
 ### Operator update — `switchroom update`
 
