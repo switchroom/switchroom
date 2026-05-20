@@ -253,6 +253,7 @@ import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
+import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -1249,12 +1250,18 @@ let lastContextExhaustionWarningAt = 0
 
 let pendingPtyPartial: string | null = null
 
-function statusKey(chatId: string, threadId?: number): string {
-  return `${chatId}:${threadId ?? '_'}`
+// statusKey + streamKey are thin re-exports of the canonical chatKey()
+// constructor (see telegram-plugin/gateway/chat-key.ts). chatKey()
+// collapses 0/null/undefined thread IDs to the same token (`_`),
+// closing the sibling-key class behind #1564 (where one site set the
+// entry under `null → _` and another cleared under `0 → 0`, leaving
+// activeTurnStartedAt non-empty forever).
+function statusKey(chatId: string, threadId?: number | null): string {
+  return chatKey(chatId, threadId)
 }
 
-function streamKey(chatId: string, threadId?: number): string {
-  return `${chatId}:${threadId ?? '_'}`
+function streamKey(chatId: string, threadId?: number | null): string {
+  return chatKey(chatId, threadId)
 }
 
 function purgeReactionTracking(key: string): void {
@@ -5397,7 +5404,7 @@ function resetOrphanedReplyTimeout(): void {
 }
 
 function closeActivityLane(chatId: string, threadId: number | undefined): void {
-  const key = `${chatId}:${threadId ?? '_'}:activity`
+  const key = chatKeyWithSuffix(chatId, threadId, 'activity')
   const stream = activeDraftStreams.get(key)
   if (stream == null) return
   activeDraftStreams.delete(key)
@@ -5409,7 +5416,7 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
   // Progress-card streams include a turnKey suffix in their key
   // (e.g. "chatId:_:progress:chatId:1"). Iterate and match by prefix
   // so the backstop actually finds the stream.
-  const prefix = `${chatId}:${threadId ?? '_'}:progress`
+  const prefix = chatKeyWithSuffix(chatId, threadId, 'progress')
   for (const [key, stream] of activeDraftStreams) {
     if (key.startsWith(prefix)) {
       activeDraftStreams.delete(key)
@@ -5465,7 +5472,11 @@ function handleSessionEvent(ev: SessionEvent): void {
         // progress-card-driver's per-chat sequence number (these are two
         // independent identifier schemes and don't need to align).
         if (turnsDb != null) {
-          const turnKey = `${ev.chatId}:${ev.threadId ?? '_'}:${startedAt}`
+          // ev.threadId is `string | null` (Telegram emits as string); convert
+          // to number for chatKeyWithSuffix. Number(null) = 0 which canonicalizes
+          // to '_' — same as the explicit `null` branch below.
+          const evThreadIdNum = ev.threadId != null ? Number(ev.threadId) : null
+          const turnKey = chatKeyWithSuffix(ev.chatId, evThreadIdNum, String(startedAt))
           next.registryKey = turnKey
           // Phase 1 of #332: capture first ~200 chars of the user's message.
           const userPromptPreview = extractUserPromptPreview(ev.rawContent)
@@ -5862,7 +5873,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // Drop progress-card streams without finalising — the normal
         // closeProgressLane call below would call stream.finalize() which
         // sends a final "Done" edit to Telegram. Skip that for silent turns.
-        const suppressPrefix = `${chatId}:${threadId ?? '_'}:progress`
+        const suppressPrefix = chatKeyWithSuffix(chatId, threadId, 'progress')
         for (const [key] of activeDraftStreams) {
           if (key.startsWith(suppressPrefix)) {
             activeDraftStreams.delete(key)
