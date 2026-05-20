@@ -1,97 +1,75 @@
 # Changelog
 
-## unreleased — feat(draft-stream): 429 + non-true fallback robustness
+## v0.13.0 — sendMessageDraft alignment (PRs A+B+C+D)
 
-PR D of the sendMessageDraft alignment sequence. Closes the durability
-hole when Telegram rate-limits `sendMessageDraft` or returns a soft
-failure.
+Closes the sendMessageDraft alignment epic — four PRs aligning
+`telegram-plugin/draft-stream.ts` with Telegram's new
+beta-graduated `sendMessageDraft` Bot API method (Bot API 9.3 / 9.5 /
+10.0). DM streams now use ephemeral draft previews for sub-second
+live-feel; long turns chain through real `sendMessage` calls when
+the draft expires; rate-limits and soft failures fall back gracefully
+to message transport.
 
-Two new failure paths handled in `draft-stream.ts:sendViaDraft`:
+### PR A — gw-trace stream-start/stream-end observability (#1596)
 
-1. **429 from `sendMessageDraft`**. Extract `retry_after` via the new
-   `extractDraft429RetryAfterSecs()` helper (shared with
-   `issues-card.ts`), fall back to message transport for the rest of
-   this stream, AND push `lastSentAt` forward by `retry_after * 1000`
-   so the fallback's next send doesn't immediately re-429 (Telegram's
-   per-chat rate cap is shared across methods). The 429 detection is
-   gated on `isDraft429()` — duck-typed on grammY's `GrammyError`
-   shape (`error_code` + `parameters.retry_after` + `method` /
-   `description` carrying `sendMessageDraft`).
+Two always-on structured stderr traces from `draft-stream.ts`:
+`gw-trace stream-start ...` captures transport resolution + reason
+at stream creation; `gw-trace stream-end ...` captures per-stream
+fire counts (drafts / sends / edits / fallbacks / persists) +
+`firstFireMs` (TTFO sub-component) at `finalize()`. Kill switch:
+`SWITCHROOM_STREAM_TRACES=0`.
 
-2. **Non-true return from `sendMessageDraft`**. Per docs the method
-   returns `true` on success. An explicit `false` or `null` return
-   means the call was accepted but the draft didn't land — fall back
-   to message transport. `undefined` is treated as success because
-   grammY's typed wrapper sometimes strips the bool; we must not
-   false-positive on that.
+### PR B — sub-second draft throttle + configurable knob (#1597)
 
-Both fallbacks bump `fallbackFires` so the `gw-trace stream-end`
-counter reflects the path the stream took.
+Transport-aware throttle defaults: **300 ms for draft transport**
+(DMs) — drafts are ephemeral and don't share `editMessageText`'s
+per-message rate cap; **1000 ms for message transport** (groups /
+forums / draft API absent). Both overridable via
+`channels.telegram.stream_throttle_ms` in agent yaml (plumbed
+through `SWITCHROOM_TG_STREAM_THROTTLE_MS` env). Floor 250 ms.
+Removes the legacy `throttleMs: 600` compromise on the LLM
+stream_reply path (PTY-activity path deliberately kept at 600 — see
+`gateway.ts:6438` comment).
 
-13 new tests: 9 unit tests for the two new helpers
-(`extractDraft429RetryAfterSecs`, `isDraft429`) and 4 end-to-end
-draft-stream tests (429 → fallback no further drafts;
-`false` return → fallback; `undefined` return → continued drafts;
-429 → fallbacks counter visible in stream-end). 81/81 vitest +
-52/52 bun-test.
+### PR C — 30s persist-then-continue chain (#1598)
 
-## unreleased — feat(draft-stream): 30s persist-then-continue chain
+Telegram's `sendMessageDraft` preview expires after 30 seconds.
+Long LLM turns blow past that. Fix: at ≥25s OR ≥4000 unpersisted
+chars, fire a real `sendMessage` with the current chunk, allocate
+a fresh `draft_id`, continue streaming. Long turns now render as a
+chain of persisted chunks separated by live previews. `finalize()`
+materializes only the unpersisted tail (no duplicate of earlier
+chunks). Per-stream `gw-trace stream-persist chunk_chars=...`
+emitted at each persist boundary; `persists=N` added to stream-end
+trace.
 
-PR C of the sendMessageDraft alignment sequence. Telegram's
-`sendMessageDraft` preview is ephemeral — it expires after 30
-seconds. Long LLM turns blow past that, leaving the user staring at
-a stale draft.
+### PR D — 429 + non-true fallback robustness (#1599)
 
-This PR makes long turns render as a CHAIN of persisted messages
-separated by live previews. At either 25s of accumulated draft
-streaming OR when the unpersisted tail approaches 4000 chars (96-char
-safety margin under Telegram's 4096-char per-message cap), the
-gateway fires a real `sendMessage` with the current chunk and
-allocates a fresh `draft_id` to continue streaming. The model still
-sees a single continuous turn; the user sees a chain of persisted
-chunks, each ≤25s/≤4000 chars, with a live preview between.
+Two new failure paths handled in `sendViaDraft`: (1) 429 from
+`sendMessageDraft` — extract `retry_after`, fall back to message
+transport, push `lastSentAt` forward by `retry_after * 1000` so
+the fallback's next send respects Telegram's cooldown
+(per-chat cap is shared across methods); (2) non-true return —
+`false`/`null` triggers fallback, `undefined` is treated as
+success (grammY's typed wrapper strips the bool). Both bump
+`fallbackFires` for the stream-end counter.
 
-`finalize()` was tightened to materialize only the unpersisted tail
-(`fullText.slice(persistedTextLen)`), so the persist chain doesn't
-duplicate earlier chunks on turn end.
+### Scope
 
-Two new constants (`PERSIST_INTERVAL_MS=25_000`,
-`PERSIST_SAFETY_CHAR_LIMIT=4000`) are overridable per-stream via
-`config.persistIntervalMs` and `config.persistSizeLimit` for tests.
-Production callers leave defaults.
+Draft transport is DM-only (per existing `auto` transport logic).
+Group / forum / threaded streams continue on the message-transport
+path unchanged.
 
-The stream-end `gw-trace` gains a `persists=N` counter; persist
-boundaries get their own `gw-trace stream-persist chunk_chars=…
-reason=time|size newMsgId=… newDraftId=…` line.
+### Test totals
 
-Scope is the draft transport only — message transport edits a
-single message id forever and is unaffected by the 30s draft expiry.
+81 vitest + 52 bun-test on `draft-stream.test.ts`; 30+ unit tests
+on the new `draft-transport.ts` helpers.
 
-5 new tests pin size-trigger, time-trigger, persists counter
-in stream-end, finalize-materializes-tail-only, and
-message-transport-persists=0. 48/48 tests total (combined with PR B).
+### Deferred follow-ups (in-code comments)
 
-## unreleased — feat(draft-stream): gw-trace stream-start/stream-end observability
-
-PR A of the sendMessageDraft alignment sequence. Adds two always-on
-structured stderr traces from `telegram-plugin/draft-stream.ts`:
-
-- `gw-trace stream-start transport=<draft|message> reason=<…> req=<auto|draft|message> dm=<bool|undef> api=<available|absent> throttleMs=<n> [draftId=<n>] chatId=<…>` — emitted at stream creation, captures WHY the transport was chosen (draft API available + DM, draft requested but no API, explicit message, auto fell back to message because non-DM, etc.).
-- `gw-trace stream-end transport=<…> drafts=<n> sends=<n> edits=<n> fallbacks=<n> firstFireMs=<n> durationMs=<n> chars=<n> chatId=<…>` — emitted on `finalize()`, captures per-stream fire counts (so the aggregator can see "stream used 80% draft + 20% edit fallback" vs "all edits, draft never fired") + per-stream first-fire latency.
-
-Kill switch: `SWITCHROOM_STREAM_TRACES=0` (default ON).
-
-Gates the rest of the sendMessageDraft alignment PR sequence (B/C/D)
-which optimise throttle, handle the 30s expiry, and harden fallback —
-without these traces every claim of "draft is the primary path" would
-be unverifiable. Pairs with the existing per-method `tg-post` lines
-(which the supervisor log already captures) by adding the
-PER-STREAM resolution context the tg-post lines lack.
-
-4 new tests in `telegram-plugin/tests/draft-stream.test.ts` (37/37
-total) pin: stream-start with draft + DM, stream-start with auto +
-non-DM falls back to message, stream-end fire-count shape,
-kill-switch.
+- Per-chunk hash dedup for lost-ACK double-persist (PR D follow-up).
+- Cumulative-text retraction tolerated as benign (stale preview
+  until model re-extends).
 
 ## v0.12.29 — feat(gateway): prefix-cache warmup (Phase 1, opt-in) + outboundEmitted refinement
 
