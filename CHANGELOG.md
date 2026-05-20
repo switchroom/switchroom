@@ -1,6 +1,56 @@
 # Changelog
 
-## v0.12.21 — fix: structural defenses against the wedge-cluster bug classes (canonical chat-key, broadcast lint, live docker-exec guard)
+## v0.12.22 — fix(P0/vision): close the 5-min restart wedge — first-after-restart messages reply in seconds, not minutes
+
+The "always-on specialist exec-assistants" vision means agents reply
+fast. Pre-v0.12.22, **every agent container restart produced ~5 minutes
+of blank** on the first user message in each thread — the silence-poke
+framework-fallback fired at 300s and only THEN drained the message.
+Observed live on all 9 fleet agents during the v0.12.21 rollout. This
+release closes the wedge: a one-line snapshot in `handleInbound` makes
+the #1556 delivery gate read the pre-receipt state instead of the live
+size that the very same handler had just mutated for this inbound.
+
+Plus the first JTBD UAT scenario explicitly tied to the always-on
+vision contract — an mtcute regression guard that restarts an agent,
+sends a fresh inbound, and asserts the reply lands well below the
+silence-poke fallback floor.
+
+### Changes
+
+#### Fixes
+
+- **fix(gateway):** snapshot `turnInFlight` at receipt to close the
+  5-min restart wedge. The #1556 delivery gate read
+  `activeTurnStartedAt.size > 0` live — but the fresh-turn branch at
+  `gateway.ts:7357` had already written a Map entry for THIS inbound's
+  turn before the gate ran. The gate saw the entry it just produced
+  and decided buffer-until-idle, stranding the turn-starting message
+  in `pendingInboundBuffer`. Claude never received it. Claude never
+  replied. 5 min later the silence-poke fallback fired, drained the
+  buffer, the reply finally landed — five minutes late. Fix: capture
+  `const turnInFlightAtReceipt = activeTurnStartedAt.size > 0` once
+  at receipt (after `gate()` early-exits, before any side effects)
+  and pass the snapshot to `decideInboundDelivery`. Captures "was a
+  turn already in flight WHEN this inbound arrived" — the actual
+  semantic #1556 wanted. (#1573)
+
+#### Tests
+
+- **test(uat):** `jtbd-always-on-after-restart-dm.test.ts` — first
+  mtcute UAT scenario explicitly tied to the always-on vision
+  contract. Shells out to `switchroom agent restart`, sends a fresh
+  inbound via the driver session, asserts reply lands within 120s
+  (hard contract — well below the 300s silence-poke floor) with a
+  30s yellow-band log for forensic visibility. Self-skips on hosts
+  without NOPASSWD sudo. Wired into `ci-uat` as a separate gated
+  step so it runs alongside the fuzz scenarios on operator-host UAT.
+  Per memory `reference_mtcute_harness_local_e2e.md` this is the
+  right tool for vision-aligned testing of the gateway delivery
+  surface — wedge-cluster fixes that mock-based tests keep missing.
+  (#1573)
+
+
 
 Five PRs that turn the lessons of the 2026-05-19 wedge cluster into
 durable structural fences. The headline fix closes the **#1564
