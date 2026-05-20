@@ -1,5 +1,47 @@
 # Changelog
 
+## unreleased — feat(gateway): Phase 2b PR 3a — bridgeUp dispatcher cutover
+
+First real cutover of the `InboundDeliveryStateMachine` (RFC
+`docs/rfcs/inbound-delivery-state-machine.md`). The `bridgeUp` event
+site in `onClientRegistered` now drives the drain and perm-verdict
+redeliver paths through `dispatchEffects()` instead of inline
+imperative loops. Behavior parity with the shadow trace baked over
+v0.12.25–v0.12.26.
+
+Scope is deliberately narrow:
+
+- **bridgeUp** cutover. Effects `drainBuffer`,
+  `redeliverPersistedPermVerdicts`, `logTrace` flow through the
+  dispatcher. The boot-card path remains imperative (out of machine
+  scope).
+- **bridgeDown** still uses imperative `flushOnAgentDisconnect` —
+  the machine's only effect on `bridgeDown` is `logTrace`.
+- **turnEnd** stays imperative this PR. The shadow's
+  `outboundEmitted: true` is currently a blind approximation
+  (`gateway.ts:1277-1281`); cutting over without refining that
+  signal first would silently corrupt invariant #5's
+  `lastOutboundAt` data and over-suppress fallback fires.
+- **inbound** stays imperative — biggest cutover, deferred.
+
+New: `telegram-plugin/gateway/inbound-delivery-machine-dispatch.ts`
++ `telegram-plugin/tests/inbound-delivery-machine-dispatch.test.ts`
+(18 unit tests pinning each effect-kind primitive call).
+
+Kill-switch: `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` falls back to the
+imperative drain path (kept inline at the bridgeUp callsite as
+parity-for-rollback; PR 4 deletes that branch once the cutover bakes).
+Default ON.
+
+**Minor behavior change**: the cutover path re-buffers an inbound on
+`client.send` throw (via `redeliverBufferedInbound`'s lossless
+re-push); the legacy imperative path dropped on throw. Strict
+improvement — buffer depth survives transient send failures — but
+mentioned because future debuggers may see non-zero depths after
+bridge flaps where the old path would have shown zero (and lost the
+message). The kill-switch fallback retains the legacy drop-on-throw
+semantics for exact rollback parity.
+
 ## v0.12.26 — fix(P0): close the chronic bridge-flap class (IPC agentIndex race)
 
 P0 hotfix for the fleet-wide chronic bridge-flap that caused
