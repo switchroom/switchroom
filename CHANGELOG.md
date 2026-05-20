@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — feat(gateway): Phase 2b PR 3a — bridgeUp dispatcher cutover
+## v0.12.27 — feat(gateway): Phase 2b PR 3a — bridgeUp dispatcher cutover
 
 First real cutover of the `InboundDeliveryStateMachine` (RFC
 `docs/rfcs/inbound-delivery-state-machine.md`). The `bridgeUp` event
