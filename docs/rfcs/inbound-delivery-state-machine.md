@@ -177,6 +177,114 @@ Once PR 2 has baked 48+ hours with no regressions, remove the now-redundant code
 
 Net: a few hundred lines removed, plus the bugs they were patching.
 
+## Updated cutover plan (post PR 2/3 — split into 3a/3b/3c)
+
+The original "PR 3 = cleanup" framing turned out to be too coarse. PR
+3 (#1591) shipped the dispatcher and bit-identical effect execution
+for the **happy paths**, but the legacy `purgeReactionTracking` callsites
+were left in place — the shadow `turnEnd` event still fires from inside
+that function, and several callsites can't see the authoritative
+`turn` object (so `outboundEmitted` falls back to module-scope
+`currentTurn` which may already be nulled).
+
+The cleanup PR is therefore being split:
+
+- **PR 3a (#1591) — DONE.** Dispatcher + happy-path effect exec.
+  Shadow continues for turn-lifecycle events.
+- **PR 3b — turnEnd cutover.** This section.
+- **PR 3c — inbound cutover.** The biggest. `handleInbound` constructs
+  the inbound Event and dispatches through the machine; the machine's
+  `deliverToBridge` / `bufferInbound` effects replace the imperative
+  in-handler routing.
+- **PR 4 — delete the imperative kill-switch fallback.** Once 3b and
+  3c have baked, remove the keep-the-old-path-as-a-fallback branches
+  and the redundant primitives listed under PR 3 above.
+
+### PR 3b — turnEnd cutover (current focus)
+
+**Step 1 — refine `outboundEmitted` (prerequisite).** Today
+`purgeReactionTracking(key, endingTurn?)` reads `outboundEmitted` from
+`endingTurn.replyCalled` if the caller threaded the turn, else falls
+back to `currentTurn?.replyCalled`. The canonical, threaded path is
+`endCurrentTurnAtomic(turn)` (gateway.ts:1381) — it nulls
+`currentTurn`, then passes `turn` explicitly. Legacy bare-purge
+callsites can produce **wrong** `outboundEmitted` data in the shadow
+trace, which makes the shadow→live cutover (step 2) unsafe.
+
+Per-callsite audit (gateway.ts on `feat/state-machine-turnend-cutover`
+worktree, baseline commit a6e48b88):
+
+| Site | Path                          | `turn` in scope? | Recommended migration                                  |
+|------|-------------------------------|------------------|--------------------------------------------------------|
+| 1601 | `endStatusReaction`           | No               | **Bug — fires premature `turnEnd`.** Called mid-turn from the reply tool path at line 4345; the bare `purgeReactionTracking(key)` emits a `turnEnd` shadow event on every reply-tool success, so a multi-reply turn fires N shadow `turnEnd`s. Either remove the purge here (`endStatusReaction` is a reaction-state transition, not a turn-end signal) or split `purgeReactionTracking` into reaction-cleanup vs turn-end primitives. |
+| 3096 | silence-poke fallback         | `wedgedTurn` snapshot at line 3031 | `wedgedTurn` *is* available, but using it would emit `outboundEmitted=true` whenever the wedged turn happened to set `replyCalled` — which is exactly wrong for a 5-min framework fallback (visible delivery never happened). Force `outboundEmitted=false`. Refactor: add an explicit `endingTurn: null` parameter or a `reason: 'silence-fallback'` discriminant. |
+| 5831 | context-exhaust warning       | Yes (line 5683)  | **Bug — duplicate `turnEnd` emit.** `endCurrentTurnAtomic(turn)` is *already* called at line 5851 (same key), so this site fires two shadow `turnEnd`s per traversal. Fix: **delete** the bare `purgeReactionTracking(ceKey)` at 5831; line 5851 already does the work. |
+| 5989 | silent-marker turn finalize   | Yes (line 5862)  | **Bug — duplicate `turnEnd` emit.** Same shape as 5831: `endCurrentTurnAtomic(turn)` is already called at line 6049 (same key). Fix: **delete** the bare `purgeReactionTracking(statusKey(chatId, threadId))` at 5989. |
+| 6130 | backstop dedup (post-finalize)| Yes (line 5884), but post-6083 null | This is inside the `flush`-branch IIFE which runs *after* `endCurrentTurnAtomic(turn)` at line 6083 (#1067 early-null). `currentTurn === turn` no longer holds by the time the IIFE callback fires, so routing through `endCurrentTurnAtomic` here would no-op via its guard. Fix: thread the captured turn explicitly — `purgeReactionTracking(statusKey(...), turn)` — so `outboundEmitted` reads `turn.replyCalled` (gateway.ts:1295-1297). |
+| 6258 | turn-flush IIFE finally       | Closure-captured turn, post-6083 null | Same post-6083 condition as 6130 — `endCurrentTurnAtomic` would no-op. Fix: `purgeReactionTracking(statusKey(...), turn)` — or better, branch on `sentIds.length > 0` and pass an explicit `outboundEmitted` discriminant (the IIFE knows whether its send succeeded). |
+| 6265 | turn-flush success            | Yes (line 5884), no prior null | This is the `flushDecision.kind !== 'flush'` and not-silent-marker tail — `endCurrentTurnAtomic(turn)` has NOT been called yet at this point, so routing through it is correct and bit-identical (it nulls `currentTurn` and forwards `turn`). Dominant happy-path turn-end. |
+
+**Risk profile by site:**
+- 1601 / 5831 / 5989 are all **duplicate-`turnEnd`-emit bugs in the
+  same class** — shadow data correctness issues that surface as
+  `turnEnd` events fired more than once per logical turn. Fixing them
+  is mostly delete-the-bare-call, not refactor. Highest value, lowest
+  risk.
+- 6130 / 6258 are post-null sites: `endCurrentTurnAtomic` would
+  no-op because `currentTurn` was already nulled in the enclosing
+  scope. The correct migration is **explicit-turn threading**
+  (`purgeReactionTracking(key, turn)`), not routing through the
+  canonical primitive. Treating these as "refactor through
+  `endCurrentTurnAtomic`" would silently drop the shadow event.
+- 6265 is the one site where routing through `endCurrentTurnAtomic`
+  is bit-identical and safe. It's also the dominant happy-path.
+- 3096 needs an explicit `outboundEmitted=false` signal regardless of
+  what `wedgedTurn.replyCalled` says, because the silence-poke
+  fallback firing at 5 min means visible delivery never happened.
+
+**Implementation order suggestion** (smallest-risk-first):
+1. Delete the bare-purge double-emits at 5831 and 5989 (mechanical
+   delete; 5851/6049 already do the work).
+2. Fix 1601's premature emit (decide: remove the purge, or split the
+   primitives).
+3. Thread `turn` explicitly at 6130 and 6258.
+4. Route 6265 through `endCurrentTurnAtomic`.
+5. Refactor 3096 with an explicit `outboundEmitted=false` signal.
+6. Add UAT: fire 5 reply-tool calls in a single turn, assert exactly
+   one `turnEnd` shadow event (catches the 1601 / 5831 / 5989 bug
+   class structurally).
+7. Bake 48h on test-harness, then proceed to step 2 cutover.
+
+**Step 2 — cutover.** Once step 1 lands and the shadow trace shows
+correct `outboundEmitted` for ≥48 hours of test-harness + fleet
+traffic: flip `shadowEmit({ kind: 'turnEnd', ...})` to
+`dispatchEvent({ kind: 'turnEnd', ...})` inside the canonical
+`endCurrentTurnAtomic` function (gateway.ts:1389), and remove the
+imperative cleanups from `purgeReactionTracking` (the effects array
+from the machine now drives them). The other turnEnd-emit callsites
+disappear by virtue of step 1's routing through
+`endCurrentTurnAtomic`.
+
+**UAT gates before step 2:**
+- `jtbd-fast-trivial-dm` (TTFO baseline)
+- `jtbd-always-on-after-restart-dm` (post-restart turn semantics)
+- `jtbd-memory-survives-restart-dm` (turn lifecycle around restart)
+- A new scenario: fire 5 reply-tool calls in a single turn and assert
+  exactly ONE `turnEnd` shadow/machine event (catches the line 1601
+  bug class).
+
+**Bake:** 48 hours on test-harness, then staggered fleet rollout
+behind a `SWITCHROOM_INBOUND_MACHINE_TURNEND=live` env knob defaulting
+to `shadow`. Knob removed in PR 4.
+
+### PR 3c — inbound cutover (preview)
+
+`handleInbound`'s imperative `if (currentTurn != null) buffer else
+deliver` becomes `dispatch({ kind: 'inboundArrival', ... })` whose
+effects array drives the same outcome. Same shadow→live pattern,
+same kill-switch env knob. Out of scope for this section; PR 3b
+prerequisites must land first.
+
 ## What this RFC does NOT cover
 
 - **The boot-time cost** of cold-starting claude + the gateway. The state machine doesn't help; it's pure model-side latency. Tracked separately under "cold-start optimization" (Sprint 4 of the vision-aligned roadmap — defer handoff, async boot card, pre-warm session).
