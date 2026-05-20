@@ -1,5 +1,26 @@
 # Changelog
 
+## unreleased — feat(gateway): per-line ISO timestamps on supervisor log
+
+Per cold-start TTFO RFC (#1589) rec #1. The gateway's stderr is captured
+to `/var/log/switchroom/gateway-supervisor.log` but had no per-line
+timestamps, which made every cold-start TTFO claim unverifiable.
+
+New module `telegram-plugin/stderr-timestamps.ts` installs a one-time
+wrapper on `process.stderr.write` that prepends an ISO-8601 timestamp
+(`[YYYY-MM-DDTHH:MM:SS.mmmZ]`) at the start of each logical line.
+Line-buffered: partial writes accumulate until a newline arrives, then
+get stamped and forwarded. Wraps closest to the original `stderr.write`
+so the existing `plugin-logger.ts` file mirror picks up the timestamped
+text.
+
+Kill switch: `SWITCHROOM_LOG_TIMESTAMPS=0` disables. Default ON.
+
+Enables: TTFO delta measurement between `bridge registered`, first
+`gw-trace dispatch stage=bridge_recover`, and first `tg-post
+method=sendMessage` — required to validate any subsequent cold-start
+optimization.
+
 ## v0.12.27 — feat(gateway): Phase 2b PR 3a — bridgeUp dispatcher cutover
 
 First real cutover of the `InboundDeliveryStateMachine` (RFC
