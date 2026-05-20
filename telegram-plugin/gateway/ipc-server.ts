@@ -266,8 +266,24 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
 
   function removeClient(client: IpcClient & { _socket: ReturnType<typeof Bun.listen> extends infer S ? any : never }) {
     clients.delete(client);
-    if (client.agentName) agentIndex.delete(client.agentName);
-    if (client.topicId != null) topicIndex.delete(client.topicId);
+    // CRITICAL race fix (2026-05-20): only delete from agentIndex /
+    // topicIndex if the index still points to THIS client. A bridge
+    // that reconnects fast can have its NEW client overwrite
+    // agentIndex[name] (via handleRegister's replace-not-reject)
+    // BEFORE the OLD client's close+removeClient runs. Blindly
+    // deleting agentIndex[name] would remove the LIVE replacement
+    // client by accident → sendToAgent returns false → all subsequent
+    // inbound buffered until the bridge happens to reconnect in an
+    // ordering that works out. User-visible symptom was the chronic
+    // bridge-flap pattern (clerk + gymbro unresponsive 2026-05-20)
+    // where the gateway log showed "bridge registered" but messages
+    // were still getting buffered as if no bridge existed.
+    if (client.agentName && agentIndex.get(client.agentName) === client) {
+      agentIndex.delete(client.agentName);
+    }
+    if (client.topicId != null && topicIndex.get(client.topicId) === client) {
+      topicIndex.delete(client.topicId);
+    }
     loggedLegacyUpdatePlaceholder.delete(client.id);
     onClientDisconnected(client);
     log(`client disconnected: ${client.id} (agent=${client.agentName})`);
@@ -406,6 +422,28 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
 
     if (client.agentName) agentIndex.delete(client.agentName);
     if (client.topicId != null) topicIndex.delete(client.topicId);
+
+    // 2026-05-20 race fix: if a PRIOR client is registered as this
+    // agent name (a stale/zombie connection that hasn't been evicted
+    // yet), explicitly close it before installing this new client.
+    // Without this, the prior client remains in `clients` set, its
+    // heartbeat watchdog still ticks, and its eventual close+removeClient
+    // can confuse routing. The removeClient identity-check fix above
+    // means the index won't be wrongly deleted, but two concurrent
+    // clients claiming the same agent name is still a routing hazard
+    // — close the zombie cleanly here.
+    const existingClient = agentIndex.get(msg.agentName);
+    if (existingClient && existingClient !== client) {
+      log(
+        `register: closing prior client for agent=${msg.agentName} ` +
+        `(prior_id=${existingClient.id} new_id=${client.id}) — bridge reconnect race`,
+      );
+      try {
+        (existingClient as IpcClientImpl).close();
+      } catch {
+        /* nothing to do */
+      }
+    }
 
     client.agentName = msg.agentName;
     client.topicId = msg.topicId ?? null;
