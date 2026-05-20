@@ -216,26 +216,44 @@ worktree, baseline commit a6e48b88):
 
 | Site | Path                          | `turn` in scope? | Recommended migration                                  |
 |------|-------------------------------|------------------|--------------------------------------------------------|
-| 1601 | `endStatusReaction`           | No               | **Misuse — investigate.** This is called mid-turn from the reply tool (line 4345); it should NOT emit `turnEnd`. Either remove the purge here (`endStatusReaction` is a reaction-state transition, not a turn-end signal) or split `purgeReactionTracking` into reaction-cleanup vs turn-end. The current code emits a premature `turnEnd` shadow event on every reply-tool success. **Highest-priority finding.** |
-| 3096 | silence-poke fallback         | `fbKey` only     | No turn object — the silence-poke fired AFTER the original turn was abandoned. Best signal is `outboundEmitted=false` explicitly. Refactor: add an `endingTurn: null` parameter or a `reason: 'silence-fallback'` discriminant so shadow data is unambiguous. |
-| 5831 | context-exhaust warning       | Yes (line 5683)  | Route through `endCurrentTurnAtomic(turn)`. This path is mid-turn-error; the canonical pattern handles the race guard + module-state null. Verify `currentTurn === turn` still holds at the call point. |
-| 5989 | silent-marker turn finalize   | Yes (line 5862)  | Same — route through `endCurrentTurnAtomic(turn)`. The silent-marker path is a legitimate turn-end, just one that didn't emit visible outbound. |
-| 6130 | backstop dedup (post-finalize)| Yes (line 5884)  | Route through `endCurrentTurnAtomic(turn)`. The reply already fired and was deduped — `outboundEmitted=true` is the truthful signal, which `endCurrentTurnAtomic` will read from `turn.replyCalled`. |
-| 6258 | turn-flush IIFE finally       | Closure-captured | The IIFE captures `turn` from the enclosing scope. Hoist `endCurrentTurnAtomic(turn)` out of the `finally` so it runs once at the end of the IIFE regardless of send success/failure (the current pattern is right, just needs the canonical primitive). |
-| 6265 | turn-flush success            | Yes (line 5884)  | Route through `endCurrentTurnAtomic(turn)`. Adjacent code at 6268 already reads `turn.startedAt`, so scope is unambiguous. This is the dominant happy-path turn-end. |
+| 1601 | `endStatusReaction`           | No               | **Bug — fires premature `turnEnd`.** Called mid-turn from the reply tool path at line 4345; the bare `purgeReactionTracking(key)` emits a `turnEnd` shadow event on every reply-tool success, so a multi-reply turn fires N shadow `turnEnd`s. Either remove the purge here (`endStatusReaction` is a reaction-state transition, not a turn-end signal) or split `purgeReactionTracking` into reaction-cleanup vs turn-end primitives. |
+| 3096 | silence-poke fallback         | `wedgedTurn` snapshot at line 3031 | `wedgedTurn` *is* available, but using it would emit `outboundEmitted=true` whenever the wedged turn happened to set `replyCalled` — which is exactly wrong for a 5-min framework fallback (visible delivery never happened). Force `outboundEmitted=false`. Refactor: add an explicit `endingTurn: null` parameter or a `reason: 'silence-fallback'` discriminant. |
+| 5831 | context-exhaust warning       | Yes (line 5683)  | **Bug — duplicate `turnEnd` emit.** `endCurrentTurnAtomic(turn)` is *already* called at line 5851 (same key), so this site fires two shadow `turnEnd`s per traversal. Fix: **delete** the bare `purgeReactionTracking(ceKey)` at 5831; line 5851 already does the work. |
+| 5989 | silent-marker turn finalize   | Yes (line 5862)  | **Bug — duplicate `turnEnd` emit.** Same shape as 5831: `endCurrentTurnAtomic(turn)` is already called at line 6049 (same key). Fix: **delete** the bare `purgeReactionTracking(statusKey(chatId, threadId))` at 5989. |
+| 6130 | backstop dedup (post-finalize)| Yes (line 5884), but post-6083 null | This is inside the `flush`-branch IIFE which runs *after* `endCurrentTurnAtomic(turn)` at line 6083 (#1067 early-null). `currentTurn === turn` no longer holds by the time the IIFE callback fires, so routing through `endCurrentTurnAtomic` here would no-op via its guard. Fix: thread the captured turn explicitly — `purgeReactionTracking(statusKey(...), turn)` — so `outboundEmitted` reads `turn.replyCalled` (gateway.ts:1295-1297). |
+| 6258 | turn-flush IIFE finally       | Closure-captured turn, post-6083 null | Same post-6083 condition as 6130 — `endCurrentTurnAtomic` would no-op. Fix: `purgeReactionTracking(statusKey(...), turn)` — or better, branch on `sentIds.length > 0` and pass an explicit `outboundEmitted` discriminant (the IIFE knows whether its send succeeded). |
+| 6265 | turn-flush success            | Yes (line 5884), no prior null | This is the `flushDecision.kind !== 'flush'` and not-silent-marker tail — `endCurrentTurnAtomic(turn)` has NOT been called yet at this point, so routing through it is correct and bit-identical (it nulls `currentTurn` and forwards `turn`). Dominant happy-path turn-end. |
 
 **Risk profile by site:**
-- 1601 is a bug, not just a refinement. Fixing it stops a class of
-  bogus shadow events. Highest value.
-- 5831 / 5989 / 6130 / 6258 / 6265 are bit-identical refactors if
-  `endCurrentTurnAtomic`'s `currentTurn === turn` guard holds — which
-  it should, since `purgeReactionTracking` is already doing the
-  end-of-turn work and the only difference is the null + race guard.
-  Add `expect(currentTurn === turn || currentTurn === null)` assertion
-  in dev mode for one bake cycle to verify the invariant before
-  trusting it.
-- 3096 is the trickiest — needs an explicit "no outbound" signal
-  because there's no surviving turn object to read.
+- 1601 / 5831 / 5989 are all **duplicate-`turnEnd`-emit bugs in the
+  same class** — shadow data correctness issues that surface as
+  `turnEnd` events fired more than once per logical turn. Fixing them
+  is mostly delete-the-bare-call, not refactor. Highest value, lowest
+  risk.
+- 6130 / 6258 are post-null sites: `endCurrentTurnAtomic` would
+  no-op because `currentTurn` was already nulled in the enclosing
+  scope. The correct migration is **explicit-turn threading**
+  (`purgeReactionTracking(key, turn)`), not routing through the
+  canonical primitive. Treating these as "refactor through
+  `endCurrentTurnAtomic`" would silently drop the shadow event.
+- 6265 is the one site where routing through `endCurrentTurnAtomic`
+  is bit-identical and safe. It's also the dominant happy-path.
+- 3096 needs an explicit `outboundEmitted=false` signal regardless of
+  what `wedgedTurn.replyCalled` says, because the silence-poke
+  fallback firing at 5 min means visible delivery never happened.
+
+**Implementation order suggestion** (smallest-risk-first):
+1. Delete the bare-purge double-emits at 5831 and 5989 (mechanical
+   delete; 5851/6049 already do the work).
+2. Fix 1601's premature emit (decide: remove the purge, or split the
+   primitives).
+3. Thread `turn` explicitly at 6130 and 6258.
+4. Route 6265 through `endCurrentTurnAtomic`.
+5. Refactor 3096 with an explicit `outboundEmitted=false` signal.
+6. Add UAT: fire 5 reply-tool calls in a single turn, assert exactly
+   one `turnEnd` shadow event (catches the 1601 / 5831 / 5989 bug
+   class structurally).
+7. Bake 48h on test-harness, then proceed to step 2 cutover.
 
 **Step 2 — cutover.** Once step 1 lands and the shadow trace shows
 correct `outboundEmitted` for ≥48 hours of test-harness + fleet
