@@ -23,6 +23,7 @@ import { homedir } from 'os'
 import { join, extname, sep, basename } from 'path'
 
 import { installPluginLogger } from '../plugin-logger.js'
+import { installStderrTimestamps } from '../stderr-timestamps.js'
 import { decideDmCommandGate } from '../dm-command-gate.js'
 import { redactAuthCodeMessage } from '../auth-code-redact.js'
 import {
@@ -380,6 +381,10 @@ import { formatIdleFooter } from '../idle-footer.js'
 import { resolveCallingSubagent } from './resolve-calling-subagent.js'
 
 // ─── Stderr logging ───────────────────────────────────────────────────────
+// Install the line-stamper FIRST so it wraps closest to the original
+// stderr.write. plugin-logger's file mirror then sees the timestamped text.
+// Kill switch: SWITCHROOM_LOG_TIMESTAMPS=0 disables.
+installStderrTimestamps()
 installPluginLogger()
 
 // ─── Telemetry ────────────────────────────────────────────────────────────
