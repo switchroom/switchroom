@@ -15,20 +15,30 @@
 # adapter callback INSIDE a `robustApiCall(...)` invocation, so the
 # regex match is a false positive).
 #
-# Allowlist format
-# ----------------
-# Each ALLOWLIST entry is `path:start-end:reason`. A match at any line
-# >= start AND <= end in `path` is skipped. Use this sparingly — every
-# entry is a place future agents may have to revisit.
+# Exemption options
+# -----------------
+# A raw call can be exempted in two ways:
 #
-# To add to the allowlist:
+# (A) Inline marker (PREFERRED — added 2026-05-20):
+#     Put `// allow-raw-bot-api: <reason>` on the line IMMEDIATELY
+#     preceding the raw call. Reason is required. Markers don't drift
+#     when surrounding code shifts, unlike the line-range allowlist below.
+#
+# (B) Line-range ALLOWLIST entry (legacy):
+#     `path:start-end:reason`. A match at any line >= start AND <= end
+#     in `path` is skipped. Every gateway.ts insertion drifts these
+#     ranges (see the bump trail in the gateway.ts entries below), so
+#     prefer (A) for new exemptions.
+#
+# To add an exemption:
 #   1. Confirm the raw call IS already inside a retry wrapper, OR
 #   2. The call is a legitimate fire-and-forget (e.g. early-ack 👀
 #      reaction) that does NOT pass `message_thread_id` and therefore
-#      cannot trigger THREAD_NOT_FOUND.
-#   3. Add the entry with a one-line reason.
+#      cannot trigger THREAD_NOT_FOUND, OR
+#   3. The call is intentionally raw because wrapping would re-enter a
+#      bug (e.g. the THREAD_NOT_FOUND chunk-loop fallback).
 #
-# If neither condition holds: don't allowlist. Wrap the call instead.
+# If none hold: don't exempt. Wrap the call instead.
 
 set -euo pipefail
 
@@ -318,6 +328,23 @@ is_allowlisted() {
   return 1
 }
 
+# Inline-marker exemption: `// allow-raw-bot-api: <reason>` on the line
+# IMMEDIATELY preceding the raw call. Reason (at least one non-whitespace
+# char after the colon) is required. Drift-proof — moves with the code.
+is_inline_marked() {
+  local file="$1" line="$2"
+  local prev_line=$(( line - 1 ))
+  if (( prev_line < 1 )); then
+    return 1
+  fi
+  local prev_text
+  prev_text="$(sed -n "${prev_line}p" "$file" 2>/dev/null || true)"
+  if [[ "$prev_text" =~ //[[:space:]]*allow-raw-bot-api:[[:space:]]*[^[:space:]] ]]; then
+    return 0
+  fi
+  return 1
+}
+
 violations=0
 violation_lines=()
 
@@ -357,6 +384,10 @@ for root in "${ROOTS[@]}"; do
       fi
     fi
 
+    if is_inline_marked "$file" "$line"; then
+      continue
+    fi
+
     if is_allowlisted "$file" "$line"; then
       continue
     fi
@@ -370,10 +401,14 @@ if (( violations > 0 )); then
   echo "check-bot-api-wrapping: ${violations} raw bot.api.* call(s) outside the retry policy:" >&2
   printf '  %s\n' "${violation_lines[@]}" >&2
   echo "" >&2
-  echo "Fix: wrap the call in robustApiCall / swallowingApiCall, or use" >&2
-  echo "retryWithThreadFallback if you need the deleted-thread fallback." >&2
-  echo "If the call is legitimately exempt, add an ALLOWLIST entry in" >&2
-  echo "scripts/check-bot-api-wrapping.sh with a one-line reason." >&2
+  echo "Fix options:" >&2
+  echo "  (1) Wrap the call in robustApiCall / swallowingApiCall, or use" >&2
+  echo "      retryWithThreadFallback if you need the deleted-thread fallback." >&2
+  echo "  (2) Add an inline marker on the line IMMEDIATELY preceding the call:" >&2
+  echo "      // allow-raw-bot-api: <reason>" >&2
+  echo "      (preferred — drift-proof, no allowlist edits required)" >&2
+  echo "  (3) Add an ALLOWLIST entry in scripts/check-bot-api-wrapping.sh" >&2
+  echo "      (legacy — line ranges drift when surrounding code shifts)." >&2
   echo "See #1075 for context." >&2
   exit 1
 fi
