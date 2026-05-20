@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.12.24 — feat: InboundDeliveryStateMachine shadow mode (Phase 2b PR 2)
+
+The state machine from PR 1 (#1578, v0.12.23) now runs ALONGSIDE the
+existing gateway code in shadow mode. Every event-site emits a
+structured `gw-trace shadow ...` stderr line showing the effects
+the machine PREDICTS the gateway should take. **Behavior unchanged**
+— the imperative code still runs everything. PR 3 will cut over
+to executing the machine's effects.
+
+This is the operator's window into validating the machine matches
+reality before the cutover. Grep for `gw-trace shadow` after a
+restart and the v0.12.22 boot-wedge fix's correctness becomes
+visible per-event: first inbound after `bridgeUp` should emit
+`effects=[setTurnStarted,deliverToBridge,...]` (not `bufferInbound`).
+
+### Changes
+
+#### Features
+
+- **feat(gateway):** wire `InboundDeliveryStateMachine` in shadow
+  mode at 4 event sites — `bridgeUp`/`bridgeDown`/`inbound`/`turnEnd`.
+  Pure module from #1578 is now exercised in production via
+  `shadowEmit()`; effects are LOGGED not EXECUTED. Kill switch:
+  `SWITCHROOM_DELIVERY_MACHINE_SHADOW=0`. Wrapped in try/catch —
+  a shadow bug can never wedge a real turn. (#1581)
+
 ## v0.12.23 — fix(memory/vision): close the remember-across-sessions moat + Phase 2b architectural foundations
 
 The moat JTBD `remember-across-sessions` was silently failing in
