@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — fix(npm): ship vendor/ in published tarball
+## v0.12.28 — fix(npm): ship vendor/ in published tarball + per-line log timestamps
 
 The `vendor/` directory (containing the hindsight-memory plugin tree)
 was missing from `package.json`'s `files` array. Effect: every npm-
@@ -15,7 +15,7 @@ rollout).
 Fix: add `"vendor"` to the `files` array. Also: the silent-null path
 now logs to stderr so a future regression of the same shape is loud.
 
-## unreleased — feat(gateway): per-line ISO timestamps on supervisor log
+### Per-line ISO timestamps on supervisor log
 
 Per cold-start TTFO RFC (#1589) rec #1. The gateway's stderr is captured
 to `/var/log/switchroom/gateway-supervisor.log` but had no per-line
