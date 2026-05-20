@@ -29,7 +29,11 @@ function statusKey(chatId: string, threadId?: number): string {
   return `${chatId}:${threadId ?? '_'}`
 }
 function streamKey(chatId: string, threadId?: number): string {
-  return `${chatId}:${threadId ?? 'default'}`
+  // Mirrors production's canonical chat-key derivation (gateway/chat-key.ts):
+  // 0/null/undefined thread IDs all collapse to '_'. Diverging sentinels
+  // here would let the harness pass with a key shape production rejects.
+  const t = threadId == null || threadId === 0 ? '_' : String(threadId)
+  return `${chatId}:${t}`
 }
 
 interface PluginState {

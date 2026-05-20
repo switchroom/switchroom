@@ -313,7 +313,12 @@ function streamKey(
   lane?: string,
   turnKey?: string,
 ): string {
-  const base = `${chatId}:${threadId ?? '_'}`
+  // Canonical chat-key derivation lives in gateway/chat-key.ts — keep this
+  // expression in lockstep with that helper (treats 0/null/undefined the
+  // same), but inline here so this file doesn't introduce a cross-package
+  // import for one expression. See #1564 for the sibling-key bug class.
+  const t = threadId == null || threadId === 0 ? '_' : String(threadId)
+  const base = `${chatId}:${t}`
   const withLane = lane != null && lane.length > 0 ? `${base}:${lane}` : base
   return turnKey != null && turnKey.length > 0 ? `${withLane}:${turnKey}` : withLane
 }

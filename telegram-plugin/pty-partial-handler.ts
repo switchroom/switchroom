@@ -94,7 +94,10 @@ export interface PtyHandlerDeps {
 }
 
 function streamKey(chatId: string, threadId?: number): string {
-  return `${chatId}:${threadId ?? '_'}`
+  // Canonical chat-key derivation lives in gateway/chat-key.ts — keep this
+  // expression in lockstep (treats 0/null/undefined the same). See #1564.
+  const t = threadId == null || threadId === 0 ? '_' : String(threadId)
+  return `${chatId}:${t}`
 }
 
 /**
