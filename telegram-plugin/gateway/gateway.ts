@@ -261,6 +261,7 @@ import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 // effects.
 import { shadowEmit } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
+import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -3204,52 +3205,32 @@ const ipcServer: IpcServer = createIpcServer({
     // causing the shadow state to read `bridge_dead` even when the
     // real bridge was healthy, because every recall.py connect+disconnect
     // would flip the state.
-    if (client.agentName != null) {
-      shadowEmit({ kind: 'bridgeUp', at: Date.now() })
-    }
+    const bridgeUpEffects = client.agentName != null
+      ? shadowEmit({ kind: 'bridgeUp', at: Date.now() })
+      : []
     client.send({ type: 'status', status: 'agent_connected' })
 
-    // #1150: drain any synthetic inbounds queued for this agent while
-    // the bridge was offline. Done BEFORE the boot-card path below so
-    // the agent wakes up to its missed wake-ups first, even if the
-    // boot card edit happens to be slow. Skip drain when agentName is
-    // null (pre-handshake / anonymous client) — those clients are
-    // bridges that never registered an identity and can't have
-    // accumulated buffered inbounds keyed by name.
+    // Phase 2b PR 3a — bridgeUp cutover. The state machine's `bridgeUp`
+    // transition returns `redeliverPersistedPermVerdicts`, `drainBuffer`,
+    // and `logTrace` effects. The dispatcher executes them in order:
+    // the perm-verdict drain unblocks any claude turn suspended inside
+    // an MCP permission call; the inbound drain flushes synthetic
+    // inbounds queued while the bridge was offline (#1150) so the agent
+    // wakes up to missed wake-ups before the boot-card path below runs.
+    // Lossless: `redeliverBufferedInbound` re-buffers per-message misses
+    // and `spool.ack` tombstones confirmed deliveries. Skipped when
+    // agentName is null (pre-handshake / anonymous client — those
+    // bridges never registered an identity and can't have accumulated
+    // buffered inbounds keyed by name).
     if (client.agentName != null) {
-      const pending = pendingInboundBuffer.drain(client.agentName)
-      for (const msg of pending) {
-        try {
-          client.send(msg)
-          // Confirmed delivery to the just-registered live bridge →
-          // tombstone the durable spool entry so it isn't boot-replayed
-          // again. A throw below leaves it spooled (un-acked) so the
-          // idle-drain / escalation path still recovers it — strictly
-          // safer than the old log-and-drop.
-          inboundSpool?.ack(msg)
-        } catch (err) {
-          process.stderr.write(
-            `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
-            `source=${msg.meta?.source ?? '-'}: ${(err as Error).message}\n`,
-          )
-        }
-      }
-      // PR-3: drain permission verdicts missed while the bridge was
-      // offline. A claude turn suspended inside the MCP permission call
-      // is unblocked the moment the reconnecting bridge relays the
-      // verdict; without this the verdict (incl. the TTL auto-deny) was
-      // lost and the turn stayed silent forever.
-      const pendingVerdicts = pendingPermissionBuffer.drain(client.agentName)
-      for (const ev of pendingVerdicts) {
-        try {
-          client.send(ev)
-        } catch (err) {
-          process.stderr.write(
-            `telegram gateway: pending-permission drain failed agent=${client.agentName} ` +
-            `request=${ev.requestId} behavior=${ev.behavior}: ${(err as Error).message}\n`,
-          )
-        }
-      }
+      dispatchEffects(bridgeUpEffects, {
+        selfAgent: client.agentName,
+        ipcServer,
+        pendingInboundBuffer,
+        inboundSpool: inboundSpool ?? null,
+        pendingPermissionBuffer,
+        client,
+      })
     }
 
     // If the agent reconnected after a /restart (or any restart), post a boot

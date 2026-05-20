@@ -1,5 +1,35 @@
 # Changelog
 
+## unreleased — feat(gateway): Phase 2b PR 3a — bridgeUp dispatcher cutover
+
+First real cutover of the `InboundDeliveryStateMachine` (RFC
+`docs/rfcs/inbound-delivery-state-machine.md`). The `bridgeUp` event
+site in `onClientRegistered` now drives the drain and perm-verdict
+redeliver paths through `dispatchEffects()` instead of inline
+imperative loops. Behavior parity with the shadow trace baked over
+v0.12.25–v0.12.26.
+
+Scope is deliberately narrow:
+
+- **bridgeUp** cutover. Effects `drainBuffer`,
+  `redeliverPersistedPermVerdicts`, `logTrace` flow through the
+  dispatcher. The boot-card path remains imperative (out of machine
+  scope).
+- **bridgeDown** still uses imperative `flushOnAgentDisconnect` —
+  the machine's only effect on `bridgeDown` is `logTrace`.
+- **turnEnd** stays imperative this PR. The shadow's
+  `outboundEmitted: true` is currently a blind approximation
+  (`gateway.ts:1277-1281`); cutting over without refining that
+  signal first would silently corrupt invariant #5's
+  `lastOutboundAt` data and over-suppress fallback fires.
+- **inbound** stays imperative — biggest cutover, deferred.
+
+New: `telegram-plugin/gateway/inbound-delivery-machine-dispatch.ts`
++ `telegram-plugin/tests/inbound-delivery-machine-dispatch.test.ts`
+(18 unit tests pinning each effect-kind primitive call). Kill-switch:
+`SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` to fall back to imperative-only
+(default ON).
+
 ## v0.12.26 — fix(P0): close the chronic bridge-flap class (IPC agentIndex race)
 
 P0 hotfix for the fleet-wide chronic bridge-flap that caused
