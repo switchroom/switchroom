@@ -207,11 +207,49 @@ export function createDraftStream(
     warn?.('draft-stream: sendMessageDraft unavailable; falling back to sendMessage/editMessageText')
   }
 
+  // Stream-start trace — always-on, structured for grep + aggregation.
+  // Resolves WHY the chosen transport landed (req=auto|draft|message;
+  // dm=true|false|undef; api=available|absent). Gates the rest of the
+  // sendMessageDraft alignment PR sequence: without this we can't tell
+  // a draft-routing regression from a config-toggle change.
+  // Kill switch: SWITCHROOM_STREAM_TRACES=0.
+  if (process.env.SWITCHROOM_STREAM_TRACES !== '0') {
+    const reason = usesDraftTransport
+      ? 'draft'
+      : requestedTransport === 'message'
+        ? 'explicit-message'
+        : requestedTransport === 'draft' && draftApi == null
+          ? 'draft-requested-but-no-api'
+          : !prefersDraft
+            ? 'auto-non-dm'
+            : 'fallback'
+    const draftIdPart = draftId != null ? ` draftId=${draftId}` : ''
+    process.stderr.write(
+      `gw-trace stream-start transport=${usesDraftTransport ? 'draft' : 'message'} ` +
+        `reason=${reason} req=${requestedTransport} ` +
+        `dm=${config.isPrivateChat === undefined ? 'undef' : String(config.isPrivateChat)} ` +
+        `api=${draftApi != null ? 'available' : 'absent'} ` +
+        `throttleMs=${throttleMs}${draftIdPart} ` +
+        `chatId=${chatId || '-'}\n`,
+    )
+  }
+
   let messageId: number | null = config.initialMessageId ?? null
   let pendingText: string | null = null
   let lastSentText: string | null = null
   let lastSentAt = 0
   let inFlight: Promise<void> | null = null
+  // PR A observability — per-stream fire counters for the stream-end
+  // trace. draftFires/editFires/sendFires let the aggregator distinguish
+  // "stream used 80% draft + 20% edit fallback" vs "all edits, draft
+  // never fired". `firstFireAtMs` is the latency from stream-start to
+  // first wire send (matches TTFO sub-component for a single stream).
+  const streamStartedAt = Date.now()
+  let firstFireAtMs: number | null = null
+  let draftFires = 0
+  let editFires = 0
+  let sendFires = 0
+  let fallbackFires = 0
   let scheduledTimer: ReturnType<typeof setTimeout> | null = null
   let final = false
   let stopped = false
@@ -232,12 +270,15 @@ export function createDraftStream(
     if (!draftApi || draftId == null) return false
     try {
       await draftApi(chatId, draftId, textToSend)
+      if (firstFireAtMs == null) firstFireAtMs = Date.now() - streamStartedAt
+      draftFires++
       log?.(`stream → draft (id: ${draftId}, ${textToSend.length} chars)`)
       return true
     } catch (err) {
       if (shouldFallbackFromDraftTransport(err)) {
         const msg = err instanceof Error ? err.message : String(err)
         warn?.(`draft-stream: sendMessageDraft rejected — falling back to sendMessage/editMessageText (${msg})`)
+        fallbackFires++
         usesDraftTransport = false
         draftId = undefined
         return false
@@ -309,9 +350,13 @@ export function createDraftStream(
   async function sendViaMessage(textToSend: string): Promise<void> {
     if (messageId == null) {
       messageId = await send(textToSend)
+      if (firstFireAtMs == null) firstFireAtMs = Date.now() - streamStartedAt
+      sendFires++
       log?.(`stream → sent (id: ${messageId}, ${textToSend.length} chars)`)
     } else {
       await edit(messageId, textToSend)
+      if (firstFireAtMs == null) firstFireAtMs = Date.now() - streamStartedAt
+      editFires++
       log?.(`stream → edited (id: ${messageId}, ${textToSend.length} chars)`)
     }
   }
@@ -429,6 +474,22 @@ export function createDraftStream(
       }
 
       log?.(`stream finalized (id: ${messageId})`)
+
+      // Stream-end trace — pairs with stream-start. `drafts`/`edits`/
+      // `sends` lets the aggregator see the transport ratio per stream;
+      // `firstFireMs` is the per-stream send latency component of TTFO;
+      // `chars` is the final committed text length.
+      if (process.env.SWITCHROOM_STREAM_TRACES !== '0') {
+        const durationMs = Date.now() - streamStartedAt
+        process.stderr.write(
+          `gw-trace stream-end transport=${usesDraftTransport ? 'draft' : 'message'} ` +
+            `drafts=${draftFires} sends=${sendFires} edits=${editFires} ` +
+            `fallbacks=${fallbackFires} ` +
+            `firstFireMs=${firstFireAtMs ?? -1} durationMs=${durationMs} ` +
+            `chars=${(lastSentText ?? '').length} ` +
+            `chatId=${chatId || '-'}\n`,
+        )
+      }
     },
 
     getMessageId(): number | null {
