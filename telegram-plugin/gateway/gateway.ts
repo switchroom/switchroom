@@ -13462,6 +13462,7 @@ function handleChecklistUpdate(
           ts: new Date(ts * 1000).toISOString(),
         },
       }
+      // allow-broadcast: informational checklist task notification, not turn-driving
       ipcServer.broadcast(inboundMsg)
       process.stderr.write(
         `telegram gateway: checklist ${kind}: chat_id=${chat_id} message_id=${message_id} task_id=${taskId} state=${state} user=${userName}\n`,
@@ -13913,7 +13914,7 @@ async function shutdown(signal: string): Promise<void> {
   // gateway no longer pre-allocates drafts on inbound, so there is
   // nothing to clear at SIGTERM time.
 
-  // Notify bridges so they can mark themselves disconnected.
+  // allow-broadcast: informational shutdown notify — bridges mark themselves disconnected
   ipcServer.broadcast({ type: 'status', status: 'gateway_shutting_down' })
 
   // Hard force-exit safety net at budget + 5s. systemd's TimeoutStopSec
