@@ -1491,6 +1491,17 @@ export function installHindsightPlugin(
 
   const sourcePath = resolveHindsightVendorPath();
   if (!existsSync(sourcePath)) {
+    // Loud about it: a missing vendor dir means the npm tarball was
+    // packed without the `vendor/` entry (regression of the bug fixed
+    // in this PR — `files` array in package.json must include
+    // `vendor`). Silent-null left a fleet on v0.12.27 with `apply`
+    // never refreshing the hindsight plugin tree on existing agents,
+    // forcing manual sed workarounds across 9 agents.
+    process.stderr.write(
+      `installHindsightPlugin: vendor source missing at ${sourcePath} ` +
+        `— hindsight plugin NOT installed for ${agentName}. ` +
+        `Likely a packaging regression: check the npm tarball's files array.\n`,
+    );
     return null;
   }
 

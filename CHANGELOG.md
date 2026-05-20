@@ -1,5 +1,20 @@
 # Changelog
 
+## unreleased — fix(npm): ship vendor/ in published tarball
+
+The `vendor/` directory (containing the hindsight-memory plugin tree)
+was missing from `package.json`'s `files` array. Effect: every npm-
+installed switchroom CLI ran `switchroom apply` with
+`resolveHindsightVendorPath()` pointing at a non-existent path. The
+guard at `scaffold.ts:1493` silently returned null, so the
+hindsight plugin tree was NEVER copied into existing agents on apply.
+Workaround was manual `sed` across all 9 fleet agents whenever a
+hindsight setting changed (e.g., the v0.12.23 `retainEveryNTurns=1`
+rollout).
+
+Fix: add `"vendor"` to the `files` array. Also: the silent-null path
+now logs to stderr so a future regression of the same shape is loud.
+
 ## unreleased — feat(gateway): per-line ISO timestamps on supervisor log
 
 Per cold-start TTFO RFC (#1589) rec #1. The gateway's stderr is captured
