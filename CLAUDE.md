@@ -451,10 +451,10 @@ Always work in a per-task worktree:
 
 ```
 git fetch upstream
-git worktree add /home/kenthompson/code/switchroom-<short-task-slug> \
+git worktree add ~/code/switchroom-<short-task-slug> \
   -b feat/<branch-name> upstream/main
-cd /home/kenthompson/code/switchroom-<short-task-slug>
-ln -s /home/kenthompson/code/switchroom-sec-1417/node_modules node_modules
+cd ~/code/switchroom-<short-task-slug>
+ln -s ~/code/switchroom-sec-1417/node_modules node_modules
 ```
 
 The `node_modules` symlink lets `bun`/`vitest` resolve dependencies
@@ -568,9 +568,9 @@ no-UAT directive).
 
 ```
 git fetch upstream
-git worktree add /home/kenthompson/code/switchroom-rel-<vX.Y.Z> \
+git worktree add ~/code/switchroom-rel-<vX.Y.Z> \
   -b chore/release-v<X.Y.Z> upstream/main
-cd /home/kenthompson/code/switchroom-rel-<vX.Y.Z>
+cd ~/code/switchroom-rel-<vX.Y.Z>
 # For a RELEASE worktree, prefer a real copy over the symlink. `bun
 # build` (the bundler in scripts/build.mjs) does NOT resolve through
 # certain symlink shapes — the `~`-prefixed form `ln` leaves unexpanded
@@ -578,7 +578,7 @@ cd /home/kenthompson/code/switchroom-rel-<vX.Y.Z>
 # this way (0.12.6 → 0.12.7 deprecation). See
 # `feedback_npm_publish_landmines` for the post-mortem. Real copy is
 # the safe default for a release worktree:
-rm -rf node_modules && cp -a /home/kenthompson/code/switchroom-sec-1417/node_modules ./node_modules
+rm -rf node_modules && cp -a ~/code/switchroom-sec-1417/node_modules ./node_modules
 ```
 
 **2. Bump `package.json` + CHANGELOG.**
