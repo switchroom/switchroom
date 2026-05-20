@@ -474,6 +474,19 @@ export const TelegramChannelSchema = z
         "a structured progress card from session-tail events — stable " +
         "order, per-tool status emojis, fires only on semantic transitions."
       ),
+    stream_throttle_ms: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Throttle window in ms between successive stream edits (or " +
+        "sendMessageDraft tics) during a turn. Lower = more responsive " +
+        "stream, higher = fewer API calls. Floored at 250 by draft-stream " +
+        "itself. Default 300 for draft transport (DMs) and 1000 for " +
+        "message transport (groups/forums). Override per-agent if a " +
+        "particular agent needs snappier or quieter streaming."
+      ),
     hotReloadStable: z
       .boolean()
       .optional()

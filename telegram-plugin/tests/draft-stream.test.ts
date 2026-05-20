@@ -836,4 +836,95 @@ describe('createDraftStream — draft transport', () => {
     })
   })
 
+  // ─── PR B: transport-aware throttle defaults ──────────────────────────
+  describe('transport-aware throttle defaults (PR B)', () => {
+    let captured: string[] = []
+    let originalWrite: typeof process.stderr.write
+
+    beforeEach(() => {
+      captured = []
+      originalWrite = process.stderr.write
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        captured.push(text)
+        return true
+      }) as typeof process.stderr.write
+    })
+    afterEach(() => {
+      process.stderr.write = originalWrite
+    })
+
+    it('draft transport defaults to 300ms throttle (sub-second)', () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'draft',
+        sendMessageDraft: draftApi,
+        chatId: 'c1',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain('throttleMs=300')
+    })
+
+    it('message transport defaults to 1000ms throttle', () => {
+      const m = makeMock()
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'message',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain('throttleMs=1000')
+    })
+
+    it('auto + DM + draftApi resolves to draft default (300ms)', () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'auto',
+        isPrivateChat: true,
+        sendMessageDraft: draftApi,
+        chatId: 'c1',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toContain('throttleMs=300')
+    })
+
+    it('auto + non-DM resolves to message default (1000ms)', () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'auto',
+        isPrivateChat: false,
+        sendMessageDraft: draftApi,
+        chatId: 'c1',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toContain('throttleMs=1000')
+    })
+
+    it('explicit config.throttleMs wins over transport default', () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'draft',
+        sendMessageDraft: draftApi,
+        chatId: 'c1',
+        throttleMs: 500,
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toContain('throttleMs=500')
+    })
+
+    it('explicit override below MIN_THROTTLE_MS is floored at 250', () => {
+      const m = makeMock()
+      createDraftStream(m.send, m.edit, {
+        previewTransport: 'message',
+        throttleMs: 100,
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toContain('throttleMs=250')
+    })
+  })
+
 })

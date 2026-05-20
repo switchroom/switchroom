@@ -1044,6 +1044,9 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.stream_mode !== undefined) {
     out.SWITCHROOM_TG_STREAM_MODE = tg.stream_mode;
   }
+  if (tg.stream_throttle_ms !== undefined) {
+    out.SWITCHROOM_TG_STREAM_THROTTLE_MS = String(tg.stream_throttle_ms);
+  }
   // Progress-card driver thresholds — only effective when stream_mode=checklist.
   if (tg.orphan_promotion_ms !== undefined) {
     out.SWITCHROOM_TG_ORPHAN_PROMOTION_MS = String(tg.orphan_promotion_ms);

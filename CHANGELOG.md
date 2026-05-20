@@ -1,5 +1,36 @@
 # Changelog
 
+## unreleased — feat(draft-stream): sub-second draft throttle + configurable knob
+
+PR B of the sendMessageDraft alignment sequence. Replaces the single
+hardcoded `DEFAULT_THROTTLE_MS = 1000` with a transport-aware default:
+
+- **Draft transport** (DMs with sendMessageDraft available): **300 ms**.
+  Drafts are ephemeral and don't share `editMessageText`'s per-message
+  rate cap, so faster refresh feels live without bandwidth cost.
+- **Message transport** (groups / forums / draft API absent): **1000 ms**
+  preserved — respects Telegram's ~1 edit/sec/message practical ceiling.
+
+Both defaults are overridable via `channels.telegram.stream_throttle_ms`
+in agent yaml (wired through `SWITCHROOM_TG_STREAM_THROTTLE_MS` env).
+Explicit caller `throttleMs` still wins. Floor stays at 250 ms.
+
+One prior `throttleMs: 600` callsite in `gateway.ts`'s
+`executeStreamReply` is removed and the `?? 600` default in
+`stream-reply-handler.ts` is replaced with passthrough — they were a
+legacy compromise that fought both ceilings on the LLM stream_reply
+path.
+
+The PTY-activity streaming path (`gateway.ts:6438` and
+`pty-partial-handler.ts:159`) DELIBERATELY keeps its `throttleMs: 600`
+— PTY drives many tiny partials as TUIs re-render and has different
+flicker characteristics from LLM token cadence. The transport-aware
+defaults do not apply there.
+
+6 new tests pin: draft default 300, message default 1000, auto+DM→
+draft default, auto+non-DM→message default, explicit-override-wins,
+MIN_THROTTLE_MS floor. 93/93 tests total.
+
 ## unreleased — feat(draft-stream): gw-trace stream-start/stream-end observability
 
 PR A of the sendMessageDraft alignment sequence. Adds two always-on

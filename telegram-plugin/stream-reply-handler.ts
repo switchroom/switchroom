@@ -514,7 +514,9 @@ export async function handleStreamReply(
       threadId,
       parseMode,
       disableLinkPreview: deps.disableLinkPreview,
-      throttleMs: deps.throttleMs ?? 600,
+      // PR B: pass undefined when caller didn't override, so draft-stream's
+      // transport-aware default (300 ms draft / 1000 ms message) wins.
+      ...(deps.throttleMs != null ? { throttleMs: deps.throttleMs } : {}),
       retry: deps.retry,
       ...(replyToMessageId != null ? { replyToMessageId } : {}),
       ...(args.quote_text != null && replyToMessageId != null ? { quoteText: args.quote_text } : {}),
