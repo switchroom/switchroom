@@ -43,16 +43,17 @@ On bridge-up after restart, the gateway synthesizes a warmup `InboundMessage` (`
 
 **Pros**
 - Single point of change (gateway `onClientRegistered`).
-- Reuses existing `NO_REPLY` suppression (gateway.ts:5906).
+- Reuses existing `NO_REPLY` suppression (gateway.ts:5900).
+- **Reuses cron's `meta.source` envelope** (`src/scheduler/dispatch.ts:174-199`). Tag the synthesized inbound with `meta.source: "warmup"` and the bridge / hindsight already know how to render and exclude non-user sources — same contract cron rides today. No new envelope field, no new bridge protocol.
 - Quota cost: ~1 OAuth turn per restart. Negligible (typical fleet sees < 10 restarts/day).
 - Naturally debounceable.
 
 **Cons** — confirmed by walking the codebase:
 - **Progress card UX cost**: the warmup inbound triggers `handleInbound`'s 👀 reaction emission + stream-reply-handler's progress card. The 👀 reaction lands on a synthetic message and the card briefly appears in the agent's primary chat. NO_REPLY suppression unpins the card on turn end but the flash is visible.
-- Suppressing the progress card cleanly requires a `meta.suppressProgressCard` flag plumbed across gateway ↔ bridge ↔ stream-reply-handler. Multi-PR plumbing.
-- Hindsight memory may capture the warmup turn; future agents see noise in transcript. Either tag the turn for memory-exclusion or accept it.
+- The cron-source path already handles parts of this (cron turns are rendered with `<channel source="cron">` framing). Reusing `meta.source="warmup"` collapses much of the UX-suppression work into "extend cron's handling for warmup" rather than new plumbing.
+- Hindsight memory may capture the warmup turn; tag for memory-exclusion via the same source-discriminator path cron uses.
 
-**Net**: 1-PR for crude version (with UX flash), 3-PR for clean version. Estimated TTFO win: 4-8s on the FIRST user turn after restart, contingent on Anthropic prefix-cache TTL (~5 min) holding through the user's response window.
+**Net**: 1-PR for the source-tagged version (much closer than originally estimated, thanks to the cron-envelope reuse). Estimated TTFO win: 4-8s on the FIRST user turn after restart, contingent on Anthropic prefix-cache TTL (~5 min) holding through the user's response window.
 
 ### Option B — Decouple claude from gateway restart
 
@@ -102,9 +103,9 @@ Maintain N hot-standby claude processes per agent slot. On restart, swap to a wa
 
 ## Recommendations
 
-1. **Ship the measurement infrastructure first**. Without per-line timestamps on `gateway-supervisor.log` (or equivalent OTel/PostHog spans), every optimization claim is unverifiable. Recommend either (a) in-gateway stderr monkey-patch that prepends `[YYYY-MM-DDTHH:MM:SS.mmm]` to every write, OR (b) an external host-side capture script that adds timestamps as it tails the per-agent log. Option (a) is more robust; (b) is faster to ship.
+1. **Ship the measurement infrastructure**. Without per-line timestamps on `gateway-supervisor.log` (or equivalent OTel/PostHog spans), every optimization claim is unverifiable. Recommend either (a) in-gateway stderr monkey-patch that prepends `[YYYY-MM-DDTHH:MM:SS.mmm]` to every write, OR (b) an external host-side capture script that adds timestamps as it tails the per-agent log. Option (a) is more robust; (b) is faster to ship. **This can ship in parallel to an Option-A spike — it doesn't gate other work.**
 
-2. **Pursue Option A (warmup turn) as the architectural fix**. The progress-card UX cost is real but addressable by a follow-up plumbing PR. The OAuth quota cost is trivial. Lowest blast radius among the four options.
+2. **Pursue Option A (warmup turn) as the architectural fix**. By reusing cron's `meta.source` envelope (per the Pros above), this is closer to a 1-PR change than originally scoped. The OAuth quota cost is trivial. Lowest blast radius among the four options.
 
 3. **Skip Option D (warm pool)**. RAM and session-slot costs don't justify the win.
 
@@ -116,7 +117,7 @@ Maintain N hot-standby claude processes per agent slot. On restart, swap to a wa
 
 These can ship without an RFC if measurement supports them:
 
-- **`hotReloadStable: true` as default**. Moves the ~12KB workspace content out of `--append-system-prompt` and into a per-turn UserPromptSubmit hook. Shrinks cold prefix. Schema's own description warns of "5-10% per-turn latency/spend" — that claim needs verification before flipping the default. Likely safe to ship measured, but not blind.
+- **`hotReloadStable: true` as default**. Moves the ~12KB workspace content out of `--append-system-prompt` and into a per-turn UserPromptSubmit hook. Shrinks cold prefix. Schema's own description (`src/config/schema.ts:485`) warns of "5-10% per-turn latency/spend" — that's a steady-state cost, not a correctness risk. Ship measured-on-canary (test-harness for 24h with `runtime-metrics.jsonl` comparison) — blind fleet-wide is harsher than the risk warrants given the kill-switch is a 1-line config flip and 9 production agents would surface a regression within hours.
 - **Parallelize `start.sh` handoff/briefing** with `&` and a final `wait`. Saves wall-clock if both calls fire (rare in production). ~0.5s expected win.
 - **Pre-warm `workspace render --stable` output** at scaffold time. Cache the rendered bytes to a file; `start.sh` just `cat`s. -0.9s wall-clock.
 
@@ -126,6 +127,7 @@ These can ship without an RFC if measurement supports them:
 2. Whether `meta.source: "warmup"` should be a first-class envelope field or piggyback on existing `meta: Record<string, string>`. Affects scheduler / autoaccept / mcp-bridge protocol contracts.
 3. Whether the warmup turn should be tagged for Hindsight exclusion (recommend yes) or written into the transcript as a system event (a la cron).
 4. Multi-bridge-reconnect debounce window — gymbro churns ~6 reconnects per UAT cycle. Without debounce, every cycle would warm. With aggressive debounce (e.g., 5 min), a real restart's warmup gets correctly emitted. Recommend cooldown anchored on the most-recent OAuth API call timestamp, not on the warmup itself.
+5. **Where does warmup dedup live?** Cron's fold-in (Phase 4, #890-#893) discovered that `meta.source`-tagged synthetic inbound interacts subtly with the per-agent scheduler's at-least-once boot replay (`SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN`). The dedup primitive there lives in `src/scheduler/dispatch.ts`'s scheduler-jsonl audit, not in the gateway. Should warmup dedup ride on the same audit log, or invent a separate cooldown store? Recommend riding the audit log — same observability, same disk format, one fewer concept to maintain.
 
 ## Success criteria (post-implementation, future PR)
 
