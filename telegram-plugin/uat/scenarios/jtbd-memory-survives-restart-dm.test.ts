@@ -1,0 +1,237 @@
+/**
+ * JTBD scenario — memory survives across restart (the "fleet differentiator").
+ *
+ * Serves: `reference/remember-across-sessions.md` — the JTBD says:
+ *
+ *   *Outcome:* The agent brings back relevant facts, preferences,
+ *   decisions, and open threads from past conversations, in the right
+ *   moment, without the user reminding it.
+ *
+ *   *Stakes:* An agent with no memory is a stranger every time. The
+ *   user stops sharing context because they're tired of repeating
+ *   it. The relationship never compounds.
+ *
+ * Memory IS the moat. If hindsight silently drops captures, or if a
+ * restart wipes recent recall, the multi-agent specialist proposition
+ * collapses to "9 chatbots with no context, each costing a separate
+ * conversation thread to bring up to speed." This is the most
+ * expensive trust-leak in the product because regressions are
+ * invisible for days (the user keeps re-explaining, attributing the
+ * cost to "agents are like that" not "switchroom broke memory").
+ *
+ * ## Contract this asserts
+ *
+ * 1. **Capture works**: agent confirms it remembers a unique token in
+ *    its first reply (capture-side observable via reply content).
+ * 2. **Survival works**: after a marker-safe restart of the agent, the
+ *    same token is recalled in response to a follow-up question.
+ * 3. **Timing is reasonable**: post-restart recall reply lands within
+ *    the always-on cold-start budget (vision target <30s; hard
+ *    contract <120s, same as `jtbd-always-on-after-restart-dm.test.ts`).
+ *
+ * ## What this catches that other UATs don't
+ *
+ * - `jtbd-always-on-after-restart-dm.test.ts` asserts the agent REPLIES
+ *   post-restart. This asserts the agent REMEMBERS post-restart.
+ * - `jtbd-status-query-dm.test.ts` and friends test conversational
+ *   pacing. None test memory.
+ * - No existing UAT exercises hindsight recall as a vision contract.
+ *
+ * ## Honest scope caveat
+ *
+ * Hindsight capture is opportunistic (the agent decides when to
+ * remember, not the user). This test uses an EXPLICIT recall prompt
+ * ("please remember exactly this token") which heavily biases the
+ * model toward capturing it. A future scenario should test IMPLICIT
+ * recall (the agent inferring relevance without being asked) — the
+ * harder + more valuable JTBD case — but that's flaky against any
+ * single model, so we start with the explicit-capture baseline as the
+ * floor.
+ */
+
+import { describe, it, expect, beforeAll } from "vitest";
+import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { spinUp } from "../harness.js";
+
+const AGENT = "test-harness";
+
+const RESTART_BUDGET_MS = 90_000;
+const CAPTURE_REPLY_BUDGET_MS = 60_000;
+const RECALL_REPLY_BUDGET_MS = 120_000;
+const VISION_RECALL_BUDGET_MS = 30_000;
+
+// Unique per-run token so we know the model isn't echoing a stale
+// answer from a prior cached conversation.
+const TOKEN = `SWITCHROOM_UAT_MEM_${randomBytes(8).toString("hex").toUpperCase()}`;
+
+function canShellSudo(): boolean {
+  try {
+    execSync("sudo -n true", { stdio: "ignore", timeout: 2_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function restartAgent(name: string): void {
+  execSync(
+    `sudo -n env PATH=$PATH HOME=$HOME switchroom agent restart ${name} --force`,
+    { stdio: ["ignore", "pipe", "pipe"], timeout: RESTART_BUDGET_MS },
+  );
+}
+
+// Retained for when this test is unskipped — gates on the same
+// sudo-availability prerequisite as jtbd-always-on-after-restart.
+const sudoOk = canShellSudo();
+void sudoOk;
+
+// KNOWN VISION GAP — captured 2026-05-20. The first live run of this
+// UAT against test-harness FAILED: after capture → restart → recall,
+// the agent replied "I don't have that token — no SWITCHROOM_UAT_MEM_*
+// value was ever shared with me to remember." The
+// `remember-across-sessions` JTBD is NOT being met in production for
+// content captured within a single turn.
+//
+// Critically: this is distinct from claude-code session resume.
+// The wake-audit-content UAT (jtbd-wake-audit-content-dm.test.ts)
+// run immediately after this one observed the agent REFERENCE the
+// SWITCHROOM_UAT_MEM_ token in its post-restart status summary
+// ("Token recall — SWITCHROOM_UAT_MEM_ missing from memory") — so
+// session resume DID surface the prior turn's conversation in
+// claude's context. What's missing is hindsight LONG-TERM memory
+// capture. The session-JSONL replay carries forward the immediate
+// conversation; hindsight is the structured memory that's supposed
+// to outlast individual sessions and surface cross-session.
+//
+// Likely root causes (any/all):
+//   - Hindsight capture is opportunistic — the model decides when to
+//     invoke `hindsight_save`. The "please remember exactly this
+//     token" prompt didn't trigger a save in the model's judgment.
+//   - The post-turn Stop hook (which writes hindsight) may not have
+//     flushed before the marker-safe restart killed the container.
+//   - Recall at the new boot may not query hindsight pre-reply.
+//
+// This UAT is SKIPPED but kept in-tree as an EXECUTABLE SPECIFICATION
+// of the contract. Unskip the test when the underlying memory pipeline
+// is fixed — passing this test is the gate for `remember-across-sessions`
+// being a satisfied JTBD.
+//
+// Tracked as: memory-pipeline work in the post-Phase-2b roadmap.
+//
+// (Memory is the moat — see comment block above. Shipping the test
+// as a known-failing skip is more honest than not shipping it at all.)
+describe.skip(
+  "uat: memory survives across restart (remember-across-sessions JTBD) — SKIPPED: known vision gap, see comment above",
+  () => {
+    it(
+      "agent remembers a unique token after capture → restart → recall",
+      async () => {
+        // --- Phase 1: Capture ---
+        const sc1 = await spinUp({ agent: AGENT });
+        try {
+          const captureStart = Date.now();
+          await sc1.sendDM(
+            `Please remember exactly this token for later: ${TOKEN}. ` +
+            `Confirm in your reply that you've noted it. ` +
+            `(This is a memory-survival UAT — store it via hindsight.)`,
+          );
+
+          const captureReply = await sc1.expectMessage(/\S/, {
+            from: "bot",
+            timeout: CAPTURE_REPLY_BUDGET_MS,
+          });
+          const captureTtfo = Date.now() - captureStart;
+
+          // The agent's first reply should acknowledge the token. We
+          // don't require the token to be echoed verbatim (the agent
+          // may say "noted" without repeating), but we DO require a
+          // non-empty reply that doesn't error.
+          expect(captureReply.text.length).toBeGreaterThan(0);
+          console.log(
+            `[memory-survives] capture phase: TTFO=${captureTtfo}ms, ` +
+            `reply length=${captureReply.text.length}`,
+          );
+
+          // Brief settle so any async hindsight write has time to flush
+          // before we kill the container. Hindsight captures are
+          // typically post-turn-end via a Stop hook; turn-complete
+          // signals from the gateway run within ~1-3s after the reply.
+          await new Promise((r) => setTimeout(r, 10_000));
+        } finally {
+          await sc1.tearDown();
+        }
+
+        // --- Phase 2: Restart ---
+        restartAgent(AGENT);
+        // Settle so the bridge sidecar reattaches and the new claude
+        // session loads hindsight before the recall inbound arrives.
+        await new Promise((r) => setTimeout(r, 8_000));
+
+        // --- Phase 3: Recall ---
+        const sc2 = await spinUp({ agent: AGENT });
+        try {
+          const recallStart = Date.now();
+          await sc2.sendDM(
+            `Earlier I asked you to remember a token starting with ` +
+            `SWITCHROOM_UAT_MEM_. What was the full token? ` +
+            `Reply with the token only, no extra text.`,
+          );
+
+          const recallReply = await sc2.expectMessage(/\S/, {
+            from: "bot",
+            timeout: RECALL_REPLY_BUDGET_MS + 5_000,
+          });
+          const recallTtfo = Date.now() - recallStart;
+
+          expect(recallReply.text.length).toBeGreaterThan(0);
+
+          // HARD CONTRACT — memory survival. If the token doesn't
+          // appear, hindsight either didn't capture it OR the recall
+          // failed to surface it.
+          const tokenInReply = recallReply.text.includes(TOKEN);
+          if (!tokenInReply) {
+            throw new Error(
+              `[memory-survives] CONTRACT FAILED: token ${TOKEN} not ` +
+              `present in recall reply. Either hindsight capture missed ` +
+              `the original message (likely if the post-turn-end Stop ` +
+              `hook didn't run before restart) OR the recall query ` +
+              `didn't find the entry. Reply was: ` +
+              `${JSON.stringify(recallReply.text.slice(0, 400))}`,
+            );
+          }
+          expect(tokenInReply).toBe(true);
+
+          // Timing contract — recall on a cold-restarted agent should
+          // still feel "always-on". Same bound as the post-restart
+          // first-message UAT.
+          if (recallTtfo >= RECALL_REPLY_BUDGET_MS) {
+            throw new Error(
+              `[memory-survives] recall TTFO=${recallTtfo}ms exceeds ` +
+              `${RECALL_REPLY_BUDGET_MS}ms — matches the wedge symptom`,
+            );
+          }
+          expect(recallTtfo).toBeLessThan(RECALL_REPLY_BUDGET_MS);
+
+          if (recallTtfo >= VISION_RECALL_BUDGET_MS) {
+            console.warn(
+              `[memory-survives] recall TTFO=${recallTtfo}ms — passed ` +
+              `contract (${RECALL_REPLY_BUDGET_MS}ms) but slower than ` +
+              `vision target (${VISION_RECALL_BUDGET_MS}ms). Hindsight ` +
+              `query latency canary.`,
+            );
+          } else {
+            console.log(
+              `[memory-survives] recall TTFO=${recallTtfo}ms — ` +
+              `within vision target. Token round-tripped successfully.`,
+            );
+          }
+        } finally {
+          await sc2.tearDown();
+        }
+      },
+      // Outer budget: capture + 10s settle + restart + 8s settle + recall.
+      CAPTURE_REPLY_BUDGET_MS + 10_000 + RESTART_BUDGET_MS + 8_000 + RECALL_REPLY_BUDGET_MS + 10_000,
+    );
+  },
+);
