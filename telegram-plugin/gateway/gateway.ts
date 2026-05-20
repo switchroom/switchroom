@@ -1026,6 +1026,7 @@ function checkApprovals(): void {
   try { files = readdirSync(APPROVED_DIR) } catch { return }
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId)
+    // allow-raw-bot-api: Paired! sendMessage to DM senderId; no thread_id, cannot trigger THREAD_NOT_FOUND
     void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.").then(
       () => rmSync(file, { force: true }),
       err => {
@@ -2675,6 +2676,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       parse_mode: 'HTML' as const,
       ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
     }
+    // allow-raw-bot-api: operator-event broadcast loop; opts has no message_thread_id
     void bot.api.sendMessage(chat_id, renderedText, opts as never).catch(e => {
       process.stderr.write(
         `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
@@ -3453,6 +3455,7 @@ const ipcServer: IpcServer = createIpcServer({
         .text(`🔁 Always allow ${alwaysRule.label}`, `perm:always:${requestId}`)
     }
     for (const chat_id of access.allowFrom) {
+      // allow-raw-bot-api: permission-request keyboard fan-out; reply_markup-only opts, no thread_id
       void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
       })
@@ -4069,6 +4072,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           stripped.length > 0
             ? stripped
             : '⚠️ (a formatted fragment could not be rendered for Telegram)'
+        // allow-raw-bot-api: plaintext last-resort fallback; wrapping would re-enter the parse-mode policy that just rejected the payload
         const sent = await lockedBot.api.sendMessage(chat_id, plain, plainOpts as never)
         sentIds.push(sent.message_id)
         logOutbound('reply', chat_id, sent.message_id, plain.length, `chunk=${i + 1}/${chunks.length} plaintext-fallback`)
@@ -4090,6 +4094,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           const retryOpts = { ...sendOpts }
           delete (retryOpts as any).message_thread_id
           try {
+            // allow-raw-bot-api: chunk-loop THREAD_NOT_FOUND fallback; thread already dropped, wrapping would re-enter the throw
             const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts as never)
             sentIds.push(sent.message_id)
           } catch (retryErr) {
@@ -10978,6 +10983,7 @@ async function grantWizardStep2(ctx: Context, chatId: string, agent: string, wiz
   const kb = buildGrantKeysKeyboard(keys, selected)
   const text = `<b>Grant capability token — Step 2/3</b>\n\nWhich keys for <code>${escapeHtmlForTg(agent)}</code>?\n<i>Tap to toggle; tap Continue when done.</i>`
   if (wizardMsgId != null) {
+    // allow-raw-bot-api: vault grant wizard step 2/3; already .catch-swallows, tap-driven UI re-renders on retry
     await ctx.api.editMessageText(chatId, wizardMsgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
@@ -11001,6 +11007,7 @@ async function grantWizardStep3(ctx: Context, chatId: string, state: Extract<Pen
   const text = `<b>Grant capability token — Step 3/3</b>\n\nKeys for <code>${escapeHtmlForTg(state.agent!)}</code>:\n${keyList}\n\nHow long should this grant be valid?`
   const msgId = state.wizardMsgId
   if (msgId != null) {
+    // allow-raw-bot-api: vault grant wizard step 3/3 (TTL select); already .catch-swallows, tap-driven UI re-renders on retry
     await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
@@ -11025,6 +11032,7 @@ async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<P
   ].join('\n')
   const msgId = state.wizardMsgId
   if (msgId != null) {
+    // allow-raw-bot-api: vault grant wizard confirm step; already .catch-swallows, tap-driven UI re-renders on retry
     await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
