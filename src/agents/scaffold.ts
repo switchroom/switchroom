@@ -1503,6 +1503,24 @@ export function installHindsightPlugin(
   }
   copyDirRecursive(sourcePath, destPath);
 
+  // Apply switchroom-specific overrides on top of the vendored plugin's
+  // default settings.json. Vendor stays untouched; overrides are applied
+  // after every copy so they survive reconcile/restart.
+  //
+  // `retainEveryNTurns: 1` (override from vendor default `10`): the
+  // vendor's default throttles auto-retention to every 10 turns. For
+  // switchroom's "always-on specialist exec-assistant" vision, that
+  // throttle is wrong — users expect "please remember this" or even a
+  // single fact-sharing turn to survive a restart. The jtbd-memory-
+  // survives-restart UAT exposed the gap (2026-05-20): a 2-turn
+  // session NEVER hit the retention threshold, so the token was lost
+  // on restart. Setting retainEveryNTurns=1 makes every Stop hook
+  // trigger retention. Cost: more frequent hindsight API calls
+  // (cheap — async POST to a local container). Memory is the moat
+  // (reference/remember-across-sessions.md); paying for it on every
+  // turn is correct.
+  applyHindsightSettingsOverrides(destPath);
+
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
   // The plugin's hooks expect HINDSIGHT_API_URL (the REST base), not the
   // /mcp/ MCP endpoint URL — strip the suffix.
@@ -1512,6 +1530,40 @@ export function installHindsightPlugin(
   const apiBaseUrl = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
 
   return { pluginDir: destPath, apiBaseUrl, bankId };
+}
+
+/**
+ * Merge switchroom-specific overrides into the vendored hindsight
+ * plugin's `settings.json`. Idempotent — runs after every plugin
+ * copy on every scaffold/reconcile/restart.
+ *
+ * Currently overrides:
+ *   - `retainEveryNTurns`: 10 → 1 (capture every turn, not every 10th)
+ *
+ * Future overrides go here, NOT in the vendor file. The vendor is
+ * third-party code and must remain untouched for clean upstream
+ * updates. This function is the single point of switchroom-specific
+ * memory tuning.
+ */
+function applyHindsightSettingsOverrides(pluginDestPath: string): void {
+  const settingsPath = join(pluginDestPath, "settings.json");
+  if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
+  let raw: string;
+  try {
+    raw = readFileSync(settingsPath, "utf-8");
+  } catch {
+    return;
+  }
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw);
+  } catch {
+    return; // vendor's settings.json malformed; don't make it worse
+  }
+  // Override: every turn retains (no throttle). See the rationale in
+  // installHindsightPlugin() above.
+  settings.retainEveryNTurns = 1;
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 
 /**
