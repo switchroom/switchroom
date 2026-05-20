@@ -48,6 +48,30 @@ const DEFAULT_DRAFT_THROTTLE_MS = 300
 const DEFAULT_MESSAGE_THROTTLE_MS = 1000
 const MIN_THROTTLE_MS = 250
 
+// PR C — sendMessageDraft 30-second ephemeral persist-chain.
+//
+// Telegram's sendMessageDraft preview expires after 30 seconds. Long
+// LLM turns blow past that, leaving the user staring at a stale draft.
+// To stay live for arbitrary-length turns: at ~25s of accumulated
+// draft streaming (or when the unpersisted chunk approaches 4000 chars
+// — the per-message length cap with safety margin), fire a real
+// sendMessage with the current chunk. This persists what the user has
+// seen so far as a real message (with push notification). Then we
+// allocate a fresh draft_id and continue streaming the next chunk
+// into a new ephemeral preview. The model still sees a single
+// continuous turn; the user sees a CHAIN of persisted messages, each
+// up to ~25s / ~4000 chars, separated by live previews.
+//
+// At done=true / finalize(), the LAST unpersisted chunk is fired via
+// sendMessage so the final state of the response is durable.
+//
+// These triggers fire on top of the normal throttle loop — i.e., the
+// persist boundary is checked just before each draft fire, not on a
+// separate timer. This keeps the loop simple and avoids fighting with
+// the in-flight promise.
+const PERSIST_INTERVAL_MS = 25_000
+const PERSIST_SAFETY_CHAR_LIMIT = 4000
+
 /**
  * Send the first message in a stream. Receives the rendered text plus a
  * thread_id (forum topic) and returns the new Telegram message_id.
@@ -121,6 +145,17 @@ export interface DraftStreamConfig {
    * so the draft can be cleared on finalize.
    */
   chatId?: string
+  /**
+   * PR C — persist-chain interval override. Default 25_000 ms. Lower
+   * for tests; production should leave default.
+   */
+  persistIntervalMs?: number
+  /**
+   * PR C — persist-chain size threshold override (chars). Default 4000.
+   * Lower for tests so the size-trigger can fire on small text without
+   * colliding with the 4096-char maxChars hard-stop.
+   */
+  persistSizeLimit?: number
   /** Optional logger for debugging. Receives one string per event. */
   log?: (msg: string) => void
   /** Optional warning logger. Used for transport fallback notices. */
@@ -179,9 +214,10 @@ export function createDraftStream(
   edit: StreamEditFn,
   config: DraftStreamConfig = {},
 ): DraftStreamHandle {
-  // Transport-aware default — the actual transport resolves a few lines
-  // below, so we replicate the prefersDraft check here. An explicit
-  // `config.throttleMs` (from the operator yaml or the caller) wins.
+  // PR B: transport-aware default — the actual transport resolves a few
+  // lines below, so we replicate the prefersDraft check here. An
+  // explicit `config.throttleMs` (from the operator yaml or the
+  // caller) wins.
   const _willPreferDraft =
     (config.previewTransport ?? 'auto') === 'draft' ||
     ((config.previewTransport ?? 'auto') === 'auto' && config.isPrivateChat === true)
@@ -189,6 +225,10 @@ export function createDraftStream(
     ? DEFAULT_DRAFT_THROTTLE_MS
     : DEFAULT_MESSAGE_THROTTLE_MS
   const throttleMs = Math.max(MIN_THROTTLE_MS, config.throttleMs ?? _defaultForTransport)
+  // PR C: persist-chain config overrides (testability — production
+  // leaves defaults at 25 s / 4000 chars).
+  const persistIntervalMs = config.persistIntervalMs ?? PERSIST_INTERVAL_MS
+  const persistSizeLimit = config.persistSizeLimit ?? PERSIST_SAFETY_CHAR_LIMIT
   const maxChars = config.maxChars ?? TELEGRAM_MAX_CHARS
   const idleMs = Math.max(0, config.idleMs ?? 0)
   const log = config.log
@@ -269,6 +309,18 @@ export function createDraftStream(
   let editFires = 0
   let sendFires = 0
   let fallbackFires = 0
+  // PR C — persist-chain state. `persistedTextLen` is the offset into
+  // the full cumulative model text that has already been committed to
+  // a real Telegram message via `sendMessage`. Subsequent draft fires
+  // send only the slice from `persistedTextLen` onward (the
+  // unpersisted tail). `currentChunkStartedAt` is when the CURRENT
+  // chunk (since last persist boundary) started streaming — drives
+  // the 25-second persist trigger. `persistChainFires` counts how
+  // many chunks have been persisted in this stream (always 0 for
+  // message-transport streams, only ticks for draft-transport).
+  let persistedTextLen = 0
+  let currentChunkStartedAt: number | null = null
+  let persistChainFires = 0
   let scheduledTimer: ReturnType<typeof setTimeout> | null = null
   let final = false
   let stopped = false
@@ -287,11 +339,24 @@ export function createDraftStream(
 
   async function sendViaDraft(textToSend: string): Promise<boolean> {
     if (!draftApi || draftId == null) return false
+    // PR C: draft sees only the unpersisted tail. If the model produced
+    // text BEYOND what's already been committed to a real sendMessage,
+    // that tail is what the user sees in the live preview. When the
+    // tail is empty (model hasn't added anything new since persist),
+    // there's nothing to draft — the draft was cleared at persist time.
+    const draftText = textToSend.slice(persistedTextLen)
+    if (draftText.length === 0) {
+      // Treat as success — no work to do, dedup will skip on next call.
+      return true
+    }
     try {
-      await draftApi(chatId, draftId, textToSend)
+      await draftApi(chatId, draftId, draftText)
       if (firstFireAtMs == null) firstFireAtMs = Date.now() - streamStartedAt
+      // Mark the start of THIS chunk's persist window on first fire of
+      // each chunk (after the previous persist boundary).
+      if (currentChunkStartedAt == null) currentChunkStartedAt = Date.now()
       draftFires++
-      log?.(`stream → draft (id: ${draftId}, ${textToSend.length} chars)`)
+      log?.(`stream → draft (id: ${draftId}, ${draftText.length} chars tail)`)
       return true
     } catch (err) {
       if (shouldFallbackFromDraftTransport(err)) {
@@ -324,8 +389,58 @@ export function createDraftStream(
       return
     }
 
-    if (textToSend.length > maxChars) {
-      log?.(`stream stopped: text exceeds ${maxChars} chars`)
+    // PR C — persist-chain trigger check. Runs BEFORE the maxChars
+    // hard-stop so we can chunk large outputs across multiple
+    // sendMessage calls instead of dropping them. Only the draft
+    // path needs this; message transport edits the same id forever
+    // and the 4096-char cap is a real terminal stop there.
+    //
+    // The trigger fires when EITHER the current chunk has been
+    // streaming for ≥25s OR the unpersisted tail is approaching the
+    // 4000-char message length cap. On fire: send the chunk via
+    // real sendMessage, bump persistedTextLen, allocate a fresh
+    // draftId, reset the chunk window. The subsequent normal-flow
+    // draft fire below sends only the (now-empty or post-persist) tail.
+    if (usesDraftTransport && currentChunkStartedAt != null) {
+      const elapsed = Date.now() - currentChunkStartedAt
+      const tailLen = textToSend.length - persistedTextLen
+      const sizeApproaching = tailLen >= persistSizeLimit
+      const timeElapsed = elapsed >= persistIntervalMs
+      if ((timeElapsed || sizeApproaching) && tailLen > 0) {
+        const chunk = textToSend.slice(persistedTextLen)
+        try {
+          const newMsgId = await send(chunk)
+          messageId = newMsgId
+          persistedTextLen = textToSend.length
+          draftId = allocateDraftId()
+          currentChunkStartedAt = null
+          persistChainFires++
+          if (process.env.SWITCHROOM_STREAM_TRACES !== '0') {
+            process.stderr.write(
+              `gw-trace stream-persist chunk_chars=${chunk.length} ` +
+                `elapsed=${elapsed} reason=${timeElapsed ? 'time' : 'size'} ` +
+                `newMsgId=${newMsgId} newDraftId=${draftId} ` +
+                `chatId=${chatId || '-'}\n`,
+            )
+          }
+          log?.(`stream → persisted chunk (id: ${newMsgId}, ${chunk.length} chars, reason=${timeElapsed ? 'time' : 'size'})`)
+        } catch (err) {
+          warn?.(
+            `draft-stream: persist sendMessage failed — chunk stays in draft (${err instanceof Error ? err.message : String(err)})`,
+          )
+        }
+      }
+    }
+
+    // Hard-stop check — applies to the sendable size (full text for
+    // message transport, post-persist tail for draft transport). After
+    // a successful persist, the tail resets so this won't fire even
+    // for huge cumulative texts in the draft path.
+    const sendableLen = usesDraftTransport
+      ? textToSend.length - persistedTextLen
+      : textToSend.length
+    if (sendableLen > maxChars) {
+      log?.(`stream stopped: ${usesDraftTransport ? 'tail' : 'text'} exceeds ${maxChars} chars`)
       stopped = true
       notifyWaiters()
       return
@@ -470,14 +585,21 @@ export function createDraftStream(
         await flush()
       }
 
-      // Draft transport: materialize as a real sendMessage for push notification,
-      // then clear the draft best-effort.
+      // Draft transport: materialize as a real sendMessage for push
+      // notification, then clear the draft best-effort.
+      //
+      // PR C: with the persist-chain in play, earlier chunks may
+      // already be persisted as their own sendMessages. We materialize
+      // ONLY the unpersisted tail here — otherwise the user gets a
+      // duplicate of the prior chunks at turn end.
       if (usesDraftTransport && draftApi != null) {
-        const textToMaterialize = lastSentText
-        if (textToMaterialize) {
+        const fullText = lastSentText ?? ''
+        const textToMaterialize = fullText.slice(persistedTextLen)
+        if (textToMaterialize.length > 0) {
           try {
             messageId = await send(textToMaterialize)
-            log?.(`stream → materialized (id: ${messageId}, ${textToMaterialize.length} chars)`)
+            persistedTextLen = fullText.length
+            log?.(`stream → materialized tail (id: ${messageId}, ${textToMaterialize.length} chars)`)
           } catch (err) {
             warn?.(`draft-stream: materialize sendMessage failed: ${err instanceof Error ? err.message : String(err)}`)
           }
@@ -488,6 +610,15 @@ export function createDraftStream(
             } catch {
               // Best-effort — ignore failures
             }
+          }
+        } else if (draftId != null) {
+          // Whole text already persisted via the chain — just clear the
+          // current draft so the input area isn't left with stale
+          // preview content.
+          try {
+            await draftApi(chatId, draftId, '')
+          } catch {
+            // Best-effort — ignore
           }
         }
       }
@@ -503,7 +634,7 @@ export function createDraftStream(
         process.stderr.write(
           `gw-trace stream-end transport=${usesDraftTransport ? 'draft' : 'message'} ` +
             `drafts=${draftFires} sends=${sendFires} edits=${editFires} ` +
-            `fallbacks=${fallbackFires} ` +
+            `fallbacks=${fallbackFires} persists=${persistChainFires} ` +
             `firstFireMs=${firstFireAtMs ?? -1} durationMs=${durationMs} ` +
             `chars=${(lastSentText ?? '').length} ` +
             `chatId=${chatId || '-'}\n`,
