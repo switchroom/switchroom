@@ -962,11 +962,11 @@ describe('createDraftStream — draft transport', () => {
       // First update: 100 chars, below threshold. Drafts.
       void stream.update('a'.repeat(100))
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       // Second update: 250 chars total, tail exceeds 200 → size persist.
       void stream.update('a'.repeat(250))
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       await microtaskFlush(20)
       await stream.finalize()
 
@@ -990,10 +990,10 @@ describe('createDraftStream — draft transport', () => {
       void stream.update('first chunk text')
       await microtaskFlush(20)
       // Advance past the time trigger.
-      await vi.advanceTimersByTimeAsync(250)
+      vi.advanceTimersByTime(250); await microtaskFlush(20)
       void stream.update('first chunk text continues')
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       await microtaskFlush(20)
       await stream.finalize()
 
@@ -1015,10 +1015,10 @@ describe('createDraftStream — draft transport', () => {
 
       void stream.update('x'.repeat(50))
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       void stream.update('x'.repeat(150))
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       await microtaskFlush(20)
       await stream.finalize()
 
@@ -1040,10 +1040,10 @@ describe('createDraftStream — draft transport', () => {
 
       void stream.update('a'.repeat(100))
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       void stream.update('a'.repeat(250)) // size trigger fires
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       await microtaskFlush(20)
       const persistsBefore = m.sendCalls.length
       expect(persistsBefore).toBeGreaterThan(0)
@@ -1052,7 +1052,7 @@ describe('createDraftStream — draft transport', () => {
       // be much smaller than 250 — only post-persist content.
       void stream.update('a'.repeat(250) + 'tail')
       await microtaskFlush(20)
-      await vi.advanceTimersByTimeAsync(300)
+      vi.advanceTimersByTime(300); await microtaskFlush(20)
       await stream.finalize()
 
       const lastSend = m.sendCalls[m.sendCalls.length - 1]
