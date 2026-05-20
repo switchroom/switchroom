@@ -1,5 +1,40 @@
 # Changelog
 
+## unreleased — feat(draft-stream): 429 + non-true fallback robustness
+
+PR D of the sendMessageDraft alignment sequence. Closes the durability
+hole when Telegram rate-limits `sendMessageDraft` or returns a soft
+failure.
+
+Two new failure paths handled in `draft-stream.ts:sendViaDraft`:
+
+1. **429 from `sendMessageDraft`**. Extract `retry_after` via the new
+   `extractDraft429RetryAfterSecs()` helper (shared with
+   `issues-card.ts`), fall back to message transport for the rest of
+   this stream, AND push `lastSentAt` forward by `retry_after * 1000`
+   so the fallback's next send doesn't immediately re-429 (Telegram's
+   per-chat rate cap is shared across methods). The 429 detection is
+   gated on `isDraft429()` — duck-typed on grammY's `GrammyError`
+   shape (`error_code` + `parameters.retry_after` + `method` /
+   `description` carrying `sendMessageDraft`).
+
+2. **Non-true return from `sendMessageDraft`**. Per docs the method
+   returns `true` on success. An explicit `false` or `null` return
+   means the call was accepted but the draft didn't land — fall back
+   to message transport. `undefined` is treated as success because
+   grammY's typed wrapper sometimes strips the bool; we must not
+   false-positive on that.
+
+Both fallbacks bump `fallbackFires` so the `gw-trace stream-end`
+counter reflects the path the stream took.
+
+13 new tests: 9 unit tests for the two new helpers
+(`extractDraft429RetryAfterSecs`, `isDraft429`) and 4 end-to-end
+draft-stream tests (429 → fallback no further drafts;
+`false` return → fallback; `undefined` return → continued drafts;
+429 → fallbacks counter visible in stream-end). 81/81 vitest +
+52/52 bun-test.
+
 ## unreleased — feat(draft-stream): 30s persist-then-continue chain
 
 PR C of the sendMessageDraft alignment sequence. Telegram's

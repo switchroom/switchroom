@@ -35,6 +35,56 @@ export function shouldFallbackFromDraftTransport(err: unknown): boolean {
 }
 
 /**
+ * PR D — extract the `retry_after` seconds from a grammY 429 error.
+ * Returns null when the error isn't a 429 (or has no retry_after).
+ *
+ * Shared with `issues-card.ts:extractRetryAfterSecs`. Duck-typed on the
+ * documented grammY `GrammyError` shape to keep this module
+ * test-friendly without importing `GrammyError` directly.
+ */
+export function extractDraft429RetryAfterSecs(err: unknown): number | null {
+  if (err == null || typeof err !== 'object') return null
+  const e = err as { error_code?: unknown; parameters?: { retry_after?: unknown } }
+  if (e.error_code !== 429) return null
+  const ra = e.parameters?.retry_after
+  if (typeof ra === 'number' && Number.isFinite(ra) && ra > 0) return ra
+  return null
+}
+
+/**
+ * PR D — was this a 429 from `sendMessageDraft` specifically? Used by
+ * draft-stream to differentiate "draft is rate-limited" (transient,
+ * just back off this stream) from a non-429 send error (handled
+ * separately by `shouldFallbackFromDraftTransport`).
+ *
+ * Both cases trigger fallback to message transport for the rest of
+ * the stream, but the 429 case ALSO bumps the throttle window to
+ * honor Telegram's `retry_after` — so the message-transport fallback
+ * doesn't immediately fire a fresh send before Telegram's cooldown
+ * elapses and re-429s.
+ */
+export function isDraft429(err: unknown): boolean {
+  if (extractDraft429RetryAfterSecs(err) == null) return false
+  // grammY GrammyError carries the method name in its `method` field.
+  // Best-effort: match either the structured method or the error text.
+  if (typeof err === 'object' && err != null && 'method' in err) {
+    const m = (err as { method?: unknown }).method
+    if (typeof m === 'string' && /sendMessageDraft/i.test(m)) return true
+  }
+  const text =
+    typeof err === 'string'
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof err === 'object' && err != null && 'description' in err
+          ? typeof (err as { description: unknown }).description === 'string'
+            ? (err as { description: string }).description
+            : ''
+          : ''
+  return /sendMessageDraft/i.test(text)
+}
+
+/**
  * Symbol-keyed shared counter for draft-id allocation across concurrent
  * streams (mirrors openclaw's getDraftStreamState). Using Symbol.for ensures
  * the same counter is shared even if this module is loaded multiple times

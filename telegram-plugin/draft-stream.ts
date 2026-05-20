@@ -32,6 +32,8 @@
 import {
   shouldFallbackFromDraftTransport,
   allocateDraftId,
+  isDraft429,
+  extractDraft429RetryAfterSecs,
 } from './draft-transport.js'
 
 const TELEGRAM_MAX_CHARS = 4096
@@ -350,7 +352,27 @@ export function createDraftStream(
       return true
     }
     try {
-      await draftApi(chatId, draftId, draftText)
+      const result = await draftApi(chatId, draftId, draftText)
+      // PR D: sendMessageDraft is documented to return `true` on success.
+      // A non-true (or missing) return is a soft failure — Telegram
+      // accepted the call but the draft didn't land. Fall back to
+      // message transport for the rest of this stream so the user still
+      // sees the content. This catches API surface changes + edge cases
+      // not covered by `shouldFallbackFromDraftTransport`'s regex.
+      if (result !== true && result !== undefined) {
+        // Some grammY wrappers strip the bool and return undefined on
+        // success; treat ONLY explicitly-falsy returns as failure to
+        // avoid false-positive fallback. true / undefined → success.
+        if (result === false || result === null) {
+          warn?.(
+            `draft-stream: sendMessageDraft returned non-true (${JSON.stringify(result)}) — falling back to message transport`,
+          )
+          fallbackFires++
+          usesDraftTransport = false
+          draftId = undefined
+          return false
+        }
+      }
       if (firstFireAtMs == null) firstFireAtMs = Date.now() - streamStartedAt
       // Mark the start of THIS chunk's persist window on first fire of
       // each chunk (after the previous persist boundary).
@@ -359,6 +381,30 @@ export function createDraftStream(
       log?.(`stream → draft (id: ${draftId}, ${draftText.length} chars tail)`)
       return true
     } catch (err) {
+      // PR D: dedicated 429 path. Telegram rate-limits sendMessageDraft
+      // independently from sendMessage/editMessageText. On 429:
+      //   - extract `retry_after`
+      //   - fall back to message transport for the rest of this stream
+      //   - bump `lastSentAt` so the throttle window absorbs the
+      //     retry_after delay — prevents the message-transport
+      //     fallback from immediately firing and getting 429'd too
+      //     (Telegram's per-chat rate cap is shared across methods).
+      const retryAfterSecs = extractDraft429RetryAfterSecs(err)
+      if (retryAfterSecs != null && isDraft429(err)) {
+        warn?.(
+          `draft-stream: sendMessageDraft 429 (retry_after=${retryAfterSecs}s) — falling back to message transport + backoff`,
+        )
+        fallbackFires++
+        usesDraftTransport = false
+        draftId = undefined
+        // Push lastSentAt forward so the NEXT flush waits at least
+        // `retry_after` seconds before the message-transport send.
+        // The throttle math at update() / schedule() compares
+        // `Date.now() - lastSentAt >= throttleMs`, so by moving
+        // lastSentAt forward we delay the next fire.
+        lastSentAt = Date.now() + retryAfterSecs * 1000 - throttleMs
+        return false
+      }
       if (shouldFallbackFromDraftTransport(err)) {
         const msg = err instanceof Error ? err.message : String(err)
         warn?.(`draft-stream: sendMessageDraft rejected — falling back to sendMessage/editMessageText (${msg})`)
