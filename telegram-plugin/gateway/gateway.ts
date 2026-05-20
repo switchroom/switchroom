@@ -254,6 +254,13 @@ import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import { chatKey, chatKeyWithSuffix } from './chat-key.js'
+// Phase 2b PR 2 — shadow mode. Each event-site below calls shadowEmit()
+// to record what the InboundDeliveryStateMachine PREDICTS the gateway
+// should do. Behavior unchanged in this PR — the imperative code below
+// still runs everything. PR 3 will cut over to executing the machine's
+// effects.
+import { shadowEmit } from './inbound-delivery-machine-shadow.js'
+import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -1265,6 +1272,13 @@ function streamKey(chatId: string, threadId?: number | null): string {
 }
 
 function purgeReactionTracking(key: string): void {
+  // Phase 2b shadow: turn end. The key was registered via setTurnStarted
+  // when the inbound arrived; purge is the canonical turn-end signal.
+  // outboundEmitted is approximated `true` here — refined in PR 3 to read
+  // from the per-turn `replyCalled` flag on `currentTurn`. Conservative
+  // shadow approximation is safe (only affects machine's lastOutboundAt
+  // tracking; can't drive incorrect behavior in shadow mode).
+  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted: true })
   const msgInfo = activeReactionMsgIds.get(key)
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
@@ -3182,6 +3196,8 @@ const ipcServer: IpcServer = createIpcServer({
 
   onClientRegistered(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
+    // Phase 2b shadow: bridge up.
+    shadowEmit({ kind: 'bridgeUp', at: Date.now() })
     client.send({ type: 'status', status: 'agent_connected' })
 
     // #1150: drain any synthetic inbounds queued for this agent while
@@ -3307,6 +3323,8 @@ const ipcServer: IpcServer = createIpcServer({
 
   onClientDisconnected(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
+    // Phase 2b shadow: bridge down.
+    shadowEmit({ kind: 'bridgeDown', at: Date.now() })
 
     // Scope the flush to clients that actually registered as an agent.
     // Anonymous one-shot connections (e.g. recall.py's legacy
@@ -6636,6 +6654,23 @@ async function handleInbound(
   // ambient-signal alerting (the dominant variance is reasoning time, not
   // network RTT) but not a user-perceived end-to-end measurement.
   const inboundReceivedAt = Date.now()
+
+  // Phase 2b shadow: inbound arrival. Emit BEFORE the snapshot/gate
+  // logic so the machine sees the event at the same point in time the
+  // imperative code would. The machine internally handles fresh-turn
+  // vs mid-turn — its decision will be visible in the gw-trace shadow
+  // line emitted to stderr.
+  const _shadowKey = statusKey(ctx.chat?.id != null ? String(ctx.chat.id) : '0', ctx.message?.message_thread_id) as _ChatKey
+  shadowEmit({
+    kind: 'inbound',
+    key: _shadowKey,
+    msg: {
+      msgId: ctx.message?.message_id ?? 0,
+      isSteering: false, // refined in PR 3 — for now shadow conservatively classifies as non-steering
+      payload: null,
+    },
+    at: Date.now(),
+  })
 
   // #1556 self-blocking fix (v0.12.22): snapshot the live turn-state
   // BEFORE the fresh-turn branch (line ~7357) sets activeTurnStartedAt
