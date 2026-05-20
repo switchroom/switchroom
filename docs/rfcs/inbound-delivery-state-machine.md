@@ -177,6 +177,96 @@ Once PR 2 has baked 48+ hours with no regressions, remove the now-redundant code
 
 Net: a few hundred lines removed, plus the bugs they were patching.
 
+## Updated cutover plan (post PR 2/3 — split into 3a/3b/3c)
+
+The original "PR 3 = cleanup" framing turned out to be too coarse. PR
+3 (#1591) shipped the dispatcher and bit-identical effect execution
+for the **happy paths**, but the legacy `purgeReactionTracking` callsites
+were left in place — the shadow `turnEnd` event still fires from inside
+that function, and several callsites can't see the authoritative
+`turn` object (so `outboundEmitted` falls back to module-scope
+`currentTurn` which may already be nulled).
+
+The cleanup PR is therefore being split:
+
+- **PR 3a (#1591) — DONE.** Dispatcher + happy-path effect exec.
+  Shadow continues for turn-lifecycle events.
+- **PR 3b — turnEnd cutover.** This section.
+- **PR 3c — inbound cutover.** The biggest. `handleInbound` constructs
+  the inbound Event and dispatches through the machine; the machine's
+  `deliverToBridge` / `bufferInbound` effects replace the imperative
+  in-handler routing.
+- **PR 4 — delete the imperative kill-switch fallback.** Once 3b and
+  3c have baked, remove the keep-the-old-path-as-a-fallback branches
+  and the redundant primitives listed under PR 3 above.
+
+### PR 3b — turnEnd cutover (current focus)
+
+**Step 1 — refine `outboundEmitted` (prerequisite).** Today
+`purgeReactionTracking(key, endingTurn?)` reads `outboundEmitted` from
+`endingTurn.replyCalled` if the caller threaded the turn, else falls
+back to `currentTurn?.replyCalled`. The canonical, threaded path is
+`endCurrentTurnAtomic(turn)` (gateway.ts:1381) — it nulls
+`currentTurn`, then passes `turn` explicitly. Legacy bare-purge
+callsites can produce **wrong** `outboundEmitted` data in the shadow
+trace, which makes the shadow→live cutover (step 2) unsafe.
+
+Per-callsite audit (gateway.ts on `feat/state-machine-turnend-cutover`
+worktree, baseline commit a6e48b88):
+
+| Site | Path                          | `turn` in scope? | Recommended migration                                  |
+|------|-------------------------------|------------------|--------------------------------------------------------|
+| 1601 | `endStatusReaction`           | No               | **Misuse — investigate.** This is called mid-turn from the reply tool (line 4345); it should NOT emit `turnEnd`. Either remove the purge here (`endStatusReaction` is a reaction-state transition, not a turn-end signal) or split `purgeReactionTracking` into reaction-cleanup vs turn-end. The current code emits a premature `turnEnd` shadow event on every reply-tool success. **Highest-priority finding.** |
+| 3096 | silence-poke fallback         | `fbKey` only     | No turn object — the silence-poke fired AFTER the original turn was abandoned. Best signal is `outboundEmitted=false` explicitly. Refactor: add an `endingTurn: null` parameter or a `reason: 'silence-fallback'` discriminant so shadow data is unambiguous. |
+| 5831 | context-exhaust warning       | Yes (line 5683)  | Route through `endCurrentTurnAtomic(turn)`. This path is mid-turn-error; the canonical pattern handles the race guard + module-state null. Verify `currentTurn === turn` still holds at the call point. |
+| 5989 | silent-marker turn finalize   | Yes (line 5862)  | Same — route through `endCurrentTurnAtomic(turn)`. The silent-marker path is a legitimate turn-end, just one that didn't emit visible outbound. |
+| 6130 | backstop dedup (post-finalize)| Yes (line 5884)  | Route through `endCurrentTurnAtomic(turn)`. The reply already fired and was deduped — `outboundEmitted=true` is the truthful signal, which `endCurrentTurnAtomic` will read from `turn.replyCalled`. |
+| 6258 | turn-flush IIFE finally       | Closure-captured | The IIFE captures `turn` from the enclosing scope. Hoist `endCurrentTurnAtomic(turn)` out of the `finally` so it runs once at the end of the IIFE regardless of send success/failure (the current pattern is right, just needs the canonical primitive). |
+| 6265 | turn-flush success            | Yes (line 5884)  | Route through `endCurrentTurnAtomic(turn)`. Adjacent code at 6268 already reads `turn.startedAt`, so scope is unambiguous. This is the dominant happy-path turn-end. |
+
+**Risk profile by site:**
+- 1601 is a bug, not just a refinement. Fixing it stops a class of
+  bogus shadow events. Highest value.
+- 5831 / 5989 / 6130 / 6258 / 6265 are bit-identical refactors if
+  `endCurrentTurnAtomic`'s `currentTurn === turn` guard holds — which
+  it should, since `purgeReactionTracking` is already doing the
+  end-of-turn work and the only difference is the null + race guard.
+  Add `expect(currentTurn === turn || currentTurn === null)` assertion
+  in dev mode for one bake cycle to verify the invariant before
+  trusting it.
+- 3096 is the trickiest — needs an explicit "no outbound" signal
+  because there's no surviving turn object to read.
+
+**Step 2 — cutover.** Once step 1 lands and the shadow trace shows
+correct `outboundEmitted` for ≥48 hours of test-harness + fleet
+traffic: flip `shadowEmit({ kind: 'turnEnd', ...})` to
+`dispatchEvent({ kind: 'turnEnd', ...})` inside the canonical
+`endCurrentTurnAtomic` function (gateway.ts:1389), and remove the
+imperative cleanups from `purgeReactionTracking` (the effects array
+from the machine now drives them). The other turnEnd-emit callsites
+disappear by virtue of step 1's routing through
+`endCurrentTurnAtomic`.
+
+**UAT gates before step 2:**
+- `jtbd-fast-trivial-dm` (TTFO baseline)
+- `jtbd-always-on-after-restart-dm` (post-restart turn semantics)
+- `jtbd-memory-survives-restart-dm` (turn lifecycle around restart)
+- A new scenario: fire 5 reply-tool calls in a single turn and assert
+  exactly ONE `turnEnd` shadow/machine event (catches the line 1601
+  bug class).
+
+**Bake:** 48 hours on test-harness, then staggered fleet rollout
+behind a `SWITCHROOM_INBOUND_MACHINE_TURNEND=live` env knob defaulting
+to `shadow`. Knob removed in PR 4.
+
+### PR 3c — inbound cutover (preview)
+
+`handleInbound`'s imperative `if (currentTurn != null) buffer else
+deliver` becomes `dispatch({ kind: 'inboundArrival', ... })` whose
+effects array drives the same outcome. Same shadow→live pattern,
+same kill-switch env knob. Out of scope for this section; PR 3b
+prerequisites must land first.
+
 ## What this RFC does NOT cover
 
 - **The boot-time cost** of cold-starting claude + the gateway. The state machine doesn't help; it's pure model-side latency. Tracked separately under "cold-start optimization" (Sprint 4 of the vision-aligned roadmap — defer handoff, async boot card, pre-warm session).
