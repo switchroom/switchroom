@@ -749,4 +749,91 @@ describe('createDraftStream — draft transport', () => {
     expect(callCount).toBeGreaterThan(1) // draft update + failed clear attempt
   })
 
+  // ─── PR A observability: gw-trace stream-start / stream-end ───────────
+  describe('gw-trace stream-start / stream-end', () => {
+    let captured: string[] = []
+    let originalWrite: typeof process.stderr.write
+
+    beforeEach(() => {
+      captured = []
+      originalWrite = process.stderr.write
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        captured.push(text)
+        return true
+      }) as typeof process.stderr.write
+    })
+    afterEach(() => {
+      process.stderr.write = originalWrite
+    })
+
+    it('emits stream-start with resolved transport=draft on dm + draftApi', async () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 1000,
+        previewTransport: 'draft',
+        sendMessageDraft: draftApi,
+        chatId: 'chat-X',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain('transport=draft')
+      expect(trace).toContain('reason=draft')
+      expect(trace).toContain('api=available')
+      expect(trace).toContain('chatId=chat-X')
+      await stream.finalize()
+    })
+
+    it('emits stream-start with reason=auto-non-dm when isPrivateChat is false', async () => {
+      const m = makeMock()
+      const draftApi = vi.fn(async () => ({ ok: true }))
+      createDraftStream(m.send, m.edit, {
+        throttleMs: 1000,
+        previewTransport: 'auto',
+        isPrivateChat: false,
+        sendMessageDraft: draftApi,
+        chatId: 'chat-Y',
+      })
+      const trace = captured.find((c) => c.includes('gw-trace stream-start'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain('transport=message')
+      expect(trace).toContain('reason=auto-non-dm')
+    })
+
+    it('emits stream-end with fire counts on finalize', async () => {
+      const m = makeMock()
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'message',
+      })
+      void stream.update('first')
+      await microtaskFlush()
+      await stream.finalize()
+      const trace = captured.find((c) => c.includes('gw-trace stream-end'))
+      expect(trace).toBeDefined()
+      expect(trace).toContain('transport=message')
+      expect(trace).toMatch(/sends=[1-9]/)
+      expect(trace).toContain('firstFireMs=')
+      expect(trace).toContain('durationMs=')
+    })
+
+    it('SWITCHROOM_STREAM_TRACES=0 suppresses both traces', async () => {
+      const prev = process.env.SWITCHROOM_STREAM_TRACES
+      process.env.SWITCHROOM_STREAM_TRACES = '0'
+      try {
+        const m = makeMock()
+        const stream = createDraftStream(m.send, m.edit, {
+          throttleMs: 50,
+          previewTransport: 'message',
+        })
+        await stream.finalize()
+        expect(captured.find((c) => c.includes('gw-trace stream-'))).toBeUndefined()
+      } finally {
+        if (prev === undefined) delete process.env.SWITCHROOM_STREAM_TRACES
+        else process.env.SWITCHROOM_STREAM_TRACES = prev
+      }
+    })
+  })
+
 })

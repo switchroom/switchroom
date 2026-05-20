@@ -1,5 +1,27 @@
 # Changelog
 
+## unreleased — feat(draft-stream): gw-trace stream-start/stream-end observability
+
+PR A of the sendMessageDraft alignment sequence. Adds two always-on
+structured stderr traces from `telegram-plugin/draft-stream.ts`:
+
+- `gw-trace stream-start transport=<draft|message> reason=<…> req=<auto|draft|message> dm=<bool|undef> api=<available|absent> throttleMs=<n> [draftId=<n>] chatId=<…>` — emitted at stream creation, captures WHY the transport was chosen (draft API available + DM, draft requested but no API, explicit message, auto fell back to message because non-DM, etc.).
+- `gw-trace stream-end transport=<…> drafts=<n> sends=<n> edits=<n> fallbacks=<n> firstFireMs=<n> durationMs=<n> chars=<n> chatId=<…>` — emitted on `finalize()`, captures per-stream fire counts (so the aggregator can see "stream used 80% draft + 20% edit fallback" vs "all edits, draft never fired") + per-stream first-fire latency.
+
+Kill switch: `SWITCHROOM_STREAM_TRACES=0` (default ON).
+
+Gates the rest of the sendMessageDraft alignment PR sequence (B/C/D)
+which optimise throttle, handle the 30s expiry, and harden fallback —
+without these traces every claim of "draft is the primary path" would
+be unverifiable. Pairs with the existing per-method `tg-post` lines
+(which the supervisor log already captures) by adding the
+PER-STREAM resolution context the tg-post lines lack.
+
+4 new tests in `telegram-plugin/tests/draft-stream.test.ts` (37/37
+total) pin: stream-start with draft + DM, stream-start with auto +
+non-DM falls back to message, stream-end fire-count shape,
+kill-switch.
+
 ## v0.12.29 — feat(gateway): prefix-cache warmup (Phase 1, opt-in) + outboundEmitted refinement
 
 Per cold-start TTFO RFC (#1589) Option A. On every bridge-up after
