@@ -5828,7 +5828,10 @@ function handleSessionEvent(ev: SessionEvent): void {
         const ceKey = statusKey(chatId, threadId)
         const ctrl = activeStatusReactions.get(ceKey)
         if (ctrl) ctrl.setError()
-        purgeReactionTracking(ceKey)
+        // Duplicate-emit removed (#1603 audit, step 1): the canonical
+        // endCurrentTurnAtomic(turn) call at line ~5851 below already
+        // invokes purgeReactionTracking on the same ceKey. The bare
+        // call here was firing a second shadow `turnEnd` per traversal.
         // Surfaced during CC-5 investigation (`docs/status-ask-cause-classes.md`):
         // the context-exhaust bail path teardown was missing
         // `silencePoke.endTurn(key)`. Without it, the silence-poke state for
@@ -5986,7 +5989,10 @@ function handleSessionEvent(ev: SessionEvent): void {
         // Fall through to normal state cleanup (ctrl.setDone, purge, etc.)
         // but skip the regular closeProgressLane so we don't re-finalize.
         if (ctrl) ctrl.setDone()
-        purgeReactionTracking(statusKey(chatId, threadId))
+        // Duplicate-emit removed (#1603 audit, step 1): endCurrentTurnAtomic(turn)
+        // at line ~6049 below invokes purgeReactionTracking on the same key
+        // (statusKey(chatId, threadId)). The bare call here was firing a
+        // second shadow `turnEnd` per silent-marker traversal.
         // Match the normal turn_end path's telemetry so silent-marker turns
         // still appear in turn-duration graphs.
         {
