@@ -9,6 +9,8 @@ import {
   shouldFallbackFromDraftTransport,
   allocateDraftId,
   __resetDraftIdForTests,
+  extractDraft429RetryAfterSecs,
+  isDraft429,
 } from '../draft-transport.js'
 
 describe('DRAFT_METHOD_UNAVAILABLE_RE', () => {
@@ -137,5 +139,73 @@ describe('allocateDraftId', () => {
     expect(allocateDraftId()).toBe(2_147_483_647)
     // Next should wrap
     expect(allocateDraftId()).toBe(1)
+  })
+})
+
+// ─── PR D: 429 + non-True helpers ──────────────────────────────────────
+
+describe('extractDraft429RetryAfterSecs (PR D)', () => {
+  it('returns retry_after on a grammY 429', () => {
+    const err = { error_code: 429, parameters: { retry_after: 7 } }
+    expect(extractDraft429RetryAfterSecs(err)).toBe(7)
+  })
+
+  it('returns null on non-429 error_code', () => {
+    const err = { error_code: 400, parameters: { retry_after: 7 } }
+    expect(extractDraft429RetryAfterSecs(err)).toBeNull()
+  })
+
+  it('returns null when retry_after is missing', () => {
+    const err = { error_code: 429 }
+    expect(extractDraft429RetryAfterSecs(err)).toBeNull()
+  })
+
+  it('returns null when retry_after is non-positive', () => {
+    expect(extractDraft429RetryAfterSecs({ error_code: 429, parameters: { retry_after: 0 } })).toBeNull()
+    expect(extractDraft429RetryAfterSecs({ error_code: 429, parameters: { retry_after: -1 } })).toBeNull()
+  })
+
+  it('returns null on primitive errors', () => {
+    expect(extractDraft429RetryAfterSecs(null)).toBeNull()
+    expect(extractDraft429RetryAfterSecs(undefined)).toBeNull()
+    expect(extractDraft429RetryAfterSecs('boom')).toBeNull()
+    expect(extractDraft429RetryAfterSecs(42)).toBeNull()
+  })
+})
+
+describe('isDraft429 (PR D)', () => {
+  it('returns true when 429 carries method=sendMessageDraft', () => {
+    const err = {
+      error_code: 429,
+      parameters: { retry_after: 5 },
+      method: 'sendMessageDraft',
+    }
+    expect(isDraft429(err)).toBe(true)
+  })
+
+  it('returns true when 429 description mentions sendMessageDraft', () => {
+    const err = {
+      error_code: 429,
+      parameters: { retry_after: 5 },
+      description: 'sendMessageDraft: Too Many Requests: retry after 5',
+    }
+    expect(isDraft429(err)).toBe(true)
+  })
+
+  it('returns false on 429 from a different method', () => {
+    const err = {
+      error_code: 429,
+      parameters: { retry_after: 5 },
+      method: 'sendMessage',
+    }
+    expect(isDraft429(err)).toBe(false)
+  })
+
+  it('returns false on non-429 errors even when mentioning sendMessageDraft', () => {
+    const err = {
+      error_code: 400,
+      description: 'sendMessageDraft: bad request',
+    }
+    expect(isDraft429(err)).toBe(false)
   })
 })

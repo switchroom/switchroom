@@ -1075,4 +1075,131 @@ describe('createDraftStream — draft transport', () => {
     })
   })
 
+  // ─── PR D: 429 + non-true return fallback robustness ──────────────────
+  describe('429 + non-true fallback (PR D)', () => {
+    it('429 on draft falls back to message transport (no further draft fires)', async () => {
+      const m = makeMock()
+      let draftCalls = 0
+      const sendMessageDraft = vi.fn(async () => {
+        draftCalls++
+        const err = new Error('sendMessageDraft: Too Many Requests: retry after 3') as Error & {
+          error_code?: number
+          method?: string
+          parameters?: { retry_after?: number }
+        }
+        err.error_code = 429
+        err.method = 'sendMessageDraft'
+        err.parameters = { retry_after: 3 }
+        throw err
+      })
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-429',
+      })
+
+      void stream.update('hello')
+      await microtaskFlush(20)
+      expect(draftCalls).toBe(1)
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(3500)
+      await microtaskFlush(20)
+      await stream.finalize()
+      expect(m.sendCalls.length).toBeGreaterThanOrEqual(1)
+      // sendMessageDraft was NOT called again after the 429.
+      expect(draftCalls).toBe(1)
+    })
+
+    it('non-true (false) return from sendMessageDraft triggers fallback', async () => {
+      const m = makeMock()
+      let draftCalls = 0
+      const sendMessageDraft = vi.fn(async () => {
+        draftCalls++
+        return false
+      })
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-nonbool',
+      })
+      void stream.update('content')
+      await microtaskFlush(20)
+      expect(draftCalls).toBe(1)
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(100)
+      await microtaskFlush(20)
+      await stream.finalize()
+      // Subsequent updates / finalize do NOT re-invoke sendMessageDraft.
+      expect(draftCalls).toBe(1)
+      expect(m.sendCalls.length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('undefined return is treated as success (does not trigger fallback)', async () => {
+      // grammY's typed wrapper sometimes returns void/undefined on
+      // success. We must not false-positive fallback on those.
+      const m = makeMock()
+      let draftCalls = 0
+      const sendMessageDraft = vi.fn(async () => {
+        draftCalls++
+        return undefined
+      })
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-undef',
+      })
+      void stream.update('first')
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(100)
+      void stream.update('second')
+      await microtaskFlush(20)
+      vi.advanceTimersByTime(100)
+      await microtaskFlush(20)
+      await stream.finalize()
+      expect(draftCalls).toBeGreaterThan(1)
+    })
+
+    it('429 path increments fallbacks counter (visible in stream-end trace)', async () => {
+      const captured: string[] = []
+      const originalWrite = process.stderr.write
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        captured.push(text)
+        return true
+      }) as typeof process.stderr.write
+      try {
+        const m = makeMock()
+        const sendMessageDraft = vi.fn(async () => {
+          const err = new Error('429') as Error & {
+            error_code?: number
+            method?: string
+            parameters?: { retry_after?: number }
+          }
+          err.error_code = 429
+          err.method = 'sendMessageDraft'
+          err.parameters = { retry_after: 2 }
+          throw err
+        })
+        const stream = createDraftStream(m.send, m.edit, {
+          throttleMs: 50,
+          previewTransport: 'draft',
+          sendMessageDraft,
+          chatId: 'chat-429-trace',
+        })
+        void stream.update('text')
+        await microtaskFlush(20)
+        vi.advanceTimersByTime(3000)
+        await stream.finalize()
+        const endLine = captured.find((c) => c.includes('gw-trace stream-end'))
+        expect(endLine).toBeDefined()
+        expect(endLine).toMatch(/fallbacks=[1-9]/)
+      } finally {
+        process.stderr.write = originalWrite
+      }
+    })
+  })
+
 })
