@@ -1,5 +1,22 @@
 # Changelog
 
+## unreleased — fix(draft-stream): include finalize-materialize in `sends` counter
+
+The v0.13.0 canary surfaced this: draft-transport streams' `gw-trace
+stream-end` showed `sends=0` even though `sendMessage` had fired in
+`finalize()` to materialize the draft into a real persisted message
+(visible in `tg-post method=sendMessage` lines). Counter
+under-reporting only — no behaviour bug — but confusing for
+observability + downstream metrics.
+
+Fix: bump `sendFires++` at the materialize callsite in `finalize()`.
+The bare `send(textToMaterialize)` call there bypassed the
+`sendViaMessage` helper that owns the increment.
+
+1 new test pins the contract: a draft-transport stream that
+materializes a non-empty reply must report `sends>=1` in stream-end.
+53/53 in both vitest and bun-test.
+
 ## v0.13.0 — sendMessageDraft alignment (PRs A+B+C+D)
 
 Closes the sendMessageDraft alignment epic — four PRs aligning

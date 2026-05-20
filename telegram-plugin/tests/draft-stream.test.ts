@@ -1202,4 +1202,47 @@ describe('createDraftStream — draft transport', () => {
     })
   })
 
+  // ─── Follow-up: stream-end `sends` counter includes finalize-materialize ───
+  describe('finalize-materialize bumps sends counter', () => {
+    let captured: string[] = []
+    let originalWrite: typeof process.stderr.write
+
+    beforeEach(() => {
+      captured = []
+      originalWrite = process.stderr.write
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        captured.push(text)
+        return true
+      }) as typeof process.stderr.write
+    })
+    afterEach(() => {
+      process.stderr.write = originalWrite
+    })
+
+    it('draft-transport stream that materializes on finalize shows sends>=1', async () => {
+      // Pre-fix this showed sends=0 even though sendMessage fired
+      // inside finalize. Bug was visible in production v0.13.0 traces.
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-x',
+      })
+      void stream.update('Hello world')
+      await microtaskFlush()
+      vi.advanceTimersByTime(100)
+      await microtaskFlush()
+      await stream.finalize()
+      // Real send() called inside finalize.
+      expect(m.sendCalls.length).toBe(1)
+      const endLine = captured.find((c) => c.includes('gw-trace stream-end'))
+      expect(endLine).toBeDefined()
+      // Counter now reflects reality.
+      expect(endLine).toMatch(/sends=[1-9]/)
+    })
+  })
+
 })

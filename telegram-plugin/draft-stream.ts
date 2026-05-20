@@ -664,6 +664,13 @@ export function createDraftStream(
           try {
             messageId = await send(textToMaterialize)
             persistedTextLen = fullText.length
+            // PR follow-up: bump sendFires so the stream-end trace
+            // reflects the finalize-materialize sendMessage call. Pre-
+            // this fix, the counter under-reported by 1 for every
+            // draft-transport stream that produced a non-empty reply:
+            // gw-trace stream-end showed `drafts=N sends=0` even
+            // though sendMessage HAD fired (visible in tg-post lines).
+            sendFires++
             log?.(`stream → materialized tail (id: ${messageId}, ${textToMaterialize.length} chars)`)
           } catch (err) {
             warn?.(`draft-stream: materialize sendMessage failed: ${err instanceof Error ? err.message : String(err)}`)
