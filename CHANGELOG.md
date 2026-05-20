@@ -1,5 +1,35 @@
 # Changelog
 
+## unreleased — feat(gateway): prefix-cache warmup turn (Phase 1, opt-in)
+
+Per cold-start TTFO RFC (#1589) Option A. On every bridge-up after
+restart, the gateway synthesizes a `__WARMUP_PING__` inbound and
+sends it to the just-registered bridge. Claude processes the message
+— paying the cold prefix-cache cost on the synthetic turn — and is
+instructed in the message text to respond `NO_REPLY`. The existing
+silent-marker suppression at `gateway.ts:5906` swallows the response.
+By the user's NEXT real message, Anthropic's prefix cache is warm and
+TTFO drops ~4-8s on cold-start.
+
+**Opt-in via `SWITCHROOM_PREFIX_WARMUP=1`. Default OFF.**
+
+Phase 1 is deliberately minimal:
+- No AGENT.md modification — the warmup TEXT carries the NO_REPLY
+  instruction inline. Agent compliance is best-effort; non-compliant
+  agents may emit a real reply to the primary chat (acceptable
+  opt-in UX cost).
+- No `meta.suppressProgressCard` plumbing — the warmup turn will
+  briefly show a 👀 reaction + progress card before NO_REPLY
+  suppression unpins it. Phase 2 will tag for full suppression.
+- Cooldown: 5-min per agent (gymbro-style 6-reconnects-per-cycle
+  doesn't burn quota).
+- Routes to the boot chat resolved by `resolveBootChatId` — same
+  helper the boot card uses.
+
+13 unit tests pin env gate, cooldown debounce (per-agent), message
+shape (`meta.source="warmup"`, synthetic messageId=0), boot-target
+fallback, send-error handling.
+
 ## unreleased — fix(gateway): refine turnEnd outboundEmitted to track replyCalled
 
 Phase 2b PR 3b precondition. The shadow emit at `gateway.ts:1287`

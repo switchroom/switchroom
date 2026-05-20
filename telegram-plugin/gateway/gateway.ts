@@ -263,6 +263,7 @@ import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import { shadowEmit } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
+import { maybeFireWarmup } from './prefix-warmup.js'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
@@ -3280,6 +3281,28 @@ const ipcServer: IpcServer = createIpcServer({
           }
         }
       }
+    }
+
+    // Prefix-cache warmup (cold-start TTFO RFC, opt-in via
+    // SWITCHROOM_PREFIX_WARMUP=1). Fires a synthetic inbound to claude
+    // BEFORE the user's next real message so Anthropic's prefix cache
+    // is warm on the user-perceived first turn. Gated, debounced
+    // (5-min cooldown per agent), and skipped if no boot chat resolves.
+    // Claude responds NO_REPLY per inline instruction; existing
+    // silent-marker suppression at gateway.ts:5906 swallows the
+    // outbound. See docs/rfcs/cold-start-ttfo.md Option A.
+    if (client.agentName != null) {
+      maybeFireWarmup({
+        selfAgent: client.agentName,
+        client,
+        resolveBootTarget: () => {
+          const marker = readRestartMarker()
+          const ageMs = marker ? Date.now() - marker.ts : undefined
+          const target = resolveBootChatId(marker, ageMs)
+          if (!target) return null
+          return { chatId: target.chatId, threadId: target.threadId }
+        },
+      })
     }
 
     // If the agent reconnected after a /restart (or any restart), post a boot
