@@ -425,12 +425,31 @@ export function createDraftStream(
           }
           log?.(`stream → persisted chunk (id: ${newMsgId}, ${chunk.length} chars, reason=${timeElapsed ? 'time' : 'size'})`)
         } catch (err) {
+          // Persist failed — log and continue. The next flush re-
+          // evaluates the trigger and re-fires.
+          //
+          // Edge case (accepted as v1 ceiling): if `send(chunk)`
+          // actually LANDED on Telegram but the response/ack was lost
+          // (network blip), the retry will double-persist — the user
+          // sees the same chunk twice as two separate sendMessages.
+          // Telegram doesn't expose a sendMessage idempotency key. The
+          // user-visible artifact is "duplicate chunk", not data loss,
+          // and observed rate of lost-ACK is rare. PR D follow-up
+          // could add a per-chunk hash dedup on retry.
           warn?.(
             `draft-stream: persist sendMessage failed — chunk stays in draft (${err instanceof Error ? err.message : String(err)})`,
           )
         }
       }
     }
+
+    // Edge case: if the model RETRACTS cumulative text (rare — most
+    // LLM streams are strict-extension), `textToSend.length` may be
+    // less than `persistedTextLen`. `slice(persistedTextLen)` returns
+    // "" and the persist trigger's `tailLen > 0` guard short-circuits,
+    // so we silently skip. The live preview goes stale until the model
+    // re-extends past `persistedTextLen`. No crash, no double-send.
+    // Tolerated as the failure mode is benign and the cause is upstream.
 
     // Hard-stop check — applies to the sendable size (full text for
     // message transport, post-persist tail for draft transport). After
