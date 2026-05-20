@@ -7,7 +7,7 @@
  * the just-registered bridge. Claude processes the message — paying
  * the full cold-cache cost on the synthetic turn — and responds
  * `NO_REPLY` per the in-prompt instruction. The existing NO_REPLY
- * suppression at `gateway.ts:5906` swallows the outbound.
+ * suppression at `gateway.ts:5949` swallows the outbound.
  *
  * By the time the user's REAL next message arrives, Anthropic's prefix
  * cache is warm and the user-perceived TTFO drops 4-8s on average.
