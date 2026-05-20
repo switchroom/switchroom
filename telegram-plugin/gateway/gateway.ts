@@ -2786,6 +2786,17 @@ function postLegacyBanner(
 // short-circuit to no-ops at runtime. `progressDriver` is typed `any`
 // so TS doesn't resolve `progressDriver?.X` to `never`.
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
+// PR B: per-agent stream throttle override via channels.telegram.stream_throttle_ms.
+// When unset, draft-stream.ts applies transport-aware defaults (300 ms draft,
+// 1000 ms message). Parsed once at boot; sub-zero / NaN values fall back to
+// undefined so the per-transport default wins. See `src/agents/scaffold.ts`
+// `channelsToEnv()` for the yaml → env wiring.
+const STREAM_THROTTLE_MS_OVERRIDE: number | undefined = (() => {
+  const raw = process.env.SWITCHROOM_TG_STREAM_THROTTLE_MS
+  if (raw == null || raw === '') return undefined
+  const n = Number.parseInt(raw, 10)
+  return Number.isFinite(n) && n >= 0 ? n : undefined
+})()
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const progressDriver: any = null
@@ -4471,7 +4482,13 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       recordOutbound,
       ...(HISTORY_ENABLED ? { getLatestInboundMessageId } : {}),
       writeError: (line) => process.stderr.write(line),
-      throttleMs: 600,
+      // PR B: drop the legacy 600 ms compromise. When the operator sets
+      // `channels.telegram.stream_throttle_ms` in yaml, the env override
+      // wins; otherwise draft-stream's transport-aware default fires
+      // (300 ms draft / 1000 ms message). `throttleMs: undefined` is a
+      // signal — handlers downgrade to `?? undefined`, which then
+      // passes through to draft-stream where the default applies.
+      ...(STREAM_THROTTLE_MS_OVERRIDE != null ? { throttleMs: STREAM_THROTTLE_MS_OVERRIDE } : {}),
       progressCardActive: streamMode === 'checklist',
     },
   )

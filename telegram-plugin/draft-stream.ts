@@ -35,7 +35,17 @@ import {
 } from './draft-transport.js'
 
 const TELEGRAM_MAX_CHARS = 4096
-const DEFAULT_THROTTLE_MS = 1000
+// PR B: transport-aware defaults.
+//   Draft transport (DMs): 300 ms — drafts are ephemeral and don't share
+//     editMessageText's per-message rate cap, so we can refresh much faster.
+//     300 ms feels live without burning bandwidth.
+//   Message transport (groups / forums / draft API absent): 1000 ms — must
+//     respect Telegram's "1 edit/sec/message" practical ceiling.
+// Both defaults can be overridden per-stream via `config.throttleMs` (which
+// is itself wired from `channels.telegram.stream_throttle_ms` in the agent
+// yaml, via the SWITCHROOM_TG_STREAM_THROTTLE_MS env var the gateway reads).
+const DEFAULT_DRAFT_THROTTLE_MS = 300
+const DEFAULT_MESSAGE_THROTTLE_MS = 1000
 const MIN_THROTTLE_MS = 250
 
 /**
@@ -169,7 +179,16 @@ export function createDraftStream(
   edit: StreamEditFn,
   config: DraftStreamConfig = {},
 ): DraftStreamHandle {
-  const throttleMs = Math.max(MIN_THROTTLE_MS, config.throttleMs ?? DEFAULT_THROTTLE_MS)
+  // Transport-aware default — the actual transport resolves a few lines
+  // below, so we replicate the prefersDraft check here. An explicit
+  // `config.throttleMs` (from the operator yaml or the caller) wins.
+  const _willPreferDraft =
+    (config.previewTransport ?? 'auto') === 'draft' ||
+    ((config.previewTransport ?? 'auto') === 'auto' && config.isPrivateChat === true)
+  const _defaultForTransport = _willPreferDraft && config.sendMessageDraft != null
+    ? DEFAULT_DRAFT_THROTTLE_MS
+    : DEFAULT_MESSAGE_THROTTLE_MS
+  const throttleMs = Math.max(MIN_THROTTLE_MS, config.throttleMs ?? _defaultForTransport)
   const maxChars = config.maxChars ?? TELEGRAM_MAX_CHARS
   const idleMs = Math.max(0, config.idleMs ?? 0)
   const log = config.log
