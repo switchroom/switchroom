@@ -1277,14 +1277,24 @@ function streamKey(chatId: string, threadId?: number | null): string {
   return chatKey(chatId, threadId)
 }
 
-function purgeReactionTracking(key: string): void {
-  // Phase 2b shadow: turn end. The key was registered via setTurnStarted
-  // when the inbound arrived; purge is the canonical turn-end signal.
-  // outboundEmitted is approximated `true` here — refined in PR 3 to read
-  // from the per-turn `replyCalled` flag on `currentTurn`. Conservative
-  // shadow approximation is safe (only affects machine's lastOutboundAt
-  // tracking; can't drive incorrect behavior in shadow mode).
-  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted: true })
+function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
+  // Phase 2b: turn end. The key was registered via setTurnStarted when
+  // the inbound arrived; purge is the canonical turn-end signal.
+  //
+  // outboundEmitted: read from the explicit `endingTurn` parameter when
+  // provided (canonical path via endCurrentTurnAtomic — module-scope
+  // currentTurn is already null by the time we get here), falling back
+  // to `currentTurn?.replyCalled` for the legacy callsites that haven't
+  // been threaded yet (sibling-key purges, restart-init cleanup).
+  // Without this explicit-turn handoff the shadow trace would report
+  // outboundEmitted=false on every replied turn (the dominant happy
+  // path), producing strictly worse data than the blind `true` it
+  // replaced. Invariant #5's `lastOutboundAt` correctness depends on
+  // this signal being accurate.
+  const outboundEmitted = endingTurn != null
+    ? endingTurn.replyCalled === true
+    : currentTurn?.replyCalled === true
+  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
   const msgInfo = activeReactionMsgIds.get(key)
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
@@ -1370,7 +1380,12 @@ function purgeReactionTracking(key: string): void {
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
   if (currentTurn !== turn) return
   currentTurn = null
-  purgeReactionTracking(statusKey(turn.sessionChatId, turn.sessionThreadId))
+  // Pass `turn` so purgeReactionTracking sees the authoritative
+  // replyCalled flag even though we just nulled module-scope
+  // currentTurn. Without this, the shadow trace's outboundEmitted
+  // would be false on every replied turn (the dominant happy path),
+  // producing strictly worse data than the blind `true` it replaced.
+  purgeReactionTracking(statusKey(turn.sessionChatId, turn.sessionThreadId), turn)
 }
 
 /**
