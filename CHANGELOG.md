@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.12.25 — fix: shadow trace only emits for REAL bridge events (observability fix)
+
+Hotfix for an observability bug in v0.12.24's shadow mode. The
+`shadowEmit({kind: 'bridgeUp'/'bridgeDown'})` calls fired on EVERY
+IPC client connect/disconnect — including anonymous MCP client
+churn (recall.py + drain_pending.py + other transient MCP
+handshakes). Every recall.py invocation flipped the shadow state to
+`bridge_dead`, giving a misleading view of fleet health.
+
+Symptom (observed during 2026-05-20 clerk/gymbro unresponsive
+incident): 7 of 9 agents showed `shadow_state=bridge_dead` while in
+reality the imperative gateway was mostly fine (UATs passed, crons
+fired). Fix: gate both shadow emits on `client.agentName != null`
+so anonymous IPC churn no longer pollutes the bridge state machine.
+
+The underlying bridge sidecar flap (the REAL issue behind clerk +
+gymbro getting stuck) is a separate investigation — see issue/task
+P0 bridge flap. The shadow fix here is observability-only.
+
+### Changes
+
+#### Fixes
+
+- **fix(gateway):** shadow only emits `bridgeUp`/`bridgeDown` for the
+  REAL bridge sidecar (non-null `agentName`). Closes the
+  `shadow_state=bridge_dead` false-positives caused by anonymous
+  MCP client churn. (#1583)
+
 ## v0.12.24 — feat: InboundDeliveryStateMachine shadow mode (Phase 2b PR 2)
 
 The state machine from PR 1 (#1578, v0.12.23) now runs ALONGSIDE the
