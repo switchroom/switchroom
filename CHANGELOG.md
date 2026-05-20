@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.12.23 — fix(memory/vision): close the remember-across-sessions moat + Phase 2b architectural foundations
+
+The moat JTBD `remember-across-sessions` was silently failing in
+production — a user's "please remember this" prompt never persisted
+because the vendored hindsight plugin throttled retention to every
+10 turns. Closed in v0.12.23: scaffold-layer override retains every
+turn. Live UAT after the fix: capture TTFO=22.7s, recall TTFO=14.1s,
+token round-tripped across restart.
+
+Phase 2b architectural foundation: RFC + pure
+`InboundDeliveryStateMachine` module with 5 property-test invariants
+validated over 5,000 random schedules. PR 2 (wiring) and PR 3
+(cleanup) follow. Zero behavior change for v0.12.23 — the module
+is shipped UNWIRED.
+
+Plus three vision-aligned UATs (fast-trivial TTFO, wake-audit
+content, memory-survives) that catch JTBD gaps mock-based testing
+keeps missing.
+
+### Changes
+
+#### Fixes
+
+- **fix(memory):** override hindsight `retainEveryNTurns=1` in the
+  per-agent scaffold (vendor file untouched). Closes the
+  `remember-across-sessions` JTBD's silent failure. (#1579)
+
+#### Features
+
+- **feat(gateway):** `InboundDeliveryStateMachine` pure module + 5
+  property-test invariants. Unwired in this release per the RFC's
+  3-PR cutover. (#1578)
+
+#### Tests
+
+- **test(uat):** `jtbd-fast-trivial-dm.test.ts` — TTFO contract for
+  short happy path. Baseline 1,771ms. (#1575)
+- **test(uat):** `jtbd-wake-audit-content-dm.test.ts` — wake-audit
+  content contract. 9 config signals on test-harness. (#1577)
+- **test(uat):** `jtbd-memory-survives-restart-dm.test.ts` — memory
+  survival contract; unskipped by #1579 above. (#1577, #1579)
+
+#### Docs / RFCs
+
+- **docs(rfc):** `docs/rfcs/inbound-delivery-state-machine.md` —
+  Phase 2b design for closing the wedge-cluster bug CLASS. (#1576)
+
 ## v0.12.22 — fix(P0/vision): close the 5-min restart wedge — first-after-restart messages reply in seconds, not minutes
 
 The "always-on specialist exec-assistants" vision means agents reply
