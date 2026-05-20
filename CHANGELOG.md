@@ -15,9 +15,17 @@ Both defaults are overridable via `channels.telegram.stream_throttle_ms`
 in agent yaml (wired through `SWITCHROOM_TG_STREAM_THROTTLE_MS` env).
 Explicit caller `throttleMs` still wins. Floor stays at 250 ms.
 
-Two prior `throttleMs: 600` callsites in `gateway.ts` and the
-`?? 600` default in `stream-reply-handler.ts` are removed — they were
-a legacy compromise that fought both ceilings.
+One prior `throttleMs: 600` callsite in `gateway.ts`'s
+`executeStreamReply` is removed and the `?? 600` default in
+`stream-reply-handler.ts` is replaced with passthrough — they were a
+legacy compromise that fought both ceilings on the LLM stream_reply
+path.
+
+The PTY-activity streaming path (`gateway.ts:6438` and
+`pty-partial-handler.ts:159`) DELIBERATELY keeps its `throttleMs: 600`
+— PTY drives many tiny partials as TUIs re-render and has different
+flicker characteristics from LLM token cadence. The transport-aware
+defaults do not apply there.
 
 6 new tests pin: draft default 300, message default 1000, auto+DM→
 draft default, auto+non-DM→message default, explicit-override-wins,

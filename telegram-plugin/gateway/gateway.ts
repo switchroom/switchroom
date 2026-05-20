@@ -6435,6 +6435,14 @@ function handlePtyActivity(text: string): void {
       historyEnabled: false,
       recordOutbound,
       writeError: (line) => process.stderr.write(line),
+      // PR B note: this is the PTY-activity stream, NOT the LLM
+      // stream_reply path. PTY drives many tiny partials as a TUI
+      // re-renders; 600 ms is a deliberate compromise tuned for the
+      // PTY flicker characteristics, not LLM token cadence. The
+      // transport-aware defaults (300/1000) deliberately do NOT
+      // apply here. If you change this, also check
+      // telegram-plugin/pty-partial-handler.ts:159 which has the
+      // same value for the same reason.
       throttleMs: 600,
     },
   ).catch((err) => {
