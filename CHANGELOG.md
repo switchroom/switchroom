@@ -9,13 +9,25 @@ stream-end` showed `sends=0` even though `sendMessage` had fired in
 under-reporting only — no behaviour bug — but confusing for
 observability + downstream metrics.
 
-Fix: bump `sendFires++` at the materialize callsite in `finalize()`.
-The bare `send(textToMaterialize)` call there bypassed the
-`sendViaMessage` helper that owns the increment.
+Fix: bump `sendFires++` at BOTH bare `send()` callsites that
+bypass the `sendViaMessage` helper that owns the increment:
 
-1 new test pins the contract: a draft-transport stream that
-materializes a non-empty reply must report `sends>=1` in stream-end.
-53/53 in both vitest and bun-test.
+1. **Finalize-materialize** (`draft-stream.ts:679`) — the
+   `send(textToMaterialize)` call inside `finalize()` that promotes
+   a draft into a real persisted message.
+2. **Persist-chain** (`draft-stream.ts:469`) — the `send(chunk)`
+   call inside the 25s/4000-char persist-chain trigger. Sibling
+   instance of the same bug; without this fix, draft-transport
+   streams that cross the chain boundary would still under-report
+   `sends` by the chain count even after the finalize fix landed.
+
+2 new tests pin the contract:
+- draft-transport stream that materializes a non-empty reply must
+  report `sends>=1` in stream-end
+- draft-transport stream that fires a persist chain + a finalize
+  materialize must report `sends>=2` and `persists>=1`
+
+54/54 in both vitest and bun-test.
 
 ## v0.13.0 — sendMessageDraft alignment (PRs A+B+C+D)
 

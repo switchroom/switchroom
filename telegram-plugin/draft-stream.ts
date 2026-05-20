@@ -461,6 +461,12 @@ export function createDraftStream(
           draftId = allocateDraftId()
           currentChunkStartedAt = null
           persistChainFires++
+          // PR follow-up: persist-chain's bare send() bypasses
+          // sendViaMessage's increment, same shape as the finalize-
+          // materialize bug. Without this, streams that cross the
+          // 25s / 4000-char boundary would under-report `sends` by
+          // the chain count in stream-end.
+          sendFires++
           if (process.env.SWITCHROOM_STREAM_TRACES !== '0') {
             process.stderr.write(
               `gw-trace stream-persist chunk_chars=${chunk.length} ` +

@@ -1243,6 +1243,42 @@ describe('createDraftStream — draft transport', () => {
       // Counter now reflects reality.
       expect(endLine).toMatch(/sends=[1-9]/)
     })
+
+    it('persist-chain bump counts toward sends (size-trigger fires + finalize)', async () => {
+      // The sibling bug at the persist-chain callsite — its bare
+      // send(chunk) also bypasses sendViaMessage. Without the fix
+      // a stream that crosses the size boundary would show sends=1
+      // (only the finalize materialize), missing the chain fire.
+      // With the fix sends counts BOTH the persist send AND the
+      // finalize materialize → sends>=2.
+      const m = makeMock()
+      const sendMessageDraft = vi.fn(async () => {})
+      const stream = createDraftStream(m.send, m.edit, {
+        throttleMs: 50,
+        previewTransport: 'draft',
+        sendMessageDraft,
+        chatId: 'chat-chain',
+        persistSizeLimit: 200,
+      })
+      void stream.update('a'.repeat(100))
+      await microtaskFlush()
+      vi.advanceTimersByTime(300)
+      void stream.update('a'.repeat(250)) // size trigger fires (tail=250 ≥ 200)
+      await microtaskFlush()
+      vi.advanceTimersByTime(300)
+      await microtaskFlush()
+      // Extra text after persist so finalize-materialize tail is non-empty.
+      void stream.update('a'.repeat(250) + 'b'.repeat(50))
+      await microtaskFlush()
+      vi.advanceTimersByTime(300)
+      await microtaskFlush()
+      await stream.finalize()
+      const endLine = captured.find((c) => c.includes('gw-trace stream-end'))
+      expect(endLine).toBeDefined()
+      // Persist send + finalize materialize = at least 2.
+      expect(endLine).toMatch(/sends=[2-9]/)
+      expect(endLine).toMatch(/persists=[1-9]/)
+    })
   })
 
 })
