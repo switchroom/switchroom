@@ -43,7 +43,7 @@
  * pacing prompt still applies; only the framework safety net is off.
  */
 
-export type PokeLevel = 'soft' | 'firm'
+export type PokeLevel = 'ack' | 'soft' | 'firm'
 
 /** #1292: snapshot of an in-flight tool call, surfaced in the 300s
  * framework-fallback message so the user sees the actual observable
@@ -76,6 +76,10 @@ export interface SilencePokeState {
   lastThinkingAt: number | null
   /** True once the 300s framework fallback has fired this turn. */
   fallbackFired: boolean
+  /** True once the early ack-budget poke has fired this turn. One-shot:
+   *  the ack nudge is specifically about the *first* outbound, so it
+   *  never re-arms even after the model later goes quiet again. */
+  ackPokeFired: boolean
   /** Wall-clock ms of last poke fire — used for poke-success latency. */
   lastPokeFiredAt: number | null
   /** #1292: in-flight tool calls keyed by toolUseId. Populated by
@@ -91,6 +95,12 @@ export interface SilencePokeState {
 }
 
 export interface ThresholdsMs {
+  /** Ack budget: if NO outbound at all has landed this many ms after
+   *  turn start, arm an 'ack' poke. This is the framework enforcing the
+   *  human-baseline "acknowledge within a beat" — far tighter than the
+   *  75s `soft` threshold, which measures silence-since-last-outbound
+   *  and is the wrong instrument for "you never said hello." */
+  ack: number
   soft: number
   firm: number
   fallback: number
@@ -101,6 +111,7 @@ export interface ThresholdsMs {
 }
 
 export const DEFAULT_THRESHOLDS: ThresholdsMs = {
+  ack: 10_000,
   soft: 75_000,
   firm: 180_000,
   fallback: 300_000,
@@ -176,6 +187,7 @@ export function startTurn(key: string, now: number): void {
     subagentDispatchActive: false,
     lastThinkingAt: null,
     fallbackFired: false,
+    ackPokeFired: false,
     lastPokeFiredAt: null,
     inFlightTools: new Map(),
   })
@@ -340,6 +352,16 @@ export function endTurn(key: string): void {
 
 /** Verbatim poke text. Wording is load-bearing — see issue #1122 design. */
 export function formatPokeText(level: PokeLevel): string {
+  if (level === 'ack') {
+    return (
+      "[silence-poke] You haven't sent the user anything yet this turn — "
+      + 'they are looking at a silent chat. Send a short, human one-line '
+      + 'acknowledgement now via `reply` (e.g. "on it — checking"), in your '
+      + "persona's voice, before you do any more work. A good colleague "
+      + "answers in a beat; don't leave the message hanging while you think. "
+      + 'If the full answer is genuinely seconds away, send that instead.'
+    )
+  }
   if (level === 'soft') {
     return (
       "[silence-poke] You've been silent to the user for 75s. If you're "
@@ -436,6 +458,32 @@ function tick(now: number): void {
     const softThreshold = s.subagentDispatchActive
       ? thresholds.subagentSoft
       : thresholds.soft
+
+    // Ack budget — the framework enforcing the human-baseline "answer
+    // in a beat." Fires once, only when NOTHING has been sent this turn
+    // (`lastOutboundAt == null`), well before the 75s `soft` threshold.
+    // `soft` measures silence-since-last-outbound and is the wrong
+    // instrument for "you never acknowledged me." Independent of the
+    // soft/firm/fallback ladder: if the model never acks, it still
+    // escalates soft → firm → fallback on schedule after this.
+    if (
+      !s.ackPokeFired
+      && s.lastOutboundAt == null
+      && s.pokesFired === 0
+      && silence >= thresholds.ack
+    ) {
+      s.pokeArmed = { level: 'ack' }
+      s.ackPokeFired = true
+      s.lastPokeFiredAt = now
+      activeDeps.emitMetric({
+        kind: 'silence_poke_fired',
+        key,
+        level: 'ack',
+        silence_ms: silence,
+        subagent_wait: s.subagentDispatchActive,
+      })
+      continue
+    }
 
     if (s.pokesFired === 0 && silence >= softThreshold) {
       s.pokeArmed = { level: 'soft' }
