@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.13.7 — auto-failover detects the new Claude usage-limit shape
+
+### fix(auth) — quota-exhaustion detection for Claude v2.1.x (#1642)
+
+Account auto-failover was dead fleet-wide: an agent that hit its Claude
+subscription quota surfaced *"You've hit your limit · resets …"* and
+stopped — never rotating to a healthy account, even with others
+available in `fallback_order`. Claude Code v2.1.x records a usage-limit
+hit as a *synthetic assistant message* (`isApiErrorMessage: true`,
+`apiErrorStatus: 429`), not the `api_error` line shape the detector
+recognised — so the exhaustion signal never reached the fleet
+auto-fallback path and `fireFleetAutoFallback` was never called. The
+detector now catches the new shape and classifies a 429 in it as
+quota-exhausted; the model-unavailable text signals learn the new
+"hit your limit" wording. Regression tests are pinned to the exact
+on-disk line shape so the next Claude format drift fails loud.
+
 ## v0.13.6 — a typing indicator for the whole turn
 
 Headline: the agent now shows `typing…` for the *entire* turn, not
