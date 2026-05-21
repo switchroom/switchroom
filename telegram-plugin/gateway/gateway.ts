@@ -1303,23 +1303,34 @@ function clearReactionState(key: string): void {
   }
 }
 
-function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
+function purgeReactionTracking(
+  key: string,
+  endingTurn?: CurrentTurn,
+  outboundEmittedOverride?: boolean,
+): void {
   // Phase 2b: turn end. The key was registered via setTurnStarted when
   // the inbound arrived; purge is the canonical turn-end signal.
   //
-  // outboundEmitted: read from the explicit `endingTurn` parameter when
-  // provided (canonical path via endCurrentTurnAtomic — module-scope
-  // currentTurn is already null by the time we get here), falling back
-  // to `currentTurn?.replyCalled` for the legacy callsites that haven't
-  // been threaded yet (sibling-key purges, restart-init cleanup).
-  // Without this explicit-turn handoff the shadow trace would report
-  // outboundEmitted=false on every replied turn (the dominant happy
-  // path), producing strictly worse data than the blind `true` it
-  // replaced. Invariant #5's `lastOutboundAt` correctness depends on
-  // this signal being accurate.
-  const outboundEmitted = endingTurn != null
-    ? endingTurn.replyCalled === true
-    : currentTurn?.replyCalled === true
+  // outboundEmitted derivation, in precedence order:
+  //   1. Explicit `outboundEmittedOverride` (e.g. silence-poke
+  //      framework fallback FORCES false because the 5-min fallback
+  //      firing proves visible delivery never happened — regardless of
+  //      whatever `replyCalled` the wedged turn object carries).
+  //   2. `endingTurn.replyCalled` when the canonical caller threads
+  //      the authoritative turn (endCurrentTurnAtomic path; module-scope
+  //      currentTurn is already null by the time we get here).
+  //   3. `currentTurn?.replyCalled` fallback for the (now-vanishing)
+  //      legacy callsites. Without the explicit-turn handoff the shadow
+  //      trace would report outboundEmitted=false on every replied
+  //      turn (the dominant happy path), producing strictly worse data
+  //      than the blind `true` it replaced. Invariant #5's
+  //      `lastOutboundAt` correctness depends on this signal being
+  //      accurate.
+  const outboundEmitted = outboundEmittedOverride !== undefined
+    ? outboundEmittedOverride
+    : endingTurn != null
+      ? endingTurn.replyCalled === true
+      : currentTurn?.replyCalled === true
   shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
   clearReactionState(key)
   activeTurnStartedAt.delete(key)
@@ -3124,7 +3135,15 @@ silencePoke.startTimer({
     // Drop silence-poke state and clear turn-active so the next inbound
     // for this chat starts a fresh turn instead of queueing forever.
     silencePoke.endTurn(fbKey)
-    purgeReactionTracking(fbKey)
+    // PR 3b step 5 (#1603 audit): force outboundEmitted=false. The
+    // framework fallback fires precisely because visible delivery
+    // didn't happen in 5 min — `wedgedTurn.replyCalled` may have been
+    // set during the turn (e.g. reply tool invoked but Telegram side
+    // never confirmed delivery), but from the user's perspective no
+    // outbound landed. The state machine's `noteOutbound` effect
+    // must NOT fire for this path. Pass `undefined` for endingTurn
+    // and `false` as the explicit override.
+    purgeReactionTracking(fbKey, undefined, false)
     // Defense-in-depth: the fallback's purgeReactionTracking above
     // clears the canonical statusKey(chatId, threadId) for fbKey
     // only. activeTurnStartedAt can hold sibling entries for the
@@ -3137,10 +3156,14 @@ silencePoke.startTimer({
     // purger. Multi-chat-safe — only touches keys for fbChatId, so
     // #1546's intentional cross-chat safety guard is preserved.
     // See turn-state-purge.ts.
+    //
+    // Same `outboundEmitted=false` rationale as the bare call above —
+    // wrap the purger so every sibling-key purge emits a fallback
+    // shadow turnEnd with the truthful "no visible delivery" signal.
     const fbExtraPurge = purgeStaleTurnsForChat(
       fbChatId,
       activeTurnStartedAt.keys(),
-      purgeReactionTracking,
+      (k) => purgeReactionTracking(k, undefined, false),
     )
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
