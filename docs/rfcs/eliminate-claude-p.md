@@ -1,6 +1,7 @@
 # RFC — Eliminate `claude -p` (programmatic usage) from switchroom
 
-> Status: proposed — 2026-05-21. Companion to `reference/vision.md`
+> Status: accepted — 2026-05-21 (Workstream A shipped in #1625;
+> Workstream B in #1626). Companion to `reference/vision.md`
 > (pillar 3 — *subscription-honest*). Driven by the 2026-06-15 Anthropic
 > billing-policy change.
 
@@ -198,15 +199,15 @@ RFC-approved → ~90–150 agent-min + a test-harness canary.
    confirm flap-free fleet-wide. *Prerequisite for B.*
 2. **Workstream A** — webhook migration (small; also closes #1617).
    May run in parallel with step 1 — independent code.
-3. **Workstream B** — handoff rework per the approved option (B1).
+3. **Workstream B** — handoff rework per the approved option (B2).
 4. **SC-1 CI guard** — landed with whichever workstream merges last.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| B1 resumed-context quality — a resumed session carries more cruft than a clean briefing | claude's built-in compaction; B2 fallback gated by SC-B5 |
-| Cold-start TTFO regression — the briefing was partly a cold-start lean-ness mechanism | SC-B5 threshold gate against the v0.13.3 baseline; B2 if breached |
+| B2 transcript tail is noisier / less navigable than an LLM summary | The tail header tells the next session to reorient from it *and* its memory files; `TURN_TEXT_MAX_CHARS` + `maxTurns` bound the size |
+| Cold-start TTFO regression — the tail adds tokens to `--append-system-prompt` | Bounded by `maxTurns` × `TURN_TEXT_MAX_CHARS`; canary measures first-turn-after-restart TTFO against the v0.13.3 baseline (SC-B5) |
 | Webhook turns now visible in main session history | Accepted — matches cron, desirable |
 
 ## Decisions
