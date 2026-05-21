@@ -3,35 +3,35 @@ import { resolve } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import {
-  summarize,
+  buildHandoff,
   findLatestSessionJsonl,
-  DEFAULT_SUMMARIZER_MODEL,
   DEFAULT_MAX_TURNS,
 } from "../agents/handoff-summarizer.js";
 
 /**
- * `switchroom handoff <agent>` — summarize the agent's most recent session
- * and write the .handoff.md + .handoff-topic sidecars. Invoked by the
- * Stop hook and by start.sh's lazy fallback. Exits 0 on every failure
- * mode (missing API key, no JSONL, API error) — the Stop hook must
- * never block agent shutdown.
+ * `switchroom handoff <agent>` — build the agent's session handoff
+ * sidecars (.handoff.md transcript tail + .handoff-topic line) from
+ * its most recent session JSONL. Invoked by the Stop hook and by
+ * start.sh's lazy fallback. Pure + deterministic — no `claude -p`
+ * (RFC #1620). Exits 0 on every failure mode (no JSONL, write error)
+ * — the Stop hook must never block agent shutdown.
  */
 export function registerHandoffCommand(program: Command): void {
   program
     .command("handoff <agent>", { hidden: true })
     .description(
-      "Summarize the agent's last session into a handoff briefing " +
-      "(.handoff.md) and topic line (.handoff-topic). [internal — used by Stop hook]",
+      "Build the agent's session handoff sidecars — a transcript-tail " +
+      "briefing (.handoff.md) and topic line (.handoff-topic). " +
+      "[internal — used by the Stop hook]",
     )
-    .option("--timeout <secs>", "API call timeout in seconds", "30")
-    .option("--max-turns <n>", "Max turns fed to the summarizer", String(DEFAULT_MAX_TURNS))
-    .option("--model <id>", "Anthropic model for the summarizer", DEFAULT_SUMMARIZER_MODEL)
+    .option(
+      "--max-turns <n>",
+      "Max turns kept in the handoff transcript tail",
+      String(DEFAULT_MAX_TURNS),
+    )
     .action(
       withConfigError(
-        async (
-          agentName: string,
-          opts: { timeout: string; maxTurns: string; model: string },
-        ) => {
+        async (agentName: string, opts: { maxTurns: string }) => {
           const config = getConfig(program);
           const agentConfig = config.agents[agentName];
           if (!agentConfig) {
@@ -59,18 +59,14 @@ export function registerHandoffCommand(program: Command): void {
             return;
           }
 
-          const timeoutMs = Math.max(1, parseInt(opts.timeout, 10)) * 1000;
           const maxTurns = Math.max(1, parseInt(opts.maxTurns, 10));
-          const model = continuity?.summarizer_model ?? opts.model;
           const cappedMaxTurns = continuity?.max_turns_in_briefing ?? maxTurns;
 
-          const status = await summarize({
+          const status = await buildHandoff({
             jsonlPath: jsonl,
             agentDir,
             agentName,
-            model,
             maxTurns: cappedMaxTurns,
-            timeoutMs,
           });
           process.stderr.write(`handoff: ${status}\n`);
         },

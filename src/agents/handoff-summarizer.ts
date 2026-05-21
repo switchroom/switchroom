@@ -1,36 +1,46 @@
 /**
- * Session-handoff summarizer.
+ * Session-handoff builder.
  *
  * Invoked by a Stop hook at session end (and as a lazy fallback in
- * start.sh). Reads the session JSONL, builds a structured markdown
- * briefing by spawning `claude -p` (using the Claude Code OAuth
- * subscription the agent already runs under — no API key required),
- * and writes two sidecars into the agent's directory:
+ * start.sh). Reads the previous session's JSONL, extracts the recent
+ * turns, and writes two sidecars into the agent's directory:
  *
- *   - .handoff.md        Full briefing, injected into the next session
- *                        via --append-system-prompt.
+ *   - .handoff.md        A bounded **raw transcript tail** of the
+ *                        previous session, injected into the next
+ *                        session via --append-system-prompt so the
+ *                        agent can reorient itself.
  *   - .handoff-topic     Single-line topic string, read by the telegram
  *                        plugin to render a "↩️ Picked up where we left
  *                        off — <topic>" line on the first reply.
  *
- * Both writes are atomic (tmpfile + rename) so the telegram plugin
- * never reads a half-written file. The briefing is also mirrored to
- * Hindsight as a tagged memory so older handoffs remain semantically
- * recallable across arbitrarily many sessions.
+ * **No `claude -p`.** Earlier releases shelled out to a headless
+ * `claude -p` here to LLM-summarize the transcript. Under Anthropic's
+ * 2026-06-15 policy a headless `claude -p` is *programmatic* usage
+ * (off the subscription) and it spawned a parasitic second telegram
+ * bridge (the #1613 flap). RFC #1620 Workstream B replaced the
+ * summarization with a deterministic, pure transcript-tail format:
+ * the next session reorients itself from the raw tail (and from its
+ * own memory files) on its first turn — the summarization "moves into"
+ * the agent's live interactive session, which is subscription-funded.
+ * See `docs/rfcs/eliminate-claude-p.md`.
  *
- * Best-effort at every step — missing `claude` CLI, subprocess failure,
- * missing JSONL, Hindsight unreachable: warn to stderr, resolve
- * cleanly. The Stop hook must never block agent shutdown.
+ * Both writes are atomic (tmpfile + rename) so the telegram plugin
+ * never reads a half-written file. The tail is also mirrored to
+ * Hindsight as a tagged memory so older handoffs remain recallable.
+ *
+ * Best-effort at every step — missing JSONL, Hindsight unreachable:
+ * warn to stderr, resolve cleanly. The Stop hook must never block
+ * agent shutdown.
  */
 
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
 
-export const DEFAULT_SUMMARIZER_MODEL = "claude-haiku-4-5-20251001";
 export const DEFAULT_MAX_TURNS = 50;
-export const DEFAULT_TIMEOUT_MS = 30_000;
 export const TOPIC_MAX_CHARS = 117;
+/** Per-turn text cap in the transcript tail — keeps a few huge turns
+ *  from blowing the next session's context budget. */
+export const TURN_TEXT_MAX_CHARS = 1200;
 
 export type Turn = {
   role: "user" | "assistant";
@@ -123,56 +133,59 @@ function extractTextBlocks(content: unknown): string | null {
   return joined.length > 0 ? joined : null;
 }
 
-export type HandoffPrompt = {
-  system: string;
-  user: string;
-};
+// ─── Transcript-tail handoff (pure — no model call) ──────────────────────────
 
-export function buildHandoffPrompt(turns: Turn[]): HandoffPrompt {
-  const system =
-    "You produce concise handoff briefings for an AI assistant that is " +
-    "about to start a fresh session. The next session has no memory of " +
-    "what just happened; your briefing is its only carry-over context.\n\n" +
-    "Output format — EXACTLY this structure, no preamble:\n" +
-    "## Topic: <one short line, max 100 chars, describing what the user and assistant were most recently focused on>\n\n" +
-    "## Summary\n<one paragraph, what we were working on>\n\n" +
-    "## Open threads\n- <bulleted list of pending/unresolved items; empty list ok>\n\n" +
-    "## Last exchange\n**User:** <verbatim or near-verbatim last user message, truncated to ~500 chars>\n**Assistant:** <last assistant response, truncated to ~500 chars>\n\n" +
-    "## Key decisions & facts\n- <bullets; empty list ok>\n\n" +
-    "## Active files / paths\n- <bullets; empty list ok>\n\n" +
-    "Keep the whole briefing under ~1500 tokens. Prefer brevity. Omit sections only if truly empty (still emit the heading with '- (none)').";
-  const transcript = turns
-    .map((t) => `### ${t.role.toUpperCase()}\n${t.text}`)
+/**
+ * Format the extracted turns into the `.handoff.md` document — a
+ * bounded raw transcript tail the next session reads to reorient.
+ * Pure and deterministic: no `claude -p`, no network.
+ */
+export function formatTranscriptTail(turns: Turn[]): string {
+  const header =
+    "# Handoff — previous session\n\n" +
+    "You are resuming this agent's work. There is no generated summary " +
+    "— below is the **raw tail of the previous session's transcript** " +
+    "(oldest first, most recent last). Read it to reorient, then carry " +
+    "on. Anything important worth keeping long-term should already be " +
+    "in your memory files — check those too.\n";
+  if (turns.length === 0) {
+    return (
+      header +
+      "\n_(No recent turns were recoverable from the previous session.)_\n"
+    );
+  }
+  const body = turns
+    .map((t) => {
+      let text = t.text;
+      if (text.length > TURN_TEXT_MAX_CHARS) {
+        text = text.slice(0, TURN_TEXT_MAX_CHARS) + "\n…[truncated]";
+      }
+      return `### ${t.role === "user" ? "User" : "Assistant"}\n${text}`;
+    })
     .join("\n\n");
-  const user =
-    "Here is the recent session transcript (oldest first). Produce the handoff briefing per the specified format.\n\n" +
-    transcript;
-  return { system, user };
+  return `${header}\n## Recent turns\n\n${body}\n`;
 }
 
 /**
- * Parse the LLM's response into topic + full briefing. We require the
- * first non-empty line to be `## Topic: <text>`. Everything from that
- * line onward IS the briefing (we keep the Topic line in the briefing
- * so the system prompt reads naturally).
+ * Derive the single-line `.handoff-topic` — "what we were last on".
+ * The most recent user turn is the best signal; fall back to the last
+ * turn of any role. Deterministic, no model call.
  */
-export function parseHandoffResponse(raw: string): {
-  topic: string;
-  briefing: string;
-} | null {
-  const lines = raw.split(/\r?\n/);
-  let start = 0;
-  while (start < lines.length && lines[start].trim() === "") start++;
-  if (start >= lines.length) return null;
-  const first = lines[start].trim();
-  const m = first.match(/^##\s*Topic:\s*(.+)$/i);
-  if (!m) return null;
-  let topic = m[1].trim();
-  if (topic.length > TOPIC_MAX_CHARS) {
-    topic = topic.slice(0, TOPIC_MAX_CHARS) + "…";
+export function deriveTopic(turns: Turn[]): string {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i]!.role === "user") return clampTopic(firstLine(turns[i]!.text));
   }
-  const briefing = lines.slice(start).join("\n").trim();
-  return { topic, briefing };
+  if (turns.length > 0) return clampTopic(firstLine(turns[turns.length - 1]!.text));
+  return "previous session";
+}
+
+function firstLine(s: string): string {
+  const line = s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? s;
+  return line.trim();
+}
+
+function clampTopic(s: string): string {
+  return s.length > TOPIC_MAX_CHARS ? s.slice(0, TOPIC_MAX_CHARS) + "…" : s;
 }
 
 export function writeSidecarsAtomic(
@@ -191,178 +204,46 @@ export function writeSidecarsAtomic(
   renameSync(topicTmp, topicPath);
 }
 
-/**
- * Shells out to `claude -p` and returns stdout. Uses the Claude Code
- * OAuth subscription the agent already runs under — no API key needed.
- * `--no-session-persistence` keeps this invocation out of session
- * history so the summarizer doesn't pollute the session JSONL it's
- * reading from. Tests inject a stub instead of spawning.
- */
-export type ClaudeCliRunner = {
-  run(opts: {
-    model: string;
-    system: string;
-    user: string;
-    timeoutMs: number;
-  }): Promise<string>;
-};
+// ─── Pipeline ─────────────────────────────────────────────────────────────────
 
-export type SummarizeOpts = {
+export type BuildHandoffOpts = {
   jsonlPath: string;
   agentDir: string;
   agentName: string;
-  model?: string;
   maxTurns?: number;
-  timeoutMs?: number;
   hindsightUrl?: string;
   hindsightBankId?: string;
-  runner?: ClaudeCliRunner;
   fetch?: typeof fetch;
 };
 
 /**
- * Full pipeline: extract turns → call `claude -p` → parse response →
- * atomic sidecar write → Hindsight mirror. Resolves with a status
- * string (for logging); never throws.
+ * Full pipeline: extract turns → format the transcript tail → derive
+ * the topic → atomic sidecar write → Hindsight mirror. Resolves with a
+ * status string (for logging); never throws.
  */
-export async function summarize(opts: SummarizeOpts): Promise<string> {
-  const model = opts.model ?? DEFAULT_SUMMARIZER_MODEL;
+export async function buildHandoff(opts: BuildHandoffOpts): Promise<string> {
   const maxTurns = opts.maxTurns ?? DEFAULT_MAX_TURNS;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const turns = extractTurnsFromJsonl(opts.jsonlPath, maxTurns);
   if (turns.length === 0) {
     return "no-turns";
   }
-  const runner = opts.runner ?? defaultClaudeCliRunner;
-  const prompt = buildHandoffPrompt(turns);
 
-  let raw: string;
-  try {
-    raw = await runner.run({
-      model,
-      system: prompt.system,
-      user: prompt.user,
-      timeoutMs,
-    });
-  } catch (err) {
-    process.stderr.write(
-      `handoff-summarizer: claude -p call failed — ${errMsg(err)}\n`,
-    );
-    return "cli-error";
-  }
-
-  raw = raw.trim();
-  if (!raw) {
-    return "empty-response";
-  }
-  const parsed = parseHandoffResponse(raw);
-  if (!parsed) {
-    process.stderr.write(
-      "handoff-summarizer: response missing '## Topic:' header; skipping\n",
-    );
-    return "parse-error";
-  }
+  const briefing = formatTranscriptTail(turns);
+  const topic = deriveTopic(turns);
 
   try {
-    writeSidecarsAtomic(opts.agentDir, parsed.briefing, parsed.topic);
+    writeSidecarsAtomic(opts.agentDir, briefing, topic);
   } catch (err) {
     process.stderr.write(
-      `handoff-summarizer: sidecar write failed — ${errMsg(err)}\n`,
+      `handoff: sidecar write failed — ${errMsg(err)}\n`,
     );
     return "write-error";
   }
 
-  await mirrorToHindsight(parsed.briefing, opts).catch(() => {});
+  await mirrorToHindsight(briefing, opts).catch(() => {});
   return "ok";
 }
-
-/**
- * Build the `claude -p` argv for the handoff summarizer.
- *
- * `--strict-mcp-config` is load-bearing. Without it, this headless
- * `claude -p` auto-discovers the agent's project `.mcp.json` and starts
- * every MCP server in it — including `switchroom-telegram`. That spins
- * up a *second* telegram bridge process which registers against the
- * same gateway socket as the live agent's real bridge (it inherits
- * `SWITCHROOM_AGENT_NAME`). The two collide under the gateway's
- * register-race close, producing the per-turn "bridge reconnect race"
- * flap (#1613 — the handoff Stop hook fires every turn, so does the
- * flap). The summarizer is pure transcript-in / briefing-out: it needs
- * no MCP tools. `--strict-mcp-config` with no `--mcp-config` loads
- * zero servers. Exported for the args regression test.
- */
-export function buildHandoffClaudeArgs(opts: {
-  model: string;
-  system: string;
-  user: string;
-}): string[] {
-  return [
-    "-p",
-    opts.user,
-    "--model",
-    opts.model,
-    "--append-system-prompt",
-    opts.system,
-    "--no-session-persistence",
-    // Do NOT inherit the agent's project .mcp.json — see doc above.
-    "--strict-mcp-config",
-  ];
-}
-
-/**
- * Spawns `claude -p <user> --append-system-prompt <system> --model
- * <model> --no-session-persistence --strict-mcp-config`, collects
- * stdout, enforces a wall-clock timeout. Uses the caller's `$PATH` to
- * locate `claude`.
- *
- * Post-RFC-H: claude reads its OAuth credentials from
- * `<agentDir>/.claude/credentials.json` directly. The auth-broker is
- * the sole writer of that file and refreshes ahead of claude's own
- * window. No env injection — `CLAUDE_CODE_OAUTH_TOKEN` was deleted
- * with the fanout path.
- */
-export const defaultClaudeCliRunner: ClaudeCliRunner = {
-  async run({ model, system, user, timeoutMs }) {
-    return await new Promise<string>((resolve, reject) => {
-      const args = buildHandoffClaudeArgs({ model, system, user });
-      const env: NodeJS.ProcessEnv = {
-        ...process.env,
-        FORCE_COLOR: "0",
-        NO_COLOR: "1",
-      };
-      const child = spawn("claude", args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        env,
-      });
-      let stdout = "";
-      let stderr = "";
-      const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-        reject(new Error(`timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-      child.stdout.on("data", (d) => {
-        stdout += d.toString("utf-8");
-      });
-      child.stderr.on("data", (d) => {
-        stderr += d.toString("utf-8");
-      });
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          const tail = stderr.trim().split("\n").slice(-3).join(" | ");
-          reject(new Error(`claude -p exited ${code}: ${tail || "(no stderr)"}`));
-        }
-      });
-    });
-  },
-};
 
 function errMsg(err: unknown): string {
   if (err && typeof err === "object" && "message" in err) {
@@ -371,25 +252,9 @@ function errMsg(err: unknown): string {
   return String(err);
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      },
-    );
-  });
-}
-
 async function mirrorToHindsight(
   briefing: string,
-  opts: SummarizeOpts,
+  opts: BuildHandoffOpts,
 ): Promise<void> {
   const url = opts.hindsightUrl ?? process.env.HINDSIGHT_API_URL;
   const bankId = opts.hindsightBankId ?? process.env.HINDSIGHT_BANK_ID ?? "default";
@@ -414,7 +279,7 @@ async function mirrorToHindsight(
     });
   } catch (err) {
     process.stderr.write(
-      `handoff-summarizer: hindsight mirror failed — ${errMsg(err)}\n`,
+      `handoff: hindsight mirror failed — ${errMsg(err)}\n`,
     );
   }
 }
@@ -432,7 +297,7 @@ export function findLatestSessionJsonl(claudeConfigDir: string): string | null {
   const walk = (dir: string): void => {
     let entries: string[];
     try {
-      entries = require("fs").readdirSync(dir);
+      entries = readdirSync(dir);
     } catch {
       return;
     }

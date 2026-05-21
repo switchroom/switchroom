@@ -422,13 +422,13 @@ mkdir -p "$TELEGRAM_STATE_DIR" 2>/dev/null || true
 
 {{#if handoffEnabled}}
 # --- Session handoff briefing ---
-# On a normal shutdown the Stop hook writes .handoff.md (compact
-# summary of the prior session) into the agent dir. Here we merge that
-# briefing into --append-system-prompt so the fresh session wakes up
-# already knowing what was going on. If the prior session crashed
-# without firing the Stop hook, we fall back to a synchronous
-# summarization capped at 2s — if that doesn't finish, skip gracefully
-# and rely on Hindsight's per-turn auto-recall.
+# On a normal shutdown the Stop hook writes .handoff.md (a bounded
+# raw transcript tail of the prior session — see RFC #1620) into the
+# agent dir. Here we merge that into --append-system-prompt so the
+# fresh session wakes up able to reorient. If the prior session
+# crashed without firing the Stop hook, we fall back to building the
+# tail synchronously, capped at 2s — if that doesn't finish, skip
+# gracefully and rely on Hindsight's per-turn auto-recall.
 #
 # In 'handoff' mode (the default as of #362), when no .handoff.md is
 # available from the Stop hook, we also run handoff-briefing.sh which
@@ -461,7 +461,7 @@ fi
 export SWITCHROOM_HANDOFF_SHOW_LINE={{#if handoffShowLine}}true{{else}}false{{/if}}
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 # Inject .handoff-briefing.md first (assembled from live sources), then
-# .handoff.md (LLM-generated session summary from Stop hook). If both
+# .handoff.md (raw transcript tail from the Stop hook). If both
 # exist, separate them with a divider so the agent sees both.
 if [ -s "$HANDOFF_BRIEFING_FILE" ]; then
   _BRIEFING_CONTENT=$(cat "$HANDOFF_BRIEFING_FILE")
