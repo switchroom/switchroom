@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/switchroom-hero-wide.png" alt="Switchroom: opinionated Telegram UX for Claude Code on your Pro or Max subscription" width="100%">
+  <img src="docs/assets/switchroom-hero-wide.png" alt="Switchroom: a standing team of specialist assistants on your Claude Pro or Max subscription, run from Telegram" width="100%">
 </p>
 
 # Switchroom
@@ -10,7 +10,7 @@
 [![Trigger evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-trigger-evals.json)](https://github.com/switchroom/switchroom/actions/workflows/ci-evals.yml)
 [![Quality evals](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fmekenthompson%2F002f3482b19111d35e57c1903b3733e2%2Fraw%2Fswitchroom-quality-evals.json)](https://github.com/switchroom/switchroom/actions/workflows/ci-evals.yml)
 
-**A switchboard for your Pro or Max.** Your Claude subscription, run as a fleet of always-on specialist agents you talk to from Telegram. Opinionated UX, done properly.
+**A switchboard for your Pro or Max.** Your standing team. Specialist assistants who remember you, own their patch, and act, while you get on with life. You text them from Telegram. They run on the Claude subscription you already pay for.
 
 [Latest release notes →](CHANGELOG.md)
 
@@ -18,44 +18,34 @@
 
 > *I loved OpenClaw + Telegram. I wanted my Claude subscription. And the UX done properly. So I built this.*
 
-You had the obvious idea. Run Claude Code agents 24/7 on a cheap Linux box, talk to them from Telegram, use the Pro or Max subscription you already pay for.
+The use case came from OpenClaw: always-on assistants in a chat app, each with a personality and a job. Good idea. Three things stopped it being the one I needed, and nothing else fixed them:
 
-Two ways to do that today. Both miss:
+- **On the subscription, properly.** The Claude plan I already pay for, the same OAuth as the desktop. Compliant. Predictable cost. Not an API meter. Not a second invoice.
+- **On the leash.** Give an assistant broad standing access and one day it helpfully does something irreversible. Credentials, tools, skills: granted deliberately, approved by a human, no way around it.
+- **Telegram, done properly.** Not a bridge spread thin across Slack, Discord, Teams. One channel. Opinionated. Excellent.
 
-- **OpenClaw + Telegram.** Great UX. But it hits the Anthropic API on your own key, so a token bill ticks over in the background. You signed up to use your subscription, not to buy API credits on top of it.
-- **Claude Code's built-in Telegram channel.** Uses the subscription correctly. But it's an MVP black box. Send a message, wait, eventually something comes back. What did the agent actually do? Which tools ran? Did it get stuck? No idea.
-
-Switchroom is the third option. Subscription-honest, and the UX done properly. The headline: the agent is never a black box and never silent. You always see what it is doing, what it is waiting on, and when it is done.
+So I built it.
 
 ## See it work
 
-Switchroom's UX is deterministic. Every agent topic carries a status line that is always one of three honest states, never a guess and never nothing:
+You text a specialist the way you'd text a good assistant. Here is `clerk`, a chief of staff that runs the calendar, watches the health data, and fields the household asks, all in one voice, because it knows you across all of it.
+
+> **You:** move my 3pm to Thursday and tell Sarah why
+
+clerk knows your week and knows who Sarah is. It gets on with it, then tells you in plain words what it did. No tool-call log to babysit.
 
 ```
-🟡 quiet · no turns yet
-⚙️ working since 2m ago
-🟢 idle · last reply 5m ago
+clerk
+Thursday 3 to 4pm is clear. Moved "Design review" there.
+
+Drafted a note to Sarah:
+  "Had to shift our 3pm to Thursday. Same agenda,
+   see you then."
+
+Send it?                          [ Send ]   [ Edit ]
 ```
 
-While the agent works, the reply streams in place (about once a second, not one delayed dump at the end) and tool steps render as they run with `MM:SS` durations. Long-running work gets a Steer button so you can redirect mid-turn without killing it. When an agent delegates, a sub-agent block shows the live fleet, up to 5 members, each with its role and current tool:
-
-```
-⚙️ Working…  ·  00:12
-refactor the auth module to use JWT
-
-✅ Read session.ts
-✅ Grep "cookie"
-🔵 Edit jwt.ts  ·  00:04
-
-Sub-agents · 2 running
-🔵 implement  ·  Edit jwt.ts
-🔵 test-runner  ·  Bash npm test
-                                   [ Steer ]
-```
-
-<p align="center"><img src="docs/diagrams/deterministic-status-anatomy.svg" width="760" alt="Deterministic status anatomy: the never-silent state strip (quiet, working, idle) feeding a working-status message with streamed tool steps at MM:SS, a sub-agent fleet block, and a Steer button. Posted and edited in the topic, never pinned."></p>
-
-Older sub-agents collapse to `+N more` once the live set passes 5. Tool arguments are sanitised before they render: file paths show the basename only, token-shaped strings get redacted, so a secret never lands in a status message. The card is posted and edited in the topic, not pinned, so it never leaves a stale `⚙️ Working…` stranded at the top of your chat. [Full UX behaviour →](docs/telegram-plugin.md)
+It does the work itself. It stops at the one thing that matters, the message leaving your hands, and waits for your tap. Nothing with consequences happens on the agent's say-so alone. You are never left wondering what it is doing, and you never have to watch it. [Full UX behaviour →](docs/telegram-plugin.md)
 
 ## Quickstart
 
@@ -93,21 +83,21 @@ Full new-user walkthrough, zero to first Telegram message in ~15 minutes, plus t
 
 | Feature | What it does |
 |---|---|
-| **Deterministic UX** | Every topic shows an honest state: quiet, working since, or idle. Never a black box, never silent. The headline. |
-| **Live step streaming** | The reply streams in place while tools run, with durations and a Steer button to redirect mid-turn. Not pinned, no stale cards. |
-| **Sub-agent fleet view** | Delegated workers surface as live rows (up to 5, then `+N more`), each with role and current tool. Args sanitised before render. |
+| **A standing team** | One bot per specialist, each with its own persona, memory, skills, tools, and credentials. Add a specialist in ten lines of YAML. You don't fork the product. |
+| **You hold the leash** | Per-agent least-privilege ACL over an AES-256-GCM vault. Anything extra needs your tap on an inline Telegram Approve/Deny card. No heartbeats: beck-and-call plus the schedules you set, never roaming. |
+| **Persistent memory** | Hindsight semantic memory, including a per-user mental model that carries across conversations and restarts. |
 | **Claude Pro/Max auth** | OAuth, not API keys. No per-token billing. Fleet-wide active account plus fallback order, broker-owned refresh and credential fanout. |
-| **Vault + approval kernel** | AES-256-GCM secrets. Per-agent least-privilege ACL. Anything extra needs your tap on an inline Telegram Approve/Deny card. |
-| **Sub-agents** | Opus plans, Sonnet implements. Sub-agent work surfaces in the fleet block. |
+| **Always available** | Long-running service per agent. Survives reboots, network drops, your laptop closing. Resumes mid-turn with a wake-audit. |
+| **Honest status** | Every topic shows plain-language state: quiet, working, or idle. Never a black box, never silent, never a tool-call log to babysit. |
+| **Live replies** | The reply streams in place while the agent works, with a Steer button to redirect mid-turn. Posted in the topic, not pinned, no stale cards. |
+| **Sub-agents** | Opus plans, Sonnet implements. Delegated work surfaces as live rows in a shared fleet block. |
 | **Config cascade** | Defaults, then profiles, then per-agent YAML. Change one line, every agent updates. |
 | **Scheduled tasks** | Cron-syntax tasks that fire across reboots. Headless secret access through the vault broker. |
-| **Persistent memory** | Hindsight semantic memory, including a per-user mental model that carries across conversations. |
-| **Always-on** | Long-running service per agent. Survives reboots, network drops, your laptop closing. Resumes mid-turn with a wake-audit. |
 | **17 Telegram MCP tools** | reply, stream, react, edit, pin, delete, forward, typing, history, checklists (+update), stickers, GIFs, attachment download, ask-user, vault request access/save. |
 
 ## Subscription-honest, and safe by default
 
-**Stock CLI, real OAuth.** Each agent runs the unmodified `claude` binary, authenticated with Anthropic through the same OAuth flow you use on the desktop app. No API key. No harness. No patched CLI. No proxied inference. One bill, the one you already pay. See the [Compliance Attestation](docs/compliance-attestation.md) for the full analysis against Anthropic's April 2026 third-party policy.
+**Stock CLI, real OAuth.** Each agent runs the unmodified `claude` binary, authenticated with Anthropic through the same OAuth flow you use on the desktop app. No API key. No Agent SDK. No harness. No patched CLI. No proxied inference. This is a hard constraint, not a preference: running the native CLI on the subscription is what keeps switchroom inside Anthropic's third-party policy. One bill, the one you already pay. See the [Compliance Attestation](docs/compliance-attestation.md) for the full analysis.
 
 **Least privilege, and you hold the keys.** This is the core opinion. An agent never holds the vault passphrase and never sees a secret it was not given. Secrets live in an AES-256-GCM vault. Each agent reaches the vault broker over its own socket whose identity is the bind path, so a compromised agent cannot pose as another. An agent can read a key only if you listed it for that agent's task: that is the standing, least-privilege ACL. Anything beyond that is just-in-time. The agent asks, you get an inline Telegram Approve/Deny card showing exactly what and why, and only your tap mints a scoped, expiring grant. The agent cannot self-elevate.
 
@@ -121,7 +111,7 @@ Switchroom's position: agents should collaborate with you on real documents, not
 
 ## Survives real life
 
-Always-on is not enough on its own. Things still die. The product has to handle that or the illusion breaks.
+Always available is not enough on its own. Things still die. The product has to handle that or the illusion breaks.
 
 <p align="center"><img src="docs/diagrams/wake-audit-lifecycle.svg" width="700" alt="Wake-audit lifecycle: kill, crash-pane snapshot, auto-restart, agent boots with SWITCHROOM_PENDING_TURN, acks with three options"></p>
 
@@ -134,16 +124,17 @@ Always-on is not enough on its own. Things still die. The product has to handle 
 
 | | Switchroom | Claude Code channels | OpenClaw | NanoClaw |
 |---|---|---|---|---|
-| Progress visibility | Deterministic status, never silent | Black box | None | None |
-| Runtime | Claude Code CLI | Claude Code CLI | Custom runtime | Agents SDK |
+| Runtime | Stock Claude Code CLI | Claude Code CLI | Custom runtime | Agents SDK |
 | Auth | Pro/Max OAuth | Pro/Max OAuth | API key | API key |
-| Sub-agent tracking | Yes, live fleet block | No | No | No |
-| Parallel display | Shared fleet status, up to 5 rows | No | No | No |
+| Standing access | Per-agent least-privilege ACL | None | Broad/permissive | Broad/permissive |
 | Approval UX | Inline Telegram cards | None | None | None |
+| Specialist fleet | One bot per specialist, own persona | Single | Yes | Yes |
+| Sub-agent tracking | Yes, live fleet block | No | No | No |
+| Progress visibility | Deterministic status, never silent | Black box | None | None |
 | Config | YAML with cascade | None | JSON/TOML | Env vars |
 | Setup | `switchroom setup` | Built-in (limited) | Docker compose | Docker compose |
 
-The wedge against OpenClaw and NanoClaw is not the substrate. It is the stock `claude` CLI under your subscription, instead of a custom runtime under your API key. [vs OpenClaw](docs/vs-openclaw.md) and [vs NanoClaw](docs/vs-nanoclaw.md).
+The wedge against OpenClaw and NanoClaw is not the substrate. It is the stock `claude` CLI under your subscription, on your leash, instead of a custom runtime under your API key with broad standing access. [vs OpenClaw](docs/vs-openclaw.md) and [vs NanoClaw](docs/vs-nanoclaw.md).
 
 ## Architecture
 
@@ -192,17 +183,17 @@ See [`docs/architecture.md`](docs/architecture.md) for the process model, IPC la
 **Can I use a Claude Pro or Max subscription instead of an API key?**
 Yes. That is the whole point. Switchroom runs the unmodified `claude` CLI with the same OAuth flow you use on the desktop app. No API key. No per-token billing.
 
-**How is this different from Claude Code's built-in Telegram channel?**
-The built-in channel is message in, message out, with no visibility into what the agent is doing in between. Switchroom shows a deterministic status on every topic (quiet, working, idle) and streams the steps in place as tools run. You always know the state, which is the bit the built-in channel gets wrong.
+**What is the leash, exactly?**
+An agent only ever uses the credentials and tools you granted it. It can ask for more, and you get an inline Telegram Approve/Deny card showing what and why. Only your tap grants it, the grant is scoped and expiring, and the agent cannot self-elevate or route around you. There are no heartbeats: agents are beck-and-call plus the schedules you set, never roaming on their own.
 
 **Does it work with multiple agents at the same time?**
-Yes. Each agent gets its own Telegram forum topic with its own status. When an agent delegates, its sub-agents show up as live rows in a shared fleet block (up to 5, then `+N more`), each with role and current tool.
+Yes. Each specialist gets its own Telegram forum topic, its own persona, memory, and tools. When an agent delegates, its sub-agents show up as live rows in a shared fleet block (up to 5, then `+N more`), each with role and current tool.
 
 **What does it cost to run?**
 A cheap Linux VPS (around $6/mo on Hetzner, DigitalOcean, wherever), plus your existing Claude Pro ($20/mo) or Max ($100/mo) subscription. Switchroom itself is MIT-licensed, free.
 
 **Is this against Anthropic's terms of service?**
-No. Switchroom uses the official `claude` binary with the official OAuth flow. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
+No. Switchroom uses the official `claude` binary with the official OAuth flow, and only ever the interactive CLI on the subscription. See [docs/compliance-attestation.md](docs/compliance-attestation.md) for the full analysis.
 
 ## Telemetry
 
