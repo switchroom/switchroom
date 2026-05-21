@@ -3768,6 +3768,102 @@ const ipcServer: IpcServer = createIpcServer({
     })
   },
 
+  /**
+   * #1623 — hostd-initiated config-edit approval card. hostd posts a
+   * `request_config_approval` message; we render the card via
+   * `handleRequestConfigApproval`, awaiting the operator tap (or
+   * timeout) before sending `config_approval_resolved` back. After
+   * hostd's apply attempt completes it posts
+   * `request_config_finalize` to flip the card to the terminal
+   * outcome.
+   */
+  async onRequestConfigApproval(client: IpcClient, msg) {
+    const { handleRequestConfigApproval } = await import(
+      './config-approval-handler.js'
+    )
+    const { InlineKeyboard } = await import('grammy')
+    await handleRequestConfigApproval(client, msg, {
+      agentName: getMyAgentName(),
+      loadTargetChat: () => {
+        const access = loadAccess()
+        const operator = access.allowFrom[0]
+        if (operator === undefined) return null
+        return { chatId: operator }
+      },
+      buildKeyboard: (requestId) =>
+        new InlineKeyboard()
+          .text('✅ Approve', `cfg:${requestId}:approve`)
+          .text('🚫 Deny', `cfg:${requestId}:deny`),
+      postCard: async (args) => {
+        try {
+          const sent = await robustApiCall(
+            () =>
+              bot.api.sendMessage(args.chatId, args.text, {
+                parse_mode: 'HTML',
+                ...(args.threadId !== undefined
+                  ? { message_thread_id: args.threadId }
+                  : {}),
+                reply_markup: args.replyMarkup as never,
+              }),
+            {
+              chat_id: String(args.chatId),
+              verb: 'config-approval-card',
+              ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+            },
+          )
+          return { messageId: (sent as { message_id: number }).message_id }
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: config-approval postCard failed: ${(err as Error).message}\n`,
+          )
+          return null
+        }
+      },
+      editCard: async (args) => {
+        try {
+          await robustApiCall(
+            () =>
+              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
+                parse_mode: 'HTML',
+              }),
+            { chat_id: String(args.chatId), verb: 'config-approval-edit' },
+          )
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: config-approval editCard failed: ${(err as Error).message}\n`,
+          )
+        }
+      },
+      log: (m) =>
+        process.stderr.write(`telegram gateway: config-approval — ${m}\n`),
+    })
+  },
+
+  async onRequestConfigFinalize(client: IpcClient, msg) {
+    const { handleRequestConfigFinalize } = await import(
+      './config-approval-handler.js'
+    )
+    await handleRequestConfigFinalize(client, msg, {
+      editCard: async (args) => {
+        try {
+          await robustApiCall(
+            () =>
+              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
+                parse_mode: 'HTML',
+              }),
+            { chat_id: String(args.chatId), verb: 'config-approval-finalize' },
+          )
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: config-finalize editCard failed: ${(err as Error).message}\n`,
+          )
+        }
+      },
+      log: (m) =>
+        process.stderr.write(`telegram gateway: config-finalize — ${m}\n`),
+    })
+  },
+
   onInjectInbound(_client: IpcClient, msg: InjectInboundMessage) {
     const promptKey = typeof msg.inbound.meta?.prompt_key === 'string'
       ? msg.inbound.meta.prompt_key
@@ -12713,6 +12809,53 @@ bot.on('callback_query:data', async ctx => {
     }
     const { handleApprovalCallback } = await import('./approval-callback.js')
     await handleApprovalCallback(ctx, data)
+    return
+  }
+
+  // #1623: cfg:<requestId>:<approve|deny> — hostd config-edit
+  // approval card. Resolves the pending approval (gateway-side
+  // in-memory map), sends `config_approval_resolved` back to hostd
+  // over the original IPC connection, and edits the card to the
+  // interim "Applying…" / "Denied" state. Same operator-allowlist
+  // gate as every other callback family.
+  if (data.startsWith('cfg:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from?.id ?? '')
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' })
+      return
+    }
+    const { parseConfigApprovalCallback, resolvePendingConfigApproval } =
+      await import('./config-approval-handler.js')
+    const parsed = parseConfigApprovalCallback(data)
+    if (parsed === null) {
+      await ctx.answerCallbackQuery({ text: 'Malformed callback.' })
+      return
+    }
+    const resolved = await resolvePendingConfigApproval(
+      parsed.requestId,
+      parsed.choice,
+      {
+        editCard: async (args) => {
+          try {
+            await bot.api.editMessageText(args.chatId, args.messageId, args.text, {
+              parse_mode: 'HTML',
+            })
+          } catch {
+            /* best effort */
+          }
+        },
+        log: (m) =>
+          process.stderr.write(`telegram gateway: config-approval cb — ${m}\n`),
+      },
+    )
+    await ctx.answerCallbackQuery({
+      text: resolved
+        ? parsed.choice === 'approve'
+          ? 'Approving…'
+          : 'Denied'
+        : 'Already resolved.',
+    })
     return
   }
 
