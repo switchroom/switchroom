@@ -22,6 +22,18 @@ Accuracy matters too. If the displayed number lags reality by an hour,
 the user plans around a phantom. Whatever the product shows, it needs
 to be current enough to act on.
 
+## One pool, not two
+
+The 2026-06-15 Anthropic policy split created a second usage pool — a
+separate Agent-SDK / `claude -p` credit alongside the interactive
+subscription limits. Switchroom deliberately has **no programmatic
+surface**: every model call is the interactive `claude` session (see
+`keep-my-subscription-honest`). So there is exactly *one* pool to
+track — the interactive subscription window — and quota tracking
+stays a single-signal problem. If a future feature ever introduced
+programmatic usage, this job would fork into two legible-but-separate
+signals; that split is itself a reason not to.
+
 ## Signs it's working
 
 - The user can answer "am I close to my limit?" without stopping what
