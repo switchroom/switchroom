@@ -17,7 +17,10 @@ import { join, relative } from "node:path";
  *
  * This test fails the build if any source file spawns `claude`
  * without `--strict-mcp-config`, so a new callsite — or a removed
- * flag — cannot silently reintroduce the flap.
+ * flag — cannot silently reintroduce the flap. As of RFC #1620 the
+ * codebase has *zero* headless-`claude` spawners at all (the handoff
+ * builder and webhook dispatch were both moved off `claude -p`); this
+ * guard keeps any future one honest.
  *
  * NOTE: source is comment-stripped before every check. A naive
  * file-wide substring scan would be defeated by the doc comments that
@@ -88,10 +91,15 @@ describe("bridge-flap regression guard — headless claude must use --strict-mcp
     }))
     .filter((x) => SPAWN_CLAUDE.test(x.code));
 
-  it("the source scan still finds claude spawners (scan-not-broken sanity)", () => {
-    // If the regex silently stops matching, every per-file check below
-    // vacuously passes — this guards the guard.
-    expect(spawners.map((s) => s.rel)).toContain("src/agents/handoff-summarizer.ts");
+  it("the SPAWN_CLAUDE scan regex still matches a claude spawn (scan-not-broken sanity)", () => {
+    // Post-#1620 the codebase has zero headless-`claude` spawners, so
+    // we cannot assert "a spawner exists". Instead verify the scan
+    // regex itself still matches the canonical spawn shapes — if it
+    // silently broke, every per-file check below would vacuously pass.
+    expect(SPAWN_CLAUDE.test('spawn("claude", args, opts)')).toBe(true);
+    expect(SPAWN_CLAUDE.test("spawnFn('claude', ['-p'])")).toBe(true);
+    expect(SPAWN_CLAUDE.test('execFile("claude")')).toBe(true);
+    expect(SPAWN_CLAUDE.test('spawn("bun", args)')).toBe(false);
   });
 
   for (const { rel, code } of spawners) {

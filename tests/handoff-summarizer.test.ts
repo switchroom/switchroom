@@ -1,18 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   extractTurnsFromJsonl,
-  buildHandoffPrompt,
-  parseHandoffResponse,
+  formatTranscriptTail,
+  deriveTopic,
   writeSidecarsAtomic,
-  summarize,
+  buildHandoff,
   findLatestSessionJsonl,
-  buildHandoffClaudeArgs,
   TOPIC_MAX_CHARS,
-  DEFAULT_SUMMARIZER_MODEL,
-  type ClaudeCliRunner,
+  TURN_TEXT_MAX_CHARS,
+  type Turn,
 } from "../src/agents/handoff-summarizer.js";
 
 function makeJsonl(lines: Record<string, unknown>[]): string {
@@ -107,47 +106,96 @@ describe("extractTurnsFromJsonl", () => {
     );
     expect(extractTurnsFromJsonl(path, 10)).toEqual([]);
   });
+
+  it("strips the <channel> wrapper from a type:user entry and collapses the queue-op twin", () => {
+    // A telegram message lands in the JSONL twice — once as a clean
+    // queue-operation enqueue, once as a type:"user" entry whose
+    // string content is the raw <channel>…</channel> envelope. The
+    // extractor must yield ONE clean user turn, not two (and not raw XML).
+    const path = join(tmp, "f.jsonl");
+    const channelBlock =
+      '<channel source="t" chat_id="1" message_id="2">what is 2 + 2?</channel>';
+    writeFileSync(
+      path,
+      makeJsonl([
+        { type: "queue-operation", operation: "enqueue", content: channelBlock },
+        { type: "user", message: { content: channelBlock } },
+        { type: "assistant", message: { content: [{ type: "text", text: "4" }] } },
+      ]),
+    );
+    expect(extractTurnsFromJsonl(path, 10)).toEqual([
+      { role: "user", text: "what is 2 + 2?" },
+      { role: "assistant", text: "4" },
+    ]);
+  });
 });
 
-describe("buildHandoffPrompt", () => {
-  it("includes the Topic header instruction and transcript", () => {
-    const { system, user } = buildHandoffPrompt([
+describe("formatTranscriptTail", () => {
+  it("emits a transcript tail with both roles, oldest first", () => {
+    const out = formatTranscriptTail([
       { role: "user", text: "start the app" },
       { role: "assistant", text: "app started" },
     ]);
-    expect(system).toContain("## Topic:");
-    expect(system).toContain("## Summary");
-    expect(system).toContain("## Last exchange");
-    expect(user).toContain("USER\nstart the app");
-    expect(user).toContain("ASSISTANT\napp started");
+    expect(out).toContain("## Recent turns");
+    expect(out).toContain("### User\nstart the app");
+    expect(out).toContain("### Assistant\napp started");
+    // oldest first — user precedes assistant in the rendered body
+    expect(out.indexOf("start the app")).toBeLessThan(out.indexOf("app started"));
+  });
+
+  it("contains no LLM-summary structure — it is a raw tail, not a briefing", () => {
+    const out = formatTranscriptTail([{ role: "user", text: "hi" }]);
+    expect(out).not.toContain("## Summary");
+    expect(out).not.toContain("## Topic:");
+  });
+
+  it("handles an empty transcript", () => {
+    const out = formatTranscriptTail([]);
+    expect(out).toContain("No recent turns were recoverable");
+  });
+
+  it("truncates an over-long turn", () => {
+    const huge = "x".repeat(TURN_TEXT_MAX_CHARS + 500);
+    const out = formatTranscriptTail([{ role: "assistant", text: huge }]);
+    expect(out).toContain("…[truncated]");
+    // the rendered turn body is bounded
+    expect(out.length).toBeLessThan(huge.length);
   });
 });
 
-describe("parseHandoffResponse", () => {
-  it("extracts topic + briefing", () => {
-    const raw = "## Topic: wiring the thing\n\n## Summary\nWorking on it.";
-    const out = parseHandoffResponse(raw);
-    expect(out).not.toBeNull();
-    expect(out!.topic).toBe("wiring the thing");
-    expect(out!.briefing).toContain("## Topic: wiring the thing");
-    expect(out!.briefing).toContain("## Summary");
+describe("deriveTopic", () => {
+  it("uses the most recent user turn", () => {
+    expect(
+      deriveTopic([
+        { role: "user", text: "first thing" },
+        { role: "assistant", text: "did it" },
+        { role: "user", text: "now the second thing" },
+        { role: "assistant", text: "working on it" },
+      ]),
+    ).toBe("now the second thing");
   });
 
-  it("truncates long topics with ellipsis", () => {
-    const long = "x".repeat(TOPIC_MAX_CHARS + 50);
-    const raw = `## Topic: ${long}\n\nbody`;
-    const out = parseHandoffResponse(raw);
-    expect(out!.topic.endsWith("…")).toBe(true);
-    expect(out!.topic.length).toBe(TOPIC_MAX_CHARS + 1);
+  it("falls back to the last turn when there is no user turn", () => {
+    expect(
+      deriveTopic([{ role: "assistant", text: "cron-fired report" }]),
+    ).toBe("cron-fired report");
   });
 
-  it("returns null when Topic header missing", () => {
-    expect(parseHandoffResponse("## Summary\nno topic")).toBeNull();
-    expect(parseHandoffResponse("")).toBeNull();
+  it("returns a placeholder for an empty transcript", () => {
+    expect(deriveTopic([])).toBe("previous session");
   });
 
-  it("is case-insensitive on the Topic keyword", () => {
-    expect(parseHandoffResponse("## topic: lowercase")!.topic).toBe("lowercase");
+  it("uses the first non-empty line of a multi-line turn", () => {
+    expect(
+      deriveTopic([{ role: "user", text: "\n\nfix the build\nand also tests" }]),
+    ).toBe("fix the build");
+  });
+
+  it("clamps a long topic with an ellipsis", () => {
+    const long = "y".repeat(TOPIC_MAX_CHARS + 40);
+    const topic = deriveTopic([{ role: "user", text: long }]);
+    expect(topic.endsWith("…")).toBe(true);
+    expect(topic.length).toBe(TOPIC_MAX_CHARS + 1);
   });
 });
 
@@ -171,11 +219,11 @@ describe("writeSidecarsAtomic", () => {
   });
 });
 
-describe("summarize pipeline", () => {
+describe("buildHandoff pipeline", () => {
   let tmp: string;
 
   beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), "handoff-summ-"));
+    tmp = mkdtempSync(join(tmpdir(), "handoff-build-"));
   });
 
   afterEach(() => {
@@ -185,82 +233,47 @@ describe("summarize pipeline", () => {
   it("returns 'no-turns' when JSONL is empty", async () => {
     const jsonlPath = join(tmp, "empty.jsonl");
     writeFileSync(jsonlPath, "");
-    const status = await summarize({
+    const status = await buildHandoff({
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      runner: fakeRunner("## Topic: x\n\nbody"),
     });
     expect(status).toBe("no-turns");
   });
 
-  it("returns 'ok' and writes sidecars on happy path", async () => {
+  it("returns 'ok' and writes the transcript-tail sidecars — no claude -p", async () => {
     const jsonlPath = join(tmp, "turns.jsonl");
     writeFileSync(
       jsonlPath,
       makeJsonl([
         {
+          type: "queue-operation",
+          operation: "enqueue",
+          content: '<channel source="t" chat_id="1" message_id="2">deploy the worker</channel>',
+        },
+        {
           type: "assistant",
-          message: { content: [{ type: "text", text: "Hey." }] },
+          message: { content: [{ type: "text", text: "Worker deployed." }] },
         },
       ]),
     );
-    const status = await summarize({
+    const status = await buildHandoff({
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      runner: fakeRunner("## Topic: greeting\n\n## Summary\nSaid hi."),
     });
     expect(status).toBe("ok");
-    expect(readFileSync(join(tmp, ".handoff-topic"), "utf-8")).toBe("greeting");
-    expect(readFileSync(join(tmp, ".handoff.md"), "utf-8")).toContain("## Summary");
+
+    const handoff = readFileSync(join(tmp, ".handoff.md"), "utf-8");
+    expect(handoff).toContain("## Recent turns");
+    expect(handoff).toContain("deploy the worker");
+    expect(handoff).toContain("Worker deployed.");
+
+    // Topic is derived from the last user turn — deterministically.
+    expect(readFileSync(join(tmp, ".handoff-topic"), "utf-8")).toBe("deploy the worker");
   });
 
-  it("returns 'parse-error' when LLM omits the Topic header", async () => {
-    const jsonlPath = join(tmp, "turns.jsonl");
-    writeFileSync(
-      jsonlPath,
-      makeJsonl([
-        {
-          type: "assistant",
-          message: { content: [{ type: "text", text: "hi" }] },
-        },
-      ]),
-    );
-    const status = await summarize({
-      jsonlPath,
-      agentDir: tmp,
-      agentName: "test",
-      runner: fakeRunner("## Summary\nno topic line"),
-    });
-    expect(status).toBe("parse-error");
-    expect(existsSync(join(tmp, ".handoff-topic"))).toBe(false);
-  });
-
-  it("returns 'cli-error' and does not write when claude -p throws", async () => {
-    const jsonlPath = join(tmp, "turns.jsonl");
-    writeFileSync(
-      jsonlPath,
-      makeJsonl([
-        {
-          type: "assistant",
-          message: { content: [{ type: "text", text: "hi" }] },
-        },
-      ]),
-    );
-    const errStderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const status = await summarize({
-      jsonlPath,
-      agentDir: tmp,
-      agentName: "test",
-      runner: failingRunner(new Error("boom")),
-    });
-    expect(status).toBe("cli-error");
-    expect(existsSync(join(tmp, ".handoff.md"))).toBe(false);
-    errStderr.mockRestore();
-  });
-
-  it("mirrors to Hindsight when URL provided and skips when not", async () => {
+  it("mirrors the tail to Hindsight when a URL is provided", async () => {
     const jsonlPath = join(tmp, "turns.jsonl");
     writeFileSync(
       jsonlPath,
@@ -276,18 +289,44 @@ describe("summarize pipeline", () => {
       fetchCalls.push(url);
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
-    const status = await summarize({
+    const status = await buildHandoff({
       jsonlPath,
       agentDir: tmp,
       agentName: "test",
-      runner: fakeRunner("## Topic: x\n\ndone"),
       hindsightUrl: "http://localhost:9999",
       hindsightBankId: "mybank",
       fetch: fakeFetch,
     });
     expect(status).toBe("ok");
-    expect(fetchCalls).toHaveLength(1);
-    expect(fetchCalls[0]).toBe("http://localhost:9999/v1/default/banks/mybank/memories");
+    expect(fetchCalls).toEqual([
+      "http://localhost:9999/v1/default/banks/mybank/memories",
+    ]);
+  });
+
+  it("skips the Hindsight mirror when no URL is configured", async () => {
+    const jsonlPath = join(tmp, "turns.jsonl");
+    writeFileSync(
+      jsonlPath,
+      makeJsonl([
+        {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "hi" }] },
+        },
+      ]),
+    );
+    const fetchCalls: string[] = [];
+    const fakeFetch = (async (url: string) => {
+      fetchCalls.push(url);
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const status = await buildHandoff({
+      jsonlPath,
+      agentDir: tmp,
+      agentName: "test",
+      fetch: fakeFetch,
+    });
+    expect(status).toBe("ok");
+    expect(fetchCalls).toEqual([]);
   });
 });
 
@@ -328,55 +367,6 @@ describe("findLatestSessionJsonl", () => {
   });
 });
 
-// Helpers: fake claude CLI runners without spawning real subprocesses.
-
-function fakeRunner(responseText: string): ClaudeCliRunner {
-  return { run: async () => responseText };
-}
-
-function failingRunner(err: Error): ClaudeCliRunner {
-  return {
-    run: async () => {
-      throw err;
-    },
-  };
-}
-
-// Keeps the model constant export referenced so rename accidents break
-// this test (canary).
-describe("module constants", () => {
-  it("exposes a stable default model id", () => {
-    expect(DEFAULT_SUMMARIZER_MODEL).toMatch(/^claude-/);
-  });
-});
-
-describe("buildHandoffClaudeArgs", () => {
-  const args = buildHandoffClaudeArgs({
-    model: "claude-haiku-4-5-20251001",
-    system: "sys prompt",
-    user: "user prompt",
-  });
-
-  // Regression guard for the per-turn bridge-flap (#1613). Without
-  // --strict-mcp-config the headless summarizer auto-loads the agent's
-  // project .mcp.json, starts switchroom-telegram, and spawns a second
-  // bridge that collides with the live agent's bridge at the gateway.
-  it("passes --strict-mcp-config so it loads zero MCP servers", () => {
-    expect(args).toContain("--strict-mcp-config");
-  });
-
-  it("passes no --mcp-config — strict + empty means no servers at all", () => {
-    expect(args).not.toContain("--mcp-config");
-  });
-
-  it("runs headless print mode without session persistence", () => {
-    expect(args).toContain("-p");
-    expect(args).toContain("--no-session-persistence");
-  });
-
-  it("threads through model, system, and user", () => {
-    expect(args[args.indexOf("--model") + 1]).toBe("claude-haiku-4-5-20251001");
-    expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("sys prompt");
-    expect(args[args.indexOf("-p") + 1]).toBe("user prompt");
-  });
-});
+// Keeps the `Turn` type referenced so a rename breaks this file (canary).
+const _typeCanary: Turn = { role: "user", text: "x" };
+void _typeCanary;
