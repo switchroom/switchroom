@@ -13,8 +13,9 @@
  *
  * The stronger, fuzzed successor of this contract is
  * `jtbd-fast-ack-dm.test.ts` — varied prompt shapes, a tight 20s
- * hard budget backstopped by the framework ack poke. This file is
- * retained as a minimal single-prompt floor.
+ * hard latency target (a tight target, not a framework guarantee —
+ * see that file's header). This file is retained as a minimal
+ * single-prompt floor.
  */
 
 import { describe, it, expect } from "vitest";
