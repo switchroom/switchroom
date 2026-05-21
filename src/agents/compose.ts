@@ -1318,7 +1318,7 @@ function emitAgentService(
   // RAM-backed and capped so a runaway can't fill the host disk.
   lines.push(`    read_only: true`);
   lines.push(`    tmpfs:`);
-  lines.push(`      - /tmp:size=256m,mode=1777`);
+  lines.push(`      - /tmp:size=1g,mode=1777`);
   lines.push(`    depends_on:`);
   lines.push(`      vault-broker:`);
   lines.push(`        condition: service_started`);
