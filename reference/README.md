@@ -29,26 +29,26 @@ that touches the job.
 
 ## JTBD index — grouped by vision outcome
 
-### Visibility — *see every step, pinned to the chat*
-
-- [`know-what-my-agent-is-doing.md`](know-what-my-agent-is-doing.md) — know what my agent is actually doing
-- [`restart-and-know-what-im-running.md`](restart-and-know-what-im-running.md) — know what I'm running after a restart, without asking
-- [`track-plan-quota-live.md`](track-plan-quota-live.md) — track my plan quota live, without a dashboard
-- [`steer-or-queue-mid-flight.md`](steer-or-queue-mid-flight.md) — steer or queue while the agent is mid-flight
-
-### Multi-agent fleet — *specialists, not one generalist*
+### A standing team that knows you — *specialists, not one generalist*
 
 - [`run-a-fleet-of-specialists.md`](run-a-fleet-of-specialists.md) — run a fleet of specialists, not one generalist
 - [`give-each-agent-its-own-workspace.md`](give-each-agent-its-own-workspace.md) — give each agent its own working copy of the code
 - [`remember-across-sessions.md`](remember-across-sessions.md) — remember across sessions without being re-told
 - [`extend-without-forking.md`](extend-without-forking.md) — extend the product without forking it
 
-### Subscription-honest — *your Pro or Max is the ceiling*
+### You hold the leash — *controlled, purposeful, never roaming*
+
+- [`know-what-my-agent-is-doing.md`](know-what-my-agent-is-doing.md) — know what my agent is actually doing
+- [`restart-and-know-what-im-running.md`](restart-and-know-what-im-running.md) — know what I'm running after a restart, without asking
+- [`track-plan-quota-live.md`](track-plan-quota-live.md) — track my plan quota live, without a dashboard
+- [`steer-or-queue-mid-flight.md`](steer-or-queue-mid-flight.md) — steer or queue while the agent is mid-flight
+
+### Subscription-honest and predictable — *the plan is the ceiling*
 
 - [`keep-my-subscription-honest.md`](keep-my-subscription-honest.md) — keep my subscription the only thing I'm paying for
 - [`share-auth-across-the-fleet.md`](share-auth-across-the-fleet.md) — log into Anthropic once per account, not once per agent
 
-### Always-on — *runs while you sleep or work offline*
+### Always available — *there when you want it*
 
 - [`survive-reboots-and-real-life.md`](survive-reboots-and-real-life.md) — survive reboots and real life
 - [`idempotent-update-and-restart.md`](idempotent-update-and-restart.md) — update switchroom and trust everything's running the new version
