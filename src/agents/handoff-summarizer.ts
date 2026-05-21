@@ -278,9 +278,43 @@ export async function summarize(opts: SummarizeOpts): Promise<string> {
 }
 
 /**
+ * Build the `claude -p` argv for the handoff summarizer.
+ *
+ * `--strict-mcp-config` is load-bearing. Without it, this headless
+ * `claude -p` auto-discovers the agent's project `.mcp.json` and starts
+ * every MCP server in it — including `switchroom-telegram`. That spins
+ * up a *second* telegram bridge process which registers against the
+ * same gateway socket as the live agent's real bridge (it inherits
+ * `SWITCHROOM_AGENT_NAME`). The two collide under the gateway's
+ * register-race close, producing the per-turn "bridge reconnect race"
+ * flap (#1613 — the handoff Stop hook fires every turn, so does the
+ * flap). The summarizer is pure transcript-in / briefing-out: it needs
+ * no MCP tools. `--strict-mcp-config` with no `--mcp-config` loads
+ * zero servers. Exported for the args regression test.
+ */
+export function buildHandoffClaudeArgs(opts: {
+  model: string;
+  system: string;
+  user: string;
+}): string[] {
+  return [
+    "-p",
+    opts.user,
+    "--model",
+    opts.model,
+    "--append-system-prompt",
+    opts.system,
+    "--no-session-persistence",
+    // Do NOT inherit the agent's project .mcp.json — see doc above.
+    "--strict-mcp-config",
+  ];
+}
+
+/**
  * Spawns `claude -p <user> --append-system-prompt <system> --model
- * <model> --no-session-persistence`, collects stdout, enforces a
- * wall-clock timeout. Uses the caller's `$PATH` to locate `claude`.
+ * <model> --no-session-persistence --strict-mcp-config`, collects
+ * stdout, enforces a wall-clock timeout. Uses the caller's `$PATH` to
+ * locate `claude`.
  *
  * Post-RFC-H: claude reads its OAuth credentials from
  * `<agentDir>/.claude/credentials.json` directly. The auth-broker is
@@ -291,15 +325,7 @@ export async function summarize(opts: SummarizeOpts): Promise<string> {
 export const defaultClaudeCliRunner: ClaudeCliRunner = {
   async run({ model, system, user, timeoutMs }) {
     return await new Promise<string>((resolve, reject) => {
-      const args = [
-        "-p",
-        user,
-        "--model",
-        model,
-        "--append-system-prompt",
-        system,
-        "--no-session-persistence",
-      ];
+      const args = buildHandoffClaudeArgs({ model, system, user });
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         FORCE_COLOR: "0",
