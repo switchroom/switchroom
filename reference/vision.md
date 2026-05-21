@@ -78,10 +78,20 @@ specialist without leaving the topic.
 Switchroom is scaffolding and lifecycle management. It creates
 directories, stands up a long-running service per agent, manages
 OAuth, routes Telegram messages, and gets out of the way. Each agent
-runs the unmodified `claude` binary, authenticated directly with
-Anthropic. No Agent SDK, no API-key routing, no credential
-interception. Fully compliant with Anthropic's April 2026 third-party
-policy.
+runs the **unmodified `claude` binary**, authenticated directly with
+Anthropic through the **Pro/Max OAuth** flow. No Agent SDK, no
+API-key routing, no `ANTHROPIC_API_KEY`, no credential interception,
+no custom inference runtime.
+
+This is a **hard constraint, not a preference** — it is what keeps
+switchroom compliant with Anthropic's third-party policy. The native
+CLI on the subscription is the compliance boundary: the moment a
+feature reaches for the Agent SDK or the raw API, it has left
+switchroom. Every model call is the interactive `claude` session, or
+a synthesized turn injected into it. (`claude -p` headless mode is the
+same CLI, but as of the 2026-06-15 policy it counts as *programmatic*
+usage — off the subscription — so switchroom routes that work back
+through the interactive session instead.)
 
 One bill. The one you already pay.
 
