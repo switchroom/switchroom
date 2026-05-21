@@ -3020,6 +3020,22 @@ export interface ReconcileOptions {
    * as-is, ignoring template updates. Default false (regeneration is default).
    */
   preserveClaudeMd?: boolean;
+  /**
+   * If true, skip re-rendering files sourced from the bundled `profiles/`
+   * tree (start.sh, CLAUDE.md, settings.json template merges). Used by
+   * the in-agent cron-only reconcile bridge (#1618): when the broker
+   * inside an agent container fires reconcile after a `schedule_add`
+   * write, the `profiles/` directory is not shipped into the agent
+   * image (`docker/Dockerfile.agent`) — `PROFILES_ROOT` resolves to a
+   * non-existent path like `/profiles/_base/` and the re-render throws
+   * `ENOENT` which the bridge surfaces as `E_RECONCILE_FAILED`,
+   * rolling the overlay back. The cron-only path never needs these
+   * re-renders: schedule changes only touch `schedule.d/` overlays and
+   * the resulting cron scripts under `cron.d/`, neither of which read
+   * profile templates. The host-side full reconcile leaves this option
+   * false and continues to regenerate templated files.
+   */
+  skipProfileTemplates?: boolean;
 }
 
 /**
@@ -3640,7 +3656,7 @@ export function reconcileAgent(
   // regenerate it. Previously we bailed on missing file which left the
   // agent permanently unable to launch until a full `agent create` rebuild.
   const startShPath = join(agentDir, "start.sh");
-  {
+  if (!options.skipProfileTemplates) {
     const basePath = getBaseProfilePath();
     const startShContext: Record<string, unknown> = {
       name,
@@ -3794,7 +3810,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
   // --- Phase 3: regenerate CLAUDE.md by default (unless --preserve-claude-md) ---
   // CLAUDE.md is regenerated deterministically from the template. CLAUDE.custom.md
   // sidecar (if present) is appended with a \n\n---\n\n separator.
-  if (!options.preserveClaudeMd) {
+  if (!options.preserveClaudeMd && !options.skipProfileTemplates) {
     const profilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
     const claudeMdSrc = join(profilePath, "CLAUDE.md.hbs");
     const claudeMdDest = join(agentDir, "CLAUDE.md");

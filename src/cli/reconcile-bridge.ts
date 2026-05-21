@@ -59,7 +59,16 @@ export function reconcileAgentCronOnly(
       config.telegram,
       config,
       undefined,
-      {},
+      // skipProfileTemplates: this bridge runs INSIDE an agent container
+      // where the bundled `profiles/` tree is not shipped (see
+      // docker/Dockerfile.agent — only dist/cli/switchroom.js is copied,
+      // not the `profiles/` sibling). The default reconcile path re-renders
+      // start.sh + CLAUDE.md from those templates, which throws ENOENT
+      // ('/profiles/_base/start.sh.hbs') here and rolls the overlay back.
+      // A cron-only reconcile has no business re-rendering profile
+      // templates anyway — schedule changes only mutate `schedule.d/` and
+      // generated `cron.d/` scripts. See switchroom #1618.
+      { skipProfileTemplates: true },
     );
     const changes = [...result.changes];
     // Defensive: refuse to silently restart on non-cron changes — the
