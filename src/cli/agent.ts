@@ -497,23 +497,20 @@ export function removeAgentFromConfig(configPath: string, name: string): void {
  * this so we can unit-test "restart always reconciles first, and skips
  * restart if reconcile fails" without booting commander.
  *
- * Why reconcile before every restart? Restart was historically a
- * pure `systemctl restart` — which meant hand-patched systemd units
- * (and any other scaffold-owned artifact) survived across restarts.
- * That silently rotted: the next `switchroom systemd install` or
- * `agent reconcile` would wipe the hand-patch with no warning. By
- * folding reconcile into restart, every restart picks up template
- * changes and regenerates scaffold files from the canonical config,
- * making the framework self-healing. Ken's manual `EnvironmentFile=`
- * patches can now live in the template itself (generateUnit /
- * generateGatewayUnit), and operators can edit switchroom.yaml
- * → restart → done, no extra commands to remember.
+ * Why reconcile before every restart? Restart was historically a pure
+ * process bounce — which meant hand-patched scaffold files survived
+ * across restarts and silently rotted: the next `agent reconcile` would
+ * wipe the hand-patch with no warning. By folding reconcile into
+ * restart, every restart picks up template changes and regenerates
+ * scaffold files from the canonical config, making the framework
+ * self-healing — operators edit switchroom.yaml → restart → done, no
+ * extra commands to remember.
  *
  * If reconcile fails, we do NOT proceed to restart — a broken config
  * shouldn't be applied on top of a working process.
  *
  * Exported for tests. `deps` lets tests inject reconcile/restart stubs
- * so the sequencing assertion doesn't require real fs/systemctl.
+ * so the sequencing assertion doesn't require real fs or docker calls.
  */
 export interface ReconcileAndRestartDeps {
   reconcileAgent: typeof reconcileAgent;
@@ -680,8 +677,8 @@ export async function reconcileAndRestartAgent(
       // Gateway IPC is the path graceful restart depends on. If the socket
       // is missing or unresponsive, the gateway itself is wedged — exactly
       // the case where the user most needs `restart` to work. Fall back to
-      // a direct systemctl bounce, which restartAgent does for both the
-      // gateway and the agent service together. See switchroom#71.
+      // a direct restart, which restartAgent does for the gateway and the
+      // agent container together. See switchroom#71.
       const msg = err instanceof Error ? err.message : String(err);
       log(
         chalk.yellow(
@@ -1135,7 +1132,7 @@ export function registerAgentCommand(program: Command): void {
           // Vault-locked pre-flight. Runs once across all targets so we
           // don't ping the broker N times. Catches the "vault: bot_token +
           // locked broker = dead agent" foot-gun BEFORE issuing any
-          // systemctl restart. --force / --force-locked skips.
+          // restart. --force / --force-locked skips.
           if (!opts.force && !opts.forceLocked) {
             const targets = names.filter((n) => config.agents[n] != null);
             if (targets.length > 0) {
@@ -1293,8 +1290,8 @@ export function registerAgentCommand(program: Command): void {
               // Stamp the restart reason so the next greeting card can
               // surface it. `cli: deploying <sha> <subject>` when the
               // running build's commit differs from HEAD, `cli: restart`
-              // otherwise. Written BEFORE the systemctl restart so the
-              // file is on disk by the time the next agent boots.
+              // otherwise. Written BEFORE the restart so the file is on
+              // disk by the time the next agent boots.
               const reason = buildCliRestartReason({ buildCommit: BUILD_COMMIT });
               // preserveExisting: keep the gateway-written "user: /restart
               // from chat" (or similar) marker if it's fresh, so the next
@@ -1604,7 +1601,6 @@ export function registerAgentCommand(program: Command): void {
             // drift is reconciled by `switchroom apply` + `docker compose
             // up -d --remove-orphans`. Reconcile only touches agent-dir
             // files (settings.json, hooks, start.sh).
-            const unitChanges: string[] = [];
             const allChanges = [...result.changes];
             if (allChanges.length === 0) {
               console.log(chalk.gray(`  ${n}: already in sync`));
@@ -1617,11 +1613,7 @@ export function registerAgentCommand(program: Command): void {
               const semantics = result.changesBySemantics;
               if (semantics) {
                 const { hot, staleTillRestart } = semantics;
-                // Treat changed systemd units as restart-required: an
-                // ExecStart / Type / EnvironmentFile flip only takes effect
-                // after `systemctl restart`. daemon-reload alone does not
-                // re-spawn the running process under the new unit.
-                const restartRequired = [...semantics.restartRequired, ...unitChanges];
+                const restartRequired = [...semantics.restartRequired];
 
                 if (restartRequired.length > 0) {
                   console.log(chalk.yellow("\n  Changed (restart required — soul/MCP/settings/start.sh):"));
@@ -1668,15 +1660,13 @@ export function registerAgentCommand(program: Command): void {
 
             // Determine whether to restart: explicit flag, graceful flag, or auto-restart
             // triggered by restart-required changes (soul fields, MCP, settings,
-            // or a regenerated systemd unit). Unit drift counts as restart-required
-            // because daemon-reload alone does not re-spawn the running process
-            // under the new ExecStart / Type.
+            // start.sh). Those only take effect on a fresh container — the
+            // running claude process loaded them at boot.
             const changesBySemantics = result.changesBySemantics;
             const autoRestartNeeded =
               !opts.noRestart &&
-              ((changesBySemantics !== undefined &&
-                changesBySemantics.restartRequired.length > 0) ||
-                unitChanges.length > 0);
+              changesBySemantics !== undefined &&
+              changesBySemantics.restartRequired.length > 0;
             const shouldRestart = (opts.restart || opts.gracefulRestart || autoRestartNeeded) && allChanges.length > 0;
 
             if (shouldRestart) {
@@ -2299,9 +2289,9 @@ export function registerAgentCommand(program: Command): void {
 
           // Runtime branch — Docker mode regenerates compose and brings
           // up only the new agent's service (--no-deps), leaving siblings
-          // and shared services untouched. Host-native systemd path
-          // already ran inside addAgent above; this is purely additive
-          // and only fires when SWITCHROOM_RUNTIME=docker.
+          // and shared services untouched. The agent dir was already
+          // scaffolded by addAgent above; this is purely additive and
+          // only fires when SWITCHROOM_RUNTIME=docker.
           if (process.env.SWITCHROOM_RUNTIME === "docker") {
             const cfg = getConfig(program);
             let composePath: string;
@@ -2321,12 +2311,11 @@ export function registerAgentCommand(program: Command): void {
                 "docker-compose.yml",
               );
               console.error(chalk.red(`  docker compose up failed: ${(err as Error).message}`));
-              // Rollback — the host-native addAgent above has already
-              // scaffolded the agent dir + (in non-Docker fleets) the
-              // systemd unit. Leaving that half-state behind means a
+              // Rollback — the addAgent call above has already scaffolded
+              // the agent dir. Leaving that half-state behind means a
               // re-run of `agent add` will fail on "already exists". Best
               // effort: stop+remove any container that may have partially
-              // started, then call destroyAgent to wipe the dir+unit.
+              // started, then call destroyAgent to wipe the dir.
               try {
                 dockerExecFile("docker", [
                   "compose", "-f", composePath,
@@ -2367,9 +2356,11 @@ export function registerAgentCommand(program: Command): void {
 
   // switchroom agent rename <old> <new>
   //
-  // First-class command for slug renames. Orchestrates all 8 steps:
-  //   stop → snapshot → rename dir → rename systemd units → rename vault key
-  //   → update switchroom.yaml → reconcile → start new.
+  // First-class command for slug renames. Orchestrates every step:
+  //   stop → snapshot → rename dir → rename vault key → update
+  //   switchroom.yaml → reconcile → start new.
+  // The compose service/volumes are not renamed here — `switchroom apply`
+  // regenerates the compose file from the updated switchroom.yaml.
   // On any failure, rolls back to the snapshot so the system is never
   // left in a half-renamed / split state.
   //
@@ -2379,7 +2370,7 @@ export function registerAgentCommand(program: Command): void {
   agent
     .command("rename <old> <new>")
     .description(
-      "Rename an agent slug: stop, snapshot, rename dir + systemd units + vault key, " +
+      "Rename an agent slug: stop, snapshot, rename dir + vault key, " +
       "update switchroom.yaml, reconcile, start. Rolls back on any failure."
     )
     .option(
@@ -2421,7 +2412,7 @@ export function registerAgentCommand(program: Command): void {
           process.stdout.write(
             chalk.yellow(
               `\nRename agent "${oldName}" → "${newName}"?\n` +
-              `  This will: stop ${oldName}, copy dir, rename systemd units,\n` +
+              `  This will: stop ${oldName}, copy dir,\n` +
               `  rename vault keys (if passphrase available), update switchroom.yaml,\n` +
               `  reconcile, and start ${newName}.\n` +
               `  Hindsight mode: ${hindsightMode}\n` +

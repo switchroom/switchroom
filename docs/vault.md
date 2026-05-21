@@ -199,9 +199,8 @@ The file is mode `0600` (user-only).  Each line is a JSON object:
   "ts": "2026-04-28T14:33:00.123Z",
   "op": "get",
   "key": "stripe/live-key",
-  "caller": "switchroom-my-agent-cron-0.service",
+  "caller": "agent:my-agent",
   "pid": 12345,
-  "cgroup": "switchroom-my-agent-cron-0.service",
   "agent_name": "my-agent",
   "result": "allowed"
 }
@@ -212,13 +211,16 @@ made from `caller`/`cgroup`.  As described in [Architecture](#architecture)
 above, the broker derives the calling agent's identity from the
 per-agent bind socket path via `socketPathToAgent` — path-as-identity,
 never cgroup membership.  The trusted, ACL-relevant identity in the
-record is `agent_name` (derived from that bind path).  The `caller` and
-`cgroup` fields are **informational forensic context only**.  Note that
-the broker still writes these two fields in a legacy
-`switchroom-<agent>-cron-N.service`-shaped format for back-compat with
-older audit tooling (tracked separately as #1383); the `.service`
-suffix is a label, not an indication that any systemd unit exists —
-cron runs in-process inside the agent's `agent-scheduler` sidecar.
+record is `agent_name` (derived from that bind path).
+
+On a v0.7+ docker deployment the `caller` field is the human-readable
+`agent:<name>` form of that same path identity, and `cgroup` is omitted
+— there is no systemd unit in-container, cron runs in-process inside the
+agent's `agent-scheduler` sidecar.  The legacy
+`switchroom-<agent>-cron-N.service`-shaped `caller`/`cgroup` strings
+appear only on pre-v0.7 systemd-mode hosts, where peercred can still
+resolve a cgroup unit.  Either way, `caller`/`cgroup` are
+**informational forensic context only** — never an ACL input.
 
 Fields:
 
@@ -227,9 +229,9 @@ Fields:
 | `ts` | ISO-8601 | Timestamp of the request |
 | `op` | string | Operation: `get`, `set`, `delete`, `list`, `unlock`, `lock` |
 | `key` | string? | Vault key name — **never the secret value** |
-| `caller` | string | Informational forensic label (legacy `.service`-shaped string for back-compat, or `pid:<n>`). **Not** used for ACL — see note above (#1383) |
+| `caller` | string | Human-readable caller: `agent:<name>` (docker, path-as-identity), `operator`, or the legacy `<unit>.service` / `pid:<n>` fallback. **Not** used for ACL |
 | `pid` | number | PID of the calling process |
-| `cgroup` | string? | Informational legacy label; mirrors `caller` when present. Not an ACL input |
+| `cgroup` | string? | Legacy cgroup unit name; set only on systemd-mode hosts, omitted on docker. Not an ACL input |
 | `agent_name` | string? | Agent slug derived from the bind socket path — the trusted identity used for the ACL decision (path-as-identity) |
 | `result` | string | `"allowed"`, `"denied:<reason>"`, or `"error:<detail>"` |
 

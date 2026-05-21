@@ -9,7 +9,7 @@
  * turn synchronously and emits every tool_use as a JSONL row.
  *
  * Workspace contract: caller passes `cwd` pointing at a dir whose
- * `.claude/skills/` symlinks (or houses) the 27 skill bundles. The
+ * `.claude/skills/` symlinks (or houses) the skill bundles. The
  * cli.ts driver wires this to `/tmp/skill-coverage-workspace` by
  * default.
  *

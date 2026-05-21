@@ -422,24 +422,31 @@ export function uptimeMsForStarttime(
 }
 
 /**
- * Compute a remediation hint for a non-active agent systemd state. Returns
+ * Compute a remediation hint for a non-active agent state. Returns
  * `undefined` when no actionable hint applies. Per `reference/principles.md`
  * principle 1, every degraded/fail row should tell the user what to do next.
- * Hints share a common journalctl shape so they're greppable across
- * agents.
+ *
+ * Runtime-aware: v0.7+ agents run in Docker — there is no systemd unit or
+ * `journalctl` in-container, so the log-tail command is gated on
+ * `SWITCHROOM_RUNTIME` exactly like the boot-card crash row (see
+ * `boot-card.ts` and #1376/#1382). All hints share a common log-tail shape
+ * so they stay greppable across agents.
  */
 function nextStepForAgentState(agentName: string, state: string): string | undefined {
+  const tailCmd = process.env.SWITCHROOM_RUNTIME === 'docker'
+    ? `docker logs --tail 100 switchroom-${agentName}`
+    : `journalctl --user -u switchroom-${agentName} -n 100`
   if (state === 'failed') {
-    return `Service failed — inspect with \`journalctl --user -u switchroom-${agentName} -n 100\` then \`switchroom agent restart ${agentName}\``
+    return `Service failed — inspect with \`${tailCmd}\` then \`switchroom agent restart ${agentName}\``
   }
   if (state === 'inactive') {
-    return `Service inactive — start with \`switchroom agent start ${agentName}\` (or \`systemctl --user start switchroom-${agentName}\`)`
+    return `Service inactive — start with \`switchroom agent start ${agentName}\``
   }
   if (state === 'deactivating' || state === 'activating' || state === 'auto-restart') {
     return `Service is in a transient \`${state}\` state — re-check with \`switchroom agent status ${agentName}\` in a few seconds`
   }
   // Unknown state — keep the door open with a generic hint.
-  return `Inspect with \`journalctl --user -u switchroom-${agentName} -n 100\``
+  return `Inspect with \`${tailCmd}\``
 }
 
 function probeAgentProcessDocker(): ProbeResult {

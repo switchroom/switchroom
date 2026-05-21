@@ -19,7 +19,7 @@ Switchroom distinguishes four populations, each living in a different place and 
 |---|---|---|---|
 | **Bundled-default skills** | `<repo>/skills/` — vendored Anthropic skills (skill-creator, mcp-builder, webapp-testing, pdf, docx, xlsx, pptx) + the slim universal switchroom trio (switchroom-cli, switchroom-status, switchroom-health) | Auto-symlinked into every agent's `.claude/skills/` on scaffold and on `switchroom apply`, regardless of role. Per-key opt-out via `defaults.bundled_skills`. See `reconcileAgentDefaultSkills` in `src/agents/reconcile-default-skills.ts` | **Every agent** |
 | **Switchroom foreman-only skills** | `<repo>/skills/` — every `switchroom-*` skill *except* the universal trio (`switchroom-install`, `switchroom-manage`, `switchroom-architecture`, `switchroom-runtime`) | Auto-symlinked only when the agent has `role: foreman`. See `installSwitchroomSkills` in `src/agents/scaffold.ts` | Foreman agents (operator) |
-| **Switchroom-bundled developer skills** | `<repo>/skills/` (without `switchroom-` prefix — e.g. `buildkite-*`, `file-bug`, `telegram-test-harness`, `humanizer*`, `token-helpers`) | NOT auto-installed; a developer agent opts in via `defaults.skills:` or per-agent `skills:` in switchroom.yaml | Switchroom developers + power-user operators |
+| **Switchroom-bundled developer skills** | `<repo>/skills/` (without `switchroom-` prefix — e.g. `file-bug`, `telegram-test-harness`, `humanizer*`, `token-helpers`) | NOT auto-installed; a developer agent opts in via `defaults.skills:` or per-agent `skills:` in switchroom.yaml | Switchroom developers + power-user operators |
 | **User-managed personal skills** | `~/.switchroom/skills/` (or wherever `switchroom.skills_dir` points) | Symlinked into agents that name them in `defaults.skills` or `agents.<name>.skills`. See `syncGlobalSkills` in `src/agents/scaffold.ts` | Fleet agents — calendar, garmin, doctor-appointments, etc. — anything personal to the operator |
 
 ## Bundled-default skills
@@ -124,28 +124,13 @@ Current `<repo>/skills/` inventory:
 | `switchroom-runtime` | foreman-only (auto when `role: foreman`) | Agent answering for itself about crash/restart/interrupt/hand-off |
 | `humanizer` | developer (opt-in) | Strips AI-writing patterns from replies; opt in via `defaults.skills` |
 | `humanizer-calibrate` | developer (opt-in) | Builds a personal voice template; companion to `humanizer` |
-| `buildkite-agent-infrastructure` | developer (opt-in) | Buildkite CI — cluster/queue/agent provisioning |
-| `buildkite-agent-runtime` | developer (opt-in) | Buildkite CI — `buildkite-agent` in-step subcommands |
-| `buildkite-api` | developer (opt-in) | Buildkite CI — REST/GraphQL/webhooks automation |
-| `buildkite-cli` | developer (opt-in) | Buildkite CI — terminal `bk` CLI |
-| `buildkite-migration` | developer (opt-in) | Buildkite CI — convert pipelines from other CI systems |
-| `buildkite-pipelines` | developer (opt-in) | Buildkite CI — author `.buildkite/pipeline.yml` |
-| `buildkite-secure-delivery` | developer (opt-in) | Buildkite CI — OIDC / SLSA / signing |
-| `buildkite-test-engine` | developer (opt-in) | Buildkite CI — `bktec` test splitting / flaky detection |
 | `file-bug` | developer (opt-in) | Files structured bug reports via `gh issue create` |
 | `telegram-test-harness` | developer (opt-in) | Guidance for writing Telegram tests against the harness |
 | `token-helpers` | developer (opt-in) | Library skill — OAuth token refresh for Google Calendar / MS Graph |
 
-> The eight `buildkite-*` skills are still vendored in `skills/` for
-> switchroom's own (now-retired) Buildkite CI work. Whether to keep or
-> remove them from the bundle is an unresolved maintainer decision —
-> tracked in **[#1384](https://github.com/switchroom/switchroom/issues/1384)**.
-> They are opt-in only; fleet agents never get them auto-installed.
-
-That's the full `skills/` tree as of the audit (27 directories: 7
-vendored Anthropic + 7 `switchroom-*` + 8 `buildkite-*` +
-`humanizer`/`humanizer-calibrate` + `file-bug` + `telegram-test-harness`
-+ `token-helpers`). Verify with `ls skills/`.
+That's the full `skills/` tree (19 directories: 7 vendored Anthropic +
+7 `switchroom-*` + `humanizer`/`humanizer-calibrate` + `file-bug` +
+`telegram-test-harness` + `token-helpers`). Verify with `ls skills/`.
 
 Real fleet agents (clerk, klanker, etc.) load their personal skills from `~/.switchroom/skills/` — that directory holds calendar, compass, coolify, doctor-appointments, fully-kiosk, garmin, and similar. **The repo doesn't track those** — they're operator-managed.
 
