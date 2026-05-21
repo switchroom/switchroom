@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.13.5 — human-feel pacing: a guaranteed fast acknowledgement
+
+Headline: an agent now opens every turn with a fast verbal
+acknowledgement. A person you message answers in a beat — *"got it"*,
+*"on it, checking now"* — before the work is done. Until now an agent
+could sit silent for the whole opening stretch of a turn while it read
+files and thought; the first safety-net poke did not fire until 75s.
+
+### feat(telegram) — guarantee a fast verbal ack (#1633)
+
+Split across the two layers the design contract demands. The
+conversational-pacing prompt teaches the model to open with a short
+human one-liner unless the answer itself lands in a second or two. The
+silence-poke subsystem *enforces* it: a new `ack`-budget poke fires at
+~10s when nothing at all has been sent this turn, nudging the model to
+acknowledge before it does more work. The poke is one-shot and sits
+outside the soft/firm/fallback ladder — a turn that still never acks
+escalates exactly as before. The framework owns the *beat*; the model
+authors every word.
+
+### fix(vault) — sub-agent inaccessible-service reports as a missing grant (#1632)
+
+A sub-agent reporting a service it cannot reach is now treated as a
+missing vault grant, routing it through the grant-request flow rather
+than surfacing an opaque error.
+
+### test(uat) — fuzzy ack-pacing validation (#1634)
+
+`jtbd-fast-ack-dm` drives eight varied non-trivial prompt shapes and
+asserts the user sees a sign of life fast on every one — the
+regression gate for the guaranteed-ack behaviour.
+`reference/conversational-pacing.md` documents the new 10s ack rung.
+
+### docs — vision + README re-anchored on the standing-team thesis (#1629, #1631)
+
+`reference/vision.md` and the top-level `README.md` are re-anchored:
+switchroom is a standing team of always-on specialist assistants that
+know you and act while you get on with life — not a tool-call
+transparency layer for developers.
+
 ## v0.13.4 — zero `claude -p` (subscription-honest under the 2026-06-15 policy)
 
 Headline: switchroom no longer spawns `claude -p` anywhere. Every model
