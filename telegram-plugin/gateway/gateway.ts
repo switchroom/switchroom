@@ -1310,6 +1310,12 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
   activeTurnStartedAt.delete(key)
+  // Human-feel UX: stop the turn-long `typing…` indicator started in
+  // the turn-start block. This is the backstop for turns that end
+  // WITHOUT a reply (silent close) — a replied turn's typing already
+  // stops when the final reply is transmitted; this catches the rest.
+  // chat_id is the segment before the first ':' in the status key.
+  stopTypingLoop(key.split(':')[0])
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
@@ -7563,6 +7569,16 @@ async function handleInbound(
         // the framework can nudge the model if it goes quiet past the
         // soft / firm thresholds.
         silencePoke.startTurn(statusKey(chat_id, messageThreadId), Date.now())
+        // Human-feel UX: hold a continuous `typing…` indicator for the
+        // WHOLE turn, not just the split-second a reply is transmitted.
+        // A person you message shows as typing the entire time they
+        // compose; switchroom used to fire only one-shot ~5s pings, so
+        // any turn that read a file or thought for a moment went dark
+        // after 5s. The loop self-renews every 4s; `purgeReactionTracking`
+        // (the canonical turn-end) stops it. Deterministic, framework-
+        // owned, no prose — the mechanical ambient layer of the pacing
+        // contract.
+        startTypingLoop(chat_id)
         // #1122 KPI: emit turn_started so dashboards can compute funnel
         // start counts + correlate to turn_ended for duration / TTFO.
         emitRuntimeMetric({
