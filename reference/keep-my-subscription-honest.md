@@ -21,6 +21,26 @@ Transparency beats cleverness here. If there's any ambiguity about what
 the agent is using, the user should be able to find out in seconds, and
 the answer should match what Anthropic's terms permit.
 
+## Interactive, not programmatic (the 2026-06-15 line)
+
+As of **2026-06-15** Anthropic splits subscription usage in two:
+*interactive* Claude Code draws the subscription; *programmatic* usage
+— the Agent SDK and headless `claude -p` — draws a separate Agent-SDK
+credit, off the subscription. "Mixing billing models" stopped being a
+hypothetical and became a line in the policy.
+
+Switchroom's rule: **every model call is the interactive `claude`
+session.** Cron fires, webhook triggers, and session handoffs are all
+delivered *into* that one session as synthesized turns — never a
+headless `claude -p`, never the SDK, never the raw API. There is no
+programmatic surface, so there is nothing that quietly draws a
+different pool. (RFC #1620 removed the last `claude -p`; a CI guard
+keeps it at zero. The constraint is stated in `reference/vision.md`
+pillar 3 and enforced as an engineering gate in `CLAUDE.md`.)
+
+This is why the job still holds after the policy split: "the
+subscription is the only thing I'm paying for" stays literally true.
+
 ## Signs it's working
 
 - The user can state in one sentence what they're paying for and what
@@ -41,6 +61,10 @@ the answer should match what Anthropic's terms permit.
 ## Anti-patterns: don't build this
 
 - Silent fallback to API billing when the subscription is rate-limited.
+- A headless `claude -p` or an Agent SDK call anywhere in a code path.
+  Since 2026-06-15 both are *programmatic* usage — they draw the
+  separate Agent-SDK credit, not the subscription, and silently split
+  the billing model. Route the work through the interactive session.
 - Asking the user for an API key as "optional" when core features need
   it. Either the subscription supports the feature, or it doesn't.
 - Proxying subscription auth through the product in a way that bends
