@@ -17,7 +17,7 @@ implementation shipped in #1122 PRs 1–4.
 
 | Layer | Purpose | Owns | Implementation |
 |---|---|---|---|
-| Ambient | "Is it alive?" — glance-level liveness | The 👀→🤔→🔥→👍 status reaction on the user's inbound message | `telegram-plugin/status-reactions.ts` |
+| Ambient | "Is it alive?" — glance-level liveness | The 👀→🤔→🔥→👍 status reaction on the user's inbound message **and** a continuous `typing…` chat-action held for the whole turn | `telegram-plugin/status-reactions.ts` + `gateway.ts:startTypingLoop` (started at turn-start, stopped by `purgeReactionTracking`) |
 | Conversational | "What is it doing? What did it find?" — meaningful state changes | The agent's own `reply` calls, paced by the conversational-pacing prompt | `profiles/_shared/telegram-style.md.hbs` + `disable_notification` parameter |
 | Safety net | "Why has it gone quiet?" — framework backstop when the model fails to chat | The silence-poke subsystem: 75s/180s/300s ladder | `telegram-plugin/silence-poke.ts` |
 

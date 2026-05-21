@@ -264,7 +264,7 @@ import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
-import { chatKey, chatKeyWithSuffix } from './chat-key.js'
+import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 // Phase 2b PR 2 — shadow mode. Each event-site below calls shadowEmit()
 // to record what the InboundDeliveryStateMachine PREDICTS the gateway
 // should do. Behavior unchanged in this PR — the imperative code below
@@ -1310,6 +1310,13 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
   activeTurnStartedAt.delete(key)
+  // Human-feel UX: stop the turn-long `typing…` indicator started in
+  // the turn-start block. `purgeReactionTracking` is the canonical
+  // turn-end, so this is the single owner of the stop. (If an abnormal
+  // abort skips purge, the stray loop self-heals: the next turn on this
+  // chat calls `startTurnTypingLoop`, which stops the old interval
+  // first.)
+  stopTurnTypingLoop(chatIdOfChatKey(key as _ChatKey))
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
@@ -1779,6 +1786,32 @@ function stopTypingLoop(chat_id: string): void {
   if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
   const retry = typingRetryTimers.get(chat_id)
   if (retry) { clearTimeout(retry); typingRetryTimers.delete(chat_id) }
+}
+
+// Turn-level `typing…` indicator. Deliberately a SEPARATE interval map
+// from `typingIntervals` (which the reply handler and the tool-use
+// typing wrapper share and freely stop). If the turn loop lived in the
+// shared map, a mid-turn reply's `finally { stopTypingLoop }` would
+// kill it and the chat would go dark for the rest of the turn — the
+// exact black-box gap this is here to close. A dedicated map makes the
+// turn loop structurally immune to those stops: only `stopTurnTypingLoop`
+// (called at the canonical turn-end) clears it. The redundant `typing`
+// pings while a reply is mid-flight are harmless — same action, and
+// sendChatAction is cheap.
+const turnTypingIntervals = new Map<string, ReturnType<typeof setInterval>>()
+
+function startTurnTypingLoop(chat_id: string): void {
+  stopTurnTypingLoop(chat_id)
+  const send = () => {
+    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  }
+  send()
+  turnTypingIntervals.set(chat_id, setInterval(send, 4000))
+}
+
+function stopTurnTypingLoop(chat_id: string): void {
+  const iv = turnTypingIntervals.get(chat_id)
+  if (iv) { clearInterval(iv); turnTypingIntervals.delete(chat_id) }
 }
 
 const typingWrapper = createTypingWrapper({
@@ -7563,6 +7596,16 @@ async function handleInbound(
         // the framework can nudge the model if it goes quiet past the
         // soft / firm thresholds.
         silencePoke.startTurn(statusKey(chat_id, messageThreadId), Date.now())
+        // Human-feel UX: hold a continuous `typing…` indicator for the
+        // WHOLE turn, not just the split-second a reply is transmitted.
+        // A person you message shows as typing the entire time they
+        // compose; switchroom used to fire only one-shot ~5s pings, so
+        // any turn that read a file or thought for a moment went dark
+        // after 5s. Self-renews every 4s; stopped at the canonical
+        // turn-end (`purgeReactionTracking → stopTurnTypingLoop`).
+        // Deterministic, framework-owned, no prose — the mechanical
+        // ambient layer of the pacing contract.
+        startTurnTypingLoop(chat_id)
         // #1122 KPI: emit turn_started so dashboards can compute funnel
         // start counts + correlate to turn_ended for duration / TTFO.
         emitRuntimeMetric({
@@ -14111,6 +14154,8 @@ async function shutdown(signal: string): Promise<void> {
 
   for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
+  for (const iv of [...turnTypingIntervals.values()]) clearInterval(iv)
+  turnTypingIntervals.clear()
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
   typingRetryTimers.clear()
 
