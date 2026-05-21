@@ -130,15 +130,26 @@ In order, all server-side, all before the operator hears a peep:
    before `git apply` is invoked. Closes the
    `+++ b/../../etc/passwd` attack vector. Reject context-less
    patches too — they're ambiguous and they defeat the operator's
-   ability to spot-check the diff visually.
-2. **Apply check.** `git apply --check` against a scratch copy of the
-   current `switchroom.yaml`. If it doesn't apply, reject with the
-   git error verbatim; the agent re-fetches and retries. This is the
+   ability to spot-check the diff visually. Patches MUST be LF-only
+   (no CRLF), no BOM, and capped at 1 MB raw bytes — this step is
+   the single source of truth for the 1 MB cap, §3.3's attachment
+   discussion references it but does not re-decide it.
+2. **Apply check.** `git apply --check --whitespace=nowarn --recount`
+   against a scratch copy of the current `switchroom.yaml`. The
+   pinned flags prevent silent CRLF / trailing-whitespace mangling.
+   If it doesn't apply, reject with the git error verbatim; the
+   agent re-fetches and retries. This is the
    race-with-operator-hand-edits guard.
 3. **Schema validation.** Apply the patch in-memory, parse the result
-   through `src/config/loader.ts` + `src/config/schema.ts`. If the
-   zod parse fails, reject with the formatted error; the operator is
-   not woken.
+   through `src/config/loader.ts` + `src/config/schema.ts`. **The
+   yaml parse step MUST use the FAILSAFE schema** (`yaml.load(...,
+   { schema: FAILSAFE_SCHEMA })` for js-yaml, or `safe_load` for
+   PyYAML-shaped libs). Reject `!!`-tags (`!!js/function`,
+   `!!python/object`, …) and reject merge-key anchors / aliases
+   (`&foo` / `*foo` / `<<:`) at parse time — these are code-
+   execution / hidden-mutation primitives the zod schema runs *after*
+   and cannot defend against. If the zod parse fails, reject with the
+   formatted error; the operator is not woken.
 4. **Secrets-deref guard.** The yaml may contain `vault:foo/bar`
    references (see `src/config/overlay-secrets-filter.ts`); the diff
    renderer in §3.3 must NOT resolve these. Render the `vault:`
@@ -184,6 +195,21 @@ materially different `switchroom.yaml`. (The `git apply --check`
 would catch it, but failing fast at 10m is friendlier than
 mysterious post-approval `does-not-apply` errors.)
 
+`diff_id` is a 128-bit cryptographically random token (not derived
+from `patch_sha256` — identical patches collide, and content-
+derived ids leak deduplication signal). Each id is single-use;
+recorded as consumed in the same sqlite row that backs the rate
+limiter (§5), so the approve-callback handler atomically transitions
+`pending → consumed` or rejects with `expired`. Closes the replay-
+the-callback-on-a-fresh-id race.
+
+**Privilege-change escalation.** Diffs that touch another agent's
+`admin:`, `secrets:`, `vault_grants:`, or `model:` keys force the
+5-second tap delay regardless of diff size, and the card header
+prepends `⚠️ privilege change to peer <name>:`. Three-line
+`admin: true` insertions into a 40-line diff are exactly the diff-
+fatigue case the static size threshold misses.
+
 ### 3.4 Apply path (on approve)
 
 Sequenced, on the host as the operator UID. The entire sequence
@@ -228,6 +254,33 @@ the conversation by the time reconcile runs. Leaving the fleet in a
 half-applied state because the human is now AFK is worse than
 reverting to a known-good config and asking them to try again later.
 
+### 3.4.6 Crash recovery
+
+`flock(2)` is released on process death, so a hostd crash mid-apply
+does not deadlock. It can, however, leave the on-disk state in two
+recoverable shapes:
+
+- **Orphan `.tmp`.** Crash between step 3 (`fsync` of `switchroom.
+  yaml.tmp`) and step 4 (`rename`). On boot, hostd unlinks any
+  `switchroom.yaml.tmp` adjacent to `switchroom.yaml` — the file is
+  by definition uncommitted.
+- **Orphan reconcile.** Crash between step 4 (rename complete) and
+  step 5 (reconcile exit). The yaml is the new version but
+  reconcile never finished. Mitigated by a journal file
+  `~/.switchroom/config-backups/reconcile-in-progress.json` written
+  atomically before invoking `switchroom apply` (containing
+  `diff_id`, `bak-<ts>` path, and the rename ts) and unlinked on
+  reconcile success or rollback. On boot, hostd checks for the
+  journal: if present, run `switchroom apply` again to finish (or
+  roll back via the snapshot if it still fails twice in a row),
+  audit the recovery outcome.
+
+In-flight diff_ids that were `pending` (card raised, not yet
+approved) are marked `expired` on hostd boot. The Telegram cards
+get edited to "Expired (hostd restarted)"; agents re-propose if
+they still want the change. Simpler than trying to resume a
+half-pending approval state.
+
 ### 3.5 Audit
 
 Every proposal terminus appends one line to
@@ -247,6 +300,21 @@ The full diff is NOT in the audit row — only its sha256 — to keep
 the audit log scannable. The diff itself is preserved in
 `~/.switchroom/config-backups/proposals/<diff_id>.diff` for the
 30-day retention window the rest of hostd audit uses.
+
+**Metrics** (Prometheus): `hostd_config_propose_total{outcome}`
+counter (one label per §3.1 outcome enum value);
+`hostd_config_propose_approval_seconds` histogram (card raised →
+operator tap); `hostd_config_propose_reconcile_seconds` histogram
+(rename → reconcile exit); `hostd_config_propose_rollback_total`
+counter. Sufficient to spot silent abuse, slow approvals, or a
+rising rollback rate without scraping the jsonl.
+
+**Operator audit UX.** `switchroom doctor` surfaces a one-line
+summary from the last 24h of proposals: "config_propose_edit: N
+total, M denied, K rate-limited, J rolled back". A full
+`switchroom config-edit log` subcommand to render the jsonl as a
+table is out of scope for the RFC but called out so future readers
+know where it goes.
 
 ## 4. Non-goals
 
@@ -289,9 +357,14 @@ the audit log scannable. The diff itself is preserved in
   `hostd.config_edit_enabled: false` and keep the paste-and-ask flow.
   Rate-limit specifics: **3 cards per requesting-agent per rolling
   hour** (default; overridable via
-  `hostd.config_edit_rate_per_hour`). Tripping the limit returns
-  `{ outcome: "rate-limited", approved: false, applied: false }`
-  immediately, audits the attempt, and does NOT raise a card.
+  `hostd.config_edit_rate_per_hour`). Implemented as a sqlite
+  token-bucket in `~/.switchroom/hostd-state.db` (atomic decrement
+  inside a single transaction — naive in-memory counters race when
+  two proposals from the same agent arrive concurrently). Tripping
+  the limit returns `{ outcome: "rate-limited", approved: false,
+  applied: false }` immediately, audits the attempt as a terminal
+  row (same `phase: "terminal"`, `outcome: "rate-limited"`), and
+  does NOT raise a card.
 - **Race with operator hand-edits.** Operator edits the file in vim
   while a proposal is in flight. `git apply --check` catches the
   mismatch on approve and rejects with `apply-rejected`. Agent re-
