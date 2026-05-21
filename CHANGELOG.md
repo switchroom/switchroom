@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.13.3 — bridge-flap fix + silent-turn fallback
+
+Headline: the recurring **bridge-flap** wedge class (#1613) is
+root-caused and fixed.
+
+### fix(handoff) — `--strict-mcp-config` stops a parasitic 2nd bridge (#1616)
+
+The handoff-briefing summarizer shells out to a headless `claude -p`
+once per turn (handoff Stop hook). It ran without
+`--strict-mcp-config`, so it auto-discovered the agent's project
+`.mcp.json` and started every MCP server in it — including
+`switchroom-telegram`. That spun up a *second* telegram bridge
+process which registered against the same gateway socket as the live
+agent's real bridge; the two collided under the gateway's
+register-race close, producing the ~2s `bridge reconnect race`
+ping-pong for the ~7-9s the `claude -p` lived. The handoff hook fires
+every turn, so did the flap.
+
+Root-caused by process-ancestry instrumentation — every flapping
+bridge traced to `claude -p … → run-hook.sh hook:handoff`, never to
+Claude Code's channel layer. Fix: pass `--strict-mcp-config` (the
+summarizer is pure transcript-in / briefing-out and needs no MCP
+tools). Canary on test-harness: parasitic bridges 4-5/burst → 0,
+`bridge reconnect race` → 0, 6/6 turns delivered.
+
+### fix(telegram) — fallback when a silent turn exhausts its re-prompt (#1614)
+
+A turn that ends silently and exhausts its re-prompt budget now
+delivers a fallback message instead of leaving the user with no
+reply.
+
+### Also in this release
+
+- docs(rfc): bridge-presence design note (#1615); webhook ingest via
+  the agent gateway socket (#1612).
+- chore(cleanup): scrub post-docker systemd ghosts, retire buildkite
+  skills (#1611).
+
 ## v0.13.2 — revert PR 3b steps 1-5 (canary regression)
 
 The v0.13.1 canary on test-harness surfaced a regression: the
