@@ -203,6 +203,21 @@ describe('silence-poke — ack budget (PR1 human-feel UX)', () => {
     ).toHaveLength(1)
   })
 
+  it('ackPokeFired resets across turns even when endTurn was skipped (CC-5 invariant)', () => {
+    // Mirrors the subagentDispatchActive CC-5 guard: `ackPokeFired` is a
+    // turn-scoped one-shot flag, and the only thing that keeps it from
+    // leaking into the next turn (when an abnormal abort skips endTurn)
+    // is startTurn's unconditional state overwrite. Pin that here so a
+    // future read-modify-write refactor of startTurn fails loud.
+    setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('k', 0)
+    __tickForTests(10_000) // ack fires
+    expect(__getStateForTests('k')?.ackPokeFired).toBe(true)
+    // Turn 2 in the same key, no endTurn — startTurn MUST clear the flag.
+    startTurn('k', 1_000_000)
+    expect(__getStateForTests('k')?.ackPokeFired).toBe(false)
+  })
+
   it('does not advance the ladder — soft still requires a full 75s of silence', () => {
     // The ack poke is deliberately outside `pokesFired`. After it fires,
     // a soft poke must still wait the normal 75s.

@@ -44,15 +44,28 @@ job.
 ## Silence-poke ladder
 
 The framework backstops the model. State per-turn:
-`{ turnStartedAt, lastOutboundAt, pokesFired, pokeArmed,
+`{ turnStartedAt, lastOutboundAt, pokesFired, pokeArmed, ackPokeFired,
 subagentDispatchActive, lastThinkingAt, fallbackFired,
 lastPokeFiredAt }`. Polled every 5s.
 
 | Threshold | Action | Wire |
 |---|---|---|
+| 10s | **Ack poke** armed — *only* when nothing has been sent this turn yet (`lastOutboundAt == null`). Nudges the model to send its own short verbal acknowledgement. One-shot per turn (`ackPokeFired`). | Same mechanism as soft/firm |
 | 75s | Soft poke armed. `<system-reminder>` block appended to next tool result. | `silence-poke.ts → consumeArmedPoke()` drained at `gateway.ts:onToolCall` chokepoint |
 | 180s | Firm poke armed (stronger wording). | Same mechanism |
 | 300s | Framework fallback: gateway sends a user-visible *"still working… (no update from agent in N min)"* or *"still thinking…"*. Pings. | `silencePoke.startTimer.onFrameworkFallback` callback |
+
+**Ack budget (10s).** A person answers in a beat; the framework
+enforces that baseline. The ack poke measures *"have you said
+anything at all this turn"* (`lastOutboundAt == null`) — distinct
+from soft/firm, which measure silence-*since-last-outbound*. It sits
+**outside** the `pokesFired` ladder: a turn that still never acks
+escalates soft → firm → fallback on exactly the same schedule. The
+framework owns the *beat*; the model authors the words (see the
+"Open with an acknowledgement" bullet in
+`profiles/_shared/telegram-style.md.hbs`). Ack-poke *success* is not
+metered — the `silence_poke_fired level=ack` rate is the signal:
+how often the model had to be nudged.
 
 **Subagent-dispatch override:** when the session stream emits a
 `tool_use` for `Task` or `Agent`, the soft threshold extends to 300s
