@@ -42,6 +42,15 @@ describe('detectModelUnavailable — quota / billing strings', () => {
   it('classifies "quota exhausted" verbatim', () => {
     expect(detectModelUnavailable('quota exhausted on slot main')?.kind).toBe('quota_exhausted')
   })
+
+  it("classifies Claude Code v2.1.x 'You've hit your limit' wording", () => {
+    // The exact text claude writes inside the synthetic
+    // isApiErrorMessage assistant message on a subscription quota hit.
+    const d = detectModelUnavailable(
+      "You've hit your limit · resets 8:50am (Australia/Melbourne)",
+    )
+    expect(d?.kind).toBe('quota_exhausted')
+  })
 })
 
 describe('detectModelUnavailable — overload / 429 / 5xx strings', () => {

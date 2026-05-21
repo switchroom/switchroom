@@ -70,6 +70,49 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(detectErrorInTranscriptLine(line)).toBeNull()
   })
 
+  // Regression — the fleet-auto-failover dead-zone. Claude Code v2.1.x
+  // records a usage-limit hit as a synthetic assistant message with
+  // isApiErrorMessage:true (no api_error type, no nested error OBJECT).
+  // Pre-fix, detectErrorInTranscriptLine missed it entirely → the
+  // operator-event path never ran → fleet auto-fallback never fired.
+  it('detects the v2.1.x synthetic-assistant-message usage-limit shape', () => {
+    // The exact on-disk line shape, verbatim from a real quota hit.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [
+          {
+            type: 'text',
+            text: "You've hit your limit · resets 8:50am (Australia/Melbourne)",
+          },
+        ],
+      },
+      error: 'rate_limit',
+      isApiErrorMessage: true,
+      apiErrorStatus: 429,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result).not.toBeNull()
+    // A 429 in this shape is a subscription usage-limit hit → must
+    // classify quota-exhausted so the operator event resolves to an
+    // auto-fallback-eligible kind.
+    expect(result!.kind).toBe('quota-exhausted')
+    // The user-facing text must survive into `detail` (the model-
+    // unavailable card + the text-pattern path both rely on it).
+    expect(result!.detail).toContain('hit your limit')
+  })
+
+  it('still returns null for a normal (non-error) assistant message', () => {
+    // No isApiErrorMessage flag → must NOT be treated as an error.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+    })
+    expect(detectErrorInTranscriptLine(line)).toBeNull()
+  })
+
   it('returns null for lines with null error field', () => {
     const line = JSON.stringify({ type: 'assistant', error: null })
     expect(detectErrorInTranscriptLine(line)).toBeNull()

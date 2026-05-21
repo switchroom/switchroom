@@ -80,6 +80,10 @@ export function detectModelUnavailable(
     'quota_exhausted',
     'plan limit',
     'subscription limit',
+    // Claude Code v2.1.x usage-limit wording: "You've hit your limit ·
+    // resets 8:50am (Australia/Melbourne)".
+    'hit your limit',
+    'hit the limit',
   ]
   if (quotaSignals.some(s => lower.includes(s))) {
     const resetAt = parseResetTime(sample)

@@ -423,6 +423,33 @@ export function detectErrorInTranscriptLine(
 
   const type = obj.type as string | undefined
 
+  // Claude Code (v2.1.x) records a usage-limit / API error as a
+  // SYNTHETIC ASSISTANT MESSAGE, not an api_error / error line:
+  //   { type: "assistant",
+  //     message: { role: "assistant",
+  //       content: [{ type: "text", text: "You've hit your limit · resets …" }] },
+  //     error: "rate_limit", isApiErrorMessage: true, apiErrorStatus: 429 }
+  // It has no `api_error`/`error` top-type and no nested error OBJECT
+  // (`error` is a bare string), so the structured checks below miss it
+  // entirely. That silent miss is what kept fleet auto-fallback from
+  // ever firing on a quota hit — the exhaustion signal never reached
+  // the operator-event path. Detect this shape explicitly.
+  if (obj.isApiErrorMessage === true) {
+    const status =
+      typeof obj.apiErrorStatus === 'number' ? obj.apiErrorStatus : null
+    const errStr = typeof obj.error === 'string' ? obj.error : ''
+    const text = extractAssistantText(obj)
+    // A 429 in this shape is a subscription usage-limit hit (it carries
+    // a reset time) — classify it quota-exhausted so the operator event
+    // resolves to an auto-fallback-eligible kind. Other statuses fall
+    // through to the shared classifier.
+    const kind: OperatorEventKind =
+      status === 429
+        ? 'quota-exhausted'
+        : classifyClaudeError({ type: errStr, status, message: text })
+    return { kind, raw: obj, detail: text || errStr || 'api error' }
+  }
+
   // Explicit error line types from Claude Code JSONL
   const isErrorLine = type === 'api_error' || type === 'error'
 
@@ -452,6 +479,32 @@ function extractDetailMessage(obj: Record<string, unknown> | null): string | nul
   if (!obj) return null
   const msg = obj.message
   return typeof msg === 'string' && msg.length > 0 ? msg : null
+}
+
+/**
+ * Pull the human-readable text out of a synthetic assistant message
+ * (`message.content[].text`, joined). Used for the v2.1.x
+ * `isApiErrorMessage` shape, where the user-facing error string lives
+ * inside the assistant message rather than in an `error` object.
+ * Returns '' for any non-conforming shape — never throws.
+ */
+function extractAssistantText(obj: Record<string, unknown>): string {
+  const message = obj.message
+  if (typeof message !== 'object' || message == null) return ''
+  const content = (message as Record<string, unknown>).content
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const block of content) {
+    if (
+      typeof block === 'object'
+      && block != null
+      && (block as Record<string, unknown>).type === 'text'
+    ) {
+      const t = (block as Record<string, unknown>).text
+      if (typeof t === 'string') parts.push(t)
+    }
+  }
+  return parts.join(' ').trim()
 }
 
 // ─── The tail watcher ─────────────────────────────────────────────────────
