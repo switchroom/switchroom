@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.13.4 — zero `claude -p` (subscription-honest under the 2026-06-15 policy)
+
+Headline: switchroom no longer spawns `claude -p` anywhere. Every model
+call is the interactive `claude` session.
+
+On **2026-06-15** Anthropic reclassifies `claude -p` and the Agent SDK
+as *programmatic* usage — billed to a separate credit, off the
+subscription. switchroom's core pillar is subscription-honest (run the
+unmodified `claude` CLI on the Pro/Max subscription), so RFC #1620
+removed the two remaining `claude -p` callsites.
+
+### feat(webhook) — deliver via `inject_inbound`, not `claude -p` (#1625)
+
+`webhook-dispatch` now synthesizes an `InboundMessage` and injects it
+into the agent's live gateway — the same path cron uses — instead of
+spawning a headless `claude -p`. The webhook turn runs in the agent's
+interactive session. Also closes #1617 (the `claude -p` spawned a
+parasitic second telegram bridge).
+
+### feat(handoff) — transcript-tail handoff, not `claude -p` (#1626)
+
+The session-handoff briefing was an LLM summary produced by a
+per-turn headless `claude -p`. It is now a pure, deterministic
+**transcript tail** — a bounded raw excerpt of the prior session that
+the next interactive session reads to reorient. No model call, no
+`claude -p`. (The per-turn `claude -p` was also the root cause of the
+v0.13.3 bridge flap.)
+
+### test(bridge-flap) — regression guards (#1622)
+
+A CI guard fails the build if any source file spawns a headless
+`claude` without `--strict-mcp-config`; a behavioural UAT scenario
+catches a reintroduced flap by symptom. The codebase now has zero
+headless-`claude` spawners and the guard keeps it that way.
+
+### docs
+
+- RFC #1620 (eliminate `claude -p`); the Claude-native /
+  subscription-funded constraint codified in `reference/vision.md`
+  pillar 3 + `CLAUDE.md` (#1624); the `keep-my-subscription-honest`
+  and `track-plan-quota-live` JTBDs refreshed for the 2026-06-15
+  policy (#1627); RFC for approval-gated admin-agent config edits
+  (#1623).
+
 ## v0.13.3 — bridge-flap fix + silent-turn fallback
 
 Headline: the recurring **bridge-flap** wedge class (#1613) is
