@@ -69,8 +69,8 @@ const AGENT = "test-harness";
 // for a model that leans on the ack-poke nudge instead of self-acking.
 const ACK_HARD_MS = 20_000;
 
-// Vision target: the model self-acknowledges in a beat, well before
-// the framework has to step in.
+// Vision target: the model self-acknowledges in a beat, fast enough
+// that the ack-poke nudge never has to come into it.
 const ACK_VISION_MS = 8_000;
 
 // A first outbound at or under this length reads as an acknowledgement
@@ -166,8 +166,9 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
           // Invariant: the outbound is a real, non-empty message.
           expect(len).toBeGreaterThan(0);
 
-          // Hard contract: a sign of life FAST, deterministically
-          // backstopped by the framework ack poke.
+          // Hard contract: a sign of life FAST. A latency target, not
+          // a framework guarantee (see header doc) — but a failure
+          // here is a real pacing defect, so it fails the build.
           if (ttfo >= ACK_HARD_MS) {
             throw new Error(
               `[ack] ${tc.name}: TTFO=${ttfo}ms exceeds the hard `
@@ -180,7 +181,7 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
           expect(ttfo).toBeLessThan(ACK_HARD_MS);
 
           // Forensic, soft: did the model self-acknowledge in a beat,
-          // or did the framework have to drag it over the line?
+          // or did it only get there with the ack-poke nudge?
           const looksLikeAck = len <= ACK_LEN_CEILING;
           if (ttfo < ACK_VISION_MS && looksLikeAck) {
             console.log(
@@ -197,14 +198,13 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
             );
           } else {
             // Passed the hard contract but slower than the vision
-            // target — the canary for the model leaning on the
-            // framework backstop instead of self-acking.
+            // target — the canary for the model needing the ack-poke
+            // nudge instead of acknowledging promptly on its own.
             console.warn(
               `[ack] ${tc.name}: TTFO=${ttfo}ms (vision target `
               + `<${ACK_VISION_MS}ms), ${len} chars`
               + `${looksLikeAck ? "" : " — and long, not an ack one-liner"}`
-              + `. The model leaned on the framework ack poke rather `
-              + `than acknowledging on its own.`,
+              + `. The model did not acknowledge promptly on its own.`,
             );
           }
         } finally {
