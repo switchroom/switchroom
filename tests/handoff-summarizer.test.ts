@@ -9,6 +9,7 @@ import {
   writeSidecarsAtomic,
   summarize,
   findLatestSessionJsonl,
+  buildHandoffClaudeArgs,
   TOPIC_MAX_CHARS,
   DEFAULT_SUMMARIZER_MODEL,
   type ClaudeCliRunner,
@@ -346,5 +347,36 @@ function failingRunner(err: Error): ClaudeCliRunner {
 describe("module constants", () => {
   it("exposes a stable default model id", () => {
     expect(DEFAULT_SUMMARIZER_MODEL).toMatch(/^claude-/);
+  });
+});
+
+describe("buildHandoffClaudeArgs", () => {
+  const args = buildHandoffClaudeArgs({
+    model: "claude-haiku-4-5-20251001",
+    system: "sys prompt",
+    user: "user prompt",
+  });
+
+  // Regression guard for the per-turn bridge-flap (#1613). Without
+  // --strict-mcp-config the headless summarizer auto-loads the agent's
+  // project .mcp.json, starts switchroom-telegram, and spawns a second
+  // bridge that collides with the live agent's bridge at the gateway.
+  it("passes --strict-mcp-config so it loads zero MCP servers", () => {
+    expect(args).toContain("--strict-mcp-config");
+  });
+
+  it("passes no --mcp-config — strict + empty means no servers at all", () => {
+    expect(args).not.toContain("--mcp-config");
+  });
+
+  it("runs headless print mode without session persistence", () => {
+    expect(args).toContain("-p");
+    expect(args).toContain("--no-session-persistence");
+  });
+
+  it("threads through model, system, and user", () => {
+    expect(args[args.indexOf("--model") + 1]).toBe("claude-haiku-4-5-20251001");
+    expect(args[args.indexOf("--append-system-prompt") + 1]).toBe("sys prompt");
+    expect(args[args.indexOf("-p") + 1]).toBe("user prompt");
   });
 });
