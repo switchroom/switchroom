@@ -33,7 +33,15 @@ function setupDeps(opts?: { thresholds?: Partial<typeof DEFAULT_THRESHOLDS> }): 
   __setDepsForTests({
     emitMetric: (e) => fixtures.emitted.push(e),
     onFrameworkFallback: (ctx) => { fixtures.fallbacks.push(ctx) },
-    thresholdsMs: { ...DEFAULT_THRESHOLDS, ...(opts?.thresholds ?? {}) },
+    // The ack budget (a new poke that fires *earlier* than `soft`) is
+    // disabled by default in this fixture so the soft/firm/fallback
+    // ladder tests stay isolated from it. The 'ack budget' describe
+    // block opts back in with a real value.
+    thresholdsMs: {
+      ...DEFAULT_THRESHOLDS,
+      ack: Number.MAX_SAFE_INTEGER,
+      ...(opts?.thresholds ?? {}),
+    },
   })
   return fixtures
 }
@@ -136,6 +144,127 @@ describe('silence-poke — escalation ladder', () => {
     __tickForTests(450_000) // continued silence
     __tickForTests(600_000)
     expect(fx.fallbacks).toHaveLength(1)
+  })
+})
+
+// PR1 (human-feel UX epic): the ack budget. A person you message
+// answers in a beat — the framework enforces that baseline by arming an
+// 'ack' poke if NOTHING has been sent within `thresholds.ack` of turn
+// start. It is a one-shot nudge (the model still authors every word),
+// deliberately OUTSIDE the soft/firm/fallback `pokesFired` ladder: if
+// the model never acks, the ladder still escalates on its own schedule.
+// See `reference/conversational-pacing.md` and the "Open with an
+// acknowledgement" bullet in `profiles/_shared/telegram-style.md.hbs`.
+//
+// NB: `setupDeps` disables the ack budget by default (ack = MAX_SAFE);
+// every test here opts back in with a real `ack` threshold.
+describe('silence-poke — ack budget (PR1 human-feel UX)', () => {
+  it('arms an ack poke at the ack threshold when nothing has been sent', () => {
+    const fx = setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('chat:0', 0)
+
+    __tickForTests(9_000) // before the ack budget
+    expect(consumeArmedPoke()).toBeNull()
+    expect(fx.emitted).toHaveLength(0)
+
+    __tickForTests(10_000) // at the ack budget
+    expect(fx.emitted).toEqual([
+      expect.objectContaining({ kind: 'silence_poke_fired', level: 'ack' }),
+    ])
+    const text = consumeArmedPoke()
+    expect(text).toContain('[silence-poke]')
+    expect(text).toContain('reply')
+  })
+
+  it('does NOT arm an ack poke if an outbound landed before the budget', () => {
+    const fx = setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('chat:0', 0)
+    noteOutbound('chat:0', 3_000) // model acked fast — inside the budget
+    __tickForTests(10_000)
+    __tickForTests(20_000)
+    expect(consumeArmedPoke()).toBeNull()
+    expect(
+      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'ack'),
+    ).toHaveLength(0)
+  })
+
+  it('is one-shot — never re-arms even if the model goes quiet again', () => {
+    const fx = setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('chat:0', 0)
+    __tickForTests(10_000)         // ack fires
+    consumeArmedPoke()             // drain it
+    noteOutbound('chat:0', 12_000) // model finally acks
+    // The model goes quiet again. The ack poke is specifically about the
+    // FIRST outbound — it must not fire twice. A later silence is the
+    // soft poke's job, not the ack budget's.
+    __tickForTests(40_000)
+    expect(
+      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'ack'),
+    ).toHaveLength(1)
+  })
+
+  it('ackPokeFired resets across turns even when endTurn was skipped (CC-5 invariant)', () => {
+    // Mirrors the subagentDispatchActive CC-5 guard: `ackPokeFired` is a
+    // turn-scoped one-shot flag, and the only thing that keeps it from
+    // leaking into the next turn (when an abnormal abort skips endTurn)
+    // is startTurn's unconditional state overwrite. Pin that here so a
+    // future read-modify-write refactor of startTurn fails loud.
+    setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('k', 0)
+    __tickForTests(10_000) // ack fires
+    expect(__getStateForTests('k')?.ackPokeFired).toBe(true)
+    // Turn 2 in the same key, no endTurn — startTurn MUST clear the flag.
+    startTurn('k', 1_000_000)
+    expect(__getStateForTests('k')?.ackPokeFired).toBe(false)
+  })
+
+  it('does not advance the ladder — soft still requires a full 75s of silence', () => {
+    // The ack poke is deliberately outside `pokesFired`. After it fires,
+    // a soft poke must still wait the normal 75s.
+    const fx = setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('chat:0', 0)
+    __tickForTests(10_000) // ack
+    consumeArmedPoke()
+    __tickForTests(70_000) // 70s total — under the 75s soft threshold
+    expect(
+      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'soft'),
+    ).toHaveLength(0)
+    __tickForTests(75_000)
+    expect(
+      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'soft'),
+    ).toHaveLength(1)
+  })
+
+  it('still escalates ack -> soft -> firm -> fallback on a turn that never acks', () => {
+    const fx = setupDeps({ thresholds: { ack: 10_000 } })
+    startTurn('chat:0', 0)
+    __tickForTests(10_000)  // ack
+    consumeArmedPoke()
+    __tickForTests(75_000)  // soft
+    consumeArmedPoke()
+    __tickForTests(180_000) // firm
+    consumeArmedPoke()
+    __tickForTests(300_000) // fallback
+    const trail = fx.emitted.map((e) =>
+      e.kind === 'silence_poke_fired'
+        ? `poke:${e.level}`
+        : e.kind === 'silence_fallback_sent'
+          ? `fallback:${e.fallback_kind}`
+          : e.kind,
+    )
+    expect(trail).toEqual([
+      'poke:ack',
+      'poke:soft',
+      'poke:firm',
+      'fallback:working',
+    ])
+  })
+
+  it('formatPokeText("ack") nudges for a human acknowledgement via reply', () => {
+    const text = formatPokeText('ack')
+    expect(text).toContain('[silence-poke]')
+    expect(text.toLowerCase()).toContain('acknowledg')
+    expect(text).toContain('reply')
   })
 })
 
@@ -608,7 +737,9 @@ describe('silence-poke — fallback handler errors do not break timer', () => {
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => { throw new Error('oh no') },
-      thresholdsMs: DEFAULT_THRESHOLDS,
+      // ack budget out of the way — this test exercises the
+      // soft/firm/fallback ladder under a throwing fallback handler.
+      thresholdsMs: { ...DEFAULT_THRESHOLDS, ack: Number.MAX_SAFE_INTEGER },
     })
     startTurn('k', 0)
     expect(() => {
@@ -625,7 +756,8 @@ describe('silence-poke — fallback handler errors do not break timer', () => {
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => Promise.reject(new Error('async fail')),
-      thresholdsMs: DEFAULT_THRESHOLDS,
+      // ack budget out of the way — see the throwing-handler test above.
+      thresholdsMs: { ...DEFAULT_THRESHOLDS, ack: Number.MAX_SAFE_INTEGER },
     })
     startTurn('k', 0)
     __tickForTests(75_000)
