@@ -145,6 +145,6 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // future fragments, so we step back up to a comparable point.
     // Each block is load-bearing. Future bumps should justify themselves
     // similarly.
-    expect(claudeMd.length).toBeLessThan(32000); // post-self-sufficiency epic; identity + peers + admin posture
+    expect(claudeMd.length).toBeLessThan(33500); // +vault sub-agent fallback guidance (PR #1632)
   });
 });
