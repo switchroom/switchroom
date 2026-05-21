@@ -23,21 +23,24 @@
  *
  * ## Targets
  *
- *   - **Hard contract (deterministic):** the first outbound lands
- *     within `ACK_HARD_MS` for every prompt. This is backstopped by
- *     the framework ack poke (~10s) — even a non-compliant model is
- *     nudged and sends *something* well inside the budget, so the
- *     assertion does not depend on model goodwill. Pre-#1633 a slow
- *     prompt's first outbound was the full answer, often 30-60s out —
- *     this bound cleanly separates the fixed behaviour from a
- *     regression.
+ *   - **Hard contract:** the first outbound lands within `ACK_HARD_MS`
+ *     for every prompt. This is a tight *latency target*, not a
+ *     framework guarantee. The silence-poke ack rung is a *nudge*
+ *     piggybacked on the model's next tool result (`consumeArmedPoke`
+ *     drained at the gateway tool-result chokepoint) — not a
+ *     framework-composed send. It helps the model along, but a
+ *     pure-reasoning prompt that issues no tool call never drains the
+ *     nudge, so the bound ultimately depends on model latency. It
+ *     still has teeth: pre-#1633 a slow prompt's first outbound was
+ *     the full answer, often 30-60s out, so 20s cleanly separates the
+ *     fixed behaviour from a regression. A failure here means the
+ *     agent left the user on a silent chat — a real pacing defect.
  *   - **Vision target (soft, per-case forensic):** the first outbound
  *     lands within `ACK_VISION_MS` and is short — a genuine
  *     acknowledgement, not a full-answer dump. The model self-acking
- *     (rather than waiting for the framework backstop) is what makes
- *     it *feel* human. Logged, not failed: real model runs vary, and
- *     the prompt explicitly lets a turn skip the ack when the answer
- *     itself arrives in the first couple of seconds.
+ *     quickly is what makes it *feel* human. Logged, not failed: real
+ *     model runs vary, and the prompt explicitly lets a turn skip the
+ *     ack when the answer itself arrives in the first couple seconds.
  *
  * ## Relationship to adjacent UATs
  *
@@ -59,9 +62,11 @@ import { spinUp } from "../harness.js";
 const AGENT = "test-harness";
 
 // Hard contract: a sign of life within this budget, every prompt.
-// Sized to comfortably cover the framework-backstop path — the ~10s
-// ack poke, plus the nudge piggybacking the next tool result, plus
-// the model emitting the reply, plus mtcute polling jitter.
+// A tight latency target — well above a healthy self-ack (~3-8s on a
+// warm agent) and well below the pre-#1633 silent-then-dump regression
+// (30-60s). Model-dependent, not a framework guarantee (see header
+// doc), so it carries generous headroom for mtcute polling jitter and
+// for a model that leans on the ack-poke nudge instead of self-acking.
 const ACK_HARD_MS = 20_000;
 
 // Vision target: the model self-acknowledges in a beat, well before
@@ -167,8 +172,8 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
             throw new Error(
               `[ack] ${tc.name}: TTFO=${ttfo}ms exceeds the hard `
               + `contract ${ACK_HARD_MS}ms — the user sat on a silent `
-              + `chat. The guaranteed-ack path (prompt + ~10s ack `
-              + `poke) is not delivering. First outbound: `
+              + `chat. The fast-ack path (pacing prompt + ack-poke `
+              + `nudge) is not delivering. First outbound: `
               + `${JSON.stringify(firstOutbound.text.slice(0, 200))}`,
             );
           }

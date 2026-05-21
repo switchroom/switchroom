@@ -30,7 +30,7 @@ const SLOW_PROMPT = (
 
 describe("uat: soft-commit pacing", () => {
   it(
-    "user asks slow question → first reply lands within 20s",
+    "user asks slow question → first reply lands within 30s",
     async () => {
       const sc = await spinUp({ agent: "test-harness" });
       try {
