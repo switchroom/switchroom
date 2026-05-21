@@ -199,9 +199,12 @@ export function readSilentEndState(deps?: SilentEndDeps): SilentEndState | null 
  *     `{ exhausted: true }` — the caller MUST then deliver a user-facing
  *     fallback so the turn never just vanishes (#1161).
  *
- * Autonomous wakeup turns never reach here: the gateway only calls this
- * for turns with an inbound chat (`decideTurnFlush` returns
- * `no-inbound-chat`, not a silent reason, when `chatId` is null).
+ * Chat-less autonomous wakeup turns never reach here: the gateway only
+ * creates a `currentTurn` (and therefore only runs a turn-end handler)
+ * when the inbound event carries a chat id. Cron-fired turns DO carry a
+ * topic chat and reach this path — a cron task that means to stay silent
+ * must emit a NO_REPLY sentinel, which routes to the gateway's
+ * silent-marker branch and never gets a fallback.
  */
 export function recordSilentTurnEnd(
   args: { chatId: string; threadId: number | null; turnKey: string },
