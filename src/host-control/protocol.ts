@@ -297,6 +297,18 @@ export const ConfigProposeEditRequestSchema = z.object({
 export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   "E_CONFIG_EDIT_DISABLED",
   "E_NOT_IMPLEMENTED",
+  // PR 1b — validation pipeline (RFC §4). The four stages each get a
+  // distinct code so callers can render targeted user-facing errors
+  // and the audit reader can branch without parsing free text.
+  "E_PATCH_INVALID_SHAPE", // stage 1: shape / size / path-traversal
+  "E_PATCH_APPLY_FAILED", // stage 2: `git apply --check` rejected
+  "E_YAML_UNSAFE_CONSTRUCT", // stage 3a: `!!`-tag, `&`-anchor, `*`-alias, `<<:` merge
+  "E_SCHEMA_INVALID", // stage 3b: post-apply yaml fails zod
+  "E_SECRET_LEAK_DETECTED", // stage 4: literal secret / un-vaulted-ref regression
+  // PR 1b sentinel — validation passed but apply path is still gated
+  // behind PR 1c. Returned in the success case so callers can tell
+  // "validation worked" apart from "validation rejected".
+  "E_NOT_IMPLEMENTED_APPLY_PATH",
   "E_VALIDATION_REJECTED",
   "E_SCHEMA_REJECTED",
   "E_APPLY_REJECTED",
