@@ -20,7 +20,7 @@
  * Usage:
  *   const audit = createAuditLogger();                  // default path
  *   const audit = createAuditLogger({ path: tmpFile }); // test override
- *   audit.write({ ts, op, key, caller, pid, cgroup, result });
+ *   audit.write({ ts, op, key, caller, pid, agent_name, result });
  */
 
 import * as fs from "node:fs";
@@ -39,7 +39,12 @@ export type AuditOp = "get" | "put" | "set" | "delete" | "list" | "unlock" | "lo
 /**
  * One audit log entry.
  * `key` is omitted for ops that don't target a specific key (e.g. unlock, lock, list).
- * `cgroup` is undefined when peercred couldn't resolve the caller's systemd unit.
+ *
+ * Identity model (v0.7+): agent identity is path-as-identity — the trusted
+ * field is `agent_name`, derived from the per-agent socket bind path. The
+ * `caller` / `cgroup` fields are legacy/informational: `cgroup` is only
+ * populated on legacy systemd-mode hosts where peercred could resolve a
+ * cgroup unit, and is undefined otherwise (the docker norm).
  */
 export interface AuditEntry {
   /** ISO-8601 timestamp, e.g. "2026-04-28T14:33:00.123Z" */
@@ -48,11 +53,19 @@ export interface AuditEntry {
   op: AuditOp;
   /** Vault key name — NEVER the secret value */
   key?: string;
-  /** Human-readable caller identity: cgroup unit name or "pid:<n>" */
+  /**
+   * Human-readable caller identity. "agent:<name>" on the v0.7+
+   * path-as-identity path, "operator" on the operator socket, or the
+   * legacy "<unit>.service" / "pid:<n>" fallback (see callerFromPeer).
+   */
   caller: string;
   /** PID of the calling process */
   pid: number;
-  /** Raw cgroup unit name if available, e.g. "switchroom-myagent-cron-0.service" */
+  /**
+   * Legacy cgroup unit name, e.g. "switchroom-myagent-cron-0.service".
+   * Only set on systemd-mode hosts; undefined on docker (path-as-identity).
+   * Informational only — never the ACL identity.
+   */
   cgroup?: string;
   /** Outcome: "allowed", "denied:<reason>", or "error:<detail>" */
   result: string;
@@ -108,8 +121,10 @@ export function defaultAuditLogPath(): string {
 }
 
 /**
- * Derive a friendly caller string from a PeerInfo-like object.
- * Prefers the cgroup unit name; falls back to "pid:<n>".
+ * Legacy fallback — derive a caller string from a PeerInfo-like object
+ * for the pre-v0.7 (non-per-agent-socket) path. Prefers the cgroup unit
+ * name; falls back to "pid:<n>". On the v0.7+ path-as-identity path the
+ * server uses "agent:<name>" directly and does not call this.
  */
 export function callerFromPeer(peer: {
   pid: number;

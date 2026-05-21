@@ -4,85 +4,19 @@ Companion to `inventory.md`. Read that first — this file references skills by 
 
 This audit feeds the probabilistic skill-coverage harness. Verdicts are biased toward "what will the fuzzer actually fire on?" rather than reading the SKILL.md charitably.
 
-> **`buildkite-*` scope caveat.** The `NEEDS-FIX` verdicts on the eight
-> `buildkite-*` skills below describe their *trigger-precision* shape
-> for the harness — they are **not** a recommendation to invest in
-> fixing those descriptions, and not a retirement call either. Whether
-> the `buildkite-*` skills stay in the bundle at all (switchroom's own
-> Buildkite CI is retired) is an unresolved maintainer decision tracked
-> in [#1384](https://github.com/switchroom/switchroom/issues/1384).
-> Treat any "highest-impact fix" / priority-ordering language about
-> `buildkite-*` in this file as conditional on #1384 resolving *keep*;
-> if it resolves *remove*, these rows simply drop out of harness scope.
-> Don't action `buildkite-*` description fixes ahead of #1384.
->
 > The estimates in §5 are *predictions* (the harness has not been
 > live-run end-to-end against a real agent here); read them as relative
 > risk ordering, not measured precision/recall.
 
 ## 1. Executive summary
 
-- **Pervasive missing negatives.** 21 of 27 skills carry `no-negatives` — most buildkite-* skills, `humanizer`, `humanizer-calibrate`, `mcp-builder`, `pdf`, `pptx`, `telegram-test-harness`, `webapp-testing`. Adjacent-but-wrong phrasings will rubber-stamp a fire. Among the non-`buildkite-*` skills the most exposed are the `pdf` / `pptx` / `webapp-testing` set; the `buildkite-cli` / `buildkite-pipelines` / `buildkite-api` triangle is the worst-overlapping cluster but its prioritisation is gated on #1384 (see caveat above).
+- **Pervasive missing negatives.** Many skills carry `no-negatives` — `humanizer`, `humanizer-calibrate`, `mcp-builder`, `pdf`, `pptx`, `telegram-test-harness`, `webapp-testing`. Adjacent-but-wrong phrasings will rubber-stamp a fire. The most exposed are the `pdf` / `pptx` / `webapp-testing` set.
 - **Switchroom-internal cluster is the cleanest negative-control discipline in the bundle** (`switchroom-cli`, `switchroom-status`, `switchroom-manage`, `switchroom-install`, `switchroom-architecture` all cite the rivals to defer to). The harness should expect ≥0.9 F1 there.
 - **`humanizer-calibrate`, `webapp-testing`, `mcp-builder` are likely under-triggers** — descriptions are abstract, no plain-language utterance enumeration. Will miss natural phrasings.
 - **`switchroom-runtime` cannot be fully NL-fuzzed.** Three of its five gates are side-channel signals (env var, sentinel file) — the harness must label those triggers as non-NL.
 - **Gaps:** no skill owns vault unlock flow, broker/socket recovery, `/restart` self-restart troubleshooting, agent-scheduler debugging, or progress-card editing. Operators will land in `switchroom-health` (too generic) or `file-bug` (too late). See §4.
 
 ## 2. Per-skill audit
-
-### buildkite-agent-infrastructure
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Strong concrete list. Will fire on the canonical operator phrasings ("create a cluster", "configure SSO", "manage agent tokens"). Ambiguity: "manage agent tokens" reads as runtime token use, not infra provisioning.
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"I want to upload a build artifact using my agent token"* — runtime concern, will mis-fire here on the `agent tokens` substring.
-- **Execution coverage assessment:** Concrete — curl + GraphQL mutations, named reference files.
-- **Recommended fix:** Add "Do NOT use when..." pointing in-step token use → `buildkite-agent-runtime`; cluster CLI shortcuts → `buildkite-cli`.
-
-### buildkite-agent-runtime
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Very strong — every subcommand named. Fires reliably on "annotate", "meta-data", "artifact upload".
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"set up a cluster secret"* — secrets-related, but this is infra, not runtime `secret get`.
-- **Execution coverage assessment:** Concrete — flag tables, per-subcommand examples.
-- **Recommended fix:** Add a "Do NOT use when the user is provisioning/configuring rather than calling from inside a running step" clause naming `buildkite-agent-infrastructure` and `buildkite-secure-delivery` (for OIDC setup vs `oidc request-token`).
-
-### buildkite-api
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Strong. "Call the Buildkite API", "GraphQL query" fire cleanly.
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"trigger a build from the command line"* — operator wants `bk`, not curl.
-- **Execution coverage assessment:** Concrete — curl + jq, Python jwt examples, reference files.
-- **Recommended fix:** Add explicit "Do NOT use for interactive `bk` CLI usage — that's `buildkite-cli`" clause. Mention "one-shot terminal CI ops" as the disambiguator.
-
-### buildkite-cli
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Strong, comprehensive verb list.
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"write a pipeline YAML"* — fires on "create a pipeline" trigger but should route to `buildkite-pipelines`.
-- **Execution coverage assessment:** Concrete — full subcommand reference, MCP-tool equivalence callout.
-- **Recommended fix:** Add "Do NOT use when authoring `.buildkite/pipeline.yml` — that's `buildkite-pipelines`; or for scripted programmatic access — that's `buildkite-api`."
-
-### buildkite-migration
-- **Status:** OK
-- **Trigger coverage assessment:** Highly distinctive ("convert from Jenkins/GitHub Actions/CircleCI"). Will fire reliably.
-- **Negative-control assessment:** Implicit via specificity; explicit clause would be belt-and-braces but isn't load-bearing.
-- **Execution coverage assessment:** Concrete — `bk pipeline convert` invocation patterns.
-
-### buildkite-pipelines
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Strong on YAML-authoring phrasings.
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"add an annotation to the build page"* — should route to `buildkite-agent-runtime` (`buildkite-agent annotate`) when it's an in-step call, but this skill's `add annotations` trigger will grab it.
-- **Execution coverage assessment:** Concrete — YAML examples + `pipeline upload` invocation.
-- **Recommended fix:** Add a "Do NOT use when the user is invoking `buildkite-agent <subcommand>` inside a step — that's `buildkite-agent-runtime`" clause.
-
-### buildkite-secure-delivery
-- **Status:** NEEDS-FIX
-- **Trigger coverage assessment:** Strong on supply-chain phrasings.
-- **Negative-control assessment:** Missing. Most plausible false-positive: *"my step needs an OIDC token, how do I request one?"* — overlaps with `buildkite-agent-runtime`'s `oidc request-token`.
-- **Execution coverage assessment:** Concrete — OIDC plugin YAML, cosign, JWKS generation.
-- **Recommended fix:** Add "Do NOT use for in-step `buildkite-agent oidc request-token` — that's `buildkite-agent-runtime`. Use this for *setting up* OIDC trust, signing infrastructure, and SLSA provenance."
-
-### buildkite-test-engine
-- **Status:** OK
-- **Trigger coverage assessment:** Highly distinctive (`bktec`, "test splitting", "flaky tests"). Minimal overlap with other buildkite-* skills.
-- **Negative-control assessment:** Missing but low risk — no plausible competing skill.
-- **Execution coverage assessment:** Concrete — test-collector plugin, env wiring.
 
 ### docx
 - **Status:** OK
@@ -207,25 +141,7 @@ This audit feeds the probabilistic skill-coverage harness. Verdicts are biased t
 
 ## 3. Overlap clusters
 
-### Cluster A: buildkite-cli vs buildkite-pipelines vs buildkite-api
-- **Conflict:** All three claim phrasings around "create / manage pipelines and builds". `buildkite-cli` says "create a pipeline" (CLI invocation), `buildkite-pipelines` claims "write a pipeline" (YAML authoring), `buildkite-api` claims "automate Buildkite" / "write a script that calls Buildkite".
-- **Competing skills:** `buildkite-cli`, `buildkite-pipelines`, `buildkite-api` (and `buildkite-migration` brushes on "convert my CI config").
-- **Disambiguation rule for the harness:**
-  - YAML file content / step types / `.buildkite/pipeline.yml` → `buildkite-pipelines`
-  - Interactive terminal verbs (`bk build view`, `bk pipeline list`) → `buildkite-cli`
-  - curl / GraphQL / programmatic / webhooks / "in a script" → `buildkite-api`
-  - "convert", "migrate", "switch from", "Jenkins/CircleCI/GHA equivalent" → `buildkite-migration` (wins over all three on these tokens)
-
-### Cluster B: buildkite-agent-runtime vs buildkite-agent-infrastructure vs buildkite-secure-delivery
-- **Conflict:** All three touch "OIDC", "tokens", "secrets", "annotations". Runtime is *in-step CLI invocation*, infrastructure is *cluster provisioning*, secure-delivery is *trust setup / signing*.
-- **Competing skills:** `buildkite-agent-runtime`, `buildkite-agent-infrastructure`, `buildkite-secure-delivery`, plus `buildkite-pipelines` ("add annotations" in YAML vs `buildkite-agent annotate`).
-- **Disambiguation rule for the harness:**
-  - Phrasing contains `buildkite-agent <subcommand>` literal → `buildkite-agent-runtime` (always wins)
-  - "Provision", "create", "configure", "scale", "set up cluster…" → `buildkite-agent-infrastructure`
-  - "Sign", "verify", "attestation", "SLSA", "JWKS", "cosign", *setup* of OIDC trust policies → `buildkite-secure-delivery`
-  - "Add annotation" inside a YAML step file → `buildkite-pipelines`; "add an annotation from my step" → `buildkite-agent-runtime`
-
-### Cluster C: switchroom-cli vs switchroom-health vs switchroom-status vs switchroom-manage vs switchroom-install
+### Cluster A: switchroom-cli vs switchroom-health vs switchroom-status vs switchroom-manage vs switchroom-install
 - **Conflict:** Five-way fleet-of-skills cluster. The bundle already does the heavy lifting via cross-deferrals; harness just needs to score against the documented rules.
 - **Competing skills:** all five.
 - **Disambiguation rule for the harness:**
@@ -235,12 +151,12 @@ This audit feeds the probabilistic skill-coverage harness. Verdicts are biased t
   - "What agents are running / uptime / how long has X been up" → `switchroom-status`
   - All other runtime verbs against existing agents (logs, restart, update, version, apply, cron) → `switchroom-cli`
 
-### Cluster D: humanizer vs humanizer-calibrate
+### Cluster B: humanizer vs humanizer-calibrate
 - **Conflict:** Both touch voice / style of writing. Calibrate produces a template; humanizer applies edits.
 - **Competing skills:** `humanizer`, `humanizer-calibrate`.
 - **Disambiguation rule:** "Make this text sound human / remove AI tells / rewrite this draft" → `humanizer`. "Build / refresh my voice profile / sound like *me* (no specific text in hand)" → `humanizer-calibrate`. Slash-prefix `/humanizer-calibrate` always wins for calibrate.
 
-### Cluster E: switchroom-runtime vs file-bug
+### Cluster C: switchroom-runtime vs file-bug
 - **Conflict:** Inventory flags `overlap:file-bug` on `switchroom-runtime`. The "status?" UX-failure handler offers to file an RCA via `/file-bug`.
 - **Disambiguation rule:** Runtime is the *handler* for the UX-failure signal; if the user explicitly says "file a bug" → `file-bug` wins. If the user sends bare "status?" / "still there?" → `switchroom-runtime` wins and may then chain to `file-bug` as a follow-up offer.
 
@@ -259,12 +175,6 @@ Predictions are for *as-is* skills (no fixes applied) against ≥0.9 F1 / ≥0.9
 
 | Skill | Predicted F1 ≥0.9? | Predicted exec ≥0.95? | Rationale |
 |---|---|---|---|
-| buildkite-agent-infrastructure | No (≈0.75) | Yes | "manage agent tokens" will bleed in from runtime concerns. Execution surface is solid. |
-| buildkite-agent-runtime | Borderline (≈0.85) | Yes | Subcommand-keyed triggers are precise but no negative-control to suppress infra / secure-delivery overlap. |
-| buildkite-api | No (≈0.80) | Yes | Programmatic-vs-interactive ambiguity. Will lose phrasings to `buildkite-cli`. |
-| buildkite-cli | No (≈0.78) | Yes | "Create a pipeline" overlap with `buildkite-pipelines` is unresolved. |
-| buildkite-pipelines | No (≈0.80) | Yes | "Add annotations" overlap with runtime. |
-| buildkite-secure-delivery | Borderline (≈0.85) | Yes | OIDC overlap with runtime. |
 | humanizer | Borderline (≈0.85) | Yes | Generic-editing phrasings will false-positive. |
 | humanizer-calibrate | No (≈0.55) | Yes | `no-triggers` flag — natural utterances will route to `humanizer`. Almost certainly misses threshold. |
 | mcp-builder | Borderline (≈0.80) | Borderline | Body is prose-shaped; deliverable not crisp. Could miss exec threshold on first-shot scaffolding. |

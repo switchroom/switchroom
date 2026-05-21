@@ -13,8 +13,9 @@ import type { AuditEntry, AuditOp } from "./broker/audit-log.js";
 
 export interface AuditFilters {
   /**
-   * Filter by caller substring match (e.g. "my-agent-cron-0").
-   * Compared case-insensitively against the `caller` field.
+   * Filter by caller substring match (e.g. "my-agent").
+   * Compared case-insensitively against the `caller` and `agent_name`
+   * fields (see #1420).
    */
   who?: string;
 

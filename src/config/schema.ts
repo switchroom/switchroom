@@ -1015,10 +1015,11 @@ const profileFields = {
     .describe(
       "IANA timezone name (e.g. 'Australia/Melbourne', 'America/New_York', " +
       "'UTC'). Used to generate the per-turn local-time hint the agent's " +
-      "UserPromptSubmit timezone hook emits, and baked into the systemd " +
-      "unit as TZ= so subprocess `date`/`Date.now()` are correct. If unset " +
-      "at every cascade layer, switchroom auto-detects from /etc/timezone " +
-      "and warns on `reconcile` when the detected zone is UTC.",
+      "UserPromptSubmit timezone hook emits, and baked into the agent " +
+      "container's `environment.TZ` in compose so subprocess `date`/" +
+      "`Date.now()` are correct. If unset at every cascade layer, switchroom " +
+      "auto-detects from /etc/timezone and warns on `reconcile` when the " +
+      "detected zone is UTC.",
     ),
   soul: z
     .object({
@@ -1268,7 +1269,7 @@ export const AgentSchema = z.object({
       "Per-agent IANA timezone override. Wins over any profile/defaults " +
       "value and over the top-level switchroom.timezone global. Controls " +
       "the UserPromptSubmit timezone hook's emitted local time and the " +
-      "systemd unit's TZ= env.",
+      "agent container's `environment.TZ` in compose.",
     ),
   auth: z
     .object({

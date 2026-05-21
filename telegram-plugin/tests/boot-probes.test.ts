@@ -1185,8 +1185,15 @@ describe('uptimeMsForStarttime', () => {
 // the probes covered by the boot-card-dedup-and-next-steps PR so we don't
 // silently lose the hint on a future refactor.
 
-describe('nextStep — agent systemd states', () => {
-  it('attaches a journalctl hint when the unit is failed', async () => {
+describe('nextStep — agent states', () => {
+  const savedRuntime = process.env.SWITCHROOM_RUNTIME
+  afterEach(() => {
+    if (savedRuntime === undefined) delete process.env.SWITCHROOM_RUNTIME
+    else process.env.SWITCHROOM_RUNTIME = savedRuntime
+  })
+
+  it('attaches a journalctl hint when the unit is failed (non-docker runtime)', async () => {
+    delete process.env.SWITCHROOM_RUNTIME
     const exec = makeSequence([makeSystemctlOutput('failed')])
     const r = await probeAgentProcess('klanker', {
       execFileImpl: exec as unknown as (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>,
@@ -1197,6 +1204,23 @@ describe('nextStep — agent systemd states', () => {
     expect(r.status).toBe('fail')
     expect(r.nextStep).toMatch(/journalctl/)
     expect(r.nextStep).toMatch(/switchroom-klanker/)
+  })
+
+  // #1382: the failed/unknown-state hints must follow SWITCHROOM_RUNTIME the
+  // same way the boot-card crash row does (#1376) — no journalctl in-container.
+  it('attaches a docker-logs hint when the unit is failed under SWITCHROOM_RUNTIME=docker', async () => {
+    process.env.SWITCHROOM_RUNTIME = 'docker'
+    const exec = makeSequence([makeSystemctlOutput('failed')])
+    const r = await probeAgentProcess('klanker', {
+      execFileImpl: exec as unknown as (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>,
+      sleepImpl: async () => {},
+      retryIntervalMs: 1,
+      retryMaxMs: 0,
+    })
+    expect(r.status).toBe('fail')
+    expect(r.nextStep).toMatch(/docker logs/)
+    expect(r.nextStep).toMatch(/switchroom-klanker/)
+    expect(r.nextStep).not.toMatch(/journalctl/)
   })
 
   it('attaches a transient-state hint when the unit is activating after retry budget', async () => {

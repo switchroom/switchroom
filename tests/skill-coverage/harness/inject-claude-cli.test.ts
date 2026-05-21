@@ -54,9 +54,9 @@ describe("extractFromStreamJson", () => {
 
   it("lowercases the slug", () => {
     const out = extractFromStreamJson(
-      [SAMPLE_INIT, assistantToolUse("Buildkite-API"), resultRow(true)].join("\n"),
+      [SAMPLE_INIT, assistantToolUse("Switchroom-CLI"), resultRow(true)].join("\n"),
     );
-    expect(out.skills).toEqual(["buildkite-api"]);
+    expect(out.skills).toEqual(["switchroom-cli"]);
   });
 
   it("returns empty skills when no Skill tool_use fires", () => {

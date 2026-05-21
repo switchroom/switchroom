@@ -156,8 +156,8 @@ export const VAULT_FORMAT_HINTS: VaultFormatHint[] = [
  *   - deny set (non-empty)        → listed agents are blocked (checked first)
  *   - deny takes precedence over allow: an agent in both lists is denied
  *
- * Agent names are the slug portion of the systemd unit, e.g. "clerk" from
- * "switchroom-clerk-cron-0.service".
+ * Agent names are the agent slug, e.g. "clerk" — the same identity the
+ * broker derives from the per-agent socket bind path (path-as-identity).
  */
 export interface VaultEntryScope {
   allow?: string[];
