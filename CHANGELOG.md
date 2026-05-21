@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.13.6 — a typing indicator for the whole turn
+
+Headline: the agent now shows `typing…` for the *entire* turn, not
+just the split-second a reply is transmitted. Messaging an agent now
+feels like messaging a person — you see them composing the whole
+time.
+
+### feat(telegram) — continuous typing indicator (#1638)
+
+The Telegram `typing…` indicator was fired as one-shot ~5s pings at
+turn start — so any turn that read a file or thought for a moment
+went dark after 5 seconds, and the chat felt like a black box until
+the answer dropped. It now holds a continuous `typing…` chat-action
+from turn-start to turn-end, self-renewing every 4s, on a dedicated
+interval map that the reply handler's and tool-wrapper's stop calls
+cannot clobber. Deterministic, framework-owned, no prose — the
+mechanical ambient layer of the conversational-pacing contract.
+
+The "Open with an acknowledgement" prompt rule is also tightened from
+a fuzzy "skip if the answer lands in a second or two" (which the
+model misjudged) to a bright line: any tool call needed → acknowledge
+first; skip only for a question answerable immediately from memory.
+
+### hostd — config_propose_edit skeleton (#1637)
+
+Flag-gated schema + dispatcher stub for approval-gated agent-config
+edits. No behaviour change (flag off).
+
 ## v0.13.5 — human-feel pacing: a guaranteed fast acknowledgement
 
 Headline: an agent now opens every turn with a fast verbal
