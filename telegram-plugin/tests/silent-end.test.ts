@@ -7,6 +7,8 @@ import {
   writeSilentEndState,
   clearSilentEndState,
   readSilentEndState,
+  recordSilentTurnEnd,
+  SILENT_END_MAX_RETRIES,
 } from '../silent-end.js'
 
 let stateDir: string
@@ -115,6 +117,73 @@ describe('silent-end.ts — gateway state writer', () => {
     expect(state).toMatchObject({ chatId: 'c', threadId: 7, turnKey: 'c:7', retryCount: 0 })
     clearSilentEndState('c:7')
     expect(readSilentEndState()).toBeNull()
+  })
+})
+
+describe('recordSilentTurnEnd — #1161 exhaustion detection', () => {
+  it('first silent-end of a turn writes state and reports exhausted:false', () => {
+    const r = recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    expect(r.exhausted).toBe(false)
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'c:_', retryCount: 0 })
+  })
+
+  it('reports exhausted:false while prior retryCount is still below the cap', () => {
+    // The Stop hook has not yet been able to push retryCount to the cap.
+    const path = join(stateDir, 'silent-end-pending.json')
+    writeFileSync(path, JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES - 1, timestamp: 0,
+    }))
+    const r = recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    expect(r.exhausted).toBe(false)
+    // State is (re)written, inheriting the prior counter for the same turn.
+    expect(readSilentEndState()!.retryCount).toBe(SILENT_END_MAX_RETRIES - 1)
+  })
+
+  it('reports exhausted:true and clears state once the re-prompt cap is reached', () => {
+    // The Stop hook already blocked once and pushed retryCount to the cap;
+    // the agent is STILL silent on this re-prompted turn.
+    const path = join(stateDir, 'silent-end-pending.json')
+    writeFileSync(path, JSON.stringify({
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: 0,
+    }))
+    const r = recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    expect(r.exhausted).toBe(true)
+    // State cleared so the Stop hook on this final turn allows the stop.
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('treats a capped prior state for a DIFFERENT turn as a fresh silent-end', () => {
+    const path = join(stateDir, 'silent-end-pending.json')
+    writeFileSync(path, JSON.stringify({
+      chatId: 'old', threadId: null, turnKey: 'old:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: 0,
+    }))
+    const r = recordSilentTurnEnd({ chatId: 'new', threadId: 9, turnKey: 'new:9' })
+    expect(r.exhausted).toBe(false)
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'new:9', retryCount: 0 })
+  })
+
+  it('full lifecycle: silent → re-prompt → still silent → exhausted', () => {
+    // 1. Turn ends silent — first record.
+    expect(recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }).exhausted).toBe(false)
+    // 2. Stop hook blocks and increments retryCount (simulated).
+    const path = join(stateDir, 'silent-end-pending.json')
+    const s = readSilentEndState()!
+    writeFileSync(path, JSON.stringify({ ...s, retryCount: s.retryCount + 1 }))
+    // 3. Re-prompted turn ends silent again — recovery exhausted.
+    expect(recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }).exhausted).toBe(true)
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('SILENT_END_MAX_RETRIES matches MAX_RETRIES in the Stop hook', () => {
+    // The hook is a standalone .mjs and hardcodes its own copy — this
+    // guards the two from drifting apart.
+    const hookSrc = readFileSync(join(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs'), 'utf8')
+    const m = hookSrc.match(/const MAX_RETRIES = (\d+)/)
+    expect(m).not.toBeNull()
+    expect(Number(m![1])).toBe(SILENT_END_MAX_RETRIES)
   })
 })
 

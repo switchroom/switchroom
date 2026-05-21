@@ -9,7 +9,9 @@
  * decision:block to re-prompt the agent instead of letting the session close.
  *
  * On the second silent-end (retryCount >= MAX_RETRIES), the hook allows the
- * stop so the gateway can render the "🙊 Ended without reply" warning card.
+ * stop. The gateway's turn-end path (recordSilentTurnEnd in silent-end.ts)
+ * detects the exhausted re-prompt and delivers a user-facing fallback
+ * message so the turn never silently vanishes (#1161).
  *
  * Carve-outs preserved:
  *   - wasAutonomous=true turns: the gateway never writes a state file for
@@ -30,6 +32,8 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
+// MUST stay in sync with SILENT_END_MAX_RETRIES in telegram-plugin/silent-end.ts
+// (this hook is a standalone .mjs and can't import the TS module).
 const MAX_RETRIES = 1
 
 function readStdin() {

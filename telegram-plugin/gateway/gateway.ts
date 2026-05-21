@@ -76,7 +76,7 @@ import {
 import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
-import { writeSilentEndState, clearSilentEndState } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordSilentTurnEnd } from '../silent-end.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
@@ -139,6 +139,16 @@ import { validateStringArray } from './access-validator.js'
  * identical envelope shapes.
  */
 const REPLY_TO_TEXT_MAX = 200
+
+/**
+ * #1161 — user-facing fallback delivered when a user-message turn ends
+ * with zero outbound messages AND the deterministic Stop-hook re-prompt
+ * has already been exhausted. Without this the user only sees the
+ * progress card vanish; silence must never be the failure mode.
+ */
+const SILENT_END_FALLBACK_TEXT =
+  '⚠️ The agent finished working but didn’t send a reply — your last ' +
+  'message may not have been answered. Please try asking again.'
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace, telegramHtmlToPlainText } from '../format.js'
 import {
   validateInlineKeyboard,
@@ -6290,16 +6300,44 @@ function handleSessionEvent(ev: SessionEvent): void {
           longest_silent_gap_ms: outboundMetrics.longestOutboundGapMs,
           ended_via: outboundMetrics.outboundCount > 0 ? 'reply' : 'silent',
         })
-        // #1122 PR4 fix: deterministic silent-end detection (see the
-        // silent-marker path above for the rationale). The Stop hook
-        // reads the file we write here and blocks the session-end so
-        // the agent can be re-prompted to call reply.
+        // #1122 PR4 / #1161: deterministic silent-end handling (see the
+        // silent-marker path above for the rationale).
+        //   - first silent-end → recordSilentTurnEnd writes the state
+        //     file so the Stop hook (silent-end-interrupt-stop.mjs)
+        //     blocks the session-end and re-prompts the agent to reply.
+        //   - the Stop-hook re-prompt is already spent and the agent is
+        //     STILL silent → recordSilentTurnEnd returns exhausted:true;
+        //     deliver a user-facing fallback so the turn never just
+        //     vanishes (the user otherwise only sees the card disappear).
         if (outboundMetrics.outboundCount === 0) {
-          writeSilentEndState({
+          const silentEnd = recordSilentTurnEnd({
             chatId,
             threadId: threadId ?? null,
             turnKey: tKey,
           })
+          if (silentEnd.exhausted) {
+            process.stderr.write(
+              `telegram gateway: WARN silent-end fallback — agent stayed ` +
+              `silent after the Stop-hook re-prompt; delivering fallback ` +
+              `message chat=${chatId} turnKey=${tKey} (#1161)\n`,
+            )
+            void retryWithThreadFallback(
+              robustApiCall,
+              (tid) =>
+                bot.api.sendMessage(
+                  chatId,
+                  SILENT_END_FALLBACK_TEXT,
+                  tid != null ? { message_thread_id: tid } : {},
+                ),
+              { threadId, chat_id: chatId, verb: 'silent-end-fallback.sendMessage' },
+            ).catch((err) => {
+              process.stderr.write(
+                `telegram gateway: silent-end fallback send failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`,
+              )
+            })
+          }
         }
         signalTracker.clear(tKey)
         silencePoke.endTurn(tKey)

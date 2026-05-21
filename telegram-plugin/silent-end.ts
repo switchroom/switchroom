@@ -51,6 +51,14 @@ export interface SilentEndDeps {
   log?: (line: string) => void
 }
 
+/**
+ * How many times the Stop hook re-prompts a silent-end turn before it
+ * gives up. MUST stay in sync with `MAX_RETRIES` in the Stop hook
+ * (`telegram-plugin/hooks/silent-end-interrupt-stop.mjs`) — the hook is a
+ * standalone `.mjs` and can't import this module.
+ */
+export const SILENT_END_MAX_RETRIES = 1
+
 function resolveStateDir(deps?: SilentEndDeps): string {
   if (deps?.stateDir != null) return deps.stateDir
   const env = process.env.TELEGRAM_STATE_DIR
@@ -171,4 +179,52 @@ export function readSilentEndState(deps?: SilentEndDeps): SilentEndState | null 
   } catch {
     return null
   }
+}
+
+/**
+ * Record a user-message turn that ended with zero outbound messages and
+ * report whether the deterministic re-prompt has been exhausted. This is
+ * the gateway's single entry point for the main turn-end path.
+ *
+ *   - First silent-end of a turn (no prior state, or prior `retryCount`
+ *     still below `SILENT_END_MAX_RETRIES`) → writes the state file via
+ *     `writeSilentEndState`, so `silent-end-interrupt-stop.mjs` blocks
+ *     the stop and re-prompts the agent. Returns `{ exhausted: false }`.
+ *
+ *   - A silent-end where the prior state for the SAME turn already shows
+ *     `retryCount >= SILENT_END_MAX_RETRIES` → the Stop hook already
+ *     spent its re-prompt and the agent is STILL silent. Recovery has
+ *     failed. Clears the state file (so the Stop hook on this final turn
+ *     finds nothing pending and allows the stop cleanly) and returns
+ *     `{ exhausted: true }` — the caller MUST then deliver a user-facing
+ *     fallback so the turn never just vanishes (#1161).
+ *
+ * Chat-less autonomous wakeup turns never reach here: the gateway only
+ * creates a `currentTurn` (and therefore only runs a turn-end handler)
+ * when the inbound event carries a chat id. Cron-fired turns DO carry a
+ * topic chat and reach this path — a cron task that means to stay silent
+ * must emit a NO_REPLY sentinel, which routes to the gateway's
+ * silent-marker branch and never gets a fallback.
+ */
+export function recordSilentTurnEnd(
+  args: { chatId: string; threadId: number | null; turnKey: string },
+  deps?: SilentEndDeps,
+): { exhausted: boolean } {
+  const prev = readSilentEndState(deps)
+  if (
+    prev != null &&
+    prev.turnKey === args.turnKey &&
+    prev.retryCount >= SILENT_END_MAX_RETRIES
+  ) {
+    clearSilentEndState(args.turnKey, deps)
+    emitLog(
+      deps,
+      `silent-end: re-prompt exhausted for turnKey=${args.turnKey} ` +
+        `(retryCount=${prev.retryCount} >= ${SILENT_END_MAX_RETRIES}) — ` +
+        `caller should deliver a fallback\n`,
+    )
+    return { exhausted: true }
+  }
+  writeSilentEndState(args, deps)
+  return { exhausted: false }
 }
