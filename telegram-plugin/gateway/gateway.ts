@@ -14154,6 +14154,8 @@ async function shutdown(signal: string): Promise<void> {
 
   for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
+  for (const iv of [...turnTypingIntervals.values()]) clearInterval(iv)
+  turnTypingIntervals.clear()
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
   typingRetryTimers.clear()
 
