@@ -657,7 +657,7 @@ describe("generateCompose", () => {
       expect(block, `agent-${name} security_opt`).toContain('no-new-privileges:true');
       expect(block, `agent-${name} cap_drop`).toMatch(/cap_drop:\s*\n\s*-\s*"ALL"/);
       expect(block, `agent-${name} read_only`).toContain("read_only: true");
-      expect(block, `agent-${name} tmpfs`).toContain("/tmp:size=256m");
+      expect(block, `agent-${name} tmpfs`).toContain("/tmp:size=1g");
     }
   });
 
