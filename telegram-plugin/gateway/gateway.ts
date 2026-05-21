@@ -6164,7 +6164,15 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // mirroring this contract — so reply-only turns transition
                 // to terminal 👍 in their own success path rather than
                 // relying on this dedup heuristic.
-                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
+                //
+                // PR 3b step 3 (#1603 audit): thread the captured `turn`
+                // explicitly. `endCurrentTurnAtomic(turn)` ran at line ~6120
+                // before this IIFE started, so `currentTurn === null` by
+                // now — without an explicit endingTurn argument, the shadow
+                // trace would read `outboundEmitted=false` for this dedup
+                // path even though `recentCount > 0` proves the reply tool
+                // did fire (turn.replyCalled === true).
+                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId), turn)
                 return
               }
             } catch {}
@@ -6292,7 +6300,19 @@ function handleSessionEvent(ev: SessionEvent): void {
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
             if (backstopCtrl) backstopCtrl.setError()
           } finally {
-            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
+            // PR 3b step 3 (#1603 audit): thread the captured `turn`
+            // explicitly. The turn-flush backstop runs inside this IIFE
+            // after `endCurrentTurnAtomic(turn)` already nulled
+            // `currentTurn` at line ~6120. Without threading, the shadow
+            // trace would read `outboundEmitted=currentTurn?.replyCalled
+            // === undefined` → false. For the turn-flush path
+            // `turn.replyCalled` is `false` regardless (the model didn't
+            // call the reply tool — the gateway backstop did the work),
+            // so the threaded value matches the existing fallback here.
+            // But pinning the source via the captured turn matches the
+            // canonical pattern and survives any future change to how
+            // `currentTurn` is sequenced.
+            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId), turn)
           }
         })()
         return
