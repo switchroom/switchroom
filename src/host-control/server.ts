@@ -51,6 +51,7 @@ import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
+import { validateConfigEdit } from "./config-edit-validator.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
 export interface ServerConfig {
@@ -113,6 +114,18 @@ export interface ServerOptions {
    * to enumerate refs from the operator's compose file.
    */
   imageRefsForDigests?: () => string[];
+  /**
+   * Path to the live `switchroom.yaml` the config-edit validator (PR 1b)
+   * reads when checking that a proposed unified diff applies cleanly
+   * and the post-apply YAML survives schema + secret-leak validation.
+   *
+   * Defaults to `/state/config/switchroom.yaml` — the canonical path
+   * the wire schema (`ConfigProposeEditRequestSchema.args.target_path`)
+   * pins. Tests override this to point at a scratch file under `tmp/`
+   * so the validation pipeline can be exercised end-to-end without
+   * touching real fleet config.
+   */
+  configPath?: string;
 }
 
 /**
@@ -1188,9 +1201,28 @@ export class HostdServer {
         Date.now() - started,
       );
     }
+    // PR 1b — run the validation pipeline (RFC §4). On any rejection
+    // we surface the stage-specific error code; on success we still
+    // return a sentinel (E_NOT_IMPLEMENTED_APPLY_PATH) because the
+    // approval card + flock + atomic-write path lands in PR 1c.
+    const configPath =
+      this.opts.configPath ?? req.args.target_path;
+    const verdict = validateConfigEdit({
+      configPath,
+      targetPath: req.args.target_path,
+      unifiedDiff: req.args.unified_diff,
+    });
+    if (!verdict.ok) {
+      return errorResponse(
+        req.request_id,
+        `${verdict.code}: ${verdict.detail}`,
+        Date.now() - started,
+      );
+    }
     return errorResponse(
       req.request_id,
-      "E_NOT_IMPLEMENTED: validation pipeline pending (PR 1b)",
+      "E_NOT_IMPLEMENTED_APPLY_PATH: validation passed (apply path " +
+        "not yet implemented — pending PR 1c)",
       Date.now() - started,
     );
   }
