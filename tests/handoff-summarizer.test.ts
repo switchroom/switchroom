@@ -106,6 +106,28 @@ describe("extractTurnsFromJsonl", () => {
     );
     expect(extractTurnsFromJsonl(path, 10)).toEqual([]);
   });
+
+  it("strips the <channel> wrapper from a type:user entry and collapses the queue-op twin", () => {
+    // A telegram message lands in the JSONL twice — once as a clean
+    // queue-operation enqueue, once as a type:"user" entry whose
+    // string content is the raw <channel>…</channel> envelope. The
+    // extractor must yield ONE clean user turn, not two (and not raw XML).
+    const path = join(tmp, "f.jsonl");
+    const channelBlock =
+      '<channel source="t" chat_id="1" message_id="2">what is 2 + 2?</channel>';
+    writeFileSync(
+      path,
+      makeJsonl([
+        { type: "queue-operation", operation: "enqueue", content: channelBlock },
+        { type: "user", message: { content: channelBlock } },
+        { type: "assistant", message: { content: [{ type: "text", text: "4" }] } },
+      ]),
+    );
+    expect(extractTurnsFromJsonl(path, 10)).toEqual([
+      { role: "user", text: "what is 2 + 2?" },
+      { role: "assistant", text: "4" },
+    ]);
+  });
 });
 
 describe("formatTranscriptTail", () => {

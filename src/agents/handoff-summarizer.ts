@@ -89,7 +89,12 @@ export function extractTurnsFromJsonl(
     }
     if (obj.type === "user" && obj.message && typeof obj.message === "object") {
       const content = (obj.message as { content?: unknown }).content;
-      const text = extractTextBlocks(content);
+      const raw = extractTextBlocks(content);
+      // A telegram message also lands here as a type:"user" entry whose
+      // string content is the raw <channel>…</channel> envelope (the
+      // queue-operation form is the clean one). Strip the wrapper so
+      // the tail and derived topic show the message body, not XML.
+      const text = raw ? extractChannelBody(raw) : null;
       if (text) turns.push({ role: "user", text });
       continue;
     }
@@ -100,10 +105,20 @@ export function extractTurnsFromJsonl(
       continue;
     }
   }
+  // A telegram message lands in the JSONL twice — once as a
+  // queue-operation enqueue, once as a type:"user" entry — and after
+  // channel-body stripping both yield identical text. Collapse
+  // consecutive identical (role, text) turns so the tail isn't doubled.
+  const deduped: Turn[] = [];
+  for (const t of turns) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.role === t.role && prev.text === t.text) continue;
+    deduped.push(t);
+  }
   // Keep the most recent `maxTurns` turns (pairs counted generously —
   // we actually cap total turn entries, not user+assistant pairs).
-  if (turns.length <= maxTurns) return turns;
-  return turns.slice(turns.length - maxTurns);
+  if (deduped.length <= maxTurns) return deduped;
+  return deduped.slice(deduped.length - maxTurns);
 }
 
 function extractChannelBody(raw: string): string | null {
