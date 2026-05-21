@@ -1,16 +1,21 @@
 /**
- * JTBD scenario — soft-commit for slow turns.
+ * JTBD scenario — first sign of life on a slow turn.
  *
- * The new conversational-pacing prompt (#1122) instructs the agent
- * to send a one-liner "let me check, back in a few" before slow
- * work. This UAT exercises that behaviour: send a prompt that
- * obviously needs >15s, expect the FIRST outbound to be a short
- * soft-commit message, with the final answer landing later.
+ * The conversational-pacing prompt instructs the agent to open with
+ * an acknowledgement before slow work. (The original ">15s soft
+ * commit" bullet this file was named for was superseded by the
+ * guaranteed "Open with an acknowledgement" bullet in PR #1633 —
+ * acknowledge every turn unless the answer lands in a second or two.)
  *
- * Not strict — the agent's allowed to skip the soft-commit if it
- * judges the work is fast enough. The assertion is "the user does
- * NOT see a long silent gap before the first sign of life": either
- * a soft-commit OR the actual reply lands within 20s.
+ * This UAT exercises a single slow prompt and asserts the loose
+ * floor: the user does NOT see a long silent gap before the first
+ * sign of life — a reply lands within 30s.
+ *
+ * The stronger, fuzzed successor of this contract is
+ * `jtbd-fast-ack-dm.test.ts` — varied prompt shapes, a tight 20s
+ * hard latency target (a tight target, not a framework guarantee —
+ * see that file's header). This file is retained as a minimal
+ * single-prompt floor.
  */
 
 import { describe, it, expect } from "vitest";
@@ -26,7 +31,7 @@ const SLOW_PROMPT = (
 
 describe("uat: soft-commit pacing", () => {
   it(
-    "user asks slow question → first reply lands within 20s",
+    "user asks slow question → first reply lands within 30s",
     async () => {
       const sc = await spinUp({ agent: "test-harness" });
       try {
