@@ -72,6 +72,7 @@ describe("TOOLS export", () => {
       "agent_restart",
       "agent_start",
       "agent_stop",
+      "config_propose_edit", // PR 1a (admin-agent-config-edit) — flag-gated stub
       "get_status",     // PR B — read last terminal update_apply audit row
       "update_apply",
       "update_check",
@@ -358,6 +359,81 @@ describe("dispatchTool — failure modes", () => {
     const res = await dispatchTool("nope", {});
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toMatch(/unknown tool: nope/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("dispatchTool — config_propose_edit (PR 1a stub)", () => {
+  const VALID_DIFF =
+    "--- a/switchroom.yaml\n+++ b/switchroom.yaml\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+
+  it("forwards a well-formed request to hostd", async () => {
+    hostdRequestMock.mockResolvedValueOnce({
+      v: 1,
+      request_id: "x",
+      result: "error",
+      exit_code: null,
+      duration_ms: 0,
+      error: "E_CONFIG_EDIT_DISABLED: ...",
+    } as HostdResponse);
+    const res = await dispatchTool("config_propose_edit", {
+      unified_diff: VALID_DIFF,
+      reason: "tweak the version comment",
+      target_path: "/state/config/switchroom.yaml",
+    });
+    // Daemon returned an error response — surfaces as isError but the
+    // request DID make it to the wire (this is the stub's expected
+    // outcome until PR 1b/1c).
+    expect(res.isError).toBe(true);
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("config_propose_edit");
+    expect(sent.args).toEqual({
+      unified_diff: VALID_DIFF,
+      reason: "tweak the version comment",
+      target_path: "/state/config/switchroom.yaml",
+    });
+    expect(sent.request_id).toMatch(/^mcp-config-propose-edit-/);
+  });
+
+  it("rejects missing unified_diff without hitting the wire", async () => {
+    const res = await dispatchTool("config_propose_edit", {
+      reason: "x",
+      target_path: "/state/config/switchroom.yaml",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/unified_diff is required/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing reason without hitting the wire", async () => {
+    const res = await dispatchTool("config_propose_edit", {
+      unified_diff: VALID_DIFF,
+      target_path: "/state/config/switchroom.yaml",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/reason is required/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an over-long reason without hitting the wire", async () => {
+    const res = await dispatchTool("config_propose_edit", {
+      unified_diff: VALID_DIFF,
+      reason: "x".repeat(501),
+      target_path: "/state/config/switchroom.yaml",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/capped at 500/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-canonical target_path without hitting the wire", async () => {
+    const res = await dispatchTool("config_propose_edit", {
+      unified_diff: VALID_DIFF,
+      reason: "x",
+      target_path: "/etc/passwd",
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/target_path/);
     expect(hostdRequestMock).not.toHaveBeenCalled();
   });
 });

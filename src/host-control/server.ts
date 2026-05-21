@@ -58,6 +58,14 @@ export interface ServerConfig {
    *  once at startup (Phase 1) and reloads on SIGHUP (post-Phase-1
    *  follow-up). */
   agents: Record<string, { admin?: boolean }>;
+  /** hostd verb-level knobs (RFC admin-agent-config-edit §3 / §4).
+   *  Optional in the wire type so existing call-sites that synthesize
+   *  a minimal config (test fixtures, legacy callers) keep compiling;
+   *  the dispatcher treats "missing block" as "flag off". */
+  hostd?: {
+    config_edit_enabled?: boolean;
+    config_edit_rate_per_hour?: number;
+  };
 }
 
 export interface ServerOptions {
@@ -576,6 +584,13 @@ export class HostdServer {
         case "agent_smoke":
           resp = await this.handleAgentSmoke(req, started);
           break;
+        // ── PR 1a (admin-agent-config-edit RFC) ──────────────────
+        // Stub dispatcher: flag-gated disabled error or a
+        // not-implemented marker. PR 1b adds validation; PR 1c adds
+        // the approval card + apply path.
+        case "config_propose_edit":
+          resp = this.handleConfigProposeEdit(req, started);
+          break;
       }
     } catch (err) {
       resp = errorResponse(
@@ -682,6 +697,16 @@ export class HostdServer {
         return callerAdmin
           ? null
           : `doctor requires admin: true on caller "${caller.name}"`;
+      case "config_propose_edit":
+        // Admin-only at the wire layer. The verb proposes mutations to
+        // the central switchroom.yaml — strictly broader blast radius
+        // than per-agent operations. The handler still returns
+        // E_CONFIG_EDIT_DISABLED when the operator hasn't opted in,
+        // but we refuse non-admin callers before that check so an
+        // un-admin'd peer can't even probe the feature flag state.
+        return callerAdmin
+          ? null
+          : `config_propose_edit requires admin: true on caller "${caller.name}"`;
     }
   }
 
@@ -1134,6 +1159,42 @@ export class HostdServer {
    * adds a real, quota-costing `claude -p` auth smoke; the default
    * makes NO model call.
    */
+  /**
+   * `config_propose_edit` — PR 1a stub.
+   *
+   * The full RFC (`docs/rfcs/admin-agent-config-edit.md`) sequences
+   * three PRs: 1a wires schema + dispatcher (this method), 1b adds
+   * the validation pipeline (§3.2), 1c adds the approval card + apply
+   * path (§3.3, §3.4). Until 1c lands the verb has no live effect on
+   * disk — it surfaces a flag-aware error so admin agents can
+   * discover the feature and operators can opt in incrementally.
+   *
+   * Error-code convention (`CONFIG_PROPOSE_EDIT_ERROR_CODES` in
+   * protocol.ts): the audit row and the `resp.error` string both
+   * carry the code so MCP callers and the audit reader can branch on
+   * it without parsing free text. Format: `<CODE>: <human message>`.
+   */
+  private handleConfigProposeEdit(
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    started: number,
+  ): HostdResponse {
+    const enabled = this.opts.config.hostd?.config_edit_enabled === true;
+    if (!enabled) {
+      return errorResponse(
+        req.request_id,
+        "E_CONFIG_EDIT_DISABLED: config_propose_edit is disabled; " +
+          "operator must set hostd.config_edit_enabled=true in " +
+          "switchroom.yaml to opt in",
+        Date.now() - started,
+      );
+    }
+    return errorResponse(
+      req.request_id,
+      "E_NOT_IMPLEMENTED: validation pipeline pending (PR 1b)",
+      Date.now() - started,
+    );
+  }
+
   private async handleAgentSmoke(
     req: Extract<HostdRequest, { op: "agent_smoke" }>,
     started: number,

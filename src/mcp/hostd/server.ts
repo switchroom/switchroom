@@ -67,6 +67,9 @@ interface ToolArgs {
   // update_apply release-override (PR B)
   channel?: "dev" | "rc" | "latest";
   pin?: string;
+  // config_propose_edit (PR 1a — admin-agent-config-edit RFC §3.1)
+  unified_diff?: string;
+  target_path?: string;
 }
 
 export const TOOLS = [
@@ -244,6 +247,52 @@ export const TOOLS = [
     },
   },
   {
+    name: "config_propose_edit",
+    description:
+      "Propose a unified-diff patch against /state/config/switchroom.yaml " +
+      "(RFC admin-agent-config-edit). When fully shipped the host validates " +
+      "the patch (applies cleanly + post-patch yaml parses against the " +
+      "config schema) and raises a Telegram approval card in the OPERATOR's " +
+      "primary chat — NOT yours; the requesting agent's chat is not the " +
+      "approval surface. Admin-only at the wire layer. " +
+      "Current status (PR 1a — skeleton): the tool is registered but the " +
+      "feature is OFF by default; calling it returns " +
+      "E_CONFIG_EDIT_DISABLED until the operator sets " +
+      "hostd.config_edit_enabled=true in switchroom.yaml. Even when enabled " +
+      "in this PR, the call returns E_NOT_IMPLEMENTED — the validation " +
+      "pipeline (PR 1b) and apply path (PR 1c) ship in follow-up PRs.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["unified_diff", "reason", "target_path"],
+      properties: {
+        unified_diff: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Unified diff against switchroom.yaml. Must have ≥3 lines " +
+            "context (enforced in PR 1b); no path-traversal or multi-file " +
+            "diffs. LF-only, ≤1 MB.",
+        },
+        reason: {
+          type: "string",
+          minLength: 1,
+          maxLength: 500,
+          description:
+            "Human-readable rationale shown to the operator on the " +
+            "approval card. Capped at 500 chars (RFC §3.3).",
+        },
+        target_path: {
+          type: "string",
+          enum: ["/state/config/switchroom.yaml"],
+          description:
+            "Must be the literal string '/state/config/switchroom.yaml'. " +
+            "Future-proofs against multi-file diffs and gives the validator " +
+            "a single canonical path to anchor on.",
+        },
+      },
+    },
+  },
+  {
     name: "get_status",
     description:
       "Read the most recent terminal `update_apply` audit row " +
@@ -392,6 +441,42 @@ export async function dispatchTool(
           ...(args.rebuild ? { rebuild: true } : {}),
           ...(args.channel ? { channel: args.channel } : {}),
           ...(args.pin ? { pin: args.pin } : {}),
+        },
+      };
+      break;
+    }
+    case "config_propose_edit": {
+      // PR 1a (admin-agent-config-edit RFC §3.1). Argument shape
+      // validated here before hitting the wire so the disabled-path
+      // response is clearly the daemon's, not a wire-decode rejection.
+      if (!args.unified_diff || typeof args.unified_diff !== "string") {
+        return errorText(
+          "config_propose_edit: unified_diff is required (non-empty string).",
+        );
+      }
+      if (!args.reason || typeof args.reason !== "string") {
+        return errorText(
+          "config_propose_edit: reason is required (non-empty string, ≤500 chars).",
+        );
+      }
+      if (args.reason.length > 500) {
+        return errorText(
+          "config_propose_edit: reason is capped at 500 chars (RFC §3.3).",
+        );
+      }
+      if (args.target_path !== "/state/config/switchroom.yaml") {
+        return errorText(
+          "config_propose_edit: target_path must be '/state/config/switchroom.yaml'.",
+        );
+      }
+      req = {
+        v: 1,
+        op: "config_propose_edit",
+        request_id: makeRequestId("mcp-config-propose-edit"),
+        args: {
+          unified_diff: args.unified_diff,
+          reason: args.reason,
+          target_path: "/state/config/switchroom.yaml",
         },
       };
       break;
