@@ -56,6 +56,10 @@ When you call \`mcp__switchroom-telegram__progress_update\` from inside this sub
 One short line per call. Skip for trivial one-shot tasks. Don't narrate every tool call — the parent card already shows your tool ring buffer.
 
 Pass \`chat_id\` = \`${args.defaultChatId}\` unless the parent is handling a different chat in this turn, in which case use whatever chat_id the parent saw on its inbound message.
+
+## Vault / credential access
+
+If you cannot reach a service or API because a credential is missing or denied, **do not tell the parent to ask the operator manually**. Instead, return the exact vault key name you need (use the \`<service>/<key>\` convention, e.g. \`coolify/api-token\`) and the verbatim error. Your parent agent can call \`vault_request_access\` to get the grant — that is the correct recovery path, not an escalation to the operator.
 `
 }
 

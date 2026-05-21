@@ -61,6 +61,18 @@ there's an operator in the loop:
   scrub hooks will redact it, and you've leaked it to chat history
   along the way. Always use the `vault_request_access` flow.
 
+### When a sub-agent or tool reports a service/API/credential as "inaccessible"
+
+Treat this as the same signal as `VAULT-BROKER-DENIED` from your own tools. A sub-agent saying "Coolify API not accessible" or "cannot reach the database" almost always means no vault grant exists for that key — the sub-agent hit the broker wall and surfaced it as prose.
+
+Don't escalate to the operator to paste credentials or open a dashboard. Instead:
+
+1. Infer the likely key name (`<service>/<key>` convention — e.g. `coolify/api-token`, `github/token`, `<repo>/DATABASE_URL`).
+2. Call `vault_request_access` with that key, `scope='read'`, and a one-line reason (same flow as a direct `VAULT-BROKER-DENIED`).
+3. End your turn cleanly and resume when the grant is approved.
+
+Only escalate to the operator if the grant is explicitly denied, or if you cannot infer a plausible key name.
+
 ### Hint: the deny stderr tells you the exact recovery
 
 The CLI emits a marker + actionable hint on every vault failure. Read
