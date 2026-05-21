@@ -144,11 +144,17 @@ yet be written to `MEMORY.md`**.
   per-turn. Still a `claude -p`; does not meet the zero-`claude -p`
   goal.
 
-### Recommendation
-**B1 as primary, B2 as documented fallback.** B1 is claude-native,
-minimal code, and compaction handles scale. Adopt B1; if SC-B3 or
-SC-B5 regress, layer B2. **This RFC's one open decision — needs
-operator sign-off.**
+### Decision
+**B2 — transcript-tail self-orient** (operator, 2026-05-21).
+
+On restart the new interactive session is seeded, on its first turn,
+with a bounded raw transcript tail and orients itself in-session. No
+`claude -p`; the summarization cost moves into the subscription-funded
+interactive session, and the context handed forward is bounded and
+controlled rather than whatever `--continue` happens to carry. B1
+(native `--continue`) was considered and set aside: a raw resume
+carries more stale tool/turn state than a deliberate tail, and the
+restart-and-know JTBD wants a clean, bounded handoff.
 
 ### Success criteria
 - **SC-B1** — no `spawn(…claude…)` / `claude -p` anywhere in
@@ -203,7 +209,7 @@ RFC-approved → ~90–150 agent-min + a test-harness canary.
 | Cold-start TTFO regression — the briefing was partly a cold-start lean-ness mechanism | SC-B5 threshold gate against the v0.13.3 baseline; B2 if breached |
 | Webhook turns now visible in main session history | Accepted — matches cron, desirable |
 
-## Open question
+## Decisions
 
-**B1 vs B2 for Workstream B.** Recommendation is **B1**. Needs operator
-sign-off on this RFC before Workstream B implementation begins.
+- **B1 vs B2 for Workstream B** — resolved 2026-05-21: **B2**
+  (transcript-tail self-orient). See Workstream B § Decision.
