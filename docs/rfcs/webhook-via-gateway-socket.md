@@ -36,6 +36,13 @@ UID. `appendFileSync` → EACCES → caught → `jsonReply(500, "write
 failed")` → GitHub treats the hook as broken and eventually disables
 it.
 
+Note that the bug is owner-mismatch, not mode-mismatch. The
+`mode: 0o600` argument on `appendFileSync` in
+`src/web/webhook-handler.ts:414` only applies at *file creation*;
+once the file exists with a non-matching owner, no mode tweak
+helps. A future reader's "just chmod it" instinct will not fix
+this class of bug.
+
 The proximate fix ("`rm webhook-events.jsonl`") works because the
 receiver recreates the file under its current UID. But that fix
 papers over the actual defect: **two processes with different UIDs
@@ -102,16 +109,13 @@ host web server (any UID)            agent gateway (agent UID)
 
 `gateway.sock` already exists with mode `0o755`-on-dir and is bound
 by the gateway with `0o600` owner-only. The web server (different
-UID) cannot connect today. **First sub-task**: relax the socket
-binding to `0o660` and grant the web server's UID via group OR
-make the socket world-connectable (`0o666`) — the verb itself is
-unauthenticated by socket perms because the verified webhook
-payload arrives through it (untrusted inbound, but already
-HMAC-verified). Recommend: `0o666` socket + verb-level allowlist
-("`webhook_ingest` accepts records only from a process whose
-peercred UID is on the host operator's allowlist; everything else
-is rejected"). Peercred check uses `SO_PEERCRED`, same primitive
-the vault broker uses.
+UID) cannot connect today. The change: rebind the socket as
+`0o666` (filesystem layer lets anyone `connect()`), with a
+`SO_PEERCRED` gate inside the gateway's `webhook_ingest` handler
+acting as the actual authn layer. Any peer whose peercred UID is
+not on the allowlist (see §7) gets the connection closed with no
+verb response. Same primitive the vault broker uses
+(`src/vault/broker/scope.test.ts`).
 
 ### 3.2 Gateway side
 
@@ -124,47 +128,83 @@ IPC. Add a `webhook_ingest` handler that:
    `telegram/webhook-events.jsonl`. Same content as today, same
    path, but now the writer is the gateway (UID match guaranteed).
 3. Triggers any matching `webhook_dispatch` rule — today this
-   logic also lives in the web server (`src/web/webhook-
-   dispatch.ts` → spawns `claude -p`). The gateway already spawns
-   `claude -p` for chat turns; the dispatch path becomes a thin
-   wrapper that reuses the existing spawn machinery instead of
-   shelling out to a top-level `switchroom claude` invocation.
-4. Returns `{ ok: true, ts }` synchronously after the append, so
-   the web server can return HTTP 202 to GitHub.
+   logic lives in the web server (`src/web/webhook-dispatch.ts`)
+   and spawns `claude -p` as a sibling of the web-server process.
+   In the new model the gateway is the parent of the long-running
+   interactive `claude` session, so dispatch spawns a *second*
+   `claude -p` while the interactive session may be mid-turn.
+   Concurrency story: dispatch turns get their own process,
+   independent of the interactive session's turn queue. They land
+   in Telegram as fresh inbound, the same way a `/cron` fire does
+   today. No shared state with the interactive turn, no need to
+   wait for it to finish. Web-server-side cooldown + dedup (kept
+   in place per §4) prevents dispatch storms.
+4. Returns `{ ok: true, ts }` to the web server after the append
+   syscall returns (NOT after `fsync` — see §5). The web server
+   then returns HTTP 202 to GitHub. Records are durable to the
+   OS page cache, not to disk; that matches the prior on-host
+   `appendFileSync` semantics exactly (no regression, no false
+   "durable" claim).
 
 ### 3.3 Web server side
 
 `src/web/webhook-handler.ts` keeps its job through the verify /
 dedup / rate-limit / render steps. The terminal `appendFileSync`
-block becomes a Unix-socket POST. New failure modes:
+block becomes a Unix-socket POST. Socket path is the well-known
+`~/.switchroom/agents/<agent>/telegram/gateway.sock` — same path
+the gateway binds, same path `mkdirSync(telegramDir, ...)` in the
+current handler already implies it knows. New failure modes:
 
-- **Gateway socket missing** (agent stopped): return HTTP 503,
-  GitHub retries on its own schedule (typically within seconds,
-  with backoff). Log `webhook-ingest: agent=X gateway-down`.
-- **Socket connect refused / EOF**: same — 503, retry.
-- **Gateway returns non-ok**: 500 with the gateway's error
-  message verbatim. Should be vanishingly rare since the gateway's
-  only failure mode is fs/disk, and that would block the agent
-  itself anyway.
+- **Socket file missing entirely** (agent never ran): HTTP 503,
+  log `webhook-ingest: agent=X socket-missing`.
+- **Socket exists but `connect()` returns ECONNREFUSED** (gateway
+  crashed, socket file orphaned): HTTP 503, log
+  `webhook-ingest: agent=X gateway-down`. Same status code; the
+  two cases differ only in operator-facing diagnostics.
+- **Socket connect EOF / write timeout**: HTTP 503.
+- **Gateway returns non-ok**: HTTP 500 with the gateway's error
+  message verbatim. Rare; only fs/disk failures inside the gateway.
+
+**Durability caveat.** GitHub retries failed deliveries up to ~8
+times with exponential backoff (minutes-to-hours), then gives up
+and (after enough failures) auto-disables the hook. A long agent
+outage (~hours) can permanently lose events. Two mitigations,
+both deferred to a follow-up RFC if the steady-state rate of
+gateway downtime warrants them:
+1. Web-server-side spool: on 503, append the verified record to
+   a web-server-owned `~/.switchroom/webhook-spool/<agent>/...`
+   directory; gateway drains on next startup. Adds a second
+   writer and a second state dir, but only as a degradation
+   path — not a steady-state second writer.
+2. `switchroom doctor` proactively pings agent sockets and warns
+   the operator when one is down for >N minutes.
+Neither is in scope here; called out so future readers don't
+think they were missed.
 
 ### 3.4 Migration
 
-Two PRs:
+Three PRs:
 
-1. **PR 1 — additive.** Add `webhook_ingest` verb to gateway,
-   add IPC client to web-server side, gate behind a defaults flag
-   (`channels.telegram.webhook_via_gateway: true` default). On the
-   `false` legacy path, keep direct `appendFileSync`. Emit a
-   deprecation warning when the legacy path fires. Tests on both
-   paths.
-2. **PR 2 — subtractive.** One release later: delete the legacy
-   `appendFileSync` path and the flag. Add a `switchroom doctor`
-   check that flags any `webhook-events.jsonl` whose owner UID
-   doesn't match the gateway's expected UID — points to either a
-   stale file (delete & let recreate) or a misconfigured deploy.
+1. **PR 1 — truly additive.** Add `webhook_ingest` verb to
+   gateway, add IPC client to web-server side, gate behind a
+   defaults flag `channels.telegram.webhook_via_gateway` with
+   **default `false`**. Legacy `appendFileSync` path stays the
+   shipped behaviour. Tests on both paths. Nothing in production
+   changes; operators can opt in per-agent for canary.
+2. **PR 2 — the rollout.** Flip the default to `true`. This is
+   the breaking change (web server now requires gateway sockets
+   to be reachable for webhook ingestion). Release notes call it
+   out. Operators with bespoke deployments can pin
+   `webhook_via_gateway: false` to defer.
+3. **PR 3 — subtractive.** One release after PR 2: delete the
+   legacy `appendFileSync` path and the flag. Add a
+   `switchroom doctor` check that flags any
+   `webhook-events.jsonl` whose owner UID doesn't match the
+   gateway's expected UID — points to either a stale file
+   (delete & let recreate) or a misconfigured deploy.
 
-A new `switchroom doctor --fix` mode could repair stale files in
-PR 2; out of scope for this RFC.
+A `switchroom doctor --fix` mode could repair stale files in
+PR 3; out of scope for this RFC.
 
 ## 4. Non-goals
 
@@ -180,15 +220,26 @@ PR 2; out of scope for this RFC.
 ## 5. Risks
 
 - **Gateway is now in the synchronous webhook path.** A slow
-  append (cold disk, fsync stall) blocks a GitHub delivery. The
-  request budget is GitHub's 10s timeout; gateway fs writes
-  typically take <5ms. Bounded.
-- **Socket permission tuning is sensitive.** `0o666` + peercred
-  allowlist is correct but easy to get wrong. The vault broker's
-  test suite is a good template (`src/vault/broker/scope.test.ts`).
-- **One more failure mode (gateway-down)**, but with the right
-  HTTP code (503), it converts a hard data loss into GitHub-side
-  retry — net improvement.
+  append blocks a GitHub delivery. The request budget is
+  GitHub's 10s timeout; `appendFileSync` to a warm log file
+  returns from the write syscall in single-digit ms on typical
+  hardware. We do NOT `fsync` (parity with prior behaviour);
+  records are durable to OS page cache only. If we ever want
+  fsync'd durability, re-cost the latency budget.
+- **Socket permission model is sensitive.** `0o666` socket file
+  perms + `SO_PEERCRED` UID gate at the verb layer. The file
+  perms are intentionally open so any local UID can `connect()`;
+  the peercred check is the actual authn. Test suite mirrors
+  `src/vault/broker/scope.test.ts`.
+- **One new hard-fail mode: gateway down.** Mapped to HTTP 503,
+  which trades silent 500-then-disable for noisy retry-then-give-
+  up. Net improvement, but see §3.3 "Durability caveat" — long
+  agent outages can still lose events if the deferred spool
+  mitigation isn't built.
+- **Webhook dispatch fans out from inside the gateway.** A
+  flood of matching events spawns a flood of `claude -p`
+  processes. Existing web-server-side cooldown (kept per §4) is
+  the back-pressure; verify it survives the move.
 
 ## 6. Alternatives considered
 
@@ -197,11 +248,17 @@ state dir). Each rejected with rationale.
 
 ## 7. Decisions
 
-- **Peercred allowlist source: auto-detect.** The gateway
-  determines the allowed UID at startup by `stat()`ing
-  `~/.switchroom/` and reading the owner. No config knob; the
-  invariant "the operator's UID is the one that owns the
-  config tree" already holds everywhere else in the codebase.
+- **Peercred allowlist source: web-server runtime UID.** The
+  web server writes its current UID to its existing pidfile
+  record at startup (alongside `pid`, `port`, `version`). The
+  gateway, at startup, reads that file and adds the UID to its
+  peercred allowlist. Re-read on SIGHUP so a web-server restart
+  under a different user (e.g. systemd unit edit) is picked up
+  without a gateway restart. **Not** derived from
+  `~/.switchroom/` ownership — that's a coincidence of typical
+  single-user installs and would silently fail closed for
+  deployments where the web server runs as e.g. `www-data`,
+  which is the exact failure mode this RFC is trying to remove.
 - **Forwarding semantics: append-complete.** The web server
   awaits the gateway's `{ ok: true, ts }` (post-append) before
   returning 202 to GitHub. Median cost is single-digit ms;
