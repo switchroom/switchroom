@@ -21,10 +21,18 @@ Two production-visible failure modes share one root:
    stranded for minutes; a turn's completion lost.
 
 Issue #1613 root-caused both and — critically — proved that **the
-flap is load-bearing**: the flap's constant bridge reconnect/re-
-register storm is the only thing that currently keeps a bridge
-continuously registered. Two structurally different fixes were built,
-canary-tested, and rejected:
+flap is load-bearing *during active-state channel cycling***: while
+claude is cycling bridges (~every 7s during a turn), the flap's
+constant reconnect/re-register storm is currently the only thing
+keeping a bridge continuously registered. This is a *scoped* claim,
+not an unconditional one — see research finding #6: an *idle* agent
+holds one stable bridge with no flap at all. The flap is therefore
+not needed in general; it is only inadvertently covering the
+**active-state handover gap**. The real fix does not need a wholesale
+"replacement for the flap" — it needs to **bound that handover gap**.
+Two structurally different fixes were built, canary-tested, and
+rejected (both removed the flap and, on a saturated host, surfaced
+the wedge):
 
 - **`superseded` handshake** (`fix/bridge-stale-socket-close-guard`)
   — gateway tells the prior bridge to stand down. Killed the flap;
@@ -33,9 +41,12 @@ canary-tested, and rejected:
   — gateway stops force-closing the prior bridge. Killed the flap;
   the wedge returned.
 
-Both confirm: **you cannot remove the flap without first installing a
-deliberate replacement for the bridge-presence guarantee it provides
-by accident.** That deliberate mechanism is what this RFC designs.
+Both confirm the scoped claim above: removing the flap is safe only
+if the **active-state handover gap is bounded** — otherwise an inbound
+that lands in the gap is delayed (until the next bridge registers, or
+until the agent settles to its idle bridge). Bounding that gap — by
+measuring it, by tolerating it, or by eliminating it structurally —
+is what this RFC designs.
 
 ## Background — the architecture
 
@@ -184,6 +195,29 @@ where the fleet sits today (v0.13.2). The cost is real but bounded.
 This RFC exists to retire Option 3, not endorse it — but it remains
 the fallback if Options 1 and 2 both prove infeasible.
 
+### Option 4 — "Sticky bridge": gateway nominates one reconnecting bridge (rejected)
+
+Surfaced in #1613 as "A′". The idea: instead of *all* bridges
+reconnecting (the flap), exactly **one** gateway-nominated bridge is
+allowed to reconnect-on-drop; the rest stand down. The single sticky
+bridge keeps `agentIndex` populated.
+
+**Rejected, on analysis:**
+
+- The gateway's "nomination" has no force. Claude owns every bridge
+  process and kills the sticky one on its normal cycle exactly like
+  any other — a gateway flag does not stop that.
+- Once the sticky bridge is killed, *something* must become the new
+  sticky bridge, and there is a gap between "old sticky killed" and
+  "new one nominated + reconnecting" — the same handover gap, not
+  removed.
+- "One bridge reconnects-on-drop" is just a single-participant flap.
+  It collapses into Option 1 if "sticky" is made to mean "a
+  long-lived process", or into Option 2 if it means "tolerate the
+  gap". It is not a distinct third mechanism.
+
+Recorded here so the design history is complete; not pursued.
+
 ## Recommendation
 
 The research (findings #6-8) shifts the verdict. **Option 2 is the
@@ -222,25 +256,34 @@ rather than an emergency.
 
 ## Open questions
 
+The handover-gap measurement is not listed here — it is not an open
+*question*, it is a *test task* (step 1 of the plan). The genuine
+unknowns:
+
 1. **Channel transport.** Can claude's experimental channel attach to
    an already-running MCP server (socket/HTTP transport, or an
    attach-don't-spawn mode), rather than spawning a stdio subprocess?
    This determines whether Option 1 is buildable in switchroom or
    needs an upstream change.
-2. **Handover-gap boundedness.** On an unloaded host, is the
-   bridge-handover gap (claude kills the current bridge → next bridge
-   registers) reliably bounded to a few seconds? The canary wedges
-   showed 90s+, but those ran on a host saturated by an all-night
-   build session — the measurement is confounded and must be redone
-   clean. **This is the gating question for Option 2** and the cheapest
-   to answer (one clean-host canary run, step 1 of the plan). It is
-   partially answered already: research finding #6 shows agents do
-   return to a stable single bridge once idle, so the gap is at worst
-   "until the active burst ends", never permanent.
-3. **Buffer-drain after marker-sweep.** When a wedge outlasts the
-   turn marker-sweep (~114s), does the buffered inbound still drain
+2. **Bridge re-spawn reliability after active churn ends — the
+   gating unknown for Option 2.** Option 2's safety rests entirely on
+   the agent always returning to a registered bridge once a burst
+   ends. Research finding #6 observed exactly this once (a 4.5-minute
+   idle hold) — but *not* across the specific race that matters: the
+   moment a turn ends while claude is mid-cycle. Does claude reliably
+   re-spawn and keep a bridge after every turn-end, including
+   turn-end-during-cycle? If there is any path where claude ends a
+   turn and leaves zero bridges indefinitely, Option 2 is unsafe and
+   Option 1 is mandatory. The clean-host re-test (step 1) must
+   specifically probe turn-end-during-cycle, not just steady idle.
+3. **Buffer-drain after marker-sweep.** When a gap outlasts the turn
+   marker-sweep (~114s), does the buffered inbound still drain
    correctly on the eventual `bridgeUp`, or does sweep interaction
    drop it? Needs a targeted test.
+4. **Inbound ordering across drain.** When `drainBuffer` flushes a
+   multi-message backlog, are the inbounds delivered in arrival
+   order? A reorder would surface as a user seeing replies out of
+   sequence. Needs a targeted test.
 
 ## Success criteria
 
@@ -249,8 +292,10 @@ A correct fix:
 - (b) keeps a bridge continuously registered (or re-registered within
   a few seconds) so no inbound is delayed more than ~5s by bridge
   absence, **and**
-- (c) passes `bridge-flap-resilience-dm.test.ts` repeatably on an
+- (c) preserves inbound ordering — a backlog drained after a gap is
+  delivered in arrival order (OQ4), **and**
+- (d) passes `bridge-flap-resilience-dm.test.ts` repeatably on an
   unloaded host (4 rapid DMs, all replied, low `bridge disconnected`
   density), **and**
-- (d) survives a 48-hour test-harness bake with zero `bridge_dead`
+- (e) survives a 48-hour test-harness bake with zero `bridge_dead`
   episodes longer than 5s.
