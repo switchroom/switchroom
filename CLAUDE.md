@@ -233,10 +233,14 @@ docs, three questions:
 **Vision — `reference/vision.md`** — *should we build this?*
 Every feature serves one of four outcomes:
 
-1. **Visibility** — see every step, pinned to the chat (progress card)
-2. **Multi-agent fleet** — specialists, not one generalist
-3. **Subscription-honest** — Pro/Max is the ceiling, no API-key routing
-4. **Always-on** — runs while you sleep or work offline
+1. **A standing team that knows you** — specialists with persona +
+   memory, not one generalist
+2. **You hold the leash** — controlled, purposeful, never roaming;
+   awareness + control, not a tool-call log to babysit
+3. **Subscription-honest and predictable** — the plan is the ceiling;
+   the unmodified `claude` CLI on the subscription, no API/SDK
+4. **Always available** — there in Telegram the second you reach for
+   it; survives reboots, runs its schedules
 
 **Principles — `reference/principles.md`** — *did we build it well?*
 Three checks. A "no" on any one is a redesign, not a follow-up:
