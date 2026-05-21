@@ -1894,6 +1894,53 @@ export const HostControlConfigSchema = z.object({
     ),
 });
 
+/**
+ * hostd verb-level knobs (separate from `host_control:` which gates
+ * the daemon itself).
+ *
+ * Introduced by `docs/rfcs/admin-agent-config-edit.md` §3 / §4 to opt
+ * in the new `config_propose_edit` verb and bound its per-agent
+ * rate. The verb is the approval-gated path for admin agents to edit
+ * `switchroom.yaml` without operator copy-paste (RFC §1). Default
+ * `config_edit_enabled: false` is deliberate — the verb is a security-
+ * critical surface (RFC §2.2, §5) and ships off until the operator
+ * explicitly opts in.
+ *
+ * PR 1a (this PR) wires the schema field + a stub dispatcher. The
+ * validation pipeline (1b) and apply path (1c) follow; until 1c lands
+ * `config_edit_rate_per_hour` is configurable but not yet enforced.
+ */
+export const HostdConfigSchema = z.object({
+  config_edit_enabled: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Opt-in toggle for the `config_propose_edit` hostd verb (RFC " +
+      "admin-agent-config-edit §3). Default false — the verb returns " +
+      "`E_CONFIG_EDIT_DISABLED` until the operator explicitly flips " +
+      "this to true. When true (and once PR 1c lands the apply path), " +
+      "admin agents can propose unified-diff patches against " +
+      "`/state/config/switchroom.yaml`, gated by an operator approval " +
+      "card in the primary chat. Same trust posture as `update_apply` " +
+      "and `agent_restart`: the human-in-the-loop tap is the security " +
+      "boundary, not the agent's judgement.",
+    ),
+  config_edit_rate_per_hour: z
+    .number()
+    .int()
+    .min(1)
+    .max(20)
+    .default(3)
+    .describe(
+      "Per-requesting-agent rate cap for `config_propose_edit` cards " +
+      "(RFC admin-agent-config-edit §5). Default 3 cards/hour; min 1, " +
+      "max 20. Implemented as a sqlite token bucket in PR 1c; the " +
+      "field is wired here in PR 1a so operators can pin it before the " +
+      "limiter is live. Above the cap, the verb returns " +
+      "`E_RATE_LIMITED` without raising a card.",
+    ),
+});
+
 export const SwitchroomConfigSchema = z.object({
   switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
@@ -2027,6 +2074,12 @@ export const SwitchroomConfigSchema = z.object({
     "to accept defaults; set `enabled: false` only on legacy systemd-" +
     "mode installs (removal tracked as RFC C Phase 3).",
   ),
+  hostd: HostdConfigSchema.default({}).describe(
+    "hostd verb-level knobs (RFC admin-agent-config-edit). Distinct " +
+    "from `host_control:` which governs whether the daemon runs at " +
+    "all. Currently scopes the opt-in flag and rate cap for the new " +
+    "`config_propose_edit` verb (PR 1a — disabled by default).",
+  ),
   google_accounts: z
     .record(
       // Google account email — case-insensitive on Google's side, so we
@@ -2116,6 +2169,7 @@ export type AgentDriveConfig = z.infer<typeof AgentDriveConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
 export type HostControlConfig = z.infer<typeof HostControlConfigSchema>;
+export type HostdConfig = z.infer<typeof HostdConfigSchema>;
 export type AuthConfig = NonNullable<z.infer<typeof SwitchroomConfigSchema>["auth"]>;
 export type AuthConsumer = NonNullable<AuthConfig["consumers"]>[number];
 export type CodeRepoEntry = z.infer<typeof CodeRepoEntrySchema>;

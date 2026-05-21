@@ -681,6 +681,64 @@ describe("ReleaseBlock (release-channel pin / pointer)", () => {
   });
 });
 
+describe("HostdConfigSchema (admin-agent-config-edit RFC §3 / §4)", () => {
+  it("populates defaults when the `hostd:` block is omitted (PR 1a — flag OFF by default)", () => {
+    const result = SwitchroomConfigSchema.parse({
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "1" },
+      agents: {},
+    });
+    expect(result.hostd).toEqual({
+      config_edit_enabled: false,
+      config_edit_rate_per_hour: 3,
+    });
+  });
+
+  it("accepts an explicit opt-in with a tuned rate", () => {
+    const result = SwitchroomConfigSchema.parse({
+      switchroom: { version: 1 },
+      telegram: { bot_token: "x", forum_chat_id: "1" },
+      hostd: { config_edit_enabled: true, config_edit_rate_per_hour: 5 },
+      agents: {},
+    });
+    expect(result.hostd.config_edit_enabled).toBe(true);
+    expect(result.hostd.config_edit_rate_per_hour).toBe(5);
+  });
+
+  it("rejects a rate below 1", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        switchroom: { version: 1 },
+        telegram: { bot_token: "x", forum_chat_id: "1" },
+        hostd: { config_edit_rate_per_hour: 0 },
+        agents: {},
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a rate above the 20/hour ceiling", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        switchroom: { version: 1 },
+        telegram: { bot_token: "x", forum_chat_id: "1" },
+        hostd: { config_edit_rate_per_hour: 100 },
+        agents: {},
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer rate", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        switchroom: { version: 1 },
+        telegram: { bot_token: "x", forum_chat_id: "1" },
+        hostd: { config_edit_rate_per_hour: 3.5 },
+        agents: {},
+      }),
+    ).toThrow();
+  });
+});
+
 describe("TelegramChannelSchema.enabled (offline-dev master switch)", () => {
   it("defaults to true when omitted", () => {
     const result = AgentSchema.parse(
