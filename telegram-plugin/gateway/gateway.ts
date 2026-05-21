@@ -1278,6 +1278,31 @@ function streamKey(chatId: string, threadId?: number | null): string {
   return chatKey(chatId, threadId)
 }
 
+/**
+ * Reaction-state cleanup — controller + msg-id maps + active-reaction
+ * file removal. PURE reaction-cleanup, no turn-end semantics:
+ *   - does NOT emit shadow `turnEnd`
+ *   - does NOT clear `activeTurnStartedAt` (turn-active marker)
+ *   - does NOT fire the model-idle restart/flush gate
+ *
+ * Called from mid-turn signals like `endStatusReaction` (post-reply-tool,
+ * post-stream-reply-finalize) where the 👍 transition fires but the
+ * turn is still active. Per #1603 audit step 2: the reply tool was
+ * previously calling `purgeReactionTracking` here, which fired premature
+ * shadow `turnEnd` events and cleared `activeTurnStartedAt` mid-turn —
+ * the latter would trigger the model-idle restart probe and
+ * pendingInbound flush as if claude had gone idle.
+ */
+function clearReactionState(key: string): void {
+  const msgInfo = activeReactionMsgIds.get(key)
+  activeStatusReactions.delete(key)
+  activeReactionMsgIds.delete(key)
+  if (msgInfo) {
+    const agentDir = resolveAgentDirFromEnv()
+    if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
+  }
+}
+
 function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // Phase 2b: turn end. The key was registered via setTurnStarted when
   // the inbound arrived; purge is the canonical turn-end signal.
@@ -1296,14 +1321,8 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
     ? endingTurn.replyCalled === true
     : currentTurn?.replyCalled === true
   shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
-  const msgInfo = activeReactionMsgIds.get(key)
-  activeStatusReactions.delete(key)
-  activeReactionMsgIds.delete(key)
+  clearReactionState(key)
   activeTurnStartedAt.delete(key)
-  if (msgInfo) {
-    const agentDir = resolveAgentDirFromEnv()
-    if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
-  }
 
   // If no more active turns and a restart is pending, perform it now.
   //
@@ -1593,12 +1612,24 @@ async function resolveCompactCard(
 }
 
 function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
+  // Mid-turn signal: the reply tool fired, or stream_reply finalized,
+  // and the status-reaction needs to transition to its terminal emoji
+  // (👍 / ⚠️). The turn itself is still active — the canonical turn-end
+  // signal is `endCurrentTurnAtomic(turn)`, which runs later via the
+  // turn_end handler / context-exhaust path / silent-marker path.
+  //
+  // Pre-#1603 audit step 2 (this commit), this called
+  // `purgeReactionTracking(key)` directly, which would fire shadow
+  // `turnEnd` and clear the turn-active marker mid-turn — the latter
+  // triggering the model-idle restart probe + pendingInbound flush as
+  // if claude had gone idle. Use `clearReactionState` to only do the
+  // reaction-cleanup work.
   const key = statusKey(chatId, threadId)
   const ctrl = activeStatusReactions.get(key)
   if (!ctrl) return
   if (outcome === 'done') ctrl.setDone()
   else ctrl.setError()
-  purgeReactionTracking(key)
+  clearReactionState(key)
 }
 
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
