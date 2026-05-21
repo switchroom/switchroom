@@ -22,6 +22,7 @@ import {
   type DispatchMatcher,
   type DispatchRule,
   type WebhookDispatchConfig,
+  type EvaluateDispatchDeps,
   type TemplateContext,
   type QuietHours,
 } from './webhook-dispatch.js'
@@ -274,6 +275,8 @@ describe('evaluateDispatch', () => {
     }
   }
 
+  const FORUM_CHAT = '-1001234567890'
+
   const baseRule: DispatchRule = {
     match: {
       event: 'pull_request',
@@ -282,12 +285,37 @@ describe('evaluateDispatch', () => {
       exclude_authors: ['dependabot[bot]'],
     },
     prompt: 'Review PR #{{number}}: {{title}}\n{{html_url}}',
-    model: 'claude-sonnet-4-6',
   }
 
-  it('fires spawn when rule matches', () => {
+  interface CapturedInject {
+    socketPath: string
+    agentName: string
+    inbound: Record<string, unknown>
+  }
+
+  /** Capture every inject_inbound the evaluator delivers (in place of
+   *  a real gateway socket connection). */
+  function captureInject(): {
+    injected: CapturedInject[]
+    injectFn: NonNullable<EvaluateDispatchDeps['injectFn']>
+  } {
+    const injected: CapturedInject[] = []
+    return {
+      injected,
+      injectFn: async (socketPath, agentName, inbound) => {
+        injected.push({
+          socketPath,
+          agentName,
+          inbound: inbound as unknown as Record<string, unknown>,
+        })
+        return true
+      },
+    }
+  }
+
+  it('injects an inbound turn when a rule matches — no claude -p spawn', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
-    const spawned: Array<{ cmd: string; args: string[] }> = []
+    const { injected, injectFn } = captureInject()
     const config: WebhookDispatchConfig = { github: [baseRule] }
 
     const count = evaluateDispatch(
@@ -297,29 +325,53 @@ describe('evaluateDispatch', () => {
         eventType: 'pull_request',
         payload: prOpened,
         dispatchConfig: config,
+        chatId: FORUM_CHAT,
+        threadId: 7,
       },
-      {
-        resolveAgentDir,
-        now: () => 1_000_000,
-        log: () => {},
-        spawnFn: (cmd, args) => {
-          spawned.push({ cmd, args })
-          return { on: () => {}, pid: 9999 }
-        },
-      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
     )
 
     expect(count).toBe(1)
-    expect(spawned).toHaveLength(1)
-    expect(spawned[0].cmd).toBe('claude')
-    expect(spawned[0].args[0]).toBe('-p')
-    expect(spawned[0].args[1]).toContain('#42')
-    expect(spawned[0].args[1]).toContain('Add dark mode support')
+    expect(injected).toHaveLength(1)
+    expect(injected[0].agentName).toBe('reggie')
+
+    const inbound = injected[0].inbound
+    expect(inbound.type).toBe('inbound')
+    expect(inbound.chatId).toBe(FORUM_CHAT)
+    expect(inbound.threadId).toBe(7)
+    expect(inbound.user).toBe('webhook')
+    expect((inbound.meta as Record<string, string>).source).toBe('webhook')
+    expect((inbound.meta as Record<string, string>).event).toBe('pull_request')
+    expect(inbound.text).toContain('#42')
+    expect(inbound.text).toContain('Add dark mode support')
+  })
+
+  it('routes to the agent gateway socket under the resolved agent dir', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInject()
+    const config: WebhookDispatchConfig = { github: [baseRule] }
+
+    evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
+    )
+
+    expect(injected).toHaveLength(1)
+    expect(injected[0].socketPath).toBe(
+      join(resolveAgentDir('reggie'), 'telegram', 'gateway.sock'),
+    )
   })
 
   it('skips dependabot PR', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
-    const spawned: Array<unknown> = []
+    const { injected, injectFn } = captureInject()
     const config: WebhookDispatchConfig = { github: [baseRule] }
 
     const count = evaluateDispatch(
@@ -329,17 +381,13 @@ describe('evaluateDispatch', () => {
         eventType: 'pull_request',
         payload: prDependabot,
         dispatchConfig: config,
+        chatId: FORUM_CHAT,
       },
-      {
-        resolveAgentDir,
-        now: () => 1_000_000,
-        log: () => {},
-        spawnFn: (_, args) => { spawned.push(args); return { on: () => {} } },
-      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
     )
 
     expect(count).toBe(0)
-    expect(spawned).toHaveLength(0)
+    expect(injected).toHaveLength(0)
   })
 
   it('returns 0 for non-github source', () => {
@@ -352,6 +400,7 @@ describe('evaluateDispatch', () => {
         eventType: 'push',
         payload: pushPayload,
         dispatchConfig: config,
+        chatId: FORUM_CHAT,
       },
       { resolveAgentDir, log: () => {} },
     )
@@ -360,7 +409,7 @@ describe('evaluateDispatch', () => {
 
   it('skips during quiet hours', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
-    const spawned: Array<unknown> = []
+    const { injected, injectFn } = captureInject()
     const ruleWithQH: DispatchRule = {
       ...baseRule,
       quiet_hours: { start: 0, end: 23, tz: 'UTC' }, // always quiet
@@ -374,49 +423,59 @@ describe('evaluateDispatch', () => {
         eventType: 'pull_request',
         payload: prOpened,
         dispatchConfig: config,
+        chatId: FORUM_CHAT,
       },
       {
         resolveAgentDir,
         nowDate: () => new Date('2026-05-06T10:00:00Z'),
         now: () => 1_000_000,
         log: () => {},
-        spawnFn: (_, args) => { spawned.push(args); return { on: () => {} } },
+        injectFn,
       },
     )
 
     expect(count).toBe(0)
-    expect(spawned).toHaveLength(0)
+    expect(injected).toHaveLength(0)
   })
 
   it('respects cooldown — second fire within window is skipped', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
-    const spawned: Array<unknown> = []
+    const { injected, injectFn } = captureInject()
     const ruleWithCooldown: DispatchRule = { ...baseRule, cooldown: '5m' }
     const config: WebhookDispatchConfig = { github: [ruleWithCooldown] }
 
-    const deps = {
-      resolveAgentDir,
-      now: () => 1_000_000,
-      log: () => {},
-      spawnFn: (_cmd: string, args: string[]) => { spawned.push(args); return { on: () => {} } },
-    }
+    const deps = { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn }
 
     evaluateDispatch(
-      { agent: 'reggie', source: 'github', eventType: 'pull_request', payload: prOpened, dispatchConfig: config },
+      {
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
       deps,
     )
     const count2 = evaluateDispatch(
-      { agent: 'reggie', source: 'github', eventType: 'pull_request', payload: prOpened, dispatchConfig: config },
+      {
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
       { ...deps, now: () => 1_060_000 }, // 1 minute later, still in cooldown
     )
 
-    expect(spawned).toHaveLength(1)
+    expect(injected).toHaveLength(1)
     expect(count2).toBe(0)
   })
 
   it('fires multiple matching rules', () => {
     const resolveAgentDir = makeTmpResolveAgentDir()
-    const spawned: Array<unknown> = []
+    const { injected, injectFn } = captureInject()
     const rule2: DispatchRule = {
       match: { event: 'pull_request', labels_any: ['enhancement'] },
       prompt: 'Enhancement PR opened: {{title}}',
@@ -424,16 +483,19 @@ describe('evaluateDispatch', () => {
     const config: WebhookDispatchConfig = { github: [baseRule, rule2] }
 
     const count = evaluateDispatch(
-      { agent: 'reggie', source: 'github', eventType: 'pull_request', payload: prOpened, dispatchConfig: config },
       {
-        resolveAgentDir,
-        now: () => 1_000_000,
-        log: () => {},
-        spawnFn: (_, args) => { spawned.push(args); return { on: () => {} } },
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
       },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
     )
 
     expect(count).toBe(2)
-    expect(spawned).toHaveLength(2)
+    expect(injected).toHaveLength(2)
+    expect((injected[1].inbound.meta as Record<string, string>).rule_index).toBe('1')
   })
 })

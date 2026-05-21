@@ -1,8 +1,8 @@
 /**
  * Webhook dispatch (#715). After an event is verified and recorded by
  * `webhook-handler.ts`, this module evaluates per-rule matchers and, for
- * each match, spawns a fresh `claude -p` invocation against the agent so
- * it can react to the event via Telegram.
+ * each match, delivers a synthesized turn to the agent so it can react
+ * to the event via Telegram.
  *
  * Design principles:
  *   - **Static matcher** (no CEL/expression parser). Fields: `event`,
@@ -14,8 +14,14 @@
  *     coalesces. State stored per-agent on disk.
  *   - **Quiet hours**: skip dispatch entirely when the wall clock is
  *     inside the configured window (events still in JSONL).
- *   - **Spawn pattern**: same shape as cron one-shots — `claude -p`
- *     with `--no-session-persistence`, env vars matching `buildCronScript`.
+ *   - **Delivery (since #1620)**: a match synthesizes an
+ *     `InboundMessage` tagged `meta.source="webhook"` and delivers it
+ *     via `inject_inbound` to the agent's gateway socket — the same
+ *     path cron uses. The webhook turn runs inside the agent's live
+ *     interactive `claude` session. No `claude -p`: a headless
+ *     `claude -p` is *programmatic* usage under Anthropic's 2026-06-15
+ *     policy (off the subscription) and would spawn a parasitic second
+ *     telegram bridge (#1617). See `docs/rfcs/eliminate-claude-p.md`.
  *
  * Configuration (in switchroom.yaml under agents.<name>.channels.telegram):
  *
@@ -33,88 +39,14 @@
  *         {{html_url}}
  *       cooldown: 5m
  *       quiet_hours: { start: 22, end: 8, tz: Australia/Melbourne }
- *       model: claude-opus-4-7
  * ```
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { spawn } from 'child_process'
-
-/**
- * When the parent process (typically the systemd-launched switchroom-web)
- * was started without nvm in PATH, `node` won't resolve for spawned
- * children — so any agent hook that uses `node /path/to/hook.mjs` exits
- * 127 and the agent's issue sink lights up. This is invisible to the
- * operator until the first webhook fires.
- *
- * Detect an nvm install (in priority order: `NVM_DIR`, `~/.nvm`) and
- * resolve a node bin directory by reading `alias/default` first, then
- * falling back to the lexicographically newest version directory. Returns
- * undefined when no usable nvm install is found, in which case the caller
- * leaves PATH untouched.
- *
- * Exported for tests.
- */
-export function resolveNvmNodeBin(env: NodeJS.ProcessEnv): string | undefined {
-  const nvmDir = env.NVM_DIR ?? join(env.HOME ?? homedir(), '.nvm')
-  if (!existsSync(nvmDir)) return undefined
-
-  const versionsDir = join(nvmDir, 'versions', 'node')
-  if (!existsSync(versionsDir)) return undefined
-
-  const tryVersion = (v: string): string | undefined => {
-    const bin = join(versionsDir, v, 'bin')
-    return existsSync(join(bin, 'node')) ? bin : undefined
-  }
-
-  // Prefer the user's default alias if set.
-  const defaultAliasPath = join(nvmDir, 'alias', 'default')
-  try {
-    if (existsSync(defaultAliasPath)) {
-      const aliased = readFileSync(defaultAliasPath, 'utf-8').trim()
-      if (aliased) {
-        const bin = tryVersion(aliased.startsWith('v') ? aliased : `v${aliased}`)
-        if (bin) return bin
-      }
-    }
-  } catch {
-    // Fall through to dir scan
-  }
-
-  // Otherwise: lexicographic max across installed versions.
-  try {
-    const versions = readdirSync(versionsDir).filter((v) => v.startsWith('v')).sort()
-    for (let i = versions.length - 1; i >= 0; i--) {
-      const bin = tryVersion(versions[i])
-      if (bin) return bin
-    }
-  } catch {
-    return undefined
-  }
-
-  return undefined
-}
-
-/**
- * Returns a copy of `env` with `node` guaranteed to be on PATH where
- * possible. No-op when `node` already resolves via the inherited PATH or
- * when no nvm install is present.
- *
- * Exported for tests.
- */
-export function ensureNodeOnPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const path = env.PATH ?? ''
-  // Cheap pre-check: if any PATH entry already contains a node binary, no-op.
-  const existing = path.split(':').some((dir) => dir && existsSync(join(dir, 'node')))
-  if (existing) return env
-
-  const nvmBin = resolveNvmNodeBin(env)
-  if (!nvmBin) return env
-
-  return { ...env, PATH: path ? `${nvmBin}:${path}` : nvmBin }
-}
+import { createInjectIpcClient, type InjectIpcClient } from '../agent-scheduler/ipc-client.js'
+import type { InboundMessageWire } from '../scheduler/dispatch.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -143,12 +75,17 @@ export interface QuietHours {
 export interface DispatchRule {
   description?: string
   match: DispatchMatcher
-  /** Handlebars-style `{{field}}` template for the claude -p prompt. */
+  /** Handlebars-style `{{field}}` template for the synthesized turn's prompt. */
   prompt: string
   /** Cooldown duration string: "5m", "1h", "30s". Defaults to "0" (no cooldown). */
   cooldown?: string
   quiet_hours?: QuietHours
-  /** Model override. Defaults to claude-sonnet-4-6. */
+  /**
+   * Deprecated and ignored since #1620. A webhook turn now runs inside
+   * the agent's live interactive session, which uses the agent's own
+   * configured model — there is no per-turn model override. Retained
+   * as an optional field only so existing configs still parse.
+   */
   model?: string
 }
 
@@ -398,19 +335,21 @@ export function isQuietHour(qh: QuietHours, now: Date): boolean {
   }
 }
 
-// ─── Spawner ──────────────────────────────────────────────────────────────────
+// ─── Inbound injection ────────────────────────────────────────────────────────
 
-export interface SpawnAgentOneShotDeps {
-  /** Override to capture spawn args in tests. */
-  spawnFn?: (
-    cmd: string,
-    args: string[],
-    opts: { env: NodeJS.ProcessEnv; stdio: [string, string, string] },
-  ) => { on: (event: string, cb: (code: number | null) => void) => void; pid?: number }
+export interface InjectWebhookInboundDeps {
+  /**
+   * Test seam — replace the gateway delivery. Default connects to the
+   * agent's gateway UDS socket and writes one `inject_inbound` envelope.
+   * Resolves true when the bytes were accepted by the socket.
+   */
+  injectFn?: (
+    socketPath: string,
+    agentName: string,
+    inbound: InboundMessageWire,
+  ) => Promise<boolean>
   /** Override agent dir resolver for tests. */
   resolveAgentDir?: (agent: string) => string
-  /** Injectable cooldown store for tests. */
-  cooldownStore?: CooldownStore
   /** Clock override for tests. */
   now?: () => number
   /** Log sink. */
@@ -418,77 +357,86 @@ export interface SpawnAgentOneShotDeps {
 }
 
 /**
- * Spawn a fresh `claude -p` process for the given agent and prompt.
- * Env setup:
- *   - CLAUDE_CONFIG_DIR → <agentDir>/.claude
- *   - SWITCHROOM_AGENT_NAME → <agentName>
- *   - TELEGRAM_STATE_DIR → <agentDir>/telegram
- *   - ANTHROPIC_API_KEY unset to force OAuth
- *
- * Post-RFC-H: claude reads its OAuth token directly from
- * `<CLAUDE_CONFIG_DIR>/credentials.json`. The auth-broker writes that
- * file atomically and refreshes ahead of claude's own window —
- * `CLAUDE_CODE_OAUTH_TOKEN` env injection has been removed everywhere
- * (one mechanism, not two).
+ * Default delivery: connect to the agent's gateway socket, write one
+ * `inject_inbound` envelope, close. The webhook process is host-side;
+ * the agent's gateway socket lives at a host-visible bind-mounted path
+ * inside the agent's telegram state dir.
  */
-export function spawnAgentOneShot(
+async function defaultInject(
+  socketPath: string,
+  agentName: string,
+  inbound: InboundMessageWire,
+): Promise<boolean> {
+  const client = createInjectIpcClient({ socketPath })
+  try {
+    const connected = await client.waitForConnect(5_000)
+    if (!connected) return false
+    return client.sendInjectInbound({
+      type: 'inject_inbound',
+      agentName,
+      // InboundMessageWire is a structural mirror of telegram-plugin's
+      // InboundMessage — the cast is a no-op at runtime. Same pattern
+      // as the scheduler's `ipcDispatcher` (agent-scheduler/index.ts).
+      inbound: inbound as unknown as Parameters<
+        InjectIpcClient['sendInjectInbound']
+      >[0]['inbound'],
+    })
+  } finally {
+    client.close()
+  }
+}
+
+/**
+ * Synthesize an `InboundMessage` for a matched webhook rule and deliver
+ * it to the agent's gateway as an `inject_inbound` envelope. The turn
+ * runs in the agent's live interactive `claude` session — the same
+ * path cron fires take.
+ *
+ * Fire-and-forget: the synthesized turn is delivered asynchronously and
+ * the result is logged; the caller's match-evaluation loop does not
+ * block on gateway round-trips.
+ */
+export function injectWebhookInbound(
   agent: string,
   prompt: string,
-  model: string,
-  deps: SpawnAgentOneShotDeps = {},
+  ctx: { chatId: string; threadId?: number; eventType: string; ruleIndex: number },
+  deps: InjectWebhookInboundDeps = {},
 ): void {
   const log = deps.log ?? ((s) => process.stderr.write(s))
   const resolveAgentDir =
     deps.resolveAgentDir ?? ((a) => join(homedir(), '.switchroom', 'agents', a))
-  const agentDir = resolveAgentDir(agent)
-  const claudeConfigDir = join(agentDir, '.claude')
-  const telegramStateDir = join(agentDir, 'telegram')
+  const now = (deps.now ?? Date.now)()
+  const socketPath = join(resolveAgentDir(agent), 'telegram', 'gateway.sock')
 
-  const env: NodeJS.ProcessEnv = ensureNodeOnPath({
-    ...process.env,
-    FORCE_COLOR: '0',
-    NO_COLOR: '1',
-    CLAUDE_CONFIG_DIR: claudeConfigDir,
-    SWITCHROOM_AGENT_NAME: agent,
-    TELEGRAM_STATE_DIR: telegramStateDir,
-  })
-
-  // Unset ANTHROPIC_API_KEY to force OAuth auth (mirrors cron script pattern).
-  delete env.ANTHROPIC_API_KEY
-  // Defence in depth: scrub any inherited CLAUDE_CODE_OAUTH_TOKEN so a
-  // legacy operator-shell export can't shadow the broker-managed
-  // credentials.json. (RFC H §7.4)
-  delete env.CLAUDE_CODE_OAUTH_TOKEN
-
-  const spawnFn = deps.spawnFn ?? (
-    (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv; stdio: [string, string, string] }) =>
-      spawn(cmd, args, { ...opts, stdio: opts.stdio as ['ignore', 'ignore', 'pipe'] })
-  )
-
-  const child = spawnFn('claude', ['-p', prompt, '--model', model, '--no-session-persistence'], {
-    env,
-    stdio: ['ignore', 'ignore', 'pipe'],
-  })
-
-  log(`webhook-dispatch: agent='${agent}' model='${model}' pid=${child.pid ?? '?'} spawned\n`)
-
-  // Drain stderr to prevent the OS pipe buffer (~64KB) from blocking
-  // the child process. We log the last few lines on failure so operators
-  // can debug a broken dispatch without attaching a PTY.
-  let stderrTail = ''
-  const stderrStream = (child as unknown as { stderr?: { on: (e: string, cb: (d: Buffer) => void) => void } }).stderr
-  if (stderrStream) {
-    stderrStream.on('data', (d: Buffer) => {
-      stderrTail = (stderrTail + d.toString('utf-8')).slice(-2048)
-    })
+  const inbound: InboundMessageWire = {
+    type: 'inbound',
+    chatId: ctx.chatId,
+    ...(ctx.threadId !== undefined ? { threadId: ctx.threadId } : {}),
+    // Synthetic id — webhook fires have no Telegram message_id. The
+    // bridge only uses messageId for reply-context, a no-op here.
+    messageId: now,
+    user: 'webhook',
+    userId: 0,
+    ts: now,
+    text: prompt,
+    meta: {
+      source: 'webhook',
+      event: ctx.eventType,
+      rule_index: String(ctx.ruleIndex),
+    },
   }
 
-  child.on('close', (code) => {
-    if (code !== 0) {
-      const tail = stderrTail.trim().split('\n').slice(-3).join(' | ')
-      log(`webhook-dispatch: agent='${agent}' claude -p exited with code ${code}${tail ? `: ${tail}` : ''}\n`)
-    }
-  })
+  const injectFn = deps.injectFn ?? defaultInject
+  injectFn(socketPath, agent, inbound)
+    .then((ok) =>
+      log(
+        `webhook-dispatch: agent='${agent}' inject_inbound ` +
+          `${ok ? 'delivered to gateway' : 'not delivered (gateway not connected)'}\n`,
+      ),
+    )
+    .catch((err: unknown) =>
+      log(`webhook-dispatch: agent='${agent}' inject failed: ${String(err)}\n`),
+    )
 }
 
 // ─── Main dispatch evaluator ──────────────────────────────────────────────────
@@ -499,17 +447,26 @@ export interface EvaluateDispatchArgs {
   eventType: string
   payload: Record<string, unknown>
   dispatchConfig: WebhookDispatchConfig
+  /**
+   * Chat the synthesized webhook turn belongs to — the fleet forum
+   * chat. The caller resolves this from `telegram.forum_chat_id`.
+   */
+  chatId: string
+  /** The agent's forum topic id, when the forum chat has topics. */
+  threadId?: number
 }
 
-export interface EvaluateDispatchDeps extends SpawnAgentOneShotDeps {
+export interface EvaluateDispatchDeps extends InjectWebhookInboundDeps {
   /** Overridable Date for quiet-hours evaluation. */
   nowDate?: () => Date
+  /** Injectable cooldown store for tests. */
+  cooldownStore?: CooldownStore
 }
 
 /**
  * Evaluate all dispatch rules for the incoming event. For each matching
- * rule that is not in cooldown and not in quiet hours, spawn a fresh
- * `claude -p` process.
+ * rule that is not in cooldown and not in quiet hours, deliver a
+ * synthesized `inject_inbound` turn to the agent.
  *
  * Returns the number of dispatches fired (0 if nothing matched).
  */
@@ -560,17 +517,22 @@ export function evaluateDispatch(
     }
 
     const prompt = renderTemplate(rule.prompt, ctx)
-    const model = rule.model ?? 'claude-sonnet-4-6'
 
     log(
       `webhook-dispatch: agent='${args.agent}' rule=${i} matched event='${args.eventType}' action='${ctx.action}' firing\n`,
     )
 
-    spawnAgentOneShot(args.agent, prompt, model, {
-      ...deps,
-      resolveAgentDir,
-      cooldownStore,
-    })
+    injectWebhookInbound(
+      args.agent,
+      prompt,
+      {
+        chatId: args.chatId,
+        ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+        eventType: args.eventType,
+        ruleIndex: i,
+      },
+      { ...deps, resolveAgentDir },
+    )
 
     fired++
   }

@@ -34,11 +34,13 @@ const ROOTS = ["src", "telegram-plugin"];
  * Every entry MUST cite a tracking issue. This list may only ever
  * shrink — when the gap is fixed the entry must be deleted, and the
  * "no stale entries" test below enforces that.
+ *
+ * Currently empty: webhook-dispatch.ts (the last entry, #1617) was
+ * migrated off `claude -p` to the `inject_inbound` path — every
+ * headless-`claude` callsite now passes `--strict-mcp-config`, or
+ * spawns no `claude` at all.
  */
-const KNOWN_GAPS: Record<string, string> = {
-  "src/web/webhook-dispatch.ts":
-    "#1617 — migrating to inject_inbound (RFC docs/rfcs/eliminate-claude-p.md, Workstream A)",
-};
+const KNOWN_GAPS: Record<string, string> = {};
 
 /** Matches `spawn("claude"`, `spawnSync('claude'`, `execFile("claude"`, etc. */
 const SPAWN_CLAUDE =
