@@ -30,6 +30,37 @@ around claude (the vision's "no Docker-as-runtime" line in
 
 See `README.md` for the user-facing description.
 
+## Hard constraint — Claude-native, subscription-funded (a core pillar)
+
+This is **non-negotiable** and load-bearing for the entire product —
+it is `reference/vision.md` pillar 3 ("subscription-honest") restated
+as an engineering gate. A change that violates it is out of scope by
+construction, however useful it seems.
+
+- **Every agent runs the unmodified `claude` CLI**, authenticated with
+  the operator's **Pro/Max OAuth** credentials. No `ANTHROPIC_API_KEY`,
+  no API keys of any kind, no Claude Agent SDK, no raw Anthropic API,
+  no protocol interception, no custom inference runtime. switchroom is
+  scaffolding and lifecycle management *around* the CLI — never a
+  harness *over* it.
+- **The reason is Anthropic policy compliance**, not merely cost. Using
+  the native CLI on the subscription is what keeps switchroom inside
+  Anthropic's third-party policy. Treat it as a compliance boundary,
+  not a preference.
+- **`claude -p` (headless/print mode)** is the same CLI + OAuth, but
+  as of the **2026-06-15** policy it is *programmatic usage* — a
+  separate credit, off subscription limits. Adding a new `claude -p`
+  callsite is a constraint violation: route the work through the
+  interactive agent session as a synthesized turn instead. The
+  existing callsites are being removed — see
+  `docs/rfcs/eliminate-claude-p.md`. A CI guard
+  (`tests/bridge-flap-regression-guard.test.ts`) already enforces
+  `--strict-mcp-config` on any headless `claude` spawn.
+- **Before adding any code path that calls a model:** it MUST be the
+  interactive `claude` session, or a synthesized turn injected into it
+  (the cron / `inject_inbound` pattern). If you reach for the SDK or
+  the API, stop — that is not switchroom.
+
 ## v0.7+ runtime architecture (read this before touching docker/compose/broker code)
 
 ```
