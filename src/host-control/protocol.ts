@@ -316,6 +316,10 @@ export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   "E_RECONCILE_FAILED",
   "E_DENIED",
   "E_EXPIRED",
+  // #1623 apply path (this PR).
+  "E_NO_APPROVAL_GATEWAY",
+  "E_APPROVAL_TIMEOUT",
+  "E_RECONCILE_FAILED_ROLLED_BACK",
 ] as const;
 export type ConfigProposeEditErrorCode =
   (typeof CONFIG_PROPOSE_EDIT_ERROR_CODES)[number];
