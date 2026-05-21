@@ -6319,7 +6319,16 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
 
       if (ctrl) ctrl.setDone()
-      purgeReactionTracking(statusKey(chatId, threadId))
+      // Duplicate-emit removed (#1603 audit, step 4 — the audit's
+      // original "route through endCurrentTurnAtomic" recommendation
+      // missed that this same code path already calls
+      // `endCurrentTurnAtomic(turn)` ~90 lines below at line ~6412
+      // on the same key — `chatId === turn.sessionChatId` and
+      // `threadId === turn.sessionThreadId` per the bindings at
+      // ~5946-5947. Removing this bare call closes the last duplicate
+      // shadow-`turnEnd` emit on the dominant happy-path turn-end
+      // tail; the canonical primitive below still fires the single
+      // authoritative turnEnd with the threaded turn).
       {
         const sKey = streamKey(chatId, threadId)
         const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
