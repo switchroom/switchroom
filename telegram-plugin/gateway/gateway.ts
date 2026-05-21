@@ -1278,62 +1278,32 @@ function streamKey(chatId: string, threadId?: number | null): string {
   return chatKey(chatId, threadId)
 }
 
-/**
- * Reaction-state cleanup — controller + msg-id maps + active-reaction
- * file removal. PURE reaction-cleanup, no turn-end semantics:
- *   - does NOT emit shadow `turnEnd`
- *   - does NOT clear `activeTurnStartedAt` (turn-active marker)
- *   - does NOT fire the model-idle restart/flush gate
- *
- * Called from mid-turn signals like `endStatusReaction` (post-reply-tool,
- * post-stream-reply-finalize) where the 👍 transition fires but the
- * turn is still active. Per #1603 audit step 2: the reply tool was
- * previously calling `purgeReactionTracking` here, which fired premature
- * shadow `turnEnd` events and cleared `activeTurnStartedAt` mid-turn —
- * the latter would trigger the model-idle restart probe and
- * pendingInbound flush as if claude had gone idle.
- */
-function clearReactionState(key: string): void {
+function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
+  // Phase 2b: turn end. The key was registered via setTurnStarted when
+  // the inbound arrived; purge is the canonical turn-end signal.
+  //
+  // outboundEmitted: read from the explicit `endingTurn` parameter when
+  // provided (canonical path via endCurrentTurnAtomic — module-scope
+  // currentTurn is already null by the time we get here), falling back
+  // to `currentTurn?.replyCalled` for the legacy callsites that haven't
+  // been threaded yet (sibling-key purges, restart-init cleanup).
+  // Without this explicit-turn handoff the shadow trace would report
+  // outboundEmitted=false on every replied turn (the dominant happy
+  // path), producing strictly worse data than the blind `true` it
+  // replaced. Invariant #5's `lastOutboundAt` correctness depends on
+  // this signal being accurate.
+  const outboundEmitted = endingTurn != null
+    ? endingTurn.replyCalled === true
+    : currentTurn?.replyCalled === true
+  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
   const msgInfo = activeReactionMsgIds.get(key)
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
+  activeTurnStartedAt.delete(key)
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
   }
-}
-
-function purgeReactionTracking(
-  key: string,
-  endingTurn?: CurrentTurn,
-  outboundEmittedOverride?: boolean,
-): void {
-  // Phase 2b: turn end. The key was registered via setTurnStarted when
-  // the inbound arrived; purge is the canonical turn-end signal.
-  //
-  // outboundEmitted derivation, in precedence order:
-  //   1. Explicit `outboundEmittedOverride` (e.g. silence-poke
-  //      framework fallback FORCES false because the 5-min fallback
-  //      firing proves visible delivery never happened — regardless of
-  //      whatever `replyCalled` the wedged turn object carries).
-  //   2. `endingTurn.replyCalled` when the canonical caller threads
-  //      the authoritative turn (endCurrentTurnAtomic path; module-scope
-  //      currentTurn is already null by the time we get here).
-  //   3. `currentTurn?.replyCalled` fallback for the (now-vanishing)
-  //      legacy callsites. Without the explicit-turn handoff the shadow
-  //      trace would report outboundEmitted=false on every replied
-  //      turn (the dominant happy path), producing strictly worse data
-  //      than the blind `true` it replaced. Invariant #5's
-  //      `lastOutboundAt` correctness depends on this signal being
-  //      accurate.
-  const outboundEmitted = outboundEmittedOverride !== undefined
-    ? outboundEmittedOverride
-    : endingTurn != null
-      ? endingTurn.replyCalled === true
-      : currentTurn?.replyCalled === true
-  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted })
-  clearReactionState(key)
-  activeTurnStartedAt.delete(key)
 
   // If no more active turns and a restart is pending, perform it now.
   //
@@ -1623,24 +1593,12 @@ async function resolveCompactCard(
 }
 
 function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
-  // Mid-turn signal: the reply tool fired, or stream_reply finalized,
-  // and the status-reaction needs to transition to its terminal emoji
-  // (👍 / ⚠️). The turn itself is still active — the canonical turn-end
-  // signal is `endCurrentTurnAtomic(turn)`, which runs later via the
-  // turn_end handler / context-exhaust path / silent-marker path.
-  //
-  // Pre-#1603 audit step 2 (this commit), this called
-  // `purgeReactionTracking(key)` directly, which would fire shadow
-  // `turnEnd` and clear the turn-active marker mid-turn — the latter
-  // triggering the model-idle restart probe + pendingInbound flush as
-  // if claude had gone idle. Use `clearReactionState` to only do the
-  // reaction-cleanup work.
   const key = statusKey(chatId, threadId)
   const ctrl = activeStatusReactions.get(key)
   if (!ctrl) return
   if (outcome === 'done') ctrl.setDone()
   else ctrl.setError()
-  clearReactionState(key)
+  purgeReactionTracking(key)
 }
 
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
@@ -3135,15 +3093,7 @@ silencePoke.startTimer({
     // Drop silence-poke state and clear turn-active so the next inbound
     // for this chat starts a fresh turn instead of queueing forever.
     silencePoke.endTurn(fbKey)
-    // PR 3b step 5 (#1603 audit): force outboundEmitted=false. The
-    // framework fallback fires precisely because visible delivery
-    // didn't happen in 5 min — `wedgedTurn.replyCalled` may have been
-    // set during the turn (e.g. reply tool invoked but Telegram side
-    // never confirmed delivery), but from the user's perspective no
-    // outbound landed. The state machine's `noteOutbound` effect
-    // must NOT fire for this path. Pass `undefined` for endingTurn
-    // and `false` as the explicit override.
-    purgeReactionTracking(fbKey, undefined, false)
+    purgeReactionTracking(fbKey)
     // Defense-in-depth: the fallback's purgeReactionTracking above
     // clears the canonical statusKey(chatId, threadId) for fbKey
     // only. activeTurnStartedAt can hold sibling entries for the
@@ -3156,14 +3106,10 @@ silencePoke.startTimer({
     // purger. Multi-chat-safe — only touches keys for fbChatId, so
     // #1546's intentional cross-chat safety guard is preserved.
     // See turn-state-purge.ts.
-    //
-    // Same `outboundEmitted=false` rationale as the bare call above —
-    // wrap the purger so every sibling-key purge emits a fallback
-    // shadow turnEnd with the truthful "no visible delivery" signal.
     const fbExtraPurge = purgeStaleTurnsForChat(
       fbChatId,
       activeTurnStartedAt.keys(),
-      (k) => purgeReactionTracking(k, undefined, false),
+      purgeReactionTracking,
     )
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
@@ -5882,10 +5828,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         const ceKey = statusKey(chatId, threadId)
         const ctrl = activeStatusReactions.get(ceKey)
         if (ctrl) ctrl.setError()
-        // Duplicate-emit removed (#1603 audit, step 1): the canonical
-        // endCurrentTurnAtomic(turn) call at line ~5851 below already
-        // invokes purgeReactionTracking on the same ceKey. The bare
-        // call here was firing a second shadow `turnEnd` per traversal.
+        purgeReactionTracking(ceKey)
         // Surfaced during CC-5 investigation (`docs/status-ask-cause-classes.md`):
         // the context-exhaust bail path teardown was missing
         // `silencePoke.endTurn(key)`. Without it, the silence-poke state for
@@ -6043,10 +5986,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // Fall through to normal state cleanup (ctrl.setDone, purge, etc.)
         // but skip the regular closeProgressLane so we don't re-finalize.
         if (ctrl) ctrl.setDone()
-        // Duplicate-emit removed (#1603 audit, step 1): endCurrentTurnAtomic(turn)
-        // at line ~6049 below invokes purgeReactionTracking on the same key
-        // (statusKey(chatId, threadId)). The bare call here was firing a
-        // second shadow `turnEnd` per silent-marker traversal.
+        purgeReactionTracking(statusKey(chatId, threadId))
         // Match the normal turn_end path's telemetry so silent-marker turns
         // still appear in turn-duration graphs.
         {
@@ -6187,15 +6127,7 @@ function handleSessionEvent(ev: SessionEvent): void {
                 // mirroring this contract — so reply-only turns transition
                 // to terminal 👍 in their own success path rather than
                 // relying on this dedup heuristic.
-                //
-                // PR 3b step 3 (#1603 audit): thread the captured `turn`
-                // explicitly. `endCurrentTurnAtomic(turn)` ran at line ~6120
-                // before this IIFE started, so `currentTurn === null` by
-                // now — without an explicit endingTurn argument, the shadow
-                // trace would read `outboundEmitted=false` for this dedup
-                // path even though `recentCount > 0` proves the reply tool
-                // did fire (turn.replyCalled === true).
-                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId), turn)
+                purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
                 return
               }
             } catch {}
@@ -6323,35 +6255,14 @@ function handleSessionEvent(ev: SessionEvent): void {
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
             if (backstopCtrl) backstopCtrl.setError()
           } finally {
-            // PR 3b step 3 (#1603 audit): thread the captured `turn`
-            // explicitly. The turn-flush backstop runs inside this IIFE
-            // after `endCurrentTurnAtomic(turn)` already nulled
-            // `currentTurn` at line ~6120. Without threading, the shadow
-            // trace would read `outboundEmitted=currentTurn?.replyCalled
-            // === undefined` → false. For the turn-flush path
-            // `turn.replyCalled` is `false` regardless (the model didn't
-            // call the reply tool — the gateway backstop did the work),
-            // so the threaded value matches the existing fallback here.
-            // But pinning the source via the captured turn matches the
-            // canonical pattern and survives any future change to how
-            // `currentTurn` is sequenced.
-            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId), turn)
+            purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
           }
         })()
         return
       }
 
       if (ctrl) ctrl.setDone()
-      // Duplicate-emit removed (#1603 audit, step 4 — the audit's
-      // original "route through endCurrentTurnAtomic" recommendation
-      // missed that this same code path already calls
-      // `endCurrentTurnAtomic(turn)` ~90 lines below at line ~6412
-      // on the same key — `chatId === turn.sessionChatId` and
-      // `threadId === turn.sessionThreadId` per the bindings at
-      // ~5946-5947. Removing this bare call closes the last duplicate
-      // shadow-`turnEnd` emit on the dominant happy-path turn-end
-      // tail; the canonical primitive below still fires the single
-      // authoritative turnEnd with the threaded turn).
+      purgeReactionTracking(statusKey(chatId, threadId))
       {
         const sKey = streamKey(chatId, threadId)
         const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0

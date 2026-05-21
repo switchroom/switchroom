@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.13.2 — revert PR 3b steps 1-5 (canary regression)
+
+The v0.13.1 canary on test-harness surfaced a regression: the
+canonical shadow `turnEnd` event no longer fires on the dominant
+happy-path turn-end. The audit's premise — that
+`endCurrentTurnAtomic(turn)` at gateway.ts:~6444 would emit the
+single authoritative event after the bare-purge deletions — turned
+out to be empirically wrong for the trivial-reply path. The
+v0.13.0 trace shows one `turnEnd outbound=false` per trivial UAT;
+the v0.13.1 trace shows zero.
+
+No user-visible impact (no fleet rolled to v0.13.1; test-harness
+rolled back to v0.13.0 within minutes of the canary). The shadow
+trace correctness fixes that PR 3b was meant to deliver are
+strictly worse off — fewer correct emits, not more.
+
+Reverts the gateway.ts changes from PRs #1604, #1605, #1606,
+#1607, #1608. The #1603 RFC addendum remains in place as
+documentation; it accurately describes the audit's findings, only
+the implementation order needs revisiting (per-step empirical
+bisection required, not pure code-review).
+
+v0.13.2 = v0.13.0 + the #1602 sends-counter fix (already shipped
+in v0.13.1) + no other changes to gateway.ts.
+
+The audit work (the per-callsite mapping) remains valuable. The
+re-implementation will:
+- Bisect each step on test-harness before committing.
+- Assert the trivial-UAT shadow `turnEnd` count BEFORE AND AFTER
+  each individual change.
+- Treat any drop in emit count as a blocker, not progress.
+
 ## v0.13.1 — sends counter fix + shadow `turnEnd` correctness audit (PR 3b)
 
 Two themes:
