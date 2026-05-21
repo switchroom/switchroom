@@ -1,6 +1,22 @@
 # Changelog
 
-## unreleased — fix(draft-stream): include finalize-materialize in `sends` counter
+## v0.13.1 — sends counter fix + shadow `turnEnd` correctness audit (PR 3b)
+
+Two themes:
+
+1. **Draft-stream `sends` counter** — finishes the v0.13.0 canary
+   follow-up by including BOTH bare `send()` callsites in the
+   counter, so `gw-trace stream-end sends=N` matches reality.
+
+2. **Shadow `turnEnd` correctness — PR 3b steps 1-5.** Per-callsite
+   audit of `purgeReactionTracking` (the canonical turn-end signal)
+   landed as an RFC addendum (#1603), then five surgical fixes
+   removed duplicate-emits / premature-emits / wrong-signal-emits
+   from the seven bare-purge callsites in `gateway.ts`. The shadow
+   trace's `turnEnd` event now emits exactly once per logical turn
+   from an authoritative source. Unblocks the shadow→live cutover.
+
+### PR — draft-stream `sends` counter (#1602)
 
 The v0.13.0 canary surfaced this: draft-transport streams' `gw-trace
 stream-end` showed `sends=0` even though `sendMessage` had fired in
@@ -27,7 +43,94 @@ bypass the `sendViaMessage` helper that owns the increment:
 - draft-transport stream that fires a persist chain + a finalize
   materialize must report `sends>=2` and `persists>=1`
 
-54/54 in both vitest and bun-test.
+### PR audit — state-machine turnEnd per-callsite plan (#1603)
+
+Extended `docs/rfcs/inbound-delivery-state-machine.md` with an
+"Updated cutover plan" section reframing PR 3 as 3a/3b/3c/PR-4,
+plus a 7-row per-callsite audit table for every bare
+`purgeReactionTracking(key)` callsite in `gateway.ts`. Reviewer-
+verified migration recommendations and an implementation-order
+suggestion (smallest-risk-first).
+
+### PR step 1 — delete duplicate `turnEnd` emits (#1604)
+
+Two bare purge calls at `gateway.ts:5831` and `:5989` were each
+firing a second shadow `turnEnd` immediately before the canonical
+`endCurrentTurnAtomic(turn)` call on the same key. Deleted.
+No runtime behaviour change — `endCurrentTurnAtomic` already does
+the work.
+
+### PR step 2 — stop premature `turnEnd` from reply-tool (#1605)
+
+`endStatusReaction` (mid-turn signal from reply tool + stream_reply
+post-finalize) was invoking `purgeReactionTracking(key)` for the 👍
+transition. That function ALSO fires turn-end semantics — shadow
+`turnEnd` emit, `activeTurnStartedAt` clear, and the model-idle
+restart/flush gate. All three fired mid-turn on every reply tool
+success. Split `purgeReactionTracking` into two primitives:
+
+- `clearReactionState(key)` — pure reaction-cleanup. Mid-turn-safe.
+- `purgeReactionTracking(key, endingTurn?)` — turn-end signal.
+  Now delegates the maps cleanup to `clearReactionState`.
+
+`endStatusReaction` swapped to `clearReactionState`. Fixes:
+- N reply-tool calls in one turn no longer fire N shadow `turnEnd`s.
+- The idle gate no longer false-trips mid-turn (preventing premature
+  `pendingInboundBuffer` flush + `triggerSelfRestart`).
+
+### PR step 3 — thread `turn` at post-null IIFE sites (#1606)
+
+Two callsites of `purgeReactionTracking` live inside the turn-flush
+backstop IIFE (`gateway.ts:6167` / `:6295`) that runs AFTER
+`endCurrentTurnAtomic(turn)` already nulled module-scope
+`currentTurn`. Without explicit threading, the function's
+`outboundEmitted` fallback reads `undefined → false` — wrong for
+the dedup branch where `recentCount > 0` proves the reply tool DID
+send messages.
+
+Both sites now pass the captured `turn` closure variable explicitly.
+
+### PR step 4 — delete duplicate at happy-path tail (#1607)
+
+The dominant happy-path turn-end tail at `gateway.ts:6322` was
+firing `purgeReactionTracking(...)` followed ~90 lines later by
+`endCurrentTurnAtomic(turn)` on the SAME key (chatId/threadId
+derived from `turn.sessionChatId/sessionThreadId` at lines
+5946-5947). Same duplicate-emit class as step 1. Deleted the bare
+call.
+
+Side benefit: the idle gate (pendingInbound flush, restart trigger,
+`maybeProactiveCompact`) now fires once at the natural point after
+all turn-end telemetry / DB recording / marker cleanup, rather
+than twice.
+
+### PR step 5 — silence-poke fallback explicit `outboundEmitted=false` (#1608)
+
+The silence-poke framework fallback fires after 5 min of agent
+silence with no visible outbound. The shadow trace's
+`outboundEmitted` field must be **false** for this path regardless
+of `wedgedTurn.replyCalled` — the fallback firing is by definition
+"no visible delivery happened." Extended `purgeReactionTracking`
+signature with a third `outboundEmittedOverride?: boolean`
+parameter (highest precedence in the derivation), applied at both
+`gateway.ts:3127` and the sibling-key sweep iterator at `:3143`.
+
+### Audit complete
+
+All six live `purgeReactionTracking` callsites in `gateway.ts` now
+emit `outboundEmitted` from an authoritative source:
+
+- `gateway.ts:1408` — canonical via `endCurrentTurnAtomic`, threads
+  `turn`.
+- `gateway.ts:3127` — silence-poke fallback, explicit `false`.
+- `gateway.ts:3143` — sibling-key sweep, explicit `false`.
+- `gateway.ts:6175` — turn-flush dedup branch, threads `turn`.
+- `gateway.ts:6315` — turn-flush finally, threads `turn`.
+- `gateway.ts:6412` — canonical happy-path tail via
+  `endCurrentTurnAtomic`, threads `turn`.
+
+Empirical validation step ("eyeball shadow trace on test-harness
+during multi-reply DM") is the canary gate before fleet rollout.
 
 ## v0.13.0 — sendMessageDraft alignment (PRs A+B+C+D)
 
