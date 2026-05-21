@@ -128,31 +128,11 @@ export interface ServerOptions {
    * touching real fleet config.
    */
   configPath?: string;
-  /**
-   * RFC §3.3 / #1623 — surface that renders the operator approval
-   * card and awaits the verdict. Production wiring uses
-   * `SocketApprovalGateway` (per-agent gateway IPC socket); tests
-   * inject an in-process mock. Optional: when unset, the apply path
-   * returns `E_NO_APPROVAL_GATEWAY` rather than skipping the
-   * approval step. Operator opts in by setting
-   * `hostd.config_edit_enabled: true` AND deploying a hostd build
-   * with the gateway wired — both signals required.
-   */
+  /** RFC §3.3 / #1623 — operator-approval surface; unset → `E_NO_APPROVAL_GATEWAY`. */
   approvalGateway?: ApprovalGateway;
-  /**
-   * Test seam: override the random hex id generator. Default is
-   * `crypto.randomBytes(4).toString('hex')`. Tests pin a deterministic
-   * id so assertions on the audit row + finalize payload stay stable.
-   */
+  /** Test seam: override the random hex id generator. */
   generateApprovalId?: () => string;
-  /**
-   * Test seam: override the `switchroom apply` subprocess invocation
-   * used after a successful atomic write. Default shells out to the
-   * `switchroomBin` with `apply` argv (mirrors the Phase-2 `apply`
-   * verb). Tests inject a function that simulates success/failure
-   * without touching docker or the host filesystem beyond the
-   * scratch config file.
-   */
+  /** Test seam: override the `switchroom apply` subprocess invocation. */
   runReconcile?: (args: {
     requestId: string;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
@@ -1220,40 +1200,7 @@ export class HostdServer {
    * makes NO model call.
    */
   /**
-   * `config_propose_edit` — PR 1a stub.
-   *
-   * The full RFC (`docs/rfcs/admin-agent-config-edit.md`) sequences
-   * three PRs: 1a wires schema + dispatcher (this method), 1b adds
-   * the validation pipeline (§3.2), 1c adds the approval card + apply
-   * path (§3.3, §3.4). Until 1c lands the verb has no live effect on
-   * disk — it surfaces a flag-aware error so admin agents can
-   * discover the feature and operators can opt in incrementally.
-   *
-   * Error-code convention (`CONFIG_PROPOSE_EDIT_ERROR_CODES` in
-   * protocol.ts): the audit row and the `resp.error` string both
-   * carry the code so MCP callers and the audit reader can branch on
-   * it without parsing free text. Format: `<CODE>: <human message>`.
-   */
-  /**
    * `config_propose_edit` — full apply path (#1623 / RFC §3.3-3.4).
-   *
-   * Sequence:
-   *   1. Flag gate (operator opted in via `hostd.config_edit_enabled`).
-   *   2. Validation pipeline (PR 1b — `validateConfigEdit`).
-   *   3. Approval card via `approvalGateway.requestApproval` (RFC §3.3).
-   *      Verdict ∈ {approve, deny, timeout}. Deny / timeout return
-   *      `E_DENIED` / `E_APPROVAL_TIMEOUT` and finalize is a no-op.
-   *   4. On approve: serialize on `configApplyLock` (single-process
-   *      mutex — RFC §3.4 explicitly walks back the belt-and-braces
-   *      flock for single-host single-operator land), take a snapshot
-   *      of the live config, atomically write the new content
-   *      (`<path>.tmp` → rename), invoke `switchroom apply`.
-   *   5. If reconcile fails: restore from snapshot atomically, re-run
-   *      reconcile (basic rollback), finalize the card to
-   *      "reconcile failed; rolled back", return
-   *      `E_RECONCILE_FAILED_ROLLED_BACK`.
-   *   6. On success: finalize the card to "applied", return result
-   *      `completed`.
    *
    * Deliberately OUT of scope per operator decision (single-operator
    * single-host posture, see PR description): rate limiter,
@@ -1348,10 +1295,6 @@ export class HostdServer {
           Date.now() - started,
         );
       }
-      // The validator already produced the post-apply text (it runs
-      // `git apply` against the live file). We re-derive it here by
-      // applying the patch a second time to obtain the post-patch
-      // bytes — the validator returns its own copy on success.
       const postApply = verdict.postApplyContent;
       // Atomic write: `<path>.tmp` → rename.
       const tmp = configPath + ".tmp";
@@ -1361,7 +1304,7 @@ export class HostdServer {
       } catch (err) {
         // Pre-write or rename failed — try to clean up tmp; live
         // file is untouched so no rollback needed.
-        try { unlinkSyncBestEffort(tmp); } catch { /* noop */ }
+        unlinkSyncBestEffort(tmp);
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
           detail: `atomic write failed: ${(err as Error).message}`,

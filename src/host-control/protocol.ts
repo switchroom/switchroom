@@ -305,10 +305,6 @@ export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   "E_YAML_UNSAFE_CONSTRUCT", // stage 3a: `!!`-tag, `&`-anchor, `*`-alias, `<<:` merge
   "E_SCHEMA_INVALID", // stage 3b: post-apply yaml fails zod
   "E_SECRET_LEAK_DETECTED", // stage 4: literal secret / un-vaulted-ref regression
-  // PR 1b sentinel — validation passed but apply path is still gated
-  // behind PR 1c. Returned in the success case so callers can tell
-  // "validation worked" apart from "validation rejected".
-  "E_NOT_IMPLEMENTED_APPLY_PATH",
   "E_VALIDATION_REJECTED",
   "E_SCHEMA_REJECTED",
   "E_APPLY_REJECTED",

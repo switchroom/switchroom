@@ -1,37 +1,6 @@
-/**
- * hostd config-edit approval handler — #1623 / RFC §3.3.
- *
- * Called by the gateway IPC dispatcher when hostd sends a
- * `request_config_approval` message. The handler:
- *
- *   1. Posts a Telegram card with the agent name, reason, and full
- *      unified diff in a fenced code block + two inline buttons:
- *      [✅ Approve] [🚫 Deny] (callback_data `cfg:<id>:approve` /
- *      `cfg:<id>:deny`).
- *   2. Registers the pending request in an in-memory map keyed by
- *      `requestId`. A single-shot timer fires `verdict: "timeout"`
- *      after `timeoutMs` and edits the card to "⏱ expired".
- *   3. On the first tap (Approve / Deny), the `cfg:` callback handler
- *      calls `resolvePendingConfigApproval(requestId, verdict)` which
- *      cancels the timer, sends `config_approval_resolved` back to
- *      hostd over the same client connection, and edits the card to
- *      an interim "👀 applying…" / "🚫 denied" state. Subsequent taps
- *      on the same id are no-ops (double-tap safe).
- *   4. After hostd's apply path completes, it sends
- *      `request_config_finalize` to flip the card body to the
- *      terminal state ("✅ applied" or
- *      "⚠️ reconcile failed; rolled back"). The finalize handler
- *      runs even after the pending entry has been cleared from the
- *      map — it edits by `chatId`+`messageId` recorded on the
- *      pending entry at post time.
- *
- * Trust model: same as the Drive-write approval handler — the
- * gateway socket is reachable only from inside the agent container
- * (or hostd via the bind-mounted state dir), so the requesting
- * client is treated as trusted. Operator-side authorization is
- * still re-checked on the callback tap against `access.allowFrom`
- * (mirrors the `apv:` / `drvpick:` / `op:` handlers in gateway.ts).
- */
+// hostd config-edit approval handler (#1623 / RFC §3.3): posts an approval
+// card, resolves the verdict back to hostd over IPC, and flips the card to
+// a terminal state on finalize.
 
 import type { IpcClient } from "./ipc-server.js";
 import type {
@@ -55,11 +24,7 @@ interface PendingConfigApproval {
 
 const pending = new Map<string, PendingConfigApproval>();
 
-// ────────────────────────────────────────────────────────────────────────
 // Injected deps — gateway.ts wires these from the existing surface.
-// Same shape pattern as drive-write-approval to keep the unit tests
-// free of grammy + telegram.
-// ────────────────────────────────────────────────────────────────────────
 
 export interface ConfigApprovalHandlerDeps {
   /** This gateway's agent name — cross-agent requests rejected. */
@@ -137,13 +102,6 @@ export async function handleRequestConfigApproval(
 
   if (msg.agentName !== deps.agentName) {
     reply("deny", `gateway serves '${deps.agentName}', not '${msg.agentName}'`);
-    return;
-  }
-
-  if (pending.has(msg.requestId)) {
-    // Defensive — hostd should never reuse a requestId, but if it
-    // does, fail closed rather than overwrite the live entry.
-    reply("deny", `duplicate requestId '${msg.requestId}'`);
     return;
   }
 
@@ -254,14 +212,7 @@ export async function resolvePendingConfigApproval(
   return true;
 }
 
-/**
- * Called by the IPC dispatcher on `request_config_finalize` — edits
- * the card body to the terminal apply outcome. Idempotent — if the
- * pending entry has already been removed (e.g. by an earlier timeout
- * + cleanup), we still attempt the edit using a chat-id we don't
- * have, so this path requires the pending entry to still exist;
- * otherwise it's a best-effort no-op.
- */
+/** IPC `request_config_finalize` handler — edits the card to the terminal outcome. */
 export async function handleRequestConfigFinalize(
   _client: Pick<IpcClient, "send">,
   msg: RequestConfigFinalizeMessage,

@@ -1,22 +1,5 @@
-/**
- * hostd ApprovalGateway — RFC §3.3 / #1623.
- *
- * Abstracts the "ask the operator to approve a config diff" surface
- * so the apply path in `HostdServer.handleConfigProposeEdit` is
- * testable without spinning up a real Telegram gateway. Production
- * code wires `SocketApprovalGateway` (below), which connects to the
- * caller agent's gateway IPC socket and exchanges the new
- * `request_config_approval` / `config_approval_resolved` /
- * `request_config_finalize` messages defined in
- * `telegram-plugin/gateway/ipc-protocol.ts`.
- *
- * The single-method contract keeps the server's apply path narrow:
- * one round-trip yields a verdict, and the returned `finalize`
- * callback is invoked once after the apply attempt completes to
- * flip the card body to the terminal outcome. The interface is
- * intentionally identical to what the in-process tests need — no
- * gateway, no sockets, just `{verdict, finalize}`.
- */
+// hostd ApprovalGateway (#1623): abstracts the operator-approval surface
+// so HostdServer.handleConfigProposeEdit's apply path is testable.
 
 import { connect, type Socket } from "node:net";
 
@@ -32,8 +15,7 @@ export interface ApprovalRequest {
 
 export interface ApprovalResult {
   verdict: ApprovalVerdict;
-  /** Update the operator-visible card with the apply outcome. Idempotent
-   *  best-effort — failures inside the gateway are logged, not thrown. */
+  /** Update the approval card with the apply outcome. */
   finalize: (outcome: {
     outcome: "applied" | "reconcile_failed_rolled_back";
     detail?: string;
@@ -44,20 +26,10 @@ export interface ApprovalGateway {
   requestApproval(req: ApprovalRequest): Promise<ApprovalResult>;
 }
 
-// ────────────────────────────────────────────────────────────────────────
-// SocketApprovalGateway — production wiring against the per-agent
-// gateway IPC socket at `<agentDir>/telegram/gateway.sock`.
-// ────────────────────────────────────────────────────────────────────────
+// SocketApprovalGateway — production wiring against `<agentDir>/telegram/gateway.sock`.
 
 export interface SocketApprovalGatewayOptions {
-  /**
-   * Resolve a per-agent gateway IPC socket path. Hostd invokes this
-   * once per request with the caller agent's name (RFC §3.3: the
-   * card lands in the calling admin agent's chat, which is the
-   * operator's primary surface for that agent). Returns null when
-   * no gateway socket is reachable — the caller treats this as a
-   * deny + diagnostic error.
-   */
+  /** Resolve gateway IPC socket path; null → deny. */
   resolveGatewaySocket: (agentName: string) => string | null;
   log?: (msg: string) => void;
 }
@@ -74,63 +46,35 @@ export class SocketApprovalGateway implements ApprovalGateway {
         finalize: async () => {},
       };
     }
-    // Single TCP-like connection holds both the request and the
-    // eventual resolved event. We keep it open until either the
-    // verdict arrives, our local timeout fires, or the connection
-    // drops — whichever first.
+    // Single connection holds both the request and the resolved event.
+    // Gateway is the source of truth for the timeout; socket error/close → deny.
     return await new Promise<ApprovalResult>((resolve) => {
       const client: Socket = connect({ path: sockPath });
       let buffer = "";
       let resolved = false;
       const log = this.opts.log ?? (() => {});
 
-      // Hostd-side hard deadline. The gateway also runs a timer and
-      // SHOULD beat us to it; this is defense-in-depth in case the
-      // gateway is silent (process gone, socket hung).
-      const localTimeout = setTimeout(() => {
-        if (resolved) return;
-        resolved = true;
-        try { client.end(); } catch { /* noop */ }
-        resolve({
-          verdict: "timeout",
-          finalize: async () => {},
-        });
-      }, req.timeoutMs + 5_000); // grace window so gateway-side timer wins
-
       const finalize = async (outcome: {
         outcome: "applied" | "reconcile_failed_rolled_back";
         detail?: string;
       }): Promise<void> => {
-        // Best-effort second message on the same connection; if it
-        // dropped after the verdict we open a fresh one.
-        const send = (sock: Socket) => {
-          try {
-            sock.write(
-              JSON.stringify({
-                type: "request_config_finalize",
-                requestId: req.requestId,
-                outcome: outcome.outcome,
-                ...(outcome.detail ? { detail: outcome.detail } : {}),
-              }) + "\n",
-            );
-            sock.end();
-          } catch (err) {
-            log(
-              `finalize write failed (requestId=${req.requestId}): ${(err as Error).message}`,
-            );
-          }
-        };
-        if (!client.destroyed) {
-          send(client);
-          return;
-        }
-        const sock2 = connect({ path: sockPath });
-        sock2.on("connect", () => send(sock2));
-        sock2.on("error", (err) => {
-          log(
-            `finalize reconnect failed (requestId=${req.requestId}): ${err.message}`,
+        // Best-effort single-shot write on the existing connection.
+        if (client.destroyed) return;
+        try {
+          client.write(
+            JSON.stringify({
+              type: "request_config_finalize",
+              requestId: req.requestId,
+              outcome: outcome.outcome,
+              ...(outcome.detail ? { detail: outcome.detail } : {}),
+            }) + "\n",
           );
-        });
+          client.end();
+        } catch (err) {
+          log(
+            `finalize write failed (requestId=${req.requestId}): ${(err as Error).message}`,
+          );
+        }
       };
 
       client.on("connect", () => {
@@ -148,7 +92,6 @@ export class SocketApprovalGateway implements ApprovalGateway {
         } catch (err) {
           if (resolved) return;
           resolved = true;
-          clearTimeout(localTimeout);
           log(
             `request_config_approval write failed (requestId=${req.requestId}): ${(err as Error).message}`,
           );
@@ -179,7 +122,6 @@ export class SocketApprovalGateway implements ApprovalGateway {
             !resolved
           ) {
             resolved = true;
-            clearTimeout(localTimeout);
             resolve({
               verdict: obj.verdict as ApprovalVerdict,
               finalize,
@@ -192,7 +134,6 @@ export class SocketApprovalGateway implements ApprovalGateway {
       client.on("error", (err) => {
         if (resolved) return;
         resolved = true;
-        clearTimeout(localTimeout);
         log(
           `gateway socket error (requestId=${req.requestId}): ${err.message}`,
         );
@@ -202,7 +143,6 @@ export class SocketApprovalGateway implements ApprovalGateway {
       client.on("close", () => {
         if (resolved) return;
         resolved = true;
-        clearTimeout(localTimeout);
         resolve({ verdict: "deny", finalize: async () => {} });
       });
     });
