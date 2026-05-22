@@ -56,13 +56,64 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(result!.kind).toBe('credit-exhausted')
   })
 
-  it('classifies overloaded_error as quota-exhausted', () => {
+  it('classifies overloaded_error as rate-limited (transient), NOT quota-exhausted', () => {
+    // A 529 "overloaded" is transient Anthropic server-capacity
+    // pressure — orthogonal to account quota. Classifying it
+    // quota-exhausted fired a false "Model unavailable" card + a
+    // self-cancelling fleet auto-fallback on every 529.
     const line = JSON.stringify({
       type: 'api_error',
       error: { type: 'overloaded_error', message: 'Overloaded' },
     })
     const result = detectErrorInTranscriptLine(line)
-    expect(result!.kind).toBe('quota-exhausted')
+    expect(result!.kind).toBe('rate-limited')
+    expect(result!.transient).toBe(true)
+    // An explicit `type:"api_error"` line (no retry state) = Claude
+    // surfaced the failure → terminal.
+    expect(result!.terminal).toBe(true)
+  })
+
+  it('marks an in-flight 529 retry transient + NOT terminal (suppressed)', () => {
+    // Real on-disk shape: a 529 Claude Code is internally retrying,
+    // annotated with retryAttempt < maxRetries.
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { status: 529, type: 'overloaded_error', message: 'Overloaded' },
+      retryAttempt: 9,
+      maxRetries: 10,
+      retryInMs: 34479,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('rate-limited')
+    expect(result!.transient).toBe(true)
+    // 9 < 10 — still retrying → in-flight → the caller suppresses it.
+    expect(result!.terminal).toBe(false)
+  })
+
+  it('marks an exhausted 529 retry terminal (escalates)', () => {
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { status: 529, type: 'overloaded_error', message: 'Overloaded' },
+      retryAttempt: 10,
+      maxRetries: 10,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('rate-limited')
+    expect(result!.transient).toBe(true)
+    // retries exhausted → terminal → escalates.
+    expect(result!.terminal).toBe(true)
+  })
+
+  it('marks non-transient errors terminal (always escalate)', () => {
+    const line = JSON.stringify({
+      type: 'api_error',
+      error: { type: 'authentication_error', message: 'expired' },
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.transient).toBe(false)
+    expect(result!.terminal).toBe(true)
   })
 
   it('returns null for lines without error field', () => {

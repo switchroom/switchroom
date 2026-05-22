@@ -326,7 +326,17 @@ export function resolveModelUnavailableFromOperatorEvent(
     return detectModelUnavailable(detail) ?? { kind: 'quota_exhausted', raw: detail }
   }
   if (ev.kind === 'rate-limited') {
-    return detectModelUnavailable(detail) ?? { kind: 'overload', raw: detail }
+    // A rate-limited / transient overload is NOT "model unavailable" —
+    // it is retryable and Claude Code retries it internally. Escalate
+    // to the model-unavailable card ONLY if the detail carries a
+    // genuine quota signal (a 4xx that slipped past the classifier
+    // with usage-limit wording in its body). A bare overload /
+    // rate-limit returns null → the caller renders the calm
+    // `rate-limited` card, never the scary "⚠️ Model unavailable" one.
+    // Returning `{kind:'overload'}` here is what fired a false
+    // model-unavailable card on every transient 529.
+    const detected = detectModelUnavailable(detail)
+    return detected?.kind === 'quota_exhausted' ? detected : null
   }
   if (ev.kind === 'unknown-5xx') {
     return detectModelUnavailable(detail) ?? { kind: 'overload', raw: detail }
