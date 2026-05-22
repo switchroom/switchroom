@@ -21,7 +21,7 @@ describe('buildSubagentHandbackInbound', () => {
   it('builds a completed-worker handback with the load-bearing meta.source', () => {
     const inbound = buildSubagentHandbackInbound({
       ctx: {
-        chatId: '8248703757',
+        chatId: '12345',
         taskDescription: 'Refactor the auth module',
         resultText: 'Done — refactored, 4 tests added, all green.',
         outcome: 'completed',
@@ -29,7 +29,7 @@ describe('buildSubagentHandbackInbound', () => {
       nowMs: FIXED_NOW,
     })
     expect(inbound.type).toBe('inbound')
-    expect(inbound.chatId).toBe('8248703757')
+    expect(inbound.chatId).toBe('12345')
     expect(inbound.userId).toBe(0)
     expect(inbound.user).toBe('subagent-watcher')
     expect(inbound.ts).toBe(FIXED_NOW)
