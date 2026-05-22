@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.13.10 — sub-agent handback + hostd config-edit + fleet defaults
+
+### feat(pacing) — deterministic sub-agent handback, beat 4 (#1650)
+
+Conversational-pacing beat 4 — the handback — now has a deterministic
+mechanism. A *background* sub-agent (the default worker/researcher)
+finishes decoupled from any turn boundary, with the parent idle and no
+turn to receive the result — so the user never heard back until they
+sent the next message themselves. The gateway's subagent-watcher
+`onFinish` now builds a `subagent_handback` inbound carrying the
+worker's result and delivers it through the idle-drain path; the agent
+wakes and synthesises a user-facing handback in its own voice. A
+foreground PostToolUse nudge covers in-turn sub-agents. Framework
+delivers the cue; the model authors the words. Kill-switch:
+`SWITCHROOM_SUBAGENT_HANDBACK=0`.
+
+### feat(hostd) — config_propose_edit apply path (#1651)
+
+hostd can apply an approved config edit: approval card → atomic
+tmp→rename write → reconcile, with atomic rollback on reconcile
+failure. No write lands without an explicit operator approve.
+
+### feat(defaults) — bake pandoc/ffmpeg/imagemagick + expand skills (#1652)
+
+The base image now ships `pandoc`, `ffmpeg`, `imagemagick`. The
+example config's `defaults.skills` expands to include docx, pdf, pptx,
+xlsx, webapp-testing, mcp-builder, skill-creator, file-bug.
+
+### fix(agent-config) — skip profile re-render in cron-only reconcile (#1619)
+
+A cron-only reconcile inside an agent container no longer attempts to
+re-render profile `.hbs` templates (absent from the container bundle),
+which previously threw `ENOENT`.
+
+### fix(gateway) — stop logging anonymous IPC disconnects as flaps (#1649)
+
+Anonymous one-shot IPC clients (recall.py's `update_placeholder`
+handshake) no longer log as `bridge disconnected — agent=null`, which
+read as a bridge flap in the supervisor log when nothing flapped.
+
 ## v0.13.9 — pacing v2.1: the ack gate is answer length, not tool use
 
 ### fix(pacing) — acknowledge first on long replies, not just tool turns
