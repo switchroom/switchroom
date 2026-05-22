@@ -39,8 +39,13 @@ vi.mock("../vault/vault.js", () => ({
 import {
   __test,
   selectDriveAccountScopes,
+  selectGoogleWorkspaceScopes,
+  workspaceScopesForTier,
   DRIVE_READONLY_SCOPES,
   DRIVE_WRITE_SCOPES,
+  GOOGLE_DOCS_SCOPE,
+  GOOGLE_SHEETS_SCOPE,
+  GOOGLE_SLIDES_SCOPE,
   type DriveCliDeps,
 } from "./drive.js";
 import type { WaitForApprovalResult } from "../vault/approvals/wait.js";
@@ -447,5 +452,68 @@ describe("selectDriveAccountScopes", () => {
     );
     // Least-privilege: NOT the full read/write `drive` scope.
     expect(s).not.toContain("https://www.googleapis.com/auth/drive");
+  });
+});
+
+describe("workspaceScopesForTier (issue #1663)", () => {
+  it("core → Docs + Sheets (core already exposes those tools)", () => {
+    const s = workspaceScopesForTier("core");
+    expect(s).toEqual([GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE]);
+    expect(s).not.toContain(GOOGLE_SLIDES_SCOPE);
+  });
+
+  it("extended → adds Slides (first tier exposing Slides tools)", () => {
+    const s = workspaceScopesForTier("extended");
+    expect(s).toContain(GOOGLE_DOCS_SCOPE);
+    expect(s).toContain(GOOGLE_SHEETS_SCOPE);
+    expect(s).toContain(GOOGLE_SLIDES_SCOPE);
+  });
+
+  it("complete → also includes Slides", () => {
+    expect(workspaceScopesForTier("complete")).toContain(GOOGLE_SLIDES_SCOPE);
+  });
+
+  it("does NOT add calendar/gmail scopes (deferred per #1663)", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      const s = workspaceScopesForTier(tier);
+      expect(s.some((x) => x.includes("calendar"))).toBe(false);
+      expect(s.some((x) => x.includes("gmail"))).toBe(false);
+    }
+  });
+});
+
+describe("selectGoogleWorkspaceScopes (issue #1663)", () => {
+  it("core read-only: Drive read + Docs + Sheets, no Slides, no drive.file", () => {
+    const s = selectGoogleWorkspaceScopes({ write: false, tier: "core" });
+    expect(s).toContain("https://www.googleapis.com/auth/drive.readonly");
+    expect(s).toContain(GOOGLE_DOCS_SCOPE);
+    expect(s).toContain(GOOGLE_SHEETS_SCOPE);
+    expect(s).not.toContain(GOOGLE_SLIDES_SCOPE);
+    expect(s).not.toContain("https://www.googleapis.com/auth/drive.file");
+  });
+
+  it("extended write: Drive read + drive.file + Docs + Sheets + Slides", () => {
+    const s = selectGoogleWorkspaceScopes({ write: true, tier: "extended" });
+    expect(s).toContain("https://www.googleapis.com/auth/drive.file");
+    expect(s).toContain(GOOGLE_DOCS_SCOPE);
+    expect(s).toContain(GOOGLE_SHEETS_SCOPE);
+    expect(s).toContain(GOOGLE_SLIDES_SCOPE);
+  });
+
+  it("undefined tier defaults to core (matches schema default)", () => {
+    const s = selectGoogleWorkspaceScopes({ write: false });
+    expect(s).toEqual(selectGoogleWorkspaceScopes({ write: false, tier: "core" }));
+  });
+
+  it("produces no duplicate scopes", () => {
+    const s = selectGoogleWorkspaceScopes({ write: true, tier: "complete" });
+    expect(new Set(s).size).toBe(s.length);
+  });
+
+  it("never requests the full read/write `drive` scope (least-privilege)", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      const s = selectGoogleWorkspaceScopes({ write: true, tier });
+      expect(s).not.toContain("https://www.googleapis.com/auth/drive");
+    }
   });
 });

@@ -607,7 +607,7 @@ function registerAccountAdd(accountParent: Command): void {
         // sizeable trees (Drive scaffolding, AES vault) that the
         // sibling enable/disable/list verbs don't need.
         const [
-          { runDriveOAuthFlow, selectDriveAccountScopes },
+          { runDriveOAuthFlow, selectGoogleWorkspaceScopes },
           { selectInitialTier },
           { brokerCall },
           { loadConfig, resolvePath },
@@ -733,7 +733,18 @@ function registerAccountAdd(accountParent: Command): void {
           );
         }
 
-        const accountScopes = selectDriveAccountScopes(opts.write ?? false);
+        // Tie the OAuth scope set to the configured Workspace tier
+        // (issue #1663). `gw.tier` defaults to `core` when unset — same
+        // default as GoogleWorkspaceTierSchema. core/extended/complete
+        // all mint Docs+Sheets scopes; extended/complete add Slides, so
+        // the token a tier mints can drive every tool that tier exposes
+        // (instead of advertising Slides/Docs/Sheets tools that 403 and
+        // trigger upstream's doomed port-8000 OAuth fallback).
+        const tier = gw.tier ?? "core";
+        const accountScopes = selectGoogleWorkspaceScopes({
+          write: opts.write ?? false,
+          tier,
+        });
         const oauthCfg = {
           client_id: clientIdRaw,
           client_secret: clientSecretRaw,
@@ -746,6 +757,21 @@ function registerAccountAdd(accountParent: Command): void {
             ),
           );
         }
+        console.log(
+          chalk.gray(
+            `  Workspace tier: ${tier} — requesting Docs + Sheets` +
+              (tier === "extended" || tier === "complete"
+                ? " + Slides"
+                : "") +
+              " API scopes so the tier's tools can authenticate.",
+          ),
+        );
+        console.log(
+          chalk.gray(
+            "  Changing the tier later requires re-running this command\n" +
+              "  (`--replace`) — OAuth scopes are fixed at consent time.",
+          ),
+        );
         // OAuthEnv is a shaped subset of process.env — picking the
         // fields the selector reads (rather than passing process.env
         // wholesale) keeps the call typed.
