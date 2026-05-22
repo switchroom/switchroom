@@ -225,6 +225,45 @@ These rules are permanent guidance for every phase of the docker migration, not 
 - Project-scoped compose teardown is also fine: `docker compose -p <project> down -v --remove-orphans`. Scope is the compose project name — won't touch anything outside it.
 - If you find yourself wanting to "just clean everything up", STOP and ask.
 
+## Vault & shared-state test discipline (HARD RULES)
+
+Same principle as the Docker rules above: tests run on the **live
+operator host**. `~/.switchroom/` is the production state tree — the
+real encrypted vault, audit log, grants DB, and per-agent scaffolds. A
+test that writes there corrupts a running fleet.
+
+**On 2026-05-22 a vault/broker test did exactly this:** it created its
+fixture vault at the *default* path and truncated the production
+`~/.switchroom/vault/vault.enc` from 77 keys to a 414-byte test vault,
+and forked the `vault-audit.log` hash chain. The fleet survived only
+because the broker re-persists the whole vault on the next `put` and a
+token rotation happened to heal the disk before any broker restart. Do
+not rely on that luck.
+
+- Any test that constructs a `VaultBroker`, opens/saves a vault
+  (`openVault` / `saveVault` / `createVault`), or writes the audit log
+  MUST point every path at an isolated tmpdir
+  (`mkdtempSync(join(tmpdir(), "…"))`). Never `~/.switchroom/`.
+- **The dangerous defaults** — each resolves to *production* when you
+  omit an override:
+  - `new VaultBroker(...)` with no `vaultPath` arg and no
+    `config.vault.path` → `~/.switchroom/vault.enc`.
+  - `createAuditLogger()` with no path → `~/.switchroom/vault-audit.log`.
+  - `openVault` / `saveVault` / `getVaultPath()` fall back to
+    `~/.switchroom/vault.enc`.
+  In tests, construct the broker via the `_testVaultPath` +
+  `_testAuditLogger` hooks on the constructor's test-options arg (see
+  `src/vault/broker/server.ts`), or pass an explicit tmp `vaultPath`.
+  `tests/integration/vault-broker-e2e.test.ts` is the canonical
+  isolated pattern (`mkdtempSync` → tmp vault + tmp socket) — copy it.
+- The same applies to the grants DB (`vault-grants.db`), per-agent
+  `.vault-token` files, and anything else under `~/.switchroom/`.
+- A test that needs the *real* broker (a true e2e) still gets an
+  isolated `SWITCHROOM_VAULT_PATH` / config + its own tmp socket — it
+  never shares the operator's vault.
+- If you're about to run a vault/broker test and can't point to where
+  its tmpdir is, STOP — assume it will hit production.
+
 ## Design contract
 
 `reference/` is the design contract for any non-trivial change. Three
