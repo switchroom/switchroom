@@ -12838,9 +12838,11 @@ bot.on('callback_query:data', async ctx => {
       {
         editCard: async (args) => {
           try {
-            await bot.api.editMessageText(args.chatId, args.messageId, args.text, {
-              parse_mode: 'HTML',
-            })
+            await robustApiCall(() =>
+              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
+                parse_mode: 'HTML',
+              }),
+            )
           } catch {
             /* best effort */
           }

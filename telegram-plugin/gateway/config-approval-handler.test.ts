@@ -156,8 +156,13 @@ describe("timeout path", () => {
         deps,
       );
       vi.advanceTimersByTime(1500);
-      // Allow microtasks scheduled inside the timer to flush.
-      await vi.runAllTimersAsync();
+      // Allow microtasks scheduled inside the timer callback to flush.
+      // NOT vi.runAllTimersAsync() — that is unimplemented under bun's
+      // vitest-compat shim and this suite also runs under `bun test`
+      // (CLAUDE.md § "Import the right runner"). advanceTimersByTime
+      // already fired the timer synchronously; we only need to drain
+      // the microtask queue the timer's async callback scheduled.
+      for (let i = 0; i < 8; i++) await Promise.resolve();
       const verdicts = sent.filter((s) => s.type === "config_approval_resolved");
       expect(verdicts.length).toBe(1);
       expect(verdicts[0]!.verdict).toBe("timeout");
