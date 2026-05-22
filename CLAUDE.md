@@ -249,8 +249,10 @@ not rely on that luck.
   - `new VaultBroker(...)` with no `vaultPath` arg and no
     `config.vault.path` → `~/.switchroom/vault.enc`.
   - `createAuditLogger()` with no path → `~/.switchroom/vault-audit.log`.
-  - `openVault` / `saveVault` / `getVaultPath()` fall back to
-    `~/.switchroom/vault.enc`.
+  - `openVault` / `saveVault` take a *required* `vaultPath` — but
+    `getVaultPath()` (`src/cli/vault.ts`) falls back to
+    `~/.switchroom/vault.enc`, so a test that derives its path from
+    `getVaultPath()` hits production.
   In tests, construct the broker via the `_testVaultPath` +
   `_testAuditLogger` hooks on the constructor's test-options arg (see
   `src/vault/broker/server.ts`), or pass an explicit tmp `vaultPath`.
