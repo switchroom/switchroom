@@ -51,6 +51,7 @@ import {
   type BrokerStatus,
 } from "./protocol.js";
 import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log.js";
+import { safeVaultPath } from "./test-isolation-guard.js";
 import { Database } from "bun:sqlite";
 import { mintGrant, validateGrant, validateGrantForWrite, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
 import { openGrantsDb } from "../grants-db.js";
@@ -198,7 +199,9 @@ export class VaultBroker {
       );
     }
     if (testOpts._testVaultPath !== undefined) {
-      this.vaultPath = testOpts._testVaultPath;
+      // test-isolation guard: redirect a _testVaultPath that points
+      // into the real ~/.switchroom tree to an isolated tmpdir.
+      this.vaultPath = safeVaultPath(testOpts._testVaultPath);
     }
 
     // Use the injected logger for tests; create the real one for production.
@@ -268,6 +271,11 @@ export class VaultBroker {
     } else {
       this.vaultPath = resolvePath(this.config.vault?.path ?? "~/.switchroom/vault.enc");
     }
+    // test-isolation guard: under the test runner, redirect a vault
+    // path that resolved into the real ~/.switchroom tree to an
+    // isolated tmpdir, so a mis-isolated test can neither read nor
+    // clobber the operator's live vault. No-op in production.
+    this.vaultPath = safeVaultPath(this.vaultPath);
 
     // Pre-load secrets if test opts provided
     if (this.testOpts._testSecrets !== undefined) {
