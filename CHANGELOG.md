@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.11 — a transient overload is not quota exhaustion
+
+### fix(auth) — honest escalation for transient overloads (#1655)
+
+Agents were showing a false "⚠️ Model unavailable — quota exhausted /
+Auto-failover in progress" card, then "Auto-fallback skipped: …probed
+healthy. Stale event?" — looping on every transient Anthropic HTTP 529.
+The accounts were never exhausted; the fleet auto-fallback correctly
+declined. The bug was a mislabel: a 529 `overloaded_error` (server
+capacity; retryable; Claude Code retries it internally) was classified
+`quota-exhausted`.
+
+- `overloaded_error` / HTTP 529 → `rate-limited`, not `quota-exhausted`.
+- Fleet auto-fallback now triggers only on a genuine `quota_exhausted`,
+  never `overload` — failing over does nothing when every account is
+  equally hit by server load.
+- A transient overload Claude is still retrying posts **no operator
+  card** — `session-tail` reads Claude Code's `retryAttempt`/`maxRetries`
+  annotations and escalates only terminal failures. The calm
+  `rate-limited` card replaces the scary "Model unavailable" one for
+  transients. Genuine usage-limit detection (the `isApiErrorMessage`
+  429 shape) is unchanged and still triggers auto-fallback.
+
+### test(pacing) — cover the sub-agent handback decision gate (#1654)
+
+The gateway `onFinish` handback gate (which injects a turn) was
+extracted into a pure `decideSubagentHandback` with 12 unit tests —
+closing the regression-coverage gap on the feature's riskiest surface.
+
 ## v0.13.10 — sub-agent handback + hostd config-edit + fleet defaults
 
 ### feat(pacing) — deterministic sub-agent handback, beat 4 (#1650)
