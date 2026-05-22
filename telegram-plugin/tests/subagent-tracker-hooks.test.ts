@@ -210,6 +210,67 @@ describe('subagent-tracker-posttool', () => {
       | undefined
     expect(row?.status).toBe('failed')
   })
+
+  it('emits a foreground handback nudge for a foreground sub-agent', () => {
+    // conversational-pacing beat 4: a FOREGROUND sub-agent's PostToolUse
+    // fires at real completion, mid-parent-turn — emit an
+    // additionalContext nudge steering the parent to synthesise a
+    // handback.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-fg',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_fg001',
+      tool_input: { description: 'A foreground task', run_in_background: false },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_fg001',
+      tool_response: { result: 'Foreground work complete.', is_error: false },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+    expect(postResult.stdout).toContain('handback')
+    expect(postResult.stdout).toContain('PostToolUse')
+  })
+
+  it('does NOT emit a handback nudge for a background sub-agent', () => {
+    // A background sub-agent's PostToolUse fires on the launch ACK, not
+    // on completion — nudging "synthesise the handback" there is wrong.
+    // The gateway's subagent-watcher onFinish path owns background.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-bg',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_bg001',
+      tool_input: { description: 'A background task', run_in_background: true },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_bg001',
+      tool_response: { result: 'launched', is_error: false },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+  })
+
+  it('does NOT emit a handback nudge when SWITCHROOM_SUBAGENT_HANDBACK=0', () => {
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-off',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_off001',
+      tool_input: { description: 'A foreground task', run_in_background: false },
+    })
+    const postResult = runHook(
+      POSTTOOL_SCRIPT,
+      {
+        tool_name: 'Agent',
+        tool_use_id: 'toolu_off001',
+        tool_response: { result: 'done', is_error: false },
+      },
+      { SWITCHROOM_SUBAGENT_HANDBACK: '0' },
+    )
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+  })
 })
 
 describe('agent-dir resolution (RFC §Bug 2)', () => {

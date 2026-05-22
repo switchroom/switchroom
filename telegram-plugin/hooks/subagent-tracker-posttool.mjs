@@ -250,6 +250,58 @@ function updateRow(dbPath, { id, status, resultSummary, now }, done) {
 }
 
 // ---------------------------------------------------------------------------
+// Foreground handback nudge (conversational-pacing beat 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Synchronously read the `background` flag for a subagent row. Returns
+ * 0 (foreground), 1 (background), or null (unknown — sync SQLite
+ * unavailable, or row not found). Used to gate the foreground handback
+ * nudge: a background sub-agent's PostToolUse fires on the ~10s launch
+ * ACK, not on completion, so it must NOT be nudged here (the gateway's
+ * subagent-watcher handles the background handback via inject_inbound).
+ */
+function readBackgroundFlagSync(dbPath, id) {
+  const DatabaseSync = resolveSyncSqlite()
+  if (DatabaseSync == null) return null
+  try {
+    const db = new DatabaseSync(dbPath)
+    const row = db.prepare('SELECT background FROM subagents WHERE id = ?').get(id)
+    db.close()
+    if (row == null) return null
+    return row.background === 1 ? 1 : 0
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Emit a PostToolUse `additionalContext` nudge. For a foreground
+ * sub-agent this fires at real completion, mid-parent-turn, with the
+ * result already in the parent's context — the nudge steers the parent
+ * to synthesise a user-facing handback (beat 4) instead of dumping the
+ * raw report or moving on silently. Same channel `sandbox-hint-posttool`
+ * uses; capped well under Claude Code's 10k hook-output limit.
+ */
+function emitForegroundHandbackNudge() {
+  const out = {
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUse',
+      additionalContext:
+        'A sub-agent you dispatched just returned. Beat 4 — the handback: '
+        + 'before you move on, send the user a reply in your own voice that '
+        + 'synthesises what the sub-agent found and your next step. Do not '
+        + 'paste its raw report and do not go silent.',
+    },
+  }
+  try {
+    process.stdout.write(JSON.stringify(out) + '\n')
+  } catch {
+    /* stdout write failures never block the tool flow */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -292,6 +344,23 @@ function main() {
   if (!existsSync(dbPath)) process.exit(0)
 
   const toolResponse = event.tool_response ?? null
+
+  // conversational-pacing beat 4 (foreground half). A foreground
+  // sub-agent's PostToolUse fires at real completion, mid-parent-turn,
+  // with its result in tool_response — nudge the parent to synthesise a
+  // user-facing handback. Background sub-agents are gated OUT: their
+  // PostToolUse fires on the launch ACK (BACKGROUND_SQL leaves status
+  // untouched for that reason), and their handback is driven by the
+  // gateway's subagent-watcher onFinish path instead. Fail-silent: an
+  // unknown background flag (null) skips the nudge.
+  if (
+    process.env.SWITCHROOM_SUBAGENT_HANDBACK !== '0'
+    && detectStatus(toolResponse) === 'completed'
+    && readBackgroundFlagSync(dbPath, id) === 0
+  ) {
+    emitForegroundHandbackNudge()
+  }
+
   updateRow(
     dbPath,
     {
