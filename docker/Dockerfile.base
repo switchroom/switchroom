@@ -54,6 +54,13 @@ RUN echo "switchroom/base building for arch=${TARGETARCH}" >&2
 #   tree, file                 — directory orientation + content sniffing
 #   dnsutils, iputils-ping,
 #   netcat-openbsd             — network connectivity debugging trio
+#   pandoc                     — universal document converter (md/docx/pdf/
+#                                html/rst/...). Pairs with the bundled docx
+#                                / pdf skills shipped on by default.
+#   ffmpeg                     — audio/video transcode + probe; voice-in
+#                                pipeline + general media handling.
+#   imagemagick                — `convert` / `identify` for image resize,
+#                                format conversion, screenshot wrangling.
 # BuildKit cache mounts persist /var/cache/apt + /var/lib/apt/lists across
 # layer-cache invalidations. The default debian docker-clean hook deletes
 # downloaded .debs after each apt-get install — the `rm -f docker-clean`
@@ -83,7 +90,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       python3-pip \
       python3-venv \
       build-essential \
+      ffmpeg \
+      imagemagick \
       jq \
+      pandoc \
       ripgrep \
       fd-find \
       tar \
