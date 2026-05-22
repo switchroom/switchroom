@@ -39,11 +39,13 @@ Messaging an agent should feel like messaging a capable colleague. The
 model — not a framework widget — carries this, via its own `reply`
 calls, in five beats:
 
-1. **Acknowledge first.** The first action on any turn that needs real
-   work (a file read, a search, a command) is a short `reply` in
-   persona voice — *"on it — checking now"* — before the work starts.
-   Skipped only when the whole answer is one immediate sentence
-   (*"what's 2+2"*).
+1. **Acknowledge first.** Unless the whole reply is a single short
+   sentence to send immediately (*"what's 2+2"*), the first action on
+   any turn is a short `reply` in persona voice — *"on it — checking
+   now"* — before the work starts. The gate is answer length, **not**
+   whether tools are involved: a turn that is pure reasoning but will
+   run to a paragraph still acks first. Skipped only for the immediate
+   one-sentence answer.
 2. **Go quiet and work.** Heads-down is correct. No narration of
    individual tool calls. Ambient liveness — the status reaction and
    the typing indicator — covers "still alive"; the model does not.
