@@ -93,13 +93,32 @@ export interface DriveApprovalPostedEvent {
   reason?: string;
 }
 
+/**
+ * hostd config-edit approval — sent by the gateway back to hostd
+ * after the operator taps Approve/Deny on a `request_config_approval`
+ * card (or the 10-minute timeout elapses).
+ *
+ * The gateway is the source of truth for the verdict; hostd treats
+ * this as a one-shot reply per `requestId`. Subsequent taps on the
+ * same card are ignored at the callback dispatcher (#1623, RFC §3.4).
+ */
+export interface ConfigApprovalResolvedEvent {
+  type: "config_approval_resolved";
+  /** Echoes the requestId from the originating request_config_approval. */
+  requestId: string;
+  verdict: "approve" | "deny" | "timeout";
+  /** Diagnostic detail when present (currently unused; reserved). */
+  reason?: string;
+}
+
 export type GatewayToClient =
   | InboundMessage
   | PermissionEvent
   | StatusEvent
   | ToolCallResult
   | ScheduleRestartResult
-  | DriveApprovalPostedEvent;
+  | DriveApprovalPostedEvent
+  | ConfigApprovalResolvedEvent;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -278,6 +297,55 @@ export interface RequestDriveApprovalMessage {
   ttlMs?: number;
 }
 
+/**
+ * hostd config-edit approval — sent by hostd to the caller agent's
+ * gateway to render an approval card with the full unified diff in
+ * the operator's primary chat. The gateway:
+ *
+ *   1. Posts a Telegram card with [✅ Approve] [🚫 Deny] buttons
+ *      using callback_data `cfg:<requestId>:approve` / `:deny`.
+ *   2. Tracks the pending request in-memory (no SQLite).
+ *   3. On button tap (or 10-minute timeout) sends a single
+ *      `config_approval_resolved` event back over the same
+ *      connection.
+ *   4. After hostd reports the apply outcome via
+ *      `request_config_finalize`, edits the card body to the final
+ *      state ("✅ applied" / "⚠️ reconcile failed; rolled back" /
+ *      "🚫 denied" / "⏱ expired").
+ *
+ * Trust model: same as request_drive_approval — the gateway socket
+ * lives inside the agent container, only that-UID processes can
+ * connect. hostd reaches it via the per-agent state-dir bind mount
+ * (`<state-dir>/gateway.sock`).
+ */
+export interface RequestConfigApprovalMessage {
+  type: "request_config_approval";
+  /** Hostd-generated stable id (8-hex). Echoed in resolved/finalize. */
+  requestId: string;
+  /** Name of the admin agent that called config_propose_edit. */
+  agentName: string;
+  /** Operator-visible justification (≤500 chars). */
+  reason: string;
+  /** Full unified diff to render in a code block on the card. */
+  unifiedDiff: string;
+  /** Card timeout in milliseconds (gateway-enforced). */
+  timeoutMs: number;
+}
+
+/**
+ * Sent by hostd after the apply attempt completes (success OR
+ * rollback) so the gateway can edit the approval card body to a
+ * terminal state. Idempotent: if the card was already edited (e.g.
+ * by the timeout path), the second edit is a best-effort no-op.
+ */
+export interface RequestConfigFinalizeMessage {
+  type: "request_config_finalize";
+  requestId: string;
+  outcome: "applied" | "reconcile_failed_rolled_back";
+  /** Optional short diagnostic appended to the card body. */
+  detail?: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -289,4 +357,6 @@ export type ClientToGateway =
   | PtyPartialForward
   | UpdatePlaceholderMessage
   | InjectInboundMessage
-  | RequestDriveApprovalMessage;
+  | RequestDriveApprovalMessage
+  | RequestConfigApprovalMessage
+  | RequestConfigFinalizeMessage;

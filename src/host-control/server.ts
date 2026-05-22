@@ -33,9 +33,10 @@ import {
   writeFileSync,
   renameSync,
   mkdirSync,
+  unlinkSync,
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import {
   decodeRequest,
   encodeResponse,
@@ -52,6 +53,7 @@ import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
 import { validateConfigEdit } from "./config-edit-validator.js";
+import type { ApprovalGateway } from "./approval-gateway.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
 export interface ServerConfig {
@@ -126,6 +128,14 @@ export interface ServerOptions {
    * touching real fleet config.
    */
   configPath?: string;
+  /** RFC §3.3 / #1623 — operator-approval surface; unset → `E_NO_APPROVAL_GATEWAY`. */
+  approvalGateway?: ApprovalGateway;
+  /** Test seam: override the random hex id generator. */
+  generateApprovalId?: () => string;
+  /** Test seam: override the `switchroom apply` subprocess invocation. */
+  runReconcile?: (args: {
+    requestId: string;
+  }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
 }
 
 /**
@@ -259,6 +269,23 @@ export function readCachedInstallType(bindRoot: string): {
     // detected value without caching. Best-effort by contract.
   }
   return payload;
+}
+
+/** RFC §3.3 — operator approval card lifespan. */
+const CONFIG_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** 8-hex random id for an in-flight config_propose_edit approval. */
+function defaultApprovalId(): string {
+  return randomBytes(4).toString("hex");
+}
+
+/** Best-effort tmp-file cleanup — swallowed errors. */
+function unlinkSyncBestEffort(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    /* noop */
+  }
 }
 
 const STATUS_RETENTION_MS = 10 * 60 * 1000; // 10 min
@@ -602,7 +629,7 @@ export class HostdServer {
         // not-implemented marker. PR 1b adds validation; PR 1c adds
         // the approval card + apply path.
         case "config_propose_edit":
-          resp = this.handleConfigProposeEdit(req, started);
+          resp = await this.handleConfigProposeEdit(req, caller, started);
           break;
       }
     } catch (err) {
@@ -1173,24 +1200,21 @@ export class HostdServer {
    * makes NO model call.
    */
   /**
-   * `config_propose_edit` — PR 1a stub.
+   * `config_propose_edit` — full apply path (#1623 / RFC §3.3-3.4).
    *
-   * The full RFC (`docs/rfcs/admin-agent-config-edit.md`) sequences
-   * three PRs: 1a wires schema + dispatcher (this method), 1b adds
-   * the validation pipeline (§3.2), 1c adds the approval card + apply
-   * path (§3.3, §3.4). Until 1c lands the verb has no live effect on
-   * disk — it surfaces a flag-aware error so admin agents can
-   * discover the feature and operators can opt in incrementally.
-   *
-   * Error-code convention (`CONFIG_PROPOSE_EDIT_ERROR_CODES` in
-   * protocol.ts): the audit row and the `resp.error` string both
-   * carry the code so MCP callers and the audit reader can branch on
-   * it without parsing free text. Format: `<CODE>: <human message>`.
+   * Deliberately OUT of scope per operator decision (single-operator
+   * single-host posture, see PR description): rate limiter,
+   * crash-recovery journal, Prometheus metrics, TOCTOU re-validation,
+   * literal `flock` on the config file (the in-process mutex is
+   * sufficient — hostd is the only writer), attachment fallback for
+   * very large diffs, 5s safety-delay button swap, privilege-
+   * escalation detection.
    */
-  private handleConfigProposeEdit(
+  private async handleConfigProposeEdit(
     req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
     started: number,
-  ): HostdResponse {
+  ): Promise<HostdResponse> {
     const enabled = this.opts.config.hostd?.config_edit_enabled === true;
     if (!enabled) {
       return errorResponse(
@@ -1201,10 +1225,6 @@ export class HostdServer {
         Date.now() - started,
       );
     }
-    // PR 1b — run the validation pipeline (RFC §4). On any rejection
-    // we surface the stage-specific error code; on success we still
-    // return a sentinel (E_NOT_IMPLEMENTED_APPLY_PATH) because the
-    // approval card + flock + atomic-write path lands in PR 1c.
     const configPath =
       this.opts.configPath ?? req.args.target_path;
     const verdict = validateConfigEdit({
@@ -1219,12 +1239,144 @@ export class HostdServer {
         Date.now() - started,
       );
     }
-    return errorResponse(
-      req.request_id,
-      "E_NOT_IMPLEMENTED_APPLY_PATH: validation passed (apply path " +
-        "not yet implemented — pending PR 1c)",
-      Date.now() - started,
-    );
+    // ── Approval card ───────────────────────────────────────────────
+    if (!this.opts.approvalGateway) {
+      return errorResponse(
+        req.request_id,
+        "E_NO_APPROVAL_GATEWAY: validation passed but hostd was " +
+          "started without an approval-gateway wiring; the operator " +
+          "build is missing the telegram-plugin link",
+        Date.now() - started,
+      );
+    }
+    const callerName = caller.kind === "agent" ? caller.name : "operator";
+    const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
+    const approval = await this.opts.approvalGateway.requestApproval({
+      requestId: approvalId,
+      agentName: callerName,
+      reason: req.args.reason,
+      unifiedDiff: req.args.unified_diff,
+      timeoutMs: CONFIG_APPROVAL_TIMEOUT_MS,
+    });
+    if (approval.verdict === "deny") {
+      return errorResponse(
+        req.request_id,
+        `E_DENIED: operator denied config_propose_edit (approval_id=${approvalId})`,
+        Date.now() - started,
+      );
+    }
+    if (approval.verdict === "timeout") {
+      return errorResponse(
+        req.request_id,
+        `E_APPROVAL_TIMEOUT: operator approval card expired without a tap (approval_id=${approvalId})`,
+        Date.now() - started,
+      );
+    }
+    // ── Apply path (mutex-serialized) ───────────────────────────────
+    // Serialize concurrent config-edit applies through a single
+    // in-process promise chain. Hostd is the only writer of
+    // switchroom.yaml; no cross-process flock is needed.
+    const release = await this.acquireConfigApplyLock();
+    try {
+      // Snapshot the live config so we can rollback if reconcile
+      // fails. Read synchronously — the lock is held, no one else
+      // is touching the file.
+      let snapshot: string;
+      try {
+        snapshot = readFileSync(configPath, "utf-8");
+      } catch (err) {
+        await approval.finalize({
+          outcome: "reconcile_failed_rolled_back",
+          detail: `pre-write snapshot read failed: ${(err as Error).message}`,
+        });
+        return errorResponse(
+          req.request_id,
+          `E_RECONCILE_FAILED_ROLLED_BACK: snapshot read failed: ${(err as Error).message}`,
+          Date.now() - started,
+        );
+      }
+      const postApply = verdict.postApplyContent;
+      // Atomic write: `<path>.tmp` → rename.
+      const tmp = configPath + ".tmp";
+      try {
+        writeFileSync(tmp, postApply);
+        renameSync(tmp, configPath);
+      } catch (err) {
+        // Pre-write or rename failed — try to clean up tmp; live
+        // file is untouched so no rollback needed.
+        unlinkSyncBestEffort(tmp);
+        await approval.finalize({
+          outcome: "reconcile_failed_rolled_back",
+          detail: `atomic write failed: ${(err as Error).message}`,
+        });
+        return errorResponse(
+          req.request_id,
+          `E_RECONCILE_FAILED_ROLLED_BACK: write failed: ${(err as Error).message}`,
+          Date.now() - started,
+        );
+      }
+      // Reconcile.
+      const runner =
+        this.opts.runReconcile ??
+        (async () => this.runSwitchroom(["apply"]));
+      const recRes = await runner({ requestId: approvalId });
+      if (recRes.exit_code === 0) {
+        await approval.finalize({ outcome: "applied" });
+        return {
+          v: 1,
+          request_id: req.request_id,
+          result: "completed",
+          exit_code: 0,
+          duration_ms: Date.now() - started,
+          stdout_tail: tail(recRes.stdout),
+          stderr_tail: tail(recRes.stderr),
+        };
+      }
+      // ── Reconcile failed → rollback to snapshot, re-run reconcile.
+      let rollbackDetail = "";
+      try {
+        writeFileSync(tmp, snapshot);
+        renameSync(tmp, configPath);
+      } catch (err) {
+        rollbackDetail = `snapshot restore failed: ${(err as Error).message}`;
+        await approval.finalize({
+          outcome: "reconcile_failed_rolled_back",
+          detail: rollbackDetail,
+        });
+        return errorResponse(
+          req.request_id,
+          `E_RECONCILE_FAILED_ROLLED_BACK: ${rollbackDetail}`,
+          Date.now() - started,
+        );
+      }
+      const recRes2 = await runner({ requestId: approvalId });
+      const recoveryNote =
+        recRes2.exit_code === 0
+          ? "rolled back successfully"
+          : `rolled back but recovery reconcile also failed (exit ${recRes2.exit_code})`;
+      await approval.finalize({
+        outcome: "reconcile_failed_rolled_back",
+        detail: recoveryNote,
+      });
+      return errorResponse(
+        req.request_id,
+        `E_RECONCILE_FAILED_ROLLED_BACK: reconcile exit ${recRes.exit_code}; ${recoveryNote}`,
+        Date.now() - started,
+      );
+    } finally {
+      release();
+    }
+  }
+
+  /** Serializes concurrent config_propose_edit apply phases. */
+  private configApplyLock: Promise<void> = Promise.resolve();
+  private async acquireConfigApplyLock(): Promise<() => void> {
+    let release!: () => void;
+    const next = new Promise<void>((r) => { release = r; });
+    const prior = this.configApplyLock;
+    this.configApplyLock = prior.then(() => next);
+    await prior;
+    return release;
   }
 
   private async handleAgentSmoke(

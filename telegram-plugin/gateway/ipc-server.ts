@@ -8,6 +8,8 @@ import type {
   PermissionRequestForward,
   PtyPartialForward,
   RegisterMessage,
+  RequestConfigApprovalMessage,
+  RequestConfigFinalizeMessage,
   RequestDriveApprovalMessage,
   ScheduleRestartMessage,
   SessionEventForward,
@@ -52,6 +54,26 @@ export interface IpcServerOptions {
   onRequestDriveApproval?: (
     client: IpcClient,
     msg: RequestDriveApprovalMessage,
+  ) => Promise<void>;
+  /**
+   * #1623 — hostd-initiated config-edit approval card. Handler posts
+   * a Telegram card with [✅ Approve] [🚫 Deny] buttons, tracks the
+   * pending request in-memory, and sends `config_approval_resolved`
+   * back over the same connection when the operator taps or the
+   * timeout fires. Optional: gateways without the hostd integration
+   * configured ignore these messages.
+   */
+  onRequestConfigApproval?: (
+    client: IpcClient,
+    msg: RequestConfigApprovalMessage,
+  ) => Promise<void>;
+  /**
+   * #1623 — hostd-initiated terminal card edit after apply completed
+   * (success OR rolled-back). Best-effort; no reply expected.
+   */
+  onRequestConfigFinalize?: (
+    client: IpcClient,
+    msg: RequestConfigFinalizeMessage,
   ) => Promise<void>;
   log?: (msg: string) => void;
   /**
@@ -205,6 +227,35 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof inb.meta === "object"
         && inb.meta !== null;
     }
+    case "request_config_approval": {
+      // #1623 — hostd-initiated config-edit approval card. Wire shape
+      // only; the handler module validates the diff content.
+      if (typeof m.requestId !== "string"
+        || (m.requestId as string).length === 0
+        || (m.requestId as string).length > 64) return false;
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.reason !== "string"
+        || (m.reason as string).length === 0
+        || (m.reason as string).length > 500) return false;
+      if (typeof m.unifiedDiff !== "string"
+        || (m.unifiedDiff as string).length === 0) return false;
+      if (typeof m.timeoutMs !== "number"
+        || !Number.isFinite(m.timeoutMs)
+        || (m.timeoutMs as number) <= 0) return false;
+      return true;
+    }
+    case "request_config_finalize": {
+      if (typeof m.requestId !== "string"
+        || (m.requestId as string).length === 0
+        || (m.requestId as string).length > 64) return false;
+      if (m.outcome !== "applied"
+        && m.outcome !== "reconcile_failed_rolled_back") return false;
+      if (m.detail !== undefined
+        && (typeof m.detail !== "string"
+          || (m.detail as string).length > 500)) return false;
+      return true;
+    }
     case "request_drive_approval": {
       // RFC E §4.2 Cut 2. Validate the wire-shaped fields the
       // gateway will route on; the inner `preview` is treated as
@@ -241,6 +292,8 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onPtyPartial,
     onInjectInbound,
     onRequestDriveApproval,
+    onRequestConfigApproval,
+    onRequestConfigFinalize,
     log = () => {},
     heartbeatTimeoutMs = 30_000,
   } = options;
@@ -382,6 +435,54 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
             /* best effort */
           }
         }
+        break;
+      case "request_config_approval":
+        if (onRequestConfigApproval) {
+          onRequestConfigApproval(
+            client,
+            msg as RequestConfigApprovalMessage,
+          ).catch((err) => {
+            log(
+              `request_config_approval handler threw (client=${client.id}): ${(err as Error).message}`,
+            );
+            try {
+              client.send({
+                type: "config_approval_resolved",
+                requestId: (msg as RequestConfigApprovalMessage).requestId,
+                verdict: "deny",
+                reason: `gateway handler error: ${(err as Error).message}`,
+              });
+            } catch {
+              /* best effort */
+            }
+          });
+        } else {
+          // Fail closed — hostd treats this as deny so the apply path
+          // never runs without an operator-attested approval card.
+          try {
+            client.send({
+              type: "config_approval_resolved",
+              requestId: (msg as RequestConfigApprovalMessage).requestId,
+              verdict: "deny",
+              reason: "gateway not configured for config-edit approval",
+            });
+          } catch {
+            /* best effort */
+          }
+        }
+        break;
+      case "request_config_finalize":
+        if (onRequestConfigFinalize) {
+          onRequestConfigFinalize(
+            client,
+            msg as RequestConfigFinalizeMessage,
+          ).catch((err) => {
+            log(
+              `request_config_finalize handler threw (client=${client.id}): ${(err as Error).message}`,
+            );
+          });
+        }
+        // No reply expected.
         break;
       case "update_placeholder":
         // Legacy recall.py IPC — placeholder UX was removed in #553 PR 5.

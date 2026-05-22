@@ -21,9 +21,12 @@
  */
 
 import { homedir } from "node:os";
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { loadConfig } from "../config/loader.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
+import { SocketApprovalGateway } from "./approval-gateway.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -48,6 +51,22 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // #1623 — wire the SocketApprovalGateway so config_propose_edit can
+  // round-trip an operator approval card through the caller agent's
+  // gateway IPC socket. Socket location mirrors
+  // `src/agents/lifecycle.ts:gracefulRestartAgent` —
+  // `<agentsDir>/<agentName>/telegram/gateway.sock`.
+  const agentsDir =
+    process.env.SWITCHROOM_AGENTS_DIR ??
+    join(homedir(), ".switchroom", "agents");
+  const approvalGateway = new SocketApprovalGateway({
+    resolveGatewaySocket: (agentName) => {
+      const sock = resolve(agentsDir, agentName, "telegram", "gateway.sock");
+      return existsSync(sock) ? sock : null;
+    },
+    log: (m) => process.stderr.write(`hostd: approval-gateway — ${m}\n`),
+  });
+
   const server = new HostdServer({
     homeDir: homedir(),
     agentUids,
@@ -55,7 +74,17 @@ async function main(): Promise<void> {
       agents: Object.fromEntries(
         Object.entries(config.agents).map(([n, a]) => [n, { admin: a.admin === true }]),
       ),
+      ...(config.hostd
+        ? {
+            hostd: {
+              ...(config.hostd.config_edit_enabled !== undefined
+                ? { config_edit_enabled: config.hostd.config_edit_enabled }
+                : {}),
+            },
+          }
+        : {}),
     },
+    approvalGateway,
   });
   await server.start();
 

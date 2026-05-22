@@ -53,7 +53,13 @@ import {
 } from "yaml";
 import { SwitchroomConfigSchema } from "../config/schema.js";
 
-export type ValidationOk = { ok: true };
+/**
+ * Successful validation. `postApplyContent` carries the post-patch
+ * file bytes so the caller (#1623 apply path) can write them directly
+ * without re-applying the diff — the validator already paid the cost
+ * of running `git apply` against the live file.
+ */
+export type ValidationOk = { ok: true; postApplyContent: string };
 export type ValidationFailure = {
   ok: false;
   code:
@@ -454,5 +460,5 @@ export function validateConfigEdit(
   }
   const leakErr = secretLeakGuard(beforeData, parsedAfter.data);
   if (leakErr) return leakErr;
-  return { ok: true };
+  return { ok: true, postApplyContent: applied.after };
 }
