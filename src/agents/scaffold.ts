@@ -3696,8 +3696,9 @@ export function reconcileAgent(
       model: agentConfig.model,
       // Keep in lockstep with buildScaffoldContext's systemPromptAppendShellQuoted:
       // when the agent uses the switchroom telegram plugin, append the
-      // human-voice progress_update guidance block so agents know to send
-      // natural-language check-ins alongside the emoji reaction ladder.
+      // five-beat "talking to a human on Telegram" pacing block so agents
+      // communicate like a person — ack first, narrate meaningful progress,
+      // hand back delegations with synthesis, deliver.
       systemPromptAppendShellQuoted: (() => {
         const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(agentConfig);
         const baseAppend = agentConfig.system_prompt_append ?? '';
