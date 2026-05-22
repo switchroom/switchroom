@@ -281,7 +281,7 @@ import {
   buildVaultSaveFailedInbound,
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
-import { buildSubagentHandbackInbound } from './subagent-handback-inbound-builder.js'
+import { decideSubagentHandback } from './subagent-handback-inbound-builder.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
   ToolCallMessage,
@@ -15063,22 +15063,24 @@ void (async () => {
               // need nothing here, and 'orphan' is a stale historical-at-
               // boot row, not a fresh completion the user is waiting on.
               onFinish: ({ agentId, outcome, description, resultText }) => {
-                if (process.env.SWITCHROOM_SUBAGENT_HANDBACK === '0') return
-                if (outcome !== 'completed' && outcome !== 'failed') return
-
-                let chatId = ''
+                // IO: resolve the fleet chat id and the background flag.
+                // The DECISION (gating + inbound build) is delegated to
+                // the pure `decideSubagentHandback` so it is unit-tested
+                // independent of the gateway — see
+                // `subagent-handback-decision.test.ts`.
+                let fleetChatId = ''
                 let isBackground = false
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
                     if (f.fleet.has(agentId)) {
-                      chatId = f.chatId ?? ''
+                      fleetChatId = f.chatId ?? ''
                       break
                     }
                   }
                 } catch {
                   // peek failures are non-fatal — fall through to the
-                  // owner-chat fallback below.
+                  // owner-chat fallback inside decideSubagentHandback.
                 }
                 if (turnsDb != null) {
                   try {
@@ -15088,36 +15090,36 @@ void (async () => {
                     if (row != null) isBackground = row.background === 1
                   } catch { /* best-effort */ }
                 }
-                if (!isBackground) return
 
-                // chatId fallback: if the progress-driver fleet entry was
-                // already cleaned up by the time onFinish fires, route to
-                // the owner chat. Every switchroom fleet agent is
-                // DM-shaped, so allowFrom[0] is the conversation that
-                // dispatched the work.
-                const handbackChatId = chatId || (loadAccess().allowFrom[0] ?? '')
-                if (!handbackChatId) {
-                  process.stderr.write(
-                    `telegram gateway: subagent-handback ${agentId} — no chat to deliver to; skipped\n`,
-                  )
+                const decision = decideSubagentHandback({
+                  handbackEnvValue: process.env.SWITCHROOM_SUBAGENT_HANDBACK,
+                  outcome,
+                  isBackground,
+                  fleetChatId,
+                  // Owner-chat fallback: if the progress-driver fleet
+                  // entry was already cleaned up, route to the owner
+                  // chat. Every switchroom fleet agent is DM-shaped, so
+                  // allowFrom[0] is the conversation that dispatched.
+                  ownerChatId: loadAccess().allowFrom[0] ?? '',
+                  taskDescription: description,
+                  resultText,
+                })
+                if (!decision.deliver) {
+                  if (decision.reason === 'no-chat') {
+                    process.stderr.write(
+                      `telegram gateway: subagent-handback ${agentId} — no chat to deliver to; skipped\n`,
+                    )
+                  }
                   return
                 }
 
-                const inbound = buildSubagentHandbackInbound({
-                  ctx: {
-                    chatId: String(handbackChatId),
-                    taskDescription: description,
-                    resultText,
-                    outcome,
-                  },
-                })
                 // Deliver via pendingInboundBuffer + the idle-drain tick.
                 // The drain only releases at an idle prompt (no active
                 // turn), so the handback always lands as a clean fresh
                 // turn and never races a turn-in-flight composer (#1556).
-                pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound)
+                pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
                 process.stderr.write(
-                  `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${handbackChatId} resultChars=${resultText.length}\n`,
+                  `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${decision.chatId} resultChars=${resultText.length}\n`,
                 )
               },
             })
