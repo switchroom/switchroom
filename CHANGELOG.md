@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.13.8 — conversational pacing v2: the five-beat human-feel model
+
+### feat(pacing) — re-found conversational pacing (#1645, #1646)
+
+Messaging a switchroom agent now follows five beats — **acknowledge
+first**, then go quiet and work, **surface meaningful progress** in
+human prose, **hand back delegations with synthesis**, deliver.
+
+The verbal acknowledgement failed across v0.13.5–v0.13.7. A broad
+pipeline trace found it was never the wording: the ack instruction was
+buried in a 32KB prompt **and actively contradicted** by card-era
+guidance — *"don't fill silence", "the reaction signals alive",
+"silence is valid", "don't narrate, the card shows it"* — left over
+from the pinned progress card retired in #1122. With no card, that
+guidance is just a black box, and it out-voted the lone ack bullet.
+
+v2 fixes both halves:
+- **#1645** re-founds the contract (`conversational-pacing.md`), the
+  prompt (`telegram-style.md.hbs`), and the high-salience append-prompt
+  (`scaffold.ts`) on the five beats, and removes every card-era
+  contradiction. The guardrail flips from pro-silence to anti-spam.
+- **#1646** injects the pacing directive **per-turn** via a
+  UserPromptSubmit hook, so "acknowledge first" is salient adjacent to
+  the user's message — not a buried sub-bullet the model must recall.
+
+### docker — agent /tmp tmpfs raised 256MB → 1GB, noexec kept (#1644)
+
 ## v0.13.7 — auto-failover detects the new Claude usage-limit shape
 
 ### fix(auth) — quota-exhaustion detection for Claude v2.1.x (#1642)
