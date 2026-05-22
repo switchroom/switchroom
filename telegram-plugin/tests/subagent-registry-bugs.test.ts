@@ -148,7 +148,6 @@ function makeHarnessWithDb(opts: {
   } = opts
 
   let currentTime = 10_000
-  const notifications: string[] = []
   const logs: string[] = []
 
   const fileContents: Map<string, Buffer> = new Map()
@@ -217,7 +216,6 @@ function makeHarnessWithDb(opts: {
 
   const watcher = startSubagentWatcher({
     agentDir,
-    sendNotification: (text) => notifications.push(text),
     stallThresholdMs,
     // Mirror the active-loop threshold for fixtures with toolCount=0;
     // tests that need the silent-synthesis vs active-loop distinction
@@ -257,7 +255,7 @@ function makeHarnessWithDb(opts: {
     if (pollInterval) pollInterval.fn()
   }
 
-  return { notifications, logs, advance, poll, watcher, now: () => currentTime, mockFs, fileContents }
+  return { logs, advance, poll, watcher, now: () => currentTime, mockFs, fileContents }
 }
 
 // ─── Bug 1 — ID mismatch: watcher never bumps last_activity_at ───────────────

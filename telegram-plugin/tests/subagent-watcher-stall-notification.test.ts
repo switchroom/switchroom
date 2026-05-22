@@ -26,7 +26,6 @@ function subAgentUserMsg(promptText: string) {
 // ─── Harness (mirrors subagent-watcher.test.ts pattern) ──────────────────────
 
 interface StallHarness {
-  notifications: string[]
   stallCalls: Array<{ agentId: string; idleMs: number; description: string }>
   unstallCalls: Array<{ agentId: string; description: string }>
   logs: string[]
@@ -55,7 +54,6 @@ function makeStallHarness(opts: {
   } = opts
 
   let currentTime = 1000
-  const notifications: string[] = []
   const stallCalls: Array<{ agentId: string; idleMs: number; description: string }> = []
   const unstallCalls: Array<{ agentId: string; description: string }> = []
   const logs: string[] = []
@@ -139,7 +137,6 @@ function makeStallHarness(opts: {
     // silent-synthesis vs active-loop split.
     silentSynthesisStallThresholdMs: silentSynthesisStallThresholdMs ?? stallThresholdMs,
     rescanMs,
-    sendNotification: (text) => notifications.push(text),
     onStall: (id, idle, desc) => stallCalls.push({ agentId: id, idleMs: idle, description: desc }),
     onUnstall: (id, desc) => unstallCalls.push({ agentId: id, description: desc }),
     now: () => currentTime,
@@ -168,7 +165,7 @@ function makeStallHarness(opts: {
     }
   }
 
-  return { notifications, stallCalls, unstallCalls, logs, advance, watcher, now: () => currentTime, fileContents, jsonlPath }
+  return { stallCalls, unstallCalls, logs, advance, watcher, now: () => currentTime, fileContents, jsonlPath }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

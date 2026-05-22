@@ -147,11 +147,6 @@ export interface SubagentWatcherConfig {
    */
   agentCwd?: string
   /**
-   * Send a fresh (non-edit) Telegram message. For stall / completion
-   * state-transition notifications.
-   */
-  sendNotification: (text: string) => void
-  /**
    * How often to re-scan for new subagent dirs (ms). Default 1000.
    */
   rescanMs?: number
@@ -862,21 +857,19 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
     if (entry.state === 'done' && !entry.completionNotified) {
       entry.completionNotified = true
-      const desc = escapeHtml(truncate(entry.description, 80))
-      const summary = entry.lastSummaryLine
-        ? ` — ${escapeHtml(truncate(entry.lastSummaryLine, 120))}`
-        : ''
-      const tools = entry.toolCount > 0 ? ` (${entry.toolCount} tools)` : ''
-      try {
-        config.sendNotification(`✓ Worker done: ${desc}${tools}${summary}`)
-      } catch (err) {
-        log?.(`subagent-watcher: completion notification error: ${(err as Error).message}`)
-      }
-      // Symmetric `sub_agent_finished` surface (#card-audit-log). Emit
-      // before the deferred cleanup runs so the callback always sees a
-      // live registry entry. Historical entries that already-completed at
-      // boot get their `completionNotified=true` shortcut in registerAgent
-      // and skip this path entirely — only post-boot transitions fire.
+      // Card retired (#1122): the watcher no longer sends a user-facing
+      // "✓ Worker done" message. A framework-authored status line is a
+      // conversational-pacing anti-pattern, and the heuristic that drove
+      // it (silent-stall synthesis) fired on a worker mid-`Bash` as
+      // readily as on a finished one. The user-facing handback is the
+      // model's own beat-4 reply, woken by Claude Code's native
+      // background-task notification. Completion is surfaced here only
+      // via the structured `onFinish` callback — emitted before the
+      // deferred cleanup runs so the callback always sees a live
+      // registry entry. Historical entries that already-completed at
+      // boot get their `completionNotified=true` shortcut in
+      // registerAgent and skip this path — only post-boot transitions
+      // fire.
       if (config.onFinish) {
         try {
           config.onFinish({

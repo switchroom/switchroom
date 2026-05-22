@@ -86,7 +86,6 @@ describe('subagent-watcher: parent turn-active marker refresh (#501)', () => {
     let nextRef = 1
     const watcher = startSubagentWatcher({
       agentDir: opts.agentDir,
-      sendNotification: () => { /* noop */ },
       stallThresholdMs: 60_000,
       rescanMs: 500,
       now: () => Date.now(),

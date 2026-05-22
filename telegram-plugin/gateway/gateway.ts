@@ -14956,26 +14956,11 @@ void (async () => {
               // inside the sub-agent. Belt-and-braces with PR #557's
               // multi-signal progress gate.
               parentStateDir: STATE_DIR,
-              sendNotification: (text: string) => {
-                const ownerChatId = loadAccess().allowFrom[0]
-                if (!ownerChatId) return
-                // #1075: thread-id-bearing — route through swallowingApiCall
-                // so a deleted TOPIC_ID forum thread doesn't crash the
-                // gateway. Notifications are best-effort.
-                void swallowingApiCall(
-                  () =>
-                    lockedBot.api.sendMessage(ownerChatId, text, {
-                      parse_mode: 'HTML',
-                      link_preview_options: { is_disabled: true },
-                      ...(TOPIC_ID != null ? { message_thread_id: TOPIC_ID } : {}),
-                    }),
-                  {
-                    chat_id: ownerChatId,
-                    verb: 'subagent-watcher-notification',
-                    ...(TOPIC_ID != null ? { threadId: TOPIC_ID } : {}),
-                  },
-                )
-              },
+              // No user-facing notification callback: the card-era
+              // "✓ Worker done" message was retired with the progress
+              // card (#1122). Sub-agent completion reaches the user as
+              // the model's own beat-4 handback reply; the watcher's
+              // role here is registry liveness + the `onFinish` cue.
               log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
               // Option C (#393): route stall detections into the progress-card
               // driver so the pinned card re-renders with a ⚠️ indicator even

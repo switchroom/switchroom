@@ -198,7 +198,10 @@ function makeHarness(opts: {
 
   const watcher = startSubagentWatcher({
     agentDir,
-    sendNotification: (text) => notifications.push(text),
+    // Card retired (#1122): completion surfaces via onFinish, not a
+    // user-facing message. Capture it so the completion assertions still
+    // verify the terminal-transition + de-dup behaviour.
+    onFinish: (info) => notifications.push(`✓ Worker done: ${info.description}`),
     stallThresholdMs,
     // Mirror the active-loop threshold so existing fixtures (which have
     // toolCount=0 and use the simple "advance past N" model) keep
@@ -382,8 +385,13 @@ describe('startSubagentWatcher', () => {
       let nextRef = 1
       const watcher = startSubagentWatcher({
         agentDir: opts.agentDir,
-        sendNotification: (text) => notifications.push(text),
-        ...(opts.onFinish ? { onFinish: opts.onFinish } : {}),
+        // Card retired (#1122): completion surfaces via onFinish. Capture
+        // it for the completion assertions and still delegate to any
+        // test-supplied onFinish.
+        onFinish: (info) => {
+          notifications.push(`✓ Worker done: ${info.description}`)
+          opts.onFinish?.(info)
+        },
         stallThresholdMs: 60_000,
         rescanMs: 500,
         now: () => Date.now(),
@@ -994,7 +1002,8 @@ describe('startSubagentWatcher', () => {
       const watcher = startSubagentWatcher({
         agentDir: opts.agentDir,
         ...(opts.agentCwd !== undefined ? { agentCwd: opts.agentCwd } : {}),
-        sendNotification: (text) => notifications.push(text),
+        // Card retired (#1122): completion surfaces via onFinish.
+        onFinish: (info) => notifications.push(`✓ Worker done: ${info.description}`),
         stallThresholdMs: 60_000,
         rescanMs: 500,
         now: () => Date.now(),
@@ -1133,7 +1142,8 @@ describe('startSubagentWatcher', () => {
       let nextRef = 1
       const watcher = startSubagentWatcher({
         agentDir,
-        sendNotification: (text) => notifications.push(text),
+        // Card retired (#1122): completion surfaces via onFinish.
+        onFinish: (info) => notifications.push(`✓ Worker done: ${info.description}`),
         stallThresholdMs: 60_000,
         rescanMs: 500,
         now: () => Date.now(),
