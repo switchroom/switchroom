@@ -3438,11 +3438,15 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onClientDisconnected(client: IpcClient) {
-    process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
-    // Phase 2b shadow: ONLY emit bridgeDown for the REAL bridge sidecar
-    // (matching the bridgeUp gate above). Anonymous IPC clients
-    // disconnect frequently — those are not bridge flaps.
+    // ONLY log "bridge disconnected" + emit bridgeDown for the REAL
+    // bridge sidecar (matching the bridgeUp gate above). Anonymous IPC
+    // clients — e.g. recall.py's one-shot legacy update_placeholder
+    // handshake — connect and disconnect constantly with agentName=null;
+    // logging those as "bridge disconnected — agent=null" reads as a
+    // bridge flap in the supervisor log when nothing flapped. The
+    // anonymous disconnect is still traced by disconnect-flush.ts.
     if (client.agentName != null) {
+      process.stderr.write(`telegram gateway: bridge disconnected — agent=${client.agentName}\n`)
       shadowEmit({ kind: 'bridgeDown', at: Date.now() })
     }
 
