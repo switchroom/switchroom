@@ -326,11 +326,15 @@ describe("findMissingWorkspaceScopes — scope↔tier preflight (#1663)", () => 
 });
 
 describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () => {
+  const DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
+  const PRESENTATIONS = "https://www.googleapis.com/auth/presentations";
+
   it("names the account, the tier, and the exact recovery command", () => {
     const msg = buildMissingScopeWarning(
-      ["https://www.googleapis.com/auth/presentations"],
+      [PRESENTATIONS],
       "extended",
       "you@example.com",
+      false,
     );
     expect(msg).toContain("you@example.com");
     expect(msg).toContain("extended");
@@ -340,13 +344,29 @@ describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () 
     );
   });
 
-  it("appends --write when drive.file is among the missing scopes", () => {
-    const msg = buildMissingScopeWarning(
-      ["https://www.googleapis.com/auth/drive.file"],
-      "core",
-      "a@b.com",
-    );
+  it("appends --write when the EXISTING token already carries drive.file", () => {
+    // findMissingWorkspaceScopes never returns drive.file — the --write
+    // suffix must be driven by the existing token's scopes, not by the
+    // missing set. A write-capable token's recovery command MUST keep
+    // --write or running it verbatim silently downgrades to read-only.
+    const missing = findMissingWorkspaceScopes(DRIVE_FILE, "core");
+    expect(missing).toEqual([
+      "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/spreadsheets",
+    ]);
+    expect(missing).not.toContain(DRIVE_FILE);
+    const msg = buildMissingScopeWarning(missing, "core", "a@b.com", true);
     expect(msg).toContain("--replace --write");
+  });
+
+  it("omits --write when the existing token has no drive.file scope", () => {
+    // A read-only token: the recovery command must NOT add --write, so
+    // the re-minted token stays read-only and capability isn't widened
+    // beyond what the operator originally consented to.
+    const missing = findMissingWorkspaceScopes("", "core");
+    const msg = buildMissingScopeWarning(missing, "core", "a@b.com", false);
+    expect(msg).toContain("--replace\n");
+    expect(msg).not.toContain("--write");
   });
 });
 

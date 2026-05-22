@@ -264,6 +264,9 @@ export function findMissingWorkspaceScopes(
   return requiredWorkspaceScopesForTier(tier).filter((s) => !have.has(s));
 }
 
+/** The Drive write scope minted by `auth google account add --write`. */
+const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+
 /**
  * Build the operator-facing warning shown when the seed token is
  * missing scopes the requested tier needs (issue #1663). The launcher
@@ -271,11 +274,21 @@ export function findMissingWorkspaceScopes(
  * keep working — but the warning makes the partial-capability state
  * loud and tells the operator exactly how to fix it, instead of the
  * silent doomed port-8000 fallback.
+ *
+ * `hasWriteScope` MUST reflect the EXISTING token's scopes (whether the
+ * current credential already carries `drive.file`), NOT the `missing`
+ * set. `missing` only ever holds Docs/Sheets/Slides scopes — never
+ * `drive.file` — so deriving the recovery command's `--write` suffix
+ * from `missing` would always drop it, and an operator with a
+ * write-capable token who runs the printed command verbatim would
+ * silently downgrade to a read-only token and lose Drive file creation
+ * that previously worked. Carry the existing write capability forward.
  */
 export function buildMissingScopeWarning(
   missing: string[],
   tier: string | undefined,
   accountEmail: string,
+  hasWriteScope: boolean,
 ): string {
   const short = missing
     .map((s) => s.replace(/^https:\/\/www\.googleapis\.com\/auth\//, ""))
@@ -288,9 +301,10 @@ export function buildMissingScopeWarning(
     `to authenticate. OAuth scopes are fixed at consent time — re-run on the ` +
     `host to re-mint the token with the correct scopes:\n` +
     `    switchroom auth google account add ${accountEmail} --replace` +
-    `${missing.includes("https://www.googleapis.com/auth/drive.file") ? " --write" : ""}\n` +
+    `${hasWriteScope ? " --write" : ""}\n` +
     `  (scopes are derived from \`google_workspace.tier\` — set the tier ` +
-    `before re-running). Drive read/file tools are unaffected.\n`
+    `before re-running${hasWriteScope ? "; --write preserves the existing " +
+    "Drive write capability" : ""}). Drive read/file tools are unaffected.\n`
   );
 }
 
@@ -810,8 +824,22 @@ export async function runDriveMcpLauncher(opts: {
   // than refusing to start.
   const missingScopes = findMissingWorkspaceScopes(brokerCreds.scope, tier);
   if (missingScopes.length > 0) {
+    // Decide the recovery command's --write suffix from the EXISTING
+    // token's scopes — NOT from `missingScopes` (which never contains
+    // drive.file). A token that already carries drive.file was minted
+    // write-capable; the printed `account add --replace` must keep
+    // --write or the operator silently downgrades to read-only.
+    const hasWriteScope = brokerCreds.scope
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .includes(DRIVE_FILE_SCOPE);
     process.stderr.write(
-      buildMissingScopeWarning(missingScopes, tier, brokerCreds.accountEmail),
+      buildMissingScopeWarning(
+        missingScopes,
+        tier,
+        brokerCreds.accountEmail,
+        hasWriteScope,
+      ),
     );
   }
 

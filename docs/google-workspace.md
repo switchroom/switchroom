@@ -256,6 +256,14 @@ cleanly instead of triggering the upstream MCP's own browser OAuth
 `switchroom auth google account list` shows each token's effective
 scopes.
 
+> **Port override.** That doomed upstream OAuth fallback binds a
+> callback server on a local port. The launcher moves it off the
+> upstream default (`8000`, commonly taken on a shared host) to
+> `8631`. If `8631` also collides, set `SWITCHROOM_GDRIVE_MCP_PORT`
+> in the agent's environment to a free port. This only affects the
+> never-meant-to-run fallback path — the seeded, browserless flow
+> doesn't bind a port at all.
+
 ### Removing an account
 
 ```bash
