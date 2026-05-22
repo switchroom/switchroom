@@ -247,9 +247,22 @@ describe('resolveModelUnavailableFromOperatorEvent — kind-driven mapping', () 
     expect(d?.kind).toBe('quota_exhausted')
   })
 
-  it('always treats kind=rate-limited as overload', () => {
+  it('treats a bare kind=rate-limited as NOT model-unavailable (transient → calm card)', () => {
+    // A transient overload / rate-limit is retryable — Claude Code
+    // retries it internally. resolveModelUnavailableFromOperatorEvent
+    // returns null so the gateway renders the calm `rate-limited` card,
+    // never the scary "⚠️ Model unavailable" one. Returning
+    // `{kind:'overload'}` here is what fired a false card on every 529.
     const d = resolveModelUnavailableFromOperatorEvent({ kind: 'rate-limited', detail: '' })
-    expect(d?.kind).toBe('overload')
+    expect(d).toBeNull()
+  })
+
+  it('escalates a kind=rate-limited that carries a genuine quota signal', () => {
+    const d = resolveModelUnavailableFromOperatorEvent({
+      kind: 'rate-limited',
+      detail: "You've hit your limit · resets 8:50am",
+    })
+    expect(d?.kind).toBe('quota_exhausted')
   })
 
   it('always treats kind=unknown-5xx as overload', () => {

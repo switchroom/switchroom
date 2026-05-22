@@ -57,13 +57,20 @@ describe('classifyClaudeError — credit-exhausted fixtures', () => {
   }
 })
 
-describe('classifyClaudeError — quota-exhausted fixtures', () => {
-  for (const fixture of fixtures['quota-exhausted']) {
-    it(`classifies: ${fixture._source}`, () => {
-      const input = '_value' in fixture ? fixture._value : fixture
-      expect(classifyClaudeError(input)).toBe('quota-exhausted')
-    })
-  }
+describe('classifyClaudeError — quota-exhausted', () => {
+  // classifyClaudeError is type/code/status-based and intentionally
+  // does NOT self-classify quota-exhausted: a genuine subscription
+  // usage-limit hit has no reliable Anthropic error TYPE — it is
+  // detected from the response TEXT. session-tail's `isApiErrorMessage`
+  // 429 branch + the `detectModelUnavailable` text path own quota
+  // detection. (`overloaded_error` used to be mapped here — wrongly;
+  // a 529 overload is transient server capacity, now `rate-limited`.)
+  it('no error TYPE maps to quota-exhausted (the text path owns it)', () => {
+    expect(fixtures['quota-exhausted']).toHaveLength(0)
+    expect(
+      classifyClaudeError({ type: 'overloaded_error', message: 'Overloaded' }),
+    ).not.toBe('quota-exhausted')
+  })
 })
 
 describe('classifyClaudeError — rate-limited fixtures', () => {

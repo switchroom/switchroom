@@ -409,9 +409,37 @@ export function projectSubagentLine(
  * Returns null when no actionable error is detected (routine lines).
  * Never throws — delegates to classifyClaudeError's own safety guarantee.
  */
+/**
+ * Extract Claude Code's retry-state annotations from a transcript line.
+ * Claude Code writes top-level `retryAttempt` / `maxRetries` on a
+ * retried API error (e.g. a 529 it is internally retrying). Used to
+ * tell an in-flight retry from an exhausted (terminal) one. Both
+ * optional — non-retried errors and older Claude Code versions omit
+ * them.
+ */
+function extractRetryState(obj: Record<string, unknown>): {
+  retryAttempt: number | null
+  maxRetries: number | null
+} {
+  return {
+    retryAttempt: typeof obj.retryAttempt === 'number' ? obj.retryAttempt : null,
+    maxRetries: typeof obj.maxRetries === 'number' ? obj.maxRetries : null,
+  }
+}
+
 export function detectErrorInTranscriptLine(
   line: string,
-): { kind: OperatorEventKind; raw: unknown; detail: string } | null {
+): {
+  kind: OperatorEventKind
+  raw: unknown
+  detail: string
+  /** True for the rate-limit / transient-overload family. */
+  transient: boolean
+  /** True when the error is final — NOT an in-flight retry. A transient
+   *  error mid-retry is `transient:true, terminal:false`; the caller
+   *  suppresses it (no operator card until the failure is terminal). */
+  terminal: boolean
+} | null {
   if (!line || line.length > 2 * 1024 * 1024) return null
   let obj: Record<string, unknown>
   try {
@@ -447,7 +475,16 @@ export function detectErrorInTranscriptLine(
       status === 429
         ? 'quota-exhausted'
         : classifyClaudeError({ type: errStr, status, message: text })
-    return { kind, raw: obj, detail: text || errStr || 'api error' }
+    // An `isApiErrorMessage` line is Claude surfacing the failure to the
+    // user — terminal by construction (Claude writes this shape only
+    // after its own internal retries are exhausted).
+    return {
+      kind,
+      raw: obj,
+      detail: text || errStr || 'api error',
+      transient: kind === 'rate-limited',
+      terminal: true,
+    }
   }
 
   // Explicit error line types from Claude Code JSONL
@@ -472,7 +509,23 @@ export function detectErrorInTranscriptLine(
     extractDetailMessage(obj) ??
     String(type ?? '')
 
-  return { kind, raw, detail }
+  // Transient = the rate-limit / overload family. For a transient,
+  // decide `terminal` from Claude Code's retry annotations: below the
+  // cap → still retrying (in-flight); at/above → exhausted. With no
+  // retry state, an explicit `type:"api_error"`/`"error"` LINE means
+  // Claude surfaced the failure (terminal); an embedded-error object
+  // with no retry state is ambiguous → treat as in-flight and suppress
+  // (the silence-poke covers a genuinely stuck turn; a false card is
+  // the bug we are fixing, a missed ambiguous card costs nothing).
+  const transient = kind === 'rate-limited'
+  const retry = extractRetryState(obj)
+  const terminal = !transient
+    ? true
+    : retry.retryAttempt != null && retry.maxRetries != null
+      ? retry.retryAttempt >= retry.maxRetries
+      : isErrorLine
+
+  return { kind, raw, detail, transient, terminal }
 }
 
 function extractDetailMessage(obj: Record<string, unknown> | null): string | null {
@@ -514,6 +567,10 @@ export interface TailOperatorEvent {
   kind: OperatorEventKind
   detail: string
   raw: unknown
+  /** True for the rate-limit / transient-overload family. */
+  transient: boolean
+  /** True when the failure is final, not an in-flight retry. */
+  terminal: boolean
 }
 
 export interface SessionTailConfig {
@@ -665,7 +722,17 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
           try {
             const errEvent = detectErrorInTranscriptLine(line)
             if (errEvent) {
-              onOperatorEvent(errEvent)
+              // Honest escalation: a transient overload Claude is still
+              // retrying (transient && !terminal) posts NO operator
+              // card — it almost always resolves on the next retry.
+              // Escalate only terminal failures + non-transient errors.
+              if (errEvent.terminal || !errEvent.transient) {
+                onOperatorEvent(errEvent)
+              } else {
+                log?.(
+                  `session-tail: transient overload suppressed (in-flight retry) kind=${errEvent.kind}`,
+                )
+              }
             }
           } catch (err) {
             log?.(`session-tail: onOperatorEvent threw: ${(err as Error).message}`)

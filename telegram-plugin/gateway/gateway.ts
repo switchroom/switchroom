@@ -2712,8 +2712,14 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // Card text branches on the AND. wouldFireFleetAutoFallback is a
     // pure read of the dedup state; calling fireFleetAutoFallback only
     // when both are true keeps the card honest.
-    const isAutoKind =
-      modelUnavailable.kind === 'quota_exhausted' || modelUnavailable.kind === 'overload'
+    // Only a genuine quota / usage-limit hit is addressable by fleet
+    // auto-fallback (swap to an account that still has runway). An
+    // `overload` is transient Anthropic SERVER-side capacity pressure —
+    // every account is equally affected, so failing over does nothing;
+    // it just produces a self-cancelling "probed healthy / Stale event?"
+    // loop on every 529. Overload is handled by Claude Code's own
+    // internal retry, not by switching accounts.
+    const isAutoKind = modelUnavailable.kind === 'quota_exhausted'
     const willActuallyFire = isAutoKind && wouldFireFleetAutoFallback()
     process.stderr.write(
       `telegram gateway: operator-event suppressing-raw-stderr-for-model-unavailable agent=${agent} kind=${kind} detected=${modelUnavailable.kind} autoKind=${isAutoKind} willFire=${willActuallyFire}\n`,

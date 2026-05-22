@@ -139,8 +139,17 @@ function classifyInner(raw: unknown): OperatorEventKind {
     message.toLowerCase().includes('overloaded_error') ||
     message.toLowerCase().includes('overloaded')
   ) {
-    // Anthropic overloaded = quota exhausted / service rate-limiting
-    return 'quota-exhausted'
+    // Anthropic "overloaded" (HTTP 529) is transient SERVER-side
+    // capacity pressure — orthogonal to account quota. It is retryable
+    // (`x-should-retry: true`) and Claude Code retries it internally.
+    // Classifying it `quota-exhausted` fired a false "Model
+    // unavailable — quota exhausted" card AND a self-cancelling fleet
+    // auto-fallback on every 529 (the active account always probes
+    // healthy — nothing is actually exhausted — so the fallback no-ops
+    // with "probed healthy / Stale event?"). It is a rate-limit-family
+    // transient; failing over to another account does nothing because
+    // every account is equally affected.
+    return 'rate-limited'
   }
 
   // Synthetic kinds (non-Anthropic — set by session-tail or IPC bridge)
