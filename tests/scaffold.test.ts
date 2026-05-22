@@ -2130,9 +2130,11 @@ describe("scaffoldAgent with global defaults cascade", () => {
     );
 
     // Native Claude Code nested shape. User's UserPromptSubmit hook +
-    // switchroom-owned workspace-dynamic and timezone hooks (always
-    // injected; the dynamic injects per-turn workspace files, the
-    // timezone hook emits a one-line local-time additionalContext).
+    // switchroom-owned workspace-dynamic, timezone, and turn-pacing
+    // hooks (always injected; the dynamic injects per-turn workspace
+    // files, the timezone hook emits a one-line local-time
+    // additionalContext, the turn-pacing hook emits the per-turn
+    // conversational-pacing directive).
     expect(settings.hooks.UserPromptSubmit).toEqual([
       {
         hooks: [
@@ -2153,6 +2155,15 @@ describe("scaffoldAgent with global defaults cascade", () => {
           {
             type: "command",
             command: expect.stringContaining("timezone-hook.sh"),
+            timeout: 3,
+          },
+        ],
+      },
+      {
+        hooks: [
+          {
+            type: "command",
+            command: expect.stringContaining("turn-pacing"),
             timeout: 3,
           },
         ],

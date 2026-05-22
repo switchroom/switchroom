@@ -3338,6 +3338,20 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   // --- Switchroom-owned UserPromptSubmit hooks ---
   const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
+  // Per-turn pacing directive (conversational-pacing v2). Injected
+  // adjacent to the user's message every turn so "acknowledge first"
+  // is salient AT TURN TIME — not one buried sub-bullet in a 32KB
+  // CLAUDE.md the model has to recall. This is the load-bearing fix:
+  // a UserPromptSubmit hook's stdout lands right next to the prompt.
+  const turnPacingDirective =
+    '<turn-pacing>You are messaging a human. First action this turn: if ' +
+    'answering needs any tool call (a file read, a search, a command), ' +
+    'send a SHORT acknowledgement via the reply tool with ' +
+    'disable_notification true BEFORE the first tool call. Then work; ' +
+    'surface meaningful progress in human prose at real milestones; hand ' +
+    'back any sub-agent findings in your own voice; deliver the answer. ' +
+    'Skip the opening ack only for a one-sentence answer you can give ' +
+    'immediately.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
@@ -3374,6 +3388,21 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           command: wrap(
             "hook:timezone",
             `bash "${join(DOCKER_BIN_PATH, "timezone-hook.sh")}"`,
+          ),
+          timeout: 3,
+        },
+      ],
+    },
+    {
+      hooks: [
+        {
+          type: "command",
+          // Emits the per-turn pacing directive (above) — its stdout is
+          // injected adjacent to the user's message. Static string; an
+          // inline `printf` avoids a baked-in hook script.
+          command: wrap(
+            "hook:turn-pacing",
+            `printf '%s\\n' ${shellSingleQuote(turnPacingDirective)}`,
           ),
           timeout: 3,
         },
