@@ -76,7 +76,8 @@ import {
 import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
-import { writeSilentEndState, clearSilentEndState, recordSilentTurnEnd } from '../silent-end.js'
+import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
+import { isFinalAnswerReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
@@ -1191,6 +1192,19 @@ type CurrentTurn = {
   startedAt: number
   gatewayReceiveAt: number
   replyCalled: boolean
+  // #1664 — whether the model has delivered its *final answer* this turn
+  // (as opposed to only an interim ack). `replyCalled` flips on the first
+  // reply / stream_reply tool_use and stays true for the rest of the turn,
+  // so it cannot tell "ack only" from "ack + real answer". This flag is the
+  // finer signal the silent-end re-prompt needs: it is set only when a reply
+  // actually lands AND `isFinalAnswerReply` (final-answer-detect.ts)
+  // classifies it as the final answer — notification-bearing, or long
+  // enough to be substantive, or a stream_reply done=true — OR when the
+  // turn-flush safety net legitimately emits the model's terminal text. A
+  // turn that ends with this still `false` triggers the silent-end re-prompt
+  // even though `replyCalled` is true — the #1664 case where the real answer
+  // ended up as plain transcript text rendered into an ephemeral draft.
+  finalAnswerDelivered: boolean
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
   registryKey: string | null
@@ -4066,6 +4080,13 @@ async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ 
 }
 
 async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  // #1664 — pin the turn this reply belongs to at entry. The
+  // finalAnswerDelivered write near the end of this function runs after
+  // several awaits; turn-pinning (the #1067 pattern used across the
+  // gateway) keeps the write attributed to THIS turn rather than reading
+  // module-scope currentTurn, which a future refactor could let roll over
+  // mid-call.
+  const turn = currentTurn
   const chat_id = args.chat_id as string
   if (!chat_id) throw new Error('reply: chat_id is required')
   const rawText = args.text as string | undefined
@@ -4488,6 +4509,19 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     } catch (err) {
       process.stderr.write(`telegram gateway: reply: endStatusReaction hook threw: ${err}\n`)
     }
+    // #1664 — mark the turn's final answer as delivered when this reply
+    // looks like the real answer rather than an interim ack. The
+    // classification (notification-bearing OR substantive length) lives
+    // in `isFinalAnswerReply`. Without this, a turn that ack'd then ended
+    // with the real answer as plain transcript text (#1664) would look
+    // "delivered" because replyCalled is true — and the silent-end
+    // re-prompt would never engage. `rawText` is the model's own answer
+    // text, measured before HTML conversion / Telegraph-link
+    // substitution. Writes `turn` (pinned at executeReply entry) so the
+    // flag always lands on the turn this reply belongs to.
+    if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification })) {
+      turn.finalAnswerDelivered = true
+    }
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
@@ -4501,6 +4535,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 }
 
 async function executeStreamReply(args: Record<string, unknown>): Promise<unknown> {
+  // #1664 — pin the turn at entry; see executeReply for the rationale.
+  const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
 
@@ -4679,6 +4715,23 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const sChatId = args.chat_id as string
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now())
+  }
+  // #1664 — mark the turn's final answer as delivered. For stream_reply a
+  // call with done=true IS the final answer by definition (the model
+  // explicitly closed the stream). A non-terminal stream_reply chunk also
+  // counts when it carries the final-answer signals — notification-bearing
+  // OR substantive length — via the same `isFinalAnswerReply` predicate
+  // executeReply uses. See the CurrentTurn.finalAnswerDelivered doc-comment
+  // for why replyCalled is not a sufficient signal here.
+  if (
+    turn != null &&
+    isFinalAnswerReply({
+      text: (args.text as string | undefined) ?? '',
+      disableNotification: args.disable_notification === true,
+      done: args.done === true,
+    })
+  ) {
+    turn.finalAnswerDelivered = true
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
@@ -5697,6 +5750,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           startedAt,
           gatewayReceiveAt: startedAt,
           replyCalled: false,
+          finalAnswerDelivered: false,
           capturedText: [],
           orphanedReplyTimeoutId: null,
           registryKey: null,
@@ -5815,6 +5869,22 @@ function handleSessionEvent(ev: SessionEvent): void {
       // #1067: snapshot at entry. The answer-stream creation closures
       // below also read `turn` instead of currentTurn so they pin to
       // this turn's chat for the stream's lifetime.
+      //
+      // #1664 ordering note: a `text` event can arrive AFTER turn_end has
+      // nulled currentTurn (the issue observed `answer_lane_update
+      // transport:"draft"` firing post-turn_end). Such a late event is
+      // dropped here by the `turn != null` guard — it is NOT folded back
+      // into the just-ended turn. That is deliberate and safe: by the
+      // time this fires, the turn atom has been handed to
+      // endCurrentTurnAtomic and turn_end has already run its flush /
+      // silent-end decision; re-opening a closed turn (re-creating an
+      // answer stream, re-evaluating decideTurnFlush) would be a large,
+      // race-prone change. The #1664 safety net does not depend on
+      // catching the late text: a turn whose real answer lost the race
+      // ends with finalAnswerDelivered=false, so recordUndeliveredTurnEnd
+      // engages the Stop-hook re-prompt and the model re-delivers the
+      // answer through the reply tool. The dropped draft text is
+      // recovered by re-prompt, not by post-hoc materialization.
       const turn = currentTurn
       if (turn != null) {
         turn.capturedText.push(ev.text)
@@ -6181,6 +6251,18 @@ function handleSessionEvent(ev: SessionEvent): void {
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
 
+        // #1664 — turn-flush only fires when !replyCalled (decideTurnFlush
+        // returns 'reply-called' otherwise). It legitimately delivers the
+        // model's terminal text as the answer, so the turn IS answered.
+        // Mark it now so the early-return below skips the silent-end
+        // re-prompt for a turn whose answer is genuinely on its way out.
+        // (The IIFE that actually sends runs after this branch's `return`;
+        // since the silent-end block is on the sibling reply-called path
+        // that this branch never reaches, this set is belt-and-braces —
+        // it keeps the captured `turn` atom internally consistent for any
+        // future reader.)
+        turn.finalAnswerDelivered = true
+
         // #654 deterministic double-message fix. Hand off the pinned
         // progress card BEFORE state reset so the driver doesn't keep
         // editing it while turn-flush is rewriting it with the answer.
@@ -6413,17 +6495,31 @@ function handleSessionEvent(ev: SessionEvent): void {
           longest_silent_gap_ms: outboundMetrics.longestOutboundGapMs,
           ended_via: outboundMetrics.outboundCount > 0 ? 'reply' : 'silent',
         })
-        // #1122 PR4 / #1161: deterministic silent-end handling (see the
-        // silent-marker path above for the rationale).
-        //   - first silent-end → recordSilentTurnEnd writes the state
-        //     file so the Stop hook (silent-end-interrupt-stop.mjs)
-        //     blocks the session-end and re-prompts the agent to reply.
+        // #1122 PR4 / #1161 / #1664: deterministic undelivered-turn
+        // handling (see the silent-marker path above for the rationale).
+        //   - first undelivered turn-end → recordSilentTurnEnd writes the
+        //     state file so the Stop hook (silent-end-interrupt-stop.mjs)
+        //     blocks the session-end and re-prompts the agent to deliver.
         //   - the Stop-hook re-prompt is already spent and the agent is
-        //     STILL silent → recordSilentTurnEnd returns exhausted:true;
-        //     deliver a user-facing fallback so the turn never just
-        //     vanishes (the user otherwise only sees the card disappear).
-        if (outboundMetrics.outboundCount === 0) {
-          const silentEnd = recordSilentTurnEnd({
+        //     STILL undelivered → recordSilentTurnEnd returns
+        //     exhausted:true; deliver a user-facing fallback so the turn
+        //     never just vanishes (the user otherwise only sees the card
+        //     disappear).
+        //
+        // #1664 — the trigger is "no final answer delivered", not "zero
+        // outbound". `outboundCount === 0` is now just the special case
+        // where nothing landed at all. The added case: the model sent an
+        // interim ack via reply/stream_reply (outboundCount > 0,
+        // replyCalled = true) but ended the turn with its real answer as
+        // plain transcript text — rendered into an ephemeral answer-lane
+        // draft and retracted at turn_end, never finalized. finalAnswer-
+        // Delivered stays false there, so the re-prompt engages and the
+        // model re-delivers the answer through the reply tool. NO_REPLY /
+        // HEARTBEAT_OK silent-marker turns return earlier and never reach
+        // this path. The turn-flush 'flush' branch also returns earlier
+        // (and sets finalAnswerDelivered=true defensively).
+        if (turn.finalAnswerDelivered === false) {
+          const silentEnd = recordUndeliveredTurnEnd({
             chatId,
             threadId: threadId ?? null,
             turnKey: tKey,

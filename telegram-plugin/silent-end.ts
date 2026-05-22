@@ -182,22 +182,39 @@ export function readSilentEndState(deps?: SilentEndDeps): SilentEndState | null 
 }
 
 /**
- * Record a user-message turn that ended with zero outbound messages and
- * report whether the deterministic re-prompt has been exhausted. This is
- * the gateway's single entry point for the main turn-end path.
+ * Record a user-message turn that ended WITHOUT the model delivering a
+ * final answer, and report whether the deterministic re-prompt has been
+ * exhausted. This is the gateway's single entry point for the main
+ * turn-end path.
  *
- *   - First silent-end of a turn (no prior state, or prior `retryCount`
+ * #1664 — the trigger generalized from "zero outbound" to "no final
+ * answer delivered". Two cases reach here now:
+ *   1. Zero outbound — the turn ended with nothing sent at all (the
+ *      original #1122/#1161 silent-end case).
+ *   2. Interim-ack only — the model sent an ack via reply/stream_reply
+ *      but ended the turn with its real answer as plain transcript text
+ *      (rendered into an ephemeral answer-lane draft that gets retracted
+ *      at turn_end, never finalized). The gateway tracks this via
+ *      `CurrentTurn.finalAnswerDelivered`; case 1 is just the subset
+ *      where that flag is false because nothing landed.
+ * In both cases the model still owes the user an answer, so the same
+ * re-prompt safety net applies — the framework re-prompts; the model
+ * re-delivers via the reply tool (never the framework materializing a
+ * message from the draft — see `reference/principles.md`).
+ *
+ *   - First undelivered turn-end (no prior state, or prior `retryCount`
  *     still below `SILENT_END_MAX_RETRIES`) → writes the state file via
  *     `writeSilentEndState`, so `silent-end-interrupt-stop.mjs` blocks
  *     the stop and re-prompts the agent. Returns `{ exhausted: false }`.
  *
- *   - A silent-end where the prior state for the SAME turn already shows
- *     `retryCount >= SILENT_END_MAX_RETRIES` → the Stop hook already
- *     spent its re-prompt and the agent is STILL silent. Recovery has
- *     failed. Clears the state file (so the Stop hook on this final turn
- *     finds nothing pending and allows the stop cleanly) and returns
- *     `{ exhausted: true }` — the caller MUST then deliver a user-facing
- *     fallback so the turn never just vanishes (#1161).
+ *   - An undelivered turn-end where the prior state for the SAME turn
+ *     already shows `retryCount >= SILENT_END_MAX_RETRIES` → the Stop
+ *     hook already spent its re-prompt and the agent is STILL
+ *     undelivered. Recovery has failed. Clears the state file (so the
+ *     Stop hook on this final turn finds nothing pending and allows the
+ *     stop cleanly) and returns `{ exhausted: true }` — the caller MUST
+ *     then deliver a user-facing fallback so the turn never just
+ *     vanishes (#1161).
  *
  * Chat-less autonomous wakeup turns never reach here: the gateway only
  * creates a `currentTurn` (and therefore only runs a turn-end handler)
@@ -228,3 +245,12 @@ export function recordSilentTurnEnd(
   writeSilentEndState(args, deps)
   return { exhausted: false }
 }
+
+/**
+ * #1664 — semantic alias for `recordSilentTurnEnd`. The trigger is now
+ * "no final answer delivered", of which "zero outbound" is one case; new
+ * callsites should prefer this name so the intent reads correctly. The
+ * behaviour, retry semantics, and `{exhausted}` contract are identical —
+ * `recordSilentTurnEnd` is kept for the existing callers and tests.
+ */
+export const recordUndeliveredTurnEnd = recordSilentTurnEnd
