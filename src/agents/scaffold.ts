@@ -1762,7 +1762,10 @@ messaging a capable colleague — not a tool emitting output. Five beats:
    \`disable_notification: true\`.
 4. **Hand back delegations with synthesis.** When a sub-agent / worker
    returns, re-enter in YOUR voice — what it found, and what you are
-   doing next. Never let its raw report stand as your reply.
+   doing next. Never let its raw report stand as your reply. A
+   *background* worker finishes after your turn ends; its result
+   arrives as a fresh \`<channel source="subagent_handback">\` turn —
+   treat that turn as the cue to do exactly this.
 5. **Deliver the answer** as a final \`reply\`.
 
 The one thing to avoid is *spam*: a reply on every tool call, on a
@@ -3775,7 +3778,10 @@ messaging a capable colleague — not a tool emitting output. Five beats:
    \`disable_notification: true\`.
 4. **Hand back delegations with synthesis.** When a sub-agent / worker
    returns, re-enter in YOUR voice — what it found, and what you are
-   doing next. Never let its raw report stand as your reply.
+   doing next. Never let its raw report stand as your reply. A
+   *background* worker finishes after your turn ends; its result
+   arrives as a fresh \`<channel source="subagent_handback">\` turn —
+   treat that turn as the cue to do exactly this.
 5. **Deliver the answer** as a final \`reply\`.
 
 The one thing to avoid is *spam*: a reply on every tool call, on a

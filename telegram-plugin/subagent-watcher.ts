@@ -106,6 +106,15 @@ export interface WorkerEntry {
   /** Short summary from last completed tool / narrative, for completion message. */
   lastSummaryLine: string
   /**
+   * Full text (capped at SUBAGENT_RESULT_TEXT_MAX) of the most recent
+   * `sub_agent_text` emission. For a worker the final such line before
+   * `turn_end` is its result summary. Carried to the gateway via
+   * `onFinish` so a background sub-agent's result can be handed back to
+   * the user (conversational-pacing beat 4). Empty until the first
+   * narrative line.
+   */
+  lastResultText: string
+  /**
    * Most recent tool call observed on this sub-agent's JSONL tail —
    * tool name + sanitised arg for fleet-row display (P0 of #662). Null
    * before any `sub_agent_tool_use` event has been seen. Replace-on-write;
@@ -270,6 +279,12 @@ export interface SubagentWatcherConfig {
     outcome: 'completed' | 'failed' | 'orphan'
     toolCount: number
     durationMs: number
+    /** Dispatch-time task description, for the handback envelope. */
+    description: string
+    /** The worker's final narrative emission (capped). May be empty if
+     *  no `sub_agent_text` line was ever observed. Feeds the
+     *  `subagent_handback` inbound. */
+    resultText: string
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -320,6 +335,15 @@ const DEFAULT_SILENT_SYNTHESIS_STALL_THRESHOLD_MS = 300_000
  * ceiling that closed-out cards used to wait on.
  */
 const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
+
+/**
+ * Cap on the result text retained per sub-agent (`entry.lastResultText`)
+ * and carried to the gateway via `onFinish`. The gateway feeds this into
+ * the `subagent_handback` inbound; the model synthesises a fresh
+ * user-facing summary from it, so the full transcript is never needed
+ * and an unbounded retain would bloat the parent's context.
+ */
+const SUBAGENT_RESULT_TEXT_MAX = 3000
 
 /**
  * Resolve a threshold-knob env var (e.g.
@@ -580,6 +604,16 @@ function readSubTail(
           // and must remain stable. Overwriting it with the sub-agent's first
           // narrative line caused a race-condition-dependent display (issue #352).
           entry.lastSummaryLine = ev.text.split('\n')[0].trim().slice(0, 120)
+          // Retain the full text of the most recent narrative emission —
+          // for a worker the final such line before turn_end IS its
+          // result summary (the worker prompt asks it to "return a
+          // concise summary"). Carried to the gateway via onFinish so a
+          // *background* sub-agent's result can be handed back to the
+          // user (conversational-pacing beat 4). Replace-on-write +
+          // capped: this is the worker's intended output, never tool
+          // args or file content — consistent with the watcher's
+          // "descriptions only" privacy posture.
+          entry.lastResultText = ev.text.trim().slice(0, SUBAGENT_RESULT_TEXT_MAX)
         } else if (ev.kind === 'sub_agent_turn_end') {
           if (entry.state === 'running') {
             entry.state = 'done'
@@ -750,6 +784,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       completionNotified: false,
       stallTerminalSynthesised: false,
       lastSummaryLine: '',
+      lastResultText: '',
       lastTool: null,
       historical: isHistorical,
     }
@@ -850,6 +885,8 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             outcome: entry.historical ? 'orphan' : 'completed',
             toolCount: entry.toolCount,
             durationMs: nowFn() - entry.dispatchedAt,
+            description: entry.description,
+            resultText: entry.lastResultText,
           })
         } catch (cbErr) {
           log?.(`subagent-watcher: onFinish callback error ${agentId}: ${(cbErr as Error).message}`)
@@ -869,6 +906,8 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             outcome: 'failed',
             toolCount: entry.toolCount,
             durationMs: nowFn() - entry.dispatchedAt,
+            description: entry.description,
+            resultText: entry.lastResultText,
           })
         } catch (cbErr) {
           log?.(`subagent-watcher: onFinish callback error ${agentId}: ${(cbErr as Error).message}`)

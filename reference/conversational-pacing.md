@@ -59,7 +59,12 @@ calls, in five beats:
    back, the main agent re-enters in its own voice — what the
    sub-agent found, and the next step — *"reviewer flagged the auth
    gap; fixing it now"*. The sub-agent's raw report is never the
-   user-facing reply.
+   user-facing reply. A foreground sub-agent's result lands in the
+   parent's own turn (a PostToolUse hook nudges the synthesis); a
+   *background* worker finishes after the turn ends, so the gateway
+   wakes the agent with a `<channel source="subagent_handback">` turn
+   carrying the result. Either way the model owns the prose — the
+   framework only delivers the cue.
 5. **Deliver the answer** as a fresh `reply` (omit
    `disable_notification` — pings the device once).
 

@@ -367,7 +367,10 @@ describe('startSubagentWatcher', () => {
       return { agentDir, jsonlPath }
     }
 
-    function startWatcherSync(opts: { agentDir: string }): {
+    function startWatcherSync(opts: {
+      agentDir: string
+      onFinish?: Parameters<typeof startSubagentWatcher>[0]['onFinish']
+    }): {
       notifications: string[]
       poll: () => void
       watcher: ReturnType<typeof startSubagentWatcher>
@@ -380,6 +383,7 @@ describe('startSubagentWatcher', () => {
       const watcher = startSubagentWatcher({
         agentDir: opts.agentDir,
         sendNotification: (text) => notifications.push(text),
+        ...(opts.onFinish ? { onFinish: opts.onFinish } : {}),
         stallThresholdMs: 60_000,
         rescanMs: 500,
         now: () => Date.now(),
@@ -463,6 +467,68 @@ describe('startSubagentWatcher', () => {
       const entry = h.watcher.getRegistry().get('deadbeef')
       expect(entry).toBeDefined()
       expect(entry?.toolCount).toBe(3)
+    })
+
+    it('captures the full last narrative line into lastResultText (handback)', () => {
+      // lastSummaryLine keeps only the first line, 120 chars — a progress
+      // preview. lastResultText keeps the full last narrative emission:
+      // for a worker that IS its result summary, fed to the gateway's
+      // subagent_handback inbound (conversational-pacing beat 4).
+      const fullResult =
+        'Done. I refactored the auth module, added 4 tests, and all green.\n' +
+        'One caveat: the legacy token path still needs a follow-up.'
+      const content = buildJSONL(
+        subAgentUserMsg('Refactor auth'),
+        subAgentAssistantText(fullResult),
+      )
+      const { agentDir } = setupRealFs(content, 'deadbeef')
+      const h = startWatcherSync({ agentDir })
+      h.poll()
+      const entry = h.watcher.getRegistry().get('deadbeef')
+      expect(entry).toBeDefined()
+      // lastSummaryLine is the truncated first line only.
+      expect(entry?.lastSummaryLine).not.toMatch(/follow-up/)
+      // lastResultText keeps the whole thing — multi-line, both sentences.
+      expect(entry?.lastResultText).toContain('refactored the auth module')
+      expect(entry?.lastResultText).toContain('legacy token path still needs a follow-up')
+    })
+
+    it('onFinish carries description + resultText for the handback', () => {
+      // onFinish fires only on a POST-boot transition (a file already
+      // done at startup is historical and short-circuits). So: register
+      // the running sub-agent first, then append turn_duration.
+      const finishes: Array<{ description: string; resultText: string; outcome: string }> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+
+      const h = startWatcherSync({
+        agentDir,
+        onFinish: ({ description, resultText, outcome }) => {
+          finishes.push({ description, resultText, outcome })
+        },
+      })
+      // Register the sub-agent as running (post-boot, not historical).
+      writeFileSync(
+        jsonlPath,
+        buildJSONL(
+          subAgentUserMsg('Run a long task'),
+          subAgentAssistantText('All set — migration applied cleanly, 0 rows dropped.'),
+        ),
+      )
+      h.poll()
+      expect(h.watcher.getRegistry().get('deadbeef')?.state).toBe('running')
+
+      // Now it finishes — onFinish must carry the result text.
+      appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
+      h.poll()
+
+      expect(finishes.length).toBe(1)
+      expect(finishes[0].outcome).toBe('completed')
+      expect(finishes[0].resultText).toContain('migration applied cleanly')
+      // description stays the dispatch description, never the narrative.
+      expect(finishes[0].description).not.toMatch(/migration applied/)
     })
 
     it('does NOT emit completion notification for a file already done at startup', () => {

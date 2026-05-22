@@ -281,6 +281,7 @@ import {
   buildVaultSaveFailedInbound,
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
+import { buildSubagentHandbackInbound } from './subagent-handback-inbound-builder.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
   ToolCallMessage,
@@ -14901,25 +14902,38 @@ void (async () => {
                   )
                 }
               },
-              // #card-audit-log: symmetric sub_agent_finished surface.
-              // The driver's per-chat shadow knows the parent turnKey and
-              // the registry DB carries the background flag — combine them
-              // into a single audit-log line for retrospective debugging.
-              onFinish: ({ agentId, outcome, toolCount, durationMs }) => {
-                let parentTurnKey = ''
+              // conversational-pacing beat 4 — the handback. A foreground
+              // sub-agent hands its result straight back as the Task tool
+              // result, inside the parent's own turn; the model sees it
+              // in-context. A *background* sub-agent does not — it
+              // finishes decoupled from any turn boundary, with the parent
+              // typically idle and no turn to receive the result. Without
+              // a nudge the user never hears back until they send the next
+              // message themselves. So: when a background sub-agent
+              // terminates, wake the agent with a `subagent_handback`
+              // inbound carrying the worker's result text, and let it
+              // synthesise a user-facing handback in its own voice.
+              //
+              // Gated to background completions: foreground sub-agents
+              // need nothing here, and 'orphan' is a stale historical-at-
+              // boot row, not a fresh completion the user is waiting on.
+              onFinish: ({ agentId, outcome, description, resultText }) => {
+                if (process.env.SWITCHROOM_SUBAGENT_HANDBACK === '0') return
+                if (outcome !== 'completed' && outcome !== 'failed') return
+
                 let chatId = ''
                 let isBackground = false
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
                     if (f.fleet.has(agentId)) {
-                      parentTurnKey = f.turnKey
                       chatId = f.chatId ?? ''
                       break
                     }
                   }
                 } catch {
-                  // peek failures are non-fatal — we still emit the event.
+                  // peek failures are non-fatal — fall through to the
+                  // owner-chat fallback below.
                 }
                 if (turnsDb != null) {
                   try {
@@ -14929,15 +14943,37 @@ void (async () => {
                     if (row != null) isBackground = row.background === 1
                   } catch { /* best-effort */ }
                 }
-                // #1122 PR3: card-event-log emission removed with the
-                // progress card. Sub-agent completion is now visible
-                // via the agent's own chat narration.
-                const finalOutcome: 'completed' | 'orphan' | 'background' =
-                  isBackground ? 'background' : (outcome === 'completed' ? 'completed' : 'orphan')
-                void finalOutcome
-                void parentTurnKey
-                void durationMs
-                void toolCount
+                if (!isBackground) return
+
+                // chatId fallback: if the progress-driver fleet entry was
+                // already cleaned up by the time onFinish fires, route to
+                // the owner chat. Every switchroom fleet agent is
+                // DM-shaped, so allowFrom[0] is the conversation that
+                // dispatched the work.
+                const handbackChatId = chatId || (loadAccess().allowFrom[0] ?? '')
+                if (!handbackChatId) {
+                  process.stderr.write(
+                    `telegram gateway: subagent-handback ${agentId} — no chat to deliver to; skipped\n`,
+                  )
+                  return
+                }
+
+                const inbound = buildSubagentHandbackInbound({
+                  ctx: {
+                    chatId: String(handbackChatId),
+                    taskDescription: description,
+                    resultText,
+                    outcome,
+                  },
+                })
+                // Deliver via pendingInboundBuffer + the idle-drain tick.
+                // The drain only releases at an idle prompt (no active
+                // turn), so the handback always lands as a clean fresh
+                // turn and never races a turn-in-flight composer (#1556).
+                pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', inbound)
+                process.stderr.write(
+                  `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${handbackChatId} resultChars=${resultText.length}\n`,
+                )
               },
             })
             process.stderr.write('telegram gateway: subagent-watcher active\n')
