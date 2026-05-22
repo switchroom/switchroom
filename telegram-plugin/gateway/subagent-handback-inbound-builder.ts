@@ -101,3 +101,85 @@ export function buildSubagentHandbackInbound(opts: {
     },
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Handback decision (pure — unit-testable gate for the gateway onFinish path)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Inputs to the handback decision. The gateway's `subagent-watcher`
+ * `onFinish` callback does the IO — resolves `isBackground` from the
+ * registry DB, `fleetChatId` from the progress-driver fleet, and
+ * `ownerChatId` from access.json — then hands the resolved values here.
+ * Keeping the *decision* pure makes the gate (which injects turns)
+ * testable without standing up a gateway.
+ */
+export interface SubagentHandbackDecisionInput {
+  /** `SWITCHROOM_SUBAGENT_HANDBACK` env var value (any non-'0' = enabled). */
+  handbackEnvValue: string | undefined
+  /** Terminal outcome the watcher reported. */
+  outcome: 'completed' | 'failed' | 'orphan'
+  /** Whether the sub-agent was a background dispatch (registry DB flag).
+   *  Foreground sub-agents hand back natively in the parent's turn. */
+  isBackground: boolean
+  /** Chat id from the progress-driver fleet entry; '' if not found. */
+  fleetChatId: string
+  /** Owner chat fallback (access.json allowFrom[0]); '' if none. */
+  ownerChatId: string
+  taskDescription: string
+  resultText: string
+  /** Deterministic clock for tests. */
+  nowMs?: number
+}
+
+/** Why a handback was NOT delivered — one of these, or `delivered`. */
+export type SubagentHandbackSkipReason =
+  | 'env-disabled'
+  | 'outcome-not-terminal'
+  | 'foreground'
+  | 'no-chat'
+
+export type SubagentHandbackDecision =
+  | { deliver: false; reason: SubagentHandbackSkipReason }
+  | { deliver: true; chatId: string; inbound: InboundMessage }
+
+/**
+ * Decide whether a finished sub-agent warrants a handback turn, and if
+ * so build the inbound. Pure: all IO is the caller's job.
+ *
+ * Gates, in order:
+ *   1. kill-switch — `SWITCHROOM_SUBAGENT_HANDBACK=0` disables entirely.
+ *   2. outcome — only `completed`/`failed` hand back; `orphan` is a
+ *      stale historical-at-boot row, not a fresh completion.
+ *   3. foreground — a foreground sub-agent already handed its result
+ *      back as the Task tool result in the parent's own turn.
+ *   4. no-chat — neither the fleet entry nor the owner chat resolved,
+ *      so there is nowhere to deliver.
+ */
+export function decideSubagentHandback(
+  input: SubagentHandbackDecisionInput,
+): SubagentHandbackDecision {
+  if (input.handbackEnvValue === '0') {
+    return { deliver: false, reason: 'env-disabled' }
+  }
+  if (input.outcome !== 'completed' && input.outcome !== 'failed') {
+    return { deliver: false, reason: 'outcome-not-terminal' }
+  }
+  if (!input.isBackground) {
+    return { deliver: false, reason: 'foreground' }
+  }
+  const chatId = input.fleetChatId || input.ownerChatId
+  if (!chatId) {
+    return { deliver: false, reason: 'no-chat' }
+  }
+  const inbound = buildSubagentHandbackInbound({
+    ctx: {
+      chatId,
+      taskDescription: input.taskDescription,
+      resultText: input.resultText,
+      outcome: input.outcome,
+    },
+    ...(input.nowMs !== undefined ? { nowMs: input.nowMs } : {}),
+  })
+  return { deliver: true, chatId, inbound }
+}
