@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.13.12 — quieter turns: no duplicate wrap-up, no card-era worker pings
+
+Three production message-noise fixes plus the agent-image Playwright
+binding. All observed live on agent "finn" (2026-05-22): every turn
+ended with a redundant recap, a stale "Worker done" ghost fired
+mid-build, and `webapp-testing` was broken on every agent.
+
+### fix(pacing) — stop posting the model's turn wrap-up as a duplicate (#1657)
+
+Every turn that called `reply` was followed by a second, redundant
+Telegram message — a third-person recap of the turn ("Answered the X
+question and acked Y…"). The model wasn't sending it: the gateway's
+turn-flush safety net was scraping the model's trailing terminal text
+and posting it.
+
+Root cause was the #1291 post-reply-tail flush — `decideTurnFlush`
+flushed any assistant text emitted after the last `reply` (≥40 chars)
+as a follow-up. The intent was to catch a soft-commit reply followed by
+the real answer in terminal text only, but the post-reply tail is
+almost never a forgotten answer — it's the model's habitual end-of-turn
+summary, indistinguishable from a real answer by length, so it misfired
+on essentially every turn.
+
+The contract is now deterministic: **a message reaches the user iff the
+model called `reply`/`stream_reply`.** Once `replyCalled` is true,
+`decideTurnFlush` always skips — trailing terminal text is the model's
+wrap-up, never a second bubble. The genuine ghost-reply backstop (a
+turn that ended with zero outbound) is unchanged. Aligns with
+`reference/conversational-pacing.md` v2 — "the framework owns the beat;
+the model authors the words".
+
+### fix(telegram) — stop subagent-watcher posting card-era "✓ Worker done" (#1659)
+
+The subagent-watcher's `sendNotification` callback still posted a
+framework-authored `✓ Worker done: sub-agent (N tools) — …` message
+straight to chat — wiring left over from the retired progress card
+(#1122). It fired from the silent-stall heuristic, so a worker mid-
+`Bash` (a build, a deploy) was declared "done" ~6 min early, surfacing
+a stale ghost of an already-answered task. Removed the callback
+entirely; sub-agent completion is surfaced through the structured
+`onFinish` cue the #1650 handback path already consumes — the model
+authors the user-facing handback in its own voice.
+
+### fix(docker) — provision the Python Playwright binding in the agent image (#1658)
+
+The bundled `webapp-testing` skill ships enabled on every agent and is
+Python-only, but the agent image baked only the JS Playwright binding —
+`import playwright` failed with `ModuleNotFoundError` on every agent.
+The image now bakes the Python binding too, pinned via a single
+`ARG PLAYWRIGHT_VERSION` (1.60.0) so the JS and Python bindings share
+one chromium revision and cannot drift. Lands on the agent-image
+rebuild + fleet rollout.
+
+### docs — Vault & shared-state test discipline (HARD RULES) (#1660)
+
+Adds a HARD-RULES section to CLAUDE.md after a mis-isolated vault/broker
+test truncated the live operator vault on 2026-05-22. Vault / broker /
+audit-log tests MUST use an isolated tmpdir; the dangerous default
+paths are now named explicitly.
+
 ## v0.13.11 — a transient overload is not quota exhaustion
 
 ### fix(auth) — honest escalation for transient overloads (#1655)
