@@ -2,11 +2,19 @@
 /**
  * Stop hook — auto-interrupt for silent-end turns.
  *
- * When a Claude Code session ends without the agent having called reply or
- * stream_reply (a "silent-end"), the Telegram gateway writes a state file at
+ * When a Claude Code session ends without the agent delivering a final
+ * answer to the user, the Telegram gateway writes a state file at
  * $TELEGRAM_STATE_DIR/silent-end-pending.json. This hook reads that file and,
  * if a first-time silent-end is detected (retryCount === 0), returns a
  * decision:block to re-prompt the agent instead of letting the session close.
+ *
+ * #1664 — "no final answer delivered" covers two cases: (a) the turn ended
+ * with zero outbound (the original case), and (b) the model sent only an
+ * interim ack via reply/stream_reply but left its real answer as plain
+ * transcript text, which the gateway renders into an ephemeral draft and
+ * never finalizes. The re-prompt below tells the model to send its answer
+ * through the reply tool, or reply NO_REPLY if it genuinely has nothing to
+ * add / already delivered.
  *
  * On the second silent-end (retryCount >= MAX_RETRIES), the hook allows the
  * stop. The gateway's turn-end path (recordSilentTurnEnd in silent-end.ts)
@@ -104,9 +112,13 @@ function main() {
     JSON.stringify({
       decision: 'block',
       reason:
-        'You ran tools but never sent a reply to the user. ' +
-        'Call mcp__switchroom-telegram__reply or mcp__switchroom-telegram__stream_reply (with done=true) ' +
-        'to send your final answer now.',
+        'This turn is ending without your final answer reaching the user. ' +
+        'If you wrote an answer as plain text (not via a tool), the user ' +
+        'cannot see it — only text sent through the reply tool is delivered. ' +
+        'Send your final answer now by calling mcp__switchroom-telegram__reply ' +
+        '(or mcp__switchroom-telegram__stream_reply with done=true). ' +
+        'If you already delivered your answer via the reply tool, or you ' +
+        'intentionally have nothing to add, reply with exactly NO_REPLY.',
     }),
   )
   process.exit(0)

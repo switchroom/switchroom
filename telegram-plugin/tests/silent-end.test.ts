@@ -8,8 +8,10 @@ import {
   clearSilentEndState,
   readSilentEndState,
   recordSilentTurnEnd,
+  recordUndeliveredTurnEnd,
   SILENT_END_MAX_RETRIES,
 } from '../silent-end.js'
+import { isFinalAnswerReply } from '../final-answer-detect.js'
 
 let stateDir: string
 const ORIG_ENV = process.env.TELEGRAM_STATE_DIR
@@ -187,6 +189,118 @@ describe('recordSilentTurnEnd — #1161 exhaustion detection', () => {
   })
 })
 
+describe('recordUndeliveredTurnEnd — #1664 extended trigger', () => {
+  it('is the same function as recordSilentTurnEnd (semantic alias)', () => {
+    expect(recordUndeliveredTurnEnd).toBe(recordSilentTurnEnd)
+  })
+
+  // The gateway computes `finalAnswerDelivered` by OR-ing isFinalAnswerReply
+  // across every reply landed this turn, then engages the re-prompt iff the
+  // flag is still false at turn_end. These tests reproduce that exact
+  // decision: classify the turn's replies, then call recordUndeliveredTurnEnd
+  // only when no reply qualified.
+  function simulateTurnEnd(
+    replies: Array<{ text: string; disableNotification: boolean; done?: boolean }>,
+    turnKey: string,
+  ): { finalAnswerDelivered: boolean; rePromptEngaged: boolean } {
+    const finalAnswerDelivered = replies.some((r) =>
+      isFinalAnswerReply(r),
+    )
+    let rePromptEngaged = false
+    if (finalAnswerDelivered === false) {
+      recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey })
+      rePromptEngaged = true
+    }
+    return { finalAnswerDelivered, rePromptEngaged }
+  }
+
+  it('#1664 regression: ack reply + answer-as-transcript → re-prompt fires', () => {
+    // The exact #1664 shape: the model sent a short interim ack via the
+    // reply tool (disable_notification:true), then ended the turn with its
+    // real answer as plain transcript text — which the gateway renders into
+    // an ephemeral draft and retracts at turn_end, never finalized. No
+    // reply qualified as the final answer, so the turn is undelivered.
+    const r = simulateTurnEnd(
+      [{ text: 'On it — give me a moment.', disableNotification: true }],
+      'c:1664',
+    )
+    expect(r.finalAnswerDelivered).toBe(false)
+    expect(r.rePromptEngaged).toBe(true)
+    // State file written so silent-end-interrupt-stop.mjs blocks the stop.
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'c:1664', retryCount: 0 })
+  })
+
+  it('a turn with a final-answer reply (notification-bearing) → re-prompt NOT engaged', () => {
+    const r = simulateTurnEnd(
+      [{ text: 'Here is the answer.', disableNotification: false }],
+      'c:final',
+    )
+    expect(r.finalAnswerDelivered).toBe(true)
+    expect(r.rePromptEngaged).toBe(false)
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('a long reply mis-marked interim → re-prompt NOT engaged (length backstop)', () => {
+    const r = simulateTurnEnd(
+      [{ text: 'x'.repeat(500), disableNotification: true }],
+      'c:long',
+    )
+    expect(r.finalAnswerDelivered).toBe(true)
+    expect(r.rePromptEngaged).toBe(false)
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('zero-outbound turn → re-prompt still engaged (regression of the original case)', () => {
+    // No replies at all — the original #1122 silent-end case is now just
+    // the subset of "no final answer delivered" where nothing landed.
+    const r = simulateTurnEnd([], 'c:zero')
+    expect(r.finalAnswerDelivered).toBe(false)
+    expect(r.rePromptEngaged).toBe(true)
+    expect(readSilentEndState()).toMatchObject({ turnKey: 'c:zero', retryCount: 0 })
+  })
+
+  it('interim ack followed by a final-answer reply in the same turn → NOT engaged', () => {
+    // The model ack'd first then properly delivered — finalAnswerDelivered
+    // latches true on the second reply; the turn is answered.
+    const r = simulateTurnEnd(
+      [
+        { text: 'Looking into it…', disableNotification: true },
+        { text: 'Done — the result is 42.', disableNotification: false },
+      ],
+      'c:ack-then-final',
+    )
+    expect(r.finalAnswerDelivered).toBe(true)
+    expect(r.rePromptEngaged).toBe(false)
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('stream_reply done=true counts as the final answer → NOT engaged', () => {
+    const r = simulateTurnEnd(
+      [{ text: 'ok', disableNotification: true, done: true }],
+      'c:stream-done',
+    )
+    expect(r.finalAnswerDelivered).toBe(true)
+    expect(r.rePromptEngaged).toBe(false)
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('exhaustion still applies on the #1664 path after the Stop-hook re-prompt', () => {
+    // First undelivered turn-end writes state.
+    expect(simulateTurnEnd(
+      [{ text: 'one sec', disableNotification: true }],
+      'c:exhaust',
+    ).rePromptEngaged).toBe(true)
+    // Stop hook blocks once and bumps retryCount (simulated).
+    const path = join(stateDir, 'silent-end-pending.json')
+    const s = readSilentEndState()!
+    writeFileSync(path, JSON.stringify({ ...s, retryCount: s.retryCount + 1 }))
+    // Re-prompted turn STILL ends with only an interim ack → exhausted.
+    const second = recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:exhaust' })
+    expect(second.exhausted).toBe(true)
+    expect(readSilentEndState()).toBeNull()
+  })
+})
+
 describe('silent-end-interrupt-stop hook — integration', () => {
   const hookPath = join(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs')
 
@@ -222,6 +336,10 @@ describe('silent-end-interrupt-stop hook — integration', () => {
     const out = JSON.parse(r.stdout.trim())
     expect(out.decision).toBe('block')
     expect(out.reason).toContain('reply')
+    // #1664 — the re-prompt must offer the NO_REPLY escape hatch so a
+    // model that already delivered (or intentionally has nothing to add)
+    // can end the turn cleanly instead of being forced to re-send.
+    expect(out.reason).toContain('NO_REPLY')
     // retryCount must have been incremented to 1
     expect(readSilentEndState()!.retryCount).toBe(1)
   })
