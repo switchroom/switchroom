@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — Google Workspace OAuth scopes tied to the tier
+## v0.13.13 — create Workspace files; streamed answers stop vanishing
 
 ### fix(auth) — mint Slides/Docs/Sheets OAuth scopes so agents can edit Workspace files (#1663)
 
@@ -27,6 +27,26 @@ own browser OAuth on port 8000 (unrecoverable inside a container).
 - Changing the tier requires re-running `account add --replace` — OAuth
   scopes are fixed at consent time. Documented in
   `docs/google-workspace.md`.
+
+### fix(pacing) — streamed answers no longer vanish from the chat (#1664)
+
+An agent often ends a turn with its real answer as plain assistant
+transcript text instead of a `reply` tool call. The gateway rendered
+that transcript as a live Telegram draft and then **deleted it at
+turn-end** — the user watched the answer stream in, then it vanished,
+and it never reached history either.
+
+The framework can't classify transcript-after-a-`reply` (sometimes the
+real answer, sometimes a redundant wrap-up — only the model knows), so
+per `reference/principles.md` ("the model communicates; the framework
+is the safety net") the fix re-prompts the model rather than faking the
+message. It extends the silent-end safety net: each turn tracks whether
+a real **final-answer beat** landed — a notification-bearing `reply`, a
+≥200-char reply, a `stream_reply` with `done=true`, or a legitimate
+turn-flush. If a turn ends without one, the Stop hook blocks turn-end
+and re-prompts the agent to send its answer via `reply` (or `NO_REPLY`
+if it already did). No duplicate, no data loss; complements the #1657
+turn-flush fix without weakening it.
 
 ## v0.13.12 — quieter turns: no duplicate wrap-up, no card-era worker pings
 
