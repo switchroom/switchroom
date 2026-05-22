@@ -1,5 +1,33 @@
 # Changelog
 
+## unreleased — Google Workspace OAuth scopes tied to the tier
+
+### fix(auth) — mint Slides/Docs/Sheets OAuth scopes so agents can edit Workspace files (#1663)
+
+Agents could read Drive and create plain Drive files but could not
+create or edit native Google **Slides / Docs / Sheets** — the
+auth-broker token only carried Drive scopes. Any Docs/Sheets/Slides API
+call 403'd, and the upstream Google Workspace MCP then fell back to its
+own browser OAuth on port 8000 (unrecoverable inside a container).
+
+- `switchroom auth google account add` now mints the Workspace API
+  scopes (`documents`, `spreadsheets`, and — at `extended`/`complete` —
+  `presentations`) alongside the Drive scopes. The scope set is **tied
+  to `google_workspace.tier`** so every tool a tier exposes can
+  authenticate. Calendar/Forms/Tasks/Chat/Gmail scopes are deliberately
+  out of scope (separate decision).
+- The `gdrive` MCP launcher runs a scope↔tier preflight at startup: a
+  token missing scopes the tier needs produces a loud, actionable
+  stderr warning naming the exact `account add --replace` recovery
+  command — instead of upstream's silent doomed port-8000 fallback.
+- The launcher also moves the upstream MCP's OAuth callback port off
+  8000 (`SWITCHROOM_GDRIVE_MCP_PORT`, default `8631`) so the fallback,
+  if ever triggered, no longer collides with whatever the host runs on
+  8000.
+- Changing the tier requires re-running `account add --replace` — OAuth
+  scopes are fixed at consent time. Documented in
+  `docs/google-workspace.md`.
+
 ## v0.13.12 — quieter turns: no duplicate wrap-up, no card-era worker pings
 
 Three production message-noise fixes plus the agent-image Playwright

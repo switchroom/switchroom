@@ -213,6 +213,87 @@ export const AIOFILE_PIN = "aiofile==3.10.2";
  */
 export const AIOFILE_PKG = AIOFILE_PIN.split("==")[0];
 
+// ─── Scope ↔ tier preflight (issue #1663) ─────────────────────────────────
+
+/**
+ * The Google Workspace API scopes a given `--tool-tier` needs in order
+ * for every tool it exposes to authenticate. Mirrors
+ * `workspaceScopesForTier` in src/cli/drive.ts — duplicated here (not
+ * imported) so the launcher's hot path stays free of the heavier
+ * drive.ts import tree. The two MUST stay in sync; a launcher unit test
+ * asserts equivalence against the drive.ts source of truth.
+ *
+ * `core` exposes Docs + Sheets tools; `extended`/`complete` add Slides.
+ * Drive scopes are not listed — the broker always mints those; the gap
+ * #1663 closes is the missing *Workspace* scopes.
+ */
+export function requiredWorkspaceScopesForTier(tier: string | undefined): string[] {
+  const docs = [
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+  ];
+  if (tier === "extended" || tier === "complete") {
+    return [...docs, "https://www.googleapis.com/auth/presentations"];
+  }
+  // core (or unset — core is the documented default) → Docs + Sheets.
+  return docs;
+}
+
+/**
+ * Compare the scopes the broker's seed credentials actually carry
+ * against the scopes the requested tier needs. Returns the list of
+ * missing scopes (empty ⇒ the seed can drive every tool the tier
+ * exposes).
+ *
+ * Pure + exported so the preflight contract is unit-pinned. The result
+ * drives a loud, actionable stderr warning in {@link runDriveMcpLauncher}
+ * BEFORE upstream spawns — so a missing scope surfaces as a clear "re-run
+ * account add" message instead of upstream silently falling back to its
+ * own port-8000 browser OAuth (unrecoverable inside a container).
+ */
+export function findMissingWorkspaceScopes(
+  seedScope: string,
+  tier: string | undefined,
+): string[] {
+  const have = new Set(
+    seedScope
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  return requiredWorkspaceScopesForTier(tier).filter((s) => !have.has(s));
+}
+
+/**
+ * Build the operator-facing warning shown when the seed token is
+ * missing scopes the requested tier needs (issue #1663). The launcher
+ * still spawns upstream — Drive tools and any in-scope Workspace tools
+ * keep working — but the warning makes the partial-capability state
+ * loud and tells the operator exactly how to fix it, instead of the
+ * silent doomed port-8000 fallback.
+ */
+export function buildMissingScopeWarning(
+  missing: string[],
+  tier: string | undefined,
+  accountEmail: string,
+): string {
+  const short = missing
+    .map((s) => s.replace(/^https:\/\/www\.googleapis\.com\/auth\//, ""))
+    .join(", ");
+  return (
+    `drive-mcp-launcher: WARNING — the Google account '${accountEmail}' was ` +
+    `consented WITHOUT the scope(s) needed for tier '${tier ?? "core"}': ` +
+    `${short}.\n` +
+    `  The matching MCP tools (Docs / Sheets / Slides create+edit) will FAIL ` +
+    `to authenticate. OAuth scopes are fixed at consent time — re-run on the ` +
+    `host to re-mint the token with the correct scopes:\n` +
+    `    switchroom auth google account add ${accountEmail} --replace` +
+    `${missing.includes("https://www.googleapis.com/auth/drive.file") ? " --write" : ""}\n` +
+    `  (scopes are derived from \`google_workspace.tier\` — set the tier ` +
+    `before re-running). Drive read/file tools are unaffected.\n`
+  );
+}
+
 export function buildUvxArgs(tier?: string): string[] {
   const args = [
     "--from",
@@ -274,6 +355,25 @@ export function buildChildEnv(
   delete env.WORKSPACE_MCP_STATELESS_MODE;
   delete env.GOOGLE_APPLICATION_CREDENTIALS;
   delete env.WORKSPACE_MCP_SERVICE_ACCOUNT_FILE;
+  // Port-8000 fallback hardening (issue #1663). When a tool call needs a
+  // scope the seed token lacks, upstream falls back to its OWN browser
+  // OAuth flow, which binds a callback server on `WORKSPACE_MCP_PORT`
+  // (default 8000). On a shared host (Coolify et al.) 8000 is taken, so
+  // the fallback can never complete and the failure is opaque
+  // ("Port 8000 is already in use … Cannot start minimal OAuth server").
+  //
+  // The browserless launcher seeds credentials and is fed by the
+  // auth-broker — it should NEVER run upstream's own OAuth flow. We
+  // cannot disable the fallback outright (no upstream knob for that),
+  // but moving the port off 8000 to an operator-configurable,
+  // unlikely-to-collide default (`SWITCHROOM_GDRIVE_MCP_PORT`, default
+  // 8631) means the doomed bind at least fails on a private port
+  // instead of fighting whatever the operator runs on 8000 — and the
+  // scope-preflight warning above tells them the real fix. Operators
+  // who genuinely need a specific port can override.
+  if (!env.WORKSPACE_MCP_PORT) {
+    env.WORKSPACE_MCP_PORT = env.SWITCHROOM_GDRIVE_MCP_PORT ?? "8631";
+  }
   return env;
 }
 
@@ -697,6 +797,24 @@ export async function runDriveMcpLauncher(opts: {
   // Per-agent tier override (passed via --tier from the scaffold entry)
   // wins over the config top-level tier.
   const tier = opts.tier ?? configSecrets.tier;
+
+  // Scope ↔ tier preflight (issue #1663). The broker's seed token was
+  // minted by `auth google account add` at whatever tier was configured
+  // THEN. If the operator later raised the tier (e.g. core → extended
+  // for Slides) without re-running `account add`, the token lacks the
+  // Slides/Docs/Sheets scopes the new tier's tools need. Surface that as
+  // a loud, actionable stderr warning BEFORE upstream spawns — instead
+  // of upstream silently falling back to its doomed port-8000 OAuth on
+  // the first Docs/Sheets/Slides call. We warn (not exit): Drive tools
+  // and any in-scope Workspace tools still work, so degrading is better
+  // than refusing to start.
+  const missingScopes = findMissingWorkspaceScopes(brokerCreds.scope, tier);
+  if (missingScopes.length > 0) {
+    process.stderr.write(
+      buildMissingScopeWarning(missingScopes, tier, brokerCreds.accountEmail),
+    );
+  }
+
   const args = buildUvxArgs(tier);
   const env = buildChildEnv(
     process.env,

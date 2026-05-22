@@ -216,9 +216,45 @@ switchroom auth google account add you@gmail.com --replace --write
 files and edit files **they create**, but cannot edit your pre-existing
 unrelated Drive files (that would be the full `drive` scope, which
 switchroom deliberately does not request). It does **not** change
-behaviour for read-only accounts. The Workspace `tier` knob
-(`core`/`extended`/`complete`) controls which upstream MCP *tools* are
-exposed — it is independent of these OAuth scopes.
+behaviour for read-only accounts.
+
+#### Workspace API scopes are tied to the tier
+
+Creating or editing **native Google Docs / Sheets / Slides** needs
+product-specific OAuth scopes on top of the Drive scopes — `drive.file`
+alone authorizes a Drive *file object*, not a `documents.batchUpdate` /
+`spreadsheets.batchUpdate` / `presentations.batchUpdate` call. So
+`account add` mints those scopes alongside Drive, and **ties the set to
+the `tier`** in your `google_workspace:` block:
+
+| tier       | Workspace API scopes minted             |
+|------------|-----------------------------------------|
+| `core`     | `documents`, `spreadsheets`             |
+| `extended` | `documents`, `spreadsheets`, `presentations` |
+| `complete` | `documents`, `spreadsheets`, `presentations` |
+
+`presentations` (Slides) is added at `extended`/`complete` because
+Slides tools first appear at the `extended` tier. Calendar / Forms /
+Tasks / Chat / Gmail scopes are **not** minted — that is a separate,
+larger decision (Gmail in particular has an unresolved approval shape;
+see RFC G §5).
+
+**Changing the tier requires re-running `account add`.** OAuth scopes
+are fixed at consent time — raising `tier: core` → `tier: extended`
+does **not** retroactively widen an already-minted token. After a tier
+change, re-mint:
+
+```bash
+switchroom auth google account add you@gmail.com --replace [--write]
+```
+
+If you skip the re-mint, the `gdrive` MCP launcher prints a loud
+warning at startup naming the missing scopes and the exact recovery
+command — and the affected tools (Docs/Sheets/Slides create+edit) fail
+cleanly instead of triggering the upstream MCP's own browser OAuth
+(which binds a callback port that is unrecoverable inside a container).
+`switchroom auth google account list` shows each token's effective
+scopes.
 
 ### Removing an account
 

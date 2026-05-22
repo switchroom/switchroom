@@ -94,14 +94,96 @@ export const DRIVE_WRITE_SCOPES = [
 ];
 const DEFAULT_SCOPES = DRIVE_READONLY_SCOPES;
 
+// ── Google Workspace API scopes (issue #1663) ────────────────────────────
+//
+// `drive.file` alone authorizes *Drive*-level create/edit (a Drive file
+// object), but native Google **Docs / Sheets / Slides** API calls
+// (`documents.batchUpdate`, `spreadsheets.batchUpdate`,
+// `presentations.batchUpdate`, and the matching `*.create` /
+// `*.get`) each require their own product-specific scope. Without them
+// the upstream Google Workspace MCP's Docs/Sheets/Slides tools 403 —
+// and upstream then falls back to its OWN browser OAuth on port 8000,
+// which is unrecoverable inside a container. These scopes are therefore
+// tied to the `--tier` so the token a tier mints can actually drive
+// every tool that tier exposes (see `selectGoogleWorkspaceScopes`).
+//
+// `documents` + `spreadsheets` cover the Docs/Sheets tools present at
+// EVERY tier (`core` already exposes them — see GoogleWorkspaceTierSchema
+// in src/config/schema.ts). `presentations` covers the Slides tools that
+// first appear at `extended`.
+//
+// Deliberately NOT added here: `calendar`, `gmail.*`, Forms/Tasks/Chat
+// scopes. The issue (#1663) scopes the fix to Slides/Docs/Sheets — the
+// surfaces explicitly broken today. Calendar/Forms/Tasks/Chat/Gmail are
+// a separate, larger scope-expansion decision (Gmail in particular has
+// an unresolved per-thread-approval shape — RFC G §5 out-of-scope).
+export const GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents";
+export const GOOGLE_SHEETS_SCOPE =
+  "https://www.googleapis.com/auth/spreadsheets";
+export const GOOGLE_SLIDES_SCOPE =
+  "https://www.googleapis.com/auth/presentations";
+
+/**
+ * The Google Workspace document scopes available at each tier. Tied to
+ * the tier→tool mapping in `GoogleWorkspaceTierSchema`:
+ *   - core / extended / complete  → Docs + Sheets (core already exposes
+ *     these tools)
+ *   - extended / complete         → + Slides (first exposed at extended)
+ *
+ * Pure + exported so the tier→scope contract is unit-pinned alongside
+ * the tier→tool contract.
+ */
+export function workspaceScopesForTier(
+  tier: "core" | "extended" | "complete",
+): string[] {
+  const docScopes = [GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE];
+  if (tier === "extended" || tier === "complete") {
+    return [...docScopes, GOOGLE_SLIDES_SCOPE];
+  }
+  return docScopes;
+}
+
 /**
  * Pick the OAuth scope set for `auth google account add`. Default is
  * read-only; write is strictly opt-in (RFC D §12 — a read grant must
  * never silently authorize writes). Pure + exported so the
  * default-is-read invariant is unit-pinned.
+ *
+ * Back-compat shim: this is the pre-#1663 Drive-only selector. New
+ * callers should use {@link selectGoogleWorkspaceScopes}, which folds
+ * the tier-tied Docs/Sheets/Slides scopes in.
  */
 export function selectDriveAccountScopes(write: boolean): string[] {
   return write ? DRIVE_WRITE_SCOPES : DRIVE_READONLY_SCOPES;
+}
+
+/**
+ * Pick the full OAuth scope set for `auth google account add`, tying the
+ * Google Workspace API scopes (Docs / Sheets / Slides) to the `--tier`
+ * (issue #1663). The Drive base is always present (read, plus
+ * `drive.file` when `write`); the Workspace document scopes are added
+ * per {@link workspaceScopesForTier}.
+ *
+ * Why tie scopes to tier: a tier advertises a set of MCP *tools*, but
+ * before #1663 the minted token carried Drive scopes only — so
+ * `extended`/`complete` surfaced Slides/Docs/Sheets tools that could
+ * never authenticate. Minting the matching scope set means every tool a
+ * tier exposes can actually run.
+ *
+ * Pure + exported so the tier→scope contract is unit-pinned. Tier
+ * defaults to `core` (matching `GoogleWorkspaceTierSchema`'s documented
+ * default) when unset.
+ */
+export function selectGoogleWorkspaceScopes(opts: {
+  write: boolean;
+  tier?: "core" | "extended" | "complete";
+}): string[] {
+  const base = selectDriveAccountScopes(opts.write);
+  const workspace = workspaceScopesForTier(opts.tier ?? "core");
+  // De-dup defensively — base and workspace sets are disjoint today but
+  // a future scope move shouldn't silently produce a doubled scope
+  // string in the consent URL.
+  return [...new Set([...base, ...workspace])];
 }
 
 export interface DriveCliDeps {

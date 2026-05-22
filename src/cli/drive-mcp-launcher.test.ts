@@ -14,13 +14,17 @@ import {
   AIOFILE_PIN,
   AIOFILE_PKG,
   buildChildEnv,
+  buildMissingScopeWarning,
   buildSeedCredentials,
   buildUvxArgs,
   encodeCredentialsFilename,
   classifyRootSchema,
+  findMissingWorkspaceScopes,
+  requiredWorkspaceScopesForTier,
   resolveCredentialsDir,
   sanitizeToolsListMessage,
 } from "./drive-mcp-launcher.js";
+import { workspaceScopesForTier } from "./drive.js";
 import { GOOGLE_WORKSPACE_MCP_PINNED_SHA } from "../memory/scaffold-integration.js";
 
 describe("buildSeedCredentials — exact upstream shape", () => {
@@ -244,6 +248,105 @@ describe("buildChildEnv — strips --single-user-incompatible knobs", () => {
     const base = { MCP_ENABLE_OAUTH21: "1" };
     buildChildEnv(base, "/tmp/c", "you@example.com");
     expect(base.MCP_ENABLE_OAUTH21).toBe("1");
+  });
+
+  it("moves WORKSPACE_MCP_PORT off 8000 to neutralize the doomed fallback (#1663)", () => {
+    const env = buildChildEnv({}, "/tmp/c", "you@example.com");
+    expect(env.WORKSPACE_MCP_PORT).toBe("8631");
+    expect(env.WORKSPACE_MCP_PORT).not.toBe("8000");
+  });
+
+  it("honours SWITCHROOM_GDRIVE_MCP_PORT override", () => {
+    const env = buildChildEnv(
+      { SWITCHROOM_GDRIVE_MCP_PORT: "9123" },
+      "/tmp/c",
+      "you@example.com",
+    );
+    expect(env.WORKSPACE_MCP_PORT).toBe("9123");
+  });
+
+  it("does not clobber an explicitly-set WORKSPACE_MCP_PORT", () => {
+    const env = buildChildEnv(
+      { WORKSPACE_MCP_PORT: "8042" },
+      "/tmp/c",
+      "you@example.com",
+    );
+    expect(env.WORKSPACE_MCP_PORT).toBe("8042");
+  });
+});
+
+describe("requiredWorkspaceScopesForTier — stays in sync with drive.ts (#1663)", () => {
+  it("matches workspaceScopesForTier for every tier", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      expect(requiredWorkspaceScopesForTier(tier)).toEqual(
+        workspaceScopesForTier(tier),
+      );
+    }
+  });
+
+  it("undefined tier behaves as core", () => {
+    expect(requiredWorkspaceScopesForTier(undefined)).toEqual(
+      workspaceScopesForTier("core"),
+    );
+  });
+});
+
+describe("findMissingWorkspaceScopes — scope↔tier preflight (#1663)", () => {
+  const DOCS = "https://www.googleapis.com/auth/documents";
+  const SHEETS = "https://www.googleapis.com/auth/spreadsheets";
+  const SLIDES = "https://www.googleapis.com/auth/presentations";
+
+  it("seed with all core scopes → nothing missing for core", () => {
+    const seed = `https://www.googleapis.com/auth/drive.readonly ${DOCS} ${SHEETS}`;
+    expect(findMissingWorkspaceScopes(seed, "core")).toEqual([]);
+  });
+
+  it("Drive-only seed (pre-#1663 token) → core flags Docs + Sheets missing", () => {
+    const seed = "https://www.googleapis.com/auth/drive.readonly";
+    expect(findMissingWorkspaceScopes(seed, "core")).toEqual([DOCS, SHEETS]);
+  });
+
+  it("core-scoped seed on an extended tier → flags Slides missing", () => {
+    const seed = `${DOCS} ${SHEETS}`;
+    expect(findMissingWorkspaceScopes(seed, "extended")).toEqual([SLIDES]);
+  });
+
+  it("full extended seed → nothing missing for extended", () => {
+    const seed = `${DOCS} ${SHEETS} ${SLIDES}`;
+    expect(findMissingWorkspaceScopes(seed, "extended")).toEqual([]);
+  });
+
+  it("empty seed scope string → all tier scopes missing", () => {
+    expect(findMissingWorkspaceScopes("", "extended")).toEqual([
+      DOCS,
+      SHEETS,
+      SLIDES,
+    ]);
+  });
+});
+
+describe("buildMissingScopeWarning — actionable re-mint guidance (#1663)", () => {
+  it("names the account, the tier, and the exact recovery command", () => {
+    const msg = buildMissingScopeWarning(
+      ["https://www.googleapis.com/auth/presentations"],
+      "extended",
+      "you@example.com",
+    );
+    expect(msg).toContain("you@example.com");
+    expect(msg).toContain("extended");
+    expect(msg).toContain("presentations");
+    expect(msg).toContain(
+      "switchroom auth google account add you@example.com --replace",
+    );
+  });
+
+  it("appends --write when drive.file is among the missing scopes", () => {
+    const msg = buildMissingScopeWarning(
+      ["https://www.googleapis.com/auth/drive.file"],
+      "core",
+      "a@b.com",
+    );
+    expect(msg).toContain("--replace --write");
   });
 });
 
