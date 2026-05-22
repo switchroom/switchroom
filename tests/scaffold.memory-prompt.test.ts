@@ -85,7 +85,7 @@ describe("Memory prompt guidance", () => {
     expect(startSh).not.toContain("## Memory — proactive, conversational");
   });
 
-  it("memory guidance appears AFTER progress_update block", () => {
+  it("memory guidance appears AFTER the Telegram pacing block", () => {
     const agentConfig: AgentConfig = {
       channels: {
         telegram: {
@@ -102,12 +102,12 @@ describe("Memory prompt guidance", () => {
     const startShPath = join(tmpDir, "test-agent", "start.sh");
     const startSh = readFileSync(startShPath, "utf-8");
 
-    const progressIdx = startSh.indexOf("## Progress updates (human-style check-ins)");
+    const pacingIdx = startSh.indexOf("## Talking to a human on Telegram");
     const memoryIdx = startSh.indexOf("## Memory — proactive, conversational");
 
-    expect(progressIdx).toBeGreaterThan(-1);
+    expect(pacingIdx).toBeGreaterThan(-1);
     expect(memoryIdx).toBeGreaterThan(-1);
-    expect(memoryIdx).toBeGreaterThan(progressIdx);
+    expect(memoryIdx).toBeGreaterThan(pacingIdx);
   });
 
   it("reconcileAgent emits identical memory guidance as scaffoldAgent", () => {
