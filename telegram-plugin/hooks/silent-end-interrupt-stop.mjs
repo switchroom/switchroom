@@ -117,7 +117,7 @@ function main() {
         'cannot see it — only text sent through the reply tool is delivered. ' +
         'Send your final answer now by calling mcp__switchroom-telegram__reply ' +
         '(or mcp__switchroom-telegram__stream_reply with done=true). ' +
-        'If you already delivered your answer via the reply tool, or you ' +
+        'If your final answer has already reached the user, or you ' +
         'intentionally have nothing to add, reply with exactly NO_REPLY.',
     }),
   )

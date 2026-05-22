@@ -4080,6 +4080,13 @@ async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ 
 }
 
 async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  // #1664 — pin the turn this reply belongs to at entry. The
+  // finalAnswerDelivered write near the end of this function runs after
+  // several awaits; turn-pinning (the #1067 pattern used across the
+  // gateway) keeps the write attributed to THIS turn rather than reading
+  // module-scope currentTurn, which a future refactor could let roll over
+  // mid-call.
+  const turn = currentTurn
   const chat_id = args.chat_id as string
   if (!chat_id) throw new Error('reply: chat_id is required')
   const rawText = args.text as string | undefined
@@ -4510,15 +4517,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     // "delivered" because replyCalled is true — and the silent-end
     // re-prompt would never engage. `rawText` is the model's own answer
     // text, measured before HTML conversion / Telegraph-link
-    // substitution. Reading the module-scope currentTurn is safe here:
-    // executeReply is invoked synchronously off an IPC dispatch within
-    // the in-flight turn; if the turn already rolled over, the stale
-    // write is harmless (the new turn re-inits the flag to false).
-    if (
-      isFinalAnswerReply({ text: rawText, disableNotification }) &&
-      currentTurn != null
-    ) {
-      currentTurn.finalAnswerDelivered = true
+    // substitution. Writes `turn` (pinned at executeReply entry) so the
+    // flag always lands on the turn this reply belongs to.
+    if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification })) {
+      turn.finalAnswerDelivered = true
     }
   }
 
@@ -4533,6 +4535,8 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 }
 
 async function executeStreamReply(args: Record<string, unknown>): Promise<unknown> {
+  // #1664 — pin the turn at entry; see executeReply for the rationale.
+  const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
 
@@ -4720,14 +4724,14 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // executeReply uses. See the CurrentTurn.finalAnswerDelivered doc-comment
   // for why replyCalled is not a sufficient signal here.
   if (
+    turn != null &&
     isFinalAnswerReply({
       text: (args.text as string | undefined) ?? '',
       disableNotification: args.disable_notification === true,
       done: args.done === true,
-    }) &&
-    currentTurn != null
+    })
   ) {
-    currentTurn.finalAnswerDelivered = true
+    turn.finalAnswerDelivered = true
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
