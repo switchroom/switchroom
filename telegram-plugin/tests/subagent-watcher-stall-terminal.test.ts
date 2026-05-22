@@ -127,7 +127,6 @@ function makeHarness(opts: {
     silentSynthesisStallThresholdMs: stallThresholdMs,
     silentStallTerminalMs,
     rescanMs,
-    sendNotification: () => {},
     onStall: (id, idleMs) => stallCalls.push({ agentId: id, idleMs }),
     onUnstall: (id) => unstallCalls.push({ agentId: id }),
     onStallTerminal: (id, desc) => stallTerminalCalls.push({ agentId: id, description: desc }),

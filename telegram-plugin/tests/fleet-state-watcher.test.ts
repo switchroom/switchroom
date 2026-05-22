@@ -50,7 +50,6 @@ describe('subagent-watcher: WorkerEntry.lastTool', () => {
     const intervals: Array<{ fn: () => void }> = []
     const w = startSubagentWatcher({
       agentDir,
-      sendNotification: () => {},
       stallThresholdMs: 60_000,
       rescanMs: 500,
       now: () => Date.now(),
