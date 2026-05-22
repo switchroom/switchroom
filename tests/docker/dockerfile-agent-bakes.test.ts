@@ -48,3 +48,51 @@ describe("Dockerfile.agent bakes", () => {
     );
   });
 });
+
+/**
+ * Playwright is delivered through TWO bindings — the JS binding for the
+ * `@playwright/mcp` default MCP, and the Python binding for the bundled
+ * `webapp-testing` skill (`from playwright.sync_api import ...`). Both
+ * share the browser binaries under $PLAYWRIGHT_BROWSERS_PATH, which is
+ * only safe when the two bindings are the SAME version: Playwright pins
+ * an exact browser revision per version, so a JS/Python skew surfaces
+ * as "browser not found" at runtime. These tests pin the single-source-
+ * of-truth invariant so a future bump can't silently desync the pair.
+ */
+describe("Dockerfile.agent Playwright provisioning", () => {
+  it("declares a single PLAYWRIGHT_VERSION build arg with a pinned value", () => {
+    const args = dockerfile.match(/ARG\s+PLAYWRIGHT_VERSION=/g) ?? [];
+    expect(args).toHaveLength(1);
+    // Exact pin (X.Y.Z) — no caret/tilde range, so the browser revision
+    // is deterministic across image rebuilds.
+    expect(dockerfile).toMatch(/ARG\s+PLAYWRIGHT_VERSION=\d+\.\d+\.\d+\s*$/m);
+  });
+
+  it("installs the JS binding at the pinned version", () => {
+    expect(dockerfile).toMatch(
+      /npm\s+install\s+-g\s+playwright@\$\{PLAYWRIGHT_VERSION\}/,
+    );
+  });
+
+  it("installs the Python binding at the SAME pinned version", () => {
+    expect(dockerfile).toMatch(
+      /pip3?\s+install\s+[^\n]*playwright==\$\{PLAYWRIGHT_VERSION\}/,
+    );
+  });
+
+  it("installs chromium + system deps for the JS binding", () => {
+    expect(dockerfile).toMatch(/playwright\s+install\s+--with-deps\s+chromium/);
+  });
+
+  it("ensures the Python binding's chromium is resolved", () => {
+    expect(dockerfile).toMatch(
+      /python3\s+-m\s+playwright\s+install\s+chromium/,
+    );
+  });
+
+  it("does not pin the JS binding to a floating npm range", () => {
+    // `playwright@^…` / `playwright@~…` would let the JS binding drift
+    // away from the exact-pinned Python binding on the next rebuild.
+    expect(dockerfile).not.toMatch(/playwright@[\^~]/);
+  });
+});
