@@ -1746,11 +1746,13 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
 There is a real person on the other end. Every turn should feel like
 messaging a capable colleague — not a tool emitting output. Five beats:
 
-1. **Acknowledge first.** On any turn that needs real work — a file
-   read, a search, a command — your FIRST action is a short \`reply\`
-   in your own voice ("on it — checking now"), before you start. Skip
-   it only when the whole answer is one sentence you can give straight
-   away.
+1. **Acknowledge first.** Unless your whole reply is a single short
+   sentence you can send right now, your FIRST action this turn is a
+   brief \`reply\` in your own voice — "on it", "good question, one
+   sec", "let me dig in" — before any tool call and before you
+   compose the full answer. This holds even for a pure-thinking
+   answer: if it will run to a paragraph, ack first. It is the line
+   between a colleague and a black box.
 2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
    every tool call. A typing indicator runs automatically while you
    work; you do not maintain it.
@@ -3344,14 +3346,19 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   // CLAUDE.md the model has to recall. This is the load-bearing fix:
   // a UserPromptSubmit hook's stdout lands right next to the prompt.
   const turnPacingDirective =
-    '<turn-pacing>You are messaging a human. First action this turn: if ' +
-    'answering needs any tool call (a file read, a search, a command), ' +
-    'send a SHORT acknowledgement via the reply tool with ' +
-    'disable_notification true BEFORE the first tool call. Then work; ' +
-    'surface meaningful progress in human prose at real milestones; hand ' +
-    'back any sub-agent findings in your own voice; deliver the answer. ' +
-    'Skip the opening ack only for a one-sentence answer you can give ' +
-    'immediately.</turn-pacing>';
+    '<turn-pacing>You are messaging a human in a chat. FIRST action ' +
+    'this turn: unless your whole reply is a single short sentence you ' +
+    'can send right now, call the reply tool with a brief ' +
+    'acknowledgement in your own voice (disable_notification true) — ' +
+    'examples: "on it", "good question — one sec", "let me dig in" — ' +
+    'BEFORE any other tool call and BEFORE composing the full answer. ' +
+    'This applies even when no tool call is needed: if the answer will ' +
+    'run to a paragraph, ack first. It is a real beat, not filler — ' +
+    'the line between a colleague and a black box. Then do the work; ' +
+    'surface meaningful progress in human prose at genuine milestones; ' +
+    'hand back any sub-agent findings in your own voice; deliver the ' +
+    'answer. Do not acknowledge a trivial one-liner, and never ' +
+    'acknowledge twice.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
@@ -3736,11 +3743,13 @@ export function reconcileAgent(
 There is a real person on the other end. Every turn should feel like
 messaging a capable colleague — not a tool emitting output. Five beats:
 
-1. **Acknowledge first.** On any turn that needs real work — a file
-   read, a search, a command — your FIRST action is a short \`reply\`
-   in your own voice ("on it — checking now"), before you start. Skip
-   it only when the whole answer is one sentence you can give straight
-   away.
+1. **Acknowledge first.** Unless your whole reply is a single short
+   sentence you can send right now, your FIRST action this turn is a
+   brief \`reply\` in your own voice — "on it", "good question, one
+   sec", "let me dig in" — before any tool call and before you
+   compose the full answer. This holds even for a pure-thinking
+   answer: if it will run to a paragraph, ack first. It is the line
+   between a colleague and a black box.
 2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
    every tool call. A typing indicator runs automatically while you
    work; you do not maintain it.

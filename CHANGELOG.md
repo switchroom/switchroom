@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.13.9 — pacing v2.1: the ack gate is answer length, not tool use
+
+### fix(pacing) — acknowledge first on long replies, not just tool turns
+
+v0.13.8 shipped the five-beat pacing model but the verbal-ack beat
+still mostly did not fire. A fuzzy UAT against test-harness (8 prompt
+shapes) measured **1/8** turns producing a genuine opening
+acknowledgement.
+
+Root cause: every pacing surface gated the ack on *"any turn that
+needs real work — a file read, a search, a command"*. Half of real
+prompts ("compare X and Y", "summarise this in plain language") need
+**no** tool call — they are pure reasoning — so the model correctly
+read the contract and skipped the ack, then went silent for 10–17s
+while composing a multi-paragraph answer.
+
+The gate is now **answer length, not tool use**: unless the whole
+reply is a single short sentence to send immediately, acknowledge
+first — *even when no tool call is involved*. Fixed in lockstep
+across `turnPacingDirective` (the per-turn UserPromptSubmit hook),
+`telegram-style.md.hbs`, `scaffold.ts`'s append-prompt, and
+`reference/conversational-pacing.md`.
+
+Re-running the same UAT: **8/8** pass the 20s contract, **5/8**
+genuine opening acks + 2 legitimate fast-answer skips (replies that
+landed in 1.7s / 4.5s — too fast to need an ack).
+
 ## v0.13.8 — conversational pacing v2: the five-beat human-feel model
 
 ### feat(pacing) — re-found conversational pacing (#1645, #1646)
