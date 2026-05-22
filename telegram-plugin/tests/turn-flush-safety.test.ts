@@ -138,112 +138,60 @@ describe('decideTurnFlush', () => {
     ).toEqual({ kind: 'skip', reason: 'reply-called' })
   })
 
-  // #1291 — when the model emits a soft-commit reply ("on it, back in a
-  // few") and then composes the real substantive answer in terminal text
-  // only, the pre-#1291 behaviour skipped flush entirely because
-  // replyCalled was true. The fix: track capturedTextLenAtLastReply and
-  // flush the post-reply tail when it meets the substantive threshold.
-  describe('#1291 — post-reply tail flush', () => {
-    it('flushes the post-reply tail when it meets the substantive threshold', () => {
+  // The turn-flush safety net covers exactly one failure mode: a turn that
+  // ended with the model never having said anything. Once the model has
+  // called reply / stream_reply the turn is served — any assistant text it
+  // emits afterwards is its own end-of-turn wrap-up (a closing summary,
+  // narration to itself), NOT a message it chose to send. The framework
+  // must never promote that terminal text into a second Telegram bubble.
+  //
+  // Regression guard for the redundant-follow-up-message fix: this reverts
+  // the #1291 post-reply-tail flush, which posted a duplicate recap on
+  // essentially every turn because the model habitually writes a closing
+  // summary after its final reply. See reference/conversational-pacing.md
+  // — "the framework owns the beat; the model authors the words".
+  describe('reply-called turns never flush trailing terminal text', () => {
+    it('skips even when a long substantive tail follows the reply', () => {
       const decision = decideTurnFlush({
         chatId: '700',
         replyCalled: true,
-        // Index 0 = the captured text BEFORE the reply tool was called
-        // (some thinking-as-text). Indices 1..2 are post-reply.
         capturedText: [
           'thinking out loud before the reply',
-          'Now here is the actual substantive answer the model composed ',
-          'in terminal text only after the interim reply call.',
+          'Answered the Playwright question and acked the calendar ' +
+            'diagnosis is still in flight. Will surface the root cause ' +
+            'when the worker returns.',
         ],
-        capturedTextLenAtLastReply: 1,
       })
-      expect(decision).toEqual({
-        kind: 'flush',
-        text:
-          'Now here is the actual substantive answer the model composed ' +
-          '\nin terminal text only after the interim reply call.',
-      })
+      expect(decision).toEqual({ kind: 'skip', reason: 'reply-called' })
     })
 
-    it('skips with reply-called-no-new-text when post-reply tail is below threshold', () => {
+    it('skips regardless of how many text blocks trail the reply', () => {
       const decision = decideTurnFlush({
         chatId: '701',
         replyCalled: true,
-        capturedText: ['the pre-reply scratch', 'ok.'], // tail = "ok." (3 chars)
-        capturedTextLenAtLastReply: 1,
+        capturedText: [
+          'a substantive paragraph the model wrote as terminal text',
+          'and another one, each well over any old length threshold',
+          'and a third closing summary block for good measure',
+        ],
       })
-      expect(decision).toEqual({
-        kind: 'skip',
-        reason: 'reply-called-no-new-text',
-      })
+      expect(decision).toEqual({ kind: 'skip', reason: 'reply-called' })
     })
 
-    it('skips with reply-called when there is no post-reply text at all', () => {
+    it('skips with reply-called when capturedText is empty', () => {
       const decision = decideTurnFlush({
         chatId: '702',
         replyCalled: true,
-        capturedText: ['everything-was-before-the-reply'],
-        capturedTextLenAtLastReply: 1, // tail slice is empty
+        capturedText: [],
       })
       expect(decision).toEqual({ kind: 'skip', reason: 'reply-called' })
     })
 
-    it('post-reply tail honors a silent marker (skip)', () => {
+    it('feature flag off still wins over a reply-called turn', () => {
       const decision = decideTurnFlush({
         chatId: '703',
         replyCalled: true,
-        capturedText: ['real answer pre-reply', 'NO_REPLY'],
-        capturedTextLenAtLastReply: 1,
-        replyCalledTailMinChars: 1, // force the marker check
-      })
-      expect(decision).toEqual({ kind: 'skip', reason: 'silent-marker' })
-    })
-
-    it('post-reply tail with null chatId still skips (no-inbound-chat)', () => {
-      const decision = decideTurnFlush({
-        chatId: null,
-        replyCalled: true,
-        capturedText: [
-          'pre',
-          'this tail would have been substantive enough to flush normally',
-        ],
-        capturedTextLenAtLastReply: 1,
-      })
-      expect(decision).toEqual({ kind: 'skip', reason: 'no-inbound-chat' })
-    })
-
-    it('preserves pre-#1291 behaviour when capturedTextLenAtLastReply is omitted', () => {
-      // Legacy caller doesn't track the marker — defaults to
-      // capturedText.length, so the tail slice is empty and we skip
-      // with reason 'reply-called' (the original behaviour).
-      const decision = decideTurnFlush({
-        chatId: '704',
-        replyCalled: true,
-        capturedText: ['some answer the model emitted'],
-      })
-      expect(decision).toEqual({ kind: 'skip', reason: 'reply-called' })
-    })
-
-    it('respects a custom replyCalledTailMinChars threshold', () => {
-      const decision = decideTurnFlush({
-        chatId: '705',
-        replyCalled: true,
-        capturedText: ['pre-reply', 'short but substantive in this test'],
-        capturedTextLenAtLastReply: 1,
-        replyCalledTailMinChars: 10,
-      })
-      expect(decision.kind).toBe('flush')
-    })
-
-    it('feature flag off still wins over post-reply tail flush', () => {
-      const decision = decideTurnFlush({
-        chatId: '706',
-        replyCalled: true,
-        capturedText: [
-          'pre',
-          'a long substantive post-reply tail that would otherwise flush',
-        ],
-        capturedTextLenAtLastReply: 1,
+        capturedText: ['a long substantive tail that pre-fix would flush'],
         flushEnabled: false,
       })
       expect(decision).toEqual({ kind: 'skip', reason: 'flag-disabled' })
