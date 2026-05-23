@@ -279,6 +279,45 @@ describe('pending-work-progress', () => {
     expect(__getStateForTests(KEY)).toBeUndefined()
   })
 
+  it('no stale carryover: turn 1 activates, clearPending fires, turn 2 (no async) does not re-activate', async () => {
+    // Reproduces the reviewer's blocker #2 path: turn 1 with async
+    // dispatch activates pending-progress; an arriving turn 2 (real
+    // inbound OR synthesised wake) must clear state so a turn 2 that
+    // does NOT itself dispatch async never inherits the prior turn's
+    // `pending=true` and re-activates against turn 2's anchor.
+    const cap = setup()
+    // ── Turn 1: dispatch async, reply, end — activates.
+    noteAsyncDispatch(KEY)
+    noteOutbound(KEY, { messageId: 100, text: 'worker dispatched' })
+    cap.now = 1_000
+    noteTurnEnd(KEY)
+    expect(__getStateForTests(KEY)?.activatedAt).toBe(1_000)
+
+    // ── Inbound (or handback / cron / vault grant) for turn 2.
+    // Gateway clears state — exactly what the inbound/enqueue hooks
+    // wire up at handleInbound + handleSessionEvent.enqueue.
+    cap.now = 90_000
+    clearPending(KEY, 'inbound')
+    expect(__getStateForTests(KEY)).toBeUndefined()
+
+    // ── Turn 2: reply only, NO async dispatch this turn.
+    noteOutbound(KEY, { messageId: 200, text: 'just answering' })
+    cap.now = 91_000
+    noteTurnEnd(KEY)
+
+    // Turn 2 must NOT activate — no async was dispatched in this turn.
+    // Pre-fix this assertion would fail because the prior turn's
+    // `pending=true` was never reset and `noteTurnEnd` re-activated
+    // against turn 2's fresh anchor.
+    expect(__getStateForTests(KEY)).toBeUndefined()
+
+    // Confirm: no edits fire over the next several poll intervals.
+    cap.now = 91_000 + EDIT_INTERVAL_MS * 3
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits).toHaveLength(0)
+  })
+
   it('multiple chats — independent state', async () => {
     const cap = setup()
     const KEY_A = 'A:_'

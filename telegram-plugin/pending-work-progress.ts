@@ -155,10 +155,22 @@ function ensure(key: string): State {
 /**
  * Fresh turn — reset the per-turn `pending` flag and the per-turn
  * anchor. The cross-turn `activated` state is per-PRIOR-turn and is
- * cleared by the explicit clear paths (inbound, handback, timeout),
- * not by a new turn — a new turn that ARRIVES while ambient is
- * running will already have called `clearPending('inbound')` from the
- * gateway's inbound path before this fires.
+ * cleared by the explicit clear paths (`clearPending` with reason
+ * `inbound` / `handback` / `timeout`), not by a new turn. The gateway
+ * wires those clears at TWO sites for full coverage:
+ *
+ *   1. `handleInbound` (real user message) → `clearPending('inbound')`
+ *      — the fast path; fires the moment the gateway sees an inbound,
+ *      before the new turn atom is even built.
+ *   2. `handleSessionEvent` `enqueue` case (every fresh turn atom)
+ *      → `clearPending('handback')` — the backstop covering
+ *      synthesised wakes (subagent-handback, cron, vault grant,
+ *      restart marker) that push directly to `pendingInboundBuffer`
+ *      and bypass `handleInbound`. Idempotent w/r/t the first clear.
+ *
+ * `startTurn` itself only matters if the state map already has an
+ * entry for `key` — which post-fix is impossible (the clears
+ * delete it). Kept for test ergonomics and as defence-in-depth.
  */
 export function startTurn(key: string): void {
   if (!enabled()) return

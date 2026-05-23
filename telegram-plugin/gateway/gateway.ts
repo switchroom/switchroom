@@ -4777,6 +4777,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const sChatId = args.chat_id as string
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now())
+    // #1445 cross-turn pending-async ambient. The terminal stream_reply
+    // (done=true) is the user-visible anchor for any cross-turn wait
+    // that follows. Capture it so if this turn ends with a pending
+    // async dispatch, the framework edits THIS message in place at
+    // intervals.
+    pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
+      messageId: result.messageId,
+      text: args.text as string,
+    })
   }
   // #1664 — mark the turn's final answer as delivered. For stream_reply a
   // call with done=true IS the final answer by definition (the model
@@ -5790,6 +5799,25 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Drain any orphaned typing-wrap entries left over from a crashed
       // prior turn before resetting focus.
       typingWrapper.drainAll()
+      if (ev.chatId) {
+        // #1445 cross-turn pending-async ambient — backstop for the
+        // `handleInbound` path's `clearPending('inbound')`. The
+        // inbound path covers real user messages, but synthesised
+        // wakes (subagent-handback channel turn, cron fires, vault
+        // grant resumes, restart markers) push directly to
+        // `pendingInboundBuffer` and bypass `handleInbound`. The
+        // `enqueue` session-event fires for EVERY fresh turn atom
+        // regardless of source — clearing here drops any prior turn's
+        // ambient before the new turn's `noteOutbound` lands. The
+        // call is idempotent so it's safe to fire in addition to the
+        // inbound-path clear (for the real-inbound case, this is a
+        // no-op because state was already deleted by then).
+        const enqThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
+        pendingProgress.clearPending(
+          statusKey(ev.chatId, enqThreadId),
+          'handback',
+        )
+      }
       if (ev.chatId) {
         // Issue #195: if a previous turn left an answer-lane stream open
         // (rapid steer/queue), force it to a new generation so its in-flight
