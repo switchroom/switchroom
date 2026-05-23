@@ -142,3 +142,117 @@ describe('flushOnAgentDisconnect — registered agent disconnects (existing beha
     expect(deps.activeDraftParseModes.size).toBe(0)
   })
 })
+
+describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)', () => {
+  // The race that motivates this: the canonical reply path fires
+  // `setDone()` on the StatusReactionController BEFORE purgeReactionTracking
+  // runs `activeTurnStartedAt.delete(key)`. If the bridge crashes between
+  // those two steps, the controller loop sees an EMPTY activeStatusReactions
+  // (already cleared by setDone) but activeTurnStartedAt still has the key.
+  // Without the sweep, that key orphans and the next inbound is "held mid-
+  // turn" against a ghost.
+
+  it('sweeps activeTurnStartedAt keys the controller loop missed', () => {
+    // Construct the exact race: activeStatusReactions is EMPTY (setDone
+    // already cleared it on the reply path) but activeTurnStartedAt still
+    // has an entry.
+    const onDanglingTurnsSwept = vi.fn()
+    const clearActiveReactions = vi.fn()
+    const disposeProgressDriver = vi.fn()
+    const log = vi.fn()
+    const deps = {
+      agentName: 'clerk',
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>([
+        ['ghost:thr:msg', { chatId: 'ghost', messageId: 42 }],
+      ]),
+      activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions,
+      disposeProgressDriver,
+      onDanglingTurnsSwept,
+      log,
+    }
+
+    flushOnAgentDisconnect(deps)
+
+    // The sweep fired and cleared the dangling entry.
+    expect(deps.activeTurnStartedAt.size).toBe(0)
+    expect(deps.activeReactionMsgIds.size).toBe(0)
+    expect(onDanglingTurnsSwept).toHaveBeenCalledTimes(1)
+    expect(onDanglingTurnsSwept.mock.calls[0][0]).toEqual(['ghost:thr:msg'])
+    // The log line names what happened so the operator can audit.
+    expect(
+      log.mock.calls.some((c: unknown[]) =>
+        typeof c[0] === 'string' && /swept .* dangling turn/.test(c[0]),
+      ),
+    ).toBe(true)
+  })
+
+  it('does not fire the sweep when the controller loop already cleaned up everything', () => {
+    // Normal-path disconnect: activeStatusReactions had entries, the
+    // controller loop ran setDone + delete on each, activeTurnStartedAt
+    // is already empty by the end of the loop. No dangling to sweep.
+    const { spies, deps } = makeDeps('clerk')
+    const onDanglingTurnsSwept = vi.fn()
+    const depsWithCallback = { ...deps, onDanglingTurnsSwept }
+
+    flushOnAgentDisconnect(depsWithCallback)
+
+    // Controller loop already cleaned both entries.
+    expect(deps.activeTurnStartedAt.size).toBe(0)
+    // Callback NOT fired — nothing left to sweep after the loop.
+    expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
+    // Regression: the existing setDone path still works.
+    expect(spies.setDoneA).toHaveBeenCalledTimes(1)
+    expect(spies.setDoneB).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT sweep for anonymous disconnects (no agent registered)', () => {
+    // Critical regression guard: the sweep MUST be gated by the
+    // agentName-null early-return. Anonymous one-shot IPC clients
+    // (recall.py, etc.) disconnect constantly and must never touch
+    // turn state.
+    const onDanglingTurnsSwept = vi.fn()
+    const deps = {
+      agentName: null,
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
+      activeTurnStartedAt: new Map<string, number>([['real-turn:thr:msg', 100]]),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions: vi.fn(),
+      disposeProgressDriver: vi.fn(),
+      onDanglingTurnsSwept,
+      log: vi.fn(),
+    }
+
+    flushOnAgentDisconnect(deps)
+
+    // Anonymous disconnect: turn state preserved, sweep callback not fired.
+    expect(deps.activeTurnStartedAt.size).toBe(1)
+    expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
+  })
+
+  it('omitting onDanglingTurnsSwept is safe (optional callback)', () => {
+    // Backward-compat guard — existing callers that don't pass the new
+    // callback still work without runtime error.
+    const deps = {
+      agentName: 'clerk',
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
+      activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions: vi.fn(),
+      disposeProgressDriver: vi.fn(),
+      // onDanglingTurnsSwept intentionally omitted.
+      log: vi.fn(),
+    }
+
+    expect(() => flushOnAgentDisconnect(deps)).not.toThrow()
+    // The sweep still happens, just without the callback observation.
+    expect(deps.activeTurnStartedAt.size).toBe(0)
+  })
+})

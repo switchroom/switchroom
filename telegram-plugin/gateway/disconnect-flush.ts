@@ -48,6 +48,18 @@ export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Strea
   /** Progress driver — disposed with `preservePending: true` for sub-agent JTBDs (#393). */
   disposeProgressDriver: () => void
 
+  /** Optional: called when the registered-agent disconnect found dangling
+   *  `activeTurnStartedAt` entries the controller loop did not clear (i.e.
+   *  `setDone()` already ran on the canonical reply path, leaving
+   *  `activeStatusReactions` empty but `activeTurnStartedAt` populated).
+   *  The gateway uses this to null its module-scope `currentTurn` — the
+   *  bridge that owned that turn just died. Without this, the next
+   *  inbound is "held mid-turn" against a ghost (the 2026-05-23 audit
+   *  found ~14 such events / 3 days / 9 agents).
+   *
+   *  No-op if no dangling keys are found. */
+  onDanglingTurnsSwept?: (purgedKeys: string[]) => void
+
   /** Logger — receives the one-line decision trace. */
   log: (msg: string) => void
 }
@@ -70,6 +82,7 @@ export function flushOnAgentDisconnect<
     activeDraftParseModes,
     clearActiveReactions,
     disposeProgressDriver,
+    onDanglingTurnsSwept,
     log,
   } = deps
 
@@ -90,6 +103,30 @@ export function flushOnAgentDisconnect<
     activeTurnStartedAt.delete(key)
   }
   clearActiveReactions()
+
+  // Defense-in-depth — sweep any `activeTurnStartedAt` keys the controller
+  // loop above did not touch. The bridge has crashed; any turn it owned is
+  // dead by definition, regardless of whether `activeStatusReactions`
+  // still tracks it. The race that motivates this: `setDone()` already
+  // fired on the canonical reply path (clearing the reaction controller)
+  // BUT the disconnect arrived BEFORE `purgeReactionTracking` ran the
+  // `activeTurnStartedAt.delete` line for that key. Without this sweep,
+  // the key orphans, and the next inbound is "held mid-turn" against
+  // a ghost — surfacing as the held-mid-turn / `currentTurn_nulled=true`
+  // wedge symptom documented in feedback_5min_restart_wedge memo and
+  // measured at ~14 events / 3 days / 9 agents (2026-05-23 audit).
+  const danglingKeys = [...activeTurnStartedAt.keys()]
+  if (danglingKeys.length > 0) {
+    for (const k of danglingKeys) {
+      activeTurnStartedAt.delete(k)
+      activeReactionMsgIds.delete(k)
+    }
+    log(
+      `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
+      `post-bridge-death (controller loop missed — setDone raced disconnect)`,
+    )
+    onDanglingTurnsSwept?.(danglingKeys)
+  }
 
   // Stop coalesce timers that could emit into a finalized draft stream, but
   // preserve chats with pendingCompletion=true — those have background

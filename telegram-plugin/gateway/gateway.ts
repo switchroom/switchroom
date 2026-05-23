@@ -3084,6 +3084,30 @@ silencePoke.startTimer({
     emitRuntimeMetric(event)
   },
   onFrameworkFallback: async (ctx) => {
+    // Late-fire short-circuit (2026-05-23 audit finding). The fallback
+    // can race a clean turn-end: the model's actual reply lands inside
+    // the silence window's final ~50ms, the canonical turn-end path
+    // clears `activeTurnStartedAt` and nulls `currentTurn`, and then
+    // this handler fires anyway. Without this check we emit a noisy
+    // "still working…" ping to the user (right after they got their
+    // real reply) AND a misleading "ended wedged turn ... currentTurn_
+    // nulled=false drained_buffered=0/0" log line. The 7-day audit
+    // showed this race accounts for ~90% of all framework_fallback log
+    // events (124 of 138 `currentTurn_nulled=false` cases). Distinct
+    // log line so observability still tracks the fact that the silence
+    // crossed threshold; the wedge counter is no longer polluted.
+    if (activeTurnStartedAt.get(ctx.key) == null && currentTurn == null) {
+      process.stderr.write(
+        `telegram gateway: silence-poke framework-fallback late-fire skipped — ` +
+        `turn ended cleanly during silence window ` +
+        `chat=${ctx.chatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs}\n`,
+      )
+      // Tell silence-poke this chat-thread is finished so the next
+      // arming doesn't carry stale state.
+      silencePoke.endTurn(ctx.key)
+      return
+    }
+
     // Deterministic in-flight update status (klanker incident). If this
     // gateway dispatched an update_apply that's still running, the
     // recurring framework fallback carries hostd's REAL phase + elapsed
@@ -3578,6 +3602,18 @@ const ipcServer: IpcServer = createIpcServer({
         // through both possibly-undefined hops. Caught by
         // scripts/check-plugin-references.mjs (TS2722).
         progressDriver?.dispose?.({ preservePending: true })
+      },
+      // When dangling activeTurnStartedAt keys were swept (setDone raced
+      // disconnect), the module-scope `currentTurn` may also point at the
+      // dead bridge's turn. Null it so the next inbound starts a fresh
+      // turn instead of inheriting a ghost.
+      onDanglingTurnsSwept: () => {
+        if (currentTurn != null) {
+          process.stderr.write(
+            `telegram gateway: disconnect-flush nulled currentTurn (bridge died with turn in flight)\n`,
+          )
+          currentTurn = null
+        }
       },
       log: (msg) => process.stderr.write(`${msg}\n`),
     })
