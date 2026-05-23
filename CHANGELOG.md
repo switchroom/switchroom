@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.13.23 — revert v0.13.22's CPU cap (was making rerank 3-10x slower)
+
+### fix(hindsight) — revert CPU cap (#1701)
+
+v0.13.22 shipped `--cpus=2.0` on the hindsight container as a smart-
+default, on the theory that bursts of concurrent rerank tasks would
+starve the agent fleet on shared hosts.
+
+**Live measurement immediately after deploy showed the opposite.** The
+cross-encoder rerank is dominated by per-pair compute, not task-level
+contention. Capping CPU at 2 cores forced each rerank to serialize
+through 2 cores instead of using the host's free cores, which made
+each pass 3-10x slower:
+
+| State | Rerank p50 | Rerank under burst |
+|---|---|---|
+| Pre-v0.13.22 (uncapped) | ~4.9s | ~14s |
+| v0.13.22 (`cpus=2.0`) | 7-20s | 25-42s |
+| v0.13.23 (cap removed) | **~2.1s** | TBD |
+
+Fix:
+- Remove `HINDSIGHT_DEFAULT_CPUS` constant + the `--cpus` flag
+  emission in `startHindsight()` and the compose snippet.
+- Restore `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` to vendor
+  default `4` (v0.13.22 lowered to `2` paired with the CPU cap; with
+  CPU uncapped, 4-way is the right knob — allows 4 fleet recalls to
+  overlap without thrashing per-pair compute).
+
+Memory cap (`4g`), reservation (`2g`), pids cap (`1000`) all stay —
+those defend against runaway memory growth without restricting the
+reranker's compute.
+
+The other v0.13.22 smart-defaults (bucket_batching, max_candidates=150,
+recall_max_concurrent=8, recall.py 8s timeout, drop cache TTL,
+recallMaxMemories=8, recallMinOverlap=0.10) keep behaving as designed.
+Only the CPU cap was wrong-headed.
+
 ## v0.13.22 — hindsight smart-defaults (recall p50 5.6s → ~2-2.5s)
 
 Forensic-audit-driven release. The 2026-05-24 audit measured hindsight
