@@ -5,7 +5,7 @@
  * (written by the summarizer Stop hook). On the FIRST assistant reply
  * of the new session the plugin prepends a subtle one-liner:
  *
- *   ↩️ Picked up where we left off — <topic>
+ *   ↩️ Picked up where we left off, <topic>
  *
  * The sidecar is consumed (read + deleted) so the line only fires once.
  * All helpers here are filesystem-only or env-only — no Telegram side
@@ -175,7 +175,13 @@ export function formatHandoffLine(
   topic: string,
   format: HandoffFormat,
 ): string {
-  const prefix = "↩️ Picked up where we left off — ";
+  // Comma instead of em-dash: the framework-emitted prefix is
+  // concatenated AFTER scrubVoice runs on the model body (gateway.ts
+  // executeReply), so any em-dash here bypasses the v0.13.20 voice
+  // scrub. Replacing at the template source is one mechanical change
+  // that closes the dominant residual em-dash leak (16 of 17 dashed
+  // messages on test-harness were this template per 2026-05-24 audit).
+  const prefix = "↩️ Picked up where we left off, ";
   if (format === "html") {
     return `<i>${prefix}${escapeHtml(topic)}</i>\n\n`;
   }
