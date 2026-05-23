@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.13.14 — cross-turn pending-async progress (no more dead-air during background work)
+
+### feat(telegram) — ambient `still working (Nm)` while async work runs across turn boundaries (#1669, closes #1445)
+
+The dominant "agent went silent for 30+ minutes" pain — the user
+dispatches background work (sub-agent worker, async `Agent` / `Task`,
+`Bash` with `run_in_background:true`), the model sends one ack reply
+that pings, the turn ends, and then nothing reaches the user until
+the worker returns. Forensic data: silence-poke success rate is **0–7%**
+across hundreds of fires (the polite levels need the model to be
+mid tool-cycle to even land), and the 300 s framework fallback is a
+destructive turn-killer, not a UX update.
+
+The fix is additive and out-of-band: a new `pending-work-progress.ts`
+state machine watches for `tool_use(Agent|Task|Bash+run_in_background)`
+in the current turn, captures the model's last `reply` / `stream_reply`
+as an anchor, and at turn-end (with pending work) edits that single
+message in place every ~60 s with a `\n\n— still working (Nm)`
+suffix. Edits are silent (no notification spam), capped at 30 min,
+and clear the moment the user re-engages, a `subagent_handback`
+channel turn lands, or any other fresh turn starts.
+
+- Kill switch: `SWITCHROOM_DISABLE_PENDING_PROGRESS=1`.
+- Coverage: both `reply` and `stream_reply` anchor capture; clear
+  hooks at `handleInbound` (real user inbound, fast path) AND
+  `handleSessionEvent.enqueue` (backstop for synthesised wakes that
+  bypass `handleInbound` — handback, cron, vault grant, restart).
+- Three new runtime-metric kinds (`pending_progress_started` /
+  `edited` / `cleared`) for observability.
+- 14-test unit suite + a UAT regression scenario
+  (`cross-turn-pending-progress-dm.test.ts`) that pins in-place edits
+  with the suffix, silent-flag, and single-anchor invariants during a
+  350 s background bash.
+
+Honest scope caveat: this is a pragmatic stopgap, not the principled
+endpoint. The within-turn silence-poke ladder (0–7% success) and the
+300 s framework-fallback's destructive turn-kill are unchanged in
+this release. The architectural fix — model emits typed events,
+framework owns delivery (#869) — remains the long-term shape.
+
 ## v0.13.13 — create Workspace files; streamed answers stop vanishing
 
 ### fix(auth) — mint Slides/Docs/Sheets OAuth scopes so agents can edit Workspace files (#1663)
