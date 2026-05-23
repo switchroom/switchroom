@@ -190,3 +190,75 @@ describe('OutboundDedupCache — multiple entries per chat', () => {
     expect(cache.check('chat', undefined, LONG_HTML, 6000)).not.toBeNull()
   })
 })
+
+// ─── turnKey carve-out (2026-05-23 cross-turn-swallow fix) ───────────────────
+// Without turnKey awareness, the 60s TTL eats the SECOND turn's reply when a
+// user asks similar questions back-to-back (forensic audit on midturn-silent
+// UAT). The carve-out: both sides non-null + distinct ⇒ treat as miss.
+// Within-turn (#546 retry race) protection unchanged: same turnKey on both
+// sides ⇒ legacy hit. Null on either side ⇒ legacy hit.
+
+const LONG_TEXT = 'long enough text to count as content for the dedup floor'
+
+describe('OutboundDedupCache — turnKey carve-out', () => {
+  it('cross-turn identical content with distinct non-null turnKeys MISSES', () => {
+    // The headline bug: dedup was eating user replies across turns.
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000, 'turn-A')
+    expect(
+      cache.check('chat', undefined, LONG_TEXT, 5000, 'turn-B'),
+    ).toBeNull()
+  })
+
+  it('within-turn duplicates (same turnKey) STILL HIT — preserves #546 protection', () => {
+    // Same-turn retry race the module was built for.
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000, 'turn-A')
+    expect(
+      cache.check('chat', undefined, LONG_TEXT, 10_000, 'turn-A'),
+    ).not.toBeNull()
+  })
+
+  it('record-null + check-non-null → legacy hit', () => {
+    // Boot-time / silent-marker callers pass null on record; later
+    // executeReply checks with a turnKey. Legacy match must persist
+    // for the #546 protection to cover these cross-context cases.
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000, null)
+    expect(
+      cache.check('chat', undefined, LONG_TEXT, 5000, 'turn-A'),
+    ).not.toBeNull()
+  })
+
+  it('record-non-null + check-null → legacy hit', () => {
+    // Symmetric direction: turn-flush records with turnKey, a later
+    // null-context probe (rare but possible) still matches.
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000, 'turn-A')
+    expect(
+      cache.check('chat', undefined, LONG_TEXT, 5000, null),
+    ).not.toBeNull()
+  })
+
+  it('cross-turn entry does NOT shadow a same-turn match later in the list', () => {
+    // Edge case the predicate must handle: when the scan hits a stale
+    // cross-turn entry whose hash matches, it must keep scanning past
+    // it to find a real same-turn match. (The carve-out is implemented
+    // as `continue`, not `return null`.)
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000, 'turn-A') // older, cross-turn
+    cache.record('chat', undefined, LONG_TEXT, 3000, 'turn-B') // newer, same turn as query
+    expect(
+      cache.check('chat', undefined, LONG_TEXT, 5000, 'turn-B'),
+    ).not.toBeNull()
+  })
+
+  it('legacy 4-arg API still compiles + matches (default turnKey=null)', () => {
+    // Backward-compat smoke test — older callers that haven't been
+    // updated to pass turnKey continue to behave as the original test
+    // suite pins.
+    const cache = new OutboundDedupCache()
+    cache.record('chat', undefined, LONG_TEXT, 1000)
+    expect(cache.check('chat', undefined, LONG_TEXT, 5000)).not.toBeNull()
+  })
+})

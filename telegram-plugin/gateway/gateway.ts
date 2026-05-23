@@ -4263,7 +4263,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // late-replies with different content sail through.
   {
     const replyThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    const dup = outboundDedup.check(chat_id, replyThreadId, text, Date.now())
+    const dup = outboundDedup.check(chat_id, replyThreadId, text, Date.now(), currentTurn?.registryKey ?? null)
     if (dup != null) {
       process.stderr.write(
         `telegram gateway: reply: deduped (#546) chatId=${chat_id} ` +
@@ -4597,6 +4597,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             threadId,
             decision.mergedText,
             Date.now(),
+            turn?.registryKey ?? null,
           )
 
           silentAnchorEditDone = true
@@ -4921,7 +4922,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // calls with this same content within DEFAULT_DEDUP_TTL_MS will
   // be suppressed.
   if (sentIds.length > 0) {
-    outboundDedup.record(chat_id, threadId, text, Date.now())
+    outboundDedup.record(chat_id, threadId, text, Date.now(), currentTurn?.registryKey ?? null)
   }
   return { content: [{ type: 'text', text: result }] }
 }
@@ -4967,7 +4968,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const sChatId = args.chat_id as string
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     const sText = args.text as string
-    const dup = outboundDedup.check(sChatId, sThreadId, sText, Date.now())
+    const dup = outboundDedup.check(sChatId, sThreadId, sText, Date.now(), currentTurn?.registryKey ?? null)
     if (dup != null) {
       process.stderr.write(
         `telegram gateway: stream_reply: deduped (#546) chatId=${sChatId} ` +
@@ -5131,7 +5132,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   if (args.done === true && result.messageId != null) {
     const sChatId = args.chat_id as string
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now())
+    outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now(), currentTurn?.registryKey ?? null)
     // #1445 cross-turn pending-async ambient. The terminal stream_reply
     // (done=true) is the user-visible anchor for any cross-turn wait
     // that follows. Capture it so if this turn ends with a pending
@@ -6443,10 +6444,10 @@ function handleSessionEvent(ev: SessionEvent): void {
             // threadId come from the captured `turn` snapshot, stable for
             // the lifetime of the stream.
             checkDedup: (text: string) => {
-              return outboundDedup.check(turn.sessionChatId, turn.sessionThreadId, text, Date.now()) != null
+              return outboundDedup.check(turn.sessionChatId, turn.sessionThreadId, text, Date.now(), turn.registryKey ?? null) != null
             },
             recordDedup: (text: string) => {
-              outboundDedup.record(turn.sessionChatId, turn.sessionThreadId, text, Date.now())
+              outboundDedup.record(turn.sessionChatId, turn.sessionThreadId, text, Date.now(), turn.registryKey ?? null)
             },
             // #648 — write answer-stream materializations into the SQLite
             // history buffer so get_recent_messages can surface them. Guard
@@ -6607,6 +6608,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               turn.sessionThreadId,
               streamedFinalText,
               Date.now(),
+              turn.registryKey ?? null,
             )
           } catch { /* best-effort */ }
           if (HISTORY_ENABLED) {
@@ -6992,6 +6994,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               backstopThreadId,
               capturedText,
               Date.now(),
+              currentTurn?.registryKey ?? null,
             )
             if (backstopCtrl) backstopCtrl.setDone()
             // Unpin the card. completeTurn cleans up pinMgr's per-turn

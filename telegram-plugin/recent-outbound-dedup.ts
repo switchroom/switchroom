@@ -57,6 +57,16 @@ interface DedupEntry {
   /** First 80 chars of the original (un-normalized) text — for
    *  operator-facing log lines that show what got deduped. */
   preview: string
+  /** The `currentTurn.registryKey` at record time, or `null` if the
+   *  recording site had no turn context. Threaded through so check()
+   *  can distinguish within-turn retries (#546 bug class — keep
+   *  protecting) from cross-turn coincidences (2026-05-23 audit found
+   *  identical mid-turn + final replies across two turns ~30s apart
+   *  silently swallowing the second turn's answer; the user gets
+   *  no response to their second question). Null on either side
+   *  matches as before, preserving the boot-time / edge-case behaviour
+   *  the original tests pin. */
+  turnKey: string | null
 }
 
 /**
@@ -75,8 +85,21 @@ export class OutboundDedupCache {
   /** Record an outbound message. Caller should invoke this after a
    *  successful send, regardless of which path sent it (turn-flush,
    *  executeReply, executeStreamReply, etc.). Short content is not
-   *  recorded — see DEDUP_MIN_CONTENT_LEN. */
-  record(chatId: string, threadId: number | undefined, text: string, now: number): void {
+   *  recorded — see DEDUP_MIN_CONTENT_LEN.
+   *
+   *  `turnKey` lets check() tell within-turn retries (the #546 race
+   *  this module exists to catch) apart from cross-turn coincidences
+   *  (a user asking similar questions in different turns). Pass
+   *  `null` if the recording site has no turn context — that matches
+   *  legacy behaviour and is what the early-boot / fallback callers
+   *  pass. */
+  record(
+    chatId: string,
+    threadId: number | undefined,
+    text: string,
+    now: number,
+    turnKey: string | null = null,
+  ): void {
     if (text.length < DEDUP_MIN_CONTENT_LEN) return
     const key = makeKey(chatId, threadId)
     const list = this.entries.get(key) ?? []
@@ -85,6 +108,7 @@ export class OutboundDedupCache {
       hash: normalizeForDedup(text),
       ts: now,
       preview: text.slice(0, 80),
+      turnKey,
     })
     this.entries.set(key, list)
   }
@@ -92,12 +116,24 @@ export class OutboundDedupCache {
   /** Check whether the given text was already sent recently to the
    *  same chat. Returns the matched entry's preview + age on hit, or
    *  null on miss. Caller decides what to do with the answer
-   *  (skip-send, log, etc.). */
+   *  (skip-send, log, etc.).
+   *
+   *  Cross-turn carve-out (2026-05-23 fix): when both sides of a hash
+   *  match carry non-null `turnKey` AND those keys differ, treat as
+   *  miss. The duplicate-reply race this module was built for (#546)
+   *  is strictly within-turn (the same turn's buffered text replays
+   *  via a stream_reply retry), so within-turn retries continue to
+   *  hit. A user typing two similar prompts back-to-back used to lose
+   *  the second turn's reply because the hashes collided across
+   *  turns; that no longer happens. Null on EITHER side (legacy /
+   *  no-turn-context callers) still matches — preserves backward
+   *  compatibility with the original test suite + early-boot paths. */
   check(
     chatId: string,
     threadId: number | undefined,
     text: string,
     now: number,
+    turnKey: string | null = null,
   ): { matched: true; preview: string; ageMs: number } | null {
     if (text.length < DEDUP_MIN_CONTENT_LEN) return null
     const key = makeKey(chatId, threadId)
@@ -106,9 +142,19 @@ export class OutboundDedupCache {
     this.evict(list, now)
     const candidateHash = normalizeForDedup(text)
     for (const entry of list) {
-      if (entry.hash === candidateHash) {
-        return { matched: true, preview: entry.preview, ageMs: now - entry.ts }
+      if (entry.hash !== candidateHash) continue
+      // Cross-turn carve-out: distinct, non-null turnKeys on both
+      // sides ⇒ different turns ⇒ not a #546 retry. Skip past this
+      // entry and keep scanning (a same-turn match later in the list
+      // should still hit).
+      if (
+        turnKey != null
+        && entry.turnKey != null
+        && entry.turnKey !== turnKey
+      ) {
+        continue
       }
+      return { matched: true, preview: entry.preview, ageMs: now - entry.ts }
     }
     return null
   }
