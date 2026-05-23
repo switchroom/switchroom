@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.13.21 — wedge cleanup + dedup turnKey + interrupt fix + scrub coverage + doc flip
+
+Forensic-audit-driven release. Seven PRs addressing prod issues
+surfaced by the 2026-05-23/05-24 fleet audit.
+
+### fix(telegram) — wedge fallback late-fire skip + disconnect dangling-turn sweep (#1685)
+
+- `gateway.ts onFrameworkFallback` short-circuits when the turn ended
+  cleanly during the silence window. Removes ~90% of misleading
+  "ended wedged turn" log noise + the spurious user "still working…"
+  ping racing the real reply.
+- `disconnect-flush.ts` unconditionally sweeps any `activeTurnStartedAt`
+  keys the controller loop missed (bridge crashed AFTER setDone
+  cleared `activeStatusReactions` but BEFORE
+  `activeTurnStartedAt.delete`). Closes the real ~14-events/3-days
+  wedge documented in `feedback_5min_restart_wedge_violates_vision`.
+- New `onDanglingTurnsSwept` callback lets the gateway null
+  `currentTurn` for the same reason.
+
+### fix(telegram) — outbound dedup keyed by turnKey (#1686)
+
+User asks two similar questions within 60s ⇒ second turn's reply
+hash collided with the first's ⇒ dedup fired ⇒ user got no
+response. The original 60s TTL was sized for the within-turn #546
+retry race; per-chat key had no turn awareness.
+
+Added optional 5th `turnKey` arg to `record()` + `check()`. When
+both sides have non-null distinct turnKeys, treat as miss. Either-
+null falls back to legacy match — preserves #546 within-turn
+protection and boot-time / silent-marker callers unchanged. Threaded
+`currentTurn?.registryKey ?? null` through all 9 gateway callsites.
+
+### fix(telegram) — subagent-watcher deregisters on ENOENT/EACCES (#1687)
+
+`readSubTail` was emitting one log line per second per stranded
+JSONL — clerk grew 540k+ ENOENT errors in 3 days (~30/sec sustained)
+from polling files Claude Code had reaped along with the parent
+session's `subagents/` dir. Each stranded entry also leaked an
+`fs.watch` FD.
+
+Fix: detect `err.code === 'ENOENT' | 'EACCES'`, log ONCE, invoke
+new optional `onFileVanished` callback wired to
+`cleanupTerminalAgent` (closes FSWatcher, drops registry entry,
+records in `terminatedAgentIds` so rescans don't re-register).
+
+### fix(telegram) — em-dash handoff-line template (#1688)
+
+PR #1683 voice scrub runs BEFORE the framework's `takeHandoffPrefix`
+concatenation in `executeReply`. The literal em-dash in the
+"↩️ Picked up where we left off — " template bypassed scrub
+entirely — 16 of 17 dashed messages on test-harness post-v0.13.20
+were this prefix. Replaced at the template source with a comma.
+
+### fix(telegram) — `!` interrupt body bypasses the buffer gate (#1689)
+
+User-facing bug: `!`-prefix interrupt SIGINTs the in-flight turn,
+but the killed turn does NOT reliably emit `turn_complete`. Without
+that event, the post-`!` body sits in `pendingInboundBuffer`
+forever. User fires `! actually do X` ⇒ agent never replies.
+
+Live UAT (`jtbd-interrupt-marker-dm`, `describe.skip`'d since
+#1132) reproduces this on test-harness with a 60s timeout. Fix: add
+`isInterrupt: boolean` to `InboundDeliveryGateInput` as a peer of
+`isSteering` (both are intentional mid-turn delivery cases). Thread
+`interrupt.isInterrupt` through to the gate call.
+
+### fix(telegram) — voice scrub wired into stream_reply + turn_flush (#1690)
+
+PR #1683 wired scrub into `executeReply` + `executeEditMessage`
+only. Modern Claude on the fleet uses the answer-stream /
+draft-stream path for multi-paragraph replies — emits via
+`stream_reply done=true` or via the turn-flush `capturedText` path,
+both bypassing the scrub.
+
+Wired scrub into both new sites with new `site:'stream_reply'` and
+`site:'turn_flush'` runtime metric variants.
+
+### docs(telegram) — steering contract flip in docs + UAT (#1691)
+
+The steering default was flipped 2026-04-17 (commits `4fff90bf` +
+`597a58af`) — unprefixed mid-turn follow-ups are QUEUED; steering
+is opt-in via `/steer` or `/s`. Three docs lagged the code change
+for 5 weeks: the model prompt
+(`profiles/_shared/telegram-style.md.hbs`), the JTBD doc
+(`reference/steer-or-queue-mid-flight.md`), and the
+`jtbd-rapid-followup-dm` UAT (was `describe.skip`'d with too-loose
+`/md5/i` assertion). All three flipped to match the live contract.
+
 ## v0.13.20 — em-dash scrubber (framework-side voice enforcement)
 
 ### feat(telegram) — em-dash voice scrubber (#1683)
