@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.13.19 — over-ping × silent-anchor: demoted finals no longer buried
+
+### fix(telegram) — over-ping-suppressed finals bypass silent-anchor merge (#1681)
+
+Closes the load-bearing follow-up from #1679's documented residuals.
+
+**Symptom.** A multi-step turn with both:
+
+- silent updates anchored into one growing bubble (#1677), AND
+- a model-intended-pinged final reply that gets demoted to silent
+  by the over-ping safety net (#1674, because an earlier reply
+  already pinged)
+
+…would *merge the demoted final answer into the silent anchor*.
+The user has long since disengaged from the silently-edited
+bubble (no ping, no scroll change), so the actual final answer is
+buried in it.
+
+**Fix.** Single bypass clause in `decideSilentReplyAnchor`: when
+`wasOverPingSuppressed === true`, the reply lands as a fresh
+silent bubble (no anchor capture). Discoverability preserved
+(user sees a new bubble); ping contract preserved (no second
+beep). Model intent ('this is a distinct delivery') honored
+visually.
+
+The over-ping safety net's job is to suppress *device pings*; the
+silent-anchor's job is to combat *visual spam*. They compose
+correctly for most cases; this fix resolves the one case where
+they fought.
+
 ## v0.13.18 — silent-anchor side-effect parity (data-loss fix)
 
 ### fix(telegram) — silent-anchor edit branch runs the chunk-loop side effects (#1679)
