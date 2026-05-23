@@ -158,7 +158,11 @@ export type RuntimeMetricEvent =
       kind: 'voice_scrub_applied'
       chatKey: string
       replaced: number
-      site: 'reply' | 'edit_message' | 'progress_update' | 'answer_stream'
+      // `stream_reply` and `turn_flush` added in v0.13.21 — modern
+      // Claude routes most multi-paragraph replies through the
+      // answer-stream / draft-stream path, bypassing the v0.13.20
+      // executeReply scrub site. The two new sites close that gap.
+      site: 'reply' | 'edit_message' | 'progress_update' | 'answer_stream' | 'stream_reply' | 'turn_flush'
     }
 
 /**
