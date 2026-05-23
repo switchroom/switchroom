@@ -1737,10 +1737,16 @@ describe("reconcileAgent", () => {
     expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=0");
   });
 
-  it("start.sh exports HINDSIGHT_RECALL_CACHE_TTL_SECS=600 by default for hindsight agents", () => {
-    // Per-session recall cache (#424 phase 4.1) — the switchroom-managed
-    // default is 10 minutes. Operators can override or disable via
-    // memory.recall.cache_ttl_secs.
+  it("start.sh does NOT export HINDSIGHT_RECALL_CACHE_TTL_SECS by default (v0.13.22 — 0% measured hit rate)", () => {
+    // The 2026-05-24 audit measured 0% cache hit rate across 430+
+    // Telegram turns: the cache key is (session_id, prompt, bank,
+    // extra_banks) and Telegram inbounds are always unique prompts.
+    // The unconditional default-600s export was removed in v0.13.22 to
+    // avoid advertising a knob that doesn't help the dominant workload.
+    // Operators who run Claude Code interactively (where prompt-repeat
+    // happens) can still opt in via memory.recall.cache_ttl_secs in
+    // switchroom.yaml — that path is exercised by the "respects an
+    // operator override" test below.
     const agentConfig = makeAgentConfig();
     const withMemory = buildSwitchroomConfig(agentConfig, {
       backend: "hindsight",
@@ -1750,7 +1756,7 @@ describe("reconcileAgent", () => {
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-    expect(startSh).toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS=600");
+    expect(startSh).not.toContain("export HINDSIGHT_RECALL_CACHE_TTL_SECS");
   });
 
   it("start.sh respects an operator override of memory.recall.cache_ttl_secs", () => {
