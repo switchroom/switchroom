@@ -4485,6 +4485,55 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             `chat=${chat_id} anchor=${decision.messageId} ` +
             `merged_len=${decision.mergedText.length}\n`,
           )
+
+          // #1679 — side effects the chunk-loop completion path runs.
+          // The edit-anchor branch returns early below, so these must
+          // be wired here too. Skipping them silently causes:
+          //   - cross-turn ambient (`pending-work-progress.ts`) holds
+          //     a stale anchor text and OVERWRITES the model's
+          //     accumulated silent content with `still working (Nm)`
+          //     when async work is in flight (this is the load-bearing
+          //     fix);
+          //   - SQLite history (`get_recent_messages`) misses the
+          //     silent-anchor content;
+          //   - #1664 silent-end re-prompt fires even when the
+          //     accumulated silent content qualifies as substantive;
+          //   - retries within the dedup window may double-send.
+          pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
+            messageId: decision.messageId,
+            text: decision.mergedText,
+          })
+          if (HISTORY_ENABLED) {
+            try {
+              recordOutbound({
+                chat_id,
+                thread_id: threadId ?? null,
+                message_ids: [decision.messageId],
+                texts: [decision.mergedText],
+                attachment_kinds: [null],
+              })
+            } catch (histErr) {
+              process.stderr.write(
+                `telegram gateway: history recordOutbound (silent-anchor-edit) failed: ${histErr instanceof Error ? histErr.message : String(histErr)}\n`,
+              )
+            }
+          }
+          if (
+            turn != null
+            && isFinalAnswerReply({
+              text: decision.mergedText,
+              disableNotification,
+            })
+          ) {
+            turn.finalAnswerDelivered = true
+          }
+          outboundDedup.record(
+            chat_id,
+            threadId,
+            decision.mergedText,
+            Date.now(),
+          )
+
           silentAnchorEditDone = true
         } catch (err) {
           // Edit failed (e.g. message deleted, rate limit exhausted,
