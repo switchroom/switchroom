@@ -4932,6 +4932,31 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
 
+  // Voice scrub (PR #1683 follow-up). Modern Claude on the fleet
+  // uses the answer-stream / draft-stream path for multi-paragraph
+  // replies — the model emits via stream_reply and the original
+  // PR #1683 scrub site (executeReply) never sees the text. klanker's
+  // 2026-05-24 log showed model output with em-dashes routed via
+  // stream_reply done=true, materializing as sendMessage with no
+  // scrub. Mirror the executeReply pattern here: scrub BEFORE the
+  // outbound-dedup check (so retries see the scrubbed key) and
+  // mutate args.text so all downstream consumers (the stream-
+  // controller, dedup record, history record) see the scrubbed
+  // version. Kill switch: SWITCHROOM_DISABLE_VOICE_SCRUB.
+  {
+    const scrub = scrubVoice(args.text as string)
+    if (scrub.replaced > 0) {
+      args.text = scrub.scrubbed
+      emitRuntimeMetric({
+        kind: 'voice_scrub_applied',
+        chatKey: statusKey(args.chat_id as string, args.message_thread_id != null
+          ? Number(args.message_thread_id) : undefined),
+        replaced: scrub.replaced,
+        site: 'stream_reply',
+      })
+    }
+  }
+
   // #546 dedup check: stream_reply done=true is the most-common
   // retry shape — claude-code re-emits the final-text call when
   // the previous bridge missed the ack. If turn-flush already sent
@@ -6751,10 +6776,30 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
 
       if (flushDecision.kind === 'flush') {
-        const capturedText = flushDecision.text
+        let capturedText = flushDecision.text
         const backstopChatId = chatId
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
+
+        // Voice scrub (PR #1683 follow-up). Turn-flush is the path
+        // that fires when the model emits raw transcript text WITHOUT
+        // calling reply / stream_reply. That captured text bypasses
+        // PR #1683's executeReply scrub site entirely and is delivered
+        // via sendMessage / editMessageText directly. Scrub the
+        // capturedText before markdownToHtml so em-dashes never reach
+        // the wire. Kill switch: SWITCHROOM_DISABLE_VOICE_SCRUB.
+        {
+          const scrub = scrubVoice(capturedText)
+          if (scrub.replaced > 0) {
+            capturedText = scrub.scrubbed
+            emitRuntimeMetric({
+              kind: 'voice_scrub_applied',
+              chatKey: statusKey(backstopChatId, backstopThreadId),
+              replaced: scrub.replaced,
+              site: 'turn_flush',
+            })
+          }
+        }
 
         // #1664 — turn-flush only fires when !replyCalled (decideTurnFlush
         // returns 'reply-called' otherwise). It legitimately delivers the
