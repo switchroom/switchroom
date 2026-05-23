@@ -57,10 +57,12 @@ user thinking they steered when they actually queued, or vice versa.
 
 ## How switchroom answers this today
 
-- **Steer** = no marker. Send a follow-up while a turn is in flight; the inbound coalescer (default 1500ms gap) merges rapid-fire messages so the agent receives a single combined turn with both signals visible. Slower follow-ups arrive as fresh turns the agent sees in its next iteration.
+(Default flipped 2026-04-17, commits `4fff90bf` + `597a58af`. Prior to that, no-marker meant *steer*; the prompt fragment + this doc lagged the code change for ~5 weeks until 2026-05-24's audit caught it.)
+
+- **Queue** (default — no marker). Send a follow-up while a turn is in flight; it queues as a new, independent task that runs after the current turn ends. The agent receives the follow-up as a fresh turn with `<channel queued="true">` so it knows to start fresh and not carry context from the in-flight work. Legacy `/queue ` / `/q ` prefix is a redundant alias (still works; same outcome).
+- **Steer** = `/steer ` or `/s ` prefix. Explicit opt-in to course-correct the in-flight task. The agent receives the body with `<channel steering="true">` and treats it as an amendment to the current work.
 - **Interrupt + new task** = `!`-prefix marker (#575, gateway-side). A message starting with `!` SIGINTs the agent, strips the marker, and forwards the body as a fresh turn. Empty `!` triggers a "send your replacement instruction now" reply rather than forwarding nothing. The CLAUDE.md template tells the agent the rule so it can teach the user when asked.
-- **What the user sees**: ⚡ reaction on the `!` message confirms the interrupt landed. The agent's normal first-turn protocol then runs against the new body — so the chosen path is visible, not inferred.
-- **Still open** if it surfaces in practice: the JTBD's "queue cleanly behind, with isolated context" sense (file a new task that runs strictly AFTER the current one finishes) isn't a first-class operation today. Today's coalescer-as-queue means second-message effectively becomes amendment context. If a real "queue this for after" workflow shows up, file an issue against this JTBD.
+- **What the user sees**: 🤝 reaction on a `/steer` message confirms the steer landed mid-turn; ⚡ reaction on a `!` message confirms the interrupt landed; queued messages get the normal 👀 (received) reaction since they're a fresh turn from the agent's perspective. The agent self-narrates the classification at the top of its reply (e.g. `_↪️ treating as steer on the prior task_` or `_📥 queued as a new task_`) so the chosen path is visible, not inferred.
 
 ## UAT prompts
 

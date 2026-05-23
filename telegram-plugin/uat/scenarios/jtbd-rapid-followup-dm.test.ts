@@ -1,38 +1,35 @@
 /**
  * JTBD scenario — rapid follow-ups (steering vs queued classification).
  *
- * Production behaviour codified in `_shared/telegram-style.md.hbs`:
+ * Live contract codified in `_shared/telegram-style.md.hbs` and
+ * `reference/steer-or-queue-mid-flight.md` (default-flip commits
+ * `4fff90bf` + `597a58af`, 2026-04-17):
  *
- * - A follow-up message arriving while a turn is in flight, with no
- *   `/queue` prefix, is `steering="true"` — treated as a course
- *   correction on the in-flight task.
- * - A follow-up prefixed with `/queue ` or `/q ` is `queued="true"` —
- *   a new independent task; the agent should NOT reference the
- *   in-flight work.
+ * - A mid-turn follow-up with NO prefix is `queued="true"` — new
+ *   independent task. The agent should NOT reference the in-flight
+ *   work.
+ * - A mid-turn follow-up prefixed with `/steer ` or `/s ` is
+ *   `steering="true"` — course-correction; the agent continues the
+ *   in-flight task incorporating the new guidance.
+ * - Legacy `/queue ` / `/q ` is a redundant alias for the default;
+ *   still works.
  *
- * This UAT fires both shapes and asserts the agent responds in a way
- * that reflects the classification — for steering it should mention
- * the correction; for queued it should treat the new task fresh.
- *
- * We can't assert directly on the internal channel meta (`steering`,
- * `queued`) from the driver side without inspecting the gateway log
- * — but the conversational pacing prompt instructs the agent to
- * "self-narrate the classification" with a small italic line at the
- * top of its reply. So we can pattern-match on that.
+ * This UAT fires both shapes and asserts the agent narrates the
+ * classification correctly. The prior version of this scenario
+ * (2026-05-13 / PR #1132) tested the pre-flip contract with
+ * too-loose assertions (`/md5/i` regex passes on the queued path
+ * by coincidence — the model answers "use md5" fresh and the reply
+ * contains "md5"). After unskipping with the corrected contract,
+ * the assertions check for the italic classification line the
+ * prompt instructs the agent to emit.
  */
 
 import { describe, it, expect } from "vitest";
 import { spinUp } from "../harness.js";
 
-// Skipped in CI: both cases failed in #1132 overnight (steering didn't
-// surface "md5"; queued didn't produce the expected fresh-task reply).
-// May be real classification bugs, may be prompt fragility — neither
-// has been root-caused. Excluded from the buildkite gate so it doesn't
-// block every PR touching telegram-plugin/. Run locally via
-// `bun run test:uat` once classification has been investigated.
-describe.skip("uat: rapid follow-ups — steering vs queued", () => {
+describe("uat: rapid follow-ups — steering vs queued classification", () => {
   it(
-    "follow-up WITHOUT /queue → agent treats as steering",
+    "follow-up with /steer prefix → agent self-narrates as steering",
     async () => {
       const sc = await spinUp({ agent: "test-harness" });
       try {
@@ -43,26 +40,39 @@ describe.skip("uat: rapid follow-ups — steering vs queued", () => {
           + "Show the work step by step with a 2-second pause between.",
         );
         await new Promise((r) => setTimeout(r, 3_000));
-        // Steer: change the algorithm
-        await sc.sendDM("actually use md5 not sha256");
+        // Steer: change the algorithm using the explicit /steer prefix.
+        await sc.sendDM("/steer actually use md5 not sha256");
 
-        // The agent should reply mentioning md5 (the steered
-        // algorithm), AND ideally surface the italic classification
-        // line per the prompt.
-        const reply = await sc.expectMessage(/md5/i, {
-          from: "bot",
-          timeout: 120_000,
-        });
+        // The agent should reply mentioning md5 AND surface the italic
+        // classification line per the prompt
+        // ("_↪️ treating as steer on the prior task_" or similar).
+        // We match either explicit-steer narration OR the steer emoji
+        // (`↪️`) to allow for natural-language variation while still
+        // failing if no narration appears (the previous version of
+        // this UAT was too loose — bare `/md5/i` passed by coincidence
+        // on the queued path).
+        const reply = await sc.expectMessage(
+          (m) => {
+            const txt = m.text;
+            const mentionsMd5 = /\bmd5\b/i.test(txt);
+            const narratesSteer =
+              /↪️|\bsteer(ing)?\b|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(
+                txt,
+              );
+            return mentionsMd5 && narratesSteer;
+          },
+          { from: "bot", timeout: 120_000 },
+        );
         expect(reply.text.toLowerCase()).toContain("md5");
       } finally {
         await sc.tearDown();
       }
     },
-    150_000,
+    180_000,
   );
 
   it(
-    "follow-up WITH /queue → agent treats as new task",
+    "follow-up with no prefix mid-turn → agent treats as queued (new task)",
     async () => {
       const sc = await spinUp({ agent: "test-harness" });
       try {
@@ -71,9 +81,10 @@ describe.skip("uat: rapid follow-ups — steering vs queued", () => {
           + "Use bash.",
         );
         await new Promise((r) => setTimeout(r, 3_000));
-        // Queued: completely independent task. The agent should NOT
-        // reference the counting task.
-        await sc.sendDM("/queue what is 2+2?");
+        // No prefix — the default-flipped contract says this is a
+        // QUEUED new task. The agent should NOT reference the
+        // counting work.
+        await sc.sendDM("what is 2+2?");
 
         // First reply should be from the counting task (still
         // in-flight). Then a second reply for the queued task.
@@ -81,16 +92,32 @@ describe.skip("uat: rapid follow-ups — steering vs queued", () => {
           from: "bot",
           timeout: 60_000,
         });
-        // Then we expect another reply (the queued task's answer).
-        // /queue is treated as a new task per the prompt — answer
-        // should be "4" or mention 2+2.
+
+        // Second reply: the queued task's answer. We want to see
+        // EITHER the italic queued-narration line OR a fresh "4"
+        // answer that doesn't reference the counting work.
         const secondReply = await sc.expectMessage(
-          (m) =>
-            m.messageId > firstReply.messageId
-            && /\b4\b|two\s+plus\s+two|2\s*\+\s*2/i.test(m.text),
+          (m) => {
+            if (m.messageId <= firstReply.messageId) return false;
+            const txt = m.text;
+            const answersTheQuestion =
+              /\b4\b|\bfour\b|two\s+plus\s+two|2\s*\+\s*2/i.test(txt);
+            const narratesQueued =
+              /📥|\bqueued\b|new\s+(?:independent\s+)?task|fresh\s+task/i.test(
+                txt,
+              );
+            // Pass if either: the explicit narration is present, OR the
+            // reply answers cleanly without referencing the counting
+            // task. The latter is the substantive behavioural check —
+            // the queued task is isolated from the in-flight context.
+            const isolatedFromCounting = !/\bcount(ing)?\b|\bsleep\b/i.test(
+              txt,
+            );
+            return answersTheQuestion && (narratesQueued || isolatedFromCounting);
+          },
           { from: "bot", timeout: 120_000 },
         );
-        expect(secondReply.text).toMatch(/4|two|2\s*\+\s*2/i);
+        expect(secondReply.text).toMatch(/4|four|2\s*\+\s*2/i);
       } finally {
         await sc.tearDown();
       }
