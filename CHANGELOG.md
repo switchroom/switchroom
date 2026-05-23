@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.13.22 — hindsight smart-defaults (recall p50 5.6s → ~2-2.5s)
+
+Forensic-audit-driven release. The 2026-05-24 audit measured hindsight
+recall p50 5.6s / p95 14.5s, with 17-26% of turns on heavy agents
+breaching the 12s UserPromptSubmit hook ceiling. Root cause: switchroom
+was passing vendor defaults sized for dedicated-host installs, not the
+actual workload (CPU-only, 9 always-on agents, shared 16-core host).
+
+### feat(hindsight) — smart-defaults for recall/rerank latency + container caps (#1699)
+
+Five changes ship the optimised-out-of-box config. All operator-
+overridable; smart-default philosophy is "simple, reliable, fast by
+default; opt-in complexity available".
+
+**Reranker env vars** (in `src/setup/hindsight.ts` `docker run` args
+AND the generated compose snippet):
+- `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true` (was `false`)
+  Vendor's own comment: "36-54% speedup, quality-identical by
+  construction". Sorts candidate pairs by length to avoid padding
+  waste.
+- `HINDSIGHT_API_RERANKER_MAX_CANDIDATES=150` (was `300`)
+  Final cap is 12 anyway; scoring 300 wastes ~50% of rerank CPU.
+- `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=2` (was `4`)
+  With 9 always-on agents, 4-way oversubscription on a 16-core box
+  thrashes. 2 leaves headroom for burst.
+- `HINDSIGHT_API_RECALL_MAX_CONCURRENT=8` (was `32`)
+  Sized for shared-host co-tenancy with the agent fleet.
+
+**Container resource caps** (`docker run` + compose):
+- `--memory=4g` (live RSS 3.4 GiB)
+- `--memory-reservation=2g`
+- `--cpus=2.0`
+- `--pids-limit=1000`
+
+Prevents reranker bursts from starving the fleet on shared hosts.
+
+**`vendor/hindsight-memory/scripts/recall.py` HTTP timeout** `10s → 8s`.
+Reclaims 4s headroom inside the 12s UserPromptSubmit hook ceiling so a
+slow recall fails cleanly with empty memories instead of blowing past
+the hook timeout and dropping the recall entirely.
+
+**Dropped the unconditional `HINDSIGHT_RECALL_CACHE_TTL_SECS=600`**
+default export in `profiles/_base/start.sh.hbs`. Audit measured 0%
+hit rate across 430+ Telegram turns: the cache key is `(session_id,
+prompt, bank, extra_banks)` and Telegram inbounds are always unique
+prompts. Operators who run Claude Code interactively (where prompt-
+repeat exists) can still opt in via `memory.recall.cache_ttl_secs`
+in switchroom.yaml.
+
+**Scaffold settings overrides** (`applyHindsightSettingsOverrides`):
+- `recallMaxMemories` 12 → 8 (tighter prompt; recall@N quality
+  unchanged in audit sample)
+- `recallMinOverlap` 0.0 → 0.10 (turn on the Jaccard-overlap gate
+  #475 that was wired but disabled)
+
+### Expected impact
+
+- Recall p50: 5.6s → ~2-2.5s
+- Recall p95: 14.5s → ~6-7s
+- UserPromptSubmit hook timeout breach rate: 17-26% → <5%
+- TTFO improvement on every Telegram turn fleet-wide
+
 ## v0.13.21 — wedge cleanup + dedup turnKey + interrupt fix + scrub coverage + doc flip
 
 Forensic-audit-driven release. Seven PRs addressing prod issues
