@@ -142,28 +142,41 @@ export const HINDSIGHT_BROKER_SOCK_VOLUME = `auth-broker-${HINDSIGHT_CONSUMER_NA
  */
 export const HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING = "true";
 export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
-export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 2;
+// Vendor default 4. v0.13.22 dropped this to 2 paired with the now-
+// reverted `--cpus=2.0` CPU cap; with CPU restored, 4-way concurrency
+// is the right knob — lets 4 fleet agents' recalls overlap without
+// thrashing per-pair compute (which is the actual bottleneck, not
+// task-level contention).
+export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4;
 export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
 
 /**
- * Container resource caps (v0.13.22 smart defaults).
+ * Container resource caps (memory + pids only; CPU intentionally NOT capped).
  *
- * Live observed RSS on a 9-agent fleet: 3.4 GiB. Capping at 4g
- * prevents a runaway reranker batch from eating the host (which is
- * shared with Coolify on Ken's setup and would be shared with the
- * agent fleet on any single-host install). 2g soft reservation
- * protects the working set under host pressure.
+ * Live observed RSS on a 9-agent fleet: 3.4 GiB. Capping memory at
+ * 4g prevents a runaway reranker batch from eating the host (which
+ * is shared with Coolify on dev/canary boxes and would be shared
+ * with the agent fleet on any single-host install). 2g soft
+ * reservation protects the working set under host pressure.
  *
- * CPU cap at 2.0 cores: the reranker is CPU-bound; uncapped, a
- * burst (cron fires across multiple agents simultaneously) starves
- * the agents' own claude processes. 2 cores leaves the rest of the
- * 16-core host for the fleet.
+ * **CPU cap intentionally NOT set (v0.13.23).** v0.13.22 shipped
+ * `--cpus=2.0` on the theory that bursts of concurrent rerank tasks
+ * would starve the agent fleet. Live measurement immediately after
+ * deploy showed the opposite: the cross-encoder rerank is dominated
+ * by per-pair compute, not contention. Capping CPU at 2 cores
+ * forced each rerank to serialize through 2 cores instead of using
+ * whatever the host had free, which made each pass 3-10x SLOWER
+ * (rerank p50 rose from ~4.9s pre-deploy → 7-20s post-deploy,
+ * despite all the other smart-defaults staying in place). Removing
+ * the cap restored ~2.1s reranks. Bursts are bounded by
+ * `RERANKER_LOCAL_MAX_CONCURRENT` (restored to vendor default of 4)
+ * — that's the right knob for fleet-fairness, not a wall-clock CPU
+ * cap.
  *
  * PIDs cap is defense-in-depth, matches the agent `coding` profile.
  */
 export const HINDSIGHT_DEFAULT_MEM_LIMIT = "4g";
 export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "2g";
-export const HINDSIGHT_DEFAULT_CPUS = "2.0";
 export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
 
 /**
@@ -311,12 +324,11 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "run", "-d",
     "--name", "switchroom-hindsight",
     "--restart", "unless-stopped",
-    // Container resource caps (v0.13.22) — see constants for rationale.
-    // Prevent a reranker burst from starving the agent fleet on shared
-    // hosts; live RSS is ~3.4 GiB so 4g is a comfortable ceiling.
+    // Container resource caps (memory + pids only; CPU uncapped —
+    // see HINDSIGHT_DEFAULT_MEM_LIMIT constant for the v0.13.22 → v0.13.23
+    // unwind rationale).
     `--memory=${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `--memory-reservation=${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
-    `--cpus=${HINDSIGHT_DEFAULT_CPUS}`,
     `--pids-limit=${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     "-p", `127.0.0.1:${apiPort}:8888`,
     "-p", `127.0.0.1:${uiPort}:9999`,
@@ -411,7 +423,6 @@ export function generateHindsightComposeSnippet(): string {
     `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
-    `    cpus: ${HINDSIGHT_DEFAULT_CPUS}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     "    volumes:",
     "      - switchroom-hindsight-data:/home/hindsight/.pg0",
