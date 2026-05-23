@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.13.18 — silent-anchor side-effect parity (data-loss fix)
+
+### fix(telegram) — silent-anchor edit branch runs the chunk-loop side effects (#1679)
+
+Principal-engineer end-to-end review of #1677 found that the
+silent-anchor edit branch (added in v0.13.17) early-returns
+without running the chunk-loop completion path's side effects.
+The load-bearing one — `pendingProgress.noteOutbound` —
+synchronises the cross-turn-ambient anchor (`pending-work-progress.ts`)
+with the latest outbound text. Skipping it caused **silent
+content loss** in turns that have BOTH:
+
+- multiple silent replies the auto-edit accumulates, AND
+- async dispatch (`Agent` / `Task` / `Bash` with
+  `run_in_background:true`) that activates cross-turn ambient.
+
+Failure mode: cross-turn ambient holds the FIRST silent reply's
+text as its anchor view. When the +60s tick fires, it appends
+`\n\n— still working (Nm)` to that stale text and edits the
+anchor — overwriting the model's accumulated "Step 1...\n\nStep
+2..." content with `"on it\n\n— still working (1m)"`. User loses
+their silent content.
+
+The fix wires four side effects into the edit-anchor branch (each
+mirrors a chunk-loop-completion call):
+
+1. `pendingProgress.noteOutbound` — load-bearing data-loss fix.
+2. `recordOutbound` — keeps SQLite `get_recent_messages` complete.
+3. `isFinalAnswerReply` → `finalAnswerDelivered = true` — silent-
+   end re-prompt now suppressed when accumulated silent content
+   qualifies as substantive (per #1664 length-backstop).
+4. `outboundDedup.record` — same-content retries within the dedup
+   window no-op, matching fresh-send.
+
 ## v0.13.17 — silent replies edit one growing message (closes the visual-spam pattern)
 
 ### feat(telegram) — consecutive silent replies edit a single anchor in place (#1677)
