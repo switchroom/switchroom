@@ -34,7 +34,7 @@ describe('decideSilentReplyAnchor — silent replies edit a single growing ancho
       effectivelySilent: true,
       anchorMessageId: 12345,
       anchorText: 'on it — checking the calendar',
-      newReplyText: 'Step 1: hostname is pixsoul-ubuntu',
+      newReplyText: 'Step 1: hostname is example-host',
       hasFiles: false,
       hasButtons: false,
     })
@@ -42,7 +42,7 @@ describe('decideSilentReplyAnchor — silent replies edit a single growing ancho
       kind: 'edit-anchor',
       messageId: 12345,
       mergedText:
-        'on it — checking the calendar\n\nStep 1: hostname is pixsoul-ubuntu',
+        'on it — checking the calendar\n\nStep 1: hostname is example-host',
     })
   })
 
