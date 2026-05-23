@@ -1206,6 +1206,17 @@ type CurrentTurn = {
   // even though `replyCalled` is true — the #1664 case where the real answer
   // ended up as plain transcript text rendered into an ephemeral draft.
   finalAnswerDelivered: boolean
+  // #1675 (over-ping safety net): wall-clock ms of the first reply
+  // this turn that landed with `disable_notification: false` (a real
+  // device ping). The conversational-pacing contract
+  // (`reference/conversational-pacing.md` beat 5) says EXACTLY ONE
+  // ping per turn — the final answer. When the model violates that
+  // (sends a substantive answer pinged + a wrap-up "Delivered…" or
+  // meta-narration also pinged), subsequent reply calls with
+  // `disable_notification: false` are auto-downgraded to silent by
+  // the framework. Null until the first ping lands. Reset on every
+  // fresh-turn enqueue.
+  firstPingAt: number | null
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
   registryKey: string | null
@@ -4208,7 +4219,43 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // so only the final answer pings the device. Default false (pings) so
   // existing call-sites and the typical "final answer" reply keep their
   // current behaviour without an explicit flag.
-  const disableNotification = args.disable_notification === true
+  let disableNotification = args.disable_notification === true
+
+  // #1675 over-ping safety net. The conversational-pacing contract
+  // (`reference/conversational-pacing.md` beat 5) says EXACTLY ONE
+  // device ping per turn — the final answer. The model sometimes
+  // violates this by sending a substantive answer pinged + a wrap-up
+  // ("Delivered all three steps…", "Sent.", or meta-narration) ALSO
+  // pinged. Both messages then fire notifications. The fleet UAT on
+  // 2026-05-23 reproduced this (Step 3 + Delivered both pinged, two
+  // beeps for a turn that should have produced one). Framework owns
+  // the safety net: once the turn has emitted ONE pinged reply, every
+  // subsequent reply call in the same turn auto-downgrades to silent
+  // (disable_notification: true). Model intent ("I want this loud")
+  // is honoured for the first ping; subsequent pings are demoted with
+  // a stderr log so operators can see the safety net engage.
+  //
+  // The slot is claimed BEFORE the actual send to keep the logic
+  // sequential — a send that fails part-way leaves firstPingAt set
+  // and subsequent pings would be silenced. Acceptable trade-off (a
+  // failed first ping is an edge case; the alternative — claim after
+  // send — races concurrent reply calls).
+  {
+    const turn = currentTurn
+    if (turn != null && !disableNotification) {
+      if (turn.firstPingAt != null) {
+        process.stderr.write(
+          `telegram gateway: reply over-ping safety net — ` +
+          `downgrading disable_notification:false → true ` +
+          `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
+          `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${Date.now() - turn.firstPingAt})\n`,
+        )
+        disableNotification = true
+      } else {
+        turn.firstPingAt = Date.now()
+      }
+    }
+  }
 
   // Telegraph publish (#579). When the reply text is long enough AND
   // the agent has telegraph enabled in access.json, publish to
@@ -5877,6 +5924,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           gatewayReceiveAt: startedAt,
           replyCalled: false,
           finalAnswerDelivered: false,
+          firstPingAt: null,
           capturedText: [],
           orphanedReplyTimeoutId: null,
           registryKey: null,
