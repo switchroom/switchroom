@@ -459,7 +459,10 @@ function backfillJsonlAgentId(
   log?.(`subagent-watcher: backfill linked ${agentId} → ${candidate.id}`)
 }
 
-function readSubTail(
+// Exported for unit-testing the ENOENT/EACCES deregister path
+// (telegram-plugin/tests/subagent-watcher-enoent-deregister.test.ts).
+// Not intended for consumption by other modules.
+export function readSubTail(
   entry: WorkerEntry,
   tail: SubTail,
   now: number,
@@ -472,6 +475,14 @@ function readSubTail(
    *  previously-stalled entry. Closes the resume edge the schema doc
    *  has always promised. */
   onUnstall?: (agentId: string, description: string) => void,
+  /** Fires when the JSONL file is no longer accessible (ENOENT — file
+   *  reaped by Claude Code when the parent session ends; EACCES —
+   *  permission change mid-poll). The caller deregisters the entry so
+   *  the 1s poll loop stops re-statting a dead path. Without this
+   *  callback, every poll re-emits the error log line — on 2026-05-23
+   *  the clerk agent logged 540k ENOENT lines in 3 days (30/sec
+   *  sustained) AND leaked one fs.watch FD per stranded entry. */
+  onFileVanished?: (agentId: string, code: 'ENOENT' | 'EACCES') => void,
 ): void {
   try {
     const stat = fs.statSync(entry.filePath)
@@ -639,6 +650,17 @@ function readSubTail(
     }
     tail.hasEmittedStart = startState.hasEmittedStart
   } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'EACCES') {
+      // JSONL is gone (Claude Code reaped the parent session's
+      // subagents/ dir) or permission flipped under us. Deregister the
+      // entry so the periodic poll stops re-emitting this same line
+      // forever. Logged ONCE per agent — operators can still audit
+      // which entries got reaped without 30 lines/sec of noise.
+      log?.(`subagent-watcher: JSONL vanished for ${entry.agentId} (${code}) — deregistering`)
+      onFileVanished?.(entry.agentId, code)
+      return
+    }
     log?.(`subagent-watcher: read error ${entry.agentId}: ${(err as Error).message}`)
   }
 }
@@ -841,7 +863,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         if (!entry || !t) return
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log, db, parentStateDir, config.onUnstall)
+        }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent)
         maybySendStateTransition(agentId)
       })
     } catch (err) {
@@ -1179,7 +1201,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (!tail) continue
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      }, fs, log, db, parentStateDir, config.onUnstall)
+      }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent)
       maybySendStateTransition(agentId)
     }
 
