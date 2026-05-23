@@ -219,7 +219,7 @@ describe("shouldShowHandoffLine", () => {
 describe("formatHandoffLine", () => {
   it("wraps the topic in italic HTML with the return emoji", () => {
     const line = formatHandoffLine("fixing the bug", "html");
-    expect(line).toBe("<i>↩️ Picked up where we left off — fixing the bug</i>\n\n");
+    expect(line).toBe("<i>↩️ Picked up where we left off, fixing the bug</i>\n\n");
   });
 
   it("escapes HTML-unsafe chars in the topic", () => {
@@ -238,12 +238,25 @@ describe("formatHandoffLine", () => {
 
   it("produces plain text for 'text' format", () => {
     const line = formatHandoffLine("simple", "text");
-    expect(line).toBe("↩️ Picked up where we left off — simple\n\n");
+    expect(line).toBe("↩️ Picked up where we left off, simple\n\n");
   });
 
   it("always ends with a blank-line separator", () => {
     for (const fmt of ["html", "markdownv2", "text"] as const) {
       expect(formatHandoffLine("t", fmt).endsWith("\n\n")).toBe(true);
+    }
+  });
+
+  // Regression guard: the handoff prefix was an em-dash bypass for the
+  // v0.13.20 voice scrubber (the framework prefix is concatenated AFTER
+  // scrubVoice runs in executeReply). Replacing the em-dash with a
+  // comma at the template source closes that leak. Pin it so a future
+  // operator who "fixes typography" doesn't re-introduce the dash.
+  it("does NOT contain an em-dash or en-dash in any format (voice-scrub guard)", () => {
+    for (const fmt of ["html", "markdownv2", "text"] as const) {
+      const line = formatHandoffLine("anything goes here", fmt);
+      expect(line).not.toContain("—");
+      expect(line).not.toContain("–");
     }
   });
 });
