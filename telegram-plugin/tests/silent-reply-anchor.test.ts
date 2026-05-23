@@ -175,4 +175,73 @@ describe('decideSilentReplyAnchor — silent replies edit a single growing ancho
       expect(d.mergedText.length).toBe(TELEGRAM_MSG_CAP)
     }
   })
+
+  // Follow-up to #1679 — when the over-ping safety net coerces a
+  // model-intended ping to silent, the demoted reply must NOT be
+  // merged into the existing silent anchor. The anchor has been
+  // edited silently for the whole turn; the user has long since
+  // disengaged. Merging the (semantically final) demoted reply
+  // there would hide the answer entirely.
+  describe('over-ping-suppressed messages bypass anchor merge', () => {
+    it('demoted reply with an active anchor lands as a fresh silent (not edit, not next-anchor)', () => {
+      const d = decideSilentReplyAnchor({
+        effectivelySilent: true,
+        anchorMessageId: 12345,
+        anchorText: 'on it — gathering facts',
+        newReplyText: 'Delivered all three steps with a wrap-up summary.',
+        hasFiles: false,
+        hasButtons: false,
+        wasOverPingSuppressed: true,
+      })
+      expect(d).toEqual({ kind: 'fresh', becomesAnchor: false })
+    })
+
+    it('demoted reply with no anchor yet also fresh-sends without capturing the anchor', () => {
+      // The model fired a stray ping before any silent ack; the
+      // safety-net demoted that ping. A demoted message is never
+      // anchor material — it's an answer, not preamble.
+      const d = decideSilentReplyAnchor({
+        effectivelySilent: true,
+        anchorMessageId: null,
+        anchorText: '',
+        newReplyText: 'Delivered all three steps with a wrap-up summary.',
+        hasFiles: false,
+        hasButtons: false,
+        wasOverPingSuppressed: true,
+      })
+      expect(d).toEqual({ kind: 'fresh', becomesAnchor: false })
+    })
+
+    it('genuinely silent reply (not over-ping-suppressed) still merges normally', () => {
+      // Regression guard: the new bypass must not over-fire on
+      // legitimate beat-3 silent ticks.
+      const d = decideSilentReplyAnchor({
+        effectivelySilent: true,
+        anchorMessageId: 12345,
+        anchorText: 'on it — gathering facts',
+        newReplyText: 'Step 1: hostname is example-host',
+        hasFiles: false,
+        hasButtons: false,
+        wasOverPingSuppressed: false,
+      })
+      expect(d).toEqual({
+        kind: 'edit-anchor',
+        messageId: 12345,
+        mergedText:
+          'on it — gathering facts\n\nStep 1: hostname is example-host',
+      })
+    })
+
+    it('omitting wasOverPingSuppressed defaults to false (backward compat)', () => {
+      const d = decideSilentReplyAnchor({
+        effectivelySilent: true,
+        anchorMessageId: 12345,
+        anchorText: 'on it',
+        newReplyText: 'next thought',
+        hasFiles: false,
+        hasButtons: false,
+      })
+      expect(d.kind).toBe('edit-anchor')
+    })
+  })
 })
