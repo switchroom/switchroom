@@ -2855,6 +2855,42 @@ const STREAM_THROTTLE_MS_OVERRIDE: number | undefined = (() => {
   return Number.isFinite(n) && n >= 0 ? n : undefined
 })()
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
+
+// #869-Phase1 / openclaw-pattern. When SET, the answer-lane stream
+// (telegram-plugin/answer-stream.ts) renders the model's transcript
+// text as a USER-VISIBLE edit-in-place message instead of writing to
+// Telegram's invisible compose-box draft (which is the default and
+// supports the #1664 "retract + re-prompt" contract). With this flag
+// on:
+//   1. createAnswerStream is instantiated without `sendMessageDraft`,
+//      so it falls back to `sendMessage` + `editMessageText` for a
+//      real chat-timeline message (`answer-stream.ts:212-214`).
+//   2. minInitialChars is set to 1 — the first text chunk pushes a
+//      visible message immediately (TTFO under 5s for short turns).
+//   3. At turn_end, if the model never called reply / stream_reply
+//      AND the streamed message has substantive captured text, the
+//      gateway DOES NOT retract (which would delete a user-visible
+//      message the user has been reading live); it calls
+//      `stream.stop()` to freeze the current text as the final
+//      answer, records the message in dedup + history, and marks
+//      `turn.finalAnswerDelivered = true` so the #1664 silent-end
+//      re-prompt does not fire. Turn-flush is suppressed for this
+//      branch — its job (deliver captured text) is structurally
+//      already done by the visible stream.
+//   4. The reply-tool / stream_reply path is unchanged — when the
+//      model uses an explicit reply tool the prior streamed message
+//      is retracted (delete) and the reply takes over as before.
+// Trade-off: a stream-as-final-answer turn does NOT push a device
+// notification (Telegram does not notify on edits, and we choose
+// not to send a duplicate fresh message for the ping). For short
+// turns where the user is actively watching, this is the right
+// shape — they see the answer materialise live. For longer waits,
+// the cross-turn pending-progress system (#1445/#1669) is the
+// canonical surface and DOES ping at the appropriate boundaries.
+// Default OFF; flip per-agent via env to canary the new behaviour.
+const ANSWER_STREAM_VISIBLE_ENABLED =
+  process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM === '1'
+  || process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM === 'true'
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const progressDriver: any = null
 const unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
@@ -5986,7 +6022,13 @@ function handleSessionEvent(ev: SessionEvent): void {
             chatId: turn.sessionChatId,
             isPrivateChat: turn.isDm,
             threadId: turn.sessionThreadId,
-            sendMessageDraft: sendMessageDraftFn,
+            // #869-Phase1 visible-answer-stream: omit the draft API so
+            // the lane uses the real sendMessage / editMessageText path
+            // and edits a user-visible chat-timeline message instead
+            // of the invisible compose-box draft.
+            ...(ANSWER_STREAM_VISIBLE_ENABLED
+              ? { minInitialChars: 1 }
+              : { sendMessageDraft: sendMessageDraftFn }),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
@@ -6189,20 +6231,71 @@ function handleSessionEvent(ev: SessionEvent): void {
       // (regression for short no-tool replies). Order matters here: this
       // call must come before the retract/null block.
       preambleSuppressor.flushNow()
-      // #656: always retract the answer-lane stream at turn_end. Turn-flush
-      // (gateway.ts ~3475) is the sole canonical emitter for no-reply turns —
-      // it runs markdownToHtml and records to outboundDedup. Materializing
-      // here would race turn-flush and post raw model text (no HTML conv).
+      // #656: by default we ALWAYS retract the answer-lane stream at
+      // turn_end. Turn-flush is the canonical emitter for no-reply
+      // turns; materialising here would race it and post raw model
+      // text (no HTML conv).
+      //
+      // #869-Phase1 override: when `ANSWER_STREAM_VISIBLE_ENABLED` is
+      // on, the stream is rendering a USER-VISIBLE message in the
+      // chat timeline. Retracting (delete) destroys content the user
+      // has been reading live — the worst possible UX flicker. So
+      // when the stream is the de-facto final answer (model never
+      // called reply, captured text is substantive) we instead call
+      // `stream.stop()` to freeze it as the final state, record the
+      // outbound for history + dedup, mark the turn answered, and
+      // suppress the turn-flush IIFE downstream.
+      let streamFinalizedAsAnswer = false
       if (turn?.answerStream != null) {
         const stream = turn.answerStream
-        turn.answerStream = null
-        void stream.retract().catch((err) => {
+        const streamedMsgId = stream.messageId()
+        const streamedFinalText = turn.capturedText.join('').trim()
+        if (
+          ANSWER_STREAM_VISIBLE_ENABLED
+          && !turn.replyCalled
+          && streamedMsgId != null
+          && streamedFinalText.length > 0
+        ) {
+          turn.answerStream = null
+          stream.stop()
+          streamFinalizedAsAnswer = true
+          turn.finalAnswerDelivered = true
+          // Record as canonical outbound so retries dedup against it
+          // and the SQLite history can surface it. Mirrors the
+          // hooks turn-flush + reply both run.
+          try {
+            outboundDedup.record(
+              turn.sessionChatId,
+              turn.sessionThreadId,
+              streamedFinalText,
+              Date.now(),
+            )
+          } catch { /* best-effort */ }
+          if (HISTORY_ENABLED) {
+            try {
+              recordOutbound({
+                chat_id: turn.sessionChatId,
+                thread_id: turn.sessionThreadId ?? null,
+                message_ids: [streamedMsgId],
+                texts: [streamedFinalText],
+              })
+            } catch { /* best-effort */ }
+          }
           process.stderr.write(
-            `telegram gateway: answer-stream retract failed: ${
-              err instanceof Error ? err.message : String(err)
-            }\n`,
+            `telegram gateway: answer-stream finalized as answer ` +
+            `chat=${turn.sessionChatId} msg=${streamedMsgId} ` +
+            `chars=${streamedFinalText.length}\n`,
           )
-        })
+        } else {
+          turn.answerStream = null
+          void stream.retract().catch((err) => {
+            process.stderr.write(
+              `telegram gateway: answer-stream retract failed: ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            )
+          })
+        }
       }
       if (turn == null) return
       const chatId = turn.sessionChatId
@@ -6214,12 +6307,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       // surface to recover from. The decideTurnFlush 'empty-text'
       // path now relies on capturedText alone.
 
-      const flushDecision = decideTurnFlush({
-        chatId: turn.sessionChatId,
-        replyCalled: turn.replyCalled,
-        capturedText: turn.capturedText,
-        flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
-      })
+      // #869-Phase1: when the answer-stream finalised as the answer
+      // above, skip the turn-flush IIFE entirely — its job (deliver
+      // captured text) is already done by the visible stream, and
+      // running it would race a duplicate fresh-sendMessage against
+      // the user-visible edited message.
+      const flushDecision = streamFinalizedAsAnswer
+        ? ({ kind: 'skip', reason: 'reply-called' } as ReturnType<typeof decideTurnFlush>)
+        : decideTurnFlush({
+            chatId: turn.sessionChatId,
+            replyCalled: turn.replyCalled,
+            capturedText: turn.capturedText,
+            flushEnabled: TURN_FLUSH_SAFETY_ENABLED,
+          })
       if (flushDecision.kind === 'skip' && flushDecision.reason !== 'reply-called') {
         process.stderr.write(
           `telegram gateway: turn-flush skipped — reason=${flushDecision.reason}\n`,
