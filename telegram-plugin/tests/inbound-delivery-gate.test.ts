@@ -41,13 +41,86 @@ describe('decideInboundDelivery', () => {
     ).toBe('deliver')
   })
 
-  it('is total: the ONLY deferral path is mid-turn AND not steering', () => {
+  it('is total: the ONLY deferral path is mid-turn AND not steering AND not interrupt', () => {
     for (const turnInFlight of [true, false]) {
       for (const isSteering of [true, false]) {
-        const decision = decideInboundDelivery({ turnInFlight, isSteering })
-        const expectBuffer = turnInFlight && !isSteering
-        expect(decision).toBe(expectBuffer ? 'buffer-until-idle' : 'deliver')
+        for (const isInterrupt of [true, false]) {
+          const decision = decideInboundDelivery({ turnInFlight, isSteering, isInterrupt })
+          const expectBuffer = turnInFlight && !isSteering && !isInterrupt
+          expect(decision).toBe(expectBuffer ? 'buffer-until-idle' : 'deliver')
+        }
       }
     }
+  })
+
+  // ─── Interrupt-marker carve-out (2026-05-24 fix for the stranded-body bug) ──
+  // Live UAT trace: user fires `! actually do X` mid-turn. SIGINT delivered
+  // to claude via tmux send-keys. The killed turn does NOT emit
+  // turn_complete in many cases (mid-tool-call kill, in-flight subagent),
+  // so the post-`!` body sits in pendingInboundBuffer forever — the
+  // turn-complete drain trigger never fires. The user never gets a reply
+  // to their replacement instruction.
+  //
+  // The carve-out is a peer of isSteering: an interrupt body is by
+  // definition an intentional mid-turn delivery — the user explicitly
+  // asked for "stop and do this instead".
+  describe('interrupt-marker carve-out', () => {
+    it('delivers a `!`-interrupt body mid-turn (does NOT buffer)', () => {
+      // The headline regression fix. Without the carve-out the killed turn
+      // strands the body indefinitely.
+      expect(
+        decideInboundDelivery({
+          turnInFlight: true,
+          isSteering: false,
+          isInterrupt: true,
+        }),
+      ).toBe('deliver')
+    })
+
+    it('delivers a `!`-interrupt body even when claude is idle (no harm)', () => {
+      expect(
+        decideInboundDelivery({
+          turnInFlight: false,
+          isSteering: false,
+          isInterrupt: true,
+        }),
+      ).toBe('deliver')
+    })
+
+    it('isInterrupt is optional — omitting it preserves legacy behavior', () => {
+      // Backward-compat for callers that haven't been updated yet. Mirrors
+      // the optional-default pattern used in other gateway predicates this
+      // session (silent-reply-anchor wasOverPingSuppressed, recent-outbound-
+      // dedup turnKey).
+      expect(
+        decideInboundDelivery({ turnInFlight: true, isSteering: false }),
+      ).toBe('buffer-until-idle')
+      expect(
+        decideInboundDelivery({ turnInFlight: false, isSteering: false }),
+      ).toBe('deliver')
+    })
+
+    it('explicit isInterrupt:false is identical to omitting it', () => {
+      expect(
+        decideInboundDelivery({
+          turnInFlight: true,
+          isSteering: false,
+          isInterrupt: false,
+        }),
+      ).toBe('buffer-until-idle')
+    })
+
+    it('interrupt + steering combination delivers (both are exempt paths)', () => {
+      // Pathological prompt: `! /steer change tactics`. parseInterruptMarker
+      // strips the `!`, then steering parse sees `/steer`. Either flag
+      // alone delivers; both together still deliver. No regression.
+      expect(
+        decideInboundDelivery({
+          turnInFlight: true,
+          isSteering: true,
+          isInterrupt: true,
+        }),
+      ).toBe('deliver')
+    })
   })
 })

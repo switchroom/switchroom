@@ -53,6 +53,27 @@
  * mid-turn — that is the whole point of the steering feature (redirect
  * the agent while it works). Steering messages keep immediate delivery.
  * The wedge only ever affected the queued-mid-turn default path.
+ *
+ * ## Interrupt-marker is also exempt (2026-05-24 fix)
+ *
+ * An inbound prefixed with `!` invokes the interrupt path
+ * (`gateway.ts:handleInbound` parse + `tmux send-keys C-c` to the
+ * bridge). The SIGINT kills the in-flight turn at the SDK level — but
+ * the killed turn does NOT always emit `turn_complete`. Without that
+ * event, the turn-complete buffer-flush never fires, and the
+ * post-SIGINT inbound body (the `!` replacement instruction) rots in
+ * `pendingInboundBuffer` indefinitely.
+ *
+ * 2026-05-24 live UAT trace: user fires `! actually reply hello`,
+ * SIGINT delivered, killed turn never emits `turn_complete`, buffer
+ * stays full, user sees no response. The Phase-3 audit had this UAT
+ * `describe.skip`'d as "real interrupt-marker wedge or prompt-shape
+ * issue" — confirmed real.
+ *
+ * Resolution: bypass the gate for interrupt inbounds. The interrupt
+ * carve-out is a peer of `isSteering` — both are "intentional
+ * mid-turn delivery" cases. Caller passes the interrupt flag from the
+ * inbound parse; the gate returns `'deliver'` immediately.
  */
 
 export interface InboundDeliveryGateInput {
@@ -63,6 +84,14 @@ export interface InboundDeliveryGateInput {
   /** This inbound carried an explicit `/steer` (`/s`) prefix and is an
    *  intentional mid-turn redirect. */
   isSteering: boolean
+  /** This inbound was parsed by `parseInterruptMarker` as a `!`-prefixed
+   *  interrupt request. The gateway has already (or is about to) deliver
+   *  the SIGINT to claude via tmux send-keys; the body of the message
+   *  (post-`!`) is the user's replacement instruction. Without this
+   *  carve-out, the body rots in pendingInboundBuffer because the
+   *  SIGINT'd turn doesn't reliably emit turn_complete to drain the
+   *  buffer. Optional + defaults false for backward compat. */
+  isInterrupt?: boolean
 }
 
 export type InboundDeliveryDecision =
@@ -73,13 +102,17 @@ export type InboundDeliveryDecision =
   | 'buffer-until-idle'
 
 /**
- * Pure. The ONLY condition that defers delivery is "a turn is in flight
- * AND this is not a steering message". Everything else delivers
- * immediately (idle → submits at once; steering → intentional mid-turn).
+ * Pure. Defers delivery ONLY when a turn is in flight AND this inbound
+ * is neither steering nor an interrupt. Idle → deliver. Steering → deliver
+ * (intentional mid-turn redirect). Interrupt → deliver (the `!`
+ * carve-out — see header doc; the killed turn may never drain the
+ * buffer, so we must not buffer in the first place).
  */
 export function decideInboundDelivery(
   input: InboundDeliveryGateInput,
 ): InboundDeliveryDecision {
-  if (input.turnInFlight && !input.isSteering) return 'buffer-until-idle'
+  if (input.isSteering) return 'deliver'
+  if (input.isInterrupt === true) return 'deliver'
+  if (input.turnInFlight) return 'buffer-until-idle'
   return 'deliver'
 }

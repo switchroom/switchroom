@@ -8491,6 +8491,15 @@ async function handleInbound(
     decideInboundDelivery({
       turnInFlight: turnInFlightAtReceipt,
       isSteering,
+      // Interrupt-marker carve-out (2026-05-24): the `!`-prefixed body
+      // must bypass the "buffer-until-turn-complete" gate because the
+      // SIGINT'd turn often doesn't emit turn_complete, leaving the
+      // body stranded in pendingInboundBuffer indefinitely. The
+      // `interrupt` const is computed at the start of handleInbound
+      // (line ~7606) and remains in scope here. When the user fires
+      // `!`-with-body, this delivers the body as a fresh inbound to
+      // the freshly-killed bridge.
+      isInterrupt: interrupt.isInterrupt,
     }) === 'buffer-until-idle'
   ) {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
