@@ -74,6 +74,7 @@ import {
   shutdownAnalytics,
 } from '../analytics-posthog.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
+import { decideOverPing } from '../over-ping-safety-net.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
@@ -4242,17 +4243,32 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // send — races concurrent reply calls).
   {
     const turn = currentTurn
-    if (turn != null && !disableNotification) {
-      if (turn.firstPingAt != null) {
+    if (turn != null) {
+      const now = Date.now()
+      const decision = decideOverPing({
+        modelRequestedPing: !disableNotification,
+        firstPingAt: turn.firstPingAt,
+        nowMs: now,
+      })
+      if (decision.suppress) {
         process.stderr.write(
           `telegram gateway: reply over-ping safety net — ` +
           `downgrading disable_notification:false → true ` +
           `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
-          `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${Date.now() - turn.firstPingAt})\n`,
+          `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${decision.sinceFirstPingMs})\n`,
         )
+        // Observability: surface to the unified runtime-metrics
+        // fan-out so the cadence dashboard can track fleet-wide
+        // over-ping rate (leading indicator of model pacing drift).
+        emitRuntimeMetric({
+          kind: 'over_ping_suppressed',
+          key: statusKey(chat_id, args.message_thread_id != null
+            ? Number(args.message_thread_id) : undefined),
+          sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
+        })
         disableNotification = true
-      } else {
-        turn.firstPingAt = Date.now()
+      } else if (decision.claimSlot) {
+        turn.firstPingAt = now
       }
     }
   }
