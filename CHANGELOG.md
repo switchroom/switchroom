@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.13.20 — em-dash scrubber (framework-side voice enforcement)
+
+### feat(telegram) — em-dash voice scrubber (#1683)
+
+Sampled 2,867 recent fleet outbound replies on 2026-05-23 and
+found em-dashes in 73% of messages despite three landed soft-layer
+fixes (SOUL.md.hbs never-em-dash rule, PR #1177 voice
+consolidation, /humanizer skill). Soft layer was not winning.
+
+This ships the hard layer: `telegram-plugin/text-voice-scrub.ts`,
+a pure predicate that rewrites em / en dashes to commas / periods
+based on the neighbour character, with format-aware protection
+for fenced code blocks, inline code, `<code>` / `<pre>` HTML, and
+URLs. Same architectural pattern as the over-ping safety net
+(#1674) and silent-reply auto-edit (#1677): pure module, gateway
+wire-in, runtime metric.
+
+Wired into `executeReply` and `executeEditMessage` (the two MCP
+entry points). Silent-anchor edits and progress updates inherit
+the scrub transitively via the same `text` variable. Kill switch
+`SWITCHROOM_DISABLE_VOICE_SCRUB=1` returns identity.
+
+Phrase denylist (`smoking gun`, `load-bearing`, `by design`, etc.)
+was scoped OUT: fleet incidence is 0.2-0.5%, and substituting
+risks semantic loss the mechanical dash-rewrite does not.
+
 ## v0.13.19 — over-ping × silent-anchor: demoted finals no longer buried
 
 ### fix(telegram) — over-ping-suppressed finals bypass silent-anchor merge (#1681)
