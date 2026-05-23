@@ -142,6 +142,24 @@ export type RuntimeMetricEvent =
       key: string
       sinceFirstPingMs: number
     }
+  /**
+   * Voice scrubber engaged: em / en dashes were rewritten to commas /
+   * periods on an outbound reply. Each event is a soft-layer policy
+   * violation the framework caught (SOUL.md.hbs "never use em-dashes"
+   * is the soft layer, this scrub is the hard layer). Fleet-wide
+   * trend over weeks shows whether the soft prompt is gaining or
+   * losing ground; a per-agent spike is prompt drift on that agent.
+   *
+   *   chatKey   → `<chatId>:<threadIdOrEmpty>` (statusKey shape)
+   *   replaced  → count of dashes rewritten in this single message
+   *   site      → which reply path saw the scrub (executeReply / edit / answer-stream)
+   */
+  | {
+      kind: 'voice_scrub_applied'
+      chatKey: string
+      replaced: number
+      site: 'reply' | 'edit_message' | 'progress_update' | 'answer_stream'
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent
