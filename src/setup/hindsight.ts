@@ -108,6 +108,65 @@ export const HINDSIGHT_DEFAULT_MCP_STATELESS = true;
 export const HINDSIGHT_BROKER_SOCK_VOLUME = `auth-broker-${HINDSIGHT_CONSUMER_NAME}-sock`;
 
 /**
+ * Reranker smart-defaults (v0.13.22).
+ *
+ * The hindsight server's cross-encoder reranker is the single biggest
+ * latency contributor on the recall path — 87% of p50 5.6s on the
+ * 2026-05-24 fleet audit. Each of these knobs has a vendor default that
+ * is sub-optimal for switchroom's workload (CPU-only, shared host,
+ * Telegram-shaped concurrency); we override to the optimal value out of
+ * the box so a fresh `switchroom setup` produces a fast hindsight
+ * without any operator tuning.
+ *
+ * - BUCKET_BATCHING: vendor default `false`. Vendor's own config.py
+ *   comment promises "36-54% speedup, quality-identical" by sorting
+ *   candidate pairs by length to avoid padding waste. Pure win on CPU.
+ *
+ * - MAX_CANDIDATES: vendor default 300. At our `recallBudget=low`
+ *   ~100 candidates feed in and we cap to 12 final memories; scoring
+ *   300 wastes ~50% of rerank CPU on candidates that will never make
+ *   the top-N.
+ *
+ * - LOCAL_MAX_CONCURRENT: vendor default 4. With 9 always-on agents
+ *   that's up to 36 simultaneous CPU-bound rerank tasks on a shared
+ *   16-core host — thrashes. Cap at 2 leaves headroom for burst.
+ *
+ * - RECALL_MAX_CONCURRENT: vendor default 32. Sized for a dedicated
+ *   hindsight box; switchroom is co-tenant with the fleet, hostd,
+ *   brokers, etc. 8 matches realistic concurrency without lock
+ *   contention.
+ *
+ * All four are operator-overridable by editing the generated compose
+ * snippet or the `docker run -e ...` flags — but they should never
+ * NEED tuning for a single-host fleet install.
+ */
+export const HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING = "true";
+export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
+export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 2;
+export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
+
+/**
+ * Container resource caps (v0.13.22 smart defaults).
+ *
+ * Live observed RSS on a 9-agent fleet: 3.4 GiB. Capping at 4g
+ * prevents a runaway reranker batch from eating the host (which is
+ * shared with Coolify on Ken's setup and would be shared with the
+ * agent fleet on any single-host install). 2g soft reservation
+ * protects the working set under host pressure.
+ *
+ * CPU cap at 2.0 cores: the reranker is CPU-bound; uncapped, a
+ * burst (cron fires across multiple agents simultaneously) starves
+ * the agents' own claude processes. 2 cores leaves the rest of the
+ * 16-core host for the fleet.
+ *
+ * PIDs cap is defense-in-depth, matches the agent `coding` profile.
+ */
+export const HINDSIGHT_DEFAULT_MEM_LIMIT = "4g";
+export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "2g";
+export const HINDSIGHT_DEFAULT_CPUS = "2.0";
+export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
+
+/**
  * Check if a TCP port is free for binding on 127.0.0.1.
  * Returns true if free, false if something is already listening.
  */
@@ -239,12 +298,26 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "-e", "HINDSIGHT_API_LLM_PROVIDER=claude-code",
     "-e", `HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
     "-e", `HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
+    // Reranker smart-defaults (v0.13.22) — see constants above for
+    // rationale. Each closes a vendor-default gap that hurts our
+    // CPU-only / shared-host / Telegram workload.
+    "-e", `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=${HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING}`,
+    "-e", `HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,
+    "-e", `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
+    "-e", `HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
   ];
 
   const args = [
     "run", "-d",
     "--name", "switchroom-hindsight",
     "--restart", "unless-stopped",
+    // Container resource caps (v0.13.22) — see constants for rationale.
+    // Prevent a reranker burst from starving the agent fleet on shared
+    // hosts; live RSS is ~3.4 GiB so 4g is a comfortable ceiling.
+    `--memory=${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
+    `--memory-reservation=${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
+    `--cpus=${HINDSIGHT_DEFAULT_CPUS}`,
+    `--pids-limit=${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     "-p", `127.0.0.1:${apiPort}:8888`,
     "-p", `127.0.0.1:${uiPort}:9999`,
     "-v", "switchroom-hindsight-data:/home/hindsight/.pg0",
@@ -332,6 +405,14 @@ export function generateHindsightComposeSnippet(): string {
     "      - HINDSIGHT_API_LLM_PROVIDER=claude-code",
     `      - HINDSIGHT_API_LLM_MODEL=${HINDSIGHT_DEFAULT_MODEL}`,
     `      - HINDSIGHT_API_MCP_STATELESS=${HINDSIGHT_DEFAULT_MCP_STATELESS}`,
+    `      - HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=${HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING}`,
+    `      - HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,
+    `      - HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
+    `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
+    `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
+    `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
+    `    cpus: ${HINDSIGHT_DEFAULT_CPUS}`,
+    `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     "    volumes:",
     "      - switchroom-hindsight-data:/home/hindsight/.pg0",
     `      - ${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,

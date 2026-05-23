@@ -1553,6 +1553,8 @@ export function installHindsightPlugin(
  *
  * Currently overrides:
  *   - `retainEveryNTurns`: 10 → 1 (capture every turn, not every 10th)
+ *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
+ *   - `recallMinOverlap`: 0.0 → 0.10 (drop weak Jaccard-overlap matches)
  *
  * Future overrides go here, NOT in the vendor file. The vendor is
  * third-party code and must remain untouched for clean upstream
@@ -1577,6 +1579,18 @@ function applyHindsightSettingsOverrides(pluginDestPath: string): void {
   // Override: every turn retains (no throttle). See the rationale in
   // installHindsightPlugin() above.
   settings.retainEveryNTurns = 1;
+  // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
+  // memories is generous; 8 keeps prompt noise down without hurting
+  // the substantive recall@N (top-8 carries the same dominant facts
+  // that top-12 does, per the 2026-05-24 audit's recall-quality sample).
+  // Operators can re-raise via memory.recall.max_memories in switchroom.yaml.
+  settings.recallMaxMemories = 8;
+  // Lexical-overlap gate at 0.10. Vendor default 0.0 (gate disabled);
+  // the gate is already implemented (#475) and the export wiring exists
+  // in profiles/_base/start.sh.hbs:226 — we just opt into a non-zero
+  // floor so weak Jaccard-overlap hits drop silently. Operators can
+  // override via memory.recall.min_overlap in switchroom.yaml.
+  settings.recallMinOverlap = 0.10;
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 

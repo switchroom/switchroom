@@ -556,7 +556,15 @@ def main():
             max_tokens=config.get("recallMaxTokens", 1024),
             budget=config.get("recallBudget", "mid"),
             types=config.get("recallTypes"),
-            timeout=10,
+            # 8s in-script timeout leaves 4s headroom inside the 12s
+            # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
+            # write + block formatting. Tightened from 10s in switchroom
+            # v0.13.22: the 2026-05-24 audit showed 17-26% of turns
+            # breaching the 12s hook timeout on heavy agents (finn /
+            # gymbro / klanker), which dropped the recall entirely; an
+            # earlier-hard-timeout failure returns cleanly with no
+            # memories instead of blowing past the hook ceiling.
+            timeout=8,
         )
         results = response.get("results", [])
     except Exception as e:
@@ -577,7 +585,15 @@ def main():
                 max_tokens=config.get("recallMaxTokens", 1024),
                 budget=config.get("recallBudget", "mid"),
                 types=config.get("recallTypes"),
-                timeout=10,
+                # 8s in-script timeout leaves 4s headroom inside the 12s
+            # UserPromptSubmit hook ceiling (see hooks.json:20) for cache
+            # write + block formatting. Tightened from 10s in switchroom
+            # v0.13.22: the 2026-05-24 audit showed 17-26% of turns
+            # breaching the 12s hook timeout on heavy agents (finn /
+            # gymbro / klanker), which dropped the recall entirely; an
+            # earlier-hard-timeout failure returns cleanly with no
+            # memories instead of blowing past the hook ceiling.
+            timeout=8,
             )
             extra_results = extra_response.get("results", [])
             if extra_results:
