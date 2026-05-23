@@ -104,6 +104,26 @@ export type RuntimeMetricEvent =
       fallback_kind: 'working' | 'thinking'
       silence_ms: number
     }
+  /**
+   * #1445 cross-turn pending-async ambient lifecycle. `started` fires
+   * when a turn ends with a captured anchor AND a pending Agent/Task/
+   * Bash-background dispatch — i.e. the framework will now edit the
+   * model's last reply in place every ~60s until cleared. `edited`
+   * fires on each successful in-place edit; `elapsed_ms` is how long
+   * ambient has been running for this chat. `cleared` fires when
+   * ambient stops — `reason` says why (inbound / handback / timeout).
+   * Targets: edited/started ratio is the "still alive minutes per
+   * activation" health proxy; cleared.reason='inbound' should
+   * dominate (model + user resolving naturally).
+   */
+  | { kind: 'pending_progress_started'; chatKey: string }
+  | { kind: 'pending_progress_edited'; chatKey: string; elapsedMs: number }
+  | {
+      kind: 'pending_progress_cleared'
+      chatKey: string
+      elapsedMs?: number
+      reason?: string
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent

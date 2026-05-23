@@ -76,6 +76,7 @@ import {
 import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
+import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
@@ -3149,6 +3150,7 @@ silencePoke.startTimer({
     // Drop silence-poke state and clear turn-active so the next inbound
     // for this chat starts a fresh turn instead of queueing forever.
     silencePoke.endTurn(fbKey)
+    pendingProgress.noteTurnEnd(fbKey)
     purgeReactionTracking(fbKey)
     // Defense-in-depth: the fallback's purgeReactionTracking above
     // clears the canonical statusKey(chatId, threadId) for fbKey
@@ -3204,6 +3206,34 @@ silencePoke.startTimer({
       `${fbExtraPurge.purged.length > 0 ? ` extra_keys_purged=${fbExtraPurge.purged.length}` : ''}\n`,
     )
   },
+})
+
+// #1445 cross-turn pending-async ambient. When a turn ends after the
+// model dispatched background async work (Agent / Task / Bash run-in-
+// background) and the model has stopped speaking, keep editing the
+// model's last reply in place at 60s intervals so the user sees
+// ambient liveness during the wait. Edits are silent, never spawn a
+// new pinged message, and stop the moment the user re-engages or the
+// model synthesises a handback. The full design rationale lives in
+// `pending-work-progress.ts`'s header docblock. Kill switch:
+// `SWITCHROOM_DISABLE_PENDING_PROGRESS=1`.
+pendingProgress.startTimer({
+  editMessage: async (ctx) => {
+    await swallowingApiCall(
+      () =>
+        lockedBot.api.editMessageText(
+          ctx.chatId,
+          ctx.messageId,
+          ctx.newText,
+        ),
+      {
+        chat_id: ctx.chatId,
+        verb: 'pending-progress-edit',
+        ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}),
+      },
+    )
+  },
+  emitMetric: (event) => emitRuntimeMetric(event),
 })
 
 // Per-agent buffer for synthetic inbounds the gateway couldn't deliver
@@ -3578,6 +3608,22 @@ const ipcServer: IpcServer = createIpcServer({
             label.length > 0 ? label : null,
             Date.now(),
           )
+          // #1445 cross-turn pending-async ambient. Mark the chat as
+          // having dispatched background work this turn so a turn_end
+          // that follows activates the edit-in-place ambient line.
+          // Covers `Agent` / `Task` (the harness-managed async path
+          // — handback channel turn clears it) and `Bash` with
+          // run_in_background:true (model is expected to poll
+          // BashOutput; the ambient ticks until next inbound or the
+          // 30-min budget cap).
+          const evInput = ev.input as { run_in_background?: boolean } | undefined
+          if (
+            ev.toolName === 'Agent'
+            || ev.toolName === 'Task'
+            || (ev.toolName === 'Bash' && evInput?.run_in_background === true)
+          ) {
+            pendingProgress.noteAsyncDispatch(key)
+          }
         }
       } else if (ev.kind === 'tool_result') {
         // #1292: drain the in-flight entry. Idempotent on unknown ids
@@ -4391,6 +4437,22 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
+  // #1445 cross-turn pending-async ambient. Capture the last text
+  // chunk as the anchor — if this turn ends with a pending async
+  // dispatch, the framework edits THIS message in place every 60s
+  // with a `— still working (Nm)` suffix until the user re-engages.
+  // Multi-chunk replies: anchor is the LAST chunk (edits append to
+  // the visually-trailing message; earlier chunks are left intact).
+  if (sentIds.length === chunks.length && chunks.length > 0) {
+    const anchorMsgId = sentIds[chunks.length - 1]
+    if (typeof anchorMsgId === 'number') {
+      pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
+        messageId: anchorMsgId,
+        text: chunks[chunks.length - 1],
+      })
+    }
+  }
+
   // #273: when files is 2-10 photos, batch them into a single
   // sendMediaGroup album rather than N separate sendPhoto calls. The
   // user's device fires one notification for the album instead of N
@@ -4715,6 +4777,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const sChatId = args.chat_id as string
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now())
+    // #1445 cross-turn pending-async ambient. The terminal stream_reply
+    // (done=true) is the user-visible anchor for any cross-turn wait
+    // that follows. Capture it so if this turn ends with a pending
+    // async dispatch, the framework edits THIS message in place at
+    // intervals.
+    pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
+      messageId: result.messageId,
+      text: args.text as string,
+    })
   }
   // #1664 — mark the turn's final answer as delivered. For stream_reply a
   // call with done=true IS the final answer by definition (the model
@@ -5729,6 +5800,25 @@ function handleSessionEvent(ev: SessionEvent): void {
       // prior turn before resetting focus.
       typingWrapper.drainAll()
       if (ev.chatId) {
+        // #1445 cross-turn pending-async ambient — backstop for the
+        // `handleInbound` path's `clearPending('inbound')`. The
+        // inbound path covers real user messages, but synthesised
+        // wakes (subagent-handback channel turn, cron fires, vault
+        // grant resumes, restart markers) push directly to
+        // `pendingInboundBuffer` and bypass `handleInbound`. The
+        // `enqueue` session-event fires for EVERY fresh turn atom
+        // regardless of source — clearing here drops any prior turn's
+        // ambient before the new turn's `noteOutbound` lands. The
+        // call is idempotent so it's safe to fire in addition to the
+        // inbound-path clear (for the real-inbound case, this is a
+        // no-op because state was already deleted by then).
+        const enqThreadId = ev.threadId != null ? Number(ev.threadId) : undefined
+        pendingProgress.clearPending(
+          statusKey(ev.chatId, enqThreadId),
+          'handback',
+        )
+      }
+      if (ev.chatId) {
         // Issue #195: if a previous turn left an answer-lane stream open
         // (rapid steer/queue), force it to a new generation so its in-flight
         // edits don't mutate the new turn's message. Materialize is best-effort
@@ -6045,6 +6135,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // full message above). Match the pattern used at the regular
         // turn-end path (line ~5039) and the wedged-turn path (~5290).
         silencePoke.endTurn(ceKey)
+        pendingProgress.noteTurnEnd(ceKey)
         // Issue #195: tear down the answer-lane stream on context-exhaustion
         // bail-out. The user is being told the session needs /restart, so any
         // partially-streamed answer would be misleading.
@@ -6230,6 +6321,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           try { removeTurnActiveMarker(STATE_DIR) } catch { /* best-effort */ }
           signalTracker.clear(tKey)
           silencePoke.endTurn(tKey)
+          pendingProgress.noteTurnEnd(tKey)
         }
         lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
         pendingPtyPartial = null
@@ -6304,6 +6396,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           const tKey = statusKey(chatId, threadId)
           signalTracker.clear(tKey)
           silencePoke.endTurn(tKey)
+          pendingProgress.noteTurnEnd(tKey)
         }
 
         void (async () => {
@@ -6550,6 +6643,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         }
         signalTracker.clear(tKey)
         silencePoke.endTurn(tKey)
+        pendingProgress.noteTurnEnd(tKey)
       }
       lastPtyPreviewByChat.delete(statusKey(chatId, threadId))
       pendingPtyPartial = null
@@ -7772,6 +7866,18 @@ async function handleInbound(
         // the framework can nudge the model if it goes quiet past the
         // soft / firm thresholds.
         silencePoke.startTurn(statusKey(chat_id, messageThreadId), Date.now())
+        // #1445 cross-turn pending-async ambient. A new turn starting
+        // (user inbound, synthesised wake, or handback channel) is the
+        // signal that the model is about to re-engage — clear any
+        // pending-progress edits anchored to the *prior* turn's
+        // outbound so the framework stops talking over the new turn.
+        // clearPending drops the per-key state outright, so the new
+        // turn's `tool_use(Agent|Task|Bash bg)` + outbound capture
+        // afresh via `noteAsyncDispatch` / `noteOutbound`.
+        pendingProgress.clearPending(
+          statusKey(chat_id, messageThreadId),
+          'inbound',
+        )
         // Human-feel UX: hold a continuous `typing…` indicator for the
         // WHOLE turn, not just the split-second a reply is transmitted.
         // A person you message shows as typing the entire time they
