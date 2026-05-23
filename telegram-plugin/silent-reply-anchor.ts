@@ -65,6 +65,15 @@ export interface SilentReplyAnchorDecisionInput {
    *  are too easy to get wrong, and the markup is rare enough
    *  that fresh-send is the safer default. */
   hasButtons: boolean
+  /** True iff this reply was an intended-ping (model requested
+   *  `disable_notification:false`) that the over-ping safety net
+   *  (#1674) coerced to silent. Anchor merge MUST bypass when true:
+   *  semantically the model intended this as a distinct/final
+   *  delivery, and merging it into the existing silent preamble
+   *  would bury the content (the user already stopped looking at
+   *  the anchor bubble because earlier ticks edited it silently).
+   *  Optional — defaults to false for non-gateway callers. */
+  wasOverPingSuppressed?: boolean
 }
 
 /**
@@ -105,6 +114,19 @@ export function decideSilentReplyAnchor(
   // Pinged replies never merge — they're the final answer bubble,
   // semantically distinct from the silent preamble.
   if (!input.effectivelySilent) {
+    return { kind: 'fresh', becomesAnchor: false }
+  }
+
+  // Over-ping-suppressed replies bypass the anchor. The model
+  // intended a ping (almost always: a final/distinct reply); the
+  // safety net demoted to silent so the user isn't double-beeped.
+  // Merging the demoted reply into the existing silent anchor
+  // hides it — the user has already disengaged from the bubble
+  // that's been edited silently for the rest of the turn. Land
+  // as a fresh silent bubble instead, preserving discoverability.
+  // Don't capture as next anchor either: this reply is the
+  // *answer*, not more preamble.
+  if (input.wasOverPingSuppressed === true) {
     return { kind: 'fresh', becomesAnchor: false }
   }
 

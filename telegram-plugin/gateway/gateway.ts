@@ -4252,6 +4252,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // and subsequent pings would be silenced. Acceptable trade-off (a
   // failed first ping is an edge case; the alternative — claim after
   // send — races concurrent reply calls).
+  // Tracks whether the over-ping safety net coerced this reply
+  // from ping→silent. Threaded into the silent-anchor predicate
+  // below: a demoted final-answer reply must NOT merge into the
+  // silent preamble bubble; it lands as a fresh silent bubble so
+  // the user can still find it (see #1674 / silent-anchor follow-up).
+  let wasOverPingSuppressed = false
   {
     const turn = currentTurn
     if (turn != null) {
@@ -4278,6 +4284,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
         })
         disableNotification = true
+        wasOverPingSuppressed = true
       } else if (decision.claimSlot) {
         turn.firstPingAt = now
       }
@@ -4445,6 +4452,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         newReplyText: effectiveText,
         hasFiles: files.length > 0,
         hasButtons: replyMarkup != null,
+        wasOverPingSuppressed,
       })
       if (decision.kind === 'edit-anchor') {
         const editParams: {
