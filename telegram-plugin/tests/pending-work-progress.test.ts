@@ -25,7 +25,7 @@ import {
   type PendingProgressMetric,
 } from '../pending-work-progress.js'
 
-const KEY = '8248703757:_'
+const KEY = '12345:_'
 
 interface Capture {
   edits: PendingProgressEditCtx[]
