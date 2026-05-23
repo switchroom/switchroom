@@ -57,17 +57,19 @@ import type { ObservedMessage } from "../driver.js";
 
 const SLEEP_SECONDS = 350;
 
+// Engineered to elicit the natural production pattern: the model
+// sends a quick ack reply ("on it — background sleep running"),
+// dispatches the sleep as a background Bash, ends its turn, then
+// returns with "done" once the sleep completes. The framework
+// fix-under-test owns the in-between ambient.
 const PROMPT =
-  `This is an instrumented stress test of cross-turn pending-async ` +
-  `progress. Please run exactly this command via the Bash tool, and ` +
-  `ONLY this command, as a SINGLE call with run_in_background=true ` +
-  `(do not break it up, do not send any further reply until it ` +
-  `completes):\n\n` +
-  "```bash\n" +
-  `sleep ${SLEEP_SECONDS}\n` +
-  "```\n\n" +
-  `After the bash command returns, send exactly the single word ` +
-  `"done" as your final reply.`;
+  `Please run \`sleep ${SLEEP_SECONDS}\` in the background using the ` +
+  `Bash tool with \`run_in_background: true\` — this is a stress ` +
+  `test of the cross-turn ambient progress surface, so the sleep ` +
+  `duration matters. Send a brief one-line acknowledgement that ` +
+  `you've dispatched it (your natural beat-1 ack is fine), then ` +
+  `wait for it to complete. When it finishes, reply with exactly ` +
+  `the single word "done".`;
 
 const OVERALL_DEADLINE_MS = (SLEEP_SECONDS + 240) * 1000;
 
