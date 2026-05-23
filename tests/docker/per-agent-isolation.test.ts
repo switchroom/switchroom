@@ -2,7 +2,8 @@
  * Phase 1c — per-agent isolation E2E.
  *
  * The production-equivalent of the Phase 0 spike's adversarial test
- * (spike/agent-client.mjs + spike/test-acl-matrix.sh), running against
+ * (docs/phase0-research/spike/agent-client.mjs +
+ * docs/phase0-research/spike/test-acl-matrix.sh), running against
  * the actual generated compose + the actual production broker / kernel
  * servers (with main() entrypoints from Phase 1b/1c).
  *
