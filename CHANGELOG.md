@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.13.15 — visible answer-stream (TTFO under 5s for the common case, flag-gated)
+
+### feat(telegram) — model's transcript text auto-renders live in the chat (#1672, narrow scope of #869 Phase 1)
+
+The existing answer-lane (`answer-stream.ts`) already reads the
+model's session-stream `text` events and edits a draft in place —
+but it writes to Telegram's invisible compose-box draft, so the user
+never sees the stream. The canonical user-facing answer is supposed
+to be a `reply` tool call, with `final-answer-detect.ts` + #1664
+re-prompt as the safety net for transcript-only turns. Forensic
+data: TTFO median 69 s on the busiest fleet agent — for what the
+distribution shows is mostly <1–3 min workflows, that's a full
+minute of zero words for a 20-second exchange.
+
+Adds env flag `SWITCHROOM_VISIBLE_ANSWER_STREAM=1` (default OFF —
+opt-in per agent). When ON:
+
+- `createAnswerStream` is instantiated WITHOUT `sendMessageDraft`,
+  falling back to `sendMessage`/`editMessageText` against a real
+  chat-timeline message. `minInitialChars` drops 50 → 1 so the
+  first text chunk pushes a visible message immediately.
+- At `turn_end`, when the model never called reply/stream_reply
+  AND captured text is substantive AND the stream actually sent a
+  message, the gateway does NOT retract (deleting the message
+  the user has been reading live). Instead it freezes the stream
+  as final, records the outbound in dedup + history, marks
+  `turn.finalAnswerDelivered=true` so the #1664 silent-end
+  re-prompt does not fire, and suppresses the turn-flush IIFE
+  (its job is structurally already done).
+- The reply-tool path is unchanged — when the model uses `reply`
+  the prior streamed message is retracted and the reply takes
+  over as before.
+
+Trade-off: a stream-as-final-answer turn does NOT push a device
+notification (Telegram does not notify on edits; we choose not to
+send a duplicate fresh message for the ping). For short turns
+where the user is watching, this is the right shape; the
+cross-turn pending-progress system (v0.13.14) covers long waits.
+
+Default OFF means zero behaviour change on agents without the env
+var. Canary plan: flip the flag on `test-harness`, validate via the
+new UAT scenario (`visible-answer-stream-dm.test.ts`), then opt
+production agents in.
+
+Honest scope: this is the high-impact slice of #869 Phase 1, not
+the full architectural rewrite. Within-turn ambient (Phase 2),
+silence-poke retirement (Phase 3), and the full `ChannelRenderer`
+generalization (Phase 4) remain follow-ups — each gated on the
+prior shipping cleanly.
+
 ## v0.13.14 — cross-turn pending-async progress (no more dead-air during background work)
 
 ### feat(telegram) — ambient `still working (Nm)` while async work runs across turn boundaries (#1669, closes #1445)
