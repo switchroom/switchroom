@@ -75,6 +75,7 @@ import {
 } from '../analytics-posthog.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
 import { decideOverPing } from '../over-ping-safety-net.js'
+import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
@@ -1218,6 +1219,16 @@ type CurrentTurn = {
   // the framework. Null until the first ping lands. Reset on every
   // fresh-turn enqueue.
   firstPingAt: number | null
+  // #1677 silent-reply auto-edit. The first silent reply of a turn
+  // captures `silentAnchorMessageId` + `silentAnchorText`; subsequent
+  // silent replies in the SAME turn editMessageText that anchor
+  // (appending with paragraph-break separator). Net visual: one
+  // growing silent bubble instead of N stacked silent bubbles.
+  // Cleared by turn-atom replacement on enqueue. See
+  // `telegram-plugin/silent-reply-anchor.ts` for the pure
+  // `decideSilentReplyAnchor` predicate.
+  silentAnchorMessageId: number | null
+  silentAnchorText: string
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
   registryKey: string | null
@@ -4417,6 +4428,91 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 
   startTypingLoop(chat_id)
 
+  // #1677 silent-reply auto-edit. Consecutive silent replies within
+  // a turn edit a single anchor message instead of stacking new
+  // bubbles. We branch BEFORE the chunk loop so the single-chunk
+  // common case takes an editMessageText path; everything else
+  // (multi-chunk, ping, files, buttons) falls through to fresh send
+  // and either captures a new anchor or doesn't, per the predicate.
+  let silentAnchorEditDone = false
+  {
+    const turn = currentTurn
+    if (turn != null && chunks.length === 1) {
+      const decision = decideSilentReplyAnchor({
+        effectivelySilent: disableNotification,
+        anchorMessageId: turn.silentAnchorMessageId,
+        anchorText: turn.silentAnchorText,
+        newReplyText: effectiveText,
+        hasFiles: files.length > 0,
+        hasButtons: replyMarkup != null,
+      })
+      if (decision.kind === 'edit-anchor') {
+        const editParams: {
+          parse_mode?: 'HTML' | 'MarkdownV2'
+          message_thread_id?: number
+          link_preview_options?: { is_disabled: boolean }
+        } = {
+          link_preview_options: { is_disabled: disableLinkPreview },
+        }
+        if (parseMode != null) editParams.parse_mode = parseMode
+        if (threadId != null) editParams.message_thread_id = threadId
+        try {
+          await robustApiCall(
+            () =>
+              lockedBot.api.editMessageText(
+                chat_id,
+                decision.messageId,
+                decision.mergedText,
+                editParams,
+              ),
+            {
+              chat_id,
+              verb: 'reply.silent-anchor-edit',
+              ...(threadId != null ? { threadId } : {}),
+            },
+          )
+          turn.silentAnchorText = decision.mergedText
+          sentIds.push(decision.messageId)
+          logOutbound(
+            'edit',
+            chat_id,
+            decision.messageId,
+            decision.mergedText.length,
+            'silent-anchor-merge',
+          )
+          process.stderr.write(
+            `telegram gateway: silent-reply auto-edit — ` +
+            `chat=${chat_id} anchor=${decision.messageId} ` +
+            `merged_len=${decision.mergedText.length}\n`,
+          )
+          silentAnchorEditDone = true
+        } catch (err) {
+          // Edit failed (e.g. message deleted, rate limit exhausted,
+          // parse error). Fall through to fresh-send below — the
+          // anchor will be overwritten by whatever lands.
+          process.stderr.write(
+            `telegram gateway: silent-reply auto-edit failed, ` +
+            `falling back to fresh send: ${err instanceof Error ? err.message : String(err)}\n`,
+          )
+        }
+      }
+    }
+  }
+
+  if (silentAnchorEditDone) {
+    // Skip the chunk loop entirely — the anchor edit IS the send.
+    // Match the normal exit path: stop typing, then return.
+    stopTypingLoop(chat_id)
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `edited (id: ${sentIds[0]})`,
+        },
+      ],
+    }
+  }
+
   try {
     for (let i = 0; i < chunks.length; i++) {
       const shouldReplyTo =
@@ -4549,6 +4645,27 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         messageId: anchorMsgId,
         text: chunks[chunks.length - 1],
       })
+    }
+  }
+
+  // #1677 silent-reply auto-edit — anchor capture for the FIRST
+  // silent reply of a turn (or the silent reply that replaced the
+  // anchor on overflow). Only captures for the single-chunk,
+  // silent, no-files, no-buttons happy path; the edit-anchor path
+  // earlier in this function handles SUBSEQUENT silent replies by
+  // editing. The next silent reply this turn will see the captured
+  // anchor and edit it in place.
+  if (
+    chunks.length === 1
+    && disableNotification
+    && files.length === 0
+    && replyMarkup == null
+    && sentIds.length === 1
+  ) {
+    const turn = currentTurn
+    if (turn != null) {
+      turn.silentAnchorMessageId = sentIds[0]!
+      turn.silentAnchorText = effectiveText
     }
   }
 
@@ -5941,6 +6058,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           replyCalled: false,
           finalAnswerDelivered: false,
           firstPingAt: null,
+          silentAnchorMessageId: null,
+          silentAnchorText: '',
           capturedText: [],
           orphanedReplyTimeoutId: null,
           registryKey: null,
