@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.13.16 — one ping per turn (framework safety net for beat-5 contract violations)
+
+### fix(telegram) — cap device pings at 1 per turn (#1674)
+
+`reference/conversational-pacing.md` beat 5 is explicit: *"Deliver
+the answer as a fresh `reply` (omit `disable_notification` — pings
+the device once)."* — EXACTLY ONE ping per turn.
+
+Live UAT against test-harness on 2026-05-23 reproduced a real
+spam pattern: the model sometimes sends two `disable_notification:
+false` replies in one turn (substantive answer pinged + a wrap-up
+"Delivered all three steps with a wrap-up summary" or meta-narration
+like "Sent." ALSO pinged). Two device beeps for what should be one.
+
+This release adds a framework safety net: once the first
+`disable_notification: false` reply lands in a turn, subsequent
+pinged replies auto-downgrade to silent (`disable_notification:
+true`), with a clear `telegram gateway: reply over-ping safety net`
+log line for operator visibility. Model intent ("I want this loud")
+is honoured for the FIRST ping; subsequent pings are demoted. No
+content is dropped — only the notification flag flips.
+
+Aligned to the principle that the framework owns the BEAT
+(cadence + count) while the model owns the WORDS. Reviewer
+verified scope and design: this is a safety net, not framework
+overreach — the model still authors every reply; the framework
+only enforces the contract's "EXACTLY ONE" count.
+
+Behaviour change is on by default — no env flag. Zero changes to
+single-ping turns (the common case); only the spam pattern is
+caught.
+
 ## v0.13.15 — visible answer-stream (TTFO under 5s for the common case, flag-gated)
 
 ### feat(telegram) — model's transcript text auto-renders live in the chat (#1672, narrow scope of #869 Phase 1)
