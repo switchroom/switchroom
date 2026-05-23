@@ -3,9 +3,9 @@
 # Phase 0 — container identity matrix
 
 Run: `2026-05-08T00:59:27Z` (rootful + rootless full matrix incl. same-UID-twin assumption row; supersedes 2026-05-08T00:47:20Z run)
-Driver: `spike/test-acl-matrix.sh`
-Spike artifacts: `spike/Dockerfile.broker`, `spike/Dockerfile.agent`, `spike/docker-compose.yml`, `spike/broker-server.mjs`, `spike/agent-client.mjs`, `spike/test-tmux-interrupt.sh`
-Raw logs: `spike/results/`
+Driver: `docs/phase0-research/spike/test-acl-matrix.sh`
+Spike artifacts: `docs/phase0-research/spike/Dockerfile.broker`, `docs/phase0-research/spike/Dockerfile.agent`, `docs/phase0-research/spike/docker-compose.yml`, `docs/phase0-research/spike/broker-server.mjs`, `docs/phase0-research/spike/agent-client.mjs`, `docs/phase0-research/spike/test-tmux-interrupt.sh`
+Raw logs: `docs/phase0-research/spike/results/`
 
 ## Matrix
 
@@ -27,9 +27,9 @@ Both Linux rootful AND Linux rootless pass the full matrix end-to-end (11/11 tes
 For each pending environment, run from the project root after fetching `feat/docker-phase0-spike`:
 
 ```bash
-cd spike
+cd docs/phase0-research/spike
 bash ./test-acl-matrix.sh
-# matrix log lands under spike/results/<env>-<ts>.log
+# matrix log lands under docs/phase0-research/spike/results/<env>-<ts>.log
 ```
 
 The driver auto-detects rootless contexts via `/run/user/$(id -u)/docker.sock`; on Mac/Windows the default Docker Desktop socket already shows up as `default` in `docker context ls`, and the spike's compose file works unchanged.
@@ -44,7 +44,7 @@ dockerd-rootless-setuptool.sh install --force
 systemctl --user start docker.service
 # rootful daemon left untouched on /var/run/docker.sock
 # rootless daemon listens on /run/user/$(id -u)/docker.sock
-cd spike && bash ./test-acl-matrix.sh
+cd docs/phase0-research/spike && bash ./test-acl-matrix.sh
 ```
 
 The driver auto-detects rootless via the user-systemd unit and runs a second matrix row. Confirmed behaviour: identical to rootful end-to-end. The broker's `chown` calls inside its container map through rootlesskit's user namespace — uid 10001 *inside* the userns is a `subuid` on the host but agents *also see* it as 10001 inside their userns, so fs-perm checks at `connect()` / `bind()` / `unlink()` work unchanged. No mount-propagation edge cases observed with named volumes (the storage driver is `vfs` under rootless rather than `overlay2`, but that doesn't affect the path-derived identity model).
@@ -54,7 +54,7 @@ The driver auto-detects rootless via the user-systemd unit and runs a second mat
 ```bash
 # Latest Docker Desktop, default settings.
 docker context use desktop-linux
-cd spike && bash ./test-acl-matrix.sh
+cd docs/phase0-research/spike && bash ./test-acl-matrix.sh
 ```
 
 Things to watch: virtiofs has historically munged mode bits and uid/gid on bind-mounted host paths. We use NAMED VOLUMES, not bind mounts, so this risk is mitigated — named volumes live inside the LinuxKit VM's filesystem, not on virtiofs. If `ls -la /run/switchroom/broker` inside agent-alice does NOT show `drwx------ alice alice alice`, the model is broken on this platform and the row fails. Expected SO_PEERCRED forensics: peer uid will be the in-VM agent uid (10001/10002), unrelated to the host macOS uid.
@@ -73,6 +73,6 @@ Same expected behaviour as Mac (named volumes, not 9p/wsl bind mounts). Watch fo
 ## Notes for review
 
 - The matrix's "SO_PEERCRED uid" column is informational per RFC §Phase 0 and is not captured here. The RFC explicitly downgrades it to a forensics column under the path-derived identity model. Adding native SO_PEERCRED capture (via `node-ffi-napi` or a small native addon) is in-scope for Phase 2's production broker, not for the Phase 0 spike.
-- The `boundSocket` field is logged on every broker response (visible in `spike/results/*.log`) and is the authoritative identity string. Reviewer can cross-check that `agent` in each response equals the basename's parent of `boundSocket`.
+- The `boundSocket` field is logged on every broker response (visible in `docs/phase0-research/spike/results/*.log`) and is the authoritative identity string. Reviewer can cross-check that `agent` in each response equals the basename's parent of `boundSocket`.
 - The "cross-mount denied" column is exercised by the `agent-bob-misconfigured` service in the compose `hostile` profile, which intentionally mounts BOTH socket dirs into a uid-10002 container. The connect attempt against alice's socket failed with `EACCES` at the kernel — the broker never accepted the connection. This is the strongest possible result: the deny is enforced before any application code runs.
 - The "same-UID twin attacks succeed" column is exercised by the `agent-evil-twin` service (also `hostile` profile), which mounts both dirs AND runs as `user: "10001:10001"` — the SAME uid alice uses. With matching uid, alice's `0700`-mode dir grants every operation (`connect()`, `bind()`, `unlink()`) to the twin. The pass criterion is **inverted**: attacks must succeed for the row to be green, because the row's purpose is to document the model's load-bearing assumption (uid uniqueness across services) rather than test a defence. The twin runs AFTER the cross-mount test and BEFORE the broker-restart test; the broker's startup-time `unlinkSync(sockPath); listen(sockPath)` heals any unlink/replace damage caused by the twin. See `phase0-findings.md` "Model assumption" section and the Phase 1 doctor TODO.
