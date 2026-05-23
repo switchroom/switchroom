@@ -124,6 +124,24 @@ export type RuntimeMetricEvent =
       elapsedMs?: number
       reason?: string
     }
+  /**
+   * #1674 over-ping safety net engaged. Fires when a `reply` call
+   * arrived with `disable_notification: false` AND the current turn
+   * already had a pinged reply land — the framework downgraded this
+   * call to silent to honour beat 5's "EXACTLY ONE ping per turn"
+   * contract. Each event is a model contract violation the safety
+   * net caught. A high rate per agent means the model is
+   * systematically over-pinging — prompt drift or training
+   * regression worth investigating.
+   *
+   *   key                 → `<chatId>:<threadIdOrEmpty>` (the statusKey shape)
+   *   sinceFirstPingMs    → time since the FIRST ping landed this turn
+   */
+  | {
+      kind: 'over_ping_suppressed'
+      key: string
+      sinceFirstPingMs: number
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent
