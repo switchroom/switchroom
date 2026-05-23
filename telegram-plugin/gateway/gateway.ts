@@ -154,6 +154,7 @@ const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace, telegramHtmlToPlainText } from '../format.js'
+import { scrubVoice } from '../text-voice-scrub.js'
 import {
   validateInlineKeyboard,
   type AnyButton,
@@ -4197,6 +4198,26 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
   let text = repairEscapedWhitespace(rawText)
+  // Voice scrub (#1683): replace em / en dashes with commas / periods.
+  // Runs BEFORE outboundDedup so retries see the scrubbed key, and
+  // BEFORE markdownToHtml so code-block content is correctly parked
+  // by the scrubber's own placeholder pass (otherwise the html
+  // converter would have already escaped/parked code, and the scrub
+  // would see only the parked placeholders). Kill switch:
+  // `SWITCHROOM_DISABLE_VOICE_SCRUB=1`.
+  {
+    const scrub = scrubVoice(text)
+    if (scrub.replaced > 0) {
+      text = scrub.scrubbed
+      emitRuntimeMetric({
+        kind: 'voice_scrub_applied',
+        chatKey: statusKey(chat_id, args.message_thread_id != null
+          ? Number(args.message_thread_id) : undefined),
+        replaced: scrub.replaced,
+        site: 'reply',
+      })
+    }
+  }
   process.stderr.write(`telegram channel: reply: invoked chatId=${chat_id} charCount=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`)
 
   // #546 dedup check: was this content just sent via turn-flush or
@@ -5842,7 +5863,23 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   const editAccess = loadAccess()
   const editConfigMode = editAccess.parseMode ?? 'html'
   const editFormat = (args.format as string | undefined) ?? editConfigMode
-  const editRawText = repairEscapedWhitespace(args.text as string)
+  let editRawText = repairEscapedWhitespace(args.text as string)
+  // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
+  // are how silent-anchor and progress-update mutate already-sent
+  // bubbles, so without this an edit can re-introduce dashes the
+  // original send had scrubbed out.
+  {
+    const scrub = scrubVoice(editRawText)
+    if (scrub.replaced > 0) {
+      editRawText = scrub.scrubbed
+      emitRuntimeMetric({
+        kind: 'voice_scrub_applied',
+        chatKey: statusKey(args.chat_id as string, undefined),
+        replaced: scrub.replaced,
+        site: 'edit_message',
+      })
+    }
+  }
   let editParseMode: 'HTML' | 'MarkdownV2' | undefined
   let editText: string
   if (editFormat === 'html') {
