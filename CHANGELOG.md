@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.13.17 — silent replies edit one growing message (closes the visual-spam pattern)
+
+### feat(telegram) — consecutive silent replies edit a single anchor in place (#1677)
+
+The operator's original complaint that drove this whole epic was
+**visual** spam, not just notification spam: *"I would like more
+regular process updates, where it edits a status message in place
+vs spamming multiple messages."* The over-ping cap (v0.13.16)
+closed the notification half. This release closes the visual half.
+
+Pre-fix multi-step turn: 4 stacked chat bubbles — silent ack +
+silent step 1 + silent step 2 + pinged final answer. Even with
+only one notification, the user still sees four separate bubbles
+stack up, which reads as spam.
+
+Post-fix: consecutive silent `reply` tool calls in the same turn
+EDIT a single anchor message instead of fresh-sending. Net visual
+for a multi-step turn = 2 bubbles total — one silent growing
+preamble (all the silent updates accumulated with paragraph-break
+separators) + one pinged final answer bubble.
+
+- Pure `decideSilentReplyAnchor` predicate (`telegram-plugin/silent-reply-anchor.ts`) with an 11-test unit suite.
+- Gateway wiring: edit-anchor branch BEFORE the chunk loop (single-chunk happy path); anchor capture AFTER successful single-chunk silent fresh send.
+- Edit failures (rate-limit, message-deleted, parse errors) fall through to fresh-send — the next silent reply re-anchors cleanly.
+- Default ON. Kill switch `SWITCHROOM_DISABLE_SILENT_REPLY_AUTOEDIT=1` reverts to per-reply fresh-send.
+
+Bypasses (anchor not engaged, fresh-send per existing semantics):
+pinged replies, files attached, inline_keyboard set, empty body,
+merged-text overflowing the 4000-char cap.
+
+### test(telegram) — unit coverage + runtime-metric for the over-ping safety net (#1676)
+
+Non-blocking follow-ups from the #1674 review pass: extracted the
+over-ping decision to a pure `decideOverPing` predicate with a
+6-test unit suite, and added an `over_ping_suppressed`
+runtime-metric for fleet-wide observability of how often the
+safety net engages. Pure refactor + additive metric — no
+behaviour change in the safety net itself.
+
 ## v0.13.16 — one ping per turn (framework safety net for beat-5 contract violations)
 
 ### fix(telegram) — cap device pings at 1 per turn (#1674)
