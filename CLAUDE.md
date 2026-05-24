@@ -4,6 +4,13 @@ This file orients Claude Code (and other agentic tools) to this repo.
 `AGENTS.md` and `AGENT.md` are symlinks to this file — edit here, not
 there.
 
+**Auto-memory is the second-tier source.** Per-conversation memories at
+`~/.claude/projects/-home-kenthompson-code-switchroom/memory/` (indexed
+by `MEMORY.md`) carry the operator's running judgments and incident
+post-mortems. CLAUDE.md is the durable contract; memories are the
+recent context. When they disagree, the memory is usually newer —
+verify against current code, then update whichever is stale.
+
 ## What this project is
 
 Switchroom is a Telegram plugin + agent lifecycle layer sitting on top of
@@ -20,13 +27,10 @@ compose`. The `claude` CLI runs unmodified inside each agent container
 around claude (the vision's "no Docker-as-runtime" line in
 `reference/vision.md` is preserved).
 
-> **Cron-fold-in note (v0.8 / Phase 4).** Earlier releases had a third
-> singleton, `switchroom-cron`, that fired every agent's scheduled
-> tasks via `docker exec`. The cutover (PRs #890–#893) retired that
-> container; cron now runs in-container in every agent as a sibling
-> of the gateway, delivering fires through the same `InboundMessage`
-> IPC path Telegram uses (synthesized turns tagged `meta.source="cron"`).
-> See `docs/scheduling.md` for the post-cutover model.
+Cron runs in-container as a per-agent sibling of the gateway (since
+v0.8 / Phase 4); the legacy `switchroom-cron` singleton is gone. See
+`docs/scheduling.md` and the "agent-scheduler" entries under "Repo
+layout" below.
 
 See `README.md` for the user-facing description.
 
@@ -80,24 +84,19 @@ project=switchroom│    binds /run/switchroom/kernel/<agent>/sock per agent
                                               ↑ agent-scheduler sidecar (cron, since Phase 4)
 ```
 
-**Agent container process tree** (since v0.7.5): `tini` is PID 1.
-`start.sh` runs as tini's child. When `SWITCHROOM_RUNTIME=docker` is set
-(by compose) and `SWITCHROOM_DOCKER_TMUX_INNER` is unset (top-level
-entry), start.sh forks `bun /opt/switchroom/autoaccept-poll.js <name>`
-as a sidecar then `exec`s into `tmux -L switchroom-<name>
-new-session -A -s <name> bash -l "$0"` — the same script re-enters
-inside tmux with the inner-marker set, skips the wrapper, and runs
-claude. autoaccept-poll uses `tmux capture-pane / send-keys` against
-the same socket+session names to dispatch first-run prompts (dev-channels
-acknowledge, MCP trust, theme picker).
+**Agent container process tree** (since v0.7.5): `tini` (PID 1) →
+`start.sh` → (forks `autoaccept-poll` sidecar) → `exec tmux -L
+switchroom-<name> new-session -A -s <name> bash -l "$0"`. The same
+script re-enters under the `SWITCHROOM_DOCKER_TMUX_INNER` marker,
+skips the wrapper, and runs `claude`.
 
-**Why both halves matter:** without tmux, autoaccept can't reach claude
-(it talks tmux), `switchroom agent attach` can't connect (it does
-`docker exec -it ... tmux attach -t <name>`), and `! interrupt`
-(`tmux send-keys C-c`) has nowhere to send. The contract is "tmux
+**The tmux layer is load-bearing**, not a convenience. Without it,
+autoaccept can't reach claude (talks tmux), `agent attach` can't
+connect (`docker exec -it ... tmux attach -t <name>`), and `!
+interrupt` (`tmux send-keys C-c`) has nowhere to send. Contract: tmux
 socket `switchroom-<name>` + session `<name>` lives inside the agent
-container" — pinned in `src/agents/autoaccept.ts:151`,
-`src/agents/lifecycle.ts:attachAgent`, and `profiles/_base/start.sh.hbs`.
+container — pinned at `src/agents/autoaccept.ts:151`,
+`src/agents/lifecycle.ts:attachAgent`, `profiles/_base/start.sh.hbs`.
 
 **Per-agent socket model:** compose mounts named volume
 `broker-<name>-sock` at `/run/switchroom/broker/<name>` inside the
@@ -109,111 +108,74 @@ name is parsed from the bind path via `socketPathToAgent` — never from
 a wire payload. Same shape for approval-kernel.
 
 **Vault auto-unlock:** machine-bound — broker derives an AES key from
-`/etc/machine-id` (host-mounted into the broker container) and decrypts
-the `vault-auto-unlock` blob on boot. Operator runs `switchroom vault
-broker enable-auto-unlock` once on the host to write the blob; rotation
-is via the same CLI. If the blob is missing or fails to decrypt, the
-broker falls back to interactive unlock (`switchroom vault broker
-unlock` from any agent's Telegram chat with `/vault unlock`, or via
-`docker exec -it switchroom-vault-broker ...`).
+host-mounted `/etc/machine-id` and decrypts the `vault-auto-unlock`
+blob on boot. Operator writes the blob once via `switchroom vault
+broker enable-auto-unlock`. If decrypt fails, broker falls back to
+interactive unlock (`/vault unlock` from any agent DM, or `switchroom
+vault broker unlock` on the host).
 
-**Vault on-disk layout (v0.7.12+).** The vault is a *directory*
-(`~/.switchroom/vault/`) containing `vault.enc`, not a single file.
-Pre-v0.7.12 it was just `~/.switchroom/vault.enc` and atomic-rename
-hit cross-fs EBUSY on docker single-file bind mounts. The migration
-helper (`src/vault/migrate-layout.ts`, PR #955) moves the file in
-place and symlinks the legacy path so existing `vault.path` configs
-keep working. The 5-state migration machine (A virgin / B
-pre-migration / C partial / D post-migration / E divergent) is
-the contract — read the file's header doc before touching it. The
-*directory* is what compose bind-mounts into the broker; the
-`apply.ts` guard refuses to mount if the dir contains files outside
-the artifact whitelist in `KNOWN_VAULT_ARTIFACT_NAMES` /
-`_PATTERNS`. See `docs/vault.md` § "Layout" and
-`docs/operators/rollback-v0.7.12.md` for downgrade.
+**Vault on-disk layout.** The vault is a *directory*
+(`~/.switchroom/vault/`) containing `vault.enc` — the *directory* is
+what compose bind-mounts into the broker. `apply.ts` refuses to mount
+if the dir contains files outside the artifact whitelist
+(`KNOWN_VAULT_ARTIFACT_NAMES` / `_PATTERNS`). The 5-state migration
+machine in `src/vault/migrate-layout.ts` handles the legacy
+single-file `~/.switchroom/vault.enc` shape — read its header doc
+before touching that file. See `docs/vault.md` § "Layout".
 
-**Networking:** agent containers use `network_mode: host` so scaffolded
-`start.sh` can reach hindsight at `127.0.0.1:18888` and operator LAN
-devices. Tradeoff: agents share the host network namespace (no
-inter-agent isolation). The trust model already assumed shared-host
-operation. Future work: an opt-in strict-isolation mode with
-`extra_hosts: host.docker.internal`.
+**Networking:** agent containers use `network_mode: host` to reach
+hindsight at `127.0.0.1:18888` and operator LAN devices. Trade-off:
+no inter-agent network isolation. The trust model already assumed
+shared-host operation.
 
 **Self-restart commands (`/restart`, `/new`, `/reset`, `/update apply`).**
-Since RFC C Phase 2 (default-flip, #1338) `host_control.enabled`
-defaults **true**, so the gateway dispatches these four verbs through
-the **`switchroom-hostd`** daemon (a host-side container in its own
-compose project with the docker socket mounted) over UDS —
-`telegram-plugin/gateway/hostd-dispatch.ts` is the primary path.
-`spawnSwitchroomDetached` (`telegram-plugin/gateway/gateway.ts`) is now
-the **fallback**, used only when hostd is `"not-configured"`
-(host_control explicitly disabled, per-agent socket absent, or daemon
-unreachable). There is deliberately *no* silent spawn fallback when
-hostd is configured-on.
+Since RFC C Phase 2 (#1338) `host_control.enabled` defaults **true**,
+so the gateway dispatches these four verbs through the
+**`switchroom-hostd`** daemon (separate compose project, docker socket
+mounted) over UDS —
+`telegram-plugin/gateway/hostd-dispatch.ts` is the primary path. There
+is deliberately *no* silent spawn fallback when hostd is configured-on.
 
-Two load-bearing primitives in the spawn-detached *fallback* path that
-are easy to "simplify away" and break the self-restart case:
+`spawnSwitchroomDetached` (`telegram-plugin/gateway/gateway.ts`) is
+the fallback, used only when hostd is `"not-configured"`. Two
+primitives in that fallback that are easy to "simplify away" and break
+self-restart:
 
-  1. **Detached spawn + restart-marker dance.** The gateway runs
-     inside the agent container in v0.7+; when it asks docker (via
-     `switchroom agent restart`) to restart its own container, the
-     parent dies as soon as the recreate begins. The fix is to
-     spawn the child with `detached: true` + `.unref()` and capture
-     the originating chat in the restart marker before the kill —
-     see primitive 2. (Historical note: a legacy branch of this
-     helper also wraps the spawn in `systemd-run --user --scope`
-     for v0.6 non-docker installs where the gateway ran as a host
-     systemd unit. That branch is unreachable in v0.7+ docker
-     agents — `systemd-run` is absent inside the container — and
-     is scheduled for removal in Phase 3 of the host-control
-     daemon rollout. Don't add new dependencies on it.)
-
+  1. **Detached spawn.** Gateway → `switchroom agent restart` → docker
+     recreate kills its own parent; the child needs `detached: true`
+     + `.unref()` to survive. A legacy branch also wraps the spawn in
+     `systemd-run --user --scope` for v0.6 non-docker installs — dead
+     code under v0.7+ docker but still present (Phase 3 cleanup
+     pending). Don't add new dependencies on it.
   2. **Restart marker + sweep** (`writeRestartMarker`,
-     `stampUserRestartReason`, `sweepBeforeSelfRestart`). Captures
-     the originating chat so the post-restart greeting card edits
-     into the same message; clears active reactions so they don't
-     get stranded across the restart. All four self-restart commands
-     share the marker, so a `/restart` fired mid-`/update` is
-     debounced by the same 15s window (and vice versa).
+     `stampUserRestartReason`, `sweepBeforeSelfRestart`). Captures the
+     originating chat so the post-restart greeting card edits into
+     the same message; clears active reactions. All four verbs share
+     the marker → a `/restart` fired mid-`/update` is debounced by
+     the same 15s window.
 
-**`/update apply` docker-availability guard (#926).** The agent
-container has no docker binary or `/var/run/docker.sock` mount.
-`isDockerReachable()` in the gateway probes both before the
-spawn-detached fallback; on failure it surfaces a clean error
-pointing at the host CLI rather than an opaque exit-127. The proper
-fix — the host-control daemon (RFC C,
-`docs/rfcs/host-control-daemon.md`) — **has landed**: Phase 1
-(library + per-agent socket bind mounts) and Phase 2 (gateway
-callsites swapped, default-on, #1306/#1338) are both shipped, so
-hostd is the primary path described above. Phase 3 (removing the
-legacy `systemd-run` fallback branch) is the only remaining step.
+The `isDockerReachable()` probe (#926) catches the case where the
+agent container has no docker binary/socket and surfaces a clean
+error pointing at the host CLI instead of exit-127.
 
-**Agent-scheduler env knobs.**
-- `SWITCHROOM_INLINE_SCHEDULER` — set to `0` in the compose env to
-  disable the in-agent scheduler entirely. Default: enabled. Useful
-  for narrowing a wedge to a single agent.
-- `SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN` — minutes the boot replay
-  walks back looking for missed cron fires. Default: 30. Set to 0
-  to disable replay.
-- `SWITCHROOM_AGENT_SCHEDULER_LOCK` / `SWITCHROOM_AGENT_SCHEDULER_JSONL`
-  — override the lockfile / audit log paths. Default: under
-  `/state/agent/`. Used by tests; operators rarely need to set.
-- `SWITCHROOM_GATEWAY_SOCKET` — override the IPC socket the
-  scheduler dispatches `inject_inbound` through. Default: under
-  the agent's telegram state dir.
-
-The empty-schedule idle path (#921) means agents with no `schedule:`
-entries stay alive (instead of restart-cap'ing). Look for the line
-`agent-scheduler: <name> has no schedule entries — idling` in
-`/var/log/switchroom/agent-scheduler.log` to confirm.
+**Agent-scheduler env knobs** (for narrowing a wedge / test overrides;
+operators rarely set):
+`SWITCHROOM_INLINE_SCHEDULER=0` disables in-agent scheduler;
+`SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN` (default 30) caps boot-replay
+window; `SWITCHROOM_AGENT_SCHEDULER_LOCK` / `_JSONL` /
+`SWITCHROOM_GATEWAY_SOCKET` override paths. Empty-schedule agents
+idle instead of restart-cap'ing (#921) — log line:
+`agent-scheduler: <name> has no schedule entries — idling`.
 
 ## Docker test discipline (HARD RULES)
 
-These rules are permanent guidance for every phase of the docker migration, not phase-1c-scoped commentary. Tests run on a host that ALSO runs Coolify, hindsight, nginx-tunnel-gateway, and every Coolify-managed app. Treat the host as production.
+Tests run on a host that ALSO runs Coolify, hindsight,
+nginx-tunnel-gateway, and every Coolify-managed app. Treat the host
+as production.
 
-- Every test container MUST be created with the label `switchroom.test=<phase>` — substitute the phase you're working in (e.g. `phase1c`, `phase2c`, `phase3a`). Add a per-run UUID label too (e.g. `switchroom.test.run=<uuid>`).
+- Every test container MUST carry the label `switchroom.test=<phase>` (e.g. `phase1c`) plus a per-run UUID label (`switchroom.test.run=<uuid>`).
 - Every `docker run` MUST use `--rm` so containers self-clean on exit.
-- The ONLY sanctioned bulk-teardown command is filtered by label — same `<phase>` value as the create label:
+- The ONLY sanctioned bulk-teardown command is filtered by label:
 
   ```
   docker rm -f $(docker ps -aq --filter label=switchroom.test=<phase>) 2>/dev/null || true
@@ -230,15 +192,8 @@ These rules are permanent guidance for every phase of the docker migration, not 
 Same principle as the Docker rules above: tests run on the **live
 operator host**. `~/.switchroom/` is the production state tree — the
 real encrypted vault, audit log, grants DB, and per-agent scaffolds. A
-test that writes there corrupts a running fleet.
-
-**On 2026-05-22 a vault/broker test did exactly this:** it created its
-fixture vault at the *default* path and truncated the production
-`~/.switchroom/vault/vault.enc` from 77 keys to a 414-byte test vault,
-and forked the `vault-audit.log` hash chain. The fleet survived only
-because the broker re-persists the whole vault on the next `put` and a
-token rotation happened to heal the disk before any broker restart. Do
-not rely on that luck.
+test that writes there corrupts a running fleet (real incident,
+2026-05-22 — see memory `project_vault_clobbered_by_test_2026_05_22`).
 
 - Any test that constructs a `VaultBroker`, opens/saves a vault
   (`openVault` / `saveVault` / `createVault`), or writes the audit log
@@ -401,30 +356,22 @@ the path-gated shards — see #1343 and the sentinel pattern in
 names are retired.) A PR cannot merge to `main` until all 10 are
 green.
 
-**Governance posture (sec WS9-F2 / R7, set 2026-05-17 — deliberate,
-do not "re-harden" without the owner revisiting):**
-- **Admin-bypass is genuinely locked** — the ruleset's `bypass_actors`
-  is empty (it previously granted the Admin role `bypass_mode:
-  always`, which contradicted this doc's prior "admin bypass is off"
-  claim). Repo admins (and anything with admin access) go through the
-  10 checks like everyone else; there is no force-merge escape — the
-  CI recovery lever is `workflow_dispatch` re-trigger, not bypass.
-- **No required human PR review, by design.** switchroom is operated
-  via autonomous agents that open PRs and auto-merge on green; a
-  required-review rule on this solo-owner repo would deadlock that
-  model. The load-bearing supply-chain hole (a PR skipping the test
-  gates via path-filter blind spots) is closed *in the checks
-  themselves* (#1405 / sec WS9-F1), so required review would be
-  defense-in-depth, not the essential control — and is intentionally
-  omitted.
-- **`strict` (require-branch-up-to-date) is intentionally OFF** (sec
-  WS9-F5, accepted residual): enabling it would stall the autonomous
-  auto-merge flow; merge-skew risk is accepted given the now-
-  comprehensive required checks.
+**Governance posture (set 2026-05-17, sec WS9-F2/R7 — do not
+"re-harden" without the owner revisiting; memory
+`feedback_repo_governance_automerge`):**
 
-Auto-merge is enabled repo-wide, so a PR with `--auto` enabled
-merges itself the moment the last required check turns green (this is
-the intended operating model — see above).
+- **Admin-bypass is locked** (`bypass_actors: []`). No force-merge
+  escape; CI recovery lever is `workflow_dispatch` re-trigger.
+- **No required human PR review, by design.** Autonomous agents open
+  PRs and auto-merge on green; required review would deadlock the
+  solo-owner model. Supply-chain hole closed in the checks themselves
+  (#1405 / sec WS9-F1).
+- **`strict` (require-branch-up-to-date) is OFF** (WS9-F5, accepted
+  residual): enabling it would stall auto-merge.
+
+Auto-merge is enabled repo-wide — a PR with `--auto` merges the
+moment the last required check turns green. This IS the operating
+model.
 
 When checking PR state, `gh pr checks <n>` is the source of truth.
 Look at:
@@ -434,23 +381,15 @@ Look at:
   with `main`, `UNSTABLE` is the not-yet-required-checks state and is
   usually fine to merge if the required ones are green.
 
-**Buildkite is retired** (PR for retirement: ci/retire-buildkite,
-2026-05-15). UAT fuzz / race-long / evals are now on GHA
-(`ci-uat`, `ci-tests-race-long`, `ci-evals`). The legacy
-`.buildkite/` directory was removed; the three load-bearing shell
-scripts (`docker-snapshot-gate.sh`, `annotate-evals.sh`,
-`publish-badges.sh`) moved to `scripts/ci/` and the GHA workflows
-were updated to reference the new paths.
+Buildkite is retired (2026-05-15); UAT / race-long / evals are now
+GHA workflows (`ci-uat`, `ci-tests-race-long`, `ci-evals`).
 
-Required-check tuning is a **Ruleset** edit, not classic protection:
+Required-check tuning is a **Ruleset** edit (classic
+`branches/main/protection/...` no longer governs):
 `gh api repos/switchroom/switchroom/rulesets/16470166` to read, then
-`gh api --method PUT repos/switchroom/switchroom/rulesets/16470166
---input <body>` with the `required_status_checks` rule's contexts
-updated (preserve the other rules + `bypass_actors: []` + `enforcement:
-active`). A new workflow that should gate merges is NOT auto-added —
-it needs an explicit ruleset update. (The old
-`branches/main/protection/...` classic-protection API path no longer
-governs this repo.)
+`PUT` with the `required_status_checks` rule's contexts updated
+(preserve other rules + `bypass_actors: []` + `enforcement: active`).
+A new gating workflow needs explicit ruleset update.
 
 ## Conventions
 
@@ -505,15 +444,6 @@ Agent working on this repo: when you open a PR, **target
 is a staging area for your own iteration; the canonical repo is where
 review + merge + release happens.
 
-### Two workflows — know which one you're in
-
-**1. Code-change dev loop (most common).** Editing source, iterating
-locally. Full process in **Standard dev process** below.
-
-**2. Release to npm (canonical maintainers).** Bump `package.json`,
-update `CHANGELOG.md`, tag, push, `npm publish`. Full process in
-**Standard release process** below.
-
 ### Standard dev process
 
 This is the **mandatory** path for any non-trivial change. Skip steps
@@ -563,21 +493,14 @@ locally cover the load-bearing subset.
 
 **Two lint traps worth memorising:**
 
-- **`check-bot-api-wrapping.sh` allowlist drift** (gateway.ts only).
-  The allowlist of permitted raw `ctx.api`/`bot.api` callsites is
-  line-keyed. Any line insertion in `gateway.ts` shifts pre-existing
-  raw callsites past their allowlist range and CI fails — tsc + tests
-  pass, only this script catches it. If you inserted any code in
-  `gateway.ts`, run the script locally; widen the allowlist range in
-  the same PR if needed. See
-  `feedback_gateway_bot_api_allowlist_drift`.
-
-- **Push Protection on token fixtures.** GitHub blocks contiguous
-  token-shaped strings even in test fixtures. If you need a fake
-  token for a secret-detector test, build it at runtime by
-  concatenation (`"sk-ant-" + "fake" + "-xyz"`), never as a single
-  literal. Pattern lives in
-  `telegram-plugin/tests/secret-detect-secretlint.test.ts`.
+- **`gateway.ts` allowlist drift.** The allowlist of raw
+  `ctx.api`/`bot.api` callsites is line-keyed. Any insertion shifts
+  pre-existing entries → CI fails (tsc + tests stay green). Run
+  `check-bot-api-wrapping.sh` locally and widen the range same-PR.
+  Memory: `feedback_gateway_bot_api_allowlist_drift`.
+- **Push Protection on token fixtures.** Build fake tokens at runtime
+  by concatenation (`"sk-ant-" + "fake" + "-xyz"`), never a single
+  literal. Pattern: `telegram-plugin/tests/secret-detect-secretlint.test.ts`.
 
 **4. Commit with Conventional Commits, push to fork, open PR against
 `upstream/main`.**
@@ -596,27 +519,23 @@ gh pr create --repo switchroom/switchroom --base main \
 PR title under 70 chars. Body covers: Summary, Why, Test plan
 (check-list), Risk. Link any related PRs.
 
-**5. Dispatch a fresh-process reviewer agent.**
+**5. Dispatch a fresh-process reviewer.**
 
 The coder agent CANNOT review its own work in the same context — it
-rubber-stamps. Spawn a separate `general-purpose` agent (or
-`reviewer` if defined) with an explicit brief:
+rubber-stamps. Spawn a separate `general-purpose` (or `reviewer`)
+agent with:
 
 > Review PR #N (branch `<name>` against `<base>`). Verdict: APPROVE /
 > REQUEST_CHANGES / BLOCK. Be specific about blockers and cite
 > `file:line`.
 
-Tell the reviewer what to check: behaviour equivalence, kill-switch
-correctness, test adequacy, hidden coupling, CI state. Read the
-review carefully. Iterate on REQUEST_CHANGES until APPROVE.
+Tell it what to check: behaviour equivalence, kill-switch correctness,
+test adequacy, hidden coupling, CI state. Iterate on REQUEST_CHANGES
+until APPROVE.
 
-**Do not enable auto-merge before the reviewer APPROVE.** Per
-`feedback_automerge_after_review`, auto-merge fires on CI-green and
-will beat an out-of-band reviewer on a fast-CI / docs PR. The **CI**
-section above documents that auto-merge is the intended *repo* policy
-(autonomous agents + green-checks-merge); this dev-process step is
-the *personal* gate that the coder agent applies on top — fresh
-reviewer first, then turn on auto-merge.
+**Do not enable auto-merge before reviewer APPROVE.** Memory
+`feedback_automerge_after_review`: auto-merge fires on CI-green and
+beats the out-of-band reviewer on fast-CI / docs PRs.
 
 **6. After APPROVE: enable auto-merge.**
 
@@ -624,15 +543,8 @@ reviewer first, then turn on auto-merge.
 gh pr merge <PR#> --repo switchroom/switchroom --auto --squash
 ```
 
-The PR merges when all 10 required checks are green. If checks fail,
-fix and re-push — never bypass hooks (`--no-verify`) or skip required
-checks.
-
-**7. UAT (when the change affects user-visible behaviour).**
-
-See **Pre-rollout UAT (MTCute harness)** below. Required before any
-fleet rollout; optional but encouraged before merging behaviour
-changes.
+**7. UAT (user-visible changes).** See **Pre-rollout UAT** below.
+Required before fleet rollout.
 
 ### Standard release process
 
@@ -647,13 +559,10 @@ git fetch upstream
 git worktree add ~/code/switchroom-rel-<vX.Y.Z> \
   -b chore/release-v<X.Y.Z> upstream/main
 cd ~/code/switchroom-rel-<vX.Y.Z>
-# For a RELEASE worktree, prefer a real copy over the symlink. `bun
-# build` (the bundler in scripts/build.mjs) does NOT resolve through
-# certain symlink shapes — the `~`-prefixed form `ln` leaves unexpanded
-# silently produces an EMPTY dist/cli/. Releases have shipped broken
-# this way (0.12.6 → 0.12.7 deprecation). See
-# `feedback_npm_publish_landmines` for the post-mortem. Real copy is
-# the safe default for a release worktree:
+# Release worktree needs a REAL node_modules, not the dev-worktree
+# symlink. `bun build` doesn't resolve through certain symlink shapes
+# and silently emits an empty dist/cli/ (broke v0.12.6→v0.12.7). See
+# memory `feedback_npm_publish_landmines`.
 rm -rf node_modules && cp -a ~/code/switchroom-sec-1417/node_modules ./node_modules
 ```
 
@@ -704,11 +613,22 @@ git push upstream vX.Y.Z
 The tag push triggers the `docker-images` workflow, which builds
 the per-version-tagged ghcr.io images (~5 min).
 
-**6. npm publish — verify the tarball first.**
+**5a. Create the GitHub Release** (silently dropped v0.12.18–v0.13.11,
+backfilled 2026-05-22 — memory `feedback_release_create_github_release`):
 
-Per `feedback_npm_publish_landmines`: ALWAYS verify the tarball has
-`dist/cli/switchroom.js` before publishing. Past releases have shipped
-broken (0.12.6→0.12.7) because dist wasn't bundled.
+```
+gh release create vX.Y.Z --repo switchroom/switchroom \
+  --title "vX.Y.Z — <theme>" \
+  --notes "$(awk '/^## vX\.Y\.Z/{f=1;print;next} /^## v/&&f{exit} f' CHANGELOG.md)"
+```
+
+(The naive `awk '/^## vX\.Y\.Z/,/^## v/'` range collapses because the
+start line also matches the end pattern — returns 1 line, not the
+section.)
+
+**6. npm publish — verify tarball first** (memory
+`feedback_npm_publish_landmines`: past releases shipped without
+`dist/cli/switchroom.js`).
 
 ```
 node scripts/build.mjs                          # rebuild — reset --hard wipes dist
@@ -717,9 +637,8 @@ tar tzf switchroom-X.Y.Z.tgz | grep -E "dist/cli/switchroom.js|vendor/hindsight"
 npm publish --ignore-scripts switchroom-X.Y.Z.tgz
 ```
 
-`--ignore-scripts` skips `prepublishOnly` (which would re-run build +
-lint + test); the just-verified tarball is what publishes. Operators
-running `npm i -g switchroom` get the newest version.
+`--ignore-scripts` skips `prepublishOnly` so the verified tarball is
+what ships.
 
 **7. Update local host CLI.**
 
@@ -728,20 +647,13 @@ sudo env PATH=$PATH npm i -g switchroom@X.Y.Z
 switchroom --version    # confirm X.Y.Z
 ```
 
-**8. Wait for docker-images workflow to complete.**
+**8. Wait for `docker-images` workflow** (`gh run list
+--workflow=docker-images --limit 2`, ~5 min). All 5 images (agent,
+broker, auth-broker, kernel, hindsight) must be pull-able under the
+new tag.
 
-```
-gh run list --repo switchroom/switchroom --workflow=docker-images --limit 2
-```
-
-The `v<X.Y.Z>` tag-trigger run takes ~5 min. Don't roll the fleet
-until ALL 5 images (agent, broker, auth-broker, kernel, hindsight)
-are pull-able under the new tag.
-
-**9. Canary on test-harness BEFORE fleet rollout.**
-
-This is the mandatory gate. See **Pre-rollout UAT (MTCute harness)**
-below.
+**9. Canary on test-harness BEFORE fleet rollout** — mandatory gate.
+See **Pre-rollout UAT** below.
 
 **10. Fleet rollout — staggered, not bulk.**
 
@@ -763,14 +675,31 @@ for a in clerk gymbro ziggy klanker lawgpt carrie finn reggie; do
 done
 ```
 
-The historical thundering-herd wedge — mass-recreate stranding
-mid-turn inbounds — was closed by the self-heal landing in v0.12.16
-(#1546/#1549) and the durable inbound spool in v0.12.19 (#1558). So
-the wedge class is no longer load-bearing for the stagger. The
-sequential per-agent recipe is still preferred for two reasons: each
-`switchroom agent restart` blocks ~30s on the boot card, naturally
-spacing the bounces; and the `--version` assertion per-agent catches
-the `:latest` pull-race that's still a live concern.
+The historical thundering-herd wedge (mass-recreate stranding
+mid-turn inbounds) was closed in v0.12.16 / v0.12.19 (#1546, #1549,
+#1558). Sequential per-agent restart is still preferred — each
+`switchroom agent restart` blocks ~30s on the boot card (spacing the
+bounces) and the `--version` assertion catches the `:latest`
+pull-race.
+
+**Pick the right restart flag for the change shipping** (memory
+`feedback_agent_restart_image_rollout_flags`):
+
+- `agent restart <name>` — recreate, deploys new image, NOT
+  marker-safe by default.
+- `--wait` — recreate + wait for in-flight turn (deploys new image,
+  marker-safe). **Use this for image rollouts.**
+- `--graceful-restart` — in-place IPC bounce, **keeps the old image**.
+  Useful for forcing a clean reconnect without pulling new bits.
+- `--force` — bypasses safety prompts; pair with `--wait` for fleet
+  rollout loops.
+
+`agent restart` does NOT self-elevate (unlike `apply`). When the
+agent is running, the scaffold dir is 0700 owned by the agent UID, so
+restart from the operator account fails EACCES. Marker-safe one-agent
+deploy: `sudo env PATH=$PATH HOME=$HOME switchroom agent restart
+<name> --wait --force` (memory
+`feedback_agent_restart_needs_sudo_when_running`).
 
 ### Pre-rollout UAT (MTCute harness)
 
@@ -790,111 +719,63 @@ bun run uat:driver-info             # confirms session is valid
 The driver session persists in `.env`'s `MTCUTE_SESSION` so subsequent
 runs are non-interactive.
 
-**Scenarios live at `telegram-plugin/uat/scenarios/`.**
-
-Naming convention: `jtbd-<job>-<surface>.test.ts`. Each scenario
-spins up a driver, sends a DM via the real Telegram API to a real
-agent, asserts the response shape and timing.
+Scenarios live at `telegram-plugin/uat/scenarios/`, named
+`jtbd-<job>-<surface>.test.ts`. Each spins up a driver, sends a real
+Telegram DM to a real agent, asserts response shape + timing.
 
 ```
 bun run --cwd telegram-plugin test:uat jtbd-fast-trivial-dm
 ```
 
-**When releasing changes that touch streaming, message format, or
-turn lifecycle, run at least:**
+**Release-critical scenarios** (streaming, message format, turn
+lifecycle changes):
 
-- `jtbd-fast-trivial-dm` — warm-cache TTFO (baseline ~1.7s in DM).
-- `jtbd-always-on-after-restart-dm` — first message after a restart
-  must reply within 60s (the 5-min wedge regression gate).
-- `jtbd-memory-survives-restart-dm` — memory persistence across
-  restart.
-- Any new scenario specific to the feature shipping.
+- `jtbd-fast-trivial-dm` — warm-cache TTFO (~1.7s baseline).
+- `jtbd-always-on-after-restart-dm` — first message after restart
+  ≤60s (5-min wedge regression gate).
+- `jtbd-memory-survives-restart-dm` — memory persistence across restart.
+- Any feature-specific scenario.
 
-If a UAT fails, **roll back the test-harness canary** and investigate.
-Do NOT proceed to fleet.
+**Canary discipline.** Always: (1) pin **test-harness** to the new
+version (`switchroom update --pin vX.Y.Z` — note: fleet-wide today,
+so accept the bounce or use a feature flag to keep new code dormant);
+(2) run UAT; (3) tail `/var/log/switchroom/gateway-supervisor.log`;
+(4) observe ≥1 real human DM round-trip; (5) green → fleet rollout;
+red → revert pin and queue a fix PR.
 
-**Canary discipline.**
-
-The flow is always:
-
-1. Roll test-harness to the new version, NOT the fleet:
-   ```
-   sudo env PATH=$PATH HOME=$HOME switchroom update --pin vX.Y.Z
-   # (update is fleet-wide; until per-agent update exists, this
-   # bounces all 9 — accept that for canary OR use a feature flag /
-   # env var to keep the new code dormant on the other 8 until
-   # validated.)
-   ```
-2. Run the UAT suite against test-harness.
-3. Tail `/var/log/switchroom/gateway-supervisor.log` for the new
-   trace lines / log shapes the change should produce.
-4. Observe ≥1 real human DM round-trip if the change is user-visible.
-5. If green: fleet rollout (step 10 of the release process).
-6. If red: revert the pin (`switchroom update --pin v<previous>`)
-   and queue a fix PR.
-
-**The release isn't "shipped" until step 5 of the canary passes.**
-Tagging + publishing + rolling are necessary but not sufficient.
+**The release isn't shipped until step 5 passes** — tagging /
+publishing / rolling are necessary but not sufficient.
 
 ### Operator update — `switchroom update`
 
 For a host that's already running switchroom and just needs to catch
-up with upstream, use the `update` verb (since #918 / v0.7.8). It
-collapses what used to be three separate operator steps:
+up with upstream:
 
 ```
 switchroom update              # pull images + apply + recreate + doctor
-switchroom update --check      # dry-run: print the plan, exit 0
+switchroom update --check      # dry-run plan
 switchroom update --status     # read-only: CLI version + image/container ages
 switchroom update --rebuild    # source-checkout users: also git pull + npm build
+switchroom update --pin vX.Y.Z # pin a specific version
 ```
 
-`apply` self-elevates via sudo internally (since #920) when the per-
-agent scaffold dirs need root — no need for the operator to memorize
-the old `sudo HOME=… PATH=… bun /path/to/dist/cli/switchroom.js
-apply --non-interactive` incantation.
-
-`apply` also runs a focused `doctor` sweep against the Agents section
-on success (since #929) so the post-apply state is visible without
-a separate verb. Suppress with `--no-doctor`; `update` passes this
-internally to avoid double-printing (it has its own doctor step).
-
-### Telegram operator surfaces
-
-The same flow is reachable from any agent's DM (since #919, #927):
-
-- `/upgradestatus` — read-only fleet snapshot (CLI version, image
-  digests + ages, container ages). Not admin-gated.
-- `/update` — dry-run plan (calls `switchroom update --check`).
-- `/update apply [--skip-images|--rebuild]` — execute. Admin-gated.
-  Internally guards with a docker-availability probe (#926): on the
-  canonical docker install the agent container has no docker
-  binary/socket, so the apply path returns a clean error pointing
-  the operator at the host CLI. Host-side update daemon (the proper
-  fix for in-Telegram apply on docker hosts) is a tracked follow-up.
+`apply` self-elevates via sudo internally and runs a focused `doctor`
+sweep on success. Reachable from any agent DM via `/upgradestatus`
+(read-only, not admin-gated), `/update` (dry-run), `/update apply`
+(admin-gated; uses hostd on docker hosts, falls back to a clean
+host-CLI error if hostd is unreachable).
 
 ### Code ≠ runtime
 
-A rebuild updates the CLI + dist/. It does **not** update running agent
-processes — those loaded the code at boot and hold it in memory.
-**Changes only go live after the runtime restarts post-build.** When
-your work affects the CLI, the telegram-plugin, or scaffolded assets,
-expect a `switchroom agent restart all` to be part of verification.
+A rebuild updates `dist/`. It does **not** update running agents —
+they loaded code at boot. Changes go live only after restart. Since
+PR #59, `agent restart` always runs reconcile first (re-emits the
+compose file + scaffold), so it's also a mini-deploy.
 
-Since PR #59, `switchroom agent restart` always runs reconcile first
-(regenerating the per-agent scaffold + the compose file if changed). So
-a restart is also a mini-deploy of any scaffold changes — under the
-hood it re-emits `~/.switchroom/compose/docker-compose.yml` and bounces
-the affected container(s) via `docker compose up -d`.
-
-### Install paths
-
-`~/.bun/bin/switchroom` is typically a symlink to the workspace's
-`dist/cli/switchroom.js`. If you built with `bun run build`, the global
-CLI is already fresh — no `npm i -g` needed. An `npm i -g switchroom`
-installs a separate, pinned copy at `~/.nvm/…/node_modules/switchroom`;
-PATH resolution order determines which wins. Prefer the bun-linked install
-on dev machines, the npm-global install on consumer machines.
+`~/.bun/bin/switchroom` is the dev-machine install (symlink to
+workspace `dist/cli/switchroom.js`). `npm i -g switchroom` is the
+consumer-machine install (separate pinned copy under `~/.nvm/…`).
+PATH order picks the winner.
 
 ### Secrets in tests
 
@@ -920,55 +801,36 @@ contiguous token pattern. See
 
 ## Where to look first
 
-(For *design intent* — outcomes, principles, JTBDs — see "Design
-contract" above. The pointers below are for *implementation*.)
+(Implementation pointers. For *design intent* — outcomes, principles,
+JTBDs — see "Design contract" above.)
 
-- **"How does config resolution work?"** → `src/config/merge.ts` +
-  `docs/configuration.md`.
-- **"How does the progress card render?"** →
-  `telegram-plugin/stream-reply-handler.ts` + `telegram-plugin/card-format.ts`
-  + `docs/telegram-plugin.md` (streaming modes section).
-- **"How does auth work?"** → `src/auth/accounts.ts` (slot storage) +
-  `src/auth/manager.ts` (OAuth flow). Telegram `/auth` routing lives in
-  `telegram-plugin/auth-slot-parser.ts`.
-- **"What can I inspect at runtime?"** → `switchroom debug turn <agent>`
-  dumps exact prompt layering; `switchroom workspace render <agent>`
-  prints the bootstrap block.
-- **"How is the docker compose file generated?"** →
-  `src/agents/compose.ts:generateCompose()`. Tests pin every emitted
-  field at `tests/docker/compose-generator.test.ts`. UID allocation is
+- **Config resolution** → `src/config/merge.ts` + `docs/configuration.md`.
+- **Progress card** → `telegram-plugin/stream-reply-handler.ts` +
+  `telegram-plugin/card-format.ts` + `docs/telegram-plugin.md`.
+- **Auth** → `src/auth/accounts.ts` (slots) + `src/auth/manager.ts`
+  (OAuth). Telegram `/auth` routing: `telegram-plugin/auth-slot-parser.ts`.
+- **Runtime inspection** → `switchroom debug turn <agent>` (prompt
+  layering) and `switchroom workspace render <agent>` (bootstrap block).
+- **Compose generation** → `src/agents/compose.ts:generateCompose()`,
+  pinned by `tests/docker/compose-generator.test.ts`. UID via
   `allocateAgentUid()` (deterministic hash → 10001-10999).
-- **"How does the broker authenticate agents?"** → path-as-identity:
-  `src/vault/broker/peercred.ts:socketPathToAgent()` parses the bind
-  path. Two canonical shapes: flat `<agent>.sock` (legacy / tests) and
-  subdir `<agent>/sock` (what compose emits). ACL is bind-time, never
-  wire-time.
-- **"How does an agent boot inside a container?"** →
-  `profiles/_base/start.sh.hbs` (docker-mode preamble forks three
-  supervised sidecars — telegram-plugin gateway, autoaccept-poll,
-  agent-scheduler — then re-execs into tmux). `docker/Dockerfile.agent`
-  copies the bundles to `/opt/switchroom/{switchroom.js,
-  telegram-plugin/dist/, autoaccept-poll.js, agent-scheduler/index.js}`
-  (the CLI is symlinked onto PATH at `/usr/local/bin/switchroom` for the
-  gateway's shell-out path) and sets CMD to `/state/agent/start.sh`
-  under tini. `src/agents/compose.ts` emits the env / volumes / caps
-  and the broker/kernel healthchecks.
-- **"How does autoaccept dispatch first-run prompts?"** →
-  `src/agents/autoaccept.ts` (tmux capture-pane + send-keys, regex
-  prompts in `PROMPTS`). Bundle entry at `src/cli/autoaccept-poll.ts`.
-  start.sh forks it as an in-container sidecar.
-- **"How does cron work post-Phase-4?"** → `src/agent-scheduler/`.
-  `index.ts` is the entrypoint, supervised by start.sh. Cron fires
-  call `dispatchAsInbound` (`src/scheduler/dispatch.ts`) to synthesize
-  an `InboundMessage` tagged `meta.source="cron"`, then send it via
-  `inject_inbound` IPC (`telegram-plugin/gateway/ipc-protocol.ts`)
-  to the local gateway, which forwards it to the bridge as a
-  synthesized turn. Audit at `/state/agent/scheduler.jsonl`; at-least-once
-  boot replay is bounded to past 30 min by default. See
-  `docs/scheduling.md` and the cron-fold-in PRs (#890–#893).
-- **"How do I know if a singleton (broker / kernel) is healthy?"** →
-  `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml ps`
-  shows the new health column. Probe is bind-presence on
-  `/run/switchroom/<svc>/*/sock` (PR #898). Empty fleets correctly
-  read as unhealthy — a singleton with no agents to serve isn't
-  doing useful work.
+- **Broker peer auth** → path-as-identity in
+  `src/vault/broker/peercred.ts:socketPathToAgent()`. Shapes: flat
+  `<agent>.sock` (legacy/tests), subdir `<agent>/sock` (compose). ACL
+  is bind-time, never wire-time.
+- **Agent boot inside container** → `profiles/_base/start.sh.hbs`
+  (forks gateway + autoaccept-poll + agent-scheduler, then re-execs
+  into tmux). `docker/Dockerfile.agent` lays the bundles under
+  `/opt/switchroom/`; CLI symlinked at `/usr/local/bin/switchroom`;
+  CMD `/state/agent/start.sh` under tini.
+- **Autoaccept first-run prompts** → `src/agents/autoaccept.ts`
+  (regex `PROMPTS`, tmux capture-pane + send-keys). Bundle entry
+  `src/cli/autoaccept-poll.ts`.
+- **Cron** → `src/agent-scheduler/index.ts` (entrypoint) →
+  `dispatchAsInbound` (`src/scheduler/dispatch.ts`) → `inject_inbound`
+  IPC to local gateway. Audit at `/state/agent/scheduler.jsonl`;
+  bounded boot replay (30 min default). See `docs/scheduling.md`.
+- **Singleton health** →
+  `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml ps`.
+  Probe is bind-presence on `/run/switchroom/<svc>/*/sock` (#898);
+  empty fleets correctly read unhealthy.
