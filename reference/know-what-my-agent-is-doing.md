@@ -171,7 +171,7 @@ experience, not just the reply.
   gets a real message describing what was interrupted.
 - **Course correction mid-task.** Send a follow-up that changes
   direction. The next reply should explicitly acknowledge the steer
-  ("↪️ treating as steer on the prior task") rather than continuing
+  ("↪️ Treating as steer on the prior task") rather than continuing
   silently.
 - **Status-ask rate.** Over a sample of real sessions, count how often
   the user types "status?", "still there?", or anything similar. Target:

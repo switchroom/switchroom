@@ -32,8 +32,8 @@ describe('markdownToHtml', () => {
     expect(markdownToHtml('Hello _world_')).toContain('<i>world</i>')
   })
 
-  test('converts emoji-leading _📥 queued as a new task_', () => {
-    expect(markdownToHtml('_📥 queued as a new task_')).toContain('<i>📥 queued as a new task</i>')
+  test('converts emoji-leading _📥 Queued as a new task_', () => {
+    expect(markdownToHtml('_📥 Queued as a new task_')).toContain('<i>📥 Queued as a new task</i>')
   })
 
   test('converts emoji-trailing _steer on the prior task 🔁_', () => {
