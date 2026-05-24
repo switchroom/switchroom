@@ -327,6 +327,27 @@ describe("vault set CLI — multi-line values", () => {
 
     expect(getStringSecret(passphrase, vaultPath, "cfg")).toBe(json);
   });
+
+  it("preserves binary --file bytes via base64 + kind=\"binary\" (#1090)", () => {
+    // 0xff in the lead position is the canonical case from the issue —
+    // the prior utf8-readFileSync silently replaced it with U+FFFD
+    // (EF BF BD), losing the original byte.
+    const bytes = Buffer.from([0xff, 0xfe, 0x00, 0x42, 0x69, 0x6e]);
+    const filePath = join(tmpDir, "blob.bin");
+    writeFileSync(filePath, bytes);
+
+    const result = runCli(["set", "test/blob", "--file", filePath]);
+    expect(result.status).toBe(0);
+    // Friendly hint pointing at base64 -d for retrieval.
+    expect(result.stderr).toContain("kind=\"binary\"");
+    expect(result.stderr).toContain("base64 -d");
+
+    const entry = getSecret(passphrase, vaultPath, "test/blob");
+    expect(entry?.kind).toBe("binary");
+    if (entry?.kind === "binary") {
+      expect(Buffer.from(entry.value, "base64")).toEqual(bytes);
+    }
+  });
 }, 30_000);
 
 describe("vault resolver", () => {

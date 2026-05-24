@@ -526,6 +526,28 @@ export function setStringSecret(
   setSecret(passphrase, vaultPath, key, entry);
 }
 
+/**
+ * Store a binary secret. `value` is expected to be a base64 string —
+ * callers convert their bytes (e.g. `buf.toString("base64")`) before
+ * passing them in. Retrievers know to `base64 -d` the returned value.
+ */
+export function setBinarySecret(
+  passphrase: string,
+  vaultPath: string,
+  key: string,
+  value: string,
+  format?: VaultFormatHint,
+  scope?: VaultEntryScope,
+): void {
+  const entry: VaultEntry = format
+    ? { kind: "binary", value, format }
+    : { kind: "binary", value };
+  if (scope !== undefined) {
+    (entry as { kind: "binary"; value: string; format?: VaultFormatHint; scope?: VaultEntryScope }).scope = scope;
+  }
+  setSecret(passphrase, vaultPath, key, entry);
+}
+
 export function getStringSecret(
   passphrase: string,
   vaultPath: string,

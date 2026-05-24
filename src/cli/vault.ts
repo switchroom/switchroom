@@ -7,6 +7,7 @@ import { resolvePath } from "../config/loader.js";
 import {
   createVault,
   setStringSecret,
+  setBinarySecret,
   getSecret,
   listSecrets,
   removeSecret,
@@ -522,10 +523,33 @@ export function registerVaultCommand(program: Command): void {
         const passphrase = await getPassphrase();
 
         let value: string;
+        // Set to true when --file reads a file whose bytes don't survive
+        // a UTF-8 round-trip — e.g. a tarball, sealed archive, or raw
+        // key material containing non-UTF-8 bytes. We store these as
+        // kind="binary" (base64) so the bytes are preserved verbatim
+        // instead of getting silently mangled to U+FFFD (#1090).
+        let isBinaryFile = false;
         if (opts.file) {
           // --file flag: read value from a file verbatim.
           try {
-            value = readFileSync(resolvePath(opts.file), "utf8");
+            const buf = readFileSync(resolvePath(opts.file));
+            const asUtf8 = buf.toString("utf8");
+            // Lossless-UTF-8 detection: if the bytes survive a decode +
+            // re-encode round-trip, treat as text (existing behaviour).
+            // Otherwise the file is binary and we must base64-encode it
+            // before storage to preserve bytes.
+            if (Buffer.compare(buf, Buffer.from(asUtf8, "utf8")) === 0) {
+              value = asUtf8;
+            } else {
+              value = buf.toString("base64");
+              isBinaryFile = true;
+              console.error(
+                chalk.yellow(
+                  `note: file contains non-UTF-8 bytes; storing as kind="binary" ` +
+                  `(base64-encoded). Retrieve with: switchroom vault get ${key} | base64 -d`,
+                ),
+              );
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(chalk.red(`Error reading file: ${msg}`));
@@ -547,7 +571,14 @@ export function registerVaultCommand(program: Command): void {
         }
 
         // Validate the value against the declared format hint.
-        if (formatHint) {
+        // Skip for binary --file content: the stored value is base64,
+        // not the original bytes, so a format hint like "json" or "pem"
+        // would never match — the operator's intent was a hint about
+        // the underlying bytes. Validating those would require decoding
+        // base64 here, which is fine but premature: callers who want
+        // format-hinted binary should pipe through a text encoding
+        // before --file.
+        if (formatHint && !isBinaryFile) {
           const validationError = validateFormatHint(value, formatHint);
           if (validationError) {
             console.error(
@@ -606,7 +637,11 @@ export function registerVaultCommand(program: Command): void {
           }
         }
 
-        setStringSecret(passphrase, vaultPath, key, value, formatHint, scope);
+        if (isBinaryFile) {
+          setBinarySecret(passphrase, vaultPath, key, value, formatHint, scope);
+        } else {
+          setStringSecret(passphrase, vaultPath, key, value, formatHint, scope);
+        }
         if (formatHint && scope) {
           const scopeDesc = [
             scope.allow?.length ? `allow: ${scope.allow.join(", ")}` : "",
