@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.13.32 — broker grants DB survives container recreate
+
+Capability grants minted via Telegram approval cards (the access-
+approve flow) live in `vault-grants.db` SQLite. Pre-fix the broker
+wrote to `/root/.switchroom/vault-grants.db` inside the container,
+which evaporated on every container recreate. Token files on disk
+(`~/.switchroom/agents/<agent>/.vault-token`) persist via per-agent
+bind mounts and reference grant IDs that no longer exist in the
+fresh broker DB — `vault get` from inside agent containers
+returns `VAULT-BROKER-DENIED [DENIED]: key 'X' not in ACL for agent
+'Y'` because the #1496 fall-through routes the unusable token to
+the standing schedule.secrets ACL, which usually denies (the whole
+reason a grant was minted in the first place).
+
+Surfaced 2026-05-24 after the v0.13.31 broker recreate wiped every
+grant minted earlier the same day (clerk's `vg_5e1991` grant for
+`ha/access-token` disappeared). Doctor doesn't catch this — it only
+inspects path-as-identity ACL, not grant-based access.
+
+### PR A — fix(broker): bind-mount vault-grants.db so capability grants survive container recreate (#1737)
+
+Mirrors the existing vault-audit.log pattern:
+- `src/agents/compose.ts` adds the RW bind mount
+  `${HOME}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`
+  in the broker service.
+- `src/cli/apply.ts:ensureHostMountSources` pre-creates the host
+  file as 0-byte mode 0600 (secrets material — bcrypt-hashed grant
+  tokens) so docker doesn't auto-create a directory at the source
+  path on greenfield installs.
+
+`openGrantsDb` runs the SQL migration idempotently on every open,
+so the broker boots cleanly on either an empty new file OR an
+existing populated DB.
+
+**Rollout impact:** broker container recreate adopts the host
+file. Any grants minted between the host file's last write and
+the rollout are lost (they were in the ephemeral container DB).
+Operators with active grants will need to re-approve via Telegram.
+
 ## v0.13.31 — buffer gate releases on every reply finalize (v0.13.30 wedge fix)
 
 Closes the trivial-prompt wedge surfaced on the v0.13.30 UAT canary
