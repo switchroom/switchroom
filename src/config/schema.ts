@@ -358,8 +358,6 @@ export const SessionSchema = z
  *     start.sh skips all handoff logic.
  *   - show_handoff_line: if false, the plugin still gets the briefing in
  *     its system prompt but suppresses the user-visible continuity line.
- *   - summarizer_model: which Anthropic model produces the briefing.
- *     Haiku is the cost-sensitive default; swap for testing.
  *   - max_turns_in_briefing: hard cap on how many recent user/assistant
  *     turn pairs are fed to the summarizer. Bounds cost and latency.
  */
@@ -376,14 +374,6 @@ export const SessionContinuitySchema = z
         "Whether the telegram plugin prepends a visible '↩️ Picked up…' " +
         "line to the first assistant reply after a restart (default true).",
       ),
-    summarizer_model: z
-      .string()
-      .regex(
-        /^[a-zA-Z0-9][a-zA-Z0-9._\-/\[\]:]*$/,
-        "Model name must be alphanumeric with ._-/[]: only",
-      )
-      .optional()
-      .describe("Anthropic model used to produce the handoff briefing."),
     max_turns_in_briefing: z
       .number()
       .int()
@@ -663,7 +653,6 @@ export const TelegramChannelSchema = z
                   tz: z.string().optional(),
                 })
                 .optional(),
-              model: z.string().optional(),
             }),
           )
           .optional(),
@@ -671,8 +660,8 @@ export const TelegramChannelSchema = z
       .optional()
       .describe(
         "Auto-dispatch rules: when a verified webhook event matches a rule, " +
-        "spawn a one-shot `claude -p` turn for the agent with the rendered " +
-        "prompt. Supports cooldowns, quiet hours, and label/action matchers. " +
+        "inject the rendered prompt into the agent's live session (#1625). " +
+        "Supports cooldowns, quiet hours, and label/action matchers. " +
         "Off by default — opt in per agent. See src/web/webhook-dispatch.ts.",
       ),
     webhook_rate_limit: z
