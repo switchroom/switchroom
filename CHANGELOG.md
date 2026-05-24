@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.13.30 — vault_request_save attest-via-posture under telegram-id
+
+Closes the UX gap where tapping Save on a `vault_request_save` card
+surfaced a misleading "🔒 Vault is locked" message even when the
+broker had been auto-unlocked at boot for hours. Telegram-id-mode
+installs never run `/vault unlock` (auto-unlock is the design intent),
+so the gateway's per-chat passphrase cache stayed empty forever and
+every save card wedged.
+
+### PR A — fix(gateway): vault_request_save routes through attest_via_posture under telegram-id (#1733)
+
+#1115 follow-up. The save handler now uses `attest_via_posture: true`
+on the broker `put` (same primitive `mint_grant` has used since
+#1115). Closes the tracked TODO named at `gateway.ts:11784`.
+
+Architecture: broker already supported `put` with
+`attest_via_posture: true` (`server.ts:1448-1500`, added by #1115
+follow-up rev 3) and broker client `putViaBroker` already accepted
+the flag. The gap was the CLI shell-out (`defaultVaultWrite`) — new
+`defaultVaultWritePosture` helper calls `putViaBroker` directly,
+returning the same `VaultWriteResult` shape for drop-in substitution.
+
+Behavioral contract:
+- interim ack reply (`isFinalAnswerReply === false`) — unchanged
+  non-event for the reaction (preserves #1713)
+- final-answer reply — unchanged (still triggers
+  `finalizeStatusReaction` from #1729)
+- **`vault_request_save` Save tap under telegram-id** — now uses
+  posture-attested broker put; no passphrase needed; no
+  `/vault unlock` prerequisite
+- `vault_request_save` Save tap under passphrase mode — unchanged
+  (cached-passphrase + shell-out to `switchroom vault set`)
+- Card text corrected from "🔒 Vault is locked" (misleading — the
+  broker may be unlocked) to "🔒 Passphrase not cached for this
+  chat" in the passphrase-mode failure branch.
+
+Operator note: under telegram-id mode the broker requires the agent
+be in `vault.broker.postureMintAgents` for posture-attested put to
+succeed (same allowlist `mint_grant` uses). Operators new to the
+posture flow who haven't allowlisted will hit
+`VAULT-BROKER-DENIED (DENIED): agent 'X' is not on
+vault.broker.postureMintAgents` — surfaces via the existing renderer
+with the existing remedy.
+
+Tests: new `vault-write-posture.test.ts` (7 cases) pins the helper's
+contract; existing `vault-approval-posture.test.ts` updated with new
+pins for the posture-attested call site and the corrected card text.
+Full plugin suite green under both runners (vitest 2745/2745 +
+bun:test 3331/3331).
+
 ## v0.13.29 — host vault list broker-first (UX, host CLI only)
 
 Single fix; no container image changes; no fleet roll needed — only
