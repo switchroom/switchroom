@@ -121,20 +121,34 @@ describe('performVaultAccessApproval — broker-mediated attestation', () => {
   })
 })
 
-describe('handleVaultRequestSaveCallback — telegram-id silent path withdrawn', () => {
-  it('NO LONGER reads an in-memory passphrase for telegram-id; falls through to cached-passphrase path', () => {
+describe('handleVaultRequestSaveCallback — posture-attested broker put (#1115 follow-up)', () => {
+  it('NO in-memory passphrase under telegram-id; routes the save through the broker via attest_via_posture', () => {
     const fnBlock =
       gatewaySrc
         .split('async function handleVaultRequestSaveCallback')[1]
         ?.split('async function handleVaultDeferCallback')[0] ?? ''
-    // Regression guard: the original PR added a
-    // `VAULT_APPROVAL_AUTH_MODE === 'telegram-id'` shortcut that
-    // pulled an in-memory passphrase. That was a bypass surface.
-    // The save handler must NOT branch on the posture for an
-    // in-memory passphrase any more.
+    // Regression guard (original #1115 first-cut withdrawal): the
+    // handler must NOT pull a long-lived in-memory passphrase under
+    // telegram-id. That was a bypass surface — claude in the same
+    // container could exfiltrate it. The follow-up replaces it with
+    // a broker-IPC `attest_via_posture` call so the passphrase
+    // never leaves the broker process.
     expect(fnBlock).not.toMatch(/AUTO_UNLOCK_PASSPHRASE/)
-    // Standard cache lookup still present.
+    // The #1115 follow-up wiring: under telegram-id the handler
+    // calls `defaultVaultWritePosture` (posture-attested broker put,
+    // no passphrase). Under passphrase mode it keeps the legacy
+    // cached-passphrase + shell-out path.
+    expect(fnBlock).toMatch(/VAULT_APPROVAL_AUTH_MODE === 'telegram-id'/)
+    expect(fnBlock).toMatch(/defaultVaultWritePosture\(/)
+    // Passphrase-mode branch still present.
     expect(fnBlock).toMatch(/vaultPassphraseCache\.get\(pending\.chat_id\)/)
+    expect(fnBlock).toMatch(/defaultVaultWrite\(pending\.key, pending\.value, cached\.passphrase\)/)
+    // The misleading pre-fix card text ("Vault is locked") must be
+    // rephrased — the broker IS unlocked under telegram-id; only
+    // the chat's passphrase cache needs warming up under passphrase
+    // mode. Pin the corrected wording so the wedge UX can't
+    // silently regress.
+    expect(fnBlock).toMatch(/Passphrase not cached for this chat/)
   })
 })
 

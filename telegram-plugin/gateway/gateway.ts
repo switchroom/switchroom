@@ -332,7 +332,7 @@ import {
 import { runPipeline } from '../secret-detect/pipeline.js'
 import { StagingMap } from '../secret-detect/staging.js'
 import { maskToken } from '../secret-detect/mask.js'
-import { defaultVaultWrite, defaultVaultList } from '../secret-detect/vault-write.js'
+import { defaultVaultWrite, defaultVaultList, defaultVaultWritePosture } from '../secret-detect/vault-write.js'
 import { parseVaultCliError, renderVaultCliError } from '../secret-detect/vault-error.js'
 import { recentDenialsFromAuditLog, type RecentDenial } from './recent-denials.js'
 import { detectSecrets } from '../secret-detect/index.js'
@@ -11774,46 +11774,49 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
     // stale "spinning" state on the button while we run the write.
     await ctx.answerCallbackQuery({ text: '⏳ Saving…' }).catch(() => {})
 
-    // #1115 follow-up: telegram-id mode silent-save was withdrawn. The
-    // original PR shortcut routed the save through an in-memory
-    // passphrase the gateway held under telegram-id; the reviewer
-    // flagged that as a bypass surface (claude in the same container
-    // could exfiltrate the passphrase). The access-approve flow now
-    // attests via the broker (`attest_via_posture: true` on
-    // mint_grant) so the passphrase never leaves the broker. The
-    // save-approve flow uses `defaultVaultWrite` which shells to the
-    // CLI — routing it through broker-IPC attest_via_posture is a
-    // tracked follow-up. Until then, vault_request_save under
-    // telegram-id falls through to the standard passphrase-cache
-    // path: the operator must have unlocked the vault in this chat
-    // (`/vault unlock` or any /vault command) so the cache is
-    // populated. Same UX as passphrase mode.
-
-    // Fetch the cached passphrase for this chat. If the gateway hasn't
-    // seen the user unlock the vault yet, we can't attest the write —
-    // surface the unlock card via the same path the deferred-secret
-    // flow uses (issue #44).
-    const cached = vaultPassphraseCache.get(pending.chat_id)
-    if (!cached || cached.expiresAt <= Date.now()) {
-      if (pending.card_message_id != null) {
-        await ctx.api
-          .editMessageText(
-            pending.chat_id,
-            pending.card_message_id,
-            `🔒 <b>Vault is locked.</b> Run <code>/vault unlock</code> (or any /vault command) to cache the passphrase, then tap Save again on the next card.`,
-            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
-          )
-          .catch(() => {})
+    // #1115 follow-up: the save-approve flow now mirrors the access-
+    // approve flow under telegram-id mode — broker `put` accepts
+    // `attest_via_posture: true` (server.ts:1448-1500), so the
+    // gateway can attest the write without a cached passphrase.
+    // Closes the UX gap where tapping Save surfaced a misleading
+    // "🔒 Vault is locked" message even when the broker had been
+    // auto-unlocked at boot.
+    //
+    // Branch: under telegram-id mode use the posture-attested put;
+    // under passphrase mode keep the existing cached-passphrase +
+    // shell-to-CLI path (operator must `/vault unlock` once per
+    // chat session to populate `vaultPassphraseCache`).
+    let write: { ok: boolean; output: string }
+    if (VAULT_APPROVAL_AUTH_MODE === 'telegram-id') {
+      // Posture-attested broker put. No passphrase needed. The broker
+      // verifies (a) telegram-id mode, (b) per-agent peer, (c) broker
+      // unlocked — see server.ts:1448-1500.
+      write = await defaultVaultWritePosture(pending.key, pending.value)
+    } else {
+      // Passphrase mode — fetch the cached passphrase for this chat.
+      // If the gateway hasn't seen the user unlock the vault yet, we
+      // can't attest the write — surface the unlock prompt.
+      const cached = vaultPassphraseCache.get(pending.chat_id)
+      if (!cached || cached.expiresAt <= Date.now()) {
+        if (pending.card_message_id != null) {
+          await ctx.api
+            .editMessageText(
+              pending.chat_id,
+              pending.card_message_id,
+              `🔒 <b>Passphrase not cached for this chat.</b> Run <code>/vault unlock</code> (or any /vault command) to cache it, then tap Save again on the next card.`,
+              { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+            )
+            .catch(() => {})
+        }
+        pendingVaultRequestSaves.delete(stageId)
+        return
       }
-      pendingVaultRequestSaves.delete(stageId)
-      return
+      // defaultVaultWrite spawns `switchroom vault set <key>` with the
+      // passphrase env set; the CLI forwards the passphrase to the
+      // broker put as operator-attestation (#969 P1a), which authorizes
+      // new-key creation.
+      write = defaultVaultWrite(pending.key, pending.value, cached.passphrase)
     }
-
-    // Run the write. defaultVaultWrite spawns `switchroom vault set
-    // <key>` with the passphrase env set; the CLI in turn forwards the
-    // passphrase to the broker put as operator-attestation (#969 P1a),
-    // which authorizes new-key creation.
-    const write = defaultVaultWrite(pending.key, pending.value, cached.passphrase)
 
     if (!write.ok) {
       // Route through the structured-error renderer from #969 P0b so
