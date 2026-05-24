@@ -27,6 +27,13 @@ import { loadConfig } from "../config/loader.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
+import { ReleaseWatcher } from "./release-watcher.js";
+import {
+  makeReleaseCheck,
+  makeApply,
+  makeRestart,
+} from "./release-watcher-shellouts.js";
+import { appendFile } from "node:fs/promises";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -93,6 +100,45 @@ async function main(): Promise<void> {
     `hostd: ready — bound ${paths.length} agent socket(s): ${paths.join(", ")}\n`,
   );
 
+  // #1743 — pull-based release-triggered fleet restart. Opt-in via
+  // `host_control.auto_release_check.enabled: true`. The watcher
+  // lives inside hostd because it's already the long-running host
+  // daemon with docker socket access + the `switchroom` CLI on PATH
+  // (RFC C §5.1).
+  let releaseWatcher: ReleaseWatcher | null = null;
+  const autoRel = config.host_control?.auto_release_check;
+  if (autoRel?.enabled === true) {
+    const eventsLog = join(
+      homedir(),
+      ".switchroom",
+      "release-watcher-events.jsonl",
+    );
+    releaseWatcher = new ReleaseWatcher({
+      intervalMs: autoRel.interval_minutes * 60_000,
+      checkFn: makeReleaseCheck({
+        imageRef: autoRel.image_ref,
+        log: (m) => process.stderr.write(`hostd: ${m}\n`),
+      }),
+      applyFn: makeApply("switchroom"),
+      restartFn: makeRestart("switchroom"),
+      applyOnDetect: autoRel.apply_on_detect,
+      log: (m) => process.stderr.write(`hostd: ${m}\n`),
+      onEvent: (e) => {
+        // Telemetry sink — JSONL append. The
+        // `time_from_release_to_fleet_caught_up_seconds` AC counter
+        // is the `duration_ms` field of the `fleet_caught_up` row
+        // (delta from the matching `release_detected` row).
+        void appendFile(eventsLog, JSON.stringify(e) + "\n").catch(() => {});
+      },
+    });
+    releaseWatcher.start();
+    process.stderr.write(
+      `hostd: release-watcher started — polling ${autoRel.image_ref} ` +
+        `every ${autoRel.interval_minutes}m ` +
+        `(apply_on_detect=${autoRel.apply_on_detect})\n`,
+    );
+  }
+
   // Wait for SIGTERM / SIGINT. `docker stop` sends SIGTERM after
   // tini relays it; Ctrl-C in dev sends SIGINT. Both shut down
   // gracefully.
@@ -101,6 +147,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     process.stderr.write(`hostd: shutting down (${reason})\n`);
+    if (releaseWatcher) releaseWatcher.stop();
     await server.stop();
     process.exit(0);
   }

@@ -42,6 +42,25 @@ This same surface is exposed over the **agent-config MCP broker**, so an agent c
 
 Either way, a schedule change takes effect once the in-container scheduler re-registers — on the next `switchroom agent restart <name>` (or any container restart). There is no hot-reload; the scheduler reads config at boot.
 
+### Release-triggered fleet restart (opt-in, #1743)
+
+Plugin / gateway fixes that ship via a `:latest` retag don't change the agent container's image digest, so `docker compose up -d --remove-orphans` is a no-op and the running `bun` process keeps the pre-fix code in memory until an unrelated restart cycles it. To close that lag, the hostd daemon can poll the remote release tag and roll the fleet automatically.
+
+Enable in `switchroom.yaml`:
+
+```yaml
+host_control:
+  auto_release_check:
+    enabled: true
+    interval_minutes: 5            # floor 5, ceiling 1440
+    apply_on_detect: true          # false → log-only (dogfood mode)
+    image_ref: ghcr.io/switchroom/switchroom-agent:latest
+```
+
+When `enabled: true`, hostd polls `docker manifest inspect <image_ref>` every `interval_minutes`. If the remote digest diverges from the local image's `RepoDigests`, it runs `switchroom update` then `switchroom restart all` (graceful — drains in-flight Telegram turns via the existing `decideRestart` path). Events land at `~/.switchroom/release-watcher-events.jsonl` (`release_detected` → `apply_started/succeeded/failed` → `restart_started` → `fleet_caught_up`), with `duration_ms` on `fleet_caught_up` giving the AC's `time_from_release_to_fleet_caught_up_seconds` counter. Failures log and drop the tick — no retry-storm.
+
+Default is `enabled: false` so existing deployments don't suddenly self-roll. Pair with `apply_on_detect: false` to dogfood the detector without rolling the fleet.
+
 ## Guardrails on agent-authored entries
 
 Operator-authored entries in `switchroom.yaml` are trusted. Entries written through the `schedule add` / MCP path are gated (structured error code → exit code):
