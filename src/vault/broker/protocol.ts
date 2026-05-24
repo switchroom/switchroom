@@ -19,10 +19,37 @@
 
 import { z } from "zod";
 import type { VaultEntry } from "../vault.js";
+import { isReservedAgentName } from "./peercred.js";
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
 export const MAX_FRAME_BYTES = 64 * 1024; // 64 KiB
+
+/**
+ * Agent-name validator (#1448). Any broker request that interpolates a
+ * wire-supplied `agent` value into a filesystem path MUST validate
+ * through this schema before use. Pre-fix `mint_grant` accepted any
+ * non-empty string and joined it directly into
+ * `~/.switchroom/agents/<agent>/.vault-token` — a malicious peer with
+ * broker-IPC access could `agent: "../foo"` to escape the agents tree.
+ *
+ * Charclass + cap mirror `src/host-control/protocol.ts` AgentNameSchema
+ * (kebab-case ASCII, first char alnum, 64-byte cap), which matches the
+ * shape `allocateAgentUid` already implicitly requires. Reserved names
+ * (e.g. `operator`) are rejected at the schema layer so the broker
+ * can't be tricked into routing through an alternate identity.
+ */
+export const AgentNameSchema = z
+  .string()
+  .min(1)
+  .max(64, "agent name max 64 chars")
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/,
+    "agent name must be kebab-case ASCII (alnum + _- only, first char alnum)",
+  )
+  .refine((s) => !isReservedAgentName(s), {
+    message: "agent name is reserved",
+  });
 
 // ─── Request schemas ────────────────────────────────────────────────────────
 
@@ -114,7 +141,7 @@ export const ListRequestSchema = z.object({
 export const MintGrantRequestSchema = z.object({
   v: z.literal(1),
   op: z.literal("mint_grant"),
-  agent: z.string().min(1),
+  agent: AgentNameSchema,
   /** Keys this grant authorizes for READ. May be empty when `write_keys`
    * is non-empty (write-only grant). */
   keys: z.array(z.string().min(1)),
@@ -165,7 +192,7 @@ export const MintGrantRequestSchema = z.object({
 export const ListGrantsRequestSchema = z.object({
   v: z.literal(1),
   op: z.literal("list_grants"),
-  agent: z.string().optional(),
+  agent: AgentNameSchema.optional(),
   /**
    * Optional operator-passphrase attestation (#1051). Same trust
    * posture as the mint_grant attestation field (#1012 Phase 2).
@@ -226,7 +253,7 @@ export const LockRequestSchema = z.object({
 export const PreflightAccessRequestSchema = z.object({
   v: z.literal(1),
   op: z.literal("preflight_access"),
-  agent: z.string().min(1),
+  agent: AgentNameSchema,
   keys: z.array(z.string().min(1)).min(1).max(128),
 });
 
