@@ -21,6 +21,7 @@ import {
 import { registerVaultSweep } from "./vault-sweep.js";
 import {
   getViaBrokerStructured,
+  listViaBroker,
   putViaBroker,
   statusViaBroker,
   unlockViaBroker,
@@ -949,39 +950,82 @@ export function registerVaultCommand(program: Command): void {
     .action(async () => {
       try {
         const parentOpts = program.opts();
+        const inSandbox = isSandboxContext();
 
-        // Sandbox: route via broker — vault.enc isn't mounted into agent
-        // containers. Falling through to listSecrets would surface
-        // "Vault file not found".
-        if (isSandboxContext()) {
-          let brokerSocket: string | undefined;
-          try {
-            const config = loadConfig(parentOpts.config);
-            brokerSocket = resolveBrokerSocketPath({
-              vaultBrokerSocket: config.vault?.broker?.socket
-                ? resolvePath(config.vault.broker.socket)
-                : undefined,
-            });
-          } catch {
-            brokerSocket = resolveBrokerSocketPath();
+        // Resolve broker socket once — config-aware so a custom
+        // vault.broker.socket override is honored on the operator
+        // host (mirrors `vault get` at ~line 722).
+        let brokerSocket: string | undefined;
+        try {
+          const config = loadConfig(parentOpts.config);
+          brokerSocket = resolveBrokerSocketPath({
+            vaultBrokerSocket: config.vault?.broker?.socket
+              ? resolvePath(config.vault.broker.socket)
+              : undefined,
+          });
+        } catch {
+          brokerSocket = resolveBrokerSocketPath();
+        }
+        const brokerOpts = { socket: brokerSocket };
+
+        // Broker-first path. Mirrors `vault get` (#1053) — when the
+        // broker is up and unlocked, route through it instead of
+        // prompting for the operator passphrase. Pre-fix `list` was
+        // the only verb that always went straight to passphrase on
+        // the host, even with the broker unlocked and reachable — a
+        // jarring UX gap relative to `get`/`set`.
+        //
+        // In a sandbox the broker is the ONLY path: vault.enc isn't
+        // mounted, so falling through would surface a misleading
+        // "Vault file not found". Hard-fail with the broker-
+        // unreachable marker that the gateway routes to a clearer UX.
+        const status = inSandbox ? null : await statusViaBroker(brokerOpts);
+
+        if (inSandbox || status !== null) {
+          if (status !== null && !status.unlocked) {
+            // Broker reachable but locked. On a TTY we could prompt
+            // and unlock, but `list` is read-only and the simpler
+            // path is to fall through to direct-decrypt below (the
+            // pre-fix host behavior). In a sandbox we can't fall
+            // through, so we must fail closed.
+            if (inSandbox) {
+              // Mirror the `vault get` locked-broker exit (line ~783):
+              // exit code 3 is the documented "broker reachable but
+              // locked" signal the gateway routes to a clearer UX.
+              process.stderr.write(
+                `VAULT-BROKER-DENIED: broker locked.\n` +
+                `${recoveryHint("locked")}\n`
+              );
+              process.exit(3);
+            }
+            // Host + broker locked → fall through to passphrase prompt.
+          } else if (status !== null || inSandbox) {
+            const keys = await listViaBroker(brokerOpts);
+            if (keys === null) {
+              if (inSandbox) {
+                process.stderr.write(
+                  `VAULT-BROKER-UNREACHABLE: cannot reach vault broker; ` +
+                  `'switchroom vault list' from a sandbox requires a live broker.\n`
+                );
+                process.exit(VAULT_EXIT_BROKER_UNREACHABLE);
+              }
+              // Host: fall through to direct-decrypt on broker
+              // unreachable (graceful degrade for cases where the
+              // operator wants to read the on-disk vault even when
+              // the broker is down).
+            } else {
+              if (keys.length === 0) {
+                console.log(chalk.dim("No secrets in vault"));
+              } else {
+                for (const key of keys) console.log(key);
+              }
+              return;
+            }
           }
-          const { listViaBroker } = await import("../vault/broker/client.js");
-          const keys = await listViaBroker({ socket: brokerSocket });
-          if (keys === null) {
-            process.stderr.write(
-              `VAULT-BROKER-UNREACHABLE: cannot reach vault broker; ` +
-              `'switchroom vault list' from a sandbox requires a live broker.\n`
-            );
-            process.exit(VAULT_EXIT_BROKER_UNREACHABLE);
-          }
-          if (keys.length === 0) {
-            console.log(chalk.dim("No secrets in vault"));
-          } else {
-            for (const key of keys) console.log(key);
-          }
-          return;
         }
 
+        // ── Direct vault access (broker unreachable on host, or
+        //    broker reachable+locked on host) ─────────────────────
         const vaultPath = getVaultPath(parentOpts.config);
         const passphrase = await getPassphrase();
 
