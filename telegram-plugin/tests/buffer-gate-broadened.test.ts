@@ -1,0 +1,138 @@
+/**
+ * Regression guard for the v0.13.30→v0.13.31 wedge fix: the buffer
+ * gate (`activeTurnStartedAt`) must release on EVERY successful
+ * reply / stream_reply finalize — not just on `isFinalAnswerReply`.
+ *
+ * Surfaced 2026-05-24 via the v0.13.30 UAT canary:
+ *   13:02:46 reply finalized for msg 1873 (charCount=67)
+ *   13:03:04 msg 1874 — held mid-turn  (gate STILL open)
+ *   13:03:40 msg 1875 — held mid-turn  (depth=2)
+ *   13:04:19 msg 1876 — held mid-turn  (depth=3)
+ *
+ * Root cause: the trivial-prompt reply used `disable_notification:
+ * true` and was < 200 chars (the model classified "4" as an interim
+ * ack), so `isFinalAnswerReply` returned false, the
+ * `finalizeStatusReaction` gate in `executeReply` short-circuited,
+ * and the buffer gate stayed set. Pre-#1718 the gate released on
+ * every reply (via `endStatusReaction → purgeReactionTracking`);
+ * #1718 deferred everything to `turn_end`, then #1729 partially
+ * restored via `isFinalAnswerReply`-gated finalize. This fix
+ * decouples the buffer-gate release from the reaction-state
+ * finalize: every successful reply releases the gate, the reaction
+ * controller stays alive (preserves #1713 bidirectional ladder +
+ * the steer-vs-queue logic).
+ *
+ * The gateway IIFE is too entangled to instantiate in-process; we
+ * do source-level assertions like `reply-terminal-reaction.test.ts`
+ * does. If a future commit regresses the contract (re-narrows the
+ * gate release, or removes the helper), these assertions trip.
+ */
+
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const gatewaySrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
+  'utf-8',
+)
+
+describe('buffer-gate release decoupled from final-answer classification', () => {
+  // Extract the helper's docstring (everything between the matching
+  // `/**` block above `function releaseTurnBufferGate` and the
+  // function declaration). The body slice (used by other tests) is
+  // separate — see fnBody().
+  function fnDocstring(): string {
+    const beforeFn = gatewaySrc.split('function releaseTurnBufferGate')[0] ?? ''
+    const lastBlockOpen = beforeFn.lastIndexOf('/**')
+    if (lastBlockOpen < 0) return ''
+    return beforeFn.slice(lastBlockOpen)
+  }
+  function fnBody(): string {
+    // The function body — everything between `function
+    // releaseTurnBufferGate(...): void {` and its matching `}`. Use
+    // a simple brace-balance over the slice from open-brace onward.
+    const afterDecl = gatewaySrc.split('function releaseTurnBufferGate')[1] ?? ''
+    const openIdx = afterDecl.indexOf('{')
+    if (openIdx < 0) return ''
+    let depth = 0
+    for (let i = openIdx; i < afterDecl.length; i++) {
+      const ch = afterDecl[i]
+      if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) return afterDecl.slice(openIdx, i + 1)
+      }
+    }
+    return afterDecl.slice(openIdx)
+  }
+
+  it('declares a narrow `releaseTurnBufferGate` helper (not the full purgeReactionTracking)', () => {
+    expect(gatewaySrc).toMatch(/function releaseTurnBufferGate\(key: string\): void/)
+    // The helper docstring must explain WHY split from
+    // purgeReactionTracking — future readers need to know.
+    const doc = fnDocstring()
+    expect(doc).toMatch(/#1713/)
+    expect(doc).toMatch(/steer-vs-queue/)
+  })
+
+  it('releaseTurnBufferGate ONLY clears activeTurnStartedAt + flushes; does NOT touch activeStatusReactions', () => {
+    const body = fnBody()
+    expect(body).toMatch(/activeTurnStartedAt\.delete\(key\)/)
+    expect(body).toMatch(/pendingInboundBuffer/)
+    // Critical regression guard: the helper must NOT touch the
+    // reaction controller, else #1713's bidirectional ladder
+    // collapses to 👍 mid-turn.
+    expect(body).not.toMatch(/activeStatusReactions\.delete/)
+    expect(body).not.toMatch(/activeReactionMsgIds\.delete/)
+    // Also must NOT call finalizeStatusReaction or
+    // purgeReactionTracking (both would clear the controller).
+    expect(body).not.toMatch(/finalizeStatusReaction\(/)
+    expect(body).not.toMatch(/purgeReactionTracking\(/)
+  })
+
+  it('executeReply calls releaseTurnBufferGate OUTSIDE the isFinalAnswerReply branch', () => {
+    // Slice the executeReply post-send block (between the anchor
+    // comments and the next exported function).
+    const post = gatewaySrc.split("fresh sendMessage from reply tool is a user-visible")[1] ?? ''
+    const slice = post.split('\nasync function ')[0] ?? ''
+    // The narrow `isFinalAnswerReply`-gated finalize MUST stay (it
+    // emits the 👍 reaction on the final-answer happy path).
+    expect(slice).toMatch(/isFinalAnswerReply\(/)
+    expect(slice).toMatch(/finalizeStatusReaction\(/)
+    // The new unconditional buffer-gate release must ALSO be
+    // present and must be OUTSIDE the isFinalAnswerReply branch
+    // (so trivial-prompt non-notification replies still release
+    // the gate).
+    expect(slice).toMatch(/releaseTurnBufferGate\(statusKey\(chat_id, threadId\)\)/)
+    // Structural check: the release must appear AFTER the
+    // isFinalAnswerReply block's closing brace but BEFORE the
+    // post-send block ends. Easiest pin: it must NOT be inside the
+    // `if (turn != null && isFinalAnswerReply(...))` block.
+    const gateBlockOpen = slice.indexOf('if (turn != null && isFinalAnswerReply(')
+    const gateBlockClose = slice.indexOf('}', gateBlockOpen)
+    const releaseIdx = slice.indexOf('releaseTurnBufferGate(')
+    expect(gateBlockOpen).toBeGreaterThan(-1)
+    expect(gateBlockClose).toBeGreaterThan(gateBlockOpen)
+    expect(releaseIdx).toBeGreaterThan(gateBlockClose)
+  })
+
+  it('executeStreamReply calls releaseTurnBufferGate before its final return', () => {
+    const post =
+      gatewaySrc.split('async function executeStreamReply')[1]
+        ?.split('\nasync function ')[0] ?? ''
+    expect(post).toMatch(/releaseTurnBufferGate\(statusKey\(/)
+  })
+
+  it('the helper is invoked from executeReply / executeStreamReply only — not from new mid-turn paths', () => {
+    // Sanity: nothing else should call releaseTurnBufferGate. The
+    // helper is narrow on purpose. If future code adds new
+    // callsites that aren't reply-finalize, the steer-vs-queue
+    // semantics could drift.
+    const callMatches = gatewaySrc.match(/releaseTurnBufferGate\(/g) ?? []
+    // Definition + 2 callsites (executeReply, executeStreamReply) = 3.
+    // If this count grows the test catches it; reviewer must justify
+    // any new callsite.
+    expect(callMatches.length).toBe(3)
+  })
+})
