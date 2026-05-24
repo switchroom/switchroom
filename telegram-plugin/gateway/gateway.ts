@@ -251,6 +251,7 @@ import {
   tryHostdDispatch,
   hostdRequestId,
   hostdWillBeUsed,
+  isHostdEnabled,
   pollHostdStatus,
   hostdGetStatusOnce,
   warnLegacySpawnIfHostdDisabled,
@@ -10081,29 +10082,64 @@ bot.command('update', async ctx => {
       return
     }
   }
-  // Docker reachability guard (#926). The gateway runs INSIDE the agent
-  // container, which has the switchroom CLI baked in but no docker
-  // binary and no /var/run/docker.sock mount. So `switchroom update`'s
-  // pull-images and recreate-containers steps would fail with
-  // "docker: command not found".
+  // Pre-dispatch availability gate (#926 / #1469 / #1470). The gateway
+  // runs INSIDE the agent container, which has the switchroom CLI baked
+  // in but no docker binary and no /var/run/docker.sock mount. So
+  // `switchroom update`'s pull-images and recreate-containers steps
+  // would fail with "docker: command not found" — UNLESS hostd is in
+  // play (#1175 Phase 2 RFC C), in which case hostd runs on the host
+  // with the docker socket mounted and the in-container docker
+  // dependency goes away.
   //
-  // BYPASSED when hostd is on (#1175 Phase 2 RFC C): hostd runs on the
-  // host with the docker socket mounted, so the in-container docker
-  // dependency goes away. Skip the guard so /update apply can dispatch
-  // through hostd. When hostd is NOT in play, keep the guard so the
-  // operator gets a clean explanation instead of an opaque exit-127.
-  if (!hostdWillBeUsed(getMyAgentName()) && !isDockerReachable()) {
-    await switchroomReply(
-      ctx,
-      `❌ <b>/update apply</b> needs docker access from inside the agent ` +
-      `container, but it's not available (no <code>docker</code> binary on ` +
-      `PATH, no <code>/var/run/docker.sock</code> mount).\n\n` +
-      `On docker installs, either run <code>switchroom update</code> from ` +
-      `the host shell, or enable <code>host_control.enabled</code> in ` +
-      `<code>switchroom.yaml</code> and <code>switchroom hostd install</code> ` +
-      `so this verb dispatches through the host-side daemon.`,
-      { html: true },
-    )
+  // Three states to distinguish here, so the operator gets a message
+  // pointing at the right remediation:
+  //
+  //   - hostd ready (socket bound): proceed — no gate.
+  //   - hostd configured-on but socket missing (#1470): tell the
+  //     operator to run `switchroom hostd install`. Don't conflate
+  //     with "enable host_control" — it's already on.
+  //   - hostd off AND no in-container docker (#1469): fall through
+  //     to spawn-detached would fail late; explain the choice between
+  //     host CLI and enabling hostd.
+  const myAgentName = getMyAgentName()
+  const hostdReady = hostdWillBeUsed(myAgentName)
+  if (!hostdReady && !isDockerReachable()) {
+    if (isHostdEnabled()) {
+      // hostd is configured on, but the per-agent socket isn't bound —
+      // hostd hasn't been installed yet, or its daemon is down.
+      await switchroomReply(
+        ctx,
+        `❌ <b>/update apply</b> needs <code>hostd</code>, but its socket ` +
+        `for agent <code>${escapeHtmlForTg(myAgentName)}</code> isn't ` +
+        `bound and in-container docker access isn't available either.\n\n` +
+        `<code>host_control.enabled</code> is on in <code>switchroom.yaml</code>, ` +
+        `so hostd is the expected dispatch path — but no socket at ` +
+        `<code>/run/switchroom/hostd/${escapeHtmlForTg(myAgentName)}/sock</code>. ` +
+        `On a fresh docker install this usually means hostd hasn't been ` +
+        `installed yet.\n\n` +
+        `Run <code>switchroom hostd install</code> on the host to install + ` +
+        `start the daemon, then retry. Send <code>/upgradestatus</code> to ` +
+        `re-check the daemon state from here.`,
+        { html: true },
+      )
+    } else {
+      // host_control explicitly off + no in-container docker: nothing
+      // can drive the apply from inside the container. Operator has to
+      // pick one of: host CLI, or enable hostd.
+      await switchroomReply(
+        ctx,
+        `❌ <b>/update apply</b> needs docker access from inside the agent ` +
+        `container, but it's not available (no <code>docker</code> binary on ` +
+        `PATH, no <code>/var/run/docker.sock</code> mount) and ` +
+        `<code>host_control.enabled</code> is off.\n\n` +
+        `Either run <code>switchroom update</code> from the host shell, or ` +
+        `set <code>host_control.enabled: true</code> in ` +
+        `<code>switchroom.yaml</code> and run ` +
+        `<code>switchroom hostd install</code> on the host so this verb ` +
+        `can dispatch through the host-side daemon.`,
+        { html: true },
+      )
+    }
     return
   }
   // Debounce vs concurrent self-restart commands (/restart, /new, /reset
