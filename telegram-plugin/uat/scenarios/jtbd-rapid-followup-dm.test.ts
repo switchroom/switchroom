@@ -45,7 +45,7 @@ describe("uat: rapid follow-ups — steering vs queued classification", () => {
 
         // The agent should reply mentioning md5 AND surface the italic
         // classification line per the prompt
-        // ("_↪️ treating as steer on the prior task_" or similar).
+        // ("_↪️ Treating as steer on the prior task_" or similar).
         // We match either explicit-steer narration OR the steer emoji
         // (`↪️`) to allow for natural-language variation while still
         // failing if no narration appears (the previous version of
