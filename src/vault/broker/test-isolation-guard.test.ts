@@ -3,6 +3,12 @@
  *
  * These run under vitest, so `isTestRuntime()` is true throughout — the
  * redirect behaviour is exercised directly.
+ *
+ * SWITCHROOM_HERMETICITY_LINT: allow-real-home — this test is the
+ * proof-of-redirect for the guard itself, so it MUST compute the real
+ * `~/.switchroom` path via `homedir()` to assert that the guard
+ * rewrites it away. The redirect is what makes referencing real-home
+ * safe here; the lint exemption is the documented escape hatch.
  */
 import { describe, it, expect } from "vitest";
 import { homedir, tmpdir } from "node:os";
