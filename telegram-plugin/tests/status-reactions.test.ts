@@ -94,7 +94,7 @@ describe('StatusReactionController', () => {
     expect(calls).toEqual(['👀'])
   })
 
-  it('setThinking is debounced by 700ms', async () => {
+  it('setThinking is debounced by 3500ms (#1713)', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)
     ctrl.setQueued()
@@ -106,43 +106,43 @@ describe('StatusReactionController', () => {
     // Not yet — debounce window
     expect(calls).toEqual(['👀'])
 
-    vi.advanceTimersByTime(700)
+    vi.advanceTimersByTime(3500)
     await flush()
     expect(calls).toEqual(['👀', '🤔'])
   })
 
-  it('rapid intermediate transitions only emit the last one (coalesces)', async () => {
+  it('rapid intermediate transitions only emit the last one (coalesces) — #1713', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)
     ctrl.setQueued()
     await flush()
 
-    // Simulate model flashing thinking → tool → thinking → coding within 200ms
+    // Simulate model flashing thinking → tool → thinking → coding within 1.2s
     ctrl.setThinking()
-    vi.advanceTimersByTime(100)
+    vi.advanceTimersByTime(400)
     ctrl.setTool('Bash')
-    vi.advanceTimersByTime(100)
+    vi.advanceTimersByTime(400)
     ctrl.setThinking()
-    vi.advanceTimersByTime(100)
+    vi.advanceTimersByTime(400)
     ctrl.setTool('Read')
     await flush()
 
     // Still nothing — debounce hasn't elapsed
     expect(calls).toEqual(['👀'])
 
-    vi.advanceTimersByTime(700)
+    vi.advanceTimersByTime(3500)
     await flush()
     // Only the final state lands (Read → coding 👨‍💻)
     expect(calls).toEqual(['👀', '👨‍💻'])
   })
 
-  it('setDone is terminal and bypasses debounce', async () => {
+  it('finalize() is the only terminal trigger and bypasses debounce (#1713)', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)
     ctrl.setQueued()
     await flush()
 
-    ctrl.setDone()
+    ctrl.finalize('done')
     await flush()
     expect(calls).toEqual(['👀', '👍'])
 
@@ -153,46 +153,75 @@ describe('StatusReactionController', () => {
     expect(calls).toEqual(['👀', '👍'])
   })
 
-  it('setError is terminal', async () => {
+  it('setError is NON-terminal — recovery to a working state is allowed (#1713)', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)
     ctrl.setQueued()
     await flush()
 
     ctrl.setError()
+    // setError is debounced (it's a normal working transition now).
+    vi.advanceTimersByTime(3500)
     await flush()
     expect(calls).toEqual(['👀', '😱'])
 
+    // Recovery to thinking is permitted — the controller is NOT finished.
     ctrl.setThinking()
-    vi.advanceTimersByTime(5000)
+    vi.advanceTimersByTime(3500)
     await flush()
-    expect(calls).toEqual(['👀', '😱'])
+    expect(calls).toEqual(['👀', '😱', '🤔'])
+
+    // Only finalize() ends.
+    ctrl.finalize('done')
+    await flush()
+    expect(calls).toEqual(['👀', '😱', '🤔', '👍'])
   })
 
-  it('issue #132: setSilent is terminal and uses 🙊 (distinct from 👍 done)', async () => {
+  it('finalize("error") terminates with 😱 (#1713)', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)
     ctrl.setQueued()
     await flush()
-    ctrl.setTool('Bash')
-    vi.advanceTimersByTime(800)
-    await flush()
 
-    // Turn ends without producing a reply.
-    ctrl.setSilent()
+    ctrl.finalize('error')
     await flush()
-    // 🙊 is in the Telegram bot reaction whitelist (speak-no-evil monkey).
-    // The choice signals "agent ran tools but said nothing" — distinct
-    // from 👍 which the user reads as "agent acknowledged with a reply".
-    // setTool('Bash') resolves to the 'coding' state → 👨‍💻 (first variant).
-    expect(calls).toEqual(['👀', '👨‍💻', '🙊'])
+    expect(calls).toEqual(['👀', '😱'])
 
-    // Subsequent calls are no-ops (terminal).
+    // Subsequent calls are no-ops — terminal.
     ctrl.setThinking()
     vi.advanceTimersByTime(5000)
     await flush()
-    expect(calls).toEqual(['👀', '👨‍💻', '🙊'])
+    expect(calls).toEqual(['👀', '😱'])
   })
+
+  it('working transitions are bidirectional — thinking → tool → thinking (#1713)', async () => {
+    const { emit, calls } = makeEmitter()
+    const ctrl = new StatusReactionController(emit)
+    ctrl.setQueued()
+    await flush()
+
+    ctrl.setThinking()
+    vi.advanceTimersByTime(3500)
+    await flush()
+    expect(calls).toEqual(['👀', '🤔'])
+
+    ctrl.setTool('Bash')
+    vi.advanceTimersByTime(3500)
+    await flush()
+    expect(calls).toEqual(['👀', '🤔', '👨‍💻'])
+
+    // Back to thinking — same state can re-enter.
+    ctrl.setThinking()
+    vi.advanceTimersByTime(3500)
+    await flush()
+    expect(calls).toEqual(['👀', '🤔', '👨‍💻', '🤔'])
+  })
+
+  // #1713: setSilent was deleted as dead code. The "turn ended without a
+  // reply" path now finalizes to 👍 like any other turn — `turn_end` is
+  // the terminal trigger, regardless of whether a reply landed. The
+  // distinct-silent-emoji concept was never wired into production
+  // anyway (no live callers as of the issue audit).
 
   it('promotes to stallSoft after 30s of no progress', async () => {
     const { emit, calls } = makeEmitter()
@@ -228,7 +257,7 @@ describe('StatusReactionController', () => {
     // Tick 25s, then signal progress
     vi.advanceTimersByTime(25000)
     ctrl.setThinking() // resets stall timers
-    vi.advanceTimersByTime(800)
+    vi.advanceTimersByTime(3500)
     await flush()
     // We should have queued + thinking, but no stall yet
     expect(calls).toEqual(['👀', '🤔'])
@@ -266,7 +295,7 @@ describe('StatusReactionController', () => {
     expect(calls).toEqual(['👍'])
 
     ctrl.setThinking() // wants 🤔, falls back through variants, then generic — none in allowed
-    vi.advanceTimersByTime(700)
+    vi.advanceTimersByTime(3500)
     await flush()
     // 🤔, 🤓, 👀 — none allowed; broad fallback hits 👍 but it's already current → no emit
     expect(calls).toEqual(['👍'])
@@ -289,7 +318,7 @@ describe('StatusReactionController', () => {
     await flush()
     // First call is in flight, blocked on firstPromise
 
-    ctrl.setDone() // also immediate (terminal)
+    ctrl.finalize() // also immediate (terminal)
     await flush()
 
     // The done call should be queued behind the in-flight queued call

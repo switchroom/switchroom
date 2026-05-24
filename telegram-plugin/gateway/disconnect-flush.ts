@@ -27,7 +27,7 @@
  * needing to spin up the whole gateway.
  */
 
-export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
+export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' | 'error') => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
   /** The disconnecting client's agentName. `null` ⇒ anonymous (never registered). */
   agentName: string | null
 
@@ -50,7 +50,7 @@ export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Strea
 
   /** Optional: called when the registered-agent disconnect found dangling
    *  `activeTurnStartedAt` entries the controller loop did not clear (i.e.
-   *  `setDone()` already ran on the canonical reply path, leaving
+   *  `finalize()` already ran on the canonical reply path, leaving
    *  `activeStatusReactions` empty but `activeTurnStartedAt` populated).
    *  The gateway uses this to null its module-scope `currentTurn` — the
    *  bridge that owned that turn just died. Without this, the next
@@ -70,7 +70,7 @@ export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Strea
  * client). The boolean is for tests + observability — callers can ignore it.
  */
 export function flushOnAgentDisconnect<
-  Ctrl extends { setDone: () => void },
+  Ctrl extends { finalize: (reason?: 'done' | 'error') => void },
   Stream extends { isFinal: () => boolean; finalize: () => Promise<void> },
 >(deps: DisconnectFlushDeps<Ctrl, Stream>): boolean {
   const {
@@ -96,8 +96,12 @@ export function flushOnAgentDisconnect<
   // Real agent disconnect (e.g. the claude bridge crashed/restarted). Flush
   // all in-flight status reactions to 👍 so user messages don't stay stuck on
   // intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
+  // #1713: route through finalize() — single terminal path for the
+  // status-reaction controller. Disconnect implies the agent bridge
+  // died mid-turn; treat as a clean terminal so the user's emoji
+  // doesn't stay stuck on an intermediate working state.
   for (const [key, ctrl] of activeStatusReactions.entries()) {
-    ctrl.setDone()
+    ctrl.finalize('done')
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)
@@ -107,7 +111,7 @@ export function flushOnAgentDisconnect<
   // Defense-in-depth — sweep any `activeTurnStartedAt` keys the controller
   // loop above did not touch. The bridge has crashed; any turn it owned is
   // dead by definition, regardless of whether `activeStatusReactions`
-  // still tracks it. The race that motivates this: `setDone()` already
+  // still tracks it. The race that motivates this: `finalize()` already
   // fired on the canonical reply path (clearing the reaction controller)
   // BUT the disconnect arrived BEFORE `purgeReactionTracking` ran the
   // `activeTurnStartedAt.delete` line for that key. Without this sweep,
@@ -123,7 +127,7 @@ export function flushOnAgentDisconnect<
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
-      `post-bridge-death (controller loop missed — setDone raced disconnect)`,
+      `post-bridge-death (controller loop missed — finalize raced disconnect)`,
     )
     onDanglingTurnsSwept?.(danglingKeys)
   }

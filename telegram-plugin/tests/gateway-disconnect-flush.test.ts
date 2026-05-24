@@ -20,7 +20,9 @@ import { describe, it, expect, vi } from 'vitest'
 import { flushOnAgentDisconnect } from '../gateway/disconnect-flush.js'
 
 interface FakeCtrl {
-  setDone: () => void
+  // #1713: disconnect-flush now routes through finalize() — single
+  // terminal path for the status-reaction controller.
+  finalize: (reason?: 'done' | 'error') => void
 }
 interface FakeStream {
   isFinal: () => boolean
@@ -37,8 +39,8 @@ function makeDeps(agentName: string | null) {
   const log = vi.fn()
 
   const activeStatusReactions = new Map<string, FakeCtrl>([
-    ['chat1:thr1:msg1', { setDone: setDoneA }],
-    ['chat2:thr2:msg2', { setDone: setDoneB }],
+    ['chat1:thr1:msg1', { finalize: setDoneA }],
+    ['chat2:thr2:msg2', { finalize: setDoneB }],
   ])
   const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>([
     ['chat1:thr1:msg1', { chatId: 'chat1', messageId: 1 }],

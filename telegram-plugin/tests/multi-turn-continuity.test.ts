@@ -37,7 +37,6 @@ function makeDeps(bot: FakeBot, overrides?: Partial<StreamReplyDeps>): StreamRep
     disableLinkPreview: true,
     defaultFormat: 'html',
     logStreamingEvent: () => {},
-    endStatusReaction: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
     writeError: () => {},

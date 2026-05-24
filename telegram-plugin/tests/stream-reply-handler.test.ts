@@ -41,7 +41,6 @@ function makeDeps(
     disableLinkPreview: true,
     defaultFormat: 'html',
     logStreamingEvent: () => {},
-    endStatusReaction: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
     writeError: () => {},
@@ -180,21 +179,14 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
   })
 
-  it('done=true finalizes and fires terminal 👍 on default lane after finalize resolves', async () => {
-    // Bug Z fix: stream_reply(done=true) on the default (unnamed) lane
-    // now fires endStatusReaction('done') AFTER stream.finalize()
-    // resolves. This ties the 👍 emoji to actual Telegram delivery
-    // (the final draft edit landing) rather than to JSONL turn_end
-    // (which races the disconnect-flush and the dedup-suppress paths).
-    //
-    // Previously this test asserted endStatusReaction was NOT called,
-    // and the gateway turn_end handler was the sole 👍 emitter. That
-    // design left 👍 firing off either (a) a 500ms-lagged read of
-    // local history (turn-flush dedup branch), or (b) a disconnect
-    // event that may have fired before any verification of delivery.
+  it('done=true finalizes the stream but does NOT touch the reaction (#1713)', async () => {
+    // #1713: stream_reply done=true is a NON-EVENT for the status
+    // reaction. Stream completion is "I'm done speaking", not "turn
+    // over"; the model may continue with post-stream tool work. Only
+    // the gateway's turn_end IPC handler finalizes the reaction.
+    // This is a deliberate revert of the Bug Z fix (PR #602 follow-up).
     const state = makeState()
-    const endStatusReaction = vi.fn()
-    const deps = makeDeps(bot, { endStatusReaction })
+    const deps = makeDeps(bot)
 
     const pending = handleStreamReply(
       { chat_id: '1', text: 'final', done: true },
@@ -206,8 +198,6 @@ describe('handleStreamReply', () => {
 
     expect(result.status).toBe('finalized')
     expect(state.activeDraftStreams.size).toBe(0)
-    expect(endStatusReaction).toHaveBeenCalledTimes(1)
-    expect(endStatusReaction).toHaveBeenCalledWith('1', undefined, 'done')
   })
 
   it('done=true on a named lane does NOT fire terminal 👍', async () => {
@@ -216,8 +206,7 @@ describe('handleStreamReply', () => {
     // must not be allowed to claim turn-completion: a progress-lane
     // emit firing setDone would race the actual answer message.
     const state = makeState()
-    const endStatusReaction = vi.fn()
-    const deps = makeDeps(bot, { endStatusReaction })
+    const deps = makeDeps(bot)
 
     const pending = handleStreamReply(
       { chat_id: '1', text: 'progress snapshot', done: true, lane: 'progress' },
@@ -226,8 +215,6 @@ describe('handleStreamReply', () => {
     )
     await microtaskFlush()
     await pending
-
-    expect(endStatusReaction).not.toHaveBeenCalled()
   })
 
   it('done=true does NOT fire 👍 if finalize never produced a messageId', async () => {
@@ -236,8 +223,7 @@ describe('handleStreamReply', () => {
     // never landed, so 👍 must not fire. Pinning that the gating on
     // `getMessageId() != null` holds.
     const state = makeState()
-    const endStatusReaction = vi.fn()
-    const deps = makeDeps(bot, { endStatusReaction })
+    const deps = makeDeps(bot)
 
     await expect(
       handleStreamReply(
@@ -246,8 +232,6 @@ describe('handleStreamReply', () => {
         deps,
       ),
     ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
-
-    expect(endStatusReaction).not.toHaveBeenCalled()
   })
 
   it('done=true with historyEnabled records the final message row', async () => {

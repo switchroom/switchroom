@@ -1,7 +1,23 @@
 # Waiting-for-reply UX — v2 spec (three-class contract)
 
 Tracks: [#545](https://github.com/mekenthompson/switchroom/issues/545),
-[#553](https://github.com/mekenthompson/switchroom/issues/553) (PR series)
+[#553](https://github.com/mekenthompson/switchroom/issues/553) (PR series),
+[#1713](https://github.com/switchroom/switchroom/issues/1713)
+(reflective status-reaction restoration)
+
+> **#1713 note — defect restoration, not feature change.** The Class B
+> contract below ("Ladder progresses through 🤔 / tool-glyphs … **Must
+> NOT collapse straight to 👍**") already documents the correct
+> reflective behaviour. The implementation had regressed: plain `reply`
+> and `stream_reply done=true` were firing the terminal 👍 mid-turn,
+> collapsing the ladder. #1713 restores the documented contract — the
+> **`turn_end` IPC event (Stop hook) is the sole terminal trigger**.
+> Mid-turn replies (ack OR final-answer) are non-events for the
+> reaction. Working states (🤔 / ✍ / 👨‍💻 / ⚡ / 🗜) are bidirectional
+> and may re-enter any number of times within a turn. 🔥 (5xx) is also
+> non-terminal: recovery to a working state is allowed; only
+> `finalize()` ends the controller. Controller debounce is 3500ms by
+> default (#1713 spec: 3-5s) to coalesce rapid state flips.
 
 This document codifies the user-perceived contract for what happens
 between "I sent a Telegram message" and "the agent's reply is locked
