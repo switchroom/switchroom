@@ -43,6 +43,7 @@ import {
 import { identify, socketPathToAgent, socketPathToIdentity, unlockSocketFor, type PeerInfo } from "./peercred.js";
 import { checkAcl, checkAclByAgent, checkEntryScope, agentSlugFromPeer, parseCronUnit } from "./acl.js";
 import {
+  AgentNameSchema,
   decodeRequest,
   encodeResponse,
   errorResponse,
@@ -2295,13 +2296,20 @@ export class VaultBroker {
       // Best-effort: find and remove any token file for this grant ID.
       // We don't know which agent it belonged to without querying — query the
       // revoked row (revoked_at is now set) to get the agent slug.
+      //
+      // Defense-in-depth (#1448 follow-up): re-validate the stored
+      // agent_slug against AgentNameSchema before joining it into a
+      // filesystem path. Wire validation now rejects bad slugs at write
+      // time, but the grants DB could carry pre-fix rows with
+      // path-traversal slugs. A bad row here would otherwise let an
+      // unlink escape the agents tree.
       try {
         const row = this.grantsDb
           .query<{ agent_slug: string }, [string]>(
             "SELECT agent_slug FROM vault_grants WHERE id = ?",
           )
           .get(id);
-        if (row) {
+        if (row && AgentNameSchema.safeParse(row.agent_slug).success) {
           const tokenPath = path.join(
             os.homedir(),
             ".switchroom",

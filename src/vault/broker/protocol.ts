@@ -36,8 +36,9 @@ export const MAX_FRAME_BYTES = 64 * 1024; // 64 KiB
  * Charclass + cap mirror `src/host-control/protocol.ts` AgentNameSchema
  * (kebab-case ASCII, first char alnum, 64-byte cap), which matches the
  * shape `allocateAgentUid` already implicitly requires. Reserved names
- * (e.g. `operator`) are rejected at the schema layer so the broker
- * can't be tricked into routing through an alternate identity.
+ * (`operator`, `hostd` — see RESERVED_AGENT_NAMES in peercred.ts) are
+ * rejected at the schema layer so the broker can't be tricked into
+ * routing through an alternate identity.
  */
 export const AgentNameSchema = z
   .string()

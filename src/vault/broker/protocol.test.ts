@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  AgentNameSchema,
   encodeRequest,
   decodeRequest,
   encodeResponse,
@@ -243,5 +244,32 @@ describe("agent-name validation on broker requests (#1448)", () => {
       keys: ["k"],
     });
     expect(() => decodeRequest(body)).toThrow();
+  });
+});
+
+// ─── AgentNameSchema direct use (#1448 follow-up) ──────────────────────────
+//
+// The schema is also used on the READ path in the revoke_grant handler
+// (defense-in-depth against pre-fix stored grants whose agent_slug
+// predates wire validation). Tests below pin the safeParse semantics
+// the handler relies on.
+
+describe("AgentNameSchema safeParse (read-path use)", () => {
+  it("returns success for canonical fleet agent names", () => {
+    for (const ok of ["klanker", "gymbro", "ziggy", "lawgpt", "carrie", "finn", "reggie", "clerk"]) {
+      expect(AgentNameSchema.safeParse(ok).success).toBe(true);
+    }
+  });
+
+  it("returns failure for path-traversal slugs (pre-fix DB rows)", () => {
+    expect(AgentNameSchema.safeParse("../escape").success).toBe(false);
+    expect(AgentNameSchema.safeParse("foo/../bar").success).toBe(false);
+    expect(AgentNameSchema.safeParse("/abs").success).toBe(false);
+    expect(AgentNameSchema.safeParse("").success).toBe(false);
+  });
+
+  it("returns failure for reserved identity names", () => {
+    expect(AgentNameSchema.safeParse("operator").success).toBe(false);
+    expect(AgentNameSchema.safeParse("hostd").success).toBe(false);
   });
 });
