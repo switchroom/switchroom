@@ -28,6 +28,7 @@
  */
 
 import {
+  chownSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -269,6 +270,35 @@ export function writeAccountCredentials(
   validateAccountLabel(label);
   mkdirSync(accountDir(label, home), { recursive: true });
   atomicWriteJson(accountCredentialsPath(label, home), enrichClaudeCreds(value));
+}
+
+/**
+ * Chown the account dir + credentials.json + meta.json to (uid, uid).
+ * No-op for files that don't exist (so it's safe to call before either
+ * artifact has landed). Throws on EPERM — callers running under the
+ * auth-broker should catch and route through `warnCapChownMissing` so
+ * dev hosts without CAP_CHOWN stay quiet after the first warning.
+ *
+ * Threat addressed by #1447 (WS1-F1): when the auth-broker runs as
+ * root and writes account-level files, the artifacts land root:root.
+ * The operator runs Switchroom commands as a non-root UID, so a
+ * subsequent `switchroom auth list` (or any tool that reads
+ * `~/.switchroom/accounts/`) hits EACCES until manual recovery.
+ * Chowning back to the operator UID after every write makes the
+ * fix durable instead of relying on the apply-time sweep.
+ */
+export function chownAccountFiles(
+  label: string,
+  uid: number,
+  home: string = homedir(),
+): void {
+  validateAccountLabel(label);
+  const dir = accountDir(label, home);
+  if (existsSync(dir)) chownSync(dir, uid, uid);
+  const creds = accountCredentialsPath(label, home);
+  if (existsSync(creds)) chownSync(creds, uid, uid);
+  const meta = accountMetaPath(label, home);
+  if (existsSync(meta)) chownSync(meta, uid, uid);
 }
 
 /* ── Meta read/write ─────────────────────────────────────────────────── */

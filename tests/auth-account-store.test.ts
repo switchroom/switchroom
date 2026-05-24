@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, rmSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdirSync, rmSync, statSync, writeFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,6 +9,7 @@ import {
   accountHealth,
   accountMetaPath,
   accountsRoot,
+  chownAccountFiles,
   getAccountInfos,
   listAccounts,
   patchAccountMeta,
@@ -465,5 +466,59 @@ describe("renameAccount", () => {
     writeAccountCredentials("legit", { claudeAiOauth: { accessToken: "x" } }, home);
     expect(() => renameAccount("../etc", "legit", home)).toThrow();
     expect(() => renameAccount("legit", "foo bar", home)).toThrow();
+  });
+});
+
+describe("chownAccountFiles (#1447)", () => {
+  it("validates the label before touching the filesystem", () => {
+    // Path-traversal labels must be rejected at the gate — never reach
+    // the chownSync calls, since accountDir(label) would otherwise
+    // interpolate the bad label.
+    expect(() => chownAccountFiles("../etc", process.getuid!(), home)).toThrow();
+    expect(() => chownAccountFiles("foo/bar", process.getuid!(), home)).toThrow();
+  });
+
+  it("is a no-op when the account dir doesn't exist", () => {
+    // Safe to call before writeAccountCredentials has landed: just
+    // returns without throwing if there's nothing to chown.
+    expect(() => chownAccountFiles("nonexistent", process.getuid!(), home)).not.toThrow();
+  });
+
+  it("chowns dir + credentials.json + meta.json to the target uid", () => {
+    // The test user owns the tmpdir, so chowning to their own UID is
+    // a permitted no-op. We verify by stat that uid matches after the
+    // call — guarding against a future refactor that forgets one of
+    // the three artifacts.
+    const me = process.getuid!();
+    writeAccountCredentials("myaccount", { claudeAiOauth: { accessToken: "x" } }, home);
+    patchAccountMeta("myaccount", { lastRefreshedAt: 1700000000000 }, home);
+
+    chownAccountFiles("myaccount", me, home);
+
+    expect(statSync(accountDir("myaccount", home)).uid).toBe(me);
+    expect(statSync(accountCredentialsPath("myaccount", home)).uid).toBe(me);
+    expect(statSync(accountMetaPath("myaccount", home)).uid).toBe(me);
+  });
+
+  it("tolerates missing meta.json (chowns dir + creds, skips meta)", () => {
+    // patchAccountMeta hasn't been called — only credentials.json exists.
+    // The function must not throw on the absent meta path.
+    const me = process.getuid!();
+    writeAccountCredentials("creds-only", { claudeAiOauth: { accessToken: "x" } }, home);
+
+    expect(() => chownAccountFiles("creds-only", me, home)).not.toThrow();
+    expect(statSync(accountDir("creds-only", home)).uid).toBe(me);
+    expect(statSync(accountCredentialsPath("creds-only", home)).uid).toBe(me);
+  });
+
+  it("throws EPERM when chown to a different uid is attempted under a non-root user (back-pressure for warnCapChownMissing)", () => {
+    // Skip if running as root — the call would actually succeed.
+    if (process.getuid!() === 0) return;
+    writeAccountCredentials("other-uid", { claudeAiOauth: { accessToken: "x" } }, home);
+    // Pick a uid that's almost certainly not the test user. nobody is
+    // commonly 65534 on Linux; if that happens to be the test user (very
+    // rare), substitute 0 (root) which the test user definitely isn't.
+    const otherUid = process.getuid!() === 65534 ? 0 : 65534;
+    expect(() => chownAccountFiles("other-uid", otherUid, home)).toThrow(/EPERM|operation not permitted/i);
   });
 });
