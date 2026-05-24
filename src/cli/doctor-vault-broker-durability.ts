@@ -26,11 +26,6 @@
  *     audit log. Missing mount → broker writes audit events to
  *     ephemeral container fs, invisible to `switchroom vault
  *     audit` and the admin-agent `:ro` mount (#1024 / #1025).
- *   - "grants DB readable + schema valid" — the broker can open
- *     the DB and the schema is the expected shape. Catches the
- *     case where a corrupted / partial file made it onto disk
- *     (e.g. a backup restore from an older switchroom version
- *     that pre-dates a schema migration).
  *
  * All probes go through `docker exec switchroom-vault-broker` —
  * the broker's view is authoritative because that's what serves
@@ -75,6 +70,17 @@ export type BindMountStatResult =
   | { kind: "broker-stat-failed"; msg: string };
 
 /**
+ * Internal broker-side stat result — the broker shell-out either
+ * returns the inode/size pair OR one of the failure shapes from
+ * `BindMountStatResult`. Exported so tests can inject mock
+ * `statBroker` callbacks with the right type rather than `as never`
+ * casting against an internal-only discriminant.
+ */
+export type BrokerStatResult =
+  | { kind: "ok-with-stat"; ino: string; size: number }
+  | Exclude<BindMountStatResult, { kind: "ok" } | { kind: "host-missing" } | { kind: "mismatch" }>;
+
+/**
  * Compare the host file's inode + size against the broker
  * container's view of the same logical path. Same inode + same
  * size = bind mount is wired. Different inode (or broker reports
@@ -87,7 +93,7 @@ export function probeBindMountInode(
   brokerContainerPath: string,
   opts?: {
     statHost?: (p: string) => { ino: bigint; size: number } | null;
-    statBroker?: (p: string) => BindMountStatResult;
+    statBroker?: (p: string) => BrokerStatResult;
   },
 ): BindMountStatResult {
   const statHost = opts?.statHost ?? defaultStatHost;
@@ -95,7 +101,7 @@ export function probeBindMountInode(
   const host = statHost(hostPath);
   if (host === null) return { kind: "host-missing", hostPath };
   const broker = statBroker(brokerContainerPath);
-  if (broker.kind !== "ok-with-stat") return broker as BindMountStatResult;
+  if (broker.kind !== "ok-with-stat") return broker;
   if (
     String(host.ino) === broker.ino &&
     host.size === broker.size
@@ -120,9 +126,6 @@ function defaultStatHost(p: string): { ino: bigint; size: number } | null {
     return null;
   }
 }
-
-type BrokerStatOk = { kind: "ok-with-stat"; ino: string; size: number };
-type BrokerStatResult = BrokerStatOk | BindMountStatResult;
 
 function defaultStatBroker(p: string): BrokerStatResult {
   // `docker exec switchroom-vault-broker stat -c '%i %s' <path>`.

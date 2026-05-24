@@ -31,13 +31,18 @@ import {
   formatBindMountResult,
   probeBrokerUnlocked,
   type BindMountStatResult,
+  type BrokerStatResult,
 } from "./doctor-vault-broker-durability.js";
 
 describe("probeBindMountInode — inode-equality bind-mount probe", () => {
   it("returns ok when host and broker inodes + sizes match", () => {
     const r = probeBindMountInode("/host/path", "/broker/path", {
       statHost: () => ({ ino: 12345n, size: 57344 }),
-      statBroker: () => ({ kind: "ok-with-stat", ino: "12345", size: 57344 }) as never,
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "12345",
+        size: 57344,
+      }),
     });
     expect(r.kind).toBe("ok");
   });
@@ -48,7 +53,11 @@ describe("probeBindMountInode — inode-equality bind-mount probe", () => {
       // Different inode means the broker is operating on its
       // container-local ephemeral file, not the bind-mounted host
       // file. This is exactly the v0.13.32 grants-DB regression.
-      statBroker: () => ({ kind: "ok-with-stat", ino: "99999", size: 4096 }) as never,
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "99999",
+        size: 4096,
+      }),
     });
     expect(r.kind).toBe("mismatch");
     if (r.kind === "mismatch") {
@@ -62,8 +71,11 @@ describe("probeBindMountInode — inode-equality bind-mount probe", () => {
   it("returns host-missing when the host file is absent", () => {
     const r = probeBindMountInode("/host/path", "/broker/path", {
       statHost: () => null,
-      statBroker: () =>
-        ({ kind: "ok-with-stat", ino: "1", size: 0 }) as never,
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "1",
+        size: 0,
+      }),
     });
     expect(r.kind).toBe("host-missing");
   });
@@ -71,7 +83,7 @@ describe("probeBindMountInode — inode-equality bind-mount probe", () => {
   it("returns broker-unreachable when docker exec fails", () => {
     const r = probeBindMountInode("/host/path", "/broker/path", {
       statHost: () => ({ ino: 1n, size: 0 }),
-      statBroker: () => ({ kind: "broker-unreachable" }),
+      statBroker: (): BrokerStatResult => ({ kind: "broker-unreachable" }),
     });
     expect(r.kind).toBe("broker-unreachable");
   });
