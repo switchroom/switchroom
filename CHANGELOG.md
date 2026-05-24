@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.13.31 — buffer gate releases on every reply finalize (v0.13.30 wedge fix)
+
+Closes the trivial-prompt wedge surfaced on the v0.13.30 UAT canary
+where short non-notification replies (the model classifying its
+answer as an interim ack — "4" for "what's 2+2?") left the buffer
+gate set forever. Every subsequent inbound logged `held mid-turn ...
+will flush on turn-complete` but `turn_end` doesn't reliably fire
+for trivial-prompt turns, so the gate never opened.
+
+The wedge has been latent since v0.13.28 (where the narrow #1729
+`isFinalAnswerReply`-gated fix first landed). v0.13.28 passed UAT
+once by cache-warm luck; the structural issue stayed. v0.13.30
+didn't regress anything — the gateway diff between v0.13.28 and
+v0.13.30 doesn't touch `executeReply`, `finalizeStatusReaction`, or
+`activeTurnStartedAt`. Just exposed it on a different cache state.
+
+### PR A — fix(gateway): release buffer gate on every reply finalize (#1735)
+
+Decouple buffer-gate cleanup from reaction-state finalize.
+
+New narrow `releaseTurnBufferGate(key)` helper does ONLY:
+- `activeTurnStartedAt.delete(key)` (the buffer gate)
+- The deterministic-delivery flush on `size === 0`
+- A `shadowEmit({ kind: 'turnEnd' })` for the structural metric
+
+It does NOT touch:
+- `activeStatusReactions` (preserves #1713's bidirectional ladder
+  AND the steer-vs-queue logic at `gateway.ts:7787` which reads
+  the controller to classify mid-turn inbounds)
+- `activeReactionMsgIds`, the typing loop, or the reaction
+  message-id removal
+
+Called unconditionally from `executeReply` and `executeStreamReply`
+on successful finalize — regardless of `isFinalAnswerReply`. The
+narrow #1729 `finalizeStatusReaction` call stays (still fires the
+👍 reaction on the final-answer happy path); only the buffer-gate
+cleanup is broadened.
+
+Net contract:
+- Final-answer reply → 👍 + buffer gate released (unchanged)
+- **Short non-notification reply → no 👍 + buffer gate released**
+  (this is the v0.13.30 fix)
+- `turn_end` event → 👍 + buffer gate released (unchanged)
+- Steer / queued mid-turn detection — unchanged (reads
+  `activeStatusReactions`, which the new helper does not touch)
+
+Tests: new `buffer-gate-broadened.test.ts` (5 cases) pins the
+narrow contract structurally — helper exists, body is narrow
+(no `activeStatusReactions.delete` / `finalizeStatusReaction` /
+`purgeReactionTracking` in body), release call is OUTSIDE the
+`isFinalAnswerReply` branch in `executeReply`, callsite count
+locked to 3 (definition + 2 usages) so any future mid-turn
+callsite trips the test for reviewer awareness.
+
+Full plugin suite green under both runners (vitest 2750/2750 +
+bun:test 3336/3336).
+
 ## v0.13.30 — vault_request_save attest-via-posture under telegram-id
 
 Closes the UX gap where tapping Save on a `vault_request_save` card
