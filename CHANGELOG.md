@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.13.33 — doctor: vault-broker durability section (regression coverage for the v0.13.27-32 wedge cluster)
+
+Single feature PR (#1739). New doctor section `Vault-broker durability`
+with 6 probes that catch deployment-shape regressions in the broker
+bind-mount + auto-unlock chain. Every regression in the v0.13.27 →
+v0.13.32 wedge cluster would have been caught by ONE of these probes
+if they had existed.
+
+### PR A — feat(doctor): vault-broker durability section (#1739)
+
+Probes:
+
+1. `vault-broker unlocked (state)` — broker actually unlocked at
+   runtime, not just `vault.broker.autoUnlock: true` in config.
+2. `vault-broker: auto-unlock blob` — `~/.switchroom/vault-auto-unlock`
+   exists with non-zero size.
+3. `vault-broker: machine-id passthrough` — `/etc/machine-id` mounted
+   into the broker.
+4. `vault-broker: vault.enc bind mount` — host inode == broker
+   container inode.
+5. `vault-broker: vault-grants.db bind mount (#1737)` — the reviewer-
+   suggested probe from #1737. Catches the EXACT regression class
+   the v0.13.32 fix addressed.
+6. `vault-broker: vault-audit.log bind mount (#1025)` — symmetric
+   coverage for the audit log.
+
+Architecture: bind-mount probes use `docker exec switchroom-vault-
+broker stat -c '%i %s'` to compare host inode/size against broker-
+container view. The unlocked-state probe uses the host CLI
+`switchroom vault broker status` because the broker container image
+doesn't ship the switchroom CLI binary.
+
+Verdict shapes: ok / fail-mismatch / warn-host-missing / skip-broker-
+unreachable / warn-broker-stat-failed. Each failure detail names the
+regression class explicitly with an actionable fix.
+
+Tests: `doctor-vault-broker-durability.test.ts` — 12 cases pin each
+verdict shape via dependency-injected mock stat/status functions
+(no real broker needed). Full CLI suite green: vitest 439/439.
+
+**Host-CLI-only fix.** Container images don't change. Operators get
+the new doctor probes by upgrading the host `switchroom` binary
+(`sudo npm i -g switchroom@0.13.33`).
+
 ## v0.13.32 — broker grants DB survives container recreate
 
 Capability grants minted via Telegram approval cards (the access-
