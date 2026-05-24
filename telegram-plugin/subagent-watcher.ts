@@ -115,6 +115,14 @@ export interface WorkerEntry {
    */
   lastResultText: string
   /**
+   * Last bucket index for which an `onProgress` callback was fired for
+   * this sub-agent (#1720). Null until the first envelope. The gateway
+   * owns the actual decision via `decideSubagentProgress`; this field
+   * persists the cursor across `sub_agent_text` events on the same
+   * entry so the watcher doesn't re-fire within the same bucket window.
+   */
+  lastProgressBucketIdx: number | null
+  /**
    * Most recent tool call observed on this sub-agent's JSONL tail —
    * tool name + sanitised arg for fleet-row display (P0 of #662). Null
    * before any `sub_agent_tool_use` event has been seen. Replace-on-write;
@@ -280,6 +288,23 @@ export interface SubagentWatcherConfig {
      *  no `sub_agent_text` line was ever observed. Feeds the
      *  `subagent_handback` inbound. */
     resultText: string
+  }) => void
+  /**
+   * #1720: fires on every `sub_agent_text` event for a running
+   * sub-agent. The gateway decides whether to materialise a
+   * `subagent_progress` envelope via `decideSubagentProgress` (pure,
+   * bucket-deterministic); the watcher just surfaces the cue.
+   * `setBucketIdx` writes back the per-entry cursor so a same-bucket
+   * re-fire is suppressed. Foreground vs background classification is
+   * the gateway's call.
+   */
+  onProgress?: (args: {
+    agentId: string
+    description: string
+    latestSummary: string
+    elapsedMs: number
+    prevBucketIdx: number | null
+    setBucketIdx: (b: number) => void
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -483,6 +508,21 @@ export function readSubTail(
    *  the clerk agent logged 540k ENOENT lines in 3 days (30/sec
    *  sustained) AND leaked one fs.watch FD per stranded entry. */
   onFileVanished?: (agentId: string, code: 'ENOENT' | 'EACCES') => void,
+  /** Fires on every `sub_agent_text` event for a running sub-agent
+   *  (#1720). The gateway decides whether to materialise a progress
+   *  envelope via `decideSubagentProgress` — pure decision, watcher
+   *  just surfaces the cue. `latestSummary` is the narrative text;
+   *  `elapsedMs` is `now - entry.dispatchedAt`; `prevBucketIdx` is
+   *  `entry.lastProgressBucketIdx` (gateway calls `setBucketIdx` on a
+   *  successful deliver so a same-bucket re-fire is suppressed). */
+  onProgress?: (args: {
+    agentId: string
+    description: string
+    latestSummary: string
+    elapsedMs: number
+    prevBucketIdx: number | null
+    setBucketIdx: (b: number) => void
+  }) => void,
 ): void {
   try {
     const stat = fs.statSync(entry.filePath)
@@ -620,6 +660,26 @@ export function readSubTail(
           // args or file content — consistent with the watcher's
           // "descriptions only" privacy posture.
           entry.lastResultText = ev.text.trim().slice(0, SUBAGENT_RESULT_TEXT_MAX)
+          // #1720: surface a progress cue for the gateway. Only fire
+          // while the entry is still running and not historical — a
+          // terminal entry's last narrative line is the handback
+          // payload, not a mid-flight progress nudge.
+          if (onProgress != null && entry.state === 'running' && !entry.historical) {
+            try {
+              onProgress({
+                agentId: entry.agentId,
+                description: entry.description,
+                latestSummary: entry.lastResultText,
+                elapsedMs: now - entry.dispatchedAt,
+                prevBucketIdx: entry.lastProgressBucketIdx,
+                setBucketIdx: (b: number) => {
+                  entry.lastProgressBucketIdx = b
+                },
+              })
+            } catch (cbErr) {
+              log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+            }
+          }
         } else if (ev.kind === 'sub_agent_turn_end') {
           if (entry.state === 'running') {
             entry.state = 'done'
@@ -802,6 +862,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       stallTerminalSynthesised: false,
       lastSummaryLine: '',
       lastResultText: '',
+      lastProgressBucketIdx: null,
       lastTool: null,
       historical: isHistorical,
     }
@@ -832,7 +893,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // Initial read
     readSubTail(entry, tail, n, (desc) => {
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-    }, fs, log, db, parentStateDir, config.onUnstall)
+    }, fs, log, db, parentStateDir, config.onUnstall, undefined, config.onProgress)
 
     // If the JSONL already contained a turn_end at registration time
     // (file written-then-watched), fire the state-transition + completion
@@ -863,7 +924,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         if (!entry || !t) return
         readSubTail(entry, t, nowFn(), (desc) => {
           log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-        }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent)
+        }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)
         maybySendStateTransition(agentId)
       })
     } catch (err) {
@@ -1201,7 +1262,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (!tail) continue
       readSubTail(entry, tail, n, (desc) => {
         log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
-      }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent)
+      }, fs, log, db, parentStateDir, config.onUnstall, cleanupTerminalAgent, config.onProgress)
       maybySendStateTransition(agentId)
     }
 

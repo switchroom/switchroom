@@ -267,12 +267,16 @@ export function noteTurnEnd(key: string): void {
  * Clear pending-progress for a chat — reasons:
  *   'inbound'   — user sent a new message, they're re-engaged
  *   'handback'  — switchroom injected a subagent_handback channel turn
+ *   'progress'  — switchroom injected a subagent_progress channel turn
+ *                 (#1720) — the model is about to compose an explicit
+ *                 in-voice reply about the worker's status, so the
+ *                 ambient "— still working (Nm)" edit should yield
  *   'timeout'   — exceeded MAX_LIFETIME_MS
  *   'manual'    — test / debug
  */
 export function clearPending(
   key: string,
-  reason: 'inbound' | 'handback' | 'timeout' | 'manual',
+  reason: 'inbound' | 'handback' | 'progress' | 'timeout' | 'manual',
 ): void {
   if (!stateByKey.has(key)) return
   const s = stateByKey.get(key)!
