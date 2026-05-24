@@ -66,6 +66,7 @@ import {
   accountDir,
   accountExists,
   accountsRoot,
+  chownAccountFiles,
   enrichClaudeCreds,
   listAccounts,
   patchAccountMeta,
@@ -1102,6 +1103,11 @@ export class AuthBroker {
       socket.write(encodeError(id, "INTERNAL", (err as Error).message));
       return;
     }
+    // #1447 (WS1-F1): broker runs as root in production (auth-broker
+    // container) and the writes above leave the dir + files root:root.
+    // The operator's CLI then can't read them — chown back to the
+    // operator UID. Swallow EPERM on dev hosts that lack CAP_CHOWN.
+    this.chownAccountFilesIfRoot(label);
     // Re-index sha so a subsequent boot doesn't trip drift detection on the new file.
     const contents = readFileSync(accountCredentialsPath(label, this.home), "utf-8");
     this.shaIndex[label] = sha256Hex(contents);
@@ -1530,6 +1536,10 @@ export class AuthBroker {
       };
       const outcome = await refreshAccountIfNeeded(label, opts);
       if (outcome.kind === "refreshed") {
+        // #1447 (WS1-F1): refreshAccountIfNeeded wrote credentials.json
+        // + meta.json under the broker's UID (root in production); chown
+        // back to the operator UID so the operator CLI keeps working.
+        this.chownAccountFilesIfRoot(label);
         const creds = readAccountCredentials(label, this.home);
         const newExpiresAt = creds?.claudeAiOauth?.expiresAt ?? outcome.newExpiresAt;
         this.lastWrittenExpiresAt.set(label, newExpiresAt);
@@ -1935,6 +1945,22 @@ export class AuthBroker {
       `Per-agent mirror written but ownership not flipped. ` +
       `Suppressing further chown warnings for this process.`,
     );
+  }
+
+  /**
+   * Chown the account dir + credentials.json + meta.json to the
+   * operator UID after a broker write (#1447). No-op when operatorUid
+   * is undefined (dev path where broker runs under the operator UID
+   * already) and silently swallows EPERM on hosts without CAP_CHOWN
+   * via the same warn helper the per-agent mirror chown uses.
+   */
+  private chownAccountFilesIfRoot(label: string): void {
+    if (this.operatorUid === undefined) return;
+    try {
+      chownAccountFiles(label, this.operatorUid, this.home);
+    } catch (err) {
+      this.warnCapChownMissing(err);
+    }
   }
 
   /* ─── Config validation ─────────────────────────────────────── */
