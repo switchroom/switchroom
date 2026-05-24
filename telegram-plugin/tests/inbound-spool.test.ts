@@ -67,6 +67,68 @@ describe('spoolId — stable dedup key', () => {
     const b = spoolId(msg({ messageId: 0, meta: { source: 'cron' }, ts: 100 }))
     expect(a).toBe(b)
   })
+  // #1719: a subagent_handback envelope carries the JSONL agent id, and
+  // spoolId() keys on it — so a re-built envelope for the same finished
+  // sub-agent (different Date.now()-derived ts/messageId across a
+  // restart or the onFinish race) collapses to one spool entry instead
+  // of re-firing the handback turn.
+  it('subagent_handback → s:handback:<jsonl_agent_id>, stable across ts', () => {
+    const a = spoolId(
+      msg({
+        messageId: 1700_000_000_000,
+        ts: 1700_000_000_000,
+        meta: { source: 'subagent_handback', subagent_jsonl_id: 'abc-123' },
+      }),
+    )
+    const b = spoolId(
+      msg({
+        messageId: 1700_000_999_999,
+        ts: 1700_000_999_999,
+        meta: { source: 'subagent_handback', subagent_jsonl_id: 'abc-123' },
+      }),
+    )
+    expect(a).toBe('s:handback:abc-123')
+    expect(b).toBe(a) // stable across Date.now() drift / restart re-build
+  })
+  it('subagent_handback for distinct sub-agents stays distinct', () => {
+    const a = spoolId(
+      msg({ messageId: 0, meta: { source: 'subagent_handback', subagent_jsonl_id: 'a' } }),
+    )
+    const b = spoolId(
+      msg({ messageId: 0, meta: { source: 'subagent_handback', subagent_jsonl_id: 'b' } }),
+    )
+    expect(a).not.toBe(b)
+  })
+  it('subagent_handback without jsonl id falls back to legacy id (back-compat)', () => {
+    const a = spoolId(
+      msg({ messageId: 555, meta: { source: 'subagent_handback' }, ts: 100 }),
+    )
+    // messageId > 0 → legacy m:<chat>:<msgId> still wins.
+    expect(a).toBe('m:c1:555')
+  })
+})
+
+describe('inbound-spool — subagent_handback dedup across restart re-build (#1719)', () => {
+  it('two handback envelopes for the same jsonl id collapse to one live entry', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs })
+    const first = msg({
+      messageId: 1700_000_000_000,
+      ts: 1700_000_000_000,
+      meta: { source: 'subagent_handback', subagent_jsonl_id: 'jsonl-xyz' },
+    })
+    // Simulates a second onFinish (or boot-replay re-build) for the
+    // same sub-agent. Different ts / messageId — same jsonl id.
+    const second = msg({
+      messageId: 1700_000_999_999,
+      ts: 1700_000_999_999,
+      meta: { source: 'subagent_handback', subagent_jsonl_id: 'jsonl-xyz' },
+    })
+    expect(s.put('worker', first)).toBe(true)
+    expect(s.put('worker', second)).toBe(false) // deduped, no re-fire
+    expect(s.liveCount()).toBe(1)
+    expect(s.liveEntries()).toHaveLength(1)
+  })
 })
 
 describe('inbound-spool — put / ack / dedup', () => {

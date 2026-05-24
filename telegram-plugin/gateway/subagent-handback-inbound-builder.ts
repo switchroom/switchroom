@@ -48,6 +48,14 @@ export interface SubagentHandbackContext {
   resultText: string
   /** Terminal outcome as classified by the watcher. */
   outcome: 'completed' | 'failed'
+  /** JSONL filename stem for this Claude Code spawn — unique per
+   *  sub-agent run. Plumbed into `meta.subagent_jsonl_id` so the
+   *  spool can mint a deterministic dedup id (`s:handback:<id>`),
+   *  closing the #1719 re-fire-on-restart class. Optional only for
+   *  back-compat with older builder callers — when present the
+   *  spoolId branch fires, when absent the spool falls back to the
+   *  legacy ts-based id (status-quo behaviour). */
+  jsonlAgentId?: string
 }
 
 function truncate(s: string, max: number): string {
@@ -98,6 +106,7 @@ export function buildSubagentHandbackInbound(opts: {
     meta: {
       source: 'subagent_handback',
       outcome: opts.ctx.outcome,
+      ...(opts.ctx.jsonlAgentId ? { subagent_jsonl_id: opts.ctx.jsonlAgentId } : {}),
     },
   }
 }
@@ -128,6 +137,10 @@ export interface SubagentHandbackDecisionInput {
   ownerChatId: string
   taskDescription: string
   resultText: string
+  /** JSONL filename stem for this Claude Code spawn — forwarded into
+   *  the built inbound's `meta.subagent_jsonl_id`. See
+   *  `SubagentHandbackContext.jsonlAgentId` for the dedup rationale. */
+  jsonlAgentId?: string
   /** Deterministic clock for tests. */
   nowMs?: number
 }
@@ -178,6 +191,7 @@ export function decideSubagentHandback(
       taskDescription: input.taskDescription,
       resultText: input.resultText,
       outcome: input.outcome,
+      ...(input.jsonlAgentId ? { jsonlAgentId: input.jsonlAgentId } : {}),
     },
     ...(input.nowMs !== undefined ? { nowMs: input.nowMs } : {}),
   })

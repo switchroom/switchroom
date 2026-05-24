@@ -15796,6 +15796,10 @@ void (async () => {
                   ownerChatId: loadAccess().allowFrom[0] ?? '',
                   taskDescription: description,
                   resultText,
+                  // Plumb the JSONL agent id so the spool can mint a
+                  // deterministic dedup key — closes the #1719
+                  // re-fire-on-restart class.
+                  jsonlAgentId: agentId,
                 })
                 if (!decision.deliver) {
                   if (decision.reason === 'no-chat') {

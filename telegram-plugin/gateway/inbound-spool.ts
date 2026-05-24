@@ -49,6 +49,20 @@ import type { InboundMessage } from './ipc-protocol.js'
  *  synthetics of the SAME logical event dedup, but distinct events
  *  (different ts) do not collapse. */
 export function spoolId(msg: InboundMessage): string {
+  // Subagent handbacks (#1719): the JSONL agent id is unique per
+  // Claude Code spawn, so use it as the dedup key. This makes the id
+  // stable across the watcher's onFinish race AND across a
+  // gateway/container restart — so a re-built handback envelope for
+  // the same finished sub-agent collapses against the live spool
+  // entry (or its tombstone) instead of minting a fresh ts-derived
+  // id and re-firing the turn. See issue #1719.
+  if (
+    msg.meta?.source === 'subagent_handback' &&
+    typeof msg.meta?.subagent_jsonl_id === 'string' &&
+    msg.meta.subagent_jsonl_id.length > 0
+  ) {
+    return `s:handback:${msg.meta.subagent_jsonl_id}`
+  }
   if (typeof msg.messageId === 'number' && msg.messageId > 0) {
     return `m:${msg.chatId}:${msg.messageId}`
   }
