@@ -1,7 +1,7 @@
 import type { Command } from "commander";
 import { resolve } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
-import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentsDir, ConfigError } from "../config/loader.js";
 import {
   buildHandoff,
   findLatestSessionJsonl,
@@ -15,6 +15,16 @@ import {
  * start.sh's lazy fallback. Pure + deterministic — no `claude -p`
  * (RFC #1620). Exits 0 on every failure mode (no JSONL, write error)
  * — the Stop hook must never block agent shutdown.
+ *
+ * Config-load is **non-fatal** (#1745). Inside sandboxed agent
+ * containers, `/state/config/switchroom.yaml` is not bind-mounted and
+ * the upward walk in `findConfigFile()` returns nothing. The handoff
+ * command only consults two yaml-derived fields
+ * (`session_continuity.enabled` — already gated at hook-emission time —
+ * and `session_continuity.max_turns_in_briefing` — has a default), and
+ * the agent dir, which can be recovered from `$CLAUDE_PROJECT_DIR` /
+ * cwd. So on `ConfigError` we warn and fall back to defaults rather
+ * than exit 1, which used to fire a red issue card on every turn-end.
  */
 export function registerHandoffCommand(program: Command): void {
   program
@@ -32,15 +42,35 @@ export function registerHandoffCommand(program: Command): void {
     .action(
       withConfigError(
         async (agentName: string, opts: { maxTurns: string }) => {
-          const config = getConfig(program);
-          const agentConfig = config.agents[agentName];
-          if (!agentConfig) {
+          // Try to load switchroom.yaml. Inside sandboxed agent
+          // containers the file isn't mounted — fall back to defaults
+          // rather than failing the Stop hook (#1745). Anything other
+          // than ConfigError still propagates.
+          let agentConfig: { session_continuity?: { enabled?: boolean; max_turns_in_briefing?: number } } | undefined;
+          let agentDir: string;
+          try {
+            const config = getConfig(program);
+            agentConfig = config.agents[agentName];
+            if (!agentConfig) {
+              process.stderr.write(
+                `handoff: agent "${agentName}" not defined in switchroom.yaml\n`,
+              );
+              return;
+            }
+            const agentsDir = resolveAgentsDir(config);
+            agentDir = resolve(agentsDir, agentName);
+          } catch (err) {
+            if (!(err instanceof ConfigError)) throw err;
             process.stderr.write(
-              `handoff: agent "${agentName}" not defined in switchroom.yaml\n`,
+              `handoff: yaml unavailable (${err.message}); using defaults\n`,
             );
-            return;
+            agentConfig = undefined;
+            // Hook runs from the agent's cwd; Claude Code also exports
+            // CLAUDE_PROJECT_DIR. Either reaches the same place.
+            agentDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
           }
-          const continuity = agentConfig.session_continuity;
+
+          const continuity = agentConfig?.session_continuity;
           if (continuity?.enabled === false) {
             process.stderr.write(
               `handoff: session_continuity.enabled=false for "${agentName}"; skipping\n`,
@@ -48,8 +78,6 @@ export function registerHandoffCommand(program: Command): void {
             return;
           }
 
-          const agentsDir = resolveAgentsDir(config);
-          const agentDir = resolve(agentsDir, agentName);
           const claudeConfigDir = resolve(agentDir, ".claude");
           const jsonl = findLatestSessionJsonl(claudeConfigDir);
           if (!jsonl) {
