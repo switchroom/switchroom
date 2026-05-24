@@ -80,12 +80,19 @@ describe("VaultBroker bindAgentSocket: pairs data + unlock socket", () => {
   let vaultPath: string;
   let auditLogPath: string;
   let prevNonLinuxFlag: string | undefined;
+  let prevHome: string | undefined;
 
   beforeEach(async () => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-pair-test-"));
+    // Hermeticity: redirect HOME to the tmpdir BEFORE any broker code path
+    // resolves `~/.switchroom/...`. See CLAUDE.md "Vault & shared-state
+    // test discipline" — without this the test corrupts the operator's
+    // live vault on a production-treated host.
+    prevHome = process.env.HOME;
+    process.env.HOME = tmpDir;
     agentDir = path.join(tmpDir, "test-agent");
     fs.mkdirSync(agentDir, { recursive: true });
     dataSock = path.join(agentDir, "sock");
@@ -117,6 +124,11 @@ describe("VaultBroker bindAgentSocket: pairs data + unlock socket", () => {
       delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     } else {
       process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+    if (prevHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prevHome;
     }
   });
 
