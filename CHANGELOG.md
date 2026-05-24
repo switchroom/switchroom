@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.13.26 — vault-broker per-agent unlock socket pair
+
+Closes a structural gap in the per-agent socket model dating to v0.7:
+`bindAgentSocket()` bound only the data socket, never a paired unlock
+socket. The documented Telegram `/vault unlock` flow (CLAUDE.md) has
+been silently non-functional since then — every in-container unlock
+attempt hit `ENOENT /run/switchroom/broker/unlock` because the broker
+never bound a listener at the path the client derives. Only the
+host-shell route (`switchroom vault broker unlock` against the
+operator socket pair) and the auto-unlock blob actually worked.
+
+Surfaced 2026-05-24 when the operator hit it from klanker.
+
+### PR A — fix(vault-broker): pair per-agent unlock socket with each data socket (#1721)
+
+`bindOperatorListener` already pairs data + unlock sockets correctly.
+Mirror that pattern in `bindAgentSocket`: bind the data socket, chown
+to the agent UID, then bind a paired unlock listener at
+`unlockSocketFor(abs)`, chown the same way, register both in
+`agentServers` so `stop()` cleans them up. Peercred stays ON for
+agent unlock — the operator-only peercred bypass added in #1561 does
+not apply.
+
+On bind failure for the unlock pair, tear down the data listener too
+so the broker can't drift into a half-bound state (data up, unlock
+down) where `/vault unlock` keeps failing silently.
+
+- `src/vault/broker/server.ts:bindAgentSocket` — paired unlock bind.
+- `src/vault/broker/server-per-agent-unlock.test.ts` (new bun:test) —
+  pins the regression with `mock.module` to bypass the canonical
+  `/run/switchroom/broker/...` regex; asserts both sockets exist as
+  sockets, connection to the unlock socket no longer ENOENTs (the
+  precise pre-fix symptom), and `stop()` unlinks both files.
+
+**Rollout note:** vault-broker container must recreate to re-run
+`bindAgentSocket` per agent. Agent containers do NOT need to restart
+— they'll dial the new socket on next attempt.
+
+### PR B — feat(doctor): probe per-agent vault-broker socket pair (#1722)
+
+Operational regression guard at the doctor layer. PR A pins
+`bindAgentSocket()` itself; this catches the deployment-level
+regression class — broker image rolled back, compose volume mounts
+drifted, `apply` skipped the reconcile — that the unit test can't
+see.
+
+- `src/cli/doctor.ts:probeVaultBrokerSocketPair` — single
+  `docker exec switchroom-vault-broker sh -c "test -S sock && test -S
+  unlock"` per agent; returns `ok | missing-unlock | missing-data |
+  missing-both | unreachable`. Mirrors `probeAuthBrokerSocket` for
+  the sibling auth-broker.
+- `src/cli/doctor.ts:checkVaultBrokerSocketPairs` — aggregates per-
+  agent verdicts into one CheckResult in the existing "Vault"
+  section. Single row for a fleet of 9+ agents (no N-row spam).
+- `src/cli/doctor-vault-broker-pairs.test.ts` (new vitest) — 9 cases
+  pinning each verdict shape, including the partial-unreachable case
+  that must NOT collapse to skip (mid-restart visibility), and the
+  operator-facing detail string that names "ENOENT" so the symptom
+  pattern-matches.
+
+Verdict shapes:
+- `ok` — all agents have both halves bound.
+- `fail (unlock missing: <agents>)` — the precise pre-#1721 bug class.
+- `fail (data missing / both missing / unreachable: <agents>)` —
+  separate bug classes surfaced with their own group label.
+- `skip` — broker container unreachable; one honest skip instead of
+  N "missing" rows.
+
 ## v0.13.25 — security MED tail (epic #1389) + vault-CLI binary fix + config hygiene
 
 Six PRs closing the medium-severity tail of the security review epic
