@@ -417,6 +417,116 @@ describe('answer-stream — stop() cancels pending throttled edits', () => {
   })
 })
 
+// ─── #1704 regression — clear the sendMessageDraft on every terminal path ──
+//
+// In DMs the answer-stream uses sendMessageDraft, which renders inside the
+// user's compose box. Telegram Desktop blocks the user from typing while
+// the bot's draft is live — so stop() / retract() / materialize() must
+// all clear the draft. Without these tests the bug class slips back in
+// the next time someone tweaks the lifecycle.
+
+describe('answer-stream — clears sendMessageDraft on terminal paths (#1704)', () => {
+  it('stop() clears the draft when draft transport was in use', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: true,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    stream.update('mid-turn thought')
+    await flushMicrotasks()
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+
+    stream.stop()
+    // stop() is sync but the clear fires fire-and-forget — drain microtasks.
+    await flushMicrotasks()
+
+    // A second draft call must have landed with empty text, clearing the
+    // compose-box preview. The draft id matches the in-flight stream's.
+    const draftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
+    expect(sendMessageDraft).toHaveBeenCalledWith('chat1', draftId, '', undefined)
+  })
+
+  it('retract() clears the draft when draft transport was in use', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: true,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    stream.update('mid-turn thought')
+    await flushMicrotasks()
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+
+    await stream.retract()
+
+    const draftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
+    expect(sendMessageDraft).toHaveBeenCalledWith('chat1', draftId, '', undefined)
+  })
+
+  it('stop() is a no-op on the draft API when message transport was in use', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: false, // forces message transport
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    stream.update('mid-turn thought')
+    await flushMicrotasks()
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    expect(sendMessageDraft).not.toHaveBeenCalled()
+
+    stream.stop()
+    await flushMicrotasks()
+
+    // Never touched the draft API at all.
+    expect(sendMessageDraft).not.toHaveBeenCalled()
+  })
+
+  it('forwards message_thread_id to the draft-clear call', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: true,
+      threadId: 42,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    stream.update('mid-turn thought')
+    await flushMicrotasks()
+
+    await stream.retract()
+
+    const lastCall = sendMessageDraft.mock.calls[sendMessageDraft.mock.calls.length - 1] as unknown as [string, number, string, { message_thread_id?: number } | undefined]
+    expect(lastCall[2]).toBe('')
+    expect(lastCall[3]).toEqual({ message_thread_id: 42 })
+  })
+})
+
 describe('answer-stream — empty / whitespace-only text is a no-op', () => {
   it('update("") does not trigger any transport call', async () => {
     const sendMessage = makeSendMessage()

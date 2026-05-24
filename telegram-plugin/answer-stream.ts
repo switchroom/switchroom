@@ -233,6 +233,34 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     }
   }
 
+  /**
+   * Clear the in-progress sendMessageDraft (#1704). When the answer
+   * stream was using draft transport (DMs), Telegram leaves the draft
+   * sitting in the user's compose area until something replaces or
+   * clears it. On Telegram Desktop this blocks the user from typing —
+   * the compose field is occupied by the bot's draft preview.
+   *
+   * Every terminal path on the stream (materialize / stop / retract)
+   * must clear the draft. Best-effort: a failed clear is logged but
+   * not re-thrown — the worst case is a transient stale draft that
+   * Telegram's own 30 s draft expiry eventually mops up.
+   */
+  async function clearDraftBestEffort(): Promise<void> {
+    if (!usesDraftTransport || draftApi == null || draftId == null) return
+    try {
+      const params: { message_thread_id?: number } = {}
+      if (threadId != null) params.message_thread_id = threadId
+      await draftApi(
+        chatId,
+        draftId,
+        '',
+        Object.keys(params).length > 0 ? params : undefined,
+      )
+    } catch {
+      // Best-effort cleanup
+    }
+  }
+
   async function sendDraft(text: string): Promise<boolean> {
     if (!draftApi || draftId == null) return false
     try {
@@ -406,20 +434,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       }
 
       // Clear draft so Telegram input area doesn't show stale text
-      if (usesDraftTransport && draftApi != null && draftId != null) {
-        try {
-          const clearParams: { message_thread_id?: number } = {}
-          if (threadId != null) clearParams.message_thread_id = threadId
-          await draftApi(
-            chatId,
-            draftId,
-            '',
-            Object.keys(clearParams).length > 0 ? clearParams : undefined,
-          )
-        } catch {
-          // Best-effort cleanup
-        }
-      }
+      await clearDraftBestEffort()
 
       // The text we want to materialize. Prefer pendingText (most recent
       // snapshot from the model) over lastSentText (what last reached the
@@ -528,6 +543,10 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     stop(): void {
       stopped = true
       cancelScheduled()
+      // #1704: clear the compose-box draft. stop() is sync — fire and
+      // forget. A dropped clear falls back on Telegram's own 30 s
+      // draft expiry; the worst case is a transient stale preview.
+      void clearDraftBestEffort()
     },
 
     async retract(): Promise<void> {
@@ -539,6 +558,12 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       if (inFlight) {
         try { await inFlight } catch { /* ignore */ }
       }
+      // #1704: clear the compose-box draft when this stream was using
+      // draft transport. Without this, Telegram Desktop leaves the
+      // draft sitting in the user's input area and blocks them from
+      // typing until the 30 s draft expiry. Awaited so a follow-up
+      // sendMessage on the same chat doesn't race a stale draft edit.
+      await clearDraftBestEffort()
       // Delete the preliminary message if one was sent and deleteMessage
       // is wired. Best-effort: failures are logged but not re-thrown.
       const msgId = streamMsgId
