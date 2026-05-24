@@ -1,5 +1,120 @@
 # Changelog
 
+## v0.13.25 — security MED tail (epic #1389) + vault-CLI binary fix + config hygiene
+
+Six PRs closing the medium-severity tail of the security review epic
+plus three small standalone fixes surfaced in the 2026-05-24 issue
+audit.
+
+### PR A — sec(WS1-F1): chown account-level credentials.json + meta.json to operator UID post-write (#1447) (#1715)
+
+The auth-broker container runs as root in production. After it wrote
+account-level OAuth state under `~/.switchroom/accounts/<label>/`,
+the artifacts landed root:root and the operator's non-root CLI hit
+EACCES on subsequent reads — `switchroom auth list` was unreadable
+until a manual chown recovered it. The apply-time
+`restoreOperatorOwnership` sweep papered over this on the next
+reconcile, but the durable fix is to chown at the write site.
+
+- New `chownAccountFiles(label, uid, home)` helper in
+  `src/auth/account-store.ts` — chowns the account dir + creds.json
+  + meta.json to (uid, uid). Validates the label first; safe to call
+  before any artifact has landed; no-op for missing files; throws on
+  EPERM so callers can route through their warn helper.
+- New `chownAccountFilesIfRoot(label)` private method on
+  `AuthBrokerServer` — no-op when `operatorUid` is undefined (dev
+  path), otherwise calls the helper and swallows EPERM via the
+  existing one-shot `warnCapChownMissing` pattern used by the
+  per-agent mirror chown.
+- Wired into both account-level write callsites: `opAddAccount` and
+  `runRefreshTick` (after the refresh helper reports `refreshed`).
+
+### PR B — sec(WS3): validate agent slug on broker requests with path-component use (#1448) (#1714)
+
+`mint_grant` previously accepted any non-empty string as the `agent`
+field on the wire and joined it directly into a filesystem path:
+
+    const tokenDir = path.join(os.homedir(), ".switchroom", "agents", agent);
+    mkdirSync(tokenDir, { recursive: true });
+    writeFileSync(tokenPath, mintResult.token, { mode: 0o600 });
+
+A peer with broker-IPC access could pass `agent: "../foo"`,
+`agent: "/etc/passwd"`, or `agent: "operator"` to escape the agents
+tree, write outside the intended directory, or shadow another
+identity.
+
+- New shared `AgentNameSchema` Zod validator in
+  `src/vault/broker/protocol.ts` — charclass + cap mirror
+  `src/host-control/protocol.ts` AgentNameSchema (kebab-case ASCII,
+  64-char cap), with a `.refine` that rejects `isReservedAgentName`
+  matches (so `operator` and `hostd` are blocked).
+- Applied to `MintGrantRequestSchema.agent`,
+  `ListGrantsRequestSchema.agent` (optional — validates only when
+  set), and `PreflightAccessRequestSchema.agent`.
+- Validation runs at `decodeRequest`/`zod.parse`, so the bad request
+  is rejected before any `mkdirSync` / `writeFileSync` runs.
+
+### PR C — sec(WS3 follow-up): defend revoke_grant token-unlink against pre-fix stored slugs (#1716)
+
+Wire validation in PR B blocks new poisoned slugs at write time, but
+the grants DB can still carry pre-fix rows whose `agent_slug`
+predates the validator. The `revoke_grant` handler joins that stored
+value into a filesystem path before `unlinkSync` — pre-fix rows
+could redirect the unlink outside the agents tree.
+
+- Re-validate `row.agent_slug` against `AgentNameSchema` before
+  path-join. Poisoned rows skip the file unlink; the DB-level revoke
+  (`revokeGrant`) still runs unconditionally so the capability is
+  gone either way.
+- JSDoc accuracy fix: example list of reserved names in
+  `protocol.ts` now mentions both `operator` and `hostd`.
+
+### PR D — fix(vault): vault set --file preserves binary bytes via kind="binary" (#1090) (#1710)
+
+`switchroom vault set <key> --file <path>` previously called
+`readFileSync(path, "utf8")`, which silently replaced non-UTF-8
+sequences with U+FFFD (3 bytes: EF BF BD). Binary inputs (tarballs,
+sealed archives, raw key material) stored a corrupted form, and
+`vault list` only verifies key presence — so the corruption was
+invisible.
+
+- Lossless-UTF-8 round-trip detection
+  (`Buffer.compare(buf, Buffer.from(buf.toString("utf8"), "utf8")) === 0`)
+  chooses between `kind="string"` (text — existing behaviour
+  preserved) and `kind="binary"` (base64-encode + stderr hint about
+  `base64 -d`).
+- New `setBinarySecret` helper as the parallel to `setStringSecret`.
+- Format-hint validation is skipped for binary `--file` inputs
+  (stored value is base64, not the original bytes; out of scope).
+
+### PR E — chore(config): remove orphaned summarizer_model + DispatchRule.model (#1630) (#1711)
+
+Two config fields left parsed-but-ignored after the `claude -p`
+elimination (RFCs #1620 / #1625 / #1626):
+
+- `session_continuity.summarizer_model` — handoff is now a
+  deterministic transcript tail (#1626); no summarizer model.
+- `webhook_dispatch[].model` (`DispatchRule.model`) — webhook turns
+  run in the agent's live session (#1625) and use the agent's own
+  model.
+
+Schema is non-strict (only `ReleaseSchema` uses `.strict()`), so
+existing configs that still set either field will silently drop the
+unknown key instead of rejecting — backwards-compatible.
+
+### PR F — test: unit-cover warnLegacyStateOnce + checkLegacyState (#1375) (#1712)
+
+Pure test addition. Pins the v0.12.x legacy-state deprecation safety
+rails (`~/.clerk` dual-read + v0.6 broker-socket detection) so the
+v0.13.0 shim-removal PR lands with green coverage. Coverage includes
+the dangling-symlink case (lstatSync detection — the case
+statSync would miss).
+
+### PR G — style(telegram): capitalise voice exemplars + drop em-dashes from prompt (#1709)
+
+Voice-style polish on the agent's first-person exemplars. No code
+behaviour change.
+
 ## v0.13.24 — telegram formatting fixes, /update apply gate, agent-config follow-up
 
 ### PR A — fix(telegram): preserve parse_mode on pending-progress edits + clear draft on answer-stream stop/retract (#1698, #1704) (#1706)
