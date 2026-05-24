@@ -3042,19 +3042,43 @@ export interface ReconcileOptions {
    */
   preserveClaudeMd?: boolean;
   /**
-   * If true, skip re-rendering files sourced from the bundled `profiles/`
-   * tree (start.sh, CLAUDE.md, settings.json template merges). Used by
-   * the in-agent cron-only reconcile bridge (#1618): when the broker
-   * inside an agent container fires reconcile after a `schedule_add`
-   * write, the `profiles/` directory is not shipped into the agent
-   * image (`docker/Dockerfile.agent`) — `PROFILES_ROOT` resolves to a
-   * non-existent path like `/profiles/_base/` and the re-render throws
-   * `ENOENT` which the bridge surfaces as `E_RECONCILE_FAILED`,
-   * rolling the overlay back. The cron-only path never needs these
-   * re-renders: schedule changes only touch `schedule.d/` overlays and
-   * the resulting cron scripts under `cron.d/`, neither of which read
-   * profile templates. The host-side full reconcile leaves this option
-   * false and continues to regenerate templated files.
+   * Set true when reconcile runs INSIDE an agent container (the
+   * `reconcileAgentCronOnly` bridge — `src/cli/reconcile-bridge.ts`).
+   * Gates every block that reads from the bundled `profiles/` tree, the
+   * vendored `vendor/hindsight-memory/` plugin, or the operator-host
+   * `~/.switchroom/skills/_bundled/` pool — none of which are shipped
+   * into the agent image (`docker/Dockerfile.agent` flattens to
+   * `/opt/switchroom/switchroom.js` and copies neither sibling).
+   *
+   * Concretely, this option short-circuits FIVE blocks inside
+   * `reconcileAgent`:
+   *
+   *   1. start.sh re-render via `getBaseProfilePath()` (the `profiles/_base/`
+   *      template tree).
+   *   2. CLAUDE.md re-render via `getProfilePath(...)`.
+   *   3. `installHindsightPlugin(...)` — copies the vendored plugin tree
+   *      from `vendor/hindsight-memory/`. Returns null + writes a misleading
+   *      "check the npm tarball" stderr when the source path is absent.
+   *   4. `installSwitchroomSkills(...)` + `reconcileAgentDefaultSkills(...)`
+   *      — both read from `~/.switchroom/skills/_bundled/` on the operator
+   *      host; in-agent that's `/state/agent/.switchroom/...` which doesn't
+   *      exist. Both warn + skip silently.
+   *   5. The workspace bootstrap re-seed (`getProfilePath` → `seedWorkspace
+   *      BootstrapFiles` → `ensureClaudeMdSymlinks`) — throws
+   *      "Profile not found: default (searched /profiles)" when the
+   *      profile tree is absent, which is THE error that surfaces as
+   *      `E_RECONCILE_FAILED` on `schedule_add` from inside an agent.
+   *
+   * #1618 / PR #1619 originally gated blocks 1+2 only. The remaining
+   * three were caught by a follow-up audit (#TODO-PR) that traced the
+   * full chain for a `schedule_add` failure on `finn` on 2026-05-24.
+   *
+   * None of these blocks are needed for a cron-only reconcile: schedule
+   * changes only touch `schedule.d/` overlays + `cron.d/` scripts, which
+   * the agent-scheduler regenerates from the loaded config; they don't
+   * read profile templates, the vendored plugin, or the bundled-skills
+   * pool. The host-side full reconcile leaves this option false and
+   * continues to run all five.
    */
   skipProfileTemplates?: boolean;
 }
@@ -4023,7 +4047,15 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
     // Stop / SessionEnd hooks via Claude Code's plugin loader. Always
     // re-copy on reconcile so plugin updates propagate via
     // `switchroom update` → reconcile.
-    installHindsightPlugin(name, agentDir, switchroomConfig);
+    //
+    // skipProfileTemplates: vendor source lives at
+    // `<install>/vendor/hindsight-memory/`, never shipped into the agent
+    // image. In-agent the resolver lands at literal `/vendor/...` and
+    // installHindsightPlugin writes a misleading "check the npm tarball"
+    // stderr line before returning null. See ReconcileOptions doc-comment.
+    if (!options.skipProfileTemplates) {
+      installHindsightPlugin(name, agentDir, switchroomConfig);
+    }
 
     // Disable Claude Code's built-in auto-memory when Hindsight is on.
     // This stops the dueling-instruction problem (see research notes
@@ -4250,14 +4282,24 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
   // Role-gated (#235 follow-up). Reconcile honors role flips both
   // ways: assistant → foreman installs the symlinks; foreman →
   // assistant retracts them.
-  installSwitchroomSkills(agentDir, { role: agentConfig.role });
+  //
+  // skipProfileTemplates: both helpers read from
+  // `~/.switchroom/skills/_bundled/` on the operator host. In-agent
+  // `homedir()` resolves to the agent's state dir (e.g. /state/agent)
+  // where the pool doesn't exist; both helpers warn + skip silently
+  // but the stderr suggests "run `switchroom update`" — an operator
+  // verb unavailable inside the agent container. See ReconcileOptions
+  // doc-comment.
+  if (!options.skipProfileTemplates) {
+    installSwitchroomSkills(agentDir, { role: agentConfig.role });
 
-  // --- Reconcile bundled default skills (anthropic + switchroom-core) ---
-  // Mirrors scaffoldAgent — additive, idempotent, honours opt-outs.
-  reconcileAgentDefaultSkills(
-    agentDir,
-    (agentConfig.bundled_skills ?? {}) as Record<string, unknown>,
-  );
+    // --- Reconcile bundled default skills (anthropic + switchroom-core) ---
+    // Mirrors scaffoldAgent — additive, idempotent, honours opt-outs.
+    reconcileAgentDefaultSkills(
+      agentDir,
+      (agentConfig.bundled_skills ?? {}) as Record<string, unknown>,
+    );
+  }
 
   // --- Reconcile .mcp.json (switchroom-telegram plugin agents only) ---
   if (usesSwitchroomTelegramPlugin(agentConfig)) {
@@ -4351,47 +4393,56 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
   //     switchroom release) will be seeded on reconcile — matching scaffold
   //     behavior. Without this call, agents scaffolded before a template
   //     addition stay out of date until rescaffolded.
-  const reconcileProfilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
-  // Use the same helper scaffoldAgent uses so workspace templates see
-  // an identical context shape on both paths. Without this, any new
-  // handlebars key referenced by a workspace template renders on
-  // scaffold but as "" on reconcile.
-  const workspaceContext = buildWorkspaceContext({
-    name,
-    agentDir,
-    agentConfig,
-    telegramConfig,
-    switchroomConfig,
-    switchroomConfigPath,
-    topicId,
-    tools,
-    permissionAllow: desiredAllow,
-    hasAllWildcard,
-    resolvedBotToken,
-    rawBotToken,
-    hindsightAutoRecallEnabled,
-    hindsightBankId,
-    hindsightApiBaseUrl,
-    hindsightRecallMaxMemories,
-    hindsightRecallCacheTtlSecs,
-    hindsightRecallMinOverlap,
-  });
-  // Phase 5 migration: preserve any agent-specific edits to the legacy
-  // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before
-  // the seed pass runs. seedWorkspaceBootstrapFiles is writeIfMissing,
-  // so it will then skip CLAUDE.md and preserve the migrated content.
+  //
+  // skipProfileTemplates: `getProfilePath` resolves source-relative to
+  // `<install>/profiles/<name>` and falls back to `<install>/profiles/default`;
+  // in-agent both resolve to literal `/profiles/...` (absent), so the call
+  // throws "Profile not found: default (searched /profiles)" — the exact
+  // error that surfaces as E_RECONCILE_FAILED on `schedule_add` from
+  // inside an agent container (#1618). See ReconcileOptions doc-comment.
   const reconcileWorkspaceDir = join(agentDir, "workspace");
-  mkdirSync(reconcileWorkspaceDir, { recursive: true });
-  migrateLegacyAgentsMdIfPresent(reconcileWorkspaceDir, changes);
-  seedWorkspaceBootstrapFiles({
-    profilePath: reconcileProfilePath,
-    agentDir,
-    context: workspaceContext,
-    created: changes,
-    skipped: [],
-    rewrittenWithBackup: changes,
-  });
-  ensureClaudeMdSymlinks(reconcileWorkspaceDir, changes);
+  if (!options.skipProfileTemplates) {
+    const reconcileProfilePath = getProfilePath(agentConfig.extends ?? DEFAULT_PROFILE);
+    // Use the same helper scaffoldAgent uses so workspace templates see
+    // an identical context shape on both paths. Without this, any new
+    // handlebars key referenced by a workspace template renders on
+    // scaffold but as "" on reconcile.
+    const workspaceContext = buildWorkspaceContext({
+      name,
+      agentDir,
+      agentConfig,
+      telegramConfig,
+      switchroomConfig,
+      switchroomConfigPath,
+      topicId,
+      tools,
+      permissionAllow: desiredAllow,
+      hasAllWildcard,
+      resolvedBotToken,
+      rawBotToken,
+      hindsightAutoRecallEnabled,
+      hindsightBankId,
+      hindsightApiBaseUrl,
+      hindsightRecallMaxMemories,
+      hindsightRecallCacheTtlSecs,
+      hindsightRecallMinOverlap,
+    });
+    // Phase 5 migration: preserve any agent-specific edits to the legacy
+    // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before
+    // the seed pass runs. seedWorkspaceBootstrapFiles is writeIfMissing,
+    // so it will then skip CLAUDE.md and preserve the migrated content.
+    mkdirSync(reconcileWorkspaceDir, { recursive: true });
+    migrateLegacyAgentsMdIfPresent(reconcileWorkspaceDir, changes);
+    seedWorkspaceBootstrapFiles({
+      profilePath: reconcileProfilePath,
+      agentDir,
+      context: workspaceContext,
+      created: changes,
+      skipped: [],
+      rewrittenWithBackup: changes,
+    });
+    ensureClaudeMdSymlinks(reconcileWorkspaceDir, changes);
+  }
 
   // --- Phase 4: idempotent workspace git init (for existing agents) ---
   if (existsSync(reconcileWorkspaceDir)) {

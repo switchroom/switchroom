@@ -9,12 +9,25 @@
  * re-rendering start.sh / CLAUDE.md anyway — it now passes
  * `skipProfileTemplates: true`.
  *
- * This test pins that contract: with `skipProfileTemplates: true`,
- * reconcileAgent does NOT touch start.sh / CLAUDE.md and does NOT throw
- * when the profile template files are unreachable.
+ * This test pins the contract: with `skipProfileTemplates: true`,
+ * reconcileAgent does NOT execute any of the 5 blocks inside reconcile
+ * that read from source-adjacent dirs absent in the agent image:
+ *
+ *   1. start.sh re-render (profiles/_base/start.sh.hbs)
+ *   2. CLAUDE.md re-render (profiles/<name>/CLAUDE.md.hbs)
+ *   3. installHindsightPlugin (vendor/hindsight-memory/)
+ *   4. installSwitchroomSkills + reconcileAgentDefaultSkills
+ *      (~/.switchroom/skills/_bundled/ on host)
+ *   5. workspace bootstrap re-seed (profiles/<name>/workspace/*.hbs)
+ *
+ * Block #5 was the direct cause of the failure (throws "Profile not
+ * found: default (searched /profiles)"). PR #1619 originally gated only
+ * blocks 1+2; this file extends coverage to all 5 after a 2026-05-24
+ * audit (#TODO-PR) found that the same `schedule_add` chain still hit
+ * blocks 3, 4, and 5.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { scaffoldAgent, reconcileAgent } from "../src/agents/scaffold.js";
@@ -112,5 +125,108 @@ describe("reconcileAgent — skipProfileTemplates (#1618)", () => {
     // Default path regenerates start.sh from the template.
     expect(result.changes).toContain(startShPath);
     expect(readFileSync(startShPath, "utf-8")).not.toBe("# stale\n");
+  });
+
+  // ─── Block #3 — installHindsightPlugin (#1618 follow-up) ────────────────
+  //
+  // Contract: with skipProfileTemplates:true, reconcileAgent must NOT
+  // call installHindsightPlugin. In-agent the vendor/hindsight-memory/
+  // source path doesn't exist (the agent image flattens the bundle), and
+  // installHindsightPlugin writes a misleading "check the npm tarball"
+  // stderr line before returning null. Even though the return-null path
+  // doesn't fail reconcile by itself, the stderr noise + the unnecessary
+  // copy work makes gating cleaner.
+
+  it("skipProfileTemplates: true → installHindsightPlugin NOT called (hindsight plugin dir not recreated after delete)", () => {
+    const name = "gamma";
+    const hindsightConfig: SwitchroomConfig = {
+      ...switchroomConfig,
+      memory: { backend: "hindsight" },
+    } as SwitchroomConfig;
+
+    scaffoldAgent(name, makeAgentConfig(), tmpDir, telegramConfig, hindsightConfig);
+
+    const pluginDir = join(tmpDir, name, ".claude", "plugins", "hindsight-memory");
+    expect(existsSync(pluginDir)).toBe(true);
+
+    // Delete the plugin dir so we can detect whether reconcile re-copies it.
+    rmSync(pluginDir, { recursive: true, force: true });
+    expect(existsSync(pluginDir)).toBe(false);
+
+    // Reconcile with skipProfileTemplates: true — must NOT recreate.
+    reconcileAgent(
+      name,
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+      hindsightConfig,
+      undefined,
+      { skipProfileTemplates: true },
+    );
+    expect(existsSync(pluginDir)).toBe(false);
+
+    // Reconcile with default options — MUST recreate (proves the gate is
+    // honest: same code path, different option, different behaviour).
+    reconcileAgent(
+      name,
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+      hindsightConfig,
+      undefined,
+      {},
+    );
+    expect(existsSync(pluginDir)).toBe(true);
+  });
+
+  // ─── Block #5 — workspace bootstrap re-seed (#1618 direct cause) ────────
+  //
+  // Contract: with skipProfileTemplates:true, reconcileAgent must NOT
+  // call getProfilePath() for the workspace re-seed. That call throws
+  // "Profile not found: default (searched /profiles)" inside the agent
+  // container — the exact error finn saw on 2026-05-24 — and is what
+  // surfaces as E_RECONCILE_FAILED on schedule_add.
+  //
+  // We exercise the contract by deleting a workspace bootstrap file and
+  // checking that reconcile with the flag on does NOT re-seed it (and
+  // does NOT throw), while reconcile with default options does.
+
+  it("skipProfileTemplates: true → workspace bootstrap NOT re-seeded (no getProfilePath throw)", () => {
+    const name = "delta";
+    scaffoldAgent(name, makeAgentConfig(), tmpDir, telegramConfig, switchroomConfig);
+
+    // Pick a workspace bootstrap file the scaffold seeds. SOUL.md is
+    // seeded once via writeIfMissing — delete it and observe whether
+    // reconcile re-seeds (default) or skips (skipProfileTemplates).
+    const soulPath = join(tmpDir, name, "workspace", "SOUL.md");
+    expect(existsSync(soulPath)).toBe(true);
+    unlinkSync(soulPath);
+    expect(existsSync(soulPath)).toBe(false);
+
+    // skipProfileTemplates: true — must NOT re-seed, must NOT throw.
+    expect(() => {
+      reconcileAgent(
+        name,
+        makeAgentConfig(),
+        tmpDir,
+        telegramConfig,
+        switchroomConfig,
+        undefined,
+        { skipProfileTemplates: true },
+      );
+    }).not.toThrow();
+    expect(existsSync(soulPath)).toBe(false);
+
+    // Default — MUST re-seed (proves the gate flips behaviour).
+    reconcileAgent(
+      name,
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+      undefined,
+      {},
+    );
+    expect(existsSync(soulPath)).toBe(true);
   });
 });
