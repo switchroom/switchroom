@@ -124,7 +124,7 @@ describe("buildSettingsHooksBlock", () => {
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 
-  it("bakes the in-container config path into the handoff command, not the host path (#1079)", () => {
+  it("never bakes --config into the handoff command, even when configPath is passed (#1745 supersedes #1079)", () => {
     const agentConfig = makeAgentConfig();
     const hostConfigPath = "/home/user/switchroom.yaml";
     const result = buildSettingsHooksBlock({
@@ -140,10 +140,16 @@ describe("buildSettingsHooksBlock", () => {
     const stopCmds = (stop ?? []).flatMap(e => e.hooks.map(h => h.command));
     const handoffCmd = stopCmds.find(c => c.includes("handoff"));
     expect(handoffCmd).toBeDefined();
-    // The hook runs inside the agent container — must reference the
-    // bind-mount path, never the host path.
-    expect(handoffCmd).toContain("--config '/state/config/switchroom.yaml'");
+    // Pre-#1745 the hook baked `--config /state/config/switchroom.yaml`
+    // into the command so the CLI could find the yaml inside the
+    // container. But the yaml isn't bind-mounted into sandboxed
+    // agents, so loadConfig() threw ConfigError on every Stop. The
+    // handoff CLI now treats config-load as non-fatal, so the
+    // `--config` arg is no longer needed and is no longer emitted —
+    // even if a host-side caller passes `configPath`.
+    expect(handoffCmd).not.toContain("--config");
     expect(handoffCmd).not.toContain(hostConfigPath);
+    expect(handoffCmd).not.toContain("/state/config/switchroom.yaml");
   });
 
   it("handoff command has no --config flag when configPath is omitted", () => {

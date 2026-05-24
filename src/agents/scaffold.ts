@@ -3098,13 +3098,15 @@ export interface HooksBlockParams {
   /** Whether this agent uses the switchroom telegram plugin */
   useSwitchroomPlugin: boolean;
   /**
-   * Whether to bake `--config` into the handoff hook command so the
-   * `switchroom handoff` invocation can locate switchroom.yaml even
-   * when its env/cwd doesn't point at it. The path written is always
-   * `DOCKER_CONFIG_PATH` (the in-container bind-mount location) — the
-   * host's resolved path would not exist inside the agent container
-   * (#1079). Pass the host config path as truthy signal; the value
-   * itself is not used.
+   * @deprecated since #1745 — no longer used. Previously baked
+   * `--config DOCKER_CONFIG_PATH` into the handoff hook command, but
+   * `/state/config/switchroom.yaml` is not bind-mounted into
+   * sandboxed agent containers, so the CLI's `loadConfig()` threw
+   * `ConfigError` on every Stop hook firing a red issue card. The
+   * handoff command now treats config-load as non-fatal and falls
+   * back to defaults (see `src/cli/handoff.ts`), so this argument is
+   * dead. Kept in the type for source-compat with existing callers;
+   * the value is ignored. Will be removed in a later cleanup.
    */
   configPath?: string;
 }
@@ -3125,7 +3127,7 @@ export interface HooksBlockParams {
  * `settings.hooks = buildSettingsHooksBlock(...)`.
  */
 export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unknown> {
-  const { agentName, agentConfig, hindsightEnabled, useSwitchroomPlugin, configPath } = p;
+  const { agentName, agentConfig, hindsightEnabled, useSwitchroomPlugin } = p;
 
   const userHooks = translateHooksToClaudeShape(agentConfig.hooks);
 
@@ -3146,21 +3148,21 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   // --- Switchroom-owned Stop hooks ---
   const handoffEnabled = agentConfig.session_continuity?.enabled !== false;
-  // The hook runs *inside* the agent container; bake the in-container
-  // bind-mount path, not the host path the scaffolder happens to know
-  // about. Pre-#1079 this used `resolve(configPath)` which produced a
-  // host path that doesn't exist in the container, so every Stop fired
-  // an issue with "Config file not found".
-  const handoffConfigArg = configPath
-    ? ` --config ${shellSingleQuote(DOCKER_CONFIG_PATH)}`
-    : "";
+  // No `--config` arg: `/state/config/switchroom.yaml` is not
+  // bind-mounted into sandboxed agent containers, so passing
+  // `--config DOCKER_CONFIG_PATH` made `loadConfig()` throw
+  // `ConfigError` and the wrapper exit 1 (red issue card on every
+  // Stop). The handoff CLI now treats config-load as non-fatal and
+  // recovers the agent dir from cwd / `$CLAUDE_PROJECT_DIR`, so the
+  // yaml dependency is fully optional (#1745). On the host the
+  // CLI's `findConfigFile()` upward walk still locates the yaml.
   const stopHooks: Array<Record<string, unknown>> = [];
   if (handoffEnabled) {
     stopHooks.push({
       type: "command",
       command: wrap(
         "hook:handoff",
-        `switchroom${handoffConfigArg} handoff ${agentName}`,
+        `switchroom handoff ${agentName}`,
       ),
       timeout: 35,
       async: true,
