@@ -4931,26 +4931,49 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     } catch { /* best-effort signal */ }
     // #203: fresh sendMessage from reply tool is a user-visible signal.
     signalTracker.noteSignal(statusKey(chat_id, threadId), Date.now())
-    // #1713: the reply tool is a NON-EVENT for the status reaction.
-    // The reaction reflects current turn activity, not delivery state —
-    // only the `turn_end` IPC handler finalizes (👍). A plain `reply`
-    // mid-turn or as the final answer does not change the emoji on the
-    // user's inbound message; the next turn_end does. This is a
-    // deliberate revert of the PR #602 follow-up that wired delivery-
-    // confirmation into the terminal path (see #1713 issue body for
-    // the rationale: "delivery confirmation ≠ turn end").
-    // #1664 — mark the turn's final answer as delivered when this reply
-    // looks like the real answer rather than an interim ack. The
-    // classification (notification-bearing OR substantive length) lives
-    // in `isFinalAnswerReply`. Without this, a turn that ack'd then ended
-    // with the real answer as plain transcript text (#1664) would look
-    // "delivered" because replyCalled is true — and the silent-end
-    // re-prompt would never engage. `rawText` is the model's own answer
-    // text, measured before HTML conversion / Telegraph-link
-    // substitution. Writes `turn` (pinned at executeReply entry) so the
-    // flag always lands on the turn this reply belongs to.
+    // #1713: the reply tool is a NON-EVENT for the status reaction
+    // WHEN IT'S AN INTERIM ACK. The reaction reflects current turn
+    // activity, not delivery state — interim acks must not collapse
+    // the working-state ladder to 👍.
+    //
+    // #1728 carve-out (2026-05-24): when this reply IS the final
+    // answer (`isFinalAnswerReply` returns true — same classifier
+    // #1664 uses for silent-end re-prompt gating), it IS effectively
+    // turn-end and we MUST finalize here. Rationale: Claude Code's
+    // `turn_duration` system event is unreliable for the trivial-
+    // prompt happy path (driver sends "what's 2+2", model replies
+    // "4", no `turn_duration` ever lands in the JSONL session tail).
+    // Pre-#1718 this wedge was masked by the legacy
+    // `endStatusReaction` shim running unconditionally on every
+    // reply (outcome='done'); #1718 removed that call site
+    // intending `turn_end` to be the sole terminal trigger. The
+    // contract was right in spirit but `turn_end` doesn't fire 100%
+    // of the time, so the buffer gate (activeTurnStartedAt) stays
+    // set forever and every subsequent inbound gets `held mid-turn`
+    // and never delivered. v0.13.27 shipped + reverted on this
+    // failure mode (#1728).
+    //
+    // Net contract:
+    //   - interim ack reply (isFinalAnswerReply === false)
+    //         → non-event, no reaction finalize, buffer gate stays
+    //   - final-answer reply (isFinalAnswerReply === true)
+    //         → finalize reaction (debounced 👍) + release buffer
+    //           gate via purgeReactionTracking (called inside
+    //           finalizeStatusReaction). currentTurn stays alive so
+    //           a subsequent `turn_end` still cleans up its share
+    //           idempotently.
+    //
+    // #1664 — `turn.finalAnswerDelivered = true` keeps the silent-
+    // end re-prompt from spuriously firing on a delivered final.
     if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification })) {
       turn.finalAnswerDelivered = true
+      // #1728: release the buffer gate + emit terminal 👍. Mid-turn
+      // acks bypass this branch and remain non-events for the
+      // reaction (preserves #1713). The full turn-state teardown
+      // (nulling `currentTurn`, the per-turn cleanup) still runs in
+      // the `turn_end` handler when it lands; this only fires the
+      // observable side effects that #1718 deferred unconditionally.
+      finalizeStatusReaction(chat_id, threadId, 'done')
     }
   }
 
