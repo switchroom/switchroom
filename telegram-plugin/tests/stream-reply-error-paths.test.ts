@@ -46,7 +46,6 @@ function makeDeps(
     disableLinkPreview: true,
     defaultFormat: 'html',
     logStreamingEvent: () => {},
-    endStatusReaction: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
     writeError: () => {},

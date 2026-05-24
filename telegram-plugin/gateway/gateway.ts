@@ -5103,7 +5103,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       disableLinkPreview: access.disableLinkPreview !== false,
       defaultFormat: access.parseMode ?? 'html',
       logStreamingEvent,
-      endStatusReaction,
       isPrivateChat: streamIsPrivate,
       isForumTopic: streamIsForumTopic,
       ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
@@ -6577,6 +6576,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // dead and has already told the user is over (the ⚠️ Context window
         // full message above). Match the pattern used at the regular
         // turn-end path (line ~5039) and the wedged-turn path (~5290).
+        const ceKey = statusKey(chatId, threadId)
         silencePoke.endTurn(ceKey)
         pendingProgress.noteTurnEnd(ceKey)
         // Issue #195: tear down the answer-lane stream on context-exhaustion
@@ -7303,7 +7303,6 @@ function handlePtyActivity(text: string): void {
       disableLinkPreview: access.disableLinkPreview !== false,
       defaultFormat: 'text',
       logStreamingEvent,
-      endStatusReaction,
       historyEnabled: false,
       recordOutbound,
       writeError: (line) => process.stderr.write(line),

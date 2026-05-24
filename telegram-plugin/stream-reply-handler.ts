@@ -207,8 +207,6 @@ export interface StreamReplyDeps {
     charCount: number
     sameAsLast: boolean
   }) => void
-  /** Called on done=true to transition the status reaction controller. */
-  endStatusReaction: (chatId: string, threadId: number | undefined, verdict: 'done') => void
   /**
    * Optional: progress-card driver completion hook. Wired by the gateway
    * to `progressDriver.forceCompleteTurn(...)`. Invoked after a

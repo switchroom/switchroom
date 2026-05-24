@@ -16,7 +16,7 @@
  *      any still-active reactions to 👍 before it gets SIGTERM'd.
  *
  * Both consumers call `sweepActiveReactions`, which is shaped as a
- * pure function that takes the setDone callback as an argument. That
+ * pure function that takes the finalize callback as an argument. That
  * keeps it testable in isolation — the tests pass a fake callback and
  * assert which reactions were visited and whether the sidecar was
  * cleared.
@@ -24,7 +24,7 @@
 
 import { readActiveReactions, clearActiveReactions, type ActiveReaction } from "./active-reactions.js";
 
-export type SetDoneReactionFn = (chatId: string, messageId: number) => Promise<unknown>;
+export type FinalizeReactionFn = (chatId: string, messageId: number) => Promise<unknown>;
 
 export interface SweepOptions {
   timeoutMs?: number;
@@ -45,7 +45,7 @@ export interface SweepResult {
  */
 export async function sweepActiveReactions(
   agentDir: string,
-  setDone: SetDoneReactionFn,
+  finalize: FinalizeReactionFn,
   options: SweepOptions = {},
 ): Promise<SweepResult> {
   const log = options.log ?? (() => {});
@@ -56,7 +56,7 @@ export async function sweepActiveReactions(
   log(`sweeping ${reactions.length} stale reaction(s)`);
   const attempts = reactions.map((r) =>
     Promise.resolve()
-      .then(() => setDone(r.chatId, r.messageId))
+      .then(() => finalize(r.chatId, r.messageId))
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         log(`reaction sweep failed for ${r.chatId}/${r.messageId}: ${msg}`);

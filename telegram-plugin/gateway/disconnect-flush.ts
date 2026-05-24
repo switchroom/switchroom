@@ -50,7 +50,7 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
 
   /** Optional: called when the registered-agent disconnect found dangling
    *  `activeTurnStartedAt` entries the controller loop did not clear (i.e.
-   *  `setDone()` already ran on the canonical reply path, leaving
+   *  `finalize()` already ran on the canonical reply path, leaving
    *  `activeStatusReactions` empty but `activeTurnStartedAt` populated).
    *  The gateway uses this to null its module-scope `currentTurn` — the
    *  bridge that owned that turn just died. Without this, the next
@@ -111,7 +111,7 @@ export function flushOnAgentDisconnect<
   // Defense-in-depth — sweep any `activeTurnStartedAt` keys the controller
   // loop above did not touch. The bridge has crashed; any turn it owned is
   // dead by definition, regardless of whether `activeStatusReactions`
-  // still tracks it. The race that motivates this: `setDone()` already
+  // still tracks it. The race that motivates this: `finalize()` already
   // fired on the canonical reply path (clearing the reaction controller)
   // BUT the disconnect arrived BEFORE `purgeReactionTracking` ran the
   // `activeTurnStartedAt.delete` line for that key. Without this sweep,
@@ -127,7 +127,7 @@ export function flushOnAgentDisconnect<
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
-      `post-bridge-death (controller loop missed — setDone raced disconnect)`,
+      `post-bridge-death (controller loop missed — finalize raced disconnect)`,
     )
     onDanglingTurnsSwept?.(danglingKeys)
   }
