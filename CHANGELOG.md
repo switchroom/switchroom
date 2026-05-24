@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.13.27 — reflective status reactions + deterministic handback/progress envelopes
+
+Four PRs tightening the conversational-pacing primitives the user
+relies on as ambient liveness signals. All gateway/streaming work;
+no broker changes; no schema/migration.
+
+### PR A — fix(#1713): reflective status reactions — only turn_end finalizes (#1718)
+
+The status reaction on a user's inbound message must reflect CURRENT
+TURN ACTIVITY, not delivery state. Plain `reply` and `stream_reply
+done=true` were both firing the terminal 👍 mid-turn, collapsing the
+working-state ladder the user relies on as their primary ambient
+liveness signal. Restores the documented contract
+(`telegram-plugin/docs/waiting-ux-spec.md` Class B).
+
+Contract (locked):
+- `finalize(reason)` is the SOLE terminal trigger on the controller.
+- `setTool` / `setThinking` / `setCompacting` / `setError` are
+  bidirectional and non-terminal.
+- Mid-turn replies (ack OR final-answer) are non-events for the
+  reaction.
+- Disconnect-flush and turn-flush backstops route through `finalize()`.
+- Debounce 3500ms coalesces rapid state flips.
+- `setSilent` removed (dead code); `setCompacting` wired into the
+  proactive-compact emit path.
+
+New JTBD UAT at
+`telegram-plugin/uat/scenarios/jtbd-reflective-status-reaction-dm.test.ts`
+covers all 4 acceptance criteria.
+
+### PR B — fix(#1719): deterministic spoolId for subagent_handback envelopes (#1724)
+
+The synthesised `subagent_handback` inbound used `Date.now()` as its
+message id, so `spoolId()` minted a fresh `m:<chat>:<msgId>` for
+every rebuild. A re-built envelope for the same finished sub-agent —
+from the `onFinish` race or a gateway/container restart re-running
+the watcher path — produced a NEW spoolId, so `InboundSpool.put`'s
+idempotency-by-id couldn't collapse the duplicate and the handback
+turn re-fired.
+
+Fix: plumb the JSONL agent id (unique per Claude Code spawn) onto
+`meta.subagent_jsonl_id` and branch `spoolId()` to return
+`s:handback:<jsonl_agent_id>` for `meta.source === 'subagent_handback'`.
+Old envelopes still work via the existing fall-through (no migration).
+
+### PR C — feat(#1720): deterministic progress-pacing envelopes for background sub-agents (#1725)
+
+Conversational-pacing beat-3 for *background* sub-agents: between
+dispatch and the eventual handback (beat 4, #1724), the user saw
+nothing about WHAT the worker was doing. The cross-turn ambient
+ticker kept the parent's last reply alive ("— still working (Nm)")
+but that's liveness, not content.
+
+Design (one primitive, event-driven):
+- The watcher already captures `lastResultText` on every
+  `sub_agent_text` emission. Add an `onProgress` callback fired from
+  the same branch.
+- Foreground sub-agents short-circuit; only background paths emit.
+- Envelope spoolId: `s:progress:<jsonl_agent_id>:<bucketIdx>` with
+  `bucketIdx = floor(elapsedMs / progressIntervalMs)`. A worker
+  emitting 10 narrative lines within one bucket window collapses to
+  ONE live entry; the next bucket gets its own.
+- TTL: every envelope carries `meta.expiresAt = nowMs + 2×interval`.
+  `InboundSpool.liveEntries()` filters past-TTL entries — the single
+  divergence from the handback shape.
+- Handback-time sweep: when the gateway queues a `subagent_handback`,
+  it calls the new `InboundSpool.dropMatching` with the
+  `s:progress:<jsonl_agent_id>:` prefix so a still-live progress
+  envelope from the same worker can't land on top of the handback turn.
+
+Kill switch: `SWITCHROOM_DISABLE_SUBAGENT_PROGRESS=1`.
+
+### PR D — chore: address post-merge nits from #1718 and #1725 (#1726)
+
+Three reviewer-identified follow-ups, no behavior changes:
+
+1. Delete dead `endStatusReaction` shim left over from #1718's
+   contract change (no production call sites; 5 test stub properties
+   also cleaned up).
+2. Harden the `SWITCHROOM_DISABLE_SUBAGENT_PROGRESS` kill-switch
+   parser — the original `!== '0'` gate foot-gunned on `"false"`,
+   `"no"`, `"off"`. New `isEnvFlagOn` helper accepts unset / empty /
+   `0` / `false` / `no` / `off` (case-insensitive, trimmed) as OFF.
+3. Wire `clearPending('progress')` at the progress-envelope enqueue
+   site so the cross-turn ambient ticker doesn't double-surface the
+   signal as a parallel "— still working (Nm)" edit when the model is
+   about to compose an explicit in-voice progress line.
+
 ## v0.13.26 — vault-broker per-agent unlock socket pair
 
 Closes a structural gap in the per-agent socket model dating to v0.7:
