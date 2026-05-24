@@ -619,8 +619,12 @@ backfilled 2026-05-22 — memory `feedback_release_create_github_release`):
 ```
 gh release create vX.Y.Z --repo switchroom/switchroom \
   --title "vX.Y.Z — <theme>" \
-  --notes "$(awk '/^## vX\.Y\.Z/,/^## v/' CHANGELOG.md | sed '$d')"
+  --notes "$(awk '/^## vX\.Y\.Z/{f=1;print;next} /^## v/&&f{exit} f' CHANGELOG.md)"
 ```
+
+(The naive `awk '/^## vX\.Y\.Z/,/^## v/'` range collapses because the
+start line also matches the end pattern — returns 1 line, not the
+section.)
 
 **6. npm publish — verify tarball first** (memory
 `feedback_npm_publish_landmines`: past releases shipped without
