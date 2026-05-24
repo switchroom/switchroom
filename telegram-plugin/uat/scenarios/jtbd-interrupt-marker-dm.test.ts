@@ -31,7 +31,7 @@ const INTERRUPT = "! actually just reply with the single word 'hello'";
 // a JTBD-floor invariant and shouldn't gate every PR that touches
 // telegram-plugin/. Unskip once the underlying behaviour has been
 // audited end-to-end via `bun run test:uat`.
-describe.skip("uat: ! interrupt marker", () => {
+describe("uat: ! interrupt marker", () => {
   it(
     "user fires !-interrupt mid-turn → agent picks up new task, drops old",
     async () => {
