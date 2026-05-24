@@ -1413,6 +1413,78 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
 }
 
 /**
+ * Narrow buffer-gate release. Clears the per-key
+ * `activeTurnStartedAt` entry and triggers the held-inbound flush
+ * if the fleet went idle, WITHOUT touching the reaction
+ * controller, the active-reaction message-id, or the typing loop.
+ *
+ * Why split from `purgeReactionTracking`. #1718's contract keeps
+ * `activeStatusReactions[key]` alive across the turn so the
+ * working-state ladder can re-paint on every tool/thinking event
+ * (and the steer-vs-queue logic at the inbound handler reads the
+ * controller — gateway.ts:8322-8323 — to classify mid-turn
+ * messages). Wiping the controller mid-turn would either collapse
+ * the ladder to 👍 prematurely (#1713 regression) or break the
+ * steer detection.
+ *
+ * The BUFFER gate (`activeTurnStartedAt`) is a separate concern:
+ * it gates `shouldBufferInbound` (gateway.ts:8603) and the
+ * "claude is idle" flush at `purgeReactionTracking`'s tail. The
+ * #1728/#1729 fix released both halves together by gating on
+ * `isFinalAnswerReply`, but a trivial-prompt reply that sets
+ * `disable_notification: true` and is < 200 chars (e.g. the model
+ * mis-classifies "4" as an interim ack) returns false from
+ * `isFinalAnswerReply`, so neither half releases and the gate
+ * wedges (v0.13.30 UAT regression — every subsequent inbound logs
+ * `held mid-turn ... will flush on turn-complete` forever).
+ *
+ * `releaseTurnBufferGate` is called from `executeReply` on EVERY
+ * successful reply finalize — regardless of `isFinalAnswerReply` —
+ * so the buffer gate releases independently of the reaction
+ * state. The reaction controller stays for #1713's bidirectional
+ * ladder + steer detection; only the gate flips.
+ *
+ * Idempotent: a second release is a no-op `.delete()` on an
+ * already-empty key.
+ *
+ * @internal exported only via the `gateway.ts` module — used by
+ * `executeReply`'s post-send block and by tests via source-level
+ * pinning in `vault-approval-posture.test.ts` / wedge-guard suites.
+ */
+function releaseTurnBufferGate(key: string): void {
+  if (!activeTurnStartedAt.has(key)) return
+  activeTurnStartedAt.delete(key)
+  // Shadow trace so the structural turn-end metric still records.
+  // outboundEmitted=true is correct here — we only reach this from
+  // executeReply AFTER an outbound landed.
+  shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted: true })
+
+  // Mirror the deterministic-delivery flush from
+  // `purgeReactionTracking` (gateway.ts:1376-1399). When the fleet
+  // hits zero-active-turns, drain any held inbound. This is the
+  // load-bearing wedge fix: the gate that pinned msg 1874+ in
+  // test-harness's 13:02 UAT now opens after the reply.
+  if (activeTurnStartedAt.size === 0) {
+    const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
+      const fr = redeliverBufferedInbound(
+        pendingInboundBuffer,
+        selfAgentForFlush,
+        (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
+        inboundSpool,
+      )
+      if (fr.redelivered > 0) {
+        process.stderr.write(
+          `telegram gateway: reply-released-gate flushed ${fr.redelivered}/${fr.drained} ` +
+          `held inbound for ${selfAgentForFlush}` +
+          `${fr.rebuffered > 0 ? ` (${fr.rebuffered} re-buffered)` : ''}\n`,
+        )
+      }
+    }
+  }
+}
+
+/**
  * Atomic null-and-purge for a wedged turn. Every site that ends a
  * turn by nulling `currentTurn` MUST also clear the turn's statusKey
  * from `activeTurnStartedAt` — else a dangling entry survives and
@@ -4975,6 +5047,24 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // observable side effects that #1718 deferred unconditionally.
       finalizeStatusReaction(chat_id, threadId, 'done')
     }
+    // v0.13.30 follow-up — release the buffer gate on EVERY reply
+    // finalize, not just on `isFinalAnswerReply`. The narrow
+    // `finalizeStatusReaction` path above misses short replies that
+    // set `disable_notification: true` (the model mis-classifies a
+    // genuine answer as an interim ack — e.g. "4" for "what's
+    // 2+2"). Pre-fix the gate stayed set forever and every later
+    // inbound logged `held mid-turn ... will flush on turn-
+    // complete` — but turn-complete never came because Claude
+    // Code's `turn_duration` system event doesn't reliably land
+    // for trivial-prompt turns. v0.13.30 UAT showed the regression
+    // (msg 1873 reply at 13:02:46, msg 1874 held at 13:03:04, gate
+    // never released).
+    //
+    // The reaction controller stays alive (preserves #1713
+    // bidirectional ladder + the steer-vs-queue logic at
+    // gateway.ts:8322 which reads `activeStatusReactions`). Only
+    // the buffer gate flips.
+    releaseTurnBufferGate(statusKey(chat_id, threadId))
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
@@ -5230,6 +5320,17 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     })
   ) {
     turn.finalAnswerDelivered = true
+  }
+  // v0.13.30 follow-up — release the buffer gate on every successful
+  // stream_reply too. Same rationale as executeReply: short replies
+  // with `disable_notification: true` would otherwise wedge the gate
+  // forever. `result.status` is always 'updated' | 'finalized'
+  // (stream-reply-handler.ts:305) at this point — earlier failures
+  // throw or return before reaching here.
+  {
+    const sChat = args.chat_id as string
+    const sThread = resolveThreadId(sChat, args.message_thread_id as string | undefined)
+    releaseTurnBufferGate(statusKey(sChat, sThread))
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
