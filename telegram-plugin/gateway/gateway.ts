@@ -3304,12 +3304,19 @@ silencePoke.startTimer({
 // `SWITCHROOM_DISABLE_PENDING_PROGRESS=1`.
 pendingProgress.startTimer({
   editMessage: async (ctx) => {
+    // #1698: preserve the anchor's original parse_mode. Without this
+    // the edit goes out as plain text, and any <b>/<code>/<a> tag in
+    // anchorOriginalText (the model authored HTML via the reply tool,
+    // which defaults to format='html') re-renders as literal text the
+    // moment the first "still working (Nm)" tick fires.
+    const editOpts = ctx.parseMode != null ? { parse_mode: ctx.parseMode } : undefined
     await swallowingApiCall(
       () =>
         lockedBot.api.editMessageText(
           ctx.chatId,
           ctx.messageId,
           ctx.newText,
+          editOpts,
         ),
       {
         chat_id: ctx.chatId,
@@ -4568,6 +4575,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
             messageId: decision.messageId,
             text: decision.mergedText,
+            parseMode,
           })
           if (HISTORY_ENABLED) {
             try {
@@ -4760,6 +4768,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
         messageId: anchorMsgId,
         text: chunks[chunks.length - 1],
+        parseMode,
       })
     }
   }
@@ -5139,9 +5148,21 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     // that follows. Capture it so if this turn ends with a pending
     // async dispatch, the framework edits THIS message in place at
     // intervals.
+    //
+    // #1698 — capture the parse_mode the stream-reply-handler used so
+    // the cross-turn edit tick reuses it. Mirrors the format→parseMode
+    // logic at stream-reply-handler.ts:355-368. Without this, the first
+    // "still working (Nm)" tick edits HTML content as plain text and
+    // <b>/<code>/<a> render as literal tags.
+    const streamFormat = (args.format as string | undefined) ?? (access.parseMode ?? 'html')
+    const streamParseMode: 'HTML' | 'MarkdownV2' | undefined =
+      streamFormat === 'html' ? 'HTML'
+      : streamFormat === 'markdownv2' ? 'MarkdownV2'
+      : undefined
     pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
       messageId: result.messageId,
       text: args.text as string,
+      parseMode: streamParseMode,
     })
   }
   // #1664 — mark the turn's final answer as delivered. For stream_reply a

@@ -45,10 +45,14 @@
  * interval is short (5s) but edits are spaced at EDIT_INTERVAL_MS so
  * the Telegram bot.api editMessageText rate stays well under limits.
  *
- * Edits are plain text (no parseMode). The suffix is appended to the
- * model's authored text; on subsequent edits the prior suffix is
- * stripped before re-appending so the message never accumulates
- * duplicate suffixes.
+ * Edits preserve the anchor's original `parse_mode` (issue #1698). The
+ * anchor was sent through the reply tool, which defaults to HTML; an
+ * earlier version of this module dropped parse_mode on edit, which made
+ * the next "still working (Nm)" tick re-render `<b>` / `<code>` tags as
+ * literal text. The suffix itself is plain text (no `<`/`>`/`&`) so it
+ * is safe under any parse_mode. On subsequent edits the prior suffix is
+ * stripped before re-appending so the message never accumulates duplicate
+ * suffixes.
  *
  * Kill switch: `SWITCHROOM_DISABLE_PENDING_PROGRESS=1` disables the
  * whole subsystem. The conversational-pacing prompt is unaffected.
@@ -76,6 +80,10 @@ export interface PendingProgressEditCtx {
   threadId: number | null
   messageId: number
   newText: string
+  /** Telegram parse_mode the original anchor was sent with (#1698).
+   *  The edit must use the same mode or pre-rendered HTML / MarkdownV2
+   *  tags in `anchorOriginalText` re-render as literal text. */
+  parseMode: 'HTML' | 'MarkdownV2' | undefined
 }
 
 /**
@@ -116,6 +124,11 @@ interface State {
   /** The captured anchor text — what the model wrote, *minus* any
    *  prior pending-progress suffix. Used as the base for every edit. */
   anchorOriginalText: string
+  /** parse_mode the anchor was originally sent with. Edits must
+   *  reuse this or the rendered HTML / MarkdownV2 tags in
+   *  anchorOriginalText render as literal text on the next tick
+   *  (issue #1698). */
+  anchorParseMode: 'HTML' | 'MarkdownV2' | undefined
   /** Wall-clock ms when the cross-turn ambient state was *activated*
    *  (at turn_end with pending+anchor). null before activation. */
   activatedAt: number | null
@@ -144,6 +157,7 @@ function ensure(key: string): State {
       pending: false,
       anchorMessageId: null,
       anchorOriginalText: '',
+      anchorParseMode: undefined,
       activatedAt: null,
       lastEditAt: null,
     }
@@ -181,6 +195,7 @@ export function startTurn(key: string): void {
   s.pending = false
   s.anchorMessageId = null
   s.anchorOriginalText = ''
+  s.anchorParseMode = undefined
 }
 
 /**
@@ -202,12 +217,24 @@ export function noteAsyncDispatch(key: string): void {
  */
 export function noteOutbound(
   key: string,
-  opts: { messageId: number; text: string },
+  opts: {
+    messageId: number
+    text: string
+    /** parse_mode the anchor was sent with. Captured so the
+     *  cross-turn edit tick can reuse it (#1698). Undefined or
+     *  omitted means the original send had no parse_mode (plain
+     *  text). Production callers MUST pass this — every reply path
+     *  knows its own parse_mode. Defaulted to undefined only so test
+     *  fixtures don't have to thread it through where they're
+     *  asserting other behaviour. */
+    parseMode?: 'HTML' | 'MarkdownV2' | undefined
+  },
 ): void {
   if (!enabled()) return
   const s = ensure(key)
   s.anchorMessageId = opts.messageId
   s.anchorOriginalText = opts.text.replace(SUFFIX_RE, '')
+  s.anchorParseMode = opts.parseMode
 }
 
 /**
@@ -331,6 +358,7 @@ function tick(now: number): void {
       threadId,
       messageId: s.anchorMessageId,
       newText,
+      parseMode: s.anchorParseMode,
     }
     // Fire-and-forget so a slow edit doesn't block the tick loop.
     // Errors are logged but never bubble (a 429 / "message not modified"

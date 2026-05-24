@@ -318,6 +318,62 @@ describe('pending-work-progress', () => {
     expect(cap.edits).toHaveLength(0)
   })
 
+  // ─── #1698 regression — preserve parse_mode on the cross-turn edit ───
+  it("preserves the anchor's parse_mode on every edit (#1698)", async () => {
+    const cap = setup()
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    // Anchor was sent through the reply tool with format='html', so
+    // the captured text is already rendered Telegram HTML.
+    noteOutbound(KEY, {
+      messageId: 100,
+      text: '<b>Worker back.</b> Both blockers fixed.',
+      parseMode: 'HTML',
+    })
+    cap.now = 0
+    noteTurnEnd(KEY)
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits).toHaveLength(1)
+    expect(cap.edits[0].parseMode).toBe('HTML')
+    expect(cap.edits[0].newText).toBe(
+      '<b>Worker back.</b> Both blockers fixed.\n\n— still working (1m)',
+    )
+  })
+
+  it('passes undefined parseMode through when the anchor was plain text', async () => {
+    const cap = setup()
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    // format: 'text' path — anchor was sent without parse_mode.
+    noteOutbound(KEY, {
+      messageId: 100,
+      text: 'plain text reply',
+      parseMode: undefined,
+    })
+    noteTurnEnd(KEY)
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits[0].parseMode).toBeUndefined()
+  })
+
+  it('defaults parseMode to undefined when caller omits it (test ergonomics)', async () => {
+    const cap = setup()
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    // Callsite that hasn't been updated for the new field — must not
+    // typecheck-fail nor crash. The edit goes out parse_mode-less,
+    // matching the pre-#1698 behaviour for legacy callers.
+    noteOutbound(KEY, { messageId: 100, text: 'wd' })
+    noteTurnEnd(KEY)
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits[0].parseMode).toBeUndefined()
+  })
+
   it('multiple chats — independent state', async () => {
     const cap = setup()
     const KEY_A = 'A:_'
