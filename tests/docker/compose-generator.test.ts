@@ -737,6 +737,34 @@ describe("generateCompose", () => {
     );
   });
 
+  it("broker bind-mounts the host vault-grants.db onto /root/.switchroom/vault-grants.db (#1737 wedge)", () => {
+    // fails when: the broker writes the capability-grants SQLite to a
+    // container-local path that evaporates on recreate. Token files on
+    // disk (~/.switchroom/agents/<agent>/.vault-token) persist via the
+    // per-agent bind mounts and reference grant IDs that no longer
+    // exist in the fresh broker DB — every `switchroom vault get` from
+    // inside an agent container returns
+    // `VAULT-BROKER-DENIED [DENIED]: key 'X' not in ACL for agent 'Y'`
+    // because the #1496 fall-through routes the unusable token to the
+    // standing schedule.secrets ACL, which usually denies (the whole
+    // reason a grant was minted in the first place).
+    //
+    // Surfaced 2026-05-24 when clerk's vg_5e1991 grant for
+    // `ha/access-token` disappeared after the v0.13.31 broker recreate.
+    // The doctor probe doesn't catch it — doctor only inspects path-
+    // as-identity ACL, not grant-based access.
+    //
+    // Mount is RW (not :ro) because the broker writes new rows on every
+    // mint_grant call; `ensureHostMountSources()` in apply.ts pre-
+    // creates the source file mode 0600 (secrets material) so docker
+    // doesn't auto-create a directory at the mount path.
+    const out = generateCompose({ config: makeConfig({ a: {} }) });
+    const block = /vault-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).toMatch(
+      /-\s+\$\{HOME\}\/\.switchroom\/vault-grants\.db:\/root\/\.switchroom\/vault-grants\.db(?!:ro)/,
+    );
+  });
+
   it("kernel keeps CHOWN + FOWNER (mirrors broker socket-ownership flow)", () => {
     const out = generateCompose({ config: makeConfig({ a: {} }) });
     const block = /approval-kernel:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
