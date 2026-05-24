@@ -1,17 +1,28 @@
 /**
  * Status reaction state machine for Telegram bot messages.
  *
- * Ports the pattern from openclaw's src/channels/status-reactions.ts +
- * extensions/telegram/src/status-reaction-variants.ts. The goal is to give
- * the user a glanceable, non-spammy progress signal on their inbound
- * message: 👀 received → 🤔 thinking → ✍/👨‍💻/⚡ working → 👍 done → 😱 error.
+ * Reflective state machine — see issue #1713 for the canonical contract.
  *
- * Three load-bearing properties (all from openclaw research):
+ * The reaction on a user's inbound message represents CURRENT TURN
+ * ACTIVITY, not delivery state. Working states (`thinking`, `tool`,
+ * `coding`, `web`, `compacting`) cycle freely and bidirectionally —
+ * the same state can re-enter multiple times within one turn. No state
+ * is "higher" than another. Mid-turn replies (plain or streamed) are
+ * non-events for the reaction.
  *
- *  1. Debounce intermediate transitions by 700ms so a model that flashes
- *     thinking → tool → thinking → tool doesn't burn the rate limit.
+ * Only ONE method terminates the controller: `finalize(reason)`. The
+ * Stop hook (delivered to the gateway as the `turn_end` IPC event) is
+ * the single terminal trigger. `setError()` paints 😱 but is NON-
+ * terminal — recovery to a working state is allowed.
  *
- *  2. Terminal states (queued / done / error) bypass the debounce.
+ * Three load-bearing properties (kept from the openclaw port):
+ *
+ *  1. Debounce intermediate transitions (3500ms by default — see #1713
+ *     decision: 3-5s) so a model that flashes thinking → tool →
+ *     thinking → tool doesn't burn the Telegram rate limit. Coalesce
+ *     same-state-within-window into a single emit.
+ *
+ *  2. The terminal `finalize()` bypasses debounce.
  *
  *  3. Serialize all API calls through a single chain promise so two
  *     concurrent transitions never race the Telegram API. Telegram's
@@ -20,12 +31,6 @@
  * Stall watchdogs auto-promote to 🥱 / 😨 if no transition arrives within
  * 30s / 90s, so a stuck/dead inference loop is visually distinguishable
  * from a long but healthy one.
- *
- * Emoji choices use Telegram's bot reaction whitelist
- * (https://core.telegram.org/bots/api#reactiontype). The fallback chain
- * tries each variant in order — if a chat restricts available reactions
- * (admin-configured in some groups) the controller silently no-ops the
- * unsupported choice instead of throwing.
  */
 
 /** Telegram allows only this fixed set of emoji as bot reactions. */
@@ -49,7 +54,6 @@ export type ReactionState =
   | 'tool'
   | 'compacting'
   | 'done'
-  | 'silent'
   | 'error'
   | 'stallSoft'
   | 'stallHard'
@@ -62,26 +66,22 @@ export type ReactionState =
  * Semantic split — do not conflate these three tiers:
  *   READ     👀  = "I have seen your message" (acknowledgement only)
  *   WORKING  ✍   = actively doing something (tools, coding, compacting)
- *   FINISHED 👍/💯/🎉 = definitively done; a reply landed
+ *   FINISHED 👍/💯/🎉 = turn over (turn_end fired)
  *
  * 🔥 is reserved for genuine 5xx server errors (operator-events.ts).
  * It reads as "on fire / broken" — keep it out of normal active-work states.
  */
 export const REACTION_VARIANTS: Record<ReactionState, string[]> = {
   queued:    ['👀', '🤔', '🤓'],     // READ: I see your message
-  thinking:  ['🤔', '🤓', '👀'],     // unchanged
+  thinking:  ['🤔', '🤓', '👀'],
   tool:      ['✍', '⚡', '👌'],      // WORKING: actively using a tool
   coding:    ['👨‍💻', '✍', '⚡'],     // WORKING: writing / running code
-  web:       ['⚡', '🤔', '👌'],      // WORKING: lookup in motion (👀 reserved for READ)
-  compacting:['✍', '🤔', '👀'],      // unchanged
-  done:      ['👍', '💯', '🎉'],      // FINISHED: reply landed
-  // 🙊 — turn ended without producing a user-visible reply. Distinct from
-  // 'done' (which means "reply landed") so the user doesn't read 👍 as
-  // "agent acknowledged" when actually nothing was sent. See issue #132.
-  silent:    ['🙊', '🤔', '😐'],      // unchanged
-  error:     ['😱', '😨', '🤯'],      // unchanged (genuine alarm)
-  stallSoft: ['🥱', '😴', '🤔'],      // unchanged
-  stallHard: ['😨', '🤯', '😱'],      // unchanged
+  web:       ['⚡', '🤔', '👌'],      // WORKING: lookup in motion
+  compacting:['✍', '🤔', '👀'],
+  done:      ['👍', '💯', '🎉'],      // FINISHED: turn_end fired
+  error:     ['😱', '😨', '🤯'],      // NON-TERMINAL — recovery allowed
+  stallSoft: ['🥱', '😴', '🤔'],
+  stallHard: ['😨', '🤯', '😱'],
 }
 
 /**
@@ -100,9 +100,12 @@ export function resolveToolReactionState(toolName: string): ReactionState {
   return 'tool'
 }
 
+/** Reason passed to `finalize()` — selects the terminal emoji.  */
+export type FinalizeReason = 'done' | 'error'
+
 /** Configuration knobs the controller respects. */
 export interface StatusReactionConfig {
-  /** Milliseconds to wait before applying a non-immediate transition. Default 700. */
+  /** Milliseconds to wait before applying a non-immediate transition. Default 3500 (#1713). */
   debounceMs?: number
   /** Milliseconds without progress before promoting to stallSoft. Default 30000. */
   stallSoftMs?: number
@@ -126,8 +129,9 @@ export type ReactionEmitter = (emoji: string) => Promise<void>
  * Controller managing the reaction lifecycle for a single inbound message.
  *
  * Lifecycle: construct → setQueued() → arbitrary intermediate transitions
- * → setDone() / setError() to terminate. After termination, all further
- * setX calls are no-ops.
+ * (setThinking / setTool / setCompacting / setError — all bidirectional
+ * and non-terminal) → finalize() to terminate. Only `finalize()` ends
+ * the controller; after termination, all further calls are no-ops.
  */
 export class StatusReactionController {
   private currentEmoji: string | null = null
@@ -148,7 +152,7 @@ export class StatusReactionController {
     private readonly allowedReactions: Set<string> | null = null,
     config: StatusReactionConfig = {},
   ) {
-    this.debounceMs = config.debounceMs ?? 700
+    this.debounceMs = config.debounceMs ?? 3500
     this.stallSoftMs = config.stallSoftMs ?? 30000
     this.stallHardMs = config.stallHardMs ?? 90000
     this.log = config.log
@@ -159,44 +163,56 @@ export class StatusReactionController {
     this.scheduleState('queued', { immediate: true })
   }
 
-  /** 🤔 — model is generating. Debounced. */
+  /** 🤔 — model is generating. Debounced, non-terminal, bidirectional. */
   setThinking(): void {
     this.scheduleState('thinking')
   }
 
-  /** Tool-specific reaction. Debounced. */
+  /** Tool-specific reaction. Debounced, non-terminal, bidirectional. */
   setTool(toolName?: string): void {
     const state = toolName ? resolveToolReactionState(toolName) : 'tool'
     this.scheduleState(state)
   }
 
-  /** ✍ — context compaction in progress. */
+  /** ✍ — context compaction in progress. Debounced, non-terminal, bidirectional. */
   setCompacting(): void {
     this.scheduleState('compacting')
   }
 
-  /** 👍 — final reply delivered. Terminal, bypasses debounce. */
-  setDone(): void {
-    this.finishWithState('done')
+  /**
+   * 😱 — non-terminal error indicator. Paints the error emoji but does
+   * NOT end the controller — recovery to a working state is permitted
+   * (see #1713). Use `finalize('error')` to actually terminate with
+   * the error emoji as the final state.
+   */
+  setError(): void {
+    this.scheduleState('error')
   }
 
   /**
-   * 🙊 — turn ended without producing a user-visible reply.
+   * Terminal — sets the controller to `finished` and emits the final
+   * emoji (👍 for 'done', 😱 for 'error'). This is the ONLY method
+   * that ends the controller; all other setX calls are non-terminal.
    *
-   * Distinct from `setDone()` so the user doesn't read 👍 as "agent
-   * acknowledged but stayed silent on purpose" when in fact nothing was
-   * actually sent. Common case (#132): agent ran a long Bash chain to
-   * answer a question, never called `reply` / `stream_reply`, and the
-   * orphaned-reply backstop had no captured text to forward either.
-   * Terminal, bypasses debounce.
+   * Driven by the `turn_end` IPC event (Stop hook) and the disconnect
+   * / boot-sweep backstops. Bypasses debounce so the terminal emoji
+   * lands promptly. Subsequent calls are no-ops.
    */
-  setSilent(): void {
-    this.finishWithState('silent')
+  finalize(reason: FinalizeReason = 'done'): void {
+    const state: ReactionState = reason === 'error' ? 'error' : 'done'
+    this.finishWithState(state)
   }
 
-  /** 😱 — generation failed. Terminal, bypasses debounce. */
-  setError(): void {
-    this.finishWithState('error')
+  /**
+   * Back-compat shim — equivalent to `finalize('done')`. Prefer
+   * `finalize()` in new call sites so the terminal contract is
+   * explicit at the call site.
+   *
+   * @deprecated Use `finalize('done')` — kept so external callers don't
+   * break mid-rollout. Will be removed once all callers migrate.
+   */
+  setDone(): void {
+    this.finalize('done')
   }
 
   /** Stop the controller without applying any new reaction. Terminal. */
@@ -216,13 +232,11 @@ export class StatusReactionController {
     if (this.finished) return
     const emoji = this.resolveEmoji(state)
     if (emoji == null) {
-      // No allowed variant for this chat — silently skip rather than fall
-      // through to the chain. We still reset stall timers so that progress
-      // signals continue to keep the watchdogs at bay.
       if (!opts.skipStallReset) this.resetStallTimers()
       return
     }
     if (emoji === this.currentEmoji || emoji === this.pendingEmoji) {
+      // Coalesce same-state-within-window into a single emit.
       if (!opts.skipStallReset) this.resetStallTimers()
       return
     }
@@ -245,15 +259,13 @@ export class StatusReactionController {
     this.clearStallTimers()
     // F1 fix (#553): if a non-terminal reaction is sitting in the
     // debounce window when the turn ends, flush it BEFORE the terminal
-    // emoji emits. Pre-fix, `clearDebounceTimer()` here silently
-    // dropped the pending state — every Class B turn that completed in
-    // under `debounceMs` (default 700ms) collapsed to 👀 → 👍 with no
-    // intermediate signal that the agent did any work.
+    // emoji emits. Without this, every Class B turn that completed in
+    // under `debounceMs` would collapse straight to 👀 → terminal with
+    // no intermediate working-state signal.
     //
     // Gate on `debounceTimer != null`: a `pendingEmoji` with no timer
     // is already enqueued (immediate emit waiting on chainPromise) and
-    // re-enqueuing would produce a duplicate. Only debounced-but-not-
-    // yet-enqueued emojis need to be flushed here.
+    // re-enqueuing would produce a duplicate.
     const flushPending = this.debounceTimer != null && this.pendingEmoji != null
       ? this.pendingEmoji
       : null

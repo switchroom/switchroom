@@ -27,7 +27,7 @@
  * needing to spin up the whole gateway.
  */
 
-export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
+export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' | 'error') => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
   /** The disconnecting client's agentName. `null` ⇒ anonymous (never registered). */
   agentName: string | null
 
@@ -70,7 +70,7 @@ export interface DisconnectFlushDeps<Ctrl extends { setDone: () => void }, Strea
  * client). The boolean is for tests + observability — callers can ignore it.
  */
 export function flushOnAgentDisconnect<
-  Ctrl extends { setDone: () => void },
+  Ctrl extends { finalize: (reason?: 'done' | 'error') => void },
   Stream extends { isFinal: () => boolean; finalize: () => Promise<void> },
 >(deps: DisconnectFlushDeps<Ctrl, Stream>): boolean {
   const {
@@ -96,8 +96,12 @@ export function flushOnAgentDisconnect<
   // Real agent disconnect (e.g. the claude bridge crashed/restarted). Flush
   // all in-flight status reactions to 👍 so user messages don't stay stuck on
   // intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
+  // #1713: route through finalize() — single terminal path for the
+  // status-reaction controller. Disconnect implies the agent bridge
+  // died mid-turn; treat as a clean terminal so the user's emoji
+  // doesn't stay stuck on an intermediate working state.
   for (const [key, ctrl] of activeStatusReactions.entries()) {
-    ctrl.setDone()
+    ctrl.finalize('done')
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)

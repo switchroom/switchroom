@@ -30,16 +30,35 @@ The shape now is three layers, in priority order:
 
 ## 1. Ambient — the reaction lifecycle
 
-The 👀 → 🤔 → 🔥 → 👍 status reaction on the user's *own* inbound
-message is the always-on liveness signal. It fires within ~100ms of the
-message arriving, escalates as the model engages, and resolves on
-completion. It's free, glanceable, lives on the user's message (not
-competing with the conversation), and never disappears mid-turn. This
-is the primary signal that "the agent is alive."
+The status reaction on the user's *own* inbound message is the
+always-on liveness signal. It fires within ~100ms of the message
+arriving (👀 received), reflects current turn activity through
+working states (🤔 thinking, ✍ tool, 👨‍💻 coding, ⚡ web lookup),
+and resolves on turn end (👍). It's free, glanceable, lives on the
+user's message (not competing with the conversation), and never
+disappears mid-turn. This is the primary signal that "the agent is
+alive."
 
-A stall escalates the reaction (😨) so the user can tell idle from
-stuck at a glance. The reaction is also where time-to-ack is
-measured — see the `inbound_ack` event in `docs/posthog.md`.
+The reaction is a **reflective state machine**, not a linear ratchet
+(#1713). Working states cycle freely and bidirectionally — the same
+state can re-enter multiple times within one turn, no state is
+"higher" than another, and mid-turn replies (ack or final answer)
+are non-events for the reaction. **Only the `turn_end` IPC event
+(Stop hook) finalizes to 👍.** Sending a message is not a state
+transition; the reaction reflects what the agent is doing, not what
+just landed in the chat.
+
+🔥 is reserved for genuine 5xx server errors and is also non-terminal:
+recovery to a working state from 🔥 is allowed; only `turn_end`
+ends the controller. A stall escalates the reaction (😨) so the user
+can tell idle from stuck at a glance. The reaction is also where
+time-to-ack is measured — see the `inbound_ack` event in
+`docs/posthog.md`.
+
+Implementation: `telegram-plugin/status-reactions.ts` (controller),
+`telegram-plugin/gateway/gateway.ts` (turn_end IPC handler →
+`finalizeStatusReaction`). The technical contract spec lives at
+`telegram-plugin/docs/waiting-ux-spec.md`.
 
 ## 2. Conversational — the chat itself is the artifact
 

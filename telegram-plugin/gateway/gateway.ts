@@ -1515,6 +1515,13 @@ function maybeProactiveCompact(): void {
       void resolveCompactCard('superseded', occupancy);
     }
     void postCompactCard(occupancy, cap);
+    // #1713: compaction is a reflective working state — paint ✍ on
+    // every in-flight inbound's status reaction so the user can see
+    // the agent is doing compaction work, not stuck. Non-terminal:
+    // post-compact transitions back to thinking/tool resume normally.
+    for (const ctrl of activeStatusReactions.values()) {
+      ctrl.setCompacting()
+    }
   }
 
   if (!decision.fire) return;
@@ -1642,13 +1649,53 @@ async function resolveCompactCard(
   }
 }
 
-function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
+/**
+ * Terminal-only reaction helper — routes through `finalize()` per #1713.
+ *
+ * Only the `turn_end` IPC handler, disconnect-flush, and boot-sweep
+ * should call this. Mid-turn replies and stream-done events are
+ * NON-EVENTS for the reaction (the reaction reflects current turn
+ * activity, not delivery state). See `reference/know-what-my-agent-is-
+ * doing.md` for the user-perceived contract.
+ */
+function finalizeStatusReaction(
+  chatId: string,
+  threadId: number | undefined,
+  reason: 'done' | 'error' = 'done',
+): void {
   const key = statusKey(chatId, threadId)
   const ctrl = activeStatusReactions.get(key)
   if (!ctrl) return
-  if (outcome === 'done') ctrl.setDone()
-  else ctrl.setError()
+  ctrl.finalize(reason)
   purgeReactionTracking(key)
+}
+
+/**
+ * Non-terminal error paint (😱). Distinct from `finalize('error')` —
+ * recovery to a working state is allowed after this (#1713). Mid-turn
+ * 5xx surfaces use this; the terminal turn_end handler decides whether
+ * the turn actually ends in error.
+ */
+function paintStatusReactionError(chatId: string, threadId: number | undefined): void {
+  const key = statusKey(chatId, threadId)
+  const ctrl = activeStatusReactions.get(key)
+  if (!ctrl) return
+  ctrl.setError()
+}
+
+/**
+ * Back-compat shim — kept so call sites that haven't migrated yet
+ * compile. New code should call `finalizeStatusReaction` (terminal) or
+ * `paintStatusReactionError` (non-terminal) instead.
+ *
+ * @deprecated Use `finalizeStatusReaction` / `paintStatusReactionError`.
+ */
+function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
+  if (outcome === 'done') {
+    finalizeStatusReaction(chatId, threadId, 'done')
+  } else {
+    finalizeStatusReaction(chatId, threadId, 'error')
+  }
 }
 
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
@@ -4895,23 +4942,14 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     } catch { /* best-effort signal */ }
     // #203: fresh sendMessage from reply tool is a user-visible signal.
     signalTracker.noteSignal(statusKey(chat_id, threadId), Date.now())
-    // PR #602 follow-up: fire the terminal 👍 here so plain `reply`-only
-    // turns get the same delivery-confirmed reaction as stream_reply
-    // (Bug Z). Pre-follow-up, the dedup-suppress branch in the gateway
-    // turn_end handler was the sole 👍 emitter for reply-tool-only
-    // turns; removing its setDone call (Bug D) left those turns with no
-    // 👍 at all. Mirror the stream_reply contract: only fire after at
-    // least one sendMessage has resolved successfully (sentIds.length>0
-    // guarantees this), so the emoji means "the reply landed in
-    // Telegram", not "the reply tool was invoked". The reply tool has
-    // no lane concept — every reply is the user-visible answer — so no
-    // lane gate is needed (unlike stream_reply where named lanes are
-    // internal driver emits).
-    try {
-      endStatusReaction(chat_id, threadId, 'done')
-    } catch (err) {
-      process.stderr.write(`telegram gateway: reply: endStatusReaction hook threw: ${err}\n`)
-    }
+    // #1713: the reply tool is a NON-EVENT for the status reaction.
+    // The reaction reflects current turn activity, not delivery state —
+    // only the `turn_end` IPC handler finalizes (👍). A plain `reply`
+    // mid-turn or as the final answer does not change the emoji on the
+    // user's inbound message; the next turn_end does. This is a
+    // deliberate revert of the PR #602 follow-up that wired delivery-
+    // confirmation into the terminal path (see #1713 issue body for
+    // the rationale: "delivery confirmation ≠ turn end").
     // #1664 — mark the turn's final answer as delivered when this reply
     // looks like the real answer rather than an interim ack. The
     // classification (notification-bearing OR substantive length) lives
@@ -6523,10 +6561,12 @@ function handleSessionEvent(ev: SessionEvent): void {
             ...(threadId != null ? { threadId } : {}),
           },
         )
-        const ceKey = statusKey(chatId, threadId)
-        const ctrl = activeStatusReactions.get(ceKey)
-        if (ctrl) ctrl.setError()
-        purgeReactionTracking(ceKey)
+        // #1713: context-exhaustion is a terminal failure path — paint 😱
+        // and finalize the controller. `setError` alone is non-terminal
+        // (recovery permitted); since this turn is genuinely ending, route
+        // through `finalize('error')` so the emoji lands and the controller
+        // stops accepting further transitions.
+        finalizeStatusReaction(chatId, threadId, 'error')
         // Surfaced during CC-5 investigation (`docs/status-ask-cause-classes.md`):
         // the context-exhaust bail path teardown was missing
         // `silencePoke.endTurn(key)`. Without it, the silence-poke state for
@@ -6729,10 +6769,11 @@ function handleSessionEvent(ev: SessionEvent): void {
         }
         // Unpin without editing the message so no orphaned card lingers.
         unpinProgressCardForChat?.(chatId, threadId)
-        // Fall through to normal state cleanup (ctrl.setDone, purge, etc.)
+        // Fall through to normal state cleanup (finalize, purge, etc.)
         // but skip the regular closeProgressLane so we don't re-finalize.
-        if (ctrl) ctrl.setDone()
-        purgeReactionTracking(statusKey(chatId, threadId))
+        // #1713: silent-marker turns still finalize to 👍 — turn_end is
+        // the terminal trigger regardless of whether a reply landed.
+        finalizeStatusReaction(chatId, threadId, 'done')
         // Match the normal turn_end path's telemetry so silent-marker turns
         // still appear in turn-duration graphs.
         {
@@ -7018,7 +7059,9 @@ function handleSessionEvent(ev: SessionEvent): void {
               Date.now(),
               currentTurn?.registryKey ?? null,
             )
-            if (backstopCtrl) backstopCtrl.setDone()
+            // #1713: route the backstop terminal through finalize() —
+            // single terminal path keeps the controller contract clean.
+            if (backstopCtrl) backstopCtrl.finalize('done')
             // Unpin the card. completeTurn cleans up pinMgr's per-turn
             // state and unpins via the API. If we didn't take over a
             // turn (cardTakeover.turnKey == null), fall back to the
@@ -7034,7 +7077,9 @@ function handleSessionEvent(ev: SessionEvent): void {
             }
           } catch (err) {
             process.stderr.write(`telegram gateway: turn-flush send failed: ${(err as Error).message}\n`)
-            if (backstopCtrl) backstopCtrl.setError()
+            // #1713: backstop send failed — finalize as error so the
+            // turn ends cleanly with 😱 rather than leaving it open.
+            if (backstopCtrl) backstopCtrl.finalize('error')
           } finally {
             purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
           }
@@ -7042,8 +7087,11 @@ function handleSessionEvent(ev: SessionEvent): void {
         return
       }
 
-      if (ctrl) ctrl.setDone()
-      purgeReactionTracking(statusKey(chatId, threadId))
+      // #1713: turn_end is THE terminal trigger. Finalize via the
+      // single terminal path (👍). Any prior intermediate states
+      // pending in the debounce window are flushed by `finalize()`
+      // before the terminal emoji emits.
+      finalizeStatusReaction(chatId, threadId, 'done')
       {
         const sKey = streamKey(chatId, threadId)
         const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
