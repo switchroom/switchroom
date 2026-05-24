@@ -247,3 +247,43 @@ For posterity:
 - **v2 rewrite** (this PR series, also numbered #553): same Phase 3
   harness, plus three v2 helpers; new spec test file pins the
   three-class contract.
+
+
+## Silent-end contract (#1122 / #1161 / #1664 / #1741 / #1744)
+
+The "silent-end" safety net catches turns that end without the agent delivering a final answer via `reply` / `stream_reply`. The hook re-prompts once; on the second consecutive silent end it gives up and sends a fallback message so the turn never just vanishes.
+
+### What it is
+
+A per-agent state file (`$TELEGRAM_STATE_DIR/silent-end-pending.json`, fallback `~/.claude/channels/telegram/silent-end-pending.json`) acts as a one-bit handshake between the gateway and the Stop hook (`telegram-plugin/hooks/silent-end-interrupt-stop.mjs`). When the file exists, the Stop hook blocks the session stop and injects a re-prompt; when absent, the stop is allowed.
+
+### When the file is WRITTEN
+
+The gateway writes the file at `turn_end` if and only if `turn.finalAnswerDelivered === false` — i.e. no `reply` or `stream_reply` call during this turn passed the `isFinalAnswerReply` predicate. See `gateway.ts` around L7267 (`recordUndeliveredTurnEnd`). The write is idempotent across re-prompt rounds: the same turnKey inherits the prior `retryCount`; a different turnKey resets to 0.
+
+### When the file is CLEARED
+
+The gateway calls `clearSilentEndState(turnKey)` on every reply that qualifies as the final answer. Three call sites:
+
+1. `executeReply` (gateway.ts L4599-4611) — fires on every `reply` tool call. Clears iff `isFinalAnswerReply` returns true.
+2. `executeStreamReply` first-emit branch (gateway.ts L5172-5195) — fires only on the FIRST emit per stream (gated by `!activeDraftStreams.has(sKey)`). Clears iff that first emit qualifies as final.
+3. `executeStreamReply` final-answer site (gateway.ts L5335-5358, added in #1744 follow-up) — fires on every emit that qualifies as final, regardless of whether it is the first emit. This is the load-bearing site for streams whose first emit was ack-shaped but whose later emit (typically `done=true`) carries the real answer. Without site 3, such streams leak the state file.
+
+The clear is fail-silent and turnKey-keyed: a clear for turnKey A does NOT unlink a state file written for turnKey B (see `silent-end.ts clearSilentEndState`). This makes calling it unconditionally on every final-answer emit safe.
+
+### The gate predicate
+
+A reply qualifies as the final answer when `isFinalAnswerReply` returns true. The predicate (in `final-answer-detect.ts`) is a logical OR of three signals:
+
+- `done === true` (stream_reply terminal call), OR
+- `disableNotification === false` (pacing-contract final-answer signal), OR
+- `text.length >= 200` (length backstop for substantive replies mis-marked as interim).
+
+A reply with `disable_notification: true`, short text, and no `done` is an interim ack — it never clears the state.
+
+### Send sites and tests
+
+- `executeReply` (gateway.ts:4340) — single send site, single clear (site 1 above).
+- `executeStreamReply` (gateway.ts:5089) — two clear sites (sites 2 and 3 above) to cover both the first-emit and the later-emit final-answer paths.
+- Unit coverage: `tests/silent-end.test.ts` (`#1741` block) — the executeReply gate as a unit.
+- Integration coverage: `tests/silent-end-integration.test.ts` (#1744) — the stream first-emit-vs-later-emit branching, with the ack-then-final regression case pinned.
