@@ -35,6 +35,7 @@ import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
+import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 
 /**
  * Result of a single doctor check.
@@ -2478,6 +2479,10 @@ export function registerDoctorCommand(program: Command): void {
           },
           { title: "Legacy State", results: checkLegacyState() },
           { title: "Vault", results: checkVault(config) },
+          {
+            title: "Vault-broker durability",
+            results: runVaultBrokerDurabilityChecks(config),
+          },
           { title: "Vault access", results: await runSecretAccessChecks(config) },
           { title: "Memory (Hindsight)", results: await checkHindsight(config) },
           { title: "Telegram", results: await checkTelegram(config) },
