@@ -1,15 +1,31 @@
 /**
  * Programmatic vault write from the Telegram plugin path.
  *
- * Reuses the existing `runVaultCli`-style approach (spawn `switchroom vault
- * set` with SWITCHROOM_VAULT_PASSPHRASE in env and the secret piped on
- * stdin) so we don't have to import and open the vault directly from this
- * subprocess.
+ * Two flavors:
  *
- * Exposed as a pure function for testability: callers inject the spawn
- * helper in tests to avoid needing a real vault on disk.
+ *   1. `defaultVaultWrite(slug, value, passphrase)` — shell-out to
+ *      `switchroom vault set`. The CLI forwards the passphrase to the
+ *      broker as operator-attestation (#969 P1a). Used by passphrase-
+ *      mode approval flows where the gateway cached the operator's
+ *      passphrase via /vault unlock.
+ *
+ *   2. `defaultVaultWritePosture(slug, value)` — direct broker call via
+ *      `putViaBroker(..., attest_via_posture: true)`. Used by
+ *      telegram-id-mode approval flows where the broker auto-unlocked
+ *      at boot and the gateway never needs the passphrase
+ *      (`vault.broker.approvalAuth: telegram-id` in switchroom.yaml).
+ *      Closes the UX gap where tapping Save on a `vault_request_save`
+ *      card surfaced a misleading "🔒 Vault is locked" message when
+ *      the operator hadn't run /vault unlock in that chat — even
+ *      though the broker had been unlocked for hours. The tracked
+ *      follow-up of #1115; broker side has supported the flag since
+ *      PR #1115 follow-up rev 3.
+ *
+ * Exposed as pure functions for testability: callers inject the spawn /
+ * broker helper in tests to avoid needing a real vault on disk.
  */
 import { execFileSync } from 'node:child_process'
+import { putViaBroker, resolveBrokerSocketPath } from '../../src/vault/broker/client.js'
 
 export interface VaultWriteResult {
   ok: boolean
@@ -21,6 +37,68 @@ export type VaultWriteFn = (
   value: string,
   passphrase: string,
 ) => VaultWriteResult
+
+/**
+ * Posture-attested vault write — no passphrase required. Returns the
+ * same `VaultWriteResult` shape as `defaultVaultWrite` for drop-in
+ * substitution at the gateway save / defer / auto-save callsites.
+ *
+ * Caller MUST verify `vault.broker.approvalAuth === 'telegram-id'` in
+ * config before invoking — the broker will reject `attest_via_posture`
+ * under passphrase mode with `attest_via_posture requires
+ * vault.broker.approvalAuth: telegram-id` (server.ts:1500). The
+ * gateway's `VAULT_APPROVAL_AUTH_MODE` flag is the canonical signal.
+ *
+ * Returns `{ ok: false, output: ... }` on any broker error so the
+ * gateway's existing parseVaultCliError / renderVaultCliError path
+ * still works.
+ */
+/**
+ * Test-injection seam for `defaultVaultWritePosture`. Production
+ * callers omit and get the live broker client; tests pass mock
+ * functions to avoid `vi.mock` / `mock.module` (which don't
+ * cross-runtime cleanly — vitest's `vi.mock` and bun:test's
+ * `mock.module` need separate wiring and shadow other tests' module
+ * imports if not carefully isolated).
+ */
+export interface VaultWritePostureDeps {
+  putViaBroker?: typeof putViaBroker
+  resolveBrokerSocketPath?: typeof resolveBrokerSocketPath
+}
+
+export type VaultWritePostureFn = (
+  slug: string,
+  value: string,
+  deps?: VaultWritePostureDeps,
+) => Promise<VaultWriteResult>
+
+export const defaultVaultWritePosture: VaultWritePostureFn = async (
+  slug,
+  value,
+  deps,
+) => {
+  const put = deps?.putViaBroker ?? putViaBroker
+  const resolveSocket = deps?.resolveBrokerSocketPath ?? resolveBrokerSocketPath
+  const socket = resolveSocket()
+  const result = await put(
+    slug,
+    { kind: 'string', value },
+    { socket, attest_via_posture: true, timeoutMs: 10000 },
+  )
+  if (result.kind === 'ok') {
+    return { ok: true, output: `sent (key: ${slug})` }
+  }
+  // Mirror the CLI's error format so the existing parseVaultCliError
+  // / renderVaultCliError stack handles broker-mediated failures
+  // without a special branch.
+  const prefix =
+    result.kind === 'unreachable'
+      ? 'VAULT-BROKER-UNREACHABLE'
+      : result.kind === 'denied'
+        ? `VAULT-BROKER-DENIED (${result.code})`
+        : `VAULT-BROKER-${result.code}`
+  return { ok: false, output: `${prefix}: ${result.msg}` }
+}
 
 export type VaultListFn = (passphrase: string) => { ok: boolean; keys: string[] }
 
