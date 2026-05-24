@@ -301,6 +301,111 @@ describe('recordUndeliveredTurnEnd — #1664 extended trigger', () => {
   })
 })
 
+describe('#1741 — ack reply must not clear silent-end state', () => {
+  // The gateway gates `clearSilentEndState` at the reply send-site on
+  // `isFinalAnswerReply`. These tests reproduce that gate as a unit:
+  // simulate a turn's reply sequence by calling the same predicate the
+  // gateway uses, and assert state-file persistence matches the contract.
+  //
+  // Why this matters: if `turn_end` never lands (Claude Code's
+  // `turn_duration` system event is unreliable for trivial-prompt
+  // turns), the only line of defence between an undelivered turn and
+  // the Stop hook is the persistence of `silent-end-pending.json`.
+  // Pre-fix, an ack reply cleared the file unconditionally — so the
+  // Stop hook found no state and allowed the stop on every ack-then-
+  // tool-then-silent shape. Post-fix, only a plausibly-final reply
+  // clears it.
+
+  function simulateReplyAtGateway(
+    reply: { text: string; disableNotification: boolean; done?: boolean },
+    turnKey: string,
+  ): void {
+    // The gateway calls clearSilentEndState ONLY when isFinalAnswerReply
+    // is true. Mirror that gate exactly.
+    if (isFinalAnswerReply(reply)) {
+      clearSilentEndState(turnKey)
+    }
+  }
+
+  it('ack reply (disable_notification, short, no done) does NOT clear pending state', () => {
+    // A prior turn-end already wrote state (or a re-prompt round wrote it).
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    // Agent sends an interim ack.
+    simulateReplyAtGateway(
+      { text: 'On it', disableNotification: true },
+      'c:_',
+    )
+    // State must persist — the Stop hook still needs to be able to
+    // catch a subsequent silent end.
+    expect(readSilentEndState()).not.toBeNull()
+    expect(readSilentEndState()!.turnKey).toBe('c:_')
+  })
+
+  it('final-answer reply (disable_notification=false) clears the state', () => {
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    simulateReplyAtGateway(
+      { text: "Done — here's the result.", disableNotification: false },
+      'c:_',
+    )
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('stream_reply done=true clears the state even with disable_notification=true', () => {
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    simulateReplyAtGateway(
+      { text: 'ok', disableNotification: true, done: true },
+      'c:_',
+    )
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('long ack-shaped reply (>=200 chars) is treated as final and clears the state', () => {
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    simulateReplyAtGateway(
+      { text: 'x'.repeat(250), disableNotification: true },
+      'c:_',
+    )
+    expect(readSilentEndState()).toBeNull()
+  })
+
+  it('ack-then-silent end-to-end: ack does not clear, Stop hook still blocks', () => {
+    // 1. The previous undelivered turn-end wrote state, OR the turn
+    //    starts fresh and only the Stop hook will see this state file
+    //    once the gateway re-writes it. Simulate the gateway's writer
+    //    firing at turn-end with finalAnswerDelivered=false (no
+    //    qualifying reply happened this turn).
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    // 2. Mid-turn ack reply lands. Pre-fix this would unlink the
+    //    state file; post-fix it must persist.
+    simulateReplyAtGateway(
+      { text: 'On it, working on it…', disableNotification: true },
+      'c:_',
+    )
+    // 3. Stop hook fires (separately tested below): it must still
+    //    find the state file and decide to block. Verify the file is
+    //    intact at the path the hook reads.
+    const state = readSilentEndState()
+    expect(state).not.toBeNull()
+    expect(state!.turnKey).toBe('c:_')
+  })
+
+  it('ack-then-final: ack does not clear, final clears', () => {
+    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+    // Interim ack — state persists.
+    simulateReplyAtGateway(
+      { text: 'On it', disableNotification: true },
+      'c:_',
+    )
+    expect(readSilentEndState()).not.toBeNull()
+    // Final answer — state cleared.
+    simulateReplyAtGateway(
+      { text: 'Done — the answer is 42.', disableNotification: false },
+      'c:_',
+    )
+    expect(readSilentEndState()).toBeNull()
+  })
+})
+
 describe('silent-end-interrupt-stop hook — integration', () => {
   const hookPath = join(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs')
 
