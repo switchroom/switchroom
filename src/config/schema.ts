@@ -1860,6 +1860,51 @@ export const QuotaConfigSchema = z.object({
  * bind mounts for admin agents so the daemon can dispatch a closed
  * set of operator verbs reached from inside the containers.
  */
+/**
+ * Pull-based release-triggered fleet restart (#1743).
+ *
+ * Closes the deployment-lag gap: hostd polls the remote image tag on
+ * a fixed interval, and when the remote digest diverges from the
+ * deployed digest it runs `switchroom update` then `switchroom
+ * restart all` (graceful — drains in-flight turns).
+ */
+export const AutoReleaseCheckSchema = z.object({
+  enabled: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, hostd polls the remote release tag every " +
+      "`interval_minutes` and applies + restarts the fleet when a new " +
+      "release is detected. Default false — opt-in.",
+    ),
+  interval_minutes: z
+    .number()
+    .int()
+    .min(5)
+    .max(1440)
+    .default(5)
+    .describe(
+      "Poll interval in minutes. Floor of 5m matches the agent-config " +
+      "cron rate limit; ceiling of 1440m (24h) is a sanity cap.",
+    ),
+  apply_on_detect: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When false, hostd logs `release_detected` but does NOT call " +
+      "update_apply / restart all. Useful for dogfooding the detector " +
+      "without rolling the fleet.",
+    ),
+  image_ref: z
+    .string()
+    .default("ghcr.io/switchroom/switchroom-agent:latest")
+    .describe(
+      "Image reference whose remote digest is compared to the local " +
+      "image digest. Defaults to the agent image's :latest tag, which " +
+      "is the canonical signal that a release has been promoted.",
+    ),
+});
+
 export const HostControlConfigSchema = z.object({
   enabled: z
     .boolean()
@@ -1881,6 +1926,12 @@ export const HostControlConfigSchema = z.object({
       "still rely on the in-container `spawnSwitchroomDetached` " +
       "shellout (removal is tracked as RFC C Phase 3).",
     ),
+  auto_release_check: AutoReleaseCheckSchema.default({}).describe(
+    "Pull-based release-triggered fleet restart (#1743). hostd polls " +
+    "the remote release tag on a fixed interval and applies + " +
+    "restarts the fleet (graceful) when a new release is detected. " +
+    "Opt-in: default enabled=false.",
+  ),
 });
 
 /**
@@ -2158,6 +2209,7 @@ export type AgentDriveConfig = z.infer<typeof AgentDriveConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;
 export type HostControlConfig = z.infer<typeof HostControlConfigSchema>;
+export type AutoReleaseCheck = z.infer<typeof AutoReleaseCheckSchema>;
 export type HostdConfig = z.infer<typeof HostdConfigSchema>;
 export type AuthConfig = NonNullable<z.infer<typeof SwitchroomConfigSchema>["auth"]>;
 export type AuthConsumer = NonNullable<AuthConfig["consumers"]>[number];
