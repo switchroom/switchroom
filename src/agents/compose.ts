@@ -951,6 +951,32 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // because broker appends; broker runs as root with CAP_DAC_OVERRIDE
   // so file ownership/mode doesn't gate the write path. See #1025.
   lines.push(`      - ${homePrefix}/.switchroom/vault-audit.log:/root/.switchroom/vault-audit.log`);
+  // Capability grants DB — bind-mount the host SQLite file into the
+  // broker so grants survive container recreate. Without this mount
+  // the broker writes to `/root/.switchroom/vault-grants.db` inside
+  // the container (which evaporates on every recreate). The token
+  // files on disk (`~/.switchroom/agents/<agent>/.vault-token`)
+  // persist via the per-agent bind mounts and reference a grant ID
+  // that no longer exists in the fresh broker DB — the broker's
+  // #1496 fall-through routes the call to the standing schedule.
+  // secrets ACL, which usually denies because the granted key
+  // isn't in the agent's static config (the whole reason a grant
+  // was minted in the first place). Surfaces as
+  // `VAULT-BROKER-DENIED [DENIED]: key 'X' not in ACL for agent
+  // 'Y'` on every `switchroom vault get` from inside the agent
+  // container after a broker recreate.
+  //
+  // Surfaced 2026-05-24 after the v0.13.31 broker recreate wiped
+  // every grant minted earlier the same day (clerk's vg_5e1991 for
+  // `ha/access-token`). The doctor probe doesn't catch this — it
+  // only inspects path-as-identity ACL, not grant-based access.
+  //
+  // Pre-created mode 0600 by `ensureHostMountSources()` (apply.ts)
+  // so docker doesn't auto-create a directory at the source path.
+  // Broker writes via root with CAP_DAC_OVERRIDE so file
+  // ownership doesn't gate the write path. (Same pattern as
+  // vault-audit.log above and host-control-audit.log on hostd.)
+  lines.push(`      - ${homePrefix}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`);
   // /etc/machine-id passthrough — required so the broker can derive
   // the same machine-bound key the host's `enable-auto-unlock` used
   // to seal the auto-unlock blob. The agent base image (node:22-bookworm-slim)

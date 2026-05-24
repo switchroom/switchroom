@@ -328,6 +328,25 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
     writeFileSync(auditLogPath, "", { mode: 0o644 });
   }
 
+  // vault-grants.db: capability-token grants persisted to a SQLite
+  // file. Same dir-vs-file race as vault-audit.log — if the source
+  // path doesn't exist, docker auto-creates it as a root-owned
+  // DIRECTORY and the broker can't write. Pre-create as a 0-byte
+  // file owned by the operator (mode 0600 — secrets material, no
+  // group/other access). The broker's `openGrantsDb` runs the SQL
+  // migration on first open and turns the empty file into a valid
+  // schema, so the broker boots cleanly on either a fresh empty
+  // file OR an existing populated DB.
+  //
+  // Without this bind mount + pre-create, broker recreates wipe
+  // every capability grant — the orphaned `.vault-token` files
+  // on disk then fail every `vault get` from inside agent
+  // containers. Surfaced 2026-05-24 after the v0.13.31 rollout.
+  const grantsDbPath = join(home, ".switchroom", "vault-grants.db");
+  if (!existsSync(grantsDbPath)) {
+    writeFileSync(grantsDbPath, "", { mode: 0o600 });
+  }
+
   // host-control-audit.log: same pattern as vault-audit.log — hostd
   // is the writer (from inside its own container at /host-home),
   // admin agents bind-mount it :ro so `/audit hostd` (#1328) can
