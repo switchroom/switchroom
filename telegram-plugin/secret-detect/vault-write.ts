@@ -53,14 +53,34 @@ export type VaultWriteFn = (
  * gateway's existing parseVaultCliError / renderVaultCliError path
  * still works.
  */
+/**
+ * Test-injection seam for `defaultVaultWritePosture`. Production
+ * callers omit and get the live broker client; tests pass mock
+ * functions to avoid `vi.mock` / `mock.module` (which don't
+ * cross-runtime cleanly — vitest's `vi.mock` and bun:test's
+ * `mock.module` need separate wiring and shadow other tests' module
+ * imports if not carefully isolated).
+ */
+export interface VaultWritePostureDeps {
+  putViaBroker?: typeof putViaBroker
+  resolveBrokerSocketPath?: typeof resolveBrokerSocketPath
+}
+
 export type VaultWritePostureFn = (
   slug: string,
   value: string,
+  deps?: VaultWritePostureDeps,
 ) => Promise<VaultWriteResult>
 
-export const defaultVaultWritePosture: VaultWritePostureFn = async (slug, value) => {
-  const socket = resolveBrokerSocketPath()
-  const result = await putViaBroker(
+export const defaultVaultWritePosture: VaultWritePostureFn = async (
+  slug,
+  value,
+  deps,
+) => {
+  const put = deps?.putViaBroker ?? putViaBroker
+  const resolveSocket = deps?.resolveBrokerSocketPath ?? resolveBrokerSocketPath
+  const socket = resolveSocket()
+  const result = await put(
     slug,
     { kind: 'string', value },
     { socket, attest_via_posture: true, timeoutMs: 10000 },

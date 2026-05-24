@@ -14,64 +14,75 @@
  *   - Forwards `kind: 'string'` entry shape verbatim (only kind the
  *     `vault_request_save` MCP tool emits).
  *
- * We mock `putViaBroker` so the unit test never hits a real socket /
- * a real vault.
+ * Test seam: the helper accepts an optional `deps` param so tests
+ * inject mock fns directly (no `vi.mock` / `mock.module`). This
+ * keeps the test runnable under both vitest AND bun:test without
+ * the module-cache cross-pollination that broke an earlier rev.
  */
 
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { defaultVaultWritePosture } from '../secret-detect/vault-write.js'
+import type { PutResult } from '../../src/vault/broker/client.js'
 
-vi.mock('../../src/vault/broker/client.js', () => ({
-  putViaBroker: vi.fn(),
-  resolveBrokerSocketPath: vi.fn(() => '/run/switchroom/broker/sock'),
-}))
+type PutCall = {
+  slug: string
+  entry: { kind: 'string'; value: string } | { kind: 'binary'; value: string }
+  opts: { socket?: string; attest_via_posture?: boolean; timeoutMs?: number }
+}
 
-const { defaultVaultWritePosture } = await import('../secret-detect/vault-write.js')
-const brokerClient = await import('../../src/vault/broker/client.js')
-const putMock = brokerClient.putViaBroker as ReturnType<typeof vi.fn>
+function makeDeps(putResult: PutResult, socket = '/run/switchroom/broker/sock'): {
+  deps: { putViaBroker: (...args: never[]) => Promise<PutResult>; resolveBrokerSocketPath: () => string }
+  calls: PutCall[]
+} {
+  const calls: PutCall[] = []
+  const deps = {
+    putViaBroker: async (...args: never[]): Promise<PutResult> => {
+      const [slug, entry, opts] = args as unknown as [PutCall['slug'], PutCall['entry'], PutCall['opts']]
+      calls.push({ slug, entry, opts })
+      return putResult
+    },
+    resolveBrokerSocketPath: () => socket,
+  }
+  return { deps, calls }
+}
 
 describe('defaultVaultWritePosture', () => {
-  beforeEach(() => {
-    putMock.mockReset()
-  })
-
   it('returns { ok: true } on broker `kind: ok`', async () => {
-    putMock.mockResolvedValueOnce({ kind: 'ok' })
-    const r = await defaultVaultWritePosture('forward-email/api-key', 'sk-value')
+    const { deps } = makeDeps({ kind: 'ok' })
+    const r = await defaultVaultWritePosture('forward-email/api-key', 'sk-value', deps)
     expect(r.ok).toBe(true)
     expect(r.output).toContain('forward-email/api-key')
   })
 
   it('forwards attest_via_posture: true on the put RPC', async () => {
-    putMock.mockResolvedValueOnce({ kind: 'ok' })
-    await defaultVaultWritePosture('ha/access-token', 'jwt-value')
-    expect(putMock).toHaveBeenCalledTimes(1)
-    const [, , opts] = putMock.mock.calls[0]
-    expect(opts).toMatchObject({ attest_via_posture: true })
+    const { deps, calls } = makeDeps({ kind: 'ok' })
+    await defaultVaultWritePosture('ha/access-token', 'jwt-value', deps)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].opts.attest_via_posture).toBe(true)
   })
 
   it('forwards kind: string entry verbatim', async () => {
-    putMock.mockResolvedValueOnce({ kind: 'ok' })
-    await defaultVaultWritePosture('some-key', 'some-value')
-    const [keyArg, entryArg] = putMock.mock.calls[0]
-    expect(keyArg).toBe('some-key')
-    expect(entryArg).toEqual({ kind: 'string', value: 'some-value' })
+    const { deps, calls } = makeDeps({ kind: 'ok' })
+    await defaultVaultWritePosture('some-key', 'some-value', deps)
+    expect(calls[0].slug).toBe('some-key')
+    expect(calls[0].entry).toEqual({ kind: 'string', value: 'some-value' })
   })
 
   it('returns ok:false with VAULT-BROKER-UNREACHABLE prefix on unreachable', async () => {
-    putMock.mockResolvedValueOnce({ kind: 'unreachable', msg: 'connect ENOENT' })
-    const r = await defaultVaultWritePosture('k', 'v')
+    const { deps } = makeDeps({ kind: 'unreachable', msg: 'connect ENOENT' })
+    const r = await defaultVaultWritePosture('k', 'v', deps)
     expect(r.ok).toBe(false)
     expect(r.output).toContain('VAULT-BROKER-UNREACHABLE')
     expect(r.output).toContain('connect ENOENT')
   })
 
   it('returns ok:false with VAULT-BROKER-DENIED prefix on denied', async () => {
-    putMock.mockResolvedValueOnce({
+    const { deps } = makeDeps({
       kind: 'denied',
       code: 'DENIED',
       msg: 'attest_via_posture requires telegram-id',
     })
-    const r = await defaultVaultWritePosture('k', 'v')
+    const r = await defaultVaultWritePosture('k', 'v', deps)
     expect(r.ok).toBe(false)
     expect(r.output).toContain('VAULT-BROKER-DENIED')
     expect(r.output).toContain('DENIED')
@@ -79,22 +90,19 @@ describe('defaultVaultWritePosture', () => {
   })
 
   it('returns ok:false with VAULT-BROKER-UNKNOWN_KEY prefix on not_found', async () => {
-    putMock.mockResolvedValueOnce({
+    const { deps } = makeDeps({
       kind: 'not_found',
       code: 'UNKNOWN_KEY',
       msg: 'no such key',
     })
-    const r = await defaultVaultWritePosture('k', 'v')
+    const r = await defaultVaultWritePosture('k', 'v', deps)
     expect(r.ok).toBe(false)
     expect(r.output).toContain('VAULT-BROKER-UNKNOWN_KEY')
   })
 
-  it('resolves the broker socket via resolveBrokerSocketPath()', async () => {
-    const resolveMock = brokerClient.resolveBrokerSocketPath as ReturnType<typeof vi.fn>
-    resolveMock.mockReturnValueOnce('/tmp/test-socket')
-    putMock.mockResolvedValueOnce({ kind: 'ok' })
-    await defaultVaultWritePosture('k', 'v')
-    const [, , opts] = putMock.mock.calls[0]
-    expect(opts).toMatchObject({ socket: '/tmp/test-socket' })
+  it('resolves the broker socket via the injected resolveBrokerSocketPath', async () => {
+    const { deps, calls } = makeDeps({ kind: 'ok' }, '/tmp/test-socket')
+    await defaultVaultWritePosture('k', 'v', deps)
+    expect(calls[0].opts.socket).toBe('/tmp/test-socket')
   })
 })
