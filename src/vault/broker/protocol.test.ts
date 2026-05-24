@@ -151,3 +151,97 @@ describe("malformed JSON rejection", () => {
     ).toThrow();
   });
 });
+
+// ─── Agent-name validation (#1448) ─────────────────────────────────────────
+//
+// Pre-fix the broker accepted any non-empty `agent` string on mint_grant
+// (and friends) and joined it directly into a filesystem path
+// (`~/.switchroom/agents/<agent>/.vault-token`). A peer with broker-IPC
+// access could escape the agents tree with `agent: "../foo"`. The
+// validation now happens at the schema layer so the bad request is
+// rejected before any filesystem call is reached.
+
+describe("agent-name validation on broker requests (#1448)", () => {
+  // Minimum-viable mint_grant body — the test mutates only `agent`.
+  function mintGrantBody(agent: unknown) {
+    return JSON.stringify({
+      v: 1,
+      op: "mint_grant",
+      agent,
+      keys: ["some_key"],
+      ttl_seconds: 60,
+      passphrase: "doesn't-matter-rejected-before-broker-runs",
+    });
+  }
+
+  it("accepts a kebab-case agent slug (regression)", () => {
+    // Common-case agent names must continue to validate cleanly.
+    for (const ok of ["klanker", "gymbro", "lawgpt", "carrie", "finn", "a1", "z9", "agent-1", "a_b_c"]) {
+      expect(() => decodeRequest(mintGrantBody(ok))).not.toThrow();
+    }
+  });
+
+  it("rejects path-traversal agent names", () => {
+    expect(() => decodeRequest(mintGrantBody("../escape"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("foo/../bar"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody(".."))).toThrow();
+  });
+
+  it("rejects absolute-path agent names", () => {
+    expect(() => decodeRequest(mintGrantBody("/etc/passwd"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("/abs"))).toThrow();
+  });
+
+  it("rejects names with separators or shell metacharacters", () => {
+    expect(() => decodeRequest(mintGrantBody("foo/bar"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("foo bar"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("foo;bar"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("foo\nbar"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("foo\\bar"))).toThrow();
+  });
+
+  it("rejects names starting with non-alnum (dot, hyphen, underscore)", () => {
+    // Leading `-` or `_` would collide with CLI flag parsing in audit
+    // contexts; leading `.` is the dotfile escape.
+    expect(() => decodeRequest(mintGrantBody(".hidden"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("-flag"))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("_under"))).toThrow();
+  });
+
+  it("rejects reserved identity names (operator)", () => {
+    // `operator` resolves to the operator identity in peercred; allowing
+    // it as an agent slug lets a malicious peer mis-route mint_grant.
+    expect(() => decodeRequest(mintGrantBody("operator"))).toThrow();
+  });
+
+  it("rejects empty and overlong names", () => {
+    expect(() => decodeRequest(mintGrantBody(""))).toThrow();
+    expect(() => decodeRequest(mintGrantBody("a".repeat(65)))).toThrow();
+    // Exactly 64 is at the boundary and should pass.
+    expect(() => decodeRequest(mintGrantBody("a".repeat(64)))).not.toThrow();
+  });
+
+  it("applies the same validation to list_grants (when agent is set)", () => {
+    const body = JSON.stringify({
+      v: 1,
+      op: "list_grants",
+      agent: "../escape",
+    });
+    expect(() => decodeRequest(body)).toThrow();
+  });
+
+  it("list_grants accepts omitted agent (back-compat)", () => {
+    const body = JSON.stringify({ v: 1, op: "list_grants" });
+    expect(() => decodeRequest(body)).not.toThrow();
+  });
+
+  it("applies the same validation to preflight_access", () => {
+    const body = JSON.stringify({
+      v: 1,
+      op: "preflight_access",
+      agent: "foo/../bar",
+      keys: ["k"],
+    });
+    expect(() => decodeRequest(body)).toThrow();
+  });
+});
