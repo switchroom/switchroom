@@ -63,6 +63,22 @@ export function spoolId(msg: InboundMessage): string {
   ) {
     return `s:handback:${msg.meta.subagent_jsonl_id}`
   }
+  // Subagent progress envelopes (#1720): deterministic per (jsonl id,
+  // bucket idx) — every elapsed bucket collapses to one live entry, so
+  // a re-fire within the same bucket window (or after a gateway
+  // restart) is a structural no-op. The bucket idx is computed by the
+  // gateway from `floor(elapsedMs / progressIntervalMs)` so a worker
+  // that emits narrative lines every 30s only produces one envelope
+  // per bucket. Mirrors the #1719 handback-spoolId pattern.
+  if (
+    msg.meta?.source === 'subagent_progress' &&
+    typeof msg.meta?.subagent_jsonl_id === 'string' &&
+    msg.meta.subagent_jsonl_id.length > 0 &&
+    typeof msg.meta?.bucket_idx === 'string' &&
+    msg.meta.bucket_idx.length > 0
+  ) {
+    return `s:progress:${msg.meta.subagent_jsonl_id}:${msg.meta.bucket_idx}`
+  }
   if (typeof msg.messageId === 'number' && msg.messageId > 0) {
     return `m:${msg.chatId}:${msg.messageId}`
   }
@@ -118,8 +134,22 @@ export interface InboundSpool {
    *  registered bridge. Idempotent. */
   ack: (msg: InboundMessage) => void
   /** Live (un-acked) entries, oldest first. Used at boot to re-push
-   *  into the in-memory buffer. Pure read — does not mutate. */
+   *  into the in-memory buffer. Pure read — does not mutate.
+   *
+   *  TTL (#1720): an entry whose `msg.meta.expiresAt` is a numeric ms
+   *  epoch in the past is OMITTED from the result. Progress envelopes
+   *  carry a TTL because stale progress lies ("still working (5m)"
+   *  delivered 4h after the worker finished is worse than no progress);
+   *  handback envelopes never set `expiresAt` so this is a no-op for
+   *  them. */
   liveEntries: () => ReplayEntry[]
+  /** Drop every live entry whose spool id matches the predicate. Used
+   *  by the handback path (#1720) to sweep stale progress envelopes
+   *  for the same sub-agent at the moment the handback is queued —
+   *  otherwise a progress envelope queued moments before the worker
+   *  finished could land on top of the handback turn. Tombstones the
+   *  dropped entries durably. */
+  dropMatching: (predicate: (id: string) => boolean) => number
   /** Escalate+drop entries older than `escalateAfterMs`. Calls
    *  `onEscalate` once per dropped entry (post the "couldn't deliver"
    *  card there). Returns the count escalated. Safe to call on a timer. */
@@ -257,7 +287,30 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     },
     liveEntries() {
       // Insertion order = Map iteration order = oldest first.
-      return [...live.values()].map((e) => ({ agent: e.agent, msg: e.msg }))
+      // TTL filter (#1720): skip entries whose meta.expiresAt is in the
+      // past. The on-disk log keeps them (cheap); compaction sweeps.
+      const cutoff = now()
+      const out: ReplayEntry[] = []
+      for (const e of live.values()) {
+        const expRaw = e.msg.meta?.expiresAt
+        if (typeof expRaw === 'string' && expRaw.length > 0) {
+          const exp = Number(expRaw)
+          if (Number.isFinite(exp) && exp <= cutoff) continue
+        }
+        out.push({ agent: e.agent, msg: e.msg })
+      }
+      return out
+    },
+    dropMatching(predicate) {
+      let n = 0
+      for (const [id, _e] of [...live.entries()]) {
+        if (!predicate(id)) continue
+        live.delete(id)
+        appendRecord({ t: 'ack', id })
+        n++
+      }
+      if (n > 0) maybeCompact()
+      return n
     },
     sweepEscalations(onEscalate) {
       const cutoff = now() - escalateAfterMs

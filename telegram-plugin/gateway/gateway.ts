@@ -288,6 +288,10 @@ import {
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
 import { decideSubagentHandback } from './subagent-handback-inbound-builder.js'
+import {
+  decideSubagentProgress,
+  DEFAULT_PROGRESS_INTERVAL_MS,
+} from './subagent-progress-inbound-builder.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
   ToolCallMessage,
@@ -15857,6 +15861,28 @@ void (async () => {
                   return
                 }
 
+                // #1720: when the handback is queued, sweep any still-
+                // live progress envelopes for the SAME sub-agent out of
+                // the spool. Without this a progress envelope queued
+                // moments before the worker finished could land on top
+                // of the handback turn, producing a duplicated /
+                // contradictory "still running" line. Prefix match on
+                // `s:progress:<jsonl_agent_id>:` — see `inbound-spool.ts`
+                // spoolId branch.
+                try {
+                  const progressPrefix = `s:progress:${agentId}:`
+                  const dropped = inboundSpool?.dropMatching((id) => id.startsWith(progressPrefix)) ?? 0
+                  if (dropped > 0) {
+                    process.stderr.write(
+                      `telegram gateway: subagent-handback ${agentId} swept ${dropped} live progress envelope(s) from spool\n`,
+                    )
+                  }
+                } catch (err) {
+                  process.stderr.write(
+                    `telegram gateway: subagent-handback ${agentId} progress-sweep error: ${(err as Error).message}\n`,
+                  )
+                }
+
                 // Deliver via pendingInboundBuffer + the idle-drain tick.
                 // The drain only releases at an idle prompt (no active
                 // turn), so the handback always lands as a clean fresh
@@ -15864,6 +15890,60 @@ void (async () => {
                 pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
                 process.stderr.write(
                   `telegram gateway: subagent-handback queued agent=${agentId} outcome=${outcome} chat=${decision.chatId} resultChars=${resultText.length}\n`,
+                )
+              },
+              // conversational-pacing beat 3 — mid-flight progress for
+              // background workers (#1720). Fires on every
+              // `sub_agent_text` event; the pure `decideSubagentProgress`
+              // gates on (a) background flag, (b) bucket-not-yet-fired
+              // (deterministic `floor(elapsed / interval)`), (c) chat
+              // resolves. Envelope spoolId is
+              // `s:progress:<jsonl_agent_id>:<bucketIdx>` so a re-fire
+              // within the same bucket — or across a gateway restart —
+              // collapses to one live entry. TTL on `meta.expiresAt`
+              // suppresses stale-after-restart delivery (a 4-h-old
+              // "still working (5m)" would be a lie). Sweep on handback
+              // lives in the `onFinish` block just above.
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx }) => {
+                let fleetChatId = ''
+                let isBackground = false
+                try {
+                  const fleets = progressDriver?.peekAllFleets() ?? []
+                  for (const f of fleets) {
+                    if (f.fleet.has(agentId)) {
+                      fleetChatId = f.chatId ?? ''
+                      break
+                    }
+                  }
+                } catch { /* peek failures non-fatal */ }
+                if (turnsDb != null) {
+                  try {
+                    const row = turnsDb
+                      .prepare('SELECT background FROM subagents WHERE jsonl_agent_id = ?')
+                      .get(agentId) as { background: number } | undefined
+                    if (row != null) isBackground = row.background === 1
+                  } catch { /* best-effort */ }
+                }
+                if (!isBackground) return // skip overhead for foreground
+
+                const decision = decideSubagentProgress({
+                  disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
+                  isBackground,
+                  fleetChatId,
+                  ownerChatId: loadAccess().allowFrom[0] ?? '',
+                  subagentJsonlId: agentId,
+                  taskDescription: description,
+                  latestSummary,
+                  elapsedMs,
+                  progressIntervalMs: DEFAULT_PROGRESS_INTERVAL_MS,
+                  lastBucketIdx: prevBucketIdx,
+                })
+                if (!decision.deliver) return
+
+                setBucketIdx(decision.bucketIdx)
+                pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
+                process.stderr.write(
+                  `telegram gateway: subagent-progress queued agent=${agentId} bucket=${decision.bucketIdx} elapsed_ms=${elapsedMs} chat=${decision.chatId}\n`,
                 )
               },
             })
