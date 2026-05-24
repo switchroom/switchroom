@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.13.34 — silent-end determinism, handoff reliability, release self-healing
+
+Four PRs landing two reliability cleanups in the Telegram-plugin
+gateway, plus a closed loop that means future fleet upgrades happen
+automatically rather than requiring an operator `update_apply` per
+agent.
+
+### PR A — fix(#1741): gate clearSilentEndState on isFinalAnswerReply (#1744)
+
+Interim ack replies (`disable_notification: true`, text < 200 chars,
+no `done` flag) were unconditionally clearing the silent-end state
+file AND bumping `outboundMetrics.outboundCount` — silencing the
+missed-reply detector on every turn that emitted a "still working"
+ping. The fix gates both state-file clearing and outbound-count
+bumping behind `isFinalAnswerReply({ text, disableNotification, done })`
+at both call sites (`executeReply`, `executeStreamReply`). 6 new unit
+tests in `tests/silent-end.test.ts` exercise the ack-persists,
+final-clears, length-backstop, and ack-then-final-ordering branches.
+
+### PR B — silent-end follow-ups: stream_reply edge case, integration test, docs (#1748)
+
+Reviewer follow-ups from PR A:
+
+- `clearSilentEndState` now also fires next to
+  `turn.finalAnswerDelivered = true` at `gateway.ts:5343` — handles
+  streams whose FIRST emit was ack-shaped (skipping the first-emit
+  gate) but whose LATER emit flips `done=true`. The clear is
+  turnKey-matched so unconditional invocation on every final-answer
+  emit is idempotent.
+- New `tests/silent-end-integration.test.ts` walks the full stream
+  state machine through ack→final ordering — closes the gap left by
+  PR A's inline-gate unit tests.
+- "Silent-end contract" section added to
+  `telegram-plugin/docs/waiting-ux-spec.md`.
+
+### PR C — feat(#1743): release-triggered fleet restart (pull-based) (#1747)
+
+Opt-in `ReleaseWatcher` inside `hostd` polls `docker manifest
+inspect` (remote digest) vs `docker image inspect` (local digest) on
+a configurable interval. On new release detected, runs `switchroom
+update` + `switchroom restart all`. Default off (`host_control.
+auto_release_check.enabled: false`); operators flip it on per host.
+Closes the deploy-lag root cause where a binary rebuild only
+propagated to running agents on next manual restart. Telemetry
+JSONL at `~/.switchroom/release-watcher-events.jsonl` records every
+state transition; the AC's `time_from_release_to_fleet_caught_up_
+seconds` counter equals `duration_ms` on the `fleet_caught_up` row.
+8 unit tests cover all branches (available/unavailable, apply
+failure, check failure, overlap, stop).
+
+### PR D — fix: handoff yaml dep + remove fictional live-briefing fallback (#1749)
+
+Closes #1745 and #1746:
+
+- `src/cli/handoff.ts` catches `ConfigError` from `loadConfig()` and
+  falls back to defaults (`agentDir = $CLAUDE_PROJECT_DIR ?? cwd`,
+  `max_turns_in_briefing = 50`). The yaml is not bind-mounted into
+  sandboxed agent containers, so the previous hard-require produced
+  a red issue card on every Stop turn-end on every sandboxed agent
+  and prevented `.handoff.md` from ever being written.
+- `src/agents/scaffold.ts` drops the `--config '/state/config/
+  switchroom.yaml'` arg from the emitted Stop-hook command. The
+  `configPath` field on `HooksBlockParams` is marked `@deprecated`.
+- Drift test in `tests/reconcile-hooks-drift.test.ts` flipped to
+  assert the inverse (must NEVER contain `--config`).
+- CLAUDE.md scaffold template (`profiles/default/CLAUDE.md.hbs`)
+  refined to accurately describe the live-briefing path that
+  `handoff-briefing.sh` provides.
+
 ## v0.13.33 — doctor: vault-broker durability section (regression coverage for the v0.13.27-32 wedge cluster)
 
 Single feature PR (#1739). New doctor section `Vault-broker durability`
