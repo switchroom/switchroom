@@ -27,6 +27,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { chainRow, seedChain, type ChainState } from "../../util/audit-hashchain.js";
+import { safeAuditLogPath } from "./test-isolation-guard.js";
 
 /** Operations the broker can perform. (PR-6: `approval_consume_record`
  *  is an additive member of the shared broker/kernel request union, so
@@ -149,7 +150,11 @@ export function callerFromPeer(peer: {
  * Linux for a low-volume audit channel.
  */
 export function createAuditLogger(opts: AuditLoggerOptions = {}): AuditLogger {
-  const logPath = opts.path ?? defaultAuditLogPath();
+  // test-isolation guard: under the test runner, a would-be-production
+  // path (a broker built without an explicit _testAuditLogger) is
+  // redirected to a tmp file so tests can't pollute the operator's real
+  // vault-audit.log. No-op in production. See test-isolation-guard.ts.
+  const logPath = safeAuditLogPath(opts.path ?? defaultAuditLogPath());
   // sec WS10-F2 / #1417: per-row hash chain for tamper-evidence.
   // Seeded once from the existing log tail at broker startup; advanced
   // in-process per write (single-writer-process contract — see
