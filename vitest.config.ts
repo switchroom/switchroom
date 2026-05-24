@@ -104,6 +104,7 @@ export default defineConfig({
       "**/src/vault/broker/server-mint-grant-posture-attest.test.ts",
       "**/src/vault/broker/client-token.test.ts",
       "**/src/vault/broker/server-unlock.test.ts",
+      "**/src/vault/broker/server-per-agent-unlock.test.ts",
       "**/src/vault/broker/auto-unlock.test.ts",
       // RFC E drive disconnect tests use bun's `mock()` primitive — run
       // via test:bun. The other Phase 1a/1b/1c drive tests use no bun-

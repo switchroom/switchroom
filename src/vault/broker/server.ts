@@ -565,19 +565,54 @@ export class VaultBroker {
         // (still-root-owned) parent dir to create the socket node.
         // Errors swallowed for non-docker dev/test runs where CAP_CHOWN
         // isn't held (callers run as the same UID as agents).
+        let agentUid: number | null = null;
         try {
-          const uid = allocateAgentUid(agentName);
-          try { chownSync(abs, uid, uid); } catch { /* see above */ }
+          agentUid = allocateAgentUid(agentName);
+          try { chownSync(abs, agentUid, agentUid); } catch { /* see above */ }
           if (abs.endsWith("/sock")) {
             const dir = abs.slice(0, -"/sock".length);
-            try { chownSync(dir, uid, uid); } catch { /* see above */ }
+            try { chownSync(dir, agentUid, agentUid); } catch { /* see above */ }
           }
         } catch {
           // allocateAgentUid is deterministic and pure; swallow only to
           // protect the listen() callback from any unexpected throw.
         }
         this.agentServers.set(abs, { server, agentName });
-        resolveP(agentName);
+
+        // Pair an unlock listener at the canonical sibling path
+        // (`<dir>/unlock` for subdir shape, `<name>.unlock.sock` for
+        // flat shape — `unlockSocketFor` is the single source of truth
+        // shared with the client). Without this, an in-container
+        // `vault unlock` from the agent (e.g. Telegram `/vault unlock`)
+        // gets ENOENT: the client derives the unlock path from the
+        // data socket but the broker would never have bound it. The
+        // operator listener (`bindOperatorListener`) already pairs the
+        // sockets this way; we mirror that here for per-agent peers.
+        // peercred stays ON (the operator-only carve-out from #1561
+        // does not apply — agents must still verify).
+        const unlockAbs = unlockSocketFor(abs);
+        if (existsSync(unlockAbs)) {
+          try { unlinkSync(unlockAbs); } catch { /* tolerate */ }
+        }
+        const unlockServer = net.createServer((sock) => {
+          this._handleUnlockConnection(sock, false);
+        });
+        unlockServer.on("error", (err) => {
+          // Tear down the data listener so the broker doesn't drift
+          // into a half-bound state (data up, unlock down) where the
+          // documented `/vault unlock` flow keeps failing silently.
+          try { server.close(); } catch { /* ignore */ }
+          this.agentServers.delete(abs);
+          rejectP(err);
+        });
+        unlockServer.listen(unlockAbs, () => {
+          try { chmodSync(unlockAbs, 0o660); } catch { /* ignore */ }
+          if (agentUid !== null) {
+            try { chownSync(unlockAbs, agentUid, agentUid); } catch { /* dev/no CAP_CHOWN */ }
+          }
+          this.agentServers.set(unlockAbs, { server: unlockServer, agentName });
+          resolveP(agentName);
+        });
       });
     });
   }
