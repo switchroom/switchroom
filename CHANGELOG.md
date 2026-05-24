@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.13.29 — host vault list broker-first (UX, host CLI only)
+
+Single fix; no container image changes; no fleet roll needed — only
+the operator's local `switchroom` CLI changes.
+
+### PR A — fix(cli): vault list routes through the broker first on the host (#1731)
+
+`switchroom vault list` on the host always prompted for the operator
+passphrase, even when the broker was up and unlocked with the
+operator socket bound. `vault get` (since #1053) and `vault set`
+(since #969 P1b) both already broker-first on the host. Only `list`
+was the outlier — it routed through the broker exclusively in
+sandbox contexts.
+
+Fix: mirror the `vault get` broker-first pattern. Pre-fix behavior
+is preserved verbatim for the fallback cases.
+
+Net contract:
+- host + broker unlocked     → list via broker (no passphrase)
+- host + broker locked       → fall through to passphrase prompt
+- host + broker unreachable  → fall through to passphrase prompt
+- sandbox + broker unlocked  → list via broker (only path)
+- sandbox + broker locked    → exit 3 (mirrors `vault get`)
+- sandbox + broker unreach.  → exit 6 (preserves pre-fix sandbox)
+
 ## v0.13.28 — v0.13.27 wedge fix (final-answer reply releases buffer gate)
 
 v0.13.27 was released and immediately reverted because every agent
