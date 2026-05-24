@@ -493,6 +493,158 @@ export function checkLegacyState(): CheckResult[] {
   return results;
 }
 
+/**
+ * Probe the vault-broker container for the per-agent socket *pair* —
+ * both `<dir>/sock` (data) AND `<dir>/unlock`. Mirrors
+ * `probeAuthBrokerSocket` for the sibling auth-broker.
+ *
+ * The unlock half historically went unbound by `bindAgentSocket()` —
+ * the documented Telegram `/vault unlock` flow returned
+ * `ENOENT /run/switchroom/broker/unlock` because the broker only paired
+ * data + unlock for the *operator* listener, never for per-agent
+ * peers. PR #1721 fixed `bindAgentSocket` itself; this probe is the
+ * operational regression guard. Volume-mount config drift, an out-of-
+ * date broker image, or an `apply` that didn't reconcile would all
+ * surface as a missing unlock half without this probe.
+ *
+ * Return values per agent:
+ *   - "ok"             — both sock + unlock are bound
+ *   - "missing-unlock" — data present, unlock absent (the original bug)
+ *   - "missing-data"   — data absent (agent never bound)
+ *   - "missing-both"   — neither bound (compose mount missing)
+ *   - "unreachable"    — broker container not running / docker unavailable
+ *
+ * @internal exported for testing
+ */
+export type PerAgentSocketPairState =
+  | "ok"
+  | "missing-unlock"
+  | "missing-data"
+  | "missing-both"
+  | "unreachable";
+
+export function probeVaultBrokerSocketPair(
+  agentName: string,
+): PerAgentSocketPairState {
+  const dataPath = `/run/switchroom/broker/${agentName}/sock`;
+  const unlockPath = `/run/switchroom/broker/${agentName}/unlock`;
+  // Single `docker exec` that prints `D=<0|1> U=<0|1>` so we avoid the
+  // 4× docker exec cost (~300ms each) per agent. `test -S` exits 0 when
+  // the path is a socket, non-zero otherwise.
+  const script =
+    `D=0; U=0; ` +
+    `test -S '${dataPath}' && D=1; ` +
+    `test -S '${unlockPath}' && U=1; ` +
+    `echo "D=$D U=$U"`;
+  const r = spawnSync(
+    "docker",
+    ["exec", "switchroom-vault-broker", "sh", "-c", script],
+    { stdio: "pipe", timeout: 3000 },
+  );
+  if (r.error || r.status === null) return "unreachable";
+  if (r.status !== 0) {
+    // Non-zero from `sh -c` itself (vs the inner `test`s) → docker
+    // couldn't reach the container (no such container, daemon down, etc).
+    if (r.status >= 125) return "unreachable";
+    // Unknown shell failure — treat conservatively as unreachable so we
+    // don't false-alarm the operator with a "missing" verdict.
+    return "unreachable";
+  }
+  const out = r.stdout.toString();
+  const dOk = /D=1/.test(out);
+  const uOk = /U=1/.test(out);
+  if (dOk && uOk) return "ok";
+  if (dOk && !uOk) return "missing-unlock";
+  if (!dOk && uOk) return "missing-data";
+  return "missing-both";
+}
+
+/**
+ * Aggregate per-agent socket-pair states into a single doctor row.
+ *
+ * Fleet-scale rationale: agents typically come in 5-15 per host. One
+ * row per agent would clobber doctor output. Group the verdict and
+ * point the operator at the specific agents that are off.
+ *
+ * @internal exported for testing
+ */
+export function checkVaultBrokerSocketPairs(
+  config: SwitchroomConfig,
+  opts?: { probe?: (agentName: string) => PerAgentSocketPairState },
+): CheckResult {
+  const agentNames = Object.keys(config.agents ?? {}).sort();
+  if (agentNames.length === 0) {
+    return {
+      name: "vault-broker per-agent socket pairs",
+      status: "ok",
+      detail: "no agents configured",
+    };
+  }
+  const probe = opts?.probe ?? probeVaultBrokerSocketPair;
+  const states = new Map<string, PerAgentSocketPairState>();
+  for (const name of agentNames) {
+    states.set(name, probe(name));
+  }
+  // All unreachable → broker container not running. One honest skip row,
+  // not N "missing" rows.
+  const allUnreachable = [...states.values()].every((s) => s === "unreachable");
+  if (allUnreachable) {
+    return {
+      name: "vault-broker per-agent socket pairs",
+      status: "skip",
+      detail:
+        "vault-broker container unreachable — couldn't probe per-agent socket pairs",
+      fix: "Check the vault-broker service health row above; `switchroom update` brings it back",
+    };
+  }
+  const groups: Record<Exclude<PerAgentSocketPairState, "ok">, string[]> = {
+    "missing-unlock": [],
+    "missing-data": [],
+    "missing-both": [],
+    "unreachable": [],
+  };
+  let okCount = 0;
+  for (const [name, state] of states) {
+    if (state === "ok") {
+      okCount++;
+    } else {
+      groups[state].push(name);
+    }
+  }
+  if (okCount === agentNames.length) {
+    return {
+      name: "vault-broker per-agent socket pairs",
+      status: "ok",
+      detail: `${okCount}/${agentNames.length} agents: data + unlock sockets bound`,
+    };
+  }
+  const parts: string[] = [];
+  if (groups["missing-unlock"].length > 0) {
+    parts.push(
+      `unlock missing: ${groups["missing-unlock"].join(", ")} ` +
+      `(the documented Telegram /vault unlock flow fails ENOENT for these)`,
+    );
+  }
+  if (groups["missing-data"].length > 0) {
+    parts.push(`data missing: ${groups["missing-data"].join(", ")}`);
+  }
+  if (groups["missing-both"].length > 0) {
+    parts.push(`both missing: ${groups["missing-both"].join(", ")}`);
+  }
+  if (groups["unreachable"].length > 0) {
+    parts.push(`unreachable: ${groups["unreachable"].join(", ")}`);
+  }
+  return {
+    name: "vault-broker per-agent socket pairs",
+    status: "fail",
+    detail: `${okCount}/${agentNames.length} ok — ${parts.join("; ")}`,
+    fix:
+      "Run `switchroom update` (or `switchroom apply` then recreate the " +
+      "vault-broker container). If only the unlock half is missing, the " +
+      "broker image predates PR #1721 — pull the latest image.",
+  };
+}
+
 function checkVault(config: SwitchroomConfig): CheckResult[] {
   const vaultPath = config.vault?.path
     ? config.vault.path.replace(/^~/, process.env.HOME ?? "")
@@ -524,6 +676,8 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
           detail: "Approval auth: passphrase (two-factor)",
         };
 
+  const pairsResult = checkVaultBrokerSocketPairs(config);
+
   if (!existsSync(vaultPath)) {
     return [
       postureResult,
@@ -533,6 +687,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
         detail: `${vaultPath} not found`,
         fix: "Run `switchroom vault init` if you plan to store secrets in the vault",
       },
+      pairsResult,
     ];
   }
 
@@ -551,6 +706,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
         detail: "SWITCHROOM_VAULT_PASSPHRASE not set; cannot verify decrypt",
         fix: "Export SWITCHROOM_VAULT_PASSPHRASE to verify the vault unlocks",
       },
+      pairsResult,
     ];
   }
 
@@ -563,6 +719,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
         status: "ok",
         detail: `${keys.length} secret(s)`,
       },
+      pairsResult,
     ];
   } catch (err) {
     return [
@@ -573,6 +730,7 @@ function checkVault(config: SwitchroomConfig): CheckResult[] {
         detail: (err as Error).message,
         fix: "SWITCHROOM_VAULT_PASSPHRASE is wrong, or the vault file is corrupted",
       },
+      pairsResult,
     ];
   }
 }
