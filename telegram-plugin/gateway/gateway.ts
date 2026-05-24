@@ -4594,12 +4594,21 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // #1122 KPI: a `reply` always produces a fresh user-visible outbound
   // message — count it for the outbound-gap / TTFO KPI AND reset the
   // silence-poke clock so the next poke is measured from this send.
-  // Also clear any silent-end state file so the Stop hook doesn't fire
-  // a stale block when the session ends (deterministic restore of the
-  // detection PR3 inadvertently removed).
   signalTracker.noteOutbound(statusKey(chat_id, threadId), Date.now())
   silencePoke.noteOutbound(statusKey(chat_id, threadId), Date.now())
-  clearSilentEndState(statusKey(chat_id, threadId))
+  // #1741 — only clear silent-end state on a plausibly-final reply.
+  // An interim ack (disable_notification:true, short text, no done)
+  // must NOT clear the state file; otherwise a turn that ends with
+  // ack-only + answer-as-transcript leaves no state for the Stop
+  // hook to act on if `turn_end` never lands (the `turn_duration`
+  // system event is unreliable for trivial-prompt turns — see the
+  // executeReply finalize comments). Final-answer replies still
+  // clear; the main turn-end path also re-writes the state when
+  // finalAnswerDelivered=false, so this is a belt-and-braces gate
+  // for the turn_end-missing case (#1741).
+  if (isFinalAnswerReply({ text: rawText, disableNotification })) {
+    clearSilentEndState(statusKey(chat_id, threadId))
+  }
 
   if (previewMessageId != null && reply_to != null && replyMode !== 'off') {
     await deleteStalePreview(previewMessageId)
@@ -5170,7 +5179,19 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       const sKey = statusKey(streamChatId, streamThreadId)
       signalTracker.noteOutbound(sKey, Date.now())
       silencePoke.noteOutbound(sKey, Date.now())
-      clearSilentEndState(sKey)
+      // #1741 — see executeReply for the rationale: only a plausibly-
+      // final stream_reply clears the silent-end state. An interim
+      // ack via stream_reply must NOT clear; the Stop hook needs
+      // the state to persist if turn_end fails to land.
+      if (
+        isFinalAnswerReply({
+          text: (args.text as string | undefined) ?? '',
+          disableNotification: args.disable_notification === true,
+          done: args.done === true,
+        })
+      ) {
+        clearSilentEndState(sKey)
+      }
     }
   }
 
