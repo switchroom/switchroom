@@ -54,11 +54,10 @@ describe('#1713 — plain reply tool is a non-event for the reaction', () => {
   })
 
   it('reply tool deps no longer wire a status-reaction terminal callback', () => {
-    // The stream-reply-handler `endStatusReaction` dep remains defined
-    // for back-compat with test fixtures and gateway wiring, but its
-    // call sites inside the handler are gone. This test pins that the
-    // stream-reply-handler source contains no live call to
-    // `deps.endStatusReaction`.
+    // Post-#1713 the stream-reply-handler has no call site for
+    // `deps.endStatusReaction`. Post follow-up cleanup, the dep itself
+    // is gone too — this test pins that the stream-reply-handler source
+    // contains no live call to `deps.endStatusReaction`.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const fs = require('node:fs') as typeof import('node:fs')
     // eslint-disable-next-line @typescript-eslint/no-require-imports

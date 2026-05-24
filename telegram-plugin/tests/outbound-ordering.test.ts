@@ -215,7 +215,6 @@ describe('wrapBot + handleStreamReply + reply ordering', () => {
       disableLinkPreview: true,
       defaultFormat: 'text',
       logStreamingEvent: () => {},
-      endStatusReaction: () => {},
       historyEnabled: false,
       recordOutbound: () => {},
       writeError: () => {},
