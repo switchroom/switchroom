@@ -556,7 +556,6 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
           for (const line of rendered.split("\n")) {
             console.log(`    ${line}`);
           }
-          console.log(`  model: ${rule.model ?? "claude-sonnet-4-6"}`);
         }
 
         console.log();
@@ -566,7 +565,8 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
           console.log(
             chalk.green(
               `${matchCount} rule(s) matched. ` +
-              `Run without --dry-run in production to spawn claude -p.`,
+              `The webhook turn injects into the agent's live session — ` +
+              `agent's configured model wins.`,
             ),
           );
         }

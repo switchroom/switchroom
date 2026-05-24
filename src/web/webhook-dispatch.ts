@@ -80,13 +80,6 @@ export interface DispatchRule {
   /** Cooldown duration string: "5m", "1h", "30s". Defaults to "0" (no cooldown). */
   cooldown?: string
   quiet_hours?: QuietHours
-  /**
-   * Deprecated and ignored since #1620. A webhook turn now runs inside
-   * the agent's live interactive session, which uses the agent's own
-   * configured model — there is no per-turn model override. Retained
-   * as an optional field only so existing configs still parse.
-   */
-  model?: string
 }
 
 export interface WebhookDispatchConfig {
