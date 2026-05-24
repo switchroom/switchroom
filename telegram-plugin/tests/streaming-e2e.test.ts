@@ -94,7 +94,6 @@ function setup(opts: { progressCardActive?: boolean } = {}): Fixture {
       disableLinkPreview: true,
       defaultFormat: 'html',
       logStreamingEvent: () => {},
-      endStatusReaction: () => {},
       historyEnabled: false,
       recordOutbound: () => {},
       writeError: () => {},

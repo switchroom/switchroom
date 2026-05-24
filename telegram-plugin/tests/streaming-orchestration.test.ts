@@ -413,7 +413,6 @@ function makeActivityDeps(
     disableLinkPreview: true,
     defaultFormat: 'text',
     logStreamingEvent: () => {},
-    endStatusReaction: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
     writeError: () => {},

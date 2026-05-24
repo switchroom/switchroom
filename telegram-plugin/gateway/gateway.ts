@@ -1687,21 +1687,6 @@ function paintStatusReactionError(chatId: string, threadId: number | undefined):
   ctrl.setError()
 }
 
-/**
- * Back-compat shim — kept so call sites that haven't migrated yet
- * compile. New code should call `finalizeStatusReaction` (terminal) or
- * `paintStatusReactionError` (non-terminal) instead.
- *
- * @deprecated Use `finalizeStatusReaction` / `paintStatusReactionError`.
- */
-function endStatusReaction(chatId: string, threadId: number | undefined, outcome: 'done' | 'error'): void {
-  if (outcome === 'done') {
-    finalizeStatusReaction(chatId, threadId, 'done')
-  } else {
-    finalizeStatusReaction(chatId, threadId, 'error')
-  }
-}
-
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
   if (explicit != null) return Number(explicit)
   return chatThreadMap.get(chat_id)
@@ -6934,24 +6919,12 @@ function handleSessionEvent(ev: SessionEvent): void {
               const recentCount = getRecentOutboundCount(backstopChatId, 2)
               if (recentCount > 0) {
                 process.stderr.write(`telegram gateway: turn-flush suppressed — reply tool sent ${recentCount} message(s) within 2s\n`)
-                // Bug D fix: do NOT fire setDone here. The previous code
-                // assumed `recentCount > 0` was sufficient proof of delivery
-                // — and it is, since recordOutbound is called synchronously
-                // after sendMessage success. But firing setDone here races
-                // with the stream_reply done=true callback (Bug Z) which now
-                // fires endStatusReaction after finalize() resolves (i.e.
-                // after the final edit lands in Telegram). Both racing on
-                // setDone is harmless (setDone is idempotent post-terminal),
-                // but the dedup branch firing FIRST means we'd be claiming
-                // delivery from a 500ms-lagged read of local history rather
-                // than from the actual API confirmation. Letting Bug Z's
-                // post-finalize callback own the 👍 transition keeps the
-                // emoji tied to true delivery. The plain `reply` tool path
-                // (PR #602 follow-up) now also fires endStatusReaction
-                // directly from executeReply after sendMessage resolves,
-                // mirroring this contract — so reply-only turns transition
-                // to terminal 👍 in their own success path rather than
-                // relying on this dedup heuristic.
+                // Do NOT finalize the status reaction here. As of #1713
+                // the reaction is only finalized by the `turn_end` IPC
+                // handler — mid-turn delivery proofs (local history,
+                // stream finalize callbacks, executeReply post-send) no
+                // longer transition the emoji. This branch just purges
+                // the per-turn reaction tracking entry and returns.
                 purgeReactionTracking(statusKey(backstopChatId, backstopThreadId))
                 return
               }
@@ -15942,6 +15915,17 @@ void (async () => {
 
                 setBucketIdx(decision.bucketIdx)
                 pendingInboundBuffer.push(process.env.SWITCHROOM_AGENT_NAME ?? '', decision.inbound)
+                // #1725 follow-up: yield the cross-turn ambient ticker
+                // for this chat. With the progress envelope queued, the
+                // model is about to compose an explicit in-voice
+                // progress line — letting the "— still working (Nm)"
+                // edit fire in parallel would double-surface the
+                // signal. Progress envelopes target the chat level
+                // (no thread id), matching how the inbound lands.
+                pendingProgress.clearPending(
+                  statusKey(decision.chatId, undefined),
+                  'progress',
+                )
                 process.stderr.write(
                   `telegram gateway: subagent-progress queued agent=${agentId} bucket=${decision.bucketIdx} elapsed_ms=${elapsedMs} chat=${decision.chatId}\n`,
                 )

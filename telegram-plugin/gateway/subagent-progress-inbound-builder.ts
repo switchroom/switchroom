@@ -199,10 +199,28 @@ export type SubagentProgressDecision =
  *      The earliest envelope is bucket 1 (≥ one full window in).
  *   6. bucket-already-fired — same bucket → same spoolId → no-op.
  */
+/**
+ * Parse a boolean-ish env var. Treats `undefined`, empty string, `'0'`,
+ * `'false'`, `'no'`, `'off'` (case-insensitive, trimmed) as OFF. Any
+ * other non-empty value is ON.
+ *
+ * The original gate used `value !== '0'`, which foot-gunned on
+ * `'false'` / `'no'` / `'off'` — treating those as enabled instead of
+ * disabled. Centralising the parse here keeps the kill-switch
+ * interpretation a single hop from the var-read site.
+ */
+export function isEnvFlagOn(value: string | undefined): boolean {
+  if (value == null) return false
+  const v = value.trim().toLowerCase()
+  if (v === '') return false
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false
+  return true
+}
+
 export function decideSubagentProgress(
   input: SubagentProgressDecisionInput,
 ): SubagentProgressDecision {
-  if (input.disableEnvValue != null && input.disableEnvValue !== '' && input.disableEnvValue !== '0') {
+  if (isEnvFlagOn(input.disableEnvValue)) {
     return { deliver: false, reason: 'env-disabled' }
   }
   if (!input.isBackground) {

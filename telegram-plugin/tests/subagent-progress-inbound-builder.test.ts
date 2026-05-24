@@ -21,6 +21,7 @@ import { describe, it, expect } from 'vitest'
 import {
   buildSubagentProgressInbound,
   decideSubagentProgress,
+  isEnvFlagOn,
   DEFAULT_PROGRESS_INTERVAL_MS,
   PROGRESS_DESC_MAX,
   PROGRESS_RESULT_MAX,
@@ -159,6 +160,19 @@ describe('buildSubagentProgressInbound', () => {
   })
 })
 
+describe('isEnvFlagOn — bool env parser', () => {
+  it('treats unset / empty / 0 / false / no / off as OFF (case-insensitive, trimmed)', () => {
+    for (const v of [undefined, '', '0', 'false', 'FALSE', 'False', 'no', 'NO', 'off', 'OFF', '  0  ', ' false ']) {
+      expect(isEnvFlagOn(v), `value=${JSON.stringify(v)}`).toBe(false)
+    }
+  })
+  it('treats 1 / true / yes / arbitrary non-empty as ON', () => {
+    for (const v of ['1', 'true', 'TRUE', 'yes', 'on', 'enabled', 'kill', 'anything']) {
+      expect(isEnvFlagOn(v), `value=${JSON.stringify(v)}`).toBe(true)
+    }
+  })
+})
+
 describe('decideSubagentProgress', () => {
   function baseInput(over: Partial<Parameters<typeof decideSubagentProgress>[0]> = {}) {
     return {
@@ -191,6 +205,21 @@ describe('decideSubagentProgress', () => {
     const d = decideSubagentProgress(baseInput({ disableEnvValue: '1' }))
     expect(d.deliver).toBe(false)
     if (!d.deliver) expect(d.reason).toBe('env-disabled')
+  })
+
+  it('kill-switch treats `false`/`no`/`off`/empty/unset as OFF (not enabled)', () => {
+    for (const v of [undefined, '', '0', 'false', 'FALSE', 'False', 'no', 'NO', 'off', 'OFF', '  0  ', ' false ']) {
+      const d = decideSubagentProgress(baseInput({ disableEnvValue: v }))
+      expect(d.deliver, `value=${JSON.stringify(v)} should NOT be env-disabled`).toBe(true)
+    }
+  })
+
+  it('kill-switch treats `1`/`true`/`yes`/arbitrary non-empty as ON', () => {
+    for (const v of ['1', 'true', 'TRUE', 'yes', 'on', 'enabled', 'kill']) {
+      const d = decideSubagentProgress(baseInput({ disableEnvValue: v }))
+      expect(d.deliver, `value=${JSON.stringify(v)} should be env-disabled`).toBe(false)
+      if (!d.deliver) expect(d.reason).toBe('env-disabled')
+    }
   })
 
   it('foreground sub-agents skip (parent already sees the narrative)', () => {
