@@ -5341,6 +5341,20 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     })
   ) {
     turn.finalAnswerDelivered = true
+    // #1744 follow-up — stream_reply edge case. The first-emit gate at
+    // L5178 only clears silent-end state on the FIRST emit of a stream.
+    // If a stream's first emit was ack-shaped (disable_notification:true,
+    // short text, no done) it correctly did NOT clear the state. But a
+    // LATER emit in the same stream may flip `done=true` or carry
+    // substantive text — that's the real final answer landing, and the
+    // state file must be cleared here too. clearSilentEndState is
+    // idempotent (no-op when the file is absent or the turnKey doesn't
+    // match), so calling it unconditionally on every final-answer-shaped
+    // emit is safe even if the first-emit path already cleared.
+    const streamThreadIdForClear = args.message_thread_id != null
+      ? Number(args.message_thread_id)
+      : undefined
+    clearSilentEndState(statusKey(streamChatId, streamThreadIdForClear))
   }
   // v0.13.30 follow-up — release the buffer gate on every successful
   // stream_reply too. Same rationale as executeReply: short replies
