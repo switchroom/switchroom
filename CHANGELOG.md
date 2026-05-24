@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.13.24 — telegram formatting fixes, /update apply gate, agent-config follow-up
+
+### PR A — fix(telegram): preserve parse_mode on pending-progress edits + clear draft on answer-stream stop/retract (#1698, #1704) (#1706)
+
+Two reply-path formatting bugs reported 2026-05-23/24, sharing no
+code but the same shape — a terminal edit forgot to honour what an
+earlier send established.
+
+- **#1698** — `pending-work-progress.ts` was editing the model's
+  anchor message in place every 60s with a "still working (Nm)"
+  suffix while async work was in flight, *without* `parse_mode`.
+  The anchor was sent through the `reply` MCP tool (default
+  `format: 'html'`), so every `<b>` / `<code>` / `<a>` tag in the
+  anchor re-rendered as literal text the moment the first tick
+  fired. Three user repros all matched: HTML tag near the start of
+  a message that had pending async work following it.
+  Fix: capture `anchorParseMode` in `noteOutbound`, thread through
+  `PendingProgressEditCtx`, reuse on every edit. All three
+  production callsites in the gateway (executeReply, silent-anchor
+  merge, stream_reply done=true) updated.
+- **#1704 part B** — `answer-stream.ts:stop()` and `retract()`
+  never called `sendMessageDraft(chatId, draftId, '')` to clear the
+  in-progress draft. Only `materialize()` did. So whenever a DM
+  turn ended without materialising (the common path when the model
+  goes on to call `reply` directly), the draft sat in the user's
+  compose box and Telegram Desktop blocked the user from typing
+  until the 30s draft expiry.
+  Fix: extracted `clearDraftBestEffort()` and called it from all
+  three terminal paths (stop fire-and-forget, retract awaited,
+  materialize replaces inline copy).
+- **#1704 part A** — diagnosed, not changed. The "stdout
+  auto-forward" is `turn-flush-safety`, deliberately kept as the
+  ghost-reply safety net (see docstring at line 99). Fixing part B
+  removes the perceptual half (stuck draft preview) in DMs.
+
+UAT on test-harness with the PR bundle bind-mounted confirmed: the
+pending-progress 60s ticks fire `editMessageText` with
+`parse_mode=HTML` (wire-log evidence), mtcute reads back the edited
+text without literal `<b>` / `<code>` characters, and the 11
+regression scenarios (smoke / fast-trivial / fast-ack ×8 / soft-commit
+/ rapid-followup) all stayed green.
+
+Closes #1698, #1704 (part B). Side-effects: closes #1120
+(non-reproducible — verified via UAT, fixed by intervening commit on
+format.ts), #1161 (architecturally addressed by turn-flush-safety +
+#1614 + #1664 + #1666 + PR #1706's draft cleanup), #1445 (closed-in-
+spirit by #1669 cross-turn pending-progress; this PR fixes a parse_mode
+regression in that fix).
+
+### PR B — feat(gateway): split /update apply availability gate by hostd state (#1469, #1470) (#1707)
+
+`/update apply` previously failed-fast when hostd was unreachable,
+producing an opaque error. PR splits the availability gate so:
+
+- `host_control.enabled=false` → clean "host-control disabled, run on
+  host CLI" error (closes #1469)
+- `host_control.enabled=true` but per-agent hostd socket absent →
+  prompt operator to install hostd via the existing `/update install
+  hostd` flow (closes #1470)
+
+### PR C — fix(agent-config): gate remaining in-agent-unsafe blocks in reconcileAgent (#1705)
+
+Follow-up to #1618 — three additional reconcile blocks needed the
+`!isInAgent` gate to avoid double-applying drift fixes that hostd
+already owns. No user-visible behaviour change; closes a low-priority
+fleet log-noise source.
+
+### Smaller fixes bundled
+
+- **fix(vault)** (#1661) — redirect mis-isolated broker tests away from
+  the live vault. Closes a 2026-05-22 incident-class fix; the broker
+  tests now provably never touch `~/.switchroom/vault/vault.enc`.
+- **test(telegram)** (#1697) — unskip `jtbd-interrupt-marker-dm` after
+  the #1689 framework fix.
+- **docs(claudemd)** (#1703) — top-level CLAUDE.md audit + restructure
+  (~140 lines cut, 3 process gaps closed). Operator-only.
+
 ## v0.13.23 — revert v0.13.22's CPU cap (was making rerank 3-10x slower)
 
 ### fix(hindsight) — revert CPU cap (#1701)
