@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.13.28 — v0.13.27 wedge fix (final-answer reply releases buffer gate)
+
+v0.13.27 was released and immediately reverted because every agent
+wedged on `inbound held mid-turn — will flush on turn-complete` with
+the gate never opening. v0.13.28 ships the targeted fix.
+
+### PR A — fix(#1728): release buffer gate on final-answer reply (#1729)
+
+Root cause: #1718's contract change made `turn_end` the sole terminal
+trigger for BOTH the 👍 reaction AND the per-turn buffer gate
+(`activeTurnStartedAt`). Pre-#1718, `executeReply` synchronously
+called `endStatusReaction('done')` → `purgeReactionTracking` which
+cleared `activeTurnStartedAt[key]` on every reply. Removing that
+call deferred the cleanup to `turn_end`. But Claude Code's
+`turn_duration` system event doesn't reliably land in the JSONL
+session tail for the trivial-prompt happy path (driver sends
+"what's 2+2", model replies "4", no `turn_duration` ever fires).
+When `turn_end` never fires, `activeTurnStartedAt[key]` stays set
+forever and every subsequent inbound queues without delivery.
+
+The contract was right in spirit (turn_end SHOULD be the sole
+terminal trigger) but it relied on an upstream guarantee the Claude
+CLI doesn't actually make. Production logs going back to 2026-05-21
+show the pre-existing 300s `silence-poke framework-fallback` firing
+regularly even on v0.13.26 with `currentTurn_nulled=false` — so this
+wedge class existed pre-#1718; #1718 just promoted it from tail-case
+to the common case for every trivial-prompt turn.
+
+Fix: when `executeReply` detects the final answer
+(`isFinalAnswerReply` — same classifier #1664 uses for silent-end
+re-prompt gating), it now calls
+`finalizeStatusReaction(chat_id, threadId, 'done')`. That fires the
+debounced 👍 AND calls `purgeReactionTracking` which releases the
+buffer gate. Interim acks (`isFinalAnswerReply === false`) bypass
+this branch and remain non-events for the reaction (preserves
+#1713's working-state ladder). `currentTurn` itself stays alive; a
+subsequent `turn_end` event still cleans up its share idempotently.
+
+Net contract:
+- interim ack reply → non-event for reaction, buffer gate stays
+- final-answer reply → finalize reaction (debounced 👍), release
+                       buffer gate, currentTurn unchanged
+- `turn_end` event → unchanged (still terminal, idempotent)
+
+Tests: `telegram-plugin/tests/reply-terminal-reaction.test.ts`
+updated to pin both halves of the new contract — the legacy
+`endStatusReaction('done')` regression guard stays, plus a new case
+asserts `finalizeStatusReaction` IS called AND IS gated on
+`isFinalAnswerReply`. Full plugin suite green (vitest 2738/2738 +
+bun 3324/3324).
+
 ## v0.13.27 — reflective status reactions + deterministic handback/progress envelopes
 
 Four PRs tightening the conversational-pacing primitives the user
