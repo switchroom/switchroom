@@ -95,6 +95,28 @@ describe('buildSubagentHandbackInbound', () => {
     expect(inbound.text).toContain('…')
   })
 
+  it('carries meta.subagent_jsonl_id when jsonlAgentId is provided (#1719 dedup key)', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: {
+        chatId: '12345',
+        taskDescription: 'x',
+        resultText: 'y',
+        outcome: 'completed',
+        jsonlAgentId: 'jsonl-xyz',
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.meta.subagent_jsonl_id).toBe('jsonl-xyz')
+  })
+
+  it('omits meta.subagent_jsonl_id when jsonlAgentId is not provided (back-compat)', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: { chatId: '12345', taskDescription: 'x', resultText: 'y', outcome: 'completed' },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.meta.subagent_jsonl_id).toBeUndefined()
+  })
+
   it('falls back to a placeholder when the description is blank', () => {
     const inbound = buildSubagentHandbackInbound({
       ctx: { chatId: '99', taskDescription: '   ', resultText: 'x', outcome: 'completed' },
