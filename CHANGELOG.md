@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.13.38 — approval-card collapsed view shows what + why without expanding
+
+### fix(telegram): approval-card collapsed view (#1790, PR #1794)
+
+Skill / MCP / generic-tool permission cards rendered as a single line
+`🔐 Permission: <title>` with the agent's stated rationale and the
+input preview hidden behind "See more". Operators couldn't tell why
+they were being asked to approve. The vault `vault_request_access`
+card already had a multi-line layout — it was the gold standard. This
+release converges all three approval surfaces on the vault layout:
+
+```
+🔐 <agent> · <tool summary>
+why: <description-or-"not provided">
+```
+
+Specifics:
+
+- **`telegram-plugin/permission-title.ts`** — new
+  `formatPermissionCardBody({toolName, inputPreview, description,
+  agentName})` pure function builds the multi-line HTML-escaped body.
+  Always renders the why-line: when the agent omitted `description`,
+  renders `why: <i>not provided</i>` so a missing rationale is visible
+  as an agent-side failure rather than a card-template choice.
+- **Skill summarizer** no longer returns bare `Skill` when no
+  skill-name key matches. Falls through `command` → first scalar arg
+  hint before giving up. Closes the regression that produced
+  "🔐 Permission: Skill" with zero context.
+- **MCP summarizer** appends `(key: value)` for the first scalar arg
+  of any uncurated MCP tool (skips routing-only keys like `chat_id` /
+  `message_thread_id` / `request_id`). Operators see context on
+  third-party / new MCP tools without an expand tap.
+- **`onPermissionRequest`** (`telegram-plugin/gateway/gateway.ts`)
+  switched to the new body builder. Send call now carries
+  `parse_mode: 'HTML'`. Passes `_client.agentName` so the operator
+  sees which agent is asking.
+- **`renderVaultRequestAccessCard`** always renders the why-line —
+  `why: <i>not provided</i>` when reason is missing.
+- **`bridge.ts`** vault tool description nudges agents to supply
+  `reason`; explains that omission will render as "not provided"
+  which operators will usually take as a Deny signal.
+
+UAT on test-harness (bind-mounted dist) triggered the vault card and
+observed clean rendering: `🔐 test-harness wants vault access / key:
+pr1790-uat-fake / scope: read · duration: 30d / why: PR #1790 card
+layout UAT` — no literal HTML tags, parse_mode=HTML honoured.
+
+Out of scope: the expanded "See more" view stays as-is — collapsed-
+view fix only. No bridge / IPC protocol changes (`description` was
+already on the wire from Claude Code's `PermissionRequest` payload).
+
 ## v0.13.37 — user-declared mcp_servers reach .mcp.json (regression class fix)
 
 Audit-driven release closing a class regression that shipped silently
