@@ -32,23 +32,25 @@ description: >
 
 When the user asks about agent status, what's running, uptime, or wants to see agent info, answer by running (or telling them to run) `switchroom agent list` — this is the canonical command for showing running agents, their uptime, and current state.
 
-## Step 1 — Always mention `switchroom agent list` in your response
+## Step 1 — Always mention `switchroom status` in your response
 
-The answer to "what agents are running", "show me agent info", "list all switchroom agents", or any uptime question is the `switchroom agent list` command. Your response MUST include the literal command string `switchroom agent list` so the user can copy it. If you have Bash tool access, run it and include the output. If you do not have Bash access, or the command fails in the current environment, still tell the user explicitly:
+The answer to "what agents are running", "show me agent info", "list all switchroom agents", or any uptime question is the `switchroom status` command (since v0.13.51). Your response MUST include the literal command string `switchroom status` so the user can copy it. If you have Bash tool access, run it and include the output. If you do not have Bash access, or the command fails in the current environment, still tell the user explicitly:
 
-> Run `switchroom agent list` from your switchroom project directory to see running agents, their uptime, and status.
+> Run `switchroom status` from your switchroom project directory to see running agents (uptime + scheduler), known auth accounts, and per-agent MCP connection state.
 
-Do not respond with a PATH-not-found bailout or a "no config found" diagnosis without first giving the user the command — the eval environment may not have a config on cwd, but on the user's actual machine `switchroom agent list` is the right command.
+Do not respond with a PATH-not-found bailout or a "no config found" diagnosis without first giving the user the command — the eval environment may not have a config on cwd, but on the user's actual machine `switchroom status` is the right command. (Pre-v0.13.51 the canonical command was `switchroom agent list` — that still works but only shows the Fleet section.)
 
 ## Step 2 — Try to run it
 
 If you have Bash tool access, run:
 
 ```bash
-switchroom agent list --json 2>/dev/null || switchroom agent list
+switchroom status --json 2>/dev/null || switchroom status
 ```
 
-If that succeeds, parse the output and present the running agent list with full uptime, status, and model details (see Step 3). If it fails (e.g. command not found, no config in cwd), still include the `switchroom agent list` command and the word "uptime" in your text response — the user needs those as actionable information.
+`switchroom status` returns three sections: **Fleet** (per-agent uptime + scheduler), **Accounts** (broker-known auth accounts with active marker), and **MCPs** (per-agent MCP connection state). If you want to skip the MCP probe (slower because it does a docker exec per agent), pass `--no-mcp`.
+
+If `switchroom status` fails (e.g. command not found, no config in cwd), fall back to `switchroom agent list` (older command, Fleet-only). Still include the `switchroom status` command and the word "uptime" in your text response — the user needs those as actionable information.
 
 ## Step 3 — For each agent, report running state and uptime
 
