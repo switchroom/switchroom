@@ -592,3 +592,174 @@ describe("ACL: Google OAuth client credential (RFC G §4.4 completion)", () => {
     expect(checkAclByAgent(config, "klanker", "stripe/api-key").allow).toBe(false);
   });
 });
+
+// ─── User-declared MCP-server secrets (PR #1799 follow-up) ────────────
+//
+// Operators wire MCP servers via `defaults.mcp_servers.<name>` in
+// switchroom.yaml; the cascade merges the entry onto every agent that
+// inherits defaults. Pre-fix the ACL only honored `schedule.secrets[]`,
+// so an MCP server whose launcher fetched its API key from the vault
+// (e.g. perplexity, notion) was broker-denied at spawn and silently
+// failed to connect. The new clause grants any key declared in the
+// agent's effective `mcp_servers.<name>.secrets[]`, generalising the
+// gdrive client-secret special-case to every user-declared MCP.
+
+describe("ACL: user-declared MCP-server secrets", () => {
+  // Helper — builds a config with one MCP server entry on the agent's
+  // post-cascade `mcp_servers` map (callers can assume cascade already
+  // ran). The ACL is index-blind to where the entry came from.
+  function mcpConfig(opts: {
+    agent: string;
+    mcpEntries?: Record<string, unknown>;
+    schedule?: Array<{ cron: string; prompt: string; secrets?: string[] }>;
+  }): SwitchroomConfig {
+    return {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      agents: {
+        [opts.agent]: {
+          topic_name: opts.agent,
+          ...(opts.mcpEntries ? { mcp_servers: opts.mcpEntries } : {}),
+          schedule: (opts.schedule ?? []).map((s) => ({
+            cron: s.cron,
+            prompt: s.prompt,
+            secrets: s.secrets ?? [],
+          })),
+        },
+      },
+    } as unknown as SwitchroomConfig;
+  }
+
+  it("allows a key declared under an effective mcp_servers entry", () => {
+    const config = mcpConfig({
+      agent: "clerk",
+      mcpEntries: {
+        perplexity: {
+          command: "/path/to/perplexity-mcp.sh",
+          secrets: ["perplexity/api-key"],
+        },
+      },
+    });
+    expect(checkAclByAgent(config, "clerk", "perplexity/api-key").allow).toBe(true);
+  });
+
+  it("allows even when the agent has zero schedule entries (MCP-only agent)", () => {
+    // The MCP-secret clause must short-circuit BEFORE the no-schedule
+    // early-deny — otherwise a long-running agent that uses MCPs but
+    // declares no cron would never see any broker-accessible keys.
+    const config = mcpConfig({
+      agent: "ziggy",
+      mcpEntries: {
+        notion: {
+          command: "/path/to/notion-mcp.sh",
+          secrets: ["notion/api-key"],
+        },
+      },
+      // intentionally no schedule
+    });
+    expect(checkAclByAgent(config, "ziggy", "notion/api-key").allow).toBe(true);
+  });
+
+  it("falls through to schedule.secrets for keys not in any mcp_servers entry", () => {
+    const config = mcpConfig({
+      agent: "clerk",
+      mcpEntries: {
+        perplexity: {
+          command: "/path/to/perplexity-mcp.sh",
+          secrets: ["perplexity/api-key"],
+        },
+      },
+      schedule: [
+        { cron: "0 * * * *", prompt: "p", secrets: ["microsoft/ken-tokens"] },
+      ],
+    });
+    expect(checkAclByAgent(config, "clerk", "microsoft/ken-tokens").allow).toBe(true);
+  });
+
+  it("denies a key not declared in MCP-secrets or schedule.secrets", () => {
+    const config = mcpConfig({
+      agent: "clerk",
+      mcpEntries: {
+        perplexity: {
+          command: "/path/to/perplexity-mcp.sh",
+          secrets: ["perplexity/api-key"],
+        },
+      },
+    });
+    const r = checkAclByAgent(config, "clerk", "stripe/api-key");
+    expect(r.allow).toBe(false);
+    if (!r.allow) {
+      expect(r.reason).toContain("stripe/api-key");
+    }
+  });
+
+  it("ignores `false` MCP entries (the per-agent opt-out shape)", () => {
+    // An agent that opts out of an inherited MCP (`mcp_servers:
+    // { perplexity: false }`) must NOT keep ACL access to its secrets.
+    // `false` is not an object, so Object.values + the typeof guard
+    // naturally skips it.
+    const config = mcpConfig({
+      agent: "carrie",
+      mcpEntries: { perplexity: false },
+    });
+    expect(
+      checkAclByAgent(config, "carrie", "perplexity/api-key").allow,
+    ).toBe(false);
+  });
+
+  it("ignores entries with no `secrets` array — declaring an MCP doesn't auto-grant keys", () => {
+    // The grant is opt-in per-MCP — an entry without `secrets:` gets
+    // nothing. Operators have to declare what their launcher will
+    // actually read.
+    const config = mcpConfig({
+      agent: "clerk",
+      mcpEntries: { perplexity: { command: "/path/to/perplexity-mcp.sh" } },
+    });
+    expect(
+      checkAclByAgent(config, "clerk", "perplexity/api-key").allow,
+    ).toBe(false);
+  });
+
+  it("ignores non-array `secrets` values (defensive against bad yaml)", () => {
+    const config = mcpConfig({
+      agent: "clerk",
+      mcpEntries: {
+        perplexity: {
+          command: "/path/to/perplexity-mcp.sh",
+          // operator typo — string instead of array
+          secrets: "perplexity/api-key" as unknown as string[],
+        },
+      },
+    });
+    expect(
+      checkAclByAgent(config, "clerk", "perplexity/api-key").allow,
+    ).toBe(false);
+  });
+
+  it("does not cross agents — one agent's MCP secret stays on that agent", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      agents: {
+        clerk: {
+          topic_name: "clerk",
+          mcp_servers: {
+            perplexity: {
+              command: "/path/to/perplexity-mcp.sh",
+              secrets: ["perplexity/api-key"],
+            },
+          },
+        },
+        gymbro: {
+          topic_name: "gymbro",
+          // gymbro has perplexity DISABLED — must not get the key
+          mcp_servers: { perplexity: false },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(checkAclByAgent(config, "clerk", "perplexity/api-key").allow).toBe(true);
+    expect(checkAclByAgent(config, "gymbro", "perplexity/api-key").allow).toBe(false);
+  });
+});

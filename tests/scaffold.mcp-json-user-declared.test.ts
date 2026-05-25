@@ -254,4 +254,44 @@ describe("scaffold/reconcile: user-declared mcp_servers reach .mcp.json", () => 
 
     expect(afterReconcile).toBe(afterScaffold);
   });
+
+  // ─── #1806 — switchroom-internal `secrets:` field is stripped from
+  // .mcp.json so vault key names aren't leaked to the in-container
+  // Claude session.
+  it("strips the `secrets:` field from rendered .mcp.json (#1806)", () => {
+    const name = "perplexity-agent";
+    const agentConfig = makeAgentConfig({
+      mcp_servers: {
+        perplexity: {
+          command: "/home/test/launchers/perplexity-mcp.sh",
+          // switchroom-internal: declares which vault keys the broker
+          // will serve to this agent. Must not reach .mcp.json.
+          secrets: ["perplexity/api-key"],
+        },
+      },
+    } as Partial<AgentConfig>);
+    const switchroomConfig = {
+      switchroom: {
+        version: 1,
+        agents_dir: "~/.switchroom/agents",
+        skills_dir: "~/.switchroom/skills",
+      },
+      telegram: telegramConfig,
+      agents: { [name]: agentConfig },
+    } as unknown as SwitchroomConfig;
+
+    const res = scaffoldAgent(
+      name,
+      agentConfig,
+      agentsDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+
+    const mcpJson = JSON.parse(readFileSync(join(res.agentDir, ".mcp.json"), "utf-8"));
+    expect(mcpJson.mcpServers.perplexity).toEqual({
+      command: "/home/test/launchers/perplexity-mcp.sh",
+    });
+    expect(mcpJson.mcpServers.perplexity).not.toHaveProperty("secrets");
+  });
 });

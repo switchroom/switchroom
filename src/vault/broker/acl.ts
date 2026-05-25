@@ -231,9 +231,14 @@ export function checkAcl(
  *         gated by the same `shouldEmitGdriveMcp` predicate the scaffold
  *         uses (config/google-workspace-acl.ts).
  *       · the agent's own effective `bot_token` vault ref.
- *   - If the agent has no `schedule` array (or empty) → deny: there's no
- *     declared per-cron secrets[] to consult. Long-running agent-direct
- *     access is opted in only via populated `schedule[i].secrets`.
+ *       · user-declared MCP-server secrets — any key listed under
+ *         `mcp_servers.<name>.secrets[]` in the effective (post-cascade)
+ *         config for this agent. Generalises the gdrive special-case
+ *         above so operator-declared MCPs (perplexity, notion, etc.)
+ *         can fetch their API keys at launcher spawn time without
+ *         per-agent `vault grant` ceremony.
+ *   - If the agent has no `schedule` array (or empty) AND no MCP-secret
+ *     match above → deny: nothing is broker-accessible.
  *   - If `key` appears in ANY schedule entry's secrets[] → allow. We
  *     deliberately do not require the caller to identify which schedule
  *     index they are; the broker container has no way to know that, and
@@ -317,11 +322,41 @@ export function checkAclByAgent(
     }
   }
 
+  // User-declared MCP-server secrets (#1790 follow-up — generalises
+  // the gdrive `google/client-secret` special-case above). Operators
+  // declare an MCP server's vault dependencies inline:
+  //
+  //   defaults:
+  //     mcp_servers:
+  //       perplexity:
+  //         command: /path/to/perplexity-mcp.sh
+  //         secrets: [ perplexity/api-key ]
+  //
+  // The cascade resolves `mcp_servers.perplexity` onto every agent
+  // that inherits defaults; the declared `secrets` array becomes
+  // broker-accessible to that agent under its own peercred identity.
+  //
+  // Checked BEFORE the no-schedule early-deny below so an MCP-only
+  // agent (no cron schedule) can still serve user-declared MCPs.
+  // The check tolerates `false` opt-outs (the `mcp_servers: { gdrive:
+  // false }` shape used to disable an inherited MCP) because
+  // Object.entries skips them naturally — a `false` entry has no
+  // `secrets[]` to consult.
+  const mcpServers = (agentConfig as { mcp_servers?: Record<string, unknown> })
+    .mcp_servers ?? {};
+  for (const mcpEntry of Object.values(mcpServers)) {
+    if (!mcpEntry || typeof mcpEntry !== "object") continue;
+    const declared = (mcpEntry as { secrets?: unknown }).secrets;
+    if (Array.isArray(declared) && declared.includes(key)) {
+      return { allow: true };
+    }
+  }
+
   const schedule = agentConfig.schedule ?? [];
   if (schedule.length === 0) {
     return {
       allow: false,
-      reason: `agent '${agentName}' has no schedule entries declaring 'secrets'; nothing is broker-accessible`,
+      reason: `agent '${agentName}' has no schedule entries declaring 'secrets' and no mcp_servers.*.secrets[] declaring '${key}'; nothing is broker-accessible`,
     };
   }
 
