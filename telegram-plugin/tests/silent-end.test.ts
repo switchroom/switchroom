@@ -406,7 +406,18 @@ describe('#1741 — ack reply must not clear silent-end state', () => {
   })
 })
 
-describe('silent-end-interrupt-stop hook — integration', () => {
+describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan signal)', () => {
+  // Post-#1775 the hook's BLOCK/ALLOW signal is derived from the
+  // transcript file, not the state file. The state file remains for
+  // retry-count bookkeeping only. These tests pin the new contract.
+  //
+  // The race the new contract closes: pre-fix the hook read the
+  // state file as its signal, but the gateway wrote that file
+  // ~175ms AFTER the hook fired (race lost every time). Now the
+  // hook reads `transcript_path` directly — Claude Code flushes
+  // assistant content before firing Stop hooks, so the read is
+  // race-free.
+
   const hookPath = join(__dirname, '..', 'hooks', 'silent-end-interrupt-stop.mjs')
 
   function runHook(input: object): { exit: number; stdout: string; stderr: string } {
@@ -420,75 +431,148 @@ describe('silent-end-interrupt-stop hook — integration', () => {
     return { exit: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
   }
 
-  it('allows the stop when no state file exists (normal completion)', () => {
-    const r = runHook({
-      session_id: 's',
-      transcript_path: '/tmp/x.jsonl',
-      hook_event_name: 'Stop',
-    })
+  function writeTranscript(lines: object[]): string {
+    const path = join(stateDir, 'transcript.jsonl')
+    mkdirSync(stateDir, { recursive: true })
+    writeFileSync(path, lines.map(l => JSON.stringify(l)).join('\n'), 'utf8')
+    return path
+  }
+
+  const ENQUEUE = {
+    type: 'queue-operation',
+    operation: 'enqueue',
+    content: '<channel source="switchroom-telegram" chat_id="c">hi</channel>',
+  }
+
+  function replyToolUse(text: string, opts: { disable_notification?: boolean; done?: boolean } = {}) {
+    return {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'mcp__switchroom-telegram__reply', input: { text, ...opts } },
+        ],
+      },
+    }
+  }
+
+  it('allows the stop when transcript_path is missing from the event (fail-open)', () => {
+    // Pre-#1775 this branch was "no state file → allow". Post-fix
+    // the same outcome holds via the fail-open transcript guard.
+    const r = runHook({ session_id: 's', hook_event_name: 'Stop' })
     expect(r.exit).toBe(0)
     expect(r.stdout.trim()).toBe('')
   })
 
-  it('blocks the stop with decision:block when silent-end state exists at retryCount=0', () => {
-    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
-    const r = runHook({
-      session_id: 's',
-      transcript_path: '/tmp/x.jsonl',
-      hook_event_name: 'Stop',
-    })
+  it('blocks the stop when transcript shows ack-only (no final reply) — Ken-2026-05-25 repro', () => {
+    const transcript = writeTranscript([
+      ENQUEUE,
+      replyToolUse('on it — checking now', { disable_notification: true }),
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'A'.repeat(2237) }] } },
+    ])
+    const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
     expect(r.exit).toBe(0)
     const out = JSON.parse(r.stdout.trim())
     expect(out.decision).toBe('block')
     expect(out.reason).toContain('reply')
-    // #1664 — the re-prompt must offer the NO_REPLY escape hatch so a
-    // model that already delivered (or intentionally has nothing to add)
-    // can end the turn cleanly instead of being forced to re-send.
+    // #1664 — the re-prompt must offer the NO_REPLY escape hatch.
     expect(out.reason).toContain('NO_REPLY')
-    // retryCount must have been incremented to 1
+    // retryCount incremented to 1 (the budget bookkeeping still
+    // uses the state file).
     expect(readSilentEndState()!.retryCount).toBe(1)
   })
 
-  it('allows the stop when retryCount >= MAX_RETRIES (1)', () => {
+  it('allows the stop when retryCount >= MAX_RETRIES (1), even if transcript still shows no reply', () => {
+    // Retry already spent — gateway will post the user-facing
+    // fallback so the user isn't left silent.
     const path = join(stateDir, 'silent-end-pending.json')
+    mkdirSync(stateDir, { recursive: true })
     writeFileSync(path, JSON.stringify({
       chatId: 'c', threadId: null, turnKey: 'c:_', retryCount: 1, timestamp: 0,
     }))
-    const r = runHook({
-      session_id: 's',
-      transcript_path: '/tmp/x.jsonl',
-      hook_event_name: 'Stop',
-    })
+    const transcript = writeTranscript([
+      ENQUEUE,
+      replyToolUse('still just an ack', { disable_notification: true }),
+    ])
+    const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
     expect(r.exit).toBe(0)
     expect(r.stdout.trim()).toBe('')
     expect(r.stderr).toContain('retry exhausted')
   })
 
-  it('end-to-end: write silent-end → hook blocks → simulate reply → next stop allows', () => {
-    // 1. Turn ends silently — gateway writes state
-    writeSilentEndState({ chatId: 'c', threadId: null, turnKey: 'c:_' })
+  it('allows the stop when transcript shows a notification-bearing reply (no state needed)', () => {
+    // Pre-#1775 this scenario depended on the gateway having
+    // already cleared the state file (race-prone). Post-fix the
+    // transcript scan finds the qualifying reply directly.
+    const transcript = writeTranscript([
+      ENQUEUE,
+      replyToolUse('here is the answer', { disable_notification: false }),
+    ])
+    const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+    expect(r.exit).toBe(0)
+    expect(r.stdout.trim()).toBe('')
+    // No state file written (nothing to bookkeep — no block).
+    expect(readSilentEndState()).toBeNull()
+  })
 
-    // 2. Stop hook fires, blocks, increments retryCount
-    const r1 = runHook({ session_id: 's', transcript_path: '/tmp/x.jsonl', hook_event_name: 'Stop' })
+  it('end-to-end: silent turn → hook blocks → re-prompt delivers → next stop allows', () => {
+    // The contract for the HOOK's stdout decision — independent of
+    // gateway state-file lifecycle. Gateway's clear happens via
+    // recordSilentTurnEnd / clearSilentEndState; this test only
+    // exercises the hook's decision based on the transcript that's
+    // on disk at hook-time.
+
+    // 1. Turn first-stop with ack-only transcript → block + retryCount→1.
+    const transcriptAck = writeTranscript([
+      ENQUEUE,
+      replyToolUse('ack', { disable_notification: true }),
+    ])
+    const r1 = runHook({ session_id: 's', transcript_path: transcriptAck, hook_event_name: 'Stop' })
     expect(JSON.parse(r1.stdout).decision).toBe('block')
     expect(readSilentEndState()!.retryCount).toBe(1)
 
-    // 3. Re-prompted agent calls reply — gateway clears the file
-    clearSilentEndState('c:_')
-    expect(readSilentEndState()).toBeNull()
-
-    // 4. Next Stop allows cleanly (no state file)
-    const r2 = runHook({ session_id: 's', transcript_path: '/tmp/x.jsonl', hook_event_name: 'Stop' })
+    // 2. Model retried within the same turn — transcript now has the
+    //    final reply appended. The hook scans transcript at its next
+    //    fire and finds the qualifying reply.
+    const transcriptFinal = writeTranscript([
+      ENQUEUE,
+      replyToolUse('ack', { disable_notification: true }),
+      replyToolUse('here is the actual answer', { disable_notification: false }),
+    ])
+    const r2 = runHook({ session_id: 's', transcript_path: transcriptFinal, hook_event_name: 'Stop' })
     expect(r2.stdout.trim()).toBe('')
+    // State file still present (retryCount=1) — gateway's
+    // clearSilentEndState path (post-finalAnswerDelivered) is what
+    // clears it; the hook doesn't manage that.
   })
 
-  it('fails open on a corrupt state file', () => {
+  it('NO_REPLY silent-marker in transcript → allow stop even without final reply', () => {
+    const transcript = writeTranscript([
+      ENQUEUE,
+      replyToolUse('NO_REPLY'),
+    ])
+    const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
+    expect(r.exit).toBe(0)
+    expect(r.stdout.trim()).toBe('')
+  })
+
+  it('fails open on a corrupt state file (when block would otherwise fire)', () => {
+    // Transcript shows ack-only (would block), but state file is
+    // corrupt. The hook treats the state file as fresh (retryCount=0)
+    // and proceeds to block + write a fresh state file. This is the
+    // safe behavior — corrupt state shouldn't cause perpetual stop.
+    const transcript = writeTranscript([
+      ENQUEUE,
+      replyToolUse('ack', { disable_notification: true }),
+    ])
     const path = join(stateDir, 'silent-end-pending.json')
     mkdirSync(stateDir, { recursive: true })
     writeFileSync(path, 'corrupt {{{', 'utf8')
-    const r = runHook({ session_id: 's', transcript_path: '/tmp/x.jsonl', hook_event_name: 'Stop' })
+    const r = runHook({ session_id: 's', transcript_path: transcript, hook_event_name: 'Stop' })
     expect(r.exit).toBe(0)
-    expect(r.stdout.trim()).toBe('')
+    // Decision is block (transcript says block, state is treated as fresh).
+    expect(JSON.parse(r.stdout.trim()).decision).toBe('block')
+    expect(readSilentEndState()!.retryCount).toBe(1)
   })
 
   it('fails open on empty stdin', () => {
