@@ -1,7 +1,9 @@
 # RFC: Agent-managed skills — fleet capability lifecycle
 
-Status: Draft v1
+Status: Draft v2 (post-review revisions)
 Date: 2026-05-25
+Reviewer pass: 2026-05-25 (general-purpose, fresh process) → 8 items
+incorporated below.
 Companion to: `reference/vision.md` (pillars 1 & 4 — *standing team of
 specialists*, *always available*), `reference/principles.md` (defaults
 test, consistency test)
@@ -48,12 +50,16 @@ narrow "diff a file" pattern — they need the lifecycle.
 
 Today the agent can describe the script it wishes existed, paste it
 in Telegram, and hope you'll save it later. The work-product
-evaporates the moment the conversation moves on.
+evaporates the moment the conversation moves on. And there's no way
+for the agent to check whether someone else already built X before
+authoring — the pool is enumerable only via filesystem listing on
+the host.
 
-After: the agent writes the skill in its personal workspace, tests
-it, uses it itself the next time the task comes up. No operator
-involvement. If it proves useful across runs, the agent can later
-propose it for promotion to the shared pool.
+After: the agent searches the pool first (read-only, no approval),
+finds nothing for X, writes the skill in its personal workspace,
+tests it, uses it itself the next time the task comes up. No
+operator involvement. If it proves useful across runs, the agent
+can later propose it for promotion to the shared pool.
 
 ### JTBD-2 — "This shared skill has a bug. Here's the fix."
 
@@ -77,24 +83,16 @@ should opt in. I see the JTBD summary, the file list, the blast
 radius, and tap approve. The skill lands in `~/.switchroom/skills/`
 and the listed agents auto-opt-in.
 
-### JTBD-4 — "Has anyone already built X?"
+### JTBD-4 — "Retire skills nothing uses anymore." *(anticipated)*
 
-Today: agents reinvent. No discovery mechanism beyond the operator's
-memory.
+**Not yet a felt operator pain — the fleet hasn't run long enough
+for skill-rot to materialise.** Listed for completeness because the
+reflection mechanism is a small natural extension of `skill_search`,
+not because it solves an active problem. If this stays a non-problem
+in practice, the corresponding `skill_propose_remove` flow can be
+deferred indefinitely; nothing else in the RFC depends on it.
 
-After: a `skill_search` op (read-only, no approval needed) lets any
-agent enumerate the pool with metadata (JTBD summary, last edit,
-authors, current opt-ins). Agents check before authoring.
-
-### JTBD-5 — "Retire skills nothing uses anymore."
-
-Today: skill dirs accumulate. Operator manually prunes when remembered.
-
-After: a periodic reflection job (running on an admin agent's cron)
-lists pool entries with zero opt-ins for N days; admin agent proposes
-removal via `skill_propose_remove`; operator approves bulk.
-
-### JTBD-6 — "Author a new skill end-to-end in the chat."
+### JTBD-5 — "Author a new skill end-to-end in the chat."
 
 Today: the operator does it. Agents help draft, but the *making* is
 a host-side activity.
@@ -232,10 +230,11 @@ tier: shared           # personal | shared | bundled
 ---
 ```
 
-Existing validator at `skill-common.ts:151-226` already rejects
-unknown frontmatter? Check — if yes, we extend the schema; if no,
-the additive fields are silently ignored on the existing path
-(safe).
+**Back-compat verified during review**: the existing validator at
+`skill-common.ts:151-226` only enforces `name` + `description`;
+unknown frontmatter keys are silently kept. So the extension is
+purely additive — no existing skill breaks, and old switchroom CLIs
+reading a new skill just ignore the new fields.
 
 ### 5.4 No search / discovery surface
 
@@ -319,6 +318,27 @@ Server-side flow on both:
 5. Run `switchroom apply` if `proposed_opt_ins` includes any current
    agent (so symlinks get materialised).
 
+**`proposed_opt_ins` vs the role-gated foreman/assistant split.**
+The existing `installSwitchroomSkills` machinery (`scaffold.ts:838-
+944`) gates a small set of skills to `foreman`-role agents. The new
+`skill_propose_publish` does *not* automatically respect role gating
+— `proposed_opt_ins` is the proposer's recommendation, not a
+hard contract. On approve, the card shows any opt-in agents whose
+role is incompatible with the skill's declared tools (when SKILL.md
+declares `tools:`) so the operator can drop them before confirming.
+Worst case the skill lands and is wired up via symlink for an
+incompatible-role agent — claude-code's per-skill role enforcement
+(if any) becomes the runtime check, same as today's pool. The RFC
+does NOT introduce role-aware refusal at write-time.
+
+**Why publish and edit stay separate verbs** (not folded into one
+`skill_propose_write`): audit-log filterability ("show me every
+*new* skill publication this week" vs "every *edit*") and the
+operator's mental model (the approval card text differs:
+"approving a new capability" vs "approving a fix"). The validator
+runs identically and the diff renderer overlaps, but the semantic
+distinction earns its keep.
+
 ### 6.2 New agent-config MCP op for personal-skill scope
 
 **`skill_init_personal`** — agent creates a personal skill in its
@@ -372,9 +392,20 @@ last_edited_at: ISO-8601       # written by the hostd verb on every edit
 tier: "personal" | "shared" | "bundled"   # informational
 ```
 
-Existing validator extended with `passthroughUnknown: false` once
-the schema lands; until then, unknown fields are silently kept (so
-adopting the extension doesn't break existing skills).
+**Back-compat verified during review**: existing validator at
+`src/cli/skill-common.ts:151-226` only enforces `name` and
+`description`; unknown frontmatter keys are silently kept. So
+extending the schema is purely additive.
+
+**Strictness stays permanent-passthrough.** An earlier draft of this
+RFC proposed flipping the validator to reject unknown keys once the
+new fields shipped — that's a rollout footgun: every operator-pool
+skill carrying a typo'd or experimental field would break at next
+reconcile. Permanent passthrough means the new fields are
+*signals* the approval card can render when present, never gates
+that fail validation when absent. If per-skill strictness ever
+becomes useful, opt in via `strict_frontmatter: true` in the skill
+itself — never a global flip.
 
 ### 6.5 Vault-key auto-grant on opt-in (stretch)
 
@@ -402,12 +433,29 @@ Mapping to this RFC:
 |---|---|---|---|
 | `skill_init_personal` (own workspace) | autonomous | none | self-scoped, blast radius = 1 |
 | `skill_edit_personal` (own workspace) | autonomous | none | same |
-| `skill_remove_personal` | autonomous | none | same |
+| `skill_remove_personal` | autonomous, **soft-undo** | none | self-scoped; moves to trash-dir, not direct unlink (see below) |
 | `skill_search` | autonomous | none | read-only |
 | `skill_propose_publish` | gated | Telegram approval card | new pool entry, fleet exposure |
 | `skill_propose_edit` | gated | Telegram approval card | mutates pool, affects all opt-ins |
 | `skill_propose_remove` | gated | Telegram approval card | mutates pool, may break opt-ins |
-| (Future) auto-approve small edits from same-author admin agent | discretionary | bypass on rules | tracked in `KNOWN_AUTO_APPROVE_RULES`, off by default |
+
+**Soft-undo for `skill_remove_personal`** (cheap insurance, real
+recovery value): the op moves the skill dir to
+`<agentDir>/.claude/skills/.trash/<name>-<unix-ts>/` rather than
+unlinking. A daily cron sweep deletes trash entries older than 24h.
+Recovery is a `mv` away. Cost: a few KB extra per delete-then-restore
+cycle; benefit: the failure mode "agent removed a skill mid-use,
+context broken on next turn" gets a 24h window to undo. Same
+philosophy as the operator's standing `trash > rm` preference (per
+global CLAUDE.md). No equivalent needed for `skill_propose_remove`
+on the shared pool — operator-gated removal is already a deliberate
+human-checked decision.
+
+**Deliberately out of v1**: auto-approve heuristics for small
+shared-pool edits from trusted authors. Specifying them now invites
+design debate that doesn't pay off until tap-fatigue is actually
+observed. Revisit in a follow-up RFC if/when the operator reports
+"these approval taps are getting tedious." See §10.
 
 The approval card itself uses the existing
 `approval-kernel` infrastructure (same shape as
@@ -435,12 +483,34 @@ Existing hostd audit log; just a new verb tag.
 Order matches blast-radius (low → high). Each phase is independently
 shippable and independently useful.
 
+### Phase 0 — §9.1 spike (estimated 1-2 agent-hours) — GATING
+
+Before Phase 1 code lands, resolve the claude-code subdir-discovery
+question. The spike is: write a SKILL.md at three candidate paths in
+a test agent's dir and observe which claude-code picks up:
+
+1. `<agentDir>/.claude/skills/personal/test-skill/SKILL.md` (subdir
+   nested under `skills/`)
+2. `<agentDir>/.claude/skills/personal-test-skill/SKILL.md` (flat,
+   name-prefixed)
+3. `<agentDir>/.claude/skills/test-skill/SKILL.md` (flat, same as
+   shared)
+
+If (1) works → Phase 1 proceeds with subdir layout as designed.
+If only (2)/(3) work → Phase 1 redesigns around the flat layout
+with a `personal-` name prefix as the namespace separator. Either
+way, Phase 1 acceptance gates on this answer being captured in
+writing.
+
 ### Phase 1 — Personal-skill autonomy (estimated 4-6 agent-hours)
 
-- Scaffold writes `<agentDir>/.claude/skills/personal/` dir mode 0700
+- Scaffold writes the agreed personal-skill path (subdir or flat
+  per Phase 0) mode 0700 owned by agent UID
 - Agent-config MCP gains `skill_init_personal` / `skill_edit_personal`
   / `skill_remove_personal` / `skill_list_personal` ops
-- New tests covering happy paths + validator rejections
+- `skill_remove_personal` implements the soft-undo trash-dir (§7)
+- New tests covering happy paths + validator rejections + trash-dir
+  recovery
 - No host approval involved
 - **Outcome**: agents can author + use their own scripts without
   asking. Half the JTBD-1 / JTBD-2 friction gone immediately.
@@ -451,6 +521,10 @@ shippable and independently useful.
   `skill_propose_remove`
 - Approval-card UI extension (multi-file diff preview; mostly reuses
   `config_propose_edit`'s renderer)
+- Server-side pre-publish behavioral validation: `bash -n` on every
+  `scripts/*.sh`, `python -m py_compile` on every `scripts/*.py`,
+  surface failures on the approval card before the operator taps
+  (see §11 AC-7).
 - Audit log integration
 - `proposed_opt_ins` triggers a follow-on `switchroom apply` on
   approve so the listed agents materialise the symlinks
@@ -459,10 +533,11 @@ shippable and independently useful.
 
 ### Phase 3 — Discovery + reflection (estimated 3-4 agent-hours)
 
-- `skill_search` op
+- `skill_search` op (read-only MCP, no approval)
 - Background reflection job (cron on an admin agent) listing
   pool entries by opt-in count, surfacing retirement candidates
-- **Outcome**: JTBD-4 and JTBD-5 shipped.
+- **Outcome**: JTBD-4 (anticipated) becomes shippable; JTBD-1's
+  pre-author search lands.
 
 ### Phase 4 — Metadata extension (estimated 2 agent-hours)
 
@@ -471,8 +546,40 @@ shippable and independently useful.
 - **Outcome**: approval cards get richer; vault-key
   auto-grant becomes possible (next RFC if/when we want it).
 
-Total: ~17-24 agent-hours. Phaseable; each phase delivers a real
-outcome.
+Total: ~18-26 agent-hours including the Phase 0 spike. Phaseable;
+each phase delivers a real outcome.
+
+### Option B (smaller-scope alternative): Phase 1 + Phase 3 only
+
+If the shared-pool design (Phase 2) feels premature or risky,
+phases 1 + 3 alone deliver:
+- Personal-skill authoring + editing + removal (JTBD-1, partial
+  JTBD-2)
+- Search across personal + bundled pools (the bundled half of
+  JTBD-1)
+- Skill-creator bundled skill becomes useful (it can write to a
+  real personal-skill scope)
+
+What Option B *defers*: shared-pool publish/edit (the
+`skill_propose_*` hostd verbs). Personal → shared promotion stays a
+manual operator step. JTBD-2 (fix shared-skill bugs) still requires
+paste-and-relay until Phase 2 lands.
+
+Argument for Option B: lets us observe how agents actually use
+personal-skill authoring before designing the publish UX. The
+approval-card content for shared-pool publish gets sharper when we
+know what agents actually want to ship.
+
+Argument against Option B: tonight's tablet-hang debug needed
+exactly the JTBD-2 path, twice. Deferring JTBD-2 means deferring
+the most-felt pain.
+
+Operator's call.
+
+### Option C (largest-scope alternative): all 4 phases + auto-approve
+
+Not recommended — see §10 ("deferred until operator tap-fatigue is
+observed").
 
 ## 9. Open questions / unknowns
 
@@ -486,9 +593,12 @@ latter, the `personal/` subdir convention won't work and we'd need
 to either flat-mount personal skills alongside shared ones (risking
 naming collisions) or wait for upstream support.
 
-**Action**: verify before Phase 1 starts. If subdir-blocked, fall
-back to a name-prefix convention (`<agentDir>/.claude/skills/
-personal-<name>/`).
+**Action**: gating spike (Phase 0 in §8). Resolution captured in
+writing before Phase 1 implementation begins. If subdir-blocked,
+fall back to the name-prefix convention
+(`<agentDir>/.claude/skills/personal-<name>/`) — same primitives,
+slightly different directory layout. Phase 1's MCP op shapes don't
+change; the on-disk layout does.
 
 ### 9.2 Trust model for promoted personal skills
 
@@ -565,6 +675,10 @@ Default: pool-resolution-order is enough. Lookup goes:
   Out of scope; explicit operator approval on every share.
 - **`claude -p`** anything. RFC `eliminate-claude-p.md` stays the
   hard constraint. All skill execution is in-session.
+- **Auto-approve heuristics for small shared-pool edits** (e.g.
+  bypass the approval card for ≤10-line diffs from the original
+  author). Deferred until operator tap-fatigue is observed as an
+  actual problem; v1 sticks to one-tap-per-mutation.
 
 ## 11. Acceptance criteria
 
@@ -582,6 +696,18 @@ Default: pool-resolution-order is enough. Lookup goes:
   skills without `jtbd:`/`vault_keys:` keep validating and working.
 - **AC-6**: Bundled skills remain source-PR only (no in-fleet edit
   path); this verb-set never writes under `skills/_bundled/`.
+- **AC-7**: Pre-publish behavioral validation runs server-side before
+  the approval card renders — `bash -n` on every `scripts/*.sh`,
+  `python -m py_compile` on every `scripts/*.py`. A skill containing
+  a script with syntax errors cannot reach the approval card; the
+  proposer agent gets a structured error pointing at the failing
+  file:line. The static SKILL.md validator (`name`, `description`,
+  size, path allowlist) keeps running first; behavioral validation
+  is an additional gate on top.
+- **AC-8**: `skill_remove_personal` is recoverable — a removed skill
+  lands in `.trash/` for 24h before the daily cron sweep finalises
+  the delete. An agent (or operator) can `mv` it back inside the
+  window with no other state change.
 
 ## 12. References
 
