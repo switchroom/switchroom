@@ -6680,27 +6680,38 @@ function handleSessionEvent(ev: SessionEvent): void {
             // forum topic. answer-stream's own try/catch already
             // tolerates undefined returns from editMessageText.
             //
-            // disable_notification: true UNCONDITIONALLY here (Bug A
-            // fix, 2026-05-25). The answer-stream lane sends a fresh
-            // sendMessage on the first text chunk to open the visible
-            // message. Without this flag the device pings — and then
-            // when the model later calls the reply MCP tool, that
-            // reply pings AGAIN (the over-ping safety net at
-            // gateway.ts:~4452 only sees executeReply paths, not this
-            // direct sendMessage). Result was two device pings per
-            // multi-step turn. Per the design contract — Telegram
-            // does not notify on edits anyway, and a stream-as-final-
-            // answer turn explicitly opts out of the device ping
-            // (see `reference/conversational-pacing.md` and the
-            // ANSWER_STREAM_VISIBLE_ENABLED comment above for the
-            // honest trade-off). Only the reply MCP tool ever pings.
+            // disable_notification gating by purpose (2026-05-25):
+            //
+            // - purpose='stream' (the live edit-in-place preview): SILENT.
+            //   Without disable_notification, the first text chunk that
+            //   opens the visible message device-pings, and then when the
+            //   model later calls the reply MCP tool, that reply pings
+            //   AGAIN (the over-ping safety net at gateway.ts:~4452 only
+            //   sees executeReply paths, not this direct sendMessage). Two
+            //   device pings per multi-step turn — the original Bug A.
+            //   Edits in place don't notify regardless (Telegram semantics).
+            //
+            // - purpose='materialize' (turn-end final-answer fresh send,
+            //   only fires for text-only turns where the stream IS the
+            //   answer): PING. The user reached for the agent and the
+            //   model produced an answer; per beat 5 of
+            //   `reference/conversational-pacing.md` the final answer MUST
+            //   ping the device exactly once. Without this carve-out, a
+            //   short text-only turn ("on it" being the whole response)
+            //   lands silently and the user has no notification to know
+            //   the answer arrived — the original over-correction.
+            //
+            // - purpose unset (defensive default): SILENT. Treat as
+            //   stream-purpose so we never accidentally fire a stray ping
+            //   from an unrecognised sendMessage callsite.
             sendMessage: async (chatId, text, params) => {
               const tid = params?.message_thread_id
+              const silent = params?.purpose !== 'materialize'
               const msg = await robustApiCall(
                 () =>
                   bot.api.sendMessage(chatId, text, {
                     parse_mode: params?.parse_mode,
-                    disable_notification: true,
+                    disable_notification: silent,
                     ...(tid != null ? { message_thread_id: tid } : {}),
                     ...(params?.link_preview_options != null
                       ? { link_preview_options: params.link_preview_options }
@@ -6711,7 +6722,7 @@ function handleSessionEvent(ev: SessionEvent): void {
                   }),
                 {
                   chat_id: chatId,
-                  verb: 'answer-stream.sendMessage',
+                  verb: `answer-stream.sendMessage(${params?.purpose ?? 'stream'})`,
                   ...(tid != null ? { threadId: tid } : {}),
                 },
               )
@@ -6902,13 +6913,30 @@ function handleSessionEvent(ev: SessionEvent): void {
       //
       // #869-Phase1 override: when `ANSWER_STREAM_VISIBLE_ENABLED` is
       // on, the stream is rendering a USER-VISIBLE message in the
-      // chat timeline. Retracting (delete) destroys content the user
-      // has been reading live — the worst possible UX flicker. So
-      // when the stream is the de-facto final answer (model never
-      // called reply, captured text is substantive) we instead call
-      // `stream.stop()` to freeze it as the final state, record the
-      // outbound for history + dedup, mark the turn answered, and
-      // suppress the turn-flush IIFE downstream.
+      // chat timeline. When the stream is the de-facto final answer
+      // (model never called reply, captured text is substantive), we
+      // need to:
+      //   1. Send a FRESH pinged message via `stream.materialize()`
+      //      so the user gets a device notification — beat 5 of the
+      //      conversational-pacing contract requires exactly one
+      //      ping per turn for the final answer. Without this,
+      //      text-only short turns ("on it" being the whole reply)
+      //      land silently and the user has no notification to know
+      //      the answer arrived (the failure caught by the
+      //      midturn-silent-dm UAT, 2026-05-25).
+      //   2. Delete the silent streamed preview message so the user
+      //      doesn't see a duplicate (the streamed message in place
+      //      + the fresh materialized ping). materialize() handles
+      //      the fresh send but leaves the old streamed message_id
+      //      orphaned by design — we delete it explicitly here.
+      //
+      // The previous behavior (just `stream.stop()` to freeze the
+      // streamed message in place) avoided the duplicate but also
+      // skipped the ping. Materialize-and-delete trades a brief
+      // visual "the streamed message is replaced by a fresh one"
+      // (often imperceptible for short turns where the streaming
+      // barely had time to register; mildly visible for longer
+      // turns) in exchange for an always-correct turn-end ping.
       let streamFinalizedAsAnswer = false
       if (turn?.answerStream != null) {
         const stream = turn.answerStream
@@ -6921,36 +6949,80 @@ function handleSessionEvent(ev: SessionEvent): void {
           && streamedFinalText.length > 0
         ) {
           turn.answerStream = null
-          stream.stop()
           streamFinalizedAsAnswer = true
           turn.finalAnswerDelivered = true
-          // Record as canonical outbound so retries dedup against it
-          // and the SQLite history can surface it. Mirrors the
-          // hooks turn-flush + reply both run.
-          try {
-            outboundDedup.record(
-              turn.sessionChatId,
-              turn.sessionThreadId,
-              streamedFinalText,
-              Date.now(),
-              turn.registryKey ?? null,
-            )
-          } catch { /* best-effort */ }
-          if (HISTORY_ENABLED) {
+          // Capture the old streamed message_id BEFORE materialize so
+          // we can delete it after the fresh ping send. materialize()
+          // overwrites `streamMsgId` internally with the new send's id;
+          // without capturing here we'd lose the reference.
+          const oldStreamedMsgId = streamedMsgId
+          // Fire-and-forget materialize-and-delete sequence.
+          //
+          // Bookkeeping (dedup + history): handled inside
+          // `materialize()` itself — see `answer-stream.ts:~548-549`
+          // which calls the injected `recordDedup` + `recordOutbound`
+          // callbacks with the NEW (fresh-send) message_id only after a
+          // successful send. We deliberately do NOT pre-record here —
+          // doing so populates the same `outboundDedup` store that
+          // materialize's internal `checkDedup` consults at
+          // `answer-stream.ts:~510`, causing materialize to dedup-
+          // suppress its own send (return undefined, no ping fires) —
+          // the exact failure mode this PR exists to fix. Let
+          // materialize own the bookkeeping; gateway only sequences the
+          // operations.
+          //
+          // Delete gating: only run the cleanup `deleteMessage` if
+          // materialize actually sent (returned a numeric sentId). If
+          // it dedup-suppressed or threw, the streamed preview is the
+          // user's only copy of the answer and MUST be preserved.
+          void (async () => {
+            let materializedId: number | undefined
             try {
-              recordOutbound({
-                chat_id: turn.sessionChatId,
-                thread_id: turn.sessionThreadId ?? null,
-                message_ids: [streamedMsgId],
-                texts: [streamedFinalText],
-              })
-            } catch { /* best-effort */ }
-          }
-          process.stderr.write(
-            `telegram gateway: answer-stream finalized as answer ` +
-            `chat=${turn.sessionChatId} msg=${streamedMsgId} ` +
-            `chars=${streamedFinalText.length}\n`,
-          )
+              materializedId = await stream.materialize()
+            } catch (err) {
+              process.stderr.write(
+                `telegram gateway: answer-stream materialize failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`,
+              )
+              return
+            }
+            if (typeof materializedId !== 'number' || !Number.isFinite(materializedId)) {
+              // materialize() returned undefined — either pendingText
+              // was empty, the body was a silent marker (NO_REPLY /
+              // HEARTBEAT_OK), or `checkDedup` suppressed it. In every
+              // such case the streamed preview is the user's only copy
+              // of the content; don't delete it.
+              process.stderr.write(
+                `telegram gateway: answer-stream materialize returned no msgId ` +
+                `chat=${turn.sessionChatId} oldMsg=${oldStreamedMsgId} — ` +
+                `preserving silent preview as the user's only copy\n`,
+              )
+              return
+            }
+            // Materialize sent a fresh pinged message at materializedId.
+            // Delete the silent streamed preview so the chat shows one
+            // canonical message (the fresh pinged one) and not two with
+            // duplicate content. Best-effort; failures (already gone,
+            // permission denied) leave a brief visible duplicate which
+            // we accept rather than retry-storming.
+            try {
+              // allow-raw-bot-api: cleanup delete of silent streamed preview
+              await bot.api.deleteMessage(turn.sessionChatId, oldStreamedMsgId)
+            } catch (delErr) {
+              process.stderr.write(
+                `telegram gateway: answer-stream materialize-cleanup ` +
+                `delete failed for msgId=${oldStreamedMsgId}: ${
+                  delErr instanceof Error ? delErr.message : String(delErr)
+                }\n`,
+              )
+            }
+            process.stderr.write(
+              `telegram gateway: answer-stream materialized as answer ` +
+              `chat=${turn.sessionChatId} oldMsg=${oldStreamedMsgId} ` +
+              `newMsg=${materializedId} chars=${streamedFinalText.length}\n`,
+            )
+          })()
         } else {
           turn.answerStream = null
           void stream.retract().catch((err) => {

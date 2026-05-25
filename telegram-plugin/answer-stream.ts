@@ -92,6 +92,22 @@ export interface AnswerStreamConfig {
       message_thread_id?: number
       link_preview_options?: { is_disabled: boolean }
       reply_parameters?: { message_id: number }
+      /**
+       * Distinguishes a streaming open (`'stream'` — silent edits-in-place
+       * preview, default) from the turn-end materialize (`'materialize'` —
+       * the user-facing final answer that should ping the device exactly
+       * once, matching beat-5 of the conversational-pacing contract).
+       *
+       * Used by the gateway wrapper in `gateway.ts` to set
+       * `disable_notification: true` for 'stream' purpose only —
+       * materialize lets the platform default (notify) through. Without
+       * this distinction, either every send pings (the original #1672
+       * bug, two device pings per multi-step turn — see
+       * `over-ping-safety-net.ts`) or none does (the over-correction
+       * where text-only short turns silently land and the user has no
+       * notification to know the answer arrived).
+       */
+      purpose?: 'stream' | 'materialize'
     },
   ) => Promise<{ message_id: number }>
   editMessageText: (
@@ -344,10 +360,14 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
         throw err
       }
     } else {
-      // First send — capture message_id; check generation for supersession
+      // First send — capture message_id; check generation for supersession.
+      // purpose: 'stream' tells the gateway wrapper this is the visible
+      // preview opener — silent (no device ping). The turn-end materialize
+      // path uses 'materialize' to allow the platform-default ping.
       const sendParams: Parameters<typeof sendMessage>[2] = {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
+        purpose: 'stream',
       }
       if (threadId != null) sendParams.message_thread_id = threadId
       if (replyToMessageId != null) sendParams.reply_parameters = { message_id: replyToMessageId }
@@ -495,10 +515,16 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
         return undefined
       }
 
-      // Always send a fresh message for push notification
+      // Always send a fresh message for push notification.
+      // purpose: 'materialize' tells the gateway wrapper to allow the
+      // platform-default device ping through (vs the 'stream' opener
+      // which is forced silent). materialize() is the turn-end final-
+      // answer surface — beat 5 of the conversational-pacing contract
+      // — and MUST ping so the user knows the answer landed.
       const sendParams: Parameters<typeof sendMessage>[2] = {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
+        purpose: 'materialize',
       }
       if (threadId != null) sendParams.message_thread_id = threadId
       // Don't quote-reply on materialize — the draft stream already established
