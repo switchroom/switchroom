@@ -194,9 +194,17 @@ export function alignAgentUid(
   // boot and the agent comes up without autoaccept or the gateway daemon.
   // See #880.
   const logsDir = join(homedir(), ".switchroom", "logs", name);
+  // ~/.switchroom/audit/<name>/ holds the agent-config audit JSONL
+  // (appendAudit in src/cli/agent-config.ts). Compose generator pre-
+  // creates the dir at compose.ts:~1750; under `apply`'s sudo self-
+  // elevation that mkdir runs as root → root-owned dir → agent UID
+  // can't appendFileSync → every audit row silently swallowed (#1831).
+  // Include here so the chown sweep aligns ownership.
+  const auditDir = join(homedir(), ".switchroom", "audit", name);
   const paths: string[] = [];
   if (existsSync(agentDir)) paths.push(agentDir);
   if (existsSync(logsDir)) paths.push(logsDir);
+  if (existsSync(auditDir)) paths.push(auditDir);
   if (paths.length === 0) return { chowned: false, paths: [] };
 
   // No fast-path: a previous `apply` may have aligned the top-level dirs
