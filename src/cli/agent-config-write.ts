@@ -60,8 +60,7 @@ import {
   type PendingReasonCode,
 } from "./agent-config-pending.js";
 import { existsSync, readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import type { ErrorEnvelope } from "../host-control/protocol.js";
+import { buildEnvelope, type ErrorEnvelope } from "../host-control/protocol.js";
 
 const MAX_ENTRIES_PER_AGENT = 20;
 
@@ -182,42 +181,29 @@ function buildEnvelopeForCode(
   message: string,
   extra: Record<string, unknown>,
 ): ErrorEnvelope | undefined {
-  // request_id is required by ErrorEnvelopeSchema; CLI emit sites have
-  // no caller-supplied id, so synthesize one. Receivers correlate via
-  // audit_id when needed; this id exists purely to satisfy the schema.
-  const request_id = `agent-config-${randomUUID()}`;
+  // #1778 — request_id is now optional on ErrorEnvelopeSchema. CLI
+  // emit sites no longer fabricate a placeholder; receivers correlate
+  // via audit_id / surrounding context.
   if (code === "E_CRON_TOO_FREQUENT") {
-    return {
-      v: 1,
-      code,
-      human: message,
-      fix: {
-        kind: "quota_exceeded",
-        quota: "cron_min_interval_minutes",
-        current: typeof extra.requested_interval_min === "number"
-          ? (extra.requested_interval_min as number)
-          : 0,
-        limit: MIN_CRON_INTERVAL_MIN,
-      },
-      request_id,
-    };
+    return buildEnvelope(code, message, {
+      kind: "quota_exceeded",
+      quota: "cron_min_interval_minutes",
+      current: typeof extra.requested_interval_min === "number"
+        ? (extra.requested_interval_min as number)
+        : 0,
+      limit: MIN_CRON_INTERVAL_MIN,
+    });
   }
   if (code === "E_QUOTA_EXCEEDED") {
     const current = typeof extra.current === "number"
       ? (extra.current as number)
       : MAX_ENTRIES_PER_AGENT;
-    return {
-      v: 1,
-      code,
-      human: message,
-      fix: {
-        kind: "quota_exceeded",
-        quota: "schedule_entries_per_agent",
-        current,
-        limit: MAX_ENTRIES_PER_AGENT,
-      },
-      request_id,
-    };
+    return buildEnvelope(code, message, {
+      kind: "quota_exceeded",
+      quota: "schedule_entries_per_agent",
+      current,
+      limit: MAX_ENTRIES_PER_AGENT,
+    });
   }
   return undefined;
 }

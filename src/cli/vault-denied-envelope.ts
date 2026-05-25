@@ -29,6 +29,8 @@
  * Split out of `vault.ts` so unit tests don't pull in the broker
  * client / sqlite-backed grants store via transitive imports.
  */
+import { buildEnvelope } from "../host-control/protocol.js";
+
 /**
  * Stderr line prefix for structured error envelopes. Canonical across
  * all envelope-emitting CLIs — chosen to NOT share a prefix with any
@@ -42,16 +44,11 @@ export function writeVaultDeniedEnvelope(
   brokerCode: string,
   human: string,
 ): void {
-  const envelope = {
-    v: 1 as const,
-    code: "VAULT-BROKER-DENIED",
-    human: `${brokerCode}: ${human}`,
-    fix: {
-      kind: "request_vault_grant" as const,
-      vault_key: vaultKey,
-    },
-    request_id: `vault-cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-  };
+  const envelope = buildEnvelope(
+    "VAULT-BROKER-DENIED",
+    `${brokerCode}: ${human}`,
+    { kind: "request_vault_grant", vault_key: vaultKey },
+  );
   process.stderr.write(
     `${ENVELOPE_SENTINEL} ${JSON.stringify(envelope)}\n`,
   );
