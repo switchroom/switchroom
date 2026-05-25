@@ -21,7 +21,7 @@
  *   MCP:  skill_search { agent?, query?, tier?, limit? }
  */
 
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -32,6 +32,14 @@ import { withConfigError } from "./helpers.js";
 
 const PERSONAL_PREFIX = "personal-";
 const BUNDLED_SUBDIR = "_bundled";
+
+/**
+ * Agent name regex — same shape used by `src/agents/lifecycle.ts` for
+ * the live fleet. Rejects path-traversal sequences (e.g. `..`, `/`, `\`)
+ * BEFORE the value is joined into a filesystem path. Same defence the
+ * personal-skill writer applies in PR-3.
+ */
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,62}$/;
 
 function defaultAgentsRoot(): string {
   return resolve(homedir(), ".switchroom/agents");
@@ -129,6 +137,10 @@ export function listPersonalSkills(
   agent: string,
   agentsRoot = defaultAgentsRoot(),
 ): SkillSearchEntry[] {
+  // Refuse path-traversal in the agent slug BEFORE it's joined into
+  // `agentsRoot`. Otherwise an MCP caller passing `agent="../../etc"`
+  // would read frontmatter from arbitrary dirs under the home UID.
+  if (!AGENT_NAME_RE.test(agent)) return [];
   const skillsDir = join(agentsRoot, agent, ".claude/skills");
   if (!existsSync(skillsDir)) return [];
   const out: SkillSearchEntry[] = [];
@@ -419,10 +431,10 @@ export function registerSkillSearchCommand(program: Command): void {
       "Cap result count (default 50, max 500).",
     )
     .option("--no-json", "Render as human table instead of JSON.")
-    // Hidden test-only roots.
-    .option("--root <path>", undefined, undefined)
-    .option("--shared-root <path>", undefined, undefined)
-    .option("--bundled-root <path>", undefined, undefined)
+    // Hidden test-only roots — never surface in --help.
+    .addOption(new Option("--root <path>").hideHelp())
+    .addOption(new Option("--shared-root <path>").hideHelp())
+    .addOption(new Option("--bundled-root <path>").hideHelp())
     .action(withConfigError(async (opts: CliOpts) => {
       searchAction(opts);
     }));

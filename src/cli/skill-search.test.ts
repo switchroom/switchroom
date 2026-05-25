@@ -92,6 +92,16 @@ describe("listPersonalSkills", () => {
     expect(listPersonalSkills(AGENT, agentsRoot)).toEqual([]);
   });
 
+  it("refuses path-traversal in the agent slug (returns [])", () => {
+    // Even if a `personal-evil` SKILL.md existed somewhere on disk, an
+    // agent slug containing `..` or `/` must never be joined into the
+    // agents-root path. The guard short-circuits to [].
+    expect(listPersonalSkills("../../etc", agentsRoot)).toEqual([]);
+    expect(listPersonalSkills("foo/bar", agentsRoot)).toEqual([]);
+    expect(listPersonalSkills("..", agentsRoot)).toEqual([]);
+    expect(listPersonalSkills("", agentsRoot)).toEqual([]);
+  });
+
   it("returns [] when .claude/skills is missing", () => {
     mkdirSync(join(agentsRoot, AGENT), { recursive: true });
     expect(listPersonalSkills(AGENT, agentsRoot)).toEqual([]);
