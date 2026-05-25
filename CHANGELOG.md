@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.13.49 — hotfix: actually register the repo-context hook in settings.json
+
+PR #1811 / v0.13.48 added the repo-context PreToolUse hook to
+`telegram-plugin/hooks/hooks.json` (the plugin-system view, loaded
+when an agent uses `--plugin-dir`). But the scaffold writes the
+agent's `settings.json` PreToolUse list from a separate hand-coded
+array in `src/agents/scaffold.ts:3184+` — and that list was missed
+in the original PR. Claude Code reads PreToolUse from `settings.json`
+at session start, so the hook never actually fired in production.
+
+Caught by the live UAT against v0.13.48: agent navigated into a repo
+with a CLAUDE.md containing a marker string, agent replied "NO
+MARKER OBSERVED" — proving the hook wasn't called. Direct invocation
+of the hook on the same envelope produces the correct
+`additionalContext`, confirming the hook itself is fine.
+
+Fix (PR #1839): add the missing entry to scaffold.ts's
+`switchroomPreToolUse` array. Extends `reconcile-hooks-drift.test.ts`
+to pin the registration so a future refactor can't silently regress
+it.
+
+Risk: low. Pure additive change to the hand-coded scaffold list;
+mirrors how the other 5 PreToolUse hooks are registered. The hook
+itself is unchanged — only the registration that enables Claude Code
+to invoke it.
+
 ## v0.13.48 — repo-context hook + buildEnvelope refactor + agent-managed-skills RFC
 
 Three independent PRs bundled — one feature, one refactor, one docs.
