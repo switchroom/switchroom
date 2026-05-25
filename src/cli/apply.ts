@@ -291,6 +291,11 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
     dirs.push(join(home, ".switchroom", "agents", name));
     dirs.push(join(home, ".switchroom", "logs", name));
     dirs.push(join(home, ".claude", "projects", name));
+    // Pre-create the per-agent audit dir so alignAgentUid's second pass
+    // can chown it to the agent UID BEFORE compose mounts it (otherwise
+    // generateCompose's mkdirSync would create it as root mid-apply,
+    // leaving the audit log unwritable on fresh installs — #1831).
+    dirs.push(join(home, ".switchroom", "audit", name));
   }
   for (const dir of dirs) {
     await mkdir(dir, { recursive: true });
