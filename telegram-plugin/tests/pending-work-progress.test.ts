@@ -407,4 +407,138 @@ describe('pending-work-progress', () => {
     expect(cap.edits.filter((e) => e.messageId === 10)).toHaveLength(1)
     expect(cap.edits.filter((e) => e.messageId === 20)).toHaveLength(2)
   })
+
+  // ─── #1760 regression tests ───────────────────────────────────────────
+  //
+  // The "— still working (Nm)" ticker can get stuck forever editing an
+  // old outbound message if the gateway misses the SDK `turn_end` event.
+  // Two layers of defence:
+  //
+  //   1. PRIMARY: the gateway tears down on every `reply: finalized`
+  //      chokepoint via `clearPending(key, 'reply_finalize')` BEFORE
+  //      `noteOutbound` on the next turn's first reply. Verified here by
+  //      simulating a missed-turn_end scenario: the prior turn's ticker
+  //      is activated, then the gateway processes a fresh reply on a NEW
+  //      turn without ever calling `noteTurnEnd` for the prior one. The
+  //      explicit `clearPending('reply_finalize')` call must wipe the
+  //      stale ambient.
+  //
+  //   2. DEFENSE-IN-DEPTH: at tick time, if `isActiveTurnNewerThan`
+  //      returns true (gateway reports a newer turn is active for this
+  //      chat), the ticker self-terminates instead of editing. Bug
+  //      becomes "at most one stale tick" rather than "stuck forever."
+
+  it('#1760 primary: reply_finalize teardown wipes a stale activated ticker', async () => {
+    const cap = setup()
+
+    // Turn 1: dispatch async work, capture an anchor, end the turn.
+    // Ticker activates and fires one edit at +60s.
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    noteOutbound(KEY, { messageId: 100, text: 'kicking off worker' })
+    noteTurnEnd(KEY)
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits).toHaveLength(1)
+    expect(cap.edits[0]?.messageId).toBe(100)
+
+    // Turn 2 begins WITHOUT a prior `noteTurnEnd` clear (simulating the
+    // #1760 missed-turn_end SDK-event-drop). The gateway's reply-
+    // finalize chokepoint MUST call clearPending('reply_finalize')
+    // BEFORE noteOutbound on the new anchor. After that, the prior
+    // ticker is gone and further ticks (even before any new
+    // noteTurnEnd) edit nothing.
+    clearPending(KEY, 'reply_finalize')
+    noteOutbound(KEY, { messageId: 200, text: 'turn 2 reply' })
+
+    cap.now = EDIT_INTERVAL_MS * 5
+    __tickForTests(cap.now)
+    await flush()
+    // No additional edits — the stale ticker is dead. Note that the new
+    // turn's ticker has not been activated yet (noteTurnEnd not called),
+    // so nothing should fire here either.
+    expect(cap.edits).toHaveLength(1)
+
+    // The 'reply_finalize' clear must surface as a metric so operators
+    // can observe the backstop firing in production.
+    const reasons = cap.metrics
+      .filter((m): m is Extract<PendingProgressMetric, { kind: 'pending_progress_cleared' }> =>
+        m.kind === 'pending_progress_cleared')
+      .map((m) => m.reason)
+    expect(reasons).toContain('reply_finalize')
+  })
+
+  it('#1760 defense-in-depth: ticker self-terminates when isActiveTurnNewerThan is true', async () => {
+    const cap: Capture = { edits: [], metrics: [], now: 0 }
+    __resetAllForTests()
+    // The activatedAt epoch captured by the ticker:
+    const TURN_1_ACTIVATED_AT = 1_000
+    // A NEWER turn starts later, simulating turn-2 racing past the
+    // missed teardown:
+    const TURN_2_STARTED_AT = TURN_1_ACTIVATED_AT + 30_000
+
+    __setDepsForTests({
+      editMessage: async (ctx) => {
+        cap.edits.push(ctx)
+      },
+      emitMetric: (e) => {
+        cap.metrics.push(e)
+      },
+      nowMs: () => cap.now,
+      // Reports a newer turn always-on for this test.
+      isActiveTurnNewerThan: (_key, activatedAt) =>
+        TURN_2_STARTED_AT > activatedAt,
+    })
+
+    // Bootstrap a "prior turn" ticker at TURN_1_ACTIVATED_AT.
+    cap.now = TURN_1_ACTIVATED_AT
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    noteOutbound(KEY, { messageId: 100, text: 'kicking off worker' })
+    noteTurnEnd(KEY)
+    expect(__getStateForTests(KEY)?.activatedAt).toBe(TURN_1_ACTIVATED_AT)
+
+    // Advance past EDIT_INTERVAL_MS so the tick would otherwise fire.
+    cap.now = TURN_1_ACTIVATED_AT + EDIT_INTERVAL_MS + 1_000
+    __tickForTests(cap.now)
+    await flush()
+
+    // No edit fired — the predicate detected a newer active turn and
+    // dropped the ticker.
+    expect(cap.edits).toHaveLength(0)
+    expect(__getStateForTests(KEY)).toBeUndefined()
+
+    const cleared = cap.metrics.find(
+      (m): m is Extract<PendingProgressMetric, { kind: 'pending_progress_cleared' }> =>
+        m.kind === 'pending_progress_cleared',
+    )
+    expect(cleared?.reason).toBe('stale_turn')
+  })
+
+  it('#1760 defense-in-depth: predicate returning false leaves ticker alone', async () => {
+    const cap: Capture = { edits: [], metrics: [], now: 0 }
+    __resetAllForTests()
+    __setDepsForTests({
+      editMessage: async (ctx) => {
+        cap.edits.push(ctx)
+      },
+      emitMetric: (e) => {
+        cap.metrics.push(e)
+      },
+      nowMs: () => cap.now,
+      // No newer turn — the legitimate cross-turn ambient case.
+      isActiveTurnNewerThan: () => false,
+    })
+
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    noteOutbound(KEY, { messageId: 100, text: 'kicking off worker' })
+    noteTurnEnd(KEY)
+
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits).toHaveLength(1)
+  })
 })

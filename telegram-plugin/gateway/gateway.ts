@@ -3434,6 +3434,14 @@ pendingProgress.startTimer({
     )
   },
   emitMetric: (event) => emitRuntimeMetric(event),
+  // #1760 defense-in-depth: if a newer turn for this chat is active at
+  // tick time, the prior turn's pending-progress is stale (the
+  // canonical teardown was missed). Drop the ticker instead of editing
+  // the old anchor — see pending-work-progress.ts's docblock.
+  isActiveTurnNewerThan: (key, activatedAt) => {
+    const turnStartedAt = activeTurnStartedAt.get(key)
+    return turnStartedAt != null && turnStartedAt > activatedAt
+  },
 })
 
 // Per-agent buffer for synthetic inbounds the gateway couldn't deliver
@@ -4689,6 +4697,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           //   - #1664 silent-end re-prompt fires even when the
           //     accumulated silent content qualifies as substantive;
           //   - retries within the dedup window may double-send.
+          // #1760 primary fix — clear any stale prior-turn ticker
+          // before re-anchoring on this silent-reply edit. See the
+          // matching comment at the executeReply finalize site below.
+          pendingProgress.clearPending(statusKey(chat_id, threadId), 'reply_finalize')
           pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
             messageId: decision.messageId,
             text: decision.mergedText,
@@ -4882,6 +4894,14 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   if (sentIds.length === chunks.length && chunks.length > 0) {
     const anchorMsgId = sentIds[chunks.length - 1]
     if (typeof anchorMsgId === 'number') {
+      // #1760 primary fix — clear any stale prior-turn ticker BEFORE
+      // re-anchoring. The canonical teardown wires (turn_end,
+      // subagent_handback, inbound) can be missed (e.g. SDK turn_end
+      // event dropped, as in the #1760 live evidence). Tearing down on
+      // every reply-finalize is idempotent and resilient: it's a no-op
+      // when nothing is active, and drops a stale ambient before the
+      // new turn captures its anchor.
+      pendingProgress.clearPending(statusKey(chat_id, threadId), 'reply_finalize')
       pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
         messageId: anchorMsgId,
         text: chunks[chunks.length - 1],
@@ -5319,6 +5339,10 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       streamFormat === 'html' ? 'HTML'
       : streamFormat === 'markdownv2' ? 'MarkdownV2'
       : undefined
+    // #1760 primary fix — clear any stale prior-turn ticker before
+    // re-anchoring on stream_reply done. See the matching comment at
+    // the executeReply finalize site.
+    pendingProgress.clearPending(statusKey(sChatId, sThreadId), 'reply_finalize')
     pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
       messageId: result.messageId,
       text: args.text as string,

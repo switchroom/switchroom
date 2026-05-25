@@ -112,6 +112,20 @@ export interface PendingProgressDeps {
   nowMs?: () => number
   /** Optional poll interval override for tests. */
   pollIntervalMs?: number
+  /**
+   * Defense-in-depth (#1760). When provided, returns the gateway's
+   * `activeTurnStartedAt` epoch ms for this chat key, or undefined if no
+   * turn is currently active. The ticker uses this on every fire to detect
+   * a stale ambient: if a NEWER turn has started (epoch > our activatedAt)
+   * the prior turn's cross-turn pending-progress is by definition orphaned
+   * (the turn_end teardown was missed, e.g. SDK event dropped) and the
+   * ticker self-terminates instead of editing a stale anchor. Converts the
+   * #1760 failure mode from "stuck forever" to "at most one stale tick."
+   *
+   * Defaults to undefined — preserves prior behaviour for tests that
+   * exercise the ticker without a gateway.
+   */
+  isActiveTurnNewerThan?: (key: string, activatedAt: number) => boolean
 }
 
 interface State {
@@ -276,7 +290,14 @@ export function noteTurnEnd(key: string): void {
  */
 export function clearPending(
   key: string,
-  reason: 'inbound' | 'handback' | 'progress' | 'timeout' | 'manual',
+  reason:
+    | 'inbound'
+    | 'handback'
+    | 'progress'
+    | 'timeout'
+    | 'manual'
+    | 'reply_finalize'
+    | 'stale_turn',
 ): void {
   if (!stateByKey.has(key)) return
   const s = stateByKey.get(key)!
@@ -334,6 +355,21 @@ function tick(now: number): void {
     const elapsed = now - s.activatedAt
     if (elapsed >= MAX_LIFETIME_MS) {
       clearPending(key, 'timeout')
+      continue
+    }
+
+    // #1760 defense-in-depth: if a newer turn is currently active for
+    // this chat, the prior turn's cross-turn pending-progress is stale
+    // (the canonical teardown — turn_end or the next turn's reply-
+    // finalize — was missed). Drop the timer instead of editing the
+    // old anchor; the new turn will manage its own anchor via the
+    // regular noteOutbound / noteTurnEnd path. Converts "stuck forever"
+    // (the live #1760 evidence) into "at most one stale tick."
+    if (
+      activeDeps.isActiveTurnNewerThan != null
+      && activeDeps.isActiveTurnNewerThan(key, s.activatedAt)
+    ) {
+      clearPending(key, 'stale_turn')
       continue
     }
 
