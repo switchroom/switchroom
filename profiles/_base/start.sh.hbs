@@ -159,6 +159,19 @@ fi
 if [ ! -e "$HOME/.switchroom" ] || [ -L "$HOME/.switchroom" ]; then
   ln -sfn {{{hostHomeQ}}}/.switchroom "$HOME/.switchroom" 2>/dev/null || true
 fi
+# Host ~/.switchroom-config symlink (#1846). Same shape as the
+# ~/.switchroom link above, for the operator's git-tracked config repo.
+# The compose generator bind-mounts a per-agent slice at
+# <host-home>/.switchroom-config/agents/<self>/personal-skills/ (when
+# the operator has opted in). Without this symlink, the CLI's
+# resolveConfigSkillsDir would call existsSync("$HOME/.switchroom-config")
+# and miss the bind-mounted path entirely → mirror silently no-ops.
+# The link lands ONLY when the host slice is actually mounted (the dir
+# the bind-mount targets) — leaving a dangling link when the operator
+# hasn't opted in is fine, existsSync resolves false through it.
+if [ ! -e "$HOME/.switchroom-config" ] || [ -L "$HOME/.switchroom-config" ]; then
+  ln -sfn {{{hostHomeQ}}}/.switchroom-config "$HOME/.switchroom-config" 2>/dev/null || true
+fi
 {{/if}}
 
 export NVM_DIR="$HOME/.nvm"

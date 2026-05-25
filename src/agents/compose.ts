@@ -1765,6 +1765,34 @@ function emitAgentService(
   // Critical: do NOT mount the parent ~/.switchroom/audit/ — that would
   // let any agent read every other agent's audit trail.
   lines.push(`      - ${homePrefix}/.switchroom/audit/${a.name}:${homePrefix}/.switchroom/audit/${a.name}:rw`);
+  // Config-repo personal-skills slice (#1846, closes JTBD from #1819).
+  // PR #1844 (v0.13.50) auto-mirrors personal-skill writes into the
+  // operator's git-tracked ~/.switchroom-config/ for durability. But the
+  // agent container can't see ~/.switchroom-config/ unless we bind-mount
+  // it — without this, the mirror silently no-ops for the dominant
+  // (in-container) caller and durability claim is false.
+  //
+  // PER-AGENT slice: only this agent's own subdir is mounted, never the
+  // whole repo. Same isolation invariant as the audit mount above. The
+  // mount target inside the container matches `homePrefix` so
+  // `resolveConfigSkillsDir` in skill-personal.ts finds it via the
+  // default `~/.switchroom-config/` path.
+  //
+  // Gated on the operator having opted in to versioned personal-skills
+  // (i.e. ~/.switchroom-config/ exists). Pre-create the per-agent
+  // subdir under operator umask so docker doesn't auto-create as root
+  // (the chown sweep in alignAgentUid will fix ownership on next apply).
+  if (existsSync(`${hostHomeForChecks}/.switchroom-config`)) {
+    try {
+      mkdirSync(
+        `${hostHomeForChecks}/.switchroom-config/agents/${a.name}/personal-skills`,
+        { recursive: true },
+      );
+    } catch { /* best-effort */ }
+    lines.push(
+      `      - ${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:rw`,
+    );
+  }
   // Bundled-skills pool: mount at the same absolute host path so the
   // symlinks created by reconcileAgentDefaultSkills (which target the
   // source-repo or npm-package skills/ dir — e.g.
