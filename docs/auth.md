@@ -265,8 +265,9 @@ per-agent slot model that's no longer needed).
 ## Ephemeral consumers (hindsight et al.)
 
 A non-agent container that needs OAuth credentials (e.g. a
-hindsight instance running `claude -p`) is declared in
-`switchroom.yaml`:
+hindsight instance using the `claude-code` LLM provider — it calls
+the Anthropic API under the consumer's OAuth identity for its own
+summarization / recall) is declared in `switchroom.yaml`:
 
 ```yaml
 auth:

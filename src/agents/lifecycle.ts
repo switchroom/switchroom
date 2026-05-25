@@ -750,18 +750,17 @@ export function getAgentLogs(name: string, follow: boolean): void {
  * agent container.
  *
  * The categories intentionally collapse together:
- *   - "cron"     — `telegram/cron-*.sh` script regeneration (a legacy
- *                  artifact). The Phase-4 in-container agent-scheduler
- *                  (`src/agent-scheduler/`) reads its schedule entries
- *                  from the cascade-resolved config at boot and closes
- *                  over each entry's cron+prompt at registration time —
- *                  it does NOT exec these scripts, nor re-read config
- *                  per fire. So a cron change is observed only after the
- *                  scheduler re-reads config (next container/scheduler
- *                  restart), not "on the next fire". We tag it "cron"
- *                  only so the caller can skip a destructive bounce on a
- *                  prompt tweak (see applyCronChangesHot) — the change
- *                  still waits for the next natural restart.
+ *   - "cron"     — stale `telegram/cron-*.sh` artifacts being swept
+ *                  (post-#1799 cleanup). The Phase-4 in-container
+ *                  agent-scheduler (`src/agent-scheduler/`) reads its
+ *                  schedule entries from the cascade-resolved config at
+ *                  boot and closes over each entry's cron+prompt at
+ *                  registration time — there are no .sh scripts to exec
+ *                  per fire. A schedule edit in the yaml is observed
+ *                  only after the scheduler re-reads config (next
+ *                  container restart). We still tag the .sh-deletion
+ *                  change as "cron" so the caller can skip a destructive
+ *                  bounce when the only change is the cleanup pass.
  *   - "skill"    — `.claude/skills/` symlinks / payload. Phase C will
  *                  build hot-reload for these; for now they still need
  *                  a restart, but we tag them so #1163's Phase C can
@@ -814,14 +813,15 @@ export interface ApplyCronChangesHotResult {
 
 /**
  * Apply cron-only reconcile changes without restarting the agent
- * container. `reconcileAgent` has already rewritten the bind-mounted
- * agent dir (config + legacy `telegram/cron-<i>.sh` scripts). This
- * helper deliberately performs NO restart — so a prompt tweak doesn't
- * kill the running session — but note it also does NOT make the change
- * live: the in-container scheduler snapshots its entries at boot, so
- * the new schedule is observed only on the scheduler's next
- * boot/restart (image pull, OOM bounce, host reboot, or an explicit
- * `switchroom agent restart`).
+ * container. `reconcileAgent` may have swept stale `telegram/cron-*.sh`
+ * artifacts (post-#1799 cleanup) from the bind-mounted agent dir; that
+ * doesn't require a restart because the agent-scheduler never read
+ * those files. This helper deliberately performs NO restart — so a
+ * schedule edit in the yaml doesn't kill the running session — but note
+ * it also does NOT make the change live: the in-container scheduler
+ * snapshots its entries at boot, so the new schedule is observed only
+ * on the scheduler's next boot/restart (image pull, OOM bounce, host
+ * reboot, or an explicit `switchroom agent restart`).
  *
  * This helper exists as a named seam so:
  *   1. Phase F's decision in `reconcileAndRestartAgent` has a single
