@@ -810,6 +810,34 @@ describe("generateCompose", () => {
     );
   });
 
+  it("broker bind-mounts each per-agent .vault-token file at /root/.switchroom/agents/<name>/.vault-token", () => {
+    // fails when: mint_grant writes the new token to
+    // `os.homedir() + .switchroom/agents/<agent>/.vault-token` —
+    // inside the broker container that path is `/root/.switchroom/...`,
+    // ephemeral, and invisible to both the operator host and the agent
+    // container. The agent's in-container `switchroom vault get` then
+    // can't read the freshly-minted token, so the broker falls back to
+    // the peercred ACL path and denies any user-declared MCP that
+    // relies on standing grants (e.g. perplexity).
+    //
+    // Surfaced 2026-05-25 after a fleet-wide `switchroom vault grant`
+    // cycle for perplexity/api-key produced grants in the DB (visible
+    // via `vault grants`) but stale on-host token files — every agent
+    // hit VAULT-BROKER-DENIED on perplexity launcher startup.
+    //
+    // Mount is RW (broker writes the token on every mint); pre-created
+    // by `ensureHostMountSources()` in apply.ts so docker doesn't
+    // auto-create a root-owned directory at the mount path.
+    const out = generateCompose({ config: makeConfig({ a: {}, b: {} }) });
+    const block = /vault-broker:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).toMatch(
+      /-\s+\$\{HOME\}\/\.switchroom\/agents\/a\/\.vault-token:\/root\/\.switchroom\/agents\/a\/\.vault-token(?!:ro)/,
+    );
+    expect(block).toMatch(
+      /-\s+\$\{HOME\}\/\.switchroom\/agents\/b\/\.vault-token:\/root\/\.switchroom\/agents\/b\/\.vault-token(?!:ro)/,
+    );
+  });
+
   it("kernel keeps CHOWN + FOWNER (mirrors broker socket-ownership flow)", () => {
     const out = generateCompose({ config: makeConfig({ a: {} }) });
     const block = /approval-kernel:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";

@@ -17,7 +17,7 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
@@ -356,6 +356,45 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
   const hostdAuditLogPath = join(home, ".switchroom", "host-control-audit.log");
   if (!existsSync(hostdAuditLogPath)) {
     writeFileSync(hostdAuditLogPath, "", { mode: 0o644 });
+  }
+
+  // Per-agent vault-grant token file (`<agentDir>/.vault-token`,
+  // mode 0600). The broker's mint_grant handler (server.ts ~2222)
+  // writes the token at `os.homedir() + .switchroom/agents/<agent>/.vault-token`
+  // — inside the broker container that path is `/root/.switchroom/...`
+  // and was never bind-mounted out, so fresh mints stranded in the
+  // broker's ephemeral filesystem. Operator-side `.vault-token` files
+  // either didn't exist or were stale, and `claude mcp list` shows
+  // "Failed to connect" for any user-declared MCP that relies on
+  // `switchroom vault get <key>` to fetch its API key (e.g. perplexity).
+  // Surfaced 2026-05-25 after the v0.13.37 launcher relocation +
+  // a fleet-wide `vault grant` cycle showed every minted token
+  // missing on the operator side.
+  //
+  // Fix: pre-create the file (so docker compose `up` doesn't
+  // auto-create a directory at this path on a fresh install) and
+  // chown to the agent UID so the agent inside the container can
+  // read it under its own peercred identity. The broker writes via
+  // CAP_DAC_OVERRIDE so its writes succeed regardless of ownership;
+  // a follow-up chownSync in mint_grant restores the agent UID after
+  // every write so subsequent reads from the agent keep working.
+  for (const name of Object.keys(config.agents)) {
+    const tokenPath = join(home, ".switchroom", "agents", name, ".vault-token");
+    if (!existsSync(tokenPath)) {
+      writeFileSync(tokenPath, "", { mode: 0o600 });
+    }
+    // Best-effort chown to the agent UID. allocateAgentUid is the
+    // deterministic UID derivation used by every other per-agent
+    // file (scaffold, broker chown-after-mint). Swallow EPERM on
+    // dev hosts that don't have the permissions — the operator
+    // running apply may not be root, and the existing .vault-token
+    // is already correctly owned in that case.
+    try {
+      const uid = allocateAgentUid(name);
+      chownSync(tokenPath, uid, uid);
+    } catch {
+      /* dev / no CAP_CHOWN — leave existing ownership */
+    }
   }
 }
 

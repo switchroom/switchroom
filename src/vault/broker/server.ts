@@ -2265,6 +2265,26 @@ export class VaultBroker {
         const tmpPath = `${tokenPath}.tmp.${process.pid}`;
         writeFileSync(tmpPath, mintResult.token, { mode: 0o600 });
         renameSync(tmpPath, tokenPath);
+        // Chown to the agent UID. Without this the file lands root:root
+        // (broker runs as root) — the agent's in-container
+        // `switchroom vault get` would then fall back to the peercred
+        // ACL with no token attached, hitting VAULT-BROKER-DENIED on
+        // every call. Pre-fix this gap was masked because the per-
+        // agent token files weren't bind-mounted into the broker at
+        // all and the write stranded inside the broker's ephemeral
+        // /root/.switchroom. CAP_CHOWN is granted to the broker (see
+        // compose.ts cap_add). Swallow EPERM on dev hosts without
+        // it — the broker still returns the token in the IPC
+        // response, just the on-disk mirror is owner-wrong.
+        try {
+          const uid = allocateAgentUid(agent);
+          chownSync(tokenPath, uid, uid);
+        } catch (chownErr) {
+          process.stderr.write(
+            `[vault-broker] mint_grant: token written but chown failed for agent ${agent}: ` +
+            `${(chownErr as Error).message} (CAP_CHOWN missing?)\n`
+          );
+        }
       } catch (err) {
         // Non-fatal: the token is still returned. File write is best-effort.
         process.stderr.write(
