@@ -977,6 +977,30 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // ownership doesn't gate the write path. (Same pattern as
   // vault-audit.log above and host-control-audit.log on hostd.)
   lines.push(`      - ${homePrefix}/.switchroom/vault-grants.db:/root/.switchroom/vault-grants.db`);
+  // Per-agent vault-grant token files. The broker's mint_grant
+  // handler (server.ts ~2222) writes the minted token at
+  // `os.homedir() + .switchroom/agents/<agent>/.vault-token`.
+  // Inside the broker container `os.homedir()` is `/root`, so the
+  // unmounted default would write to `/root/.switchroom/agents/<agent>/.vault-token`
+  // — ephemeral, invisible to both the operator host and the
+  // agent containers that need to read the token to authenticate
+  // back to the broker. Pre-fix every fresh mint stranded.
+  //
+  // Bind each per-agent token file at the same path the broker
+  // computes, so writes land on the operator's host fs and the
+  // agent's per-agent dir mount surfaces them inside the agent
+  // container too. Source files are pre-created (mode 0600,
+  // owned by the agent UID) by `ensureHostMountSources` in
+  // apply.ts so docker doesn't auto-create a root-owned directory
+  // here. Broker writes via root with CAP_DAC_OVERRIDE; a
+  // post-write chownSync (server.ts mint_grant) restores agent-UID
+  // ownership after every mint so the agent keeps being able to
+  // read the file from its own peercred identity.
+  for (const a of describeAgents(config)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/agents/${a.name}/.vault-token:/root/.switchroom/agents/${a.name}/.vault-token`,
+    );
+  }
   // /etc/machine-id passthrough — required so the broker can derive
   // the same machine-bound key the host's `enable-auto-unlock` used
   // to seal the auto-unlock blob. The agent base image (node:22-bookworm-slim)
