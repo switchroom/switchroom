@@ -96,7 +96,7 @@ jobs:
         # is ~90s. On a hit we skip dist build, buildx setup, and the
         # whole image build sequence.
         id: img-cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: /tmp/switchroom-images.tar
           key: docker-images-${{ hashFiles('docker/Dockerfile.base', 'docker/Dockerfile.broker', 'docker/Dockerfile.kernel', 'docker/Dockerfile.agent', 'docker/Dockerfile.auth-broker', 'tests/docker/build-images.sh', 'src/vault/**', 'src/agents/compose.ts', 'src/agent-scheduler/**', 'src/auth/broker/**', 'src/cli/apply.ts', 'bun.lock', 'telegram-plugin/bun.lock', 'scripts/build.mjs') }}
