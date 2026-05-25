@@ -132,6 +132,36 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(existsSync(statePath)).toBe(true)
     const state = JSON.parse(readFileSync(statePath, 'utf8'))
     expect(state.retryCount).toBe(1)
+    // Reviewer-flagged regression: the hook's state-file write MUST
+    // include turnKey + chatId derived from the enqueue envelope. Without
+    // these, the gateway's later `recordSilentTurnEnd` write (~175ms after
+    // the hook) sees a turnKey mismatch and resets retryCount to 0,
+    // doubling the effective re-prompt budget. The shape here must match
+    // `chatKey(chatId, threadId)` at telegram-plugin/gateway/chat-key.ts:46.
+    expect(state.chatId).toBe('111')
+    expect(state.turnKey).toBe('111:_')
+  })
+
+  it('preserves retryCount across the hook→gateway write order (reviewer regression)', () => {
+    // Simulates what happens on the gateway side once it runs its own
+    // `writeSilentEndState` ~175ms after the hook: it reads the hook's
+    // file, sees matching turnKey, preserves retryCount. Then the next
+    // `recordSilentTurnEnd` call sees retryCount=1 >= MAX_RETRIES=1 and
+    // returns exhausted — the design budget. Without matching turnKey
+    // this branch never fires on time and the budget doubles.
+    const transcript = writeTranscript(tmp, [
+      ENQUEUE,
+      reply('on it', { disable_notification: true }),
+    ])
+    const r = runHook({
+      event: { session_id: 's1', transcript_path: transcript },
+      stateDir,
+    })
+    expect(r.status).toBe(0)
+    const statePath = join(stateDir, 'silent-end-pending.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8'))
+    expect(state.turnKey).toBe('111:_')
+    expect(state.retryCount).toBe(1)
   })
 
   it('allows stop when retry budget already exhausted (retryCount >= MAX_RETRIES)', () => {

@@ -150,12 +150,30 @@ function main() {
   // chat hits the exhaustion branch above. The gateway's existing
   // clearSilentEndState path (`silent-end.ts:155-180`) handles
   // resetting on successful delivery.
+  //
+  // CRITICAL: include `turnKey` (and the supporting `chatId` / `threadId`)
+  // when the scan derived them from the enqueue envelope. The gateway's
+  // `recordSilentTurnEnd` (`silent-end.ts:114`) preserves retryCount
+  // ONLY when `prev.turnKey === args.turnKey`. Without turnKey here,
+  // the gateway's later write (~175ms after the hook) sees `prev.turnKey
+  // === undefined`, fails the match, and resets retryCount to 0 — which
+  // doubles the effective re-prompt budget vs. the design. With turnKey
+  // present (same chatKey shape the gateway uses), the match succeeds
+  // and the budget is honored.
+  const nextState = {
+    ...state,
+    retryCount: retryCount + 1,
+    timestamp: Date.now(),
+  }
+  if (decision.turnKey) {
+    nextState.turnKey = decision.turnKey
+    nextState.chatId = decision.chatId
+    if (decision.threadId != null) {
+      nextState.threadId = decision.threadId
+    }
+  }
   try {
-    writeFileSync(
-      statePath,
-      JSON.stringify({ ...state, retryCount: retryCount + 1, timestamp: Date.now() }),
-      'utf8',
-    )
+    writeFileSync(statePath, JSON.stringify(nextState), 'utf8')
   } catch (err) {
     process.stderr.write(`[silent-end-interrupt] failed to update state file: ${err.message}\n`)
     // Fail-open: a retry-count write failure shouldn't loop the

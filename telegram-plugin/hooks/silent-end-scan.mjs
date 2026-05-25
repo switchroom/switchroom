@@ -56,12 +56,60 @@ export function isFinalAnswerReply({ text, disableNotification, done }) {
 }
 
 /**
+ * Parse a `<channel ...>` envelope's chat_id and message_thread_id
+ * attributes. Same shape session-tail.ts:125-140 uses to derive these
+ * from the enqueue line's `content` string.
+ *
+ * Returns `null` if the envelope can't be parsed (caller treats as
+ * "no turn key derivable" and writes a turnKey-less state file —
+ * still functional, just loses retry-count preservation across the
+ * hook→gateway write order).
+ *
+ * @param {string} content
+ * @returns {{ chatId: string | null, threadId: number | null }}
+ */
+function parseChannelEnvelope(content) {
+  if (typeof content !== 'string') return { chatId: null, threadId: null }
+  const chatMatch = content.match(/chat_id="([^"]+)"/)
+  const threadMatch = content.match(/message_thread_id="([^"]+)"/)
+  const threadRaw = threadMatch ? Number(threadMatch[1]) : NaN
+  return {
+    chatId: chatMatch ? chatMatch[1] : null,
+    threadId: Number.isFinite(threadRaw) && threadRaw !== 0 ? threadRaw : null,
+  }
+}
+
+/**
+ * Build the turnKey the gateway will use for `recordSilentTurnEnd`'s
+ * write of the state file. Matches `chatKey(chatId, threadId)` shape
+ * at `gateway/chat-key.ts:46`: `${chatId}:${threadId || '_'}`.
+ *
+ * @param {string} chatId
+ * @param {number | null} threadId
+ * @returns {string}
+ */
+function buildTurnKey(chatId, threadId) {
+  return `${chatId}:${threadId == null || threadId === 0 ? '_' : threadId}`
+}
+
+/**
  * Scan a JSONL transcript and decide whether the current turn ended
  * with a final reply delivered.
  *
  * Returns:
  *   { decided: 'allow', reason }    — qualifying reply OR silent marker found
- *   { decided: 'block', reason }    — turn-start found, no qualifying reply, no marker
+ *   { decided: 'block', reason, turnKey?, chatId?, threadId? }
+ *                                   — turn-start found, no qualifying reply,
+ *                                     no marker. `turnKey`/`chatId`/`threadId`
+ *                                     populated from the enqueue's channel
+ *                                     envelope so the hook can write a state
+ *                                     file shape that matches what the
+ *                                     gateway's `recordSilentTurnEnd` would
+ *                                     write — keeping the retry-count
+ *                                     preservation gate at
+ *                                     `silent-end.ts:114` happy when the
+ *                                     gateway's later write reads back the
+ *                                     hook's state.
  *   { decided: 'unknown', reason }  — couldn't locate turn-start; caller fail-open
  *
  * Turn-start anchor: the most recent `queue-operation`/`enqueue` line
@@ -73,13 +121,14 @@ export function isFinalAnswerReply({ text, disableNotification, done }) {
  * enqueue's append; accepted residual.)
  *
  * @param {string} jsonl
- * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string }}
+ * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, chatId?: string, threadId?: number | null }}
  */
 export function scanTurnForFinalReply(jsonl) {
   const lines = jsonl.split('\n')
 
   // 1. Walk backward to most-recent queue-operation/enqueue.
   let startIdx = -1
+  let envelope = { chatId: null, threadId: null }
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]
     if (!line || line[0] !== '{') continue
@@ -87,6 +136,7 @@ export function scanTurnForFinalReply(jsonl) {
     try { obj = JSON.parse(line) } catch { continue }
     if (obj?.type === 'queue-operation' && obj.operation === 'enqueue') {
       startIdx = i
+      envelope = parseChannelEnvelope(obj.content)
       break
     }
   }
@@ -130,5 +180,11 @@ export function scanTurnForFinalReply(jsonl) {
     }
   }
 
-  return { decided: 'block', reason: 'no-final-reply' }
+  const block = { decided: 'block', reason: 'no-final-reply' }
+  if (envelope.chatId) {
+    block.chatId = envelope.chatId
+    block.threadId = envelope.threadId
+    block.turnKey = buildTurnKey(envelope.chatId, envelope.threadId)
+  }
+  return block
 }

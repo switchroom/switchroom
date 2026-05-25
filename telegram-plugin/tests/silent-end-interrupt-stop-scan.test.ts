@@ -240,6 +240,47 @@ describe('scanTurnForFinalReply — non-reply tool_use does NOT satisfy', () => 
   })
 })
 
+describe('scanTurnForFinalReply — envelope-derived turnKey (block result)', () => {
+  it('block carries turnKey/chatId/threadId parsed from the enqueue envelope', () => {
+    const enq = JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: '<channel source="switchroom-telegram" chat_id="abc" message_thread_id="42" message_id="9">hi</channel>',
+    })
+    const text = jsonl(
+      enq,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ack', disable_notification: true }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('block')
+    expect(r.chatId).toBe('abc')
+    expect(r.threadId).toBe(42)
+    expect(r.turnKey).toBe('abc:42')
+  })
+
+  it("DM (no message_thread_id) → turnKey uses '_' sentinel matching chatKey()", () => {
+    // chatKey() at telegram-plugin/gateway/chat-key.ts:46 returns
+    // `${chatId}:_` when threadId is missing/0. This must match.
+    const r = scanTurnForFinalReply(
+      jsonl(ENQUEUE, assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ack', disable_notification: true })),
+    )
+    expect(r.decided).toBe('block')
+    expect(r.turnKey).toBe('111:_')
+    expect(r.chatId).toBe('111')
+    expect(r.threadId).toBeNull()
+  })
+
+  it('allow result does NOT need turnKey (only block path writes the state file)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', { text: 'ok', disable_notification: false }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.turnKey).toBeUndefined()
+  })
+})
+
 describe('scanTurnForFinalReply — malformed input tolerance', () => {
   it('malformed JSON lines interleaved → skipped, decision matches the well-formed ones', () => {
     const text = jsonl(
