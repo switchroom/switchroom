@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.13.41 — #1799 follow-up: apply-side sweep + docs cleanup, quota reset UX
+
+### fix(#1799 follow-up): apply-side cleanup of stale cron-*.sh (PR #1802)
+
+Discovered during the v0.13.40 rollout: PR #1799 added the
+dormant-script sweep to `reconcileAgentDir`, but `switchroom apply`
+calls `scaffoldAgent` (not reconcile) for agents it considers "up to
+date". On the live host, agents WITH `schedule:` entries still had
+their dormant `cron-*.sh` + `.source` files on disk after rolling
+v0.13.40 because the scaffold path had no sweep.
+
+This release moves the sweep into `scaffoldAgent` so `switchroom
+apply` sweeps regardless of which code path it takes per agent.
+Idempotent: no-op when nothing matches. Defense-in-depth: the
+reconcile sweep is retained.
+
+Also cleans up stale doc/comment references that still described
+the retired cron-script generation path:
+- `src/agents/cron-unit-name.ts` — header rewritten to make the
+  file's cleanup-only survival role explicit
+- `src/agents/lifecycle.ts` — `classifyChangeKind` + `applyCronChangesHot`
+  doc comments updated (cron change-kind now signals stale-script
+  deletion, not regeneration)
+- `src/cli/agent.ts:597` — Phase F hot-reload comment updated
+- `docs/auth.md:268` — hindsight described accurately as using the
+  `claude-code` LLM provider (over the Anthropic API under the
+  consumer's OAuth identity), not "running `claude -p`"
+
+### feat(web): surface quota reset times under the 5h/7d % cells (PR #1801)
+
+Pure UI: the operator web dashboard now shows the wall-clock reset
+time alongside the 5h/7d quota percentages — easier at-a-glance
+"when does this reset?" without doing math from now+remaining.
+
 ## v0.13.40 — bridge-flap class closed: eliminate `claude -p` cron generator, vault-broker per-agent token mount
 
 Two fixes that together close out a 2026-05-25 forensic investigation
