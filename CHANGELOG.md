@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### feat(#1770): error envelope Phase 3 — VAULT-BROKER-DENIED and cron quota errors
+
+Extends the structured `error_envelope` (#1758 Phase 1, #1759 / #1769 Phase 2)
+to the two error families that live outside hostd. The vault CLI now writes
+a sibling `VAULT-BROKER-DENIED-ENVELOPE: <json>` line on stderr alongside the
+byte-identical legacy `VAULT-BROKER-DENIED [<code>]: <msg>` line — `fix.kind`
+is `request_vault_grant` with `vault_key` populated so the gateway's auto-
+resume flow has the unlock-card hint it needs. The `agent-config` CLI's
+`emitError` JSON line now carries an `error_envelope` sibling for
+`E_CRON_TOO_FREQUENT` and `E_QUOTA_EXCEEDED`, both `fix.kind: quota_exceeded`
+with the `quota`/`current`/`limit` triplet filled. Top-level `code`/`message`
+fields preserved verbatim for back-compat with string-matching decoders.
+
 ### feat(#1761): error envelope Phase 2 — batch migration + denied-vs-error classification + negative-path tests
 
 Follow-ups on the Phase 1 wire protocol (#1759). Five tightenings:

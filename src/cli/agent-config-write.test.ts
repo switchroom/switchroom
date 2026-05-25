@@ -70,6 +70,61 @@ describe("scheduleAdd — security gates", () => {
     expect(r.exit).toBe(9);
   });
 
+  // #1770 Phase 3 — envelope shape assertions parallel to the Phase 2
+  // tests in tests/host-control/. The ScheduleErrorResult now carries
+  // a `meta` side-channel that the CLI's emitError lifts into the
+  // `error_envelope` JSON sibling on stderr. We assert the meta shape
+  // here (the actual stderr serialisation is exercised end-to-end by
+  // the CLI tests; the meta payload is the structured contract).
+  describe("#1770 — error_envelope meta side-channel", () => {
+    it("E_CRON_TOO_FREQUENT carries meta.requested_interval_min", () => {
+      const r = scheduleAdd({
+        cronExpr: "* * * * *",
+        prompt: "spammy",
+        root,
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.code).toBe("E_CRON_TOO_FREQUENT");
+      expect(r.meta).toBeDefined();
+      // `*` → 1 minute cadence (extractCronIntervalMin contract)
+      expect(r.meta?.requested_interval_min).toBe(1);
+    });
+
+    it("E_CRON_TOO_FREQUENT parses */N step form", () => {
+      const r = scheduleAdd({
+        cronExpr: "*/2 * * * *",
+        prompt: "twomin",
+        root,
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.code).toBe("E_CRON_TOO_FREQUENT");
+      expect(r.meta?.requested_interval_min).toBe(2);
+    });
+
+    it("E_QUOTA_EXCEEDED carries meta.current at the cap", () => {
+      // Fill the agent to MAX_ENTRIES_PER_AGENT (20) then attempt one more.
+      for (let i = 0; i < 20; i++) {
+        const r = scheduleAdd({
+          cronExpr: `${i} 9 * * *`,
+          prompt: `task ${i}`,
+          root,
+        });
+        expect(r.ok).toBe(true);
+      }
+      const overflow = scheduleAdd({
+        cronExpr: "0 10 * * *",
+        prompt: "one too many",
+        root,
+      });
+      expect(overflow.ok).toBe(false);
+      if (overflow.ok) return;
+      expect(overflow.code).toBe("E_QUOTA_EXCEEDED");
+      expect(overflow.meta?.current).toBe(20);
+    });
+  });
+
   it("empty secrets array passes through", () => {
     const r = scheduleAdd({
       cronExpr: "0 9 * * *",

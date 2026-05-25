@@ -71,6 +71,11 @@ const VAULT_EXIT_NEEDS_APPROVAL = 5;
 const VAULT_EXIT_BROKER_UNREACHABLE = 6;
 const VAULT_EXIT_SANDBOX_CONTEXT = 7;
 
+// VAULT-BROKER-DENIED-ENVELOPE helper moved to ./vault-denied-envelope.ts
+// so it can be unit-tested without dragging the rest of vault.ts (which
+// transitively pulls bun:sqlite) into the vitest module graph.
+import { writeVaultDeniedEnvelope } from "./vault-denied-envelope.js";
+
 function refuseSandboxDirectAccess(verbHint: string): never {
   process.stderr.write(
     `VAULT-SANDBOX-CONTEXT: direct vault access is unavailable inside an ` +
@@ -511,6 +516,7 @@ export function registerVaultCommand(program: Command): void {
           process.stderr.write(
             `VAULT-BROKER-DENIED [${result.code}]: ${result.msg}\n`
           );
+          writeVaultDeniedEnvelope(key, result.code, result.msg);
           process.exit(VAULT_EXIT_DENIED);
         }
 
@@ -876,6 +882,7 @@ export function registerVaultCommand(program: Command): void {
                 `VAULT-BROKER-DENIED [${result.code}]: ${result.msg}\n` +
                 `${recoveryHint("denied", key)}\n`
               );
+              writeVaultDeniedEnvelope(key, result.code, result.msg);
               process.exit(2);
             }
           } else {

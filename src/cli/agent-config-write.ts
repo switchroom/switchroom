@@ -60,8 +60,44 @@ import {
   type PendingReasonCode,
 } from "./agent-config-pending.js";
 import { existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import type { ErrorEnvelope } from "../host-control/protocol.js";
 
 const MAX_ENTRIES_PER_AGENT = 20;
+
+/** Min-interval cron floor (minutes). Mirrors `violatesMinInterval`. */
+const MIN_CRON_INTERVAL_MIN = 5;
+
+/**
+ * Best-effort interval extraction for the `current` field of the
+ * envelope's `quota_exceeded` fix. Parses the minutes column of a
+ * 5-field cron expr; returns 1 for `*`, the step for a stepped value, the count
+ * for a CSV list, or 0 when we can't tell (e.g. complex range exprs).
+ * Used purely as structured metadata — the user-facing message is
+ * still the canonical truth.
+ */
+function extractCronIntervalMin(expr: string): number {
+  const fields = expr.trim().split(/\s+/);
+  if (fields.length < 5) return 0;
+  const min = fields[0];
+  if (min === "*") return 1;
+  const step = min.match(/^\*\/(\d+)$/);
+  if (step) return Number(step[1]);
+  if (min.includes(",")) {
+    const parts = min.split(",").map((s) => Number(s)).filter((n) => Number.isFinite(n));
+    if (parts.length >= 2) {
+      // Approximate cadence: smallest gap between sorted entries.
+      const sorted = [...parts].sort((a, b) => a - b);
+      let smallest = Infinity;
+      for (let i = 1; i < sorted.length; i++) {
+        const gap = sorted[i] - sorted[i - 1];
+        if (gap > 0 && gap < smallest) smallest = gap;
+      }
+      return Number.isFinite(smallest) ? smallest : 0;
+    }
+  }
+  return 0;
+}
 
 /**
  * Defense-in-depth check that the caller is the operator host CLI,
@@ -120,8 +156,68 @@ export type ReconcileFn = (
   agent: string,
 ) => ReconcileBridgeResult | ReconcileBridgeError;
 
+/**
+ * Build the structured `error_envelope` (#1758 / #1770 Phase 3) for
+ * codes whose fix kind is well-defined. Returns `undefined` for codes
+ * we haven't migrated yet — callers spread it into the JSON line so an
+ * `undefined` simply elides the field, preserving byte-identity of the
+ * legacy `{ code, message, ...extra }` shape for any decoder still
+ * string-matching the old form.
+ */
+function buildEnvelopeForCode(
+  code: ErrorCode,
+  message: string,
+  extra: Record<string, unknown>,
+): ErrorEnvelope | undefined {
+  // request_id is required by ErrorEnvelopeSchema; CLI emit sites have
+  // no caller-supplied id, so synthesize one. Receivers correlate via
+  // audit_id when needed; this id exists purely to satisfy the schema.
+  const request_id = `agent-config-${randomUUID()}`;
+  if (code === "E_CRON_TOO_FREQUENT") {
+    return {
+      v: 1,
+      code,
+      human: message,
+      fix: {
+        kind: "quota_exceeded",
+        quota: "cron_min_interval_minutes",
+        current: typeof extra.requested_interval_min === "number"
+          ? (extra.requested_interval_min as number)
+          : 0,
+        limit: MIN_CRON_INTERVAL_MIN,
+      },
+      request_id,
+    };
+  }
+  if (code === "E_QUOTA_EXCEEDED") {
+    const current = typeof extra.current === "number"
+      ? (extra.current as number)
+      : MAX_ENTRIES_PER_AGENT;
+    return {
+      v: 1,
+      code,
+      human: message,
+      fix: {
+        kind: "quota_exceeded",
+        quota: "schedule_entries_per_agent",
+        current,
+        limit: MAX_ENTRIES_PER_AGENT,
+      },
+      request_id,
+    };
+  }
+  return undefined;
+}
+
 function emitError(code: ErrorCode, message: string, extra: Record<string, unknown> = {}): void {
-  process.stderr.write(JSON.stringify({ code, message, ...extra }) + "\n");
+  const error_envelope = buildEnvelopeForCode(code, message, extra);
+  // Legacy `{ code, message, ...extra }` preserved verbatim. The
+  // `error_envelope` (when present) is appended as a sibling key —
+  // mirrors the Phase 2 `{ ...built, error: legacy }` byte-identity
+  // pattern. Decoders that only read `code`/`message` see no change.
+  const line: Record<string, unknown> = { code, message, ...extra };
+  if (error_envelope) line.error_envelope = error_envelope;
+  process.stderr.write(JSON.stringify(line) + "\n");
 }
 
 function exitCodeFor(code: ErrorCode): number {
@@ -187,6 +283,14 @@ export interface ScheduleErrorResult {
   code: ErrorCode;
   message: string;
   exit: number;
+  /**
+   * Structured side-channel for the envelope builder (#1770). Optional
+   * per-code numerics like `current`, `requested_interval_min` that
+   * `buildEnvelopeForCode` lifts into `fix.quota_exceeded` fields.
+   * Not part of the legacy stderr JSON shape — keys are spread into
+   * `extra` only when an emit site routes through them.
+   */
+  meta?: Record<string, unknown>;
 }
 
 /**
@@ -269,6 +373,7 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
       code: "E_CRON_TOO_FREQUENT",
       message: "cron interval is tighter than the minimum (5 minutes)",
       exit: 9,
+      meta: { requested_interval_min: extractCronIntervalMin(opts.cronExpr) },
     };
   }
 
@@ -291,6 +396,7 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
       code: "E_QUOTA_EXCEEDED",
       message: `agent already has ${existing.length} overlay entries (max ${MAX_ENTRIES_PER_AGENT})`,
       exit: 9,
+      meta: { current: existing.length },
     };
   }
 
@@ -569,7 +675,7 @@ export function registerAgentConfigWriteCommands(program: Command): void {
       if (opts.agent) resolvedAgent = opts.agent;
       else if (process.env.SWITCHROOM_AGENT_NAME) resolvedAgent = process.env.SWITCHROOM_AGENT_NAME;
       if (!r.ok) {
-        emitError(r.code, r.message);
+        emitError(r.code, r.message, r.meta ?? {});
         appendAudit(
           resolvedAgent,
           "schedule.add",
@@ -725,7 +831,7 @@ export function registerAgentConfigWriteCommands(program: Command): void {
       if (opts.agent) resolvedAgent = opts.agent;
       else if (process.env.SWITCHROOM_AGENT_NAME) resolvedAgent = process.env.SWITCHROOM_AGENT_NAME;
       if (!r.ok) {
-        emitError(r.code, r.message);
+        emitError(r.code, r.message, r.meta ?? {});
         appendAudit(resolvedAgent, "schedule.remove", { ...opts, code: r.code }, r.exit);
         process.exit(r.exit);
       }
