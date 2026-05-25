@@ -59,6 +59,7 @@ import {
   validateSkillBundle,
 } from "./skill-common.js";
 import { withConfigError } from "./helpers.js";
+import { appendAudit } from "./agent-config.js";
 import chalk from "chalk";
 
 // ─── Constants ─────────────────────────────────────────────────────
@@ -455,6 +456,9 @@ export function initPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ true);
+  // Audit row on success only (failure paths exit via fail() before this).
+  // Used by scripts/observe-personal-skills.mjs for adoption telemetry.
+  appendAudit(agent, "skill.init_personal", { name, files: Object.keys(files).length }, 0);
 }
 
 export function editPersonalAction(name: string, opts: InitEditOpts): void {
@@ -462,6 +466,7 @@ export function editPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ false);
+  appendAudit(agent, "skill.edit_personal", { name, files: Object.keys(files).length }, 0);
 }
 
 export function removePersonalAction(name: string, opts: RemoveOpts): void {
@@ -510,6 +515,7 @@ export function removePersonalAction(name: string, opts: RemoveOpts): void {
       recoverable_until: new Date(ts + TRASH_TTL_MS).toISOString(),
     }),
   );
+  appendAudit(agent, "skill.remove_personal", { name }, 0);
 }
 
 export function listPersonalAction(opts: ListOpts): void {
