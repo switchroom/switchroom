@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.13.46 — agent-managed skills follow-ups (UX + observability)
+
+Two small follow-ups to v0.13.45, both surfaced during that release's UAT
+and addressed before they could rot:
+
+### fix(skill-search): default --agent to $SWITCHROOM_AGENT_NAME (PR #1828, closes #1827)
+
+`skill search` was the only personal-skill verb that didn't default
+`--agent` from the in-container env. Agents calling `skill_search`
+from inside their own session had to pass `--agent` explicitly to see
+their personal tier — otherwise personal results were silently
+omitted. Now mirrors the four sibling ops (init/edit/remove/list).
+
+Three regression tests pin: env-populates-personal-tier,
+explicit-flag-overrides-env, no-env-no-flag-still-searches-shared.
+
+### feat(skill): observability for personal-skills adoption (PR #1829)
+
+Telemetry for the 60-day Phase 2 decision (RFC #1819 defers operator-
+approval-gated shared-pool edits until usage data exists):
+
+1. **Audit rows** — three mutating personal-skill ops
+   (`init_personal`, `edit_personal`, `remove_personal`) now write one
+   row each to `~/.switchroom/audit/<agent>/agent-config.jsonl` on
+   success. Same shape as existing `config.get` / `cron.list` rows.
+   Read-only ops (`list_personal`, `search`) deliberately NOT audited
+   — disk state is the ground truth.
+2. **`scripts/observe-personal-skills.mjs`** — host-side fleet scan.
+   Reports per-agent: current personal skills, trash entries
+   (24h-recoverable), audit-row counts. Supports `--json` and
+   `--since 7d`.
+3. **`docs/personal-skills-adoption-observability.md`** — decision
+   rubric with explicit thresholds (strong/weak/no Phase 2 demand)
+   for the ~2026-07-25 checkpoint.
+
+Hardening: `dirSize` in the observability script uses `lstatSync`
+not `statSync` to keep enumeration scoped to the agent's skill tree
+(can't be lured out via a `personal-foo → /etc` symlink).
+
 ## v0.13.45 — agent-managed skills (Phase 1 + Phase 3)
 
 Four PRs that ship the first cut of **agents authoring their own skills**:
