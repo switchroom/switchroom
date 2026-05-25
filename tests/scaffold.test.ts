@@ -186,6 +186,10 @@ describe("scaffoldAgent", () => {
       expect(startSh).toMatch(/ln -sfn '\/home\/op'\/\.switchroom "\$HOME\/\.switchroom"/);
       // Idempotent guard refuses to clobber a real directory.
       expect(startSh).toContain('[ ! -e "$HOME/.switchroom" ] || [ -L "$HOME/.switchroom" ]');
+      // #1846: sibling symlink for the config repo so the in-container
+      // CLI's resolveConfigSkillsDir finds the bind-mounted slice.
+      expect(startSh).toMatch(/ln -sfn '\/home\/op'\/\.switchroom-config "\$HOME\/\.switchroom-config"/);
+      expect(startSh).toContain('[ ! -e "$HOME/.switchroom-config" ] || [ -L "$HOME/.switchroom-config" ]');
     } finally {
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
@@ -201,6 +205,7 @@ describe("scaffoldAgent", () => {
       const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
       // Without hostHomeQ, the {{#if hostHomeQ}} guard renders nothing.
       expect(startSh).not.toContain('"$HOME/.switchroom"');
+      expect(startSh).not.toContain('"$HOME/.switchroom-config"');
       expect(startSh).not.toContain("ln -sfn");
     } finally {
       if (prevHome !== undefined) process.env.HOME = prevHome;
