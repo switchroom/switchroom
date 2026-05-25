@@ -1,6 +1,64 @@
 # Changelog
 
-## Unreleased
+## v0.13.36 — silent-end determinism, error-envelope completeness, ticker + oversize-card fixes
+
+15 commits since v0.13.35. Headline: the silent-end Stop hook is now
+deterministic (#1775 race closed) — instead of depending on a gateway-
+written state file as its block/allow signal (a file written ~175ms
+AFTER the hook fires, so the race was structurally always lost), the
+hook now reads `transcript_path` directly and scans the just-finished
+turn's tool_use entries. The state file is preserved for retry-count
+bookkeeping only.
+
+Error-envelope rollout completes (#1769 Phase 2 + #1770 Phase 3 +
+#1773 / #1774 / #1780 tightenings) — `ERROR-ENVELOPE: <json>` sibling
+lines on every denial path; negative-path schema tests pin the
+integrity boundary; `VAULT-BROKER-DENIED` prefix collision fixed.
+
+Plus a small cluster of UX fixes: still-working ticker teardown on
+reply finalize (#1763), drive-write approval-card oversize-body
+overflow (#1768), config_propose_edit silent E_DENIED on oversize
+diff (#1766), cron-interval doc clarity (#1782).
+
+### fix(#1775): deterministic silent-end Stop hook via transcript scan
+
+The pre-fix Stop hook (silent-end-interrupt-stop.mjs) depended on the
+gateway's `silent-end-pending.json` as its block/allow signal. That
+file is written by the gateway's `turn_end` handler downstream of the
+JSONL `turn_duration` line, which is itself written AFTER
+`stop_hook_summary`. Live evidence on clerk (12 correlated samples,
+2026-05-25): the state file lands ~175ms (range 111-287ms) after the
+hook fires. The race is structurally always lost — the hook never saw
+its OWN turn's signal. The recovery mechanism only worked
+one-turn-delayed via stale state from prior turns.
+
+The hook now reads `transcript_path` from its event input directly
+(Claude Code flushes assistant content to JSONL before firing Stop
+hooks — verified empirically) and scans the current turn's
+`tool_use` entries for a qualifying reply. The `isFinalAnswerReply`
+predicate (done===true OR !disableNotification OR text.length>=200)
+mirrors `telegram-plugin/final-answer-detect.ts:78-83`. NO_REPLY /
+HEARTBEAT_OK silent-marker carve-out preserved; sub-agent
+(`isSidechain:true`) lines skipped (the parent's reply obligation
+isn't satisfied by a sub-agent's reply tool).
+
+The hook's state-file write now includes `turnKey` + `chatId` derived
+from the enqueue envelope so the gateway's later `recordSilentTurnEnd`
+write matches in `writeSilentEndState`'s preservation gate
+(`silent-end.ts:114`) and honors the 1-retry design budget. Without
+this, the gateway would reset retryCount to 0 and double the
+effective re-prompt budget.
+
+29 new tests pin every branch (scan helper + spawn-subprocess
+integration). Live UAT against Ken's msg 12227 slip data: ack-only
++ plain-text answer → block; final reply → allow; trivial reply →
+allow; NO_REPLY → allow; exhausted retry → allow.
+
+### fix(#1779/#1782): clarify extractCronIntervalMin returns smallest gap, not worst-case
+
+Documentation-only clarification — the helper computes the smallest
+gap between adjacent fires, not the worst-case interval. Misnaming
+risked downstream callers treating it as a ceiling.
 
 ### fix(#1777): rename envelope sentinel to `ERROR-ENVELOPE:` to avoid `VAULT-BROKER-DENIED` prefix collision
 
@@ -70,6 +128,50 @@ Follow-ups on the Phase 1 wire protocol (#1759). Five tightenings:
    leading `Structured error — fix.kind=…` discriminator hint). Tooling
    that string-matches `content[0].text` is still safe; tooling that
    parses the structured form should branch on `content.length === 2`.
+
+### test(#1771/#1774): envelope-shape assertions for three Phase 2 codes
+
+Pins the wire-format of `E_PATCH_APPLY_FAILED`, `E_DENIED`,
+`E_APPROVAL_TIMEOUT` envelopes — the three Phase 2 migrations most
+likely to regress on a future codepath change.
+
+### fix(#1772/#1773): diff-preview-card error message says '8 hex' but regex is 32
+
+The user-facing error said "expected 8 hex characters" while the
+backing regex required 32. Aligned the message to the regex.
+
+### fix(#1767/#1768): drive-write approval card oversize-body overflow
+
+Card body text larger than Telegram's per-message budget overflowed
+silently and never rendered. Now truncates with a "…[N chars
+truncated]" suffix and emits the full body to the audit log so
+operators can recover the original on demand.
+
+### fix(#1762/#1766): config_propose_edit silent E_DENIED on oversize diff
+
+`agent_config` would return `E_DENIED` (looks like a policy denial)
+when the diff exceeded the size budget — the user got no hint that
+they were close to a hard limit. Now returns `E_INPUT_TOO_LARGE`
+with the byte counts in the envelope so the operator can decide
+whether to split the edit.
+
+### fix(#1760/#1763): tear down still-working ticker on every reply finalize
+
+The "still working…" ticker was started on the first non-trivial
+tool_use and torn down only when the model called `done:true`. For
+turns that ended via a final reply WITHOUT a done flag (the
+common case for short factual answers), the ticker was left
+running until the gateway's turn-end housekeeping caught it ~5s
+later — visible as a stray "still working…" beat AFTER the final
+answer had already landed. Now torn down on every reply finalize.
+
+### chore(deps): dependabot bumps
+
+- `docker/setup-buildx-action` 4.0.0 → 4.1.0 (#1751)
+- `node` base image `689c110` → `7af03b1` (#1752)
+- `docker/build-push-action` 7.1.0 → 7.2.0 (#1753)
+- `docker/login-action` 4.1.0 → 4.2.0 (#1754)
+- `actions/cache` 4.3.0 → 5.0.5 (#1755)
 
 ## v0.13.35 — gateway crash-banner noise, error envelope, timezone hook
 
