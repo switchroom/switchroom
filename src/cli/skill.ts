@@ -563,7 +563,13 @@ function fail(msg: string): never {
 // ─── Command registration ────────────────────────────────────────────
 
 export function registerSkillCommand(program: Command): void {
-  const skill = program.command("skill").description("Skill pool management.");
+  // The `skill` parent command is shared across several files
+  // (agent-config.ts, agent-config-skill-write.ts, skill-personal.ts,
+  // skill-search.ts). Commander throws "cannot add command 'skill'" on
+  // any duplicate `.command("skill")`, so find-or-create.
+  const skill =
+    program.commands.find((c) => c.name() === "skill") ??
+    program.command("skill").description("Skill pool management.");
 
   skill
     .command("apply <name>")

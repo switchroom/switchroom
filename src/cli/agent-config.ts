@@ -306,10 +306,14 @@ export function registerAgentConfigCommands(program: Command): void {
       }),
     );
 
-  // switchroom skill list
-  const skill = program
-    .command("skill")
-    .description("Read-only access to an agent's skill list");
+  // switchroom skill list — find-or-create because the `skill` parent
+  // is shared across several files (skill.ts, skill-personal.ts,
+  // skill-search.ts, agent-config-skill-write.ts).
+  const skill =
+    program.commands.find((c) => c.name() === "skill") ??
+    program
+      .command("skill")
+      .description("Read-only access to an agent's skill list");
   skill
     .command("list")
     .description("List the agent's configured skills as JSON")

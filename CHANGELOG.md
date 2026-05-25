@@ -1,5 +1,94 @@
 # Changelog
 
+## v0.13.45 — agent-managed skills (Phase 1 + Phase 3)
+
+Four PRs that ship the first cut of **agents authoring their own skills**:
+admin and non-admin agents alike can now write, edit, list, remove, and
+discover skills from inside their own Claude Code session — no operator
+involvement, no `claude -p` programmatic call. The RFC's deferred phases
+(propose-publish to shared pool with operator approval card) remain
+out of scope; everything in this release is per-agent scope only.
+
+### PR A — `switchroom skill apply` CLI verb (PR #1822, #1817)
+
+Operator-facing helper that takes a skill payload (stdin, file, directory,
+or tarball) and writes it to the global skills pool at
+`~/.switchroom/skills/<name>/`. Same validation gates that the new MCP
+ops use (name regex, path allowlist, SKILL.md frontmatter, banned-headless-
+phrase content scan, behavioural `bash -n` / `python3 -m py_compile`).
+
+### PR B — Phase 0 spike findings (PR #1824, #1818)
+
+Resolved 7 open design questions before Phase 1 code landed. Headline:
+binary-extracted from the Claude Code v2.1.150 CLI that personal-skill
+discovery is **depth-1** and hard-coded to `.claude/skills/` — so the
+RFC's draft "personal/ subdir" convention won't work; ships as
+`<agentDir>/.claude/skills/personal-<name>/` (name-prefix) instead.
+
+### PR C — Phase 1 personal-skill primitives (PR #1825, #1819)
+
+Four new actions, each callable as both an operator CLI verb and an
+in-agent MCP op via the agent-config server:
+
+- `switchroom skill init  <name> --agent <a> [--from <file|dir>|stdin]`
+- `switchroom skill edit  <name> --agent <a> [--from <file|dir>|stdin]`
+- `switchroom skill remove <name> --agent <a>`
+- `switchroom skill list  --agent <a>`
+
+MCP-side: `skill_init_personal`, `skill_edit_personal`,
+`skill_remove_personal`, `skill_list_personal`. Multi-file payloads via
+`files: { path: content }` JSON map, JSON-piped through the CLI's stdin
+so the MCP and operator paths share one validator (
+`src/cli/skill-common.ts:validateSkillBundle`).
+
+**Symlink-safe writes** (defense-in-depth vs. T3 from the security
+review): `lstatSync` pre-flight refuses to overwrite a live OR dangling
+symlink, then `mkdtempSync` staging dir + single atomic rename so a
+half-written bundle never lands at the final path.
+
+**Delete = trash + lazy sweep**, not unlink: `remove` moves the dir to
+`<agentDir>/.claude/skills-trash/<name>-<unix-ts>/` (sibling of
+`skills/`, so it's never picked up by depth-1 discovery). Every
+personal-skill op also sweeps `skills-trash/` for entries older than 24h
+(`TRASH_TTL_MS`). No host cron — the cron singleton was retired in
+Phase 4 of the agent-scheduler fold-in.
+
+### PR D — Phase 3 read-only `skill_search` (PR #1826, #1819)
+
+Enumerate skills across three tiers an agent can see:
+
+- `personal`: `<agentDir>/.claude/skills/personal-<name>/SKILL.md`
+- `shared`: `~/.switchroom/skills/<name>/SKILL.md` (operator pool)
+- `bundled`: `~/.switchroom/skills/_bundled/<name>/SKILL.md` (shipped)
+
+Surface: `switchroom skill search [--agent <a>] [--query <q>]
+[--tier personal|shared|bundled|any] [--limit N] [--no-json]` + MCP op
+`skill_search`. Case-insensitive substring match against name,
+description, and the new `jtbd` frontmatter key. Stable sort:
+personal → shared → bundled, then name. Limit defaults to 50, max 500.
+
+Path-traversal guard on the `agent` slug: an MCP caller passing
+`agent="../../etc"` short-circuits to `[]` before the value is joined
+into the agents-root path (`AGENT_NAME_RE` mirror of
+`src/agents/lifecycle.ts`). Hidden test-only `--root`, `--shared-root`,
+`--bundled-root` flags stay out of `--help`.
+
+### Deliberately deferred
+
+The full `skill_propose_publish` / `skill_propose_edit` /
+`skill_propose_remove` hostd verb suite (operator-approval-gated edits
+to the **shared** pool). Security + UX reviewer passes surfaced 8
+must-fixes (per-opt-in vault-grant delta, multi-file diff card flow,
+rationale typographic quarantine, semantic lint pass, rate-limit, etc.)
+that need a fresh RFC. Tracked under #1821. Until 60+ days of personal-
+skill usage data exists, PR-A's CLI verb is the operator-driven fallback
+for shared-pool changes.
+
+The `installed_by` filter on `skill_search` (cross-agent opt-in
+enumeration) and the "current opt-in count per match" — both deferred
+until "does the skill exist?" proves insufficient as the dominant
+discovery use case.
+
 ## v0.13.44 — visible-answer-stream goes live, recovery ladder widened
 
 Three PRs that together convert the dominant catastrophic UX failure on
