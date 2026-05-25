@@ -244,15 +244,22 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
    * must clear the draft. Best-effort: a failed clear is logged but
    * not re-thrown — the worst case is a transient stale draft that
    * Telegram's own 30 s draft expiry eventually mops up.
+   *
+   * #1792 — accepts an explicit `targetDraftId` so `forceNewMessage`
+   * can clear the OLD id before bumping the closure's `draftId`. The
+   * default reads the live closure, which is what stop() / retract()
+   * want — clear whatever's current at the time the call lands.
    */
-  async function clearDraftBestEffort(): Promise<void> {
-    if (!usesDraftTransport || draftApi == null || draftId == null) return
+  async function clearDraftBestEffort(
+    targetDraftId: number | undefined = draftId,
+  ): Promise<void> {
+    if (!usesDraftTransport || draftApi == null || targetDraftId == null) return
     try {
       const params: { message_thread_id?: number } = {}
       if (threadId != null) params.message_thread_id = threadId
       await draftApi(
         chatId,
-        draftId,
+        targetDraftId,
         '',
         Object.keys(params).length > 0 ? params : undefined,
       )
@@ -531,6 +538,18 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       stopped = false
       materialized = false
       if (usesDraftTransport) {
+        // #1792: clear the OLD draftId BEFORE rotating. Otherwise the
+        // stale content stays in the user's compose box until the 30 s
+        // Telegram draft expiry — the typical caller (gateway.ts mid-
+        // turn rapid-steer path: `forceNewMessage(); stop();`) cleans
+        // up the prior turn's stream, so the prior draft's content is
+        // semantically retracted. Fire-and-forget — forceNewMessage is
+        // sync; the worst-case failure mode is the same 30 s expiry
+        // we'd have had without the call.
+        const staleDraftId = draftId
+        if (staleDraftId != null) {
+          void clearDraftBestEffort(staleDraftId)
+        }
         draftId = allocateDraftId()
       }
       log?.(`answer-stream: forceNewMessage (gen=${generation})`)
@@ -546,6 +565,10 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       // #1704: clear the compose-box draft. stop() is sync — fire and
       // forget. A dropped clear falls back on Telegram's own 30 s
       // draft expiry; the worst case is a transient stale preview.
+      // (#1792: the stale-id-after-rotation hazard is owned by
+      // forceNewMessage itself now — it clears its own draftId before
+      // rotating. stop() just clears whatever's current; clearing an
+      // already-cleared or never-used id is a harmless no-op.)
       void clearDraftBestEffort()
     },
 
@@ -563,6 +586,8 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       // draft sitting in the user's input area and blocks them from
       // typing until the 30 s draft expiry. Awaited so a follow-up
       // sendMessage on the same chat doesn't race a stale draft edit.
+      // (See #1792 note in stop() — forceNewMessage owns its own stale
+      // id cleanup; retract just clears whatever's current.)
       await clearDraftBestEffort()
       // Delete the preliminary message if one was sent and deleteMessage
       // is wired. Best-effort: failures are logged but not re-thrown.
