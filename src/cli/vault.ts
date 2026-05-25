@@ -71,7 +71,7 @@ const VAULT_EXIT_NEEDS_APPROVAL = 5;
 const VAULT_EXIT_BROKER_UNREACHABLE = 6;
 const VAULT_EXIT_SANDBOX_CONTEXT = 7;
 
-// VAULT-BROKER-DENIED-ENVELOPE helper moved to ./vault-denied-envelope.ts
+// ERROR-ENVELOPE helper moved to ./vault-denied-envelope.ts
 // so it can be unit-tested without dragging the rest of vault.ts (which
 // transitively pulls bun:sqlite) into the vitest module graph.
 import { writeVaultDeniedEnvelope } from "./vault-denied-envelope.js";
