@@ -4,6 +4,43 @@
 > approval-gated edits to the **shared** skill pool — until 60+ days of
 > personal-skill usage data is in. This doc says how to read that data.
 
+## Version control (durability)
+
+Personal skills are *runtime state* at
+`~/.switchroom/agents/<agent>/.claude/skills/personal-<name>/` —
+survive container recreate but NOT git-tracked. A host rebuild loses
+every personal skill.
+
+If `~/.switchroom-config/` exists (the operator's private config repo),
+every successful `init_personal` / `edit_personal` / `clone_to_personal`
+also writes an opportunistic mirror to:
+
+```
+~/.switchroom-config/agents/<agent>/personal-skills/<name>/
+```
+
+`remove_personal` moves the corresponding mirror to a sibling
+`.<name>-trash-<ts>/` dir so the deletion shows up in `git status`.
+Each edit also leaves a `.<name>-prior-<ts>/` sibling holding the
+prior content (cheap recovery before the operator commits).
+
+**Retention.** `.prior-*` and `.trash-*` siblings older than **24h**
+get swept lazily on the next mirror op. Without this, a chatty agent
+would accumulate one stale dir per edit forever. Mirrors the live
+`skills-trash` 24h sweep so the operator's mental model is uniform.
+Anything older than 24h lives in git history once the operator
+commits.
+
+Override `SWITCHROOM_CONFIG_DIR` to point at an alternate repo
+(separate-operator fleets, tests). If the config repo doesn't exist
+the mirror **silently no-ops** (operator hasn't opted in). If the
+repo exists but a mirror write fails (EACCES, ENOSPC,
+cross-device-link), a warning prints to stderr and the live copy
+continues unaffected.
+
+**No auto-commit.** The operator commits the config repo at their own
+cadence. `cd ~/.switchroom-config && git status` shows what's changed.
+
 ## What's instrumented
 
 After v0.13.45 + the audit-instrumentation follow-up, every **mutating**
