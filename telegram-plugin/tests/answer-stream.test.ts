@@ -527,6 +527,92 @@ describe('answer-stream — clears sendMessageDraft on terminal paths (#1704)', 
   })
 })
 
+// ─── #1792 — forceNewMessage clears the stale draftId before rotating ───
+//
+// Background: `forceNewMessage()` rotates `draftId` to a fresh allocation
+// so the stream can be re-used for a new turn (typical caller: gateway
+// rapid-steer path in `handleSessionEvent` enqueue branch — calls
+// `forceNewMessage(); stop()` on the prior turn's stream before opening
+// the new turn). Pre-#1792, the rotation orphaned the prior turn's
+// draft content in the user's compose box until Telegram's 30 s draft
+// expiry — `stop()`'s fire-and-forget clear closed over the (now-new)
+// `draftId`, so the clear targeted the unused id, not the stale one.
+//
+// Post-fix: `forceNewMessage` itself clears the stale draftId BEFORE
+// rotating. `stop()` continues to clear whatever draftId is current
+// at the time it runs (defensive, also fine: clearing an unused id
+// is a harmless no-op for the user).
+
+describe('answer-stream — forceNewMessage clears the stale draft before rotating (#1792)', () => {
+  it('clears the pre-rotation draftId when forceNewMessage rotates', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: true,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    // Open the stream — this allocates draftId N and fires sendDraft(N).
+    stream.update('first turn thought')
+    await flushMicrotasks()
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+    const staleDraftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
+    sendMessageDraft.mockClear()
+
+    // Rotate. forceNewMessage must enqueue a clear against the OLD
+    // draftId before bumping to the new allocation — pre-fix the
+    // stale content stayed in the compose box for 30 s.
+    stream.forceNewMessage()
+    await flushMicrotasks()
+
+    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
+    const clearedId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
+    const clearedText = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[2]
+    expect(clearedId).toBe(staleDraftId)
+    expect(clearedText).toBe('')
+  })
+
+  it('the gateway sequence forceNewMessage(); stop() clears the stale draftId', async () => {
+    // Mirrors the only production caller — telegram-plugin/gateway/
+    // gateway.ts:6476-6477 cleans up the prior turn's answer-stream
+    // before opening a new turn (rapid steer / queue path).
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const sendMessageDraft = makeSendMessageDraft()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: true,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      sendMessageDraft,
+    })
+
+    stream.update('prior turn thought')
+    await flushMicrotasks()
+    const staleDraftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
+    sendMessageDraft.mockClear()
+
+    stream.forceNewMessage()
+    stream.stop()
+    await flushMicrotasks()
+
+    // The stale id must have been cleared by ONE of the two calls
+    // (forceNewMessage in this design); the new unused id may also
+    // be cleared by stop() — harmless. The load-bearing invariant
+    // is "the stale id reaches sendMessageDraft('') somewhere".
+    const clearedIds = (sendMessageDraft.mock.calls as unknown as Array<[string, number, string, unknown]>)
+      .filter(c => c[2] === '')
+      .map(c => c[1])
+    expect(clearedIds).toContain(staleDraftId)
+  })
+})
+
 describe('answer-stream — empty / whitespace-only text is a no-op', () => {
   it('update("") does not trigger any transport call', async () => {
     const sendMessage = makeSendMessage()
