@@ -73,7 +73,7 @@ describe('summarizeToolForTitle (#186)', () => {
     // chat_id / message_thread_id / request_id never help an operator
     // decide; the helper skips them and finds the next useful field.
     const input = JSON.stringify({
-      chat_id: '8248703757',
+      chat_id: '12345',
       message_thread_id: '42',
       topic: 'morning summary',
     })
@@ -178,7 +178,7 @@ describe('summarizeToolForTitle (#186)', () => {
   })
 
   test('MCP arg hint skips routing-only keys (#1790)', () => {
-    const input = JSON.stringify({ chat_id: '8248703757', query: 'budget Q3' })
+    const input = JSON.stringify({ chat_id: '12345', query: 'budget Q3' })
     expect(summarizeToolForTitle('mcp__hindsight__recall', input)).toBe(
       'Recall relevant memories (query: budget Q3)',
     )
