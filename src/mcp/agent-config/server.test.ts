@@ -40,6 +40,7 @@ describe("TOOLS export", () => {
       "peers_list",            // identity / peer-awareness
       "schedule_add",
       "schedule_remove",
+      "skill_clone_to_personal", // #1819 follow-up — fork shared/bundled
       "skill_edit_personal",   // #1819 Phase 1 (agent-managed personal skills)
       "skill_init_personal",   // #1819 Phase 1
       "skill_install",         // #1163 Phase 2 (shared library)

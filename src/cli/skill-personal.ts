@@ -419,16 +419,6 @@ function loadValidateWrite(
   }
 
   writePersonalSkill(target, files);
-  console.log(
-    JSON.stringify({
-      ok: true,
-      action: ensureNew ? "init" : "edit",
-      agent,
-      name,
-      path: target,
-      files: Object.keys(files).length,
-    }),
-  );
 }
 
 // ─── Public entry points (CLI command actions) ─────────────────────
@@ -456,6 +446,16 @@ export function initPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ true);
+  console.log(
+    JSON.stringify({
+      ok: true,
+      action: "init",
+      agent,
+      name,
+      path: personalSkillDir(agentsRoot, agent, name),
+      files: Object.keys(files).length,
+    }),
+  );
   // Audit row on success only (failure paths exit via fail() before this).
   // Used by scripts/observe-personal-skills.mjs for adoption telemetry.
   appendAudit(agent, "skill.init_personal", { name, files: Object.keys(files).length }, 0);
@@ -466,7 +466,178 @@ export function editPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ false);
+  console.log(
+    JSON.stringify({
+      ok: true,
+      action: "edit",
+      agent,
+      name,
+      path: personalSkillDir(agentsRoot, agent, name),
+      files: Object.keys(files).length,
+    }),
+  );
   appendAudit(agent, "skill.edit_personal", { name, files: Object.keys(files).length }, 0);
+}
+
+// ─── Clone-to-personal ─────────────────────────────────────────────
+
+interface CloneOpts extends AgentOpts {
+  /** Optional override slug. Defaults to the source slug. */
+  name?: string;
+  /** Test hooks. */
+  root?: string;
+  sharedRoot?: string;
+  bundledRoot?: string;
+}
+
+/** Source allow-list: `shared:<name>` or `bundled:<name>`. */
+const CLONE_SOURCE_RE = /^(shared|bundled):([a-z0-9][a-z0-9_-]{0,62})$/;
+
+function defaultSharedRoot(): string {
+  return join(homedir(), ".switchroom", "skills");
+}
+
+function defaultBundledRoot(): string {
+  return join(homedir(), ".switchroom", "skills", "_bundled");
+}
+
+function resolveCloneSource(
+  source: string,
+  opts: CloneOpts,
+): { tier: "shared" | "bundled"; slug: string; dir: string } {
+  const m = CLONE_SOURCE_RE.exec(source);
+  if (!m) {
+    fail(
+      `source must be \`shared:<name>\` or \`bundled:<name>\` (got ${JSON.stringify(source)})`,
+    );
+  }
+  const tier = m[1] as "shared" | "bundled";
+  const slug = m[2]!;
+  const root =
+    tier === "bundled"
+      ? (opts.bundledRoot ?? defaultBundledRoot())
+      : (opts.sharedRoot ?? defaultSharedRoot());
+  const dir = join(root, slug);
+  if (!existsSync(dir)) {
+    fail(
+      `clone source ${JSON.stringify(source)} not found at ${dir}; ` +
+        `check \`switchroom skill search --tier ${tier}\``,
+      1,
+    );
+  }
+  // Symlink-safety: refuse to read through a symlinked source dir. The
+  // bundled tier uses symlinks (see reconcileAgentDefaultSkills) but
+  // those point INTO the shared pool — we want the canonical pool path.
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink()) {
+    fail(
+      `clone source ${JSON.stringify(source)} is a symlink at ${dir}; ` +
+        `point clone at the canonical pool path instead`,
+    );
+  }
+  return { tier, slug, dir };
+}
+
+/**
+ * Read all files from a source skill dir into a SkillFileMap. Same
+ * walk as `loadFromDir` but doesn't fail on the inner symlink check —
+ * it operates on the canonical pool path resolved above.
+ */
+function readSourceFiles(dir: string): SkillFileMap {
+  const files: SkillFileMap = {};
+  const walk = (sub: string): void => {
+    for (const ent of readdirSync(sub, { withFileTypes: true })) {
+      const full = join(sub, ent.name);
+      if (ent.isSymbolicLink()) {
+        // Skip internal symlinks (e.g. operator drop-ins) — clone is a
+        // self-contained copy, not a symlink-preserving mirror.
+        continue;
+      }
+      if (ent.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (ent.isFile()) {
+        const rel = relative(dir, full).replace(/\\/g, "/");
+        files[rel] = readFileSync(full, "utf-8");
+      }
+    }
+  };
+  walk(dir);
+  return files;
+}
+
+/**
+ * Patch the SKILL.md `name:` frontmatter field so the cloned copy is
+ * internally consistent with its new slug. Without this, validation
+ * would fail when the source's name and the personal-tier slug differ.
+ */
+function rewriteSkillMdName(content: string, newName: string): string {
+  if (!content.startsWith("---\n") && !content.startsWith("---\r\n")) {
+    return content;
+  }
+  const rest = content.slice(content.indexOf("\n") + 1);
+  const endIdx = rest.indexOf("\n---");
+  if (endIdx < 0) return content;
+  const fm = rest.slice(0, endIdx);
+  const body = rest.slice(endIdx);
+  // Replace the first `name:` line; preserve other frontmatter as-is.
+  const patched = fm.replace(
+    /^(\s*name\s*:)[ \t]*\S.*$/m,
+    `$1 ${newName}`,
+  );
+  return "---\n" + patched + body;
+}
+
+export function clonePersonalAction(source: string, opts: CloneOpts): void {
+  const agent = resolveAgent(opts);
+  const agentsRoot = resolveAgentsRoot(opts);
+  const src = resolveCloneSource(source, opts);
+  const newName = opts.name ?? src.slug;
+  if (!SKILL_SLUG_RE.test(newName)) {
+    fail(`destination name must match ${SKILL_SLUG_RE.source}: got ${JSON.stringify(newName)}`);
+  }
+
+  // Read source files, rewrite SKILL.md name to match the new slug so
+  // the personal-tier validator (which enforces name == slug) accepts
+  // the bundle.
+  const files = readSourceFiles(src.dir);
+  if (!files["SKILL.md"]) {
+    fail(`source ${JSON.stringify(source)} has no SKILL.md at ${src.dir}`);
+  }
+  if (newName !== src.slug) {
+    files["SKILL.md"] = rewriteSkillMdName(files["SKILL.md"]!, newName);
+  }
+
+  // Same validate+write pipeline as init_personal: ensureNew=true so a
+  // pre-existing personal copy isn't silently clobbered.
+  loadValidateWrite(agentsRoot, agent, newName, files, /*ensureNew=*/ true);
+
+  console.log(
+    JSON.stringify({
+      ok: true,
+      action: "clone_to_personal",
+      agent,
+      source,
+      source_tier: src.tier,
+      source_slug: src.slug,
+      name: newName,
+      path: personalSkillDir(agentsRoot, agent, newName),
+      files: Object.keys(files).length,
+    }),
+  );
+  appendAudit(
+    agent,
+    "skill.clone_to_personal",
+    {
+      source,
+      source_tier: src.tier,
+      source_slug: src.slug,
+      name: newName,
+      files: Object.keys(files).length,
+    },
+    0,
+  );
 }
 
 export function removePersonalAction(name: string, opts: RemoveOpts): void {
@@ -623,5 +794,23 @@ export function registerSkillPersonalCommands(program: Command): void {
     .option("--root <path>", "Test-only override for agents-root dir")
     .action(withConfigError(async (opts: ListOpts) => {
       listPersonalAction(opts);
+    }));
+
+  parent
+    .command("clone-to-personal <source>")
+    .description(
+      "Fork a shared or bundled skill into this agent's writable workspace. " +
+      "Source format: `shared:<name>` or `bundled:<name>`. The personal copy " +
+      "becomes mutable via edit-personal; the upstream source is untouched. " +
+      "Use --name to give the fork a different slug. No operator approval — " +
+      "agent's own workspace.",
+    )
+    .option("--agent <name>", "Agent name (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option("--name <slug>", "Override destination slug (default: source slug)")
+    .option("--root <path>", "Test-only override for agents-root dir")
+    .option("--shared-root <path>", "Test-only override for shared-pool dir")
+    .option("--bundled-root <path>", "Test-only override for bundled-pool dir")
+    .action(withConfigError(async (source: string, opts: CloneOpts) => {
+      clonePersonalAction(source, opts);
     }));
 }
