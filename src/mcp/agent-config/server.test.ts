@@ -47,6 +47,7 @@ describe("TOOLS export", () => {
       "skill_list_personal",   // #1819 Phase 1
       "skill_remove",          // #1163 Phase 2
       "skill_remove_personal", // #1819 Phase 1
+      "skill_search",          // #1819 Phase 3
     ]);
   });
 

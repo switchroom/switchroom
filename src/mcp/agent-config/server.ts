@@ -75,6 +75,9 @@ interface ToolArgs {
   include_self?: boolean;
   // skill_{init,edit}_personal (#1819 PR-3) — file map for the bundle
   files?: Record<string, string>;
+  // skill_search (#1819 Phase 3)
+  query?: string;
+  tier?: string;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -220,6 +223,38 @@ export const TOOLS = [
           pattern: "^[a-z0-9][a-z0-9_-]{0,62}$",
           description:
             "Optional override slug (defaults to the skill name from source).",
+        },
+      },
+    },
+  },
+  // #1819 Phase 3 — read-only enumeration across all tiers.
+  {
+    name: "skill_search",
+    description:
+      "Enumerate skills the calling agent can see, across three tiers: " +
+      "`personal` (own .claude/skills/personal-* workspace), `shared` " +
+      "(operator-curated pool at ~/.switchroom/skills/), `bundled` " +
+      "(shipped with switchroom). Read-only — no approval, no write, no " +
+      "fleet exposure. Returns SKILL.md frontmatter + path + size + " +
+      "mtime per match, with stable sort (personal → shared → bundled, " +
+      "then name). Use this BEFORE authoring a new skill — odds are it " +
+      "exists already, possibly in bundled.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Case-insensitive substring match against name, description, jtbd.",
+        },
+        tier: {
+          type: "string",
+          enum: ["personal", "shared", "bundled", "any"],
+          description: "Filter to one tier; default `any`.",
+        },
+        limit: {
+          type: "number",
+          description: "Cap result count (default 50, max 500).",
         },
       },
     },
@@ -455,6 +490,18 @@ export function dispatchTool(
       const a = args as ToolArgs;
       const base = ["skill", "list-personal"];
       if (a.agent) base.push("--agent", a.agent as string);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    // PR-4 (#1819 Phase 3) — read-only enumeration across all tiers.
+    case "skill_search": {
+      const a = args as ToolArgs;
+      const base = ["skill", "search"];
+      if (a.agent) base.push("--agent", a.agent);
+      if (a.query) base.push("--query", a.query);
+      if (a.tier) base.push("--tier", a.tier);
+      if (typeof a.limit === "number") base.push("--limit", String(a.limit));
       cliArgs = base;
       parseMode = "json";
       break;
