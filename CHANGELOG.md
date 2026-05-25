@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.13.48 — repo-context hook + buildEnvelope refactor + agent-managed-skills RFC
+
+Three independent PRs bundled — one feature, one refactor, one docs.
+
+### feat(hooks): repo-context PreToolUse — auto-inject mid-session repo CLAUDE.md (#1811)
+
+Closes the "agent navigates into a code repo mid-session and forgets
+its CLAUDE.md" gap. Claude Code's native CLAUDE.md auto-load is
+cwd-at-session-start + parents only; a switchroom agent's session
+launches at the agent's workspace, so when a user (often a non-coder
+over Telegram) asks "go work on `~/code/foo`", that repo's CLAUDE.md
+is NOT in the agent's context. The agent's system prompt soft-nudges
+it to `Read` the marker file but that depends on model obedience.
+
+New PreToolUse hook fires on Read/Edit/Write/MultiEdit/NotebookEdit/
+Bash. The first time a session's tool call touches a path under a
+repo with `CLAUDE.md` (or `AGENTS.md` / `AGENT.md`), the hook reads
+the marker file and injects it via `additionalContext` wrapped in a
+`<repo-context>` envelope. Subsequent calls in the same repo are
+no-ops (tracked per-session in `/tmp/switchroom-repo-context-<session_id>/loaded.txt`).
+
+- **Per-tool target resolution:** file tools use `dirname(file_path)`;
+  Bash uses the hook envelope's `cwd` (which the Bash tool's
+  persistent shell maintains across calls per Claude Code docs).
+- **Safety caps:** 5 distinct repos / 100 KB total / 30 KB per file
+  per session (overridable via env). Oversized files emit a one-liner
+  pointer rather than the body.
+- **Skips the agent workspace** (already auto-loaded by Claude Code).
+- **Walks UP only to filesystem root or `$HOME`** — no accidental
+  operator-home CLAUDE.md.
+- **Fail-open on every error path** — hook never blocks tool
+  execution.
+- **Kill switch:** `SWITCHROOM_DISABLE_REPO_CONTEXT_HOOK=1`.
+
+29 new tests covering pure helpers + end-to-end spawn.
+
+### refactor: extract buildEnvelope() + make request_id optional (#1784)
+
+Two cleanups for the #1758 error-envelope rollout:
+
+- Extract `buildEnvelope(code, human, fix?, opts?)` in
+  `src/host-control/protocol.ts` as the single source of truth for
+  the `ErrorEnvelope` wire shape. `ErrorBuilder.build()`,
+  `writeVaultDeniedEnvelope`, and `agent-config-write.ts`'s
+  `buildEnvelopeForCode` now all delegate envelope assembly; per-code
+  → `fix.kind` selection stays at each callsite.
+- Relax `request_id` on `ErrorEnvelopeSchema` to `optional()`. Both
+  CLI emit sites previously fabricated placeholder ids
+  (`agent-config-${randomUUID()}`, `vault-cli-${Date.now()}-…`)
+  purely to satisfy the receiver schema. They now omit; receivers
+  correlate via `audit_id` / surrounding context. The hostd dispatch
+  path still threads the real RPC `request_id`.
+
+Refs #1758, #1759, #1769, #1770, #1776, #1777.
+
+### docs(rfc): agent-managed skills — fleet capability lifecycle (#1814)
+
+Historical RFC for the personal-skill autonomy work that shipped
+across #1825 (Phase 1) / #1826 (Phase 3) / #1828 (Phase 3 follow-up)
+/ #1829 (60-day observability). Preserved as institutional memory;
+status line updated post-merge to mark Phases 1+3 as shipped.
+
 ## v0.13.47 — audit-log unblocking (closes the silent-audit class)
 
 Two narrow fixes that resolve UAT findings from v0.13.46. The
