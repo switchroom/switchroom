@@ -254,6 +254,52 @@ describe("writePayload", () => {
     // The symlink must still exist (write was rejected).
     expect(existsSync(join(poolDir, "foo"))).toBe(true);
   });
+
+  it("refuses to overwrite a DANGLING symlink target (B1 regression)", () => {
+    // Regression for review B1: existsSync() returns false on a dangling
+    // symlink, so the symlink-refuse check used to be bypassed entirely.
+    // Now we use lstatSync to detect symlinks (live or dangling) before
+    // any write begins.
+    mkdirSync(poolDir, { recursive: true });
+    symlinkSync("/nonexistent-target-for-test", join(poolDir, "foo"));
+    expect(() => {
+      writePayload(poolDir, "foo", { "SKILL.md": validSkillMd("foo") });
+    }).toThrowError();
+    // The dangling symlink must still exist (write was rejected, NOT
+    // followed and clobbered).
+    expect(existsSync(join(poolDir, "foo"))).toBe(false); // dangling → existsSync false
+    // But lstatSync sees it
+    const fs = require("node:fs") as typeof import("node:fs");
+    expect(fs.lstatSync(join(poolDir, "foo")).isSymbolicLink()).toBe(true);
+  });
+});
+
+describe("claude -p evasion-resistance (B2 regression)", () => {
+  it("catches `claude -p` across a shell line continuation", () => {
+    // The exact evasion the reviewer caught: split across a continued line.
+    const r = validatePayload("foo", {
+      "SKILL.md": validSkillMd("foo"),
+      "scripts/sneaky.sh": "#!/bin/bash\nclaude \\\n  -p 'sneaky attack'\n",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.errors.some((e) => e.includes("claude -p"))).toBe(true);
+  });
+
+  it("catches `claude -p` across a Python backslash continuation", () => {
+    const r = validatePayload("foo", {
+      "SKILL.md": validSkillMd("foo"),
+      "scripts/sneaky.py": "import os\nos.system('claude \\\n  -p \"x\"')\n",
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  it("catches `claude -p` after multiple whitespace types", () => {
+    const r = validatePayload("foo", {
+      "SKILL.md": validSkillMd("foo"),
+      "scripts/sneaky.sh": "#!/bin/bash\nclaude\t-p 'tabbed'\n",
+    });
+    expect(r.ok).toBe(false);
+  });
 });
 
 describe("diffSummary", () => {

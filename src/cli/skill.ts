@@ -79,8 +79,36 @@ const SKILL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const SH_SCRIPT_RE = /^scripts\/[A-Za-z0-9_.-]+\.sh$/;
 const PY_SCRIPT_RE = /^scripts\/[A-Za-z0-9_.-]+\.py$/;
 
-/** Regex catching `claude -p` literally in script content (NOT in a comment). */
-const CLAUDE_P_LITERAL_RE = /(^|[^#\w])claude\s+-p\b/m;
+/**
+ * Regex catching `claude -p` literally in script content. Conservative
+ * by design — matches in comments and string literals too, because the
+ * compliance gate is "this script must not invoke claude -p", and the
+ * easiest evasion (move it to a comment, then uncomment at runtime) is
+ * caught by being aggressive.
+ *
+ * Line-continuation evasion (`claude \<newline> -p`) is handled by
+ * normalising backslash-newline pairs BEFORE the scan; see
+ * `scanForClaudeP()` below.
+ */
+const CLAUDE_P_LITERAL_RE = /\bclaude\s+-p\b/m;
+
+/**
+ * Run the `claude -p` evasion-resistant content scan over a script
+ * body. Returns true if a match is found.
+ *
+ * Normalises shell-style line continuations (`\<newline>`) and
+ * Python-style line continuations to a single space before scanning,
+ * so a payload like:
+ *
+ *   claude \
+ *     -p 'attack'
+ *
+ * still trips the gate. (Without this, the single-line regex misses.)
+ */
+function scanForClaudeP(content: string): boolean {
+  const normalised = content.replace(/\\\r?\n\s*/g, " ");
+  return CLAUDE_P_LITERAL_RE.test(normalised);
+}
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -190,14 +218,48 @@ function loadFromDir(dir: string): FileMap {
  * `validateRelPath` is the gate.
  */
 function loadFromTarball(tarPath: string): FileMap {
+  // PRE-EXTRACT VALIDATION: list the tarball entries via `tar -t` first
+  // and refuse any entry that fails `validateRelPath`. This closes the
+  // window where `tar` would write a path-traversal entry (`../etc/passwd`,
+  // absolute `/etc/passwd`) BEFORE validation ever ran. tar handles
+  // `--no-absolute-names` for absolute paths, but `../` traversal is
+  // historically inconsistent — better to refuse them ourselves.
+  const isGz = tarPath.endsWith(".gz") || tarPath.endsWith(".tgz");
+  const listFlags = isGz ? ["-tzf"] : ["-tf"];
+  const list = spawnSync("tar", [...listFlags, tarPath], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (list.status !== 0) {
+    fail(`tar list failed (exit ${list.status}): ${(list.stderr ?? "").trim()}`);
+  }
+  const entries = (list.stdout ?? "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !s.endsWith("/")); // ignore dir entries
+  for (const entry of entries) {
+    if (!validateRelPath(entry)) {
+      fail(
+        `tarball contains disallowed path: ${JSON.stringify(entry)} — ` +
+        `refusing to extract before any file is written`,
+      );
+    }
+  }
+
   const staging = mkdtempSync(join(tmpdir(), "skill-apply-extract-"));
   try {
-    const flags = tarPath.endsWith(".gz") || tarPath.endsWith(".tgz")
-      ? ["-xzf"]
-      : ["-xf"];
+    const flags = isGz ? ["-xzf"] : ["-xf"];
     const r = spawnSync(
       "tar",
-      [...flags, tarPath, "-C", staging, "--no-same-owner", "--no-same-permissions"],
+      [
+        ...flags,
+        tarPath,
+        "-C",
+        staging,
+        "--no-same-owner",
+        "--no-same-permissions",
+        "--no-absolute-names",
+      ],
       { stdio: "pipe" },
     );
     if (r.status !== 0) {
@@ -293,9 +355,10 @@ export function validatePayload(name: string, files: FileMap): ValidateResult {
   }
 
   // 5. Pre-publish `claude -p` content scan in scripts.
+  //    Uses evasion-resistant scanner that normalises line continuations.
   for (const [path, content] of Object.entries(files)) {
     if (SH_SCRIPT_RE.test(path) || PY_SCRIPT_RE.test(path)) {
-      if (CLAUDE_P_LITERAL_RE.test(content)) {
+      if (scanForClaudeP(content)) {
         errors.push(
           `${path} contains \`claude -p\` literal — banned under Anthropic ` +
           `2026-06-15 policy (programmatic usage). Route via inject_inbound ` +
@@ -404,14 +467,38 @@ export function writePayload(poolDir: string, name: string, files: FileMap): voi
     mkdirSync(poolDir, { recursive: true, mode: 0o755 });
   }
   const target = join(poolDir, name);
+
+  // Pre-flight: refuse if the target slot is a symlink (including dangling
+  // symlinks). MUST happen BEFORE the staging dir is created and BEFORE
+  // the try/catch — otherwise the rollback path tries to clean up
+  // nonexistent state and the symlink would have already been clobbered.
+  // existsSync follows symlinks (and returns false on dangling ones), so
+  // we use lstatSync inside a try/catch to detect both cases.
+  let targetIsSymlink = false;
+  try {
+    const st = lstatSync(target);
+    if (st.isSymbolicLink()) {
+      targetIsSymlink = true;
+    }
+  } catch {
+    // ENOENT — target doesn't exist; that's fine, proceed.
+  }
+  if (targetIsSymlink) {
+    fail(`refusing to overwrite symlink at ${target}; investigate manually`);
+  }
+
   const staging = mkdtempSync(join(poolDir, `.skill-apply-stage-${name}-`));
   let oldRename: string | null = null;
   try {
-    // Write files into staging with O_EXCL to refuse any symlink follow.
+    // Write files into staging with O_CREAT|O_EXCL ('wx') so any
+    // pre-existing file or symlink at the staging path errors out
+    // rather than getting silently followed/overwritten. The staging
+    // dir was just mkdtempSync'd so there can't be pre-existing files
+    // unless an attacker raced the rename — the wx flag closes that
+    // window too.
     for (const [path, content] of Object.entries(files)) {
       const full = join(staging, path);
       mkdirSync(dirname(full), { recursive: true, mode: 0o755 });
-      // O_NOFOLLOW | O_CREAT | O_EXCL via fs flags.
       const fd = openSync(full, "wx");
       try {
         writeFileSync(fd, content);
@@ -426,13 +513,15 @@ export function writePayload(poolDir: string, name: string, files: FileMap): voi
       }
     }
     // Atomic swap: rename existing target aside, rename staging → target,
-    // then rm old.
-    if (existsSync(target)) {
-      // Refuse if target is a symlink — the operator should investigate.
-      const st = lstatSync(target);
-      if (st.isSymbolicLink()) {
-        fail(`refusing to overwrite symlink at ${target}; investigate manually`);
-      }
+    // then rm old. Use lstatSync (not existsSync) because we already
+    // verified above that target isn't a symlink — but a dir could have
+    // been created concurrently, and existsSync follows symlinks.
+    let targetExists = false;
+    try {
+      lstatSync(target);
+      targetExists = true;
+    } catch { /* ENOENT — proceed */ }
+    if (targetExists) {
       oldRename = `${target}.skill-apply-old-${Date.now()}`;
       renameSync(target, oldRename);
     }
