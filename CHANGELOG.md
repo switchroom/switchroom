@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.13.35 — gateway crash-banner noise, error envelope, timezone hook
+
+Three reliability/UX fixes landed since v0.13.34.
+
+### PR A — fix(gateway): stop the agent-crashed banner noise (#1764)
+
+"Clerk seems to be crashing" investigation 2026-05-25 surfaced two
+distinct sources of misleading `agent-crashed` Telegram banners:
+
+1. **Clean-shutdown marker never cleared on boot.** A marker from a
+   prior graceful shutdown could sit on disk for hours; when the
+   gateway later crashed via `unhandledRejection` (which explicitly
+   SKIPS writing a fresh marker per `gateway.ts:15107`), the next
+   boot read the old marker, classified it stale-by-age, and posted
+   a banner with detail like `clean-shutdown marker stale
+   age=39976s` — misleadingly tying the old marker to the current
+   crash. Fix: clear the marker after the boot reads it. The marker
+   now describes the IMMEDIATELY PRECEDING shutdown only.
+
+2. **429 + 5xx + HttpError leaked past the retry policy → crash.**
+   `classifyRejection` returned `shutdown` for these even though
+   `retry-api-call.ts:100-162` already handles them with backoff.
+   A leaked rejection from a fire-and-forget callsite (or 3
+   sustained retries) crashed the gateway and posted a banner.
+   Fix: broaden `log_only` to cover 429 (flood-wait), 5xx
+   (transient server errors), and `HttpError` (network-layer
+   transient failures). `401` / `403` / unknown-`400` still
+   crash (genuine config bugs).
+
+Tests: `unhandled-rejection-policy.test.ts` updated (old "shutdown
+for 429"/"shutdown for 500" tests inverted to `log_only`; new
+502/503/HttpError cases). New `boot-clears-clean-shutdown-marker.
+test.ts` pins the import + call-site + comment-explains-edge-case
+structurally.
+
+### PR B — feat(#1758): error envelope Phase 1 (#1759)
+
+Wire protocol + builder + `E_CONFIG_EDIT_DISABLED` migration +
+unlock card. First phase of the error-envelope refactor that lets
+verbs return structured failure codes with operator-facing
+remediation instead of opaque strings.
+
+### PR C — fix(timezone-hook): include weekday + AM/PM (#1757)
+
+The timezone hook injected ISO datetime only, which let the LLM
+drift on day-of-week and 12h/24h context. Now includes weekday +
+AM/PM in the injected line.
+
 ## v0.13.34 — silent-end determinism, handoff reliability, release self-healing
 
 Four PRs landing two reliability cleanups in the Telegram-plugin
