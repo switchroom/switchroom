@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.13.47 — audit-log unblocking (closes the silent-audit class)
+
+Two narrow fixes that resolve UAT findings from v0.13.46. The
+headline is that **the agent-config audit log was silently empty on
+every host since the audit feature shipped** — `~/.switchroom/audit/<agent>/`
+was created root-owned by `apply` running under sudo, so every
+`appendAudit` from the in-container agent UID returned EACCES which
+`appendAudit` swallows silently by design. v0.13.46's observability
+work depended on those rows; v0.13.47 actually makes them land.
+
+### fix(scaffold): chown audit dir to agent UID (PR #1833, closes #1831)
+
+`alignAgentUid` now includes `~/.switchroom/audit/<name>/` in its
+chown sweep alongside the existing agent state dir and per-agent log
+dir. Same shape as the #880 log-dir chown; same idempotent sudo
+fallback. `ensureHostMountSources` pre-creates the dir under
+operator umask BEFORE the chown pass so a fresh install lands
+agent-owned in one apply cycle (reviewer caught this — without the
+pre-create, the dir doesn't exist on first apply and the chown is a
+no-op).
+
+Security implication: with audit writes restored, the agent-config
+audit log (config-read denials, cron-list deny-by-default,
+skill.*_personal mutations) is **usable for the first time** on
+freshly-applied hosts. Existing hosts get the fix on next
+`switchroom update` — the manual chown workaround applied during
+v0.13.46 UAT is no longer required.
+
+### fix(observe-personal-skills): surface EACCES (PR #1834, closes #1832)
+
+`scripts/observe-personal-skills.mjs` used to report `files=0 bytes=0`
+for unreadable 0700 personal-skill dirs — silent and misleading. Now
+distinguishes "unreadable" from "empty": per-entry shows `<opaque
+(need sudo)>`, a top-of-report `Unreadable (0700 dirs): N` line
+points at the sudo workaround, and the JSON output carries an
+`unreadable: true` flag plus a `totals.unreadable_personals` rollup.
+
+The dir COUNT — the load-bearing signal for the 60-day Phase 2
+decision rubric — is unchanged. This is observability honesty, not
+a load-bearing fix.
+
 ## v0.13.46 — agent-managed skills follow-ups (UX + observability)
 
 Two small follow-ups to v0.13.45, both surfaced during that release's UAT
