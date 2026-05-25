@@ -12,8 +12,24 @@ import {
   listPersonalSkills,
   listSharedSkills,
   readSkillFrontmatter,
+  searchAction,
   searchSkills,
 } from "./skill-search.js";
+
+function captureStdout(fn: () => void): string {
+  const orig = console.log;
+  let captured = "";
+  console.log = (...args: unknown[]): void => {
+    captured +=
+      args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ") + "\n";
+  };
+  try {
+    fn();
+  } finally {
+    console.log = orig;
+  }
+  return captured;
+}
 
 const AGENT = "test-agent";
 
@@ -338,5 +354,88 @@ describe("searchSkills", () => {
       bundledRoot,
     });
     expect(rBig.length).toBeLessThanOrEqual(500);
+  });
+});
+
+describe("searchAction — env-default --agent (#1827)", () => {
+  let agentsRoot: string;
+  let sharedRoot: string;
+  let bundledRoot: string;
+  const ENV = "SWITCHROOM_AGENT_NAME";
+  const SAVED = process.env[ENV];
+
+  beforeEach(() => {
+    agentsRoot = mkdtempSync(join(tmpdir(), "skill-search-envdefault-a-"));
+    sharedRoot = mkdtempSync(join(tmpdir(), "skill-search-envdefault-s-"));
+    bundledRoot = mkdtempSync(join(tmpdir(), "skill-search-envdefault-b-"));
+    // Personal skill under the env-set agent.
+    writeSkillDir(
+      join(agentsRoot, AGENT, ".claude/skills/personal-mine"),
+      "mine",
+    );
+    // Shared skill (always visible regardless of agent).
+    writeSkillDir(join(sharedRoot, "common"), "common");
+  });
+
+  afterEach(() => {
+    if (SAVED === undefined) delete process.env[ENV];
+    else process.env[ENV] = SAVED;
+    rmSync(agentsRoot, { recursive: true, force: true });
+    rmSync(sharedRoot, { recursive: true, force: true });
+    rmSync(bundledRoot, { recursive: true, force: true });
+  });
+
+  it("uses $SWITCHROOM_AGENT_NAME when --agent is omitted (personal tier visible)", () => {
+    process.env[ENV] = AGENT;
+    const out = captureStdout(() => {
+      searchAction({
+        // no `agent` — exercise the env-default
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+    const results = JSON.parse(out);
+    const names = results.map((r: { name: string }) => r.name).sort();
+    expect(names).toEqual(["common", "mine"]);
+    const personal = results.find(
+      (r: { tier: string }) => r.tier === "personal",
+    );
+    expect(personal?.name).toBe("mine");
+    expect(personal?.agent).toBe(AGENT);
+  });
+
+  it("explicit --agent overrides the env default", () => {
+    process.env[ENV] = "different-agent";
+    const out = captureStdout(() => {
+      searchAction({
+        agent: AGENT,
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+    const results = JSON.parse(out);
+    const personal = results.find(
+      (r: { tier: string }) => r.tier === "personal",
+    );
+    expect(personal?.agent).toBe(AGENT);
+  });
+
+  it("with no --agent and no env, personal tier yields zero (shared/bundled still searched)", () => {
+    delete process.env[ENV];
+    const out = captureStdout(() => {
+      searchAction({
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+    const results = JSON.parse(out);
+    expect(results.find((r: { tier: string }) => r.tier === "personal")).toBeUndefined();
+    // Shared still visible.
+    expect(results.find((r: { tier: string }) => r.tier === "shared")?.name).toBe(
+      "common",
+    );
   });
 });
