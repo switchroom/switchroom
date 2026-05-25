@@ -368,8 +368,16 @@ export function searchAction(opts: CliOpts): void {
     limit = Math.floor(n);
   }
 
+  // Default --agent to $SWITCHROOM_AGENT_NAME so an in-container agent
+  // sees its own personal tier without having to pass --agent explicitly.
+  // Mirrors the resolveAgent() helper in skill-personal.ts — but stays
+  // optional here (no agent → personal tier yields zero, caller still gets
+  // shared + bundled results). Closes #1827.
+  const resolvedAgent =
+    opts.agent ?? process.env.SWITCHROOM_AGENT_NAME ?? undefined;
+
   const results = searchSkills({
-    agent: opts.agent,
+    agent: resolvedAgent,
     query: opts.query,
     tier,
     limit,
