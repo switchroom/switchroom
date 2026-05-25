@@ -319,12 +319,16 @@ import {
 import {
   writeCleanShutdownMarker,
   readCleanShutdownMarker,
-  // clearCleanShutdownMarker is intentionally NOT imported here —
-  // the marker is a single self-overwriting file; staleness is bounded by
-  // `shouldSuppressRecoveryBanner` (DEFAULT_MAX_AGE_MS), so leaving it on
-  // disk is harmless. Pre-#142 the agent-side `session-greeting.sh` did
-  // the cleanup after rendering its "Restarted <reason>" row; that script
-  // was deleted in #142 PR 1.
+  // 2026-05-25 — clearCleanShutdownMarker IS imported and called on every
+  // boot after the marker is read. The earlier "intentionally NOT imported"
+  // comment was wrong: it assumed every shutdown writes a fresh marker, but
+  // unhandledRejection / uncaughtException paths explicitly SKIP the write
+  // (gateway.ts:15107 — "crash path"). A marker from a prior graceful
+  // shutdown then sits on disk for hours and triggers a misleading stale-
+  // marker crash banner on the next boot after an unhandled rejection.
+  // Clearing on boot collapses the marker to "describes the immediately
+  // preceding shutdown only" semantics.
+  clearCleanShutdownMarker,
   shouldSuppressRecoveryBanner,
   resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS as CLEAN_SHUTDOWN_MAX_AGE_MS,
@@ -15618,10 +15622,26 @@ void (async () => {
             } else {
               process.stderr.write(`telegram gateway: boot.clean_shutdown_marker_stale age=${ageSec}s signal=${cleanMarker.signal}${reasonTag}\n`)
             }
-            // No clearCleanShutdownMarker() call — the marker is a single
-            // self-overwriting file, age-gated by shouldSuppressRecoveryBanner,
-            // so leaving it on disk is harmless. (Pre-#142 the agent-side
-            // session-greeting.sh did the cleanup; that script is deleted.)
+            // 2026-05-25 — clear the marker after this boot has read it.
+            // Pre-fix the comment here claimed the file was "self-
+            // overwriting, age-gated, harmless to leave on disk" — that's
+            // true ONLY for the cycle where every shutdown writes a fresh
+            // marker. The unhandledRejection / uncaughtException paths
+            // explicitly SKIP writing (gateway.ts:15107 — the "crash path")
+            // so a marker from an earlier graceful shutdown sits on disk
+            // for hours, then on the next boot looks stale-by-age and
+            // fires a misleading agent-crashed banner with detail
+            // `clean-shutdown marker stale age=39976s` (clerk 2026-05-25
+            // 01:11). Clearing now means the marker only ever describes
+            // the IMMEDIATELY PRECEDING shutdown, not "some shutdown in
+            // the past". After this clear: a subsequent crash with no
+            // marker write = no marker file = correctly classified
+            // 'crash' via the sessionMarker fallback (boot-reason.ts:84);
+            // a graceful shutdown writes a fresh marker that the next
+            // boot reads + clears. The historical session-greeting.sh
+            // ownership the old comment referred to is gone since #142
+            // but the GC step was never re-homed — this is it.
+            clearCleanShutdownMarker(GATEWAY_CLEAN_SHUTDOWN_MARKER_PATH)
           }
 
           if (marker) {
