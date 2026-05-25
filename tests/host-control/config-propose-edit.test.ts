@@ -141,7 +141,14 @@ describe("hostd config_propose_edit — PR 1a gates (still live)", () => {
     const resp = await send({ unified_diff: TINY_DIFF, request_id: "cpe-1" });
     expect(resp.result).toBe("error");
     expect(resp.error).toMatch(/^E_CONFIG_EDIT_DISABLED/);
-    expect(resp.error).toMatch(/hostd\.config_edit_enabled=true/);
+    // #1758 Phase 1: yaml-path hint moved from legacy `error` string
+    // into `error_envelope.fix.yaml_path`.
+    expect(resp.error_envelope?.code).toBe("E_CONFIG_EDIT_DISABLED");
+    expect(resp.error_envelope?.fix).toEqual({
+      kind: "flip_yaml_flag",
+      yaml_path: "hostd.config_edit_enabled",
+      to: true,
+    });
   });
 
   it("returns E_CONFIG_EDIT_DISABLED when the flag is explicitly false", async () => {

@@ -372,6 +372,60 @@ export type HostdVerb = HostdRequest["op"];
 export const ResultSchema = z.enum(["started", "completed", "denied", "error"]);
 export type Result = z.infer<typeof ResultSchema>;
 
+// ─── Error envelope (issue #1758 Phase 1) ─────────────────────────────────
+//
+// Structured error envelope carried alongside the legacy `error: string`
+// field on a `denied` / `error` response. Agents read `fix.kind` directly
+// instead of regexing the human string; the Telegram bridge can render
+// one-tap unlock / grant cards for safe `fix.kind`s (allowlist-gated).
+//
+// `error: string` is preserved for one release cycle so existing decoders
+// continue to work — the builder synthesises a stable legacy string from
+// `code` + `human` + `why`.
+
+export const ErrorFixSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("flip_yaml_flag"),
+    yaml_path: z.string(),
+    to: z.unknown(),
+  }),
+  z.object({
+    kind: z.literal("request_vault_grant"),
+    vault_key: z.string(),
+  }),
+  z.object({
+    kind: z.literal("operator_action"),
+    subkind: z.enum(["policy_denied", "infra", "out_of_scope"]),
+    operator_steps: z.array(z.string()).min(1).optional(),
+  }),
+  z.object({
+    kind: z.literal("retry_after"),
+    retry_at: z.string(),
+  }),
+  z.object({
+    kind: z.literal("quota_exceeded"),
+    quota: z.string(),
+    current: z.number(),
+    limit: z.number(),
+  }),
+  z.object({
+    kind: z.literal("bad_input"),
+    field: z.string().optional(),
+  }),
+]);
+export type ErrorFix = z.infer<typeof ErrorFixSchema>;
+
+export const ErrorEnvelopeSchema = z.object({
+  v: z.literal(1),
+  code: z.string().regex(/^(E_[A-Z0-9_]+|VAULT-[A-Z-]+)$/),
+  human: z.string().min(1),
+  why: z.string().optional(),
+  fix: ErrorFixSchema.optional(),
+  docs: z.string().url().optional(),
+  request_id: z.string().min(1),
+});
+export type ErrorEnvelope = z.infer<typeof ErrorEnvelopeSchema>;
+
 const ResponseEnvelope = {
   v: z.literal(1),
   request_id: z.string().min(1).max(128),
@@ -388,6 +442,9 @@ const ResponseEnvelope = {
   stderr_tail: z.string().optional(),
   /** Operator-visible error message for `denied` / `error`. */
   error: z.string().optional(),
+  /** Structured error envelope (#1758 Phase 1). Sibling of `error`;
+   *  agents read `fix.kind` directly to know the next move. */
+  error_envelope: ErrorEnvelopeSchema.optional(),
 };
 
 export const ResponseSchema = z.object(ResponseEnvelope);

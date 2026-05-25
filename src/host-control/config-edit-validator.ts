@@ -75,6 +75,24 @@ export type ValidationResult = ValidationOk | ValidationFailure;
 /** Hard cap on raw unified-diff bytes. RFC §3.2 step 1. */
 export const MAX_PATCH_BYTES = 1024 * 1024;
 
+/**
+ * Allowlist of operator-flippable yaml paths the Telegram bridge is
+ * permitted to render a one-tap unlock card for (#1758 Phase 1).
+ *
+ * Scoped narrowly on purpose: a malformed / hostile `error_envelope`
+ * from any backend could otherwise nudge the operator into approving
+ * an arbitrary yaml flag flip. The list grows only when the operator
+ * UX explicitly wants one-tap unlock for a new flag.
+ */
+export const UNLOCK_CARD_YAML_ALLOWLIST = new Set<string>([
+  "hostd.config_edit_enabled",
+]);
+
+/** True iff `path` is in {@link UNLOCK_CARD_YAML_ALLOWLIST}. */
+export function isAllowlistedYamlPath(path: string): boolean {
+  return UNLOCK_CARD_YAML_ALLOWLIST.has(path);
+}
+
 export interface ValidatorOptions {
   /** Live config file the patch is applied against (read fresh each call). */
   configPath: string;
