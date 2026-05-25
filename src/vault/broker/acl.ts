@@ -332,19 +332,31 @@ export function checkAclByAgent(
   //         command: /path/to/perplexity-mcp.sh
   //         secrets: [ perplexity/api-key ]
   //
-  // The cascade resolves `mcp_servers.perplexity` onto every agent
-  // that inherits defaults; the declared `secrets` array becomes
-  // broker-accessible to that agent under its own peercred identity.
+  // The check consults the EFFECTIVE (post-cascade) mcp_servers map —
+  // per-key shallow merge of defaults + per-agent overrides, mirroring
+  // `src/config/merge.ts:391-397`. The broker loads raw yaml without
+  // running the full cascade pipeline (that lives in resolveAgentConfig
+  // / mergeAgentConfig and is too expensive per ACL request), so the
+  // mcp_servers cascade is open-coded here. Defaults-only MCPs (the
+  // common case — perplexity declared once in defaults, inherited by
+  // every agent) are correctly granted; per-agent additions still win
+  // on key conflict; per-agent `false` opt-outs drop the grant
+  // because the typeof guard below skips non-object entries.
+  //
+  // #1806 (v0.13.42) shipped the per-agent-only read; the
+  // defaults-cascade was missed and only surfaced when an operator
+  // tried to wire perplexity for an agent that inherited the MCP
+  // from defaults rather than declaring it per-agent. Fixed here.
   //
   // Checked BEFORE the no-schedule early-deny below so an MCP-only
   // agent (no cron schedule) can still serve user-declared MCPs.
-  // The check tolerates `false` opt-outs (the `mcp_servers: { gdrive:
-  // false }` shape used to disable an inherited MCP) because
-  // Object.entries skips them naturally — a `false` entry has no
-  // `secrets[]` to consult.
-  const mcpServers = (agentConfig as { mcp_servers?: Record<string, unknown> })
-    .mcp_servers ?? {};
-  for (const mcpEntry of Object.values(mcpServers)) {
+  const effectiveMcp: Record<string, unknown> = {
+    ...((config as { defaults?: { mcp_servers?: Record<string, unknown> } })
+      .defaults?.mcp_servers ?? {}),
+    ...((agentConfig as { mcp_servers?: Record<string, unknown> })
+      .mcp_servers ?? {}),
+  };
+  for (const mcpEntry of Object.values(effectiveMcp)) {
     if (!mcpEntry || typeof mcpEntry !== "object") continue;
     const declared = (mcpEntry as { secrets?: unknown }).secrets;
     if (Array.isArray(declared) && declared.includes(key)) {

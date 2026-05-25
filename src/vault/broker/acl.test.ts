@@ -737,6 +737,96 @@ describe("ACL: user-declared MCP-server secrets", () => {
     ).toBe(false);
   });
 
+  // ─── #1806 follow-up: defaults-cascade ─────────────────────────────
+  // The broker loads raw yaml; cascade was open-coded inline in the
+  // ACL clause. Pre-this-fix the read was per-agent-only, so an MCP
+  // declared in defaults (the documented common case for perplexity)
+  // was never seen by the ACL — every agent that inherited it via
+  // cascade hit VAULT-BROKER-DENIED. Discovered live 2026-05-25 on
+  // clerk against v0.13.42.
+
+  it("allows a key declared under defaults.mcp_servers (cascade)", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      defaults: {
+        mcp_servers: {
+          perplexity: {
+            command: "/path/to/perplexity-mcp.sh",
+            secrets: ["perplexity/api-key"],
+          },
+        },
+      },
+      agents: {
+        clerk: { topic_name: "clerk" },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(checkAclByAgent(config, "clerk", "perplexity/api-key").allow).toBe(true);
+  });
+
+  it("per-agent override of a defaults MCP entry wins (replaces secrets too)", () => {
+    // Per `src/config/merge.ts:391-397` the cascade is per-key shallow:
+    // an agent's mcp_servers.perplexity FULLY replaces the defaults
+    // entry rather than partial-merging. So if the agent re-declares
+    // perplexity, only its own `secrets:` apply.
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      defaults: {
+        mcp_servers: {
+          perplexity: {
+            command: "/default/launcher.sh",
+            secrets: ["perplexity/api-key"],
+          },
+        },
+      },
+      agents: {
+        clerk: {
+          topic_name: "clerk",
+          mcp_servers: {
+            perplexity: {
+              command: "/clerk-custom-launcher.sh",
+              secrets: ["perplexity/api-key", "perplexity/extra-key"],
+            },
+          },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    // Both the inherited key and the per-agent-only key are accessible
+    // because the agent's full override re-declares both.
+    expect(checkAclByAgent(config, "clerk", "perplexity/api-key").allow).toBe(true);
+    expect(checkAclByAgent(config, "clerk", "perplexity/extra-key").allow).toBe(true);
+  });
+
+  it("per-agent `false` opt-out drops the inherited MCP's grant (cascade)", () => {
+    // The shallow merge applies `false` over the defaults entry; the
+    // typeof guard then skips it.
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      defaults: {
+        mcp_servers: {
+          perplexity: {
+            command: "/path/to/launcher.sh",
+            secrets: ["perplexity/api-key"],
+          },
+        },
+      },
+      agents: {
+        clerk: {
+          topic_name: "clerk",
+          mcp_servers: { perplexity: false },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(
+      checkAclByAgent(config, "clerk", "perplexity/api-key").allow,
+    ).toBe(false);
+  });
+
   it("does not cross agents — one agent's MCP secret stays on that agent", () => {
     const config = {
       switchroom: { version: 1 },
