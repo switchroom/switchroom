@@ -157,6 +157,69 @@ defaults:
     playwright: false   # opt-out: no agent gets the browser MCP unless they explicitly enable it
 ```
 
+### Wiring an MCP server that needs vault secrets
+
+The common pattern for adding a third-party MCP server is:
+
+1. **Drop a launcher script** into `~/.switchroom/mcp-launchers/`. The directory is bind-mounted into every agent container at the same path (since v0.13.36 / PR #1787) so any executable there is reachable from inside an agent without rebuilding the image.
+2. **Store the API key** in the vault: `switchroom vault set <service>/api-key`.
+3. **Have the launcher fetch the key at spawn** via `switchroom vault get <service>/api-key` (this asks the vault-broker, no operator prompt needed).
+4. **Declare the MCP server + its vault dependency** in `switchroom.yaml`:
+
+```yaml
+defaults:
+  mcp_servers:
+    perplexity:
+      command: /home/<operator>/.switchroom/mcp-launchers/perplexity-mcp.sh
+      # Vault keys the launcher will fetch via `switchroom vault get`.
+      # The broker grants these to every agent that inherits this MCP
+      # entry through the cascade. Without this declaration, the
+      # launcher will hit VAULT-BROKER-DENIED at spawn time.
+      secrets: [ perplexity/api-key ]
+```
+
+The `secrets:` array is the **broker-ACL declaration**: it tells the vault-broker which keys an agent running this MCP is allowed to fetch under its own peercred identity. No per-agent `vault grant` ceremony required.
+
+Example launcher (`~/.switchroom/mcp-launchers/perplexity-mcp.sh`):
+
+```bash
+#!/bin/bash
+set -euo pipefail
+export PERPLEXITY_API_KEY="$(switchroom vault get perplexity/api-key)"
+exec npx -y @perplexity-ai/mcp-server "$@"
+```
+
+**Opt-out per agent** works as usual:
+
+```yaml
+agents:
+  some-agent:
+    mcp_servers:
+      perplexity: false   # this agent doesn't get perplexity (or its vault grant)
+```
+
+The `false` opt-out drops the ACL grant too — the broker won't serve `perplexity/api-key` to an agent that disabled the MCP.
+
+**Multiple secrets per server** are supported — list them all:
+
+```yaml
+defaults:
+  mcp_servers:
+    notion:
+      command: /home/operator/.switchroom/mcp-launchers/notion-mcp.sh
+      secrets: [ notion/api-key, notion/workspace-id ]
+```
+
+**Special cases that don't need this declaration:**
+
+- **gdrive** — wired through `google_workspace.google_client_secret` + `google_accounts.<email>.enabled_for[]` (RFC G §4.4). The broker's ACL has a dedicated clause for the Google OAuth client credential and per-account token slots; `mcp_servers.gdrive.secrets:` is not required. See [google-workspace.md](google-workspace.md) for the full setup.
+- **switchroom-telegram** — agent's effective `bot_token` is granted to that agent via a dedicated ACL clause (the per-agent `bot_token` override or the global `telegram.bot_token`).
+- **hindsight** — runs as an HTTP server on the host; no vault keys at launcher spawn.
+
+If you're wiring **any other** third-party MCP that needs a vault key, use the `secrets:` field above. The fault-mode for a missing declaration is silent: `claude mcp list` will report the server as "Failed to connect" because the launcher hits `VAULT-BROKER-DENIED` and the upstream MCP rejects on missing env.
+
+The `switchroom doctor` health check confirms the broker is reachable; an MCP-specific reachability probe is on the follow-up list.
+
 ## Progress-Card Tunable Thresholds
 
 When `channels.telegram.stream_mode` is `checklist` (the default), the progress-card driver manages an edit-in-place Telegram message that tracks tool calls and sub-agent activity during a turn. The five knobs below control how it handles edge cases — timeouts, JSONL gaps, and Telegram API rate limits.

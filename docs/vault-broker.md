@@ -31,9 +31,21 @@ arbitrary scripts.
 | Caller context | Broker access |
 |---|---|
 | Scheduled run for `agent-<name>` (via that agent's bound socket) | Allowed if the requested key is in `schedule[N].secrets` |
+| MCP-server launcher for `agent-<name>` (via that agent's bound socket) | Allowed if the requested key is in any of the agent's effective `mcp_servers.<name>.secrets` |
 | Interactive shell (`switchroom vault get`) | **Denied** — use `--no-broker` |
 | Claude Code / agent session | **Denied** — use `--no-broker` |
 | Any other caller | **Denied** |
+
+### Identity-bound ACL exceptions
+
+The broker grants four classes of identity-bound keys to an agent under its own peercred (path-as-identity), in addition to the schedule.secrets allowlist:
+
+1. **Agent's own `bot_token`** — the gateway reads `agents.<name>.bot_token` (per-agent override) or falls back to `telegram.bot_token` (global). The ACL grants exactly that resolved key to the owning agent.
+2. **Google OAuth client credential** — `google_workspace.google_client_secret` (and `_id`) when the agent has `gdrive` MCP enabled. Gated by the same `shouldEmitGdriveMcp` predicate the scaffold uses, so the broker and scaffold can't disagree. See [google-workspace.md](google-workspace.md).
+3. **Google account slot tokens** — `google:<account>:<field>` keys, gated by `google_accounts.<account>.enabled_for[]` per RFC G §4.4.
+4. **User-declared MCP-server secrets** — any key listed in the agent's effective `mcp_servers.<name>.secrets[]` (post-cascade). Generalises the gdrive special-case to every operator-declared MCP launcher. See [configuration.md § Wiring an MCP server that needs vault secrets](configuration.md#wiring-an-mcp-server-that-needs-vault-secrets) for the operator-facing how-to. Added in v0.13.42.
+
+These four exceptions are checked **before** the schedule.secrets allowlist; an MCP-only agent (no cron schedule) still serves its MCP secrets correctly because the exceptions short-circuit the "no schedule → deny all" early return.
 
 Identity is **path-as-identity**: compose binds one socket per agent at
 `/run/switchroom/broker/<agent>/sock`, chowned to that agent's UID at
