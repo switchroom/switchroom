@@ -431,7 +431,7 @@ const TOOL_SCHEMAS = [
         chat_id: { type: 'string', description: 'Chat to render the approval card in (use the chat_id of the user message that triggered the workflow).' },
         key: { type: 'string', description: 'Vault key the agent wants access to (matches the key shown in the VAULT-BROKER-DENIED error, e.g. `fatsecret/credentials`).' },
         scope: { type: 'string', enum: ['read', 'write'], description: 'Access scope: "read" (default) for `vault:<key>` references; "write" if the agent needs to put new values.' },
-        reason: { type: 'string', description: 'Short human-readable rationale rendered on the card (e.g. "to look up today\'s food log entries"). Helps the operator decide.' },
+        reason: { type: 'string', description: 'REQUIRED in practice — short human-readable rationale rendered on the card (e.g. "to look up today\'s food log entries"). The approval card now renders "why: not provided" when this is omitted, which signals to the operator that the agent skipped its explanation — they will usually Deny. Always supply a one-line rationale.' },
         duration: { type: 'string', description: 'Requested grant TTL, like "30d" or "12h". Default 30d, capped at 90d. Beyond 90d the operator should use the host CLI explicitly.' },
         message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
       },
