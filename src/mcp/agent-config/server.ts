@@ -78,6 +78,8 @@ interface ToolArgs {
   // skill_search (#1819 Phase 3)
   query?: string;
   tier?: string;
+  // (`source?: string` for skill_install + skill_clone_to_personal is
+  // declared above.)
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -362,6 +364,35 @@ export const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "skill_clone_to_personal",
+    description:
+      "Fork a shared or bundled skill into this agent's writable workspace. " +
+      "Use when you find a defect or gap in a skill you depend on and want " +
+      "to fix it yourself — the upstream source is untouched, your fork is " +
+      "yours to edit via `skill_edit_personal`. Source format: " +
+      "`shared:<name>` or `bundled:<name>`. Same validation gates as " +
+      "init/edit. Pre-existing personal-<name> is refused (use edit or " +
+      "remove first). No operator approval.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["source"],
+      properties: {
+        source: {
+          type: "string",
+          pattern: "^(shared|bundled):[a-z0-9][a-z0-9_-]{0,62}$",
+          description:
+            "Source skill: `shared:<name>` (operator pool) or `bundled:<name>` (shipped).",
+        },
+        name: {
+          type: "string",
+          pattern: "^[a-z0-9][a-z0-9_-]{0,62}$",
+          description:
+            "Optional destination slug (defaults to the source slug).",
+        },
+      },
+    },
+  },
 ];
 
 export function dispatchTool(
@@ -502,6 +533,19 @@ export function dispatchTool(
       if (a.query) base.push("--query", a.query);
       if (a.tier) base.push("--tier", a.tier);
       if (typeof a.limit === "number") base.push("--limit", String(a.limit));
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    // Clone a shared or bundled skill into the agent's personal tier.
+    case "skill_clone_to_personal": {
+      const a = args as ToolArgs;
+      if (!a.source || typeof a.source !== "string") {
+        return errorText("skill_clone_to_personal: source is required");
+      }
+      const base = ["skill", "clone-to-personal", a.source];
+      if (a.agent) base.push("--agent", a.agent);
+      if (a.name) base.push("--name", a.name);
       cliArgs = base;
       parseMode = "json";
       break;

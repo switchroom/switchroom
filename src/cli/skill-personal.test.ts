@@ -26,6 +26,7 @@ import {
   editPersonalAction,
   removePersonalAction,
   listPersonalAction,
+  clonePersonalAction,
 } from "./skill-personal.js";
 
 const AGENT = "test-agent";
@@ -360,5 +361,175 @@ describe("symlink-safe writes (security T3 regression)", () => {
     }, 9);
     // Symlink must still exist (write was rejected, NOT followed).
     expect(existsSync(skillsDir)).toBe(true);
+  });
+});
+
+describe("clonePersonalAction (fork shared/bundled into personal)", () => {
+  let agentsRoot: string;
+  let sharedRoot: string;
+  let bundledRoot: string;
+
+  beforeEach(() => {
+    agentsRoot = tmpAgentsRoot();
+    sharedRoot = mkdtempSync(join(tmpdir(), "clone-shared-"));
+    bundledRoot = mkdtempSync(join(tmpdir(), "clone-bundled-"));
+  });
+
+  afterEach(() => {
+    try { rmSync(agentsRoot, { recursive: true, force: true }); } catch { /**/ }
+    try { rmSync(sharedRoot, { recursive: true, force: true }); } catch { /**/ }
+    try { rmSync(bundledRoot, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("clones a shared skill into the agent's personal tier", () => {
+    // Seed a shared skill (operator-curated).
+    const src = join(sharedRoot, "garmin");
+    mkdirSync(join(src, "scripts"), { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("garmin"));
+    writeFileSync(join(src, "scripts/list.sh"), "#!/bin/bash\necho v1\n");
+
+    const out = captureStdout(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT,
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+
+    const parsed = JSON.parse(out);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.action).toBe("clone_to_personal");
+    expect(parsed.source_tier).toBe("shared");
+    expect(parsed.name).toBe("garmin");
+    expect(parsed.files).toBe(2);
+
+    const dest = join(agentsRoot, AGENT, ".claude/skills/personal-garmin");
+    expect(existsSync(join(dest, "SKILL.md"))).toBe(true);
+    expect(existsSync(join(dest, "scripts/list.sh"))).toBe(true);
+    // Shared source is untouched.
+    expect(readFileSync(join(src, "SKILL.md"), "utf-8")).toContain("name: garmin");
+  });
+
+  it("clones a bundled skill into the agent's personal tier", () => {
+    const src = join(bundledRoot, "docx");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("docx", "Word docs"));
+
+    captureStdout(() => {
+      clonePersonalAction("bundled:docx", {
+        agent: AGENT,
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+
+    const dest = join(agentsRoot, AGENT, ".claude/skills/personal-docx/SKILL.md");
+    expect(existsSync(dest)).toBe(true);
+  });
+
+  it("renames the SKILL.md `name:` field when --name override is given", () => {
+    const src = join(sharedRoot, "garmin");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("garmin"));
+
+    captureStdout(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT,
+        name: "garmin-v2",
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    });
+
+    const dest = join(agentsRoot, AGENT, ".claude/skills/personal-garmin-v2/SKILL.md");
+    expect(existsSync(dest)).toBe(true);
+    expect(readFileSync(dest, "utf-8")).toContain("name: garmin-v2");
+    expect(readFileSync(dest, "utf-8")).not.toContain("name: garmin\n");
+  });
+
+  it("refuses if personal-<name> already exists", () => {
+    const src = join(sharedRoot, "garmin");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("garmin"));
+
+    // Seed an existing personal copy.
+    captureStdout(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    });
+
+    expectExitCode(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 9);
+  });
+
+  it("rejects malformed source string", () => {
+    expectExitCode(() => {
+      clonePersonalAction("notvalid", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 2);
+    expectExitCode(() => {
+      clonePersonalAction("file:///etc/passwd", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 2);
+  });
+
+  it("rejects unknown source (exit 1)", () => {
+    expectExitCode(() => {
+      clonePersonalAction("shared:nonexistent", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 1);
+  });
+
+  it("rejects symlinked source (won't follow out of the pool)", () => {
+    const realDir = mkdtempSync(join(tmpdir(), "clone-evil-"));
+    mkdirSync(realDir, { recursive: true });
+    writeFileSync(join(realDir, "SKILL.md"), validSkillMd("garmin"));
+    symlinkSync(realDir, join(sharedRoot, "garmin"));
+
+    expectExitCode(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 2);
+
+    try { rmSync(realDir, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("rejects invalid destination slug", () => {
+    const src = join(sharedRoot, "garmin");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("garmin"));
+
+    expectExitCode(() => {
+      clonePersonalAction("shared:garmin", {
+        agent: AGENT,
+        name: "BadCase",
+        root: agentsRoot,
+        sharedRoot,
+        bundledRoot,
+      });
+    }, 2);
+  });
+
+  it("rejects source dir missing SKILL.md", () => {
+    const src = join(sharedRoot, "no-md");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "README.md"), "# nothing useful");
+
+    expectExitCode(() => {
+      clonePersonalAction("shared:no-md", {
+        agent: AGENT, root: agentsRoot, sharedRoot, bundledRoot,
+      });
+    }, 2);
   });
 });
