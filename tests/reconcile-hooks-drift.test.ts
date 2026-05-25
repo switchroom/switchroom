@@ -76,6 +76,17 @@ describe("buildSettingsHooksBlock", () => {
       e.hooks.some(h => h.command.includes("subagent-tracker-posttool.mjs")),
     );
     expect(subagentPostEntry?.matcher).toBe("^(Agent|Task)$");
+
+    // PR #1811 / v0.13.48: repo-context-pretool must be registered AND
+    // matched to the file-touching + Bash tools. Drift between the
+    // scaffold list (here) and telegram-plugin/hooks/hooks.json silently
+    // skips the hook — the live UAT for #1811 caught exactly this gap on
+    // v0.13.48 before the v0.13.49 hotfix landed.
+    expect(preCmds.some(c => c.includes("repo-context-pretool.mjs"))).toBe(true);
+    const repoContextEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("repo-context-pretool.mjs")),
+    );
+    expect(repoContextEntry?.matcher).toBe("^(Read|Edit|Write|MultiEdit|NotebookEdit|Bash)$");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {
