@@ -32,6 +32,7 @@ that touches the job.
 ### A standing team that knows you — *specialists, not one generalist*
 
 - [`run-a-fleet-of-specialists.md`](run-a-fleet-of-specialists.md) — run a fleet of specialists, not one generalist
+- [`feel-like-a-colleague.md`](feel-like-a-colleague.md) — feel like a colleague, not a chatbot
 - [`give-each-agent-its-own-workspace.md`](give-each-agent-its-own-workspace.md) — give each agent its own working copy of the code
 - [`remember-across-sessions.md`](remember-across-sessions.md) — remember across sessions without being re-told
 - [`extend-without-forking.md`](extend-without-forking.md) — extend the product without forking it
