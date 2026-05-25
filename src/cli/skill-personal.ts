@@ -32,7 +32,7 @@
  * `existsSync` (which follows symlinks and misses dangling).
  */
 
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import {
   closeSync,
   existsSync,
@@ -542,7 +542,13 @@ function resolveCloneSource(
  * Read all files from a source skill dir into a SkillFileMap. Same
  * walk as `loadFromDir` but doesn't fail on the inner symlink check —
  * it operates on the canonical pool path resolved above.
+ *
+ * Skips internal symlinks (defence in depth) and refuses to read any
+ * individual file > 1 MiB. Both `validateSkillBundle` and the
+ * `MAX_FILE_BYTES` gate downstream would catch giant files, but
+ * declining to read them upfront avoids OOM on a pathological source.
  */
+const CLONE_MAX_FILE_BYTES = 1024 * 1024;
 function readSourceFiles(dir: string): SkillFileMap {
   const files: SkillFileMap = {};
   const walk = (sub: string): void => {
@@ -559,6 +565,19 @@ function readSourceFiles(dir: string): SkillFileMap {
       }
       if (ent.isFile()) {
         const rel = relative(dir, full).replace(/\\/g, "/");
+        // Pre-flight size check via lstat (no need to open).
+        try {
+          const st = lstatSync(full);
+          if (st.size > CLONE_MAX_FILE_BYTES) {
+            fail(
+              `clone source has oversized file ${rel} (${st.size} bytes > ${CLONE_MAX_FILE_BYTES}); ` +
+                `refuse to read`,
+              3,
+            );
+          }
+        } catch {
+          // Stat failure on a regular file is unusual; let readFileSync surface it.
+        }
         files[rel] = readFileSync(full, "utf-8");
       }
     }
@@ -807,9 +826,9 @@ export function registerSkillPersonalCommands(program: Command): void {
     )
     .option("--agent <name>", "Agent name (defaults to $SWITCHROOM_AGENT_NAME)")
     .option("--name <slug>", "Override destination slug (default: source slug)")
-    .option("--root <path>", "Test-only override for agents-root dir")
-    .option("--shared-root <path>", "Test-only override for shared-pool dir")
-    .option("--bundled-root <path>", "Test-only override for bundled-pool dir")
+    .addOption(new Option("--root <path>").hideHelp())
+    .addOption(new Option("--shared-root <path>").hideHelp())
+    .addOption(new Option("--bundled-root <path>").hideHelp())
     .action(withConfigError(async (source: string, opts: CloneOpts) => {
       clonePersonalAction(source, opts);
     }));
