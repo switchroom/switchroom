@@ -201,10 +201,26 @@ export function alignAgentUid(
   // can't appendFileSync → every audit row silently swallowed (#1831).
   // Include here so the chown sweep aligns ownership.
   const auditDir = join(homedir(), ".switchroom", "audit", name);
+  // ~/.switchroom-config/agents/<name>/personal-skills/ holds the
+  // git-tracked mirror of the agent's personal-skill bundles (#1844).
+  // Compose generator pre-creates the dir + bind-mounts it into the
+  // container (#1846); the in-container CLI writes through the mount.
+  // Without this chown, `apply`'s sudo self-elevation leaves the dir
+  // root-owned and the agent UID can't write — identical failure
+  // shape to the audit dir (#1831). Gated on existence so non-opted-
+  // in operators don't get a phantom chown target.
+  const configMirrorDir = join(
+    homedir(),
+    ".switchroom-config",
+    "agents",
+    name,
+    "personal-skills",
+  );
   const paths: string[] = [];
   if (existsSync(agentDir)) paths.push(agentDir);
   if (existsSync(logsDir)) paths.push(logsDir);
   if (existsSync(auditDir)) paths.push(auditDir);
+  if (existsSync(configMirrorDir)) paths.push(configMirrorDir);
   if (paths.length === 0) return { chowned: false, paths: [] };
 
   // No fast-path: a previous `apply` may have aligned the top-level dirs

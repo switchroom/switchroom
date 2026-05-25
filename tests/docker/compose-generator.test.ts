@@ -524,6 +524,62 @@ describe("generateCompose", () => {
     }
   });
 
+  it("emits a per-agent :rw mount for ~/.switchroom-config/agents/<a>/personal-skills (#1846)", async () => {
+    // Auto-mirror of personal skills (PR #1844) writes to
+    // ~/.switchroom-config/agents/<agent>/personal-skills/. For the
+    // dominant in-container caller to see that dir, the slice must
+    // be bind-mounted into each agent container. Per-agent isolation
+    // matches the audit-dir mount above.
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-config-mirror-"));
+    mkdirSync(join(tmp, ".switchroom-config"), { recursive: true });
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {}, b: {} }),
+        homeDir: tmp,
+      });
+      // Agent "a" mounts ONLY its own slice.
+      expect(out).toContain(
+        `${tmp}/.switchroom-config/agents/a/personal-skills:${tmp}/.switchroom-config/agents/a/personal-skills:rw`,
+      );
+      // Agent "b" mounts ONLY its own slice.
+      expect(out).toContain(
+        `${tmp}/.switchroom-config/agents/b/personal-skills:${tmp}/.switchroom-config/agents/b/personal-skills:rw`,
+      );
+      // Agent "a" does NOT see agent "b"'s mirror.
+      const lineA = out.split("\n").find((l) => l.includes("agent-b/personal-skills") && l.includes("agent-a"));
+      expect(lineA).toBeUndefined();
+      // The parent ~/.switchroom-config/ itself is NEVER mounted —
+      // would leak every other agent's mirror + the operator's
+      // switchroom.yaml etc. into each agent.
+      expect(out).not.toContain(
+        `${tmp}/.switchroom-config:${tmp}/.switchroom-config`,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT emit the config-mirror mount when operator hasn't opted in (#1846)", async () => {
+    // Operator without ~/.switchroom-config/ → no mount line. Mirror
+    // silently no-ops (vault-backup precedent: only when opted in).
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-no-config-"));
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain(".switchroom-config");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("emits a :ro mount for the operator's mcp-launchers/ dir when present (#1786 follow-up)", async () => {
     // Operators who declare user-level MCP servers with a host `command:`
     // path (e.g. defaults.mcp_servers.perplexity.command:

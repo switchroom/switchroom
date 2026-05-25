@@ -296,6 +296,14 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
     // generateCompose's mkdirSync would create it as root mid-apply,
     // leaving the audit log unwritable on fresh installs — #1831).
     dirs.push(join(home, ".switchroom", "audit", name));
+    // Pre-create the per-agent config-mirror dir IF the operator has
+    // opted into versioned personal-skills (~/.switchroom-config exists).
+    // Same first-apply rationale as the audit dir (#1846).
+    if (existsSync(join(home, ".switchroom-config"))) {
+      dirs.push(
+        join(home, ".switchroom-config", "agents", name, "personal-skills"),
+      );
+    }
   }
   for (const dir of dirs) {
     await mkdir(dir, { recursive: true });

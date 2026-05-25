@@ -68,6 +68,17 @@ describe("alignAgentUid", () => {
   // ~/.switchroom/audit/<name>/ and is chowned alongside state + logs
   // so the agent-config audit JSONL is writable from inside the container.
   const expectedAuditDir = join(homedir(), ".switchroom", "audit", "agent");
+  // Added 2026-05-26 (#1846): config-repo personal-skills mirror dir
+  // chowned when ~/.switchroom-config/agents/<n>/personal-skills/ exists
+  // (operator opted into versioned personal-skills). The existsSync mock
+  // returns true by default in this file, so this path is included.
+  const expectedConfigMirrorDir = join(
+    homedir(),
+    ".switchroom-config",
+    "agents",
+    "agent",
+    "personal-skills",
+  );
 
   it("still runs recursive chown even when the top-level dir is already owned (subtree may be stale)", () => {
     // The previous behaviour was a fast-path no-op when statSync said the
@@ -87,6 +98,7 @@ describe("alignAgentUid", () => {
       "/fake/state/agent",
       expectedLogsDir,
       expectedAuditDir,
+      expectedConfigMirrorDir,
     ]);
     expect(mockedExecFileSync).toHaveBeenCalledTimes(1);
     const [bin, args] = mockedExecFileSync.mock.calls[0];
@@ -97,6 +109,7 @@ describe("alignAgentUid", () => {
       "/fake/state/agent",
       expectedLogsDir,
       expectedAuditDir,
+      expectedConfigMirrorDir,
     ]);
   });
 
@@ -119,6 +132,7 @@ describe("alignAgentUid", () => {
       "/fake/state/agent",
       expectedLogsDir,
       expectedAuditDir,
+      expectedConfigMirrorDir,
     ]);
   });
 
@@ -149,6 +163,7 @@ describe("alignAgentUid", () => {
       "/fake/state/agent",
       expectedLogsDir,
       expectedAuditDir,
+      expectedConfigMirrorDir,
     ]);
   });
 
@@ -194,10 +209,14 @@ describe("alignAgentUid", () => {
   });
 
   it("still chowns when only the logs dir exists (legacy state-only paths absent)", () => {
-    // existsSync returns true for everything EXCEPT /fake/state/agent
-    // and the audit dir, isolating the logs-dir-only path.
+    // existsSync returns true for everything EXCEPT /fake/state/agent,
+    // the audit dir, and the config-mirror dir — isolating the
+    // logs-dir-only path.
     mockedExistsSync.mockImplementation(
-      (p) => p !== "/fake/state/agent" && p !== expectedAuditDir,
+      (p) =>
+        p !== "/fake/state/agent" &&
+        p !== expectedAuditDir &&
+        p !== expectedConfigMirrorDir,
     );
     mockedStatSync.mockReturnValue({ uid: 1000, gid: 1000 } as never);
     mockedExecFileSync.mockImplementationOnce(() => Buffer.from(""));
@@ -248,6 +267,40 @@ describe("alignAgentUid", () => {
     expect(res.paths).not.toContain(expectedAuditDir);
   });
 
+  // #1846 — config-repo personal-skills mirror dir must be chowned so
+  // the in-container agent UID can write through the bind mount.
+  // Without this, mirror writes silently fail (no audit row, EACCES
+  // swallowed by mirrorToConfigRepo's try/catch).
+  it("includes the config-repo personal-skills dir in the chown sweep (#1846)", () => {
+    mockedStatSync.mockReturnValue({ uid: 0, gid: 0 } as never);
+    mockedExecFileSync.mockImplementationOnce(() => Buffer.from(""));
+
+    const res = alignAgentUid("agent", "/fake/state/agent", 10042, {
+      writeOut: () => {},
+      confirm: false,
+    });
+
+    expect(res.chowned).toBe(true);
+    expect(res.paths).toContain(expectedConfigMirrorDir);
+    const [, args] = mockedExecFileSync.mock.calls[0];
+    expect(args).toContain(expectedConfigMirrorDir);
+  });
+
+  it("skips the config-mirror dir when operator hasn't opted into versioned skills (#1846)", () => {
+    // Operator doesn't have ~/.switchroom-config/ → no mirror dir to chown.
+    mockedExistsSync.mockImplementation((p) => p !== expectedConfigMirrorDir);
+    mockedStatSync.mockReturnValue({ uid: 0, gid: 0 } as never);
+    mockedExecFileSync.mockImplementationOnce(() => Buffer.from(""));
+
+    const res = alignAgentUid("agent", "/fake/state/agent", 10042, {
+      writeOut: () => {},
+      confirm: false,
+    });
+
+    expect(res.chowned).toBe(true);
+    expect(res.paths).not.toContain(expectedConfigMirrorDir);
+  });
+
   // PR-D1 / v0.7 coverage gap #4 — when alignAgentUid actually shells
   // chown, it must record the prior owner of every top-level path to
   // ~/.switchroom/.uid-alignment.log so a future rollback can restore
@@ -261,9 +314,9 @@ describe("alignAgentUid", () => {
       confirm: false,
     });
 
-    // Three paths chowned (state dir + logs dir + audit dir), so
-    // three audit lines.
-    expect(mockedAppendFileSync).toHaveBeenCalledTimes(3);
+    // Four paths chowned (state dir + logs dir + audit dir +
+    // config-mirror dir from #1846), so four audit lines.
+    expect(mockedAppendFileSync).toHaveBeenCalledTimes(4);
     for (const call of mockedAppendFileSync.mock.calls) {
       const [logPath, line] = call;
       expect(logPath).toBe(join(homedir(), ".switchroom", ".uid-alignment.log"));
