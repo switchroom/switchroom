@@ -1,6 +1,70 @@
 # Changelog
 
-## v0.13.39 — PR #1706 follow-ups: entity decode + draft-id rotation + UAT promotion
+## v0.13.40 — bridge-flap class closed: eliminate `claude -p` cron generator, vault-broker per-agent token mount
+
+Two fixes that together close out a 2026-05-25 forensic investigation
+of recurring bridge-reconnect-race storms on a long-running agent.
+
+### fix: eliminate `claude -p` cron script generator (#1613/#1616 follow-up, PR #1799)
+
+The 2026-05-25 storm cluster on clerk was caused by the legacy
+`src/agents/scaffold.ts:buildCronScript` writing literal `claude -p
+'<prompt>'` to `~/.switchroom/agents/<name>/telegram/cron-*.sh` on
+every `switchroom apply`. The agent-scheduler (Phase 4 cron-fold-in,
+#890-#893) had moved cron firing to in-container `inject_inbound`
+IPC, but the scripts remained on disk — and any code path that
+invoked one (or any external trigger we couldn't fully pin down
+in the forensic window) spawned a parasitic 2nd claude code session
+that loaded the agent's full `.mcp.json` (including
+`switchroom-telegram`), creating a 2nd telegram bridge that
+ping-pong'd with the live agent's bridge against the gateway IPC's
+`register: closing prior client for agent=... — bridge reconnect
+race` eviction. That's the #1613/#1616 flap class.
+
+Separately and equally important: `claude -p` is **programmatic**
+usage under Anthropic's 2026-06-15 policy — off the Pro/Max
+subscription. Generating these scripts at all is a switchroom
+pillar-3 compliance violation (CLAUDE.md hard constraint).
+
+Changes:
+- `src/agents/scaffold.ts`: delete `buildCronScript` and both
+  callsites. Reconcile path now unconditionally deletes any
+  `cron-*.sh` + `.source` files (both content-hash and legacy
+  `cron-<index>.sh` forms). Idempotent — re-running on a clean
+  agent is a no-op.
+- `src/cli/migrate.ts` (deleted): one-shot pre-Phase-D filename-
+  migration verb, now moot.
+- `src/agents/sub-agent-telegram-prompt.ts`: delete the cron-
+  specific `build/applyCronTelegramGuidance` helpers (sub-agent
+  progress guidance for live sessions stays). Cron prompts now
+  flow into the live session via `inject_inbound` and use the
+  session's existing reply-tool guidance.
+- `tests/bridge-flap-regression-guard.test.ts`: add second scan
+  that catches `claude -p` in **string-template literals** (single,
+  double, backtick), with a `KNOWN_TEMPLATE_GAPS` allowlist that
+  may only shrink. The existing spawn-callsite regex missed the
+  scaffold.ts violation because the literal was inside a TS string
+  template emitted to a shell script, not a direct spawn callsite.
+- `tests/scaffold.test.ts`: replace the cron-script generation
+  tests (asserting old shape) with retirement-contract tests
+  (scaffold writes no `cron-*.sh`; reconcile deletes any stale
+  ones).
+
+The first `switchroom apply` after rolling this release sweeps
+every agent's `telegram/cron-*.sh` + `.source` artifacts, closing
+the active-code path of the flap class for good.
+
+### fix(broker): bind-mount per-agent `.vault-token` files into vault-broker (#1798)
+
+The vault-broker's `mint_grant` flow writes the per-agent capability
+token to a per-agent file. Pre-fix the broker container had no
+bind-mount for the path on the agent side, so the file write
+silently no-op'd from the broker's perspective and the agent's
+next vault read missed the freshly-minted grant. This bind-mounts
+each `~/.switchroom/agents/<name>/telegram/.vault-token` path into
+the broker's matching agent dir so `mint_grant` lands durably.
+
+
 
 Three independent fixes batched into a single release. All from the
 fresh-process reviewer pass on PR #1706.
