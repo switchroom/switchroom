@@ -1682,6 +1682,23 @@ function emitAgentService(
   if (existsSync(`${hostHomeForChecks}/.switchroom/skills`)) {
     lines.push(`      - ${homePrefix}/.switchroom/skills:${homePrefix}/.switchroom/skills:ro`);
   }
+  // Operator-declared MCP launcher dir (#1786 follow-up). Operators who
+  // declare a user-level MCP server with a `command:` host path (e.g.
+  // `defaults.mcp_servers.perplexity.command:
+  // /home/<op>/.switchroom/mcp-launchers/perplexity-mcp.sh`) need that
+  // launcher to resolve INSIDE the agent container too — otherwise the
+  // .mcp.json entry lands (per the scaffold fix) but the launcher
+  // ENOENTs at spawn. Mount the operator's `~/.switchroom/mcp-launchers/`
+  // at the same host-absolute path so the operator's yaml `command:`
+  // value just works in-container. Same-path :ro mount mirrors the
+  // skills/ pattern above; existsSync-guarded so dev installs without
+  // a launcher dir don't hard-fail compose `up`. Pure-URL MCPs (e.g.
+  // notion `type: http`) don't need this mount.
+  if (existsSync(`${hostHomeForChecks}/.switchroom/mcp-launchers`)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/mcp-launchers:${homePrefix}/.switchroom/mcp-launchers:ro`,
+    );
+  }
   // PER-AGENT credentials mount (sec WS6-F2, #1390). Previously the
   // ENTIRE `~/.switchroom/credentials/` dir was bind-mounted `:ro`
   // into EVERY agent — so a prompt-injected agent could read every
