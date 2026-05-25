@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.13.50 — agents fix their own skills (clone-to-personal + versioned mirror)
+
+Two PRs that close the biggest gap surfaced by v0.13.47 UAT — agents
+finding defects in skills they depend on, hitting a wall at "I can't
+edit the shared pool", and pinging the operator to fix it manually.
+That doesn't scale to multi-operator fleets (e.g. Lisa's agents on
+her own host).
+
+### feat(skill): clone-to-personal (PR #1843)
+
+5th personal-skill verb: agent forks a `shared:<name>` or
+`bundled:<name>` source into its own personal tier; the fork is
+mutable via `edit-personal`; upstream pool is untouched.
+
+```
+switchroom skill clone-to-personal shared:garmin
+# or via MCP:
+skill_clone_to_personal { source: "shared:garmin" }
+```
+
+Source allow-list mirrors `skill_install`: only `shared:` and
+`bundled:` accepted, no `file://`, no arbitrary paths, no symlinks
+(refuses to follow out of the canonical pool). When `--name` differs
+from the source slug, the SKILL.md `name:` frontmatter is rewritten
+to match so the validator accepts the bundle. 1 MiB per-file cap on
+source reads (defense-in-depth vs. pathological input). All test-
+only CLI flags are `hideHelp()`-ed.
+
+Why this shape vs. delegation/RBAC or Phase 2 propose-publish: blast
+radius matches existing personal-tier invariant (self-only), zero
+new ACL concepts, ~3 agent-hour implementation. Phase 2
+propose-publish (deferred to ~2026-07-25) becomes the eventual
+*promotion* path back to shared — complementary, not competing.
+
+9 new tests covering the security-critical paths.
+
+### feat(skill): auto-mirror to ~/.switchroom-config (PR #1844)
+
+After every successful `init_personal` / `edit_personal` /
+`clone_to_personal`, opportunistically mirror the dir into:
+
+```
+~/.switchroom-config/agents/<agent>/personal-skills/<name>/
+```
+
+if the operator has the config repo. `remove_personal` moves the
+mirror to a `.<name>-trash-<ts>/` sibling so the deletion shows in
+`git status`. Each edit leaves a `.<name>-prior-<ts>/` sibling for
+recovery before commit. **24h lazy sweep** of `.prior-*` / `.trash-*`
+prevents chatty agents from accumulating stale dirs forever (same
+TTL as the live skills-trash).
+
+If the config repo doesn't exist, the mirror **silently no-ops**
+(operator hasn't opted in). If a mirror write fails, a warning
+prints to stderr and the **live copy continues unaffected** —
+`appendAudit`'s "never block a live action" pattern. No auto-commit;
+operator commits at their own cadence via plain git.
+
+`SWITCHROOM_CONFIG_DIR` env override for multi-operator hosts and
+tests.
+
+Mirror-after-write (vs. bind-mount/symlink redirect): zero claude-
+code discovery changes, zero compose mount changes, zero UID
+alignment changes, free migration. Tradeoff is the live → mirror gap
+is bounded by the next successful sync (typically same call); on
+failure the audit row + live copy still land.
+
+Critical test-discipline fix found in review: previous test suite
+leaked fixtures into the operator's real `~/.switchroom-config` (36
+dirs of test-agent state, cleaned up before merge). File-level
+`beforeAll` now pins `SWITCHROOM_CONFIG_DIR` to a tmpdir before any
+test runs — same Vault/shared-state HARD rule as `project_vault_
+clobbered_by_test_2026_05_22`.
+
+8 new tests covering happy paths, opt-in/opt-out, failure isolation,
+24h sweep, and symlink defense.
+
 ## v0.13.49 — hotfix: actually register the repo-context hook in settings.json
 
 PR #1811 / v0.13.48 added the repo-context PreToolUse hook to
