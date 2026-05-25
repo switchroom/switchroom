@@ -774,16 +774,24 @@
       // usage % cell: live 5h/7d utilization from the last cached
       // probe (cost-gated — see refreshQuota). null → "—" + a per-
       // account ↻ that force-probes. quotaStale → value shown muted
-      // with ↻ to refresh.
-      const pctCell = (pct, label, stale) => {
+      // with ↻ to refresh. When `resetAt` is provided we append a
+      // muted "resets in Xh" line so the operator can see WHEN the
+      // window rolls over without hovering for a tooltip — matches
+      // anthropic-ratelimit-unified-{5h,7d}-reset headers exposed by
+      // the broker probe (src/auth/quota.ts:97-98).
+      const pctCell = (pct, label, stale, resetAt) => {
         if (pct == null) return '<span style="color:var(--text-dim)">—</span>';
         let cls = 'quota-pct';
         if (pct >= 90) cls += ' high';
         else if (pct >= 70) cls += ' mid';
         const v = `${Math.round(pct)}%`;
-        return stale
+        const reset = resetAt
+          ? `<div style="font-size:.72rem;color:var(--text-dim);font-weight:normal;margin-top:.1rem">resets ${formatTimestamp(resetAt)}</div>`
+          : '';
+        const pctSpan = stale
           ? `<span class="${cls}" title="stale — click ↻" style="opacity:.55">${v}</span>`
           : `<span class="${cls}">${v}</span>`;
+        return reset ? `<div>${pctSpan}${reset}</div>` : pctSpan;
       };
       const enriched = accounts.map(a => {
         const q = a.quota || null;
@@ -792,9 +800,8 @@
         return {
           a,
           usedBy: a.usedBy || [],
-          fiveH: pctCell(u ? u.fiveHourPct : null, '5h', a.quotaStale),
-          sevenD: pctCell(u ? u.sevenDayPct : null, '7d', a.quotaStale),
-          fiveReset: u && u.fiveHourResetAt ? formatTimestamp(u.fiveHourResetAt) : '<span style="color:var(--text-dim)">—</span>',
+          fiveH: pctCell(u ? u.fiveHourPct : null, '5h', a.quotaStale, u ? u.fiveHourResetAt : null),
+          sevenD: pctCell(u ? u.sevenDayPct : null, '7d', a.quotaStale, u ? u.sevenDayResetAt : null),
           captured: u && u.capturedAt
             ? formatTimestamp(u.capturedAt)
             : '<span style="color:var(--text-dim)">never</span>',
