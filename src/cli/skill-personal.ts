@@ -121,6 +121,32 @@ function resolveConfigSkillsDir(agent: string): string | null {
  * (if any) is moved to a `.<name>-trash-<ts>` sibling so a stray
  * `git status` still shows the deletion.
  */
+/**
+ * `.prior-<ts>/` and `.trash-<ts>/` siblings retention: lazy sweep at
+ * the start of each mirror op deletes entries older than 24h. Without
+ * this, every edit leaves a permanent stale copy in the config repo —
+ * 100 edits = 100 dirs of stale skill content (#1844 reviewer flag).
+ * Same TTL as the live skills-trash sweep so the operator's mental
+ * model is uniform.
+ */
+const MIRROR_PRIOR_TTL_MS = 24 * 60 * 60 * 1000;
+function sweepMirrorPriors(configSkillsRoot: string): void {
+  try {
+    if (!existsSync(configSkillsRoot)) return;
+    const now = Date.now();
+    for (const ent of readdirSync(configSkillsRoot)) {
+      const m = /^\.(?:.+)-(?:prior|trash)-(\d+)$/.exec(ent);
+      if (!m) continue;
+      const ts = Number(m[1]!);
+      if (!Number.isFinite(ts)) continue;
+      if (now - ts < MIRROR_PRIOR_TTL_MS) continue;
+      try {
+        rmSync(join(configSkillsRoot, ent), { recursive: true, force: true });
+      } catch { /* best-effort */ }
+    }
+  } catch { /* best-effort */ }
+}
+
 function mirrorToConfigRepo(
   agent: string,
   name: string,
@@ -131,7 +157,28 @@ function mirrorToConfigRepo(
   const dest = join(configSkillsRoot, name);
 
   try {
+    // Defense in depth: liveSkillDir should be a canonical path under
+    // <agentDir>/.claude/skills, but if it were ever a symlink (future
+    // redirect mode, misconfigured scaffold), don't follow it across
+    // the file system.
+    if (liveSkillDir !== null) {
+      try {
+        const st = lstatSync(liveSkillDir);
+        if (st.isSymbolicLink()) {
+          process.stderr.write(
+            chalk.yellow(
+              `warning: refusing to mirror ${liveSkillDir} — source is a symlink\n`,
+            ),
+          );
+          return;
+        }
+      } catch {
+        // Fall through; readdirSync below will surface a useful error.
+      }
+    }
+
     if (liveSkillDir === null) {
+      sweepMirrorPriors(configSkillsRoot);
       if (existsSync(dest)) {
         const trash = join(
           configSkillsRoot,
@@ -143,6 +190,7 @@ function mirrorToConfigRepo(
     }
 
     mkdirSync(configSkillsRoot, { recursive: true, mode: 0o755 });
+    sweepMirrorPriors(configSkillsRoot);
     // Atomic-ish: stage under a sibling, swap, remove old.
     const staging = mkdtempSync(join(configSkillsRoot, `.${name}-staging-`));
     const walk = (src: string, dst: string): void => {
@@ -162,8 +210,7 @@ function mirrorToConfigRepo(
     if (existsSync(dest)) {
       const prior = join(configSkillsRoot, `.${name}-prior-${Date.now()}`);
       renameSync(dest, prior);
-      // Leave .<name>-prior-<ts> for git diff visibility; operator
-      // commits when ready and can rm the .prior- sibling.
+      // .prior- siblings: bounded by sweepMirrorPriors above (24h TTL).
     }
     renameSync(staging, dest);
   } catch (err) {

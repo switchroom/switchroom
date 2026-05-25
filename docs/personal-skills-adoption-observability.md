@@ -21,12 +21,22 @@ also writes an opportunistic mirror to:
 
 `remove_personal` moves the corresponding mirror to a sibling
 `.<name>-trash-<ts>/` dir so the deletion shows up in `git status`.
+Each edit also leaves a `.<name>-prior-<ts>/` sibling holding the
+prior content (cheap recovery before the operator commits).
+
+**Retention.** `.prior-*` and `.trash-*` siblings older than **24h**
+get swept lazily on the next mirror op. Without this, a chatty agent
+would accumulate one stale dir per edit forever. Mirrors the live
+`skills-trash` 24h sweep so the operator's mental model is uniform.
+Anything older than 24h lives in git history once the operator
+commits.
 
 Override `SWITCHROOM_CONFIG_DIR` to point at an alternate repo
 (separate-operator fleets, tests). If the config repo doesn't exist
-**or** the mirror write fails, the live copy still works — just
-isn't version-controlled until the next successful sync. A warning
-prints on stderr in that case.
+the mirror **silently no-ops** (operator hasn't opted in). If the
+repo exists but a mirror write fails (EACCES, ENOSPC,
+cross-device-link), a warning prints to stderr and the live copy
+continues unaffected.
 
 **No auto-commit.** The operator commits the config repo at their own
 cadence. `cd ~/.switchroom-config && git status` shows what's changed.
