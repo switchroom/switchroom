@@ -28,6 +28,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "^(Read|Edit|Write|MultiEdit|NotebookEdit|Bash)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/repo-context-pretool.mjs\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
