@@ -45,7 +45,7 @@ fi
 # `-d "@<unix>"` is required (Linux-only, fine for switchroom production).
 NOW_UNIX=$(date +%s)
 ROUNDED=$(( NOW_UNIX - (NOW_UNIX % 900) ))
-NOW=$(TZ="$TZ_VAL" date -d "@$ROUNDED" '+%Y-%m-%d %H:%M %Z (UTC%:z)')
+NOW=$(TZ="$TZ_VAL" date -d "@$ROUNDED" '+%A %Y-%m-%d %I:%M %p %Z (UTC%:z)')
 
 if [ "$TZ_UNSET" = "1" ]; then
   MSG="Current local time: $NOW ($TZ_VAL — WARNING: SWITCHROOM_TIMEZONE unset; compose env may be stale, run \`switchroom apply && switchroom agent restart <agent>\` to refresh)"
