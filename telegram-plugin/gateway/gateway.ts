@@ -4051,6 +4051,26 @@ const ipcServer: IpcServer = createIpcServer({
       },
       buildCard: ({ preview, suggestRequestId }) =>
         buildDiffPreviewCard({ preview, suggestRequestId }),
+      // #1767 review: ship the full pre-truncation preview as a `.txt`
+      // attachment when the inline card body had to shrink — mirrors
+      // the config-approval `.patch` fallback so the operator can see
+      // whatever was elided before approving.
+      postAttachment: async (args) => {
+        const input = new InputFile(Buffer.from(args.content, 'utf8'), args.filename)
+        await robustApiCall(
+          () =>
+            bot.api.sendDocument(args.chatId, input, {
+              ...(args.threadId !== undefined
+                ? { message_thread_id: args.threadId }
+                : {}),
+            }),
+          {
+            chat_id: String(args.chatId),
+            verb: 'drive-approval-attachment',
+            ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+          },
+        )
+      },
       log: (m) => process.stderr.write(`telegram gateway: drive-approval — ${m}\n`),
     })
   },

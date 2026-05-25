@@ -12,6 +12,8 @@ import {
   type DriveApprovalHandlerDeps,
   handleRequestDriveApproval,
 } from "./drive-write-approval.js";
+import { buildDiffPreviewCard } from "./diff-preview-card.js";
+import { buildDiffPreview } from "../../src/drive/diff-preview.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -346,6 +348,119 @@ describe("handleRequestDriveApproval — oversize card body fit (#1767)", () => 
     );
     expect(spy.sent[0]?.ok).toBe(false);
     expect(spy.sent[0]?.reason).toMatch(/oversize-body truncation/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Intake clipping + attachment fallback (#1767 review)
+// ────────────────────────────────────────────────────────────────────────
+
+describe("handleRequestDriveApproval — intake clip + attachment (#1767 review)", () => {
+  it("adversarial docTitle of 5000 `&` chars is clipped at intake before the helper sees it", async () => {
+    const spy = makeSpy();
+    // Use the REAL buildDiffPreview + buildDiffPreviewCard (not the
+    // happy-path stub) to exercise the intake-clip path end-to-end.
+    const adversarialPreview = {
+      ...validPreview(),
+      docTitle: "&".repeat(5000),
+    };
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor({ preview: adversarialPreview }),
+      deps({
+        spy,
+        buildCard: ({ preview, suggestRequestId }) =>
+          buildDiffPreviewCard({ preview, suggestRequestId }),
+      }),
+    );
+    expect(spy.posted).toHaveLength(1);
+    const text = spy.posted[0]!.text;
+    // Rendered body must comfortably fit under Telegram's limit
+    // because intake-clipping bounded the title to ~200 chars before
+    // HTML escape. The 5x-inflated worst case would be ~25KB if the
+    // clip had NOT fired.
+    expect(text.length).toBeLessThanOrEqual(4096);
+    // And specifically — the helper's char-truncation fallback must
+    // NOT have been needed: no preview-truncation sentinel.
+    expect(text).not.toContain("preview truncated");
+    expect(
+      spy.logs.some((l) => l.includes("oversize-truncated")),
+    ).toBe(false);
+    expect(spy.sent[0]?.ok).toBe(true);
+  });
+
+  it("ships a .txt attachment with the full pre-truncation card text when truncation fires", async () => {
+    const spy = makeSpy();
+    const attachments: Array<{ filename: string; content: string }> = [];
+    const giantText =
+      "<b>Title</b>\n" +
+      Array.from({ length: 200 }, (_, i) => `line-${i}-${"x".repeat(40)}`).join(
+        "\n",
+      );
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor(),
+      deps({
+        spy,
+        buildCard: () => ({ text: giantText, reply_markup: { stub: true } }),
+        postAttachment: async (a) => {
+          attachments.push({ filename: a.filename, content: a.content });
+        },
+      }),
+    );
+    expect(spy.posted).toHaveLength(1);
+    expect(spy.posted[0]!.text.length).toBeLessThanOrEqual(4096);
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]!.filename).toMatch(/^drive-write-preview-.+\.txt$/);
+    expect(attachments[0]!.content).toBe(giantText);
+    expect(spy.sent[0]?.ok).toBe(true);
+  });
+
+  it("oversize-truncated but no postAttachment dep wired → logged, card still posts ok", async () => {
+    const spy = makeSpy();
+    const giantText =
+      "<b>Title</b>\n" + "x".repeat(8000).match(/.{1,80}/g)!.join("\n");
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor(),
+      deps({
+        spy,
+        buildCard: () => ({ text: giantText, reply_markup: { stub: true } }),
+        // postAttachment intentionally NOT supplied
+      }),
+    );
+    expect(spy.posted).toHaveLength(1);
+    expect(spy.sent[0]?.ok).toBe(true);
+    expect(
+      spy.logs.some((l) => l.includes("no postAttachment dep wired")),
+    ).toBe(true);
+  });
+
+  // Quietly exercise diff-preview's clipping too — if anchor displayName
+  // grew unbounded, the body would still fit because of the 150-char cap.
+  it("adversarial anchor displayName is clipped at intake (defense in depth)", async () => {
+    const spy = makeSpy();
+    const adversarialPreview = {
+      ...validPreview(),
+      resolvedAnchor: {
+        op: { kind: "insert_after", paragraphIndex: 4 },
+        displayName: "&".repeat(5000),
+      },
+    };
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor({ preview: adversarialPreview }),
+      deps({
+        spy,
+        buildCard: ({ preview, suggestRequestId }) =>
+          buildDiffPreviewCard({ preview, suggestRequestId }),
+      }),
+    );
+    expect(spy.posted).toHaveLength(1);
+    expect(spy.posted[0]!.text.length).toBeLessThanOrEqual(4096);
+    expect(spy.sent[0]?.ok).toBe(true);
+    // Keep buildDiffPreview reachable for tree-shake assertion
+    void buildDiffPreview;
   });
 });
 

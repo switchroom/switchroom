@@ -130,9 +130,24 @@ export interface DiffPreview {
 export function buildDiffPreview(input: DiffPreviewInput): DiffPreview {
   validateInput(input);
 
+  // Pre-render intake clipping. Telegram caps `sendMessage` at 4096
+  // chars and we render with `parse_mode=HTML` — worst-case escape
+  // (`&` → `&amp;`) inflates 5x. The wrapper attests `docTitle` and
+  // anchor `displayName` honestly, but they originate from Drive
+  // metadata / heading text where adversarial inputs (e.g. a 10 KB
+  // doc title full of `&`) can still push the rendered card past
+  // 4096. Clip per-field here so the helper's char-truncation
+  // fallback in `oversize-card-body.ts` (which can bisect HTML
+  // entities) is unreachable on user-controlled fields. (#1767 review)
+  const safeDocTitle = clipField(input.docTitle, DOC_TITLE_MAX);
+  const safeAnchorDisplay = clipField(
+    input.resolvedAnchor.displayName,
+    ANCHOR_DISPLAY_MAX,
+  );
+
   const titleIcon = input.mode === "write" ? "⚠" : "✏️";
   const titleVerb = input.mode === "write" ? "wants to write to" : "wants to add to";
-  const title = `${titleIcon} ${input.agentName} ${titleVerb} "${input.docTitle}"`;
+  const title = `${titleIcon} ${input.agentName} ${titleVerb} "${safeDocTitle}"`;
 
   const lines: DiffPreviewLine[] = [];
 
@@ -140,7 +155,7 @@ export function buildDiffPreview(input: DiffPreviewInput): DiffPreview {
   // The 📍 prefix is the load-bearing visual cue per RFC E §4.2 mockup.
   lines.push({
     order: 0,
-    text: `📍 ${input.resolvedAnchor.displayName}`,
+    text: `📍 ${safeAnchorDisplay}`,
     wrapperAttested: true,
   });
 
@@ -206,6 +221,8 @@ export function buildDiffPreview(input: DiffPreviewInput): DiffPreview {
     emphasis: "secondary",
   });
 
+  // Audit retains the *original* (unclipped) wrapper-attested values so
+  // post-hoc review sees ground truth, not the card-display projection.
   const audit: DiffPreview["audit"] = {
     wrapperAttested: {
       anchorDisplayName: input.resolvedAnchor.displayName,
@@ -246,6 +263,29 @@ function formatMetrics(m: DiffMetrics): string {
  * content; our defense is the wrapper-attested anchor surfaced
  * separately). This is a "card stays well-formed" hygiene step.
  */
+/**
+ * Per-field intake caps for wrapper-attested strings (#1767 review).
+ * Sized comfortably under Telegram's 4096-char sendMessage limit even
+ * after worst-case 5x HTML-escape inflation: a 200-char title becomes
+ * at most 1000 rendered chars, leaving plenty of headroom for the
+ * anchor line, metrics line, summary, and framing.
+ */
+const DOC_TITLE_MAX = 200;
+const ANCHOR_DISPLAY_MAX = 150;
+const FIELD_ELLIPSIS = "…";
+
+/**
+ * Clip a wrapper-attested string to `max` chars (counting the
+ * ellipsis suffix). Strips control characters first so an embedded
+ * newline can't break the card's line-oriented layout. Mirrors the
+ * `clipReason` shape in `config-approval-handler.ts`.
+ */
+function clipField(value: string, max: number): string {
+  const oneLine = value.replace(/[\r\n\t]+/g, " ").trim();
+  if (oneLine.length <= max) return oneLine;
+  return oneLine.slice(0, max - FIELD_ELLIPSIS.length) + FIELD_ELLIPSIS;
+}
+
 function sanitizeSummary(summary: string): string {
   const oneLine = summary.replace(/[\r\n\t]+/g, " ").trim();
   const noQuotes = oneLine.replace(/"/g, "'");

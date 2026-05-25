@@ -327,16 +327,17 @@ describe("oversize diff → attachment fallback (#1762)", () => {
   }
 
   it("truncateDiffForCard caps the diff and appends a sentinel", () => {
-    const truncated = truncateDiffForCard(bigDiff(200), 50, 3000);
-    expect(truncated.length).toBeLessThanOrEqual(3050);
-    expect(truncated.endsWith("[… diff continues, see attached file]")).toBe(
-      true,
-    );
+    const { out, truncated } = truncateDiffForCard(bigDiff(200), 50, 3000);
+    expect(truncated).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(3050);
+    expect(out.endsWith("[… diff continues, see attached file]")).toBe(true);
   });
 
   it("returns the original diff unchanged when below the line cap", () => {
     const small = "--- a\n+++ b\n@@\n-x\n+y\n";
-    expect(truncateDiffForCard(small, 50)).toBe(small);
+    const { out, truncated } = truncateDiffForCard(small, 50);
+    expect(out).toBe(small);
+    expect(truncated).toBe(false);
   });
 
   it("oversize body still posts a card with buttons AND fires postAttachment", async () => {

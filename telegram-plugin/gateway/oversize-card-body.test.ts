@@ -90,6 +90,27 @@ describe("truncateRawToFit", () => {
     expect(body).toContain("truncated");
   });
 
+  it("when caller passes already-escaped raw + identity render on a single long line, char-truncation still bounds output (call-site contract is documented)", () => {
+    // #1767 review: documents the load-bearing contract — the helper's
+    // `raw` field is per-doc spec pre-escape text. The drive-write
+    // call site violates that contract (passes escaped card text with
+    // identity render) which is SAFE only because intake clipping in
+    // buildDiffPreview keeps inputs short enough that the char-
+    // truncation fallback never fires. This test pins the worst-case
+    // behavior: even with entity-laden raw, the output respects the
+    // cap (it may bisect an entity visually, but length is bounded).
+    const raw = "&amp;".repeat(2000); // 10000 chars, no newlines
+    const { body, truncated } = truncateRawToFit({
+      raw,
+      render: (s) => s, // identity render — call-site contract violation
+      cap: 500,
+      sentinel: SENTINEL,
+    });
+    expect(truncated).toBe(true);
+    // Length is bounded — the load-bearing safety property.
+    expect(body.length).toBeLessThanOrEqual(500);
+  });
+
   it("hard-cuts at hardLimit when framing alone overflows (defensive)", () => {
     // Framing-alone is 5000 chars (way past cap), and the renderer
     // ignores its input — so no slice of raw can ever fit. The

@@ -90,6 +90,19 @@ export interface DriveApprovalHandlerDeps {
     preview: ReturnType<typeof buildDiffPreview>;
     suggestRequestId: string;
   }) => { text: string; reply_markup: unknown };
+  /**
+   * Send the full pre-truncation preview as a `.txt` attachment when
+   * the inline card body had to shrink (#1767 review). Best-effort:
+   * failures are logged and do NOT block the approval flow — the
+   * truncated card is still actionable. Mirrors the config-approval
+   * `.patch` attachment path.
+   */
+  postAttachment?: (args: {
+    chatId: number | string;
+    threadId?: number;
+    filename: string;
+    content: string;
+  }) => Promise<void>;
   log?: (msg: string) => void;
   /** TTL clamping policy. */
   defaultTtlMs?: number;
@@ -217,26 +230,26 @@ export async function handleRequestDriveApproval(
     });
     return;
   }
-  // Oversize guard (#1767). buildDiffPreviewCard renders title +
-  // every body line HTML-escaped with no length cap. Worst-case `&`
-  // / `<` / `>` inflate 5x — a long docTitle or anchor displayName
-  // pushes past Telegram's 4096-char sendMessage limit and the API
-  // returns a generic 400 that surfaces as a silent E_DENIED. Cap
-  // the rendered body BEFORE posting.
+  // Oversize guard (#1767). The primary defense lives upstream in
+  // `buildDiffPreview` (per-field intake clipping on docTitle +
+  // anchor displayName + summary), so the rendered card is
+  // bounded by ~200+150+200 raw chars × 5x inflate ≈ ~2.75KB +
+  // framing. This block is defensive belt-and-braces: if a future
+  // change relaxes a clip or a new field is added without one, we
+  // still cap the rendered body BEFORE posting so Telegram doesn't
+  // 400 and silently surface as E_DENIED.
+  //
+  // NOTE: `raw: card.text` is the already-HTML-escaped card body.
+  // Line-snap is safe (entities never span `\n`); the helper's
+  // defensive char-truncation fallback at `oversize-card-body.ts`
+  // could in theory bisect an entity like `&am|p;`, but with intake
+  // clipping in place the binary search always lands well before
+  // that fallback fires. Verified by the adversarial-docTitle test.
   let cardText = card.text;
   let truncatedForFit = false;
   if (cardText.length > RENDERED_BODY_CAP) {
     const fit = truncateRawToFit({
       raw: card.text,
-      // The "raw" here is the already-escaped card text — we don't
-      // have access to pre-escape source at this layer because
-      // buildDiffPreviewCard owns escaping. Line-snap is the safe
-      // granularity: HTML entities like `&amp;` never span `\n`, so
-      // truncating at a newline boundary can't bisect an entity.
-      // The defensive single-long-line fallback may char-cut into an
-      // entity, but the drive-preview lines are short (anchor name,
-      // metrics, capped 200-char summary) so this is unreachable
-      // unless a multi-KB docTitle slipped through Drive itself.
       render: (slice) => slice,
       cap: RENDERED_BODY_CAP,
       sentinel: OVERSIZE_SENTINEL,
@@ -266,6 +279,30 @@ export async function handleRequestDriveApproval(
     deps.log?.(
       `drive_approval_posted oversize-truncated correlation=${msg.correlationId} original_len=${card.text.length} rendered_len=${cardText.length}`,
     );
+    // Ship the FULL pre-truncation preview as a `.txt` attachment so
+    // the operator can read whatever was elided before approving.
+    // Best-effort; mirrors config-approval's `.patch` fallback. (#1767
+    // review) The attachment carries the raw card text — already
+    // HTML-escaped but readable as plain text when the operator
+    // downloads it from Telegram.
+    if (deps.postAttachment !== undefined) {
+      try {
+        await deps.postAttachment({
+          chatId: target.chatId,
+          ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
+          filename: `drive-write-preview-${registered.request_id}.txt`,
+          content: card.text,
+        });
+      } catch (err) {
+        deps.log?.(
+          `drive_approval attachment failed correlation=${msg.correlationId}: ${(err as Error).message}`,
+        );
+      }
+    } else {
+      deps.log?.(
+        `drive_approval oversize-truncated but no postAttachment dep wired (correlation=${msg.correlationId})`,
+      );
+    }
   }
 
   deps.log?.(

@@ -90,7 +90,7 @@ export function truncateDiffForCard(
   unifiedDiff: string,
   maxLines = 50,
   maxChars = 3000,
-): string {
+): { out: string; truncated: boolean } {
   const sentinel = "\n[… diff continues, see attached file]";
   const lines = unifiedDiff.split("\n");
   let out: string;
@@ -106,7 +106,8 @@ export function truncateDiffForCard(
     const lastNl = cap.lastIndexOf("\n");
     out = lastNl > 0 ? cap.slice(0, lastNl) : cap;
   }
-  return out === unifiedDiff ? out : out + sentinel;
+  if (out === unifiedDiff) return { out, truncated: false };
+  return { out: out + sentinel, truncated: true };
 }
 
 /**
@@ -234,14 +235,14 @@ export async function handleRequestConfigApproval(
   const built = buildConfigApprovalCardBody({
     agentName: msg.agentName,
     reason: msg.reason,
-    unifiedDiff: prelim,
+    unifiedDiff: prelim.out,
   });
   const body = built.body;
   // Oversize iff EITHER the cheap raw fast-path trimmed lines OR the
   // post-escape rendered cap had to re-truncate. Keyed off the
-  // builder's structured `truncated` flag instead of substring-
-  // matching the sentinel string (#1767 nit).
-  const oversize = prelim !== msg.unifiedDiff || built.truncated;
+  // structured `truncated` booleans from both layers rather than
+  // substring-matching the sentinel string (#1767 review).
+  const oversize = prelim.truncated || built.truncated;
   const replyMarkup = deps.buildKeyboard(msg.requestId);
 
   const posted = await deps.postCard({
