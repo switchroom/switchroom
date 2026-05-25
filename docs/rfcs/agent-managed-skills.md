@@ -58,9 +58,12 @@ fleet co-manages":
    / `skill_remove_personal` / `skill_list_personal`. Multi-file
    bundle validator (new code per feasibility review). `O_NOFOLLOW |
    O_EXCL` writes (per security T3). Trash-dir soft-undo with
-   host-side sweep cron (per security T4). Pre-publish `claude -p`
-   content scan in skill scripts (closes the CI-guard gap flagged by
-   security + feasibility independently).
+   sweep mechanism per PR-2's decision (NOT host-side cron — switchroom
+   has none post-Phase-4; likely a lazy-on-write sweep + an
+   agent-scheduler-registered immutable schedule entry the agent
+   can't disable). Pre-publish `claude -p` content scan in skill
+   scripts (closes the CI-guard gap flagged by security + feasibility
+   independently).
 
 4. **PR-4 (Phase 3 read-only discovery, 3h):** `skill_search` MCP op.
    Read-only enumeration across personal + shared + bundled pools
@@ -492,7 +495,10 @@ Mapping to this RFC:
 **Soft-undo for `skill_remove_personal`** (cheap insurance, real
 recovery value): the op moves the skill dir to
 `<agentDir>/.claude/skills/.trash/<name>-<unix-ts>/` rather than
-unlinking. A daily cron sweep deletes trash entries older than 24h.
+unlinking. A sweep mechanism (per PR-2's design decision — switchroom
+has no host-side cron post-Phase-4, so likely a lazy-on-write sweep
+plus an immutable scaffold-baked agent-scheduler entry) deletes
+trash entries older than 24h.
 Recovery is a `mv` away. Cost: a few KB extra per delete-then-restore
 cycle; benefit: the failure mode "agent removed a skill mid-use,
 context broken on next turn" gets a 24h window to undo. Same
@@ -630,9 +636,13 @@ After PR-2 resolves the layout. Implementation:
   refuses if any path ancestor is a symlink; rejects symlinks in
   payload contents. (Closes security review T3.)
 - **Trash-dir soft-undo** (per §7): `skill_remove_personal` moves to
-  trash-dir, host-side daily cron sweeps entries older than 24h. The
-  sweep cron is in scaffold (operator-side), NOT agent-side. (Closes
-  security review T4.)
+  trash-dir; sweep mechanism per PR-2 (#1818) decision. **Not a
+  host-side cron** — switchroom retired host-side cron in Phase 4
+  (`src/agents/lifecycle.ts:841`). The most likely answer from PR-2's
+  spike is a *lazy sweep* (on next `skill_remove_personal` / agent
+  boot, sweep trash entries older than 24h) plus an immutable
+  scaffold-baked agent-scheduler entry the agent can't disable. PR-2
+  decides; PR-3 implements whatever PR-2 says.
 - **Pre-publish content scan**: every `scripts/*.{sh,py}` file in the
   payload is grepped server-side for `\bclaude\s+-p\b`; reject the
   write if found. Closes the CI-guard gap that was flagged by both
@@ -822,7 +832,7 @@ Default: pool-resolution-order is enough. Lookup goes:
   size, path allowlist) keeps running first; behavioral validation
   is an additional gate on top.
 - **AC-8**: `skill_remove_personal` is recoverable — a removed skill
-  lands in `.trash/` for 24h before the daily cron sweep finalises
+  lands in `.trash/` for 24h before the sweep mechanism finalises
   the delete. An agent (or operator) can `mv` it back inside the
   window with no other state change.
 
