@@ -6956,73 +6956,73 @@ function handleSessionEvent(ev: SessionEvent): void {
           // overwrites `streamMsgId` internally with the new send's id;
           // without capturing here we'd lose the reference.
           const oldStreamedMsgId = streamedMsgId
-          // Fire-and-forget — turn_end must not block on the
-          // materialize promise. Errors are logged but never propagated;
-          // worst case the user sees the silent streamed preview (which
-          // already happened) without the ping (the failure case this
-          // branch was designed to fix), so we still need a record/dedup
-          // pass BEFORE awaiting to keep the bookkeeping accurate.
-          try {
-            outboundDedup.record(
-              turn.sessionChatId,
-              turn.sessionThreadId,
-              streamedFinalText,
-              Date.now(),
-              turn.registryKey ?? null,
-            )
-          } catch { /* best-effort */ }
-          if (HISTORY_ENABLED) {
-            try {
-              recordOutbound({
-                chat_id: turn.sessionChatId,
-                thread_id: turn.sessionThreadId ?? null,
-                message_ids: [streamedMsgId],
-                texts: [streamedFinalText],
-              })
-            } catch { /* best-effort */ }
-          }
-          // Now materialize-and-delete. Both calls fire-and-forget;
-          // materialize() is itself idempotent (`materialized` guard
-          // at the top of the function in answer-stream.ts) and
-          // dedup-aware (turn-flush already recorded above).
+          // Fire-and-forget materialize-and-delete sequence.
+          //
+          // Bookkeeping (dedup + history): handled inside
+          // `materialize()` itself — see `answer-stream.ts:~548-549`
+          // which calls the injected `recordDedup` + `recordOutbound`
+          // callbacks with the NEW (fresh-send) message_id only after a
+          // successful send. We deliberately do NOT pre-record here —
+          // doing so populates the same `outboundDedup` store that
+          // materialize's internal `checkDedup` consults at
+          // `answer-stream.ts:~510`, causing materialize to dedup-
+          // suppress its own send (return undefined, no ping fires) —
+          // the exact failure mode this PR exists to fix. Let
+          // materialize own the bookkeeping; gateway only sequences the
+          // operations.
+          //
+          // Delete gating: only run the cleanup `deleteMessage` if
+          // materialize actually sent (returned a numeric sentId). If
+          // it dedup-suppressed or threw, the streamed preview is the
+          // user's only copy of the answer and MUST be preserved.
           void (async () => {
+            let materializedId: number | undefined
             try {
-              await stream.materialize()
-              // Delete the silent streamed preview. The fresh
-              // materialized message lives at a NEW message_id; delete
-              // the OLD streamedMsgId so the chat doesn't show two
-              // messages with the same content. Best-effort; the catch
-              // below swallows any failure (already-deleted, permission,
-              // etc.) — wrapping in robustApiCall would retry-storm on
-              // permanent failures, and the worst case is a brief
-              // visible duplicate which is acceptable.
-              try {
-                // allow-raw-bot-api: cleanup delete of silent streamed preview
-                await bot.api.deleteMessage(turn.sessionChatId, oldStreamedMsgId)
-              } catch (delErr) {
-                // Best-effort — if the delete fails (already gone,
-                // permission denied, etc.) we accept the small
-                // visual duplicate rather than retry-storming.
-                process.stderr.write(
-                  `telegram gateway: answer-stream materialize-cleanup ` +
-                  `delete failed for msgId=${oldStreamedMsgId}: ${
-                    delErr instanceof Error ? delErr.message : String(delErr)
-                  }\n`,
-                )
-              }
+              materializedId = await stream.materialize()
             } catch (err) {
               process.stderr.write(
                 `telegram gateway: answer-stream materialize failed: ${
                   err instanceof Error ? err.message : String(err)
                 }\n`,
               )
+              return
             }
+            if (typeof materializedId !== 'number' || !Number.isFinite(materializedId)) {
+              // materialize() returned undefined — either pendingText
+              // was empty, the body was a silent marker (NO_REPLY /
+              // HEARTBEAT_OK), or `checkDedup` suppressed it. In every
+              // such case the streamed preview is the user's only copy
+              // of the content; don't delete it.
+              process.stderr.write(
+                `telegram gateway: answer-stream materialize returned no msgId ` +
+                `chat=${turn.sessionChatId} oldMsg=${oldStreamedMsgId} — ` +
+                `preserving silent preview as the user's only copy\n`,
+              )
+              return
+            }
+            // Materialize sent a fresh pinged message at materializedId.
+            // Delete the silent streamed preview so the chat shows one
+            // canonical message (the fresh pinged one) and not two with
+            // duplicate content. Best-effort; failures (already gone,
+            // permission denied) leave a brief visible duplicate which
+            // we accept rather than retry-storming.
+            try {
+              // allow-raw-bot-api: cleanup delete of silent streamed preview
+              await bot.api.deleteMessage(turn.sessionChatId, oldStreamedMsgId)
+            } catch (delErr) {
+              process.stderr.write(
+                `telegram gateway: answer-stream materialize-cleanup ` +
+                `delete failed for msgId=${oldStreamedMsgId}: ${
+                  delErr instanceof Error ? delErr.message : String(delErr)
+                }\n`,
+              )
+            }
+            process.stderr.write(
+              `telegram gateway: answer-stream materialized as answer ` +
+              `chat=${turn.sessionChatId} oldMsg=${oldStreamedMsgId} ` +
+              `newMsg=${materializedId} chars=${streamedFinalText.length}\n`,
+            )
           })()
-          process.stderr.write(
-            `telegram gateway: answer-stream materialized as answer ` +
-            `chat=${turn.sessionChatId} oldMsg=${oldStreamedMsgId} ` +
-            `chars=${streamedFinalText.length}\n`,
-          )
         } else {
           turn.answerStream = null
           void stream.retract().catch((err) => {
