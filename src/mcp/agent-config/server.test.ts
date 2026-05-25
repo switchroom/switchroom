@@ -37,12 +37,16 @@ describe("TOOLS export", () => {
       "audit_tail",
       "config_get",
       "cron_list",
-      "peers_list",      // identity / peer-awareness
+      "peers_list",            // identity / peer-awareness
       "schedule_add",
       "schedule_remove",
-      "skill_install",   // #1163 Phase 2
+      "skill_edit_personal",   // #1819 Phase 1 (agent-managed personal skills)
+      "skill_init_personal",   // #1819 Phase 1
+      "skill_install",         // #1163 Phase 2 (shared library)
       "skill_list",
-      "skill_remove",    // #1163 Phase 2
+      "skill_list_personal",   // #1819 Phase 1
+      "skill_remove",          // #1163 Phase 2
+      "skill_remove_personal", // #1819 Phase 1
     ]);
   });
 

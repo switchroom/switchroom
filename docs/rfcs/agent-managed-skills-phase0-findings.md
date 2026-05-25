@@ -28,7 +28,7 @@ was verified two ways:
   `plugin:skill-name`).
 
 - Direct extraction from the Claude Code v2.1.150 binary at
-  `/home/kenthompson/.local/share/claude/versions/2.1.150` — string
+  `~/.local/share/claude/versions/2.1.150` — string
   extract confirms the discovery glob is depth-1, hard-coded to
   `.claude/skills/` and `~/.claude/skills/`. No "personal" subdir
   keyword anywhere in the binary.
@@ -265,5 +265,5 @@ decisions above.
   (#1822), the tactical bridge that ships before this Phase 0 doc
 - Q3 evidence: `skills/skill-creator/scripts/{improve_description,run_eval}.py`
 - Q4 evidence: claude-code v2.1.150 binary at
-  `/home/kenthompson/.local/share/claude/versions/2.1.150`,
+  `~/.local/share/claude/versions/2.1.150`,
   code.claude.com/docs/en/skills

@@ -36,11 +36,12 @@ interface ExecResult {
   status: number;
 }
 
-export function execCli(args: string[]): ExecResult {
+export function execCli(args: string[], stdin?: string): ExecResult {
   const r = spawnSync(CLI_BIN, args, {
     encoding: "utf-8",
     env: process.env,
     timeout: 15000,
+    ...(stdin !== undefined ? { input: stdin } : {}),
   });
   return {
     stdout: r.stdout ?? "",
@@ -72,6 +73,8 @@ interface ToolArgs {
   source?: string;
   // peers_list
   include_self?: boolean;
+  // skill_{init,edit}_personal (#1819 PR-3) — file map for the bundle
+  files?: Record<string, string>;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -240,6 +243,90 @@ export const TOOLS = [
       },
     },
   },
+  // PR-3 (#1819) — personal-skill authoring ops. Each agent has a
+  // writable workspace at `<agentDir>/.claude/skills/personal-<name>/`;
+  // no operator approval required (agent's own files).
+  {
+    name: "skill_init_personal",
+    description:
+      "Create a personal skill in this agent's writable workspace " +
+      "(`<agentDir>/.claude/skills/personal-<name>/`). Multi-file " +
+      "payload via `files: {path: content}`. Validates against the " +
+      "same gates an operator-driven `switchroom skill apply` would " +
+      "— name regex, path allowlist, SKILL.md frontmatter, bundle " +
+      "size, banned-headless-phrase content scan, bash -n / py_compile. " +
+      "No operator approval — agent owns its workspace.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name", "files"],
+      properties: {
+        name: {
+          type: "string",
+          pattern: "^[a-z0-9][a-z0-9_-]{0,62}$",
+          description: "Skill slug (becomes the dir name `personal-<slug>`).",
+        },
+        files: {
+          type: "object",
+          description:
+            "Multi-file payload — keys are relative paths under the skill " +
+            "dir (must match the SKILL.md allowlist: SKILL.md, README.md, " +
+            "scripts/*.{sh,py}, assets/..., reference/*.md). Values are " +
+            "the file contents (strings).",
+        },
+      },
+    },
+  },
+  {
+    name: "skill_edit_personal",
+    description:
+      "Overwrite an existing personal skill. Same gates as " +
+      "skill_init_personal. Fails if the skill doesn't already exist " +
+      "(use skill_init_personal first).",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name", "files"],
+      properties: {
+        name: {
+          type: "string",
+          pattern: "^[a-z0-9][a-z0-9_-]{0,62}$",
+          description: "Skill slug to overwrite.",
+        },
+        files: {
+          type: "object",
+          description: "Multi-file payload (see skill_init_personal).",
+        },
+      },
+    },
+  },
+  {
+    name: "skill_remove_personal",
+    description:
+      "Soft-remove a personal skill. The dir moves to " +
+      "`<agentDir>/.claude/skills-trash/<name>-<unix-ts>/` for 24h " +
+      "recovery. Lazy sweep on next personal-skill op deletes " +
+      "entries older than 24h.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          pattern: "^[a-z0-9][a-z0-9_-]{0,62}$",
+          description: "Skill slug to remove.",
+        },
+      },
+    },
+  },
+  {
+    name: "skill_list_personal",
+    description:
+      "List personal skills owned by this agent. Returns name, on-disk " +
+      "path, file count, and total bytes per skill. Read-only.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 export function dispatchTool(
@@ -248,6 +335,7 @@ export function dispatchTool(
 ): { content: { type: "text"; text: string }[]; isError?: boolean } {
   let cliArgs: string[];
   let parseMode: "json" | "jsonl";
+  let stdinJson: string | undefined; // PR-3: piped to skill_*_personal ops
   switch (name) {
     case "config_get":
       cliArgs = buildArgs(["config", "get"], args);
@@ -330,11 +418,52 @@ export function dispatchTool(
       parseMode = "json";
       break;
     }
+    // PR-3 (#1819) — personal-skill ops. Each routes to the CLI verb
+    // which writes to the agent's writable workspace; no operator
+    // approval surface. The `files` JSON map is passed via stdin (the
+    // execCli wrapper passes the calling context's stdin through).
+    case "skill_init_personal":
+    case "skill_edit_personal": {
+      const a = args as ToolArgs;
+      if (!a.name || typeof a.name !== "string") {
+        return errorText(`${name}: name is required`);
+      }
+      if (!a.files || typeof a.files !== "object" || Array.isArray(a.files)) {
+        return errorText(`${name}: files object is required`);
+      }
+      const verb = name === "skill_init_personal" ? "init-personal" : "edit-personal";
+      const base = ["skill", verb, a.name as string];
+      if (a.agent) base.push("--agent", a.agent as string);
+      cliArgs = base;
+      parseMode = "json";
+      // Stash the files JSON for execCli to pipe to stdin.
+      stdinJson = JSON.stringify(a.files);
+      break;
+    }
+    case "skill_remove_personal": {
+      const a = args as ToolArgs;
+      if (!a.name) {
+        return errorText("skill_remove_personal: name is required");
+      }
+      const base = ["skill", "remove-personal", a.name as string];
+      if (a.agent) base.push("--agent", a.agent as string);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    case "skill_list_personal": {
+      const a = args as ToolArgs;
+      const base = ["skill", "list-personal"];
+      if (a.agent) base.push("--agent", a.agent as string);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
     default:
       return errorText(`unknown tool: ${name}`);
   }
 
-  const r = execCli(cliArgs);
+  const r = execCli(cliArgs, stdinJson);
   if (r.status !== 0) {
     return errorText(
       `CLI exit ${r.status}: ${r.stderr.trim() || r.stdout.trim()}`,

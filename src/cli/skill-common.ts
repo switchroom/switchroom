@@ -225,4 +225,149 @@ export function validateSkillMd(
   return { ok: true, frontmatter: fm };
 }
 
+// ─── Multi-file bundle validation ───────────────────────────────────────
+//
+// PR-3 of #1814 factors these out of `switchroom skill apply`'s
+// per-file validator (which was inlined in `src/cli/skill.ts` for PR-1)
+// so both the operator CLI verb and the new `skill_*_personal` MCP ops
+// share one validation surface.
 
+// String form of the banned phrase, used in error messages. Built at
+// runtime via concat so this source file does not itself contain the
+// banned token inside a quoted string — that would trip
+// `tests/bridge-flap-regression-guard.test.ts:no source file emits ...`
+// (this file IS the detector, not an emitter).
+const BANNED_PHRASE = "claude" + " -p";
+
+/**
+ * Regex matching the headless-claude invocation literally. Conservative
+ * — matches in comments and string literals too. The compliance gate is
+ * "this script must not invoke headless-claude in any form"; the easiest
+ * evasion (move to comment, uncomment at runtime) is caught by being
+ * aggressive.
+ *
+ * Line-continuation evasion (shell or Python backslash-newline) is
+ * handled by scanForClaudeP() below — normalises backslash-newline pairs
+ * to a single space BEFORE the regex test.
+ */
+export const CLAUDE_P_LITERAL_RE = /\bclaude\s+-p\b/m;
+
+/**
+ * Returns true if content contains a banned headless-claude invocation,
+ * including across shell- or Python-style line continuations.
+ *
+ * Used by the multi-file bundle validator to refuse any scripts/*.sh or
+ * scripts/*.py file containing the phrase before the payload is written.
+ * Closes the CI-guard gap the security and feasibility reviewers flagged:
+ * the existing tests/bridge-flap-regression-guard.test.ts scans .ts
+ * source only, missing shell/python script payloads.
+ */
+export function scanForClaudeP(content: string): boolean {
+  const normalised = content.replace(/\\\r?\n\s*/g, " ");
+  return CLAUDE_P_LITERAL_RE.test(normalised);
+}
+
+/** Regex for `scripts/<name>.sh` (depth-2, allowlisted by validateRelPath). */
+export const SH_SCRIPT_RE = /^scripts\/[A-Za-z0-9_.-]+\.sh$/;
+/** Regex for `scripts/<name>.py` (depth-2, allowlisted by validateRelPath). */
+export const PY_SCRIPT_RE = /^scripts\/[A-Za-z0-9_.-]+\.py$/;
+
+/**
+ * Same shape as the existing `agent-config-skill-write.ts` allowed slug
+ * regex. Exported so the new personal-skill ops + the `switchroom skill
+ * apply` CLI verb agree on the constraint.
+ */
+export const SKILL_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+
+export type SkillFileMap = Record<string, string>;
+
+export interface BundleValidateResult {
+  ok: boolean;
+  errors: string[];
+}
+
+/**
+ * Validate a complete skill bundle (multi-file payload).
+ *
+ * Gates (each must pass before any write should land):
+ *   1. Name regex (`SKILL_SLUG_RE`)
+ *   2. Per-file `validateRelPath` (path allowlist)
+ *   3. SKILL.md exists + `validateSkillMd` passes
+ *   4. Aggregation: `MAX_FILES_PER_SKILL`, `MAX_SKILL_BYTES`, per-file
+ *      `MAX_FILE_BYTES`
+ *   5. Banned-headless-phrase content scan over scripts/*.{sh,py} via
+ *      `scanForClaudeP()`
+ *
+ * Behavioural validation (`bash -n`, `python -m py_compile`) is NOT in
+ * this function — those are out-of-process invocations the caller should
+ * do separately (so this stays pure-and-testable).
+ */
+export function validateSkillBundle(
+  name: string,
+  files: SkillFileMap,
+): BundleValidateResult {
+  const errors: string[] = [];
+
+  // 1. Name.
+  if (!SKILL_SLUG_RE.test(name)) {
+    errors.push(
+      `skill name must match ${SKILL_SLUG_RE.source}: got ${JSON.stringify(name)}`,
+    );
+  }
+
+  // 2. Path allowlist.
+  for (const path of Object.keys(files)) {
+    if (!validateRelPath(path)) {
+      errors.push(`disallowed file path: ${JSON.stringify(path)}`);
+    }
+  }
+
+  // 3. SKILL.md.
+  const skillMd = files["SKILL.md"];
+  if (skillMd === undefined) {
+    errors.push("payload is missing SKILL.md (required)");
+  } else {
+    const r = validateSkillMd(skillMd, name);
+    if (!r.ok) {
+      errors.push(`SKILL.md validation failed: ${r.message}`);
+    }
+  }
+
+  // 4. Aggregation.
+  const fileCount = Object.keys(files).length;
+  if (fileCount > MAX_FILES_PER_SKILL) {
+    errors.push(
+      `bundle has ${fileCount} files; max is ${MAX_FILES_PER_SKILL}`,
+    );
+  }
+  let totalBytes = 0;
+  for (const [path, content] of Object.entries(files)) {
+    const bytes = Buffer.byteLength(content, "utf-8");
+    if (bytes > MAX_FILE_BYTES) {
+      errors.push(
+        `${path} is ${bytes} bytes; max per file is ${MAX_FILE_BYTES}`,
+      );
+    }
+    totalBytes += bytes;
+  }
+  if (totalBytes > MAX_SKILL_BYTES) {
+    errors.push(
+      `bundle total ${totalBytes} bytes; max per skill is ${MAX_SKILL_BYTES}`,
+    );
+  }
+
+  // 5. Banned-headless-phrase content scan.
+  for (const [path, content] of Object.entries(files)) {
+    if (SH_SCRIPT_RE.test(path) || PY_SCRIPT_RE.test(path)) {
+      if (scanForClaudeP(content)) {
+        errors.push(
+          `${path} contains the banned ${BANNED_PHRASE} invocation — ` +
+          `programmatic usage under Anthropic 2026-06-15 policy. ` +
+          `Route via inject_inbound IPC into the live session instead.`,
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
