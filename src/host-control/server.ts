@@ -48,6 +48,7 @@ import {
   type HostdResponse,
   type Result,
 } from "./protocol.js";
+import { err } from "./error-builder.js";
 import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js";
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
@@ -1217,13 +1218,14 @@ export class HostdServer {
   ): Promise<HostdResponse> {
     const enabled = this.opts.config.hostd?.config_edit_enabled === true;
     if (!enabled) {
-      return errorResponse(
-        req.request_id,
-        "E_CONFIG_EDIT_DISABLED: config_propose_edit is disabled; " +
-          "operator must set hostd.config_edit_enabled=true in " +
-          "switchroom.yaml to opt in",
-        Date.now() - started,
-      );
+      return err("E_CONFIG_EDIT_DISABLED", "config_propose_edit is disabled")
+        .why("operator opt-in per RFC §3.3")
+        .fixFlipFlag("hostd.config_edit_enabled", true)
+        .docs("https://switchroom.dev/docs/config-edit#opt-in")
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .build(req.request_id, Date.now() - started);
     }
     const configPath =
       this.opts.configPath ?? req.args.target_path;

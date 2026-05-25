@@ -507,10 +507,23 @@ export async function dispatchTool(
   // denied/error: tool-error so the model can see it failed but also
   // sees the full daemon response (including the daemon's error
   // message) without raising an exception.
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(resp) }],
-    isError: true,
-  };
+  const content: { type: "text"; text: string }[] = [
+    { type: "text", text: JSON.stringify(resp) },
+  ];
+  // #1758 Phase 1: when a structured error envelope is present, surface
+  // it as a second content item with a leading discriminator hint so
+  // the agent can branch on `fix.kind` without re-parsing the legacy
+  // `error` string.
+  if (resp.error_envelope) {
+    const env = resp.error_envelope;
+    content.push({
+      type: "text",
+      text:
+        `Structured error — fix.kind=${env.fix?.kind ?? "none"}\n` +
+        JSON.stringify(env, null, 2),
+    });
+  }
+  return { content, isError: true };
 }
 
 /**

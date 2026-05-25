@@ -110,3 +110,49 @@ describe("hostd protocol — framing & schema", () => {
     expect(IDEMPOTENCY_WINDOW_MS).toBe(15_000);
   });
 });
+
+describe("error_envelope — #1758 Phase 1 round-trip", () => {
+  const variants: Array<{ name: string; fix: unknown }> = [
+    { name: "flip_yaml_flag", fix: { kind: "flip_yaml_flag", yaml_path: "hostd.config_edit_enabled", to: true } },
+    { name: "request_vault_grant", fix: { kind: "request_vault_grant", vault_key: "openai/api-key" } },
+    { name: "operator_action no steps", fix: { kind: "operator_action", subkind: "policy_denied" } },
+    { name: "operator_action with steps", fix: { kind: "operator_action", subkind: "infra", operator_steps: ["restart gateway"] } },
+    { name: "retry_after", fix: { kind: "retry_after", retry_at: "2026-01-01T00:00:00Z" } },
+    { name: "quota_exceeded", fix: { kind: "quota_exceeded", quota: "cron-entries", current: 20, limit: 20 } },
+    { name: "bad_input", fix: { kind: "bad_input", field: "agent_name" } },
+    { name: "bad_input no field", fix: { kind: "bad_input" } },
+  ];
+  for (const v of variants) {
+    it(`survives encode/decode round-trip — ${v.name}`, () => {
+      const resp: HostdResponse = {
+        v: 1,
+        request_id: "rt-1",
+        result: "error",
+        exit_code: null,
+        duration_ms: 0,
+        error: "E_FOO: human",
+        error_envelope: {
+          v: 1,
+          code: "E_FOO",
+          human: "human",
+          fix: v.fix as never,
+          request_id: "rt-1",
+        },
+      };
+      const decoded = decodeResponse(encodeResponse(resp).trimEnd());
+      expect(decoded).toEqual(resp);
+    });
+  }
+
+  it("ResponseSchema accepts a response WITHOUT error_envelope (backwards-compat)", () => {
+    const resp: HostdResponse = {
+      v: 1,
+      request_id: "rt-bc",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 0,
+    };
+    const decoded = decodeResponse(encodeResponse(resp).trimEnd());
+    expect(decoded).toEqual(resp);
+  });
+});
