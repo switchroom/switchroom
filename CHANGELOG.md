@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.13.42 — broker ACL grants user-declared MCP secrets + silent-end retry-budget hygiene
+
+### fix(broker): ACL grants user-declared mcp_servers.*.secrets[] keys (PR #1806)
+
+User-declared MCP servers in switchroom.yaml (perplexity, notion, any
+operator-added entry) whose launcher fetches its API key via
+`switchroom vault get <key>` were broker-denied at spawn time. The
+vault-broker ACL only special-cased three identity-bound exceptions
+— Google account slots, gdrive's `google/client-secret`, per-agent
+`telegram-bot-token` — plus the union of `schedule[].secrets[]`. Any
+launcher-time vault fetch outside those clauses hit
+`VAULT-BROKER-DENIED`, the launcher exported an empty env var, and
+the upstream MCP server hard-rejected on missing key.
+
+Live repro 2026-05-25 (clerk): the perplexity MCP was wired through
+scaffold (#1786) + launcher mount (#1787) + mint_grant persistence
+(#1798), all green. But `claude mcp list` reported perplexity as
+"Failed to connect" because clerk's broker ACL had no entry for
+`perplexity/api-key`.
+
+Fix: generalise the gdrive `google/client-secret` special-case into
+a per-MCP `secrets:` declaration on each `mcp_servers.<name>` entry.
+Operators opt in inline:
+
+```yaml
+defaults:
+  mcp_servers:
+    perplexity:
+      command: /home/<operator>/.switchroom/mcp-launchers/perplexity-mcp.sh
+      secrets: [ perplexity/api-key ]
+```
+
+The cascade resolves `mcp_servers.perplexity` onto every agent that
+inherits defaults; the declared `secrets[]` array is then broker-
+accessible to that agent under its peercred identity. No per-agent
+`vault grant` ceremony required.
+
+- Checked BEFORE the no-schedule early-deny so an MCP-only agent
+  (no cron) still works.
+- `false` opt-outs (`mcp_servers: { perplexity: false }` per-agent)
+  drop the ACL grant too.
+- Opt-in per-MCP — an entry without `secrets:` gets nothing.
+- Switchroom-internal `secrets:` is stripped from rendered `.mcp.json`
+  so vault key names don't leak to the in-container Claude session.
+
+8 new ACL unit tests + 1 scaffold test pin the contract. Docs
+updated in `docs/configuration.md` ("Wiring an MCP server that
+needs vault secrets") and `docs/vault-broker.md` ("Identity-bound
+ACL exceptions").
+
+### fix(telegram): silent-end retry-budget hygiene (PRs #1804 + #1805)
+
+Two related fixes to the Stop-hook silent-end re-prompt budget
+introduced in #1664:
+
+- **#1804** — `clearSilentEndState` widened to evict pre-#1664
+  legacy-format state files. Pre-fix, legacy files survived every
+  clear path forever and broke the retry budget on any subsequent
+  silent-end for the affected agent. Reproduced live on clerk
+  2026-05-25 around 17:15 Melbourne.
+- **#1805** — `clearSilentEndState` now called at turn-start
+  (immediately after `currentTurn = next`) so the Stop hook's retry
+  budget resets to zero on every new turn instead of inheriting from
+  prior turns.
+
 ## v0.13.41 — #1799 follow-up: apply-side sweep + docs cleanup, quota reset UX
 
 ### fix(#1799 follow-up): apply-side cleanup of stale cron-*.sh (PR #1802)
