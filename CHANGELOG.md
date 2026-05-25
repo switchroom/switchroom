@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.13.43 — broker ACL mcp_servers cascade hotfix (PR #1809)
+
+PR #1806 / v0.13.42 added an ACL clause for user-declared
+`mcp_servers.<name>.secrets[]` but the implementation read
+`agentConfig.mcp_servers` only. The broker loads raw yaml via
+`loadConfig` and never runs the cascade pipeline
+(`resolveAgentConfig` / `mergeAgentConfig`), so an MCP declared
+*once* in `defaults.mcp_servers` (the documented common case for
+perplexity / notion / etc.) was invisible to the ACL — every agent
+that inherited the entry via cascade still hit
+`VAULT-BROKER-DENIED`.
+
+Discovered live 2026-05-25 on clerk against v0.13.42: operator
+declared `secrets: [perplexity/api-key]` under
+`defaults.mcp_servers.perplexity`, restarted the broker, and clerk's
+`switchroom vault get perplexity/api-key` still returned DENIED.
+
+Fix: open-code the canonical 3-layer cascade inline in
+`checkAclByAgent` — `defaults.mcp_servers` → `profiles.<extends>.
+mcp_servers` (when the agent has `extends:`) → `agents.<name>.
+mcp_servers`. Per-key shallow merge, matching
+`src/config/merge.ts:391-397`. Full cascade pipeline would be too
+expensive per ACL request and pull in deeper machinery (env merges,
+deprecation-warn side effects); the ACL only needs to know "which
+mcp_servers entries are effectively live for this agent".
+
+`false` opt-outs still drop the grant because the shallow merge
+applies `false` over the inherited entry and the typeof guard skips
+non-object values.
+
+7 new ACL unit tests (53 total in the file): defaults-only inherited,
+per-agent override re-declares secrets (replace-not-merge), per-agent
+`false` over defaults, profile-inherited via `extends:`, no-extends
+agent doesn't see profiles, per-agent override beats profile,
+per-agent `false` over profile drops grant.
+
 ## v0.13.42 — broker ACL grants user-declared MCP secrets + silent-end retry-budget hygiene
 
 ### fix(broker): ACL grants user-declared mcp_servers.*.secrets[] keys (PR #1806)
