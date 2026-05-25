@@ -280,6 +280,34 @@ function defaultApprovalId(): string {
   return randomBytes(4).toString("hex");
 }
 
+/**
+ * Map a deny `ApprovalResult` to the appropriate error string for
+ * the config_propose_edit response. (#1762)
+ *
+ *   - `denySource === "dispatch_failure"` → `E_APPROVAL_DISPATCH_FAILED`
+ *     (Telegram card never reached the operator — opaque
+ *     "operator denied" would be a lie)
+ *   - operator tap deny → `E_DENIED` with the reason (when present)
+ *     appended for diagnostic value
+ *
+ * Exported only for unit testing — the production caller is
+ * `handleConfigProposeEdit` in this file.
+ */
+export function formatConfigApprovalDenyError(
+  approval: {
+    reason?: string;
+    denySource?: "operator" | "dispatch_failure";
+  },
+  approvalId: string,
+): string {
+  if (approval.denySource === "dispatch_failure") {
+    const detail = approval.reason ?? "card dispatch failed";
+    return `E_APPROVAL_DISPATCH_FAILED: ${detail} (approval_id=${approvalId})`;
+  }
+  const suffix = approval.reason ? `: ${approval.reason}` : "";
+  return `E_DENIED: operator denied config_propose_edit${suffix} (approval_id=${approvalId})`;
+}
+
 /** Best-effort tmp-file cleanup — swallowed errors. */
 function unlinkSyncBestEffort(path: string): void {
   try {
@@ -1261,9 +1289,13 @@ export class HostdServer {
       timeoutMs: CONFIG_APPROVAL_TIMEOUT_MS,
     });
     if (approval.verdict === "deny") {
+      // #1762: distinguish operator-tap deny from gateway-side
+      // dispatch failure (card never reached the operator). Without
+      // this, a Telegram sendMessage 400 surfaces as a misleading
+      // "operator denied" — see ref #1758 structured-error work.
       return errorResponse(
         req.request_id,
-        `E_DENIED: operator denied config_propose_edit (approval_id=${approvalId})`,
+        formatConfigApprovalDenyError(approval, approvalId),
         Date.now() - started,
       );
     }

@@ -17,6 +17,7 @@ import {
   handleRequestConfigFinalize,
   parseConfigApprovalCallback,
   resolvePendingConfigApproval,
+  truncateDiffForCard,
   _resetPendingConfigApprovalsForTest,
   _peekPendingConfigApprovalForTest,
 } from "./config-approval-handler.js";
@@ -74,6 +75,57 @@ describe("buildConfigApprovalCardBody", () => {
     expect(body).toContain("&lt;script&gt;");
     expect(body).toContain("a &amp; b &lt;c&gt;");
   });
+
+  it("rendered body stays under Telegram's 4096-char limit when raw diff is all `&` (worst-case 5x escape inflation)", () => {
+    // 3000 `&` chars escape to 15000 `&amp;` chars — far past 4096.
+    // The post-escape cap MUST kick in and truncate the rendered body.
+    const evilDiff = "&".repeat(3000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body).toContain("diff continues, see attached file");
+  });
+
+  it("rendered body stays under 4096 when raw diff is all `<` (5x escape)", () => {
+    const evilDiff = "<".repeat(3000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body).toContain("&lt;");
+  });
+
+  it("clips an unbounded operator-supplied `reason` to ~500 chars with ellipsis", () => {
+    const longReason = "x".repeat(2000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: longReason,
+      unifiedDiff: "small",
+    });
+    // The escaped reason should appear, but capped.
+    const reasonLine = body
+      .split("\n")
+      .find((l) => l.startsWith("Reason: "))!;
+    // "Reason: " prefix (8) + clipped reason.
+    expect(reasonLine.length).toBeLessThanOrEqual(8 + 500);
+    expect(reasonLine.endsWith("…")).toBe(true);
+  });
+
+  it("rendered body stays under 4096 even when reason is also adversarial", () => {
+    const evilDiff = "&".repeat(3000);
+    const evilReason = "&".repeat(2000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: evilReason,
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+  });
 });
 
 describe("handleRequestConfigApproval", () => {
@@ -100,6 +152,7 @@ describe("handleRequestConfigApproval", () => {
         requestId: "req-1",
         verdict: "deny",
         reason: expect.stringContaining("gateway serves 'klanker'"),
+        denySource: "dispatch_failure",
       },
     ]);
   });
@@ -222,6 +275,100 @@ describe("handleRequestConfigFinalize", () => {
       deps,
     );
     expect(editCalls.length).toBe(0);
+  });
+});
+
+describe("oversize diff → attachment fallback (#1762)", () => {
+  function bigDiff(lines: number): string {
+    // Each line ~80 chars → 200 lines ≈ 16 KB, comfortably > 4096.
+    const row =
+      "-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    return Array.from({ length: lines }, (_, i) => `${row}${i}`).join("\n");
+  }
+
+  it("truncateDiffForCard caps the diff and appends a sentinel", () => {
+    const truncated = truncateDiffForCard(bigDiff(200), 50, 3000);
+    expect(truncated.length).toBeLessThanOrEqual(3050);
+    expect(truncated.endsWith("[… diff continues, see attached file]")).toBe(
+      true,
+    );
+  });
+
+  it("returns the original diff unchanged when below the line cap", () => {
+    const small = "--- a\n+++ b\n@@\n-x\n+y\n";
+    expect(truncateDiffForCard(small, 50)).toBe(small);
+  });
+
+  it("oversize body still posts a card with buttons AND fires postAttachment", async () => {
+    const huge = bigDiff(200);
+    const attachmentCalls: Array<{
+      chatId: number | string;
+      filename: string;
+      content: string;
+    }> = [];
+    const { client, sent, deps } = fakeDeps({
+      postAttachment: async (a: {
+        chatId: number | string;
+        filename: string;
+        content: string;
+      }) => {
+        attachmentCalls.push({
+          chatId: a.chatId,
+          filename: a.filename,
+          content: a.content,
+        });
+      },
+    });
+    await handleRequestConfigApproval(
+      client,
+      { ...baseMsg, unifiedDiff: huge },
+      deps,
+    );
+
+    // Card was posted exactly once, with buttons, and within Telegram's limit.
+    expect(deps.postCard).toHaveBeenCalledTimes(1);
+    const postArgs = (deps.postCard as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0] as { text: string; replyMarkup: unknown };
+    expect(postArgs.text.length).toBeLessThanOrEqual(4096);
+    expect(postArgs.text).toMatch(/diff continues, see attached file/);
+    expect(postArgs.replyMarkup).toBeDefined();
+
+    // Attachment carries the FULL diff, named .patch, keyed by requestId.
+    expect(attachmentCalls.length).toBe(1);
+    expect(attachmentCalls[0]!.filename).toBe("config-edit-req-1.patch");
+    expect(attachmentCalls[0]!.content).toBe(huge);
+
+    // The pending entry is registered — handler hasn't auto-denied.
+    expect(_peekPendingConfigApprovalForTest("req-1")).toBeDefined();
+    // No verdict has crossed the wire yet (still pending operator tap).
+    expect(sent.filter((s) => s.type === "config_approval_resolved")).toEqual(
+      [],
+    );
+  });
+
+  it("oversize but no postAttachment dep → card still posts, missing-attachment is logged", async () => {
+    const huge = bigDiff(200);
+    const logs: string[] = [];
+    const { client, deps } = fakeDeps({ log: (m: string) => logs.push(m) });
+    await handleRequestConfigApproval(
+      client,
+      { ...baseMsg, unifiedDiff: huge },
+      deps,
+    );
+    expect(deps.postCard).toHaveBeenCalledTimes(1);
+    expect(
+      logs.some((l) => l.includes("no postAttachment dep wired")),
+    ).toBe(true);
+    expect(_peekPendingConfigApprovalForTest("req-1")).toBeDefined();
+  });
+
+  it("postCard failure → deny carries denySource='dispatch_failure'", async () => {
+    const { client, sent, deps } = fakeDeps({
+      postCard: vi.fn(async () => null),
+    });
+    await handleRequestConfigApproval(client, baseMsg, deps);
+    expect(sent[0]!.verdict).toBe("deny");
+    expect(sent[0]!.denySource).toBe("dispatch_failure");
   });
 });
 

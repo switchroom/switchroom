@@ -107,8 +107,17 @@ export interface ConfigApprovalResolvedEvent {
   /** Echoes the requestId from the originating request_config_approval. */
   requestId: string;
   verdict: "approve" | "deny" | "timeout";
-  /** Diagnostic detail when present (currently unused; reserved). */
+  /** Diagnostic detail when present. */
   reason?: string;
+  /**
+   * Distinguishes an actual operator tap-deny (`"operator"`) from a
+   * gateway-side dispatch failure that auto-denied because the card
+   * never reached the operator (`"dispatch_failure"`). Only set on
+   * `verdict: "deny"` events. Caller (hostd) maps `dispatch_failure`
+   * to a distinct error code so the failure isn't misattributed to
+   * the operator. Issue #1762.
+   */
+  denySource?: "operator" | "dispatch_failure";
 }
 
 export type GatewayToClient =

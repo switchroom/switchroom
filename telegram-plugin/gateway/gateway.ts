@@ -4121,6 +4121,24 @@ const ipcServer: IpcServer = createIpcServer({
           )
         }
       },
+      // #1762: send the full diff as a `.patch` attachment when the
+      // card body would exceed Telegram's 4096-char sendMessage limit.
+      postAttachment: async (args) => {
+        const input = new InputFile(Buffer.from(args.content, 'utf8'), args.filename)
+        await robustApiCall(
+          () =>
+            bot.api.sendDocument(args.chatId, input, {
+              ...(args.threadId !== undefined
+                ? { message_thread_id: args.threadId }
+                : {}),
+            }),
+          {
+            chat_id: String(args.chatId),
+            verb: 'config-approval-attachment',
+            ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+          },
+        )
+      },
       log: (m) =>
         process.stderr.write(`telegram gateway: config-approval — ${m}\n`),
     })

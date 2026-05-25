@@ -15,6 +15,21 @@ export interface ApprovalRequest {
 
 export interface ApprovalResult {
   verdict: ApprovalVerdict;
+  /**
+   * Diagnostic detail from the gateway when present. On a
+   * dispatch-failure deny this carries the underlying cause (e.g.
+   * "Telegram sendMessage failed") so the caller can surface a
+   * descriptive error instead of an opaque `E_DENIED`. Issue #1762.
+   */
+  reason?: string;
+  /**
+   * On `verdict: "deny"`, distinguishes an actual operator tap
+   * (`"operator"`) from a gateway-side dispatch failure that
+   * auto-denied because the card never reached the operator
+   * (`"dispatch_failure"`). Undefined when verdict is not "deny".
+   * Issue #1762.
+   */
+  denySource?: "operator" | "dispatch_failure";
   /** Update the approval card with the apply outcome. */
   finalize: (outcome: {
     outcome: "applied" | "reconcile_failed_rolled_back";
@@ -43,6 +58,8 @@ export class SocketApprovalGateway implements ApprovalGateway {
       // No reachable gateway — fail closed.
       return {
         verdict: "deny",
+        reason: "no reachable telegram gateway socket for this agent",
+        denySource: "dispatch_failure",
         finalize: async () => {},
       };
     }
@@ -95,7 +112,12 @@ export class SocketApprovalGateway implements ApprovalGateway {
           log(
             `request_config_approval write failed (requestId=${req.requestId}): ${(err as Error).message}`,
           );
-          resolve({ verdict: "deny", finalize: async () => {} });
+          resolve({
+            verdict: "deny",
+            reason: `request_config_approval write failed: ${(err as Error).message}`,
+            denySource: "dispatch_failure",
+            finalize: async () => {},
+          });
         }
       });
 
@@ -122,8 +144,23 @@ export class SocketApprovalGateway implements ApprovalGateway {
             !resolved
           ) {
             resolved = true;
+            const verdict = obj.verdict as ApprovalVerdict;
+            const reasonField =
+              typeof obj.reason === "string" ? obj.reason : undefined;
+            // denySource is only meaningful on deny verdicts. Gateway
+            // omits the field on operator-tap denies — default to
+            // "operator" in that case so the caller can rely on the
+            // discriminant being present whenever verdict==="deny".
+            const denySource: "operator" | "dispatch_failure" | undefined =
+              verdict === "deny"
+                ? obj.denySource === "dispatch_failure"
+                  ? "dispatch_failure"
+                  : "operator"
+                : undefined;
             resolve({
-              verdict: obj.verdict as ApprovalVerdict,
+              verdict,
+              ...(reasonField !== undefined ? { reason: reasonField } : {}),
+              ...(denySource !== undefined ? { denySource } : {}),
               finalize,
             });
             // Note: we keep `client` open so finalize can reuse it.
@@ -137,13 +174,23 @@ export class SocketApprovalGateway implements ApprovalGateway {
         log(
           `gateway socket error (requestId=${req.requestId}): ${err.message}`,
         );
-        resolve({ verdict: "deny", finalize: async () => {} });
+        resolve({
+          verdict: "deny",
+          reason: `gateway socket error: ${err.message}`,
+          denySource: "dispatch_failure",
+          finalize: async () => {},
+        });
       });
 
       client.on("close", () => {
         if (resolved) return;
         resolved = true;
-        resolve({ verdict: "deny", finalize: async () => {} });
+        resolve({
+          verdict: "deny",
+          reason: "gateway socket closed before verdict",
+          denySource: "dispatch_failure",
+          finalize: async () => {},
+        });
       });
     });
   }
