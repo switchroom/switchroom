@@ -3111,6 +3111,35 @@ describe("scheduled task: cron-*.sh retirement (Phase 4 cron-fold-in)", () => {
     expect(existsSync(join(result.agentDir, "telegram", `${stem0}.source`))).toBe(false);
   });
 
+  it("scaffoldAgent ALSO deletes stale cron-*.sh + .source from prior installs", () => {
+    // Regression for the apply-side gap: `switchroom apply` calls
+    // `scaffoldAgent` (not `reconcileAgentDir`) for agents it considers
+    // "up to date". Without a sweep here, stale `cron-*.sh` files from
+    // pre-#1799 installs persist across applies. This test pins the
+    // sweep into the scaffold path.
+    const agentConfig = makeAgentConfig({
+      schedule: [{ cron: "0 6 * * *", prompt: "irrelevant" }],
+    });
+    // Pre-create a stale .sh + .source pair (simulating a v0.13.39-or-
+    // older agent dir that still has the dormant `claude -p` cron
+    // script on disk).
+    const telegramDir = join(tmpDir, "scaffold-cleanup", "telegram");
+    mkdirSync(telegramDir, { recursive: true });
+    const staleStem = cronUnitName("0 6 * * *", "irrelevant");
+    const staleScriptPath = join(telegramDir, `${staleStem}.sh`);
+    const staleSourcePath = join(telegramDir, `${staleStem}.source`);
+    writeFileSync(staleScriptPath, "#!/bin/bash\nclaude -p 'stale'\n", { mode: 0o700 });
+    writeFileSync(staleSourcePath, "main\n");
+    expect(existsSync(staleScriptPath)).toBe(true);
+    expect(existsSync(staleSourcePath)).toBe(true);
+
+    // Run scaffoldAgent — it should sweep the stale files even though
+    // it never had any reason to write a fresh one (and never will).
+    scaffoldAgent("scaffold-cleanup", agentConfig, tmpDir, telegramConfig);
+    expect(existsSync(staleScriptPath)).toBe(false);
+    expect(existsSync(staleSourcePath)).toBe(false);
+  });
+
   it("reconcileAgentDir deletes stale cron-*.sh + .source from prior installs", () => {
     const agentConfig = makeAgentConfig({
       schedule: [{ cron: "0 6 * * *", prompt: "irrelevant" }],

@@ -593,12 +593,13 @@ export async function reconcileAndRestartAgent(
   }
 
   // ── Phase F (switchroom#1163): cron-only hot reload ──────────────────────
-  // A `cron:` block edit in switchroom.yaml regenerates
-  // `telegram/cron-<i>.sh` on the host bind-mount. The script content is
-  // live in-container without any docker touch — `docker compose up -d
-  // --force-recreate --no-deps` would needlessly kill any in-flight
-  // Claude session for what's effectively a file edit. So: when every
-  // change in this reconcile is cron-tagged, take the hot path.
+  // Post-#1799 there are no `telegram/cron-*.sh` scripts on disk — cron
+  // fires through the in-container agent-scheduler via inject_inbound
+  // IPC. The "cron" change tag now signals stale-script cleanup (a
+  // file deletion that the agent-scheduler doesn't read, so no restart
+  // is needed) rather than script regeneration. When every change in
+  // this reconcile is cron-tagged, take the hot path — no docker bounce
+  // for what's effectively a tidy-up.
   //
   // Most-restrictive wins: any single non-cron change in `allChanges`
   // falls through to the bot-token preflight + restart path below.

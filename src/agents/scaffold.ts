@@ -2679,9 +2679,29 @@ export function scaffoldAgent(
   // the in-container `agent-scheduler` sibling, which delivers each
   // fire as a synthesized `meta.source="cron"` inbound via
   // `inject_inbound` IPC — there are no more per-agent cron .sh
-  // scripts. See `src/scheduler/dispatch.ts`. The `reconcileAgentDir`
-  // path below removes any stale `cron-*.sh` + `.source` sidecars
-  // left on disk from prior installs.
+  // scripts. See `src/scheduler/dispatch.ts`.
+  //
+  // Sweep any stale `cron-*.sh` + `.source` sidecars from prior
+  // installs. This MUST run from the scaffold path (not just
+  // `reconcileAgentDir`) because `switchroom apply` calls
+  // `scaffoldAgent` — not reconcile — for agents it considers
+  // "up to date". Without this sweep, files left over from the
+  // pre-retirement code path persist across applies until a
+  // separate `switchroom agent reconcile` is run. Idempotent: no-op
+  // when nothing matches.
+  {
+    const telegramDir = join(agentDir, "telegram");
+    if (existsSync(telegramDir)) {
+      for (const file of readdirSync(telegramDir)) {
+        const isCronScript = CRON_SCRIPT_BASENAME_RE.test(file) || LEGACY_CRON_SCRIPT_BASENAME_RE.test(file);
+        if (isCronScript) {
+          unlinkSync(join(telegramDir, file));
+          const sidecar = join(telegramDir, file.replace(/\.sh$/, ".source"));
+          if (existsSync(sidecar)) unlinkSync(sidecar);
+        }
+      }
+    }
+  }
 
   // --- Copy skill files from profile ---
   // Profile-bundled skills land in .claude/skills/ so Claude Code discovers
