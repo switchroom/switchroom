@@ -30,6 +30,7 @@ import type {
   DriveApprovalPostedEvent,
   RequestDriveApprovalMessage,
 } from "./ipc-protocol.js";
+import { truncateRawToFit } from "./oversize-card-body.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Injected deps — caller (gateway.ts) wires these from the existing
@@ -99,6 +100,18 @@ export interface DriveApprovalHandlerDeps {
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MIN_TTL_MS = 30 * 1000; // 30 seconds
+
+/**
+ * Telegram `sendMessage` hard limit. `buildDiffPreviewCard` HTML-
+ * escapes the docTitle + every body line with no upstream length
+ * cap, so an adversarial or just-unusually-long docTitle / anchor
+ * displayName / agent-supplied summary can render past 4096 once
+ * `&` / `<` / `>` inflate up to 5x. We rebuild a truncated body
+ * keyed off the wrapper-attested fields when that happens. (#1767)
+ */
+const TELEGRAM_SENDMESSAGE_LIMIT = 4096;
+const RENDERED_BODY_CAP = 3900;
+const OVERSIZE_SENTINEL = "\n[… preview truncated; open in Drive for full context]";
 
 /**
  * Top-level handler called by ipc-server's onRequestDriveApproval.
@@ -204,19 +217,55 @@ export async function handleRequestDriveApproval(
     });
     return;
   }
+  // Oversize guard (#1767). buildDiffPreviewCard renders title +
+  // every body line HTML-escaped with no length cap. Worst-case `&`
+  // / `<` / `>` inflate 5x — a long docTitle or anchor displayName
+  // pushes past Telegram's 4096-char sendMessage limit and the API
+  // returns a generic 400 that surfaces as a silent E_DENIED. Cap
+  // the rendered body BEFORE posting.
+  let cardText = card.text;
+  let truncatedForFit = false;
+  if (cardText.length > RENDERED_BODY_CAP) {
+    const fit = truncateRawToFit({
+      raw: card.text,
+      // The "raw" here is the already-escaped card text — we don't
+      // have access to pre-escape source at this layer because
+      // buildDiffPreviewCard owns escaping. Line-snap is the safe
+      // granularity: HTML entities like `&amp;` never span `\n`, so
+      // truncating at a newline boundary can't bisect an entity.
+      // The defensive single-long-line fallback may char-cut into an
+      // entity, but the drive-preview lines are short (anchor name,
+      // metrics, capped 200-char summary) so this is unreachable
+      // unless a multi-KB docTitle slipped through Drive itself.
+      render: (slice) => slice,
+      cap: RENDERED_BODY_CAP,
+      sentinel: OVERSIZE_SENTINEL,
+      hardLimit: TELEGRAM_SENDMESSAGE_LIMIT,
+    });
+    cardText = fit.body;
+    truncatedForFit = fit.truncated;
+  }
+
   const posted = await deps.postCard({
     chatId: target.chatId,
     ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
-    text: card.text,
+    text: cardText,
     replyMarkup: card.reply_markup,
   });
   if (posted === null) {
     reply({
       correlationId: msg.correlationId,
       ok: false,
-      reason: "Telegram sendMessage failed",
+      reason: truncatedForFit
+        ? "Telegram sendMessage failed even after oversize-body truncation"
+        : "Telegram sendMessage failed",
     });
     return;
+  }
+  if (truncatedForFit) {
+    deps.log?.(
+      `drive_approval_posted oversize-truncated correlation=${msg.correlationId} original_len=${card.text.length} rendered_len=${cardText.length}`,
+    );
   }
 
   deps.log?.(
