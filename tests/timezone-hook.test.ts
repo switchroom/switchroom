@@ -89,8 +89,9 @@ describe("timezone-hook.sh", () => {
     const { json } = runHook({ SWITCHROOM_TIMEZONE: "UTC" });
     const ctx = (json as { hookSpecificOutput: { additionalContext: string } })
       .hookSpecificOutput.additionalContext;
-    // Match "YYYY-MM-DD HH:MM " — the literal minute token after the colon.
-    const m = ctx.match(/\d{4}-\d{2}-\d{2} \d{2}:(\d{2}) /);
+    // Match "Weekday YYYY-MM-DD HH:MM AM/PM " — the literal minute token after the colon.
+    // Format is now '%A %Y-%m-%d %I:%M %p %Z (UTC%:z)' e.g. "Monday 2026-05-25 10:00 AM AEST (UTC+10:00)"
+    const m = ctx.match(/\w+ \d{4}-\d{2}-\d{2} \d{2}:(\d{2}) [AP]M /);
     expect(m).not.toBeNull();
     const mins = parseInt(m![1], 10);
     expect(mins % 15).toBe(0);
