@@ -62,6 +62,38 @@ describe('silent-end.ts — gateway state writer', () => {
     expect(state!.retryCount).toBe(0)
   })
 
+  it('turn-start clear pattern resets retryCount for a new turn on the same chat', () => {
+    // 2026-05-25 finn incident: the stored turnKey is `chat:thread`
+    // shape (no per-instance startedAt suffix). When a prior turn for
+    // a chat left the silent-end-pending.json at retryCount=1 (Stop
+    // hook had incremented but no successful reply cleared it),
+    // writeSilentEndState on the next silent-end for the SAME chat
+    // matches `prev.turnKey === args.turnKey` and inherits
+    // retryCount=1 — so the Stop hook bails on the very first
+    // silent-end of the new turn without re-prompting.
+    //
+    // The gateway's fix (gateway.ts:6503) calls
+    // clearSilentEndState(statusKey(chatId, threadId)) at turn-start.
+    // This test pins the contract: clear-then-write yields
+    // retryCount=0, not the inherited 1.
+    const path = join(stateDir, 'silent-end-pending.json')
+    // Prior turn left retryCount=1 stuck on this chat.
+    writeFileSync(path, JSON.stringify({
+      chatId: '12345', threadId: null, turnKey: '12345:_',
+      retryCount: 1, timestamp: 0,
+    }))
+
+    // Gateway turn-start hook fires for a NEW turn on the same chat.
+    clearSilentEndState('12345:_')
+    expect(existsSync(path)).toBe(false)
+
+    // The new turn later ends silent → writeSilentEndState writes
+    // fresh state. Without the turn-start clear above, retryCount
+    // would have inherited as 1 (per the test at line 42 above).
+    writeSilentEndState({ chatId: '12345', threadId: null, turnKey: '12345:_' })
+    expect(readSilentEndState()!.retryCount).toBe(0)
+  })
+
   it('writeSilentEndState falls back to ~/.claude/channels/telegram when TELEGRAM_STATE_DIR is unset', () => {
     // Updated 2026-05-13 UAT overnight: discovered the writer used to
     // silently no-op when the env var was unset, while the Stop hook

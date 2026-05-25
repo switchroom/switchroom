@@ -6503,6 +6503,23 @@ function handleSessionEvent(ev: SessionEvent): void {
         currentTurn = next
         // #549 fix — fresh turn, reset preamble-suppression state.
         preambleSuppressor.reset()
+        // Reset the silent-end retry budget for this chat. The stored
+        // turnKey is `chat:thread` shape (no per-instance suffix), so
+        // without an explicit per-turn clear, `writeSilentEndState`
+        // (silent-end.ts:114) inherits `retryCount` across turns
+        // whenever a prior turn for the same chat hit retryCount=1.
+        // The Stop hook then sees `retryCount >= MAX_RETRIES=1` on the
+        // very first silent-end of every subsequent turn and bails
+        // without re-prompting. finn hit this on 2026-05-25 with a
+        // stuck retryCount=1 file. A new turn invalidates any prior
+        // turn's retry budget by definition; clear it eagerly here.
+        // ev.threadId is `string | null` (Telegram's wire shape);
+        // statusKey wants `number | null` — same conversion as the
+        // registry-key branch a few lines down.
+        clearSilentEndState(statusKey(
+          ev.chatId,
+          ev.threadId != null ? Number(ev.threadId) : null,
+        ))
         // Stage 3b: stamp turn-start in the registry. turn_key is
         // chat:thread:startTs — unique per turn, distinct from the
         // progress-card-driver's per-chat sequence number (these are two
