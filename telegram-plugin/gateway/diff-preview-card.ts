@@ -73,12 +73,12 @@ export function buildDiffPreviewCard(
 ): BuiltDiffPreviewCard {
   if (!REQUEST_ID_RE.test(input.suggestRequestId)) {
     throw new Error(
-      `buildDiffPreviewCard: suggestRequestId must be 8 hex chars (got '${input.suggestRequestId}')`,
+      `buildDiffPreviewCard: suggestRequestId must be 32 hex chars (got '${input.suggestRequestId}')`,
     );
   }
   if (input.writeRequestId !== undefined && !REQUEST_ID_RE.test(input.writeRequestId)) {
     throw new Error(
-      `buildDiffPreviewCard: writeRequestId must be 8 hex chars (got '${input.writeRequestId}')`,
+      `buildDiffPreviewCard: writeRequestId must be 32 hex chars (got '${input.writeRequestId}')`,
     );
   }
 

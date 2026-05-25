@@ -111,7 +111,7 @@ describe("buildDiffPreviewCard — input validation", () => {
     const preview = buildDiffPreview(baseInput());
     expect(() =>
       buildDiffPreviewCard({ preview, suggestRequestId: "not-hex" }),
-    ).toThrow(/8 hex chars/);
+    ).toThrow(/32 hex chars/);
   });
 
   it("throws on a malformed writeRequestId", () => {
@@ -122,7 +122,7 @@ describe("buildDiffPreviewCard — input validation", () => {
         suggestRequestId: "aabbccddaabbccddaabbccddaabbccdd",
         writeRequestId: "ABCDEF01", // wrong case
       }),
-    ).toThrow(/8 hex chars/);
+    ).toThrow(/32 hex chars/);
   });
 });
 
