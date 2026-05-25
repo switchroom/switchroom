@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.13.37 — user-declared mcp_servers reach .mcp.json (regression class fix)
+
+Audit-driven release closing a class regression that shipped silently
+since PR #875 (v0.7.6 docker cutover): user-declared `mcp_servers` in
+`switchroom.yaml` (under `defaults.mcp_servers` or per-agent
+`agents.<name>.mcp_servers`) never reached `.mcp.json` for any agent.
+Live state on the operator's fleet pre-fix: `defaults.mcp_servers.perplexity`
+and `agents.carrie.mcp_servers.notion` both absent from `claude mcp list`
+on every agent despite being declared in yaml.
+
+Three PRs, scoped per concern.
+
+### PR A — fix(scaffold): user-declared mcp_servers reach .mcp.json (both writers) (#1786)
+
+Root cause: both `.mcp.json` writers in `src/agents/scaffold.ts`
+(`scaffoldAgent` and `reconcileAgent`) were template-driven — emitting
+only the hardcoded framework set (`switchroom-telegram`, `agent-config`,
+`hostd` if admin, hindsight, gdrive). User-declared entries DID land
+in `settings.json` (via `profiles/_base/settings.json.hbs`), but the
+agent's `exec claude` line at `profiles/_base/start.sh.hbs:559` carries
+`--dangerously-load-development-channels server:switchroom-telegram`
+with no `--mcp-config` — Claude Code loads project MCPs from `.mcp.json`
+in CWD only. `settings.json.mcpServers` is dead text for this
+invocation.
+
+Fix: after the framework set is assembled, spread
+`agentConfig.mcp_servers` into the rendered `mcpServers` map in both
+writers, filtered through the existing `filterMcpServers` helper (which
+strips `false` opt-out sentinels). User-declared entries win on key
+collision — matches the settings.json precedence at line ~2255 where
+built-in defaults only land when `!settings.mcpServers[entry.key]`.
+
+The trust pass `ensureMcpServersTrusted` automatically picks up the
+new entries because it iterates `Object.keys(mcpServers)`.
+
+### PR B — feat(compose): mount ~/.switchroom/mcp-launchers/ for user-declared command-based MCPs (#1787)
+
+PR A makes user-declared HTTP MCPs (e.g. carrie's `notion` with
+`type: http`) work as soon as it lands. For command-based MCPs (e.g.
+perplexity's `command: /home/<op>/.switchroom/perplexity-mcp.sh`) the
+launcher path also needs to resolve inside the agent container — pre-fix
+only the per-agent subdirs of `~/.switchroom/` were bind-mounted,
+nothing at the root.
+
+Fix: `src/agents/compose.ts` adds a same-path `:ro` bind-mount of
+`~/.switchroom/mcp-launchers/` into every agent, mirroring the existing
+`skills/` mount pattern. Operators drop launchers in that convention
+directory; the yaml `command:` value Just Works in-container.
+`existsSync`-guarded so dev installs without a launcher dir don't
+hard-fail compose `up`.
+
+### PR C — feat(doctor): probe user-declared MCPs against rendered .mcp.json (#1788)
+
+Regression guard for the bug class fixed in PR A. New
+`checkUserDeclaredMcps` helper cross-references the cascade-resolved
+`mcp_servers` (defaults + per-agent merge via the canonical
+`resolveAgentConfig`) against the keys actually in the rendered
+`.mcp.json`. Three outcomes per agent: **skip** (no user-declared),
+**ok** (all present), **warn** (with missing-key list + reconcile
+fix-up). `false` opt-out sentinels are filtered before the diff. A
+future writer regression of the same class would surface as a warn
+within one `switchroom doctor` invocation instead of silently shipping
+again.
+
+### Operator-side migration (private config repo)
+
+Operators with launchers at the root of `~/.switchroom/` must move
+them under `~/.switchroom/mcp-launchers/` for the new bind-mount to
+reach them and update the corresponding `command:` paths in
+`switchroom.yaml`. One-time migration; the launcher contents are
+unchanged.
+
 ## v0.13.36 — silent-end determinism, error-envelope completeness, ticker + oversize-card fixes
 
 15 commits since v0.13.35. Headline: the silent-end Stop hook is now
