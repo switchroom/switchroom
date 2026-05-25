@@ -67,7 +67,7 @@ describe("writeVaultDeniedEnvelope — envelope shape", () => {
     });
     expect(parsed.human).toContain("DENIED");
     expect(parsed.human).toContain("no grant");
-    expect(typeof parsed.request_id).toBe("string");
-    expect(parsed.request_id.length).toBeGreaterThan(0);
+    // #1778 — request_id is optional; CLI sites no longer fabricate one.
+    expect(parsed.request_id).toBeUndefined();
   });
 });

@@ -27,6 +27,7 @@ import type {
   ErrorFix,
   HostdResponse,
 } from "./protocol.js";
+import { buildEnvelope } from "./protocol.js";
 import {
   recordErrorFriction,
   type ErrorFrictionContext,
@@ -135,15 +136,11 @@ export class ErrorBuilder {
   }
 
   build(requestId: string, durationMs: number): HostdResponse {
-    const envelope: ErrorEnvelope = {
-      v: 1,
-      code: this._code,
-      human: this._human,
-      ...(this._why !== undefined ? { why: this._why } : {}),
-      ...(this._fix !== undefined ? { fix: this._fix } : {}),
-      ...(this._docs !== undefined ? { docs: this._docs } : {}),
+    const envelope: ErrorEnvelope = buildEnvelope(this._code, this._human, this._fix, {
+      why: this._why,
+      docs: this._docs,
       request_id: requestId,
-    };
+    });
     // Synthesise the legacy `error` string so existing string-matching
     // decoders (audit reader, vault-broker client, telegram-plugin
     // gateway response handler) see no semantic regression.

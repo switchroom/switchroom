@@ -6,6 +6,7 @@ import {
   decodeResponse,
   deniedResponse,
   errorResponse,
+  buildEnvelope,
   IDEMPOTENCY_WINDOW_MS,
   MAX_FRAME_BYTES,
   ErrorFixSchema,
@@ -258,11 +259,24 @@ describe("ErrorEnvelopeSchema — negative paths (#1761)", () => {
     expect(r.success).toBe(false);
   });
 
-  it("rejects a missing request_id", () => {
+  // #1778 — request_id is optional. CLI emit sites (vault denial,
+  // agent-config sibling JSON key) no longer fabricate placeholders;
+  // hostd-path responses still thread the real RPC id through.
+  it("accepts an envelope without request_id (now optional, #1778)", () => {
     const { request_id: _omit, ...rest } = base;
     void _omit;
     const r = ErrorEnvelopeSchema.safeParse(rest);
-    expect(r.success).toBe(false);
+    expect(r.success).toBe(true);
+  });
+
+  it("round-trips an envelope without request_id through safeParse", () => {
+    const noId = { v: 1 as const, code: "VAULT-BROKER-DENIED", human: "denied" };
+    const r = ErrorEnvelopeSchema.safeParse(noId);
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.request_id).toBeUndefined();
+      expect(r.data).toEqual(noId);
+    }
   });
 
   it("accepts the VAULT- prefix shape", () => {
@@ -279,5 +293,73 @@ describe("ErrorEnvelopeSchema — negative paths (#1761)", () => {
       fix: { kind: "magic_unlock" },
     });
     expect(r.success).toBe(false);
+  });
+});
+
+describe("buildEnvelope — pure constructor (#1778)", () => {
+  it("produces a minimal envelope (no fix, no opts)", () => {
+    const env = buildEnvelope("E_FOO", "broken");
+    expect(env).toEqual({ v: 1, code: "E_FOO", human: "broken" });
+    expect(env.fix).toBeUndefined();
+    expect(env.request_id).toBeUndefined();
+    expect(ErrorEnvelopeSchema.safeParse(env).success).toBe(true);
+  });
+
+  it("threads request_id, why, docs through opts", () => {
+    const env = buildEnvelope("E_FOO", "broken", undefined, {
+      why: "because",
+      docs: "https://example.com/x",
+      request_id: "req-9",
+    });
+    expect(env).toEqual({
+      v: 1,
+      code: "E_FOO",
+      human: "broken",
+      why: "because",
+      docs: "https://example.com/x",
+      request_id: "req-9",
+    });
+    expect(ErrorEnvelopeSchema.safeParse(env).success).toBe(true);
+  });
+
+  it("passes each fix.kind variant through verbatim", () => {
+    const cases = [
+      { kind: "flip_yaml_flag", yaml_path: "hostd.x", to: true } as const,
+      { kind: "request_vault_grant", vault_key: "svc/key" } as const,
+      { kind: "operator_action", subkind: "policy_denied", operator_steps: ["s1"] } as const,
+      { kind: "operator_action", subkind: "infra" } as const,
+      { kind: "retry_after", retry_at: "2026-01-01T00:00:00Z" } as const,
+      { kind: "quota_exceeded", quota: "q", current: 1, limit: 2 } as const,
+      { kind: "bad_input", field: "f" } as const,
+      { kind: "bad_input" } as const,
+    ];
+    for (const fix of cases) {
+      const env = buildEnvelope("E_FOO", "h", fix);
+      expect(env.fix).toEqual(fix);
+      expect(ErrorEnvelopeSchema.safeParse(env).success).toBe(true);
+    }
+  });
+
+  it("does not synthesize a fix for an unknown code (caller's job)", () => {
+    const env = buildEnvelope("E_NEVER_SEEN_BEFORE", "huh");
+    expect(env.fix).toBeUndefined();
+  });
+
+  it("does not validate fix payloads itself — schema is the gate", () => {
+    // Missing required fields for the kind: buildEnvelope passes
+    // through as-is. ErrorEnvelopeSchema.safeParse is what catches it.
+    const env = buildEnvelope("E_FOO", "h", {
+      // @ts-expect-error — intentionally malformed for the test
+      kind: "quota_exceeded",
+    });
+    expect(env.fix).toEqual({ kind: "quota_exceeded" });
+    expect(ErrorEnvelopeSchema.safeParse(env).success).toBe(false);
+  });
+
+  it("omits why / docs / request_id when undefined (no nullish keys leak in)", () => {
+    const env = buildEnvelope("E_FOO", "h", undefined, { why: undefined });
+    expect("why" in env).toBe(false);
+    expect("docs" in env).toBe(false);
+    expect("request_id" in env).toBe(false);
   });
 });

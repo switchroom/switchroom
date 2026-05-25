@@ -422,9 +422,57 @@ export const ErrorEnvelopeSchema = z.object({
   why: z.string().optional(),
   fix: ErrorFixSchema.optional(),
   docs: z.string().url().optional(),
-  request_id: z.string().min(1),
+  /**
+   * Optional. The hostd dispatcher path threads the real RPC
+   * `request_id` through; CLI emit sites (vault-broker denial line,
+   * agent-config sibling JSON key) have no caller-supplied id and
+   * omit the field — receivers correlate via `audit_id` or the
+   * surrounding context. Relaxed from `.min(1)` to `.optional()`
+   * in #1778 to stop fabricated `<service>-<uuid>` placeholders.
+   */
+  request_id: z.string().min(1).optional(),
 });
 export type ErrorEnvelope = z.infer<typeof ErrorEnvelopeSchema>;
+
+/**
+ * Pure envelope constructor (#1778) — single source of truth for the
+ * `ErrorEnvelope` wire shape. Used by the hostd `ErrorBuilder` (which
+ * adds `request_id` + `why`/`docs` and wraps in `HostdResponse`) and
+ * directly by CLI emit sites (`writeVaultDeniedEnvelope`,
+ * `agent-config-write.ts`) that don't have an RPC request_id to thread.
+ *
+ * `fix` is passed through verbatim — validation that the discriminator
+ * + required fields line up is `ErrorEnvelopeSchema`'s job, not this
+ * function's. Callers that want author-time validation should pipe the
+ * result through `ErrorEnvelopeSchema.parse`.
+ *
+ * Per-code `fix.kind` selection is the CALLER's responsibility — this
+ * function does not mint a default `fix` for any code. Unknown / un-
+ * migrated codes pass `undefined` and the field elides from the
+ * envelope, matching `ErrorEnvelopeSchema`'s `fix.optional()`.
+ */
+export interface BuildEnvelopeOptions {
+  why?: string;
+  docs?: string;
+  request_id?: string;
+}
+
+export function buildEnvelope(
+  code: string,
+  human: string,
+  fix?: ErrorFix,
+  opts: BuildEnvelopeOptions = {},
+): ErrorEnvelope {
+  return {
+    v: 1,
+    code,
+    human,
+    ...(opts.why !== undefined ? { why: opts.why } : {}),
+    ...(fix !== undefined ? { fix } : {}),
+    ...(opts.docs !== undefined ? { docs: opts.docs } : {}),
+    ...(opts.request_id !== undefined ? { request_id: opts.request_id } : {}),
+  };
+}
 
 const ResponseEnvelope = {
   v: z.literal(1),
