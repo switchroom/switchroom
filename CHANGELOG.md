@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.13.51 — closes the agent-managed-skills JTBD end-to-end
+
+Two PRs that complete what v0.13.50 started: the durability story is
+now true for the dominant in-container caller, and bundled skills are
+finally cloneable.
+
+UAT of v0.13.50 surfaced two gaps the principled triage (fresh-process
+Opus reviewer, aligned to vision + principles) ranked as load-bearing:
+
+### fix(skill-clone): skip non-allowlisted source files (PR #1848, closes #1847)
+
+Six of nine bundled skills (\`docx\`, \`mcp-builder\`, \`humanizer\`,
+\`pdf\`, \`pptx\`, \`skill-creator\`) ship with operator-relevant files
+at root (LICENSE, VENDORED.md, reference.md, scripts/requirements.txt)
+that aren't in the agent-authored-skill path allowlist. \`skill clone-
+to-personal bundled:<name>\` was failing the dominant case.
+
+\`readSourceFiles\` now filters source files through \`validateRelPath\`.
+Skipped paths surface as a single-line yellow stderr note + an explicit
+\`skipped[]\` array in the JSON output (empty when source was shape-
+clean — distinguishable from "we silently dropped something you might
+care about"). Publish-side validator stays strict.
+
+### feat(compose): bind-mount config-repo personal-skills per-agent (PR #1849, closes #1846)
+
+The load-bearing JTBD fix. v0.13.50 (#1844) auto-mirrored personal-
+skill writes to \`~/.switchroom-config/agents/<agent>/personal-skills/\`
+for durability. But the agent runs **inside** a container where
+\`~/.switchroom-config/\` didn't exist → \`resolveConfigSkillsDir\`
+returned null → mirror silently no-op'd for the dominant caller.
+
+Four coordinated changes (all four layers of the audit-dir precedent):
+
+1. **\`compose.ts\`** — per-agent \`rw\` bind mount of the operator's
+   slice (\`~/.switchroom-config/agents/<a>/personal-skills/\`) when
+   the operator has opted into versioned skills (\`~/.switchroom-config\`
+   exists on host)
+2. **\`profiles/_base/start.sh.hbs\`** — sibling \`ln -sfn\` so the
+   in-container CLI's \`homedir()\` call resolves to the bind-mounted
+   host path (matches the existing \`~/.switchroom\` symlink at #910)
+3. **\`scaffold.ts:alignAgentUid\`** — chown the mirror dir to the
+   agent UID so the in-container write doesn't EACCES
+4. **\`apply.ts:ensureHostMountSources\`** — pre-create the per-agent
+   dir at pass-1 so the chown sweep finds it on first apply
+
+Fresh-process Opus reviewer caught the missing fourth layer (#3
+symlink) during initial review. The four-layer pattern is now
+documented for future bind-mounts of operator state.
+
 ## v0.13.50 — agents fix their own skills (clone-to-personal + versioned mirror)
 
 Two PRs that close the biggest gap surfaced by v0.13.47 UAT — agents
