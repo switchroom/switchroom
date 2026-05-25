@@ -103,11 +103,6 @@ describe('classifyRejection — genuine errors still crash', () => {
     expect(classifyRejection(err)).toBe('shutdown')
   })
 
-  it('returns "shutdown" for GrammyError 429 (rate limit) — should be retried not masked', () => {
-    const err = grammyError(429, 'Too Many Requests: retry after 5')
-    expect(classifyRejection(err)).toBe('shutdown')
-  })
-
   it('returns "shutdown" for GrammyError 400 with NEW unknown description', () => {
     // Use a description that's not in the benign list — the policy is
     // intentionally narrow so genuinely new bug categories still crash
@@ -115,9 +110,59 @@ describe('classifyRejection — genuine errors still crash', () => {
     const err = grammyError(400, 'Bad Request: PHOTO_INVALID_DIMENSIONS')
     expect(classifyRejection(err)).toBe('shutdown')
   })
+})
 
-  it('returns "shutdown" for GrammyError 500 server error', () => {
+describe('classifyRejection — transient API errors (2026-05-25 follow-up)', () => {
+  // The pre-fix policy crashed on 429 + 5xx + network errors. That's
+  // wrong shape: those errors are already handled by retry-api-call.ts
+  // (3 attempts with backoff). When one leaks past the retry policy —
+  // either because the caller didn't wrap, or because 3 sustained
+  // attempts all failed — crashing the gateway is the worst outcome
+  // (one bad packet = visible "agent-crashed" banner + restart loop
+  // risk). log_only matches the daemon-stays-up posture.
+  //
+  // Surfaced 2026-05-25 on clerk: a sendMessage hit 429 after exhausting
+  // retries, the rejection bubbled to the unhandledRejection handler,
+  // shutdown fired, operator-event banner posted, "clerk seems to be
+  // crashing" user-visible.
+
+  it('returns "log_only" for GrammyError 429 (rate limit) — already handled by retry-api-call', () => {
+    const err = grammyError(429, 'Too Many Requests: retry after 5')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for GrammyError 500 (server error)', () => {
     const err = grammyError(500, 'Internal Server Error')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for GrammyError 502 (Bad Gateway)', () => {
+    const err = grammyError(502, 'Bad Gateway')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for GrammyError 503 (Service Unavailable)', () => {
+    const err = grammyError(503, 'Service Unavailable')
+    expect(classifyRejection(err)).toBe('log_only')
+  })
+
+  it('returns "log_only" for HttpError (network failure) via injected detector', () => {
+    // Real grammy HttpError surfaces as e.g. "Network request for
+    // 'sendMessage' failed!" wrapping ECONNRESET / ETIMEDOUT / fetch
+    // failed. We inject the detector so this test doesn't depend on
+    // grammy internals; the production path uses `err instanceof
+    // HttpError`.
+    const fakeHttp = new Error("Network request for 'sendMessage' failed!")
+    expect(
+      classifyRejection(fakeHttp, { isHttpError: () => true }),
+    ).toBe('log_only')
+  })
+
+  it('still returns "shutdown" for GrammyError 403 (forbidden) — must not be masked', () => {
+    // 401 (covered above at line 101) and 403 are NOT transient — they
+    // indicate a genuine configuration bug (revoked bot token, removed
+    // from chat) and must crash so systemd surfaces the failure.
+    const err = grammyError(403, 'Forbidden: bot was blocked by the user')
     expect(classifyRejection(err)).toBe('shutdown')
   })
 })
