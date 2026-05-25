@@ -3024,10 +3024,24 @@ const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 // shape — they see the answer materialise live. For longer waits,
 // the cross-turn pending-progress system (#1445/#1669) is the
 // canonical surface and DOES ping at the appropriate boundaries.
-// Default OFF; flip per-agent via env to canary the new behaviour.
-const ANSWER_STREAM_VISIBLE_ENABLED =
-  process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM === '1'
-  || process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM === 'true'
+//
+// 2026-05-25: default flipped ON after fleet-log audit showed
+// framework-fallback rate at ~19% of inbounds (target per
+// `reference/conversational-pacing.md`: <0.5%). Streaming the
+// model's text events live into the chat closes the
+// catastrophic-UX failure mode at the lane-of-first-defense level.
+// Aligned with the "chat IS the artifact" sub-principle (the user
+// sees a normal chat message that grows — no chrome, no parallel
+// widget). Override with SWITCHROOM_VISIBLE_ANSWER_STREAM=0 to
+// disable, e.g. for an agent that needs the legacy draft-only
+// behaviour during debugging.
+const ANSWER_STREAM_VISIBLE_ENABLED = (() => {
+  const raw = process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM
+  if (raw == null) return true
+  const v = raw.trim().toLowerCase()
+  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false
+  return true
+})()
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const progressDriver: any = null
 const unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
@@ -6665,12 +6679,28 @@ function handleSessionEvent(ev: SessionEvent): void {
             // instead of crashing the answer-stream loop on a deleted
             // forum topic. answer-stream's own try/catch already
             // tolerates undefined returns from editMessageText.
+            //
+            // disable_notification: true UNCONDITIONALLY here (Bug A
+            // fix, 2026-05-25). The answer-stream lane sends a fresh
+            // sendMessage on the first text chunk to open the visible
+            // message. Without this flag the device pings — and then
+            // when the model later calls the reply MCP tool, that
+            // reply pings AGAIN (the over-ping safety net at
+            // gateway.ts:~4452 only sees executeReply paths, not this
+            // direct sendMessage). Result was two device pings per
+            // multi-step turn. Per the design contract — Telegram
+            // does not notify on edits anyway, and a stream-as-final-
+            // answer turn explicitly opts out of the device ping
+            // (see `reference/conversational-pacing.md` and the
+            // ANSWER_STREAM_VISIBLE_ENABLED comment above for the
+            // honest trade-off). Only the reply MCP tool ever pings.
             sendMessage: async (chatId, text, params) => {
               const tid = params?.message_thread_id
               const msg = await robustApiCall(
                 () =>
                   bot.api.sendMessage(chatId, text, {
                     parse_mode: params?.parse_mode,
+                    disable_notification: true,
                     ...(tid != null ? { message_thread_id: tid } : {}),
                     ...(params?.link_preview_options != null
                       ? { link_preview_options: params.link_preview_options }
