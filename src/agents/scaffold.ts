@@ -3268,6 +3268,37 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
             },
           ],
         },
+        {
+          // PR #1811 / v0.13.48 — repo-context auto-injection.
+          // When the agent's tool call touches a file under a code repo
+          // OUTSIDE its workspace, walk up from the target to find the
+          // nearest CLAUDE.md / AGENTS.md / AGENT.md, read it, and
+          // inject as additionalContext via hookSpecificOutput. Dedups
+          // per session via /tmp/switchroom-repo-context-<session_id>/.
+          // Closes the "non-coder user asks agent to work on ~/code/foo
+          // and the agent forgets the repo's CLAUDE.md" gap.
+          //
+          // Scaffold-side registration MUST mirror what's in
+          // telegram-plugin/hooks/hooks.json — that JSON is the
+          // plugin-system view (loaded when an agent uses
+          // --plugin-dir), but Claude Code reads PreToolUse hooks
+          // from settings.json at session start, which the scaffold
+          // writes from this list. Both must agree or the hook
+          // silently doesn't fire (#1811 UAT caught this on v0.13.48
+          // — settings.json was missing the entry, so Claude Code
+          // never invoked the hook in production).
+          matcher: "^(Read|Edit|Write|MultiEdit|NotebookEdit|Bash)$",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:repo-context-pretool",
+                `node "${join(DOCKER_HOOKS_PATH, "repo-context-pretool.mjs")}"`,
+              ),
+              timeout: 5,
+            },
+          ],
+        },
       ]
     : [];
 
