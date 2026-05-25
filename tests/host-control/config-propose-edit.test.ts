@@ -535,6 +535,12 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     expect(resp.result).toBe("error");
     expect(resp.error).toMatch(/^E_RECONCILE_FAILED_ROLLED_BACK/);
     expect(resp.error).toMatch(/rolled back successfully/);
+    // #1771: envelope-shape assertion for E_RECONCILE_FAILED_ROLLED_BACK
+    // (the shared `reconcileFailedRolledBack()` helper introduced in #1769).
+    // Infra-class failure — agent cannot self-recover, so the structured
+    // hint points the operator at the underlying write/reconcile output.
+    expect(resp.error_envelope?.code).toBe("E_RECONCILE_FAILED_ROLLED_BACK");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
     // Snapshot restored — live file matches the pre-write content.
     expect(readFile(configPath, "utf8")).toBe(snapshotBefore);
     // Card finalized to the failure state.
@@ -561,5 +567,75 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     expect(resp.result).toBe("completed");
     expect(requests.length).toBe(1);
     expect(finalizeCalls.length).toBe(1);
+  });
+
+  // #1771: envelope-shape assertion for E_APPROVAL_DISPATCH_FAILED — the
+  // infra-vs-policy split introduced in #1769 branches on
+  // `denySource === "dispatch_failure"`. The dispatch-failure branch must
+  // be an INFRA error (result: "error", fix.kind: "operator_action"),
+  // distinct from an operator-tap deny (which is policy → result: "denied").
+  it("deny with denySource=dispatch_failure → E_APPROVAL_DISPATCH_FAILED envelope (infra, not policy)", async () => {
+    let reconcileInvocations = 0;
+    const finalizeCalls: Array<{ outcome: string; detail?: string }> = [];
+    const gw: ApprovalGateway = {
+      async requestApproval(_req): Promise<ApprovalResult> {
+        return {
+          verdict: "deny",
+          reason: "telegram sendMessage 400 bad request",
+          denySource: "dispatch_failure",
+          finalize: async (out) => {
+            finalizeCalls.push(out);
+          },
+        };
+      },
+    };
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await server.start();
+    const before = readFile(configPath, "utf8");
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ap-6" });
+    // Infra-class failure — NOT a policy denial.
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/^E_APPROVAL_DISPATCH_FAILED/);
+    expect(resp.error_envelope?.code).toBe("E_APPROVAL_DISPATCH_FAILED");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
+    // No write, no reconcile attempted (deny short-circuits).
+    expect(reconcileInvocations).toBe(0);
+    expect(readFile(configPath, "utf8")).toBe(before);
+    // Gateway-side denial already shown to operator — no finalize call.
+    expect(finalizeCalls.length).toBe(0);
+  });
+
+  // #1771: envelope-shape assertion for E_DISPATCH_FAILED — top-level
+  // catch-all on uncaught dispatch exceptions (server.ts:663-680). Forced
+  // here by injecting a `runReconcile` that throws synchronously inside
+  // the handler, bubbling out past all inner try blocks to the outer
+  // dispatch try/catch. Genuine server fault: no `fix` hint is set
+  // (the agent cannot self-recover from an unexpected exception).
+  it("uncaught dispatch exception → E_DISPATCH_FAILED envelope (no fix kind)", async () => {
+    const { gw } = stubGateway("approve");
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        throw new Error("simulated reconcile-runner crash");
+      },
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ap-7" });
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/^hostd dispatch failed: /);
+    expect(resp.error).toMatch(/simulated reconcile-runner crash/);
+    expect(resp.error_envelope?.code).toBe("E_DISPATCH_FAILED");
+    // Genuine server fault — no actionable fix hint.
+    expect(resp.error_envelope?.fix).toBeUndefined();
   });
 });
