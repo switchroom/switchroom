@@ -74,13 +74,16 @@ export interface ConfigApprovalHandlerDeps {
 /**
  * Truncate a unified diff for inline display in the card body when
  * the full diff would exceed Telegram's 4096-char sendMessage limit.
- * Caps at `maxLines` lines AND at `maxChars` characters (whichever
- * trips first), then appends a sentinel pointing to the attached
- * `.patch` document. (#1762)
+ * Caps at `maxLines` lines AND at `maxChars` *raw* characters
+ * (whichever trips first), then appends a sentinel pointing to the
+ * attached `.patch` document. (#1762)
  *
- * The char cap is the load-bearing one — long single lines can still
- * overflow a 50-line slice. We leave ~600 chars of headroom under the
- * 4096 cap for the framing (header lines, `<pre>` tags, HTML escapes).
+ * NOTE: This is a *raw-input* cap. HTML escaping happens downstream
+ * and can inflate by up to 5x per char (`&` → `&amp;`). The
+ * load-bearing post-escape cap lives in `buildConfigApprovalCardBody`
+ * (rendered-body cap), which re-truncates the raw diff if escaping
+ * blew past Telegram's 4096 sendMessage limit. This function is the
+ * cheap fast-path for the common case.
  */
 export function truncateDiffForCard(
   unifiedDiff: string,
@@ -105,19 +108,92 @@ export function truncateDiffForCard(
   return out === unifiedDiff ? out : out + sentinel;
 }
 
+/**
+ * Telegram `sendMessage` hard limit. We render with `parse_mode=HTML`,
+ * so the limit applies to the rendered (escaped) body, NOT the raw
+ * pre-escape source. Worst-case escape is `&` → `&amp;` (5x).
+ */
+const TELEGRAM_SENDMESSAGE_LIMIT = 4096;
+/** Safety margin under the hard limit for invisible framing wobble. */
+const RENDERED_BODY_CAP = 3900;
+/** Operator-supplied `reason` is unbounded at the wire — clip it. */
+const REASON_MAX_CHARS = 500;
+const REASON_ELLIPSIS = "…";
+const DIFF_SENTINEL = "\n[… diff continues, see attached file]";
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function clipReason(reason: string): string {
+  if (reason.length <= REASON_MAX_CHARS) return reason;
+  return reason.slice(0, REASON_MAX_CHARS - REASON_ELLIPSIS.length) +
+    REASON_ELLIPSIS;
+}
+
+/**
+ * Render the card body, guaranteeing the result fits under Telegram's
+ * 4096-char sendMessage limit even when HTML escaping inflates the
+ * raw diff up to 5x (worst case: all `&`). Strategy:
+ *
+ *   1. Clip `reason` (user-supplied, unbounded) to REASON_MAX_CHARS.
+ *   2. Render with the (already line/char-capped) diff.
+ *   3. If the rendered body still exceeds RENDERED_BODY_CAP, binary-
+ *      shrink the raw diff and re-render until it fits. Truncation
+ *      happens on the RAW diff (then re-escaped), so we never cut
+ *      mid-entity like `&am|p;`.
+ *
+ * The full diff still ships as a `.patch` attachment — this cap only
+ * shrinks the inline preview.
+ */
 export function buildConfigApprovalCardBody(args: {
   agentName: string;
   reason: string;
   unifiedDiff: string;
 }): string {
-  const esc = (s: string) =>
-    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return (
+  const safeReason = clipReason(args.reason);
+  const render = (diff: string): string =>
     `🛠 <b>Config edit proposed</b>\n` +
-    `Agent: <code>${esc(args.agentName)}</code>\n` +
-    `Reason: ${esc(args.reason)}\n\n` +
-    `<pre>${esc(args.unifiedDiff)}</pre>`
-  );
+    `Agent: <code>${escapeHtml(args.agentName)}</code>\n` +
+    `Reason: ${escapeHtml(safeReason)}\n\n` +
+    `<pre>${escapeHtml(diff)}</pre>`;
+
+  let body = render(args.unifiedDiff);
+  if (body.length <= RENDERED_BODY_CAP) return body;
+
+  // Rendered body too big — escaping inflated the diff past our cap.
+  // Binary-search the raw-diff slice that fits, snapping to a line
+  // boundary where possible and appending the truncation sentinel.
+  let lo = 0;
+  let hi = args.unifiedDiff.length;
+  let bestDiff = "";
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const slice = args.unifiedDiff.slice(0, mid);
+    const candidate = slice + DIFF_SENTINEL;
+    if (render(candidate).length <= RENDERED_BODY_CAP) {
+      bestDiff = candidate;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // Snap to last newline so we don't cut mid-line. The sentinel is
+  // suffixed AFTER the snap so the trailing line stays intact.
+  const rawCap = bestDiff.length - DIFF_SENTINEL.length;
+  if (rawCap > 0) {
+    const rawSlice = args.unifiedDiff.slice(0, rawCap);
+    const lastNl = rawSlice.lastIndexOf("\n");
+    if (lastNl > 0) bestDiff = rawSlice.slice(0, lastNl) + DIFF_SENTINEL;
+  }
+  body = render(bestDiff);
+  // Defensive: if the framing alone (with empty diff + sentinel) still
+  // overflowed (e.g. reason clip somehow failed), hard-cut the rendered
+  // body and append a plain-text marker. Should be unreachable.
+  if (body.length > TELEGRAM_SENDMESSAGE_LIMIT) {
+    body = body.slice(0, TELEGRAM_SENDMESSAGE_LIMIT - 1);
+  }
+  return body;
 }
 
 /**
@@ -167,23 +243,22 @@ export async function handleRequestConfigApproval(
     return;
   }
 
-  // Pre-flight oversize check (#1762). Telegram caps sendMessage at
-  // 4096 chars; rendered HTML adds escaping + framing so we threshold
-  // the raw diff conservatively. When oversize, we truncate the diff
-  // in the card body and ship the full diff as a `.patch` attachment.
-  const fullBody = buildConfigApprovalCardBody({
+  // Pre-flight oversize handling (#1762). Telegram caps sendMessage
+  // at 4096 chars and we render with parse_mode=HTML, so the limit
+  // applies to the rendered (escaped) body — worst-case `&` → `&amp;`
+  // inflates 5x. Fast-path with a cheap raw-input cap, then let
+  // buildConfigApprovalCardBody enforce the post-escape rendered cap
+  // (which re-truncates the diff if escaping blew past the limit). We
+  // ship the full diff as a `.patch` attachment whenever truncation
+  // happens in either layer.
+  const prelim = truncateDiffForCard(msg.unifiedDiff);
+  const body = buildConfigApprovalCardBody({
     agentName: msg.agentName,
     reason: msg.reason,
-    unifiedDiff: msg.unifiedDiff,
+    unifiedDiff: prelim,
   });
-  const oversize = fullBody.length > 3500;
-  const body = oversize
-    ? buildConfigApprovalCardBody({
-        agentName: msg.agentName,
-        reason: msg.reason,
-        unifiedDiff: truncateDiffForCard(msg.unifiedDiff),
-      })
-    : fullBody;
+  const oversize =
+    prelim !== msg.unifiedDiff || body.includes("diff continues, see attached file");
   const replyMarkup = deps.buildKeyboard(msg.requestId);
 
   const posted = await deps.postCard({
@@ -314,10 +389,6 @@ export async function handleRequestConfigFinalize(
       `config finalize card edit failed (requestId=${msg.requestId}): ${(err as Error).message}`,
     );
   }
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**

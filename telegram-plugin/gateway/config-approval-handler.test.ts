@@ -75,6 +75,57 @@ describe("buildConfigApprovalCardBody", () => {
     expect(body).toContain("&lt;script&gt;");
     expect(body).toContain("a &amp; b &lt;c&gt;");
   });
+
+  it("rendered body stays under Telegram's 4096-char limit when raw diff is all `&` (worst-case 5x escape inflation)", () => {
+    // 3000 `&` chars escape to 15000 `&amp;` chars — far past 4096.
+    // The post-escape cap MUST kick in and truncate the rendered body.
+    const evilDiff = "&".repeat(3000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body).toContain("diff continues, see attached file");
+  });
+
+  it("rendered body stays under 4096 when raw diff is all `<` (5x escape)", () => {
+    const evilDiff = "<".repeat(3000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body).toContain("&lt;");
+  });
+
+  it("clips an unbounded operator-supplied `reason` to ~500 chars with ellipsis", () => {
+    const longReason = "x".repeat(2000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: longReason,
+      unifiedDiff: "small",
+    });
+    // The escaped reason should appear, but capped.
+    const reasonLine = body
+      .split("\n")
+      .find((l) => l.startsWith("Reason: "))!;
+    // "Reason: " prefix (8) + clipped reason.
+    expect(reasonLine.length).toBeLessThanOrEqual(8 + 500);
+    expect(reasonLine.endsWith("…")).toBe(true);
+  });
+
+  it("rendered body stays under 4096 even when reason is also adversarial", () => {
+    const evilDiff = "&".repeat(3000);
+    const evilReason = "&".repeat(2000);
+    const body = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: evilReason,
+      unifiedDiff: evilDiff,
+    });
+    expect(body.length).toBeLessThanOrEqual(4096);
+  });
 });
 
 describe("handleRequestConfigApproval", () => {
