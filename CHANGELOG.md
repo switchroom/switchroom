@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.13.39 — PR #1706 follow-ups: entity decode + draft-id rotation + UAT promotion
+
+Three independent fixes batched into a single release. All from the
+fresh-process reviewer pass on PR #1706.
+
+### fix(telegram): decode entities before re-escape in prior_assistant_preview (#1791, PR #1796)
+
+`steering.ts:formatPriorAssistantPreview` stripped HTML tags and then
+XML-escaped *without* decoding entities first. A turn containing
+inline `<code>` (stored in history as `<code>&lt;…&gt;</code>`)
+surfaced to the model on the next inbound's `prior_assistant_preview`
+attribute as `&amp;amp;lt;…&amp;amp;gt;` — triple-encoded. The model
+had to mentally decode three layers to recover the original
+characters it wrote one turn ago — measurably hostile to
+comprehension on turns with placeholders, JSX, XML, generics, etc.
+
+Fix: decode the canonical six entities (`&lt;` / `&gt;` / `&quot;` /
+`&apos;` / `&nbsp;` / `&amp;`) after strip and before the existing
+re-escape pass. Attribute boundary stays safe because
+`escapeXmlAttribute` runs unchanged at the tail. Decode order has
+`&amp;` last so a single pass can't strip two layers (e.g. someone
+deliberately encoding the word `&lt;` round-trips back to itself).
+
+### fix(telegram): answer-stream forceNewMessage clears stale draftId before rotating (#1792, PR #1796)
+
+PR #1706 added `clearDraftBestEffort` to `stop()` and `retract()` so
+the sendMessageDraft preview doesn't sit in the user's compose box
+after turn end. The fresh-process reviewer flagged a latent race:
+the only production caller (`gateway.ts:6476` rapid-steer path)
+invokes `forceNewMessage(); stop();` on the prior turn's stream.
+`forceNewMessage` synchronously rotates `draftId` to a fresh
+allocation; stop's fire-and-forget clear then read the NEW (unused)
+id, leaving the prior turn's stale content in the compose box until
+Telegram's 30 s expiry.
+
+Fix is in `forceNewMessage` itself — clear the OLD draftId BEFORE
+rotating. That puts the responsibility on the rotation point, the
+natural owner of the "abandon current turn, start fresh" semantic.
+`stop()` and `retract()` continue to clear whatever draftId is
+current at the time they run (defensive; clearing an unused id is a
+harmless no-op).
+
+### test(uat): promote pending-progress-html-dm to a permanent jtbd scenario (#1793, PR #1796)
+
+The PR #1706 verification scenario (parse_mode-preserved on
+cross-turn edits) becomes `jtbd-pending-progress-html-dm.test.ts`.
+The pending-progress / silent-anchor / answer-stream code family all
+touch the parse_mode contract on cross-turn edits; the existing UAT
+suite covers cadence / round-trip / pacing but not parse_mode. #1698
+shipped to prod with the suite green throughout — this scenario
+closes that blind spot. ~80-90s runtime, part of `bun run test:uat`.
+
 ## v0.13.38 — approval-card collapsed view shows what + why without expanding
 
 ### fix(telegram): approval-card collapsed view (#1790, PR #1794)
