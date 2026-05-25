@@ -1061,7 +1061,20 @@ function filterMcpServers(
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(servers)) {
     if (value === false) continue; // opt-out: skip this server
-    out[key] = value;
+    if (value != null && typeof value === "object" && !Array.isArray(value)) {
+      // Strip switchroom-internal fields before they reach .mcp.json
+      // (#1806). Currently just `secrets:` — the broker-ACL declaration
+      // for vault keys the launcher will fetch (see vault-broker.md).
+      // Claude Code ignores unknown fields, but leaking the field
+      // (a) clutters .mcp.json which agents may read directly, and
+      // (b) discloses which vault keys an MCP needs to anything that
+      // can read the file. Discloses key NAMES only (not values), but
+      // there's no upside to keeping it.
+      const { secrets: _secrets, ...rest } = value as Record<string, unknown>;
+      out[key] = rest;
+    } else {
+      out[key] = value;
+    }
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
