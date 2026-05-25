@@ -226,10 +226,11 @@ describe('recordSilentTurnEnd — #1161 exhaustion detection', () => {
   it('full lifecycle: silent → re-prompt → still silent → exhausted', () => {
     // 1. Turn ends silent — first record.
     expect(recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }).exhausted).toBe(false)
-    // 2. Stop hook blocks and increments retryCount (simulated).
+    // 2. Stop hook blocks and bumps retryCount up to the ceiling
+    //    (simulated; the hook does retryCount+1 each block until MAX).
     const path = join(stateDir, 'silent-end-pending.json')
     const s = readSilentEndState()!
-    writeFileSync(path, JSON.stringify({ ...s, retryCount: s.retryCount + 1 }))
+    writeFileSync(path, JSON.stringify({ ...s, retryCount: SILENT_END_MAX_RETRIES }))
     // 3. Re-prompted turn ends silent again — recovery exhausted.
     expect(recordSilentTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:_' }).exhausted).toBe(true)
     expect(readSilentEndState()).toBeNull()
@@ -346,10 +347,11 @@ describe('recordUndeliveredTurnEnd — #1664 extended trigger', () => {
       [{ text: 'one sec', disableNotification: true }],
       'c:exhaust',
     ).rePromptEngaged).toBe(true)
-    // Stop hook blocks once and bumps retryCount (simulated).
+    // Stop hook blocks until retryCount hits the ceiling (simulated;
+    // the hook does retryCount+1 each block until SILENT_END_MAX_RETRIES).
     const path = join(stateDir, 'silent-end-pending.json')
     const s = readSilentEndState()!
-    writeFileSync(path, JSON.stringify({ ...s, retryCount: s.retryCount + 1 }))
+    writeFileSync(path, JSON.stringify({ ...s, retryCount: SILENT_END_MAX_RETRIES }))
     // Re-prompted turn STILL ends with only an interim ack → exhausted.
     const second = recordUndeliveredTurnEnd({ chatId: 'c', threadId: null, turnKey: 'c:exhaust' })
     expect(second.exhausted).toBe(true)
@@ -538,13 +540,14 @@ describe('silent-end-interrupt-stop hook — integration (#1775: transcript-scan
     expect(readSilentEndState()!.retryCount).toBe(1)
   })
 
-  it('allows the stop when retryCount >= MAX_RETRIES (1), even if transcript still shows no reply', () => {
-    // Retry already spent — gateway will post the user-facing
+  it('allows the stop when retryCount >= MAX_RETRIES, even if transcript still shows no reply', () => {
+    // Retry budget already spent — gateway will post the user-facing
     // fallback so the user isn't left silent.
     const path = join(stateDir, 'silent-end-pending.json')
     mkdirSync(stateDir, { recursive: true })
     writeFileSync(path, JSON.stringify({
-      chatId: 'c', threadId: null, turnKey: 'c:_', retryCount: 1, timestamp: 0,
+      chatId: 'c', threadId: null, turnKey: 'c:_',
+      retryCount: SILENT_END_MAX_RETRIES, timestamp: 0,
     }))
     const transcript = writeTranscript([
       ENQUEUE,
