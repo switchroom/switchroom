@@ -106,6 +106,30 @@ describe('silent-end.ts — gateway state writer', () => {
     expect(() => clearSilentEndState('123:_')).not.toThrow()
   })
 
+  it('clearSilentEndState unlinks a pre-#1664 legacy-format file (no turnKey field)', () => {
+    // 2026-05-25 incident: clerk had a stale `{retryCount:1,timestamp:...}`
+    // file with NO `turnKey` field — written by a pre-#1664 build before
+    // the chatId/threadId/turnKey schema landed. The strict
+    // `prev.turnKey !== turnKey` check meant `undefined !== <anything>`
+    // returned true and every clear callsite no-op'd against it. The file
+    // survived two container restarts. When a new turn ended silently
+    // ~hours later, the Stop hook read the stale retryCount=1 and bailed
+    // without re-prompting, leaving the user with no reply for 5 minutes
+    // (until the framework's silence-poke fallback fired).
+    //
+    // Contract: any clearSilentEndState call must be able to evict a
+    // legacy file whose turnKey is missing. Strict matching still applies
+    // when both sides have a turnKey (the `clearSilentEndState leaves the
+    // file alone when turnKey does NOT match` test above pins that).
+    const path = join(stateDir, 'silent-end-pending.json')
+    writeFileSync(path, JSON.stringify({ retryCount: 1, timestamp: 1779692417907 }))
+    expect(existsSync(path)).toBe(true)
+
+    clearSilentEndState('any-turn-key-here')
+
+    expect(existsSync(path)).toBe(false)
+  })
+
   it('writeSilentEndState handles corrupt prior file by resetting retryCount', () => {
     const path = join(stateDir, 'silent-end-pending.json')
     writeFileSync(path, 'not valid json {{{')

@@ -150,6 +150,18 @@ export function writeSilentEndState(
  * Called the moment a reply / stream_reply first-emit lands so the
  * Stop hook doesn't fire a stale block on the next stop.
  *
+ * Pre-#1664 (`commit f664cde8`) state files lacked a `turnKey` field
+ * entirely. The strict `prev.turnKey !== turnKey` check meant
+ * `undefined !== <anything>` was always true, so legacy files survived
+ * every clear path and remained readable by the Stop hook indefinitely.
+ * In production this stranded clerk with `retryCount=1` for ~hours
+ * across two container restarts, breaking the Stop hook's retry budget
+ * for every subsequent silent-end (the 2026-05-25 incident).
+ *
+ * Tolerance: treat a missing `prev.turnKey` as "stale unknown, unlink
+ * it" rather than "preserve". Strict comparison still applies when
+ * both sides are present, so the same-turn invariant is preserved.
+ *
  * Fail-silent: missing file, mismatched turnKey, or read/unlink errors
  * are all benign. The Stop hook itself defends against stale files via
  * the retryCount mechanism.
@@ -159,7 +171,7 @@ export function clearSilentEndState(turnKey: string, deps?: SilentEndDeps): void
   if (!existsSync(statePath)) return
   try {
     const prev = JSON.parse(readFileSync(statePath, 'utf8')) as Partial<SilentEndState>
-    if (prev.turnKey !== turnKey) return
+    if (prev.turnKey != null && prev.turnKey !== turnKey) return
     unlinkSync(statePath)
     emitLog(deps, `silent-end: cleared state file turnKey=${turnKey}\n`)
   } catch {
