@@ -524,6 +524,51 @@ describe("generateCompose", () => {
     }
   });
 
+  it("emits a :ro mount for the operator's mcp-launchers/ dir when present (#1786 follow-up)", async () => {
+    // Operators who declare user-level MCP servers with a host `command:`
+    // path (e.g. defaults.mcp_servers.perplexity.command:
+    // /home/<op>/.switchroom/mcp-launchers/perplexity-mcp.sh) need that
+    // path to resolve INSIDE the agent container too — otherwise the
+    // .mcp.json entry lands but the launcher ENOENTs at spawn. Same-
+    // path :ro mount makes the operator's yaml command Just Work.
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-mcp-launchers-"));
+    mkdirSync(join(tmp, ".switchroom", "mcp-launchers"), { recursive: true });
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).toContain(
+        `${tmp}/.switchroom/mcp-launchers:${tmp}/.switchroom/mcp-launchers:ro`,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("omits the mcp-launchers mount when the host dir doesn't exist", async () => {
+    // Same `:ro` source absent guard as skills/credentials — docker
+    // compose `up` hard-fails on a missing source. Operators without
+    // any user-declared command-based MCPs simply have no
+    // ~/.switchroom/mcp-launchers/ dir; the mount must be omitted.
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-no-launchers-"));
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain(`/.switchroom/mcp-launchers`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("emits each mount independently when only one host dir exists (#907)", async () => {
     // Vault-only operators commonly have populated skills/ but no
     // filesystem credentials/ (everything via vault). The two
