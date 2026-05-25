@@ -90,7 +90,25 @@ export class ErrorBuilder {
     return this;
   }
 
+  /**
+   * Set the docs URL. Validated at author-time (fail loud) so a new
+   * call site can't ship an envelope that fails its own
+   * `ErrorEnvelopeSchema` (which enforces `z.string().url()`).
+   * Throws `TypeError` on a non-URL string — matches how the rest of
+   * the codebase treats author-mistake categories (e.g. zod schemas
+   * elsewhere parse-throw rather than silently coerce). Issue #1761.
+   */
   docs(url: string): this {
+    try {
+      // node's URL constructor is stricter than a regex and matches
+      // zod's `.url()` behavior. Author-time throw beats a runtime
+      // schema parse-failure at the receiver.
+      new URL(url);
+    } catch {
+      throw new TypeError(
+        `err().docs(): invalid URL: ${JSON.stringify(url)} — ErrorEnvelopeSchema requires a fully-qualified URL`,
+      );
+    }
     this._docs = url;
     return this;
   }

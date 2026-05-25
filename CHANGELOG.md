@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### feat(#1761): error envelope Phase 2 — batch migration + denied-vs-error classification + negative-path tests
+
+Follow-ups on the Phase 1 wire protocol (#1759). Five tightenings:
+
+1. **Negative-path schema tests for `ErrorFixSchema` / `ErrorEnvelopeSchema`.**
+   Phase 1 only pinned the happy path. Phase 2 adds `safeParse` rejections
+   for: unknown `fix.kind`, missing required field per kind, non-URL
+   `docs`, malformed `code` (`e_lowercase`, bare `FOO`). The discriminator
+   is the integrity boundary for the unlock-card path — every silently-
+   accepted garbage shape becomes a load-bearing allowlist bypass on the
+   gateway side.
+
+2. **`err().docs(URL)` now throws `TypeError` at author-time** on a
+   non-URL string, matching `ErrorEnvelopeSchema`'s `z.string().url()`
+   receiver-side check. A new call site can no longer ship an envelope
+   that fails its own schema.
+
+3. **`E_CONFIG_EDIT_DISABLED` returns `result: "denied"`** instead of
+   `"error"` — it's a policy denial (feature flag off), not a server
+   fault. `asDenied()` swept across the other policy-denial codes
+   migrated in this PR (`E_DENIED`, `E_APPROVAL_TIMEOUT`).
+
+4. **Batch-migrated every remaining `errorResponse()` call site** in
+   `src/host-control/server.ts` to the `err()` builder with the
+   appropriate `fix` envelope:
+   - validation rejections (`E_PATCH_APPLY_FAILED` etc.) → `fix: bad_input`
+   - `E_NO_APPROVAL_GATEWAY` → `fix: operator_action` (infra)
+   - operator tap-deny `E_DENIED` → `fix: operator_action` (policy_denied), `result: "denied"`
+   - dispatch-failure `E_APPROVAL_DISPATCH_FAILED` → `fix: operator_action` (infra), `result: "error"`
+   - `E_APPROVAL_TIMEOUT` → `fix: operator_action` (policy_denied), `result: "denied"`
+   - rollback-path `E_RECONCILE_FAILED_ROLLED_BACK` → `fix: operator_action` (infra)
+   - top-level dispatch catch → `E_DISPATCH_FAILED` (no fix, internal)
+   - `get_status` invariant violation → `E_INTERNAL` (no fix)
+
+   Legacy `error: string` is preserved verbatim at every migrated site
+   so existing string-matching decoders (audit reader, telegram-plugin
+   gateway response handler, broker client) see no semantic regression.
+
+5. **MCP hostd surface — `content` length goes 1 → 2 on errors.** When
+   `error_envelope` is present, the MCP hostd tool response now appends
+   a second `content` text item carrying the envelope JSON (with a
+   leading `Structured error — fix.kind=…` discriminator hint). Tooling
+   that string-matches `content[0].text` is still safe; tooling that
+   parses the structured form should branch on `content.length === 2`.
+
 ## v0.13.35 — gateway crash-banner noise, error envelope, timezone hook
 
 Three reliability/UX fixes landed since v0.13.34.
