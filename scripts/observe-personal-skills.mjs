@@ -27,7 +27,7 @@
  * existing src/cli/skill-search.ts helpers).
  */
 
-import { readdirSync, statSync, readFileSync, existsSync } from "node:fs";
+import { readdirSync, statSync, lstatSync, readFileSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -69,6 +69,14 @@ function safeStat(p) {
   }
 }
 
+function safeLstat(p) {
+  try {
+    return lstatSync(p);
+  } catch {
+    return null;
+  }
+}
+
 function dirSize(dir) {
   let bytes = 0;
   let files = 0;
@@ -77,8 +85,12 @@ function dirSize(dir) {
     const cur = stack.pop();
     for (const ent of safeReaddir(cur)) {
       const sub = join(cur, ent);
-      const st = safeStat(sub);
+      // lstat NOT stat — never follow a symlink out of the skill tree.
+      // A malicious `personal-foo → /etc` would otherwise have us
+      // walking arbitrary host dirs (metadata only, but still wrong).
+      const st = safeLstat(sub);
       if (!st) continue;
+      if (st.isSymbolicLink()) continue;
       if (st.isDirectory()) stack.push(sub);
       else if (st.isFile()) {
         bytes += st.size;
