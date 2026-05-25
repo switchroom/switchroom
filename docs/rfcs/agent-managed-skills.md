@@ -1,7 +1,13 @@
 # RFC: Agent-managed skills — fleet capability lifecycle
 
-Status: Draft v3 — **rescoped to Option B + tactical CLI escape hatch**
-after four independent Opus reviewer passes (2026-05-25)
+Status: **Historical** — Phase 1 (personal-skill autonomy) shipped in
+PR #1825, Phase 3 (`skill_search` MCP) in PR #1826; agent-default
+follow-up in PR #1828; 60-day observability in PR #1829. Phase 2
+remains deferred. Original framing below preserved as institutional
+memory.
+
+Original status: Draft v3 — **rescoped to Option B + tactical CLI
+escape hatch** after four independent Opus reviewer passes (2026-05-25)
 Date: 2026-05-25
 Reviewer pass v1 → v2: 1 reviewer (general-purpose, 8 items incorporated)
 Reviewer pass v2 → v3: 4 reviewers (Opus, parallel, distinct angles —
