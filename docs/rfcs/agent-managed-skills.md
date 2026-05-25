@@ -1,105 +1,155 @@
 # RFC: Agent-managed skills — fleet capability lifecycle
 
-Status: Draft v2 (post-review revisions)
+Status: Draft v3 — **rescoped to Option B + tactical CLI escape hatch**
+after four independent Opus reviewer passes (2026-05-25)
 Date: 2026-05-25
-Reviewer pass: 2026-05-25 (general-purpose, fresh process) → 8 items
-incorporated below.
-Companion to: `reference/vision.md` (pillars 1 & 4 — *standing team of
-specialists*, *always available*), `reference/principles.md` (defaults
-test, consistency test)
+Reviewer pass v1 → v2: 1 reviewer (general-purpose, 8 items incorporated)
+Reviewer pass v2 → v3: 4 reviewers (Opus, parallel, distinct angles —
+security threat model / implementation feasibility / operator UX /
+independent design alignment)
+
+**v3 net change from v2**: scope cut from ~26 agent-hours across 4 phases
+to ~13-16 agent-hours across 3 PRs. The shared-pool publish/edit verbs
+(was Phase 2) are deferred entirely pending 60 days of personal-skill
+usage data; the 8 reviewer must-fixes for them are captured in a
+separate tracking issue for when Phase 2 ever revives. The framing is
+re-anchored to the existing `extend-without-forking.md` JTBD instead of
+inventing five new ones.
+
+JTBD: `reference/extend-without-forking.md` ("the user adds a new
+agent, skill, or tool by configuring it, not by editing the product").
+This RFC advances the *skill* leg of that job by removing operator-
+bottleneck on day-to-day skill maintenance.
 
 ## 1. Summary
 
 Today every change to the global skills pool requires the operator on
 the host. Skill authoring, editing, validation, deployment, and
-retirement all sit on a write-barrier the agents can't cross. This
-RFC closes that gap by making **skills a first-class capability
-that the fleet co-manages with the operator**, not operator-installed
-software.
+retirement all sit on a write-barrier the agents can't cross. The
+v3 plan ships the lowest-cost / highest-value subset of "skills the
+fleet co-manages":
 
-Three tiers of skill ownership land in this RFC:
-
-| Tier | Lives at | Author | Approval | Blast radius |
+| Tier | Lives at | Author | Approval | Status in v3 |
 |---|---|---|---|---|
-| **Personal** | `<agentDir>/.claude/skills/personal/<name>/` | Owning agent | None (own workspace) | 1 agent |
-| **Shared pool** | `~/.switchroom/skills/<name>/` (today's global) | Any agent proposes | Operator approval card | Fleet subset that opts in |
-| **Bundled** | `skills/_bundled/<name>/` (ships with CLI) | Source PR only | Code review on switchroom repo | Universal opt-out |
+| **Personal** | `<agentDir>/.claude/skills/personal/<name>/` (or flat per Phase 0) | Owning agent | None (own workspace) | **Phase 1 — ships** |
+| **Shared pool** | `~/.switchroom/skills/<name>/` (today's global) | Operator (today) OR a 2-hour CLI verb (PR-1 below) | Manual today; **`skill_propose_*` approval-card flow deferred** | Deferred — pending 60d Phase 1 data |
+| **Bundled** | shipped with CLI | Source PR only | GitHub review | Unchanged from today |
 
-The shipping primitive is **two new hostd verbs** (`skill_propose_publish`,
-`skill_propose_edit`) mirroring the `config_propose_edit` pattern
-(RFC `admin-agent-config-edit.md`), plus a writable per-agent personal-
-skill dir for the lowest tier. The agent-config MCP gains a
-`skill_init_personal` op so agents can bootstrap their own toolkit
-without operator touch. Approval card UX, audit log, and apply path
-all reuse existing machinery.
+**What ships in v3 (three PRs, ~13-16 agent-hours total):**
 
-The change is **outcome-driven, not feature-driven**: the goal is
-removing operator-bottleneck for skill maintenance so the fleet can
-evolve its own toolkit unattended (pillar 4 — *always available*).
-The proof point is when an agent says "I keep doing this manually,
-should be a skill" and the next time the same task comes up, the
-skill exists — without the operator having to be at a terminal in
-between.
+1. **PR-1 (tactical, 2h):** `switchroom skill apply <name>` CLI verb.
+   Operator runs locally with content from stdin or a file path; it
+   validates against the existing SKILL.md gate (`skill-common.ts`)
+   and writes to `~/.switchroom/skills/<name>/`. No agents involved,
+   no new approval surface. Solves the immediate tablet-hang-class
+   pain (JTBD: "fix a shared-pool skill bug in one operator step")
+   without prejudicing the larger design.
 
-## 2. JTBDs this RFC solves
+2. **PR-2 (Phase 0 spike, 2-3h):** Documentation-only PR resolving the
+   load-bearing unknowns surfaced by reviewers — claude-code subdir
+   discovery semantics, `.trash/` exclusion, `skill-creator` overlap,
+   upstream Anthropic personal-skills feature signals, path-conflict
+   risk. Outcome: written design decision for Phase 1's on-disk
+   layout + scanner exclusions, before code lands.
 
-Each is currently a Ken-bottleneck. None of them are solved by the
-narrow "diff a file" pattern — they need the lifecycle.
+3. **PR-3 (Phase 1 personal-skill autonomy, 6-8h):** Scaffold writes
+   the agreed personal-skill path (mode 0700 owned by agent UID).
+   Agent-config MCP gains `skill_init_personal` / `skill_edit_personal`
+   / `skill_remove_personal` / `skill_list_personal`. Multi-file
+   bundle validator (new code per feasibility review). `O_NOFOLLOW |
+   O_EXCL` writes (per security T3). Trash-dir soft-undo with
+   host-side sweep cron (per security T4). Pre-publish `claude -p`
+   content scan in skill scripts (closes the CI-guard gap flagged by
+   security + feasibility independently).
 
-### JTBD-1 — "I keep doing X manually. Should be a skill."
+4. **PR-4 (Phase 3 read-only discovery, 3h):** `skill_search` MCP op.
+   Read-only enumeration across personal + shared + bundled pools
+   returning SKILL.md frontmatter, no approval required.
+
+**What does NOT ship in v3:** the `skill_propose_publish` /
+`skill_propose_edit` hostd verbs (the heavy machinery — approval card
+UX, audit-log integration, multi-file apply primitive, `proposed_opt_ins`
+chaining, the 8 reviewer must-fixes). Tracked in
+[GH issue: deferred Phase 2 design].
+
+**Why the rescope is right.** Three of the four Opus reviewers
+independently recommended Option B. The triggering pain (two paste-
+and-relay loops during a debug session) is N=1 evidence; a 2-hour CLI
+verb solves it today. The shared-pool publish/edit machinery is
+~17h of work resting on assumptions about an approval-card UX whose
+needs we don't yet know — personal-skill usage in PR-3 generates the
+signal that should drive that design.
+
+## 2. Operator workflows v3 serves
+
+The governing JTBD is `reference/extend-without-forking.md` ("the user
+adds a new agent, skill, or tool by configuring it, not by editing the
+product"). The workflows below are concrete instances of that job on
+the skill axis. Each is annotated with which v3 PR (or deferral) it
+maps to.
+
+**Honest framing**: v3 ships a partial answer. The shared-pool
+publish/edit lifecycle is deferred until personal-skill usage data
+informs the approval-card UX. The 2-hour `switchroom skill apply` CLI
+verb (PR-1) is a tactical bridge that solves the most-felt pain today
+without committing to the heavy machinery.
+
+### Workflow 1 — "I keep doing X manually. Should be a skill." *(PR-3 + PR-4)*
 
 Today the agent can describe the script it wishes existed, paste it
-in Telegram, and hope you'll save it later. The work-product
-evaporates the moment the conversation moves on. And there's no way
-for the agent to check whether someone else already built X before
-authoring — the pool is enumerable only via filesystem listing on
-the host.
+in Telegram, and hope you'll save it later. The work-product evaporates
+the moment the conversation moves on. And there's no way for the agent
+to check whether someone else already built X.
 
-After: the agent searches the pool first (read-only, no approval),
-finds nothing for X, writes the skill in its personal workspace,
-tests it, uses it itself the next time the task comes up. No
-operator involvement. If it proves useful across runs, the agent
-can later propose it for promotion to the shared pool.
+After v3: the agent searches the pool first (`skill_search`, PR-4),
+finds nothing for X, writes the skill in its personal workspace
+(`skill_init_personal`, PR-3), uses it itself the next time the task
+comes up. No operator involvement. If it proves useful across runs,
+the agent flags it for the operator to promote via PR-1 (or wait for
+the eventual Phase 2 `skill_propose_publish` flow).
 
-### JTBD-2 — "This shared skill has a bug. Here's the fix."
+### Workflow 2 — "This shared skill has a bug. Here's the fix." *(PR-1)*
 
 Today the agent says "the fully-kiosk hang-watcher is missing
-`screenLocked`, let me draft the fix in Telegram." Then I paste it
-on the host. We did this twice tonight.
+`screenLocked`, let me draft the fix in Telegram." Then I paste it on
+the host. We did this twice tonight.
 
-After: the agent forks the shared skill to its personal workspace,
-fixes it, dry-runs against a fixture, then submits a
-`skill_propose_edit` with the diff. I tap approve once. Same
-end-state, zero rounds of paste-and-relay.
+After PR-1: the agent dumps the patched content; the operator runs
+`switchroom skill apply fully-kiosk < /tmp/patched.tar` (or pipes the
+single SKILL.md if it's a one-file change). The CLI validates against
+`skill-common.ts`, writes atomically, runs `switchroom apply` to
+re-sync agents. **Same end-state as today, but one CLI invocation
+instead of nine paste-and-relay steps.** This is the tactical bridge
+until Phase 2 ever ships.
 
-### JTBD-3 — "Promote my personal skill to shared."
+### Workflow 3 — "Promote my personal skill to shared." *(deferred)*
 
-Today: doesn't exist. A personal skill stays personal forever
-because there's no path to make it shared.
+Today: doesn't exist. A personal skill stays personal forever because
+there's no path to make it shared.
 
-After: the agent submits `skill_propose_publish` with the personal
-skill's content + a one-line rationale + the agents it thinks
-should opt in. I see the JTBD summary, the file list, the blast
-radius, and tap approve. The skill lands in `~/.switchroom/skills/`
-and the listed agents auto-opt-in.
+After v3: still doesn't exist *automatically*. Operator can use PR-1
+to manually publish a personal skill they want to share (read it out
+of the agent's personal-skill dir, run `switchroom skill apply`).
+The full `skill_propose_publish` approval-card flow is deferred —
+the design needs personal-skill telemetry from PR-3 first.
 
-### JTBD-4 — "Retire skills nothing uses anymore." *(anticipated)*
+### Workflow 4 — "Retire skills nothing uses anymore." *(anticipated, deferred)*
 
-**Not yet a felt operator pain — the fleet hasn't run long enough
-for skill-rot to materialise.** Listed for completeness because the
-reflection mechanism is a small natural extension of `skill_search`,
-not because it solves an active problem. If this stays a non-problem
-in practice, the corresponding `skill_propose_remove` flow can be
-deferred indefinitely; nothing else in the RFC depends on it.
+Not yet a felt operator pain — the fleet hasn't run long enough for
+skill-rot to materialise. PR-4's `skill_search` makes the audit
+possible (list pool entries + opt-ins); the *retirement primitive*
+itself is deferred. If skill-rot is never observed in practice, the
+remove primitive never needs to land.
 
-### JTBD-5 — "Author a new skill end-to-end in the chat."
+### Workflow 5 — "Author a new skill end-to-end in the chat." *(PR-3, partial)*
 
 Today: the operator does it. Agents help draft, but the *making* is
 a host-side activity.
 
-After: agent does the full author-test-publish-roll-out flow itself,
-operator only touches an approval card. The operator's job shifts
-from "do skill maintenance" to "approve skill maintenance proposals."
+After PR-3: the agent does author-test-use end-to-end *in its personal
+scope*. The fleet-wide "publish to shared pool" step still requires
+the operator (PR-1). That's an honest partial-shipment of the
+workflow.
 
 ## 3. Outcome being optimized for
 
@@ -502,84 +552,151 @@ with a `personal-` name prefix as the namespace separator. Either
 way, Phase 1 acceptance gates on this answer being captured in
 writing.
 
-### Phase 1 — Personal-skill autonomy (estimated 4-6 agent-hours)
+### PR-1 — `switchroom skill apply <name>` CLI verb (2 agent-hours, ships first)
 
-- Scaffold writes the agreed personal-skill path (subdir or flat
-  per Phase 0) mode 0700 owned by agent UID
-- Agent-config MCP gains `skill_init_personal` / `skill_edit_personal`
-  / `skill_remove_personal` / `skill_list_personal` ops
-- `skill_remove_personal` implements the soft-undo trash-dir (§7)
-- New tests covering happy paths + validator rejections + trash-dir
-  recovery
-- No host approval involved
-- **Outcome**: agents can author + use their own scripts without
-  asking. Half the JTBD-1 / JTBD-2 friction gone immediately.
+Tactical bridge. Operator runs locally; no agents involved. Closes
+Workflow 2 today without committing to the heavy machinery.
 
-### Phase 2 — Shared-pool publish/edit via hostd (estimated 8-12 agent-hours)
+- New CLI verb registered alongside the existing `agent-config`
+  subcommands. Argument shape:
+  ```
+  switchroom skill apply <name> [--from <path-or-tarball>] [--dry-run]
+  ```
+  If `--from` is omitted, reads SKILL.md content from stdin (single-
+  file case) or detects a tarball stream (multi-file).
+- Validates with the existing `skill-common.ts:validateSkillMd` +
+  per-file `validateRelPath` + multi-file bundle aggregator (new,
+  ~20 LOC).
+- Writes to `~/.switchroom/skills/<name>/` via stage-rename atomic
+  pattern (mirrors `overlay-writer.ts:writeOverlayEntry` shape,
+  generalised to a multi-file write).
+- Runs `bash -n` on every `scripts/*.sh` and `python -m py_compile`
+  on every `scripts/*.py` before the write — same pre-publish
+  validation Phase 2 would have done.
+- Runs `switchroom apply` on success to re-sync agents.
+- `--dry-run` validates + diffs against current pool content, prints
+  what would change, makes no writes.
+- **No new approval surface**: the operator's existence at the
+  terminal IS the approval.
 
-- New hostd verbs `skill_propose_publish` / `skill_propose_edit` /
-  `skill_propose_remove`
-- Approval-card UI extension (multi-file diff preview; mostly reuses
-  `config_propose_edit`'s renderer)
-- Server-side pre-publish behavioral validation: `bash -n` on every
-  `scripts/*.sh`, `python -m py_compile` on every `scripts/*.py`,
-  surface failures on the approval card before the operator taps
-  (see §11 AC-7).
-- Audit log integration
-- `proposed_opt_ins` triggers a follow-on `switchroom apply` on
-  approve so the listed agents materialise the symlinks
-- **Outcome**: agents can ship to the shared pool. JTBD-2 and JTBD-3
-  shipped.
+### PR-2 — Phase 0 spike (2-3 agent-hours, docs-only)
 
-### Phase 3 — Discovery + reflection (estimated 3-4 agent-hours)
+Resolve the load-bearing unknowns surfaced by reviewers, in writing,
+before PR-3 starts coding. Doc PR adding `docs/rfcs/
+agent-managed-skills-phase0-findings.md` with explicit answers to:
 
-- `skill_search` op (read-only MCP, no approval)
-- Background reflection job (cron on an admin agent) listing
-  pool entries by opt-in count, surfacing retirement candidates
-- **Outcome**: JTBD-4 (anticipated) becomes shippable; JTBD-1's
-  pre-author search lands.
+1. **Claude-code subdir discovery**: write a SKILL.md at three
+   candidate paths, observe which claude-code picks up:
+   (a) `<agentDir>/.claude/skills/personal/foo/SKILL.md`,
+   (b) `<agentDir>/.claude/skills/personal-foo/SKILL.md`,
+   (c) `<agentDir>/.claude/skills/foo/SKILL.md`.
+2. **`.trash/` exclusion**: does claude-code skill-scan
+   `.claude/skills/.trash/<...>/SKILL.md`? If yes, trash-dir lives
+   outside `.claude/skills/` (e.g. `<agentDir>/.skill-trash/`).
+3. **`skill-creator` bundled skill**: read its SKILL.md + scripts;
+   confirm what it writes today and whether PR-3 needs to coordinate
+   (e.g. by updating skill-creator to use the new MCP ops once they
+   land).
+4. **Upstream Anthropic personal-skills feature signals**: check the
+   claude-code release notes for any nascent personal-skills feature.
+   If upstream is shipping something, document the migration plan and
+   consider choosing a switchroom-namespaced path
+   (`.switchroom/personal-skills/`) instead of `.claude/skills/`.
+5. **Path-conflict risk**: confirm no existing reconcile/cleanup code
+   matches the chosen personal-skill path (e.g.
+   `CRON_SCRIPT_BASENAME_RE` from #1799 cleanup).
 
-### Phase 4 — Metadata extension (estimated 2 agent-hours)
+Outcome: a 1-page findings doc that pins PR-3's on-disk layout +
+scanner exclusions. PR-3 acceptance gates on this doc being merged
+first.
 
-- SKILL.md frontmatter extension (back-compat, optional fields)
-- Skill-creator bundled skill updated to author the new fields
-- **Outcome**: approval cards get richer; vault-key
-  auto-grant becomes possible (next RFC if/when we want it).
+### PR-3 — Personal-skill autonomy (6-8 agent-hours)
 
-Total: ~18-26 agent-hours including the Phase 0 spike. Phaseable;
-each phase delivers a real outcome.
+After PR-2 resolves the layout. Implementation:
 
-### Option B (smaller-scope alternative): Phase 1 + Phase 3 only
+- **Scaffold**: writes the agreed personal-skill path mode 0700 owned
+  by agent UID. Trash-dir lives at the path PR-2 chose.
+- **Agent-config MCP ops** (additive to
+  `src/cli/agent-config-skill-write.ts`): `skill_init_personal` /
+  `skill_edit_personal` / `skill_remove_personal` /
+  `skill_list_personal`.
+- **Multi-file bundle validator** (~20 LOC, new): aggregates
+  per-file size, per-skill size, per-file count caps against the
+  existing `MAX_SKILL_BYTES` / `MAX_FILES_PER_SKILL` constants.
+- **Multi-file overlay writer** (~30 LOC, new): generalises
+  `overlay-writer.ts:writeOverlayEntry` to a multi-file payload
+  under one flock + stage-dir + rename-into-place.
+- **Symlink-safe writes**: every write uses `O_NOFOLLOW | O_EXCL`;
+  refuses if any path ancestor is a symlink; rejects symlinks in
+  payload contents. (Closes security review T3.)
+- **Trash-dir soft-undo** (per §7): `skill_remove_personal` moves to
+  trash-dir, host-side daily cron sweeps entries older than 24h. The
+  sweep cron is in scaffold (operator-side), NOT agent-side. (Closes
+  security review T4.)
+- **Pre-publish content scan**: every `scripts/*.{sh,py}` file in the
+  payload is grepped server-side for `\bclaude\s+-p\b`; reject the
+  write if found. Closes the CI-guard gap that was flagged by both
+  security and feasibility reviewers — the existing
+  `tests/bridge-flap-regression-guard.test.ts` only scans TS source.
+- **Behavioral validation**: `bash -n` on shell scripts,
+  `python -m py_compile` on python scripts. Surface structured
+  errors back to the calling agent through the MCP tool result (not
+  Telegram).
+- Tests covering: happy paths, every validator rejection, trash-dir
+  recovery, symlink-escape attempts, `claude -p` rejection.
 
-If the shared-pool design (Phase 2) feels premature or risky,
-phases 1 + 3 alone deliver:
-- Personal-skill authoring + editing + removal (JTBD-1, partial
-  JTBD-2)
-- Search across personal + bundled pools (the bundled half of
-  JTBD-1)
-- Skill-creator bundled skill becomes useful (it can write to a
-  real personal-skill scope)
+### PR-4 — `skill_search` MCP op (3 agent-hours)
 
-What Option B *defers*: shared-pool publish/edit (the
-`skill_propose_*` hostd verbs). Personal → shared promotion stays a
-manual operator step. JTBD-2 (fix shared-skill bugs) still requires
-paste-and-relay until Phase 2 lands.
+Read-only enumeration across personal + shared + bundled pools.
 
-Argument for Option B: lets us observe how agents actually use
-personal-skill authoring before designing the publish UX. The
-approval-card content for shared-pool publish gets sharper when we
-know what agents actually want to ship.
+- New agent-config MCP op `skill_search`:
+  ```typescript
+  { op: "skill_search",
+    query?: string,        // matches name + jtbd + description
+    tier?: "personal" | "shared" | "bundled" | "any",
+    installed_by?: string }
+  ```
+- Returns SKILL.md frontmatter + path + size + last-edit + current
+  opt-in count per match.
+- No write, no approval. Pure enumeration via `readdir` + SKILL.md
+  parse using the existing validator.
+- Tests covering: empty pool, large pool pagination, tier filtering,
+  query matching.
 
-Argument against Option B: tonight's tablet-hang debug needed
-exactly the JTBD-2 path, twice. Deferring JTBD-2 means deferring
-the most-felt pain.
+### Total scope
 
-Operator's call.
+~13-16 agent-hours across 4 PRs. Each PR is independently shippable
+and independently reviewable. PR-1 ships first (tactical), PR-2 ships
+second (docs), PR-3 + PR-4 land after PR-2's findings inform the
+design.
 
-### Option C (largest-scope alternative): all 4 phases + auto-approve
+### What's deliberately NOT in v3
 
-Not recommended — see §10 ("deferred until operator tap-fatigue is
-observed").
+The full `skill_propose_publish` / `skill_propose_edit` /
+`skill_propose_remove` hostd verb suite. The reviewer passes
+(particularly security and operator UX) surfaced 8 must-fixes for
+that suite before it can ship safely:
+
+1. Per-opt-in vault-grant delta on approval card (security T6)
+2. Multi-file diff attachment flow (UX) + content-quoting for `scripts/*`
+3. Personal-skill writer symlink safety (security T3) — covered in PR-3
+4. Rationale typographic quarantine + 200-char cap (UX + security T5)
+5. Semantic lint pass for diff content (security T2)
+6. Per-agent rate-limit on propose verbs (security T8)
+7. `.trash/` claude-code-scan exclusion (security T4) — covered by PR-2
+8. Strict line-equality patcher for diffs (security)
+
+Plus the new finding from feasibility review: the "mirrors
+`config_propose_edit`" claim is structurally wrong — the existing
+framework is single-file-YAML-only. A real Phase 2 would need a new
+multi-file apply primitive, new approval-card multi-file payload
+shape, new audit-log entries. Net new code, not reuse.
+
+These are captured in [GH issue: deferred Phase 2 must-fixes]. When
+sufficient personal-skill usage data exists (60+ days post-PR-3) and
+operator tap-fatigue / Workflow 3 demand has been observed, that
+issue becomes a follow-up RFC. Until then: PR-1's CLI verb is the
+fallback for manual operator-driven shared-pool changes.
 
 ## 9. Open questions / unknowns
 
