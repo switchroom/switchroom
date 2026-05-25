@@ -8,6 +8,8 @@ import {
   errorResponse,
   IDEMPOTENCY_WINDOW_MS,
   MAX_FRAME_BYTES,
+  ErrorFixSchema,
+  ErrorEnvelopeSchema,
   type HostdRequest,
   type HostdResponse,
 } from "../../src/host-control/protocol.js";
@@ -154,5 +156,128 @@ describe("error_envelope — #1758 Phase 1 round-trip", () => {
     };
     const decoded = decodeResponse(encodeResponse(resp).trimEnd());
     expect(decoded).toEqual(resp);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// #1761 Phase 2: negative-path schema tests. The discriminator is the
+// integrity boundary for the unlock-card path — every garbage shape it
+// silently accepts becomes a load-bearing allowlist bypass for the
+// gateway-side renderer. Pin the rejections.
+// ─────────────────────────────────────────────────────────────────────
+
+describe("ErrorFixSchema — negative paths (#1761)", () => {
+  it("rejects an unknown fix.kind", () => {
+    const r = ErrorFixSchema.safeParse({ kind: "magic_unlock", token: "x" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects request_vault_grant without vault_key", () => {
+    const r = ErrorFixSchema.safeParse({ kind: "request_vault_grant" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects flip_yaml_flag without yaml_path", () => {
+    const r = ErrorFixSchema.safeParse({ kind: "flip_yaml_flag", to: true });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects operator_action with an unknown subkind", () => {
+    const r = ErrorFixSchema.safeParse({
+      kind: "operator_action",
+      subkind: "smells_bad",
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects operator_action with an empty operator_steps array", () => {
+    const r = ErrorFixSchema.safeParse({
+      kind: "operator_action",
+      subkind: "policy_denied",
+      operator_steps: [],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects quota_exceeded missing limit", () => {
+    const r = ErrorFixSchema.safeParse({
+      kind: "quota_exceeded",
+      quota: "cron-entries",
+      current: 1,
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects retry_after missing retry_at", () => {
+    const r = ErrorFixSchema.safeParse({ kind: "retry_after" });
+    expect(r.success).toBe(false);
+  });
+
+  it("accepts bad_input without field (field is optional)", () => {
+    const r = ErrorFixSchema.safeParse({ kind: "bad_input" });
+    expect(r.success).toBe(true);
+  });
+});
+
+describe("ErrorEnvelopeSchema — negative paths (#1761)", () => {
+  const base = {
+    v: 1 as const,
+    code: "E_OK",
+    human: "fine",
+    request_id: "r-1",
+  };
+
+  it("rejects a non-URL docs string", () => {
+    const r = ErrorEnvelopeSchema.safeParse({
+      ...base,
+      docs: "not-a-url-just-a-slug",
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("accepts a fully-qualified docs URL", () => {
+    const r = ErrorEnvelopeSchema.safeParse({
+      ...base,
+      docs: "https://switchroom.dev/docs/foo",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("rejects a lowercase code (e_lowercase)", () => {
+    const r = ErrorEnvelopeSchema.safeParse({ ...base, code: "e_lowercase" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a bare-word code without the E_ / VAULT- prefix", () => {
+    const r = ErrorEnvelopeSchema.safeParse({ ...base, code: "FOO" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects an empty human string", () => {
+    const r = ErrorEnvelopeSchema.safeParse({ ...base, human: "" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a missing request_id", () => {
+    const { request_id: _omit, ...rest } = base;
+    void _omit;
+    const r = ErrorEnvelopeSchema.safeParse(rest);
+    expect(r.success).toBe(false);
+  });
+
+  it("accepts the VAULT- prefix shape", () => {
+    const r = ErrorEnvelopeSchema.safeParse({
+      ...base,
+      code: "VAULT-BROKER-DENIED",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("rejects an envelope whose nested fix fails the discriminator", () => {
+    const r = ErrorEnvelopeSchema.safeParse({
+      ...base,
+      fix: { kind: "magic_unlock" },
+    });
+    expect(r.success).toBe(false);
   });
 });

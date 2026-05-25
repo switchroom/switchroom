@@ -130,6 +130,22 @@ describe("error-builder — wire shape", () => {
     expect(props.has_docs).toBe(true);
   });
 
+  it("docs() throws at author-time on a non-URL (#1761)", () => {
+    expect(() => err("E_FOO", "bar").docs("not-a-url")).toThrow(TypeError);
+    expect(() => err("E_FOO", "bar").docs("/relative/path")).toThrow(TypeError);
+    // sanity: a real URL passes
+    expect(() =>
+      err("E_FOO", "bar").docs("https://switchroom.dev/docs/foo"),
+    ).not.toThrow();
+  });
+
+  it("asDenied() flips result from 'error' to 'denied' (#1761)", () => {
+    const resp = err("E_CONFIG_EDIT_DISABLED", "off")
+      .asDenied()
+      .build("r", 0);
+    expect(resp.result).toBe("denied");
+  });
+
   it("operator_steps content stays out of PostHog", () => {
     err("E_FOO", "human")
       .fixOperatorAction("policy_denied", ["PII-STEP-1", "PII-STEP-2"])

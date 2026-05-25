@@ -139,7 +139,8 @@ describe("hostd config_propose_edit — PR 1a gates (still live)", () => {
     server = makeServer({});
     await server.start();
     const resp = await send({ unified_diff: TINY_DIFF, request_id: "cpe-1" });
-    expect(resp.result).toBe("error");
+    // #1761: policy denial, not server error.
+    expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/^E_CONFIG_EDIT_DISABLED/);
     // #1758 Phase 1: yaml-path hint moved from legacy `error` string
     // into `error_envelope.fix.yaml_path`.
@@ -155,7 +156,8 @@ describe("hostd config_propose_edit — PR 1a gates (still live)", () => {
     server = makeServer({ configEditEnabled: false });
     await server.start();
     const resp = await send({ unified_diff: TINY_DIFF, request_id: "cpe-2" });
-    expect(resp.result).toBe("error");
+    // #1761: policy denial, not server error.
+    expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/^E_CONFIG_EDIT_DISABLED/);
   });
 
@@ -248,6 +250,14 @@ describe("hostd config_propose_edit — PR 1b stage 2 (clean apply)", () => {
     const resp = await send({ unified_diff: bad, request_id: "s2-1" });
     expect(resp.result).toBe("error");
     expect(resp.error).toMatch(/^E_PATCH_APPLY_FAILED/);
+    // #1761: validation rejections now carry a structured envelope
+    // (fix.kind: "bad_input") so the agent can render a targeted fix
+    // hint instead of regexing the legacy string.
+    expect(resp.error_envelope?.code).toBe("E_PATCH_APPLY_FAILED");
+    expect(resp.error_envelope?.fix).toEqual({
+      kind: "bad_input",
+      field: "unified_diff",
+    });
   });
 });
 
@@ -399,6 +409,9 @@ describe("hostd config_propose_edit — PR 1b happy path (no approval gateway wi
     const resp = await send({ unified_diff: good, request_id: "happy-1" });
     expect(resp.result).toBe("error");
     expect(resp.error).toMatch(/^E_NO_APPROVAL_GATEWAY/);
+    // #1761: structured envelope hints operator wiring is missing.
+    expect(resp.error_envelope?.code).toBe("E_NO_APPROVAL_GATEWAY");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
   });
 });
 
@@ -465,8 +478,11 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     await server.start();
     const before = readFile(configPath, "utf8");
     const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ap-2" });
-    expect(resp.result).toBe("error");
+    // #1761: operator tap-deny is a policy denial, not server error.
+    expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/^E_DENIED/);
+    expect(resp.error_envelope?.code).toBe("E_DENIED");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
     expect(finalizeCalls.length).toBe(0); // gateway already showed 'denied'
     expect(reconcileInvocations).toBe(0);
     // Live file untouched.
@@ -488,8 +504,11 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     await server.start();
     const before = readFile(configPath, "utf8");
     const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ap-3" });
-    expect(resp.result).toBe("error");
+    // #1761: approval-card timeout is a policy denial path.
+    expect(resp.result).toBe("denied");
     expect(resp.error).toMatch(/^E_APPROVAL_TIMEOUT/);
+    expect(resp.error_envelope?.code).toBe("E_APPROVAL_TIMEOUT");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
     expect(reconcileInvocations).toBe(0);
     expect(readFile(configPath, "utf8")).toBe(before);
   });

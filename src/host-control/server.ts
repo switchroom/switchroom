@@ -41,7 +41,6 @@ import {
   decodeRequest,
   encodeResponse,
   deniedResponse,
-  errorResponse,
   IDEMPOTENCY_WINDOW_MS,
   MAX_FRAME_BYTES,
   type HostdRequest,
@@ -661,12 +660,23 @@ export class HostdServer {
           resp = await this.handleConfigProposeEdit(req, caller, started);
           break;
       }
-    } catch (err) {
-      resp = errorResponse(
-        req.request_id,
-        `hostd dispatch failed: ${(err as Error).message}`,
-        Date.now() - started,
-      );
+    } catch (e) {
+      // #1761: top-level dispatch failure — no fix.kind applies
+      // (genuine server fault). Envelope still carries the code so
+      // agents can branch on `error_envelope.code` instead of regex.
+      const msg = (e as Error).message;
+      resp = err(
+        "E_DISPATCH_FAILED",
+        "hostd dispatch failed",
+      )
+        .why(msg)
+        .op(req.op)
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .build(req.request_id, Date.now() - started);
+      // Preserve the legacy error string for back-compat with existing
+      // string-matching decoders.
+      resp = { ...resp, error: `hostd dispatch failed: ${msg}` };
     }
     await this.writeAudit({ caller, req, resp });
     socket.write(encodeResponse(resp));
@@ -1246,6 +1256,9 @@ export class HostdServer {
   ): Promise<HostdResponse> {
     const enabled = this.opts.config.hostd?.config_edit_enabled === true;
     if (!enabled) {
+      // #1761: policy denial (feature flag off), not a server error.
+      // Flip to `denied` so callers branching on `result` see the
+      // right classification.
       return err("E_CONFIG_EDIT_DISABLED", "config_propose_edit is disabled")
         .why("operator opt-in per RFC §3.3")
         .fixFlipFlag("hostd.config_edit_enabled", true)
@@ -1253,6 +1266,7 @@ export class HostdServer {
         .op("config_propose_edit")
         .caller(caller.kind === "agent" ? "agent" : "operator")
         .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .asDenied()
         .build(req.request_id, Date.now() - started);
     }
     const configPath =
@@ -1263,21 +1277,30 @@ export class HostdServer {
       unifiedDiff: req.args.unified_diff,
     });
     if (!verdict.ok) {
-      return errorResponse(
-        req.request_id,
-        `${verdict.code}: ${verdict.detail}`,
-        Date.now() - started,
-      );
+      // #1761: surface a structured envelope so the agent can render a
+      // targeted fix hint (the unified_diff is the only author-input).
+      return err(verdict.code, verdict.detail)
+        .fixBadInput("unified_diff")
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .build(req.request_id, Date.now() - started);
     }
     // ── Approval card ───────────────────────────────────────────────
     if (!this.opts.approvalGateway) {
-      return errorResponse(
-        req.request_id,
-        "E_NO_APPROVAL_GATEWAY: validation passed but hostd was " +
-          "started without an approval-gateway wiring; the operator " +
-          "build is missing the telegram-plugin link",
-        Date.now() - started,
-      );
+      // #1761: missing approval-gateway wiring is an operator/infra
+      // configuration gap — the agent cannot self-recover.
+      return err(
+        "E_NO_APPROVAL_GATEWAY",
+        "validation passed but hostd was started without an approval-gateway wiring; the operator build is missing the telegram-plugin link",
+      )
+        .fixOperatorAction("infra", [
+          "ensure hostd was launched with --approval-gateway / telegram-plugin link",
+        ])
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .build(req.request_id, Date.now() - started);
     }
     const callerName = caller.kind === "agent" ? caller.name : "operator";
     const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
@@ -1293,18 +1316,50 @@ export class HostdServer {
       // dispatch failure (card never reached the operator). Without
       // this, a Telegram sendMessage 400 surfaces as a misleading
       // "operator denied" — see ref #1758 structured-error work.
-      return errorResponse(
-        req.request_id,
-        formatConfigApprovalDenyError(approval, approvalId),
-        Date.now() - started,
-      );
+      // #1761: tap-deny is a POLICY DENIAL (result: "denied").
+      // Dispatch-failure is INFRA (result: "error").
+      const legacy = formatConfigApprovalDenyError(approval, approvalId);
+      const isDispatchFailure = approval.denySource === "dispatch_failure";
+      const code = isDispatchFailure
+        ? "E_APPROVAL_DISPATCH_FAILED"
+        : "E_DENIED";
+      const human = isDispatchFailure
+        ? "approval card dispatch failed before the operator could see it"
+        : "operator denied config_propose_edit";
+      const b = err(code, human)
+        .why(legacy)
+        .fixOperatorAction(
+          isDispatchFailure ? "infra" : "policy_denied",
+          isDispatchFailure
+            ? ["check telegram-plugin gateway connectivity"]
+            : undefined,
+        )
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined);
+      if (!isDispatchFailure) b.asDenied();
+      const built = b.build(req.request_id, Date.now() - started);
+      // Preserve the verbatim legacy `error` string (tests + existing
+      // string-matching decoders depend on the exact format from
+      // `formatConfigApprovalDenyError`).
+      return { ...built, error: legacy };
     }
     if (approval.verdict === "timeout") {
-      return errorResponse(
-        req.request_id,
-        `E_APPROVAL_TIMEOUT: operator approval card expired without a tap (approval_id=${approvalId})`,
-        Date.now() - started,
-      );
+      // #1761: timeout is a policy-path denial (operator never acted),
+      // not a server failure.
+      const legacy = `E_APPROVAL_TIMEOUT: operator approval card expired without a tap (approval_id=${approvalId})`;
+      const built = err(
+        "E_APPROVAL_TIMEOUT",
+        "operator approval card expired without a tap",
+      )
+        .why(`approval_id=${approvalId}`)
+        .fixOperatorAction("policy_denied")
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .asDenied()
+        .build(req.request_id, Date.now() - started);
+      return { ...built, error: legacy };
     }
     // ── Apply path (mutex-serialized) ───────────────────────────────
     // Serialize concurrent config-edit applies through a single
@@ -1318,15 +1373,17 @@ export class HostdServer {
       let snapshot: string;
       try {
         snapshot = readFileSync(configPath, "utf-8");
-      } catch (err) {
+      } catch (e) {
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
-          detail: `pre-write snapshot read failed: ${(err as Error).message}`,
+          detail: `pre-write snapshot read failed: ${(e as Error).message}`,
         });
-        return errorResponse(
-          req.request_id,
-          `E_RECONCILE_FAILED_ROLLED_BACK: snapshot read failed: ${(err as Error).message}`,
-          Date.now() - started,
+        // #1761: real infrastructure failure during rollback path.
+        return this.reconcileFailedRolledBack(
+          `snapshot read failed: ${(e as Error).message}`,
+          req,
+          caller,
+          started,
         );
       }
       const postApply = verdict.postApplyContent;
@@ -1335,18 +1392,19 @@ export class HostdServer {
       try {
         writeFileSync(tmp, postApply);
         renameSync(tmp, configPath);
-      } catch (err) {
+      } catch (e) {
         // Pre-write or rename failed — try to clean up tmp; live
         // file is untouched so no rollback needed.
         unlinkSyncBestEffort(tmp);
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
-          detail: `atomic write failed: ${(err as Error).message}`,
+          detail: `atomic write failed: ${(e as Error).message}`,
         });
-        return errorResponse(
-          req.request_id,
-          `E_RECONCILE_FAILED_ROLLED_BACK: write failed: ${(err as Error).message}`,
-          Date.now() - started,
+        return this.reconcileFailedRolledBack(
+          `write failed: ${(e as Error).message}`,
+          req,
+          caller,
+          started,
         );
       }
       // Reconcile.
@@ -1371,16 +1429,17 @@ export class HostdServer {
       try {
         writeFileSync(tmp, snapshot);
         renameSync(tmp, configPath);
-      } catch (err) {
-        rollbackDetail = `snapshot restore failed: ${(err as Error).message}`;
+      } catch (e) {
+        rollbackDetail = `snapshot restore failed: ${(e as Error).message}`;
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
           detail: rollbackDetail,
         });
-        return errorResponse(
-          req.request_id,
-          `E_RECONCILE_FAILED_ROLLED_BACK: ${rollbackDetail}`,
-          Date.now() - started,
+        return this.reconcileFailedRolledBack(
+          rollbackDetail,
+          req,
+          caller,
+          started,
         );
       }
       const recRes2 = await runner({ requestId: approvalId });
@@ -1392,14 +1451,45 @@ export class HostdServer {
         outcome: "reconcile_failed_rolled_back",
         detail: recoveryNote,
       });
-      return errorResponse(
-        req.request_id,
-        `E_RECONCILE_FAILED_ROLLED_BACK: reconcile exit ${recRes.exit_code}; ${recoveryNote}`,
-        Date.now() - started,
+      return this.reconcileFailedRolledBack(
+        `reconcile exit ${recRes.exit_code}; ${recoveryNote}`,
+        req,
+        caller,
+        started,
       );
     } finally {
       release();
     }
+  }
+
+  /**
+   * #1761: shared helper for the five sites that bail out of
+   * `handleConfigProposeEdit` with `E_RECONCILE_FAILED_ROLLED_BACK`.
+   * Carries a structured `operator_action`/`infra` envelope (the
+   * agent can't self-recover from a write/reconcile failure) while
+   * preserving the verbatim legacy `error` string so audit-reader /
+   * existing string-match decoders see no regression.
+   */
+  private reconcileFailedRolledBack(
+    detail: string,
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): HostdResponse {
+    const legacy = `E_RECONCILE_FAILED_ROLLED_BACK: ${detail}`;
+    const built = err(
+      "E_RECONCILE_FAILED_ROLLED_BACK",
+      "config write or reconcile failed; live file rolled back to snapshot",
+    )
+      .why(detail)
+      .fixOperatorAction("infra", [
+        "inspect hostd logs + switchroom apply output to identify the underlying failure",
+      ])
+      .op("config_propose_edit")
+      .caller(caller.kind === "agent" ? "agent" : "operator")
+      .agentName(caller.kind === "agent" ? caller.name : undefined)
+      .build(req.request_id, Date.now() - started);
+    return { ...built, error: legacy };
   }
 
   /** Serializes concurrent config_propose_edit apply phases. */
@@ -1683,11 +1773,12 @@ export class HostdServer {
     // checkGate already rejected unknown / cross-agent cases above.
     // If we got here `entry` must exist.
     if (!entry) {
-      return errorResponse(
-        req.request_id,
-        `get_status: internal: entry missing despite gate accept`,
-        Date.now() - started,
-      );
+      // #1761: internal invariant violation — no fix.kind applies.
+      const legacy = `get_status: internal: entry missing despite gate accept`;
+      const built = err("E_INTERNAL", "entry missing despite gate accept")
+        .op("get_status")
+        .build(req.request_id, Date.now() - started);
+      return { ...built, error: legacy };
     }
     return this.statusEntryToResponse(req.request_id, entry);
   }
