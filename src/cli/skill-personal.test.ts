@@ -768,3 +768,102 @@ describe("config-repo mirror (versioned personal skills)", () => {
     }
   });
 });
+
+describe("clone-to-personal skips non-allowlisted source files (#1847)", () => {
+  let agentsRoot: string;
+  let sharedRoot: string;
+
+  beforeEach(() => {
+    agentsRoot = tmpAgentsRoot();
+    sharedRoot = mkdtempSync(join(tmpdir(), "clone-skip-shared-"));
+  });
+
+  afterEach(() => {
+    try { rmSync(agentsRoot, { recursive: true, force: true }); } catch { /**/ }
+    try { rmSync(sharedRoot, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("clones a source dir with LICENSE/VENDORED.md/non-allowlisted extras, dropping them", () => {
+    const src = join(sharedRoot, "vendored");
+    mkdirSync(join(src, "scripts"), { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("vendored"));
+    writeFileSync(join(src, "LICENSE"), "MIT License\n");
+    writeFileSync(join(src, "VENDORED.md"), "vendored from upstream\n");
+    writeFileSync(join(src, "reference.md"), "ad-hoc reference doc\n"); // not allowlisted at root
+    writeFileSync(join(src, "scripts/run.sh"), "#!/bin/bash\necho ok\n");
+
+    const origStderr = process.stderr.write.bind(process.stderr);
+    let stderrText = "";
+    process.stderr.write = ((c: unknown) => {
+      stderrText += typeof c === "string" ? c : (c as Buffer).toString("utf-8");
+      return true;
+    }) as typeof process.stderr.write;
+
+    let stdout = "";
+    try {
+      stdout = captureStdout(() => {
+        clonePersonalAction("shared:vendored", {
+          agent: AGENT,
+          root: agentsRoot,
+          sharedRoot,
+        });
+      });
+    } finally {
+      process.stderr.write = origStderr;
+    }
+
+    // SKILL.md + scripts/run.sh land; the rest do NOT.
+    const dest = join(agentsRoot, AGENT, ".claude/skills/personal-vendored");
+    expect(existsSync(join(dest, "SKILL.md"))).toBe(true);
+    expect(existsSync(join(dest, "scripts/run.sh"))).toBe(true);
+    expect(existsSync(join(dest, "LICENSE"))).toBe(false);
+    expect(existsSync(join(dest, "VENDORED.md"))).toBe(false);
+    expect(existsSync(join(dest, "reference.md"))).toBe(false);
+
+    // Stderr notes the skip + names the offenders.
+    expect(stderrText).toMatch(/skipped 3 non-allowlisted/);
+    expect(stderrText).toMatch(/LICENSE/);
+    expect(stderrText).toMatch(/VENDORED\.md/);
+
+    // JSON success surface lists them.
+    const parsed = JSON.parse(stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.action).toBe("clone_to_personal");
+    expect(parsed.files).toBe(2); // SKILL.md + scripts/run.sh
+    expect(parsed.skipped).toHaveLength(3);
+    expect(parsed.skipped).toEqual(
+      expect.arrayContaining(["LICENSE", "VENDORED.md", "reference.md"]),
+    );
+  });
+
+  it("emits skipped:[] (empty) when source is shape-clean — distinguishable from silent drop", () => {
+    const src = join(sharedRoot, "clean");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), validSkillMd("clean"));
+
+    const out = captureStdout(() => {
+      clonePersonalAction("shared:clean", {
+        agent: AGENT,
+        root: agentsRoot,
+        sharedRoot,
+      });
+    });
+    const parsed = JSON.parse(out);
+    expect(parsed.skipped).toEqual([]);
+  });
+
+  it("still refuses if SKILL.md itself is missing (even after skipping extras)", () => {
+    const src = join(sharedRoot, "no-md");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "LICENSE"), "MIT\n");
+    writeFileSync(join(src, "README"), "no skill here\n"); // README (no .md) is not allowlisted
+
+    expectExitCode(() => {
+      clonePersonalAction("shared:no-md", {
+        agent: AGENT,
+        root: agentsRoot,
+        sharedRoot,
+      });
+    }, 2);
+  });
+});

@@ -56,6 +56,7 @@ import {
   SH_SCRIPT_RE,
   SKILL_SLUG_RE,
   type SkillFileMap,
+  validateRelPath,
   validateSkillBundle,
 } from "./skill-common.js";
 import { withConfigError } from "./helpers.js";
@@ -702,8 +703,16 @@ function resolveCloneSource(
  * declining to read them upfront avoids OOM on a pathological source.
  */
 const CLONE_MAX_FILE_BYTES = 1024 * 1024;
-function readSourceFiles(dir: string): SkillFileMap {
+
+interface CloneReadResult {
+  files: SkillFileMap;
+  /** Paths that existed in the source but didn't pass the allowlist. */
+  skipped: string[];
+}
+
+function readSourceFiles(dir: string): CloneReadResult {
   const files: SkillFileMap = {};
+  const skipped: string[] = [];
   const walk = (sub: string): void => {
     for (const ent of readdirSync(sub, { withFileTypes: true })) {
       const full = join(sub, ent.name);
@@ -718,6 +727,17 @@ function readSourceFiles(dir: string): SkillFileMap {
       }
       if (ent.isFile()) {
         const rel = relative(dir, full).replace(/\\/g, "/");
+        // Allowlist gate (closes #1847): bundled skills ship with
+        // operator-relevant files at root (LICENSE, VENDORED.md,
+        // reference.md, scripts/requirements.txt, etc.) that aren't
+        // in the agent-authored-skill path allowlist. Skipping them
+        // here keeps the personal fork shape-clean and the publish-
+        // side validator strict — the agent never sees these files
+        // in their workspace, which is correct.
+        if (!validateRelPath(rel)) {
+          skipped.push(rel);
+          continue;
+        }
         // Pre-flight size check via lstat (no need to open).
         try {
           const st = lstatSync(full);
@@ -736,7 +756,7 @@ function readSourceFiles(dir: string): SkillFileMap {
     }
   };
   walk(dir);
-  return files;
+  return { files, skipped };
 }
 
 /**
@@ -773,12 +793,23 @@ export function clonePersonalAction(source: string, opts: CloneOpts): void {
   // Read source files, rewrite SKILL.md name to match the new slug so
   // the personal-tier validator (which enforces name == slug) accepts
   // the bundle.
-  const files = readSourceFiles(src.dir);
+  const { files, skipped } = readSourceFiles(src.dir);
   if (!files["SKILL.md"]) {
     fail(`source ${JSON.stringify(source)} has no SKILL.md at ${src.dir}`);
   }
   if (newName !== src.slug) {
     files["SKILL.md"] = rewriteSkillMdName(files["SKILL.md"]!, newName);
+  }
+
+  // Surface skipped paths to the operator/agent on stderr so the fork
+  // is honest about what landed (LICENSE, VENDORED.md, README, etc.
+  // — see #1847). Single line, not per-file noise.
+  if (skipped.length > 0) {
+    process.stderr.write(
+      chalk.yellow(
+        `note: skipped ${skipped.length} non-allowlisted path${skipped.length === 1 ? "" : "s"} from source: ${skipped.join(", ")}\n`,
+      ),
+    );
   }
 
   // Same validate+write pipeline as init_personal: ensureNew=true so a
@@ -798,6 +829,10 @@ export function clonePersonalAction(source: string, opts: CloneOpts): void {
       name: newName,
       path: skillDir,
       files: Object.keys(files).length,
+      // Empty array when nothing was skipped — explicit so MCP callers
+      // can distinguish "shape-clean source" from "we silently dropped
+      // something you might care about".
+      skipped,
     }),
   );
   appendAudit(
@@ -809,6 +844,7 @@ export function clonePersonalAction(source: string, opts: CloneOpts): void {
       source_slug: src.slug,
       name: newName,
       files: Object.keys(files).length,
+      skipped_count: skipped.length,
     },
     0,
   );
