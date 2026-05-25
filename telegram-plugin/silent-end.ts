@@ -56,8 +56,18 @@ export interface SilentEndDeps {
  * gives up. MUST stay in sync with `MAX_RETRIES` in the Stop hook
  * (`telegram-plugin/hooks/silent-end-interrupt-stop.mjs`) — the hook is a
  * standalone `.mjs` and can't import this module.
+ *
+ * 2026-05-25 bump from 1 → 2. With the original budget of 1, a model
+ * that stubbornly emitted `type:"text"` + `stop_reason:"end_turn"` twice
+ * in a row (instead of calling the reply tool) fell through to the
+ * gateway's 5-minute silence-poke framework-fallback. Second-retry
+ * cases now get a chance before the user-visible nudge fires. Memory:
+ * the Stop hook prompt itself is explicit ("only text sent through the
+ * reply tool is delivered. Send your final answer now"), so a second
+ * nudge isn't redundant — it's giving a different sample from the
+ * model under the same prompt.
  */
-export const SILENT_END_MAX_RETRIES = 1
+export const SILENT_END_MAX_RETRIES = 2
 
 function resolveStateDir(deps?: SilentEndDeps): string {
   if (deps?.stateDir != null) return deps.stateDir

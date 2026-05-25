@@ -62,7 +62,8 @@ import { scanTurnForFinalReply } from './silent-end-scan.mjs'
 
 // MUST stay in sync with SILENT_END_MAX_RETRIES in telegram-plugin/silent-end.ts
 // (this hook is a standalone .mjs and can't import the TS module).
-const MAX_RETRIES = 1
+// Bumped 1 → 2 on 2026-05-25 — see the matching doc-comment in silent-end.ts.
+const MAX_RETRIES = 2
 
 function readStdin() {
   try {

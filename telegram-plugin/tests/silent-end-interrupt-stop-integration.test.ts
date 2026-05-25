@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import { SILENT_END_MAX_RETRIES } from '../silent-end.js'
 import {
   mkdtempSync,
   mkdirSync,
@@ -172,7 +173,10 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
       reply('ack', { disable_notification: true }),
     ])
     const statePath = join(stateDir, 'silent-end-pending.json')
-    writeFileSync(statePath, JSON.stringify({ retryCount: 1, chatId: '111' }), 'utf8')
+    // Use the canonical ceiling so this test stays accurate as MAX_RETRIES evolves.
+    writeFileSync(statePath, JSON.stringify({
+      retryCount: SILENT_END_MAX_RETRIES, chatId: '111',
+    }), 'utf8')
 
     const r = runHook({
       event: { session_id: 's1', transcript_path: transcript },
@@ -183,7 +187,7 @@ describe('silent-end-interrupt-stop.mjs — integration', () => {
     expect(r.stderr).toMatch(/retry exhausted/)
     // State unchanged.
     const state = JSON.parse(readFileSync(statePath, 'utf8'))
-    expect(state.retryCount).toBe(1)
+    expect(state.retryCount).toBe(SILENT_END_MAX_RETRIES)
   })
 
   it('NO_REPLY in transcript → allow stop, no state file written', () => {
