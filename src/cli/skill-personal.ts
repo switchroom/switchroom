@@ -74,6 +74,108 @@ const TRASH_DIRNAME = "skills-trash";
 /** Recovery window: trash entries older than this get swept. */
 const TRASH_TTL_MS = 24 * 60 * 60 * 1000;
 
+// ─── Config-repo mirror (versioned personal skills) ──────────────────
+
+/**
+ * Personal skills are *runtime state* at
+ * `<agentDir>/.claude/skills/personal-<name>/` so claude-code's
+ * depth-1 discovery finds them without a custom mount. Runtime state
+ * survives container recreate (the agent dir is bind-mounted) but is
+ * NOT git-tracked — a host rebuild loses every agent's personal-skill
+ * workspace.
+ *
+ * The fix: after every successful personal-skill write, opportunistically
+ * mirror the dir into
+ * `~/.switchroom-config/agents/<agent>/personal-skills/<name>/`
+ * if the operator has the config repo set up. Mirror is best-effort:
+ *
+ *   - If `~/.switchroom-config/` doesn't exist, skip silently (operator
+ *     hasn't opted in to the versioned-skill pattern).
+ *   - If mirroring fails (EACCES, ENOSPC, etc.), warn on stderr and
+ *     continue. The live copy still works; just not version-controlled
+ *     until the next successful sync.
+ *   - No auto-commit. Operator decides commit cadence (`cd
+ *     ~/.switchroom-config && git status` shows the changes).
+ *
+ * Override `SWITCHROOM_CONFIG_DIR` to point at an alternate config repo
+ * (e.g. Lisa's `~lisa/.switchroom-config/` for her fleet, or a tmpdir
+ * in tests).
+ */
+const PERSONAL_SKILLS_SUBPATH = "personal-skills";
+
+function resolveConfigSkillsDir(agent: string): string | null {
+  const override = process.env.SWITCHROOM_CONFIG_DIR;
+  const candidate = override
+    ? resolve(override)
+    : join(homedir(), ".switchroom-config");
+  if (!existsSync(candidate)) return null;
+  return join(candidate, "agents", agent, PERSONAL_SKILLS_SUBPATH);
+}
+
+/**
+ * Mirror a successfully-written personal-skill dir into the operator's
+ * config repo, if one exists. Best-effort: errors logged to stderr and
+ * swallowed so a broken config-repo path never blocks a live write.
+ *
+ * Pass `liveSkillDir = null` to mirror a REMOVAL — the existing mirror
+ * (if any) is moved to a `.<name>-trash-<ts>` sibling so a stray
+ * `git status` still shows the deletion.
+ */
+function mirrorToConfigRepo(
+  agent: string,
+  name: string,
+  liveSkillDir: string | null,
+): void {
+  const configSkillsRoot = resolveConfigSkillsDir(agent);
+  if (!configSkillsRoot) return; // operator hasn't opted in
+  const dest = join(configSkillsRoot, name);
+
+  try {
+    if (liveSkillDir === null) {
+      if (existsSync(dest)) {
+        const trash = join(
+          configSkillsRoot,
+          `.${name}-trash-${Date.now()}`,
+        );
+        renameSync(dest, trash);
+      }
+      return;
+    }
+
+    mkdirSync(configSkillsRoot, { recursive: true, mode: 0o755 });
+    // Atomic-ish: stage under a sibling, swap, remove old.
+    const staging = mkdtempSync(join(configSkillsRoot, `.${name}-staging-`));
+    const walk = (src: string, dst: string): void => {
+      mkdirSync(dst, { recursive: true, mode: 0o755 });
+      for (const ent of readdirSync(src, { withFileTypes: true })) {
+        const s = join(src, ent.name);
+        const d = join(dst, ent.name);
+        if (ent.isSymbolicLink()) continue; // skip — same defense as readSourceFiles
+        if (ent.isDirectory()) walk(s, d);
+        else if (ent.isFile()) {
+          writeFileSync(d, readFileSync(s));
+        }
+      }
+    };
+    walk(liveSkillDir, staging);
+
+    if (existsSync(dest)) {
+      const prior = join(configSkillsRoot, `.${name}-prior-${Date.now()}`);
+      renameSync(dest, prior);
+      // Leave .<name>-prior-<ts> for git diff visibility; operator
+      // commits when ready and can rm the .prior- sibling.
+    }
+    renameSync(staging, dest);
+  } catch (err) {
+    process.stderr.write(
+      chalk.yellow(
+        `warning: mirror to ${dest} failed (${(err as Error).message ?? err}); ` +
+          `live copy still works, but this skill is not version-controlled until next successful sync.\n`,
+      ),
+    );
+  }
+}
+
 // ─── Types ─────────────────────────────────────────────────────────
 
 interface AgentOpts {
@@ -446,13 +548,15 @@ export function initPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ true);
+  const skillDir = personalSkillDir(agentsRoot, agent, name);
+  mirrorToConfigRepo(agent, name, skillDir);
   console.log(
     JSON.stringify({
       ok: true,
       action: "init",
       agent,
       name,
-      path: personalSkillDir(agentsRoot, agent, name),
+      path: skillDir,
       files: Object.keys(files).length,
     }),
   );
@@ -466,13 +570,15 @@ export function editPersonalAction(name: string, opts: InitEditOpts): void {
   const agentsRoot = resolveAgentsRoot(opts);
   const files = loadFiles(opts);
   loadValidateWrite(agentsRoot, agent, name, files, /*ensureNew=*/ false);
+  const skillDir = personalSkillDir(agentsRoot, agent, name);
+  mirrorToConfigRepo(agent, name, skillDir);
   console.log(
     JSON.stringify({
       ok: true,
       action: "edit",
       agent,
       name,
-      path: personalSkillDir(agentsRoot, agent, name),
+      path: skillDir,
       files: Object.keys(files).length,
     }),
   );
@@ -631,6 +737,8 @@ export function clonePersonalAction(source: string, opts: CloneOpts): void {
   // Same validate+write pipeline as init_personal: ensureNew=true so a
   // pre-existing personal copy isn't silently clobbered.
   loadValidateWrite(agentsRoot, agent, newName, files, /*ensureNew=*/ true);
+  const skillDir = personalSkillDir(agentsRoot, agent, newName);
+  mirrorToConfigRepo(agent, newName, skillDir);
 
   console.log(
     JSON.stringify({
@@ -641,7 +749,7 @@ export function clonePersonalAction(source: string, opts: CloneOpts): void {
       source_tier: src.tier,
       source_slug: src.slug,
       name: newName,
-      path: personalSkillDir(agentsRoot, agent, newName),
+      path: skillDir,
       files: Object.keys(files).length,
     }),
   );
@@ -695,6 +803,8 @@ export function removePersonalAction(name: string, opts: RemoveOpts): void {
   const now = new Date(ts);
   utimesSync(trashTarget, now, now);
 
+  // Mirror the removal into the config repo (null signals delete).
+  mirrorToConfigRepo(agent, name, null);
   console.log(
     JSON.stringify({
       ok: true,

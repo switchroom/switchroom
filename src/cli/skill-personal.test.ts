@@ -533,3 +533,147 @@ describe("clonePersonalAction (fork shared/bundled into personal)", () => {
     }, 2);
   });
 });
+
+describe("config-repo mirror (versioned personal skills)", () => {
+  let agentsRoot: string;
+  let configDir: string;
+  const ENV = "SWITCHROOM_CONFIG_DIR";
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    agentsRoot = tmpAgentsRoot();
+    configDir = mkdtempSync(join(tmpdir(), "skill-config-"));
+    savedEnv = process.env[ENV];
+    process.env[ENV] = configDir;
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV];
+    else process.env[ENV] = savedEnv;
+    try { rmSync(agentsRoot, { recursive: true, force: true }); } catch { /**/ }
+    try { rmSync(configDir, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("init mirrors the new skill into ~/.switchroom-config/agents/<agent>/personal-skills/<name>/", () => {
+    const skillFile = join(agentsRoot, "input.md");
+    writeFileSync(skillFile, validSkillMd("mirrored"));
+    captureStdout(() => {
+      initPersonalAction("mirrored", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+
+    const mirror = join(configDir, "agents", AGENT, "personal-skills", "mirrored");
+    expect(existsSync(mirror)).toBe(true);
+    expect(existsSync(join(mirror, "SKILL.md"))).toBe(true);
+    expect(readFileSync(join(mirror, "SKILL.md"), "utf-8")).toContain("name: mirrored");
+
+    // Live copy also exists (mirror is additive, not redirect).
+    expect(existsSync(join(agentsRoot, AGENT, ".claude/skills/personal-mirrored/SKILL.md"))).toBe(true);
+  });
+
+  it("edit re-mirrors with updated content", () => {
+    const skillFile = join(agentsRoot, "input.md");
+    writeFileSync(skillFile, validSkillMd("edited", "v1"));
+    captureStdout(() => {
+      initPersonalAction("edited", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+
+    // Update content + edit.
+    writeFileSync(skillFile, validSkillMd("edited", "v2-updated"));
+    captureStdout(() => {
+      editPersonalAction("edited", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+
+    const mirror = join(configDir, "agents", AGENT, "personal-skills", "edited/SKILL.md");
+    expect(readFileSync(mirror, "utf-8")).toContain("v2-updated");
+  });
+
+  it("remove moves the mirror to .<name>-trash-<ts>/ sibling for git-visible deletion", () => {
+    const skillFile = join(agentsRoot, "input.md");
+    writeFileSync(skillFile, validSkillMd("doomed"));
+    captureStdout(() => {
+      initPersonalAction("doomed", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+    const mirrorDir = join(configDir, "agents", AGENT, "personal-skills", "doomed");
+    expect(existsSync(mirrorDir)).toBe(true);
+
+    captureStdout(() => {
+      removePersonalAction("doomed", { agent: AGENT, root: agentsRoot });
+    });
+
+    expect(existsSync(mirrorDir)).toBe(false);
+    // A .doomed-trash-<ts>/ sibling appears.
+    const siblings = readdirSync(join(configDir, "agents", AGENT, "personal-skills"));
+    expect(siblings.some((s: string) => /^\.doomed-trash-\d+$/.test(s))).toBe(true);
+  });
+
+  it("silent skip when the config repo doesn't exist (operator hasn't opted in)", () => {
+    delete process.env[ENV]; // override removed; falls back to ~/.switchroom-config which we won't create
+    const realHomeDir = join(tmpdir(), "no-config-repo-test-fakehome");
+    mkdirSync(realHomeDir, { recursive: true });
+
+    const skillFile = join(agentsRoot, "input.md");
+    writeFileSync(skillFile, validSkillMd("opted-out"));
+
+    // Should succeed without writing anywhere outside agentsRoot.
+    captureStdout(() => {
+      initPersonalAction("opted-out", { agent: AGENT, from: skillFile, root: agentsRoot });
+    });
+
+    // Live copy is fine.
+    expect(existsSync(join(agentsRoot, AGENT, ".claude/skills/personal-opted-out/SKILL.md"))).toBe(true);
+
+    try { rmSync(realHomeDir, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  it("clone-to-personal mirrors the cloned fork", () => {
+    const sharedRoot = mkdtempSync(join(tmpdir(), "clone-shared-mirror-"));
+    try {
+      const src = join(sharedRoot, "calendar");
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, "SKILL.md"), validSkillMd("calendar"));
+
+      captureStdout(() => {
+        clonePersonalAction("shared:calendar", {
+          agent: AGENT,
+          root: agentsRoot,
+          sharedRoot,
+        });
+      });
+
+      const mirror = join(configDir, "agents", AGENT, "personal-skills", "calendar/SKILL.md");
+      expect(existsSync(mirror)).toBe(true);
+    } finally {
+      try { rmSync(sharedRoot, { recursive: true, force: true }); } catch { /**/ }
+    }
+  });
+
+  it("mirror failure (read-only config dir) does NOT block the live write", () => {
+    // Make the config dir effectively unwritable by pointing the override
+    // at a non-dir (a regular file). The mirror try/catch should swallow.
+    const blockFile = join(tmpdir(), `block-${Date.now()}`);
+    writeFileSync(blockFile, "i am not a dir");
+    process.env[ENV] = blockFile;
+
+    const origStderr = process.stderr.write.bind(process.stderr);
+    let stderrText = "";
+    process.stderr.write = ((c: unknown) => {
+      stderrText += typeof c === "string" ? c : (c as Buffer).toString("utf-8");
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const skillFile = join(agentsRoot, "input.md");
+      writeFileSync(skillFile, validSkillMd("survives"));
+      captureStdout(() => {
+        initPersonalAction("survives", { agent: AGENT, from: skillFile, root: agentsRoot });
+      });
+      // Live copy lands fine.
+      expect(existsSync(join(agentsRoot, AGENT, ".claude/skills/personal-survives/SKILL.md"))).toBe(true);
+      // Warning printed.
+      expect(stderrText).toMatch(/mirror.*failed/);
+    } finally {
+      process.stderr.write = origStderr;
+      try { rmSync(blockFile, { force: true }); } catch { /**/ }
+    }
+  });
+});
