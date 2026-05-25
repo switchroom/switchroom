@@ -3074,236 +3074,96 @@ describe("phase-6b bug fixes", () => {
   });
 });
 
-describe("scheduled task cron script generation", () => {
+describe("scheduled task: cron-*.sh retirement (Phase 4 cron-fold-in)", () => {
+  // Pre-Phase-4 each schedule entry got a self-contained bash script that
+  // wrapped `claude -p`. Phase 4 (#890-#893) moved cron firing into the
+  // in-container agent-scheduler → inject_inbound IPC → live session, and
+  // the per-agent .sh scripts became dead weight (and a parasitic-bridge
+  // hazard — #1613/#1616). These tests pin the post-retirement contract:
+  //   - scaffold writes NO cron-*.sh / .source files even when schedule[] is set
+  //   - reconcile DELETES stale cron-*.sh / .source files left from prior installs
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-cron-"));
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-cron-retired-"));
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("generates cron-N.sh scripts for each schedule entry", () => {
+  it("scaffoldAgent writes no cron-*.sh files even with schedule entries", () => {
     const agentConfig = makeAgentConfig({
       schedule: [
         { cron: "0 8 * * *", prompt: "Morning briefing" },
         { cron: "0 20 * * 0", prompt: "Weekly review" },
       ],
     });
-    const result = scaffoldAgent(
-      "cron-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
+    const result = scaffoldAgent("cron-agent", agentConfig, tmpDir, telegramConfig);
 
     const script0 = join(result.agentDir, "telegram", cronScriptFilename("0 8 * * *", "Morning briefing"));
     const script1 = join(result.agentDir, "telegram", cronScriptFilename("0 20 * * 0", "Weekly review"));
-    expect(existsSync(script0)).toBe(true);
-    expect(existsSync(script1)).toBe(true);
+    expect(existsSync(script0)).toBe(false);
+    expect(existsSync(script1)).toBe(false);
 
-    const content = readFileSync(script0, "utf-8");
-    expect(content).toContain("claude -p");
-    expect(content).toContain("Morning briefing");
-    expect(content).toContain("--model");
-    expect(content).toContain("claude-sonnet-4-6"); // default model
-    expect(content).toContain("--no-session-persistence");
+    // Defense-in-depth: no .source sidecars either
+    const stem0 = cronUnitName("0 8 * * *", "Morning briefing");
+    expect(existsSync(join(result.agentDir, "telegram", `${stem0}.source`))).toBe(false);
   });
 
-  it("uses the configured model when specified", () => {
+  it("reconcileAgentDir deletes stale cron-*.sh + .source from prior installs", () => {
     const agentConfig = makeAgentConfig({
-      schedule: [
-        { cron: "0 9 * * *", prompt: "Important analysis", model: "claude-opus-4-7" },
-      ],
-    });
-    const result = scaffoldAgent(
-      "model-cron",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-
-    const content = readFileSync(
-      join(result.agentDir, "telegram", cronScriptFilename("0 9 * * *", "Important analysis")),
-      "utf-8",
-    );
-    expect(content).toContain("claude-opus-4-7");
-    expect(content).not.toContain("claude-sonnet-4-6");
-  });
-
-  // Issue #269: all cron scripts now use the MCP-only delivery path.
-  // The model is guided via applyCronTelegramGuidance to call the reply tool
-  // directly and print HEARTBEAT_OK as its sole stdout line. Stdout is
-  // discarded so no trailing text reaches Telegram as a duplicate.
-  it("cron script uses MCP-only delivery path (stdout suppressed, no curl)", () => {
-    const agentConfig = makeAgentConfig({
-      schedule: [{ cron: "0 8 * * *", prompt: "default-route" }],
-    });
-    const result = scaffoldAgent("default-cron", agentConfig, tmpDir, telegramConfig);
-    const stem0 = cronUnitName("0 8 * * *", "default-route");
-    const content = readFileSync(
-      join(result.agentDir, "telegram", `${stem0}.sh`),
-      "utf-8",
-    );
-    // MCP path: claude runs as a child (not exec) so the success-trailer can
-    // run after it; stdout goes to /dev/null. The trailer auto-resolves any
-    // unresolved issues with source=cron:cron-<index> on a 0 exit (PR
-    // following #565). Stderr stays attached for journalctl.
-    expect(content).toContain("claude -p");
-    expect(content).not.toContain("exec claude -p");
-    expect(content).toMatch(/> \/dev\/null(?!\s*2>&1)/); // stdout-only, stderr left for journal
-    // Success-trailer: bulk-resolve issues filed under this job's source.
-    expect(content).toContain(`switchroom issues resolve --source "cron:${stem0}"`);
-    expect(content).toContain("--quiet");
-    expect(content).toContain("exit $rc");
-    expect(content).not.toContain("> /dev/null 2>&1"); // don't swallow stderr
-    expect(content).not.toContain("api.telegram.org");
-    expect(content).not.toContain("OUTPUT=");
-    // The wrapped prompt must contain the MCP tool instruction
-    expect(content).toContain("mcp__switchroom-telegram__reply");
-    expect(content).toContain("HEARTBEAT_OK");
-  });
-
-  it("reconcile regenerates cron scripts when prompt content changes", () => {
-    // Sanity check that the MCP-path cron script is what we expect, and
-    // that prompt edits propagate through reconcile to the .sh file.
-    const baseAgent = makeAgentConfig({
-      schedule: [{ cron: "0 6 * * *", prompt: "test" }],
+      schedule: [{ cron: "0 6 * * *", prompt: "irrelevant" }],
     });
     const switchroomConfig: SwitchroomConfig = {
       switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
-      agents: { "flip-cron": baseAgent },
+      agents: { "cron-cleanup": agentConfig },
     } as SwitchroomConfig;
-    scaffoldAgent("flip-cron", baseAgent, tmpDir, telegramConfig, switchroomConfig);
-    const scriptPath = join(tmpDir, "flip-cron", "telegram", cronScriptFilename("0 6 * * *", "test"));
-    // Both scripts are identical — MCP path always used
-    expect(readFileSync(scriptPath, "utf-8")).toContain("claude -p");
-    expect(readFileSync(scriptPath, "utf-8")).not.toContain("exec claude -p");
-    expect(readFileSync(scriptPath, "utf-8")).not.toContain("api.telegram.org");
+    scaffoldAgent("cron-cleanup", agentConfig, tmpDir, telegramConfig, switchroomConfig);
 
-    const updated = makeAgentConfig({
-      schedule: [{ cron: "0 6 * * *", prompt: "test updated prompt" }],
-    });
-    const updatedConfig: SwitchroomConfig = {
-      ...switchroomConfig,
-      agents: { "flip-cron": updated },
-    } as SwitchroomConfig;
-    const result = reconcileAgent("flip-cron", updated, tmpDir, telegramConfig, updatedConfig);
-    // Phase D: prompt change ⇒ new hash filename. The old file is removed
-    // by the cleanup pass and a new file is written.
-    const newScriptPath = join(tmpDir, "flip-cron", "telegram", cronScriptFilename("0 6 * * *", "test updated prompt"));
-    expect(result.changes).toContain(newScriptPath);
-    expect(existsSync(scriptPath)).toBe(false);
-    const updatedScript = readFileSync(newScriptPath, "utf-8");
-    expect(updatedScript).toContain("claude -p");
-    expect(updatedScript).not.toContain("exec claude -p");
-    expect(updatedScript).not.toContain("api.telegram.org");
+    // Simulate pre-Phase-4 disk state: write a `claude -p`-bearing cron
+    // script + its .source sidecar manually, then expect reconcile to
+    // remove both. Filename matches the current content-hash scheme so
+    // CRON_SCRIPT_BASENAME_RE catches it.
+    const telegramDir = join(tmpDir, "cron-cleanup", "telegram");
+    const staleStem = cronUnitName("0 6 * * *", "irrelevant");
+    const staleScriptPath = join(telegramDir, `${staleStem}.sh`);
+    const staleSourcePath = join(telegramDir, `${staleStem}.source`);
+    writeFileSync(staleScriptPath, "#!/bin/bash\nclaude -p 'stale'\n", { mode: 0o700 });
+    writeFileSync(staleSourcePath, "main\n");
+    expect(existsSync(staleScriptPath)).toBe(true);
+    expect(existsSync(staleSourcePath)).toBe(true);
+
+    const result = reconcileAgent("cron-cleanup", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    expect(existsSync(staleScriptPath)).toBe(false);
+    expect(existsSync(staleSourcePath)).toBe(false);
+    expect(result.changes).toContain(staleScriptPath);
+    expect(result.changes).toContain(staleSourcePath);
   });
 
-  it("cron script appends success-trailer that auto-resolves issues by source", () => {
-    // PR following #565: when claude -p exits 0, the script bulk-resolves
-    // any unresolved issue whose source is `cron:cron-<index>`. The trailer
-    // is `|| true`-guarded so a missing CLI never masks a real failure.
-    const agentConfig = makeAgentConfig({
-      schedule: [
-        { cron: "0 8 * * *", prompt: "first" },
-        { cron: "0 9 * * *", prompt: "second" },
-      ],
-    });
-    const result = scaffoldAgent("trailer-cron", agentConfig, tmpDir, telegramConfig);
-
-    const stem0 = cronUnitName("0 8 * * *", "first");
-    const stem1 = cronUnitName("0 9 * * *", "second");
-    const c0 = readFileSync(join(result.agentDir, "telegram", `${stem0}.sh`), "utf-8");
-    const c1 = readFileSync(join(result.agentDir, "telegram", `${stem1}.sh`), "utf-8");
-
-    // Each script targets ITS OWN slug — c0 must not auto-resolve c1's issues.
-    expect(c0).toContain(`switchroom issues resolve --source "cron:${stem0}"`);
-    expect(c0).not.toContain(`"cron:${stem1}"`);
-    expect(c1).toContain(`switchroom issues resolve --source "cron:${stem1}"`);
-    expect(c1).not.toContain(`"cron:${stem0}"`);
-
-    // Required trailer shape: capture rc, gate on success, exit with rc.
-    expect(c0).toMatch(/rc=\$\?/);
-    expect(c0).toMatch(/if \[ \$rc -eq 0 \]; then/);
-    expect(c0).toContain("|| true");
-    expect(c0).toMatch(/exit \$rc/);
-
-    // State dir is exported so the CLI can find issues.jsonl.
-    expect(c0).toContain("export TELEGRAM_STATE_DIR=");
-
-    // Prompt-side guidance teaches the model the matching --source string
-    // so any issues it records during the run are auto-resolved on success.
-    expect(c0).toContain(`--source "cron:${stem0}"`);
-  });
-
-  it("reconcile regenerates cron scripts when prompt changes", () => {
-    const initial = makeAgentConfig({
-      schedule: [{ cron: "0 8 * * *", prompt: "v1 prompt" }],
-    });
+  it("reconcileAgentDir deletes legacy cron-<index>.sh as well", () => {
+    // Pre-Phase-D (content-hash filenames) used `cron-<int>.sh`. The
+    // cleanup pass must catch both shapes via the legacy regex so a
+    // long-running operator with a very old install gets the same
+    // disk-state outcome.
+    const agentConfig = makeAgentConfig({ schedule: [] });
     const switchroomConfig: SwitchroomConfig = {
       switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
-      agents: { "cron-rec": initial },
+      agents: { "cron-legacy": agentConfig },
     } as SwitchroomConfig;
-    scaffoldAgent("cron-rec", initial, tmpDir, telegramConfig, switchroomConfig);
+    scaffoldAgent("cron-legacy", agentConfig, tmpDir, telegramConfig, switchroomConfig);
 
-    const scriptPath = join(tmpDir, "cron-rec", "telegram", cronScriptFilename("0 8 * * *", "v1 prompt"));
-    expect(readFileSync(scriptPath, "utf-8")).toContain("v1 prompt");
+    const telegramDir = join(tmpDir, "cron-legacy", "telegram");
+    const legacyPath = join(telegramDir, "cron-0.sh");
+    const legacySourcePath = join(telegramDir, "cron-0.source");
+    writeFileSync(legacyPath, "#!/bin/bash\nclaude -p 'legacy'\n", { mode: 0o700 });
+    writeFileSync(legacySourcePath, "main\n");
 
-    const updated = makeAgentConfig({
-      schedule: [{ cron: "0 8 * * *", prompt: "v2 prompt updated" }],
-    });
-    const updatedConfig: SwitchroomConfig = {
-      ...switchroomConfig,
-      agents: { "cron-rec": updated },
-    } as SwitchroomConfig;
-    const result = reconcileAgent("cron-rec", updated, tmpDir, telegramConfig, updatedConfig);
-
-    // Phase D: prompt change ⇒ new hash filename. Old file removed, new file written.
-    const newScriptPath = join(tmpDir, "cron-rec", "telegram", cronScriptFilename("0 8 * * *", "v2 prompt updated"));
-    expect(result.changes).toContain(newScriptPath);
-    expect(readFileSync(newScriptPath, "utf-8")).toContain("v2 prompt updated");
-    expect(existsSync(scriptPath)).toBe(false);
-  });
-
-  it("schedule entries from defaults cascade into cron scripts", () => {
-    const agentConfig = makeAgentConfig({
-      schedule: [{ cron: "0 17 * * *", prompt: "Agent evening check" }],
-    });
-    const switchroomConfig: SwitchroomConfig = {
-      switchroom: { version: 1, agents_dir: tmpDir },
-      telegram: telegramConfig,
-      defaults: {
-        schedule: [{ cron: "0 8 * * *", prompt: "Global morning briefing" }],
-      },
-      agents: { "cascade-cron": agentConfig },
-    } as SwitchroomConfig;
-
-    const result = scaffoldAgent(
-      "cascade-cron",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-      switchroomConfig,
-    );
-
-    // Defaults schedule is prepended — global entry first
-    const script0 = readFileSync(
-      join(result.agentDir, "telegram", cronScriptFilename("0 8 * * *", "Global morning briefing")),
-      "utf-8",
-    );
-    expect(script0).toContain("Global morning briefing");
-
-    // Agent's own entry
-    const script1 = readFileSync(
-      join(result.agentDir, "telegram", cronScriptFilename("0 17 * * *", "Agent evening check")),
-      "utf-8",
-    );
-    expect(script1).toContain("Agent evening check");
+    reconcileAgent("cron-legacy", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(existsSync(legacySourcePath)).toBe(false);
   });
 });
 
