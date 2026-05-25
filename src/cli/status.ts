@@ -205,7 +205,13 @@ export function registerStatusCommand(program: Command): void {
     .option(
       "--mcp-timeout <ms>",
       `MCP probe per-agent timeout in ms (default ${MCP_PROBE_TIMEOUT_MS})`,
-      (v) => Number.parseInt(v, 10),
+      (v) => {
+        // Fall back to the default on NaN / non-positive values so a
+        // typo like `--mcp-timeout abc` doesn't silently disable the
+        // timeout (Node's execFile treats `timeout: NaN` as no timeout).
+        const n = Number.parseInt(v, 10);
+        return Number.isFinite(n) && n > 0 ? n : MCP_PROBE_TIMEOUT_MS;
+      },
       MCP_PROBE_TIMEOUT_MS,
     )
     .action(
