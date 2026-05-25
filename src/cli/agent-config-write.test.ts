@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scheduleAdd, scheduleRemove } from "./agent-config-write.js";
+import { scheduleAdd, scheduleRemove, extractCronSmallestGapMin } from "./agent-config-write.js";
 import { cronUnitHash } from "../agents/cron-unit-name.js";
 
 let root: string;
@@ -252,5 +252,35 @@ describe("scheduleAdd — cross-agent denial", () => {
     expect(() => {
       scheduleAdd({ agent: "other-agent", cronExpr: "0 9 * * *", prompt: "p", root });
     }).toThrow(/cross-agent/);
+  });
+});
+
+// #1779 — extractCronSmallestGapMin returns the *smallest gap* between
+// consecutive fires, used as the rejection signal for the 5-min floor.
+// Explicitly NOT the worst-case wait (see fn docstring). For
+// `0,1,2 * * * *` the worst-case wait is ~58 min, but the rejection
+// signal — and what this fn returns — is the smallest gap (1 min).
+describe("extractCronSmallestGapMin (#1779)", () => {
+  it("CSV `0,1,2` → 1 (smallest gap is the rejection signal, not 58)", () => {
+    expect(extractCronSmallestGapMin("0,1,2 * * * *")).toBe(1);
+  });
+  it("CSV `0,30` → 30", () => {
+    expect(extractCronSmallestGapMin("0,30 * * * *")).toBe(30);
+  });
+  it("CSV `0,15,30,45` → 15", () => {
+    expect(extractCronSmallestGapMin("0,15,30,45 * * * *")).toBe(15);
+  });
+  it("stepped `*/5` → 5 (== floor, accepted)", () => {
+    expect(extractCronSmallestGapMin("*/5 * * * *")).toBe(5);
+  });
+  it("stepped `*/4` → 4 (< floor, rejected)", () => {
+    expect(extractCronSmallestGapMin("*/4 * * * *")).toBe(4);
+  });
+  it("`*` → 1 (every minute)", () => {
+    expect(extractCronSmallestGapMin("* * * * *")).toBe(1);
+  });
+  it("range / unknown forms → 0", () => {
+    expect(extractCronSmallestGapMin("0-30 * * * *")).toBe(0);
+    expect(extractCronSmallestGapMin("bogus")).toBe(0);
   });
 });

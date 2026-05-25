@@ -69,14 +69,28 @@ const MAX_ENTRIES_PER_AGENT = 20;
 const MIN_CRON_INTERVAL_MIN = 5;
 
 /**
- * Best-effort interval extraction for the `current` field of the
- * envelope's `quota_exceeded` fix. Parses the minutes column of a
- * 5-field cron expr; returns 1 for `*`, the step for a stepped value, the count
- * for a CSV list, or 0 when we can't tell (e.g. complex range exprs).
- * Used purely as structured metadata — the user-facing message is
- * still the canonical truth.
+ * Returns the **smallest gap (in minutes)** between consecutive fires
+ * implied by the minutes column of a 5-field cron expr. This is the
+ * rejection signal used by the min-interval floor: if the smallest
+ * gap is below `MIN_CRON_INTERVAL_MIN`, the schedule fires too fast
+ * and is refused.
+ *
+ * Semantics by minute-field shape:
+ *   - `*`        → 1  (fires every minute)
+ *   - `*\/N`     → N  (stepped cadence)
+ *   - CSV list   → smallest pairwise gap between sorted values
+ *                  (e.g. `0,1,2` → 1, `0,30` → 30, `0,15,30,45` → 15)
+ *   - anything else (ranges, mixed) → 0 (unknown)
+ *
+ * NOTE: this is **not** the worst-case wait between fires. For CSV
+ * lists clustered at the top of the hour like `0,1,2 * * * *`, the
+ * worst-case wait is ~58 min (minute 2 → next hour's minute 0), but
+ * the *smallest* gap is 1 — which is what the floor cares about.
+ * Surfaced as `requested_interval_min` in the error envelope's
+ * `quota_exceeded.current` field; receivers should read it as "the
+ * tightest cadence the schedule implies", not "the user's wait time".
  */
-function extractCronIntervalMin(expr: string): number {
+export function extractCronSmallestGapMin(expr: string): number {
   const fields = expr.trim().split(/\s+/);
   if (fields.length < 5) return 0;
   const min = fields[0];
@@ -86,7 +100,6 @@ function extractCronIntervalMin(expr: string): number {
   if (min.includes(",")) {
     const parts = min.split(",").map((s) => Number(s)).filter((n) => Number.isFinite(n));
     if (parts.length >= 2) {
-      // Approximate cadence: smallest gap between sorted entries.
       const sorted = [...parts].sort((a, b) => a - b);
       let smallest = Infinity;
       for (let i = 1; i < sorted.length; i++) {
@@ -373,7 +386,7 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
       code: "E_CRON_TOO_FREQUENT",
       message: "cron interval is tighter than the minimum (5 minutes)",
       exit: 9,
-      meta: { requested_interval_min: extractCronIntervalMin(opts.cronExpr) },
+      meta: { requested_interval_min: extractCronSmallestGapMin(opts.cronExpr) },
     };
   }
 
