@@ -67,7 +67,7 @@ afterEach(() => {
 
 describe("buildConfigApprovalCardBody", () => {
   it("HTML-escapes the diff body so `<` / `&` can't break out of the <pre> block", () => {
-    const body = buildConfigApprovalCardBody({
+    const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "<script>",
       unifiedDiff: "a & b <c>",
@@ -80,7 +80,7 @@ describe("buildConfigApprovalCardBody", () => {
     // 3000 `&` chars escape to 15000 `&amp;` chars — far past 4096.
     // The post-escape cap MUST kick in and truncate the rendered body.
     const evilDiff = "&".repeat(3000);
-    const body = buildConfigApprovalCardBody({
+    const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
       unifiedDiff: evilDiff,
@@ -91,7 +91,7 @@ describe("buildConfigApprovalCardBody", () => {
 
   it("rendered body stays under 4096 when raw diff is all `<` (5x escape)", () => {
     const evilDiff = "<".repeat(3000);
-    const body = buildConfigApprovalCardBody({
+    const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
       unifiedDiff: evilDiff,
@@ -102,7 +102,7 @@ describe("buildConfigApprovalCardBody", () => {
 
   it("clips an unbounded operator-supplied `reason` to ~500 chars with ellipsis", () => {
     const longReason = "x".repeat(2000);
-    const body = buildConfigApprovalCardBody({
+    const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: longReason,
       unifiedDiff: "small",
@@ -116,10 +116,50 @@ describe("buildConfigApprovalCardBody", () => {
     expect(reasonLine.endsWith("…")).toBe(true);
   });
 
+  it("returns truncated:false when the rendered body fits without trimming", () => {
+    const { body, truncated } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "small",
+      unifiedDiff: "-a\n+b\n",
+    });
+    expect(truncated).toBe(false);
+    expect(body).toContain("<pre>-a\n+b\n</pre>");
+  });
+
+  it("returns truncated:true and appends the sentinel when the body has to shrink", () => {
+    const { body, truncated } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: "&".repeat(3000),
+    });
+    expect(truncated).toBe(true);
+    expect(body).toContain("diff continues, see attached file");
+  });
+
+  it("handles a single unbroken line (no `\\n` to snap to) by char-truncation fallback", () => {
+    // 8000 `x` chars on a single line. After HTML escape (no inflation
+    // for `x`) the diff body alone is 8000 chars + framing — way past
+    // the cap. There's no newline to snap to, so the helper must fall
+    // through to char-truncation rather than returning empty.
+    const oneLongLine = "x".repeat(8000);
+    const { body, truncated } = buildConfigApprovalCardBody({
+      agentName: "klanker",
+      reason: "test",
+      unifiedDiff: oneLongLine,
+    });
+    expect(truncated).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(4096);
+    // Should still contain SOME of the line content — the helper
+    // shouldn't degenerate to "framing + sentinel only" when char-
+    // truncation is available.
+    expect(body).toMatch(/x{100,}/);
+    expect(body).toContain("diff continues, see attached file");
+  });
+
   it("rendered body stays under 4096 even when reason is also adversarial", () => {
     const evilDiff = "&".repeat(3000);
     const evilReason = "&".repeat(2000);
-    const body = buildConfigApprovalCardBody({
+    const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: evilReason,
       unifiedDiff: evilDiff,

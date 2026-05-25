@@ -7,6 +7,7 @@ import type {
   RequestConfigApprovalMessage,
   RequestConfigFinalizeMessage,
 } from "./ipc-protocol.js";
+import { truncateRawToFit } from "./oversize-card-body.js";
 
 /** Pending approval state — in-memory only (no SQLite per RFC §3.4). */
 interface PendingConfigApproval {
@@ -119,7 +120,14 @@ const RENDERED_BODY_CAP = 3900;
 /** Operator-supplied `reason` is unbounded at the wire — clip it. */
 const REASON_MAX_CHARS = 500;
 const REASON_ELLIPSIS = "…";
-const DIFF_SENTINEL = "\n[… diff continues, see attached file]";
+/**
+ * Sentinel appended to a truncated diff in the inline card body when
+ * the full diff ships separately as a `.patch` attachment. Exported
+ * so the dispatcher can key oversize detection off the
+ * `{truncated}` flag returned by `buildConfigApprovalCardBody`
+ * instead of substring-matching this string.
+ */
+export const DIFF_SENTINEL = "\n[… diff continues, see attached file]";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -150,7 +158,7 @@ export function buildConfigApprovalCardBody(args: {
   agentName: string;
   reason: string;
   unifiedDiff: string;
-}): string {
+}): { body: string; truncated: boolean } {
   const safeReason = clipReason(args.reason);
   const render = (diff: string): string =>
     `🛠 <b>Config edit proposed</b>\n` +
@@ -158,42 +166,13 @@ export function buildConfigApprovalCardBody(args: {
     `Reason: ${escapeHtml(safeReason)}\n\n` +
     `<pre>${escapeHtml(diff)}</pre>`;
 
-  let body = render(args.unifiedDiff);
-  if (body.length <= RENDERED_BODY_CAP) return body;
-
-  // Rendered body too big — escaping inflated the diff past our cap.
-  // Binary-search the raw-diff slice that fits, snapping to a line
-  // boundary where possible and appending the truncation sentinel.
-  let lo = 0;
-  let hi = args.unifiedDiff.length;
-  let bestDiff = "";
-  while (lo <= hi) {
-    const mid = (lo + hi) >>> 1;
-    const slice = args.unifiedDiff.slice(0, mid);
-    const candidate = slice + DIFF_SENTINEL;
-    if (render(candidate).length <= RENDERED_BODY_CAP) {
-      bestDiff = candidate;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  // Snap to last newline so we don't cut mid-line. The sentinel is
-  // suffixed AFTER the snap so the trailing line stays intact.
-  const rawCap = bestDiff.length - DIFF_SENTINEL.length;
-  if (rawCap > 0) {
-    const rawSlice = args.unifiedDiff.slice(0, rawCap);
-    const lastNl = rawSlice.lastIndexOf("\n");
-    if (lastNl > 0) bestDiff = rawSlice.slice(0, lastNl) + DIFF_SENTINEL;
-  }
-  body = render(bestDiff);
-  // Defensive: if the framing alone (with empty diff + sentinel) still
-  // overflowed (e.g. reason clip somehow failed), hard-cut the rendered
-  // body and append a plain-text marker. Should be unreachable.
-  if (body.length > TELEGRAM_SENDMESSAGE_LIMIT) {
-    body = body.slice(0, TELEGRAM_SENDMESSAGE_LIMIT - 1);
-  }
-  return body;
+  return truncateRawToFit({
+    raw: args.unifiedDiff,
+    render,
+    cap: RENDERED_BODY_CAP,
+    sentinel: DIFF_SENTINEL,
+    hardLimit: TELEGRAM_SENDMESSAGE_LIMIT,
+  });
 }
 
 /**
@@ -252,13 +231,17 @@ export async function handleRequestConfigApproval(
   // ship the full diff as a `.patch` attachment whenever truncation
   // happens in either layer.
   const prelim = truncateDiffForCard(msg.unifiedDiff);
-  const body = buildConfigApprovalCardBody({
+  const built = buildConfigApprovalCardBody({
     agentName: msg.agentName,
     reason: msg.reason,
     unifiedDiff: prelim,
   });
-  const oversize =
-    prelim !== msg.unifiedDiff || body.includes("diff continues, see attached file");
+  const body = built.body;
+  // Oversize iff EITHER the cheap raw fast-path trimmed lines OR the
+  // post-escape rendered cap had to re-truncate. Keyed off the
+  // builder's structured `truncated` flag instead of substring-
+  // matching the sentinel string (#1767 nit).
+  const oversize = prelim !== msg.unifiedDiff || built.truncated;
   const replyMarkup = deps.buildKeyboard(msg.requestId);
 
   const posted = await deps.postCard({

@@ -280,6 +280,76 @@ describe("handleRequestDriveApproval — TTL clamping", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────
+// Oversize-body fit (#1767)
+// ────────────────────────────────────────────────────────────────────────
+
+describe("handleRequestDriveApproval — oversize card body fit (#1767)", () => {
+  it("truncates the rendered text under 4096 chars before posting", async () => {
+    const spy = makeSpy();
+    // buildCard returns a body well past Telegram's 4096-char limit
+    // (simulates a docTitle / anchor / summary whose HTML-escape
+    // inflated past the limit). Handler must shrink it before postCard.
+    const giantText =
+      "<b>Title</b>\n" +
+      Array.from({ length: 200 }, (_, i) => `line-${i}-${"x".repeat(40)}`).join(
+        "\n",
+      );
+    expect(giantText.length).toBeGreaterThan(4096);
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor(),
+      deps({
+        spy,
+        buildCard: () => ({ text: giantText, reply_markup: { stub: true } }),
+      }),
+    );
+    expect(spy.posted).toHaveLength(1);
+    expect(spy.posted[0]!.text.length).toBeLessThanOrEqual(4096);
+    expect(spy.posted[0]!.text).toContain("preview truncated");
+    // Card was successfully posted → ok:true response went back.
+    expect(spy.sent[0]?.ok).toBe(true);
+    // The log line surfaces the truncation event.
+    expect(
+      spy.logs.some((l) => l.includes("oversize-truncated")),
+    ).toBe(true);
+  });
+
+  it("does not touch the body when it already fits", async () => {
+    const spy = makeSpy();
+    const small = "<b>Small</b>\nline 1\nline 2";
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor(),
+      deps({
+        spy,
+        buildCard: () => ({ text: small, reply_markup: { stub: true } }),
+      }),
+    );
+    expect(spy.posted[0]!.text).toBe(small);
+    expect(
+      spy.logs.some((l) => l.includes("oversize-truncated")),
+    ).toBe(false);
+  });
+
+  it("post failure after truncation surfaces a structured reason", async () => {
+    const spy = makeSpy();
+    const giantText =
+      "<b>Title</b>\n" + "x".repeat(8000);
+    await handleRequestDriveApproval(
+      clientFor(spy),
+      msgFor(),
+      deps({
+        spy,
+        buildCard: () => ({ text: giantText, reply_markup: { stub: true } }),
+        postCard: async () => null,
+      }),
+    );
+    expect(spy.sent[0]?.ok).toBe(false);
+    expect(spy.sent[0]?.reason).toMatch(/oversize-body truncation/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
 // Always responds (no path drops the response)
 // ────────────────────────────────────────────────────────────────────────
 
