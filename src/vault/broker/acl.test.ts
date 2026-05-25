@@ -827,6 +827,119 @@ describe("ACL: user-declared MCP-server secrets", () => {
     ).toBe(false);
   });
 
+  // ─── #1810 follow-up: profile-layer cascade ──────────────────────────
+  // Per `src/config/merge.ts:resolveAgentConfig` the canonical cascade
+  // is 3-layer: defaults → profiles.<agent.extends> → agent.
+  // ProfileSchema accepts `mcp_servers` by design, so an operator can
+  // declare an MCP under a custom profile and expect every agent
+  // extending that profile to inherit it. Pin the profile layer.
+
+  it("allows a key declared under profiles.<extends>.mcp_servers (cascade)", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      profiles: {
+        coding: {
+          mcp_servers: {
+            github: {
+              command: "/path/to/github-mcp.sh",
+              secrets: ["github/api-token"],
+            },
+          },
+        },
+      },
+      agents: {
+        clerk: { topic_name: "clerk", extends: "coding" },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(checkAclByAgent(config, "clerk", "github/api-token").allow).toBe(true);
+  });
+
+  it("agent without extends does NOT inherit a profile's mcp_servers", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      profiles: {
+        coding: {
+          mcp_servers: {
+            github: {
+              command: "/path/to/github-mcp.sh",
+              secrets: ["github/api-token"],
+            },
+          },
+        },
+      },
+      agents: {
+        clerk: { topic_name: "clerk" }, // no extends
+      },
+    } as unknown as SwitchroomConfig;
+    expect(checkAclByAgent(config, "clerk", "github/api-token").allow).toBe(false);
+  });
+
+  it("per-agent override beats the profile's MCP entry", () => {
+    // Layer order: defaults → profile → agent. The agent's per-key
+    // entry fully replaces the profile's.
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      profiles: {
+        coding: {
+          mcp_servers: {
+            github: {
+              command: "/profile/github.sh",
+              secrets: ["github/api-token"],
+            },
+          },
+        },
+      },
+      agents: {
+        clerk: {
+          topic_name: "clerk",
+          extends: "coding",
+          mcp_servers: {
+            github: {
+              command: "/clerk/custom-github.sh",
+              secrets: ["github/api-token", "github/extra-scope"],
+            },
+          },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(checkAclByAgent(config, "clerk", "github/api-token").allow).toBe(true);
+    expect(checkAclByAgent(config, "clerk", "github/extra-scope").allow).toBe(true);
+  });
+
+  it("per-agent `false` over a profile MCP drops the grant", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      profiles: {
+        coding: {
+          mcp_servers: {
+            github: {
+              command: "/path/to/github-mcp.sh",
+              secrets: ["github/api-token"],
+            },
+          },
+        },
+      },
+      agents: {
+        clerk: {
+          topic_name: "clerk",
+          extends: "coding",
+          mcp_servers: { github: false },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    expect(
+      checkAclByAgent(config, "clerk", "github/api-token").allow,
+    ).toBe(false);
+  });
+
   it("does not cross agents — one agent's MCP secret stays on that agent", () => {
     const config = {
       switchroom: { version: 1 },

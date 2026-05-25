@@ -333,26 +333,42 @@ export function checkAclByAgent(
   //         secrets: [ perplexity/api-key ]
   //
   // The check consults the EFFECTIVE (post-cascade) mcp_servers map —
-  // per-key shallow merge of defaults + per-agent overrides, mirroring
-  // `src/config/merge.ts:391-397`. The broker loads raw yaml without
-  // running the full cascade pipeline (that lives in resolveAgentConfig
-  // / mergeAgentConfig and is too expensive per ACL request), so the
-  // mcp_servers cascade is open-coded here. Defaults-only MCPs (the
-  // common case — perplexity declared once in defaults, inherited by
-  // every agent) are correctly granted; per-agent additions still win
-  // on key conflict; per-agent `false` opt-outs drop the grant
-  // because the typeof guard below skips non-object entries.
+  // per-key shallow merge of defaults + extends-profile + per-agent
+  // overrides, mirroring `src/config/merge.ts:resolveAgentConfig` (the
+  // 3-layer pipeline at lines 168-211) and the field-level merge at
+  // lines 391-397. The broker loads raw yaml without running the full
+  // cascade pipeline (it pulls in env merges, deprecation-warn side
+  // effects, and is too expensive per ACL request), so the
+  // mcp_servers-only cascade is open-coded here.
   //
-  // #1806 (v0.13.42) shipped the per-agent-only read; the
-  // defaults-cascade was missed and only surfaced when an operator
-  // tried to wire perplexity for an agent that inherited the MCP
-  // from defaults rather than declaring it per-agent. Fixed here.
+  // Layer order matches the canonical cascade:
+  //   1. defaults.mcp_servers
+  //   2. profiles.<agent.extends>.mcp_servers   (if extends is set)
+  //   3. agents.<name>.mcp_servers
+  //
+  // Per-key shallow merge — a later layer's entry FULLY REPLACES an
+  // earlier layer's entry at that key. `false` opt-outs survive the
+  // merge as the literal value and are then skipped by the typeof
+  // guard below.
+  //
+  // History:
+  //   #1806 (v0.13.42) shipped per-agent-only read — defaults invisible.
+  //   #1810 (this fix) added the defaults + profile cascade.
   //
   // Checked BEFORE the no-schedule early-deny below so an MCP-only
   // agent (no cron schedule) can still serve user-declared MCPs.
+  const cfgWithProfiles = config as {
+    defaults?: { mcp_servers?: Record<string, unknown> };
+    profiles?: Record<string, { mcp_servers?: Record<string, unknown> }>;
+  };
+  const profileName = (agentConfig as { extends?: string }).extends;
+  const profileMcp =
+    profileName != null && profileName.length > 0
+      ? (cfgWithProfiles.profiles?.[profileName]?.mcp_servers ?? {})
+      : {};
   const effectiveMcp: Record<string, unknown> = {
-    ...((config as { defaults?: { mcp_servers?: Record<string, unknown> } })
-      .defaults?.mcp_servers ?? {}),
+    ...(cfgWithProfiles.defaults?.mcp_servers ?? {}),
+    ...profileMcp,
     ...((agentConfig as { mcp_servers?: Record<string, unknown> })
       .mcp_servers ?? {}),
   };
