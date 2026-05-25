@@ -138,10 +138,43 @@ describe('formatPriorAssistantPreview', () => {
     expect(formatPriorAssistantPreview('a & b < c')).toBe('a &amp; b &lt; c')
   })
 
-  test('does NOT decode HTML entities (documented)', () => {
-    // Entities like &amp; survive as literal "&amp;" through strip and then
-    // get re-escaped to &amp;amp;. Acceptable for a model-facing preview.
-    expect(formatPriorAssistantPreview('a &amp; b')).toBe('a &amp;amp; b')
+  // ─── #1791 — decode entities before re-escape ───────────────────────────
+  // Pre-fix this function did NOT decode, so an already-encoded source
+  // (e.g. the rendered HTML stored in history) was re-escaped on top of
+  // its own encoding. The model saw `&amp;amp;lt;bar&amp;amp;gt;` (triple
+  // encoded) instead of `<bar>`. Decoding before the trim/re-escape pass
+  // closes that loop; the attribute boundary stays safe because
+  // escapeXmlAttribute runs unchanged at the tail.
+
+  test('decodes &amp; before re-escape (single-pass, not triple) — #1791', () => {
+    // Source stored in history as escaped HTML: `a &amp; b`.
+    // Pre-fix output: `a &amp;amp; b`. Post-fix: `a &amp; b` (single).
+    expect(formatPriorAssistantPreview('a &amp; b')).toBe('a &amp; b')
+  })
+
+  test('decodes &lt; / &gt; inside stripped tags — #1791', () => {
+    // The classic #1120 case: model wrote `Path: \`/tmp/foo-<bar>/\``,
+    // markdownToHtml stored it as `<code>/tmp/foo-&lt;bar&gt;/</code>`,
+    // strip removes the <code> tags, decode brings back the angle
+    // brackets, escape re-encodes safely for the attribute.
+    expect(formatPriorAssistantPreview('<code>/tmp/foo-&lt;bar&gt;/</code>'))
+      .toBe('/tmp/foo-&lt;bar&gt;/')
+  })
+
+  test('decodes &quot; / &apos; / &nbsp; — #1791', () => {
+    expect(formatPriorAssistantPreview('say &quot;hi&quot;')).toBe('say &quot;hi&quot;')
+    expect(formatPriorAssistantPreview('it&apos;s here')).toBe("it&apos;s here")
+    expect(formatPriorAssistantPreview('a&nbsp;b')).toBe('a b')
+  })
+
+  test('does not over-decode: bare `&amp;lt;` decodes to `&lt;`, not `<` — #1791', () => {
+    // The decode order (&lt; / &gt; / &quot; / &apos; / &nbsp; first, then
+    // &amp;) ensures a single pass doesn't strip two layers of escape.
+    // A literal `&amp;lt;` in source (i.e. someone deliberately encoded
+    // the word "&lt;") becomes `&lt;` after one decode pass, and then
+    // re-escapes back to `&amp;lt;`. Pin this so the order isn't accidentally
+    // flipped to a re-decode loop.
+    expect(formatPriorAssistantPreview('&amp;lt;')).toBe('&amp;lt;')
   })
 
   test('empty string returns empty', () => {

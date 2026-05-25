@@ -74,21 +74,52 @@ export function escapeXmlAttribute(s: string): string {
 }
 
 /**
+ * Decode the small set of HTML / XML entities switchroom emits when it
+ * renders model output as Telegram HTML. Pre-#1791 this function did
+ * not decode and `formatPriorAssistantPreview` then re-escaped the
+ * already-encoded entities, so a turn containing inline `<code>` would
+ * surface to the model on the next inbound as `&amp;amp;lt;…&amp;amp;gt;`
+ * (triple-encoded). The model had to mentally decode three layers to
+ * recover the original characters it wrote — measurably hostile to
+ * comprehension on turns with placeholders, JSX, XML, generics, etc.
+ *
+ * Decoding before re-escape closes that loop: the attribute boundary
+ * stays safe because `escapeXmlAttribute` runs unchanged at the tail.
+ *
+ * Limited to the canonical six entities — there's no general HTML
+ * entity table here, which keeps the surface predictable.
+ */
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    // `&amp;` last so we don't accidentally re-decode `&amp;lt;` → `<` on
+    // a single pass — the order above relies on `&amp;` still being
+    // intact during the prior replaces.
+    .replace(/&amp;/g, '&')
+}
+
+/**
  * Produce a short, safe preview of the last assistant turn for injection
  * as an XML attribute. Strips HTML tags (so `<b>foo</b>` becomes `foo`),
- * collapses all whitespace runs into single spaces, truncates to
- * `maxChars` visible characters, then XML-escapes.
- *
- * We do NOT decode HTML entities — a literal `&amp;` in the source
- * survives as `&amp;amp;` after escape, which is fine: the attribute is
- * for the model's situational awareness, not faithful rendering.
+ * decodes the canonical six XML entities so the model sees the original
+ * characters (not triple-encoded `&amp;amp;lt;` — see #1791), collapses
+ * all whitespace runs into single spaces, truncates to `maxChars` visible
+ * characters, then XML-escapes for safe attribute injection.
  */
 export function formatPriorAssistantPreview(text: string, maxChars = 200): string {
   // Strip HTML tags. Anything angle-bracketed between < and > goes away;
   // this is deliberately liberal (no tag-name whitelist) because the
   // preview is for the model's eyes only.
   const stripped = text.replace(/<[^>]*>/g, '')
-  const collapsed = stripped.replace(/\s+/g, ' ').trim()
+  // #1791: decode entities BEFORE collapse/truncate/re-escape so the
+  // model sees the prose it actually wrote. The re-escape at the tail
+  // preserves attribute-injection safety.
+  const decoded = decodeXmlEntities(stripped)
+  const collapsed = decoded.replace(/\s+/g, ' ').trim()
   const truncated = collapsed.length > maxChars ? collapsed.slice(0, maxChars) : collapsed
   return escapeXmlAttribute(truncated)
 }
