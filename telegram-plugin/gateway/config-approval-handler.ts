@@ -50,6 +50,18 @@ export interface ConfigApprovalHandlerDeps {
     messageId: number;
     text: string;
   }) => Promise<void>;
+  /**
+   * Send the full diff as a `.patch` document attachment when the
+   * card body exceeds Telegram's 4096-char sendMessage limit
+   * (#1762). Best-effort — failures are logged and do NOT block the
+   * approval flow (the truncated card is still actionable).
+   */
+  postAttachment?: (args: {
+    chatId: number | string;
+    threadId?: number;
+    filename: string;
+    content: string;
+  }) => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -59,6 +71,40 @@ export interface ConfigApprovalHandlerDeps {
  * diffs may be truncated by the API; the validator already caps
  * unified_diff at ~63 KiB so practical fleet edits fit comfortably.
  */
+/**
+ * Truncate a unified diff for inline display in the card body when
+ * the full diff would exceed Telegram's 4096-char sendMessage limit.
+ * Caps at `maxLines` lines AND at `maxChars` characters (whichever
+ * trips first), then appends a sentinel pointing to the attached
+ * `.patch` document. (#1762)
+ *
+ * The char cap is the load-bearing one — long single lines can still
+ * overflow a 50-line slice. We leave ~600 chars of headroom under the
+ * 4096 cap for the framing (header lines, `<pre>` tags, HTML escapes).
+ */
+export function truncateDiffForCard(
+  unifiedDiff: string,
+  maxLines = 50,
+  maxChars = 3000,
+): string {
+  const sentinel = "\n[… diff continues, see attached file]";
+  const lines = unifiedDiff.split("\n");
+  let out: string;
+  if (lines.length <= maxLines) {
+    out = unifiedDiff;
+  } else {
+    out = lines.slice(0, maxLines).join("\n");
+  }
+  if (out.length > maxChars) {
+    // Snap to the last complete line within the cap, falling back to
+    // a hard char cut if a single line exceeds maxChars.
+    const cap = out.slice(0, maxChars);
+    const lastNl = cap.lastIndexOf("\n");
+    out = lastNl > 0 ? cap.slice(0, lastNl) : cap;
+  }
+  return out === unifiedDiff ? out : out + sentinel;
+}
+
 export function buildConfigApprovalCardBody(args: {
   agentName: string;
   reason: string;
@@ -85,6 +131,7 @@ export async function handleRequestConfigApproval(
   const reply = (
     verdict: "approve" | "deny" | "timeout",
     reason?: string,
+    denySource?: "operator" | "dispatch_failure",
   ) => {
     try {
       client.send({
@@ -92,6 +139,7 @@ export async function handleRequestConfigApproval(
         requestId: msg.requestId,
         verdict,
         ...(reason ? { reason } : {}),
+        ...(denySource ? { denySource } : {}),
       });
     } catch (err) {
       deps.log?.(
@@ -101,21 +149,41 @@ export async function handleRequestConfigApproval(
   };
 
   if (msg.agentName !== deps.agentName) {
-    reply("deny", `gateway serves '${deps.agentName}', not '${msg.agentName}'`);
+    reply(
+      "deny",
+      `gateway serves '${deps.agentName}', not '${msg.agentName}'`,
+      "dispatch_failure",
+    );
     return;
   }
 
   const target = deps.loadTargetChat();
   if (target === null) {
-    reply("deny", "no target chat available — operator not paired?");
+    reply(
+      "deny",
+      "no target chat available — operator not paired?",
+      "dispatch_failure",
+    );
     return;
   }
 
-  const body = buildConfigApprovalCardBody({
+  // Pre-flight oversize check (#1762). Telegram caps sendMessage at
+  // 4096 chars; rendered HTML adds escaping + framing so we threshold
+  // the raw diff conservatively. When oversize, we truncate the diff
+  // in the card body and ship the full diff as a `.patch` attachment.
+  const fullBody = buildConfigApprovalCardBody({
     agentName: msg.agentName,
     reason: msg.reason,
     unifiedDiff: msg.unifiedDiff,
   });
+  const oversize = fullBody.length > 3500;
+  const body = oversize
+    ? buildConfigApprovalCardBody({
+        agentName: msg.agentName,
+        reason: msg.reason,
+        unifiedDiff: truncateDiffForCard(msg.unifiedDiff),
+      })
+    : fullBody;
   const replyMarkup = deps.buildKeyboard(msg.requestId);
 
   const posted = await deps.postCard({
@@ -125,8 +193,11 @@ export async function handleRequestConfigApproval(
     replyMarkup,
   });
   if (posted === null) {
-    reply("deny", "Telegram sendMessage failed");
+    reply("deny", "Telegram sendMessage failed", "dispatch_failure");
     return;
+  }
+  if (oversize) {
+    await maybePostAttachment(deps, target, msg);
   }
 
   const entry: PendingConfigApproval = {
@@ -247,6 +318,36 @@ export async function handleRequestConfigFinalize(
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Best-effort attachment of the full diff as a `.patch` document.
+ * Logged-and-swallowed on failure — the truncated card body remains
+ * actionable even without the attachment. (#1762)
+ */
+async function maybePostAttachment(
+  deps: ConfigApprovalHandlerDeps,
+  target: { chatId: number | string; threadId?: number },
+  msg: RequestConfigApprovalMessage,
+): Promise<void> {
+  if (deps.postAttachment === undefined) {
+    deps.log?.(
+      `oversize config approval card but no postAttachment dep wired (requestId=${msg.requestId})`,
+    );
+    return;
+  }
+  try {
+    await deps.postAttachment({
+      chatId: target.chatId,
+      ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
+      filename: `config-edit-${msg.requestId}.patch`,
+      content: msg.unifiedDiff,
+    });
+  } catch (err) {
+    deps.log?.(
+      `config approval attachment failed (requestId=${msg.requestId}): ${(err as Error).message}`,
+    );
+  }
 }
 
 // Test-only: clear the in-memory pending map between cases.
