@@ -31,7 +31,18 @@ errors already cover the failure case).
 node scripts/observe-personal-skills.mjs            # text report
 node scripts/observe-personal-skills.mjs --json     # machine-readable
 node scripts/observe-personal-skills.mjs --since 7d # last week only
+sudo node scripts/observe-personal-skills.mjs       # full file/byte counts
 ```
+
+**Personal-skill dirs are mode 0700** (per-agent private workspace).
+The host operator can see the dir NAME (via the 0755 parent at
+`.claude/skills/`), but the dir's CONTENTS are unreadable without
+root. Running as operator surfaces the entry correctly but shows
+`files=? bytes=?  <opaque (need sudo)>` for each. The top-of-report
+`Unreadable (0700 dirs): N` line tells you when to re-run with sudo
+for accurate file/byte numbers. The **dir count itself** — the
+load-bearing signal for the 60-day decision — is correct either way
+(#1832).
 
 The script reads:
 
