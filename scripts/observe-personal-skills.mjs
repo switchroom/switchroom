@@ -61,6 +61,21 @@ function safeReaddir(p) {
   }
 }
 
+// readdirSync with the EACCES case distinguished from "empty dir".
+// Personal-skill dirs are mode 0700 owned by the agent UID — the host
+// operator can list the parent (.claude/skills is 0755) and see the
+// dir NAME, but can't read the dir's CONTENTS. Silently treating
+// EACCES as "empty" would misreport the skill as files=0 bytes=0
+// (#1832). Use this variant in code paths that report a skill entry to
+// the operator, so they know whether to re-run with sudo.
+function safeReaddirStatus(p) {
+  try {
+    return { entries: readdirSync(p), readable: true };
+  } catch (err) {
+    return { entries: [], readable: false, code: err?.code ?? "EUNK" };
+  }
+}
+
 function safeStat(p) {
   try {
     return statSync(p);
@@ -80,14 +95,18 @@ function safeLstat(p) {
 function dirSize(dir) {
   let bytes = 0;
   let files = 0;
+  let unreadable = false;
   const stack = [dir];
   while (stack.length) {
     const cur = stack.pop();
-    for (const ent of safeReaddir(cur)) {
+    const r = safeReaddirStatus(cur);
+    if (!r.readable) {
+      unreadable = true;
+      continue;
+    }
+    for (const ent of r.entries) {
       const sub = join(cur, ent);
       // lstat NOT stat — never follow a symlink out of the skill tree.
-      // A malicious `personal-foo → /etc` would otherwise have us
-      // walking arbitrary host dirs (metadata only, but still wrong).
       const st = safeLstat(sub);
       if (!st) continue;
       if (st.isSymbolicLink()) continue;
@@ -98,7 +117,7 @@ function dirSize(dir) {
       }
     }
   }
-  return { files, bytes };
+  return { files, bytes, unreadable };
 }
 
 function enumerateAgent(agentDir) {
@@ -110,13 +129,17 @@ function enumerateAgent(agentDir) {
     const p = join(skillsDir, ent);
     const st = safeStat(p);
     if (!st?.isDirectory()) continue;
-    const { files, bytes } = dirSize(p);
+    const { files, bytes, unreadable } = dirSize(p);
     personal.push({
       name: ent.slice(PERSONAL_PREFIX.length),
       path: p,
       files,
       bytes,
       mtime: st.mtime.toISOString(),
+      // If the dir was unreadable (EACCES — typical when running as
+      // operator UID against a 0700 agent-owned skill dir), surface
+      // the gap rather than silently reporting 0/0 (#1832).
+      ...(unreadable ? { unreadable: true } : {}),
     });
   }
   const trash = [];
@@ -182,6 +205,12 @@ const summary = {
     personal_skills: report.reduce((n, r) => n + r.personal.length, 0),
     trash_entries: report.reduce((n, r) => n + r.trash.length, 0),
     audit_rows_skill_star: report.reduce((n, r) => n + r.audit.length, 0),
+    // Count personal-skill entries we could see but couldn't enumerate
+    // (typical when running as operator UID — dirs are 0700 agent-owned).
+    unreadable_personals: report.reduce(
+      (n, r) => n + r.personal.filter((p) => p.unreadable).length,
+      0,
+    ),
   },
   per_agent: report,
 };
@@ -200,6 +229,11 @@ console.log(`Agents with personals : ${totals.agents_with_personal}`);
 console.log(`Personal skills total : ${totals.personal_skills}`);
 console.log(`Trashed (recoverable) : ${totals.trash_entries}`);
 console.log(`Audit rows (skill.*)  : ${totals.audit_rows_skill_star}${sinceFilter ? ` (since ${sinceFilter})` : ""}`);
+if (totals.unreadable_personals > 0) {
+  console.log(
+    `Unreadable (0700 dirs): ${totals.unreadable_personals} — re-run with sudo for files/bytes accuracy`,
+  );
+}
 console.log(``);
 
 for (const r of report) {
@@ -208,7 +242,11 @@ for (const r of report) {
   if (r.personal.length > 0) {
     console.log(`  personal skills:`);
     for (const p of r.personal) {
-      console.log(`    ${p.name.padEnd(28)} files=${String(p.files).padStart(3)}  bytes=${String(p.bytes).padStart(7)}  mtime=${p.mtime}`);
+      const sizeCol = p.unreadable
+        ? `files=  ?  bytes=      ?`
+        : `files=${String(p.files).padStart(3)}  bytes=${String(p.bytes).padStart(7)}`;
+      const suffix = p.unreadable ? `  <opaque (need sudo)>` : "";
+      console.log(`    ${p.name.padEnd(28)} ${sizeCol}  mtime=${p.mtime}${suffix}`);
     }
   }
   if (r.trash.length > 0) {
