@@ -2423,9 +2423,29 @@ export function scaffoldAgent(
       }
     }
 
-    // .mcp.json is purely template-driven. writeIfChanged so a stale
-    // file from a pre-v0.7.6 release (different plugin path resolution)
-    // is rewritten on the next `switchroom apply`.
+    // User-declared mcp_servers from switchroom.yaml (`defaults.mcp_servers`
+    // and per-agent `agents.<name>.mcp_servers`, already merged by the
+    // config cascade). Spread AFTER the framework set so user-declared
+    // entries can override on key collision — matching the
+    // settings.json precedence at line ~2255 where built-in defaults
+    // only land when `!settings.mcpServers[entry.key]`. `false`
+    // opt-outs are stripped by `filterMcpServers`. Without this spread
+    // (the pre-fix state since v0.7.6) the only MCPs Claude could see
+    // were the framework set — perplexity, notion, and any other
+    // operator-declared entries were silently dropped.
+    if (agentConfig.mcp_servers) {
+      const filtered = filterMcpServers(agentConfig.mcp_servers);
+      if (filtered) {
+        for (const [key, value] of Object.entries(filtered)) {
+          mcpServers[key] = value as McpServerConfig;
+        }
+      }
+    }
+
+    // .mcp.json contents: framework MCPs + user-declared MCPs from
+    // switchroom.yaml. writeIfChanged so a stale file from a pre-v0.7.6
+    // release (different plugin path resolution) is rewritten on the
+    // next `switchroom apply`.
     writeIfChanged(
       mcpJsonPath,
       () => JSON.stringify({ mcpServers }, null, 2) + "\n",
@@ -4369,6 +4389,23 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
       const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
       if (gdrive) {
         mcpServers[gdrive.key] = gdrive.value;
+      }
+    }
+
+    // User-declared mcp_servers from switchroom.yaml. Mirrors the
+    // scaffoldAgent path: spread AFTER the framework set with user
+    // winning on key collision. `false` opt-outs stripped by
+    // filterMcpServers. Without this spread the entire user MCP
+    // surface in switchroom.yaml is silently dropped from .mcp.json
+    // (the surface Claude Code actually loads), regression class
+    // since v0.7.6's docker cutover — see the in-block comment at
+    // the scaffoldAgent writer for the full story.
+    if (agentConfig.mcp_servers) {
+      const filtered = filterMcpServers(agentConfig.mcp_servers);
+      if (filtered) {
+        for (const [key, value] of Object.entries(filtered)) {
+          mcpServers[key] = value as McpServerConfig;
+        }
       }
     }
 
