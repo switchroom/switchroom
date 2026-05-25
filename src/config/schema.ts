@@ -69,8 +69,8 @@ export const ScheduleEntrySchema = z.object({
     .optional()
     .describe(
       "DEPRECATED / IGNORED. Pre-v0.8 the singleton scheduler ran each " +
-      "task as an isolated `claude -p` and could set --model per task. " +
-      "Post cron-fold-in (v0.8) the fire is injected into the agent's " +
+      "task as an isolated headless invocation and could set --model per " +
+      "task. Post cron-fold-in (v0.8) the fire is injected into the agent's " +
       "running session, so it always uses the agent's configured model " +
       "— this field has no effect. Accepted (optional) only so existing " +
       "configs keep validating; set the model at the agent level instead. " +

@@ -484,7 +484,7 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
     .description(
       "Dry-run dispatch rule matching against a captured payload file. " +
       "Prints which rules would match and the rendered prompt, without " +
-      "spawning a claude -p process.",
+      "actually injecting an inbound into the agent's live session.",
     )
     .requiredOption("--agent <name>", "Agent name (must exist in switchroom.yaml)")
     .requiredOption("--payload <file>", "Path to a JSON payload file")

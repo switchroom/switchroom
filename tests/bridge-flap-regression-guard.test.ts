@@ -132,4 +132,95 @@ describe("bridge-flap regression guard — headless claude must use --strict-mcp
       ).toContain(rel);
     }
   });
+
+  // ── Tightening (#1798) — also catch `claude -p` in string-template form ──
+  //
+  // The spawn-callsite regex above only catches direct spawn() / execFile()
+  // invocations. The bridge flap we hunted on 2026-05-25 came from a
+  // different shape: `src/agents/scaffold.ts` was building bash scripts as
+  // template strings containing literal `claude -p '<prompt>'`, writing
+  // them to `~/.switchroom/agents/<name>/telegram/cron-*.sh` on every
+  // `switchroom apply`. The CI guard missed it because the TS source had
+  // no `spawn("claude", …)` callsite — the violation was in the *string
+  // template* the source emits to disk.
+  //
+  // Match shape: a TS string literal (single or double quote, or
+  // template-literal backtick) that contains ` claude -p` (claude as a
+  // word, immediately followed by `-p`). Comment-stripped scan rules out
+  // doc-comment mentions.
+  const CLAUDE_P_TEMPLATE =
+    /['"`][^'"`\n]*\bclaude -p\b[^'"`\n]*['"`]|`[^`]*\bclaude -p\b[^`]*`/;
+
+  it("the CLAUDE_P_TEMPLATE scan regex matches a string template containing 'claude -p'", () => {
+    // Single-quoted, double-quoted, backtick (template) — all caught.
+    expect(CLAUDE_P_TEMPLATE.test(`const s = 'claude -p \\'hi\\'';`)).toBe(true);
+    expect(CLAUDE_P_TEMPLATE.test(`const s = "claude -p \\"hi\\"";`)).toBe(true);
+    expect(CLAUDE_P_TEMPLATE.test('const s = `claude -p ${prompt}`;')).toBe(true);
+    // String that doesn't contain `claude -p` does not match.
+    expect(CLAUDE_P_TEMPLATE.test(`const s = 'claude --strict-mcp-config';`)).toBe(false);
+    expect(CLAUDE_P_TEMPLATE.test(`const s = "spawn claude with --print";`)).toBe(false);
+  });
+
+  /**
+   * Allowlist for the `claude -p` string-template check, mirroring
+   * KNOWN_GAPS for the spawn-callsite check. Every entry MUST cite a
+   * tracking issue. Shrink-only — when the offender migrates off the
+   * `claude -p` template, delete the entry. The "no stale entries" test
+   * below enforces that.
+   */
+  const KNOWN_TEMPLATE_GAPS: Record<string, string> = {
+    // The "deep" doctor auth-live smoke runs `claude -p ok` as a quota-
+    // costing check that the agent's OAuth is live. Opt-in, off by default
+    // (deep === true is required). Same compliance concern as any other
+    // `claude -p` callsite — needs migration to a session-side liveness
+    // check (e.g. token-introspect via auth-broker, or `mcp__hindsight__
+    // ping` round-trip). Tracking issue: #1798 follow-up.
+    "src/host-control/server.ts": "#1798",
+  };
+
+  it("no source file emits a `claude -p` string template to disk (#1798)", () => {
+    const repoRoot = process.cwd();
+    const allTs = ROOTS.flatMap((r) => walkTs(join(repoRoot, r)));
+    const offenders: string[] = [];
+    for (const f of allTs) {
+      const rel = relative(repoRoot, f).replace(/\\/g, "/");
+      if (rel in KNOWN_TEMPLATE_GAPS) {
+        expect(KNOWN_TEMPLATE_GAPS[rel]).toMatch(/#\d+/);
+        continue;
+      }
+      const code = stripComments(readFileSync(f, "utf8"));
+      if (CLAUDE_P_TEMPLATE.test(code)) {
+        offenders.push(rel);
+      }
+    }
+    expect(
+      offenders,
+      `These source files contain a string template that emits 'claude -p' ` +
+        `to disk — when written to a shell script and executed, each fire ` +
+        `spawns a parasitic claude code session that loads the agent's full ` +
+        `.mcp.json (including switchroom-telegram), connects a 2nd bridge ` +
+        `to the gateway, and triggers the #1613/#1616 reconnect-race storm. ` +
+        `Worse: 'claude -p' is *programmatic* usage under Anthropic's ` +
+        `2026-06-15 policy (off the subscription) — a pillar-3 compliance ` +
+        `violation independent of the bridge flap. Route the work through ` +
+        `the live interactive claude session via 'inject_inbound' IPC ` +
+        `(scheduler / webhook / cron-fold-in patterns) instead. If genuinely ` +
+        `intentional, add the file to KNOWN_TEMPLATE_GAPS with a tracking-` +
+        `issue reference.\n\nOffending file(s):\n  ${offenders.join("\n  ")}`,
+    ).toEqual([]);
+  });
+
+  it("KNOWN_TEMPLATE_GAPS has no stale entries", () => {
+    const repoRoot = process.cwd();
+    const allTs = ROOTS.flatMap((r) => walkTs(join(repoRoot, r)));
+    for (const rel of Object.keys(KNOWN_TEMPLATE_GAPS)) {
+      const f = join(repoRoot, rel);
+      const code = stripComments(readFileSync(f, "utf8"));
+      expect(
+        CLAUDE_P_TEMPLATE.test(code),
+        `${rel} is allowlisted in KNOWN_TEMPLATE_GAPS but no longer ` +
+          `contains a 'claude -p' string template — delete the entry.`,
+      ).toBe(true);
+    }
+  });
 });

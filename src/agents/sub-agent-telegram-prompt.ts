@@ -9,14 +9,12 @@
  * messages, so the spam concern is gone and the JTBD (user sees what
  * the sub-agent is doing) is restored without attention cost.
  *
- * Cron guidance (issue #269): scheduled tasks run as isolated `claude -p`
- * invocations with no live session. They must deliver their Telegram message
- * via `mcp__switchroom-telegram__reply` (which applies markdown→HTML
- * conversion) and then emit `HEARTBEAT_OK` as their sole stdout line so the
- * cron script can confirm execution without forwarding model text to Telegram.
- * The `buildCronTelegramGuidance` / `applyCronTelegramGuidance` helpers below
- * are independent of the disabled progress-update guidance above and remain
- * active.
+ * Cron guidance (originally issue #269) was REMOVED in #1798 along with
+ * the `claude -p` cron-fold-in retirement. The cron-specific helpers
+ * (`buildCronTelegramGuidance` / `applyCronTelegramGuidance`) wrapped the
+ * cron prompt with delivery instructions for the headless-claude path that
+ * Phase 4 retired (cron now flows through `inject_inbound` into the live
+ * session, which already knows how to deliver via the reply tool).
  */
 
 /**
@@ -78,82 +76,9 @@ export function applyTelegramProgressGuidance(
   return body + buildTelegramProgressGuidance({ defaultChatId: args.defaultChatId as string })
 }
 
-/**
- * Instruction block appended to cron task prompts (issue #269).
- *
- * Cron tasks are isolated `claude -p` invocations — no live session, no
- * PTY tail. They must deliver their Telegram message via the MCP reply tool
- * (which applies markdown→HTML conversion, smart chunking, and all the same
- * rendering logic as a live session) rather than relying on the cron script
- * to forward stdout via curl (which sends raw text with no conversion).
- *
- * After sending, the model MUST print `HEARTBEAT_OK` as its sole stdout line.
- * The cron script discards stdout, so this serves only as a structured
- * exit-status indicator for monitoring (e.g. a future watchdog that fails the
- * systemd service when the sentinel is absent).
- */
-export function buildCronTelegramGuidance(args: {
-  chatId: string
-  jobSlug?: string
-}): string {
-  // The cron wrapper auto-resolves any issue whose source is `cron:<jobSlug>`
-  // when this script exits 0. So if THIS task records an issue mid-run, it
-  // must use that exact source string — otherwise the auto-resolve trailer
-  // can't find it and the issue stays open forever even after a successful
-  // re-run. The block below is appended only when jobSlug is known
-  // (production scaffold/reconcile always supplies one).
-  const issuesBlock = args.jobSlug
-    ? `
-
-## If you need to record a transient issue
-
-If something half-broken happens during this run (e.g. an upstream API timed out, a vault key was missing, a non-fatal data gap), record it via:
-
-\`\`\`
-switchroom issues record --severity warn --source "cron:${args.jobSlug}" --code <stable-code> --summary "<one-line>" --detail "Fix: <one-line remediation, e.g. exact command the user can run>"
-\`\`\`
-
-The \`--detail\` field is rendered as a "→ Fix: ..." line under the issue on the user's Telegram card. Make it actionable — a copy-pastable command or a one-line action, not a description of the problem. Examples:
-
-- \`--detail "Fix: switchroom vault unlock"\` (when the vault broker is locked)
-- \`--detail "Fix: re-run \`claude setup-token\` for ken@example.com"\` (when an account is unauthenticated)
-- \`--detail "Fix: \\\`switchroom auth heal --account=<name>\\\`"\` (when an OAuth token expired)
-
-Skip \`--detail\` if there's no clean one-line fix — leaving it empty means the card shows just the summary, which is fine.
-
-Use the EXACT \`--source "cron:${args.jobSlug}"\` shown above — the cron wrapper auto-resolves issues with that source on a clean run. Picking a different source means the issue persists across recoveries.
-`
-    : ""
-
-  return `
-
-## Delivery instructions (cron context)
-
-This task runs as a one-shot \`claude -p\` invocation — there is no live Telegram session. Your stdout is discarded; the user will NOT see anything you print.
-
-To deliver your response to the user, you MUST call:
-
-\`\`\`
-mcp__switchroom-telegram__reply(chat_id="${args.chatId}", text="<your message>")
-\`\`\`
-
-The \`reply\` tool handles markdown→HTML conversion, chunking, and all formatting automatically — write normal markdown and it will render correctly on the user's phone.
-
-After calling \`reply\`, print \`HEARTBEAT_OK\` as your final stdout line and nothing else. This confirms successful execution to the cron watchdog.
-
-If you have nothing useful to say (data is dull, all signals are nominal), print \`HEARTBEAT_OK\` without calling \`reply\` — a silent heartbeat is correct behaviour, not an error.
-${issuesBlock}`
-}
-
-/**
- * Combine an existing cron prompt body with the cron Telegram delivery
- * guidance. Pure: returns the body unchanged when chatId is absent.
- */
-export function applyCronTelegramGuidance(
-  body: string,
-  args: { chatId: string | undefined; jobSlug?: string },
-): string {
-  if (!args.chatId) return body
-  const trimmed = body.replace(/\s+$/, '')
-  return trimmed + buildCronTelegramGuidance({ chatId: args.chatId, jobSlug: args.jobSlug })
-}
+// `buildCronTelegramGuidance` / `applyCronTelegramGuidance` were removed
+// with the cron-fold-in retirement (#1798). They wrapped cron prompts
+// with instructions for headless `claude -p` delivery — which is the
+// retired pre-Phase-4 path. Post-fold-in, cron prompts flow through
+// `inject_inbound` IPC into the live session, which already knows how
+// to deliver via the reply tool. No per-prompt wrapping needed.
