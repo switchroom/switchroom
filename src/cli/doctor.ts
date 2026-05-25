@@ -17,13 +17,14 @@ import { dirname, join, resolve } from "node:path";
 import { createPublicKey, createPrivateKey } from "node:crypto";
 import { listSecrets, getStringSecret } from "../vault/vault.js";
 import { resolveAgentsDir, resolvePath } from "../config/loader.js";
+import { resolveAgentConfig } from "../config/merge.js";
 import { resolveStatePath, LEGACY_STATE_DIR } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import { readQuarantineMarkerForAgent } from "../agents/quarantine.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
-import type { SwitchroomConfig } from "../config/schema.js";
+import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled } from "../memory/hindsight.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
@@ -439,6 +440,64 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
   });
 
   return results;
+}
+
+/**
+ * Cross-reference user-declared `mcp_servers` (cascade-merged from
+ * `defaults.mcp_servers` + per-agent `agents.<name>.mcp_servers`)
+ * against the keys actually present in the rendered `.mcp.json`. Warns
+ * when an operator declared an MCP server in switchroom.yaml that
+ * never made it into `.mcp.json` — the runtime regression class that
+ * silently shipped from PR #875 (v0.7.6 docker cutover) until PR #1786
+ * (scaffold writer fix).
+ *
+ * `false` opt-out sentinels in the declared map are intentional
+ * suppressions, not missing entries — filtered out before the diff.
+ *
+ * Returns ONE CheckResult per agent (skip when no user-declared
+ * entries; ok when all declared keys are present; warn with the
+ * missing-keys list otherwise).
+ */
+export function checkUserDeclaredMcps(
+  name: string,
+  agentConfig: AgentConfig,
+  config: SwitchroomConfig,
+  renderedMcpServers: Record<string, unknown>,
+): CheckResult {
+  const resolved = resolveAgentConfig(
+    config.defaults,
+    config.profiles,
+    agentConfig,
+  );
+  const declaredMcp = resolved.mcp_servers ?? {};
+  const declaredKeys = Object.entries(declaredMcp)
+    .filter(([, v]) => v !== false)
+    .map(([k]) => k);
+  const renderedKeys = Object.keys(renderedMcpServers);
+  const missing = declaredKeys.filter((k) => !renderedKeys.includes(k));
+
+  if (declaredKeys.length === 0) {
+    return {
+      name: `${name}: user-declared MCPs`,
+      status: "skip",
+      detail: "no user-declared mcp_servers in switchroom.yaml",
+    };
+  }
+  if (missing.length === 0) {
+    return {
+      name: `${name}: user-declared MCPs`,
+      status: "ok",
+      detail:
+        `${declaredKeys.length} declared, all in .mcp.json (${declaredKeys.join(", ")})`,
+    };
+  }
+  return {
+    name: `${name}: user-declared MCPs`,
+    status: "warn",
+    detail:
+      `${missing.length}/${declaredKeys.length} declared but missing from .mcp.json: ${missing.join(", ")}`,
+    fix: `Run \`switchroom agent reconcile ${name} --restart\`. If the entry still doesn't appear, check switchroom.yaml shape (defaults.mcp_servers.<key> or agents.${name}.mcp_servers.<key>).`,
+  };
 }
 
 /**
@@ -1694,6 +1753,19 @@ export function checkAgents(config: SwitchroomConfig, configPath: string): Check
               detail: memoryEnabled ? "switchroom-telegram + hindsight" : "switchroom-telegram",
             });
           }
+
+          // User-declared MCPs configured-vs-delivered check (#1786
+          // follow-up). The cascade-resolved `mcp_servers` (defaults
+          // + per-agent merge) is the operator's contract; the
+          // rendered .mcp.json is what Claude Code actually loads.
+          // Pre-fix (PR #1786) the writer was template-driven and
+          // silently dropped every user-declared entry — perplexity,
+          // notion, etc. all absent from the live fleet despite being
+          // in yaml. This probe surfaces any future regression of the
+          // same class loudly instead of silently.
+          results.push(
+            checkUserDeclaredMcps(name, agentConfig, config, mcp.mcpServers ?? {}),
+          );
         } catch (err) {
           results.push({
             name: `${name}: .mcp.json`,
