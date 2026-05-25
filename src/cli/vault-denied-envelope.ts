@@ -6,8 +6,13 @@
  * line — the legacy line is kept byte-identical for any decoder (audit
  * reader, gateway response handler) still string-matching the old
  * form. Structured consumers parse the second line which is a single-
- * line JSON object prefixed with `VAULT-BROKER-DENIED-ENVELOPE:` for
- * easy grep-and-slice.
+ * line JSON object prefixed with `ERROR-ENVELOPE:` for easy grep-
+ * and-slice. The sentinel is deliberately distinct from the legacy
+ * `VAULT-BROKER-DENIED` prefix so a loose `/^VAULT-BROKER-DENIED/`
+ * decoder regex can't accidentally match the envelope line and try
+ * to parse `ENVELOPE: {...}` as a legacy code (#1777). The
+ * `ERROR-ENVELOPE:` name is also canonical — reusable across any
+ * future envelope-emitting CLI without a per-domain prefix.
  *
  * The envelope's `fix.kind` is always `request_vault_grant` with
  * `vault_key` populated from the denial context — that's the unlock-
@@ -24,6 +29,14 @@
  * Split out of `vault.ts` so unit tests don't pull in the broker
  * client / sqlite-backed grants store via transitive imports.
  */
+/**
+ * Stderr line prefix for structured error envelopes. Canonical across
+ * all envelope-emitting CLIs — chosen to NOT share a prefix with any
+ * legacy domain-specific sentinel (e.g. `VAULT-BROKER-DENIED`) so a
+ * loose decoder regex can't cross-match.
+ */
+export const ENVELOPE_SENTINEL = "ERROR-ENVELOPE:";
+
 export function writeVaultDeniedEnvelope(
   vaultKey: string,
   brokerCode: string,
@@ -40,6 +53,6 @@ export function writeVaultDeniedEnvelope(
     request_id: `vault-cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
   };
   process.stderr.write(
-    `VAULT-BROKER-DENIED-ENVELOPE: ${JSON.stringify(envelope)}\n`,
+    `${ENVELOPE_SENTINEL} ${JSON.stringify(envelope)}\n`,
   );
 }

@@ -3,9 +3,12 @@
  *
  * Parallels the Phase 2 envelope-shape tests in tests/host-control/.
  * The helper writes a single NDJSON line to stderr prefixed with
- * `VAULT-BROKER-DENIED-ENVELOPE: ` so structured consumers can grep-
- * and-slice while string-matching decoders still see the legacy
+ * `ERROR-ENVELOPE: ` so structured consumers can grep-and-slice
+ * while string-matching decoders still see the legacy
  * `VAULT-BROKER-DENIED [<code>]: <msg>` line emitted just before it.
+ * The sentinel is deliberately NOT prefixed `VAULT-BROKER-DENIED-`
+ * to avoid collision with a loose `/^VAULT-BROKER-DENIED/` decoder
+ * regex (#1777).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeVaultDeniedEnvelope } from "./vault-denied-envelope.js";
@@ -30,16 +33,23 @@ afterEach(() => {
 });
 
 describe("writeVaultDeniedEnvelope — envelope shape", () => {
-  it("emits a single VAULT-BROKER-DENIED-ENVELOPE: line on stderr", () => {
+  it("emits a single ERROR-ENVELOPE: line on stderr", () => {
     writeVaultDeniedEnvelope("fatsecret/client_id", "DENIED", "not in ACL");
     expect(writes).toHaveLength(1);
-    expect(writes[0]).toMatch(/^VAULT-BROKER-DENIED-ENVELOPE: /);
+    expect(writes[0]).toMatch(/^ERROR-ENVELOPE: /);
     expect(writes[0].endsWith("\n")).toBe(true);
+  });
+
+  it("sentinel does not share the VAULT-BROKER-DENIED prefix (#1777)", () => {
+    writeVaultDeniedEnvelope("fatsecret/client_id", "DENIED", "not in ACL");
+    // A loose `/^VAULT-BROKER-DENIED/` decoder regex must NOT match the
+    // envelope line — that was the collision bug #1777 fixed.
+    expect(writes[0]).not.toMatch(/^VAULT-BROKER-DENIED/);
   });
 
   it("envelope parses cleanly against ErrorEnvelopeSchema", () => {
     writeVaultDeniedEnvelope("github/token", "DENIED", "unit not in ACL");
-    const jsonPart = writes[0].replace(/^VAULT-BROKER-DENIED-ENVELOPE: /, "").trimEnd();
+    const jsonPart = writes[0].replace(/^ERROR-ENVELOPE: /, "").trimEnd();
     const parsed = JSON.parse(jsonPart);
     const res = ErrorEnvelopeSchema.safeParse(parsed);
     expect(res.success).toBe(true);
@@ -47,7 +57,7 @@ describe("writeVaultDeniedEnvelope — envelope shape", () => {
 
   it("fix.kind is request_vault_grant with vault_key populated", () => {
     writeVaultDeniedEnvelope("coolify/api-token", "DENIED", "no grant");
-    const jsonPart = writes[0].replace(/^VAULT-BROKER-DENIED-ENVELOPE: /, "").trimEnd();
+    const jsonPart = writes[0].replace(/^ERROR-ENVELOPE: /, "").trimEnd();
     const parsed = JSON.parse(jsonPart);
     expect(parsed.v).toBe(1);
     expect(parsed.code).toBe("VAULT-BROKER-DENIED");

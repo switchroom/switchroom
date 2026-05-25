@@ -2,11 +2,22 @@
 
 ## Unreleased
 
+### fix(#1777): rename envelope sentinel to `ERROR-ENVELOPE:` to avoid `VAULT-BROKER-DENIED` prefix collision
+
+The Phase 3 envelope sentinel originally shipped as
+`VAULT-BROKER-DENIED-ENVELOPE: <json>` (#1776), which shares a prefix
+with the legacy `VAULT-BROKER-DENIED [<code>]: <msg>` line. A loose
+`/^VAULT-BROKER-DENIED/` decoder regex matched both lines and tried
+to parse the envelope as legacy, getting `ENVELOPE: {...}` as the
+"code". Renamed the sentinel to `ERROR-ENVELOPE:` — canonical across
+all envelope-emitting CLIs, and breaks the prefix collision cleanly.
+Exported as `ENVELOPE_SENTINEL` from `src/cli/vault-denied-envelope.ts`.
+
 ### feat(#1770): error envelope Phase 3 — VAULT-BROKER-DENIED and cron quota errors
 
 Extends the structured `error_envelope` (#1758 Phase 1, #1759 / #1769 Phase 2)
 to the two error families that live outside hostd. The vault CLI now writes
-a sibling `VAULT-BROKER-DENIED-ENVELOPE: <json>` line on stderr alongside the
+a sibling `ERROR-ENVELOPE: <json>` line on stderr alongside the
 byte-identical legacy `VAULT-BROKER-DENIED [<code>]: <msg>` line — `fix.kind`
 is `request_vault_grant` with `vault_key` populated so the gateway's auto-
 resume flow has the unlock-card hint it needs. The `agent-config` CLI's
