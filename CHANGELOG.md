@@ -1,5 +1,103 @@
 # Changelog
 
+## v0.13.44 — visible-answer-stream goes live, recovery ladder widened
+
+Three PRs that together convert the dominant catastrophic UX failure on
+Telegram (model emits transcript text instead of calling the reply
+tool, user sees nothing until the 5-minute silence-poke framework
+fallback fires a canned "no update from agent in N min" nudge) into a
+non-issue. Fleet log audit on 2026-05-25 measured this failure mode at
+**~19% of inbound events fleet-wide** (target per
+`reference/conversational-pacing.md`: <0.5%). The audit revisited the
+shelve memo's prior 5% assumption; empirical rate is ~4× that.
+
+### feat: visible-answer-stream default ON + over-ping fix (PR #1813, follow-up to #1672)
+
+Flips `SWITCHROOM_VISIBLE_ANSWER_STREAM` from default OFF → ON. The
+answer-stream lane (introduced flag-gated in #1672 / v0.13.15) now
+renders the model's transcript text as a USER-VISIBLE chat-timeline
+message that grows in place as the model thinks, instead of writing
+to Telegram's invisible compose-box draft. When the turn ends without
+the model calling the `reply` MCP tool, the stream IS the canonical
+final answer — no recovery ladder needed.
+
+Also fixes Bug A from the shelve memo: the visible-mode sendMessage
+callback at `gateway.ts:~6651` was forwarding `parse_mode`,
+`message_thread_id`, `link_preview_options`, `reply_parameters` — but
+NOT `disable_notification`. The over-ping safety net at
+`gateway.ts:~4452` is wired into `executeReply` only, not into the
+direct answer-stream send. Without the fix, the first text chunk that
+opened the visible message device-pinged, and when the model later
+called reply, that reply pinged AGAIN. Two device pings per multi-step
+turn.
+
+The fix: per-call `purpose: 'stream' | 'materialize'` discriminator on
+the sendMessage params. Streaming opens are silent; the turn-end
+materialize fresh-send pings the device exactly once per the beat-5
+contract.
+
+The "chat IS the artifact" principle clarification: the retired
+progress card (#1122) was chrome — a pinned widget separate from the
+chat. Visible-answer-stream is **not chrome**. It is a regular Telegram
+chat message that grows. From the user's perspective it is
+indistinguishable from "the model is typing live." The chat is still
+the artifact; the artifact just shows the model's actual thought
+process surfacing in real time.
+
+### fix: visible-answer-stream materialize-and-delete at turn-end (PR #1815, R1 review caught dedup hazard)
+
+Initial #1813 ship forced `disable_notification: true` unconditionally
+on every answer-stream sendMessage to fix Bug A. Live UAT on
+test-harness caught the regression: text-only short turns ("on it"
+being the whole reply) now landed silently — the user had no
+notification to know the answer arrived. The midturn-silent-dm UAT
+failed on this.
+
+Fix: at turn-end stream-as-answer, call `stream.materialize()` to
+send a fresh pinged message, then `bot.api.deleteMessage` the old
+silent streamed preview. The materialize-and-delete pattern: during
+the turn the user sees text streaming live in a silent preview; at
+turn-end that preview is replaced atomically by a fresh pinged
+message with the final content.
+
+R1 review caught a load-bearing dedup hazard in the first cut: the
+pre-materialize `outboundDedup.record(...)` populated the same dedup
+store that `materialize()`'s internal `checkDedup` consults. Result:
+materialize would dedup-suppress its own send, the delete would still
+fire, and the user would lose the content entirely. R2 fix: remove the
+pre-record, let `materialize()` own bookkeeping itself (it already
+calls `recordDedup` + `recordOutbound` internally with the correct NEW
+message_id), and gate the cleanup `deleteMessage` on a numeric sentId
+return.
+
+### fix: SILENT_END_MAX_RETRIES bumped from 1 to 2 (PR #1812)
+
+When the visible-answer-stream lane is OFF (or the model emits text in
+a way the lane doesn't capture), the Stop hook's `silent-end-interrupt`
+re-prompt is the last working safety net before the 5-min framework
+fallback. With `MAX_RETRIES=1`, a stubborn model that emits text+end_turn
+twice falls through to the user-visible canned nudge. Bumped to 2 —
+two re-prompt rounds give the model another chance to call the reply
+tool before the user sees the framework's "no update" message.
+
+Both constants stay in sync (`telegram-plugin/silent-end.ts:60` and
+`telegram-plugin/hooks/silent-end-interrupt-stop.mjs:65`); the in-sync
+regression test at `silent-end.test.ts:238` regex-extracts the hook
+value and asserts equality.
+
+### UAT (pre-release, on test-harness)
+
+Full scenario sweep on `sha-52dd5d9` (the v0.13.44 merge tip pre-tag):
+
+| Scenario | Result | Notes |
+|---|---|---|
+| `midturn-silent-dm` | ✓ PASS (52.9s) | Single-message text-only turns now ping at materialize |
+| `visible-answer-stream-dm` | ✓ PASS (58.8s) | Multi-step: silent streamed preview + final pinged reply |
+| `silent-end-recovery-dm` | ✓ PASS (15.1s) | Headline 19%-fallback failure mode resolved |
+| `jtbd-fast-trivial-dm` | ✓ PASS (TTFO=9.1s) | Within 12s contract |
+| `jtbd-rapid-followup-dm` | ✓ PASS | Steer + queue classification works |
+| `jtbd-subagent-handback-dm` | ✓ PASS (43.3s) | Beat-4 handback synthesis |
+
 ## v0.13.43 — broker ACL mcp_servers cascade hotfix (PR #1809)
 
 PR #1806 / v0.13.42 added an ACL clause for user-declared
