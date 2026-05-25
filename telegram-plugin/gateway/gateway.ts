@@ -356,7 +356,7 @@ import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
-import { summarizeToolForTitle } from '../permission-title.js'
+import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
 import { resolveAlwaysAllowRule } from '../permission-rule.js'
 import {
   readClaudeJsonOverage,
@@ -3863,10 +3863,18 @@ const ipcServer: IpcServer = createIpcServer({
     const { requestId, toolName, description, inputPreview } = msg
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     const access = loadAccess()
-    // Lift the most-identifying field into the title so the user can
-    // approve at a glance — e.g. `Skill (mail)` instead of bare `Skill`.
-    // See #186.
-    const text = `🔐 Permission: ${summarizeToolForTitle(toolName, inputPreview)}`
+    // #1790 — multi-line collapsed body so the operator can see what
+    // is being requested and why without tapping "See more". Mirrors
+    // the `vault_request_access` card layout (the gold standard).
+    // The detail (expanded `tool_name` / pretty `input_preview`)
+    // still surfaces on the See-more tap; this is the
+    // collapsed-view fix only. Sent with parse_mode=HTML below.
+    const text = formatPermissionCardBody({
+      toolName,
+      inputPreview,
+      description,
+      agentName: _client.agentName,
+    })
     // Build the keyboard. The "🔁 Always" button only appears when we
     // can synthesize a meaningful allow-rule for this tool — for an
     // unknown tool we'd write a useless rule (or worse, a rule that
@@ -3887,8 +3895,13 @@ const ipcServer: IpcServer = createIpcServer({
         .text(`🔁 Always allow ${alwaysRule.label}`, `perm:always:${requestId}`)
     }
     for (const chat_id of access.allowFrom) {
-      // allow-raw-bot-api: permission-request keyboard fan-out; reply_markup-only opts, no thread_id
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+      // parse_mode=HTML pairs with formatPermissionCardBody (#1790)
+      // so the <b>/<i> tags render as formatting.
+      // allow-raw-bot-api: permission-request keyboard fan-out; reply_markup + parse_mode only, no thread_id
+      void bot.api.sendMessage(chat_id, text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
       })
     }
@@ -5998,8 +6011,17 @@ function renderVaultRequestAccessCard(req: PendingVaultRequestAccess): string {
   lines.push(`🔐 <b>${escapeHtmlForTg(req.agent)}</b> wants vault access`)
   lines.push(`key: <code>${escapeHtmlForTg(req.key)}</code>`)
   lines.push(`scope: <code>${scopeLabel}</code> · duration: <code>${durationLabel}</code>`)
+  // #1790 — always render the why-line, even when the agent omitted
+  // `reason`. Rendering "not provided" makes a missing rationale
+  // visibly an agent-side failure (the tool description nudges the
+  // model to supply one — see executeVaultRequestAccess); skipping
+  // the line silently used to make the omission look like a card-
+  // template choice, which the operator couldn't tell apart from a
+  // legitimate "no reason needed" case.
   if (req.reason && req.reason.length > 0) {
     lines.push(`why: <i>${escapeHtmlForTg(req.reason)}</i>`)
+  } else {
+    lines.push(`why: <i>not provided</i>`)
   }
   lines.push('')
   lines.push(`<i>Tap Approve to mint a scoped grant token (same flow as <code>switchroom vault grant</code>). Tap Deny to refuse — the agent will receive a denial result.</i>`)

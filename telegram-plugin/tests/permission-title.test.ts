@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest'
-import { summarizeToolForTitle } from '../permission-title.js'
+import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
 
 describe('summarizeToolForTitle (#186)', () => {
   test('Skill: surfaces the skill name in brackets', () => {
@@ -49,10 +49,35 @@ describe('summarizeToolForTitle (#186)', () => {
     expect(summarizeToolForTitle('Skill', undefined)).toBe('Skill')
   })
 
-  test('falls back to bare toolName when expected key is missing', () => {
+  test('falls back to bare toolName for non-Skill tools when expected key is missing', () => {
     const input = JSON.stringify({ unrelated: 'x' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill')
+    // Bash has no first-arg fallback (its only identifying field is command).
     expect(summarizeToolForTitle('Bash', input)).toBe('Bash')
+  })
+
+  // #1790 — the prior contract was "fall back to bare toolName when no
+  // skill-name key matched"; that produced operator-hostile cards like
+  // `🔐 Permission: Skill` with zero context. The Skill summarizer now
+  // tries `command`, then a first-scalar-arg hint, before giving up.
+  test('Skill: when no skill-name key matches, falls back to command field (#1790)', () => {
+    const input = JSON.stringify({ command: 'gen calendar event' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill: gen calendar event')
+  })
+
+  test('Skill: when no skill-name and no command, surfaces the first scalar arg (#1790)', () => {
+    const input = JSON.stringify({ unrelated: 'x' })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (unrelated: x)')
+  })
+
+  test('Skill: skips routing-only keys when surfacing first scalar arg (#1790)', () => {
+    // chat_id / message_thread_id / request_id never help an operator
+    // decide; the helper skips them and finds the next useful field.
+    const input = JSON.stringify({
+      chat_id: '12345',
+      message_thread_id: '42',
+      topic: 'morning summary',
+    })
+    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (topic: morning summary)')
   })
 
   test('Bash: collapses internal whitespace before truncating', () => {
@@ -133,5 +158,124 @@ describe('summarizeToolForTitle (#186)', () => {
 
   test('MCP malformed: bare mcp__ prefix without __<server>__<verb> shape is left alone', () => {
     expect(summarizeToolForTitle('mcp__bad', undefined)).toBe('mcp__bad')
+  })
+
+  // #1790 — append a `(key: value)` hint when an MCP tool's preview
+  // carries a scalar arg. Gives operators context on curated and
+  // uncurated MCP tools alike without an expand tap.
+  test('MCP curated tool appends first-arg hint when input_preview present (#1790)', () => {
+    const input = JSON.stringify({ key: 'coolify/api-token' })
+    expect(summarizeToolForTitle('mcp__agent-config__config_get', input)).toBe(
+      'Read its own merged config (key: coolify/api-token)',
+    )
+  })
+
+  test('MCP uncurated tool appends first-arg hint (#1790)', () => {
+    const input = JSON.stringify({ folder_id: 'abc123' })
+    expect(summarizeToolForTitle('mcp__google-workspace__list_files', input)).toBe(
+      'google-workspace: list files (folder_id: abc123)',
+    )
+  })
+
+  test('MCP arg hint skips routing-only keys (#1790)', () => {
+    const input = JSON.stringify({ chat_id: '12345', query: 'budget Q3' })
+    expect(summarizeToolForTitle('mcp__hindsight__recall', input)).toBe(
+      'Recall relevant memories (query: budget Q3)',
+    )
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// #1790 — formatPermissionCardBody: multi-line collapsed-view body
+// for approval cards. Mirrors the vault_request_access card layout.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('formatPermissionCardBody (#1790)', () => {
+  test('renders agent · summary, then a why-line, when both are present', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Skill',
+      inputPreview: JSON.stringify({ skill: 'mail' }),
+      description: 'Compose the morning brief',
+      agentName: 'clerk',
+    })
+    expect(body).toBe(
+      [
+        '🔐 <b>clerk</b> · Skill (mail)',
+        'why: <i>Compose the morning brief</i>',
+      ].join('\n'),
+    )
+  })
+
+  test('renders "why: <i>not provided</i>" when description is missing', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'ls /tmp' }),
+      description: undefined,
+      agentName: 'gymbro',
+    })
+    expect(body).toBe(
+      ['🔐 <b>gymbro</b> · Bash: ls /tmp', 'why: <i>not provided</i>'].join('\n'),
+    )
+  })
+
+  test('renders "not provided" when description is whitespace-only', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'ls /tmp' }),
+      description: '   \n  ',
+      agentName: 'gymbro',
+    })
+    expect(body).toContain('why: <i>not provided</i>')
+  })
+
+  test('drops the agent prefix when agentName is null (early-boot edge)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Skill',
+      inputPreview: JSON.stringify({ skill: 'mail' }),
+      description: 'do the thing',
+      agentName: null,
+    })
+    expect(body).toBe(['🔐 Skill (mail)', 'why: <i>do the thing</i>'].join('\n'))
+  })
+
+  test('HTML-escapes < > & in agentName / summary / description', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'echo "a < b && c > d"' }),
+      description: 'compare a < b & c > d',
+      agentName: 'agent<test>',
+    })
+    expect(body).toContain('&lt;test&gt;')
+    expect(body).toContain('&amp;')
+    expect(body).not.toContain('<test>')
+    // The literal "<i>not provided</i>" and "<b>...</b>" wrapping tags
+    // around legitimate fields must survive untouched — only the
+    // user-supplied content is escaped.
+    expect(body).toContain('<b>')
+    expect(body).toContain('<i>')
+  })
+
+  test('truncates a very long description with an ellipsis', () => {
+    const longWhy = 'x'.repeat(500)
+    const body = formatPermissionCardBody({
+      toolName: 'Skill',
+      inputPreview: JSON.stringify({ skill: 'mail' }),
+      description: longWhy,
+      agentName: 'clerk',
+    })
+    // 240-char ceiling + trailing ellipsis
+    expect(body).toContain('xxxx…</i>')
+    // First line still intact
+    expect(body.split('\n')[0]).toBe('🔐 <b>clerk</b> · Skill (mail)')
+  })
+
+  test('collapses internal whitespace in description so the layout stays one-line', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Skill',
+      inputPreview: JSON.stringify({ skill: 'mail' }),
+      description: 'first\n\nsecond\t\t paragraph',
+      agentName: 'clerk',
+    })
+    expect(body).toContain('why: <i>first second paragraph</i>')
   })
 })

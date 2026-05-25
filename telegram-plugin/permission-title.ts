@@ -1,21 +1,32 @@
 /**
- * Build a human-readable title for the inline-keyboard permission
- * approval message. Pre-fix the title was always `🔐 Permission:
- * ${toolName}` — for a `Skill` or `Bash` call the user couldn't tell
- * which skill / command was being approved without tapping "See more".
+ * Build the inline-keyboard permission approval message — title + body.
  *
- * The detail surfaces (the expanded view at server.ts/gateway.ts) still
- * render the full description + input_preview block; this helper just
- * lifts the most identifying field into the title so the user can
- * approve at a glance.
+ * Two related concerns:
  *
- * See #186.
+ *   `summarizeToolForTitle` (one line, no escaping) is the bare summary
+ *   used in the always-allow rule label and as the body-builder's
+ *   internal building block. Pre-#186 the title was always `🔐
+ *   Permission: ${toolName}` — for a `Skill` or `Bash` call the user
+ *   couldn't tell which skill / command was being approved without
+ *   tapping "See more".
+ *
+ *   `formatPermissionCardBody` (multi-line, HTML-escaped for
+ *   parse_mode=HTML) is the body of the card itself. Pre-#1790 the
+ *   collapsed card was a single line — operators had to tap "See more"
+ *   to see the agent's stated reason or input preview. This mirrors
+ *   the vault `vault_request_access` card's three-line layout (the
+ *   gold standard) so every approval surface answers "what" + "why"
+ *   without an expand tap.
+ *
+ * See #186 (title) and #1790 (body).
  */
 
 import { basename } from "node:path";
 
 const COMMAND_TITLE_MAX = 40;
 const PATH_TITLE_MAX = 40;
+const DESCRIPTION_LINE_MAX = 240;
+const INPUT_VALUE_MAX = 60;
 
 /**
  * Human-friendly descriptions for switchroom-managed MCP tools. The
@@ -70,17 +81,26 @@ export function summarizeToolForTitle(
   // description (so the card reads "Read its own merged config"
   // instead of "mcp__agent-config__config_get"). Fall through to a
   // generic `<server>: <verb-with-spaces>` shape for unknown MCP
-  // tools and finally to the raw name when even that fails.
+  // tools and finally to the raw name when even that fails. When
+  // we have an input preview, append the first arg-value pair so
+  // the operator sees what's being requested without expanding —
+  // e.g. `Read its own merged config (key: coolify/api-token)`
+  // rather than just `Read its own merged config`. (#1790)
   if (toolName.startsWith("mcp__")) {
     const curated = MCP_TOOL_DESCRIPTIONS[toolName];
-    if (curated) return curated;
-    const parts = toolName.split("__");
-    if (parts.length >= 3) {
-      const server = parts[1]!;
-      const verb = parts.slice(2).join("__").replace(/_/g, " ");
-      return `${server}: ${verb}`;
-    }
-    return toolName;
+    const base = curated
+      ? curated
+      : (() => {
+          const parts = toolName.split("__");
+          if (parts.length >= 3) {
+            const server = parts[1]!;
+            const verb = parts.slice(2).join("__").replace(/_/g, " ");
+            return `${server}: ${verb}`;
+          }
+          return toolName;
+        })();
+    const argHint = firstScalarArgHint(parseInput(inputPreview));
+    return argHint ? `${base} (${argHint})` : base;
   }
 
   const input = parseInput(inputPreview);
@@ -90,17 +110,26 @@ export function summarizeToolForTitle(
     case "Skill": {
       // Claude Code's Skill tool input shape has shifted across versions
       // and skill flavours. Read defensively from every known field
-      // before falling back to the bare tool name — the user reported
-      // a popup that rendered as `🔐 Permission: Skill` (no brackets)
-      // because we'd only checked `skill`. The skill name is the most
-      // identifying field of the prompt; never drop it silently.
+      // before falling back. The skill name is the most identifying
+      // field of the prompt; never drop it silently.
+      //
+      // (#1790) Final fallback added: when no skill-name key matches,
+      // try `command` (some Skill variants pass the invocation under
+      // that key), then the first scalar arg-value pair. Pre-fix the
+      // default returned a bare `Skill` with zero context — operators
+      // saw "🔐 Permission: Skill" with no way to tell what was being
+      // asked without tapping See more.
       const skill =
         readString(input, "skill") ??
         readString(input, "skill_name") ??
         readString(input, "skillName") ??
         readString(input, "name") ??
         skillBasenameFromPath(input);
-      return skill ? `${toolName} (${skill})` : toolName;
+      if (skill) return `${toolName} (${skill})`;
+      const command = readString(input, "command");
+      if (command) return `${toolName}: ${truncate(command, COMMAND_TITLE_MAX)}`;
+      const argHint = firstScalarArgHint(input);
+      return argHint ? `${toolName} (${argHint})` : toolName;
     }
     case "Bash": {
       const command = readString(input, "command");
@@ -127,6 +156,108 @@ export function summarizeToolForTitle(
     default:
       return toolName;
   }
+}
+
+/**
+ * Build the multi-line collapsed body of an approval card (#1790).
+ *
+ * Pre-fix the card was a single line — `🔐 Permission: <title>` —
+ * and the agent's stated `description` plus the input preview only
+ * surfaced when the operator tapped "See more". For skill / generic
+ * tool prompts the title alone (e.g. `Skill (mail)`) is rarely
+ * enough to approve at a glance; the operator needs to see *why*
+ * before they tap Allow / Deny.
+ *
+ * Layout mirrors the `vault_request_access` card (the gold standard):
+ *
+ *   🔐 <agent> · <tool summary>
+ *   why: <description-or-"not provided">
+ *
+ * The agent line is dropped when `agentName` is null (the
+ * gateway's bridge client may be anonymous during early-boot edge
+ * cases — better to render the title than a misleading blank).
+ *
+ * Output is HTML-escaped and intended for `parse_mode: 'HTML'`
+ * via Telegram's Bot API.
+ */
+export function formatPermissionCardBody(opts: {
+  toolName: string;
+  inputPreview: string | undefined;
+  description: string | undefined;
+  agentName: string | null;
+}): string {
+  const summary = summarizeToolForTitle(opts.toolName, opts.inputPreview);
+  const lines: string[] = [];
+
+  const agentBit = opts.agentName && opts.agentName.length > 0
+    ? `<b>${escapeTgHtml(opts.agentName)}</b> · `
+    : "";
+  lines.push(`🔐 ${agentBit}${escapeTgHtml(summary)}`);
+
+  // The agent's stated reason. Always render the line — when the
+  // agent omitted a `description`, render an explicit
+  // `why: <i>not provided</i>` rather than skip silently, so the
+  // missing-rationale is visible as an agent-side failure (matches
+  // the vault card's #1790 treatment of an omitted `reason`).
+  const rawWhy = (opts.description ?? "").replace(/\s+/g, " ").trim();
+  const truncatedWhy =
+    rawWhy.length > DESCRIPTION_LINE_MAX
+      ? rawWhy.slice(0, DESCRIPTION_LINE_MAX - 1) + "…"
+      : rawWhy;
+  if (truncatedWhy.length > 0) {
+    lines.push(`why: <i>${escapeTgHtml(truncatedWhy)}</i>`);
+  } else {
+    lines.push(`why: <i>not provided</i>`);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Minimal HTML escape for Telegram `parse_mode=HTML`. Mirrors
+ * `escapeHtmlForTg` in gateway.ts; duplicated here to keep
+ * permission-title.ts free of a gateway import (the file is
+ * referenced by both server.ts and gateway.ts).
+ */
+function escapeTgHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Return a `key: value` hint for the first scalar (string / number /
+ * boolean) arg in the input preview. Used as a last-ditch context
+ * line on uncurated MCP tools and Skill calls whose canonical
+ * skill-name fields are all missing.
+ *
+ * Skips obviously-routing keys (`chat_id`, `message_thread_id`,
+ * `request_id`) that aren't useful to a human operator deciding
+ * whether to approve. Returns `null` when nothing scalar remains.
+ */
+function firstScalarArgHint(
+  input: Record<string, unknown> | null,
+): string | null {
+  if (!input) return null;
+  const SKIP = new Set([
+    "chat_id",
+    "chatId",
+    "message_thread_id",
+    "messageThreadId",
+    "request_id",
+    "requestId",
+  ]);
+  for (const [key, value] of Object.entries(input)) {
+    if (SKIP.has(key)) continue;
+    if (typeof value === "string" && value.length > 0) {
+      return `${key}: ${truncate(value, INPUT_VALUE_MAX)}`;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return `${key}: ${String(value)}`;
+    }
+  }
+  return null;
 }
 
 function parseInput(raw: string | undefined): Record<string, unknown> | null {
