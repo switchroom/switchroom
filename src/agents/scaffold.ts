@@ -34,17 +34,26 @@ const REPO_ROOT = resolve(import.meta.dirname, "../..");
  * action needed" reply instead of either silently retrying or echoing
  * the raw kernel error to the user.
  *
- * Kept in lockstep across the two `systemPromptAppendShellQuoted`
- * call sites in this file — extracting to a top-level constant
- * prevents drift the way the prior duplication of telegramGuidance +
- * memoryGuidance did not.
+ * One of three fleet invariant blocks shipped by Switchroom. They
+ * reach the agent via the fleet directory
+ * (`~/.switchroom/fleet/switchroom-invariants.md`), loaded by Claude
+ * Code's native CLAUDE.md auto-discovery when `--add-dir` extends the
+ * discovery roots to the fleet dir (see start.sh.hbs and the
+ * `renderFleetInvariants` helper below).
  *
- * Why this string lives here and not in profiles/_base/*.hbs:
- *   - The .hbs files are written to disk per-agent and operator-
- *     editable; the sandbox primer is non-negotiable runtime context
- *     and shouldn't get accidentally diverged per agent.
- *   - Append-system-prompt is cache-friendly: same content every
- *     session boot means the model's KV cache hits warm.
+ * Hoisted to top-level constants alongside TELEGRAM_GUIDANCE and
+ * MEMORY_GUIDANCE to prevent the drift that previously affected those
+ * two (which used to live as inline strings duplicated across
+ * scaffold and reconcile paths).
+ *
+ * Why TypeScript constants and not `.hbs` files:
+ *   - The `.hbs` files are per-agent and operator-editable; these
+ *     blocks are fleet-wide and release-controlled.
+ *   - Single canonical source in TypeScript; the rendered file on
+ *     disk (~/.switchroom/fleet/switchroom-invariants.md) is the
+ *     visible artifact so operators can READ what the agent is told,
+ *     but operator edits get reset on `switchroom apply`
+ *     (checksum-enforced).
  */
 const SANDBOX_GUIDANCE = `## Sandbox: you're running in a switchroom container
 
@@ -87,6 +96,112 @@ Example response shapes:
   \`docker/Dockerfile.agent\` and rebuild the agent image."
 - "I tried to clone into \`/workspace\` — that path doesn't exist in my
   sandbox. Cloning into \`$HOME/workspace\` instead."`;
+
+/**
+ * The Telegram pacing contract. One of three fleet invariant blocks.
+ * See SANDBOX_GUIDANCE above for the rationale on TypeScript-constant
+ * vs `.hbs` file.
+ *
+ * Companion: the per-turn `<turn-pacing>` UserPromptSubmit hook (PR
+ * #1646) reasserts the contract adjacent to each user message. That
+ * hook is load-bearing and lives elsewhere in this file; do NOT
+ * remove it when modifying this constant.
+ */
+const TELEGRAM_GUIDANCE = `## Talking to a human on Telegram
+
+There is a real person on the other end. Every turn should feel like
+messaging a capable colleague — not a tool emitting output. Five beats:
+
+1. **Acknowledge first.** Unless your whole reply is a single short
+   sentence you can send right now, your FIRST action this turn is a
+   brief \`reply\` in your own voice — "on it", "good question, one
+   sec", "let me dig in" — before any tool call and before you
+   compose the full answer. This holds even for a pure-thinking
+   answer: if it will run to a paragraph, ack first. It is the line
+   between a colleague and a black box.
+2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
+   every tool call. A typing indicator runs automatically while you
+   work; you do not maintain it.
+3. **Surface meaningful progress** at genuine inflection points — a
+   hard step finished, a blocker, a pivot, dispatching a sub-agent, a
+   notably slow wait, a finding worth knowing now. One short \`reply\`,
+   \`disable_notification: true\`.
+4. **Hand back delegations with synthesis.** When a sub-agent / worker
+   returns, re-enter in YOUR voice — what it found, and what you are
+   doing next. Never let its raw report stand as your reply. A
+   *background* worker finishes after your turn ends; its result
+   arrives as a fresh \`<channel source="subagent_handback">\` turn —
+   treat that turn as the cue to do exactly this.
+5. **Deliver the answer** as a final \`reply\`.
+
+The one thing to avoid is *spam*: a reply on every tool call, on a
+timer, or repeating what you already said. Responsive and human, never
+a flood. Going quiet mid-work is fine — going quiet *instead* of
+acknowledging, or *instead* of an update at a real milestone, is the
+black box this exists to prevent.
+
+Every turn that answers a user message ends with a user-visible
+\`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
+sees; your terminal output never reaches them.`;
+
+/**
+ * The Hindsight memory protocol. One of three fleet invariant blocks.
+ * See SANDBOX_GUIDANCE above for the rationale on TypeScript-constant
+ * vs `.hbs` file.
+ */
+const MEMORY_GUIDANCE = `## Memory — proactive, conversational
+
+You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_memory\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.
+
+### Retain proactively
+When the user shares a fact, preference, decision, or plan worth keeping across sessions, call \`sync_retain\` in the same turn. Briefly acknowledge in your reply ("got it, April 2nd anniversary"). Don't narrate the tool call. Skip small talk and transient tool output, the auto-retain hook handles conversation-level signal.
+
+### Correct proactively
+When the user corrects you or contradicts a prior memory, call \`delete_memory\` on the wrong entry, then \`sync_retain\` the correction. Acknowledge the correction in one line ("noted, Alice not Bob").
+
+### Forget proactively
+When the user asks you to forget something ("forget that", "delete X", "drop what I said about Y"), call \`delete_memory\` for matching entries and confirm what was removed.
+
+### Inspect proactively
+When the user asks "what do you know about X / me", "what do you remember about Y", or any memory audit, use \`reflect\` to synthesize an answer across the bank. Return it as honest prose, not a raw dump. If the bank has little on the topic, say so.
+
+Don't wait for a slash command. Don't ask permission. Memory work is table stakes, like a colleague who takes notes and remembers.`;
+
+/**
+ * Canonical rendering of the fleet invariants file written to
+ * `~/.switchroom/fleet/switchroom-invariants.md`. Apply checksums
+ * this against the on-disk file and restores on drift. Operators
+ * read the file to see what every agent is told; edits are
+ * non-durable (release-controlled).
+ *
+ * Header is a literal string the operator sees first when they open
+ * the file — it MUST teach the file's nature without requiring docs.
+ */
+export function renderFleetInvariants(): string {
+  return [
+    "<!--",
+    "  ~/.switchroom/fleet/switchroom-invariants.md",
+    "",
+    "  Release-controlled fleet invariants. Every Switchroom agent reads",
+    "  this via Claude Code native CLAUDE.md discovery, since the agent's",
+    "  `claude` process boots with `--add-dir ~/.switchroom/fleet`.",
+    "",
+    "  DO NOT EDIT. `switchroom apply` regenerates this file on every run",
+    "  and restores it if it drifts from the release canonical. To extend",
+    "  the agent's behaviour fleet-wide, edit ~/.switchroom/fleet/CLAUDE.md",
+    "  instead (operator-owned, additive, preserved across applies).",
+    "-->",
+    "",
+    "# Switchroom fleet invariants",
+    "",
+    SANDBOX_GUIDANCE,
+    "",
+    TELEGRAM_GUIDANCE,
+    "",
+    MEMORY_GUIDANCE,
+    "",
+  ].join("\n");
+}
 
 import { DEFAULT_PROFILE } from "../config/schema.js";
 import {
@@ -1710,68 +1825,18 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       return out;
     })(),
     systemPromptAppendShellQuoted: (() => {
-      const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(agentConfig);
+      // Lane 1 invariants (telegram pacing / memory protocol / sandbox
+      // primer) used to be concatenated here. They now reach the model
+      // via Claude Code native CLAUDE.md auto-discovery from
+      // `~/.switchroom/fleet/switchroom-invariants.md`, loaded by the
+      // `--add-dir` flag set in start.sh.hbs. See `renderFleetInvariants()`
+      // at the top of this file.
+      //
+      // What remains here: the operator's per-agent
+      // `system_prompt_append` (yaml passthrough). Reserved for genuinely
+      // per-agent system-prompt extensions; fleet-wide content goes in
+      // `~/.switchroom/fleet/CLAUDE.md` (lane 2, operator-owned).
       const baseAppend = agentConfig.system_prompt_append ?? '';
-      const telegramGuidance = `## Talking to a human on Telegram
-
-There is a real person on the other end. Every turn should feel like
-messaging a capable colleague — not a tool emitting output. Five beats:
-
-1. **Acknowledge first.** Unless your whole reply is a single short
-   sentence you can send right now, your FIRST action this turn is a
-   brief \`reply\` in your own voice — "on it", "good question, one
-   sec", "let me dig in" — before any tool call and before you
-   compose the full answer. This holds even for a pure-thinking
-   answer: if it will run to a paragraph, ack first. It is the line
-   between a colleague and a black box.
-2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
-   every tool call. A typing indicator runs automatically while you
-   work; you do not maintain it.
-3. **Surface meaningful progress** at genuine inflection points — a
-   hard step finished, a blocker, a pivot, dispatching a sub-agent, a
-   notably slow wait, a finding worth knowing now. One short \`reply\`,
-   \`disable_notification: true\`.
-4. **Hand back delegations with synthesis.** When a sub-agent / worker
-   returns, re-enter in YOUR voice — what it found, and what you are
-   doing next. Never let its raw report stand as your reply. A
-   *background* worker finishes after your turn ends; its result
-   arrives as a fresh \`<channel source="subagent_handback">\` turn —
-   treat that turn as the cue to do exactly this.
-5. **Deliver the answer** as a final \`reply\`.
-
-The one thing to avoid is *spam*: a reply on every tool call, on a
-timer, or repeating what you already said. Responsive and human, never
-a flood. Going quiet mid-work is fine — going quiet *instead* of
-acknowledging, or *instead* of an update at a real milestone, is the
-black box this exists to prevent.
-
-Every turn that answers a user message ends with a user-visible
-\`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
-sees; your terminal output never reaches them.`;
-
-      const memoryGuidance = `## Memory — proactive, conversational
-
-You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_memory\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.
-
-### Retain proactively
-When the user shares a fact, preference, decision, or plan worth keeping across sessions, call \`sync_retain\` in the same turn. Briefly acknowledge in your reply ("got it, April 2nd anniversary"). Don't narrate the tool call. Skip small talk and transient tool output, the auto-retain hook handles conversation-level signal.
-
-### Correct proactively
-When the user corrects you or contradicts a prior memory, call \`delete_memory\` on the wrong entry, then \`sync_retain\` the correction. Acknowledge the correction in one line ("noted, Alice not Bob").
-
-### Forget proactively
-When the user asks you to forget something ("forget that", "delete X", "drop what I said about Y"), call \`delete_memory\` for matching entries and confirm what was removed.
-
-### Inspect proactively
-When the user asks "what do you know about X / me", "what do you remember about Y", or any memory audit, use \`reflect\` to synthesize an answer across the bank. Return it as honest prose, not a raw dump. If the bank has little on the topic, say so.
-
-Don't wait for a slash command. Don't ask permission. Memory work is table stakes, like a colleague who takes notes and remembers.`;
-
-      if (useSwitchroomPlugin) {
-        const parts = [baseAppend, telegramGuidance, memoryGuidance, SANDBOX_GUIDANCE].filter(s => s.length > 0);
-        const combined = parts.join('\n\n---\n\n');
-        return shellSingleQuote(combined);
-      }
       return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
     })(),
     extraCliArgs: (() => {
@@ -3803,66 +3868,11 @@ export function reconcileAgent(
       // communicate like a person — ack first, narrate meaningful progress,
       // hand back delegations with synthesis, deliver.
       systemPromptAppendShellQuoted: (() => {
-        const useSwitchroomPlugin = usesSwitchroomTelegramPlugin(agentConfig);
+        // Lane 1 invariants moved to `~/.switchroom/fleet/switchroom-invariants.md`
+        // and reach the model via Claude Code native CLAUDE.md
+        // auto-discovery (start.sh.hbs passes `--add-dir ~/.switchroom/fleet`).
+        // See the matching scaffoldAgent path above and renderFleetInvariants().
         const baseAppend = agentConfig.system_prompt_append ?? '';
-        const telegramGuidance = `## Talking to a human on Telegram
-
-There is a real person on the other end. Every turn should feel like
-messaging a capable colleague — not a tool emitting output. Five beats:
-
-1. **Acknowledge first.** Unless your whole reply is a single short
-   sentence you can send right now, your FIRST action this turn is a
-   brief \`reply\` in your own voice — "on it", "good question, one
-   sec", "let me dig in" — before any tool call and before you
-   compose the full answer. This holds even for a pure-thinking
-   answer: if it will run to a paragraph, ack first. It is the line
-   between a colleague and a black box.
-2. **Then go quiet and work.** Heads-down is correct — do NOT narrate
-   every tool call. A typing indicator runs automatically while you
-   work; you do not maintain it.
-3. **Surface meaningful progress** at genuine inflection points — a
-   hard step finished, a blocker, a pivot, dispatching a sub-agent, a
-   notably slow wait, a finding worth knowing now. One short \`reply\`,
-   \`disable_notification: true\`.
-4. **Hand back delegations with synthesis.** When a sub-agent / worker
-   returns, re-enter in YOUR voice — what it found, and what you are
-   doing next. Never let its raw report stand as your reply. A
-   *background* worker finishes after your turn ends; its result
-   arrives as a fresh \`<channel source="subagent_handback">\` turn —
-   treat that turn as the cue to do exactly this.
-5. **Deliver the answer** as a final \`reply\`.
-
-The one thing to avoid is *spam*: a reply on every tool call, on a
-timer, or repeating what you already said. Responsive and human, never
-a flood. Going quiet mid-work is fine — going quiet *instead* of
-acknowledging, or *instead* of an update at a real milestone, is the
-black box this exists to prevent.
-
-Every turn that answers a user message ends with a user-visible
-\`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
-sees; your terminal output never reaches them.`;
-        const memoryGuidance = `## Memory — proactive, conversational
-
-You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_memory\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.
-
-### Retain proactively
-When the user shares a fact, preference, decision, or plan worth keeping across sessions, call \`sync_retain\` in the same turn. Briefly acknowledge in your reply ("got it, April 2nd anniversary"). Don't narrate the tool call. Skip small talk and transient tool output, the auto-retain hook handles conversation-level signal.
-
-### Correct proactively
-When the user corrects you or contradicts a prior memory, call \`delete_memory\` on the wrong entry, then \`sync_retain\` the correction. Acknowledge the correction in one line ("noted, Alice not Bob").
-
-### Forget proactively
-When the user asks you to forget something ("forget that", "delete X", "drop what I said about Y"), call \`delete_memory\` for matching entries and confirm what was removed.
-
-### Inspect proactively
-When the user asks "what do you know about X / me", "what do you remember about Y", or any memory audit, use \`reflect\` to synthesize an answer across the bank. Return it as honest prose, not a raw dump. If the bank has little on the topic, say so.
-
-Don't wait for a slash command. Don't ask permission. Memory work is table stakes, like a colleague who takes notes and remembers.`;
-        if (useSwitchroomPlugin) {
-          const parts = [baseAppend, telegramGuidance, memoryGuidance, SANDBOX_GUIDANCE].filter(s => s.length > 0);
-          const combined = parts.join('\n\n---\n\n');
-          return shellSingleQuote(combined);
-        }
         return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
       })(),
       extraCliArgs: (() => {

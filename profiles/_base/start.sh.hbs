@@ -568,16 +568,29 @@ for f in \
   fi
 done
 
+# Fleet directory — epic #1850 / issue #1852. Extends Claude Code's
+# native CLAUDE.md auto-discovery to `~/.switchroom/fleet/` so every
+# agent reads the release-pinned `switchroom-invariants.md` (lane 1)
+# and operator-owned `CLAUDE.md` (lane 2) from there. Guarded on the
+# directory existing so a fresh-install or a half-applied state
+# doesn't fail boot — `switchroom apply`'s ensureHostMountSources
+# creates the dir + seeds the files.
+SR_FLEET_DIR="$HOME/.switchroom/fleet"
+SR_FLEET_ARG=""
+if [ -d "$SR_FLEET_DIR" ]; then
+  SR_FLEET_ARG="--add-dir $SR_FLEET_DIR"
+fi
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{else}}
 if [ -n "$APPEND_PROMPT" ]; then
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 else
-  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}}{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
+  exec claude $CONTINUE_FLAG --channels plugin:telegram@claude-plugins-official --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}}{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
 fi
 {{/if}}

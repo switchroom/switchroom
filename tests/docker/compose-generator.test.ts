@@ -625,6 +625,47 @@ describe("generateCompose", () => {
     }
   });
 
+  it("emits a :ro mount for the fleet dir when present (epic #1850 / issue #1852)", async () => {
+    // The fleet directory holds the agent prompt cascade's lane 1
+    // (release-pinned invariants) and lane 2 (operator-owned fleet
+    // defaults). Reaches each agent's `claude` process via
+    // `--add-dir ~/.switchroom/fleet` in start.sh.hbs — Claude Code
+    // native CLAUDE.md auto-discovery loads the `.md` files from
+    // there into the system prompt.
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-fleet-"));
+    mkdirSync(join(tmp, ".switchroom", "fleet"), { recursive: true });
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).toContain(
+        `${tmp}/.switchroom/fleet:${tmp}/.switchroom/fleet:ro`,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("omits the fleet mount when the host dir doesn't exist (pre-apply state)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-no-fleet-"));
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain(`/.switchroom/fleet`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("emits each mount independently when only one host dir exists (#907)", async () => {
     // Vault-only operators commonly have populated skills/ but no
     // filesystem credentials/ (everything via vault). The two

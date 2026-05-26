@@ -1723,6 +1723,21 @@ function emitAgentService(
       `      - ${homePrefix}/.switchroom/mcp-launchers:${homePrefix}/.switchroom/mcp-launchers:ro`,
     );
   }
+  // Fleet directory — agent prompt cascade lanes 1 and 2 (epic
+  // #1850, issue #1852). Holds `switchroom-invariants.md`
+  // (release-pinned) and `CLAUDE.md` (operator-owned fleet defaults).
+  // Reaches the agent's `claude` process via `--add-dir` (set in
+  // start.sh.hbs), which extends Claude Code's native CLAUDE.md
+  // discovery roots. Same-path mount so the operator can edit the
+  // file and the agent reads the same bytes. `:ro` because the
+  // agent never writes here; `switchroom apply` is the only writer.
+  // Created with seeded files by `ensureHostMountSources` in apply.ts,
+  // so existsSync is true on every post-apply install.
+  if (existsSync(`${hostHomeForChecks}/.switchroom/fleet`)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/fleet:${homePrefix}/.switchroom/fleet:ro`,
+    );
+  }
   // PER-AGENT credentials mount (sec WS6-F2, #1390). Previously the
   // ENTIRE `~/.switchroom/credentials/` dir was bind-mounted `:ro`
   // into EVERY agent — so a prompt-injected agent could read every

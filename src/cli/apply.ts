@@ -17,7 +17,7 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
@@ -55,7 +55,7 @@ import {
   findConfigFile,
   ConfigError,
 } from "../config/loader.js";
-import { scaffoldAgent, alignAgentUid } from "../agents/scaffold.js";
+import { scaffoldAgent, alignAgentUid, renderFleetInvariants } from "../agents/scaffold.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { generateCompose, allocateAgentUid } from "../agents/compose.js";
 import { resolveImageTag, resolveRelease } from "../config/release-resolve.js";
@@ -408,6 +408,55 @@ async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
     } catch {
       /* dev / no CAP_CHOWN — leave existing ownership */
     }
+  }
+
+  // Fleet directory — lane 1 (release-pinned invariants) and lane 2
+  // (operator-owned fleet defaults) of the agent prompt cascade. The
+  // dir is bind-mounted `:ro` into every agent at the same host-absolute
+  // path (`src/agents/compose.ts`) and reaches the agent's `claude`
+  // process via `--add-dir "$HOME/.switchroom/fleet"` set in
+  // `profiles/_base/start.sh.hbs`. Claude Code native CLAUDE.md
+  // discovery then loads `.md` files in this dir into the system
+  // prompt. See epic #1850 + child issue #1852.
+  //
+  // L1 invariants: rendered from TypeScript constants
+  // (TELEGRAM_GUIDANCE, MEMORY_GUIDANCE, SANDBOX_GUIDANCE in
+  // scaffold.ts) via `renderFleetInvariants()`. Release-controlled,
+  // checksum-restored on drift. Operator reads to know what every
+  // agent is told; operator edits get reset on next apply.
+  //
+  // L2 fleet defaults: empty placeholder for now. The actual lane 2
+  // content (operating principles, concision norm, tool-family
+  // catalogue) lands in epic issue #1855. `writeIfMissing` semantics
+  // — operator edits are preserved across applies.
+  const fleetDir = join(home, ".switchroom", "fleet");
+  await mkdir(fleetDir, { recursive: true });
+  const invariantsPath = join(fleetDir, "switchroom-invariants.md");
+  const invariantsCanonical = renderFleetInvariants();
+  const invariantsCurrent = existsSync(invariantsPath)
+    ? readFileSync(invariantsPath, "utf-8")
+    : null;
+  if (invariantsCurrent !== invariantsCanonical) {
+    writeFileSync(invariantsPath, invariantsCanonical, { mode: 0o644 });
+  }
+  const fleetClaudePath = join(fleetDir, "CLAUDE.md");
+  if (!existsSync(fleetClaudePath)) {
+    // L2 placeholder. Real content arrives via epic issue #1855.
+    writeFileSync(
+      fleetClaudePath,
+      [
+        "# Switchroom fleet defaults",
+        "",
+        "Operator-owned fleet brain. Every agent reads this via",
+        "`--add-dir ~/.switchroom/fleet` (Claude Code native CLAUDE.md",
+        "discovery). Additions stack across the fleet; `switchroom apply`",
+        "never clobbers your edits here.",
+        "",
+        "<!-- L2 fleet defaults content lands in switchroom #1855 -->",
+        "",
+      ].join("\n"),
+      { mode: 0o644 },
+    );
   }
 }
 
