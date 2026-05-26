@@ -1,0 +1,173 @@
+# JSON Schema (YAML form) for Phase 1 finding files.
+# A finding file lives at audit/<run-date>/findings/<unit-id>.yaml
+# and must validate against this schema.
+#
+# Validate manually with `ajv` or `yajsv` after `yq -o=json`.
+
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://github.com/switchroom/switchroom/scripts/drift-audit/schema/finding.schema.yaml"
+title: drift-audit finding file
+type: object
+additionalProperties: false
+required: [unit_id, unit_path, category, audited_at, findings]
+
+properties:
+  unit_id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9-]*$"
+    description: Kebab-case id matching the manifest.
+
+  unit_path:
+    type: string
+    description: Repo-relative path to the audited file.
+
+  category:
+    type: string
+    enum:
+      - jtbd
+      - contract
+      - artefact-current
+      - rfc-shipped
+      - rfc-draft
+      - archived
+      - historical
+      - docs
+      - src-comments
+
+  audited_at:
+    type: string
+    format: date-time
+
+  auditor_notes:
+    type: string
+    description: Optional free-text notes from the audit agent to triage.
+
+  findings:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+        - claim_id
+        - quote
+        - loc
+        - verdict
+        - evidence_strength
+        - action
+        - confidence
+        - rationale
+      properties:
+
+        claim_id:
+          type: string
+          pattern: "^c[0-9]+$"
+          description: Sequential claim id within this file (c1, c2, ...).
+
+        quote:
+          type: string
+          maxLength: 500
+          description: 1-2 sentence excerpt from the unit file.
+
+        loc:
+          type: string
+          pattern: "^L[0-9]+(-L[0-9]+)?$"
+          description: Line or line range in the unit file (L42 or L42-L45).
+
+        verdict:
+          type: string
+          enum:
+            # Universal verdicts
+            - aligned
+            - drift-minor
+            - drift-major
+            - dead-pointer
+            - vision-only
+            # JTBD-specific verdicts
+            - outcome-not-realized
+            - jtbd-too-technical
+            - jtbd-stale-example
+            # Contract-specific verdicts
+            - code-violates-contract
+            - contract-example-stale
+            # RFC-specific verdicts
+            - rfc-status-wrong
+            - rfc-superseded-quietly
+            # Archived/historical-specific verdicts
+            - archive-leaks
+            - disclaimer-stale
+
+        evidence:
+          type: array
+          description: |
+            Citations from the codebase or other docs supporting the
+            verdict. Empty when evidence_strength is "none."
+          items:
+            type: object
+            additionalProperties: false
+            required: [path, lines]
+            properties:
+              path:
+                type: string
+                description: Repo-relative path to the evidence file.
+              lines:
+                type: string
+                pattern: "^L[0-9]+(-L[0-9]+)?$"
+              snippet:
+                type: string
+                maxLength: 1000
+
+        evidence_strength:
+          type: string
+          enum: [strong, medium, weak, none]
+          description: |
+            strong = test pins the behavior;
+            medium = code directly matches description;
+            weak   = inferred or partial match;
+            none   = no implementation found.
+
+        action:
+          type: string
+          enum:
+            - keep
+            - update-text
+            - delete
+            - rewrite-at-outcome-level
+            - mark-vision
+            - update-frontmatter
+            - fix-referrer
+            - escalate
+
+        proposed_text:
+          type: string
+          maxLength: 2000
+          description: |
+            Required when action is update-text, rewrite-at-outcome-
+            level, mark-vision, or update-frontmatter. A 1-2 sentence
+            sketch of the replacement; the Phase 3 fix agent will
+            adapt to surrounding context.
+
+        referrer:
+          type: object
+          description: |
+            Required when action is fix-referrer. Points the fix
+            agent at the file that needs the edit.
+          additionalProperties: false
+          required: [path, lines]
+          properties:
+            path:
+              type: string
+            lines:
+              type: string
+              pattern: "^L[0-9]+(-L[0-9]+)?$"
+
+        confidence:
+          type: string
+          enum: [high, medium, low]
+
+        rationale:
+          type: string
+          maxLength: 1000
+          description: |
+            One short paragraph explaining why this verdict, citing
+            evidence. Triage and the operator read this; make it
+            standalone.
