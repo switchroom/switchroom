@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.52 — agents now know about clone-to-personal (discovery gap)
+
+The plumbing landed in v0.13.45-51, but the doc every agent reads on
+every turn (\`profiles/_shared/agent-self-service.md.hbs\`) was silent
+on the new verbs — agents had the tools but didn't know they existed.
+The gymbro screenshot that drove this whole arc ("Operator action:
+edit ~/.switchroom/agents/gymbro/.claude/skills/garmin/scripts/
+garmin-list.py") would have kept happening until this doc shipped.
+
+### docs(agent): teach agents about clone-to-personal + personal-skill ops (PR #1863)
+
+Closes the discovery gap. Adds to the bundled
+\`agent-self-service.md.hbs\` template (reconciled into every agent's
+\`CLAUDE.md\` at scaffold time):
+
+- **Trigger-table rows** — including the explicit "YOU find a bug in
+  a skill you depend on → clone+edit yourself" pattern that fires
+  when an LLM agent recognises the situation
+- **"Fixing a skill you depend on — don't ask the operator"** section
+  with the 3-step flow (clone → edit → use \`personal-<name>\`)
+- **"Discovering skills"** section with the three-tier model + advice
+  to \`skill_search\` BEFORE authoring
+- **Tool docs** for the six new MCP verbs (search, init/edit/remove/
+  list_personal, clone_to_personal) — same voice as the existing
+  \`schedule_add\` / \`skill_install\` entries
+
+No code change — every agent picks up the new guidance on next
+\`switchroom apply\` / agent restart.
+
 ## v0.13.51 — closes the agent-managed-skills JTBD end-to-end
 
 Two PRs that complete what v0.13.50 started: the durability story is
