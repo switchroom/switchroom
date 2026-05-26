@@ -22,9 +22,9 @@ tools is to let you do the edit yourself.
 | "what other agents are running here?" / "is there an agent that does X?" / "who handles Y?" | `peers_list` |
 | "install the foo skill" / "give yourself the foo skill" | `skill_install` with `source: "bundled:foo"` |
 | "drop the foo skill" / "remove the foo skill" | `skill_remove` with `name: "foo"` |
-| "is there a skill that does X?" / "what skills are available?" | `skill_search` with `query: "X"` |
-| **YOU find a bug in a skill you depend on** (missing field, broken script, wrong output) | `skill_clone_to_personal` then `skill_edit_personal` — fix it yourself, see below |
-| "write me a custom skill that does X" | `skill_init_personal` with the bundle |
+| "is there a skill for X?" | `skill_search` with `query: "X"` |
+| **YOU find a bug in a skill you're using** | `skill_clone_to_personal` then `skill_edit_personal` — fork-and-fix yourself |
+| "write me a custom skill that does X" | `skill_init_personal` |
 
 ### Tools
 
@@ -69,34 +69,7 @@ tools is to let you do the edit yourself.
   Does NOT remove skills the operator wrote directly into
   `switchroom.yaml` — those are removed by the operator only.
 
-- **`skill_search(query?, tier?, limit?)`** — read-only enumeration
-  across personal/shared/bundled tiers. Returns name, path,
-  frontmatter, size, mtime per match. Use BEFORE authoring a new
-  skill — odds are it already exists.
-
-- **`skill_init_personal(name, files)`** — author a new personal skill
-  in your workspace. `files` is a `{path: content}` JSON map. Path
-  allowlist: `SKILL.md`, `scripts/*.{sh,py}`, `references/*.md`,
-  `assets/<sub>/<file>`. Validation gates: name/path regex, SKILL.md
-  frontmatter, `bash -n` / `python3 -m py_compile`, banned-headless-
-  phrase scan.
-
-- **`skill_edit_personal(name, files)`** — overwrite an existing
-  personal skill. Same validation; refuses if the skill doesn't
-  already exist (use `init_personal` for new).
-
-- **`skill_remove_personal(name)`** — soft-remove (moves to
-  `<agentDir>/.claude/skills-trash/<name>-<ts>/` for 24h recovery).
-
-- **`skill_list_personal()`** — list YOUR personal skills (the ones
-  you've authored or forked). Read-only.
-
-- **`skill_clone_to_personal(source, name?)`** — fork a `shared:<name>`
-  or `bundled:<name>` into your personal tier. The fork is yours to
-  edit via `skill_edit_personal`. Operator-shipped files outside the
-  agent-authored allowlist (LICENSE, VENDORED.md, etc.) are skipped
-  with a note. Use this whenever you find a defect or missing
-  capability in a skill you depend on — don't ask the operator.
+- **`skill_search` / `skill_init_personal` / `skill_edit_personal` / `skill_remove_personal` / `skill_list_personal` / `skill_clone_to_personal`** — author/fork your own. `files` is `{path: content}` JSON; allowlist `SKILL.md`, `scripts/*.{sh,py}`, `references/*.md`.
 
 ### Safety rails — what gets rejected
 
@@ -111,80 +84,13 @@ the rails will block:
 - **20 entries per agent maximum.** `E_QUOTA_EXCEEDED`. If you're near the
   cap, `cron_list` first; if full, prompt the user to remove an old one
   before adding the new one.
-- **No `secrets:` on agent-authored entries.** `E_OVERLAY_SECRETS_REQUIRES_APPROVAL`.
-  If the user's task needs a credential (e.g. "use the GitHub API to
-  check…"), the cron fires the prompt and YOU at runtime go through the
-  normal `vault_request_access` flow on first execution — don't bake the
-  `secrets:` allowlist into the schedule entry.
-- **Cross-agent writes.** You can only manage your OWN schedule. The
-  broker pins identity via the `$SWITCHROOM_AGENT_NAME` env var the
-  gateway sets when spawning your CLI — calls passing
-  `agent: "<other-agent>"` that doesn't match the pin are rejected. If
-  the user wants to set something up on a different agent, tell them
-  which agent to ask.
+- **No `secrets:` on agent-authored entries** (`E_OVERLAY_SECRETS_REQUIRES_APPROVAL`). Cron fires the prompt; you go through `vault_request_access` at runtime.
+- **Cross-agent writes rejected** — you manage only your own schedule. The broker pins identity via `$SWITCHROOM_AGENT_NAME`; if the user wants something on a different agent, tell them which agent to ask.
 
-### Skills — self-service is live (#1163 Phase 2)
+### Skills — self-service
 
-You can `skill_list` to inventory, `skill_install` to add, and
-`skill_remove` to drop. v1 source format is `bundled:<name>` only — the
-skill must exist in the host's bundled-skills pool (run `skill_list` on
-the host to see what's available, or pass an obvious slug like
-`webapp-testing`, `pdf`, `mcp-builder`). git+https sources are designed
-but not yet shipped; if the user asks for an arbitrary URL, tell them
-the operator needs to drop it under `~/.switchroom/skills/<name>/` and
-run `switchroom apply`.
-
-### Fixing a skill you depend on — don't ask the operator
-
-If a skill you're using has a bug, a missing field, or needs a tweak
-to fit YOUR workflow, **fix it yourself**. Do not stop to ask the
-operator to edit the file. Three steps:
-
-1. **`skill_clone_to_personal`** with `source: "shared:<name>"` or
-   `"bundled:<name>"`. This forks the skill into YOUR private workspace
-   at `<agentDir>/.claude/skills/personal-<name>/`. The upstream
-   skill is untouched — no other agent is affected.
-2. **`skill_edit_personal`** with the fixed files (multi-file JSON
-   payload `{path: content, ...}`, or a single SKILL.md via the CLI).
-3. **From now on, use `personal-<name>` instead of `<name>`** — both
-   exist; claude-code discovers both; prefer the personal copy for
-   your own future use.
-
-The fork is durable: it survives container recreate, AND (if the
-operator has set up `~/.switchroom-config/`) it auto-mirrors into the
-operator's git-tracked config repo, so a host rebuild won't lose your
-work either.
-
-**When to choose `skill_init_personal` instead:** when you need a
-*new* skill that doesn't exist anywhere yet. `init` writes a fresh
-bundle from scratch; `clone-to-personal` starts from an existing
-upstream. If the user describes "I want a daily report" and no
-matching skill exists, `init_personal`. If you find that
-`scripts/garmin-list.py` is missing a field, `clone_to_personal
-shared:garmin` then `edit_personal`.
-
-**Skill discipline** — your personal fork is just for you. Don't
-write `claude -p` invocations (the validator rejects it, anyway). Keep
-the bundle small: `SKILL.md` plus `scripts/*.sh`/`*.py` and
-`references/*.md`. Hard caps at 20 files / 256 KB total.
-
-### Discovering skills
-
-Use `skill_search` to find skills before you write one. Three tiers
-visible to you:
-
-- **`personal`** — skills YOU've authored (or forked); private to you
-- **`shared`** — operator-curated pool, all agents can opt in via `skill_install`
-- **`bundled`** — ships with switchroom (docx, pdf, mcp-builder, webapp-testing, ...)
-
-```
-skill_search { query: "garmin" }
-skill_search { tier: "bundled" }
-skill_search { query: "calendar", tier: "shared" }
-```
-
-Always search before you `init_personal` — odds are something already
-exists.
+- **Install** — `skill_install` (`bundled:<name>`) / `skill_remove`. git+https deferred.
+- **Fix a skill yourself** — `skill_clone_to_personal` → `skill_edit_personal` → use `personal-<name>`. Fork is durable + auto-mirrors to `~/.switchroom-config/` when present.
 
 ### Honest confirmation pattern
 
