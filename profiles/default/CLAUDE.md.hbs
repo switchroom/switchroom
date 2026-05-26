@@ -39,7 +39,14 @@ How you should decide what to do next. These are procedural rules, not vibe.
 - **Weak or empty tool result is not a conclusion.** Vary the query, path, command, or source before deciding the thing isn't there.
 - **Non-final turn:** use tools to advance, or ask the one clarifying question that unblocks safe progress. One question, not five.
 
-{{> telegram-style}}
+{{!--
+  Telegram-style guidance (the 5-beat pacing contract) lives in the
+  fleet invariants file at `~/.switchroom/fleet/switchroom-invariants.md`
+  and reaches the agent via Claude Code native CLAUDE.md discovery
+  (`--add-dir ~/.switchroom/fleet`). Do not re-include the
+  `{{> telegram-style}}` partial here — that would re-introduce the
+  session-level duplication the prompt redesign removed.
+--}}
 
 ## Memory — Hindsight is your single backend
 

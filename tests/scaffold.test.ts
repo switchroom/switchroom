@@ -2305,14 +2305,33 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("export LOG_LEVEL='debug'");
   });
 
-  it("appends the sandbox primer to system prompt so agents recognise EROFS as the sandbox", () => {
+  it("renderFleetInvariants() includes the sandbox primer (epic #1850 lane 1)", async () => {
     // Closes the UX gap where agents hitting `EROFS` on a read-only mount
     // would either silently retry or echo the raw kernel error to the
     // user. The primer (top-level `SANDBOX_GUIDANCE` constant) names
     // the writable mounts + tells the agent how to respond when it hits
-    // the boundary. Kept in lockstep across both
-    // `systemPromptAppendShellQuoted` call sites — this test would fail
-    // if either site forgets to include it after a future refactor.
+    // the boundary.
+    //
+    // PR redesigning epic #1850 moved this content from
+    // `--append-system-prompt` into the fleet invariants file at
+    // `~/.switchroom/fleet/switchroom-invariants.md`, loaded by Claude
+    // Code native CLAUDE.md discovery via `--add-dir`. This test
+    // verifies the content is in the rendered invariants file.
+    const { renderFleetInvariants } = await import("../src/agents/scaffold.js");
+    const out = renderFleetInvariants();
+    expect(out).toContain("## Sandbox: you");
+    expect(out).toContain("running in a switchroom container");
+    expect(out).toContain("$HOME");
+    expect(out).toContain("/state/agent/home");
+    expect(out).toContain("/tmp");
+    expect(out).toContain("read-only file system");
+    expect(out).toContain("Operator action");
+  });
+
+  it("scaffoldAgent no longer appends the sandbox primer to system_prompt_append (moved to fleet invariants)", () => {
+    // Post-#1850 the sandbox primer is in `~/.switchroom/fleet/switchroom-invariants.md`,
+    // not in `--append-system-prompt`. This test guards against
+    // re-introducing the duplication.
     const agentConfig = makeAgentConfig({});
     const result = scaffoldAgent(
       "sandbox-primer-agent",
@@ -2321,46 +2340,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
       telegramConfig,
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-
-    // Load-bearing headings — drop these and the agent's reply
-    // template stops working. Substrings are chosen to NOT cross an
-    // ASCII apostrophe (POSIX single-quote wrapping splits the literal
-    // around apostrophes via the `'"'"'` idiom, so a substring spanning
-    // one wouldn't appear contiguously in start.sh).
-    expect(startSh).toContain("## Sandbox: you");
-    expect(startSh).toContain("running in a switchroom container");
-    // Writable paths the agent must know about
-    expect(startSh).toContain("$HOME");
-    expect(startSh).toContain("/state/agent/home");
-    expect(startSh).toContain("/tmp");
-    // Read-only paths + the operator-action framing
-    expect(startSh).toContain("read-only file system");
-    expect(startSh).toContain("Operator action");
-    // The primer must NOT leak when an agent doesn't use the switchroom
-    // telegram plugin (host-systemd legacy / non-telegram dispatches).
-    // The wrapping logic only includes the guidance when
-    // `useSwitchroomPlugin` is true; a regression there would attach
-    // the primer to agents whose telegram plumbing is different and
-    // confuse the model.
-  });
-
-  it("does NOT append sandbox primer for agents without the switchroom telegram plugin", () => {
-    const agentConfig = makeAgentConfig({
-      channels: {
-        telegram: {
-          plugin: "official",
-        },
-      },
-    });
-    const result = scaffoldAgent(
-      "sandbox-primer-skip-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    // start.sh should NOT inline the sandbox primer. The agent reads
+    // it via `--add-dir ~/.switchroom/fleet` instead.
     expect(startSh).not.toContain("## Sandbox: you");
     expect(startSh).not.toContain("running in a switchroom container");
+    // start.sh DOES carry the --add-dir flag pointing at the fleet dir,
+    // unconditionally for every plugin path.
+    expect(startSh).toContain("SR_FLEET_DIR");
+    expect(startSh).toContain(".switchroom/fleet");
   });
 
   it("escapes system_prompt_append via POSIX single-quote wrapping", () => {
@@ -2513,7 +2500,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("--allowedTools 'Edit'");
   });
 
-  it("agents with no add_dirs/allowed_tools/disallowed_tools render no flags (#199)", () => {
+  it("agents with no add_dirs/allowed_tools/disallowed_tools render no per-agent flags (#199)", () => {
+    // Pre-#1850: this test asserted start.sh had no `--add-dir` flag
+    // when the agent didn't configure any add_dirs. Post-#1850 the
+    // fleet directory mount adds an unconditional `--add-dir
+    // $SR_FLEET_DIR` (guarded by directory existence), so the
+    // "no add-dir flags" assertion shifted from "no occurrences" to
+    // "no per-agent occurrences" — i.e. no add-dir tied to a yaml
+    // `add_dirs:` entry.
     const agentConfig = makeAgentConfig();
     const result = scaffoldAgent(
       "bare-agent",
@@ -2522,7 +2516,16 @@ describe("scaffoldAgent with global defaults cascade", () => {
       telegramConfig,
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).not.toContain("--add-dir");
+    // The fleet add-dir is expected and conditional on the directory
+    // existing at runtime; it's emitted via the SR_FLEET_ARG shell var.
+    expect(startSh).toContain("SR_FLEET_DIR");
+    expect(startSh).toContain("SR_FLEET_ARG");
+    // No per-agent add-dirs from yaml `add_dirs:` (since none configured).
+    // Per-agent add-dirs render as literal `--add-dir '<path>'` tokens
+    // inside extraCliArgs; the fleet add-dir uses an unquoted shell
+    // variable `$SR_FLEET_ARG`. Distinguish by looking for literal
+    // quoted `--add-dir '` which only per-agent emissions produce.
+    expect(startSh).not.toContain("--add-dir '");
     expect(startSh).not.toContain("--allowedTools");
     expect(startSh).not.toContain("--disallowedTools");
   });

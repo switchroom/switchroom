@@ -2,10 +2,22 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { scaffoldAgent, reconcileAgent } from "../src/agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, renderFleetInvariants } from "../src/agents/scaffold.js";
 import type { AgentConfig, SwitchroomConfig, TelegramConfig } from "../src/config/schema.js";
 
-describe("Memory prompt guidance", () => {
+/**
+ * Memory prompt guidance — epic #1850 redesign moved this content from
+ * `--append-system-prompt` into the fleet invariants file at
+ * `~/.switchroom/fleet/switchroom-invariants.md`, loaded by Claude
+ * Code native CLAUDE.md discovery via `--add-dir`. These tests now
+ * verify the content is in the rendered invariants file (single source
+ * of truth) rather than in scaffold-emitted start.sh.
+ *
+ * Regression guard: start.sh must NOT contain the memory guidance —
+ * if it does, the session-level duplication the redesign removed
+ * has been re-introduced.
+ */
+describe("Memory prompt guidance (post-#1850)", () => {
   let tmpDir: string;
   let telegramConfig: TelegramConfig;
   let switchroomConfig: SwitchroomConfig;
@@ -35,118 +47,46 @@ describe("Memory prompt guidance", () => {
     }
   });
 
-  it("includes memory guidance block when using switchroom telegram plugin", () => {
-    const agentConfig: AgentConfig = {
-      channels: {
-        telegram: {
-          plugin: "switchroom",
-        },
-      },
-      memory: {
-        collection: "test-agent",
-      },
-    };
-
-    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
-
-    const startShPath = join(tmpDir, "test-agent", "start.sh");
-    const startSh = readFileSync(startShPath, "utf-8");
-
-    expect(startSh).toContain("## Memory — proactive, conversational");
-    expect(startSh).toContain("### Retain proactively");
-    expect(startSh).toContain("### Correct proactively");
-    expect(startSh).toContain("### Forget proactively");
-    expect(startSh).toContain("### Inspect proactively");
-    expect(startSh).toContain("mcp__hindsight__sync_retain");
-    expect(startSh).toContain("mcp__hindsight__delete_memory");
-    expect(startSh).toContain("mcp__hindsight__recall");
-    expect(startSh).toContain("mcp__hindsight__reflect");
+  it("renderFleetInvariants() includes the memory guidance block (lane 1)", () => {
+    const out = renderFleetInvariants();
+    expect(out).toContain("## Memory — proactive, conversational");
+    expect(out).toContain("### Retain proactively");
+    expect(out).toContain("### Correct proactively");
+    expect(out).toContain("### Forget proactively");
+    expect(out).toContain("### Inspect proactively");
+    expect(out).toContain("mcp__hindsight__sync_retain");
+    expect(out).toContain("mcp__hindsight__delete_memory");
+    expect(out).toContain("mcp__hindsight__recall");
+    expect(out).toContain("mcp__hindsight__reflect");
   });
 
-  it("does NOT include memory guidance when using official telegram plugin", () => {
-    const agentConfig: AgentConfig = {
-      channels: {
-        telegram: {
-          plugin: "official",
-        },
-      },
-    };
-
-    const noMemoryConfig: SwitchroomConfig = {
-      agents: {},
-      telegram: telegramConfig,
-    };
-
-    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, noMemoryConfig);
-
-    const startShPath = join(tmpDir, "test-agent", "start.sh");
-    const startSh = readFileSync(startShPath, "utf-8");
-
-    expect(startSh).not.toContain("## Memory — proactive, conversational");
-  });
-
-  it("memory guidance appears AFTER the Telegram pacing block", () => {
-    const agentConfig: AgentConfig = {
-      channels: {
-        telegram: {
-          plugin: "switchroom",
-        },
-      },
-      memory: {
-        collection: "test-agent",
-      },
-    };
-
-    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
-
-    const startShPath = join(tmpDir, "test-agent", "start.sh");
-    const startSh = readFileSync(startShPath, "utf-8");
-
-    const pacingIdx = startSh.indexOf("## Talking to a human on Telegram");
-    const memoryIdx = startSh.indexOf("## Memory — proactive, conversational");
-
+  it("renderFleetInvariants() orders Telegram pacing BEFORE memory guidance", () => {
+    // The fleet invariants file orders sections so the model reads
+    // them in the same sequence as the prior --append-system-prompt
+    // assembly. Telegram pacing first (it governs every turn),
+    // memory second (it governs cross-turn retention).
+    const out = renderFleetInvariants();
+    const pacingIdx = out.indexOf("## Talking to a human on Telegram");
+    const memoryIdx = out.indexOf("## Memory — proactive, conversational");
     expect(pacingIdx).toBeGreaterThan(-1);
     expect(memoryIdx).toBeGreaterThan(-1);
     expect(memoryIdx).toBeGreaterThan(pacingIdx);
   });
 
-  it("reconcileAgent emits identical memory guidance as scaffoldAgent", () => {
-    const agentConfig: AgentConfig = {
-      channels: {
-        telegram: {
-          plugin: "switchroom",
-        },
-      },
-      memory: {
-        collection: "test-agent",
-      },
-    };
+  it("renderFleetInvariants() includes all four memory sub-sections in correct order", () => {
+    const out = renderFleetInvariants();
+    const retainIdx = out.indexOf("### Retain proactively");
+    const correctIdx = out.indexOf("### Correct proactively");
+    const forgetIdx = out.indexOf("### Forget proactively");
+    const inspectIdx = out.indexOf("### Inspect proactively");
 
-    // First scaffold
-    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
-    const scaffoldStartSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-
-    // Then reconcile
-    reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
-    const reconcileStartSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-
-    // Extract the APPEND_PROMPT sections. Bash single-quoted strings embed
-    // literal `'` as the `'"'"'` sequence; match those along with normal
-    // non-quote chars so the Memory block (which contains apostrophes)
-    // survives the extract.
-    const extractAppend = (content: string) => {
-      const match = content.match(/APPEND_PROMPT='((?:[^']|'"'"')*)'/s);
-      return match ? match[1] : "";
-    };
-
-    const scaffoldAppend = extractAppend(scaffoldStartSh);
-    const reconcileAppend = extractAppend(reconcileStartSh);
-
-    expect(scaffoldAppend).toBe(reconcileAppend);
-    expect(scaffoldAppend).toContain("## Memory — proactive, conversational");
+    expect(retainIdx).toBeGreaterThan(-1);
+    expect(correctIdx).toBeGreaterThan(retainIdx);
+    expect(forgetIdx).toBeGreaterThan(correctIdx);
+    expect(inspectIdx).toBeGreaterThan(forgetIdx);
   });
 
-  it("includes all four sub-sections in correct order", () => {
+  it("scaffoldAgent does NOT include memory guidance in start.sh (regression guard for session-level duplication)", () => {
     const agentConfig: AgentConfig = {
       channels: {
         telegram: {
@@ -163,14 +103,38 @@ describe("Memory prompt guidance", () => {
     const startShPath = join(tmpDir, "test-agent", "start.sh");
     const startSh = readFileSync(startShPath, "utf-8");
 
-    const retainIdx = startSh.indexOf("### Retain proactively");
-    const correctIdx = startSh.indexOf("### Correct proactively");
-    const forgetIdx = startSh.indexOf("### Forget proactively");
-    const inspectIdx = startSh.indexOf("### Inspect proactively");
+    // Memory content now lives in ~/.switchroom/fleet/switchroom-invariants.md
+    // (loaded via --add-dir). It must NOT also appear in start.sh's
+    // APPEND_PROMPT — that was the pre-#1850 duplication.
+    expect(startSh).not.toContain("## Memory — proactive, conversational");
+    expect(startSh).not.toContain("### Retain proactively");
+    // But the fleet --add-dir IS present:
+    expect(startSh).toContain("SR_FLEET_DIR");
+    expect(startSh).toContain(".switchroom/fleet");
+  });
 
-    expect(retainIdx).toBeGreaterThan(-1);
-    expect(correctIdx).toBeGreaterThan(retainIdx);
-    expect(forgetIdx).toBeGreaterThan(correctIdx);
-    expect(inspectIdx).toBeGreaterThan(forgetIdx);
+  it("reconcileAgent emits identical start.sh as scaffoldAgent (parity, post-#1850)", () => {
+    const agentConfig: AgentConfig = {
+      channels: {
+        telegram: {
+          plugin: "switchroom",
+        },
+      },
+      memory: {
+        collection: "test-agent",
+      },
+    };
+
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    const scaffoldStartSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+
+    reconcileAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    const reconcileStartSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+
+    // After #1850 the APPEND_PROMPT is just the operator's per-agent
+    // `system_prompt_append` (empty by default), so scaffoldAgent and
+    // reconcileAgent should produce identical start.sh for the same
+    // input. Confirms the init-vs-reconcile drift fix held.
+    expect(reconcileStartSh).toBe(scaffoldStartSh);
   });
 });
