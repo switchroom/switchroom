@@ -14,9 +14,9 @@
  *      `loader.ts` already cross-validates at config-load, so this
  *      is a "did the config-load step actually run?" guard.)
  *   3. **vault-acl-aligned** — for every agent with `notion_workspace:`,
- *      verify the agent is in the broker ACL (`vault acl list
- *      notion/integration-token`). Fail with the precise remediation
- *      command if not. **Highest-leverage probe** — without this
+ *      verify the agent is in the broker ACL (read via
+ *      `getViaBrokerStructured` → `entry.scope.allow`). Fail with the
+ *      precise `vault set ... --allow` re-statement command if not. **Highest-leverage probe** — without this
  *      check the launcher fails 503 at runtime instead of at
  *      config-edit time.
  *   4. **launcher-heartbeat** — `/state/agent/<agent>/notion-launcher.heartbeat.json`
@@ -195,7 +195,7 @@ async function checkVaultAclAligned(
         name: "notion:integration-token-present",
         status: "fail",
         detail: `vault key '${key}' is missing but ${notionAgents.length} agent(s) want Notion`,
-        fix: `Create the Notion integration in Notion settings, then \`switchroom vault put ${key} --allow ${notionAgents.join(" --allow ")}\` on the host.`,
+        fix: `Create the Notion integration in Notion settings, then \`switchroom vault set ${key} --allow ${notionAgents.join(",")}\` on the host.`,
       },
     ];
   }
@@ -208,11 +208,12 @@ async function checkVaultAclAligned(
   });
   for (const name of notionAgents) {
     if (!allowedSet.has(name)) {
+      const updated = [...acl.allow, name].join(",");
       results.push({
         name: `notion:vault-acl-aligned:${name}`,
         status: "fail",
         detail: `agent '${name}' has notion_workspace: set but is NOT in the vault ACL for ${key} — launcher will 503 at runtime`,
-        fix: `\`switchroom vault acl add ${key} ${name}\` on the host.`,
+        fix: `Re-run \`switchroom vault set ${key} --allow ${updated}\` on the host (vault set overwrites the scope, so re-state the full list including '${name}').`,
       });
     } else {
       results.push({
@@ -225,11 +226,14 @@ async function checkVaultAclAligned(
   // agent block. Benign waste; warn so the operator can clean up.
   for (const a of acl.allow) {
     if (!notionAgents.includes(a)) {
+      const trimmed = acl.allow.filter((x) => x !== a).join(",");
       results.push({
         name: `notion:vault-acl-aligned:${a}`,
         status: "warn",
         detail: `agent '${a}' is on the vault ACL for ${key} but has no notion_workspace: block — never reads the token`,
-        fix: `Remove via \`switchroom vault acl remove ${key} ${a}\`, or add a notion_workspace: block to agent '${a}' in switchroom.yaml.`,
+        fix: trimmed.length > 0
+          ? `Re-run \`switchroom vault set ${key} --allow ${trimmed}\` to drop '${a}' from the allowlist, or add a notion_workspace: block to agent '${a}' in switchroom.yaml.`
+          : `Re-run \`switchroom vault set ${key} --allow ''\` to clear the allowlist (no other agent uses this key), or add a notion_workspace: block to agent '${a}' in switchroom.yaml.`,
       });
     }
   }

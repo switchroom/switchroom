@@ -113,7 +113,8 @@ describe("runNotionChecks — vault ACL drift (load-bearing probe)", () => {
     );
     expect(carrieAcl?.status).toBe("fail");
     expect(carrieAcl?.detail).toMatch(/NOT in the vault ACL/);
-    expect(carrieAcl?.fix).toMatch(/vault acl add notion\/integration-token carrie/);
+    expect(carrieAcl?.fix).toMatch(/vault set notion\/integration-token --allow/);
+    expect(carrieAcl?.fix).toMatch(/carrie/);
   });
 
   it("warns when an agent is on ACL but has no notion_workspace block", async () => {
@@ -133,7 +134,8 @@ describe("runNotionChecks — vault ACL drift (load-bearing probe)", () => {
     });
     const probe = r.find((c) => c.name === "notion:integration-token-present");
     expect(probe?.status).toBe("fail");
-    expect(probe?.fix).toMatch(/vault put notion\/integration-token/);
+    expect(probe?.fix).toMatch(/vault set notion\/integration-token/);
+    expect(probe?.fix).toMatch(/--allow/);
   });
 
   it("warns when vault-broker is unreachable", async () => {

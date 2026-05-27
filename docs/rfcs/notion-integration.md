@@ -123,9 +123,9 @@ The operator creates an internal integration in Notion's settings:
    - Read user information (no email)
 5. Copy the **Internal Integration Secret** (starts with `secret_...`
    or `ntn_...`).
-6. Run on host: `switchroom vault put notion/integration-token`,
-   paste, choose which agents may read it via `--allow clerk --allow
-   carrie` (or `--allow '*'` for fleet-wide).
+6. Run on host: `switchroom vault set notion/integration-token`,
+   paste, choose which agents may read it via `--allow clerk,carrie`
+   (comma-separated list).
 
 After registration, the operator goes back to each Notion page /
 database they want any switchroom agent to touch and **shares it with
@@ -183,7 +183,7 @@ default. Public OAuth is out of scope for v1 — flagged in §12.
 
 - Vault key: `notion/integration-token` (plural-namespace contract:
   `<provider>/<artifact>`).
-- ACL: operator sets `--allow <agent>` per agent at `vault put` time.
+- ACL: operator sets `--allow <agents>` (comma-separated) at `vault set` time.
   The broker enforces this on every grant request — agents not in the
   ACL get `E_BROKER_GRANT_DENIED`.
 - The launcher fetches via `vault_request_access` → ephemeral token →
@@ -197,8 +197,9 @@ own):
 
 1. Notion Settings → Integrations → `switchroom` → **Refresh secret**.
 2. Copy new secret.
-3. `switchroom vault put notion/integration-token` (overwrite). ACL
-   inherits from the prior write unless `--allow` is re-specified.
+3. `switchroom vault set notion/integration-token` (overwrite).
+   Re-state `--allow` to preserve the existing allowlist — `vault set`
+   replaces the entire scope.
 4. Agents pick up the new token on their next vault grant — for the
    notion launcher specifically that means **launcher restart**.
    `switchroom agent restart <name> --graceful-restart` is sufficient
@@ -208,9 +209,10 @@ own):
 
 Two paths:
 
-- **Per-agent**: drop the agent from the broker ACL
-  (`switchroom vault acl remove notion/integration-token <agent>`).
-  Next launcher fetch fails closed.
+- **Per-agent**: drop the agent from the broker ACL by re-running
+  `switchroom vault set notion/integration-token --allow <remaining-list>`
+  with the agent omitted (`vault set` overwrites the scope). Next
+  launcher fetch fails closed.
 - **Full revocation**: Notion Settings → Integrations → `switchroom`
   → **Delete integration**. Every agent's launcher fails the next
   time it tries to fetch tools; the integration is gone upstream.
@@ -303,7 +305,7 @@ The allowlist gates Notion tool calls in three buckets:
    `notion/integration-token` key — fail at `apply`, not at runtime.
 4. Agent has `notion_workspace:` but is **not in the vault ACL** for
    `notion/integration-token`. Surface the precise remediation:
-   `switchroom vault acl add notion/integration-token <agent>`. This
+   `switchroom vault set notion/integration-token --allow <full-list>` re-stating the allowlist including the missing agent. This
    is the highest-leverage check: without it the launcher fails 503
    at runtime instead of at config-edit time.
 
@@ -632,7 +634,7 @@ its own reviewer pass; only the final PR enables auto-merge.
 ### PR 5 — Docs + bundled skill + UAT (~350 LOC)
 
 - `docs/notion-integration.md`: operator-facing setup guide.
-  Integration registration → vault put → share DBs → list-dbs →
+  Integration registration → vault set → share DBs → list-dbs →
   YAML → apply → first run.
 - `docs/configuration.md`: cascade documentation parallel to
   existing `google_workspace` / `microsoft_workspace` sections.

@@ -8,7 +8,7 @@
  *   1. **No per-account concept.** Notion has one integration token =
  *      one workspace per switchroom install. There is no
  *      `notion_accounts:` analog; the broker ACL on the vault key (set
- *      via `vault put --allow <agent>`) is the authoritative list of
+ *      via `vault set --allow <agents>`) is the authoritative list of
  *      which agents may receive the token.
  *   2. **Per-DB allowlist.** The per-agent `databases:` field narrows
  *      which databases this agent may read/write within the
@@ -31,7 +31,7 @@ import type { SwitchroomConfig } from "./schema.js";
  * Does NOT check broker ACL — that's a runtime broker concern, not
  * scaffold-time. The launcher fetching the token at runtime will get
  * a clean `E_BROKER_GRANT_DENIED` if the operator forgot to grant
- * access via `vault put --allow <agent>`. The doctor probe
+ * access via `vault set --allow <agents>`. The doctor probe
  * `notion:vault-acl-aligned` (PR 4) surfaces the mismatch at config
  * time.
  *

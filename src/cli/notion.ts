@@ -293,7 +293,7 @@ async function fetchToken(vaultKey: string): Promise<string> {
   }
   if (result.kind === "not_found") {
     throw new Error(
-      `vault key '${vaultKey}' is missing. Run \`switchroom vault put ${vaultKey}\` first.`,
+      `vault key '${vaultKey}' is missing. Run \`switchroom vault set ${vaultKey}\` first.`,
     );
   }
   if (result.kind === "denied") {
