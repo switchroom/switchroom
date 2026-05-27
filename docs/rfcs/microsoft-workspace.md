@@ -64,6 +64,12 @@ The four switchroom vision outcomes:
 After evaluating three candidates (full research at
 [Notable gotchas](#11-research-appendix)):
 
+Evaluation criteria, in priority order: (1) auth model compatible
+with switchroom's broker (refresh held by us, MCP gets short-lived
+access tokens); (2) maintenance velocity (active commits, recent
+releases); (3) tool coverage across mail/calendar/OneDrive/Office;
+(4) license compatible with bundling.
+
 | Server | Tools | Auth model | Verdict |
 |---|---|---|---|
 | `softeria/ms-365-mcp-server` | 200+ (mail/cal/OneDrive/Excel/Tasks/Planner; Teams+SharePoint behind `--org-mode`) | Device-code default; **BYOT** via `MS365_MCP_OAUTH_TOKEN` env | ✓ Primary |
@@ -135,18 +141,40 @@ microsoft_workspace:
 ### 4.2 Per-account auth (per Microsoft account)
 
 Operator runs `switchroom auth microsoft account add [--label
-personal|work|<name>]`. Flow:
+personal|work|<name>]`. Two flows depending on host capability —
+same tiering as Google's RFC D §3.2:
+
+**Tier 1 — desktop loopback** (default when `$DISPLAY` is set or
+`--loopback` forced):
 
 1. Spawns a local HTTP server on an ephemeral port bound to `127.0.0.1`.
 2. Constructs auth URL via MSAL-Node `getAuthCodeUrl({ scopes, state,
    codeChallenge })` — auth code + PKCE.
-3. Opens browser (or prints URL for headless / SSH hosts — same
-   fallback shape as Google's loopback).
+3. Opens browser to that URL.
 4. Catches callback at `/auth/callback?code=...&state=...`, validates
    state, hands code to MSAL `acquireTokenByCode()`.
+
+**Tier 2 — device-code flow** (default on headless SSH hosts, or
+`--device-code` forced):
+
+1. Calls MSAL-Node `acquireTokenByDeviceCode({ scopes, deviceCodeCallback })`.
+2. Wizard prints: "Open https://microsoft.com/devicelogin and enter
+   code: ABCD-1234 (expires in 15min)". Operator opens that URL on any
+   device — phone, laptop, work computer — and pastes the code.
+3. Wizard polls Microsoft's `/token` endpoint until the user completes
+   auth on the other device, then receives tokens.
+
+Switchroom is regularly installed on headless VPSs (see
+`reference_install_validation_loop`); device-code is the right
+default for those hosts. Both flows converge after token acquisition:
+
 5. Decodes `idTokenClaims.tid`:
    - `tid === "9188040d-6c67-4c5b-b112-36a304b66dad"` → **personal MSA**
-   - else → **work/school** (records the tenant GUID for audit)
+   - else → **work/school** (records the tenant GUID for audit).
+   Note: device-code flow does not return id_token unless `openid
+   profile email` are in the scope set (they are, per §4.3); guard
+   against missing id_token defensively by falling back to a
+   `/me` Graph call to read `userPrincipalName`.
 6. Resolves account email from `idTokenClaims.preferred_username` (or
    `email` fallback).
 7. Persists MSAL's serialized token cache to
@@ -173,7 +201,22 @@ personal|work|<name>]`. Flow:
 
 ### 4.3 Scope set v1
 
-Single fixed set (no tiering — see §6 product rationale):
+Two scope sets — chosen at consent time based on account type and
+`org_mode`. **Not "tiering"** (which would be per-agent and create
+upgrade friction) — this is per-account-at-consent, set once.
+
+**Default v1 (personal MSA + work without `org_mode`):**
+
+```
+openid profile email offline_access
+User.Read
+Mail.ReadWrite
+Calendars.ReadWrite
+Files.ReadWrite.All
+```
+
+**With `microsoft_workspace.org_mode: true` (work account, opt-in
+SharePoint surface):**
 
 ```
 openid profile email offline_access
@@ -184,16 +227,25 @@ Files.ReadWrite.All
 Sites.ReadWrite.All
 ```
 
+Rationale for the split:
+
+- `Sites.ReadWrite.All` grants read/write to **every SharePoint site
+  the user can access** — in a large enterprise that's potentially
+  thousands of sites holding HR/finance/legal docs. The defaults
+  test (`reference/principles.md` §2) says the working default for
+  a personal-use solo founder is not "agent has write access to my
+  employer's entire SharePoint." Opt-in via `org_mode`.
+- `Files.ReadWrite.All` is bounded to the user's OneDrive (personal
+  or business) — narrow blast radius, the right default.
 - `offline_access` — **mandatory** for long-lived refresh tokens.
   Without it, Microsoft issues access-token-only.
-- `Files.ReadWrite.All` + `Sites.ReadWrite.All` — covers OneDrive
-  personal + OneDrive for Business + SharePoint document libraries
-  (where M365 work files often live).
 - `Mail.ReadWrite` (not `Mail.Send`) — agents draft mail; sending
-  routes through approval-kernel for v1.
-- No `Mail.Send` v1 — sending mail is the kind of action that
-  warrants an explicit second-RFC discussion of audit + revocation
-  shape.
+  routes through approval-kernel for v1. `Mail.Send` defers to its
+  own RFC (audit + revocation shape).
+
+`org_mode` flips two things together: the SharePoint scope above
+AND softeria's `--org-mode` flag (Teams/SharePoint tools). Single
+knob, single mental model.
 
 ### 4.4 Personal MSA caveats (worth surfacing to operator)
 
@@ -240,22 +292,46 @@ recover without operator re-auth.
 
 ### 5.3 Refresh distribution to softeria (BYOT)
 
-softeria has no in-server refresh. Two design points:
+softeria has no in-server refresh — `MS365_MCP_OAUTH_TOKEN` is read
+once at process spawn and softeria forwards it on every Graph call
+until it 401s. Claude Code does **not** auto-respawn MCP servers on
+tool errors; MCP children persist for the agent session lifetime
+(hours, sometimes days). A 60-min token against a session that long
+is total outage every hour. The original draft of this RFC tried to
+defer the refresher to v2 — that's wrong, the math is deterministic
+and the v1 UX would be unusable.
 
-**At launcher spawn** (every MCP spawn):
-1. Launcher calls auth-broker `get_credentials({provider:
-   "microsoft"})` → broker calls MSAL `acquireTokenSilent` → returns
-   fresh AT with ≥55-min validity → launcher writes
-   `MS365_MCP_OAUTH_TOKEN=<at>` into spawned env.
+**v1 ships a sidecar refresher.** The launcher (`m365-mcp-launcher`)
+spawns two processes per agent:
 
-**Mid-session expiry** (sessions longer than ~50 min):
-- v1: accept that softeria 401s and rely on Claude Code's
-  MCP-respawn behavior to pick up a fresh token. UAT will measure
-  how disruptive this is in practice.
-- v2 (defer if v1 noisy): launcher spawns a sidecar refresher that
-  rotates the env / signals softeria via SIGHUP. Or contribute
-  `--single-user --refresh-token-mode` upstream to softeria (mirrors
-  google_workspace_mcp's contract).
+1. **softeria child** with `MS365_MCP_OAUTH_TOKEN=<initial-at>` in env.
+2. **Refresher sidecar** (Node, ~50 LoC) that:
+   - Sleeps until `expiresAt - 5min` (≥55min lead time matches the
+     RFC H broker refresh threshold)
+   - Calls auth-broker `get_credentials({provider: "microsoft"})` to
+     mint a fresh AT
+   - Writes the new AT to a tmpfile + atomically renames it to a
+     well-known path (e.g. `/tmp/m365-token-<agent>.json`)
+   - Sends softeria child SIGHUP (which softeria docs as a
+     refresh-trigger — verify in PR 1 spike; if not honored,
+     restart-child semantics instead)
+   - Loops
+
+Why not just rely on broker-mediated per-call freshness like Google
+does? Because softeria's BYOT contract is env-var-once-at-spawn,
+not env-var-per-call. We can't change that without forking.
+
+**Fork-or-contribute option (preferred but not v1)**: add
+`--refresh-token-mode --single-user` to softeria upstream, matching
+`taylorwilsdon/google_workspace_mcp`'s contract. Then refresh happens
+in-process. Submit upstream PR after v1 ships; if accepted, retire
+the sidecar in v1.5. Carry a fork only if upstream resists.
+
+**Sidecar lifecycle**: if softeria child dies, sidecar reaps and the
+whole launcher exits → Claude Code respawns on next tool call. If
+sidecar dies, softeria keeps running until its current token
+expires, then 401s indefinitely → doctor probe catches it. Tests
+must cover both crash directions.
 
 ### 5.4 Revocation
 
@@ -293,8 +369,12 @@ microsoft_accounts:
 Verbs:
 - `auth microsoft enable <account> <agent>...` — adds to ACL
 - `auth microsoft disable <account> <agent>...` — removes; empty
-  `enabled_for[]` prunes the account entry entirely (loud-removal
-  per RFC H retrospective)
+  `enabled_for[]` leaves the account entry as **dormant** (matches
+  current shipped Google behavior at `src/cli/auth-google.ts:405`).
+  RFC G v3 proposed prune-on-empty but hasn't shipped. Microsoft
+  follows shipped Google for *one mind built this* consistency
+  (`reference/principles.md` §3). If Google ships the prune later,
+  Microsoft follows in the same series.
 - `auth microsoft list` — accounts × agents matrix
 
 ### 6.2 Per-agent account selector (YAML)
@@ -404,14 +484,29 @@ Mirror RFC E's PreToolUse-hook pattern (Path A Cut 2):
   - `create-event`, `update-event`, `delete-event` (calendar writes)
   - `update-message`, `delete-message` (mail edits)
 - Card metadata:
-  - **Wrapper-attested**: file path / item ID, byte delta or change
-    count, deep link (constructed from Graph item `webUrl`),
-    target account
+  - **Wrapper-attested (v1, weak)**: file path / item ID, byte
+    delta (current vs proposed), deep link (constructed from Graph
+    item `webUrl`), target account, MIME type, file size before/after
+  - **Wrapper-attested (v1.5, structural diff)**: for `.docx` /
+    `.xlsx` / `.pptx` uploads, the hook downloads the current
+    OneDrive version, invokes the matching skill in diff-mode against
+    the proposed upload, attaches a structural change summary
+    (sections added/removed, sheets touched + cell-range count,
+    slides added/removed/modified). The skills already know how to
+    parse these formats; teaching them a `--diff` flag is small.
   - **Agent-supplied**: 1-line rationale (advisory, shown but
     distinct visual treatment per RFC E)
 - Action buttons: `Approve` / `Deny` / `Open in OneDrive`
 - Kernel returns `{decision: "block"}` to hook on Deny → softeria
   call short-circuits → agent sees clean error
+
+**Honest scoping**: v1 ships the weak metadata (byte delta + size +
+link + agent rationale). The operator must trust the agent's
+rationale + click through to OneDrive to see the actual diff. v1.5
+ships structural diff via skills `--diff` mode and brings attestation
+to parity with Google's RFC E. Don't market v1 as full parity — it
+isn't. UAT measures whether the weak-metadata UX is good enough in
+practice for personal-use; if it isn't, v1.5 follows immediately.
 
 **Reads are standing grants** (no per-call approval) — same as Google.
 The grant is implicit in `enabled_for[]`.
@@ -429,14 +524,22 @@ Add to `switchroom doctor`:
 - `microsoft:agent-ACL-and-selector-aligned` (per agent) — every
   agent with `microsoft_workspace.account` set has matching
   `enabled_for[]` entry
-- `microsoft:scopes-match-tier` (per account) — granted scopes
-  include all v1 required scopes (covers post-scope-bump migration)
+- `microsoft:scopes-cover-v1-set` (per account) — granted scopes
+  include all v1 required scopes (catches post-scope-bump migration
+  drift and accounts that were consented under an older scope set)
+- `microsoft:personal-msa-graph-smoke` (per personal-MSA account) —
+  broker can call `/me/drive/root/children` against an MSA token
+  (some Graph endpoints silently no-op on consumer tokens; this
+  smoke catches the class)
 
 ## 10. Implementation plan
 
-**3 PRs total**, sized to keep each reviewable:
+**5 PRs total**, sized to keep each reviewable. The original 3-PR
+draft was 30-50% under realistic size — Google's `drive-mcp-launcher.ts`
+is 919 LOC alone, `auth-google.ts` is 1,282 LOC. Sizing here is
+calibrated against shipped equivalents.
 
-### PR 1 — Auth scaffolding (~600 LOC)
+### PR 1 — Provider + broker registration (~500 LOC)
 
 - `src/auth/broker/microsoft-provider.ts` — `MicrosoftProvider`
   implementing `Provider` interface (refresh, extractExpiresAt,
@@ -444,33 +547,52 @@ Add to `switchroom doctor`:
 - `src/auth/broker/microsoft-storage.ts` — filesystem helpers
   (normalize, validate, paths, read/write/remove/list)
 - `src/auth/broker/microsoft-msal-cache-plugin.ts` — ICachePlugin
-  that proxies MSAL cache to `cache.json`
+  proxying MSAL cache to `cache.json` (atomic writes)
 - Broker registers provider on boot
-- Add `@azure/msal-node` to `package.json`
-- Tests: provider refresh against mocked Microsoft `/token` endpoint;
-  cache plugin round-trip; invalid_grant handling
+- `@azure/msal-node` added to `package.json`
+- Tests: provider refresh against mocked `/token`; cache plugin
+  round-trip; invalid_grant handling; atomic-write torn-write
+  recovery
 
-### PR 2 — CLI verbs + setup wizard + launcher (~800 LOC)
+### PR 2 — CLI verbs + setup wizard + loopback/device-code handlers (~1,000 LOC)
 
 - `src/cli/auth-microsoft.ts` — `connect / account add / account
   remove / account list / enable / disable / list` verbs
-- `src/cli/m365-mcp-launcher.ts` — mirrors `drive-mcp-launcher.ts`:
-  resolve account → broker call → spawn softeria with
-  `MS365_MCP_OAUTH_TOKEN`
-- `src/agents/scaffold.ts` — `.mcp.json` entry for `ms-365` MCP
-  pointing at `m365-mcp-launcher`
-- `MS365_MCP_PINNED_REF` constant — softeria commit SHA pin
+- Entra-portal walkthrough wizard for `connect`
 - Loopback HTTP server with ephemeral-port + PKCE + state CSRF guard
-- Browser-launch + headless-fallback (paste URL, paste code)
-- Tests: CLI smoke; launcher seed-and-spawn; loopback handler;
-  account-type detection from `tid`
+- Device-code flow as headless tier (§4.2 Tier 2)
+- Browser-launch detection + headless-fallback selection
+- Account-type detection from `tid` claim
+- Tests: CLI smoke; loopback handler; device-code mock flow;
+  account-type detection; ACL CRUD
 
-### PR 3 — Approval kernel hook + doctor + docs (~500 LOC)
+### PR 3 — Launcher + sidecar refresher + scaffold integration (~900 LOC)
+
+- `src/cli/m365-mcp-launcher.ts` — resolve account → broker call →
+  spawn softeria + sidecar refresher
+- `src/cli/m365-token-refresher.ts` — sidecar process (§5.3),
+  sleep-until-expiry / refresh / write-tmpfile / signal pattern
+- `src/agents/scaffold.ts` — `.mcp.json` entry for `ms-365` MCP
+  pointing at `m365-mcp-launcher`; per-agent `.mcp.json` env wiring
+- `MS365_MCP_PINNED_REF` constant — softeria commit SHA pin
+- Cascade integration: `microsoft_workspace:` block in
+  `src/config/merge.ts`
+- Tests: launcher seed-and-spawn; refresher sleep/wake cycle;
+  child-crash and sidecar-crash handling; SIGHUP delivery
+
+### PR 4 — Approval kernel hook + weak-metadata write cards (~500 LOC)
 
 - `profiles/_shared/hooks/microsoft-write-approval.mjs.hbs` — hook
-  template
+  template intercepting softeria write tools
 - Hook → kernel IPC verb (extends existing approval card builders)
-- Doctor probes (§9)
+- Weak metadata only v1 (byte delta + size + link + rationale —
+  §8 explicitly scopes this)
+- Tests: hook intercept; card metadata extraction; deny → block
+  short-circuit
+
+### PR 5 — Doctor probes + user docs + UAT (~400 LOC)
+
+- Doctor probes (§9), including the personal-MSA Graph smoke
 - `docs/microsoft-workspace.md` — user-facing operator doc
   (mirrors `docs/google-workspace.md`)
 - Entra app-registration walkthrough doc with screenshots
@@ -479,37 +601,61 @@ Add to `switchroom doctor`:
   - `jtbd-onedrive-read-work.test.ts`
   - `jtbd-docx-edit-via-skill.test.ts`
   - `jtbd-onedrive-write-approval.test.ts`
+  - `jtbd-token-refresh-survives-50min.test.ts`
 
-## 11. Effort
+### Follow-up (separate RFC or v1.5)
 
-- **PR 1** — ~40 agent minutes (auth lib integration is the heaviest
-  piece; MSAL-Node has good docs)
-- **PR 2** — ~50 agent minutes (loopback handler is the only novel
-  piece; rest is mirroring auth-google.ts)
-- **PR 3** — ~30 agent minutes (hook is straight clone of Google
-  hook with new tool-name filter)
-- **+ UAT + docs** — ~20 agent minutes
+- Structural-diff write cards (skills `--diff` mode) — §8 v1.5
+- `Mail.Send` scope + send-approval card — separate RFC
+- Multi-account-per-agent — separate RFC
+- softeria upstream `--refresh-token-mode` contribution
 
-Total: **~140 agent minutes** end-to-end, plus reviewer rounds.
+## 11. Effort estimate
+
+Calibrated against Google's shipped equivalents (per RFC G §8 and
+shipped LOC counts):
+
+- **PR 1** — ~60 agent minutes (MSAL cache plugin is novel; rest
+  mirrors `google-provider.ts` + `google-storage.ts`)
+- **PR 2** — ~90 agent minutes (CLI surface + two loopback/device-code
+  handlers; auth-google.ts is 1,282 LOC for reference)
+- **PR 3** — ~70 agent minutes (sidecar refresher is the novel piece;
+  launcher mirrors drive-mcp-launcher.ts at ~919 LOC)
+- **PR 4** — ~40 agent minutes (hook is a clone of the Google hook
+  with new tool-name filter)
+- **PR 5** — ~40 agent minutes (probes + docs + 5 UAT scenarios)
+- **Reviewer rounds** — assume ~30 min each PR
+
+Total: **~300 agent minutes** end-to-end (~5 hours). Roughly double
+the original 140-min estimate — sized honestly so review and UAT
+have room.
 
 ## 12. Out of scope (v1)
 
 - **Tiering** (core/extended/complete) — defer until a real JTBD
-  demands it
+  demands it (§6.4)
 - **`Mail.Send` scope** — drafts only v1; sending mail needs its own
   RFC for audit + revocation shape
-- **Teams + SharePoint admin surfaces** (`--org-mode`) — operator
-  can flip the flag manually, but no automated probe/approval UX v1
+- **Teams + admin/management surfaces** — `org_mode` gates SharePoint
+  + Teams tools, but no automated probe/approval UX for admin verbs v1
 - **Publisher verification** — accept "unverified app" warning v1;
   pursue MPN verification if/when switchroom goes commercial
 - **Multi-account-per-agent** (one agent talking to ken@personal +
   ken@work simultaneously) — defer; same one-account-per-agent
   constraint as Google v1
-- **Forking softeria for refresh-mode** — if 401-storm noise is
-  measurable in UAT, ship as PR 4 or contribute upstream
+- **softeria upstream `--refresh-token-mode` contribution** — v1
+  ships our own sidecar refresher (§5.3); upstream contribution is
+  v1.5 cleanup
 - **Tenant-restricted enterprise tenants** — orgs that forbid
   multi-tenant app consent need their own single-tenant Entra app
   registration; doc this, defer auto-detection
+- **Structural-diff approval cards** — v1 ships weak-metadata cards
+  (§8); structural diff via skills `--diff` mode is v1.5
+- **Operator-host MS-MCP** (`examples/personal-microsoft-workspace-mcp/`
+  pattern mirroring RFC G §4.7) — defer until the agent-fleet
+  integration ships and proves stable. The operator's own Claude Code
+  session connecting to MS is a parallel feature, not a blocker, and
+  shouldn't share PR scope with the fleet path.
 
 ## 13. Open questions / risks
 
@@ -529,27 +675,37 @@ Total: **~140 agent minutes** end-to-end, plus reviewer rounds.
    write + on-startup integrity check + `doctor` probe for
    parse-ability.
 
-4. **`tid` ambiguity in Storm-0558-era tokens** — extremely rare
-   edge case where personal-MSA `tid` shows up on a work token.
-   Mitigation: log `iss` alongside `tid`; surface conflict in
-   `account list` if detected.
-
-5. **MS Graph rate limits** — Microsoft Graph throttles aggressively
+4. **MS Graph rate limits** — Microsoft Graph throttles aggressively
    (10000 req / 10min / app, but per-tenant much lower). softeria
    doesn't surface backoff hints clearly. Risk: aggressive agent
    doing bulk OneDrive listing trips a throttle. Mitigation: doctor
    probe + UAT measures sustained read rate; defer rate-limit hooks
    to v2 if it surfaces.
 
+5. **Sidecar refresher reliability** — the §5.3 sidecar is the
+   load-bearing piece that keeps softeria fed. Crash modes matter:
+   if sidecar dies, softeria runs until token expires then 401s
+   indefinitely. Mitigation: doctor probe checks both processes
+   alive + sidecar's last-refresh timestamp; UAT scenario
+   `jtbd-token-refresh-survives-50min` explicitly exercises the
+   refresh boundary.
+
 6. **`--org-mode` opt-in default** — should default `org_mode: true`
    for first-class M365 work-account support? Recommendation: keep
-   `false` default (personal-use bias), document the flip for
-   work-only deployments.
+   `false` default (personal-use bias + narrower SharePoint blast
+   radius per §4.3), document the flip for work-only deployments.
 
 7. **Skills + workspace path collision** — the docx/xlsx/pptx skills
    write to the agent's CWD by default. Need to confirm the agent's
-   workspace is writable + has enough space for typical Office files.
-   Verify in UAT.
+   workspace is writable + has enough space for typical Office files
+   (up to 4MB inline, larger via chunked upload). Verify in UAT.
+
+8. **Weak attestation v1** (§8) — operator must trust the agent's
+   1-line rationale for the first iteration of write cards. If the
+   agent fabricates an innocuous-sounding rationale for a destructive
+   edit, the operator has no wrapper-attested counter-signal until
+   v1.5 ships structural diff. UAT measures whether this is felt as
+   a real gap or acceptable for personal-use.
 
 ## 14. Research appendix
 
