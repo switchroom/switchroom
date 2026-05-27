@@ -24,6 +24,19 @@
  * key by `chat_id` alone via the canonical `chatKey(chat, null)`
  * collapse — same behavior as before for those callsites.
  *
+ * **General-topic strip (PR4a of supergroup-mode):** Telegram's General
+ * topic has `id=1` at the MTProto layer, but the Bot API's send-side
+ * REJECTS `message_thread_id=1` with HTTP 400 "message thread not
+ * found" (see tdlib/telegram-bot-api#447). The wrapper detects an
+ * incoming `message_thread_id: 1`, strips it from the options bag
+ * before the underlying API call, AND normalizes the lock key as if
+ * the thread were null — since semantically id=1 IS the chat root
+ * for the Bot API send-side, treating it as a distinct lane would
+ * mean two General-topic sends in the same chat would race past
+ * each other. (`editMessageText` etc. don't accept `message_thread_id`
+ * at all, so this only fires for sends like `sendMessage` and
+ * `sendChatAction`.)
+ *
  * Telegram's per-chat rate ceiling is still respected via grammY's
  * autoRetry transformer; if two topics in the same chat both burst
  * past the limit, grammY backs off per the Retry-After header — same
@@ -86,13 +99,27 @@ export function createChatLock(): ChatLock {
           // pins infer thread from message_id; they fall through with
           // `null` thread and serialize per-chat as before.
           const last = args[args.length - 1]
-          const threadFromOpts =
+          const lastIsOpts =
             last != null &&
             typeof last === 'object' &&
             !Array.isArray(last)
-              ? (last as Record<string, unknown>).message_thread_id
-              : undefined
-          const tid = typeof threadFromOpts === 'number' ? threadFromOpts : null
+          const threadFromOpts = lastIsOpts
+            ? (last as Record<string, unknown>).message_thread_id
+            : undefined
+          let tid = typeof threadFromOpts === 'number' ? threadFromOpts : null
+          // General-topic strip: id=1 is rejected by the Bot API on send.
+          // Strip from opts AND normalize the lock key as if thread were
+          // null (semantically id=1 IS chat-root for the send-side). See
+          // the file-header comment + RFC for the full rationale.
+          if (tid === 1) {
+            tid = null
+            // Rebuild args with a copy of opts that drops message_thread_id,
+            // so the underlying bot.api call won't receive the rejected
+            // value. Don't mutate the caller's opts object.
+            const cleanedOpts: Record<string, unknown> = { ...(last as Record<string, unknown>) }
+            delete cleanedOpts.message_thread_id
+            args = args.slice(0, -1).concat([cleanedOpts])
+          }
           return run(chatKey(chatId, tid), () =>
             (orig as (...a: unknown[]) => Promise<unknown>).apply(target, args),
           )

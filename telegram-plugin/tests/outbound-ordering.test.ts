@@ -277,6 +277,127 @@ describe('wrapBot — bot.api.* calls auto-lock by first-arg chat id', () => {
     expect(rA.message_id).toBe(1)
   })
 
+  it('strips message_thread_id=1 from sendMessage opts (General-topic Bot API quirk)', async () => {
+    // Telegram's General topic has id=1 at MTProto but the Bot API
+    // REJECTS message_thread_id=1 on send with HTTP 400 "message thread
+    // not found" (tdlib/telegram-bot-api#447). The wrapper strips id=1
+    // from the opts bag before the underlying API call.
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    bot.api.sendMessage.mockImplementationOnce(async () => ({ message_id: 1 }))
+
+    await wrapped.api.sendMessage('supergrp', 'hello General', { message_thread_id: 1 })
+
+    const callOpts = bot.api.sendMessage.mock.calls[0]![2]
+    expect(callOpts).toBeDefined()
+    expect((callOpts as Record<string, unknown>).message_thread_id).toBeUndefined()
+  })
+
+  it('preserves other opts when stripping message_thread_id=1', async () => {
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+    bot.api.sendMessage.mockImplementationOnce(async () => ({ message_id: 1 }))
+
+    await wrapped.api.sendMessage('supergrp', 'hello', {
+      message_thread_id: 1,
+      parse_mode: 'HTML',
+      reply_to_message_id: 42,
+    })
+
+    const callOpts = bot.api.sendMessage.mock.calls[0]![2] as Record<string, unknown>
+    expect(callOpts.message_thread_id).toBeUndefined()
+    expect(callOpts.parse_mode).toBe('HTML')
+    expect(callOpts.reply_to_message_id).toBe(42)
+  })
+
+  it('does NOT mutate the caller\'s opts object (strip uses a copy)', async () => {
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+    bot.api.sendMessage.mockImplementationOnce(async () => ({ message_id: 1 }))
+
+    const callerOpts = { message_thread_id: 1, parse_mode: 'HTML' as const }
+    await wrapped.api.sendMessage('supergrp', 'hello', callerOpts)
+
+    expect(callerOpts.message_thread_id).toBe(1)  // caller's object untouched
+  })
+
+  it('does NOT strip non-1 thread IDs', async () => {
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+    bot.api.sendMessage.mockImplementationOnce(async () => ({ message_id: 1 }))
+
+    await wrapped.api.sendMessage('supergrp', 'planning msg', { message_thread_id: 17 })
+
+    const callOpts = bot.api.sendMessage.mock.calls[0]![2] as Record<string, unknown>
+    expect(callOpts.message_thread_id).toBe(17)  // non-General threads untouched
+  })
+
+  it('two SAME-chat General-topic sends still serialize (id=1 normalized to chat-root lane)', async () => {
+    // After stripping id=1, the lock key normalizes to chatKey(chatId, null)
+    // = `chatId:_`. Two General-topic sends queue through the same
+    // chat-root lane preserving order (Telegram per-chat order matters).
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    const dSlow = deferred<{ message_id: number }>()
+    const order: string[] = []
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      order.push(`first:${t}`)
+      const r = await dSlow.promise
+      order.push(`first:end:${t}`)
+      return r
+    })
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      order.push(`second:${t}`)
+      return { message_id: 2 }
+    })
+
+    const p1 = wrapped.api.sendMessage('supergrp', 'general msg 1', { message_thread_id: 1 })
+    const p2 = wrapped.api.sendMessage('supergrp', 'general msg 2', { message_thread_id: 1 })
+
+    await Promise.resolve(); await Promise.resolve()
+    expect(order).toEqual(['first:general msg 1'])  // second waits
+
+    dSlow.resolve({ message_id: 1 })
+    await Promise.all([p1, p2])
+    expect(order).toEqual(['first:general msg 1', 'first:end:general msg 1', 'second:general msg 2'])
+  })
+
+  it('General-topic strip does NOT serialize against non-General sends in the same chat', async () => {
+    // id=1 → chat-root lane. id=17 → its own lane. Independent dispatch.
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    const dGeneral = deferred<{ message_id: number }>()
+    const dPlanning = deferred<{ message_id: number }>()
+    const started: string[] = []
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      started.push('general')
+      return dGeneral.promise
+    })
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      started.push('planning')
+      return dPlanning.promise
+    })
+
+    const pGeneral = wrapped.api.sendMessage('supergrp', 'g', { message_thread_id: 1 })
+    const pPlanning = wrapped.api.sendMessage('supergrp', 'p', { message_thread_id: 17 })
+
+    await Promise.resolve(); await Promise.resolve()
+    expect(started).toEqual(['general', 'planning'])  // both started concurrently
+
+    dPlanning.resolve({ message_id: 17 })
+    dGeneral.resolve({ message_id: 1 })
+    await Promise.all([pGeneral, pPlanning])
+  })
+
   it('react (setMessageReaction) queues behind an in-flight reply (sendMessage) to the same chat', async () => {
     const lock = createChatLock()
     const bot = createMockBot()
