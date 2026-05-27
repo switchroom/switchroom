@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { VERSION } from "../build-info.js";
 import { registerAgentCommand } from "./agent.js";
+import { registerStatusCommand } from "./status.js";
 import { registerTopicsCommand } from "./topics.js";
 import { registerAuthCommand } from "./auth.js";
 import { registerVaultCommand } from "./vault.js";
@@ -65,6 +66,7 @@ registerRestartCommand(program);
 registerVersionCommand(program);
 registerVersionsCommand(program);
 registerAgentCommand(program);
+registerStatusCommand(program);
 registerTopicsCommand(program);
 registerAuthCommand(program);
 registerVaultCommand(program);
