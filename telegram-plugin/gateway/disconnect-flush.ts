@@ -140,6 +140,30 @@ export function flushOnAgentDisconnect<
     onDanglingTurnsSwept?.(danglingKeys)
   }
 
+  // PR3b orphan-sweep (#1880 follow-up): claudeBusyKeys can hold keys
+  // that activeTurnStartedAt does NOT — specifically when a synthetic
+  // inbound (cron via onInjectInbound, reaction dispatch, vault
+  // grant-approved / -denied / save-discarded / -failed / -completed,
+  // button-callback) was delivered. Those paths bypass handleInbound's
+  // fresh-turn branch (which is what would set activeTurnStartedAt),
+  // so the sweep loop above wouldn't notice them. Pre-PR3b this was
+  // invisible because the fleet gate read activeTurnStartedAt.size —
+  // synthetic-only turns never registered. PR3b's claudeBusyKeys.add
+  // is the more-accurate "claude is busy on this" gate, which means
+  // a synthetic-delivered turn that dies WITHOUT turn_end leaves an
+  // orphan that the activeTurnStartedAt-keyed sweep can't see.
+  // Cure: clear any leftover busy keys here. Bridge died → every
+  // busy key is dead by definition. Same justification as the
+  // dangling-sweep above for activeTurnStartedAt.
+  if (claudeBusyKeys.size > 0) {
+    const orphanCount = claudeBusyKeys.size
+    claudeBusyKeys.clear()
+    log(
+      `telegram gateway: disconnect-flush cleared ${orphanCount} orphan claudeBusyKeys ` +
+      `entr${orphanCount === 1 ? 'y' : 'ies'} (synthetic-inbound deliveries that never turn_ended)`,
+    )
+  }
+
   // Stop coalesce timers that could emit into a finalized draft stream, but
   // preserve chats with pendingCompletion=true — those have background
   // sub-agents that legitimately outlive the parent bridge disconnect. The

@@ -252,6 +252,106 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
     expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
   })
 
+  // PR3b orphan-sweep regression: synthetic-inbound deliveries
+  // (cron, reactions, vault, button-callback) bypass handleInbound's
+  // fresh-turn branch and so never stamp activeTurnStartedAt. They
+  // DO mark claudeBusyKeys. If their turn dies without turn_end, the
+  // activeTurnStartedAt-keyed dangling sweep misses them — orphan
+  // persists in claudeBusyKeys → fleet gate wedges. This test pins
+  // the post-sweep claudeBusyKeys.clear() fix.
+  it('sweeps claudeBusyKeys orphans that have NO activeTurnStartedAt entry (PR3b follow-up)', () => {
+    const onDanglingTurnsSwept = vi.fn()
+    const log = vi.fn()
+    const deps = {
+      agentName: 'clerk',
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
+      activeTurnStartedAt: new Map<string, number>(),
+      // The orphan scenario: claude was handed a turn (e.g. cron
+      // synthetic delivered), so claudeBusyKeys has it, but
+      // activeTurnStartedAt was never set because cron bypasses
+      // handleInbound's fresh-turn branch.
+      claudeBusyKeys: new Set<string>(['cron-only-key:_']),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions: vi.fn(),
+      disposeProgressDriver: vi.fn(),
+      onDanglingTurnsSwept,
+      log,
+    }
+
+    flushOnAgentDisconnect(deps)
+
+    // The orphan is cleared even though it never had an
+    // activeTurnStartedAt entry.
+    expect(deps.claudeBusyKeys.size).toBe(0)
+    // The activeTurnStartedAt-keyed sweep wasn't fired (nothing in
+    // that map to sweep) — so onDanglingTurnsSwept shouldn't fire
+    // either. The orphan sweep is a separate observation.
+    expect(onDanglingTurnsSwept).not.toHaveBeenCalled()
+    // But it logs the orphan-clear so operators can see it.
+    expect(
+      log.mock.calls.some((c: unknown[]) =>
+        typeof c[0] === 'string' && /orphan claudeBusyKeys/.test(c[0]),
+      ),
+    ).toBe(true)
+  })
+
+  it('orphan-sweep singular vs plural log message agrees with count', () => {
+    // Tiny grammar regression: "1 entry" vs "2 entries".
+    const log = vi.fn()
+    const baseDeps = {
+      agentName: 'clerk',
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
+      activeTurnStartedAt: new Map<string, number>(),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions: vi.fn(),
+      disposeProgressDriver: vi.fn(),
+    }
+    // Singular form.
+    flushOnAgentDisconnect({
+      ...baseDeps,
+      claudeBusyKeys: new Set<string>(['k1:_']),
+      log,
+    })
+    expect(log.mock.calls.some((c: unknown[]) =>
+      typeof c[0] === 'string' && / 1 orphan claudeBusyKeys entry /.test(c[0]),
+    )).toBe(true)
+    // Plural form.
+    log.mockClear()
+    flushOnAgentDisconnect({
+      ...baseDeps,
+      claudeBusyKeys: new Set<string>(['k1:_', 'k2:1']),
+      log,
+    })
+    expect(log.mock.calls.some((c: unknown[]) =>
+      typeof c[0] === 'string' && / 2 orphan claudeBusyKeys entries /.test(c[0]),
+    )).toBe(true)
+  })
+
+  it('does NOT fire orphan-sweep log when claudeBusyKeys is empty', () => {
+    // Zero-noise discipline: every disconnect for a healthy idle
+    // agent shouldn't produce a "0 orphan claudeBusyKeys" line.
+    const log = vi.fn()
+    flushOnAgentDisconnect({
+      agentName: 'clerk',
+      activeStatusReactions: new Map<string, FakeCtrl>(),
+      activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
+      activeTurnStartedAt: new Map<string, number>(),
+      claudeBusyKeys: new Set<string>(),
+      activeDraftStreams: new Map<string, FakeStream>(),
+      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
+      clearActiveReactions: vi.fn(),
+      disposeProgressDriver: vi.fn(),
+      log,
+    })
+    expect(log.mock.calls.some((c: unknown[]) =>
+      typeof c[0] === 'string' && /orphan claudeBusyKeys/.test(c[0]),
+    )).toBe(false)
+  })
+
   it('omitting onDanglingTurnsSwept is safe (optional callback)', () => {
     // Backward-compat guard — existing callers that don't pass the new
     // callback still work without runtime error.
