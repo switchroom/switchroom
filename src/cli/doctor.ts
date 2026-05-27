@@ -31,6 +31,7 @@ import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
+import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
@@ -2574,6 +2575,10 @@ export function registerDoctorCommand(program: Command): void {
               ...runDriveChecks(config),
               ...(await runDriveBrokerReachabilityChecks(config)),
             ],
+          },
+          {
+            title: "Microsoft 365 (RFC #1873)",
+            results: runMicrosoftChecks(config),
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
         ];
