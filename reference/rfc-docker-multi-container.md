@@ -1,6 +1,7 @@
 ---
 title: One container per agent + docker compose
-status: Draft
+status: Shipped
+shippedIn: v0.7
 audience: switchroom maintainers, anyone considering picking this up
 related: #793 (parent epic), #788, #776 (status-card RCAs that the per-agent process model touches), #786 (PreToolUse labels — must keep working), #725 (tmux supervision — load-bearing under this design)
 source: research output for issue #793, "Option 3" of the comparison
@@ -16,9 +17,10 @@ healthchecks + `restart: unless-stopped` self-heal), and the `switchroom
 up` / `switchroom init` / `switchroom update` / `switchroom systemd`
 verbs are gone. The v0.7 install path is `curl ... install.sh | sh`,
 then `switchroom setup`, then `switchroom apply && docker compose pull
-&& docker compose up -d --remove-orphans`. Four published GHCR images
+&& docker compose up -d --remove-orphans`. Seven published GHCR images
 (`switchroom-base`, `switchroom-agent`, `switchroom-broker`,
-`switchroom-kernel`) — no `docker build` on the operator's host. The
+`switchroom-kernel`, `switchroom-auth-broker`, `switchroom-hostd`,
+`switchroom-hindsight`) — no `docker build` on the operator's host. The
 singleton `switchroom-scheduler` container described later in this RFC
 was retired in PR #893 (Phase 4 cron-fold-in); cron now runs in-container
 in every agent as a sibling of the gateway. See `docs/scheduling.md`.
@@ -140,17 +142,21 @@ PID 1 is `tini`. tini reaps zombies, forwards signals, and exits clean. The proc
 
 ```
 tini (PID 1)
-└── tmux (daemonised, listening on /tmp/tmux-1000/<agent>)
-    └── start.sh           (rendered from profiles/_base/start.sh.hbs)
-        └── claude --continue
-            ├── MCP child: telegram gateway (telegram-plugin/server.ts)
-            ├── MCP child: hindsight
-            └── MCP child: ... (per-agent .mcp.json)
+└── start.sh           (rendered from profiles/_base/start.sh.hbs)
+    ├── gateway sidecar (bun telegram-plugin gateway.js, supervised by _switchroom_supervise)
+    ├── autoaccept-poll sidecar
+    ├── agent-scheduler sidecar (cron, since Phase 4)
+    └── exec tmux (daemonised, listening on /tmp/tmux-1000/<agent>)
+        └── bash
+            └── claude --continue
+                ├── MCP child: telegram-plugin/server.ts (in-claude MCP stdio bridge)
+                ├── MCP child: hindsight
+                └── MCP child: ... (per-agent .mcp.json)
 ```
 
-`start.sh` does env setup, then `exec`s into `claude --continue` inside the tmux pane. The telegram gateway is an MCP child of `claude`, not a sibling — it inherits claude's stdio and shares its lifecycle. There is no userland supervisor: tini handles signal forwarding and zombie reaping, tmux handles the pane, and claude's own MCP supervisor handles the gateway and hindsight children. The previous draft's "tini supervises start.sh + tmux + claude + gateway" framing was wrong; nothing in this tree is doing 4-way supervision and we should not introduce a 50-line process supervisor where none is needed.
+`start.sh` forks the gateway daemon and autoaccept-poll as supervised background processes (`_switchroom_supervise ... &`), then `exec`s into a tmux session. The telegram gateway is a **supervised sidecar sibling** launched before tmux — it is not an MCP child of claude. The in-claude MCP entry (`telegram-plugin/server.ts`) is the stdio bridge that talks to the already-running gateway process over a unix socket; the gateway itself runs outside claude's process tree. tini handles PID 1 signal forwarding and zombie reaping.
 
-Inside the container `CLAUDE_CONFIG_DIR=/state/.claude` (per-agent bind-mount, see Volume layout). The container is the only place we need tmux. The `!` interrupt path stays local: the gateway (an MCP child of claude) and claude itself share a single tmux socket at `/tmp/tmux-1000/<agent>` — same socket family as today. `tmux send-keys C-c` is a local IPC call. No container boundary is crossed for the interrupt.
+Inside the container `CLAUDE_CONFIG_DIR=/state/.claude` (per-agent bind-mount, see Volume layout). The `!` interrupt path stays local: `tmux send-keys C-c` is a local IPC call inside the container. No container boundary is crossed for the interrupt.
 
 ### Container identity model — per-agent socket directories
 
@@ -163,17 +169,19 @@ Layout:
 ```
 broker container:
   /run/switchroom/broker/
-    klanker/sock        mode 0700, owned by uid:gid 1100:1100
-    coach/sock          mode 0700, owned by uid:gid 1101:1101
-    finn/sock           mode 0700, owned by uid:gid 1102:1102
+    klanker/sock        mode 0700, owned by uid:gid 10001:10001
+    coach/sock          mode 0700, owned by uid:gid 10002:10002
+    finn/sock           mode 0700, owned by uid:gid 10003:10003
     ...
 ```
 
-Per-agent UIDs are allocated deterministically from the agent name at compose-generation time (e.g. `1100 + stable_hash(agent_name) % 800`, collision-checked across the fleet). Each agent container runs as its own UID. The compose generator emits per-agent volumes:
+(Actual UID values are deterministic hashes of the agent name in the 10001..10999 range; the sequential examples above are illustrative.)
+
+Per-agent UIDs are allocated deterministically in the range 10001..10999 (`AGENT_UID_MIN`/`AGENT_UID_MAX` in `src/agents/compose.ts`), collision-checked across the fleet. Each agent container runs as its own UID. The compose generator emits per-agent volumes:
 
 ```yaml
 agent-klanker:
-  user: "1100:1100"
+  user: "10001:10001"   # deterministic hash of "klanker" in 10001..10999 range
   volumes:
     - broker-klanker-sock:/run/switchroom/broker        # read-write, klanker only
     # NOT mounted: broker-coach-sock, broker-finn-sock, etc.
@@ -246,23 +254,23 @@ Volumes that are shared between containers (broker socket, kernel IPC) are Docke
 
 ### Host UID alignment for bind-mounts
 
-Agent containers run as a per-agent UID (1100, 1101, …) — see Container identity model. Bind-mounted host paths (`~/.switchroom/agents/<agent>/`, `~/.claude/projects/<agent>/`, `~/.switchroom/logs/<agent>/`) need to be readable and writable by the matching in-container UID, otherwise `start.sh` fails on first write.
+Agent containers run as a per-agent UID in the 10001..10999 range — see Container identity model. Bind-mounted host paths (`~/.switchroom/agents/<agent>/`, `~/.claude/projects/<agent>/`, `~/.switchroom/logs/<agent>/`) need to be readable and writable by the matching in-container UID, otherwise `start.sh` fails on first write.
 
 Convention:
 
 - **`SWITCHROOM_HOST_UID`** env var, sourced from `~/.switchroom/.env` written by `switchroom setup`. Linux default: the operator's own UID (the output of `id -u` at setup time, typically `1000`). Mac/Windows: explicit, no default — `switchroom setup` prompts and writes whatever the operator confirms.
 - The compose generator sets `user: "${SWITCHROOM_HOST_UID}:${SWITCHROOM_HOST_GID}"` on every agent container that mounts host paths, **plus** an in-container supplementary group binding for the per-agent identity used inside `/run/switchroom/broker/<agent>/`. The two-UID story is: outside-mounted host files are owned as the host operator; inside-only sockets are owned as the per-agent UID. Compose's `user:` directive sets the primary UID; supplementary groups are added at start.sh entry.
 - **Docker Desktop caveat (Mac/Windows):** the LinuxKit VM's virtiofs translates host UIDs so that *every* host file appears owned by container UID 1000 inside the VM, regardless of the host operator's actual UID. Per-agent isolation between bind-mounted host paths therefore cannot rely on UID separation on Mac/Win — it can only rely on the **compose generator never mounting agent-A's host path into agent-B's container**. This invariant is enforced by `src/agents/compose.ts` (a single agent's `~/.switchroom/agents/<name>` and `~/.claude/projects/<name>` paths only ever appear under that agent's service block) and audited by a doctor check `switchroom doctor --check cross-agent-mounts` that grep-asserts the rendered compose has no host path appearing under more than one service.
-- The doctor check runs on every `switchroom reconcile`, every `switchroom up`, and as a CI gate on the compose generator's snapshot tests. Operator hand-edits that violate it fail the next doctor invocation with a hard error and a pointer to the offending lines.
+- The doctor check runs on every `switchroom apply`, and as a CI gate on the compose generator's snapshot tests. Operator hand-edits that violate it fail the next doctor invocation with a hard error and a pointer to the offending lines.
 
 ### Compose skeleton
 
 ```yaml
-# generated by `switchroom reconcile` — do not edit by hand
-version: "3.9"
+# generated by switchroom — do not edit by hand
+name: switchroom
 
 x-agent-defaults: &agent-defaults
-  image: ghcr.io/switchroom/agent:0.7.0
+  image: ghcr.io/switchroom/agent:latest
   init: false                            # tini is PID 1 inside
   restart: unless-stopped
   stop_grace_period: 45s                 # gateway needs ~35s to drain — see note below
@@ -275,7 +283,7 @@ x-agent-defaults: &agent-defaults
 
 services:
   vault-broker:
-    image: ghcr.io/switchroom/broker:0.7.0
+    image: ghcr.io/switchroom/broker:latest
     restart: unless-stopped
     volumes:
       - broker-sock:/run/switchroom
@@ -286,7 +294,7 @@ services:
       retries: 3
 
   approval-kernel:
-    image: ghcr.io/switchroom/kernel:0.7.0
+    image: ghcr.io/switchroom/kernel:latest
     restart: unless-stopped
     volumes:
       - kernel-sock:/run/switchroom-kernel
@@ -327,7 +335,7 @@ volumes:
   # ... one pair per agent, generated
 ```
 
-`switchroom reconcile` regenerates this whole file from `switchroom.yaml`, the same way it regenerates systemd units today. Hand edits get clobbered. There's a `# generated by` warning at the top.
+`switchroom apply` regenerates this whole file from `switchroom.yaml`, the same way it regenerates systemd units today. Hand edits get clobbered. There's a `# generated by` warning at the top.
 
 **Why `stop_grace_period: 45s`.** Docker's default SIGTERM-to-SIGKILL window is 10s. The telegram gateway's drain path (`telegram-plugin/gateway/gateway.ts` shutdown handler) needs ~35s in the worst case to flush in-flight stream-replies, finalise the progress card, persist the FIFO queue tail, and let claude write its session JSONL. Without `stop_grace_period`, every `docker compose restart` becomes a SIGKILL crash mid-flush, which is precisely the failure mode the watchdog exists to detect — and would make routine restarts indistinguishable from real wedges in the audit log. 45s gives a 10s safety margin over observed peak.
 
@@ -462,7 +470,7 @@ Abort criteria:
 
 Files: 5 Dockerfiles (base, agent, broker, kernel, scheduler), `src/agents/compose.ts`, `src/scheduler/`, tests. Generate compose from the existing config cascade. Cover defaults, profiles, per-agent overrides, vault refs, mem/cpu limits, per-agent socket volumes, scheduler service generation. Scheduler implementation (node-cron loop, `docker exec` dispatch, audit DB) lands here so Phase 2's broker ACL changes have a working consumer.
 
-Success: `switchroom reconcile` writes a compose file that `docker compose config` validates and `docker compose up -d` runs. Three agents up, all responding in Telegram.
+Success: `switchroom apply` writes a compose file that `docker compose config` validates and `docker compose up -d` runs. Three agents up, all responding in Telegram.
 
 **Acceptance test (promoted from Open Questions): `switchroom add agent` reconcile-then-up race.** Adding a new agent must update compose AND start the new container without disturbing existing ones. Test: 3-agent fleet running, send a message to agent-A every 2s, run `switchroom add agent newbie` concurrently, verify (a) agent-A's response stream is uninterrupted, (b) `docker compose up -d --no-deps agent-newbie` only touches the new service, (c) no broker/kernel restart, (d) newbie reaches "first reply in Telegram" within 60s. Failure to pass = Phase 1 incomplete, regardless of other criteria.
 
@@ -578,7 +586,7 @@ Files: `src/cli/migrate-to-docker.ts`, `src/cli/migrate-to-host.ts`, e2e suite. 
 
 README install path messaging: **Docker is the default install path for Mac and Linux.** The bare-metal/host-native install path stays fully supported on Linux for operators who prefer it or already have it — no behavioural difference, same product promise. Other platforms (Windows-WSL2, Synology, Unraid, RasPi) work via the same Docker compose file but are best-effort: expected to work, not formally tested or release-gated. Migration tooling and CLI verbs work on those platforms when Docker Desktop or Docker Engine is functional, they're just not part of the validated release matrix. The CLI auto-detects which mode it's in by looking for `~/.switchroom/compose/docker-compose.yml`.
 
-**UID alignment in migration.** Host-native files are owned by the operator's host UID (typically `1000`). Under Docker, agents may run as a different UID (e.g. `1100` per the identity model on Mac/Win where virtiofs translates everything to `1000` regardless, or as `${SWITCHROOM_HOST_UID}` for bind-mounted host paths). Migration must `chown -R` session JSONLs, hindsight banks, and per-agent state to match the destination UID:
+**UID alignment in migration.** Host-native files are owned by the operator's host UID (typically `1000`). Under Docker, agents may run as a different UID (e.g. a value in the 10001..10999 range per the identity model on Linux, or as `${SWITCHROOM_HOST_UID}` for bind-mounted host paths on Mac/Win where virtiofs translates everything to `1000` regardless). Migration must `chown -R` session JSONLs, hindsight banks, and per-agent state to match the destination UID:
 
 - **`migrate to-docker`:** read `SWITCHROOM_HOST_UID` from `~/.switchroom/.env` (prompt and write if absent on Mac/Win). `chown -R $SWITCHROOM_HOST_UID:$SWITCHROOM_HOST_GID ~/.switchroom/agents/ ~/.claude/projects/ ~/.switchroom/logs/`. Fail loudly if any path can't be chowned (likely indicates the operator is on a multi-user box and needs `sudo`).
 - **`migrate to-host`:** inverse. `chown -R $(id -u):$(id -g) ~/.switchroom/agents/ ~/.claude/projects/ ~/.switchroom/logs/`. Same fail-loud discipline.
