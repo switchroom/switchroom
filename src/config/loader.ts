@@ -6,6 +6,7 @@ import { ZodError } from "zod";
 import { SwitchroomConfigSchema, type SwitchroomConfig } from "./schema.js";
 import { resolveDualPath } from "./paths.js";
 import { applyAgentOverlays } from "./overlay-loader.js";
+import { resolveAgentConfig } from "./merge.js";
 
 export class ConfigError extends Error {
   constructor(
@@ -199,7 +200,59 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
   // per-file isolated and surfaced as warnings — they never fail the load.
   applyAgentOverlays(config);
 
+  // PR4b-cron follow-up: validate that every per-cron `topic:` alias
+  // resolves against the agent's channels.telegram.topic_aliases. This
+  // is a cross-field check that needs the resolved cascade, so it lives
+  // here in the loader rather than the zod schema. A typo'd alias would
+  // otherwise silently fall back to default_topic_id at dispatch time —
+  // far worse UX than failing fast at config-load.
+  validateAllCronTopicAliases(config, filePath);
+
   return config;
+}
+
+/**
+ * Walk every agent's resolved schedule and reject any per-cron `topic:`
+ * alias that doesn't exist in the agent's `channels.telegram.topic_aliases`.
+ *
+ * Fleet-mode and DM agents have no aliases — a string `topic:` there is
+ * also rejected (resolveOutboundTopic would silently fall through to
+ * undefined and the cron fire would land at chat-root, definitely not
+ * what the operator intended). Numeric `topic:` IDs are always accepted.
+ *
+ * Throws a `ConfigError` aggregating all violations across the fleet so
+ * a yaml with multiple typos surfaces them all in one pass.
+ */
+function validateAllCronTopicAliases(
+  config: SwitchroomConfig,
+  filePath: string,
+): void {
+  const issues: string[] = [];
+  for (const [agentName, agentRaw] of Object.entries(config.agents)) {
+    if (!agentRaw) continue;
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentRaw);
+    const schedule = resolved.schedule ?? [];
+    if (schedule.length === 0) continue;
+    const tg = resolved.channels?.telegram;
+    const aliases = new Set(Object.keys(tg?.topic_aliases ?? {}));
+    for (const entry of schedule) {
+      if (entry.topic == null) continue;
+      if (typeof entry.topic === "number") continue;
+      if (!aliases.has(entry.topic)) {
+        issues.push(
+          `  agents.${agentName}.schedule cron \`${entry.cron}\`: ` +
+          `topic alias "${entry.topic}" is not defined in ` +
+          `channels.telegram.topic_aliases.`,
+        );
+      }
+    }
+  }
+  if (issues.length > 0) {
+    throw new ConfigError(
+      `Cron \`topic:\` alias references unknown topic_aliases in ${filePath}`,
+      issues,
+    );
+  }
 }
 
 export function resolveAgentsDir(config: SwitchroomConfig): string {

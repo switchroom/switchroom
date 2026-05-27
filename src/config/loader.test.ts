@@ -225,3 +225,170 @@ describe("resolveAgentsDir: SWITCHROOM_AGENTS_DIR env var override", () => {
     expect(resolveAgentsDir(cfg)).toBe(yamlAgentsDir);
   });
 });
+
+// ─── PR4b-cron follow-up: cron topic alias validation ────────────────────
+describe("loadConfig: cron `topic:` alias validation", () => {
+  it("accepts schedule entries with aliases that resolve in topic_aliases", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    channels:
+      telegram:
+        chat_id: "-1002222222222"
+        default_topic_id: 1
+        topic_aliases:
+          planning: 17
+          cron: 23
+    schedule:
+      - cron: "0 8 * * 1-5"
+        prompt: "Morning digest"
+        topic: planning
+      - cron: "30 9 * * *"
+        prompt: "Another check"
+        topic: cron
+`);
+    expect(() => loadConfig(path)).not.toThrow();
+  });
+
+  it("accepts numeric topic IDs without consulting topic_aliases", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    channels:
+      telegram:
+        chat_id: "-1002222222222"
+        default_topic_id: 1
+    schedule:
+      - cron: "0 8 * * 1-5"
+        prompt: "Send to thread 99"
+        topic: 99
+`);
+    expect(() => loadConfig(path)).not.toThrow();
+  });
+
+  it("accepts schedule entries without a topic field (default fallback)", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "Daily — no topic override"
+`);
+    expect(() => loadConfig(path)).not.toThrow();
+  });
+
+  it("rejects an unknown alias with a clear, agent-and-cron-cited error", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    channels:
+      telegram:
+        chat_id: "-1002222222222"
+        default_topic_id: 1
+        topic_aliases:
+          planning: 17
+    schedule:
+      - cron: "0 8 * * 1-5"
+        prompt: "Typo here"
+        topic: plannign
+`);
+    let caught: Error | null = null;
+    try { loadConfig(path); } catch (e) { caught = e as Error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+    const ce = caught as ConfigError;
+    expect(ce.message).toContain("Cron \`topic:\` alias references unknown");
+    expect(ce.details?.join("\n")).toContain("klanker");
+    expect(ce.details?.join("\n")).toContain("plannign");
+    expect(ce.details?.join("\n")).toContain("0 8 * * 1-5");
+  });
+
+  it("rejects string aliases when fleet-mode agents have no topic_aliases at all", () => {
+    // Fleet/DM agents: silent dispatch to undefined / chat-root would be
+    // worse than failing fast — definitely not what the operator meant.
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    topic_id: 42
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "Where does this go?"
+        topic: planning
+`);
+    let caught: Error | null = null;
+    try { loadConfig(path); } catch (e) { caught = e as Error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+  });
+
+  it("aggregates multiple violations from multiple agents in a single error", () => {
+    const path = writeTempConfig(`
+switchroom:
+  version: 1
+telegram:
+  bot_token: "x"
+  forum_chat_id: "-1001111111111"
+agents:
+  klanker:
+    topic_name: planning
+    channels:
+      telegram:
+        chat_id: "-1002222222222"
+        default_topic_id: 1
+        topic_aliases:
+          planning: 17
+    schedule:
+      - cron: "0 8 * * *"
+        prompt: "Typo 1"
+        topic: plannign
+  ziggy:
+    topic_name: cron
+    channels:
+      telegram:
+        chat_id: "-1003333333333"
+        default_topic_id: 1
+        topic_aliases:
+          admin: 31
+    schedule:
+      - cron: "30 8 * * *"
+        prompt: "Typo 2"
+        topic: alerst
+`);
+    let caught: Error | null = null;
+    try { loadConfig(path); } catch (e) { caught = e as Error; }
+    expect(caught).toBeInstanceOf(ConfigError);
+    const ce = caught as ConfigError;
+    expect(ce.details?.length).toBe(2);
+    const joined = ce.details?.join("\n") ?? "";
+    expect(joined).toContain("plannign");
+    expect(joined).toContain("alerst");
+  });
+});
