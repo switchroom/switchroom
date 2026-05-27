@@ -224,8 +224,10 @@ import {
   getHindsightSettingsEntry,
   getBuiltinDefaultMcpEntries,
   getGdriveMcpSettingsEntry,
+  getMs365McpSettingsEntry,
 } from "../memory/scaffold-integration.js";
 import { shouldEmitGdriveMcp } from "../config/google-workspace-acl.js";
+import { shouldEmitMs365Mcp } from "../config/microsoft-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
@@ -2039,6 +2041,51 @@ export function resolveGdriveMcpEntry(
   return entry;
 }
 
+/**
+ * RFC #1873 PR 3 — resolve the per-agent `ms-365` MCP entry.
+ *
+ * Mirrors `resolveGdriveMcpEntry` for Microsoft 365. Gate is identical
+ * shape: NOT hard opt-out + `shouldEmitMs365Mcp` returns true (i.e.
+ * `microsoft_workspace.account` set AND that account lists this agent
+ * in `microsoft_accounts.<account>.enabled_for[]`).
+ *
+ * Returns null when the entry must not be emitted.
+ */
+export function resolveMs365McpEntry(
+  agentName: string,
+  agentConfig: AgentConfig,
+  switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig } | null {
+  if ((agentConfig.mcp_servers ?? {})["ms-365"] === false) return null;
+  const account = agentConfig.microsoft_workspace?.account;
+  const microsoftAccounts = switchroomConfig?.microsoft_accounts;
+  if (!shouldEmitMs365Mcp(agentName, account, microsoftAccounts)) return null;
+  // org_mode: per-agent override → top-level default. Launcher
+  // re-reads from config and is authoritative; threading here just
+  // makes the resolved choice visible in settings.json.
+  const orgMode =
+    agentConfig.microsoft_workspace?.org_mode ??
+    switchroomConfig?.microsoft_workspace?.org_mode ??
+    false;
+  const entry = getMs365McpSettingsEntry(
+    DOCKER_SWITCHROOM_CLI_PATH,
+    orgMode ? { orgMode: true } : {},
+  );
+  // Env-threading shape, minus vault-broker (the m365 launcher only
+  // talks to the auth-broker — no vault calls for client_secret yet
+  // because that gates per-agent vault ACL which isn't wired in PR 3).
+  // If a future PR teaches the launcher to resolve `vault:` refs for
+  // client_secret directly, re-add SWITCHROOM_VAULT_BROKER_SOCK here.
+  entry.value.env = {
+    SWITCHROOM_CONFIG: DOCKER_CONFIG_PATH,
+    SWITCHROOM_AGENT_NAME: agentName,
+    SWITCHROOM_CONTAINER: "1",
+    SWITCHROOM_AUTH_BROKER_SOCKET: DOCKER_AUTH_BROKER_SOCKET,
+    HOME: DOCKER_AGENT_HOME,
+  };
+  return entry;
+}
+
 export function scaffoldAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -2292,6 +2339,10 @@ export function scaffoldAgent(
         if (gdrive && !settings.mcpServers[gdrive.key]) {
           settings.mcpServers[gdrive.key] = gdrive.value;
         }
+        const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
+        if (ms365 && !settings.mcpServers[ms365.key]) {
+          settings.mcpServers[ms365.key] = ms365.value;
+        }
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
@@ -2442,6 +2493,10 @@ export function scaffoldAgent(
       const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
       if (gdrive) {
         mcpServers[gdrive.key] = gdrive.value;
+      }
+      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
+      if (ms365) {
+        mcpServers[ms365.key] = ms365.value;
       }
     }
 
@@ -4048,6 +4103,12 @@ export function reconcileAgent(
         // switchroom-mcp retraction works.
         delete mcpServers["gdrive"];
       }
+      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
+      if (ms365) {
+        mcpServers[ms365.key] = ms365.value;
+      } else {
+        delete mcpServers["ms-365"];
+      }
     }
 
     // User-defined extras from switchroom.yaml agents.<name>.mcp_servers.
@@ -4351,6 +4412,10 @@ export function reconcileAgent(
       const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
       if (gdrive) {
         mcpServers[gdrive.key] = gdrive.value;
+      }
+      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
+      if (ms365) {
+        mcpServers[ms365.key] = ms365.value;
       }
     }
 
