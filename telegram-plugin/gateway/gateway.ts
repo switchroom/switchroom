@@ -7870,7 +7870,11 @@ async function handleInboundCoalesced(
   //     defensive against future routers that might call this without one).
   maybeEarlyAckReaction(ctx, from)
 
-  const key = inboundCoalesceKey(String(ctx.chat!.id), String(from.id))
+  const key = inboundCoalesceKey(
+    String(ctx.chat!.id),
+    ctx.message?.message_thread_id,
+    String(from.id),
+  )
   const result = inboundCoalescer.enqueue(key, { text, ctx, downloadImage, attachment })
   if (result.bypass) return handleInbound(ctx, text, undefined, undefined)
 }

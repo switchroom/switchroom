@@ -21,10 +21,26 @@ beforeEach(() => { vi.useFakeTimers() })
 afterEach(() => { vi.useRealTimers() })
 
 describe('inboundCoalesceKey', () => {
-  it('combines chatId and userId so distinct senders never collide', () => {
-    expect(inboundCoalesceKey('c1', 'u1')).not.toBe(inboundCoalesceKey('c1', 'u2'))
-    expect(inboundCoalesceKey('c1', 'u1')).not.toBe(inboundCoalesceKey('c2', 'u1'))
-    expect(inboundCoalesceKey('c1', 'u1')).toBe(inboundCoalesceKey('c1', 'u1'))
+  it('combines chatId, threadId, and userId so distinct senders never collide', () => {
+    expect(inboundCoalesceKey('c1', null, 'u1')).not.toBe(inboundCoalesceKey('c1', null, 'u2'))
+    expect(inboundCoalesceKey('c1', null, 'u1')).not.toBe(inboundCoalesceKey('c2', null, 'u1'))
+    expect(inboundCoalesceKey('c1', null, 'u1')).toBe(inboundCoalesceKey('c1', null, 'u1'))
+  })
+
+  it('keeps the same user\'s messages in DIFFERENT topics in distinct buckets (supergroup-mode)', () => {
+    // CPO decision #9 ratified 2026-05-27: per-topic coalesce intent.
+    // The 1.5s window is "user sends 3 sentences as one thought" —
+    // applying it cross-topic merges genuinely separate conversations.
+    expect(inboundCoalesceKey('c1', 17, 'u1')).not.toBe(inboundCoalesceKey('c1', 23, 'u1'))
+    expect(inboundCoalesceKey('c1', 17, 'u1')).not.toBe(inboundCoalesceKey('c1', null, 'u1'))
+  })
+
+  it('collapses null / undefined / 0 thread IDs to the same key (chatKey convention)', () => {
+    const k1 = inboundCoalesceKey('c1', null, 'u1')
+    const k2 = inboundCoalesceKey('c1', undefined, 'u1')
+    const k3 = inboundCoalesceKey('c1', 0, 'u1')
+    expect(k1).toBe(k2)
+    expect(k1).toBe(k3)
   })
 })
 

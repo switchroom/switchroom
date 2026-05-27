@@ -23,6 +23,7 @@ import {
   type RetryPolicy,
 } from './stream-controller.js'
 import { sanitizeTelegramHtml } from './html-sanitize.js'
+import { chatKey, chatKeyWithSuffix } from './gateway/chat-key.js'
 
 /**
  * Builds the inline status-accent header line for `reply` / `stream_reply`.
@@ -311,14 +312,15 @@ function streamKey(
   lane?: string,
   turnKey?: string,
 ): string {
-  // Canonical chat-key derivation lives in gateway/chat-key.ts — keep this
-  // expression in lockstep with that helper (treats 0/null/undefined the
-  // same), but inline here so this file doesn't introduce a cross-package
-  // import for one expression. See #1564 for the sibling-key bug class.
-  const t = threadId == null || threadId === 0 ? '_' : String(threadId)
-  const base = `${chatId}:${t}`
-  const withLane = lane != null && lane.length > 0 ? `${base}:${lane}` : base
-  return turnKey != null && turnKey.length > 0 ? `${withLane}:${turnKey}` : withLane
+  // Adopt the canonical chatKey() / chatKeyWithSuffix() primitives from
+  // gateway/chat-key.ts (PR2 of supergroup mode — kills the previously
+  // inlined copy of the key expression). The brand erases to string at
+  // runtime, so callers using `streamKey` as a `Map<string, T>` key
+  // continue to work unchanged.
+  const base = lane != null && lane.length > 0
+    ? chatKeyWithSuffix(chatId, threadId ?? null, lane)
+    : chatKey(chatId, threadId ?? null)
+  return turnKey != null && turnKey.length > 0 ? `${base}:${turnKey}` : base
 }
 
 export async function handleStreamReply(
