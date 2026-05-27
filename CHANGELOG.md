@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.13.56 — human-feel UX: ack-first gate + awareness ping + telemetry honesty
+
+### Headline — ack-first PreToolUse gate (#1921)
+
+UAT on v0.13.55 (jtbd-fast-ack-dm, 2026-05-28, 8 non-trivial prompts)
+showed the model produces a real fast ack on only **1 of 8 prompts**.
+3 of 8 are full-answer dumps with no ack at all — the user stares at
+a silent chat for ~10s, then gets a 400-600 char dump. The
+conversational-pacing design contract calls this out: "the framework
+deterministically owns the mechanical beat and enforces compliance,
+but never composes user-facing prose." The advisory levers (prompt
+directives, per-turn `<turn-pacing>` hook, silence-poke ack-poke
+piggyback) are model-suggestions. The model ignores them ~70% of the
+time on non-trivial prompts.
+
+This release ships the missing **enforcement primitive**: a
+`PreToolUse` hook that blocks non-reply tool calls when no reply has
+been sent yet this turn. Reply tools always allowed; non-reply tools
+require the gateway-touched `$TELEGRAM_STATE_DIR/ack-sent.flag` to
+exist. The flag is cleared at every fresh turn atom (real inbound,
+cron fire, subagent handback, vault-grant resume, restart marker).
+Kill-switched via `SWITCHROOM_DISABLE_ACK_FIRST_GATE=1`.
+
+Trivial-answer turns are unaffected (their first call IS reply).
+Heavy turns gain one extra reply call (~100-300ms) for immediate
+user awareness. Closes #1918.
+
+### Awareness ping at 60s (#1920)
+
+Sibling to the existing 300s framework_fallback, but earlier and
+silent (no device ping). Lands even during pure extended-thinking or
+held-inbound silences when the model-targeted ack/soft/firm pokes
+can't reach the model via tool_result piggyback. One-shot per turn.
+Reuses `formatFrameworkFallbackText` so the wording stays consistent
+("still working… (no update from agent in 1 min)") and in-flight
+tools are still named when known.
+
+User-visible UX: no more 5-minute silent chats while the model is
+busy. At 60s into any wedged turn, the user sees a framework-tagged
+status message; the louder 300s fallback escalates with a
+notification if the model still hasn't replied.
+
+### Telemetry honesty: post-fallback recovery accounting (#1919)
+
+`gateway.ts` was clearing the `signalTracker` state immediately at
+framework_fallback. Late reply tool calls (the model's eventual
+recovery — the load-bearing unwedge primitive) then silently no-oped
+against cleared state. Both `turn_ended` emissions (the fallback
+itself + the canonical session-end follow-up) reported
+`outbound_count: 0` even when replies were demonstrably delivered.
+The framework's actual unwedge success rate was systematically
+under-reported in the KPIs.
+
+Fix: defer the clear to the canonical session-end paths. The
+silence-poke ladder is already drained at fallback so no further
+pokes fire — only the metrics state survives long enough to catch
+late `noteOutbound` calls.
+
+### Known: inbound-delivery hold (filed #1922)
+
+Live trace on clerk 2026-05-27 showed an inbound the gateway received
+at 12:50:57 didn't reach the claude session until 12:55:58 — a
+5-minute hold with no observable cause (no thinking, no tool, no
+event). Root cause not yet diagnosed; likely candidates are IPC
+backpressure during post-turn Hindsight/compaction or a bridge
+state-machine corner. The three fixes above make the user UX
+acceptable even when this bug recurs; the underlying delivery hold
+is tracked separately.
+
 ## v0.13.55 — Notion integration (5-PR series)
 
 Adds a Notion provider to switchroom: one operator-owned internal
