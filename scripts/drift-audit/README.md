@@ -91,7 +91,7 @@ with a category that selects the right Phase 1 prompt branch:
 | `rfc-shipped` | `reference/sub-agent-visibility-rfc.md` | Verify `status: shipped` still true; flag if reverted. |
 | `rfc-draft` | `reference/rfc-docker-multi-container.md` | Verify Draft hasn't been overtaken by reality. If shipped, mark superseded or promote to a shipped artefact. |
 | `archived` | `reference/status-card-design.md` | Confirm `status: archived` still appropriate; flag references elsewhere that treat it as current. |
-| `historical` | `reference/PRD.md`, `reference/onboarding-gap-analysis.md` | Verify the historical disclaimer still holds; flag if anyone is using it as current spec. |
+| `historical` | `reference/onboarding-gap-analysis.md` | Verify the historical disclaimer still holds; flag if anyone is using it as current spec. |
 | `docs` | `docs/*.md` (post-pilot) | Code is authoritative. Standard drift verdicts. |
 | `src-comments` | `src/<module>/` (post-pilot) | Code is authoritative. Comments referencing dead code/PRs/versions get deleted or updated. |
 

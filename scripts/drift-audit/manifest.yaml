@@ -224,18 +224,10 @@ units:
       the active design. The pinned progress card was retired in
       #1122 — verify no other artefact contradicts the archival.
 
-  # ── Historical (2) ─────────────────────────────────────────────
-  - id: historical-prd
-    path: reference/PRD.md
-    category: historical
-    anchors_hint: |
-      Carries a "⚠️ Historical design document" disclaimer at the top
-      listing specific dated sections (Telegram plugin model, CLI
-      surface, memory model). Verify the disclaimer is still accurate
-      — are the listed dated areas still the right list, or has more
-      drifted since? Verify the canonical-sources pointer block is
-      still accurate.
-
+  # ── Historical (1) ─────────────────────────────────────────────
+  # Note: a previous draft of this manifest listed `reference/PRD.md`
+  # as a unit. That file was deleted in PR #534 (commit 8bdb86cb)
+  # before the audit infra landed, so the unit was removed.
   - id: historical-onboarding-gap-analysis
     path: reference/onboarding-gap-analysis.md
     category: historical
