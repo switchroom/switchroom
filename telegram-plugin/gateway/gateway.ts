@@ -6791,6 +6791,14 @@ function handleSessionEvent(ev: SessionEvent): void {
           statusKey(ev.chatId, enqThreadId),
           'handback',
         )
+        // Ack-first gate (`reference/conversational-pacing.md` beat 1):
+        // wipe the prior turn's `ack-sent.flag` so the ack-first-
+        // pretool hook re-arms for this fresh turn. Centralised HERE
+        // (not in handleInbound) because `enqueue` is the single
+        // canonical fresh-turn atom — fires for real inbounds, cron
+        // fires, subagent-handback channel wakes, vault-grant resumes,
+        // and restart markers alike. Best-effort — see ack-flag.ts.
+        clearAckSent()
       }
       if (ev.chatId) {
         // Issue #195: if a previous turn left an answer-lane stream open
@@ -9051,12 +9059,11 @@ async function handleInbound(
         // the framework can nudge the model if it goes quiet past the
         // soft / firm thresholds.
         silencePoke.startTurn(statusKey(chat_id, messageThreadId), Date.now())
-        // Ack-first gate (`reference/conversational-pacing.md` beat 1):
-        // wipe the previous turn's marker so the ack-first-pretool hook
-        // re-arms for this fresh turn. The first reply this turn will
-        // re-touch the flag, unlocking subsequent non-reply tool calls.
-        // Best-effort — see ack-flag.ts.
-        clearAckSent()
+        // Ack-first gate clear is centralised in handleSessionEvent's
+        // `enqueue` branch — that fires for EVERY fresh turn atom
+        // (real inbound, cron, subagent-handback, vault-grant wake,
+        // restart marker) so cron/handback turns also re-arm the gate.
+        // See the call site under `case 'enqueue'` (~line 6794).
         // #1445 cross-turn pending-async ambient. A new turn starting
         // (user inbound, synthesised wake, or handback channel) is the
         // signal that the model is about to re-engage — clear any

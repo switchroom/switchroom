@@ -87,6 +87,12 @@ export function decide(
 ): HookDecision {
   const toolName = input.tool_name ?? "";
 
+  // Fail-open: a missing/empty tool_name is a Claude Code protocol
+  // error — never gate on it (we don't know what we'd be gating).
+  if (toolName === "") {
+    return { decision: "allow" };
+  }
+
   // Reply tools are always allowed — that's literally the call the
   // hook asks the model to make.
   if (REPLY_TOOL_NAMES.has(toolName)) {

@@ -101,11 +101,12 @@ describe("ack-first-pretool — decide()", () => {
       ).toBe("allow");
     });
 
-    it("treats missing tool_name as a non-reply tool (block)", () => {
-      // Defensive: an empty / missing tool_name shouldn't crash. It falls
-      // through to the "non-reply" branch which blocks — fail-safe for the
-      // protocol-error case.
-      expect(decide({}, stateDir).decision).toBe("block");
+    it("allows when tool_name is missing (protocol-error → fail-open)", () => {
+      // A Claude Code protocol error (no tool_name) shouldn't gate
+      // anything — we don't know what we'd be gating. Fail-open per
+      // the file-doc.
+      expect(decide({}, stateDir).decision).toBe("allow");
+      expect(decide({ tool_name: "" }, stateDir).decision).toBe("allow");
     });
   });
 });
