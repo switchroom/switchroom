@@ -50,6 +50,14 @@ function makeDeps(agentName: string | null) {
     ['chat1:thr1:msg1', 100],
     ['chat2:thr2:msg2', 200],
   ])
+  // PR3b: claudeBusyKeys tracks turns actually handed to claude. In a
+  // healthy registered-disconnect scenario both maps would carry the
+  // same keys (delivery succeeded); the dangling-sweep tests below
+  // override individual deps to exercise the orphaned-key path.
+  const claudeBusyKeys = new Set<string>([
+    'chat1:thr1:msg1',
+    'chat2:thr2:msg2',
+  ])
   const activeDraftStreams = new Map<string, FakeStream>([
     ['chat1:thr1:r1', { isFinal: () => false, finalize: finalizeA }],
     ['chat2:thr2:r2', { isFinal: () => true, finalize: finalizeB }],
@@ -66,6 +74,7 @@ function makeDeps(agentName: string | null) {
       activeStatusReactions,
       activeReactionMsgIds,
       activeTurnStartedAt,
+      claudeBusyKeys,
       activeDraftStreams,
       activeDraftParseModes,
       clearActiveReactions,
@@ -169,6 +178,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
         ['ghost:thr:msg', { chatId: 'ghost', messageId: 42 }],
       ]),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
+      claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
       activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions,
@@ -179,6 +189,10 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
 
     flushOnAgentDisconnect(deps)
 
+    // PR3b: claudeBusyKeys swept alongside the activeTurnStartedAt
+    // dangling entry — both maps mirror each other on registered
+    // disconnects, so a key in one is always a key in the other.
+    expect(deps.claudeBusyKeys.size).toBe(0)
     // The sweep fired and cleared the dangling entry.
     expect(deps.activeTurnStartedAt.size).toBe(0)
     expect(deps.activeReactionMsgIds.size).toBe(0)
@@ -222,6 +236,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeStatusReactions: new Map<string, FakeCtrl>(),
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['real-turn:thr:msg', 100]]),
+      claudeBusyKeys: new Set<string>(['real-turn:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
       activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
@@ -245,6 +260,7 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeStatusReactions: new Map<string, FakeCtrl>(),
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
+      claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
       activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),

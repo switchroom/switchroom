@@ -37,6 +37,11 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
   activeReactionMsgIds: Map<string, { chatId: string; messageId: number }>
   /** Mirror map: same keys → turn-start timestamps. */
   activeTurnStartedAt: Map<string, number>
+  /** PR3b: keys claude has actually been handed (delivered, not just
+   *  received). Cleared on disconnect for the same reason as
+   *  activeTurnStartedAt — the bridge just died, every turn it
+   *  was handed is dead by definition. */
+  claudeBusyKeys: Set<string>
 
   /** Open draft-stream handles keyed by chat:thread:replyId. */
   activeDraftStreams: Map<string, Stream>
@@ -78,6 +83,7 @@ export function flushOnAgentDisconnect<
     activeStatusReactions,
     activeReactionMsgIds,
     activeTurnStartedAt,
+    claudeBusyKeys,
     activeDraftStreams,
     activeDraftParseModes,
     clearActiveReactions,
@@ -105,6 +111,7 @@ export function flushOnAgentDisconnect<
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)
+    claudeBusyKeys.delete(key)
   }
   clearActiveReactions()
 
@@ -124,6 +131,7 @@ export function flushOnAgentDisconnect<
     for (const k of danglingKeys) {
       activeTurnStartedAt.delete(k)
       activeReactionMsgIds.delete(k)
+      claudeBusyKeys.delete(k)
     }
     log(
       `telegram gateway: disconnect-flush swept ${danglingKeys.length} dangling turn key(s) ` +
